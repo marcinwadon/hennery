@@ -61,6 +61,9 @@ struct HostArgs {
     /// Agent adapter, as `name=command args…`. Repeatable.
     #[arg(long = "agent", value_parser = parse_agent)]
     agents: Vec<(String, AgentCommand)>,
+    /// Park sessions idle for this many seconds; 0 turns the reaper off.
+    #[arg(long, default_value_t = 1800)]
+    idle_timeout_secs: u64,
 }
 
 #[derive(Args)]
@@ -73,6 +76,9 @@ struct UpArgs {
     dev_token: String,
     #[arg(long = "agent", value_parser = parse_agent)]
     agents: Vec<(String, AgentCommand)>,
+    /// Park sessions idle for this many seconds; 0 turns the reaper off.
+    #[arg(long, default_value_t = 1800)]
+    idle_timeout_secs: u64,
 }
 
 fn parse_agent(s: &str) -> Result<(String, AgentCommand), String> {
@@ -120,6 +126,7 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
 async fn run_host(args: HostArgs) -> Result<()> {
     let mut cfg = HostConfig::new(args.collector, args.host_id, args.dev_token, args.data_dir);
     cfg.agents = args.agents.into_iter().collect();
+    cfg.idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
     // Returning from main drops the runtime, which drops every session actor
     // and with it (kill_on_drop) every adapter process.
     tokio::select! {
@@ -175,6 +182,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
         ])
         .arg("--data-dir")
         .arg(args.data_dir.join("host"))
+        .arg("--idle-timeout-secs")
+        .arg(args.idle_timeout_secs.to_string())
         .env("HENNERY_DEV_TOKEN", &args.dev_token)
         .kill_on_drop(true)
         .process_group(0);

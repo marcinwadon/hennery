@@ -642,3 +642,65 @@ async fn updates_never_land_outside_their_turn_under_a_multi_thread_runtime() {
     let frames = uplink.pending().unwrap();
     assert_updates_stay_inside_their_turns(&kinds(&frames));
 }
+
+fn reaping(uplink: &Uplink, script: &FakeScript, idle: Option<Duration>) -> SessionHandle {
+    session::spawn(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        fake_with(script),
+        std::env::temp_dir(),
+        SessionOptions {
+            idle_timeout: idle,
+            kill_grace: Duration::from_secs(1),
+            ..SessionOptions::default()
+        },
+    )
+}
+
+#[tokio::test]
+async fn an_idle_session_is_reaped_its_group_killed_and_parked() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("grandchild.pid");
+    let script = FakeScript {
+        grandchild_pid_file: Some(pid_file.to_string_lossy().into_owned()),
+        ..FakeScript::default()
+    };
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let handle = reaping(&uplink, &script, Some(Duration::from_millis(300)));
+    let grandchild = read_pid(&pid_file).await;
+    let frames = wait_until(&uplink, has("session_parked:idle")).await;
+    assert_eq!(kinds(&frames), ["session_started", "session_parked:idle"]);
+    wait_dead(grandchild).await;
+    wait_ended(&handle).await;
+}
+
+#[tokio::test]
+async fn the_reaper_never_parks_a_session_mid_turn() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    // A 2 s turn against a 300 ms idle window.
+    let handle = reaping(&uplink, &slow_script(), Some(Duration::from_millis(300)));
+    assert!(handle.send(prompt("r1", "t1")));
+    wait_until(&uplink, has("turn_started")).await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(
+        !has("session_parked:idle")(&uplink.pending().unwrap()),
+        "reaped mid-turn"
+    );
+    // Once the turn is over, the window starts again and the reaper parks it.
+    let frames = wait_until(&uplink, has("session_parked:idle")).await;
+    let kinds = kinds(&frames);
+    let ended = kinds.iter().position(|k| k == "turn_ended").expect("turn ended");
+    let parked = kinds.iter().position(|k| k == "session_parked:idle").unwrap();
+    assert!(ended < parked, "{kinds:?}");
+}
+
+#[tokio::test]
+async fn a_disabled_reaper_leaves_an_idle_session_attached() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let handle = reaping(&uplink, &FakeScript::default(), None);
+    wait_until(&uplink, has("session_started")).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(kinds(&uplink.pending().unwrap()), ["session_started"]);
+    assert!(!handle.is_ended());
+}

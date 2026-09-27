@@ -5,7 +5,7 @@
 //! writing to the outbox, which is resent on the next connection.
 
 use crate::outbox::Outbox;
-use crate::session::{self, AgentCommand, SessionCmd, SessionHandle};
+use crate::session::{self, AgentCommand, SessionCmd, SessionHandle, SessionOptions};
 use crate::uplink::Uplink;
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
@@ -32,6 +32,8 @@ pub struct HostConfig {
     pub reconnect_max: Duration,
     pub ping_interval: Duration,
     pub read_timeout: Duration,
+    /// Idle reaper window (ACP core §4.7); zero turns the reaper off.
+    pub idle_timeout: Duration,
 }
 
 impl HostConfig {
@@ -51,6 +53,15 @@ impl HostConfig {
             reconnect_max: Duration::from_secs(30),
             ping_interval: Duration::from_secs(15),
             read_timeout: Duration::from_secs(45),
+            idle_timeout: session::IDLE_TIMEOUT,
+        }
+    }
+
+    /// Options for every session actor this host spawns.
+    pub fn session_options(&self) -> SessionOptions {
+        SessionOptions {
+            idle_timeout: (!self.idle_timeout.is_zero()).then_some(self.idle_timeout),
+            ..SessionOptions::default()
         }
     }
 }
@@ -197,12 +208,13 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
                 // its session_started fact is already in the outbox.
                 return Ok(());
             }
-            let handle = session::start(
+            let handle = session::spawn(
                 uplink.clone(),
                 request_id,
                 session_id.clone(),
                 command,
                 PathBuf::from(cwd),
+                cfg.session_options(),
             );
             map.insert(session_id, handle);
         }

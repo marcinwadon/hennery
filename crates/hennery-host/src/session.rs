@@ -24,6 +24,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 /// How long `start` waits for spawn → `initialize` → `session/new` →
@@ -39,6 +40,9 @@ const EXIT_SETTLE: Duration = Duration::from_millis(500);
 /// After an exit, adapter output still in the pipe is forwarded until the
 /// notification stream has been quiet this long.
 const DRAIN_QUIET: Duration = Duration::from_millis(100);
+
+/// Default idle window before the reaper parks a session (ACP core §4.7).
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Messages from the connection task to a session actor.
 #[derive(Debug)]
@@ -64,6 +68,9 @@ pub struct SessionOptions {
     pub start_timeout: Duration,
     /// SIGTERM → SIGKILL grace when the actor kills its adapter.
     pub kill_grace: Duration,
+    /// Park the session after this long with no turn in flight
+    /// (`session_parked{idle}`); `None` disables the reaper.
+    pub idle_timeout: Option<Duration>,
 }
 
 impl Default for SessionOptions {
@@ -71,6 +78,7 @@ impl Default for SessionOptions {
         Self {
             start_timeout: START_TIMEOUT,
             kill_grace: KILL_GRACE,
+            idle_timeout: Some(IDLE_TIMEOUT),
         }
     }
 }
@@ -294,6 +302,10 @@ impl Actor {
         // rejected (invalid) prompt with the same turn_id still runs.
         let mut seen_turns = HashSet::new();
         let mut turn: Option<Turn> = None;
+        // The reaper's clock: restarted when the session starts and when a
+        // turn ends; it never runs while a turn (or a pending question
+        // inside one) is in flight.
+        let mut idle_since = Instant::now();
         loop {
             tokio::select! {
                 // Biased: adapter output already received is emitted before
@@ -346,6 +358,7 @@ impl Actor {
                 },
                 result = next_reply(&mut turn) => {
                     let ended = turn.take().expect("a reply implies a turn");
+                    idle_since = Instant::now();
                     // Closes the race described on `drain_updates`: a late
                     // update that arrived just as the reply resolved must be
                     // emitted before this turn's `turn_ended`.
@@ -363,6 +376,11 @@ impl Actor {
                             self.end_turn(ended.id, TurnOutcome::Failed, None, Some(err.to_string()));
                         }
                     }
+                }
+                _ = idle_deadline(self.options.idle_timeout, idle_since), if turn.is_none() => {
+                    tracing::info!(session_id = %self.session_id, "reaping idle session");
+                    adapter.terminate(self.options.kill_grace).await;
+                    return self.emit(SessionBody::SessionParked { reason: ParkReason::Idle });
                 }
             }
         }
@@ -444,6 +462,15 @@ impl Actor {
         self.emit(SessionBody::SessionParked {
             reason: ParkReason::AdapterExited,
         });
+    }
+}
+
+/// Resolves when the idle window since `since` has passed; never if the
+/// reaper is off.
+async fn idle_deadline(window: Option<Duration>, since: Instant) {
+    match window {
+        Some(window) => tokio::time::sleep_until(since + window).await,
+        None => std::future::pending().await,
     }
 }
 
