@@ -1,0 +1,186 @@
+//! The host WebSocket endpoint (ACP core §3, §5).
+
+use crate::AppState;
+use axum::Router;
+use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::response::Response;
+use axum::routing::get;
+use futures::{SinkExt, StreamExt};
+use hennery_proto::frames::{CollectorFrame, HostFrame, SessionBody};
+use hennery_proto::{PROTOCOL_VERSION, protocol_major};
+use std::collections::BTreeMap;
+use std::time::Duration;
+use tokio::sync::mpsc;
+
+const MAX_FRAME: usize = 32 << 20;
+const PING_INTERVAL: Duration = Duration::from_secs(15);
+const READ_TIMEOUT: Duration = Duration::from_secs(45);
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+pub fn router(state: AppState) -> Router {
+    Router::new().route("/api/hosts/ws", get(upgrade)).with_state(state)
+}
+
+async fn upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    ws.max_message_size(MAX_FRAME)
+        .max_frame_size(MAX_FRAME)
+        .on_upgrade(move |socket| serve(socket, state))
+}
+
+fn text(frame: &CollectorFrame) -> Message {
+    Message::Text(serde_json::to_string(frame).expect("frame serializes").into())
+}
+
+async fn serve(socket: WebSocket, state: AppState) {
+    let (mut sink, mut stream) = socket.split();
+
+    // 1. hello: first frame, authenticated.
+    let hello = match tokio::time::timeout(HELLO_TIMEOUT, stream.next()).await {
+        Ok(Some(Ok(Message::Text(t)))) => serde_json::from_str::<HostFrame>(&t).ok(),
+        _ => None,
+    };
+    let Some(HostFrame::Hello {
+        protocol_version,
+        host_id,
+        token,
+        attached_sessions,
+        ..
+    }) = hello
+    else {
+        return;
+    };
+    let reject = |code: &str, message: &str| CollectorFrame::HelloError {
+        code: code.into(),
+        message: message.into(),
+    };
+    if protocol_major(&protocol_version) != protocol_major(PROTOCOL_VERSION) {
+        let _ = sink
+            .send(text(&reject("incompatible_protocol", "unsupported protocol major")))
+            .await;
+        return;
+    }
+    if !state.token.matches(&token) {
+        let _ = sink
+            .send(text(&reject("unauthorized", "invalid host credential")))
+            .await;
+        return;
+    }
+    let (tx, mut rx) = mpsc::unbounded_channel::<CollectorFrame>();
+    let Some(conn_id) = state.hub.register(&host_id, tx.clone()) else {
+        let _ = sink
+            .send(text(&reject(
+                "already_connected",
+                "another connection for this host is live",
+            )))
+            .await;
+        return;
+    };
+
+    let mut committed = BTreeMap::new();
+    for a in &attached_sessions {
+        committed.insert(
+            a.session_id.clone(),
+            state.store.committed_seq(&a.session_id).unwrap_or(0),
+        );
+    }
+    let ack = CollectorFrame::HelloAck {
+        protocol_version: PROTOCOL_VERSION.into(),
+        collector_version: env!("CARGO_PKG_VERSION").into(),
+        committed,
+    };
+    if sink.send(text(&ack)).await.is_err() {
+        state.hub.unregister(&host_id, conn_id);
+        return;
+    }
+    tracing::info!(%host_id, "host connected");
+
+    // 2. writer: frames for this host plus keepalive pings.
+    let writer = tokio::spawn(async move {
+        let mut ping = tokio::time::interval(PING_INTERVAL);
+        ping.tick().await;
+        loop {
+            tokio::select! {
+                frame = rx.recv() => match frame {
+                    Some(frame) => if sink.send(text(&frame)).await.is_err() { break },
+                    None => break,
+                },
+                _ = ping.tick() => if sink.send(Message::Ping(Default::default())).await.is_err() { break },
+            }
+        }
+    });
+
+    // 3. reader.
+    loop {
+        let next = tokio::select! {
+            _ = state.shutdown.cancelled() => break,
+            next = tokio::time::timeout(READ_TIMEOUT, stream.next()) => next,
+        };
+        let msg = match next {
+            Ok(Some(Ok(msg))) => msg,
+            _ => break,
+        };
+        let Message::Text(t) = msg else {
+            if matches!(msg, Message::Close(_)) {
+                break;
+            }
+            continue;
+        };
+        let frame = match serde_json::from_str::<HostFrame>(&t) {
+            Ok(f) => f,
+            Err(err) => {
+                tracing::warn!(%host_id, error = %err, "ignoring unknown or invalid frame");
+                continue;
+            }
+        };
+        match frame {
+            HostFrame::Session { session_id, seq, body } => {
+                // A host may only write to its own sessions.
+                match state.store.session(&session_id) {
+                    Ok(Some(row)) if row.host_id == host_id => {}
+                    _ => {
+                        tracing::warn!(%host_id, %session_id, "frame for a session this host does not own");
+                        continue;
+                    }
+                }
+                match state.store.ingest(&session_id, seq, &body) {
+                    Ok(created) => {
+                        for event in created {
+                            state.hub.publish(event);
+                        }
+                        match &body {
+                            SessionBody::SessionStarted { request_id, .. }
+                            | SessionBody::TurnStarted { request_id, .. } => {
+                                state.hub.resolve(request_id, body.clone());
+                            }
+                            SessionBody::StartFailed {
+                                request_id,
+                                code,
+                                message,
+                            } => {
+                                state.hub.reject(request_id, code.clone(), message.clone());
+                            }
+                            _ => {}
+                        }
+                        let _ = tx.send(CollectorFrame::Ack {
+                            session_id,
+                            ack_seq: seq,
+                        });
+                    }
+                    Err(err) => tracing::error!(%host_id, error = %err, "ingest failed; not acking"),
+                }
+            }
+            HostFrame::Error {
+                request_id,
+                code,
+                message,
+            } => state.hub.reject(&request_id, code, message),
+            HostFrame::ResendComplete => tracing::debug!(%host_id, "host finished resending"),
+            HostFrame::Hello { .. } => tracing::warn!(%host_id, "ignoring repeated hello"),
+        }
+    }
+
+    writer.abort();
+    state.hub.unregister(&host_id, conn_id);
+    tracing::info!(%host_id, "host disconnected");
+}

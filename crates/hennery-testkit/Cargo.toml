@@ -17,8 +17,12 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+anyhow.workspace = true
 futures.workspace = true
 hennery-host.workspace = true
+hennery-kernel.workspace = true
 hennery-proto.workspace = true
+hennery-sessions.workspace = true
+reqwest.workspace = true
 tempfile = "3"
 tokio-tungstenite.workspace = true
