@@ -36,6 +36,39 @@ fn a_malformed_agent_flag_is_rejected() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("name=command"));
 }
 
+/// Kills this test's `up` process tree and removes its scratch dir
+/// unconditionally, including on an assertion panic mid-test — nothing below
+/// is allowed to leave a process running just because a `assert!` fired
+/// first.
+struct KillTree {
+    up: std::process::Child,
+    dir: std::path::PathBuf,
+}
+
+impl Drop for KillTree {
+    fn drop(&mut self) {
+        let up_pid = self.up.id() as i32;
+        // Enumerate `up`'s current children *before* touching `up` itself:
+        // once `up` terminates they're reparented and no longer show up
+        // under `-P up_pid`, and SIGKILL bypasses all of `up`'s own cleanup
+        // (its `kill_on_drop` adapters, its ordered host-then-collector
+        // shutdown) — so each must be signalled directly, not left to `up`.
+        for pid in children_of(up_pid) {
+            unsafe {
+                // Each child leads its own process group (`run_up` sets
+                // `process_group(0)`), so kill both the pid and that group.
+                libc::kill(pid, libc::SIGKILL);
+                libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+        // Only PIDs this test started: `up` is our direct child, so kill+wait
+        // it to avoid leaving a zombie for the rest of the test binary's run.
+        let _ = self.up.kill();
+        let _ = self.up.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
 /// A terminal's Ctrl-C delivers SIGINT to every process in the foreground
 /// process group at once. `run_up` pulls its two children out of that group
 /// (`process_group(0)` on both spawns) so only the supervisor is signalled
@@ -49,6 +82,10 @@ fn a_malformed_agent_flag_is_rejected() {
 /// (host before collector): both children shut themselves down promptly on
 /// SIGINT regardless of which fix is in place, so "no leftover processes" is
 /// the observable signal here, not a strict ordering.
+///
+/// `guard` (a `KillTree`) is created immediately after spawn, before any
+/// assertion that could panic, so a failure anywhere below still SIGKILLs the
+/// whole tree and removes the scratch dir on the way out.
 #[test]
 fn sigint_to_ups_process_group_still_shuts_down_cleanly() {
     let free_port = {
@@ -79,8 +116,9 @@ fn sigint_to_ups_process_group_still_shuts_down_cleanly() {
             Ok(())
         });
     }
-    let mut up = command.spawn().unwrap();
+    let up = command.spawn().unwrap();
     let up_pgid = up.id() as i32;
+    let mut guard = KillTree { up, dir };
 
     // Wait for the collector to be listening.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -94,7 +132,7 @@ fn sigint_to_ups_process_group_still_shuts_down_cleanly() {
     // Give the host child a moment to spawn too (it's launched right after
     // the collector, independent of the collector's readiness).
     std::thread::sleep(Duration::from_millis(300));
-    let children = children_of(up.id() as i32);
+    let children = children_of(guard.up.id() as i32);
     assert!(
         children.len() >= 2,
         "expected up to have spawned a collector and a host child, found {children:?}"
@@ -104,7 +142,7 @@ fn sigint_to_ups_process_group_still_shuts_down_cleanly() {
     let rc = unsafe { libc::kill(-up_pgid, libc::SIGINT) };
     assert_eq!(rc, 0, "kill(-pgid, SIGINT) failed: {}", std::io::Error::last_os_error());
 
-    let status = wait_with_timeout(&mut up, Duration::from_secs(15)).expect("up did not exit after SIGINT");
+    let status = wait_with_timeout(&mut guard.up, Duration::from_secs(15)).expect("up did not exit after SIGINT");
     assert!(status.success(), "up exited with {status:?}");
 
     // Give any lingering child a moment to finish reaping before we check.
@@ -112,8 +150,6 @@ fn sigint_to_ups_process_group_still_shuts_down_cleanly() {
     for pid in children {
         assert!(!pid_alive(pid), "child pid {pid} is still alive after up exited");
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 fn children_of(ppid: i32) -> Vec<i32> {
