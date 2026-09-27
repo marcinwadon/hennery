@@ -143,6 +143,15 @@ impl Hub {
         ids
     }
 
+    /// The host is connected and reconciled.
+    pub fn is_ready(&self, host_id: &str) -> bool {
+        self.hosts
+            .lock()
+            .expect("hosts lock")
+            .get(host_id)
+            .is_some_and(|h| h.ready)
+    }
+
     /// Send a frame to a ready host without waiting for anything.
     pub fn send(&self, host_id: &str, frame: CollectorFrame) -> bool {
         self.hosts

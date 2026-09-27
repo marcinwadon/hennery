@@ -9,7 +9,7 @@ use axum::routing::get;
 use futures::{SinkExt, StreamExt};
 use hennery_proto::frames::{CollectorFrame, HostFrame, SessionBody};
 use hennery_proto::{PROTOCOL_VERSION, protocol_major};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -113,6 +113,13 @@ async fn serve(socket: WebSocket, state: AppState) {
     // 3. reader. Requests reach this host only once its resend is complete
     // and reconciled (`mark_ready`).
     let mut reconciled = false;
+    // `close_session` frames the reconciliation loop re-sends by itself
+    // (below), outside `Hub::request_for_session`: no waiter is registered
+    // for them, so their `request_id` is tracked here instead. A `not_attached`
+    // rejection for one still has to close the session collector-side
+    // (decision 7), or it would silently wedge as `closed` in the store but
+    // still attached from the host's point of view.
+    let mut reconcile_closes: HashMap<String, String> = HashMap::new();
     loop {
         let next = tokio::select! {
             _ = state.shutdown.cancelled() => break,
@@ -194,7 +201,26 @@ async fn serve(socket: WebSocket, state: AppState) {
                 request_id,
                 code,
                 message,
-            } => state.hub.reject(&request_id, code, message),
+            } => {
+                if let Some(session_id) = reconcile_closes.remove(&request_id) {
+                    if code == "not_attached" {
+                        match state.store.close_now(&session_id) {
+                            Ok(events) => {
+                                for event in events {
+                                    state.hub.publish(event);
+                                }
+                            }
+                            Err(err) => {
+                                tracing::error!(%host_id, %session_id, error = %err, "close_now failed after a reconcile close was rejected");
+                            }
+                        }
+                    } else {
+                        tracing::warn!(%host_id, %session_id, %code, %message, "reconcile close_session rejected");
+                    }
+                } else {
+                    state.hub.reject(&request_id, code, message);
+                }
+            }
             HostFrame::ResendComplete if !reconciled => {
                 // Everything the host had in its outbox is ingested: only now
                 // is anything still unresolved known to be lost (ACP core
@@ -205,10 +231,9 @@ async fn serve(socket: WebSocket, state: AppState) {
                             state.hub.publish(event);
                         }
                         for session_id in done.close {
-                            let _ = tx.send(CollectorFrame::CloseSession {
-                                request_id: uuid::Uuid::now_v7().to_string(),
-                                session_id,
-                            });
+                            let request_id = uuid::Uuid::now_v7().to_string();
+                            reconcile_closes.insert(request_id.clone(), session_id.clone());
+                            let _ = tx.send(CollectorFrame::CloseSession { request_id, session_id });
                         }
                         reconciled = true;
                         state.hub.mark_ready(&host_id, conn_id);

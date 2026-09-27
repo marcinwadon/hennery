@@ -350,6 +350,54 @@ async fn a_restarted_host_parks_its_sessions_and_interrupts_the_open_turn_only_a
 }
 
 #[tokio::test]
+async fn a_reconcile_close_rejected_not_attached_still_closes_it_collector_side() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+
+    // Close it through the API while the host is connected, then drop the
+    // connection before it answers: the close stays `close_requested` and is
+    // re-sent by the reconciliation loop itself (`ws.rs`, outside
+    // `Hub::request_for_session` — no waiter is registered for it).
+    let c = client();
+    let url = collector.url(&format!("/api/sessions/{session}/close"));
+    let call = tokio::spawn(async move { post(&c, url, json!({})).await });
+    assert!(matches!(host.next().await, CollectorFrame::CloseSession { .. }));
+    let seq = host.seq;
+    host.drop_connection(&collector).await;
+    assert_eq!(call.await.unwrap().0, 503);
+
+    // The host reconnects still reporting the session attached.
+    let mut host = ScriptedHost::connect(&collector, vec![attached(&session, seq)], seq).await;
+    let CollectorFrame::CloseSession { request_id, .. } = host.next().await else {
+        panic!("expected the reconcile-driven close_session");
+    };
+    // The host answers `not_attached`: decision 7 says this still closes the
+    // session collector-side, even though nothing is waiting on this
+    // request_id.
+    host.send(&HostFrame::Error {
+        request_id,
+        code: "not_attached".into(),
+        message: "no such session".into(),
+    })
+    .await;
+
+    wait_for("closed", || async {
+        (collector.lifecycle(&session) == "closed").then_some(())
+    })
+    .await;
+    assert_eq!(
+        collector
+            .event_kinds(&session)
+            .iter()
+            .filter(|k| *k == "operator_closed")
+            .count(),
+        1,
+        "the rejection must not record a second operator_closed"
+    );
+}
+
+#[tokio::test]
 async fn a_request_that_times_out_on_a_live_connection_drops_it() {
     let collector = Collector::start().await;
     let _host = ScriptedHost::connect(&collector, vec![], 0).await;
