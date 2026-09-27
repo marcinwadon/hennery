@@ -175,6 +175,7 @@ async fn empty_prompts_and_overlapping_prompts_are_refused() {
     let slow = FakeScript {
         chunks: vec!["a".into(), "b".into(), "c".into()],
         chunk_delay_ms: 300,
+        ..FakeScript::default()
     };
     start_host(collector.addr, &dir.path().join("host"), &slow);
     let c = client();
@@ -216,6 +217,7 @@ async fn a_collector_restart_mid_turn_loses_nothing_and_duplicates_nothing() {
     let script = FakeScript {
         chunks: (1..=6).map(|n| format!("{n}.")).collect(),
         chunk_delay_ms: 250,
+        ..FakeScript::default()
     };
     start_host(addr, &dir.path().join("host"), &script);
     let c = client();

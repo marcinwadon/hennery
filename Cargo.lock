@@ -988,6 +988,7 @@ dependencies = [
  "hennery-kernel",
  "hennery-proto",
  "hennery-sessions",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",

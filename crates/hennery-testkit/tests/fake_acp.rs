@@ -57,3 +57,103 @@ fn script_env_controls_the_chunks() {
     let updates = out.iter().filter(|m| m["method"] == "session/update").count();
     assert_eq!(updates, 1);
 }
+
+#[test]
+fn exit_after_chunks_crashes_mid_turn_without_answering_the_prompt() {
+    let script = r#"{"chunks":["a","b","c"],"exit_after_chunks":1,"stderr_lines":["using token sk-live-123"]}"#;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hennery-fake-acp"))
+        .env(hennery_testkit::SCRIPT_ENV, script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for r in session_requests() {
+        writeln!(stdin, "{r}").unwrap();
+    }
+    // Read until EOF: the process exits, so stdout closes.
+    let out: Vec<Value> = BufReader::new(child.stdout.take().unwrap())
+        .lines()
+        .map(|l| serde_json::from_str(&l.unwrap()).unwrap())
+        .collect();
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(hennery_testkit::CRASH_EXIT_CODE));
+    let updates = out.iter().filter(|m| m["method"] == "session/update").count();
+    assert_eq!(updates, 1, "{out:?}");
+    assert!(
+        out.iter().all(|m| m["id"] != json!(3)),
+        "the prompt must not be answered: {out:?}"
+    );
+    let mut stderr = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut stderr).unwrap();
+    assert!(
+        stderr.contains("sk-live-123") && stderr.contains("crashing"),
+        "{stderr}"
+    );
+}
+
+/// Owns the fake adapter's `Child` and, on drop, SIGKILLs its whole process
+/// group (adapter + its `sleep 600` grandchild) then reaps it. `Child` alone
+/// does not kill on drop, so without this a failed assertion between spawn
+/// and the manual cleanup at the end of the test would leak both processes
+/// (the grandchild for up to ten minutes). Deref lets the test read the
+/// child's id like a plain `Child`.
+struct KillGroupOnDrop(std::process::Child);
+
+impl std::ops::Deref for KillGroupOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for KillGroupOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: killpg on the process group this test spawned as leader
+        // (`process_group(0)`); called before wait so the pid (== pgid while
+        // the leader is unreaped) cannot be recycled in between.
+        unsafe {
+            libc::killpg(self.0.id() as i32, libc::SIGKILL);
+        }
+        self.0.wait().ok();
+    }
+}
+
+#[test]
+fn grandchild_pid_file_records_a_live_process_in_the_adapters_group() {
+    use std::os::unix::process::CommandExt;
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("grandchild.pid");
+    let script = serde_json::to_string(&hennery_testkit::FakeScript {
+        grandchild_pid_file: Some(pid_file.to_string_lossy().into_owned()),
+        ..Default::default()
+    })
+    .unwrap();
+    let child = KillGroupOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_hennery-fake-acp"))
+            .env(hennery_testkit::SCRIPT_ENV, script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let pid: i32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&pid_file).ok().and_then(|s| s.parse().ok()) {
+            break pid;
+        }
+        assert!(std::time::Instant::now() < deadline, "no grandchild pid file");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert!(hennery_testkit::pid_alive(pid));
+    assert_eq!(
+        // SAFETY: getpgid on a process this test spawned.
+        unsafe { libc::getpgid(pid) },
+        child.id() as i32,
+        "grandchild left the adapter's group"
+    );
+    // `child` drops here: SIGKILLs the group and reaps the adapter, on this
+    // path and on any assertion failure above.
+}
