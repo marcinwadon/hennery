@@ -63,10 +63,21 @@ pub struct AdapterIo {
 pub struct Adapter {
     pgid: i32,
     exit: watch::Receiver<Option<ExitInfo>>,
-    stderr: Arc<Mutex<VecDeque<u8>>>,
+    stderr: Arc<Mutex<StderrRing>>,
     stderr_done: watch::Receiver<bool>,
-    /// Set once the group has been sent SIGKILL; `Drop` then does nothing.
+    /// Set once this `Adapter` has itself sent (or skipped, because the exit
+    /// watcher already did) a group SIGKILL; `kill_group`/`Drop` then do
+    /// nothing further.
     group_killed: bool,
+}
+
+/// The bounded stderr buffer, plus whether it has ever dropped bytes from
+/// the front. Once it has, the byte now at the front may sit mid-line (or
+/// mid-token) rather than after a genuine newline.
+#[derive(Default)]
+struct StderrRing {
+    buf: VecDeque<u8>,
+    truncated: bool,
 }
 
 impl Adapter {
@@ -92,7 +103,7 @@ impl Adapter {
             stdout: child.stdout.take().expect("piped stdout"),
         };
 
-        let stderr = Arc::new(Mutex::new(VecDeque::new()));
+        let stderr = Arc::new(Mutex::new(StderrRing::default()));
         let (stderr_tx, stderr_done) = watch::channel(false);
         let mut pipe = child.stderr.take().expect("piped stderr");
         let sink = stderr.clone();
@@ -102,10 +113,13 @@ impl Adapter {
                 if n == 0 {
                     break;
                 }
-                let mut tail = sink.lock().expect("stderr lock");
-                tail.extend(&buf[..n]);
-                let excess = tail.len().saturating_sub(STDERR_TAIL_BYTES);
-                tail.drain(..excess);
+                let mut ring = sink.lock().expect("stderr lock");
+                ring.buf.extend(&buf[..n]);
+                let excess = ring.buf.len().saturating_sub(STDERR_TAIL_BYTES);
+                if excess > 0 {
+                    ring.buf.drain(..excess);
+                    ring.truncated = true;
+                }
             }
             let _ = stderr_tx.send(true);
         });
@@ -123,6 +137,13 @@ impl Adapter {
                     signal: None,
                 },
             };
+            // Decision #5: after any exit, SIGKILL whatever remains of the
+            // group, right here — before anything else can act on the exit.
+            // The leader's pid is freed the instant `wait` reaps it, so any
+            // gap before this point is a window in which the kernel could
+            // recycle that number for an unrelated process group; doing it
+            // inline, synchronously, keeps the window at zero.
+            signal_group(pgid, libc::SIGKILL);
             let _ = exit_tx.send(Some(info));
         });
 
@@ -176,21 +197,45 @@ impl Adapter {
         info
     }
 
-    /// SIGKILL whatever is left of the group. Used after an unexpected exit
-    /// too: descendants of a crashed adapter are orphans nobody else reaps.
+    /// SIGKILL whatever is left of the group. Safe to call before the
+    /// process has exited (e.g. from `Drop`) — but a no-op once the exit
+    /// watcher has already recorded the exit, since it SIGKILLs the group
+    /// itself the instant it reaps the leader (decision #5); signalling
+    /// again then would only risk hitting a pgid the kernel has since
+    /// recycled for an unrelated process group.
     pub fn kill_group(&mut self) {
-        if !self.group_killed {
-            signal_group(self.pgid, libc::SIGKILL);
-            self.group_killed = true;
+        if self.group_killed {
+            return;
         }
+        if self.exit.borrow().is_none() {
+            signal_group(self.pgid, libc::SIGKILL);
+        }
+        self.group_killed = true;
     }
 
     /// The last `STDERR_TAIL_BYTES` of stderr, scrubbed of token-like
     /// strings. Waits briefly for the pipe to drain if the adapter exited.
+    ///
+    /// Once the buffer has ever been truncated, its front byte is an
+    /// arbitrary offset into the original stream, not necessarily the start
+    /// of a line — a token can be cut in half there and only the tail would
+    /// leak, unscrubbed, because `scrub` needs the whole prefix to recognise
+    /// it. So a truncated buffer is first cut through its own first
+    /// newline, trading a little more history for the guarantee that
+    /// scrubbing only ever sees genuine line starts.
     pub async fn stderr_tail(&mut self) -> String {
         let _ = tokio::time::timeout(STDERR_SETTLE, self.stderr_done.wait_for(|done| *done)).await;
-        let bytes: Vec<u8> = self.stderr.lock().expect("stderr lock").iter().copied().collect();
-        scrub(&String::from_utf8_lossy(&bytes))
+        let ring = self.stderr.lock().expect("stderr lock");
+        let bytes: Vec<u8> = ring.buf.iter().copied().collect();
+        let truncated = ring.truncated;
+        drop(ring);
+        if !truncated {
+            return scrub(&String::from_utf8_lossy(&bytes));
+        }
+        match bytes.iter().position(|&b| b == b'\n') {
+            Some(idx) => scrub(&String::from_utf8_lossy(&bytes[idx + 1..])),
+            None => "[stderr truncated]".to_string(),
+        }
     }
 }
 

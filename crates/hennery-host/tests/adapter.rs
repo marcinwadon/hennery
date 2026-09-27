@@ -40,6 +40,16 @@ async fn read_pid(path: &Path) -> i32 {
     }
 }
 
+/// Poll until `path` exists, instead of sleeping a fixed guess at how long
+/// some earlier setup step (e.g. installing a signal trap) takes.
+async fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "{} never appeared", path.display());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// `sh` that starts a background `sleep` (the grandchild), records its pid,
 /// then waits on it.
 fn with_grandchild(pid_file: &Path) -> AgentCommand {
@@ -60,8 +70,13 @@ async fn terminate_kills_the_whole_process_group() {
 #[tokio::test]
 async fn terminate_escalates_to_sigkill_when_sigterm_is_ignored() {
     let dir = tempfile::tempdir().unwrap();
-    let (mut adapter, _io) = Adapter::spawn(&sh("trap '' TERM; while :; do sleep 0.05; done"), dir.path()).unwrap();
-    tokio::time::sleep(Duration::from_millis(100)).await; // let the trap install
+    let ready = dir.path().join("ready");
+    let script = sh(&format!(
+        "trap '' TERM; touch {}; while :; do sleep 0.05; done",
+        ready.display()
+    ));
+    let (mut adapter, _io) = Adapter::spawn(&script, dir.path()).unwrap();
+    wait_for_file(&ready).await; // poll until the trap is actually installed
     let began = Instant::now();
     let info = adapter.terminate(Duration::from_millis(300)).await;
     assert!(began.elapsed() >= Duration::from_millis(300), "{:?}", began.elapsed());
@@ -79,22 +94,59 @@ async fn dropping_an_adapter_kills_its_group() {
 }
 
 #[tokio::test]
+async fn a_leaders_own_exit_reaps_its_grandchild_immediately() {
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("gc.pid");
+    // The leader starts a grandchild that outlives it and exits right away
+    // (no `wait`, unlike `with_grandchild`) — an unattended, "unexpected"
+    // exit with no `terminate`/`kill_group`/`Drop` call in sight.
+    let script = sh(&format!("sleep 600 & echo $! > {}", pid_file.display()));
+    let (mut adapter, _io) = Adapter::spawn(&script, dir.path()).unwrap();
+    let grandchild = read_pid(&pid_file).await;
+    adapter.exited().await;
+    // Decision #5: the exit watcher SIGKILLs the rest of the group itself,
+    // the instant it reaps the leader — nobody else has to.
+    wait_dead(grandchild).await;
+}
+
+#[tokio::test]
 async fn an_unexpected_exit_reports_code_and_a_bounded_scrubbed_stderr_tail() {
     let dir = tempfile::tempdir().unwrap();
+    // The explicit `\n` right after the padding guarantees the padding/last
+    // line boundary survives the truncation cut (whichever `x` it lands on):
+    // once truncated, `stderr_tail` drops through its *own* first newline,
+    // so without one there to anchor it, this would drop the last line too.
     let script = "echo 'early Bearer abc.def' >&2; \
                   head -c 100000 /dev/zero | tr '\\0' x >&2; \
+                  printf '\\n' >&2; \
                   echo ' late ghp_abcdefghijklmnop' >&2; exit 7";
     let (mut adapter, _io) = Adapter::spawn(&sh(script), dir.path()).unwrap();
     let info = adapter.exited().await;
     assert_eq!((info.code, info.signal), (Some(7), None));
     let tail = adapter.stderr_tail().await;
     assert!(tail.len() <= STDERR_TAIL_BYTES, "{}", tail.len());
-    assert!(
-        tail.ends_with(" late ghp_[redacted]\n"),
-        "{:?}",
-        &tail[tail.len() - 40..]
-    );
+    assert_eq!(tail, " late ghp_[redacted]\n");
     assert!(!tail.contains("early"), "the tail keeps only the last bytes");
+}
+
+#[tokio::test]
+async fn a_token_split_by_the_truncation_boundary_never_leaks_even_a_fragment() {
+    let dir = tempfile::tempdir().unwrap();
+    // A single unbroken run of padding (no newlines) big enough that the
+    // rolling 64 KiB window must cut through it — and, since nothing before
+    // the final line has a newline, through the token too, wherever exactly
+    // the cut lands. A real token cut this way would keep a suffix like
+    // `p_abcdefghijklmnopqrstuvwxyz0123456789` (missing its `ghp_` prefix),
+    // which `scrub` cannot recognise without the prefix.
+    let script = "head -c 70000 /dev/zero | tr '\\0' x >&2; \
+                  printf 'ghp_abcdefghijklmnopqrstuvwxyz0123456789\\nsafe-tail-marker\\n' >&2; exit 0";
+    let (mut adapter, _io) = Adapter::spawn(&sh(script), dir.path()).unwrap();
+    adapter.exited().await;
+    let tail = adapter.stderr_tail().await;
+    assert_eq!(
+        tail, "safe-tail-marker\n",
+        "a truncated tail must drop through its first newline, never scrub a slice of a token"
+    );
 }
 
 #[tokio::test]
