@@ -136,3 +136,88 @@ async fn an_adapter_that_cannot_start_reports_start_failed_durably() {
     let frames = wait_until(&uplink, |f| !f.is_empty()).await;
     assert_eq!(kinds(&frames), ["start_failed"]);
 }
+
+#[tokio::test]
+async fn an_adapter_that_hangs_on_start_reports_start_failed() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    // Never answers `initialize`: simulates an adapter that hangs on start.
+    let hanger = AgentCommand::parse("/bin/sleep 100").unwrap();
+    let _tx = session::start_with_timeout(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        hanger,
+        std::env::temp_dir(),
+        Duration::from_millis(200),
+    );
+    let frames = wait_until(&uplink, |f| !f.is_empty()).await;
+    assert_eq!(kinds(&frames), ["start_failed"]);
+    match frames.last().unwrap() {
+        HostFrame::Session {
+            body: SessionBody::StartFailed { message, .. },
+            ..
+        } => {
+            assert!(message.contains("did not start"), "{message}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_invalid_prompt_does_not_consume_its_turn_id() {
+    let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let fake = AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    let tx = session::start(uplink.clone(), "r0".into(), "s1".into(), fake, std::env::temp_dir());
+    wait_until(&uplink, |f| !f.is_empty()).await;
+
+    // Reject an empty prompt under turn_id "t1"...
+    tx.send(SessionCmd::Prompt {
+        request_id: "r1".into(),
+        turn_id: "t1".into(),
+        content: vec![],
+    })
+    .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(reply, HostFrame::Error { ref code, .. } if code == "invalid"),
+        "{reply:?}"
+    );
+
+    // ...then a corrected retry under the SAME turn_id must still run.
+    tx.send(SessionCmd::Prompt {
+        request_id: "r2".into(),
+        turn_id: "t1".into(),
+        content: vec![json!({"type":"text","text":"hi"})],
+    })
+    .unwrap();
+    let frames = wait_until(&uplink, |f| kinds(f).contains(&"turn_ended".to_string())).await;
+    let kinds = kinds(&frames);
+    assert_eq!(kinds.iter().filter(|k| *k == "turn_started").count(), 1, "{kinds:?}");
+    assert_eq!(kinds.iter().filter(|k| *k == "turn_ended").count(), 1, "{kinds:?}");
+}
+
+#[tokio::test]
+async fn an_unparseable_prompt_is_rejected_without_starting_a_turn() {
+    let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let fake = AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    let tx = session::start(uplink.clone(), "r0".into(), "s1".into(), fake, std::env::temp_dir());
+    wait_until(&uplink, |f| !f.is_empty()).await;
+    tx.send(SessionCmd::Prompt {
+        request_id: "r1".into(),
+        turn_id: "t1".into(),
+        content: vec![json!({"type":"bogus"})],
+    })
+    .unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(5), replies.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(reply, HostFrame::Error { ref code, .. } if code == "invalid"),
+        "{reply:?}"
+    );
+    assert_eq!(kinds(&uplink.pending().unwrap()), ["session_started"]);
+}

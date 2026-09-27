@@ -11,12 +11,18 @@ use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 /// Environment variables that make an agent refuse to start or double-report
 /// when hennery itself runs inside an agent session (ACP core §2.3).
 pub const NESTING_VARS: &[&str] = &["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT"];
+
+/// How long `start` waits for spawn → `initialize` → `session/new` →
+/// `session_started` before giving up. Kept below the collector's 90s start
+/// timeout (ACP core §3.4) so the host's `start_failed` always beats it.
+pub const START_TIMEOUT: Duration = Duration::from_secs(75);
 
 /// How to launch an agent's ACP adapter.
 #[derive(Debug, Clone)]
@@ -57,17 +63,34 @@ pub fn start(
     agent: AgentCommand,
     cwd: PathBuf,
 ) -> mpsc::UnboundedSender<SessionCmd> {
+    start_with_timeout(uplink, request_id, session_id, agent, cwd, START_TIMEOUT)
+}
+
+/// Like `start`, but with an explicit start timeout. `start` uses
+/// `START_TIMEOUT`; tests use a short one so they don't have to wait out the
+/// production value.
+pub fn start_with_timeout(
+    uplink: Uplink,
+    request_id: String,
+    session_id: String,
+    agent: AgentCommand,
+    cwd: PathBuf,
+    start_timeout: Duration,
+) -> mpsc::UnboundedSender<SessionCmd> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let started = Arc::new(AtomicBool::new(false));
         let result = run(
-            uplink.clone(),
-            &request_id,
-            &session_id,
-            agent,
-            cwd,
+            SessionStart {
+                uplink: uplink.clone(),
+                request_id: request_id.clone(),
+                session_id: session_id.clone(),
+                agent,
+                cwd,
+                started: started.clone(),
+                start_timeout,
+            },
             rx,
-            started.clone(),
         )
         .await;
         if let Err(err) = result {
@@ -89,15 +112,28 @@ pub fn start(
     tx
 }
 
-async fn run(
+/// Bundles `run`'s parameters (which otherwise trip clippy's
+/// `too_many_arguments`) into one value.
+struct SessionStart {
     uplink: Uplink,
-    request_id: &str,
-    session_id: &str,
+    request_id: String,
+    session_id: String,
     agent: AgentCommand,
     cwd: PathBuf,
-    mut commands: mpsc::UnboundedReceiver<SessionCmd>,
     started: Arc<AtomicBool>,
-) -> anyhow::Result<()> {
+    start_timeout: Duration,
+}
+
+async fn run(config: SessionStart, mut commands: mpsc::UnboundedReceiver<SessionCmd>) -> anyhow::Result<()> {
+    let SessionStart {
+        uplink,
+        request_id,
+        session_id,
+        agent,
+        cwd,
+        started,
+        start_timeout,
+    } = config;
     let mut command = tokio::process::Command::new(&agent.program);
     command
         .args(&agent.args)
@@ -117,9 +153,7 @@ async fn run(
     let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
 
     let updates_uplink = uplink.clone();
-    let updates_session = session_id.to_string();
-    let request_id = request_id.to_string();
-    let session_id = session_id.to_string();
+    let updates_session = session_id.clone();
 
     Client
         .builder()
@@ -143,27 +177,30 @@ async fn run(
             agent_client_protocol::on_receive_notification!(),
         )
         .connect_with(transport, async move |conn: ConnectionTo<Agent>| {
-            conn.send_request(InitializeRequest::new(ProtocolVersion::V1))
-                .block_task()
-                .await?;
-            let created = conn
-                .send_request(NewSessionRequest::new(cwd.clone()))
-                .block_task()
-                .await?;
-            let agent_session: SessionId = created.session_id;
-            uplink
-                .emit(
-                    &session_id,
-                    SessionBody::SessionStarted {
-                        request_id: request_id.clone(),
-                        agent_session_id: agent_session.to_string(),
-                    },
-                )
-                .map_err(|e| agent_client_protocol::Error::into_internal_error(&*e))?;
+            let agent_session = match tokio::time::timeout(
+                start_timeout,
+                negotiate_session(&conn, &uplink, &session_id, &request_id, cwd.clone()),
+            )
+            .await
+            {
+                Ok(result) => result?,
+                Err(_elapsed) => {
+                    // Not durable via `started`: `start`'s wrapper emits
+                    // `start_failed` from this error, since `started` is
+                    // still false at this point.
+                    return Err(agent_client_protocol::Error::new(
+                        i32::from(agent_client_protocol::ErrorCode::InternalError),
+                        format!("adapter did not start within {}s", start_timeout.as_secs()),
+                    ));
+                }
+            };
             started.store(true, Ordering::SeqCst);
 
             // Prompts are deduplicated by turn_id: a retried delivery after a
-            // lost acknowledgement must never run the same turn twice.
+            // lost acknowledgement must never run the same turn twice. Only a
+            // turn that actually started is recorded here, so a corrected
+            // retry of a rejected (invalid) prompt with the same turn_id is
+            // not silently dropped.
             let mut seen_turns = std::collections::HashSet::new();
             while let Some(cmd) = commands.recv().await {
                 match cmd {
@@ -172,20 +209,22 @@ async fn run(
                         turn_id,
                         content,
                     } => {
+                        let blocks = match parse_prompt(content) {
+                            Ok(blocks) => blocks,
+                            Err(message) => {
+                                uplink.reply(HostFrame::Error {
+                                    request_id,
+                                    code: "invalid".into(),
+                                    message,
+                                });
+                                continue;
+                            }
+                        };
                         if !seen_turns.insert(turn_id.clone()) {
                             tracing::info!(%turn_id, "ignoring duplicate prompt delivery");
                             continue;
                         }
-                        run_turn(
-                            &conn,
-                            &uplink,
-                            &session_id,
-                            &agent_session,
-                            request_id,
-                            turn_id,
-                            content,
-                        )
-                        .await;
+                        run_turn(&conn, &uplink, &session_id, &agent_session, request_id, turn_id, blocks).await;
                     }
                 }
             }
@@ -195,6 +234,45 @@ async fn run(
     Ok(())
 }
 
+/// `initialize` then `session/new`, then durably emit `session_started`.
+/// Split out from `run` so the whole sequence can be raced against a timeout
+/// without also bounding the (potentially long-lived) prompt loop that
+/// follows it.
+async fn negotiate_session(
+    conn: &ConnectionTo<Agent>,
+    uplink: &Uplink,
+    session_id: &str,
+    request_id: &str,
+    cwd: PathBuf,
+) -> agent_client_protocol::Result<SessionId> {
+    conn.send_request(InitializeRequest::new(ProtocolVersion::V1))
+        .block_task()
+        .await?;
+    let created = conn.send_request(NewSessionRequest::new(cwd)).block_task().await?;
+    let agent_session: SessionId = created.session_id;
+    uplink
+        .emit(
+            session_id,
+            SessionBody::SessionStarted {
+                request_id: request_id.to_string(),
+                agent_session_id: agent_session.to_string(),
+            },
+        )
+        .map_err(|e| agent_client_protocol::Error::into_internal_error(&*e))?;
+    Ok(agent_session)
+}
+
+/// Validate raw prompt content into ACP content blocks. `Err` carries the
+/// user-facing rejection reason for `error{code: invalid}`.
+fn parse_prompt(content: Vec<Value>) -> Result<Vec<ContentBlock>, String> {
+    let blocks: Result<Vec<ContentBlock>, _> = content.into_iter().map(serde_json::from_value).collect();
+    match blocks {
+        Ok(blocks) if !blocks.is_empty() => Ok(blocks),
+        Ok(_) => Err("empty prompt".to_string()),
+        Err(err) => Err(err.to_string()),
+    }
+}
+
 async fn run_turn(
     conn: &ConnectionTo<Agent>,
     uplink: &Uplink,
@@ -202,28 +280,8 @@ async fn run_turn(
     agent_session: &SessionId,
     request_id: String,
     turn_id: String,
-    content: Vec<Value>,
+    blocks: Vec<ContentBlock>,
 ) {
-    let blocks: Result<Vec<ContentBlock>, _> = content.into_iter().map(serde_json::from_value).collect();
-    let blocks = match blocks {
-        Ok(blocks) if !blocks.is_empty() => blocks,
-        Ok(_) => {
-            uplink.reply(HostFrame::Error {
-                request_id,
-                code: "invalid".into(),
-                message: "empty prompt".into(),
-            });
-            return;
-        }
-        Err(err) => {
-            uplink.reply(HostFrame::Error {
-                request_id,
-                code: "invalid".into(),
-                message: err.to_string(),
-            });
-            return;
-        }
-    };
     if let Err(err) = uplink.emit(
         session_id,
         SessionBody::TurnStarted {
