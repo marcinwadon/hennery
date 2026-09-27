@@ -201,7 +201,7 @@ async fn connect_once(
                 *backoff = cfg.reconnect_min;
             }
             _ = uplink.changed() => send_pending(&mut sink, uplink, &mut sent).await?,
-            Some(frame) = replies.recv() => send(&mut sink, &frame).await?,
+            Some(frame) = replies.recv() => send_reply(&mut sink, uplink, &mut sent, &frame).await?,
             _ = ping.tick() => sink.send(Message::Ping(Default::default())).await?,
             _ = tokio::time::sleep_until(deadline) => bail!("no frame from collector within {:?}", cfg.read_timeout),
             msg = stream.next() => {
@@ -356,6 +356,18 @@ where
     Ok(())
 }
 
+/// A reply, after every fact already in the outbox: the `select!` above is
+/// unbiased, so without this a `not_attached` rejection could overtake the
+/// `session_parked`/`session_closed` its actor emitted just before it.
+async fn send_reply<S>(sink: &mut S, uplink: &Uplink, sent: &mut HashMap<String, u64>, frame: &HostFrame) -> Result<()>
+where
+    S: futures::Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    send_pending(sink, uplink, sent).await?;
+    send(sink, frame).await
+}
+
 async fn send<S>(sink: &mut S, frame: &HostFrame) -> Result<()>
 where
     S: futures::Sink<Message> + Unpin,
@@ -363,4 +375,44 @@ where
 {
     sink.send(Message::text(serde_json::to_string(frame)?)).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hennery_proto::frames::{ParkReason, SessionBody};
+
+    #[tokio::test]
+    async fn a_reply_goes_out_after_the_facts_already_in_the_outbox() {
+        let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+        uplink
+            .emit(
+                "s1",
+                SessionBody::SessionParked {
+                    reason: ParkReason::Operator,
+                },
+            )
+            .unwrap();
+        let reply = HostFrame::Error {
+            request_id: "r1".into(),
+            code: "not_attached".into(),
+            message: "the session has ended on this host".into(),
+        };
+        let (mut sink, mut wire) = futures::channel::mpsc::unbounded::<Message>();
+        let mut sent = HashMap::new();
+        send_reply(&mut sink, &uplink, &mut sent, &reply).await.unwrap();
+        // A fact already on the wire is not sent twice.
+        send_reply(&mut sink, &uplink, &mut sent, &reply).await.unwrap();
+        drop(sink);
+        let mut kinds = Vec::new();
+        while let Some(Message::Text(text)) = wire.next().await {
+            let frame: HostFrame = serde_json::from_str(&text).unwrap();
+            kinds.push(match frame {
+                HostFrame::Session { seq, .. } => format!("session#{seq}"),
+                HostFrame::Error { code, .. } => code,
+                other => format!("{other:?}"),
+            });
+        }
+        assert_eq!(kinds, ["session#1", "not_attached", "not_attached"]);
+    }
 }
