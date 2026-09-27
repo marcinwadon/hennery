@@ -319,3 +319,42 @@ async fn a_start_that_fails_on_the_host_is_reported_as_502() {
         assert_eq!(resp.json::<Value>().await.unwrap()["code"], expected, "agent {agent}");
     }
 }
+
+/// A start whose delivery is unknown (the connection died before a reply)
+/// still creates a session that may go on to start; the 503 must carry its
+/// id, or the caller has no way to ever look it up again.
+#[tokio::test]
+async fn a_start_with_unknown_delivery_reports_503_with_the_session_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let c = client();
+
+    // Register a fake host connection directly (no real socket): once the
+    // collector sends `start_session` on it, drop the connection before any
+    // reply arrives, so the request resolves as DeliveryUnknown rather than
+    // a rejection.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let conn_id = collector.state.hub.register("host-1", tx).expect("register fake host");
+    let hub = collector.state.hub.clone();
+    tokio::spawn(async move {
+        rx.recv().await; // the StartSession frame; proves it was delivered
+        hub.unregister("host-1", conn_id);
+    });
+
+    let resp = c
+        .post(collector.url("/api/sessions"))
+        .json(&json!({ "host_id": "host-1", "agent": "fake", "cwd": std::env::temp_dir() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 503);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "delivery_unknown");
+    let session_id = body["session_id"].as_str().expect("session_id present in the 503 body");
+
+    let row = collector.state.store.session(session_id).unwrap().unwrap();
+    assert_eq!(
+        row.lifecycle, "starting",
+        "an unknown-delivery start must not be marked failed"
+    );
+}

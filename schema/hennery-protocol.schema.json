@@ -7,6 +7,13 @@
         },
         "message": {
           "type": "string"
+        },
+        "session_id": {
+          "description": "Set when the error leaves a session reachable by id (e.g. a session\nstart whose delivery is unknown: the session was created and may\nstill start, but the caller has no other way to learn its id).",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

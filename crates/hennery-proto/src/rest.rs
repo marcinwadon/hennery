@@ -45,4 +45,10 @@ pub struct EventDto {
 pub struct ApiError {
     pub code: String,
     pub message: String,
+    /// Set when the error leaves a session reachable by id (e.g. a session
+    /// start whose delivery is unknown: the session was created and may
+    /// still start, but the caller has no other way to learn its id).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub session_id: Option<String>,
 }

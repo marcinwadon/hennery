@@ -43,6 +43,22 @@ fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response
         Json(ApiError {
             code: code.into(),
             message: message.into(),
+            session_id: None,
+        }),
+    )
+        .into_response()
+}
+
+/// Like `error`, but with a `session_id` the caller can otherwise have no
+/// way to learn (e.g. a session start whose delivery is unknown: the
+/// session was created and may still start, but a 202 never arrived).
+fn error_with_session(status: StatusCode, code: &str, message: impl Into<String>, session_id: String) -> Response {
+    (
+        status,
+        Json(ApiError {
+            code: code.into(),
+            message: message.into(),
+            session_id: Some(session_id),
         }),
     )
         .into_response()
@@ -94,7 +110,14 @@ async fn start_session(State(state): State<AppState>, Json(req): Json<StartSessi
     };
     match state.hub.request(&req.host_id, &request_id, frame, START_TIMEOUT).await {
         Ok(_) => (StatusCode::ACCEPTED, Json(StartSessionResponse { session_id })).into_response(),
-        Err(RequestError::DeliveryUnknown) => request_failed(RequestError::DeliveryUnknown),
+        // The session was created and may still start; without its id here,
+        // the caller would have no way to look it up (ACP core §3.4).
+        Err(RequestError::DeliveryUnknown) => error_with_session(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "delivery_unknown",
+            "host disconnected; delivery unknown",
+            session_id,
+        ),
         Err(err) => {
             let reason = match &err {
                 RequestError::Rejected { code, .. } => code.clone(),
