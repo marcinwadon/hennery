@@ -56,14 +56,13 @@ async fn serve(socket: WebSocket, state: AppState) {
     };
     if protocol_major(&protocol_version) != protocol_major(PROTOCOL_VERSION) {
         let _ = sink
-            .send(text(&reject("incompatible_protocol", "unsupported protocol major")))
+            .send(text(&reject("incompatible", "unsupported protocol major")))
             .await;
         return;
     }
     if !state.token.matches(&token) {
-        let _ = sink
-            .send(text(&reject("unauthorized", "invalid host credential")))
-            .await;
+        // The dev token stands in for ACP core §3.3's proof of identity.
+        let _ = sink.send(text(&reject("bad_proof", "invalid host credential"))).await;
         return;
     }
     let (tx, mut rx) = mpsc::unbounded_channel::<CollectorFrame>();
