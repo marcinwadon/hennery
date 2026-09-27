@@ -213,12 +213,17 @@ impl Actor {
         while let Some(cmd) = commands.recv().await {
             match cmd {
                 SessionCmd::Prompt { request_id, .. }
+                | SessionCmd::Restart { request_id }
                 | SessionCmd::Park { request_id }
                 | SessionCmd::Close { request_id } => {
+                    // Also covers a start that reached this actor while it was
+                    // tearing down (park/close/reap/adapter exit): the
+                    // connection routed it to `Restart` because the handle
+                    // was not yet `is_ended()`, but by the time this drain
+                    // sees it the session really has ended. Answered here
+                    // too, or the collector's start waiter (up to 90s) would
+                    // eventually drop the whole host connection.
                     self.reject(request_id, "not_attached", "the session has ended on this host".into());
-                }
-                SessionCmd::Restart { request_id } => {
-                    tracing::info!(session_id = %self.session_id, %request_id, "ignoring a start for an ended session");
                 }
             }
         }

@@ -137,7 +137,11 @@ async fn connect_once(
     // ack `hello` and then drop every subsequent frame without acking it
     // (ws.rs never acks past a failed ingest). Resetting backoff here would
     // make the host hammer such a collector at `reconnect_min` forever;
-    // instead it is reset below, only once the first real `ack` lands.
+    // instead it is reset below, once the first real `ack` lands, or —
+    // failing that — once the connection has simply stayed up for
+    // `healthy_after` (an idle host has nothing to ack). So a collector that
+    // never acks anything now costs at most one reconnect per
+    // `healthy_after`, not an ever-growing backoff.
     tracing::info!(collector = %cfg.collector_url, "connected to collector");
 
     // Resend everything unacked, then tell the collector we are done.

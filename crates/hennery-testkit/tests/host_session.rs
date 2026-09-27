@@ -267,6 +267,21 @@ fn fake_with(script: &FakeScript) -> AgentCommand {
     fake
 }
 
+/// The fake adapter, but with SIGTERM ignored (`trap '' TERM` survives the
+/// `exec` into the same process, per POSIX): its teardown must ride out the
+/// full kill grace before SIGKILL lands, exactly like a real agent CLI that
+/// does not react to SIGTERM.
+fn fake_ignoring_sigterm(script: &FakeScript) -> AgentCommand {
+    AgentCommand {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            format!("trap '' TERM; exec {}", env!("CARGO_BIN_EXE_hennery-fake-acp")),
+        ],
+        env: vec![(SCRIPT_ENV.into(), serde_json::to_string(script).unwrap())],
+    }
+}
+
 fn slow_script() -> FakeScript {
     FakeScript {
         chunks: (1..=20).map(|n| n.to_string()).collect(),
@@ -589,6 +604,51 @@ async fn commands_queued_behind_an_ending_actor_are_answered_not_attached() {
         ]
     );
     wait_until(&uplink, has("session_parked:operator")).await;
+}
+
+/// A start that reaches this actor while it is still tearing down (mid
+/// `kill_grace`, because its adapter ignores SIGTERM) must be answered, not
+/// dropped: the connection routes a repeated `start_session` for an attached
+/// session to `Restart` as long as `is_ended()` is false, but by the time the
+/// post-teardown drain reads it the session really has ended. Without an
+/// answer, the collector's start waiter sits out its own timeout and then
+/// (maintainer decision 1) drops the whole host connection.
+#[tokio::test]
+async fn a_start_that_reaches_an_ending_actor_is_answered_not_attached() {
+    let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let handle = session::spawn(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        fake_ignoring_sigterm(&FakeScript::default()),
+        std::env::temp_dir(),
+        SessionOptions {
+            kill_grace: Duration::from_millis(300),
+            ..SessionOptions::default()
+        },
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(SessionCmd::Park {
+        request_id: "rp".into()
+    }));
+    // The actor is now inside `teardown()`, riding out the full kill grace
+    // because the adapter ignores SIGTERM: it has not read this yet, and its
+    // handle is not `is_ended()` yet either — exactly what routes a real
+    // `start_session` here to `Restart` instead of a fresh spawn.
+    assert!(!handle.is_ended());
+    assert!(handle.send(SessionCmd::Restart {
+        request_id: "r5".into()
+    }));
+    let reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .expect("a reply, not silence")
+        .unwrap();
+    assert!(
+        matches!(&reply, HostFrame::Error { request_id, code, .. } if request_id == "r5" && code == "not_attached"),
+        "{reply:?}"
+    );
+    wait_until(&uplink, has("session_parked:operator")).await;
+    wait_ended(&handle).await;
 }
 
 /// Every `update:*` must sit between the `turn_started`/`turn_ended` pair of

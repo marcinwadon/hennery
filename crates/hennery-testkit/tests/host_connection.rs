@@ -426,7 +426,58 @@ async fn park_reaches_the_actor_and_frames_for_a_detached_session_are_not_attach
         },
     )
     .await;
-    read_until(&mut stream, error_for("r4")).await;
+    let close_refused = read_until(&mut stream, error_for("r4")).await;
+    assert!(
+        matches!(&close_refused, HostFrame::Error { code, .. } if code == "not_attached"),
+        "{close_refused:?}"
+    );
+    send_frame(
+        &mut sink,
+        &CollectorFrame::Prompt {
+            request_id: "r5".into(),
+            session_id: "s1".into(),
+            turn_id: "t1".into(),
+            content: vec![serde_json::json!({"type": "text", "text": "go"})],
+        },
+    )
+    .await;
+    let prompt_refused = read_until(&mut stream, error_for("r5")).await;
+    assert!(
+        matches!(&prompt_refused, HostFrame::Error { code, .. } if code == "not_attached"),
+        "{prompt_refused:?}"
+    );
+}
+
+/// After a session is parked, a repeated `start_session` for the same id must
+/// not be routed to `Restart` (there is no live actor left to answer it) —
+/// it spawns a fresh actor, whose `session_started` carries the new request.
+#[tokio::test]
+async fn a_start_after_park_spawns_a_fresh_actor() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(host_with_fake(addr, "start-after-park", slow_fake())));
+
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    send_frame(&mut sink, &start("r1", "s1")).await;
+    read_until(&mut stream, body_is("s1", "session_started")).await;
+    send_frame(
+        &mut sink,
+        &CollectorFrame::ParkSession {
+            request_id: "r2".into(),
+            session_id: "s1".into(),
+        },
+    )
+    .await;
+    read_until(&mut stream, body_is("s1", "session_parked")).await;
+
+    send_frame(&mut sink, &start("r5", "s1")).await;
+    if let HostFrame::Session {
+        body: hennery_proto::frames::SessionBody::SessionStarted { request_id, .. },
+        ..
+    } = read_until(&mut stream, body_is("s1", "session_started")).await
+    {
+        assert_eq!(request_id, "r5");
+    }
 }
 
 #[tokio::test]
