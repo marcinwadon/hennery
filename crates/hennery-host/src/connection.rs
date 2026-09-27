@@ -122,9 +122,12 @@ async fn connect_once(
         },
         other => bail!("no hello_ack: {other:?}"),
     }
-    // The handshake succeeded: forget any accumulated backoff from earlier
-    // failed attempts, even if this connection later dies before returning.
-    *backoff = cfg.reconnect_min;
+    // A bare handshake is not proof the collector is actually committing
+    // anything: a persistently failing collector (e.g. disk full) can still
+    // ack `hello` and then drop every subsequent frame without acking it
+    // (ws.rs never acks past a failed ingest). Resetting backoff here would
+    // make the host hammer such a collector at `reconnect_min` forever;
+    // instead it is reset below, only once the first real `ack` lands.
     tracing::info!(collector = %cfg.collector_url, "connected to collector");
 
     // Resend everything unacked, then tell the collector we are done.
@@ -152,7 +155,16 @@ async fn connect_once(
                     None => bail!("collector closed the connection"),
                     Some(Err(err)) => return Err(err.into()),
                     Some(Ok(Message::Text(text))) => match serde_json::from_str::<CollectorFrame>(&text) {
-                        Ok(frame) => handle(cfg, uplink, sessions, frame)?,
+                        Ok(frame) => {
+                            if matches!(frame, CollectorFrame::Ack { .. }) {
+                                // Proof the collector is actually committing
+                                // frames, not just accepting the handshake:
+                                // only now is it safe to forget the backoff
+                                // accumulated from earlier failed attempts.
+                                *backoff = cfg.reconnect_min;
+                            }
+                            handle(cfg, uplink, sessions, frame)?
+                        }
                         Err(err) => tracing::warn!(error = %err, "ignoring unknown or invalid frame"),
                     },
                     Some(Ok(Message::Close(_))) => bail!("collector closed the connection"),

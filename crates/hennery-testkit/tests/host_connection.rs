@@ -1,6 +1,9 @@
 //! The host's connection loop against a fake collector: enforcing the read
 //! deadline on a half-open socket (F1) and resetting the reconnect backoff
-//! after a successful handshake (F2).
+//! only once the collector has proven it is actually committing frames (an
+//! `ack`), not merely on a successful `hello` handshake (F2) — a collector
+//! that always accepts `hello` but never commits (e.g. disk full) must not
+//! be hammered at `reconnect_min` forever.
 
 use futures::{SinkExt, StreamExt};
 use hennery_host::{HostConfig, run};
@@ -109,9 +112,46 @@ async fn a_silent_connection_is_dropped_and_reconnected_within_the_read_deadline
         .expect("hello channel open");
 }
 
-/// Accepts connections, acks `hello`, then immediately closes cleanly.
-/// Reports the instant each `hello` was received on `hellos`.
+/// Accepts connections, acks `hello`, then acks one (fabricated) session
+/// frame — proof it is actually committing, not just handshaking — and
+/// immediately closes cleanly. Reports the instant each `hello` was
+/// received on `hellos`.
 async fn ack_then_close_server(listener: TcpListener, hellos: mpsc::UnboundedSender<Instant>) {
+    loop {
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        let hellos = hellos.clone();
+        tokio::spawn(async move {
+            let Ok(ws) = tokio_tungstenite::accept_async(tcp).await else {
+                return;
+            };
+            let (mut sink, mut stream) = ws.split();
+            let hello = read_host_frame(&mut stream).await;
+            assert!(matches!(hello, HostFrame::Hello { .. }), "{hello:?}");
+            hellos.send(Instant::now()).ok();
+            let _ = sink
+                .send(Message::text(serde_json::to_string(&hello_ack()).unwrap()))
+                .await;
+            // No session is actually attached, but any session_id is enough
+            // to prove backoff resets on real commit evidence, not just the
+            // handshake: `Outbox::ack` on an unknown session harmlessly
+            // deletes zero rows.
+            let ack = CollectorFrame::Ack {
+                session_id: "s0".into(),
+                ack_seq: 0,
+            };
+            let _ = sink.send(Message::text(serde_json::to_string(&ack).unwrap())).await;
+            let _ = sink.close().await;
+        });
+    }
+}
+
+/// Accepts connections, acks `hello`, then immediately closes cleanly
+/// WITHOUT ever acking a frame — the disk-full-collector scenario, where
+/// only the handshake succeeds. Reports the instant each `hello` was
+/// received on `hellos`.
+async fn ack_hello_only_then_close_server(listener: TcpListener, hellos: mpsc::UnboundedSender<Instant>) {
     loop {
         let Ok((tcp, _)) = listener.accept().await else {
             return;
@@ -134,7 +174,7 @@ async fn ack_then_close_server(listener: TcpListener, hellos: mpsc::UnboundedSen
 }
 
 #[tokio::test]
-async fn backoff_resets_to_reconnect_min_after_every_successful_handshake() {
+async fn backoff_resets_to_reconnect_min_after_every_acked_frame() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let (tx, mut hellos) = mpsc::unbounded_channel();
@@ -171,4 +211,42 @@ async fn backoff_resets_to_reconnect_min_after_every_successful_handshake() {
              (an unreset backoff would exceed 200ms well before the 6th reconnect)"
         );
     }
+}
+
+/// The disk-full-collector scenario: the handshake always succeeds, but
+/// nothing is ever acked. A handshake alone must not be enough to reset
+/// backoff, or the host would hammer such a collector at reconnect_min
+/// forever instead of backing off.
+#[tokio::test]
+async fn backoff_keeps_growing_when_the_collector_never_acks_a_frame() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut hellos) = mpsc::unbounded_channel();
+    tokio::spawn(ack_hello_only_then_close_server(listener, tx));
+
+    let mut cfg = HostConfig::new(
+        format!("ws://{addr}/api/hosts/ws"),
+        "host1",
+        "token",
+        unique_data_dir("backoff-no-ack"),
+    );
+    cfg.reconnect_min = Duration::from_millis(20);
+    cfg.reconnect_max = Duration::from_secs(10);
+    tokio::spawn(run(cfg));
+
+    let mut timestamps = Vec::new();
+    for _ in 0..6 {
+        let t = tokio::time::timeout(Duration::from_secs(2), hellos.recv())
+            .await
+            .expect("hello within 2s")
+            .expect("hello channel open");
+        timestamps.push(t);
+    }
+
+    let gaps: Vec<Duration> = timestamps.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(
+        *gaps.last().unwrap() > Duration::from_millis(100),
+        "gaps were {gaps:?}; without any ack ever landing, backoff should have kept \
+         doubling from reconnect_min (20ms) instead of resetting on the handshake alone"
+    );
 }
