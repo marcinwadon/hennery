@@ -43,17 +43,25 @@ fn a_malformed_agent_flag_is_rejected() {
 struct KillTree {
     up: std::process::Child,
     dir: std::path::PathBuf,
+    /// `up`'s children, recorded as soon as they're known (`&mut` field set
+    /// right after `children_of` finds them). Once `up` exits — whether
+    /// gracefully or via the `kill()` below — any child still alive is
+    /// immediately reparented away from `up`'s pid, so a *fresh* `pgrep -P
+    /// up_pid` at drop time can no longer find it. The recorded list is the
+    /// only reliable way to reach it; a fresh query is kept only as a
+    /// fallback for a panic that happened before anything was recorded.
+    children: Vec<i32>,
 }
 
 impl Drop for KillTree {
     fn drop(&mut self) {
         let up_pid = self.up.id() as i32;
-        // Enumerate `up`'s current children *before* touching `up` itself:
-        // once `up` terminates they're reparented and no longer show up
-        // under `-P up_pid`, and SIGKILL bypasses all of `up`'s own cleanup
-        // (its `kill_on_drop` adapters, its ordered host-then-collector
-        // shutdown) — so each must be signalled directly, not left to `up`.
-        for pid in children_of(up_pid) {
+        let targets = if self.children.is_empty() {
+            children_of(up_pid)
+        } else {
+            std::mem::take(&mut self.children)
+        };
+        for pid in targets {
             unsafe {
                 // Each child leads its own process group (`run_up` sets
                 // `process_group(0)`), so kill both the pid and that group.
@@ -118,7 +126,11 @@ fn sigint_to_ups_process_group_still_shuts_down_cleanly() {
     }
     let up = command.spawn().unwrap();
     let up_pgid = up.id() as i32;
-    let mut guard = KillTree { up, dir };
+    let mut guard = KillTree {
+        up,
+        dir,
+        children: Vec::new(),
+    };
 
     // Wait for the collector to be listening.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -133,6 +145,7 @@ fn sigint_to_ups_process_group_still_shuts_down_cleanly() {
     // the collector, independent of the collector's readiness).
     std::thread::sleep(Duration::from_millis(300));
     let children = children_of(guard.up.id() as i32);
+    guard.children = children.clone();
     assert!(
         children.len() >= 2,
         "expected up to have spawned a collector and a host child, found {children:?}"
