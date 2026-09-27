@@ -128,12 +128,10 @@ async fn run_host(args: HostArgs) -> Result<()> {
     let mut cfg = HostConfig::new(args.collector, args.host_id, args.dev_token, args.data_dir);
     cfg.agents = args.agents.into_iter().collect();
     cfg.idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
-    // Returning from main drops the runtime, which drops every session actor
-    // and with it (kill_on_drop) every adapter process.
-    tokio::select! {
-        result = hennery_host::run(cfg) => result,
-        _ = terminated() => Ok(()),
-    }
+    // On SIGINT/SIGTERM the host stops its connection and waits (bounded)
+    // for every session actor to SIGTERM its adapter's group and SIGKILL it
+    // after the grace; only then does returning drop the runtime.
+    hennery_host::run_until(cfg, terminated()).await
 }
 
 /// Resolves on SIGINT or SIGTERM.

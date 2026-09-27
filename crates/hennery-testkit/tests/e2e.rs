@@ -51,6 +51,13 @@ fn start_host(collector: SocketAddr, data_dir: &Path, script: &FakeScript) -> to
 /// spawn). Aborting the returned task is a host restart: its actors end and
 /// kill their adapters.
 fn start_host_with(collector: SocketAddr, data_dir: &Path, fake: AgentCommand) -> tokio::task::JoinHandle<()> {
+    let cfg = host_config(collector, data_dir, fake);
+    tokio::spawn(async move {
+        hennery_host::run(cfg).await.unwrap();
+    })
+}
+
+fn host_config(collector: SocketAddr, data_dir: &Path, fake: AgentCommand) -> HostConfig {
     let mut cfg = HostConfig::new(
         format!("ws://{collector}/api/hosts/ws"),
         "host-1",
@@ -64,9 +71,7 @@ fn start_host_with(collector: SocketAddr, data_dir: &Path, fake: AgentCommand) -
         "broken".into(),
         AgentCommand::parse("/nonexistent/hennery-test-adapter").unwrap(),
     );
-    tokio::spawn(async move {
-        hennery_host::run(cfg).await.unwrap();
-    })
+    cfg
 }
 
 fn client() -> reqwest::Client {
@@ -594,4 +599,82 @@ async fn a_dropped_connection_mid_turn_parks_nothing_and_loses_nothing() {
         collector.state.store.session(&session).unwrap().unwrap().lifecycle,
         "active"
     );
+}
+
+/// The fake adapter behind a shell (the group leader, its pid written to
+/// `pid_file`) that records a SIGTERM in `marker` and exits. The fake runs
+/// in the background with the shell's stdin dup'ed in: a non-interactive
+/// shell would otherwise give a background job `/dev/null` as stdin.
+fn fake_recording_sigterm(marker: &Path, pid_file: &Path) -> AgentCommand {
+    AgentCommand {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            r#"trap 'touch "$0"; exit 0' TERM; echo $$ > "$1"; exec 3<&0; "$2" <&3 3<&- & wait"#.into(),
+            marker.to_string_lossy().into_owned(),
+            pid_file.to_string_lossy().into_owned(),
+            env!("CARGO_BIN_EXE_hennery-fake-acp").into(),
+        ],
+        env: vec![(
+            SCRIPT_ENV.into(),
+            serde_json::to_string(&FakeScript::default()).unwrap(),
+        )],
+    }
+}
+
+/// SIGKILLs the process group led by the pid in the file, on every path.
+struct ReapGroup(std::path::PathBuf);
+
+impl Drop for ReapGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = pid_from(&self.0) {
+            // SAFETY: killpg(2) on the group of an adapter this test started.
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn host_shutdown_gives_every_adapter_its_sigterm_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let marker = dir.path().join("sigterm");
+    let pid_file = dir.path().join("adapter.pid");
+    let _reap = ReapGroup(pid_file.clone());
+    let cfg = host_config(
+        collector.addr,
+        &dir.path().join("host"),
+        fake_recording_sigterm(&marker, &pid_file),
+    );
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let host = tokio::spawn(hennery_host::run_until(cfg, async {
+        let _ = stopped.await;
+    }));
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    lifecycle_is(&collector, &session, "active").await;
+    let leader = pid_from(&pid_file).expect("the adapter wrapper never wrote its pid");
+
+    let bound = hennery_host::adapter::KILL_GRACE + Duration::from_secs(2);
+    let begun = std::time::Instant::now();
+    stop.send(()).unwrap();
+    tokio::time::timeout(bound, host)
+        .await
+        .expect("the host did not return within the kill grace")
+        .unwrap()
+        .unwrap();
+    assert!(
+        marker.exists(),
+        "the host returned without giving its adapter SIGTERM (after {:?})",
+        begun.elapsed()
+    );
+    // The host awaited its actor: the group leader is already reaped.
+    assert!(
+        !hennery_testkit::pid_alive(leader),
+        "the host returned before its adapter exited"
+    );
+    collector.stop().await;
 }

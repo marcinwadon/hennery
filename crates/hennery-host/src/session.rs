@@ -26,6 +26,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 /// How long `start` waits for spawn → `initialize` → `session/new` →
 /// `session_started` before giving up. Kept below the collector's 90s start
@@ -88,6 +89,8 @@ impl Default for SessionOptions {
 pub struct SessionHandle {
     commands: mpsc::UnboundedSender<SessionCmd>,
     open_turn: Arc<Mutex<Option<String>>>,
+    /// Cancelled when the actor's task has finished (its adapter is gone).
+    done: CancellationToken,
 }
 
 impl SessionHandle {
@@ -106,6 +109,13 @@ impl SessionHandle {
     /// so `None` means every emitted turn has also been ended.
     pub fn open_turn_id(&self) -> Option<String> {
         self.open_turn.lock().expect("open turn lock").clone()
+    }
+
+    /// Resolves once the actor's task has finished — after its adapter has
+    /// been terminated. Owned, so it can be awaited after every handle is
+    /// dropped (host shutdown).
+    pub fn finished(&self) -> WaitForCancellationFutureOwned {
+        self.done.clone().cancelled_owned()
     }
 }
 
@@ -139,10 +149,16 @@ pub fn spawn(
         open_turn: open_turn.clone(),
         options,
     };
-    tokio::spawn(actor.run(request_id, agent, cwd, rx));
+    let done = CancellationToken::new();
+    let finished = done.clone().drop_guard();
+    tokio::spawn(async move {
+        let _finished = finished;
+        actor.run(request_id, agent, cwd, rx).await;
+    });
     SessionHandle {
         commands: tx,
         open_turn,
+        done,
     }
 }
 

@@ -77,17 +77,49 @@ type Sessions = Arc<Mutex<HashMap<String, SessionHandle>>>;
 
 /// Run the host until the process exits. Reconnects with exponential backoff.
 pub async fn run(cfg: HostConfig) -> Result<()> {
+    run_until(cfg, std::future::pending()).await
+}
+
+/// Run the host until `shutdown` resolves.
+pub async fn run_until(cfg: HostConfig, shutdown: impl Future<Output = ()>) -> Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     let outbox = Outbox::open(&cfg.data_dir.join("outbox.db"))?;
     let (uplink, mut replies) = Uplink::new(outbox);
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
-    let mut backoff = cfg.reconnect_min;
-    loop {
-        if let Err(err) = connect_once(&cfg, &uplink, &sessions, &mut replies, &mut backoff).await {
-            tracing::warn!(error = %err, "collector connection ended");
+    let serve = async {
+        let mut backoff = cfg.reconnect_min;
+        loop {
+            if let Err(err) = connect_once(&cfg, &uplink, &sessions, &mut replies, &mut backoff).await {
+                tracing::warn!(error = %err, "collector connection ended");
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(cfg.reconnect_max);
         }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(cfg.reconnect_max);
+    };
+    tokio::select! {
+        _ = serve => unreachable!("the connection loop never ends"),
+        _ = shutdown => {}
+    }
+    shut_down(&sessions, cfg.session_options().kill_grace + Duration::from_secs(1)).await;
+    Ok(())
+}
+
+/// Host shutdown (ACP core §2.3): the connection loop is already stopped;
+/// dropping every handle closes each actor's command channel, so each takes
+/// its graceful path — SIGTERM its adapter's group, SIGKILL after the grace.
+/// Returning without waiting would let the runtime drop the actors instead,
+/// and `Adapter::drop` SIGKILLs at once. Bounded: an actor still starting
+/// does not read its commands and is left to that drop.
+async fn shut_down(sessions: &Sessions, bound: Duration) {
+    let actors: Vec<_> = std::mem::take(&mut *sessions.lock().expect("sessions lock"))
+        .into_values()
+        .map(|handle| handle.finished())
+        .collect();
+    if tokio::time::timeout(bound, futures::future::join_all(actors))
+        .await
+        .is_err()
+    {
+        tracing::warn!(?bound, "session actors did not stop in time; killing their adapters");
     }
 }
 
