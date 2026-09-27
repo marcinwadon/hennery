@@ -5,7 +5,7 @@
 //! writing to the outbox, which is resent on the next connection.
 
 use crate::outbox::Outbox;
-use crate::session::{self, AgentCommand, SessionCmd};
+use crate::session::{self, AgentCommand, SessionCmd, SessionHandle};
 use crate::uplink::Uplink;
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
@@ -55,7 +55,7 @@ impl HostConfig {
     }
 }
 
-type Sessions = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<SessionCmd>>>>;
+type Sessions = Arc<Mutex<HashMap<String, SessionHandle>>>;
 
 /// Run the host until the process exits. Reconnects with exponential backoff.
 pub async fn run(cfg: HostConfig) -> Result<()> {
@@ -197,14 +197,14 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
                 // its session_started fact is already in the outbox.
                 return Ok(());
             }
-            let tx = session::start(
+            let handle = session::start(
                 uplink.clone(),
                 request_id,
                 session_id.clone(),
                 command,
                 PathBuf::from(cwd),
             );
-            map.insert(session_id, tx);
+            map.insert(session_id, handle);
         }
         CollectorFrame::Prompt {
             request_id,
@@ -212,16 +212,14 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
             turn_id,
             content,
         } => {
-            let tx = sessions.lock().expect("sessions lock").get(&session_id).cloned();
-            match tx {
-                Some(tx)
-                    if tx
-                        .send(SessionCmd::Prompt {
-                            request_id: request_id.clone(),
-                            turn_id,
-                            content,
-                        })
-                        .is_ok() => {}
+            let handle = sessions.lock().expect("sessions lock").get(&session_id).cloned();
+            match handle {
+                Some(handle)
+                    if handle.send(SessionCmd::Prompt {
+                        request_id: request_id.clone(),
+                        turn_id,
+                        content,
+                    }) => {}
                 _ => uplink.reply(HostFrame::Error {
                     request_id,
                     code: "not_attached".into(),
