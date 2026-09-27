@@ -44,7 +44,7 @@ Confirmed by the maintainer on 2026-09-27. The tasks implement them as written.
 
 1. **A request timeout on a live connection drops that connection** (`Hub::disconnect`). §3.4 says such a timeout is "reported the same way" as a drop, but reconciliation only runs at a handshake. Forcing a reconnect is what makes the timed-out start or turn reconcile at all. The cost is that the other sessions on that host see a reconnect; their adapters are unaffected (§2.1).
 2. **A late `turn_started` wins over `not_delivered`.** The turn opens again, because the adapter really has it. This happens if the fact was emitted after the host's resend snapshot.
-3. **A started turn still open after a full resend, which the host no longer reports** (only possible with a lost outbox), gets `turn_ended_synthesized{interrupted}`. Leaving it open would wedge the session at 409.
+3. **A started turn still open after a full resend, which the host no longer reports** (reachable with a lost outbox, and also when the `hello` snapshot of attached sessions and the resend are taken at different moments, so a turn whose `turn_started` is emitted in between is resent but not listed as open; the host's reconnect backoff of at least 500 ms makes that window practically unreachable), gets `turn_ended_synthesized{interrupted}`. Leaving it open would wedge the session at 409.
 4. **An open turn that never started, on a host that restarted**, becomes `turn_not_delivered`, not `interrupted`: the agent never saw it.
 5. **After an unexpected adapter exit, the rest of its process group is SIGKILLed.** Descendants of a crashed adapter are orphans that nothing else reaps (P-5).
 6. **Closing a `starting` session** returns 409 `starting` while its host is connected and reconciled. If the host is not connected, the session is closed immediately.
@@ -5131,6 +5131,7 @@ git commit -m "feat(sessions): add park and close endpoints and end-to-end teard
 - `hello.capabilities`, and gating park on it.
 - `GET /api/sessions/{id}` detail with the open turn.
 - **Clear a stale open turn on detach.** A host's `not_attached` answer to a prompt is not outboxed. If it is lost, the collector can ingest `session_parked` / `session_closed` while the session still has an open turn in state `sent`. `reconcile_host` only looks at `active` sessions, so the first resume would inherit a 409. Plan B must release a `sent` open turn as `turn_not_delivered` when it ingests `session_parked` / `session_closed` (or when it resumes).
+- **Key hub waiters on `conn_id`.** Waiters are keyed on `host_id` today, so an old connection's `unregister` fails waiters a newer connection of the same host now serves, and a timed-out request's `disconnect` kicks whichever connection is current. Filter both by `conn_id`. Until then this relies on every request timeout exceeding the collector's read deadline (asserted at compile time in `api.rs`).
 
 Then, in order:
 - **(2) Permission and elicitation.** The pending set and answer queue, including the teardown hooks this plan leaves out: cancel pending requests with `adapter_lost` / `session_parked` / `session_closed` / `host_restarted`, and drain the answer queue after reconciliation.
