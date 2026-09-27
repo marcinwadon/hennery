@@ -1,4 +1,33 @@
-use hennery_proto::codegen::{render_schema, render_ts};
+use hennery_proto::codegen::{SCHEMA_PATH, TS_PATH, render_schema, render_ts};
+use std::path::Path;
+
+/// The generated output must not depend on which packages this test binary
+/// was built with: `cargo test --workspace` unifies `serde_json`'s
+/// `preserve_order` feature across the whole build graph (because
+/// `agent-client-protocol-schema` enables it), while `cargo run -p
+/// hennery-proto --bin gen` never does. Both must still match the committed
+/// files.
+#[test]
+fn generated_schema_matches_the_checked_in_copy() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let committed = std::fs::read_to_string(root.join(SCHEMA_PATH)).expect("read committed schema");
+    assert_eq!(
+        render_schema(),
+        committed,
+        "{SCHEMA_PATH} is stale for this build's feature set; run `cargo run -p hennery-proto --bin gen`"
+    );
+}
+
+#[test]
+fn generated_ts_matches_the_checked_in_copy() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let committed = std::fs::read_to_string(root.join(TS_PATH)).expect("read committed ts");
+    assert_eq!(
+        render_ts(),
+        committed,
+        "{TS_PATH} is stale for this build's feature set; run `cargo run -p hennery-proto --bin gen`"
+    );
+}
 
 #[test]
 fn typescript_declares_tagged_unions() {

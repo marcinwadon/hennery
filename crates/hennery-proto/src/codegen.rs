@@ -41,9 +41,18 @@ pub fn render_schema() -> String {
         rest::EventDto,
         rest::ApiError,
     );
-    // BTreeMap, not the generator's own serde_json::Map, so key order is
-    // deterministic regardless of whether some dependency enables
-    // schemars/serde_json's `preserve_order` feature.
+    // `serde_json::Map` is a `BTreeMap` (always iterates sorted) by default,
+    // or an `IndexMap` (iterates in insertion order) when serde_json's
+    // `preserve_order` feature is enabled anywhere in the build — and Cargo
+    // unifies features across a shared dependency for the whole
+    // compilation, so `-p hennery-proto` alone (preserve_order never
+    // enabled) and a workspace build (`agent-client-protocol-schema` enables
+    // it) render byte-different documents for the same types: every object
+    // literal here (this `json!`, and every nested object schemars built
+    // while generating `defs`) is affected, not just the top-level `$defs`.
+    // `sort_keys` recursively canonicalizes every object in the whole
+    // document, at every depth, so the rendered output is identical either
+    // way.
     let defs: std::collections::BTreeMap<String, serde_json::Value> =
         generator.take_definitions(true).into_iter().collect();
     let doc = serde_json::json!({
@@ -51,9 +60,28 @@ pub fn render_schema() -> String {
         "title": "hennery protocol",
         "$defs": defs,
     });
-    let mut out = serde_json::to_string_pretty(&doc).expect("schema serializes");
+    let mut out = serde_json::to_string_pretty(&sort_keys(doc)).expect("schema serializes");
     out.push('\n');
     out
+}
+
+/// Rebuild every object in `value`, at every depth, inserting its keys in
+/// sorted order. Insertion order is what a `serde_json::Map` actually
+/// iterates in when it is backed by an `IndexMap` (the `preserve_order`
+/// feature); a plain `BTreeMap`-backed `Map` already iterates sorted, so
+/// this is a no-op change in output for that build either way.
+fn sort_keys(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            // A `BTreeMap` always iterates in sorted key order regardless of
+            // which `Map` implementation built it.
+            let sorted: std::collections::BTreeMap<String, serde_json::Value> =
+                map.into_iter().map(|(key, v)| (key, sort_keys(v))).collect();
+            serde_json::Value::Object(sorted.into_iter().collect())
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(items.into_iter().map(sort_keys).collect()),
+        other => other,
+    }
 }
 
 /// One TypeScript module exporting every hennery wire type.
