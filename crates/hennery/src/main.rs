@@ -152,12 +152,18 @@ fn sigterm(child: &tokio::process::Child) {
 /// child exits; restart policy comes with the distribution work.
 async fn run_up(args: UpArgs) -> Result<()> {
     let exe = std::env::current_exe()?;
+    // Keep both children out of the terminal's foreground process group: a
+    // Ctrl-C there delivers SIGINT to every process in that group at once,
+    // which would race each child's own signal handler against the ordered
+    // shutdown below. With their own group, only this supervisor is signalled
+    // and it alone decides the order (host, then collector).
     let mut collector = tokio::process::Command::new(&exe)
         .args(["collector", "--listen", &args.listen])
         .arg("--data-dir")
         .arg(args.data_dir.join("collector"))
         .env("HENNERY_DEV_TOKEN", &args.dev_token)
         .kill_on_drop(true)
+        .process_group(0)
         .spawn()?;
     let mut host_cmd = tokio::process::Command::new(&exe);
     host_cmd
@@ -170,7 +176,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
         .arg("--data-dir")
         .arg(args.data_dir.join("host"))
         .env("HENNERY_DEV_TOKEN", &args.dev_token)
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        .process_group(0);
     for (name, command) in &args.agents {
         let mut spec = format!("{name}={}", command.program);
         for a in &command.args {
