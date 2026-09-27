@@ -336,7 +336,13 @@ async fn a_start_with_unknown_delivery_reports_503_with_the_session_id() {
     // reply arrives, so the request resolves as DeliveryUnknown rather than
     // a rejection.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let conn_id = collector.state.hub.register("host-1", tx).expect("register fake host");
+    let conn_id = collector
+        .state
+        .hub
+        .register("host-1", tx)
+        .expect("register fake host")
+        .conn_id;
+    collector.state.hub.mark_ready("host-1", conn_id);
     let hub = collector.state.hub.clone();
     tokio::spawn(async move {
         rx.recv().await; // the StartSession frame; proves it was delivered
