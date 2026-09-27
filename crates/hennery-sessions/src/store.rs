@@ -135,6 +135,24 @@ fn turn_not_delivered(tx: &Transaction<'_>, session_id: &str, turn_id: &str, ts:
     collector_event(tx, session_id, "turn_not_delivered", json!({ "turn_id": turn_id }), ts)
 }
 
+/// Whether a `conflict` event with this exact `received` body is already
+/// recorded for `(session_id, seq)` (fix round 1, ruling D): a re-sent
+/// conflicting frame must not pile up a second `conflict` event.
+fn conflict_already_recorded(tx: &Transaction<'_>, session_id: &str, seq: u64, received: &Value) -> Result<bool> {
+    let mut stmt = tx.prepare(
+        "SELECT body FROM events WHERE session_id = ?1 AND kind = 'conflict' AND json_extract(body, '$.seq') = ?2",
+    )?;
+    let mut rows = stmt.query(params![session_id, seq as i64])?;
+    while let Some(row) = rows.next()? {
+        let body: String = row.get(0)?;
+        let value: Value = serde_json::from_str(&body)?;
+        if value["received"] == *received {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         Self::init(hennery_kernel::db::open(path)?)
@@ -258,29 +276,43 @@ impl Store {
     }
 
     /// Close a session with no adapter the collector can reach (parked,
-    /// failed, or its host offline) immediately (ACP core §4.8). Writes
-    /// `operator_closed` unless a close request already recorded it.
-    /// Idempotent: a closed session is left alone.
+    /// failed, or its host offline) immediately (ACP core §4.8). Resolves
+    /// any open turn first — `started` → `turn_ended_synthesized`,
+    /// otherwise → `turn_not_delivered` (fix round 1, ruling C: a turn must
+    /// not be left open under a closed session, or a later real
+    /// `turn_ended` staying unapplied would mean it never gets an end at
+    /// all) — then writes `operator_closed` unless a close request already
+    /// recorded it. Idempotent: a closed session is left alone.
     pub fn close_now(&self, session_id: &str) -> Result<Vec<EventDto>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let row: Option<(String, bool)> = tx
+        let row: Option<(String, bool, Option<String>)> = tx
             .query_row(
-                "SELECT lifecycle, close_requested FROM sessions WHERE id = ?1",
+                "SELECT lifecycle, close_requested, open_turn_id FROM sessions WHERE id = ?1",
                 [session_id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
         let mut events = Vec::new();
-        if let Some((lifecycle, close_requested)) = row
+        if let Some((lifecycle, close_requested, open_turn)) = row
             && lifecycle != "closed"
         {
             let ts = now();
+            if let Some(turn) = open_turn.as_deref() {
+                let state: Option<String> = tx
+                    .query_row("SELECT state FROM turns WHERE turn_id = ?1", [turn], |r| r.get(0))
+                    .optional()?;
+                events.push(match state.as_deref() {
+                    Some("started") => synthesize_turn_end(&tx, session_id, turn, &ts)?,
+                    _ => turn_not_delivered(&tx, session_id, turn, &ts)?,
+                });
+            }
             if !close_requested {
                 events.push(collector_event(&tx, session_id, "operator_closed", json!({}), &ts)?);
             }
             tx.execute(
-                "UPDATE sessions SET lifecycle = 'closed', activity = NULL, close_requested = 0 WHERE id = ?1",
+                "UPDATE sessions SET lifecycle = 'closed', activity = NULL, open_turn_id = NULL, close_requested = 0
+                 WHERE id = ?1",
                 [session_id],
             )?;
         }
@@ -323,6 +355,9 @@ impl Store {
             // (serde_json's `preserve_order` is feature-unified).
             let created = if serde_json::from_str::<Value>(&stored)? == received {
                 Vec::new()
+            } else if conflict_already_recorded(&tx, session_id, seq, &received)? {
+                // A re-sent conflicting frame: already on record, ruling D.
+                Vec::new()
             } else {
                 vec![collector_event(
                     &tx,
@@ -358,23 +393,65 @@ impl Store {
                 )?;
             }
             SessionBody::TurnStarted { turn_id, .. } => {
-                // The fact wins over reconciliation: a turn marked
-                // `not_delivered` whose `turn_started` arrives late is open
-                // again (the adapter really has it).
-                tx.execute(
-                    "UPDATE sessions SET activity = 'running', open_turn_id = ?2
-                     WHERE id = ?1 AND (open_turn_id IS NULL OR open_turn_id = ?2)",
-                    params![session_id, turn_id],
-                )?;
-                tx.execute("UPDATE turns SET state = 'started' WHERE turn_id = ?1", [turn_id])?;
-                // The user's turn is recorded only once the adapter has it
-                // (ACP core §4.4), in seq order before the turn's updates.
-                let content: Option<String> = tx
-                    .query_row("SELECT content FROM turns WHERE turn_id = ?1", [turn_id], |r| r.get(0))
+                // The fact wins over reconciliation, but never over a fact
+                // already resolved (fix round 1, ruling A, extending
+                // decision 2): a late `turn_started` applies only when the
+                // session is still active and `turn_id`'s own state is
+                // still `sent` or `not_delivered` — it never reopens a turn
+                // that has already `ended`.
+                let turn_state: Option<String> = tx
+                    .query_row("SELECT state FROM turns WHERE turn_id = ?1", [turn_id], |r| r.get(0))
                     .optional()?;
-                if let Some(content) = content {
-                    let body = json!({ "turn_id": turn_id, "content": serde_json::from_str::<Value>(&content)? });
-                    created.push(collector_event(&tx, session_id, "user_turn", body, &ts)?);
+                let (lifecycle, slot): (String, Option<String>) = tx.query_row(
+                    "SELECT lifecycle, open_turn_id FROM sessions WHERE id = ?1",
+                    [session_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                let applies =
+                    lifecycle == "active" && matches!(turn_state.as_deref(), Some("sent") | Some("not_delivered"));
+                let mut takes_slot = false;
+                if applies {
+                    takes_slot = match slot.as_deref() {
+                        None => true,
+                        Some(t) if t == turn_id => true,
+                        Some(other) => {
+                            // The host serialises turns: if the one holding
+                            // the slot never started, `turn_id`'s late fact
+                            // takes the slot back and that turn is released
+                            // as `turn_not_delivered` — before `turn_id`'s
+                            // own `user_turn` (timeline order).
+                            let other_state: Option<String> = tx
+                                .query_row("SELECT state FROM turns WHERE turn_id = ?1", [other], |r| r.get(0))
+                                .optional()?;
+                            if other_state.as_deref() == Some("sent") {
+                                created.push(turn_not_delivered(&tx, session_id, other, &ts)?);
+                                true
+                            } else {
+                                // The slot holds a turn already `started`:
+                                // store the fact, apply nothing.
+                                false
+                            }
+                        }
+                    };
+                }
+                if takes_slot {
+                    tx.execute(
+                        "UPDATE sessions SET activity = 'running', open_turn_id = ?2 WHERE id = ?1",
+                        params![session_id, turn_id],
+                    )?;
+                    tx.execute("UPDATE turns SET state = 'started' WHERE turn_id = ?1", [turn_id])?;
+                    // The user's turn is recorded only once the adapter has
+                    // it (ACP core §4.4), in seq order before the turn's
+                    // updates.
+                    let content: Option<String> = tx
+                        .query_row("SELECT content FROM turns WHERE turn_id = ?1", [turn_id], |r| r.get(0))
+                        .optional()?;
+                    if let Some(content) = content {
+                        let body = json!({ "turn_id": turn_id, "content": serde_json::from_str::<Value>(&content)? });
+                        created.push(collector_event(&tx, session_id, "user_turn", body, &ts)?);
+                    }
+                } else {
+                    created.clear();
                 }
             }
             SessionBody::TurnEnded { turn_id, outcome, .. } => {
@@ -386,8 +463,11 @@ impl Store {
                     "UPDATE sessions SET open_turn_id = NULL, activity = 'idle' WHERE id = ?1 AND open_turn_id = ?2",
                     params![session_id, turn_id],
                 )?;
+                // Only a `started` turn can be ended by a real `turn_ended`
+                // (fix round 1, ruling B): a stray end must not jump a
+                // `sent`/`not_delivered` turn straight to `ended`.
                 tx.execute(
-                    "UPDATE turns SET state = 'ended', outcome = ?2 WHERE turn_id = ?1 AND outcome IS NULL",
+                    "UPDATE turns SET state = 'ended', outcome = ?2 WHERE turn_id = ?1 AND state = 'started'",
                     params![turn_id, serde_json::to_value(outcome)?.as_str().unwrap_or_default()],
                 )?;
                 if applied == 0 {

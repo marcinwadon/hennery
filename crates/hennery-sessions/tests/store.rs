@@ -414,3 +414,116 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
     assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("started"));
     assert!(!store.session("s1").unwrap().unwrap().close_requested);
 }
+
+// Fix round 1: a late `turn_started` must never leave a turn orphaned with
+// no possible end (rulings A-D).
+
+#[test]
+fn a_late_turn_started_takes_the_slot_back_from_a_turn_that_never_started() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.reconcile_host("h1", &[attached("s1", None)]).unwrap();
+    assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("not_delivered"));
+    assert!(store.open_turn("s1", "t2", &prompt_text()).unwrap());
+
+    let created = store.ingest("s1", 2, &turn_started("t1")).unwrap();
+    assert_eq!(kinds(&created), ["turn_started", "turn_not_delivered", "user_turn"]);
+    assert_eq!(created[1].body, json!({ "turn_id": "t2" }));
+    assert_eq!(store.turn_state("t2").unwrap().as_deref(), Some("not_delivered"));
+    assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("started"));
+    assert_eq!(
+        store.session("s1").unwrap().unwrap().open_turn_id.as_deref(),
+        Some("t1")
+    );
+
+    // The host rejecting t2 (it lost the slot) leaves t1's slot alone.
+    store.abandon_turn("s1", "t2").unwrap();
+    assert_eq!(
+        store.session("s1").unwrap().unwrap().open_turn_id.as_deref(),
+        Some("t1")
+    );
+}
+
+#[test]
+fn a_turn_displaced_back_into_the_slot_is_still_resolved_by_reconciliation() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.reconcile_host("h1", &[attached("s1", None)]).unwrap();
+    assert!(store.open_turn("s1", "t2", &prompt_text()).unwrap());
+    store.ingest("s1", 2, &turn_started("t1")).unwrap();
+    store.abandon_turn("s1", "t2").unwrap();
+
+    // The host restarts before ever ending t1: reconciliation must still
+    // give it exactly one end (previously it was silently orphaned).
+    let r = store.reconcile_host("h1", &[]).unwrap();
+    assert_eq!(kinds(&r.events), ["host_restarted", "turn_ended_synthesized"]);
+    assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("ended"));
+}
+
+#[test]
+fn a_late_turn_started_for_an_already_ended_turn_changes_nothing() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.ingest("s1", 2, &turn_started("t1")).unwrap();
+    store.ingest("s1", 3, &ended("t1")).unwrap();
+    assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("ended"));
+    assert!(store.open_turn("s1", "t2", &prompt_text()).unwrap());
+
+    let created = store.ingest("s1", 4, &turn_started("t1")).unwrap();
+    assert!(created.is_empty());
+    let s = store.session("s1").unwrap().unwrap();
+    assert_eq!(s.open_turn_id.as_deref(), Some("t2"));
+    assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("ended"));
+}
+
+#[test]
+fn a_turn_ended_for_a_turn_that_never_started_does_not_jump_it_to_ended() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    // No turn_started for t1 ever arrives; a turn_ended lands at the
+    // session's open turn anyway. The session slot still clears (the
+    // session-level fact), but the turns row must not be corrupted into
+    // `ended` for a turn that was never `started` (ruling B).
+    store.ingest("s1", 2, &ended("t1")).unwrap();
+    assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("sent"));
+}
+
+#[test]
+fn close_now_resolves_a_started_turn_before_closing_and_reconcile_finds_nothing_left() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.ingest("s1", 2, &turn_started("t1")).unwrap();
+
+    let events = store.close_now("s1").unwrap();
+    assert_eq!(kinds(&events), ["turn_ended_synthesized", "operator_closed"]);
+    assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("ended"));
+
+    // Nothing left for reconciliation to resolve, and no second end.
+    let r = store.reconcile_host("h1", &[]).unwrap();
+    assert_eq!(r, Default::default());
+    assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("ended"));
+}
+
+#[test]
+fn a_resent_identical_conflicting_frame_does_not_duplicate_the_conflict_event() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.ingest("s1", 2, &update(1)).unwrap();
+    let first = store.ingest("s1", 2, &update(2)).unwrap();
+    assert_eq!(kinds(&first), ["conflict"]);
+
+    let resent = store.ingest("s1", 2, &update(2)).unwrap();
+    assert!(resent.is_empty());
+    let conflicts = store
+        .events("s1", 0, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "conflict")
+        .count();
+    assert_eq!(conflicts, 1);
+}
