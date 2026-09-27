@@ -929,6 +929,7 @@ dependencies = [
  "anyhow",
  "futures",
  "hennery-proto",
+ "libc",
  "rusqlite",
  "serde_json",
  "tempfile",

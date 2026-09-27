@@ -1,6 +1,7 @@
 //! One session actor per attached session (ACP core §2.2), each owning one
 //! adapter process (umbrella §6.9).
 
+pub use crate::adapter::{AgentCommand, NESTING_VARS};
 use crate::uplink::Uplink;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, SessionId};
@@ -15,35 +16,10 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-/// Environment variables that make an agent refuse to start or double-report
-/// when hennery itself runs inside an agent session (ACP core §2.3).
-pub const NESTING_VARS: &[&str] = &["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT"];
-
 /// How long `start` waits for spawn → `initialize` → `session/new` →
 /// `session_started` before giving up. Kept below the collector's 90s start
 /// timeout (ACP core §3.4) so the host's `start_failed` always beats it.
 pub const START_TIMEOUT: Duration = Duration::from_secs(75);
-
-/// How to launch an agent's ACP adapter.
-#[derive(Debug, Clone)]
-pub struct AgentCommand {
-    pub program: String,
-    pub args: Vec<String>,
-    pub env: Vec<(String, String)>,
-}
-
-impl AgentCommand {
-    /// Parse `"program arg1 arg2"` (whitespace-separated, no quoting).
-    pub fn parse(command: &str) -> Option<Self> {
-        let mut parts = command.split_whitespace().map(str::to_string);
-        let program = parts.next()?;
-        Some(Self {
-            program,
-            args: parts.collect(),
-            env: Vec::new(),
-        })
-    }
-}
 
 /// Messages from the connection task to a session actor.
 #[derive(Debug)]
