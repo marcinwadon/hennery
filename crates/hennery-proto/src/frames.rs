@@ -1,0 +1,141 @@
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::BTreeMap;
+use ts_rs::TS;
+
+/// A session that a host still has an adapter for, reported in `hello`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct AttachedSession {
+    pub session_id: String,
+    #[ts(type = "number")]
+    pub last_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_turn_id: Option<String>,
+}
+
+/// How a turn ended. Exactly one `turn_ended` per accepted turn (ACP core §4.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnOutcome {
+    Completed,
+    Cancelled,
+    Failed,
+    Interrupted,
+}
+
+/// Fields the collector may read from a session event. Closed set (ACP core §3.2).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct Indexed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+/// The body of a sequenced, outboxed session frame.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SessionBody {
+    /// The adapter session exists. Resolves the collector's start waiter.
+    SessionStarted {
+        request_id: String,
+        agent_session_id: String,
+    },
+    /// The host accepted a start but could not create the adapter session
+    /// (spawn, `initialize` or `session/new` failed). Rejects the start waiter.
+    StartFailed {
+        request_id: String,
+        code: String,
+        message: String,
+    },
+    /// The prompt reached the adapter. Resolves the collector's prompt waiter.
+    TurnStarted { request_id: String, turn_id: String },
+    /// An ACP message from the adapter, verbatim in `payload`.
+    AcpUpdate {
+        #[serde(default)]
+        indexed: Indexed,
+        #[ts(type = "unknown")]
+        payload: Value,
+    },
+    TurnEnded {
+        turn_id: String,
+        outcome: TurnOutcome,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+}
+
+/// Host -> collector.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HostFrame {
+    Hello {
+        protocol_version: String,
+        host_version: String,
+        host_id: String,
+        /// Walking skeleton only: a shared development token. Replaced by an
+        /// Ed25519 proof of possession (ACP core §3.5).
+        token: String,
+        attached_sessions: Vec<AttachedSession>,
+    },
+    /// Every state-bearing fact is a sequenced frame: it goes through the host
+    /// outbox and is acked (ACP core §3.3).
+    Session {
+        session_id: String,
+        #[ts(type = "number")]
+        seq: u64,
+        body: SessionBody,
+    },
+    /// A rejected request. Not outboxed: a rejection means nothing happened,
+    /// so losing it only costs the collector a timeout.
+    Error {
+        request_id: String,
+        code: String,
+        message: String,
+    },
+    /// Sent once per connection after the unacked outbox has been resent.
+    /// The collector reconciles `hello.attached_sessions` only after this
+    /// frame, so a resent `turn_ended` is never duplicated by a synthesised
+    /// one (ACP core §5.2).
+    ResendComplete,
+}
+
+/// Collector -> host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum CollectorFrame {
+    HelloAck {
+        protocol_version: String,
+        collector_version: String,
+        /// Highest committed seq per session listed in `hello`; the host
+        /// fast-forwards its counters if they are lower (lost outbox).
+        #[ts(type = "Record<string, number>")]
+        committed: BTreeMap<String, u64>,
+    },
+    HelloError {
+        code: String,
+        message: String,
+    },
+    StartSession {
+        request_id: String,
+        session_id: String,
+        agent: String,
+        cwd: String,
+    },
+    Prompt {
+        request_id: String,
+        session_id: String,
+        turn_id: String,
+        /// ACP ContentBlocks, built by the frontend.
+        #[ts(type = "unknown[]")]
+        content: Vec<Value>,
+    },
+    Ack {
+        session_id: String,
+        #[ts(type = "number")]
+        ack_seq: u64,
+    },
+}
