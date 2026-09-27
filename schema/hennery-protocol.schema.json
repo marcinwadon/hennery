@@ -178,6 +178,48 @@
             "ack_seq"
           ],
           "type": "object"
+        },
+        {
+          "description": "Completed by `session_parked{operator}` (ACP core §4.8).",
+          "properties": {
+            "request_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "park_session",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "session_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Completed by `session_closed` (ACP core §4.8).",
+          "properties": {
+            "request_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "close_session",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "session_id"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -340,6 +382,31 @@
       },
       "type": "object"
     },
+    "LifecycleResponse": {
+      "description": "Result of a park or close: the session's lifecycle once the request took\neffect (`parked` or `closed`).",
+      "properties": {
+        "lifecycle": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "lifecycle"
+      ],
+      "type": "object"
+    },
+    "ParkReason": {
+      "description": "Why a session was parked (ACP core §3.2).",
+      "enum": [
+        "idle",
+        "adapter_exited",
+        "operator"
+      ],
+      "type": "string"
+    },
     "PromptRequest": {
       "properties": {
         "content": {
@@ -481,6 +548,67 @@
             "kind",
             "turn_id",
             "outcome"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The adapter process is gone and the session is detached (idle reap,\nadapter exit, or an operator park). Completes `park_session`.",
+          "properties": {
+            "kind": {
+              "const": "session_parked",
+              "type": "string"
+            },
+            "reason": {
+              "$ref": "#/$defs/ParkReason"
+            }
+          },
+          "required": [
+            "kind",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The operator closed an attached session. Completes `close_session`.",
+          "properties": {
+            "kind": {
+              "const": "session_closed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The adapter exited without being asked to (ACP core §2.3). Followed by\n`session_parked{adapter_exited}`. The stderr tail is scrubbed.",
+          "properties": {
+            "code": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "kind": {
+              "const": "adapter_exited",
+              "type": "string"
+            },
+            "signal": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "stderr_tail": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "stderr_tail"
           ],
           "type": "object"
         }

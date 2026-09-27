@@ -1,4 +1,4 @@
-use hennery_proto::frames::{CollectorFrame, HostFrame, Indexed, SessionBody, TurnOutcome};
+use hennery_proto::frames::{CollectorFrame, HostFrame, Indexed, ParkReason, SessionBody, TurnOutcome};
 use serde_json::json;
 
 #[test]
@@ -84,10 +84,43 @@ fn every_collector_frame_round_trips() {
             session_id: "s".into(),
             ack_seq: 3,
         },
+        CollectorFrame::ParkSession {
+            request_id: "r".into(),
+            session_id: "s".into(),
+        },
+        CollectorFrame::CloseSession {
+            request_id: "r".into(),
+            session_id: "s".into(),
+        },
     ];
     for f in frames {
         let back: CollectorFrame = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
         assert_eq!(back, f);
+    }
+}
+
+#[test]
+fn teardown_bodies_use_the_spec_field_names() {
+    let cases = [
+        (
+            SessionBody::SessionParked {
+                reason: ParkReason::AdapterExited,
+            },
+            json!({"kind": "session_parked", "reason": "adapter_exited"}),
+        ),
+        (SessionBody::SessionClosed, json!({"kind": "session_closed"})),
+        (
+            SessionBody::AdapterExited {
+                code: None,
+                signal: Some(9),
+                stderr_tail: "boom".into(),
+            },
+            json!({"kind": "adapter_exited", "signal": 9, "stderr_tail": "boom"}),
+        ),
+    ];
+    for (body, expected) in cases {
+        assert_eq!(serde_json::to_value(&body).unwrap(), expected);
+        assert_eq!(serde_json::from_value::<SessionBody>(expected).unwrap(), body);
     }
 }
 

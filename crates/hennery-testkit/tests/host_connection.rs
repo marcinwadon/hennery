@@ -250,3 +250,355 @@ async fn backoff_keeps_growing_when_the_collector_never_acks_a_frame() {
          doubling from reconnect_min (20ms) instead of resetting on the handshake alone"
     );
 }
+
+type ServerSink = futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>, Message>;
+
+/// Accept one host connection: read its `hello`, answer `hello_ack`, and
+/// read up to its `resend_complete`. Returns the hello's attached sessions.
+async fn accept_host(
+    listener: &TcpListener,
+) -> (ServerSink, ServerStream, Vec<hennery_proto::frames::AttachedSession>) {
+    let (tcp, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("host connects")
+        .unwrap();
+    let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    let (mut sink, mut stream) = ws.split();
+    let HostFrame::Hello { attached_sessions, .. } = read_host_frame(&mut stream).await else {
+        panic!("expected hello");
+    };
+    send_frame(&mut sink, &hello_ack()).await;
+    read_until(&mut stream, |f| matches!(f, HostFrame::ResendComplete)).await;
+    (sink, stream, attached_sessions)
+}
+
+async fn send_frame(sink: &mut ServerSink, frame: &CollectorFrame) {
+    sink.send(Message::text(serde_json::to_string(frame).unwrap()))
+        .await
+        .unwrap();
+}
+
+/// Read frames until one matches (10 s bound).
+async fn read_until(stream: &mut ServerStream, pred: impl Fn(&HostFrame) -> bool) -> HostFrame {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match stream.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    let frame: HostFrame = serde_json::from_str(&text).unwrap();
+                    if pred(&frame) {
+                        return frame;
+                    }
+                }
+                Some(Ok(_)) => {}
+                other => panic!("connection ended while waiting: {other:?}"),
+            }
+        }
+    })
+    .await
+    .expect("expected frame within 10s")
+}
+
+fn body_is(session: &str, kind: &str) -> impl Fn(&HostFrame) -> bool {
+    let (session, kind) = (session.to_string(), kind.to_string());
+    move |f| match f {
+        HostFrame::Session { session_id, body, .. } => {
+            session_id == &session && serde_json::to_value(body).unwrap()["kind"] == kind.as_str()
+        }
+        _ => false,
+    }
+}
+
+fn error_for(request: &str) -> impl Fn(&HostFrame) -> bool {
+    let request = request.to_string();
+    move |f| matches!(f, HostFrame::Error { request_id, .. } if *request_id == request)
+}
+
+fn start(request_id: &str, session_id: &str) -> CollectorFrame {
+    CollectorFrame::StartSession {
+        request_id: request_id.into(),
+        session_id: session_id.into(),
+        agent: "fake".into(),
+        cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+    }
+}
+
+/// A host with the fake adapter (a slow 2 s turn) registered as `fake`.
+fn host_with_fake(addr: std::net::SocketAddr, name: &str, program: hennery_host::AgentCommand) -> HostConfig {
+    let mut cfg = HostConfig::new(
+        format!("ws://{addr}/api/hosts/ws"),
+        "host1",
+        "token",
+        unique_data_dir(name),
+    );
+    cfg.reconnect_min = Duration::from_millis(50);
+    cfg.reconnect_max = Duration::from_millis(200);
+    cfg.agents.insert("fake".into(), program);
+    cfg
+}
+
+fn slow_fake() -> hennery_host::AgentCommand {
+    let mut fake = hennery_host::AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    let script = hennery_testkit::FakeScript {
+        chunks: (1..=20).map(|n| n.to_string()).collect(),
+        chunk_delay_ms: 100,
+        ..Default::default()
+    };
+    fake.env.push((
+        hennery_testkit::SCRIPT_ENV.into(),
+        serde_json::to_string(&script).unwrap(),
+    ));
+    fake
+}
+
+#[tokio::test]
+async fn hello_reports_live_sessions_with_their_open_turn_and_drops_ended_ones() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(host_with_fake(addr, "hello-open-turn", slow_fake())));
+
+    let (mut sink, mut stream, attached) = accept_host(&listener).await;
+    assert!(attached.is_empty());
+    send_frame(&mut sink, &start("r1", "s1")).await;
+    read_until(&mut stream, body_is("s1", "session_started")).await;
+    send_frame(
+        &mut sink,
+        &CollectorFrame::Prompt {
+            request_id: "r2".into(),
+            session_id: "s1".into(),
+            turn_id: "t1".into(),
+            content: vec![serde_json::json!({"type": "text", "text": "go"})],
+        },
+    )
+    .await;
+    read_until(&mut stream, body_is("s1", "turn_started")).await;
+    send_frame(&mut sink, &start("r3", "s2")).await;
+    read_until(&mut stream, body_is("s2", "session_started")).await;
+    send_frame(
+        &mut sink,
+        &CollectorFrame::CloseSession {
+            request_id: "r4".into(),
+            session_id: "s2".into(),
+        },
+    )
+    .await;
+    read_until(&mut stream, body_is("s2", "session_closed")).await;
+    drop((sink, stream)); // the connection drops mid-turn
+
+    let (_sink, _stream, attached) = accept_host(&listener).await;
+    assert_eq!(attached.len(), 1, "{attached:?}");
+    assert_eq!(attached[0].session_id, "s1");
+    assert_eq!(attached[0].open_turn_id.as_deref(), Some("t1"));
+    assert!(attached[0].last_seq >= 2, "{attached:?}");
+}
+
+#[tokio::test]
+async fn park_reaches_the_actor_and_frames_for_a_detached_session_are_not_attached() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(host_with_fake(addr, "park", slow_fake())));
+
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    send_frame(&mut sink, &start("r1", "s1")).await;
+    read_until(&mut stream, body_is("s1", "session_started")).await;
+    let park = |request_id: &str| CollectorFrame::ParkSession {
+        request_id: request_id.into(),
+        session_id: "s1".into(),
+    };
+    send_frame(&mut sink, &park("r2")).await;
+    let parked = read_until(&mut stream, body_is("s1", "session_parked")).await;
+    assert!(
+        matches!(&parked, HostFrame::Session { body: hennery_proto::frames::SessionBody::SessionParked { reason }, .. }
+            if *reason == hennery_proto::frames::ParkReason::Operator),
+        "{parked:?}"
+    );
+    // The actor is gone: a second park, a close and a prompt are all refused.
+    send_frame(&mut sink, &park("r3")).await;
+    let refused = read_until(&mut stream, error_for("r3")).await;
+    assert!(
+        matches!(&refused, HostFrame::Error { code, .. } if code == "not_attached"),
+        "{refused:?}"
+    );
+    send_frame(
+        &mut sink,
+        &CollectorFrame::CloseSession {
+            request_id: "r4".into(),
+            session_id: "s1".into(),
+        },
+    )
+    .await;
+    let close_refused = read_until(&mut stream, error_for("r4")).await;
+    assert!(
+        matches!(&close_refused, HostFrame::Error { code, .. } if code == "not_attached"),
+        "{close_refused:?}"
+    );
+    send_frame(
+        &mut sink,
+        &CollectorFrame::Prompt {
+            request_id: "r5".into(),
+            session_id: "s1".into(),
+            turn_id: "t1".into(),
+            content: vec![serde_json::json!({"type": "text", "text": "go"})],
+        },
+    )
+    .await;
+    let prompt_refused = read_until(&mut stream, error_for("r5")).await;
+    assert!(
+        matches!(&prompt_refused, HostFrame::Error { code, .. } if code == "not_attached"),
+        "{prompt_refused:?}"
+    );
+}
+
+/// After a session is parked, a repeated `start_session` for the same id must
+/// not be routed to `Restart` (there is no live actor left to answer it) —
+/// it spawns a fresh actor, whose `session_started` carries the new request.
+#[tokio::test]
+async fn a_start_after_park_spawns_a_fresh_actor() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(host_with_fake(addr, "start-after-park", slow_fake())));
+
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    send_frame(&mut sink, &start("r1", "s1")).await;
+    read_until(&mut stream, body_is("s1", "session_started")).await;
+    send_frame(
+        &mut sink,
+        &CollectorFrame::ParkSession {
+            request_id: "r2".into(),
+            session_id: "s1".into(),
+        },
+    )
+    .await;
+    read_until(&mut stream, body_is("s1", "session_parked")).await;
+
+    send_frame(&mut sink, &start("r5", "s1")).await;
+    if let HostFrame::Session {
+        body: hennery_proto::frames::SessionBody::SessionStarted { request_id, .. },
+        ..
+    } = read_until(&mut stream, body_is("s1", "session_started")).await
+    {
+        assert_eq!(request_id, "r5");
+    }
+}
+
+#[tokio::test]
+async fn a_repeated_start_session_re_emits_session_started_without_a_second_adapter() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let spawns = dir.path().join("spawns");
+    // Counts adapter launches, then becomes the fake adapter.
+    let counting = hennery_host::AgentCommand {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            format!(
+                "echo spawned >> {}; exec {}",
+                spawns.display(),
+                env!("CARGO_BIN_EXE_hennery-fake-acp")
+            ),
+        ],
+        env: Vec::new(),
+    };
+    tokio::spawn(run(host_with_fake(addr, "restart", counting)));
+
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    send_frame(&mut sink, &start("r1", "s1")).await;
+    send_frame(&mut sink, &start("r2", "s1")).await;
+    let mut request_ids = Vec::new();
+    for _ in 0..2 {
+        if let HostFrame::Session {
+            body: hennery_proto::frames::SessionBody::SessionStarted { request_id, .. },
+            ..
+        } = read_until(&mut stream, body_is("s1", "session_started")).await
+        {
+            request_ids.push(request_id);
+        }
+    }
+    assert_eq!(request_ids, ["r1", "r2"]);
+    assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 1);
+}
+
+/// Acks `hello`, keeps the connection up for `hold`, then closes cleanly,
+/// never acking a frame. Reports each hello's arrival time.
+async fn hold_then_close_server(listener: TcpListener, hold: Duration, hellos: mpsc::UnboundedSender<Instant>) {
+    loop {
+        let Ok((tcp, _)) = listener.accept().await else {
+            return;
+        };
+        let hellos = hellos.clone();
+        tokio::spawn(async move {
+            let Ok(ws) = tokio_tungstenite::accept_async(tcp).await else {
+                return;
+            };
+            let (mut sink, mut stream) = ws.split();
+            let hello = read_host_frame(&mut stream).await;
+            assert!(matches!(hello, HostFrame::Hello { .. }), "{hello:?}");
+            hellos.send(Instant::now()).ok();
+            let _ = sink
+                .send(Message::text(serde_json::to_string(&hello_ack()).unwrap()))
+                .await;
+            tokio::time::sleep(hold).await;
+            let _ = sink.close().await;
+        });
+    }
+}
+
+#[tokio::test]
+async fn backoff_resets_after_a_healthy_connection_even_without_acks() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, mut hellos) = mpsc::unbounded_channel();
+    // Up for 150 ms each time, against a 100 ms healthy threshold.
+    tokio::spawn(hold_then_close_server(listener, Duration::from_millis(150), tx));
+
+    let mut cfg = HostConfig::new(
+        format!("ws://{addr}/api/hosts/ws"),
+        "host1",
+        "token",
+        unique_data_dir("healthy-reset"),
+    );
+    cfg.reconnect_min = Duration::from_millis(20);
+    cfg.reconnect_max = Duration::from_secs(10);
+    cfg.healthy_after = Duration::from_millis(100);
+    tokio::spawn(run(cfg));
+
+    let mut timestamps = Vec::new();
+    for _ in 0..6 {
+        let t = tokio::time::timeout(Duration::from_secs(3), hellos.recv())
+            .await
+            .expect("hello within 3s")
+            .expect("hello channel open");
+        timestamps.push(t);
+    }
+    // Each gap is the 150 ms hold plus the backoff; without the reset the
+    // backoff alone would pass 300 ms by the fifth reconnect.
+    let gaps: Vec<Duration> = timestamps.windows(2).map(|w| w[1] - w[0]).collect();
+    for (i, gap) in gaps.iter().enumerate() {
+        assert!(*gap < Duration::from_millis(350), "gap {i} was {gap:?}; gaps {gaps:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_collector_that_never_completes_the_handshake_is_retried() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut cfg = HostConfig::new(
+        format!("ws://{addr}/api/hosts/ws"),
+        "host1",
+        "token",
+        unique_data_dir("connect-timeout"),
+    );
+    cfg.connect_timeout = Duration::from_millis(200);
+    cfg.reconnect_min = Duration::from_millis(50);
+    tokio::spawn(run(cfg));
+
+    // Accept TCP but never answer the WebSocket upgrade.
+    let mut held = Vec::new();
+    for attempt in 0..2 {
+        let (tcp, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap_or_else(|_| panic!("connection attempt {attempt} within 2s"))
+            .unwrap();
+        held.push(tcp);
+    }
+}

@@ -12,6 +12,7 @@ path = "src/bin/hennery-fake-acp.rs"
 
 [dependencies]
 agent-client-protocol.workspace = true
+libc = "0.2"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true

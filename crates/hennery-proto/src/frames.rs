@@ -24,6 +24,15 @@ pub enum TurnOutcome {
     Interrupted,
 }
 
+/// Why a session was parked (ACP core §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ParkReason {
+    Idle,
+    AdapterExited,
+    Operator,
+}
+
 /// Fields the collector may read from a session event. Closed set (ACP core §3.2).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct Indexed {
@@ -65,6 +74,20 @@ pub enum SessionBody {
         stop_reason: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+    },
+    /// The adapter process is gone and the session is detached (idle reap,
+    /// adapter exit, or an operator park). Completes `park_session`.
+    SessionParked { reason: ParkReason },
+    /// The operator closed an attached session. Completes `close_session`.
+    SessionClosed,
+    /// The adapter exited without being asked to (ACP core §2.3). Followed by
+    /// `session_parked{adapter_exited}`. The stderr tail is scrubbed.
+    AdapterExited {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signal: Option<i32>,
+        stderr_tail: String,
     },
 }
 
@@ -137,5 +160,15 @@ pub enum CollectorFrame {
         session_id: String,
         #[ts(type = "number")]
         ack_seq: u64,
+    },
+    /// Completed by `session_parked{operator}` (ACP core §4.8).
+    ParkSession {
+        request_id: String,
+        session_id: String,
+    },
+    /// Completed by `session_closed` (ACP core §4.8).
+    CloseSession {
+        request_id: String,
+        session_id: String,
     },
 }

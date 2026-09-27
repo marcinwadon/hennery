@@ -5,7 +5,7 @@
 //! writing to the outbox, which is resent on the next connection.
 
 use crate::outbox::Outbox;
-use crate::session::{self, AgentCommand, SessionCmd};
+use crate::session::{self, AgentCommand, SessionCmd, SessionHandle, SessionOptions};
 use crate::uplink::Uplink;
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
@@ -32,6 +32,13 @@ pub struct HostConfig {
     pub reconnect_max: Duration,
     pub ping_interval: Duration,
     pub read_timeout: Duration,
+    /// Idle reaper window (ACP core §4.7); zero turns the reaper off.
+    pub idle_timeout: Duration,
+    /// Bound on the TCP + WebSocket handshake of one connection attempt.
+    pub connect_timeout: Duration,
+    /// A connection that stays up this long resets the reconnect backoff,
+    /// even if nothing was acked (an idle host sends nothing to ack).
+    pub healthy_after: Duration,
 }
 
 impl HostConfig {
@@ -51,25 +58,68 @@ impl HostConfig {
             reconnect_max: Duration::from_secs(30),
             ping_interval: Duration::from_secs(15),
             read_timeout: Duration::from_secs(45),
+            idle_timeout: session::IDLE_TIMEOUT,
+            connect_timeout: Duration::from_secs(10),
+            healthy_after: Duration::from_secs(60),
+        }
+    }
+
+    /// Options for every session actor this host spawns.
+    pub fn session_options(&self) -> SessionOptions {
+        SessionOptions {
+            idle_timeout: (!self.idle_timeout.is_zero()).then_some(self.idle_timeout),
+            ..SessionOptions::default()
         }
     }
 }
 
-type Sessions = Arc<Mutex<HashMap<String, mpsc::UnboundedSender<SessionCmd>>>>;
+type Sessions = Arc<Mutex<HashMap<String, SessionHandle>>>;
 
 /// Run the host until the process exits. Reconnects with exponential backoff.
 pub async fn run(cfg: HostConfig) -> Result<()> {
+    run_until(cfg, std::future::pending()).await
+}
+
+/// Run the host until `shutdown` resolves.
+pub async fn run_until(cfg: HostConfig, shutdown: impl Future<Output = ()>) -> Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)?;
     let outbox = Outbox::open(&cfg.data_dir.join("outbox.db"))?;
     let (uplink, mut replies) = Uplink::new(outbox);
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
-    let mut backoff = cfg.reconnect_min;
-    loop {
-        if let Err(err) = connect_once(&cfg, &uplink, &sessions, &mut replies, &mut backoff).await {
-            tracing::warn!(error = %err, "collector connection ended");
+    let serve = async {
+        let mut backoff = cfg.reconnect_min;
+        loop {
+            if let Err(err) = connect_once(&cfg, &uplink, &sessions, &mut replies, &mut backoff).await {
+                tracing::warn!(error = %err, "collector connection ended");
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(cfg.reconnect_max);
         }
-        tokio::time::sleep(backoff).await;
-        backoff = (backoff * 2).min(cfg.reconnect_max);
+    };
+    tokio::select! {
+        _ = serve => unreachable!("the connection loop never ends"),
+        _ = shutdown => {}
+    }
+    shut_down(&sessions, cfg.session_options().kill_grace + Duration::from_secs(1)).await;
+    Ok(())
+}
+
+/// Host shutdown (ACP core §2.3): the connection loop is already stopped;
+/// dropping every handle closes each actor's command channel, so each takes
+/// its graceful path — SIGTERM its adapter's group, SIGKILL after the grace.
+/// Returning without waiting would let the runtime drop the actors instead,
+/// and `Adapter::drop` SIGKILLs at once. Bounded: an actor still starting
+/// does not read its commands and is left to that drop.
+async fn shut_down(sessions: &Sessions, bound: Duration) {
+    let actors: Vec<_> = std::mem::take(&mut *sessions.lock().expect("sessions lock"))
+        .into_values()
+        .map(|handle| handle.finished())
+        .collect();
+    if tokio::time::timeout(bound, futures::future::join_all(actors))
+        .await
+        .is_err()
+    {
+        tracing::warn!(?bound, "session actors did not stop in time; killing their adapters");
     }
 }
 
@@ -80,24 +130,16 @@ async fn connect_once(
     replies: &mut mpsc::UnboundedReceiver<HostFrame>,
     backoff: &mut Duration,
 ) -> Result<()> {
-    let (ws, _) = tokio_tungstenite::connect_async(&cfg.collector_url)
-        .await
-        .context("connect to collector")?;
+    let (ws, _) = tokio::time::timeout(
+        cfg.connect_timeout,
+        tokio_tungstenite::connect_async(&cfg.collector_url),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("no WebSocket handshake within {:?}", cfg.connect_timeout))?
+    .context("connect to collector")?;
     let (mut sink, mut stream) = ws.split();
 
-    let attached = {
-        let ids: Vec<String> = sessions.lock().expect("sessions lock").keys().cloned().collect();
-        let mut out = Vec::new();
-        for session_id in ids {
-            let last_seq = uplink.last_seq(&session_id)?;
-            out.push(AttachedSession {
-                session_id,
-                last_seq,
-                open_turn_id: None,
-            });
-        }
-        out
-    };
+    let attached = attached_sessions(uplink, sessions)?;
     send(
         &mut sink,
         &HostFrame::Hello {
@@ -127,7 +169,11 @@ async fn connect_once(
     // ack `hello` and then drop every subsequent frame without acking it
     // (ws.rs never acks past a failed ingest). Resetting backoff here would
     // make the host hammer such a collector at `reconnect_min` forever;
-    // instead it is reset below, only once the first real `ack` lands.
+    // instead it is reset below, once the first real `ack` lands, or —
+    // failing that — once the connection has simply stayed up for
+    // `healthy_after` (an idle host has nothing to ack). So a collector that
+    // never acks anything now costs at most one reconnect per
+    // `healthy_after`, not an ever-growing backoff.
     tracing::info!(collector = %cfg.collector_url, "connected to collector");
 
     // Resend everything unacked, then tell the collector we are done.
@@ -143,10 +189,19 @@ async fn connect_once(
     // outbox wakeup, a reply), so the "no frame in read_timeout" branch could
     // never actually fire. `deadline` only moves when a frame arrives.
     let mut deadline = Instant::now() + cfg.read_timeout;
+    // An idle host has nothing to ack, so a connection that simply stays up
+    // is proof enough too (the ack-based reset below covers busy hosts).
+    let healthy = tokio::time::sleep(cfg.healthy_after);
+    tokio::pin!(healthy);
+    let mut proven = false;
     loop {
         tokio::select! {
+            _ = &mut healthy, if !proven => {
+                proven = true;
+                *backoff = cfg.reconnect_min;
+            }
             _ = uplink.changed() => send_pending(&mut sink, uplink, &mut sent).await?,
-            Some(frame) = replies.recv() => send(&mut sink, &frame).await?,
+            Some(frame) = replies.recv() => send_reply(&mut sink, uplink, &mut sent, &frame).await?,
             _ = ping.tick() => sink.send(Message::Ping(Default::default())).await?,
             _ = tokio::time::sleep_until(deadline) => bail!("no frame from collector within {:?}", cfg.read_timeout),
             msg = stream.next() => {
@@ -175,6 +230,44 @@ async fn connect_once(
     }
 }
 
+/// `hello.attached_sessions`: every session whose actor is still running,
+/// with its open turn (ACP core §5.1). Ended actors are pruned here.
+fn attached_sessions(uplink: &Uplink, sessions: &Sessions) -> Result<Vec<AttachedSession>> {
+    let live: Vec<(String, SessionHandle)> = {
+        let mut map = sessions.lock().expect("sessions lock");
+        map.retain(|_, handle| !handle.is_ended());
+        map.iter().map(|(id, h)| (id.clone(), h.clone())).collect()
+    };
+    let mut out = Vec::new();
+    for (session_id, handle) in live {
+        out.push(AttachedSession {
+            last_seq: uplink.last_seq(&session_id)?,
+            open_turn_id: handle.open_turn_id(),
+            session_id,
+        });
+    }
+    out.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+    Ok(out)
+}
+
+/// The running actor for `session_id`, if any.
+fn live_session(sessions: &Sessions, session_id: &str) -> Option<SessionHandle> {
+    sessions
+        .lock()
+        .expect("sessions lock")
+        .get(session_id)
+        .filter(|h| !h.is_ended())
+        .cloned()
+}
+
+fn not_attached(uplink: &Uplink, request_id: String) {
+    uplink.reply(HostFrame::Error {
+        request_id,
+        code: "not_attached".into(),
+        message: "session is not attached on this host".into(),
+    });
+}
+
 fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: CollectorFrame) -> Result<()> {
     match frame {
         CollectorFrame::StartSession {
@@ -192,43 +285,54 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
                 return Ok(());
             };
             let mut map = sessions.lock().expect("sessions lock");
-            if map.contains_key(&session_id) {
-                // Idempotent: a retried start for an attached session is a no-op;
-                // its session_started fact is already in the outbox.
+            // Idempotent (ACP core §2.2): a repeated start for an attached
+            // session re-emits `session_started` with the new request id and
+            // never spawns a second adapter.
+            if let Some(handle) = map.get(&session_id).filter(|h| !h.is_ended())
+                && handle.send(SessionCmd::Restart {
+                    request_id: request_id.clone(),
+                })
+            {
                 return Ok(());
             }
-            let tx = session::start(
+            let handle = session::spawn(
                 uplink.clone(),
                 request_id,
                 session_id.clone(),
                 command,
                 PathBuf::from(cwd),
+                cfg.session_options(),
             );
-            map.insert(session_id, tx);
+            map.insert(session_id, handle);
         }
         CollectorFrame::Prompt {
             request_id,
             session_id,
             turn_id,
             content,
-        } => {
-            let tx = sessions.lock().expect("sessions lock").get(&session_id).cloned();
-            match tx {
-                Some(tx)
-                    if tx
-                        .send(SessionCmd::Prompt {
-                            request_id: request_id.clone(),
-                            turn_id,
-                            content,
-                        })
-                        .is_ok() => {}
-                _ => uplink.reply(HostFrame::Error {
-                    request_id,
-                    code: "not_attached".into(),
-                    message: "session is not attached on this host".into(),
-                }),
-            }
-        }
+        } => match live_session(sessions, &session_id) {
+            Some(handle)
+                if handle.send(SessionCmd::Prompt {
+                    request_id: request_id.clone(),
+                    turn_id,
+                    content,
+                }) => {}
+            _ => not_attached(uplink, request_id),
+        },
+        CollectorFrame::ParkSession { request_id, session_id } => match live_session(sessions, &session_id) {
+            Some(handle)
+                if handle.send(SessionCmd::Park {
+                    request_id: request_id.clone(),
+                }) => {}
+            _ => not_attached(uplink, request_id),
+        },
+        CollectorFrame::CloseSession { request_id, session_id } => match live_session(sessions, &session_id) {
+            Some(handle)
+                if handle.send(SessionCmd::Close {
+                    request_id: request_id.clone(),
+                }) => {}
+            _ => not_attached(uplink, request_id),
+        },
         CollectorFrame::Ack { session_id, ack_seq } => uplink.ack(&session_id, ack_seq)?,
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }
@@ -252,6 +356,18 @@ where
     Ok(())
 }
 
+/// A reply, after every fact already in the outbox: the `select!` above is
+/// unbiased, so without this a `not_attached` rejection could overtake the
+/// `session_parked`/`session_closed` its actor emitted just before it.
+async fn send_reply<S>(sink: &mut S, uplink: &Uplink, sent: &mut HashMap<String, u64>, frame: &HostFrame) -> Result<()>
+where
+    S: futures::Sink<Message> + Unpin,
+    S::Error: std::error::Error + Send + Sync + 'static,
+{
+    send_pending(sink, uplink, sent).await?;
+    send(sink, frame).await
+}
+
 async fn send<S>(sink: &mut S, frame: &HostFrame) -> Result<()>
 where
     S: futures::Sink<Message> + Unpin,
@@ -259,4 +375,44 @@ where
 {
     sink.send(Message::text(serde_json::to_string(frame)?)).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hennery_proto::frames::{ParkReason, SessionBody};
+
+    #[tokio::test]
+    async fn a_reply_goes_out_after_the_facts_already_in_the_outbox() {
+        let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+        uplink
+            .emit(
+                "s1",
+                SessionBody::SessionParked {
+                    reason: ParkReason::Operator,
+                },
+            )
+            .unwrap();
+        let reply = HostFrame::Error {
+            request_id: "r1".into(),
+            code: "not_attached".into(),
+            message: "the session has ended on this host".into(),
+        };
+        let (mut sink, mut wire) = futures::channel::mpsc::unbounded::<Message>();
+        let mut sent = HashMap::new();
+        send_reply(&mut sink, &uplink, &mut sent, &reply).await.unwrap();
+        // A fact already on the wire is not sent twice.
+        send_reply(&mut sink, &uplink, &mut sent, &reply).await.unwrap();
+        drop(sink);
+        let mut kinds = Vec::new();
+        while let Some(Message::Text(text)) = wire.next().await {
+            let frame: HostFrame = serde_json::from_str(&text).unwrap();
+            kinds.push(match frame {
+                HostFrame::Session { seq, .. } => format!("session#{seq}"),
+                HostFrame::Error { code, .. } => code,
+                other => format!("{other:?}"),
+            });
+        }
+        assert_eq!(kinds, ["session#1", "not_attached", "not_attached"]);
+    }
 }

@@ -1,49 +1,49 @@
 //! One session actor per attached session (ACP core §2.2), each owning one
 //! adapter process (umbrella §6.9).
+//!
+//! The actor is the only emitter of the session's frames: adapter
+//! notifications are forwarded to it in arrival order and it stamps them
+//! into the outbox, interleaved with its own facts (turn start/end, exit,
+//! park, close). The ACP connection runs in a task of its own, so a dead
+//! adapter never takes the actor's teardown down with it.
 
+use crate::adapter::{Adapter, ExitInfo, KILL_GRACE};
+pub use crate::adapter::{AgentCommand, NESTING_VARS};
 use crate::uplink::Uplink;
 use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::schema::v1::{ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, SessionId};
+use agent_client_protocol::schema::v1::{
+    ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest, PromptResponse, SessionId,
+};
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, UntypedMessage};
-use hennery_proto::frames::{HostFrame, Indexed, SessionBody, TurnOutcome};
+use hennery_proto::frames::{HostFrame, Indexed, ParkReason, SessionBody, TurnOutcome};
 use serde_json::Value;
+use std::collections::HashSet;
+use std::future::Future;
 use std::path::PathBuf;
-use std::process::Stdio;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
-
-/// Environment variables that make an agent refuse to start or double-report
-/// when hennery itself runs inside an agent session (ACP core §2.3).
-pub const NESTING_VARS: &[&str] = &["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT"];
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 /// How long `start` waits for spawn → `initialize` → `session/new` →
 /// `session_started` before giving up. Kept below the collector's 90s start
 /// timeout (ACP core §3.4) so the host's `start_failed` always beats it.
 pub const START_TIMEOUT: Duration = Duration::from_secs(75);
 
-/// How to launch an agent's ACP adapter.
-#[derive(Debug, Clone)]
-pub struct AgentCommand {
-    pub program: String,
-    pub args: Vec<String>,
-    pub env: Vec<(String, String)>,
-}
+/// A prompt that fails because the adapter died can resolve before the exit
+/// watcher reaps the process; wait this long for the exit before calling
+/// the turn `failed` rather than `interrupted`.
+const EXIT_SETTLE: Duration = Duration::from_millis(500);
 
-impl AgentCommand {
-    /// Parse `"program arg1 arg2"` (whitespace-separated, no quoting).
-    pub fn parse(command: &str) -> Option<Self> {
-        let mut parts = command.split_whitespace().map(str::to_string);
-        let program = parts.next()?;
-        Some(Self {
-            program,
-            args: parts.collect(),
-            env: Vec::new(),
-        })
-    }
-}
+/// After an exit, adapter output still in the pipe is forwarded until the
+/// notification stream has been quiet this long.
+const DRAIN_QUIET: Duration = Duration::from_millis(100);
+
+/// Default idle window before the reaper parks a session (ACP core §4.7).
+pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// Messages from the connection task to a session actor.
 #[derive(Debug)]
@@ -53,213 +53,489 @@ pub enum SessionCmd {
         turn_id: String,
         content: Vec<Value>,
     },
+    /// A repeated `start_session` for an attached session: re-emit
+    /// `session_started` with the new request id, never a second adapter
+    /// (ACP core §2.2).
+    Restart { request_id: String },
+    /// Operator park: end any turn, kill the group, `session_parked{operator}`.
+    Park { request_id: String },
+    /// Operator close: end any turn, kill the group, `session_closed`.
+    Close { request_id: String },
 }
 
-/// Spawn a session actor. Returns the actor's mailbox.
+/// Tunables of one session actor.
+#[derive(Debug, Clone)]
+pub struct SessionOptions {
+    pub start_timeout: Duration,
+    /// SIGTERM → SIGKILL grace when the actor kills its adapter.
+    pub kill_grace: Duration,
+    /// Park the session after this long with no turn in flight
+    /// (`session_parked{idle}`); `None` disables the reaper.
+    pub idle_timeout: Option<Duration>,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        Self {
+            start_timeout: START_TIMEOUT,
+            kill_grace: KILL_GRACE,
+            idle_timeout: Some(IDLE_TIMEOUT),
+        }
+    }
+}
+
+/// The connection task's handle on a session actor.
+#[derive(Clone)]
+pub struct SessionHandle {
+    commands: mpsc::UnboundedSender<SessionCmd>,
+    open_turn: Arc<Mutex<Option<String>>>,
+    /// Cancelled when the actor's task has finished (its adapter is gone).
+    done: CancellationToken,
+}
+
+impl SessionHandle {
+    /// Queue a command. `false` if the actor has ended.
+    pub fn send(&self, cmd: SessionCmd) -> bool {
+        self.commands.send(cmd).is_ok()
+    }
+
+    /// The actor has ended (its last fact is already in the outbox).
+    pub fn is_ended(&self) -> bool {
+        self.commands.is_closed()
+    }
+
+    /// The turn in flight, for `hello.attached_sessions` (ACP core §5.1).
+    /// Set before `turn_started` is emitted and cleared after `turn_ended`,
+    /// so `None` means every emitted turn has also been ended.
+    pub fn open_turn_id(&self) -> Option<String> {
+        self.open_turn.lock().expect("open turn lock").clone()
+    }
+
+    /// Resolves once the actor's task has finished — after its adapter has
+    /// been terminated. Owned, so it can be awaited after every handle is
+    /// dropped (host shutdown).
+    pub fn finished(&self) -> WaitForCancellationFutureOwned {
+        self.done.clone().cancelled_owned()
+    }
+}
+
+/// Spawn a session actor with default options.
 pub fn start(
     uplink: Uplink,
     request_id: String,
     session_id: String,
     agent: AgentCommand,
     cwd: PathBuf,
-) -> mpsc::UnboundedSender<SessionCmd> {
-    start_with_timeout(uplink, request_id, session_id, agent, cwd, START_TIMEOUT)
+) -> SessionHandle {
+    spawn(uplink, request_id, session_id, agent, cwd, SessionOptions::default())
 }
 
-/// Like `start`, but with an explicit start timeout. `start` uses
-/// `START_TIMEOUT`; tests use a short one so they don't have to wait out the
-/// production value.
-pub fn start_with_timeout(
+/// Spawn a session actor. Returns its handle; the actor ends (and the handle
+/// reports `is_ended`) after start failure, adapter exit, park, close, or
+/// when every handle has been dropped (host shutdown).
+pub fn spawn(
     uplink: Uplink,
     request_id: String,
     session_id: String,
     agent: AgentCommand,
     cwd: PathBuf,
-    start_timeout: Duration,
-) -> mpsc::UnboundedSender<SessionCmd> {
+    options: SessionOptions,
+) -> SessionHandle {
     let (tx, rx) = mpsc::unbounded_channel();
+    let open_turn = Arc::new(Mutex::new(None));
+    let actor = Actor {
+        uplink,
+        session_id,
+        open_turn: open_turn.clone(),
+        options,
+    };
+    let done = CancellationToken::new();
+    let finished = done.clone().drop_guard();
     tokio::spawn(async move {
-        let started = Arc::new(AtomicBool::new(false));
-        let result = run(
-            SessionStart {
-                uplink: uplink.clone(),
-                request_id: request_id.clone(),
-                session_id: session_id.clone(),
-                agent,
-                cwd,
-                started: started.clone(),
-                start_timeout,
-            },
-            rx,
-        )
-        .await;
-        if let Err(err) = result {
-            tracing::warn!(%session_id, error = %err, "session actor ended with an error");
-            // Before `session_started`, the failure is the start's outcome and
-            // must reach the collector durably (ACP core §3.2).
-            if !started.load(Ordering::SeqCst) {
-                let body = SessionBody::StartFailed {
-                    request_id,
-                    code: "start_failed".into(),
-                    message: err.to_string(),
-                };
-                if let Err(e) = uplink.emit(&session_id, body) {
-                    tracing::error!(error = %e, "failed to persist start_failed");
+        let _finished = finished;
+        actor.run(request_id, agent, cwd, rx).await;
+    });
+    SessionHandle {
+        commands: tx,
+        open_turn,
+        done,
+    }
+}
+
+type Reply = Pin<Box<dyn Future<Output = agent_client_protocol::Result<PromptResponse>> + Send>>;
+
+struct Turn {
+    id: String,
+    reply: Reply,
+}
+
+/// Aborts the ACP connection task when the actor ends.
+struct AcpTask(tokio::task::JoinHandle<()>);
+
+impl Drop for AcpTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+struct Actor {
+    uplink: Uplink,
+    session_id: String,
+    open_turn: Arc<Mutex<Option<String>>>,
+    options: SessionOptions,
+}
+
+impl Actor {
+    fn emit(&self, body: SessionBody) {
+        if let Err(err) = self.uplink.emit(&self.session_id, body) {
+            tracing::error!(session_id = %self.session_id, error = %err, "failed to persist a session frame");
+        }
+    }
+
+    fn set_open_turn(&self, turn_id: Option<String>) {
+        *self.open_turn.lock().expect("open turn lock") = turn_id;
+    }
+
+    fn start_failed(&self, request_id: String, message: String) {
+        tracing::warn!(session_id = %self.session_id, %message, "session start failed");
+        self.emit(SessionBody::StartFailed {
+            request_id,
+            code: "start_failed".into(),
+            message,
+        });
+    }
+
+    async fn run(
+        self,
+        request_id: String,
+        agent: AgentCommand,
+        cwd: PathBuf,
+        mut commands: mpsc::UnboundedReceiver<SessionCmd>,
+    ) {
+        self.drive(request_id, agent, cwd, &mut commands).await;
+        // The session's last frame is in the outbox. Commands sent while the
+        // actor was ending (killing its adapter can take the whole grace) are
+        // answered, never dropped: the collector would otherwise wait out its
+        // timeout. `close()` stops new sends from succeeding but does not
+        // make a `try_recv` drain safe: `UnboundedSender::send` reserves its
+        // slot (so the caller sees `Ok`/`true`) before it actually pushes the
+        // value, so a send that reserved its slot just before `close()` can
+        // still push after `close()` returns, while the queue looks empty to
+        // `try_recv` in between — losing that command after its sender was
+        // told it was queued. `recv().await` instead waits for the channel to
+        // truly go empty (every already-permitted send observed) before
+        // yielding `None`, so nothing sent before `close()` is lost.
+        commands.close();
+        while let Some(cmd) = commands.recv().await {
+            match cmd {
+                SessionCmd::Prompt { request_id, .. }
+                | SessionCmd::Restart { request_id }
+                | SessionCmd::Park { request_id }
+                | SessionCmd::Close { request_id } => {
+                    // Also covers a start that reached this actor while it was
+                    // tearing down (park/close/reap/adapter exit): the
+                    // connection routed it to `Restart` because the handle
+                    // was not yet `is_ended()`, but by the time this drain
+                    // sees it the session really has ended. Answered here
+                    // too, or the collector's start waiter (up to 90s) would
+                    // eventually drop the whole host connection.
+                    self.reject(request_id, "not_attached", "the session has ended on this host".into());
                 }
             }
         }
-    });
-    tx
-}
-
-/// Bundles `run`'s parameters (which otherwise trip clippy's
-/// `too_many_arguments`) into one value.
-struct SessionStart {
-    uplink: Uplink,
-    request_id: String,
-    session_id: String,
-    agent: AgentCommand,
-    cwd: PathBuf,
-    started: Arc<AtomicBool>,
-    start_timeout: Duration,
-}
-
-async fn run(config: SessionStart, mut commands: mpsc::UnboundedReceiver<SessionCmd>) -> anyhow::Result<()> {
-    let SessionStart {
-        uplink,
-        request_id,
-        session_id,
-        agent,
-        cwd,
-        started,
-        start_timeout,
-    } = config;
-    let mut command = tokio::process::Command::new(&agent.program);
-    command
-        .args(&agent.args)
-        .envs(agent.env.iter().cloned())
-        .current_dir(&cwd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .process_group(0)
-        .kill_on_drop(true);
-    for var in NESTING_VARS {
-        command.env_remove(var);
     }
-    let mut child = command.spawn()?;
-    let stdin = child.stdin.take().expect("piped stdin");
-    let stdout = child.stdout.take().expect("piped stdout");
-    let transport = ByteStreams::new(stdin.compat_write(), stdout.compat());
 
-    let updates_uplink = uplink.clone();
-    let updates_session = session_id.clone();
+    /// The actor's life: start, then serve until it parks, closes or ends.
+    /// Every return leaves the session's final frame in the outbox.
+    async fn drive(
+        &self,
+        request_id: String,
+        agent: AgentCommand,
+        cwd: PathBuf,
+        commands: &mut mpsc::UnboundedReceiver<SessionCmd>,
+    ) {
+        let (mut adapter, io) = match Adapter::spawn(&agent, &cwd) {
+            Ok(spawned) => spawned,
+            Err(err) => return self.start_failed(request_id, format!("spawn {}: {err}", agent.program)),
+        };
+        let (updates_tx, mut updates) = mpsc::unbounded_channel::<Value>();
+        let (conn_tx, conn_rx) = oneshot::channel::<ConnectionTo<Agent>>();
+        let (_stop_tx, stop_rx) = oneshot::channel::<()>();
+        let transport = ByteStreams::new(io.stdin.compat_write(), io.stdout.compat());
+        let session_id = self.session_id.clone();
+        let _acp = AcpTask(tokio::spawn(async move {
+            let result = Client
+                .builder()
+                .name("hennery-host")
+                // Raw handler: payloads are forwarded verbatim, including
+                // update kinds this build does not know (ACP core §2.4).
+                .on_receive_notification(
+                    async move |msg: UntypedMessage, _cx| {
+                        if msg.method == "session/update" {
+                            let _ = updates_tx.send(msg.params);
+                        }
+                        Ok(())
+                    },
+                    agent_client_protocol::on_receive_notification!(),
+                )
+                .connect_with(transport, async move |conn: ConnectionTo<Agent>| {
+                    let _ = conn_tx.send(conn);
+                    // Keep the connection up until the actor ends.
+                    let _ = stop_rx.await;
+                    Ok(())
+                })
+                .await;
+            if let Err(err) = result {
+                tracing::debug!(%session_id, error = %err, "ACP connection ended");
+            }
+        }));
 
-    Client
-        .builder()
-        .name("hennery-host")
-        // Raw handler: ACP payloads are forwarded verbatim, including update
-        // kinds this build does not know (ACP core §2.4). Emitting inside the
-        // handler keeps frames in arrival order.
-        .on_receive_notification(
-            async move |msg: UntypedMessage, _cx| {
-                if msg.method == "session/update" {
-                    let body = SessionBody::AcpUpdate {
-                        indexed: Indexed::default(),
-                        payload: msg.params,
-                    };
-                    if let Err(err) = updates_uplink.emit(&updates_session, body) {
-                        tracing::error!(error = %err, "failed to persist a session update");
-                    }
-                }
-                Ok(())
+        let Ok(conn) = conn_rx.await else {
+            adapter.terminate(self.options.kill_grace).await;
+            return self.start_failed(request_id, "the ACP connection could not be set up".into());
+        };
+        let negotiated = tokio::select! {
+            result = tokio::time::timeout(self.options.start_timeout, negotiate(&conn, cwd)) => match result {
+                Ok(Ok(agent_session)) => Ok(agent_session),
+                Ok(Err(err)) => Err(err.to_string()),
+                Err(_) => Err(format!("adapter did not start within {}s", self.options.start_timeout.as_secs())),
             },
-            agent_client_protocol::on_receive_notification!(),
-        )
-        .connect_with(transport, async move |conn: ConnectionTo<Agent>| {
-            let agent_session = match tokio::time::timeout(
-                start_timeout,
-                negotiate_session(&conn, &uplink, &session_id, &request_id, cwd.clone()),
-            )
-            .await
-            {
-                Ok(result) => result?,
-                Err(_elapsed) => {
-                    // Not durable via `started`: `start`'s wrapper emits
-                    // `start_failed` from this error, since `started` is
-                    // still false at this point.
-                    return Err(agent_client_protocol::Error::new(
-                        i32::from(agent_client_protocol::ErrorCode::InternalError),
-                        format!("adapter did not start within {}s", start_timeout.as_secs()),
-                    ));
-                }
-            };
-            started.store(true, Ordering::SeqCst);
+            info = adapter.exited() => {
+                let tail = adapter.stderr_tail().await;
+                Err(format!("adapter exited during start ({}): {}", describe(info), last_lines(&tail, 5)))
+            }
+        };
+        let agent_session = match negotiated {
+            Ok(agent_session) => agent_session,
+            Err(message) => {
+                adapter.terminate(self.options.kill_grace).await;
+                return self.start_failed(request_id, message);
+            }
+        };
+        self.emit(SessionBody::SessionStarted {
+            request_id,
+            agent_session_id: agent_session.to_string(),
+        });
 
-            // Prompts are deduplicated by turn_id: a retried delivery after a
-            // lost acknowledgement must never run the same turn twice. Only a
-            // turn that actually started is recorded here, so a corrected
-            // retry of a rejected (invalid) prompt with the same turn_id is
-            // not silently dropped.
-            let mut seen_turns = std::collections::HashSet::new();
-            while let Some(cmd) = commands.recv().await {
-                match cmd {
-                    SessionCmd::Prompt {
-                        request_id,
-                        turn_id,
-                        content,
-                    } => {
+        // Prompts are deduplicated by turn_id: a retried delivery after a
+        // lost acknowledgement must never run the same turn twice. Only a
+        // turn that actually started is recorded, so a corrected retry of a
+        // rejected (invalid) prompt with the same turn_id still runs.
+        let mut seen_turns = HashSet::new();
+        let mut turn: Option<Turn> = None;
+        // The reaper's clock: restarted when the session starts and when a
+        // turn ends; it never runs while a turn (or a pending question
+        // inside one) is in flight.
+        let mut idle_since = Instant::now();
+        loop {
+            tokio::select! {
+                // Biased: adapter output already received is emitted before
+                // the prompt reply it preceded on the wire.
+                biased;
+                Some(payload) = updates.recv() => self.emit(update(payload)),
+                info = adapter.exited() => {
+                    return self.adapter_exited(info, &mut adapter, &mut updates, turn.take()).await;
+                }
+                cmd = commands.recv() => match cmd {
+                    // Every handle dropped: the host is shutting down.
+                    None => {
+                        adapter.terminate(self.options.kill_grace).await;
+                        return;
+                    }
+                    Some(SessionCmd::Prompt { request_id, turn_id, content }) => {
                         let blocks = match parse_prompt(content) {
                             Ok(blocks) => blocks,
                             Err(message) => {
-                                uplink.reply(HostFrame::Error {
-                                    request_id,
-                                    code: "invalid".into(),
-                                    message,
-                                });
+                                self.reject(request_id, "invalid", message);
                                 continue;
                             }
                         };
-                        if !seen_turns.insert(turn_id.clone()) {
+                        if seen_turns.contains(&turn_id) {
                             tracing::info!(%turn_id, "ignoring duplicate prompt delivery");
                             continue;
                         }
-                        run_turn(&conn, &uplink, &session_id, &agent_session, request_id, turn_id, blocks).await;
+                        if turn.is_some() {
+                            self.reject(request_id, "turn_in_progress", "a turn is already running".into());
+                            continue;
+                        }
+                        seen_turns.insert(turn_id.clone());
+                        self.set_open_turn(Some(turn_id.clone()));
+                        self.emit(SessionBody::TurnStarted { request_id, turn_id: turn_id.clone() });
+                        let reply = conn.send_request(PromptRequest::new(agent_session.clone(), blocks)).block_task();
+                        turn = Some(Turn { id: turn_id, reply: Box::pin(reply) });
+                    }
+                    Some(SessionCmd::Restart { request_id }) => self.emit(SessionBody::SessionStarted {
+                        request_id,
+                        agent_session_id: agent_session.to_string(),
+                    }),
+                    Some(SessionCmd::Park { .. }) => {
+                        self.teardown(&mut adapter, &mut updates, turn.take()).await;
+                        return self.emit(SessionBody::SessionParked { reason: ParkReason::Operator });
+                    }
+                    Some(SessionCmd::Close { .. }) => {
+                        self.teardown(&mut adapter, &mut updates, turn.take()).await;
+                        return self.emit(SessionBody::SessionClosed);
+                    }
+                },
+                result = next_reply(&mut turn) => {
+                    let ended = turn.take().expect("a reply implies a turn");
+                    idle_since = Instant::now();
+                    // Closes the race described on `drain_updates`: a late
+                    // update that arrived just as the reply resolved must be
+                    // emitted before this turn's `turn_ended`.
+                    self.drain_updates(&mut updates);
+                    match result {
+                        Ok(response) => self.end_turn(ended.id, TurnOutcome::Completed, stop_reason(&response), None),
+                        Err(err) => {
+                            let exited = adapter.exited_within(EXIT_SETTLE).await;
+                            // Updates that arrived during the wait above are
+                            // also ahead of this turn's end.
+                            self.drain_updates(&mut updates);
+                            if let Some(info) = exited {
+                                return self.adapter_exited(info, &mut adapter, &mut updates, Some(ended)).await;
+                            }
+                            self.end_turn(ended.id, TurnOutcome::Failed, None, Some(err.to_string()));
+                        }
                     }
                 }
+                _ = idle_deadline(self.options.idle_timeout, idle_since), if turn.is_none() => {
+                    tracing::info!(session_id = %self.session_id, "reaping idle session");
+                    self.teardown(&mut adapter, &mut updates, None).await;
+                    return self.emit(SessionBody::SessionParked { reason: ParkReason::Idle });
+                }
             }
-            Ok(())
-        })
-        .await?;
-    Ok(())
+        }
+    }
+
+    fn reject(&self, request_id: String, code: &str, message: String) {
+        self.uplink.reply(HostFrame::Error {
+            request_id,
+            code: code.into(),
+            message,
+        });
+    }
+
+    fn end_turn(&self, turn_id: String, outcome: TurnOutcome, stop_reason: Option<String>, error: Option<String>) {
+        self.emit(SessionBody::TurnEnded {
+            turn_id,
+            outcome,
+            stop_reason,
+            error,
+        });
+        self.set_open_turn(None);
+    }
+
+    /// Emit whatever updates are already queued, without waiting. The ACP
+    /// connection task and this actor run on different worker threads: it
+    /// can push a notification and then resolve the matching reply in quick
+    /// succession, and this actor's `select!` can observe the reply as ready
+    /// before it happens to observe the notification, in the same poll. ACP
+    /// delivers messages in order, so the notification's send always
+    /// completes-before the reply resolves — a non-blocking drain right
+    /// before acting on a reply (or before ending a torn-down turn) is
+    /// therefore guaranteed to see it, closing that ordering gap.
+    fn drain_updates(&self, updates: &mut mpsc::UnboundedReceiver<Value>) {
+        while let Ok(payload) = updates.try_recv() {
+            self.emit(update(payload));
+        }
+    }
+
+    /// Park or close: forward any output already queued, end the turn as
+    /// interrupted, then kill the group.
+    async fn teardown(&self, adapter: &mut Adapter, updates: &mut mpsc::UnboundedReceiver<Value>, turn: Option<Turn>) {
+        self.drain_updates(updates);
+        if let Some(turn) = turn {
+            self.end_turn(turn.id, TurnOutcome::Interrupted, None, None);
+        }
+        adapter.terminate(self.options.kill_grace).await;
+    }
+
+    /// The exit watcher's steps (ACP core §2.3): outstanding calls fail (the
+    /// reply future is dropped), the turn ends `interrupted`, then
+    /// `adapter_exited` and `session_parked{adapter_exited}`.
+    async fn adapter_exited(
+        &self,
+        info: ExitInfo,
+        adapter: &mut Adapter,
+        updates: &mut mpsc::UnboundedReceiver<Value>,
+        turn: Option<Turn>,
+    ) {
+        tracing::warn!(session_id = %self.session_id, exit = %describe(info), "adapter exited");
+        // Output the adapter wrote before dying is still in the pipe.
+        while let Ok(Some(payload)) = tokio::time::timeout(DRAIN_QUIET, updates.recv()).await {
+            self.emit(update(payload));
+        }
+        if let Some(turn) = turn {
+            self.end_turn(
+                turn.id,
+                TurnOutcome::Interrupted,
+                None,
+                Some("the adapter exited".into()),
+            );
+        }
+        let stderr_tail = adapter.stderr_tail().await;
+        adapter.kill_group();
+        self.emit(SessionBody::AdapterExited {
+            code: info.code,
+            signal: info.signal,
+            stderr_tail,
+        });
+        self.emit(SessionBody::SessionParked {
+            reason: ParkReason::AdapterExited,
+        });
+    }
 }
 
-/// `initialize` then `session/new`, then durably emit `session_started`.
-/// Split out from `run` so the whole sequence can be raced against a timeout
-/// without also bounding the (potentially long-lived) prompt loop that
-/// follows it.
-async fn negotiate_session(
-    conn: &ConnectionTo<Agent>,
-    uplink: &Uplink,
-    session_id: &str,
-    request_id: &str,
-    cwd: PathBuf,
-) -> agent_client_protocol::Result<SessionId> {
+/// Resolves when the idle window since `since` has passed; never if the
+/// reaper is off.
+async fn idle_deadline(window: Option<Duration>, since: Instant) {
+    match window {
+        Some(window) => tokio::time::sleep_until(since + window).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The in-flight prompt's reply, or never if no turn is running.
+async fn next_reply(turn: &mut Option<Turn>) -> agent_client_protocol::Result<PromptResponse> {
+    match turn {
+        Some(turn) => (&mut turn.reply).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// `initialize` then `session/new`.
+async fn negotiate(conn: &ConnectionTo<Agent>, cwd: PathBuf) -> agent_client_protocol::Result<SessionId> {
     conn.send_request(InitializeRequest::new(ProtocolVersion::V1))
         .block_task()
         .await?;
     let created = conn.send_request(NewSessionRequest::new(cwd)).block_task().await?;
-    let agent_session: SessionId = created.session_id;
-    uplink
-        .emit(
-            session_id,
-            SessionBody::SessionStarted {
-                request_id: request_id.to_string(),
-                agent_session_id: agent_session.to_string(),
-            },
-        )
-        .map_err(|e| agent_client_protocol::Error::into_internal_error(&*e))?;
-    Ok(agent_session)
+    Ok(created.session_id)
+}
+
+fn update(payload: Value) -> SessionBody {
+    SessionBody::AcpUpdate {
+        indexed: Indexed::default(),
+        payload,
+    }
+}
+
+fn stop_reason(response: &PromptResponse) -> Option<String> {
+    serde_json::to_value(response.stop_reason)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+}
+
+fn describe(info: ExitInfo) -> String {
+    match (info.code, info.signal) {
+        (Some(code), _) => format!("exit code {code}"),
+        (None, Some(signal)) => format!("signal {signal}"),
+        (None, None) => "unknown status".into(),
+    }
+}
+
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().rev().take(n).collect();
+    lines.into_iter().rev().collect::<Vec<_>>().join("\n")
 }
 
 /// Validate raw prompt content into ACP content blocks. `Err` carries the
@@ -270,49 +546,5 @@ fn parse_prompt(content: Vec<Value>) -> Result<Vec<ContentBlock>, String> {
         Ok(blocks) if !blocks.is_empty() => Ok(blocks),
         Ok(_) => Err("empty prompt".to_string()),
         Err(err) => Err(err.to_string()),
-    }
-}
-
-async fn run_turn(
-    conn: &ConnectionTo<Agent>,
-    uplink: &Uplink,
-    session_id: &str,
-    agent_session: &SessionId,
-    request_id: String,
-    turn_id: String,
-    blocks: Vec<ContentBlock>,
-) {
-    if let Err(err) = uplink.emit(
-        session_id,
-        SessionBody::TurnStarted {
-            request_id,
-            turn_id: turn_id.clone(),
-        },
-    ) {
-        tracing::error!(error = %err, "failed to persist turn_started");
-        return;
-    }
-    let result = conn
-        .send_request(PromptRequest::new(agent_session.clone(), blocks))
-        .block_task()
-        .await;
-    let body = match result {
-        Ok(response) => SessionBody::TurnEnded {
-            turn_id,
-            outcome: TurnOutcome::Completed,
-            stop_reason: serde_json::to_value(response.stop_reason)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_string)),
-            error: None,
-        },
-        Err(err) => SessionBody::TurnEnded {
-            turn_id,
-            outcome: TurnOutcome::Failed,
-            stop_reason: None,
-            error: Some(err.to_string()),
-        },
-    };
-    if let Err(err) = uplink.emit(session_id, body) {
-        tracing::error!(error = %err, "failed to persist turn_ended");
     }
 }

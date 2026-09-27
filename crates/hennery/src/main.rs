@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use axum::response::Html;
 use axum::routing::get;
 use clap::{Args, Parser, Subcommand};
+use hennery_host::session::IDLE_TIMEOUT;
 use hennery_host::{AgentCommand, HostConfig};
 use hennery_kernel::auth::DevToken;
 use hennery_sessions::{AppState, store::Store};
@@ -61,6 +62,9 @@ struct HostArgs {
     /// Agent adapter, as `name=command args…`. Repeatable.
     #[arg(long = "agent", value_parser = parse_agent)]
     agents: Vec<(String, AgentCommand)>,
+    /// Park sessions idle for this many seconds; 0 turns the reaper off.
+    #[arg(long, default_value_t = IDLE_TIMEOUT.as_secs())]
+    idle_timeout_secs: u64,
 }
 
 #[derive(Args)]
@@ -73,6 +77,9 @@ struct UpArgs {
     dev_token: String,
     #[arg(long = "agent", value_parser = parse_agent)]
     agents: Vec<(String, AgentCommand)>,
+    /// Park sessions idle for this many seconds; 0 turns the reaper off.
+    #[arg(long, default_value_t = IDLE_TIMEOUT.as_secs())]
+    idle_timeout_secs: u64,
 }
 
 fn parse_agent(s: &str) -> Result<(String, AgentCommand), String> {
@@ -120,12 +127,11 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
 async fn run_host(args: HostArgs) -> Result<()> {
     let mut cfg = HostConfig::new(args.collector, args.host_id, args.dev_token, args.data_dir);
     cfg.agents = args.agents.into_iter().collect();
-    // Returning from main drops the runtime, which drops every session actor
-    // and with it (kill_on_drop) every adapter process.
-    tokio::select! {
-        result = hennery_host::run(cfg) => result,
-        _ = terminated() => Ok(()),
-    }
+    cfg.idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
+    // On SIGINT/SIGTERM the host stops its connection and waits (bounded)
+    // for every session actor to SIGTERM its adapter's group and SIGKILL it
+    // after the grace; only then does returning drop the runtime.
+    hennery_host::run_until(cfg, terminated()).await
 }
 
 /// Resolves on SIGINT or SIGTERM.
@@ -175,6 +181,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
         ])
         .arg("--data-dir")
         .arg(args.data_dir.join("host"))
+        .arg("--idle-timeout-secs")
+        .arg(args.idle_timeout_secs.to_string())
         .env("HENNERY_DEV_TOKEN", &args.dev_token)
         .kill_on_drop(true)
         .process_group(0);

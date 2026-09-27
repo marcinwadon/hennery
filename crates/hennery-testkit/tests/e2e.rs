@@ -40,7 +40,24 @@ impl Collector {
     }
 }
 
-fn start_host(collector: SocketAddr, data_dir: &Path, script: &FakeScript) {
+fn start_host(collector: SocketAddr, data_dir: &Path, script: &FakeScript) -> tokio::task::JoinHandle<()> {
+    let mut fake = AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    fake.env
+        .push((SCRIPT_ENV.into(), serde_json::to_string(script).unwrap()));
+    start_host_with(collector, data_dir, fake)
+}
+
+/// A host whose `fake` agent is `fake` (plus a `broken` one that cannot
+/// spawn). Aborting the returned task is a host restart: its actors end and
+/// kill their adapters.
+fn start_host_with(collector: SocketAddr, data_dir: &Path, fake: AgentCommand) -> tokio::task::JoinHandle<()> {
+    let cfg = host_config(collector, data_dir, fake);
+    tokio::spawn(async move {
+        hennery_host::run(cfg).await.unwrap();
+    })
+}
+
+fn host_config(collector: SocketAddr, data_dir: &Path, fake: AgentCommand) -> HostConfig {
     let mut cfg = HostConfig::new(
         format!("ws://{collector}/api/hosts/ws"),
         "host-1",
@@ -49,17 +66,12 @@ fn start_host(collector: SocketAddr, data_dir: &Path, script: &FakeScript) {
     );
     cfg.reconnect_min = Duration::from_millis(100);
     cfg.reconnect_max = Duration::from_millis(500);
-    let mut fake = AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
-    fake.env
-        .push((SCRIPT_ENV.into(), serde_json::to_string(script).unwrap()));
     cfg.agents.insert("fake".into(), fake);
     cfg.agents.insert(
         "broken".into(),
         AgentCommand::parse("/nonexistent/hennery-test-adapter").unwrap(),
     );
-    tokio::spawn(async move {
-        hennery_host::run(cfg).await.unwrap();
-    });
+    cfg
 }
 
 fn client() -> reqwest::Client {
@@ -175,6 +187,7 @@ async fn empty_prompts_and_overlapping_prompts_are_refused() {
     let slow = FakeScript {
         chunks: vec!["a".into(), "b".into(), "c".into()],
         chunk_delay_ms: 300,
+        ..FakeScript::default()
     };
     start_host(collector.addr, &dir.path().join("host"), &slow);
     let c = client();
@@ -216,6 +229,7 @@ async fn a_collector_restart_mid_turn_loses_nothing_and_duplicates_nothing() {
     let script = FakeScript {
         chunks: (1..=6).map(|n| format!("{n}.")).collect(),
         chunk_delay_ms: 250,
+        ..FakeScript::default()
     };
     start_host(addr, &dir.path().join("host"), &script);
     let c = client();
@@ -334,7 +348,13 @@ async fn a_start_with_unknown_delivery_reports_503_with_the_session_id() {
     // reply arrives, so the request resolves as DeliveryUnknown rather than
     // a rejection.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let conn_id = collector.state.hub.register("host-1", tx).expect("register fake host");
+    let conn_id = collector
+        .state
+        .hub
+        .register("host-1", tx)
+        .expect("register fake host")
+        .conn_id;
+    collector.state.hub.mark_ready("host-1", conn_id);
     let hub = collector.state.hub.clone();
     tokio::spawn(async move {
         rx.recv().await; // the StartSession frame; proves it was delivered
@@ -357,4 +377,304 @@ async fn a_start_with_unknown_delivery_reports_503_with_the_session_id() {
         row.lifecycle, "starting",
         "an unknown-delivery start must not be marked failed"
     );
+}
+
+async fn lifecycle_is(collector: &Collector, session: &str, want: &str) {
+    wait_for(&format!("lifecycle {want}"), || async {
+        let row = collector.state.store.session(session).unwrap().unwrap();
+        (row.lifecycle == want).then_some(())
+    })
+    .await;
+}
+
+fn of_kind<'a>(events: &'a [EventDto], kind: &str) -> Vec<&'a EventDto> {
+    events.iter().filter(|e| e.kind == kind).collect()
+}
+
+async fn post_json(c: &reqwest::Client, url: String, body: Value) -> (u16, Value) {
+    let resp = c.post(url).json(&body).send().await.unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+fn slow_script(chunks: usize) -> FakeScript {
+    FakeScript {
+        chunks: (1..=chunks).map(|n| format!("{n}.")).collect(),
+        chunk_delay_ms: 200,
+        ..FakeScript::default()
+    }
+}
+
+fn pid_from(path: &Path) -> Option<i32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+async fn wait_dead(pid: i32) {
+    wait_for("adapter subtree killed", || async {
+        (!hennery_testkit::pid_alive(pid)).then_some(())
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn an_adapter_crash_mid_turn_parks_the_session_with_a_scrubbed_stderr_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let script = FakeScript {
+        chunks: vec!["1.".into(), "2.".into(), "3.".into()],
+        chunk_delay_ms: 100,
+        exit_after_chunks: Some(1),
+        stderr_lines: vec!["using key sk-live-abcdefghijk".into()],
+        ..FakeScript::default()
+    };
+    start_host(collector.addr, &dir.path().join("host"), &script);
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    let prompt_url = collector.url(&format!("/api/sessions/{session}/prompt"));
+    assert_eq!(
+        post_json(&c, prompt_url.clone(), json!({ "content": text("go") }))
+            .await
+            .0,
+        202
+    );
+
+    lifecycle_is(&collector, &session, "parked").await;
+    let evs = events(&c, &collector, &session).await;
+    let ends = turn_ends(&evs);
+    assert_eq!(ends.len(), 1);
+    assert_eq!(ends[0].body["outcome"], "interrupted");
+    let exited = of_kind(&evs, "adapter_exited");
+    assert_eq!(exited.len(), 1);
+    let tail = exited[0].body["stderr_tail"].as_str().unwrap();
+    assert!(
+        tail.contains("sk-[redacted]") && !tail.contains("abcdefghijk"),
+        "{tail}"
+    );
+    assert_eq!(of_kind(&evs, "session_parked")[0].body["reason"], "adapter_exited");
+    let (status, body) = post_json(&c, prompt_url, json!({ "content": text("again") })).await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("not_attached")));
+}
+
+#[tokio::test]
+async fn park_then_close_through_the_api_kill_the_adapters_whole_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let pid_file = dir.path().join("grandchild.pid");
+    let script = FakeScript {
+        grandchild_pid_file: Some(pid_file.to_string_lossy().into_owned()),
+        ..slow_script(20)
+    };
+    start_host(collector.addr, &dir.path().join("host"), &script);
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    let grandchild = wait_for("grandchild pid", || async { pid_from(&pid_file) }).await;
+    let prompt_url = collector.url(&format!("/api/sessions/{session}/prompt"));
+    assert_eq!(post_json(&c, prompt_url, json!({ "content": text("go") })).await.0, 202);
+
+    let (status, body) = post_json(&c, collector.url(&format!("/api/sessions/{session}/park")), json!({})).await;
+    assert_eq!((status, body["lifecycle"].as_str()), (202, Some("parked")), "{body}");
+    wait_dead(grandchild).await;
+    let evs = events(&c, &collector, &session).await;
+    assert_eq!(turn_ends(&evs)[0].body["outcome"], "interrupted");
+    assert_eq!(of_kind(&evs, "session_parked")[0].body["reason"], "operator");
+
+    // A parked session closes at once, collector-side.
+    let (status, body) = post_json(&c, collector.url(&format!("/api/sessions/{session}/close")), json!({})).await;
+    assert_eq!((status, body["lifecycle"].as_str()), (202, Some("closed")), "{body}");
+    let kinds: Vec<String> = events(&c, &collector, &session)
+        .await
+        .into_iter()
+        .map(|e| e.kind)
+        .collect();
+    let tail: Vec<&str> = kinds.iter().rev().take(1).map(String::as_str).collect();
+    assert_eq!(tail, ["operator_closed"], "{kinds:?}");
+    assert!(kinds.contains(&"operator_parked".to_string()), "{kinds:?}");
+}
+
+#[tokio::test]
+async fn closing_an_attached_session_waits_for_the_host_to_close_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    start_host(collector.addr, &dir.path().join("host"), &FakeScript::default());
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    let (status, body) = post_json(&c, collector.url(&format!("/api/sessions/{session}/close")), json!({})).await;
+    assert_eq!((status, body["lifecycle"].as_str()), (202, Some("closed")), "{body}");
+    let kinds: Vec<String> = events(&c, &collector, &session)
+        .await
+        .into_iter()
+        .map(|e| e.kind)
+        .collect();
+    assert!(
+        kinds.ends_with(&["operator_closed".to_string(), "session_closed".to_string()]),
+        "{kinds:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_host_restart_mid_turn_parks_and_interrupts_without_respawning() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let spawns = dir.path().join("spawns");
+    let script = slow_script(20);
+    // Counts adapter launches, then becomes the fake adapter.
+    let counting = AgentCommand {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            format!(
+                "echo spawned >> {}; exec {}",
+                spawns.display(),
+                env!("CARGO_BIN_EXE_hennery-fake-acp")
+            ),
+        ],
+        env: vec![(SCRIPT_ENV.into(), serde_json::to_string(&script).unwrap())],
+    };
+    let host = start_host_with(collector.addr, &dir.path().join("host"), counting.clone());
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    let prompt_url = collector.url(&format!("/api/sessions/{session}/prompt"));
+    assert_eq!(
+        post_json(&c, prompt_url.clone(), json!({ "content": text("go") }))
+            .await
+            .0,
+        202
+    );
+    wait_for("first chunk", || async {
+        (!agent_text(&events(&c, &collector, &session).await).is_empty()).then_some(())
+    })
+    .await;
+
+    host.abort(); // the host process dies with its adapters
+    let _ = host.await;
+    start_host_with(collector.addr, &dir.path().join("host"), counting);
+
+    lifecycle_is(&collector, &session, "parked").await;
+    let evs = events(&c, &collector, &session).await;
+    assert_eq!(of_kind(&evs, "host_restarted").len(), 1);
+    let synthesized = of_kind(&evs, "turn_ended_synthesized");
+    assert_eq!(synthesized.len(), 1);
+    assert_eq!(synthesized[0].body["outcome"], "interrupted");
+    assert!(turn_ends(&evs).is_empty(), "the dead host cannot have ended the turn");
+    let (status, body) = post_json(&c, prompt_url, json!({ "content": text("again") })).await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("not_attached")));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        std::fs::read_to_string(&spawns).unwrap().lines().count(),
+        1,
+        "no eager re-spawn"
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_connection_mid_turn_parks_nothing_and_loses_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    start_host(collector.addr, &dir.path().join("host"), &slow_script(6));
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    let prompt_url = collector.url(&format!("/api/sessions/{session}/prompt"));
+    assert_eq!(post_json(&c, prompt_url, json!({ "content": text("go") })).await.0, 202);
+    wait_for("first chunk", || async {
+        (!agent_text(&events(&c, &collector, &session).await).is_empty()).then_some(())
+    })
+    .await;
+
+    collector.state.hub.disconnect("host-1");
+    let evs = wait_for("turn end after the drop", || async {
+        let evs = events(&c, &collector, &session).await;
+        (!turn_ends(&evs).is_empty()).then_some(evs)
+    })
+    .await;
+    assert_eq!(agent_text(&evs), "1.2.3.4.5.6.");
+    assert_eq!(turn_ends(&evs)[0].body["outcome"], "completed");
+    assert!(of_kind(&evs, "host_restarted").is_empty());
+    assert!(of_kind(&evs, "turn_ended_synthesized").is_empty());
+    assert_eq!(
+        collector.state.store.session(&session).unwrap().unwrap().lifecycle,
+        "active"
+    );
+}
+
+/// The fake adapter behind a shell (the group leader, its pid written to
+/// `pid_file`) that records a SIGTERM in `marker` and exits. The fake runs
+/// in the background with the shell's stdin dup'ed in: a non-interactive
+/// shell would otherwise give a background job `/dev/null` as stdin.
+fn fake_recording_sigterm(marker: &Path, pid_file: &Path) -> AgentCommand {
+    AgentCommand {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            r#"trap 'touch "$0"; exit 0' TERM; echo $$ > "$1"; exec 3<&0; "$2" <&3 3<&- & wait"#.into(),
+            marker.to_string_lossy().into_owned(),
+            pid_file.to_string_lossy().into_owned(),
+            env!("CARGO_BIN_EXE_hennery-fake-acp").into(),
+        ],
+        env: vec![(
+            SCRIPT_ENV.into(),
+            serde_json::to_string(&FakeScript::default()).unwrap(),
+        )],
+    }
+}
+
+/// SIGKILLs the process group led by the pid in the file, on every path.
+struct ReapGroup(std::path::PathBuf);
+
+impl Drop for ReapGroup {
+    fn drop(&mut self) {
+        if let Some(pid) = pid_from(&self.0) {
+            // SAFETY: killpg(2) on the group of an adapter this test started.
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn host_shutdown_gives_every_adapter_its_sigterm_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let marker = dir.path().join("sigterm");
+    let pid_file = dir.path().join("adapter.pid");
+    let _reap = ReapGroup(pid_file.clone());
+    let cfg = host_config(
+        collector.addr,
+        &dir.path().join("host"),
+        fake_recording_sigterm(&marker, &pid_file),
+    );
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let host = tokio::spawn(hennery_host::run_until(cfg, async {
+        let _ = stopped.await;
+    }));
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    lifecycle_is(&collector, &session, "active").await;
+    let leader = pid_from(&pid_file).expect("the adapter wrapper never wrote its pid");
+
+    let bound = hennery_host::adapter::KILL_GRACE + Duration::from_secs(2);
+    let begun = std::time::Instant::now();
+    stop.send(()).unwrap();
+    tokio::time::timeout(bound, host)
+        .await
+        .expect("the host did not return within the kill grace")
+        .unwrap()
+        .unwrap();
+    assert!(
+        marker.exists(),
+        "the host returned without giving its adapter SIGTERM (after {:?})",
+        begun.elapsed()
+    );
+    // The host awaited its actor: the group leader is already reaped.
+    assert!(
+        !hennery_testkit::pid_alive(leader),
+        "the host returned before its adapter exited"
+    );
+    collector.stop().await;
 }

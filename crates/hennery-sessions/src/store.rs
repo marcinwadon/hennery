@@ -2,14 +2,16 @@
 //! the connection mutex (kernel §1's writer thread replaces it later).
 
 use anyhow::Result;
-use hennery_proto::frames::SessionBody;
+use hennery_proto::frames::{AttachedSession, SessionBody};
 use hennery_proto::rest::EventDto;
-use rusqlite::{Connection, OptionalExtension, params};
-use serde_json::Value;
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex;
 
-const MIGRATIONS: &[&str] = &["
+const MIGRATIONS: &[&str] = &[
+    "
     CREATE TABLE sessions (
         id TEXT PRIMARY KEY,
         host_id TEXT NOT NULL,
@@ -36,7 +38,26 @@ const MIGRATIONS: &[&str] = &["
         body TEXT NOT NULL,
         ts TEXT NOT NULL,
         UNIQUE(session_id, host_seq));
-"];
+",
+    // Teardown and reconciliation: a durable close intent (so a close whose
+    // delivery is unknown is re-sent after the next handshake) and the turn
+    // states reconciliation needs (sent → started → ended | not_delivered).
+    "
+    ALTER TABLE sessions ADD COLUMN close_requested INTEGER NOT NULL DEFAULT 0;
+    ALTER TABLE turns ADD COLUMN state TEXT NOT NULL DEFAULT 'sent';
+    UPDATE turns SET state = 'ended' WHERE outcome IS NOT NULL;
+    UPDATE turns SET state = 'started' WHERE outcome IS NULL AND EXISTS (
+        SELECT 1 FROM events e
+        WHERE e.kind = 'turn_started' AND json_extract(e.body, '$.turn_id') = turns.turn_id);
+",
+    // A host fact that is stored (its row is the (session_id, host_seq)
+    // idempotency key) but did not apply — e.g. a real `turn_ended` after the
+    // collector already synthesized the turn's end — is kept with
+    // `applied = 0` and never listed (final review F1).
+    "
+    ALTER TABLE events ADD COLUMN applied INTEGER NOT NULL DEFAULT 1;
+",
+];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionRow {
@@ -47,6 +68,19 @@ pub struct SessionRow {
     pub lifecycle: String,
     pub activity: Option<String>,
     pub open_turn_id: Option<String>,
+    pub failure_reason: Option<String>,
+    /// The operator closed the session while it was attached and the host
+    /// has not confirmed yet (ACP core §4.8).
+    pub close_requested: bool,
+}
+
+/// What the collector did after a host's `resend_complete` (ACP core §5.1).
+#[derive(Debug, Default, PartialEq)]
+pub struct Reconciliation {
+    /// Collector-originated events, in the order written.
+    pub events: Vec<EventDto>,
+    /// Attached sessions the operator has closed: send them `close_session`.
+    pub close: Vec<String>,
 }
 
 pub struct Store {
@@ -57,6 +91,80 @@ fn now() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .expect("RFC 3339 formatting of the current time")
+}
+
+/// Write a collector-originated event (`host_seq` NULL, ACP core §8).
+fn collector_event(tx: &Transaction<'_>, session_id: &str, kind: &str, body: Value, ts: &str) -> Result<EventDto> {
+    tx.execute(
+        "INSERT INTO events(session_id, host_seq, kind, body, ts) VALUES (?1, NULL, ?2, ?3, ?4)",
+        params![session_id, kind, body.to_string(), ts],
+    )?;
+    tx.execute(
+        "UPDATE sessions SET last_event_at = ?2 WHERE id = ?1",
+        params![session_id, ts],
+    )?;
+    Ok(EventDto {
+        event_id: tx.last_insert_rowid(),
+        session_id: session_id.to_string(),
+        host_seq: None,
+        kind: kind.to_string(),
+        body,
+        ts: ts.to_string(),
+    })
+}
+
+/// Close an open turn that the host will never end, as `interrupted`.
+fn synthesize_turn_end(tx: &Transaction<'_>, session_id: &str, turn_id: &str, ts: &str) -> Result<EventDto> {
+    tx.execute(
+        "UPDATE turns SET state = 'ended', outcome = 'interrupted' WHERE turn_id = ?1",
+        [turn_id],
+    )?;
+    tx.execute(
+        "UPDATE sessions SET open_turn_id = NULL, activity = 'idle' WHERE id = ?1 AND open_turn_id = ?2",
+        params![session_id, turn_id],
+    )?;
+    collector_event(
+        tx,
+        session_id,
+        "turn_ended_synthesized",
+        json!({ "turn_id": turn_id, "outcome": "interrupted" }),
+        ts,
+    )
+}
+
+/// Release an open turn whose prompt never reached the adapter.
+fn turn_not_delivered(tx: &Transaction<'_>, session_id: &str, turn_id: &str, ts: &str) -> Result<EventDto> {
+    tx.execute("UPDATE turns SET state = 'not_delivered' WHERE turn_id = ?1", [turn_id])?;
+    tx.execute(
+        "UPDATE sessions SET open_turn_id = NULL, activity = 'idle' WHERE id = ?1 AND open_turn_id = ?2",
+        params![session_id, turn_id],
+    )?;
+    collector_event(tx, session_id, "turn_not_delivered", json!({ "turn_id": turn_id }), ts)
+}
+
+/// Keep a stored host fact that did not apply as the idempotency key only:
+/// it is hidden from `Store::events` (and so from SSE replay).
+fn mark_unapplied(tx: &Transaction<'_>, event_id: i64) -> Result<()> {
+    tx.execute("UPDATE events SET applied = 0 WHERE event_id = ?1", [event_id])?;
+    Ok(())
+}
+
+/// Whether a `conflict` event with this exact `received` body is already
+/// recorded for `(session_id, seq)` (fix round 1, ruling D): a re-sent
+/// conflicting frame must not pile up a second `conflict` event.
+fn conflict_already_recorded(tx: &Transaction<'_>, session_id: &str, seq: u64, received: &Value) -> Result<bool> {
+    let mut stmt = tx.prepare(
+        "SELECT body FROM events WHERE session_id = ?1 AND kind = 'conflict' AND json_extract(body, '$.seq') = ?2",
+    )?;
+    let mut rows = stmt.query(params![session_id, seq as i64])?;
+    while let Some(row) = rows.next()? {
+        let body: String = row.get(0)?;
+        let value: Value = serde_json::from_str(&body)?;
+        if value["received"] == *received {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 impl Store {
@@ -99,7 +207,8 @@ impl Store {
         Ok(self
             .conn()
             .query_row(
-                "SELECT id, host_id, agent, cwd, lifecycle, activity, open_turn_id FROM sessions WHERE id = ?1",
+                "SELECT id, host_id, agent, cwd, lifecycle, activity, open_turn_id, failure_reason, close_requested
+                 FROM sessions WHERE id = ?1",
                 [id],
                 |r| {
                     Ok(SessionRow {
@@ -110,9 +219,19 @@ impl Store {
                         lifecycle: r.get(4)?,
                         activity: r.get(5)?,
                         open_turn_id: r.get(6)?,
+                        failure_reason: r.get(7)?,
+                        close_requested: r.get(8)?,
                     })
                 },
             )
+            .optional()?)
+    }
+
+    /// A turn's state: `sent`, `started`, `ended` or `not_delivered`.
+    pub fn turn_state(&self, turn_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT state FROM turns WHERE turn_id = ?1", [turn_id], |r| r.get(0))
             .optional()?)
     }
 
@@ -149,6 +268,72 @@ impl Store {
         Ok(())
     }
 
+    /// Record an operator park before `park_session` is sent.
+    pub fn record_park_request(&self, session_id: &str) -> Result<EventDto> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let event = collector_event(&tx, session_id, "operator_parked", json!({}), &now())?;
+        tx.commit()?;
+        Ok(event)
+    }
+
+    /// Record an operator close of an attached session before
+    /// `close_session` is sent. The intent is durable: if the host never
+    /// confirms, the next handshake sends `close_session` again.
+    pub fn record_close_request(&self, session_id: &str) -> Result<EventDto> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE sessions SET close_requested = 1 WHERE id = ?1", [session_id])?;
+        let event = collector_event(&tx, session_id, "operator_closed", json!({}), &now())?;
+        tx.commit()?;
+        Ok(event)
+    }
+
+    /// Close a session with no adapter the collector can reach (parked,
+    /// failed, or its host offline) immediately (ACP core §4.8). Resolves
+    /// any open turn first — `started` → `turn_ended_synthesized`,
+    /// otherwise → `turn_not_delivered` (fix round 1, ruling C: a turn must
+    /// not be left open under a closed session, or a later real
+    /// `turn_ended` staying unapplied would mean it never gets an end at
+    /// all) — then writes `operator_closed` unless a close request already
+    /// recorded it. Idempotent: a closed session is left alone.
+    pub fn close_now(&self, session_id: &str) -> Result<Vec<EventDto>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let row: Option<(String, bool, Option<String>)> = tx
+            .query_row(
+                "SELECT lifecycle, close_requested, open_turn_id FROM sessions WHERE id = ?1",
+                [session_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let mut events = Vec::new();
+        if let Some((lifecycle, close_requested, open_turn)) = row
+            && lifecycle != "closed"
+        {
+            let ts = now();
+            if let Some(turn) = open_turn.as_deref() {
+                let state: Option<String> = tx
+                    .query_row("SELECT state FROM turns WHERE turn_id = ?1", [turn], |r| r.get(0))
+                    .optional()?;
+                events.push(match state.as_deref() {
+                    Some("started") => synthesize_turn_end(&tx, session_id, turn, &ts)?,
+                    _ => turn_not_delivered(&tx, session_id, turn, &ts)?,
+                });
+            }
+            if !close_requested {
+                events.push(collector_event(&tx, session_id, "operator_closed", json!({}), &ts)?);
+            }
+            tx.execute(
+                "UPDATE sessions SET lifecycle = 'closed', activity = NULL, open_turn_id = NULL, close_requested = 0
+                 WHERE id = ?1",
+                [session_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(events)
+    }
+
     /// Highest committed host seq for a session (0 if none).
     pub fn committed_seq(&self, session_id: &str) -> Result<u64> {
         let v: Option<i64> = self.conn().query_row(
@@ -159,28 +344,53 @@ impl Store {
         Ok(v.unwrap_or(0) as u64)
     }
 
-    /// Ingest one sequenced host frame. Idempotent on (session_id, seq).
-    /// Returns the events it created (empty for a duplicate), in order.
+    /// Ingest one sequenced host frame. Idempotent on (session_id, seq): a
+    /// duplicate with the same body is discarded; one with a different body
+    /// is kept as a `conflict` event (ACP core §3.6). Returns the events it
+    /// created, in order.
     pub fn ingest(&self, session_id: &str, seq: u64, body: &SessionBody) -> Result<Vec<EventDto>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let ts = now();
         let kind = body_kind(body);
+        let received = serde_json::to_value(body)?;
         let inserted = tx.execute(
             "INSERT INTO events(session_id, host_seq, kind, body, ts) VALUES (?1, ?2, ?3, ?4, ?5)
              ON CONFLICT(session_id, host_seq) DO NOTHING",
-            params![session_id, seq as i64, kind, serde_json::to_string(body)?, ts],
+            params![session_id, seq as i64, kind, received.to_string(), ts],
         )?;
         if inserted == 0 {
+            let stored: String = tx.query_row(
+                "SELECT body FROM events WHERE session_id = ?1 AND host_seq = ?2",
+                params![session_id, seq as i64],
+                |r| r.get(0),
+            )?;
+            // Structural comparison: key order is not stable across builds
+            // (serde_json's `preserve_order` is feature-unified).
+            let created = if serde_json::from_str::<Value>(&stored)? == received {
+                Vec::new()
+            } else if conflict_already_recorded(&tx, session_id, seq, &received)? {
+                // A re-sent conflicting frame: already on record, ruling D.
+                Vec::new()
+            } else {
+                vec![collector_event(
+                    &tx,
+                    session_id,
+                    "conflict",
+                    json!({ "seq": seq, "received": received }),
+                    &ts,
+                )?]
+            };
             tx.commit()?;
-            return Ok(Vec::new());
+            return Ok(created);
         }
+        let fact_id = tx.last_insert_rowid();
         let mut created = vec![EventDto {
-            event_id: tx.last_insert_rowid(),
+            event_id: fact_id,
             session_id: session_id.to_string(),
             host_seq: Some(seq),
             kind: kind.to_string(),
-            body: serde_json::to_value(body)?,
+            body: received,
             ts: ts.clone(),
         }];
         match body {
@@ -198,27 +408,66 @@ impl Store {
                 )?;
             }
             SessionBody::TurnStarted { turn_id, .. } => {
-                tx.execute("UPDATE sessions SET activity = 'running' WHERE id = ?1", [session_id])?;
-                // The user's turn is recorded only once the adapter has it
-                // (ACP core §4.4), in seq order before the turn's updates.
-                let content: Option<String> = tx
-                    .query_row("SELECT content FROM turns WHERE turn_id = ?1", [turn_id], |r| r.get(0))
+                // The fact wins over reconciliation, but never over a fact
+                // already resolved (fix round 1, ruling A, extending
+                // decision 2): a late `turn_started` applies only when the
+                // session is still active and `turn_id`'s own state is
+                // still `sent` or `not_delivered` — it never reopens a turn
+                // that has already `ended`.
+                let turn_state: Option<String> = tx
+                    .query_row("SELECT state FROM turns WHERE turn_id = ?1", [turn_id], |r| r.get(0))
                     .optional()?;
-                if let Some(content) = content {
-                    let body =
-                        serde_json::json!({ "turn_id": turn_id, "content": serde_json::from_str::<Value>(&content)? });
+                let (lifecycle, slot): (String, Option<String>) = tx.query_row(
+                    "SELECT lifecycle, open_turn_id FROM sessions WHERE id = ?1",
+                    [session_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                let applies =
+                    lifecycle == "active" && matches!(turn_state.as_deref(), Some("sent") | Some("not_delivered"));
+                let mut takes_slot = false;
+                if applies {
+                    takes_slot = match slot.as_deref() {
+                        None => true,
+                        Some(t) if t == turn_id => true,
+                        Some(other) => {
+                            // The host serialises turns: if the one holding
+                            // the slot never started, `turn_id`'s late fact
+                            // takes the slot back and that turn is released
+                            // as `turn_not_delivered` — before `turn_id`'s
+                            // own `user_turn` (timeline order).
+                            let other_state: Option<String> = tx
+                                .query_row("SELECT state FROM turns WHERE turn_id = ?1", [other], |r| r.get(0))
+                                .optional()?;
+                            if other_state.as_deref() == Some("sent") {
+                                created.push(turn_not_delivered(&tx, session_id, other, &ts)?);
+                                true
+                            } else {
+                                // The slot holds a turn already `started`:
+                                // store the fact, apply nothing.
+                                false
+                            }
+                        }
+                    };
+                }
+                if takes_slot {
                     tx.execute(
-                        "INSERT INTO events(session_id, host_seq, kind, body, ts) VALUES (?1, NULL, 'user_turn', ?2, ?3)",
-                        params![session_id, body.to_string(), ts],
+                        "UPDATE sessions SET activity = 'running', open_turn_id = ?2 WHERE id = ?1",
+                        params![session_id, turn_id],
                     )?;
-                    created.push(EventDto {
-                        event_id: tx.last_insert_rowid(),
-                        session_id: session_id.to_string(),
-                        host_seq: None,
-                        kind: "user_turn".into(),
-                        body,
-                        ts: ts.clone(),
-                    });
+                    tx.execute("UPDATE turns SET state = 'started' WHERE turn_id = ?1", [turn_id])?;
+                    // The user's turn is recorded only once the adapter has
+                    // it (ACP core §4.4), in seq order before the turn's
+                    // updates.
+                    let content: Option<String> = tx
+                        .query_row("SELECT content FROM turns WHERE turn_id = ?1", [turn_id], |r| r.get(0))
+                        .optional()?;
+                    if let Some(content) = content {
+                        let body = json!({ "turn_id": turn_id, "content": serde_json::from_str::<Value>(&content)? });
+                        created.push(collector_event(&tx, session_id, "user_turn", body, &ts)?);
+                    }
+                } else {
+                    created.clear();
+                    mark_unapplied(&tx, fact_id)?;
                 }
             }
             SessionBody::TurnEnded { turn_id, outcome, .. } => {
@@ -230,15 +479,38 @@ impl Store {
                     "UPDATE sessions SET open_turn_id = NULL, activity = 'idle' WHERE id = ?1 AND open_turn_id = ?2",
                     params![session_id, turn_id],
                 )?;
+                // Only a `started` turn can be ended by a real `turn_ended`
+                // (fix round 1, ruling B): a stray end must not jump a
+                // `sent`/`not_delivered` turn straight to `ended`.
                 tx.execute(
-                    "UPDATE turns SET outcome = ?2 WHERE turn_id = ?1 AND outcome IS NULL",
+                    "UPDATE turns SET state = 'ended', outcome = ?2 WHERE turn_id = ?1 AND state = 'started'",
                     params![turn_id, serde_json::to_value(outcome)?.as_str().unwrap_or_default()],
                 )?;
                 if applied == 0 {
                     created.clear();
+                    mark_unapplied(&tx, fact_id)?;
                 }
             }
-            SessionBody::AcpUpdate { .. } => {}
+            SessionBody::SessionParked { .. } => {
+                // A park that overtakes an operator close ends the session
+                // as the operator asked: closed.
+                tx.execute(
+                    "UPDATE sessions SET
+                         lifecycle = CASE WHEN close_requested = 1 THEN 'closed' ELSE 'parked' END,
+                         activity = NULL, close_requested = 0
+                     WHERE id = ?1 AND lifecycle = 'active'",
+                    [session_id],
+                )?;
+            }
+            SessionBody::SessionClosed => {
+                tx.execute(
+                    "UPDATE sessions SET lifecycle = 'closed', activity = NULL, close_requested = 0
+                     WHERE id = ?1 AND lifecycle = 'active'",
+                    [session_id],
+                )?;
+            }
+            // Diagnostics only; the `session_parked` that follows detaches.
+            SessionBody::AdapterExited { .. } | SessionBody::AcpUpdate { .. } => {}
         }
         tx.execute(
             "UPDATE sessions SET last_event_at = ?2 WHERE id = ?1",
@@ -248,12 +520,85 @@ impl Store {
         Ok(created)
     }
 
-    /// Events of one session with `event_id > after`, oldest first.
+    /// Reconcile a host's sessions after its `resend_complete` (ACP core
+    /// §5.1 step 4, §5.2). Everything the host had in its outbox has been
+    /// ingested by now, so anything still unresolved never happened:
+    ///
+    /// - `starting`, not attached → `failed{start_not_delivered}`;
+    /// - `active`, not attached → the host restarted: `host_restarted`,
+    ///   parked (or closed, if the operator asked), its open turn ended;
+    /// - an open turn the host does not report: `turn_not_delivered` if it
+    ///   never started, `turn_ended_synthesized{interrupted}` if it did;
+    /// - attached sessions the operator closed → returned in `close`.
+    pub fn reconcile_host(&self, host_id: &str, attached: &[AttachedSession]) -> Result<Reconciliation> {
+        let listed: HashMap<&str, &AttachedSession> = attached.iter().map(|a| (a.session_id.as_str(), a)).collect();
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let ts = now();
+        let rows: Vec<(String, String, Option<String>, bool)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, lifecycle, open_turn_id, close_requested FROM sessions
+                 WHERE host_id = ?1 AND lifecycle IN ('starting', 'active', 'closed') ORDER BY id",
+            )?;
+            let rows = stmt.query_map([host_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut out = Reconciliation::default();
+        for (id, lifecycle, open_turn, close_requested) in rows {
+            let host = listed.get(id.as_str());
+            match (lifecycle.as_str(), host) {
+                ("starting", None) => {
+                    out.events
+                        .push(collector_event(&tx, &id, "start_not_delivered", json!({}), &ts)?);
+                    tx.execute(
+                        "UPDATE sessions SET lifecycle = 'failed', failure_reason = 'start_not_delivered' WHERE id = ?1",
+                        [&id],
+                    )?;
+                }
+                ("active", _) => {
+                    if host.is_none() {
+                        out.events
+                            .push(collector_event(&tx, &id, "host_restarted", json!({}), &ts)?);
+                    }
+                    let host_turn = host.and_then(|a| a.open_turn_id.as_deref());
+                    if let Some(turn) = open_turn.as_deref()
+                        && host_turn != Some(turn)
+                    {
+                        let state: Option<String> = tx
+                            .query_row("SELECT state FROM turns WHERE turn_id = ?1", [turn], |r| r.get(0))
+                            .optional()?;
+                        out.events.push(match state.as_deref() {
+                            Some("started") => synthesize_turn_end(&tx, &id, turn, &ts)?,
+                            _ => turn_not_delivered(&tx, &id, turn, &ts)?,
+                        });
+                    }
+                    if host.is_none() {
+                        tx.execute(
+                            "UPDATE sessions SET
+                                 lifecycle = CASE WHEN close_requested = 1 THEN 'closed' ELSE 'parked' END,
+                                 activity = NULL, open_turn_id = NULL, close_requested = 0
+                             WHERE id = ?1",
+                            [&id],
+                        )?;
+                    } else if close_requested {
+                        out.close.push(id);
+                    }
+                }
+                ("closed", Some(_)) => out.close.push(id),
+                _ => {}
+            }
+        }
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Events of one session with `event_id > after`, oldest first. Host
+    /// facts stored but not applied are left out (final review F1).
     pub fn events(&self, session_id: &str, after: i64, limit: u32) -> Result<Vec<EventDto>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT event_id, host_seq, kind, body, ts FROM events
-             WHERE session_id = ?1 AND event_id > ?2 ORDER BY event_id LIMIT ?3",
+             WHERE session_id = ?1 AND event_id > ?2 AND applied = 1 ORDER BY event_id LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![session_id, after, limit], |r| {
             Ok((
@@ -287,6 +632,9 @@ fn body_kind(body: &SessionBody) -> &'static str {
         SessionBody::TurnStarted { .. } => "turn_started",
         SessionBody::AcpUpdate { .. } => "acp_update",
         SessionBody::TurnEnded { .. } => "turn_ended",
+        SessionBody::SessionParked { .. } => "session_parked",
+        SessionBody::SessionClosed => "session_closed",
+        SessionBody::AdapterExited { .. } => "adapter_exited",
     }
 }
 

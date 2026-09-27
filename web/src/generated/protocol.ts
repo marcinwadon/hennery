@@ -4,9 +4,11 @@ export type AttachedSession = { session_id: string, last_seq: number, open_turn_
 
 export type TurnOutcome = "completed" | "cancelled" | "failed" | "interrupted";
 
+export type ParkReason = "idle" | "adapter_exited" | "operator";
+
 export type Indexed = { turn_id?: string | null, title?: string | null, };
 
-export type SessionBody = { "kind": "session_started", request_id: string, agent_session_id: string, } | { "kind": "start_failed", request_id: string, code: string, message: string, } | { "kind": "turn_started", request_id: string, turn_id: string, } | { "kind": "acp_update", indexed: Indexed, payload: unknown, } | { "kind": "turn_ended", turn_id: string, outcome: TurnOutcome, stop_reason?: string | null, error?: string | null, };
+export type SessionBody = { "kind": "session_started", request_id: string, agent_session_id: string, } | { "kind": "start_failed", request_id: string, code: string, message: string, } | { "kind": "turn_started", request_id: string, turn_id: string, } | { "kind": "acp_update", indexed: Indexed, payload: unknown, } | { "kind": "turn_ended", turn_id: string, outcome: TurnOutcome, stop_reason?: string | null, error?: string | null, } | { "kind": "session_parked", reason: ParkReason, } | { "kind": "session_closed" } | { "kind": "adapter_exited", code?: number | null, signal?: number | null, stderr_tail: string, };
 
 export type HostFrame = { "type": "hello", protocol_version: string, host_version: string, host_id: string, 
 /**
@@ -24,7 +26,7 @@ committed: Record<string, number>, } | { "type": "hello_error", code: string, me
 /**
  * ACP ContentBlocks, built by the frontend.
  */
-content: unknown[], } | { "type": "ack", session_id: string, ack_seq: number, };
+content: unknown[], } | { "type": "ack", session_id: string, ack_seq: number, } | { "type": "park_session", request_id: string, session_id: string, } | { "type": "close_session", request_id: string, session_id: string, };
 
 export type StartSessionRequest = { host_id: string, agent: string, cwd: string, };
 
@@ -43,3 +45,5 @@ export type ApiError = { code: string, message: string,
  * still start, but the caller has no other way to learn its id).
  */
 session_id?: string | undefined, };
+
+export type LifecycleResponse = { session_id: string, lifecycle: string, };

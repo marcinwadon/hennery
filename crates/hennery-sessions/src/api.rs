@@ -11,7 +11,7 @@ use axum::{Json, Router, middleware};
 use futures::stream::{self, Stream, StreamExt};
 use hennery_proto::frames::CollectorFrame;
 use hennery_proto::rest::{
-    ApiError, EventDto, PromptRequest, PromptResponse, StartSessionRequest, StartSessionResponse,
+    ApiError, EventDto, LifecycleResponse, PromptRequest, PromptResponse, StartSessionRequest, StartSessionResponse,
 };
 use serde::Deserialize;
 use std::convert::Infallible;
@@ -22,12 +22,26 @@ const START_TIMEOUT: Duration = Duration::from_secs(90);
 /// At least the WebSocket read deadline, so a half-open socket is detected
 /// before the request gives up (ACP core §3.4).
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
+/// `park_session` / `close_session` (ACP core §3.4).
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+
+// Hub waiters are keyed on host_id, not on the connection: a request only
+// fails over safely if a half-open socket is dropped (after READ_TIMEOUT)
+// before the request's own timeout gives up. `Duration`'s `>` is not const.
+const _: () = assert!(
+    START_TIMEOUT.as_millis() > crate::ws::READ_TIMEOUT.as_millis()
+        && PROMPT_TIMEOUT.as_millis() > crate::ws::READ_TIMEOUT.as_millis()
+        && TEARDOWN_TIMEOUT.as_millis() > crate::ws::READ_TIMEOUT.as_millis(),
+    "every request timeout must exceed the host connection's read deadline"
+);
 
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/hosts", get(list_hosts))
         .route("/api/sessions", post(start_session))
         .route("/api/sessions/{id}/prompt", post(prompt))
+        .route("/api/sessions/{id}/park", post(park))
+        .route("/api/sessions/{id}/close", post(close))
         .route("/api/sessions/{id}/events", get(events))
         .route("/api/stream/sessions/{id}", get(stream_session))
         .layer(middleware::from_fn_with_state(
@@ -74,7 +88,7 @@ fn request_failed(err: RequestError) -> Response {
         RequestError::NotConnected => error(StatusCode::CONFLICT, "host_offline", "the host is not connected"),
         RequestError::Rejected { code, message } => {
             let status = match code.as_str() {
-                "not_attached" => StatusCode::CONFLICT,
+                "not_attached" | "turn_in_progress" => StatusCode::CONFLICT,
                 "unknown_agent" | "start_failed" => StatusCode::BAD_GATEWAY,
                 "invalid" => StatusCode::BAD_REQUEST,
                 _ => StatusCode::BAD_GATEWAY,
@@ -180,6 +194,111 @@ async fn prompt(State(state): State<AppState>, Path(id): Path<String>, Json(req)
             }
             request_failed(err)
         }
+    }
+}
+
+fn lifecycle_response(state: &AppState, id: &str) -> Response {
+    match state.store.session(id) {
+        Ok(Some(s)) => (
+            StatusCode::ACCEPTED,
+            Json(LifecycleResponse {
+                session_id: s.id,
+                lifecycle: s.lifecycle,
+            }),
+        )
+            .into_response(),
+        Ok(None) => error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) => internal(err),
+    }
+}
+
+/// Close collector-side: the session has no adapter the collector can
+/// reach (ACP core §4.8).
+fn close_unattached(state: &AppState, id: &str) -> Response {
+    match state.store.close_now(id) {
+        Ok(events) => {
+            for event in events {
+                state.hub.publish(event);
+            }
+            lifecycle_response(state, id)
+        }
+        Err(err) => internal(err),
+    }
+}
+
+/// Explicit park of an attached session: 202 with the lifecycle once the
+/// host's `session_parked` is ingested.
+async fn park(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let session = match state.store.session(&id) {
+        Ok(Some(s)) => s,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) => return internal(err),
+    };
+    if session.lifecycle != "active" || !state.hub.is_ready(&session.host_id) {
+        return error(StatusCode::CONFLICT, "not_attached", "the session is not attached");
+    }
+    match state.store.record_park_request(&id) {
+        Ok(event) => state.hub.publish(event),
+        Err(err) => return internal(err),
+    }
+    let request_id = uuid::Uuid::now_v7().to_string();
+    let frame = CollectorFrame::ParkSession {
+        request_id: request_id.clone(),
+        session_id: id.clone(),
+    };
+    match state
+        .hub
+        .request_for_session(&session.host_id, &request_id, &id, frame, TEARDOWN_TIMEOUT)
+        .await
+    {
+        Ok(_) => lifecycle_response(&state, &id),
+        Err(err) => request_failed(err),
+    }
+}
+
+/// Close: attached sessions are closed by their host (`session_closed`);
+/// anything else is closed immediately. A close whose delivery is unknown
+/// stays requested and is re-sent after the host's next handshake.
+async fn close(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let session = match state.store.session(&id) {
+        Ok(Some(s)) => s,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) => return internal(err),
+    };
+    let reachable = state.hub.is_ready(&session.host_id);
+    match session.lifecycle.as_str() {
+        "closed" => return lifecycle_response(&state, &id),
+        "starting" if reachable => {
+            return error(
+                StatusCode::CONFLICT,
+                "starting",
+                "the session is starting; close it once the start settles",
+            );
+        }
+        "active" if reachable => {}
+        _ => return close_unattached(&state, &id),
+    }
+    match state.store.record_close_request(&id) {
+        Ok(event) => state.hub.publish(event),
+        Err(err) => return internal(err),
+    }
+    let request_id = uuid::Uuid::now_v7().to_string();
+    let frame = CollectorFrame::CloseSession {
+        request_id: request_id.clone(),
+        session_id: id.clone(),
+    };
+    match state
+        .hub
+        .request_for_session(&session.host_id, &request_id, &id, frame, TEARDOWN_TIMEOUT)
+        .await
+    {
+        // `session_closed`, or a `session_parked` that overtook the close
+        // (ingest turns that into `closed`, since a close was requested).
+        Ok(_) => lifecycle_response(&state, &id),
+        // The host no longer has it (or went away): nothing left to stop.
+        Err(RequestError::Rejected { code, .. }) if code == "not_attached" => close_unattached(&state, &id),
+        Err(RequestError::NotConnected) => close_unattached(&state, &id),
+        Err(err) => request_failed(err),
     }
 }
 
