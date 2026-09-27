@@ -10,6 +10,25 @@
 
 **Spec:** [`docs/specs/2026-09-26-acp-core-design.md`](../specs/2026-09-26-acp-core-design.md). The relevant sections are §2.1–2.3 (lifetimes, actor, supervisor), §3.2–3.6 (bodies, catalogue, timeouts, seqs), §4.2, §4.4, §4.7, §4.8 (state machine, turns, reaper, park/close), §5.1–5.4 (handshake, host restart, collector restart) and §12 (scenarios 5, 6, 7, 14, 15, 18). It builds on the executed [walking skeleton](2026-09-26-walking-skeleton.md): read its "Execution status" first, because the code there wins over its task text.
 
+## Execution status (2026-09-27)
+
+**Executed** on branch `feat/teardown-reconciliation` (task-by-task with reviews, then a whole-branch review
+and one fix wave; 115 tests). Where review found the plan's code wrong, the **code and the spec win**; the task
+bodies below are kept as written. Deviations:
+
+| Area | As built | Why |
+|---|---|---|
+| Stderr tail (T3) | Once the ring truncates, the partial first line is dropped before scrubbing | A token cut at the ring's edge escaped the scrubber |
+| Process group (T3) | The exit watcher SIGKILLs the group right after reaping the leader; `kill_group` is a no-op after exit | Decision 5 inside the supervisor; closes the pgid-recycle window |
+| Actor ordering (T4) | Queued updates are drained before every `turn_ended` (reply, failed, teardown, reaper); commands drained with `recv().await` after `close()` | Multi-thread races put an update after its turn end or dropped a command |
+| Restart during teardown (T6) | Answered `not_attached` | A start reaching an ending actor was silently dropped (90 s wait, then a reconnect) |
+| Late `turn_started` (T7) | Takes the slot back only from a turn still `sent` (that turn becomes `turn_not_delivered`); never reopens an ended turn | Extension of decision 2: otherwise a turn could be orphaned with no end |
+| `close_now` (T7) | Resolves an open turn first (synthesized end or not delivered) | A started turn could stay open forever |
+| Reconcile close (T9) | A host `not_attached` answer closes the session collector-side | Decision 7 on the reconcile path |
+| Unapplied facts (final) | `events.applied` (migration 3); `events()` and SSE replay list only applied rows | Replay could show two ends for one turn |
+| Host shutdown (final) | Waits for actors (bounded by kill grace + 1 s), so adapters get SIGTERM first | Shutdown SIGKILLed adapters with no grace |
+| Wire order (final) | Outboxed facts are sent before each reply | A rejection could overtake the fact before it |
+
 ## Scope
 
 This is **plan A** of the skeleton's "After this plan" item (1). That item was too big for one plan of right-sized tasks, so it is split. Plan A is the reconciliation and teardown core: it removes every known wedge. Plan B (resume) is scoped under "After this plan" below.

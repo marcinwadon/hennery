@@ -28,7 +28,8 @@ slice); everything else is design. The maintainer's decisions are recorded below
      lists where the built code deviates from the task text.
    - [Teardown and reconciliation](plans/2026-09-27-teardown-and-reconciliation.md) —
      plan A of the resume work (9 tasks): adapter supervisor and exit watcher, park/close,
-     idle reaper, conflict events and reconciliation after reconnect. Decisions confirmed 2026-09-27.
+     idle reaper, conflict events and reconciliation after reconnect. Executed 2026-09-27 (see its
+     "Execution status").
 
 ## Maintainer decisions (2026-09-27)
 
