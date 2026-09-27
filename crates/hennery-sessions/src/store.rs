@@ -50,6 +50,13 @@ const MIGRATIONS: &[&str] = &[
         SELECT 1 FROM events e
         WHERE e.kind = 'turn_started' AND json_extract(e.body, '$.turn_id') = turns.turn_id);
 ",
+    // A host fact that is stored (its row is the (session_id, host_seq)
+    // idempotency key) but did not apply — e.g. a real `turn_ended` after the
+    // collector already synthesized the turn's end — is kept with
+    // `applied = 0` and never listed (final review F1).
+    "
+    ALTER TABLE events ADD COLUMN applied INTEGER NOT NULL DEFAULT 1;
+",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -133,6 +140,13 @@ fn turn_not_delivered(tx: &Transaction<'_>, session_id: &str, turn_id: &str, ts:
         params![session_id, turn_id],
     )?;
     collector_event(tx, session_id, "turn_not_delivered", json!({ "turn_id": turn_id }), ts)
+}
+
+/// Keep a stored host fact that did not apply as the idempotency key only:
+/// it is hidden from `Store::events` (and so from SSE replay).
+fn mark_unapplied(tx: &Transaction<'_>, event_id: i64) -> Result<()> {
+    tx.execute("UPDATE events SET applied = 0 WHERE event_id = ?1", [event_id])?;
+    Ok(())
 }
 
 /// Whether a `conflict` event with this exact `received` body is already
@@ -370,8 +384,9 @@ impl Store {
             tx.commit()?;
             return Ok(created);
         }
+        let fact_id = tx.last_insert_rowid();
         let mut created = vec![EventDto {
-            event_id: tx.last_insert_rowid(),
+            event_id: fact_id,
             session_id: session_id.to_string(),
             host_seq: Some(seq),
             kind: kind.to_string(),
@@ -452,6 +467,7 @@ impl Store {
                     }
                 } else {
                     created.clear();
+                    mark_unapplied(&tx, fact_id)?;
                 }
             }
             SessionBody::TurnEnded { turn_id, outcome, .. } => {
@@ -472,6 +488,7 @@ impl Store {
                 )?;
                 if applied == 0 {
                     created.clear();
+                    mark_unapplied(&tx, fact_id)?;
                 }
             }
             SessionBody::SessionParked { .. } => {
@@ -575,12 +592,13 @@ impl Store {
         Ok(out)
     }
 
-    /// Events of one session with `event_id > after`, oldest first.
+    /// Events of one session with `event_id > after`, oldest first. Host
+    /// facts stored but not applied are left out (final review F1).
     pub fn events(&self, session_id: &str, after: i64, limit: u32) -> Result<Vec<EventDto>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT event_id, host_seq, kind, body, ts FROM events
-             WHERE session_id = ?1 AND event_id > ?2 ORDER BY event_id LIMIT ?3",
+             WHERE session_id = ?1 AND event_id > ?2 AND applied = 1 ORDER BY event_id LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![session_id, after, limit], |r| {
             Ok((

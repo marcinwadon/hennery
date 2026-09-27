@@ -406,6 +406,7 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
         conn.execute_batch(
             "ALTER TABLE turns DROP COLUMN state;
              ALTER TABLE sessions DROP COLUMN close_requested;
+             ALTER TABLE events DROP COLUMN applied;
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -413,6 +414,11 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
     let store = Store::open(&db).unwrap();
     assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("started"));
     assert!(!store.session("s1").unwrap().unwrap().close_requested);
+    // Rows written before migration 3 count as applied.
+    assert_eq!(
+        kinds(&store.events("s1", 0, 100).unwrap()),
+        ["session_started", "turn_started", "user_turn"]
+    );
 }
 
 // Fix round 1: a late `turn_started` must never leave a turn orphaned with
@@ -526,4 +532,69 @@ fn a_resent_identical_conflicting_frame_does_not_duplicate_the_conflict_event() 
         .filter(|e| e.kind == "conflict")
         .count();
     assert_eq!(conflicts, 1);
+}
+
+// Final review F1: a host fact that is stored (it is the (session_id, seq)
+// idempotency key) but not applied must not be listed by `events()` (the
+// REST listing and the SSE replay), or a turn can show two ends.
+
+fn ends_of(store: &Store, turn: &str) -> Vec<String> {
+    store
+        .events("s1", 0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| {
+            matches!(
+                e.kind.as_str(),
+                "turn_ended" | "turn_ended_synthesized" | "turn_not_delivered"
+            ) && e.body["turn_id"] == turn
+        })
+        .map(|e| e.kind)
+        .collect()
+}
+
+#[test]
+fn a_real_turn_ended_after_an_offline_close_is_not_listed_as_a_second_end() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.ingest("s1", 2, &turn_started("t1")).unwrap();
+    // The host is offline: the operator closes now, the turn is synthesized.
+    store.close_now("s1").unwrap();
+    // The host reconnects and resends the turn's real end.
+    let created = store.ingest("s1", 3, &ended("t1")).unwrap();
+    assert!(created.is_empty());
+    assert_eq!(ends_of(&store, "t1"), ["turn_ended_synthesized"]);
+    // A resend of the unapplied fact is still recognised as a duplicate,
+    // and it still counts towards the committed seq (hello_ack).
+    assert!(store.ingest("s1", 3, &ended("t1")).unwrap().is_empty());
+    assert_eq!(store.committed_seq("s1").unwrap(), 3);
+}
+
+#[test]
+fn a_real_turn_ended_after_reconcile_synthesis_is_not_listed_as_a_second_end() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.ingest("s1", 2, &turn_started("t1")).unwrap();
+    store.reconcile_host("h1", &[attached("s1", None)]).unwrap();
+    assert!(store.ingest("s1", 3, &ended("t1")).unwrap().is_empty());
+    assert_eq!(ends_of(&store, "t1"), ["turn_ended_synthesized"]);
+}
+
+#[test]
+fn an_unapplied_late_turn_started_is_not_listed() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    // Closed before the host's turn_started arrived: t1 is not_delivered.
+    store.close_now("s1").unwrap();
+    assert!(store.ingest("s1", 2, &turn_started("t1")).unwrap().is_empty());
+    let listed = store.events("s1", 0, 1000).unwrap();
+    assert!(
+        !listed.iter().any(|e| e.kind == "turn_started" || e.kind == "user_turn"),
+        "{:?}",
+        kinds(&listed)
+    );
+    assert!(store.ingest("s1", 2, &turn_started("t1")).unwrap().is_empty());
 }
