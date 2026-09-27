@@ -138,6 +138,35 @@ async fn an_adapter_that_cannot_start_reports_start_failed_durably() {
 }
 
 #[tokio::test]
+async fn an_adapter_that_exits_immediately_reports_start_failed_durably_and_quickly() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    // Spawns fine, but never speaks ACP: exits before answering `initialize`.
+    let dying = AgentCommand::parse("/usr/bin/false").unwrap();
+    let began = tokio::time::Instant::now();
+    let _tx = session::start(uplink.clone(), "r0".into(), "s1".into(), dying, std::env::temp_dir());
+    // Uses the production `start` (75s START_TIMEOUT), not a shortened test
+    // timeout: the point is that a dead process fails fast on its own,
+    // without waiting anywhere near that deadline.
+    let frames = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let frames = uplink.pending().unwrap();
+            if !frames.is_empty() {
+                return frames;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("start_failed did not arrive quickly");
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "took {:?}, expected well under the 75s START_TIMEOUT",
+        began.elapsed()
+    );
+    assert_eq!(kinds(&frames), ["start_failed"]);
+}
+
+#[tokio::test]
 async fn an_adapter_that_hangs_on_start_reports_start_failed() {
     let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
     // Never answers `initialize`: simulates an adapter that hangs on start.
