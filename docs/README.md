@@ -26,6 +26,9 @@ slice); everything else is design. The maintainer's decisions are recorded below
    - [Walking skeleton](plans/2026-09-26-walking-skeleton.md) — the first
      implementation plan (9 tasks) — executed 2026-09-27; its "Execution status" section
      lists where the built code deviates from the task text.
+   - [Teardown and reconciliation](plans/2026-09-27-teardown-and-reconciliation.md) —
+     plan A of the resume work (9 tasks): adapter supervisor and exit watcher, park/close,
+     idle reaper, conflict events and reconciliation after reconnect. Draft awaiting review.
 
 ## Maintainer decisions (2026-09-27)
 
