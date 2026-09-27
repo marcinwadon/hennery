@@ -1,7 +1,7 @@
 # hennery design documents
 
-Status: design phase. Everything here is a draft awaiting the maintainer's
-review; nothing is implemented yet.
+Status: design phase; the maintainer's open decisions are recorded below.
+Nothing is implemented yet.
 
 ## Reading order
 
@@ -26,27 +26,22 @@ review; nothing is implemented yet.
    - [Walking skeleton](plans/2026-09-26-walking-skeleton.md) — the first
      implementation plan (9 tasks, code verified by replaying the plan).
 
-## Decisions waiting for the maintainer
+## Maintainer decisions (2026-09-27)
 
-Collected from the specs' open-question sections, most consequential first.
+Every open design decision is resolved; the specs carry the details.
 
-1. **`hennery up` and credentials of several hats.** In the all-in-one install
-   the collector runs as the same OS user as every agent, so any agent can read
-   the master key and database (umbrella §8.4, kernel §10). The specs document
-   this and recommend a separate collector; should v1 also support the OS
-   keystore for the master key (kernel open question 3)?
-2. **Per-hat "isolate agent user config".** Claude's strict MCP mode isolates
-   MCP servers only; the user's `~/.claude` instructions, memory, hooks and
-   plugins still load in every hat (umbrella §8.3). Worth a v1 option?
-3. **Concurrent Codex processes sharing a composed `CODEX_HOME`** must be
-   measured; until then Codex on a mixed host gets default-hat mounts only.
-4. **Headless macOS hosts** — "requires a logged-in user" acceptable for v1?
-   (distribution open question 1)
-5. **Adapter set size** (~700 MB per set, mostly the bundled agent CLIs) — offer
-   "use my own CLI" as a first-class, space-saving option? (distribution 2)
-6. Smaller ones: attachment retention caps (ACP core 1), VAPID contact
-   (kernel 1), multiple listeners (kernel 2), static-token header templates
-   (gateway 3), transcript windowing threshold (frontend 1).
+| # | Question | Decision | Where |
+|---|---|---|---|
+| 1 | `master.key` in the OS keystore | No — a 0600 file in v1; a separate OS user or container is the real protection | kernel §10 |
+| 2 | Per-hat "isolate agent user config" | Documentation only in v1 | umbrella §8.4, ACP core §15 |
+| 3 | Codex sharing a composed `CODEX_HOME` | Stays on the mixed-host fallback until measured | umbrella §8.5, ACP core §6 |
+| 4 | Headless macOS hosts | A logged-in user is required in v1 | distribution §6.2, §13 |
+| 5 | "Use my own CLI" | Advanced install option (`--use-cli`), not the default | distribution §13 |
+| 6a | Attachment size cap | None in v1; disk usage shown in Settings | ACP core §15 |
+| 6b | VAPID contact | Not asked at setup; derived from `public_url`, optional in Settings | kernel §6 |
+| 6c | Multiple listeners | Supported; browser access stays bound to `public_url` | kernel §7 |
+| 6d | Static-token header | Header name plus optional value prefix | gateway §1 |
+| 6e | Windowing threshold, vendor token behaviour, `GET` SSE | Measured once the code exists | frontend §15, gateway §13 |
 
 ---
 

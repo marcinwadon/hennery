@@ -756,7 +756,8 @@ silently drops a session server whose name exists in config).
 skills and plugins (whether plugin MCP servers load under strict mode is
 unmeasured). Codex loads the global `AGENTS.md` and any `notify` command.
 These are accidental cross-hat channels outside hennery's control in v1
-(umbrella §8.4; §15, open question 2).
+(umbrella §8.4); v1 documents them instead of offering a per-hat switch
+(§15, decision 2).
 
 **Agent availability** in `hello.agents[]` and `probe_agents`:
 `available` = the adapter can be launched; `auth` = `ok | missing | unknown`.
@@ -1058,13 +1059,19 @@ session, Changes tab, config explorer, auto-naming, memory. Gateway internals
 
 ## 15. Open questions
 
-1. **Attachment retention.** Images live as long as their session. Is a size
-   cap per installation needed in v1?
-2. **Per-hat "isolate agent user config".** Should a hat be able to stop its
-   sessions from loading the user's own agent configuration (§6)? For Claude
-   this might be done through the SDK's `settingSources` passed in `_meta`
-   (unverified); for Codex by leaving `AGENTS.md` out of the composed home and
-   stripping `notify`. Both cost the operator their personal agent setup in
-   that hat.
+Resolved by the maintainer on 2026-09-27:
+
+1. **Attachment retention** — no size cap in v1. Images live as long as their
+   session; Settings shows the attachment store's disk usage (frontend §8).
+2. **Per-hat "isolate agent user config"** — not in v1, documentation only.
+   The docs next to the hat settings say that each session still loads the
+   user's own agent configuration (umbrella §8.4) and that a hat needing this
+   isolation belongs on its own host. Possible later routes, unverified: the
+   SDK's `settingSources` in `_meta` for Claude; leaving `AGENTS.md` out of the
+   composed home and stripping `notify` for Codex.
+
+Still open (a measurement, not a decision):
+
 3. **Concurrent Codex processes sharing state** through the composed home —
-   needs a live gate before Codex leaves the fallback on mixed hosts (§6).
+   Codex on mixed hosts stays on the fallback until a live gate measures it
+   (§6).

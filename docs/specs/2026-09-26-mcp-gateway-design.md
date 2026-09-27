@@ -69,8 +69,10 @@ holds session ids as opaque values; the gateway never reads session tables.
 
 - **`cred_kind`:**
   - `none` — no credential (public or network-trusted upstreams).
-  - `static` — a personal access token or API key, sent as a bearer token or a
-    configured header name. Preferred where the vendor offers one: no refresh,
+  - `static` — a personal access token or API key, sent as
+    `Authorization: Bearer <token>` by default, or under a configured header
+    name with an optional value prefix (`<prefix><token>`, prefix may be
+    empty; e.g. `X-API-Key: <token>` or `Authorization: token <token>`). Preferred where the vendor offers one: no refresh,
     no expiry probe.
   - `oauth_dcr` — OAuth with dynamic client registration as a public client.
   - `oauth_client` — OAuth with a **pre-registered** client the operator
@@ -414,8 +416,8 @@ collector. In the default `hennery up` install the collector runs as the same OS
 user as every agent, so any agent can read `master.key` and `hennery.db` and
 decrypt every grant. Whenever the gateway holds credentials for more than one
 hat, the collector should run as a separate OS user or in a container (the
-Docker image); `hennery up` warns in that situation (kernel §10). Keeping
-`master.key` in the OS keystore is an open question (kernel §12).
+Docker image); `hennery up` warns in that situation (kernel §10). In v1
+`master.key` stays a file, not an OS keystore entry (kernel §10).
 
 ---
 
@@ -594,6 +596,5 @@ the boundary: the `hennery-gateway` crate does not depend on `hennery-sessions`.
    Worth a small live-gate matrix once the gateway exists.
 2. **`GET` SSE channel.** Forwarded in v1; whether any vendor uses it for
    server-initiated messages that hennery then has to refuse (§5.6) is unknown.
-3. **Static-token header name.** Most vendors take `Authorization: Bearer`;
-   some want a custom header (e.g. an API-key header). The connection form
-   allows a header name; is a value template (prefix) also needed?
+3. ~~**Static-token header name.**~~ Resolved 2026-09-27: header name plus an
+   optional value prefix (§1).

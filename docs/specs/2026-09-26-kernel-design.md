@@ -107,7 +107,7 @@ per route class:
 
 | Route | Authentication | `Origin` |
 |---|---|---|
-| Browser routes, state-changing methods (`POST`, `PUT`, `PATCH`, `DELETE`) | Session cookie | Must match `public_url`; a missing `Origin` is rejected |
+| Browser routes, state-changing methods (`POST`, `PUT`, `PATCH`, `DELETE`) | Session cookie | Must match `public_url`; a missing `Origin` is rejected. Same rule on every listener (§7) |
 | Browser routes, `GET` (JSON, SSE streams, attachments, logos) | Session cookie (`SameSite=Strict`) | Browsers do not send `Origin` on same-origin `GET`s, so these check `Sec-Fetch-Site` instead: `same-origin` or `none` accepted, anything else rejected; a present `Origin` must match |
 | `GET /api/hosts/ws` | Unauthenticated until a valid `hello` proof (ACP core §3.5) | Exempt |
 | `POST /api/hosts/enroll` | Pairing code | Exempt |
@@ -263,7 +263,8 @@ host cannot be purged until the hosts are moved to another hat):
 - **VAPID keys:** P-256 key pair generated on first run into `<data>/vapid.key`
   (0600). The VAPID `sub` claim is `mailto:<owner contact>` if configured, else
   the `public_url`; never a non-routable placeholder (iOS silently rejects
-  those).
+  those). Setup does not ask for the contact; it is an optional field in
+  Settings.
 - **Delivery:** `web-push-native` builds RFC 8291 (aes128gcm) requests with
   VAPID (RFC 8292), sent with the shared HTTP client under the egress policy
   (§7.1; push endpoints must be public). TTL 1 hour, urgency `high` for "needs
@@ -276,9 +277,20 @@ host cannot be purged until the hosts are moved to another hat):
 
 ## 7. HTTP server
 
-- `axum` on one listener (default `127.0.0.1:7117`, configurable). TLS is
-  provided by the deployment topology (umbrella §7.5); the kernel does not
-  terminate TLS in v1.
+- `axum` on **one or more listeners** (`listen = ["127.0.0.1:7117"]` in
+  `config.toml`; `--listen` repeatable; `HENNERY_LISTEN` comma-separated;
+  default `127.0.0.1:7117`). Every listener serves the same router and the
+  same authentication and `Origin` rules (§3.3). Start fails if any address
+  cannot be bound. TLS is provided by the deployment topology (umbrella §7.5);
+  the kernel does not terminate TLS in v1.
+- **Browser access is bound to `public_url`, not to a listener.** Passkeys
+  need a domain as RP id (an IP address cannot be one) and state-changing
+  requests must carry the `public_url` origin, so a browser has to reach the
+  collector through the `public_url` address. Extra listeners are for
+  origin-exempt clients: e.g. loopback for the local host child of
+  `hennery up` plus a LAN or Tailscale address for remote hosts and gateway
+  clients, without binding `0.0.0.0`. `doctor` warns when `public_url` reaches
+  neither a listener nor a reverse proxy (distribution §7, check 16).
 - Static assets are embedded (`rust-embed`, deterministic timestamps): hashed
   assets `Cache-Control: immutable`, `index.html` and the service worker
   `no-cache` with an ETag.
@@ -363,6 +375,11 @@ an existing data directory without `--force`.
   with the host child.
 - The admin socket's TTY confirmation (§4.2) protects against accidents, not
   against a local process of the same user.
+- **`master.key` stays a file (0600) in v1, not an OS keystore entry**
+  (decided 2026-09-27). A keystore would stop same-user agents from reading
+  the file but not from asking the running collector through `admin.sock` or
+  the database it decrypts, and it breaks headless and container installs. The
+  separate OS user or container above is the real protection.
 
 ## 11. Testing
 
@@ -370,7 +387,8 @@ an existing data directory without `--force`.
   printed only to a TTY.
 - Login rate limiting; constant-time failure path.
 - Passkey flows with a software authenticator (`passkey` crate).
-- `Origin` rules per route class (§3.3), including a missing `Origin`.
+- `Origin` rules per route class (§3.3), including a missing `Origin`, on
+  every listener; start fails when one of several addresses is taken.
 - Step-up: every listed action refused without a fresh check, accepted within
   5 minutes, refused after.
 - CSP header present on every HTML response; the theme bootstrap hash matches
@@ -389,11 +407,10 @@ an existing data directory without `--force`.
 
 ## 12. Open questions
 
-1. **Owner contact for VAPID** — ask at setup, or derive from `public_url`
-   only?
-2. **Multiple listeners** (loopback plus a LAN address) — needed in v1, or is
-   one address plus a reverse proxy enough?
-3. **`master.key` in the OS keystore** (macOS keychain, Secret Service) instead
-   of a file. It would stop same-user agents from reading the key file
-   directly, but not from asking the running collector; weigh against headless
-   and container installs.
+None open. Resolved by the maintainer on 2026-09-27:
+
+1. **Owner contact for VAPID** — not asked at setup; derived from
+   `public_url` unless set in Settings (§6).
+2. **Multiple listeners** — supported in v1; browser access stays bound to
+   `public_url` (§7).
+3. **`master.key` in the OS keystore** — no; a file in v1 (§10).

@@ -372,6 +372,8 @@ are never printed (only "logged in" and the method).
 | 13 | Bundled vs terminal CLI: the pinned bundled `claude`/`codex` version compared with the one on the user's PATH; warn on a large gap (sessions resumed from the terminal may meet an unexpected format) |
 | 14 | Single instance: no other host process holds `host.lock` in this data directory |
 | 15 | Collector isolation: gateway credentials for more than one hat while the collector shares its OS user with agents (warn, kernel spec §10) |
+| 16 | Collector listeners: every configured address bound; `public_url` reaches one of them or a reverse proxy (warn, kernel spec §7) |
+| 17 | CLI overrides (`--use-cli`): the operator's CLI version against the pinned one (warn on a gap, §13) |
 
 The host runs checks 3–4, 9, 12 and 13 on demand (`probe_agents`) and reports
 them to the collector, so the Hosts view shows them without a terminal.
@@ -464,11 +466,15 @@ Checked 2026-09-27:
 
 ## 13. Open questions
 
-1. **Headless macOS hosts** — is "requires a logged-in user" acceptable for v1,
-   or should hennery support a keychain-less credential path?
-2. **Adapter set size** — ~700 MB per set is mostly the bundled CLIs. Is it
-   worth offering "use my own CLI" (`CLAUDE_CODE_EXECUTABLE`, `CODEX_PATH`) as a
-   first-class, space-saving install option? The cost is losing the pin's
-   guarantee and, because any override drops that agent to the mixed-host MCP
-   fallback unless the operator accepts unverified isolation (ACP core §6), the
-   gateway's per-hat mounts on mixed hosts.
+None open. Resolved by the maintainer on 2026-09-27:
+
+1. **Headless macOS hosts** — "requires a logged-in user" is accepted for v1
+   (§6.2). Headless deployments use Linux or the container image.
+2. **"Use my own CLI"** — offered as an **advanced** install option, not the
+   default. `--use-cli claude=<path>` (and `codex=<path>`) on `hennery host
+   join` or `hennery host adapters update` records the override in `host.toml`
+   and skips downloading that CLI, saving most of the ~700 MB set. The installer and the host's
+   Hosts page say plainly that the agent loses the pin's guarantee and, on a
+   mixed host, drops to the MCP fallback unless the operator accepts
+   unverified isolation (ACP core §6). `doctor` reports the CLI's version
+   against the pinned one (check 17).

@@ -337,8 +337,9 @@ One form, one request (`POST /api/sessions`):
   "Purge hat" (lists what will be deleted; confirmation plus step-up).
 - **Settings:** account and passkeys, push devices (subscribe/unsubscribe per
   device), `public_url` (with a warning that passkeys and OAuth registrations
-  must be redone after a change), per-hat push policy (mute, include details,
-  generic title), and the deployment warning when the collector shares its OS
+  must be redone after a change), optional owner contact for push (kernel spec
+  §6), attachment store disk usage (ACP core §15), per-hat push policy (mute,
+  include details, generic title), and the deployment warning when the collector shares its OS
   user with agents while holding credentials for several hats (kernel spec
   §10).
 

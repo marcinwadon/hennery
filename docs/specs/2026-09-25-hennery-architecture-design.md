@@ -667,8 +667,9 @@ confirmation on a terminal.
 servers only. Each Claude session still loads the user's own `~/.claude`
 configuration — `CLAUDE.md` and its imports, auto-memory, hooks, skills and
 plugins — and Codex loads the global `AGENTS.md` and any `notify` command.
-These are accidental cross-hat channels outside hennery's control in v1 (open
-question in §16).
+These are accidental cross-hat channels outside hennery's control in v1; v1
+documents them rather than offering a per-hat switch (decided 2026-09-27,
+ACP core §15).
 
 A hat that needs strong isolation belongs on **its own host**: a separate OS
 user, container or machine, paired as a separate host whose default hat is that
@@ -1057,18 +1058,24 @@ Resolved since the first draft:
 - *Symlinked paths* — canonicalised on the host before any matching
   (kernel §5.2).
 
-Still open:
+Decided by the maintainer on 2026-09-27 (details in the subsystem specs):
 
-1. **Per-hat "isolate agent user config".** Whether a hat can keep its sessions
-   from loading the user's own agent configuration (§8.4); ACP core open
-   question 2.
-2. **Concurrent Codex processes sharing a composed home** — must be measured
-   before Codex leaves the fallback on mixed hosts (§8.5); ACP core open
-   question 3.
-3. **`master.key` in the OS keystore** instead of a file (kernel open
-   questions).
-4. Other subsystem-level open questions are listed at the end of each
-   subsystem spec.
+- *Per-hat "isolate agent user config"* — documentation only in v1 (§8.4,
+  ACP core §15).
+- *`master.key`* — a file, not an OS keystore entry (kernel §10).
+- *Headless macOS* — a logged-in user is required in v1; *"use my own CLI"*
+  is an advanced install option (distribution §13).
+- *Attachments* — no size cap in v1; *VAPID contact* — optional, derived from
+  `public_url`; *listeners* — several allowed, browser access bound to
+  `public_url`; *static-token headers* — name plus optional prefix.
+
+Still open — measurements, not decisions:
+
+1. **Concurrent Codex processes sharing a composed home** — Codex on mixed
+   hosts stays on the fallback until a live gate measures it (§8.5).
+2. Transcript windowing threshold (frontend §15), vendor token behaviour over
+   days and the `GET` SSE channel (gateway §13) — measured once the code
+   exists.
 
 ---
 
