@@ -223,8 +223,10 @@ impl Store {
             }
             SessionBody::TurnEnded { turn_id, outcome, .. } => {
                 // Applied only to the open turn; a late duplicate for an
-                // already-ended turn is stored but changes nothing.
-                tx.execute(
+                // already-ended turn is stored but not applied, and (ACP core
+                // §4.4) must never be pushed to a caller — only the store
+                // knows whether the transition actually applied.
+                let applied = tx.execute(
                     "UPDATE sessions SET open_turn_id = NULL, activity = 'idle' WHERE id = ?1 AND open_turn_id = ?2",
                     params![session_id, turn_id],
                 )?;
@@ -232,6 +234,9 @@ impl Store {
                     "UPDATE turns SET outcome = ?2 WHERE turn_id = ?1 AND outcome IS NULL",
                     params![turn_id, serde_json::to_value(outcome)?.as_str().unwrap_or_default()],
                 )?;
+                if applied == 0 {
+                    created.clear();
+                }
             }
             SessionBody::AcpUpdate { .. } => {}
         }

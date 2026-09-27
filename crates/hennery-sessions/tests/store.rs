@@ -112,12 +112,23 @@ fn turn_ended_closes_only_the_open_turn_and_a_late_duplicate_changes_nothing() {
             .open_turn("s1", "t2", &[json!({"type": "text", "text": "b"})])
             .unwrap()
     );
-    // A late turn_ended for t1 (e.g. resent after a reconnect) must not close t2.
-    store.ingest("s1", 3, &ended("t1")).unwrap();
-    assert_eq!(
-        store.session("s1").unwrap().unwrap().open_turn_id.as_deref(),
-        Some("t2")
-    );
+    store
+        .ingest(
+            "s1",
+            3,
+            &SessionBody::TurnStarted {
+                request_id: "r2".into(),
+                turn_id: "t2".into(),
+            },
+        )
+        .unwrap();
+    // A late turn_ended for t1 (e.g. resent after a reconnect) must not close t2,
+    // and per ACP core §4.4 must not be pushed since it was not applied.
+    let late = store.ingest("s1", 4, &ended("t1")).unwrap();
+    assert!(late.is_empty());
+    let s = store.session("s1").unwrap().unwrap();
+    assert_eq!(s.open_turn_id.as_deref(), Some("t2"));
+    assert_eq!(s.activity.as_deref(), Some("running"));
 }
 
 #[test]
