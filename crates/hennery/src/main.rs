@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use axum::response::Html;
 use axum::routing::get;
 use clap::{Args, Parser, Subcommand};
+use hennery_host::session::IDLE_TIMEOUT;
 use hennery_host::{AgentCommand, HostConfig};
 use hennery_kernel::auth::DevToken;
 use hennery_sessions::{AppState, store::Store};
@@ -62,7 +63,7 @@ struct HostArgs {
     #[arg(long = "agent", value_parser = parse_agent)]
     agents: Vec<(String, AgentCommand)>,
     /// Park sessions idle for this many seconds; 0 turns the reaper off.
-    #[arg(long, default_value_t = 1800)]
+    #[arg(long, default_value_t = IDLE_TIMEOUT.as_secs())]
     idle_timeout_secs: u64,
 }
 
@@ -77,7 +78,7 @@ struct UpArgs {
     #[arg(long = "agent", value_parser = parse_agent)]
     agents: Vec<(String, AgentCommand)>,
     /// Park sessions idle for this many seconds; 0 turns the reaper off.
-    #[arg(long, default_value_t = 1800)]
+    #[arg(long, default_value_t = IDLE_TIMEOUT.as_secs())]
     idle_timeout_secs: u64,
 }
 

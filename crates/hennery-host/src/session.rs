@@ -379,7 +379,7 @@ impl Actor {
                 }
                 _ = idle_deadline(self.options.idle_timeout, idle_since), if turn.is_none() => {
                     tracing::info!(session_id = %self.session_id, "reaping idle session");
-                    adapter.terminate(self.options.kill_grace).await;
+                    self.teardown(&mut adapter, &mut updates, None).await;
                     return self.emit(SessionBody::SessionParked { reason: ParkReason::Idle });
                 }
             }
