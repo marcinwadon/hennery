@@ -709,6 +709,8 @@ name = "hennery-testkit"
 version = "0.0.0"
 dependencies = [
  "agent-client-protocol",
+ "hennery-host",
+ "hennery-proto",
  "serde",
  "serde_json",
  "tokio",

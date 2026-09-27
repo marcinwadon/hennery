@@ -2,3 +2,7 @@
 //! sessions to the collector (ACP core spec §2).
 
 pub mod outbox;
+pub mod session;
+pub mod uplink;
+
+pub use session::AgentCommand;
