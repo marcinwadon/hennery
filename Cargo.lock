@@ -868,6 +868,7 @@ dependencies = [
  "hennery-proto",
  "hennery-sessions",
  "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

@@ -135,12 +135,21 @@ async fn serve(socket: WebSocket, state: AppState) {
         };
         match frame {
             HostFrame::Session { session_id, seq, body } => {
-                // A host may only write to its own sessions.
+                // A host may only write to its own sessions. Acks are
+                // cumulative and the host prunes its outbox on ack, so any
+                // store error here (lookup or ingest) must drop the
+                // connection rather than silently skip the frame: acking a
+                // later frame would tell the host this one is safe to
+                // discard forever (ACP core §3.3, §5).
                 match state.store.session(&session_id) {
                     Ok(Some(row)) if row.host_id == host_id => {}
-                    _ => {
+                    Ok(_) => {
                         tracing::warn!(%host_id, %session_id, "frame for a session this host does not own");
                         continue;
+                    }
+                    Err(err) => {
+                        tracing::error!(%host_id, %session_id, error = %err, "store lookup failed; dropping connection without acking");
+                        break;
                     }
                 }
                 match state.store.ingest(&session_id, seq, &body) {
@@ -167,7 +176,10 @@ async fn serve(socket: WebSocket, state: AppState) {
                             ack_seq: seq,
                         });
                     }
-                    Err(err) => tracing::error!(%host_id, error = %err, "ingest failed; not acking"),
+                    Err(err) => {
+                        tracing::error!(%host_id, error = %err, "ingest failed; dropping connection without acking");
+                        break;
+                    }
                 }
             }
             HostFrame::Error {

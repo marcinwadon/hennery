@@ -66,9 +66,9 @@ fn request_failed(err: RequestError) -> Response {
             error(status, &code, message)
         }
         RequestError::DeliveryUnknown => error(
-            StatusCode::GATEWAY_TIMEOUT,
+            StatusCode::SERVICE_UNAVAILABLE,
             "delivery_unknown",
-            "the host did not confirm in time; the result will appear when it reconnects",
+            "host disconnected; delivery unknown",
         ),
     }
 }

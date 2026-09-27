@@ -24,5 +24,6 @@ hennery-kernel.workspace = true
 hennery-proto.workspace = true
 hennery-sessions.workspace = true
 reqwest.workspace = true
+rusqlite.workspace = true
 tempfile = "3"
 tokio-tungstenite.workspace = true
