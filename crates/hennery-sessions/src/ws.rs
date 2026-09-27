@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 const MAX_FRAME: usize = 32 << 20;
 const PING_INTERVAL: Duration = Duration::from_secs(15);
-const READ_TIMEOUT: Duration = Duration::from_secs(45);
+pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(45);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub fn router(state: AppState) -> Router {
@@ -117,8 +117,9 @@ async fn serve(socket: WebSocket, state: AppState) {
     // (below), outside `Hub::request_for_session`: no waiter is registered
     // for them, so their `request_id` is tracked here instead. A `not_attached`
     // rejection for one still has to close the session collector-side
-    // (decision 7), or it would silently wedge as `closed` in the store but
-    // still attached from the host's point of view.
+    // (decision 7): the host no longer has it attached, but the store would
+    // otherwise keep it `active` with `close_requested = 1` (until the host's
+    // next reconnect reconciles it).
     let mut reconcile_closes: HashMap<String, String> = HashMap::new();
     loop {
         let next = tokio::select! {
