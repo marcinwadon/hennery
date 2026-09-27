@@ -1,7 +1,7 @@
 # hennery design documents
 
-Status: design phase; the maintainer's open decisions are recorded below.
-Nothing is implemented yet.
+Status: the walking skeleton is implemented (Rust workspace, end-to-end host ↔ collector
+slice); everything else is design. The maintainer's decisions are recorded below.
 
 ## Reading order
 
@@ -24,7 +24,8 @@ Nothing is implemented yet.
      and its [harness](../spikes/2026-09-25-mcp-per-session/).
 4. Plans:
    - [Walking skeleton](plans/2026-09-26-walking-skeleton.md) — the first
-     implementation plan (9 tasks, code verified by replaying the plan).
+     implementation plan (9 tasks) — executed 2026-09-27; its "Execution status" section
+     lists where the built code deviates from the task text.
 
 ## Maintainer decisions (2026-09-27)
 

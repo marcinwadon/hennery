@@ -10,6 +10,33 @@
 
 **Spec:** [`docs/specs/2026-09-26-acp-core-design.md`](../specs/2026-09-26-acp-core-design.md) (primary), with the [architecture spec](../specs/2026-09-25-hennery-architecture-design.md) §5–§6 and the [kernel spec](../specs/2026-09-26-kernel-design.md) §1. Read the ACP core spec before starting; this plan implements a deliberate subset of it (see "Scope" below).
 
+## Execution status (2026-09-27)
+
+**Executed** on branch `feat/walking-skeleton` (task-by-task, each reviewed; then a whole-branch review and
+one fix wave). 51 tests pass. Where review found the plan's code wrong or in conflict with the spec, the
+**code and the spec win**; the task bodies below are kept as written and are not authoritative. Deviations:
+
+| Area | Plan text | As built | Why |
+|---|---|---|---|
+| Schema codegen (T1) | `root_schema_for` per root type | One generator, `subschema_for` + top-level `$defs`; keys sorted recursively | Plan output had dangling `$ref`s; key order depended on cargo feature unification (`preserve_order`) |
+| Adapter start (T4) | No start bound | `START_TIMEOUT` 75 s → `start_failed` | "Never left `starting`"; below the collector's 90 s (ACP core §3.4) |
+| Prompt dedup (T4) | `turn_id` recorded before validation | Validated first; only started turns are recorded | An invalid prompt blocked its corrected retry |
+| Read deadline (T5) | `timeout()` per `select!` iteration | Real deadline, moved only by received messages | The 15 s ping reset the 45 s deadline, so it never fired |
+| Backoff (T5) | Reset on `Ok` (never reached) | Reset after the first `ack` of a connection | Plan reset was dead code; resetting on `hello_ack` alone spun on a collector that cannot commit |
+| Late `turn_ended` (T7) | Returned from `ingest` and pushed | Stored, never returned or pushed | ACP core §4.4 |
+| Ingest error (T8) | Log and continue | Drop the host socket | Cumulative acks would ack past an uncommitted frame and the host would delete it |
+| Delivery unknown (T8) | 504 | 503 "host disconnected; delivery unknown", plus `session_id` on a start | ACP core §3.4 / §7 |
+| `hello_error` codes (T8) | `incompatible_protocol`, `unauthorized` | `incompatible`, `bad_proof` | ACP core §3.3 |
+| `hennery up` (T9) | Children share the terminal's process group | `process_group(0)`; supervisor forwards SIGTERM host-first | Ctrl-C hit both children directly, bypassing the ordered shutdown |
+| CI | `cargo …` | `cargo … --locked` | A stale `Cargo.lock` must fail, not be fixed silently |
+
+Obligations this skeleton hands to later plans:
+- **resume/park:** reconcile starts and turns after a drop or timeout (§3.4; today a lost prompt can wedge a session at 409, and a start can stay `starting`); `conflict` events for same-seq, different-payload duplicates (§3.6); hold `enqueue` for a resumed session until the handshake's fast-forward; fill `AttachedSession.open_turn_id`; re-emit `session_started` for a retried start.
+- **teardown:** end the actor when its adapter exits; kill the adapter's process group, not just the direct child.
+- **host connection:** reset backoff after a healthy period too (an idle host never gets an ack); bound `connect_async`.
+- **distribution:** the systemd unit needs `KillMode=mixed`.
+- **frontend:** settle generated TS optionals (`host_seq`, `indexed`).
+
 ## Scope
 
 In: workspace and tooling; wire types and codegen with a CI drift gate; the fake ACP adapter; the host outbox, session actor and connection loop; the collector store, host WebSocket, REST (`/api/hosts`, `/api/sessions`, `/api/sessions/{id}/prompt`, `/api/sessions/{id}/events`) and the session SSE stream; the `hennery` binary with `collector`, `host run` and `up`; end-to-end tests including a collector restart mid-turn.
@@ -4222,7 +4249,7 @@ All commands below run from the repository root inside the dev shell (`nix devel
   cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo run -p hennery-proto --bin gen -- --check
   ```
 
-  Expected: clean; 36 tests pass.
+  Expected: clean; 36 tests pass (as planned; 51 as built, see Execution status).
 
   ```bash
   git add crates/hennery Cargo.lock

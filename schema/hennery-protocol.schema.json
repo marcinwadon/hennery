@@ -1,0 +1,532 @@
+{
+  "$defs": {
+    "ApiError": {
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "session_id": {
+          "description": "Set when the error leaves a session reachable by id (e.g. a session\nstart whose delivery is unknown: the session was created and may\nstill start, but the caller has no other way to learn its id).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "code",
+        "message"
+      ],
+      "type": "object"
+    },
+    "AttachedSession": {
+      "description": "A session that a host still has an adapter for, reported in `hello`.",
+      "properties": {
+        "last_seq": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "open_turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "last_seq"
+      ],
+      "type": "object"
+    },
+    "CollectorFrame": {
+      "description": "Collector -> host.",
+      "oneOf": [
+        {
+          "properties": {
+            "collector_version": {
+              "type": "string"
+            },
+            "committed": {
+              "additionalProperties": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "description": "Highest committed seq per session listed in `hello`; the host\nfast-forwards its counters if they are lower (lost outbox).",
+              "type": "object"
+            },
+            "protocol_version": {
+              "type": "string"
+            },
+            "type": {
+              "const": "hello_ack",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "protocol_version",
+            "collector_version",
+            "committed"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "type": {
+              "const": "hello_error",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "code",
+            "message"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "start_session",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "session_id",
+            "agent",
+            "cwd"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "content": {
+              "description": "ACP ContentBlocks, built by the frontend.",
+              "items": true,
+              "type": "array"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "turn_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "prompt",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "session_id",
+            "turn_id",
+            "content"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "ack_seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "ack",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "ack_seq"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "EventDto": {
+      "description": "One stored timeline event, as served by REST and SSE.",
+      "properties": {
+        "body": true,
+        "event_id": {
+          "format": "int64",
+          "type": "integer"
+        },
+        "host_seq": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "kind": {
+          "type": "string"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "ts": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_id",
+        "session_id",
+        "kind",
+        "body",
+        "ts"
+      ],
+      "type": "object"
+    },
+    "HostFrame": {
+      "description": "Host -> collector.",
+      "oneOf": [
+        {
+          "properties": {
+            "attached_sessions": {
+              "items": {
+                "$ref": "#/$defs/AttachedSession"
+              },
+              "type": "array"
+            },
+            "host_id": {
+              "type": "string"
+            },
+            "host_version": {
+              "type": "string"
+            },
+            "protocol_version": {
+              "type": "string"
+            },
+            "token": {
+              "description": "Walking skeleton only: a shared development token. Replaced by an\nEd25519 proof of possession (ACP core §3.5).",
+              "type": "string"
+            },
+            "type": {
+              "const": "hello",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "protocol_version",
+            "host_version",
+            "host_id",
+            "token",
+            "attached_sessions"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Every state-bearing fact is a sequenced frame: it goes through the host\noutbox and is acked (ACP core §3.3).",
+          "properties": {
+            "body": {
+              "$ref": "#/$defs/SessionBody"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "session",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "session_id",
+            "seq",
+            "body"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A rejected request. Not outboxed: a rejection means nothing happened,\nso losing it only costs the collector a timeout.",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "error",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "code",
+            "message"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Sent once per connection after the unacked outbox has been resent.\nThe collector reconciles `hello.attached_sessions` only after this\nframe, so a resent `turn_ended` is never duplicated by a synthesised\none (ACP core §5.2).",
+          "properties": {
+            "type": {
+              "const": "resend_complete",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Indexed": {
+      "description": "Fields the collector may read from a session event. Closed set (ACP core §3.2).",
+      "properties": {
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "turn_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "PromptRequest": {
+      "properties": {
+        "content": {
+          "items": true,
+          "type": "array"
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "type": "object"
+    },
+    "PromptResponse": {
+      "properties": {
+        "turn_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "turn_id"
+      ],
+      "type": "object"
+    },
+    "SessionBody": {
+      "description": "The body of a sequenced, outboxed session frame.",
+      "oneOf": [
+        {
+          "description": "The adapter session exists. Resolves the collector's start waiter.",
+          "properties": {
+            "agent_session_id": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "session_started",
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "request_id",
+            "agent_session_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The host accepted a start but could not create the adapter session\n(spawn, `initialize` or `session/new` failed). Rejects the start waiter.",
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "kind": {
+              "const": "start_failed",
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "request_id",
+            "code",
+            "message"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The prompt reached the adapter. Resolves the collector's prompt waiter.",
+          "properties": {
+            "kind": {
+              "const": "turn_started",
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "turn_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "request_id",
+            "turn_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "An ACP message from the adapter, verbatim in `payload`.",
+          "properties": {
+            "indexed": {
+              "$ref": "#/$defs/Indexed",
+              "default": {}
+            },
+            "kind": {
+              "const": "acp_update",
+              "type": "string"
+            },
+            "payload": true
+          },
+          "required": [
+            "kind",
+            "payload"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "kind": {
+              "const": "turn_ended",
+              "type": "string"
+            },
+            "outcome": {
+              "$ref": "#/$defs/TurnOutcome"
+            },
+            "stop_reason": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "turn_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "turn_id",
+            "outcome"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "StartSessionRequest": {
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "host_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "host_id",
+        "agent",
+        "cwd"
+      ],
+      "type": "object"
+    },
+    "StartSessionResponse": {
+      "properties": {
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "TurnOutcome": {
+      "description": "How a turn ended. Exactly one `turn_ended` per accepted turn (ACP core §4.4).",
+      "enum": [
+        "completed",
+        "cancelled",
+        "failed",
+        "interrupted"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "hennery protocol"
+}

@@ -1,0 +1,19 @@
+[package]
+name = "hennery"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+libc = "0.2"
+hennery-host.workspace = true
+hennery-kernel.workspace = true
+hennery-sessions.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
