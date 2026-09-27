@@ -40,7 +40,7 @@ This is **plan A** of the skeleton's "After this plan" item (1). That item was t
 
 ## Decisions this plan makes where the spec is silent
 
-These go to the maintainer for confirmation. The tasks implement them as written.
+Confirmed by the maintainer on 2026-09-27. The tasks implement them as written.
 
 1. **A request timeout on a live connection drops that connection** (`Hub::disconnect`). §3.4 says such a timeout is "reported the same way" as a drop, but reconciliation only runs at a handshake. Forcing a reconnect is what makes the timed-out start or turn reconcile at all. The cost is that the other sessions on that host see a reconnect; their adapters are unaffected (§2.1).
 2. **A late `turn_started` wins over `not_delivered`.** The turn opens again, because the adapter really has it. This happens if the fact was emitted after the host's resend snapshot.
