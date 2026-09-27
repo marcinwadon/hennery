@@ -590,3 +590,55 @@ async fn commands_queued_behind_an_ending_actor_are_answered_not_attached() {
     );
     wait_until(&uplink, has("session_parked:operator")).await;
 }
+
+/// Every `update:*` must sit between the `turn_started`/`turn_ended` pair of
+/// the turn that produced it: an update outside that window means it landed
+/// after its turn had already ended (or before it started).
+fn assert_updates_stay_inside_their_turns(kinds: &[String]) {
+    let mut in_turn = false;
+    for kind in kinds {
+        if kind == "turn_started" {
+            in_turn = true;
+        } else if kind == "turn_ended" {
+            in_turn = false;
+        } else if kind.starts_with("update:") {
+            assert!(in_turn, "an update landed outside any open turn: {kinds:?}");
+        }
+    }
+}
+
+/// Regression test for a multi-thread-only race: the ACP connection runs in
+/// its own task, on its own worker thread. It can push a `session/update`
+/// notification and then resolve the matching prompt reply in quick
+/// succession; the actor's `select!` can observe the reply as ready before
+/// it happens to observe the notification in the very same poll, emitting
+/// `turn_ended` first and the update after, as a stray. A single-thread
+/// runtime can never interleave the two tasks like this, so this needs
+/// `flavor = "multi_thread"` to have a chance of ever exercising the gap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn updates_never_land_outside_their_turn_under_a_multi_thread_runtime() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        chunks: (1..=30).map(|n| n.to_string()).collect(),
+        chunk_delay_ms: 0,
+        ..FakeScript::default()
+    };
+    let handle = session::start(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        fake_with(&script),
+        std::env::temp_dir(),
+    );
+    wait_until(&uplink, has("session_started")).await;
+    for i in 0..40 {
+        assert!(handle.send(prompt(&format!("r{i}"), &format!("t{i}"))));
+        let ended = i + 1;
+        wait_until(&uplink, move |f| {
+            kinds(f).iter().filter(|k| *k == "turn_ended").count() == ended
+        })
+        .await;
+    }
+    let frames = uplink.pending().unwrap();
+    assert_updates_stay_inside_their_turns(&kinds(&frames));
+}

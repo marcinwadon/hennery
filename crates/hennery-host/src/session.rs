@@ -190,12 +190,19 @@ impl Actor {
     ) {
         self.drive(request_id, agent, cwd, &mut commands).await;
         // The session's last frame is in the outbox. Commands sent while the
-        // actor was ending (killing its adapter can take the whole grace)
-        // are answered, never dropped: the collector would otherwise wait
-        // out its timeout. `close` first, so nothing slips in after the
-        // last `try_recv`.
+        // actor was ending (killing its adapter can take the whole grace) are
+        // answered, never dropped: the collector would otherwise wait out its
+        // timeout. `close()` stops new sends from succeeding but does not
+        // make a `try_recv` drain safe: `UnboundedSender::send` reserves its
+        // slot (so the caller sees `Ok`/`true`) before it actually pushes the
+        // value, so a send that reserved its slot just before `close()` can
+        // still push after `close()` returns, while the queue looks empty to
+        // `try_recv` in between — losing that command after its sender was
+        // told it was queued. `recv().await` instead waits for the channel to
+        // truly go empty (every already-permitted send observed) before
+        // yielding `None`, so nothing sent before `close()` is lost.
         commands.close();
-        while let Ok(cmd) = commands.try_recv() {
+        while let Some(cmd) = commands.recv().await {
             match cmd {
                 SessionCmd::Prompt { request_id, .. }
                 | SessionCmd::Park { request_id }
@@ -329,20 +336,28 @@ impl Actor {
                         agent_session_id: agent_session.to_string(),
                     }),
                     Some(SessionCmd::Park { .. }) => {
-                        self.teardown(&mut adapter, turn.take()).await;
+                        self.teardown(&mut adapter, &mut updates, turn.take()).await;
                         return self.emit(SessionBody::SessionParked { reason: ParkReason::Operator });
                     }
                     Some(SessionCmd::Close { .. }) => {
-                        self.teardown(&mut adapter, turn.take()).await;
+                        self.teardown(&mut adapter, &mut updates, turn.take()).await;
                         return self.emit(SessionBody::SessionClosed);
                     }
                 },
                 result = next_reply(&mut turn) => {
                     let ended = turn.take().expect("a reply implies a turn");
+                    // Closes the race described on `drain_updates`: a late
+                    // update that arrived just as the reply resolved must be
+                    // emitted before this turn's `turn_ended`.
+                    self.drain_updates(&mut updates);
                     match result {
                         Ok(response) => self.end_turn(ended.id, TurnOutcome::Completed, stop_reason(&response), None),
                         Err(err) => {
-                            if let Some(info) = adapter.exited_within(EXIT_SETTLE).await {
+                            let exited = adapter.exited_within(EXIT_SETTLE).await;
+                            // Updates that arrived during the wait above are
+                            // also ahead of this turn's end.
+                            self.drain_updates(&mut updates);
+                            if let Some(info) = exited {
                                 return self.adapter_exited(info, &mut adapter, &mut updates, Some(ended)).await;
                             }
                             self.end_turn(ended.id, TurnOutcome::Failed, None, Some(err.to_string()));
@@ -371,8 +386,25 @@ impl Actor {
         self.set_open_turn(None);
     }
 
-    /// Park or close: end the turn as interrupted, then kill the group.
-    async fn teardown(&self, adapter: &mut Adapter, turn: Option<Turn>) {
+    /// Emit whatever updates are already queued, without waiting. The ACP
+    /// connection task and this actor run on different worker threads: it
+    /// can push a notification and then resolve the matching reply in quick
+    /// succession, and this actor's `select!` can observe the reply as ready
+    /// before it happens to observe the notification, in the same poll. ACP
+    /// delivers messages in order, so the notification's send always
+    /// completes-before the reply resolves — a non-blocking drain right
+    /// before acting on a reply (or before ending a torn-down turn) is
+    /// therefore guaranteed to see it, closing that ordering gap.
+    fn drain_updates(&self, updates: &mut mpsc::UnboundedReceiver<Value>) {
+        while let Ok(payload) = updates.try_recv() {
+            self.emit(update(payload));
+        }
+    }
+
+    /// Park or close: forward any output already queued, end the turn as
+    /// interrupted, then kill the group.
+    async fn teardown(&self, adapter: &mut Adapter, updates: &mut mpsc::UnboundedReceiver<Value>, turn: Option<Turn>) {
+        self.drain_updates(updates);
         if let Some(turn) = turn {
             self.end_turn(turn.id, TurnOutcome::Interrupted, None, None);
         }
