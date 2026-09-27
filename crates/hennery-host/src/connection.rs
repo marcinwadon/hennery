@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Debug, Clone)]
@@ -64,9 +65,8 @@ pub async fn run(cfg: HostConfig) -> Result<()> {
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
     let mut backoff = cfg.reconnect_min;
     loop {
-        match connect_once(&cfg, &uplink, &sessions, &mut replies).await {
-            Ok(()) => backoff = cfg.reconnect_min,
-            Err(err) => tracing::warn!(error = %err, "collector connection ended"),
+        if let Err(err) = connect_once(&cfg, &uplink, &sessions, &mut replies, &mut backoff).await {
+            tracing::warn!(error = %err, "collector connection ended");
         }
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(cfg.reconnect_max);
@@ -78,6 +78,7 @@ async fn connect_once(
     uplink: &Uplink,
     sessions: &Sessions,
     replies: &mut mpsc::UnboundedReceiver<HostFrame>,
+    backoff: &mut Duration,
 ) -> Result<()> {
     let (ws, _) = tokio_tungstenite::connect_async(&cfg.collector_url)
         .await
@@ -121,6 +122,9 @@ async fn connect_once(
         },
         other => bail!("no hello_ack: {other:?}"),
     }
+    // The handshake succeeded: forget any accumulated backoff from earlier
+    // failed attempts, even if this connection later dies before returning.
+    *backoff = cfg.reconnect_min;
     tracing::info!(collector = %cfg.collector_url, "connected to collector");
 
     // Resend everything unacked, then tell the collector we are done.
@@ -130,21 +134,30 @@ async fn connect_once(
 
     let mut ping = tokio::time::interval(cfg.ping_interval);
     ping.tick().await;
+    // Tracks the deadline independently of `select!`'s per-iteration futures:
+    // rebuilding `timeout(stream.next())` fresh every loop (as the earlier
+    // version did) restarts its clock on every unrelated arm (a ping tick, an
+    // outbox wakeup, a reply), so the "no frame in read_timeout" branch could
+    // never actually fire. `deadline` only moves when a frame arrives.
+    let mut deadline = Instant::now() + cfg.read_timeout;
     loop {
         tokio::select! {
             _ = uplink.changed() => send_pending(&mut sink, uplink, &mut sent).await?,
             Some(frame) = replies.recv() => send(&mut sink, &frame).await?,
             _ = ping.tick() => sink.send(Message::Ping(Default::default())).await?,
-            msg = tokio::time::timeout(cfg.read_timeout, stream.next()) => match msg {
-                Err(_) => bail!("no frame from collector within {:?}", cfg.read_timeout),
-                Ok(None) => bail!("collector closed the connection"),
-                Ok(Some(Err(err))) => return Err(err.into()),
-                Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<CollectorFrame>(&text) {
-                    Ok(frame) => handle(cfg, uplink, sessions, frame)?,
-                    Err(err) => tracing::warn!(error = %err, "ignoring unknown or invalid frame"),
-                },
-                Ok(Some(Ok(Message::Close(_)))) => bail!("collector closed the connection"),
-                Ok(Some(Ok(_))) => {} // ping/pong/binary: liveness only
+            _ = tokio::time::sleep_until(deadline) => bail!("no frame from collector within {:?}", cfg.read_timeout),
+            msg = stream.next() => {
+                deadline = Instant::now() + cfg.read_timeout;
+                match msg {
+                    None => bail!("collector closed the connection"),
+                    Some(Err(err)) => return Err(err.into()),
+                    Some(Ok(Message::Text(text))) => match serde_json::from_str::<CollectorFrame>(&text) {
+                        Ok(frame) => handle(cfg, uplink, sessions, frame)?,
+                        Err(err) => tracing::warn!(error = %err, "ignoring unknown or invalid frame"),
+                    },
+                    Some(Ok(Message::Close(_))) => bail!("collector closed the connection"),
+                    Some(Ok(_)) => {} // ping/pong/binary: liveness only
+                }
             },
         }
     }

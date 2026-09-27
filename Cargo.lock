@@ -709,11 +709,14 @@ name = "hennery-testkit"
 version = "0.0.0"
 dependencies = [
  "agent-client-protocol",
+ "futures",
  "hennery-host",
  "hennery-proto",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]
