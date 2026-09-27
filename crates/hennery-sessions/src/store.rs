@@ -238,7 +238,12 @@ impl Store {
                     created.clear();
                 }
             }
-            SessionBody::AcpUpdate { .. } => {}
+            // Stored on the timeline; their state transitions land with
+            // reconciliation.
+            SessionBody::AcpUpdate { .. }
+            | SessionBody::SessionParked { .. }
+            | SessionBody::SessionClosed
+            | SessionBody::AdapterExited { .. } => {}
         }
         tx.execute(
             "UPDATE sessions SET last_event_at = ?2 WHERE id = ?1",
@@ -287,6 +292,9 @@ fn body_kind(body: &SessionBody) -> &'static str {
         SessionBody::TurnStarted { .. } => "turn_started",
         SessionBody::AcpUpdate { .. } => "acp_update",
         SessionBody::TurnEnded { .. } => "turn_ended",
+        SessionBody::SessionParked { .. } => "session_parked",
+        SessionBody::SessionClosed => "session_closed",
+        SessionBody::AdapterExited { .. } => "adapter_exited",
     }
 }
 

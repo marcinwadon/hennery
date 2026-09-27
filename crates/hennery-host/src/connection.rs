@@ -229,6 +229,14 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
                 }),
             }
         }
+        // Wired to the session actor with teardown; until then a park or
+        // close is refused, so the collector's waiter returns at once.
+        CollectorFrame::ParkSession { request_id, .. } | CollectorFrame::CloseSession { request_id, .. } => uplink
+            .reply(HostFrame::Error {
+                request_id,
+                code: "unsupported".into(),
+                message: "this host cannot park or close sessions yet".into(),
+            }),
         CollectorFrame::Ack { session_id, ack_seq } => uplink.ack(&session_id, ack_seq)?,
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }

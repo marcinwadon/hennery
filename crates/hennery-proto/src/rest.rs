@@ -52,3 +52,11 @@ pub struct ApiError {
     #[ts(type = "string | undefined", optional)]
     pub session_id: Option<String>,
 }
+
+/// Result of a park or close: the session's lifecycle once the request took
+/// effect (`parked` or `closed`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct LifecycleResponse {
+    pub session_id: String,
+    pub lifecycle: String,
+}

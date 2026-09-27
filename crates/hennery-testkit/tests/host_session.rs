@@ -24,6 +24,14 @@ fn kinds(frames: &[HostFrame]) -> Vec<String> {
                     )
                 }
                 SessionBody::TurnEnded { .. } => "turn_ended".to_string(),
+                SessionBody::SessionParked { reason } => {
+                    format!(
+                        "session_parked:{}",
+                        serde_json::to_value(reason).unwrap().as_str().unwrap()
+                    )
+                }
+                SessionBody::SessionClosed => "session_closed".to_string(),
+                SessionBody::AdapterExited { .. } => "adapter_exited".to_string(),
             },
             other => format!("{other:?}"),
         })
