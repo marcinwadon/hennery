@@ -593,3 +593,259 @@ async fn a_host_that_returns_after_a_collector_restart_is_not_presumed_offline()
     assert_eq!(collector.lifecycle("s1"), "active");
     assert!(!presumed(&collector, "s1"));
 }
+
+// Plan B: the resume and detail endpoints, against a scripted host.
+
+async fn get(c: &reqwest::Client, url: String) -> (u16, Value) {
+    let resp = c.get(url).timeout(Duration::from_secs(15)).send().await.unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+/// A started session its host has just parked (idle reap).
+async fn parked_session(collector: &Collector, host: &mut ScriptedHost) -> String {
+    let session = started_session(collector, host).await;
+    host.emit(
+        &session,
+        SessionBody::SessionParked {
+            reason: hennery_proto::frames::ParkReason::Idle,
+        },
+    )
+    .await;
+    wait_for("parked", || async {
+        (collector.lifecycle(&session) == "parked").then_some(())
+    })
+    .await;
+    session
+}
+
+fn resume_url(collector: &Collector, session: &str) -> String {
+    collector.url(&format!("/api/sessions/{session}/resume"))
+}
+
+/// The next frame must be a `resume_session` carrying everything the host
+/// needs, including the seq of the last frame it sent (all of them are
+/// committed by now); returns its request id.
+async fn expect_resume(host: &mut ScriptedHost, session: &str) -> String {
+    let committed_seq = host.seq;
+    match host.next().await {
+        CollectorFrame::ResumeSession {
+            request_id,
+            session_id,
+            committed_seq: seq,
+            agent,
+            cwd,
+            agent_session_id,
+        } => {
+            assert_eq!(
+                (
+                    session_id.as_str(),
+                    seq,
+                    agent.as_str(),
+                    cwd.as_str(),
+                    agent_session_id.as_str()
+                ),
+                (session, committed_seq, "fake", "/tmp", "agent-1")
+            );
+            request_id
+        }
+        other => panic!("expected resume_session, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_resume_attaches_a_parked_session_again() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = parked_session(&collector, &mut host).await;
+    let c = client();
+    let url = resume_url(&collector, &session);
+    let call = tokio::spawn(async move { post(&c, url, json!({})).await });
+    let request_id = expect_resume(&mut host, &session).await;
+    assert_eq!(collector.lifecycle(&session), "starting");
+    host.emit(
+        &session,
+        SessionBody::SessionStarted {
+            request_id,
+            agent_session_id: "agent-1".into(),
+        },
+    )
+    .await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!((status, body["lifecycle"].as_str()), (202, Some("active")), "{body}");
+    let kinds = collector.event_kinds(&session);
+    assert!(
+        kinds.ends_with(&["operator_resumed".to_string(), "session_started".to_string()]),
+        "{kinds:?}"
+    );
+}
+
+/// ACP core §12 scenario 11: of two concurrent resumes, one attaches and
+/// the other gets 409; the host is asked only once.
+#[tokio::test]
+async fn two_concurrent_resumes_attach_once() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = parked_session(&collector, &mut host).await;
+    let c = client();
+    let url = resume_url(&collector, &session);
+    let first = tokio::spawn(async move { post(&c, url, json!({})).await });
+    let request_id = expect_resume(&mut host, &session).await;
+    let (status, body) = post(&client(), resume_url(&collector, &session), json!({})).await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("starting")), "{body}");
+    host.emit(
+        &session,
+        SessionBody::SessionStarted {
+            request_id,
+            agent_session_id: "agent-1".into(),
+        },
+    )
+    .await;
+    assert_eq!(first.await.unwrap().0, 202);
+    let more = tokio::time::timeout(Duration::from_millis(300), host.next()).await;
+    assert!(more.is_err(), "a second request reached the host: {more:?}");
+}
+
+/// ACP core §12 scenario 3, collector side: the host's `start_failed`
+/// reason becomes the session's failure reason and the HTTP error code.
+#[tokio::test]
+async fn a_resume_the_agent_cannot_load_fails_with_its_reason_and_can_be_retried() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = parked_session(&collector, &mut host).await;
+    let c = client();
+    let url = resume_url(&collector, &session);
+    let call = tokio::spawn(async move { post(&c, url, json!({})).await });
+    let request_id = expect_resume(&mut host, &session).await;
+    host.emit(
+        &session,
+        SessionBody::StartFailed {
+            request_id,
+            code: "agent_has_no_record".into(),
+            message: "Resource not found".into(),
+        },
+    )
+    .await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!((status, body["code"].as_str()), (502, Some("agent_has_no_record")));
+    let row = collector.state.store.session(&session).unwrap().unwrap();
+    assert_eq!(
+        (row.lifecycle.as_str(), row.failure_reason.as_deref()),
+        ("failed", Some("agent_has_no_record"))
+    );
+    // Failed is resumable: the operator may try again.
+    let c = client();
+    let url = resume_url(&collector, &session);
+    let _retry = tokio::spawn(async move { post(&c, url, json!({})).await });
+    expect_resume(&mut host, &session).await;
+}
+
+#[tokio::test]
+async fn a_resume_is_refused_while_active_offline_or_without_agent_history() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let active = started_session(&collector, &mut host).await;
+    let (status, body) = post(&client(), resume_url(&collector, &active), json!({})).await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("active")));
+
+    // A start the host failed: the agent never created a session.
+    let c = client();
+    let url = collector.url("/api/sessions");
+    let call =
+        tokio::spawn(async move { post(&c, url, json!({ "host_id": HOST, "agent": "fake", "cwd": "/tmp" })).await });
+    let CollectorFrame::StartSession {
+        request_id, session_id, ..
+    } = host.next().await
+    else {
+        panic!("expected start_session");
+    };
+    host.emit(
+        &session_id,
+        SessionBody::StartFailed {
+            request_id,
+            code: "agent_not_logged_in".into(),
+            message: "log in".into(),
+        },
+    )
+    .await;
+    assert_eq!(call.await.unwrap().0, 502);
+    let (status, body) = post(&client(), resume_url(&collector, &session_id), json!({})).await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("agent_has_no_record")));
+
+    let parked = parked_session(&collector, &mut host).await;
+    host.drop_connection(&collector).await;
+    let (status, body) = post(&client(), resume_url(&collector, &parked), json!({})).await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("host_offline")));
+    assert_eq!(
+        collector.lifecycle(&parked),
+        "parked",
+        "an offline resume changed the session"
+    );
+    let (status, _) = post(&client(), resume_url(&collector, "no-such-session"), json!({})).await;
+    assert_eq!(status, 404);
+}
+
+/// ACP core §5.1: a resume must not reach a host before its post-drop
+/// reconciliation, or it could race the resend of a turn it is still
+/// running against the presumed-parked session (Task 8 review).
+#[tokio::test]
+async fn a_resume_is_refused_while_the_host_is_connected_but_not_yet_reconciled() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = parked_session(&collector, &mut host).await;
+    let seq = host.seq;
+    host.drop_connection(&collector).await;
+    let _host = ScriptedHost::hello(&collector, vec![attached(&session, seq)], seq).await;
+    // Connected, but its resend is not complete: a resume must be refused,
+    // never sent, so it cannot race the resend (ACP core §5.1).
+    let (status, body) = post(&client(), resume_url(&collector, &session), json!({})).await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("host_offline")));
+    assert_eq!(
+        collector.lifecycle(&session),
+        "parked",
+        "a resume during reconciliation changed the session"
+    );
+}
+
+#[tokio::test]
+async fn a_resume_lost_in_a_drop_is_reconciled_like_a_start() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = parked_session(&collector, &mut host).await;
+    let c = client();
+    let url = resume_url(&collector, &session);
+    let call = tokio::spawn(async move { post(&c, url, json!({})).await });
+    expect_resume(&mut host, &session).await;
+    let seq = host.seq;
+    host.drop_connection(&collector).await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!((status, body["code"].as_str()), (503, Some("delivery_unknown")));
+    assert_eq!(collector.lifecycle(&session), "starting");
+    // The host comes back without it: the resume never happened.
+    let _host = ScriptedHost::connect(&collector, vec![], seq).await;
+    let row = collector.state.store.session(&session).unwrap().unwrap();
+    assert_eq!(
+        (row.lifecycle.as_str(), row.failure_reason.as_deref()),
+        ("failed", Some("start_not_delivered"))
+    );
+}
+
+#[tokio::test]
+async fn the_session_detail_shows_the_open_turn() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let turn = started_turn(&collector, &mut host, &session).await;
+    let (status, body) = get(&client(), collector.url(&format!("/api/sessions/{session}"))).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body,
+        json!({
+            "session_id": session, "host_id": HOST, "agent": "fake", "cwd": "/tmp",
+            "lifecycle": "active", "activity": "running", "presumed_parked": false,
+            "open_turn": { "turn_id": turn, "state": "started" }
+        })
+    );
+    let (status, _) = get(&client(), collector.url("/api/sessions/no-such-session")).await;
+    assert_eq!(status, 404);
+}

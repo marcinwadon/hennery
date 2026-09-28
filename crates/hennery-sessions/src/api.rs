@@ -2,6 +2,7 @@
 
 use crate::AppState;
 use crate::hub::RequestError;
+use crate::store::ResumeRequest;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -11,7 +12,8 @@ use axum::{Json, Router, middleware};
 use futures::stream::{self, Stream, StreamExt};
 use hennery_proto::frames::CollectorFrame;
 use hennery_proto::rest::{
-    ApiError, EventDto, LifecycleResponse, PromptRequest, PromptResponse, StartSessionRequest, StartSessionResponse,
+    ApiError, EventDto, LifecycleResponse, OpenTurn, PromptRequest, PromptResponse, SessionDetail, StartSessionRequest,
+    StartSessionResponse,
 };
 use serde::Deserialize;
 use std::convert::Infallible;
@@ -40,6 +42,8 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/api/hosts", get(list_hosts))
         .route("/api/sessions", post(start_session))
+        .route("/api/sessions/{id}", get(session_detail))
+        .route("/api/sessions/{id}/resume", post(resume))
         .route("/api/sessions/{id}/prompt", post(prompt))
         .route("/api/sessions/{id}/park", post(park))
         .route("/api/sessions/{id}/close", post(close))
@@ -141,6 +145,114 @@ async fn start_session(State(state): State<AppState>, Json(req): Json<StartSessi
                 _ => "host_offline".into(),
             };
             if let Err(e) = state.store.mark_failed(&session_id, &reason) {
+                return internal(e);
+            }
+            request_failed(err)
+        }
+    }
+}
+
+/// Session detail (ACP core §9): the list item plus the open turn.
+async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let session = match state.store.session(&id) {
+        Ok(Some(s)) => s,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) => return internal(err),
+    };
+    let open_turn = match session.open_turn_id {
+        Some(turn_id) => match state.store.turn_state(&turn_id) {
+            Ok(Some(turn_state)) => Some(OpenTurn {
+                turn_id,
+                state: turn_state,
+            }),
+            Ok(None) => None,
+            Err(err) => return internal(err),
+        },
+        None => None,
+    };
+    Json(SessionDetail {
+        session_id: session.id,
+        host_id: session.host_id,
+        agent: session.agent,
+        cwd: session.cwd,
+        lifecycle: session.lifecycle,
+        activity: session.activity,
+        failure_reason: session.failure_reason,
+        presumed_parked: session.presumed_parked,
+        open_turn,
+    })
+    .into_response()
+}
+
+/// Resume a parked, closed or failed session (ACP core §4.3): 202 with the
+/// lifecycle once the host's `session_started` is ingested.
+async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let session = match state.store.session(&id) {
+        Ok(Some(s)) => s,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) => return internal(err),
+    };
+    let busy = |lifecycle: &str| {
+        error(
+            StatusCode::CONFLICT,
+            lifecycle,
+            format!("the session is already {lifecycle}"),
+        )
+    };
+    if matches!(session.lifecycle.as_str(), "starting" | "active") {
+        return busy(&session.lifecycle);
+    }
+    // Checked before any state changes, so an offline host leaves the
+    // session exactly as it was.
+    if !state.hub.is_ready(&session.host_id) {
+        return request_failed(RequestError::NotConnected);
+    }
+    let (agent_session_id, committed_seq) = match state.store.request_resume(&id) {
+        Ok(ResumeRequest::Starting {
+            events,
+            agent_session_id,
+            committed_seq,
+        }) => {
+            for event in events {
+                state.hub.publish(event);
+            }
+            (agent_session_id, committed_seq)
+        }
+        // A concurrent resume got there first (ACP core §12 scenario 11).
+        Ok(ResumeRequest::Busy(lifecycle)) => return busy(&lifecycle),
+        Ok(ResumeRequest::NoRecord) => {
+            return error(
+                StatusCode::CONFLICT,
+                "agent_has_no_record",
+                "the agent never created this session; start a new one in the same project",
+            );
+        }
+        Ok(ResumeRequest::NotFound) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) => return internal(err),
+    };
+    let request_id = uuid::Uuid::now_v7().to_string();
+    let frame = CollectorFrame::ResumeSession {
+        request_id: request_id.clone(),
+        session_id: id.clone(),
+        committed_seq,
+        agent: session.agent,
+        cwd: session.cwd,
+        agent_session_id,
+    };
+    match state
+        .hub
+        .request(&session.host_id, &request_id, frame, START_TIMEOUT)
+        .await
+    {
+        Ok(_) => lifecycle_response(&state, &id),
+        // Still `starting`: the next handshake reconciles it (ACP core §3.4).
+        Err(RequestError::DeliveryUnknown) => request_failed(RequestError::DeliveryUnknown),
+        Err(err) => {
+            let reason = match &err {
+                RequestError::Rejected { code, .. } => code.clone(),
+                _ => "host_offline".into(),
+            };
+            if let Err(e) = state.store.mark_failed(&id, &reason) {
                 return internal(e);
             }
             request_failed(err)
