@@ -1073,3 +1073,61 @@ fn closing_or_resuming_a_presumed_session_ends_the_presumption() {
     let s2 = store.session("s2").unwrap().unwrap();
     assert_eq!((s2.lifecycle.as_str(), s2.presumed_parked), ("closed", false));
 }
+
+// The brief's tests above never send `presume_parked` a session whose open
+// turn is still genuinely open when a *real* detach fact later arrives (the
+// only test that reaches `session_parked` with `presumed_parked = 1` first
+// ends the turn for real, so `release_turn_on_detach` finds nothing to
+// release). Cover that path directly: `release_turn_on_detach`,
+// `SessionParked`'s guard, `SessionClosed`'s guard and `fact_applies` must
+// all treat a presumed-parked session as attached, not just `reconcile_host`
+// and the explicitly-listed store methods.
+
+#[test]
+fn a_real_session_parked_fact_still_releases_a_presumed_sessions_open_turn() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.ingest("s1", 2, &turn_started("t1")).unwrap();
+    store.presume_parked("h1").unwrap();
+    // The host, still holding the turn the presumption left it, reports a
+    // real park before any reconciliation happens.
+    let events = store
+        .ingest(
+            "s1",
+            3,
+            &SessionBody::SessionParked {
+                reason: ParkReason::Idle,
+            },
+        )
+        .unwrap();
+    assert_eq!(kinds(&events), ["session_parked", "turn_ended_synthesized"]);
+    let s1 = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (s1.lifecycle.as_str(), s1.presumed_parked, s1.open_turn_id),
+        ("parked", false, None)
+    );
+    assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("ended"));
+}
+
+#[test]
+fn a_real_session_closed_fact_still_applies_to_a_presumed_session() {
+    let store = Store::open_in_memory().unwrap();
+    two_hosts(&store);
+    store.presume_parked("h2").unwrap();
+    let events = store.ingest("s2", 2, &SessionBody::SessionClosed).unwrap();
+    assert_eq!(kinds(&events), ["session_closed"]);
+    let s2 = store.session("s2").unwrap().unwrap();
+    assert_eq!((s2.lifecycle.as_str(), s2.presumed_parked), ("closed", false));
+}
+
+#[test]
+fn an_acp_update_for_its_open_turn_still_applies_to_a_presumed_session() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.ingest("s1", 2, &turn_started("t1")).unwrap();
+    store.presume_parked("h1").unwrap();
+    let update = turn_update(Some("t1"));
+    assert_eq!(kinds(&store.ingest("s1", 3, &update).unwrap()), ["acp_update"]);
+}
