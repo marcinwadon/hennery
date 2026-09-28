@@ -25,9 +25,10 @@ const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 /// `park_session` / `close_session` (ACP core §3.4).
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 
-// Hub waiters are keyed on host_id, not on the connection: a request only
-// fails over safely if a half-open socket is dropped (after READ_TIMEOUT)
-// before the request's own timeout gives up. `Duration`'s `>` is not const.
+// ACP core §3.4: every state-changing request waits at least the read
+// deadline, so on a live connection its fact or rejection arrives first and
+// a half-open socket is dropped before the request gives up. `Duration`'s
+// `>` is not const.
 const _: () = assert!(
     START_TIMEOUT.as_millis() > crate::ws::READ_TIMEOUT.as_millis()
         && PROMPT_TIMEOUT.as_millis() > crate::ws::READ_TIMEOUT.as_millis()
