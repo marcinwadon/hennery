@@ -102,11 +102,6 @@ impl Hub {
         Some(Registration { conn_id, kicked })
     }
 
-    /// The latest connection `host_id` registered, if any since start.
-    pub fn last_conn(&self, host_id: &str) -> Option<u64> {
-        self.last_conn.lock().expect("last_conn lock").get(host_id).copied()
-    }
-
     /// Run `f` only if `host_id` has registered no connection since `since`
     /// (`None`: none since this collector started). The lock is held while
     /// `f` runs, so a reconnect waits for it and its reconciliation sees
@@ -185,15 +180,6 @@ impl Hub {
             .expect("hosts lock")
             .get(host_id)
             .is_some_and(|h| h.ready)
-    }
-
-    /// Send a frame to a ready host without waiting for anything.
-    pub fn send(&self, host_id: &str, frame: CollectorFrame) -> bool {
-        self.hosts
-            .lock()
-            .expect("hosts lock")
-            .get(host_id)
-            .is_some_and(|h| h.ready && h.tx.send(frame).is_ok())
     }
 
     /// Send a request and wait until the outboxed fact carrying `request_id`
