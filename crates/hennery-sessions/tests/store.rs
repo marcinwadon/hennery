@@ -1156,3 +1156,24 @@ fn a_rejected_reconcile_close_closes_only_a_session_still_waiting_on_that_close(
     assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "starting");
     assert_eq!(store.events("s1", 0, 100).unwrap(), before);
 }
+
+#[test]
+fn a_failed_resume_fails_only_a_session_still_starting() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.mark_failed_if_starting("s1", "not_attached").unwrap();
+    let s = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (s.lifecycle.as_str(), s.failure_reason.as_deref()),
+        ("active", None),
+        "an active session was overwritten"
+    );
+    parked(&store, 2);
+    store.request_resume("s1").unwrap();
+    store.mark_failed_if_starting("s1", "not_attached").unwrap();
+    let s = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (s.lifecycle.as_str(), s.failure_reason.as_deref()),
+        ("failed", Some("not_attached"))
+    );
+}

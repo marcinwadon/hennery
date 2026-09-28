@@ -263,7 +263,7 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
                 RequestError::Rejected { code, .. } => code.clone(),
                 _ => "host_offline".into(),
             };
-            if let Err(e) = state.store.mark_failed(&id, &reason) {
+            if let Err(e) = state.store.mark_failed_if_starting(&id, &reason) {
                 return internal(e);
             }
             resume_failed(err)

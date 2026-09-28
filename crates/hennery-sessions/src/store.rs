@@ -312,6 +312,18 @@ impl Store {
         Ok(())
     }
 
+    /// Like `mark_failed`, for a resume whose request failed: only a
+    /// session still `starting` is failed. Whatever moved it on while the
+    /// request was out (its `session_started`, a close, a newer resume's
+    /// outcome) is left as it is.
+    pub fn mark_failed_if_starting(&self, id: &str, reason: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE sessions SET lifecycle = 'failed', failure_reason = ?2 WHERE id = ?1 AND lifecycle = 'starting'",
+            params![id, reason],
+        )?;
+        Ok(())
+    }
+
     pub fn session(&self, id: &str) -> Result<Option<SessionRow>> {
         Ok(self
             .conn()
