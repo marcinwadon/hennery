@@ -765,3 +765,211 @@ async fn a_disabled_reaper_leaves_an_idle_session_attached() {
     assert_eq!(kinds(&uplink.pending().unwrap()), ["session_started"]);
     assert!(!handle.is_ended());
 }
+
+/// Every replayed kind the fake can send: six history kinds, two state
+/// kinds and one this build does not know.
+fn replay_script() -> FakeScript {
+    FakeScript {
+        replay: vec![
+            json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "old question"}}),
+            json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "old answer"}}),
+            json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": "old thought"}}),
+            json!({"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "ls"}),
+            json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1", "status": "completed"}),
+            json!({"sessionUpdate": "plan", "entries": []}),
+            json!({"sessionUpdate": "available_commands_update", "availableCommands": []}),
+            json!({"sessionUpdate": "current_mode_update", "currentModeId": "plan"}),
+            json!({"sessionUpdate": "from_the_future"}),
+        ],
+        ..FakeScript::default()
+    }
+}
+
+fn resuming(uplink: &Uplink, script: &FakeScript) -> SessionHandle {
+    session::resume(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        "agent-7".into(),
+        fake_with(script),
+        std::env::temp_dir(),
+        SessionOptions::default(),
+    )
+}
+
+/// `sessionUpdate` of every `acp_update` frame, with its `turn_id` extract.
+fn updates_of(frames: &[HostFrame]) -> Vec<(String, Option<String>)> {
+    frames
+        .iter()
+        .filter_map(|f| match f {
+            HostFrame::Session {
+                body: SessionBody::AcpUpdate { indexed, payload },
+                ..
+            } => Some((
+                payload["update"]["sessionUpdate"].as_str().unwrap_or("?").to_string(),
+                indexed.turn_id.clone(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+fn start_failed_code(frames: &[HostFrame]) -> Option<String> {
+    frames.iter().find_map(|f| match f {
+        HostFrame::Session {
+            body: SessionBody::StartFailed { code, .. },
+            ..
+        } => Some(code.clone()),
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn a_resume_loads_the_agents_session_drops_replayed_history_and_keeps_state() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let handle = resuming(&uplink, &replay_script());
+    let frames = wait_until(&uplink, has("host_note:replay_unknown_dropped")).await;
+    assert_eq!(
+        kinds(&frames),
+        [
+            "session_started",
+            "update:?",
+            "update:?",
+            "host_note:replay_unknown_dropped"
+        ]
+    );
+    let HostFrame::Session {
+        body: SessionBody::SessionStarted { agent_session_id, .. },
+        ..
+    } = &frames[0]
+    else {
+        panic!("{frames:?}");
+    };
+    assert_eq!(agent_session_id, "agent-7");
+    assert_eq!(
+        updates_of(&frames),
+        [
+            ("available_commands_update".to_string(), None),
+            ("current_mode_update".to_string(), None)
+        ]
+    );
+    // The adapter loaded the id it was given: it streams under that id.
+    for frame in &frames[1..3] {
+        let HostFrame::Session {
+            body: SessionBody::AcpUpdate { payload, .. },
+            ..
+        } = frame
+        else {
+            panic!("{frame:?}");
+        };
+        assert_eq!(payload["sessionId"], "agent-7");
+    }
+    let HostFrame::Session {
+        body: SessionBody::HostNote { text, .. },
+        ..
+    } = &frames[3]
+    else {
+        panic!("{frames:?}");
+    };
+    assert!(text.contains("from_the_future ×1"), "{text}");
+
+    // The resumed session takes prompts; live updates carry their turn.
+    assert!(handle.send(prompt("r1", "t1")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    assert_eq!(
+        kinds(&frames)[4..],
+        ["turn_started", "update:Hello", "update: world", "turn_ended"]
+    );
+    let live: Vec<(String, Option<String>)> = updates_of(&frames).into_iter().skip(2).collect();
+    assert_eq!(
+        live,
+        [
+            ("agent_message_chunk".to_string(), Some("t1".to_string())),
+            ("agent_message_chunk".to_string(), Some("t1".to_string()))
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_resume_the_agent_has_no_record_of_fails_agent_has_no_record() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        load_error: Some(-32002),
+        ..replay_script()
+    };
+    let handle = resuming(&uplink, &script);
+    let frames = wait_until(&uplink, has("start_failed")).await;
+    // Nothing the failed load replayed leaks out.
+    assert_eq!(kinds(&frames), ["start_failed"]);
+    assert_eq!(start_failed_code(&frames).as_deref(), Some("agent_has_no_record"));
+    wait_ended(&handle).await;
+}
+
+#[tokio::test]
+async fn an_agent_that_is_not_logged_in_fails_start_and_resume_as_agent_not_logged_in() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        new_session_error: Some(-32000),
+        ..FakeScript::default()
+    };
+    let _new = session::start(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        fake_with(&script),
+        std::env::temp_dir(),
+    );
+    let frames = wait_until(&uplink, has("start_failed")).await;
+    assert_eq!(start_failed_code(&frames).as_deref(), Some("agent_not_logged_in"));
+
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        load_error: Some(-32000),
+        ..FakeScript::default()
+    };
+    let _resumed = resuming(&uplink, &script);
+    let frames = wait_until(&uplink, has("start_failed")).await;
+    assert_eq!(start_failed_code(&frames).as_deref(), Some("agent_not_logged_in"));
+}
+
+#[tokio::test]
+async fn a_resume_on_an_adapter_without_session_load_fails_load_unsupported() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        no_load_session: true,
+        ..FakeScript::default()
+    };
+    let _handle = resuming(&uplink, &script);
+    let frames = wait_until(&uplink, has("start_failed")).await;
+    assert_eq!(start_failed_code(&frames).as_deref(), Some("load_unsupported"));
+}
+
+/// The replay-suppression twin of the multi-thread ordering test above: a
+/// replayed notification can still be in the channel when the load's answer
+/// resolves. It arrived before the answer, so it is history and must be
+/// dropped, never emitted as if it were live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replayed_history_never_leaks_under_a_multi_thread_runtime() {
+    // History last: the notification right before the answer is the one
+    // that can race it, and a leaked history chunk is visible.
+    let mut replay = vec![json!({"sessionUpdate": "available_commands_update", "availableCommands": []})];
+    replay.extend(
+        (0..200).map(
+            |n| json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": n.to_string()}}),
+        ),
+    );
+    let script = FakeScript {
+        replay,
+        ..FakeScript::default()
+    };
+    for _ in 0..30 {
+        let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+        let handle = resuming(&uplink, &script);
+        wait_until(&uplink, has("session_started")).await;
+        // Give a leaked replay frame time to land behind the start.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let frames = uplink.pending().unwrap();
+        assert_eq!(kinds(&frames), ["session_started", "update:?"]);
+        drop(handle);
+    }
+}
