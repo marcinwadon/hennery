@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -123,12 +124,26 @@ pub struct SessionHandle {
     open_turn: Arc<Mutex<Option<String>>>,
     /// Cancelled when the actor's task has finished (its adapter is gone).
     done: CancellationToken,
+    /// A park or close has been queued: this actor will serve no further
+    /// start or resume, even before it has read that command.
+    ending: Arc<AtomicBool>,
 }
 
 impl SessionHandle {
     /// Queue a command. `false` if the actor has ended.
     pub fn send(&self, cmd: SessionCmd) -> bool {
-        self.commands.send(cmd).is_ok()
+        let ends = matches!(cmd, SessionCmd::Park { .. } | SessionCmd::Close { .. });
+        let sent = self.commands.send(cmd).is_ok();
+        if sent && ends {
+            self.ending.store(true, Ordering::SeqCst);
+        }
+        sent
+    }
+
+    /// A park or close is queued (or done): a `Restart` sent now would be
+    /// answered `not_attached` once the actor gets to it.
+    pub fn is_ending(&self) -> bool {
+        self.ending.load(Ordering::SeqCst)
     }
 
     /// The actor has ended (its last fact is already in the outbox).
@@ -220,6 +235,7 @@ fn spawn_actor(
         commands: tx,
         open_turn,
         done,
+        ending: Arc::new(AtomicBool::new(false)),
     }
 }
 
