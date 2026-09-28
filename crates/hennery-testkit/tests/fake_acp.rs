@@ -157,3 +157,85 @@ fn grandchild_pid_file_records_a_live_process_in_the_adapters_group() {
     // `child` drops here: SIGKILLs the group and reaps the adapter, on this
     // path and on any assertion failure above.
 }
+
+/// Send `requests`, read replies until the response with id `last`.
+fn exchange_until(script: &str, requests: &[Value], last: i64) -> Vec<Value> {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hennery-fake-acp"))
+        .env(hennery_testkit::SCRIPT_ENV, script)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    for r in requests {
+        writeln!(stdin, "{r}").unwrap();
+    }
+    let mut out = Vec::new();
+    for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+        let msg: Value = serde_json::from_str(&line.unwrap()).unwrap();
+        let done = msg["id"] == json!(last);
+        out.push(msg);
+        if done {
+            break;
+        }
+    }
+    drop(stdin);
+    child.kill().ok();
+    child.wait().ok();
+    out
+}
+
+fn load_requests(session_id: &str) -> Vec<Value> {
+    vec![
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":session_id,"cwd":"/tmp","mcpServers":[]}}),
+    ]
+}
+
+#[test]
+fn session_load_replays_the_script_in_order_before_answering() {
+    let script = json!({
+        "chunks": [],
+        "replay": [
+            {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "old"}},
+            {"sessionUpdate": "available_commands_update", "availableCommands": []},
+            {"sessionUpdate": "from_the_future", "x": 1}
+        ]
+    })
+    .to_string();
+    let out = exchange_until(&script, &load_requests("agent-7"), 2);
+    assert_eq!(out[0]["result"]["agentCapabilities"]["loadSession"], true, "{out:?}");
+    let kinds: Vec<&str> = out
+        .iter()
+        .filter(|m| m["method"] == "session/update")
+        .map(|m| {
+            assert_eq!(m["params"]["sessionId"], "agent-7");
+            m["params"]["update"]["sessionUpdate"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        kinds,
+        ["agent_message_chunk", "available_commands_update", "from_the_future"]
+    );
+    let answer = out.last().unwrap();
+    assert_eq!(answer["id"], 2);
+    assert!(answer.get("error").is_none(), "{answer}");
+}
+
+#[test]
+fn scripted_errors_answer_session_load_and_session_new_with_their_codes() {
+    let out = exchange_until(r#"{"chunks":[],"load_error":-32002}"#, &load_requests("agent-7"), 2);
+    assert_eq!(out.last().unwrap()["error"]["code"], -32002, "{out:?}");
+    let out = exchange_until(
+        r#"{"chunks":[],"new_session_error":-32000}"#,
+        &session_requests()[..2],
+        2,
+    );
+    assert_eq!(out.last().unwrap()["error"]["code"], -32000, "{out:?}");
+}
+
+#[test]
+fn no_load_session_withholds_the_capability() {
+    let out = exchange_until(r#"{"chunks":[],"no_load_session":true}"#, &load_requests("a")[..1], 1);
+    assert_eq!(out[0]["result"]["agentCapabilities"]["loadSession"], false, "{out:?}");
+}

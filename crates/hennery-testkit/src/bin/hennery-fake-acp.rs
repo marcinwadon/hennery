@@ -3,10 +3,11 @@
 //! wire format real adapters use.
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse, NewSessionRequest,
-    NewSessionResponse, PromptRequest, PromptResponse, SessionNotification, SessionUpdate, StopReason, TextContent,
+    AgentCapabilities, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse, LoadSessionRequest,
+    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionNotification,
+    SessionUpdate, StopReason, TextContent,
 };
-use agent_client_protocol::{Agent, Stdio};
+use agent_client_protocol::{Agent, Stdio, UntypedMessage};
 use hennery_testkit::{CRASH_EXIT_CODE, FakeScript, SCRIPT_ENV};
 use std::time::Duration;
 
@@ -36,19 +37,46 @@ async fn main() -> agent_client_protocol::Result<()> {
         std::fs::write(path, child.id().to_string()).expect("write grandchild pid");
     }
 
+    let load_session = !script.no_load_session;
     Agent
         .builder()
         .name("hennery-fake-acp")
         .on_receive_request(
             async move |req: InitializeRequest, responder, _cx| {
-                responder
-                    .respond(InitializeResponse::new(req.protocol_version).agent_capabilities(AgentCapabilities::new()))
+                responder.respond(
+                    InitializeResponse::new(req.protocol_version)
+                        .agent_capabilities(AgentCapabilities::new().load_session(load_session)),
+                )
             },
             agent_client_protocol::on_receive_request!(),
         )
         .on_receive_request(
-            async move |_req: NewSessionRequest, responder, _cx| {
-                responder.respond(NewSessionResponse::new("fake-session-1"))
+            {
+                let script = script.clone();
+                async move |_req: NewSessionRequest, responder, _cx| match script.new_session_error {
+                    Some(code) => responder.respond_with_error(agent_client_protocol::Error::new(code, "scripted")),
+                    None => responder.respond(NewSessionResponse::new("fake-session-1")),
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
+        .on_receive_request(
+            {
+                let script = script.clone();
+                async move |req: LoadSessionRequest, responder, cx| {
+                    // History first, then the answer: an ACP agent replays a
+                    // loaded session as `session/update`s before it responds.
+                    for update in &script.replay {
+                        cx.send_notification(UntypedMessage::new(
+                            "session/update",
+                            serde_json::json!({ "sessionId": req.session_id, "update": update }),
+                        )?)?;
+                    }
+                    match script.load_error {
+                        Some(code) => responder.respond_with_error(agent_client_protocol::Error::new(code, "scripted")),
+                        None => responder.respond(LoadSessionResponse::new()),
+                    }
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )

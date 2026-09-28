@@ -22,6 +22,20 @@ pub struct FakeScript {
     /// host) in the adapter's process group and write its pid to this file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grandchild_pid_file: Option<String>,
+    /// Raw ACP `update` objects streamed as `session/update` during
+    /// `session/load`, in order, before the load is answered. Sent untyped,
+    /// so unknown `sessionUpdate` kinds reach the host as they are.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replay: Vec<serde_json::Value>,
+    /// Answer `session/load` with this JSON-RPC error code (after the replay).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_error: Option<i32>,
+    /// Answer `session/new` with this JSON-RPC error code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_session_error: Option<i32>,
+    /// Advertise `loadSession: false` in `initialize`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_load_session: bool,
 }
 
 impl Default for FakeScript {
@@ -32,6 +46,10 @@ impl Default for FakeScript {
             exit_after_chunks: None,
             stderr_lines: Vec::new(),
             grandchild_pid_file: None,
+            replay: Vec::new(),
+            load_error: None,
+            new_session_error: None,
+            no_load_session: false,
         }
     }
 }
