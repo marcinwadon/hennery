@@ -191,6 +191,27 @@ fn release_turn_on_detach(tx: &Transaction<'_>, session_id: &str, ts: &str) -> R
     }
 }
 
+/// Whether a host fact with no transition of its own (an update, a
+/// diagnostic) still belongs on the timeline: not once the operator has
+/// closed the session, and an update of a turn only while that turn is
+/// open. An update for a turn the collector already ended (a synthesized
+/// end) would otherwise be listed after that end.
+fn fact_applies(tx: &Transaction<'_>, session_id: &str, turn_id: Option<&str>) -> Result<bool> {
+    let lifecycle: String = tx.query_row("SELECT lifecycle FROM sessions WHERE id = ?1", [session_id], |r| {
+        r.get(0)
+    })?;
+    if lifecycle == "closed" {
+        return Ok(false);
+    }
+    let Some(turn_id) = turn_id else {
+        return Ok(true);
+    };
+    let state: Option<String> = tx
+        .query_row("SELECT state FROM turns WHERE turn_id = ?1", [turn_id], |r| r.get(0))
+        .optional()?;
+    Ok(state.as_deref() == Some("started"))
+}
+
 /// Keep a stored host fact that did not apply as the idempotency key only:
 /// it is hidden from `Store::events` (and so from SSE replay).
 fn mark_unapplied(tx: &Transaction<'_>, event_id: i64) -> Result<()> {
@@ -486,17 +507,38 @@ impl Store {
         }];
         match body {
             SessionBody::SessionStarted { agent_session_id, .. } => {
-                tx.execute(
-                    "UPDATE sessions SET lifecycle = 'active', activity = 'idle', agent_session_id = ?2
+                // A re-emitted `session_started` for a session already
+                // active (a retried start or resume) changes nothing. It
+                // also clears a stale `failure_reason`: a start reconciled
+                // as `start_not_delivered` that in fact ran must not stay
+                // `active` with that guess still attached.
+                let changed = tx.execute(
+                    "UPDATE sessions SET lifecycle = 'active', activity = 'idle', agent_session_id = ?2,
+                         failure_reason = NULL
                      WHERE id = ?1 AND lifecycle IN ('starting', 'failed')",
                     params![session_id, agent_session_id],
                 )?;
+                if changed == 0 {
+                    created.clear();
+                    mark_unapplied(&tx, fact_id)?;
+                }
             }
             SessionBody::StartFailed { code, .. } => {
-                tx.execute(
-                    "UPDATE sessions SET lifecycle = 'failed', failure_reason = ?2 WHERE id = ?1 AND lifecycle = 'starting'",
+                // Also applies from `failed` when the recorded reason is the
+                // collector's own guess (`start_not_delivered`, reconciled
+                // after no answer ever came): the host's real failure code
+                // replaces that guess rather than being swallowed as a fact
+                // that "changes nothing" (controller ruling, task 6 review).
+                let changed = tx.execute(
+                    "UPDATE sessions SET lifecycle = 'failed', failure_reason = ?2
+                     WHERE id = ?1 AND (lifecycle = 'starting'
+                         OR (lifecycle = 'failed' AND failure_reason = 'start_not_delivered'))",
                     params![session_id, code],
                 )?;
+                if changed == 0 {
+                    created.clear();
+                    mark_unapplied(&tx, fact_id)?;
+                }
             }
             SessionBody::TurnStarted { turn_id, .. } => {
                 // The fact wins over reconciliation, but never over a fact
@@ -586,24 +628,45 @@ impl Store {
                 created.extend(release_turn_on_detach(&tx, session_id, &ts)?);
                 // A park that overtakes an operator close ends the session
                 // as the operator asked: closed.
-                tx.execute(
+                let changed = tx.execute(
                     "UPDATE sessions SET
                          lifecycle = CASE WHEN close_requested = 1 THEN 'closed' ELSE 'parked' END,
                          activity = NULL, close_requested = 0
                      WHERE id = ?1 AND lifecycle = 'active'",
                     [session_id],
                 )?;
+                if changed == 0 {
+                    created.clear();
+                    mark_unapplied(&tx, fact_id)?;
+                }
             }
             SessionBody::SessionClosed => {
                 created.extend(release_turn_on_detach(&tx, session_id, &ts)?);
-                tx.execute(
+                // Also the host's confirmation of a close the collector
+                // already made (an offline close): nothing left to change.
+                let changed = tx.execute(
                     "UPDATE sessions SET lifecycle = 'closed', activity = NULL, close_requested = 0
                      WHERE id = ?1 AND lifecycle = 'active'",
                     [session_id],
                 )?;
+                if changed == 0 {
+                    created.clear();
+                    mark_unapplied(&tx, fact_id)?;
+                }
+            }
+            SessionBody::AcpUpdate { indexed, .. } => {
+                if !fact_applies(&tx, session_id, indexed.turn_id.as_deref())? {
+                    created.clear();
+                    mark_unapplied(&tx, fact_id)?;
+                }
             }
             // Diagnostics only; the `session_parked` that follows detaches.
-            SessionBody::AdapterExited { .. } | SessionBody::AcpUpdate { .. } | SessionBody::HostNote { .. } => {}
+            SessionBody::AdapterExited { .. } | SessionBody::HostNote { .. } => {
+                if !fact_applies(&tx, session_id, None)? {
+                    created.clear();
+                    mark_unapplied(&tx, fact_id)?;
+                }
+            }
         }
         tx.execute(
             "UPDATE sessions SET last_event_at = ?2 WHERE id = ?1",

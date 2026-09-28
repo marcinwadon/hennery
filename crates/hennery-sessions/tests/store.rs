@@ -785,3 +785,173 @@ fn a_resume_releases_a_turn_an_older_database_left_open() {
     assert_eq!(kinds(&events), ["turn_not_delivered", "operator_resumed"]);
     assert_eq!(store.session("s1").unwrap().unwrap().open_turn_id, None);
 }
+
+// Plan B: one rule for every stored-but-unapplied host fact (decision 7).
+
+fn listed(store: &Store, session: &str) -> Vec<String> {
+    store
+        .events(session, 0, 1000)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.kind)
+        .collect()
+}
+
+fn turn_update(turn: Option<&str>) -> SessionBody {
+    SessionBody::AcpUpdate {
+        indexed: Indexed {
+            turn_id: turn.map(str::to_string),
+            ..Indexed::default()
+        },
+        payload: json!({ "update": { "sessionUpdate": "agent_message_chunk" } }),
+    }
+}
+
+#[test]
+fn a_re_emitted_session_started_for_an_active_session_is_stored_but_not_listed() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    let again = SessionBody::SessionStarted {
+        request_id: "r5".into(),
+        agent_session_id: "a1".into(),
+    };
+    assert!(store.ingest("s1", 2, &again).unwrap().is_empty());
+    assert_eq!(listed(&store, "s1"), ["session_started"]);
+    assert_eq!(store.committed_seq("s1").unwrap(), 2);
+    // Still the idempotency key: the resend is a duplicate, not a conflict.
+    assert!(store.ingest("s1", 2, &again).unwrap().is_empty());
+}
+
+#[test]
+fn a_start_failed_that_changes_nothing_is_not_listed() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    let failed = SessionBody::StartFailed {
+        request_id: "r".into(),
+        code: "start_failed".into(),
+        message: "late".into(),
+    };
+    assert!(store.ingest("s1", 2, &failed).unwrap().is_empty());
+    assert_eq!(listed(&store, "s1"), ["session_started"]);
+    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "active");
+}
+
+#[test]
+fn a_hosts_detach_of_a_session_already_closed_is_not_listed() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    // Closed while its host was offline; the host comes back, is sent
+    // `close_session`, and confirms. Or its adapter had died meanwhile.
+    store.close_now("s1").unwrap();
+    let before = listed(&store, "s1");
+    for (seq, body) in [
+        (2, SessionBody::SessionClosed),
+        (
+            3,
+            SessionBody::AdapterExited {
+                code: Some(1),
+                signal: None,
+                stderr_tail: String::new(),
+            },
+        ),
+        (
+            4,
+            SessionBody::SessionParked {
+                reason: ParkReason::AdapterExited,
+            },
+        ),
+        (
+            5,
+            SessionBody::HostNote {
+                note: "n".into(),
+                text: "t".into(),
+            },
+        ),
+        (6, turn_update(None)),
+    ] {
+        assert!(store.ingest("s1", seq, &body).unwrap().is_empty(), "seq {seq}");
+    }
+    assert_eq!(listed(&store, "s1"), before);
+    assert_eq!(store.committed_seq("s1").unwrap(), 6);
+}
+
+#[test]
+fn a_late_update_after_a_synthesized_end_is_not_listed() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.ingest("s1", 2, &turn_started("t1")).unwrap();
+    assert_eq!(
+        kinds(&store.ingest("s1", 3, &turn_update(Some("t1"))).unwrap()),
+        ["acp_update"]
+    );
+    // The host's snapshot missed the turn (decision 3 of plan A): the
+    // collector ends it; the session stays active.
+    store.reconcile_host("h1", &[attached("s1", None)]).unwrap();
+    assert!(store.ingest("s1", 4, &turn_update(Some("t1"))).unwrap().is_empty());
+    // An update outside any turn on the active session is still listed.
+    assert_eq!(
+        kinds(&store.ingest("s1", 5, &turn_update(None)).unwrap()),
+        ["acp_update"]
+    );
+    let listed = listed(&store, "s1");
+    let end = listed.iter().position(|k| k == "turn_ended_synthesized").unwrap();
+    assert_eq!(listed[end + 1..], ["acp_update"], "{listed:?}");
+}
+
+#[test]
+fn a_start_that_ran_after_all_revives_the_session_without_its_failure_reason() {
+    let store = Store::open_in_memory().unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store.reconcile_host("h1", &[]).unwrap();
+    assert_eq!(
+        store.session("s1").unwrap().unwrap().failure_reason.as_deref(),
+        Some("start_not_delivered")
+    );
+    let created = store
+        .ingest(
+            "s1",
+            1,
+            &SessionBody::SessionStarted {
+                request_id: "r0".into(),
+                agent_session_id: "a1".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(kinds(&created), ["session_started"]);
+    let s = store.session("s1").unwrap().unwrap();
+    assert_eq!((s.lifecycle.as_str(), s.failure_reason), ("active", None));
+}
+
+// Controller ruling on the Task 6 review, folded into this same task: the
+// collector's `start_not_delivered` guess (reconciliation never having heard
+// back) is only ever a guess. When the host's real answer to that same start
+// finally arrives, it must replace the guess, not be swallowed as a fact
+// that "changes nothing" because the session is already `failed`.
+#[test]
+fn a_start_failed_replaces_a_reconciled_guess_of_start_not_delivered() {
+    let store = Store::open_in_memory().unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store.reconcile_host("h1", &[]).unwrap();
+    assert_eq!(
+        store.session("s1").unwrap().unwrap().failure_reason.as_deref(),
+        Some("start_not_delivered")
+    );
+    let created = store
+        .ingest(
+            "s1",
+            1,
+            &SessionBody::StartFailed {
+                request_id: "r0".into(),
+                code: "agent_not_logged_in".into(),
+                message: "please log in".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(kinds(&created), ["start_failed"]);
+    let s = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (s.lifecycle.as_str(), s.failure_reason.as_deref()),
+        ("failed", Some("agent_not_logged_in"))
+    );
+}
