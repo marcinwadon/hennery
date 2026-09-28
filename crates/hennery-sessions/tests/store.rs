@@ -1131,3 +1131,28 @@ fn an_acp_update_for_its_open_turn_still_applies_to_a_presumed_session() {
     let update = turn_update(Some("t1"));
     assert_eq!(kinds(&store.ingest("s1", 3, &update).unwrap()), ["acp_update"]);
 }
+
+// Final review fix wave.
+
+#[test]
+fn a_rejected_reconcile_close_closes_only_a_session_still_waiting_on_that_close() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.record_close_request("s1").unwrap();
+    assert_eq!(
+        kinds(&store.close_after_rejected_reconcile_close("s1").unwrap()),
+        Vec::<&str>::new(),
+        "operator_closed is already recorded"
+    );
+    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "closed");
+
+    // Closed, then resumed: the late rejection must leave the start alone.
+    assert!(matches!(
+        store.request_resume("s1").unwrap(),
+        ResumeRequest::Starting { .. }
+    ));
+    let before = store.events("s1", 0, 100).unwrap();
+    assert!(store.close_after_rejected_reconcile_close("s1").unwrap().is_empty());
+    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "starting");
+    assert_eq!(store.events("s1", 0, 100).unwrap(), before);
+}

@@ -407,6 +407,76 @@ async fn a_reconcile_close_rejected_not_attached_still_closes_it_collector_side(
     );
 }
 
+/// A reconcile close answered `not_attached` only after the operator has
+/// resumed the session (final review F1): the old actor was already tearing
+/// down, its park closed the session, the resume moved it to `starting`, and
+/// the late rejection must not close that fresh start.
+#[tokio::test]
+async fn a_reconcile_close_rejected_after_a_resume_leaves_the_resume_alone() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let c = client();
+    let url = collector.url(&format!("/api/sessions/{session}/close"));
+    let call = tokio::spawn(async move { post(&c, url, json!({})).await });
+    assert!(matches!(host.next().await, CollectorFrame::CloseSession { .. }));
+    let seq = host.seq;
+    host.drop_connection(&collector).await;
+    assert_eq!(call.await.unwrap().0, 503);
+
+    let mut host = ScriptedHost::connect(&collector, vec![attached(&session, seq)], seq).await;
+    let CollectorFrame::CloseSession {
+        request_id: close_request,
+        ..
+    } = host.next().await
+    else {
+        panic!("expected the reconcile-driven close_session");
+    };
+    // The actor was already being reaped: its park lands first and, since a
+    // close was requested, closes the session.
+    host.emit(
+        &session,
+        SessionBody::SessionParked {
+            reason: hennery_proto::frames::ParkReason::Idle,
+        },
+    )
+    .await;
+    wait_for("closed", || async {
+        (collector.lifecycle(&session) == "closed").then_some(())
+    })
+    .await;
+
+    let c = client();
+    let url = resume_url(&collector, &session);
+    let resume = tokio::spawn(async move { post(&c, url, json!({})).await });
+    let resume_request = expect_resume(&mut host, &session).await;
+    // The drained close is answered only now, then the fresh adapter starts.
+    host.send(&HostFrame::Error {
+        request_id: close_request,
+        code: "not_attached".into(),
+        message: "no such session".into(),
+    })
+    .await;
+    host.emit(
+        &session,
+        SessionBody::SessionStarted {
+            request_id: resume_request,
+            agent_session_id: "agent-1".into(),
+        },
+    )
+    .await;
+
+    let (status, body) = resume.await.unwrap();
+    assert_eq!((status, body["lifecycle"].as_str()), (202, Some("active")), "{body}");
+    assert_eq!(collector.lifecycle(&session), "active");
+    let kinds = collector.event_kinds(&session);
+    assert_eq!(kinds.iter().filter(|k| *k == "operator_closed").count(), 1, "{kinds:?}");
+    assert!(
+        kinds.ends_with(&["operator_resumed".to_string(), "session_started".to_string()]),
+        "{kinds:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_request_that_times_out_on_a_live_connection_drops_it() {
     let collector = Collector::start().await;

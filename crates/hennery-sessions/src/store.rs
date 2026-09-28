@@ -221,6 +221,36 @@ fn fact_applies(tx: &Transaction<'_>, session_id: &str, turn_id: Option<&str>) -
     Ok(state.as_deref() == Some("started"))
 }
 
+/// `Store::close_now`'s body, inside the caller's transaction.
+fn close_in(tx: &Transaction<'_>, session_id: &str) -> Result<Vec<EventDto>> {
+    let row: Option<(String, bool, Option<String>)> = tx
+        .query_row(
+            "SELECT lifecycle, close_requested, open_turn_id FROM sessions WHERE id = ?1",
+            [session_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let mut events = Vec::new();
+    if let Some((lifecycle, close_requested, open_turn)) = row
+        && lifecycle != "closed"
+    {
+        let ts = now();
+        if let Some(turn) = open_turn.as_deref() {
+            events.push(resolve_open_turn(tx, session_id, turn, &ts)?);
+        }
+        if !close_requested {
+            events.push(collector_event(tx, session_id, "operator_closed", json!({}), &ts)?);
+        }
+        tx.execute(
+            "UPDATE sessions SET lifecycle = 'closed', activity = NULL, open_turn_id = NULL, close_requested = 0,
+                 presumed_parked = 0
+             WHERE id = ?1",
+            [session_id],
+        )?;
+    }
+    Ok(events)
+}
+
 /// Keep a stored host fact that did not apply as the idempotency key only:
 /// it is hidden from `Store::events` (and so from SSE replay).
 fn mark_unapplied(tx: &Transaction<'_>, event_id: i64) -> Result<()> {
@@ -381,31 +411,35 @@ impl Store {
     pub fn close_now(&self, session_id: &str) -> Result<Vec<EventDto>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let row: Option<(String, bool, Option<String>)> = tx
+        let events = close_in(&tx, session_id)?;
+        tx.commit()?;
+        Ok(events)
+    }
+
+    /// A `close_session` that reconciliation sent was answered
+    /// `not_attached`: close collector-side like `close_now`, but only while
+    /// the session is still what reconciliation asked to close — attached
+    /// (`active` or presumed parked) with the close still requested. A
+    /// resume that began since (`starting`, close request cleared) is left
+    /// alone: the rejection is about the old adapter, not the fresh start
+    /// (final review F1). Checked and closed in one transaction.
+    pub fn close_after_rejected_reconcile_close(&self, session_id: &str) -> Result<Vec<EventDto>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let still_requested: bool = tx
             .query_row(
-                "SELECT lifecycle, close_requested, open_turn_id FROM sessions WHERE id = ?1",
+                "SELECT close_requested = 1 AND (lifecycle = 'active' OR presumed_parked = 1)
+                 FROM sessions WHERE id = ?1",
                 [session_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| r.get(0),
             )
-            .optional()?;
-        let mut events = Vec::new();
-        if let Some((lifecycle, close_requested, open_turn)) = row
-            && lifecycle != "closed"
-        {
-            let ts = now();
-            if let Some(turn) = open_turn.as_deref() {
-                events.push(resolve_open_turn(&tx, session_id, turn, &ts)?);
-            }
-            if !close_requested {
-                events.push(collector_event(&tx, session_id, "operator_closed", json!({}), &ts)?);
-            }
-            tx.execute(
-                "UPDATE sessions SET lifecycle = 'closed', activity = NULL, open_turn_id = NULL, close_requested = 0,
-                     presumed_parked = 0
-                 WHERE id = ?1",
-                [session_id],
-            )?;
-        }
+            .optional()?
+            .unwrap_or(false);
+        let events = if still_requested {
+            close_in(&tx, session_id)?
+        } else {
+            Vec::new()
+        };
         tx.commit()?;
         Ok(events)
     }
