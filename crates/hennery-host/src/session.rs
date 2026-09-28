@@ -140,8 +140,10 @@ impl SessionHandle {
         sent
     }
 
-    /// A park or close is queued (or done): a `Restart` sent now would be
-    /// answered `not_attached` once the actor gets to it.
+    /// A park or close has been queued through `send` (set only there; an
+    /// actor that ends by itself — an idle reap, an adapter exit — never
+    /// sets it, and shows only as `is_ended` once it is done): a `Restart`
+    /// sent now would be answered `not_attached` once the actor gets to it.
     pub fn is_ending(&self) -> bool {
         self.ending.load(Ordering::SeqCst)
     }
@@ -708,7 +710,12 @@ async fn negotiate(
             result = &mut load => {
                 // Everything the adapter sent before its answer is replay,
                 // even if this select saw the answer first (see
-                // `Actor::drain_updates` for the ordering argument).
+                // `Actor::drain_updates` for the ordering argument). The
+                // drain cannot tell "before" from "just after", though: a
+                // live notification the adapter sends microseconds after
+                // its load answer, already queued when this drain runs, is
+                // classified as replay too — dropped if a history kind,
+                // passed through if a state kind.
                 while let Ok(payload) = updates.try_recv() {
                     replay.observe(payload);
                 }

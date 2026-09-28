@@ -624,9 +624,11 @@ impl Store {
             SessionBody::StartFailed { code, .. } => {
                 // Also applies from `failed` when the recorded reason is the
                 // collector's own guess (`start_not_delivered`, reconciled
-                // after no answer ever came): the host's real failure code
-                // replaces that guess rather than being swallowed as a fact
-                // that "changes nothing" (controller ruling, task 6 review).
+                // after no answer ever came, ACP core §5.1 step 4): the
+                // host's real failure code replaces that guess rather than
+                // being swallowed as a fact that "changes nothing" (ACP core
+                // §4.2 stores the `start_failed` reason; resume plan
+                // decision 3 sets `failed` with that code).
                 let changed = tx.execute(
                     "UPDATE sessions SET lifecycle = 'failed', failure_reason = ?2
                      WHERE id = ?1 AND (lifecycle = 'starting'
@@ -760,7 +762,10 @@ impl Store {
                     mark_unapplied(&tx, fact_id)?;
                 }
             }
-            // Diagnostics only; the `session_parked` that follows detaches.
+            // Diagnostics only, with no transition of their own: an
+            // `adapter_exited` is followed by the `session_parked` that
+            // detaches; a `host_note` (e.g. `replay_unknown_dropped` after a
+            // load) changes nothing.
             SessionBody::AdapterExited { .. } | SessionBody::HostNote { .. } => {
                 if !fact_applies(&tx, session_id, None)? {
                     created.clear();
