@@ -1177,3 +1177,44 @@ fn a_failed_resume_fails_only_a_session_still_starting() {
         ("failed", Some("not_attached"))
     );
 }
+
+/// Review Focus 1, collector half: the old actor's detach facts landing
+/// after a resume has begun change nothing, and the fresh start still
+/// attaches.
+#[test]
+fn an_old_actors_detach_after_a_resume_began_changes_nothing() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    parked(&store, 2);
+    assert!(matches!(
+        store.request_resume("s1").unwrap(),
+        ResumeRequest::Starting { .. }
+    ));
+    let before = store.events("s1", 0, 100).unwrap();
+    assert!(store.ingest("s1", 3, &SessionBody::SessionClosed).unwrap().is_empty());
+    assert!(
+        store
+            .ingest(
+                "s1",
+                4,
+                &SessionBody::SessionParked {
+                    reason: ParkReason::Idle,
+                },
+            )
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.events("s1", 0, 100).unwrap(), before);
+    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "starting");
+    store
+        .ingest(
+            "s1",
+            5,
+            &SessionBody::SessionStarted {
+                request_id: "r9".into(),
+                agent_session_id: "a1".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "active");
+}
