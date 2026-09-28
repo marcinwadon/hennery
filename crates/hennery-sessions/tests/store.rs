@@ -598,3 +598,190 @@ fn an_unapplied_late_turn_started_is_not_listed() {
     );
     assert!(store.ingest("s1", 2, &turn_started("t1")).unwrap().is_empty());
 }
+
+// Plan B: resume, and no turn left open across a detach.
+
+use hennery_sessions::store::ResumeRequest;
+
+fn parked(store: &Store, seq: u64) {
+    store
+        .ingest(
+            "s1",
+            seq,
+            &SessionBody::SessionParked {
+                reason: ParkReason::Operator,
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_resume_moves_a_parked_session_to_starting_with_what_the_host_needs() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.ingest("s1", 2, &update(1)).unwrap();
+    parked(&store, 3);
+    let ResumeRequest::Starting {
+        events,
+        agent_session_id,
+        committed_seq,
+    } = store.request_resume("s1").unwrap()
+    else {
+        panic!("not resumable");
+    };
+    assert_eq!(kinds(&events), ["operator_resumed"]);
+    assert_eq!((agent_session_id.as_str(), committed_seq), ("a1", 3));
+    let s = store.session("s1").unwrap().unwrap();
+    assert_eq!((s.lifecycle.as_str(), s.activity.as_deref()), ("starting", None));
+    store
+        .ingest(
+            "s1",
+            4,
+            &SessionBody::SessionStarted {
+                request_id: "r9".into(),
+                agent_session_id: "a1".into(),
+            },
+        )
+        .unwrap();
+    let s = store.session("s1").unwrap().unwrap();
+    assert_eq!((s.lifecycle.as_str(), s.activity.as_deref()), ("active", Some("idle")));
+}
+
+#[test]
+fn a_second_concurrent_resume_is_refused_while_the_first_is_starting() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    assert_eq!(
+        store.request_resume("s1").unwrap(),
+        ResumeRequest::Busy("active".into())
+    );
+    parked(&store, 2);
+    assert!(matches!(
+        store.request_resume("s1").unwrap(),
+        ResumeRequest::Starting { .. }
+    ));
+    assert_eq!(
+        store.request_resume("s1").unwrap(),
+        ResumeRequest::Busy("starting".into())
+    );
+    assert_eq!(
+        kinds(&store.events("s1", 0, 100).unwrap())
+            .iter()
+            .filter(|k| **k == "operator_resumed")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_resume_of_a_failed_or_closed_session_clears_what_stopped_it() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store
+        .ingest(
+            "s1",
+            2,
+            &SessionBody::StartFailed {
+                request_id: "r".into(),
+                code: "agent_not_logged_in".into(),
+                message: "log in".into(),
+            },
+        )
+        .unwrap();
+    // Not applied: the session is active, not starting.
+    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "active");
+    store.close_now("s1").unwrap();
+    assert!(matches!(
+        store.request_resume("s1").unwrap(),
+        ResumeRequest::Starting { .. }
+    ));
+    store
+        .ingest(
+            "s1",
+            3,
+            &SessionBody::StartFailed {
+                request_id: "r2".into(),
+                code: "agent_has_no_record".into(),
+                message: "gone".into(),
+            },
+        )
+        .unwrap();
+    let s = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (s.lifecycle.as_str(), s.failure_reason.as_deref()),
+        ("failed", Some("agent_has_no_record"))
+    );
+    assert!(matches!(
+        store.request_resume("s1").unwrap(),
+        ResumeRequest::Starting { .. }
+    ));
+    assert_eq!(store.session("s1").unwrap().unwrap().failure_reason, None);
+}
+
+#[test]
+fn a_session_the_agent_never_created_cannot_be_resumed() {
+    let store = Store::open_in_memory().unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store.mark_failed("s1", "start_not_delivered").unwrap();
+    assert_eq!(store.request_resume("s1").unwrap(), ResumeRequest::NoRecord);
+    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "failed");
+    assert_eq!(store.request_resume("nope").unwrap(), ResumeRequest::NotFound);
+}
+
+#[test]
+fn detaching_releases_a_prompt_the_host_never_acknowledged() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    // The prompt went out; the host's `not_attached` answer was lost.
+    assert!(store.open_turn("s1", "t1", &prompt_text()).unwrap());
+    let created = store
+        .ingest(
+            "s1",
+            2,
+            &SessionBody::SessionParked {
+                reason: ParkReason::AdapterExited,
+            },
+        )
+        .unwrap();
+    assert_eq!(kinds(&created), ["session_parked", "turn_not_delivered"]);
+    assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("not_delivered"));
+    assert_eq!(store.session("s1").unwrap().unwrap().open_turn_id, None);
+
+    store.create_session("s2", "h1", "fake", "/tmp").unwrap();
+    store
+        .ingest(
+            "s2",
+            1,
+            &SessionBody::SessionStarted {
+                request_id: "r".into(),
+                agent_session_id: "a2".into(),
+            },
+        )
+        .unwrap();
+    assert!(store.open_turn("s2", "t2", &prompt_text()).unwrap());
+    let created = store.ingest("s2", 2, &SessionBody::SessionClosed).unwrap();
+    assert_eq!(kinds(&created), ["session_closed", "turn_not_delivered"]);
+    assert_eq!(store.session("s2").unwrap().unwrap().open_turn_id, None);
+}
+
+#[test]
+fn a_resume_releases_a_turn_an_older_database_left_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    {
+        let store = Store::open(&db).unwrap();
+        started(&store);
+        assert!(store.open_turn("s1", "t1", &prompt_text()).unwrap());
+    }
+    // What plan A could leave behind: parked with a `sent` turn still open.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute("UPDATE sessions SET lifecycle = 'parked', activity = NULL", [])
+        .unwrap();
+    let store = Store::open(&db).unwrap();
+    let ResumeRequest::Starting { events, .. } = store.request_resume("s1").unwrap() else {
+        panic!("not resumable");
+    };
+    assert_eq!(kinds(&events), ["turn_not_delivered", "operator_resumed"]);
+    assert_eq!(store.session("s1").unwrap().unwrap().open_turn_id, None);
+}

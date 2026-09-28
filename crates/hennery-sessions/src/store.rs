@@ -74,6 +74,23 @@ pub struct SessionRow {
     pub close_requested: bool,
 }
 
+/// The outcome of `Store::request_resume`.
+#[derive(Debug, PartialEq)]
+pub enum ResumeRequest {
+    /// The session is now `starting`: send `resume_session` with these.
+    Starting {
+        /// Collector events written (a released turn, `operator_resumed`).
+        events: Vec<EventDto>,
+        agent_session_id: String,
+        committed_seq: u64,
+    },
+    /// Refused: the session is `starting` or `active` (this lifecycle).
+    Busy(String),
+    /// The agent never created a session for it: there is nothing to load.
+    NoRecord,
+    NotFound,
+}
+
 /// What the collector did after a host's `resend_complete` (ACP core §5.1).
 #[derive(Debug, Default, PartialEq)]
 pub struct Reconciliation {
@@ -140,6 +157,38 @@ fn turn_not_delivered(tx: &Transaction<'_>, session_id: &str, turn_id: &str, ts:
         params![session_id, turn_id],
     )?;
     collector_event(tx, session_id, "turn_not_delivered", json!({ "turn_id": turn_id }), ts)
+}
+
+/// Resolve an open turn the host will never end: `interrupted` if the
+/// adapter had it (`started`), otherwise `turn_not_delivered`.
+fn resolve_open_turn(tx: &Transaction<'_>, session_id: &str, turn_id: &str, ts: &str) -> Result<EventDto> {
+    let state: Option<String> = tx
+        .query_row("SELECT state FROM turns WHERE turn_id = ?1", [turn_id], |r| r.get(0))
+        .optional()?;
+    match state.as_deref() {
+        Some("started") => synthesize_turn_end(tx, session_id, turn_id, ts),
+        _ => turn_not_delivered(tx, session_id, turn_id, ts),
+    }
+}
+
+/// The host detached an active session (`session_parked`/`session_closed`).
+/// A turn still open is one the host never acknowledged: its `not_attached`
+/// answer is not outboxed and can be lost. Release it, or the next resume
+/// inherits a permanent 409 (plan A, "After this plan").
+fn release_turn_on_detach(tx: &Transaction<'_>, session_id: &str, ts: &str) -> Result<Option<EventDto>> {
+    let row: Option<(String, Option<String>)> = tx
+        .query_row(
+            "SELECT lifecycle, open_turn_id FROM sessions WHERE id = ?1",
+            [session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    match row {
+        Some((lifecycle, Some(turn))) if lifecycle == "active" => {
+            Ok(Some(resolve_open_turn(tx, session_id, &turn, ts)?))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Keep a stored host fact that did not apply as the idempotency key only:
@@ -313,13 +362,7 @@ impl Store {
         {
             let ts = now();
             if let Some(turn) = open_turn.as_deref() {
-                let state: Option<String> = tx
-                    .query_row("SELECT state FROM turns WHERE turn_id = ?1", [turn], |r| r.get(0))
-                    .optional()?;
-                events.push(match state.as_deref() {
-                    Some("started") => synthesize_turn_end(&tx, session_id, turn, &ts)?,
-                    _ => turn_not_delivered(&tx, session_id, turn, &ts)?,
-                });
+                events.push(resolve_open_turn(&tx, session_id, turn, &ts)?);
             }
             if !close_requested {
                 events.push(collector_event(&tx, session_id, "operator_closed", json!({}), &ts)?);
@@ -332,6 +375,54 @@ impl Store {
         }
         tx.commit()?;
         Ok(events)
+    }
+
+    /// Move a `parked`, `closed` or `failed` session to `starting` for a
+    /// resume (ACP core §4.2). Atomic: of two concurrent resumes, the second
+    /// sees `starting` and is refused (§12 scenario 11). A turn still open
+    /// (a database written before plan B) is released first.
+    pub fn request_resume(&self, session_id: &str) -> Result<ResumeRequest> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let row: Option<(String, Option<String>, Option<String>)> = tx
+            .query_row(
+                "SELECT lifecycle, agent_session_id, open_turn_id FROM sessions WHERE id = ?1",
+                [session_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((lifecycle, agent_session_id, open_turn)) = row else {
+            return Ok(ResumeRequest::NotFound);
+        };
+        if !matches!(lifecycle.as_str(), "parked" | "closed" | "failed") {
+            return Ok(ResumeRequest::Busy(lifecycle));
+        }
+        let Some(agent_session_id) = agent_session_id else {
+            return Ok(ResumeRequest::NoRecord);
+        };
+        let ts = now();
+        let mut events = Vec::new();
+        if let Some(turn) = open_turn.as_deref() {
+            events.push(resolve_open_turn(&tx, session_id, turn, &ts)?);
+        }
+        events.push(collector_event(&tx, session_id, "operator_resumed", json!({}), &ts)?);
+        tx.execute(
+            "UPDATE sessions SET lifecycle = 'starting', activity = NULL, failure_reason = NULL,
+                 close_requested = 0, open_turn_id = NULL
+             WHERE id = ?1",
+            [session_id],
+        )?;
+        let committed: Option<i64> = tx.query_row(
+            "SELECT MAX(host_seq) FROM events WHERE session_id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(ResumeRequest::Starting {
+            events,
+            agent_session_id,
+            committed_seq: committed.unwrap_or(0) as u64,
+        })
     }
 
     /// Highest committed host seq for a session (0 if none).
@@ -492,6 +583,7 @@ impl Store {
                 }
             }
             SessionBody::SessionParked { .. } => {
+                created.extend(release_turn_on_detach(&tx, session_id, &ts)?);
                 // A park that overtakes an operator close ends the session
                 // as the operator asked: closed.
                 tx.execute(
@@ -503,6 +595,7 @@ impl Store {
                 )?;
             }
             SessionBody::SessionClosed => {
+                created.extend(release_turn_on_detach(&tx, session_id, &ts)?);
                 tx.execute(
                     "UPDATE sessions SET lifecycle = 'closed', activity = NULL, close_requested = 0
                      WHERE id = ?1 AND lifecycle = 'active'",
@@ -564,13 +657,7 @@ impl Store {
                     if let Some(turn) = open_turn.as_deref()
                         && host_turn != Some(turn)
                     {
-                        let state: Option<String> = tx
-                            .query_row("SELECT state FROM turns WHERE turn_id = ?1", [turn], |r| r.get(0))
-                            .optional()?;
-                        out.events.push(match state.as_deref() {
-                            Some("started") => synthesize_turn_end(&tx, &id, turn, &ts)?,
-                            _ => turn_not_delivered(&tx, &id, turn, &ts)?,
-                        });
+                        out.events.push(resolve_open_turn(&tx, &id, turn, &ts)?);
                     }
                     if host.is_none() {
                         tx.execute(
