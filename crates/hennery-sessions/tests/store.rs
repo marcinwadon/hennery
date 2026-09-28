@@ -407,6 +407,7 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
             "ALTER TABLE turns DROP COLUMN state;
              ALTER TABLE sessions DROP COLUMN close_requested;
              ALTER TABLE events DROP COLUMN applied;
+             ALTER TABLE sessions DROP COLUMN presumed_parked;
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -954,4 +955,121 @@ fn a_start_failed_replaces_a_reconciled_guess_of_start_not_delivered() {
         (s.lifecycle.as_str(), s.failure_reason.as_deref()),
         ("failed", Some("agent_not_logged_in"))
     );
+}
+
+// Plan B: host offline, presumed park, reattached (ACP core §5.3).
+
+/// s1 active on h1 with a started turn t1, s2 active on another host.
+fn two_hosts(store: &Store) {
+    started(store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.ingest("s1", 2, &turn_started("t1")).unwrap();
+    store.create_session("s2", "h2", "fake", "/tmp").unwrap();
+    store
+        .ingest(
+            "s2",
+            1,
+            &SessionBody::SessionStarted {
+                request_id: "r".into(),
+                agent_session_id: "a2".into(),
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn presume_parked_parks_the_hosts_active_sessions_and_keeps_their_open_turn() {
+    let store = Store::open_in_memory().unwrap();
+    two_hosts(&store);
+    assert_eq!(store.hosts_with_active_sessions().unwrap(), ["h1", "h2"]);
+    let events = store.presume_parked("h1").unwrap();
+    assert_eq!(kinds(&events), ["presumed_parked"]);
+    assert_eq!(events[0].body["reason"], "host_offline");
+    let s1 = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (s1.lifecycle.as_str(), s1.presumed_parked, s1.open_turn_id.as_deref()),
+        ("parked", true, Some("t1"))
+    );
+    assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("started"));
+    assert_eq!(store.session("s2").unwrap().unwrap().lifecycle, "active");
+    // Idempotent: nothing is active on h1 any more.
+    assert!(store.presume_parked("h1").unwrap().is_empty());
+    assert_eq!(store.hosts_with_active_sessions().unwrap(), ["h2"]);
+}
+
+#[test]
+fn reconcile_reattaches_a_presumed_session_the_host_still_has() {
+    let store = Store::open_in_memory().unwrap();
+    two_hosts(&store);
+    store.presume_parked("h1").unwrap();
+    let done = store.reconcile_host("h1", &[attached("s1", Some("t1"))]).unwrap();
+    assert_eq!(kinds(&done.events), ["reattached"]);
+    let s1 = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (s1.lifecycle.as_str(), s1.presumed_parked, s1.open_turn_id.as_deref()),
+        ("active", false, Some("t1"))
+    );
+    // The turn the host kept running ends for real.
+    assert_eq!(kinds(&store.ingest("s1", 3, &ended("t1")).unwrap()), ["turn_ended"]);
+}
+
+#[test]
+fn reconcile_of_a_presumed_session_the_host_lost_is_a_host_restart() {
+    let store = Store::open_in_memory().unwrap();
+    two_hosts(&store);
+    store.presume_parked("h1").unwrap();
+    let done = store.reconcile_host("h1", &[]).unwrap();
+    assert_eq!(kinds(&done.events), ["host_restarted", "turn_ended_synthesized"]);
+    let s1 = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (s1.lifecycle.as_str(), s1.presumed_parked, s1.open_turn_id),
+        ("parked", false, None)
+    );
+}
+
+#[test]
+fn facts_a_returning_host_resends_still_apply_to_a_presumed_session() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    // A prompt went out just before the host dropped off.
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.presume_parked("h1").unwrap();
+    // The resend: the prompt had reached the adapter, and the host reaped
+    // the session while it was away.
+    assert_eq!(
+        kinds(&store.ingest("s1", 2, &turn_started("t1")).unwrap()),
+        ["turn_started", "user_turn"]
+    );
+    store.ingest("s1", 3, &ended("t1")).unwrap();
+    let parked = store
+        .ingest(
+            "s1",
+            4,
+            &SessionBody::SessionParked {
+                reason: ParkReason::Idle,
+            },
+        )
+        .unwrap();
+    assert_eq!(kinds(&parked), ["session_parked"]);
+    let s1 = store.session("s1").unwrap().unwrap();
+    assert_eq!((s1.lifecycle.as_str(), s1.presumed_parked), ("parked", false));
+    // Reconciliation leaves a real park alone.
+    assert!(store.reconcile_host("h1", &[]).unwrap().events.is_empty());
+}
+
+#[test]
+fn closing_or_resuming_a_presumed_session_ends_the_presumption() {
+    let store = Store::open_in_memory().unwrap();
+    two_hosts(&store);
+    store.presume_parked("h1").unwrap();
+    assert!(matches!(
+        store.request_resume("s1").unwrap(),
+        ResumeRequest::Starting { .. }
+    ));
+    assert!(!store.session("s1").unwrap().unwrap().presumed_parked);
+
+    store.presume_parked("h2").unwrap();
+    store.close_now("s2").unwrap();
+    let s2 = store.session("s2").unwrap().unwrap();
+    assert_eq!((s2.lifecycle.as_str(), s2.presumed_parked), ("closed", false));
 }

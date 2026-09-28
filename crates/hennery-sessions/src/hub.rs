@@ -52,6 +52,9 @@ pub struct Registration {
 pub struct Hub {
     next_conn: AtomicU64,
     hosts: Mutex<HashMap<String, HostConn>>,
+    /// The latest connection each host registered (kept after it ends), so
+    /// an offline timer can tell whether the host came back since.
+    last_conn: Mutex<HashMap<String, u64>>,
     waiters: Mutex<HashMap<String, Waiter>>,
     events: broadcast::Sender<EventDto>,
 }
@@ -67,6 +70,7 @@ impl Hub {
         Self {
             next_conn: AtomicU64::new(1),
             hosts: Mutex::new(HashMap::new()),
+            last_conn: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
             events: broadcast::channel(1024).0,
         }
@@ -91,7 +95,25 @@ impl Hub {
                 kicked: kicked.clone(),
             },
         );
+        self.last_conn
+            .lock()
+            .expect("last_conn lock")
+            .insert(host_id.to_string(), conn_id);
         Some(Registration { conn_id, kicked })
+    }
+
+    /// The latest connection `host_id` registered, if any since start.
+    pub fn last_conn(&self, host_id: &str) -> Option<u64> {
+        self.last_conn.lock().expect("last_conn lock").get(host_id).copied()
+    }
+
+    /// Run `f` only if `host_id` has registered no connection since `since`
+    /// (`None`: none since this collector started). The lock is held while
+    /// `f` runs, so a reconnect waits for it and its reconciliation sees
+    /// whatever `f` wrote (ACP core §5.3).
+    pub fn if_offline_since<R>(&self, host_id: &str, since: Option<u64>, f: impl FnOnce() -> R) -> Option<R> {
+        let last = self.last_conn.lock().expect("last_conn lock");
+        (last.get(host_id).copied() == since).then(f)
     }
 
     /// Reconciliation for this connection is done: requests may flow.

@@ -91,6 +91,7 @@ async fn serve(socket: WebSocket, state: AppState) {
     let conn_id = registration.conn_id;
     if sink.send(text(&ack)).await.is_err() {
         state.hub.unregister(&host_id, conn_id);
+        crate::offline::after_disconnect(&state, host_id, conn_id);
         return;
     }
     tracing::info!(%host_id, "host connected");
@@ -254,4 +255,5 @@ async fn serve(socket: WebSocket, state: AppState) {
     writer.abort();
     state.hub.unregister(&host_id, conn_id);
     tracing::info!(%host_id, "host disconnected");
+    crate::offline::after_disconnect(&state, host_id, conn_id);
 }

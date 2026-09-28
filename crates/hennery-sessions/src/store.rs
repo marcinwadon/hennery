@@ -57,6 +57,12 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE events ADD COLUMN applied INTEGER NOT NULL DEFAULT 1;
 ",
+    // Resume: a session parked only because its host has been offline past
+    // the threshold (ACP core §5.3). A presumption, not a fact: the host
+    // may still run it, so it keeps its open turn.
+    "
+    ALTER TABLE sessions ADD COLUMN presumed_parked INTEGER NOT NULL DEFAULT 0;
+",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -72,6 +78,9 @@ pub struct SessionRow {
     /// The operator closed the session while it was attached and the host
     /// has not confirmed yet (ACP core §4.8).
     pub close_requested: bool,
+    /// `parked` only because the host has been offline past the threshold
+    /// (ACP core §5.3).
+    pub presumed_parked: bool,
 }
 
 /// The outcome of `Store::request_resume`.
@@ -176,15 +185,15 @@ fn resolve_open_turn(tx: &Transaction<'_>, session_id: &str, turn_id: &str, ts: 
 /// answer is not outboxed and can be lost. Release it, or the next resume
 /// inherits a permanent 409 (plan A, "After this plan").
 fn release_turn_on_detach(tx: &Transaction<'_>, session_id: &str, ts: &str) -> Result<Option<EventDto>> {
-    let row: Option<(String, Option<String>)> = tx
+    let row: Option<(String, Option<String>, bool)> = tx
         .query_row(
-            "SELECT lifecycle, open_turn_id FROM sessions WHERE id = ?1",
+            "SELECT lifecycle, open_turn_id, presumed_parked FROM sessions WHERE id = ?1",
             [session_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
     match row {
-        Some((lifecycle, Some(turn))) if lifecycle == "active" => {
+        Some((lifecycle, Some(turn), presumed)) if lifecycle == "active" || presumed => {
             Ok(Some(resolve_open_turn(tx, session_id, &turn, ts)?))
         }
         _ => Ok(None),
@@ -277,7 +286,8 @@ impl Store {
         Ok(self
             .conn()
             .query_row(
-                "SELECT id, host_id, agent, cwd, lifecycle, activity, open_turn_id, failure_reason, close_requested
+                "SELECT id, host_id, agent, cwd, lifecycle, activity, open_turn_id, failure_reason, close_requested,
+                        presumed_parked
                  FROM sessions WHERE id = ?1",
                 [id],
                 |r| {
@@ -291,6 +301,7 @@ impl Store {
                         open_turn_id: r.get(6)?,
                         failure_reason: r.get(7)?,
                         close_requested: r.get(8)?,
+                        presumed_parked: r.get(9)?,
                     })
                 },
             )
@@ -389,7 +400,8 @@ impl Store {
                 events.push(collector_event(&tx, session_id, "operator_closed", json!({}), &ts)?);
             }
             tx.execute(
-                "UPDATE sessions SET lifecycle = 'closed', activity = NULL, open_turn_id = NULL, close_requested = 0
+                "UPDATE sessions SET lifecycle = 'closed', activity = NULL, open_turn_id = NULL, close_requested = 0,
+                     presumed_parked = 0
                  WHERE id = ?1",
                 [session_id],
             )?;
@@ -429,7 +441,7 @@ impl Store {
         events.push(collector_event(&tx, session_id, "operator_resumed", json!({}), &ts)?);
         tx.execute(
             "UPDATE sessions SET lifecycle = 'starting', activity = NULL, failure_reason = NULL,
-                 close_requested = 0, open_turn_id = NULL
+                 close_requested = 0, open_turn_id = NULL, presumed_parked = 0
              WHERE id = ?1",
             [session_id],
         )?;
@@ -444,6 +456,46 @@ impl Store {
             agent_session_id,
             committed_seq: committed.unwrap_or(0) as u64,
         })
+    }
+
+    /// The host has been offline past the threshold: presume its `active`
+    /// sessions parked (ACP core §5.3). Their open turns stay open, since
+    /// the host may still be running them.
+    pub fn presume_parked(&self, host_id: &str) -> Result<Vec<EventDto>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let ts = now();
+        let ids: Vec<String> = {
+            let mut stmt =
+                tx.prepare("SELECT id FROM sessions WHERE host_id = ?1 AND lifecycle = 'active' ORDER BY id")?;
+            let rows = stmt.query_map([host_id], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut events = Vec::new();
+        for id in &ids {
+            events.push(collector_event(
+                &tx,
+                id,
+                "presumed_parked",
+                json!({ "reason": "host_offline" }),
+                &ts,
+            )?);
+            tx.execute(
+                "UPDATE sessions SET lifecycle = 'parked', presumed_parked = 1 WHERE id = ?1",
+                [id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(events)
+    }
+
+    /// Hosts the collector believes are running at least one session.
+    pub fn hosts_with_active_sessions(&self) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT host_id FROM sessions WHERE lifecycle = 'active' ORDER BY host_id")?;
+        let rows = stmt.query_map([], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Highest committed host seq for a session (0 if none).
@@ -550,13 +602,15 @@ impl Store {
                 let turn_state: Option<String> = tx
                     .query_row("SELECT state FROM turns WHERE turn_id = ?1", [turn_id], |r| r.get(0))
                     .optional()?;
-                let (lifecycle, slot): (String, Option<String>) = tx.query_row(
-                    "SELECT lifecycle, open_turn_id FROM sessions WHERE id = ?1",
+                let (lifecycle, slot, presumed): (String, Option<String>, bool) = tx.query_row(
+                    "SELECT lifecycle, open_turn_id, presumed_parked FROM sessions WHERE id = ?1",
                     [session_id],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )?;
-                let applies =
-                    lifecycle == "active" && matches!(turn_state.as_deref(), Some("sent") | Some("not_delivered"));
+                // A presumed-parked session is still attached as far as its
+                // host's facts go (ACP core §5.3).
+                let applies = (lifecycle == "active" || presumed)
+                    && matches!(turn_state.as_deref(), Some("sent") | Some("not_delivered"));
                 let mut takes_slot = false;
                 if applies {
                     takes_slot = match slot.as_deref() {
@@ -631,8 +685,8 @@ impl Store {
                 let changed = tx.execute(
                     "UPDATE sessions SET
                          lifecycle = CASE WHEN close_requested = 1 THEN 'closed' ELSE 'parked' END,
-                         activity = NULL, close_requested = 0
-                     WHERE id = ?1 AND lifecycle = 'active'",
+                         activity = NULL, close_requested = 0, presumed_parked = 0
+                     WHERE id = ?1 AND (lifecycle = 'active' OR presumed_parked = 1)",
                     [session_id],
                 )?;
                 if changed == 0 {
@@ -645,8 +699,8 @@ impl Store {
                 // Also the host's confirmation of a close the collector
                 // already made (an offline close): nothing left to change.
                 let changed = tx.execute(
-                    "UPDATE sessions SET lifecycle = 'closed', activity = NULL, close_requested = 0
-                     WHERE id = ?1 AND lifecycle = 'active'",
+                    "UPDATE sessions SET lifecycle = 'closed', activity = NULL, close_requested = 0, presumed_parked = 0
+                     WHERE id = ?1 AND (lifecycle = 'active' OR presumed_parked = 1)",
                     [session_id],
                 )?;
                 if changed == 0 {
@@ -691,18 +745,25 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let ts = now();
-        let rows: Vec<(String, String, Option<String>, bool)> = {
+        let rows: Vec<(String, String, Option<String>, bool, bool)> = {
             let mut stmt = tx.prepare(
-                "SELECT id, lifecycle, open_turn_id, close_requested FROM sessions
-                 WHERE host_id = ?1 AND lifecycle IN ('starting', 'active', 'closed') ORDER BY id",
+                "SELECT id, lifecycle, open_turn_id, close_requested, presumed_parked FROM sessions
+                 WHERE host_id = ?1 AND (lifecycle IN ('starting', 'active', 'closed') OR presumed_parked = 1)
+                 ORDER BY id",
             )?;
-            let rows = stmt.query_map([host_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            let rows = stmt.query_map([host_id], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })?;
             rows.collect::<rusqlite::Result<_>>()?
         };
         let mut out = Reconciliation::default();
-        for (id, lifecycle, open_turn, close_requested) in rows {
+        for (id, lifecycle, open_turn, close_requested, presumed) in rows {
             let host = listed.get(id.as_str());
-            match (lifecycle.as_str(), host) {
+            // A presumed park was a guess made while the host was away: now
+            // that it is back, treat the session as the active one it may
+            // still be (ACP core §5.1 step 4, §5.3).
+            let lifecycle = if presumed { "active" } else { lifecycle.as_str() };
+            match (lifecycle, host) {
                 ("starting", None) => {
                     out.events
                         .push(collector_event(&tx, &id, "start_not_delivered", json!({}), &ts)?);
@@ -715,6 +776,13 @@ impl Store {
                     if host.is_none() {
                         out.events
                             .push(collector_event(&tx, &id, "host_restarted", json!({}), &ts)?);
+                    } else if presumed {
+                        out.events
+                            .push(collector_event(&tx, &id, "reattached", json!({}), &ts)?);
+                        tx.execute(
+                            "UPDATE sessions SET lifecycle = 'active', presumed_parked = 0 WHERE id = ?1",
+                            [&id],
+                        )?;
                     }
                     let host_turn = host.and_then(|a| a.open_turn_id.as_deref());
                     if let Some(turn) = open_turn.as_deref()
@@ -726,7 +794,7 @@ impl Store {
                         tx.execute(
                             "UPDATE sessions SET
                                  lifecycle = CASE WHEN close_requested = 1 THEN 'closed' ELSE 'parked' END,
-                                 activity = NULL, open_turn_id = NULL, close_requested = 0
+                                 activity = NULL, open_turn_id = NULL, close_requested = 0, presumed_parked = 0
                              WHERE id = ?1",
                             [&id],
                         )?;

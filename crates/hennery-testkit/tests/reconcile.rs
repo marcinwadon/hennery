@@ -24,13 +24,23 @@ struct Collector {
 
 impl Collector {
     async fn start() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        Self::start_in(
+            tempfile::tempdir().unwrap(),
+            hennery_sessions::offline::OFFLINE_THRESHOLD,
+        )
+        .await
+    }
+
+    /// A collector over the database in `dir` that presumes a host's
+    /// sessions parked once it has been offline for `offline`.
+    async fn start_in(dir: tempfile::TempDir, offline: Duration) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let state = AppState::new(
+        let mut state = AppState::new(
             Store::open(&dir.path().join("hennery.db")).unwrap(),
             DevToken::new(TOKEN),
         );
+        state.offline_threshold = offline;
         tokio::spawn(hennery_sessions::serve(listener, state.clone()));
         Self { addr, state, _dir: dir }
     }
@@ -418,4 +428,168 @@ async fn a_request_that_times_out_on_a_live_connection_drops_it() {
         (!collector.state.hub.connected_hosts().contains(&HOST.to_string())).then_some(())
     })
     .await;
+}
+
+// Plan B: host offline past the threshold (ACP core §5.3, §12 scenario 8).
+
+fn presumed(collector: &Collector, session: &str) -> bool {
+    collector.state.store.session(session).unwrap().unwrap().presumed_parked
+}
+
+async fn presumed_parked(collector: &Collector, session: &str) {
+    wait_for("presumed parked", || async {
+        (collector.lifecycle(session) == "parked" && presumed(collector, session)).then_some(())
+    })
+    .await;
+}
+
+/// A prompt the host has started; returns its turn id.
+async fn started_turn(collector: &Collector, host: &mut ScriptedHost, session: &str) -> String {
+    let c = client();
+    let url = collector.url(&format!("/api/sessions/{session}/prompt"));
+    let call = tokio::spawn(async move { post(&c, url, prompt_body()).await });
+    let CollectorFrame::Prompt {
+        request_id, turn_id, ..
+    } = host.next().await
+    else {
+        panic!("expected a prompt");
+    };
+    host.emit(
+        session,
+        SessionBody::TurnStarted {
+            request_id,
+            turn_id: turn_id.clone(),
+        },
+    )
+    .await;
+    assert_eq!(call.await.unwrap().0, 202);
+    turn_id
+}
+
+#[tokio::test]
+async fn a_host_offline_past_the_threshold_is_presumed_parked_and_reattached_on_reconnect() {
+    let collector = Collector::start_in(tempfile::tempdir().unwrap(), Duration::from_millis(500)).await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let turn = started_turn(&collector, &mut host, &session).await;
+    let seq = host.seq;
+    host.drop_connection(&collector).await;
+    assert_eq!(collector.lifecycle(&session), "active", "presumed before the threshold");
+
+    presumed_parked(&collector, &session).await;
+    assert!(
+        collector
+            .event_kinds(&session)
+            .ends_with(&["presumed_parked".to_string()])
+    );
+    let (status, body) = post(
+        &client(),
+        collector.url(&format!("/api/sessions/{session}/prompt")),
+        prompt_body(),
+    )
+    .await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("not_attached")));
+
+    // The host comes back; its adapter is still running the turn.
+    let listed = AttachedSession {
+        open_turn_id: Some(turn.clone()),
+        ..attached(&session, seq)
+    };
+    let mut host = ScriptedHost::connect(&collector, vec![listed], seq).await;
+    assert_eq!(collector.lifecycle(&session), "active");
+    assert!(!presumed(&collector, &session));
+    let kinds = collector.event_kinds(&session);
+    assert!(
+        kinds.ends_with(&["presumed_parked".to_string(), "reattached".to_string()]),
+        "{kinds:?}"
+    );
+    assert_eq!(
+        collector.state.store.turn_state(&turn).unwrap().as_deref(),
+        Some("started")
+    );
+    host.emit(
+        &session,
+        SessionBody::TurnEnded {
+            turn_id: turn.clone(),
+            outcome: hennery_proto::frames::TurnOutcome::Completed,
+            stop_reason: None,
+            error: None,
+        },
+    )
+    .await;
+    wait_for("turn ended", || async {
+        (collector.state.store.turn_state(&turn).unwrap().as_deref() == Some("ended")).then_some(())
+    })
+    .await;
+}
+
+/// The offline clock restarts with every connection: a host that dropped,
+/// came back and dropped again is presumed offline only a full threshold
+/// after the second drop.
+#[tokio::test]
+async fn an_older_drop_never_presumes_a_host_that_came_back() {
+    let collector = Collector::start_in(tempfile::tempdir().unwrap(), Duration::from_millis(1000)).await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let seq = host.seq;
+    let t0 = tokio::time::Instant::now();
+    host.drop_connection(&collector).await; // its timer fires at ~t0 + 1000 ms
+    let host = ScriptedHost::connect(&collector, vec![attached(&session, seq)], seq).await;
+    tokio::time::sleep_until(t0 + Duration::from_millis(500)).await;
+    host.drop_connection(&collector).await; // its timer fires at ~t0 + 1500 ms
+    tokio::time::sleep_until(t0 + Duration::from_millis(1250)).await;
+    assert_eq!(
+        collector.lifecycle(&session),
+        "active",
+        "presumed by the first drop's timer"
+    );
+    presumed_parked(&collector, &session).await;
+}
+
+/// ACP core §5.4: after a collector restart, a host that never connects
+/// again gets the same threshold, counted from the restart.
+#[tokio::test]
+async fn a_host_that_never_returns_after_a_collector_restart_is_presumed_offline() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = Store::open(&dir.path().join("hennery.db")).unwrap();
+        store.create_session("s1", HOST, "fake", "/tmp").unwrap();
+        store
+            .ingest(
+                "s1",
+                1,
+                &SessionBody::SessionStarted {
+                    request_id: "r0".into(),
+                    agent_session_id: "a1".into(),
+                },
+            )
+            .unwrap();
+    }
+    let collector = Collector::start_in(dir, Duration::from_millis(300)).await;
+    assert_eq!(collector.lifecycle("s1"), "active");
+    presumed_parked(&collector, "s1").await;
+}
+
+#[tokio::test]
+async fn a_host_that_returns_after_a_collector_restart_is_not_presumed_offline() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = Store::open(&dir.path().join("hennery.db")).unwrap();
+        store.create_session("s1", HOST, "fake", "/tmp").unwrap();
+        store
+            .ingest(
+                "s1",
+                1,
+                &SessionBody::SessionStarted {
+                    request_id: "r0".into(),
+                    agent_session_id: "a1".into(),
+                },
+            )
+            .unwrap();
+    }
+    let collector = Collector::start_in(dir, Duration::from_millis(300)).await;
+    let _host = ScriptedHost::connect(&collector, vec![attached("s1", 1)], 1).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(collector.lifecycle("s1"), "active");
+    assert!(!presumed(&collector, "s1"));
 }
