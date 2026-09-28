@@ -108,6 +108,17 @@ fn request_failed(err: RequestError) -> Response {
     }
 }
 
+/// A resume answers like a start (decision 3): whatever code the host
+/// rejects it with, the session is marked `failed` with that code and the
+/// answer is 502 with it, so the answer and the session agree. An offline
+/// host and an unknown delivery answer as for any other request.
+fn resume_failed(err: RequestError) -> Response {
+    match err {
+        RequestError::Rejected { code, message } => error(StatusCode::BAD_GATEWAY, &code, message),
+        other => request_failed(other),
+    }
+}
+
 async fn list_hosts(State(state): State<AppState>) -> Json<Vec<String>> {
     Json(state.hub.connected_hosts())
 }
@@ -255,7 +266,7 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
             if let Err(e) = state.store.mark_failed(&id, &reason) {
                 return internal(e);
             }
-            request_failed(err)
+            resume_failed(err)
         }
     }
 }

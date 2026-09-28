@@ -810,6 +810,36 @@ async fn a_resume_the_agent_cannot_load_fails_with_its_reason_and_can_be_retried
     expect_resume(&mut host, &session).await;
 }
 
+/// Decision 3: a resume the host rejects is answered like one it fails —
+/// 502 with the host's code, the session `failed` with it — whatever the
+/// code, not the 409/400 the shared request mapping gives other endpoints
+/// (final review F2).
+#[tokio::test]
+async fn a_resume_the_host_rejects_is_a_502_with_its_code() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = parked_session(&collector, &mut host).await;
+    for code in ["not_attached", "invalid"] {
+        let c = client();
+        let url = resume_url(&collector, &session);
+        let call = tokio::spawn(async move { post(&c, url, json!({})).await });
+        let request_id = expect_resume(&mut host, &session).await;
+        host.send(&HostFrame::Error {
+            request_id,
+            code: code.into(),
+            message: "rejected".into(),
+        })
+        .await;
+        let (status, body) = call.await.unwrap();
+        assert_eq!((status, body["code"].as_str()), (502, Some(code)), "{body}");
+        let row = collector.state.store.session(&session).unwrap().unwrap();
+        assert_eq!(
+            (row.lifecycle.as_str(), row.failure_reason.as_deref()),
+            ("failed", Some(code))
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_resume_is_refused_while_active_offline_or_without_agent_history() {
     let collector = Collector::start().await;
