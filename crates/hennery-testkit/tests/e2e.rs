@@ -678,3 +678,179 @@ async fn host_shutdown_gives_every_adapter_its_sigterm_grace() {
     );
     collector.stop().await;
 }
+
+// Plan B: resume end to end (ACP core §12 scenarios 2, 3, 17).
+
+fn history_and_state() -> FakeScript {
+    FakeScript {
+        replay: vec![
+            json!({"sessionUpdate": "user_message_chunk", "content": {"type": "text", "text": "old question"}}),
+            json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "old answer"}}),
+            json!({"sessionUpdate": "tool_call", "toolCallId": "c1", "title": "ls"}),
+            json!({"sessionUpdate": "available_commands_update", "availableCommands": []}),
+            json!({"sessionUpdate": "from_the_future"}),
+        ],
+        ..FakeScript::default()
+    }
+}
+
+async fn prompt_and_wait(c: &reqwest::Client, collector: &Collector, session: &str, ends: usize) -> Vec<EventDto> {
+    let url = collector.url(&format!("/api/sessions/{session}/prompt"));
+    let (status, body) = post_json(c, url, json!({ "content": text("hi") })).await;
+    assert_eq!(status, 202, "{body}");
+    wait_for("turn end", || async {
+        let evs = events(c, collector, session).await;
+        (turn_ends(&evs).len() == ends).then_some(evs)
+    })
+    .await
+}
+
+async fn resume(c: &reqwest::Client, collector: &Collector, session: &str) -> (u16, Value) {
+    post_json(c, collector.url(&format!("/api/sessions/{session}/resume")), json!({})).await
+}
+
+fn assert_no_duplicate_seqs(evs: &[EventDto]) {
+    let mut seqs: Vec<u64> = evs.iter().filter_map(|e| e.host_seq).collect();
+    let n = seqs.len();
+    seqs.sort_unstable();
+    seqs.dedup();
+    assert_eq!(seqs.len(), n, "duplicate host seqs stored");
+}
+
+#[tokio::test]
+async fn a_parked_session_resumes_without_replaying_its_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    start_host(collector.addr, &dir.path().join("host"), &history_and_state());
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    prompt_and_wait(&c, &collector, &session, 1).await;
+    let (status, body) = post_json(&c, collector.url(&format!("/api/sessions/{session}/park")), json!({})).await;
+    assert_eq!((status, body["lifecycle"].as_str()), (202, Some("parked")), "{body}");
+
+    let (status, body) = resume(&c, &collector, &session).await;
+    assert_eq!((status, body["lifecycle"].as_str()), (202, Some("active")), "{body}");
+    // The 202 fires once `session_started` is ingested (decision 3); the
+    // trailing `available_commands_update` and `host_note` land afterward,
+    // so wait for the last of the three before asserting on the sequence.
+    let evs = wait_for("post-resume host_note", || async {
+        let evs = events(&c, &collector, &session).await;
+        let resumed = evs.iter().position(|e| e.kind == "operator_resumed")?;
+        evs[resumed + 1..].iter().any(|e| e.kind == "host_note").then_some(evs)
+    })
+    .await;
+    let resumed = evs.iter().position(|e| e.kind == "operator_resumed").unwrap();
+    let after: Vec<String> = evs[resumed + 1..]
+        .iter()
+        .map(|e| match e.kind.as_str() {
+            "acp_update" => format!(
+                "acp_update:{}",
+                e.body["payload"]["update"]["sessionUpdate"].as_str().unwrap()
+            ),
+            kind => kind.to_string(),
+        })
+        .collect();
+    assert_eq!(
+        after,
+        ["session_started", "acp_update:available_commands_update", "host_note"]
+    );
+    assert!(
+        evs[resumed + 3].body["text"]
+            .as_str()
+            .unwrap()
+            .contains("from_the_future"),
+        "{:?}",
+        evs[resumed + 3]
+    );
+
+    // The resumed session takes a prompt; the transcript holds each reply once.
+    let evs = prompt_and_wait(&c, &collector, &session, 2).await;
+    assert_eq!(agent_text(&evs), "Hello worldHello world");
+    assert_eq!(of_kind(&evs, "user_turn").len(), 2);
+    assert_no_duplicate_seqs(&evs);
+}
+
+#[tokio::test]
+async fn resuming_a_session_the_agent_has_no_record_of_fails_agent_has_no_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let script = FakeScript {
+        load_error: Some(-32002),
+        ..FakeScript::default()
+    };
+    start_host(collector.addr, &dir.path().join("host"), &script);
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    post_json(&c, collector.url(&format!("/api/sessions/{session}/park")), json!({})).await;
+    let (status, body) = resume(&c, &collector, &session).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (502, Some("agent_has_no_record")),
+        "{body}"
+    );
+    let detail: Value = c
+        .get(collector.url(&format!("/api/sessions/{session}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        (detail["lifecycle"].as_str(), detail["failure_reason"].as_str()),
+        (Some("failed"), Some("agent_has_no_record"))
+    );
+}
+
+/// The whole restart path a user meets: the host restarts, the collector
+/// parks its session, the operator resumes it on the new host process and
+/// keeps working. With `lose_outbox`, the host also comes back with an empty
+/// data dir: its seq counter restarts at 0 and only `resume_session`'s
+/// `committed_seq` keeps the new frames from being taken as duplicates of
+/// stored ones (§12 scenario 17).
+async fn resume_after_a_host_restart(lose_outbox: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let mut fake = AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    fake.env.push((
+        SCRIPT_ENV.into(),
+        serde_json::to_string(&FakeScript::default()).unwrap(),
+    ));
+    let host = start_host_with(collector.addr, &dir.path().join("host"), fake.clone());
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    prompt_and_wait(&c, &collector, &session, 1).await;
+
+    host.abort();
+    let _ = host.await;
+    let data_dir = if lose_outbox {
+        dir.path().join("host-fresh")
+    } else {
+        dir.path().join("host")
+    };
+    start_host_with(collector.addr, &data_dir, fake);
+    lifecycle_is(&collector, &session, "parked").await;
+
+    let (status, body) = resume(&c, &collector, &session).await;
+    assert_eq!((status, body["lifecycle"].as_str()), (202, Some("active")), "{body}");
+    let evs = prompt_and_wait(&c, &collector, &session, 2).await;
+    assert_eq!(agent_text(&evs), "Hello worldHello world");
+    assert_no_duplicate_seqs(&evs);
+    assert!(
+        of_kind(&evs, "conflict").is_empty(),
+        "new frames collided with stored seqs"
+    );
+}
+
+#[tokio::test]
+async fn a_session_parked_by_a_host_restart_resumes_on_the_restarted_host() {
+    resume_after_a_host_restart(false).await;
+}
+
+#[tokio::test]
+async fn a_session_resumes_on_a_host_that_lost_its_outbox() {
+    resume_after_a_host_restart(true).await;
+}
