@@ -404,6 +404,7 @@ async fn a_request_that_times_out_on_a_live_connection_drops_it() {
     let request = CollectorFrame::StartSession {
         request_id: "r-timeout".into(),
         session_id: "s-timeout".into(),
+        committed_seq: 0,
         agent: "fake".into(),
         cwd: "/tmp".into(),
     };

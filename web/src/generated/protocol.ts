@@ -8,7 +8,7 @@ export type ParkReason = "idle" | "adapter_exited" | "operator";
 
 export type Indexed = { turn_id?: string | null, title?: string | null, };
 
-export type SessionBody = { "kind": "session_started", request_id: string, agent_session_id: string, } | { "kind": "start_failed", request_id: string, code: string, message: string, } | { "kind": "turn_started", request_id: string, turn_id: string, } | { "kind": "acp_update", indexed: Indexed, payload: unknown, } | { "kind": "turn_ended", turn_id: string, outcome: TurnOutcome, stop_reason?: string | null, error?: string | null, } | { "kind": "session_parked", reason: ParkReason, } | { "kind": "session_closed" } | { "kind": "adapter_exited", code?: number | null, signal?: number | null, stderr_tail: string, };
+export type SessionBody = { "kind": "session_started", request_id: string, agent_session_id: string, } | { "kind": "start_failed", request_id: string, code: string, message: string, } | { "kind": "turn_started", request_id: string, turn_id: string, } | { "kind": "acp_update", indexed: Indexed, payload: unknown, } | { "kind": "turn_ended", turn_id: string, outcome: TurnOutcome, stop_reason?: string | null, error?: string | null, } | { "kind": "session_parked", reason: ParkReason, } | { "kind": "session_closed" } | { "kind": "adapter_exited", code?: number | null, signal?: number | null, stderr_tail: string, } | { "kind": "host_note", note: string, text: string, };
 
 export type HostFrame = { "type": "hello", protocol_version: string, host_version: string, host_id: string, 
 /**
@@ -22,7 +22,21 @@ export type CollectorFrame = { "type": "hello_ack", protocol_version: string, co
  * Highest committed seq per session listed in `hello`; the host
  * fast-forwards its counters if they are lower (lost outbox).
  */
-committed: Record<string, number>, } | { "type": "hello_error", code: string, message: string, } | { "type": "start_session", request_id: string, session_id: string, agent: string, cwd: string, } | { "type": "prompt", request_id: string, session_id: string, turn_id: string, 
+committed: Record<string, number>, } | { "type": "hello_error", code: string, message: string, } | { "type": "start_session", request_id: string, session_id: string, 
+/**
+ * The collector's highest committed seq for this session; the host
+ * continues from the larger of this and its own counter (§5.1).
+ */
+committed_seq: number, agent: string, cwd: string, } | { "type": "resume_session", request_id: string, session_id: string, 
+/**
+ * Fast-forward the host's counter before the first frame (§5.1).
+ */
+committed_seq: number, agent: string, cwd: string, 
+/**
+ * The adapter's own session id, from the stored `session_started`:
+ * the host keeps no copy across restarts.
+ */
+agent_session_id: string, } | { "type": "prompt", request_id: string, session_id: string, turn_id: string, 
 /**
  * ACP ContentBlocks, built by the frontend.
  */
@@ -47,3 +61,16 @@ export type ApiError = { code: string, message: string,
 session_id?: string | undefined, };
 
 export type LifecycleResponse = { session_id: string, lifecycle: string, };
+
+export type OpenTurn = { turn_id: string, 
+/**
+ * `sent` (not yet acknowledged by the adapter) or `started`.
+ */
+state: string, };
+
+export type SessionDetail = { session_id: string, host_id: string, agent: string, cwd: string, lifecycle: string, activity?: string | undefined, failure_reason?: string | undefined, 
+/**
+ * Parked only because its host has been offline past the threshold
+ * (ACP core §5.3); the host may still be running it.
+ */
+presumed_parked: boolean, open_turn?: OpenTurn | undefined, };

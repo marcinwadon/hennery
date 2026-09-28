@@ -275,6 +275,7 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
             session_id,
             agent,
             cwd,
+            ..
         } => {
             let Some(command) = cfg.agents.get(&agent).cloned() else {
                 uplink.reply(HostFrame::Error {
@@ -333,6 +334,13 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
                 }) => {}
             _ => not_attached(uplink, request_id),
         },
+        // Wired to the session actor with resume; until then it is refused,
+        // so the collector's waiter returns at once.
+        CollectorFrame::ResumeSession { request_id, .. } => uplink.reply(HostFrame::Error {
+            request_id,
+            code: "unsupported".into(),
+            message: "this host cannot resume sessions yet".into(),
+        }),
         CollectorFrame::Ack { session_id, ack_seq } => uplink.ack(&session_id, ack_seq)?,
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }

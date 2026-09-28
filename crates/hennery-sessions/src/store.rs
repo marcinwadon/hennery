@@ -510,7 +510,7 @@ impl Store {
                 )?;
             }
             // Diagnostics only; the `session_parked` that follows detaches.
-            SessionBody::AdapterExited { .. } | SessionBody::AcpUpdate { .. } => {}
+            SessionBody::AdapterExited { .. } | SessionBody::AcpUpdate { .. } | SessionBody::HostNote { .. } => {}
         }
         tx.execute(
             "UPDATE sessions SET last_event_at = ?2 WHERE id = ?1",
@@ -635,6 +635,7 @@ fn body_kind(body: &SessionBody) -> &'static str {
         SessionBody::SessionParked { .. } => "session_parked",
         SessionBody::SessionClosed => "session_closed",
         SessionBody::AdapterExited { .. } => "adapter_exited",
+        SessionBody::HostNote { .. } => "host_note",
     }
 }
 

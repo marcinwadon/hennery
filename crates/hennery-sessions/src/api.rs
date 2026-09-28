@@ -119,6 +119,8 @@ async fn start_session(State(state): State<AppState>, Json(req): Json<StartSessi
     let frame = CollectorFrame::StartSession {
         request_id: request_id.clone(),
         session_id: session_id.clone(),
+        // A session minted just now has nothing committed.
+        committed_seq: 0,
         agent: req.agent,
         cwd: req.cwd,
     };

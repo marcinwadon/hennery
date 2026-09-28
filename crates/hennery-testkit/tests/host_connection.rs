@@ -317,6 +317,7 @@ fn start(request_id: &str, session_id: &str) -> CollectorFrame {
     CollectorFrame::StartSession {
         request_id: request_id.into(),
         session_id: session_id.into(),
+        committed_seq: 0,
         agent: "fake".into(),
         cwd: std::env::temp_dir().to_string_lossy().into_owned(),
     }

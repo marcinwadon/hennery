@@ -71,8 +71,17 @@ fn every_collector_frame_round_trips() {
         CollectorFrame::StartSession {
             request_id: "r".into(),
             session_id: "s".into(),
+            committed_seq: 0,
             agent: "claude".into(),
             cwd: "/tmp".into(),
+        },
+        CollectorFrame::ResumeSession {
+            request_id: "r".into(),
+            session_id: "s".into(),
+            committed_seq: 41,
+            agent: "claude".into(),
+            cwd: "/tmp".into(),
+            agent_session_id: "a1".into(),
         },
         CollectorFrame::Prompt {
             request_id: "r".into(),
@@ -122,6 +131,63 @@ fn teardown_bodies_use_the_spec_field_names() {
         assert_eq!(serde_json::to_value(&body).unwrap(), expected);
         assert_eq!(serde_json::from_value::<SessionBody>(expected).unwrap(), body);
     }
+}
+
+#[test]
+fn resume_frames_and_host_notes_use_the_spec_field_names() {
+    let resume = CollectorFrame::ResumeSession {
+        request_id: "r".into(),
+        session_id: "s".into(),
+        committed_seq: 41,
+        agent: "claude".into(),
+        cwd: "/tmp".into(),
+        agent_session_id: "a1".into(),
+    };
+    assert_eq!(
+        serde_json::to_value(&resume).unwrap(),
+        json!({
+            "type": "resume_session", "request_id": "r", "session_id": "s", "committed_seq": 41,
+            "agent": "claude", "cwd": "/tmp", "agent_session_id": "a1"
+        })
+    );
+    let note = SessionBody::HostNote {
+        note: "replay_dropped".into(),
+        text: "dropped 2 unknown update kinds during session/load".into(),
+    };
+    let expected = json!({
+        "kind": "host_note",
+        "note": "replay_dropped",
+        "text": "dropped 2 unknown update kinds during session/load"
+    });
+    assert_eq!(serde_json::to_value(&note).unwrap(), expected);
+    assert_eq!(serde_json::from_value::<SessionBody>(expected).unwrap(), note);
+}
+
+#[test]
+fn session_detail_leaves_out_absent_optionals() {
+    use hennery_proto::rest::{OpenTurn, SessionDetail};
+    let detail = SessionDetail {
+        session_id: "s".into(),
+        host_id: "h".into(),
+        agent: "claude".into(),
+        cwd: "/tmp".into(),
+        lifecycle: "active".into(),
+        activity: Some("running".into()),
+        failure_reason: None,
+        presumed_parked: false,
+        open_turn: Some(OpenTurn {
+            turn_id: "t".into(),
+            state: "started".into(),
+        }),
+    };
+    assert_eq!(
+        serde_json::to_value(&detail).unwrap(),
+        json!({
+            "session_id": "s", "host_id": "h", "agent": "claude", "cwd": "/tmp",
+            "lifecycle": "active", "activity": "running", "presumed_parked": false,
+            "open_turn": {"turn_id": "t", "state": "started"}
+        })
+    );
 }
 
 #[test]

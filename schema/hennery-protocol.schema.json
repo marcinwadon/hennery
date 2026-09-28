@@ -104,6 +104,12 @@
             "agent": {
               "type": "string"
             },
+            "committed_seq": {
+              "description": "The collector's highest committed seq for this session; the host\ncontinues from the larger of this and its own counter (§5.1).",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
             "cwd": {
               "type": "string"
             },
@@ -122,8 +128,50 @@
             "type",
             "request_id",
             "session_id",
+            "committed_seq",
             "agent",
             "cwd"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Attach a parked, closed or failed session again: spawn the adapter and\n`session/load` it with replay suppression (ACP core §4.3, §4.5).\nCompleted by `session_started` | `start_failed`, like a start.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "agent_session_id": {
+              "description": "The adapter's own session id, from the stored `session_started`:\nthe host keeps no copy across restarts.",
+              "type": "string"
+            },
+            "committed_seq": {
+              "description": "Fast-forward the host's counter before the first frame (§5.1).",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cwd": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "resume_session",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "session_id",
+            "committed_seq",
+            "agent",
+            "cwd",
+            "agent_session_id"
           ],
           "type": "object"
         },
@@ -398,6 +446,23 @@
       ],
       "type": "object"
     },
+    "OpenTurn": {
+      "description": "A session's open turn, for the detail view.",
+      "properties": {
+        "state": {
+          "description": "`sent` (not yet acknowledged by the adapter) or `started`.",
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "turn_id",
+        "state"
+      ],
+      "type": "object"
+    },
     "ParkReason": {
       "description": "Why a session was parked (ACP core §3.2).",
       "enum": [
@@ -611,8 +676,84 @@
             "stderr_tail"
           ],
           "type": "object"
+        },
+        {
+          "description": "hennery's own diagnostic that is not state (ACP core §3.2): a failed\nre-apply, or update kinds dropped during `session/load` (§4.5).\n`note` is a machine code; `text` is scrubbed.",
+          "properties": {
+            "kind": {
+              "const": "host_note",
+              "type": "string"
+            },
+            "note": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "note",
+            "text"
+          ],
+          "type": "object"
         }
       ]
+    },
+    "SessionDetail": {
+      "description": "`GET /api/sessions/{id}` (ACP core §9): the list item plus the open turn.\nPending requests join it with permission handling.",
+      "properties": {
+        "activity": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent": {
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "failure_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "host_id": {
+          "type": "string"
+        },
+        "lifecycle": {
+          "type": "string"
+        },
+        "open_turn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OpenTurn"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "presumed_parked": {
+          "description": "Parked only because its host has been offline past the threshold\n(ACP core §5.3); the host may still be running it.",
+          "type": "boolean"
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "host_id",
+        "agent",
+        "cwd",
+        "lifecycle",
+        "presumed_parked"
+      ],
+      "type": "object"
     },
     "StartSessionRequest": {
       "properties": {
