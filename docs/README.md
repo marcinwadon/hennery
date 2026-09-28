@@ -32,7 +32,7 @@ slice); everything else is design. The maintainer's decisions are recorded below
      "Execution status").
    - [Resume (B1)](plans/2026-09-28-resume.md) — plan B1 (10 tasks): `resume_session` with
      `session/load` and replay suppression, presumed park while a host is offline, conn_id-keyed
-     waiters, one visibility rule for unapplied facts. Draft awaiting review.
+     waiters, one visibility rule for unapplied facts. Decisions confirmed 2026-09-28.
 
 ## Maintainer decisions (2026-09-27)
 
