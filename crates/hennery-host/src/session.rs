@@ -625,6 +625,7 @@ impl Actor {
         }));
 
         let Ok(conn) = conn_rx.await else {
+            self.begin_ending();
             adapter.terminate(self.options.kill_grace).await;
             return self.start_failed(
                 request_id,
@@ -657,6 +658,7 @@ impl Actor {
         let (agent_session, replay, applied) = match started {
             Ok(started) => started,
             Err(error) => {
+                self.begin_ending();
                 adapter.terminate(self.options.kill_grace).await;
                 return self.start_failed(request_id, error);
             }

@@ -311,25 +311,23 @@ fn attach(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, req: AttachReq
     // a session resumed after the outbox was lost never reuses a seq.
     uplink.fast_forward(&req.session_id, req.committed_seq)?;
     let options = cfg.session_options();
-    match live_session(sessions, &req.session_id).filter(SessionHandle::is_ending) {
-        // The actor is ending (a park or close is queued ahead of this
-        // request, or it is ending by itself), so a `Restart` would be
-        // answered `not_attached`: attach a fresh adapter once the old one is
-        // gone.
-        Some(old) => {
-            let (uplink, sessions) = (uplink.clone(), sessions.clone());
-            tokio::spawn(async move {
-                old.finished().await;
-                spawn_or_restart(&uplink, &sessions, req, command, options);
-            });
-        }
-        None => spawn_or_restart(uplink, sessions, req, command, options),
-    }
+    spawn_or_restart(uplink, sessions, req, command, options);
     Ok(())
 }
 
 /// Re-emit `session_started` from a live actor (never a second adapter), or
-/// spawn a fresh one.
+/// spawn a fresh one. Restart, wait and launch are all decided from one
+/// locked read of the map: deciding "is it ending" and "then launch" as two
+/// separate locked reads (the old `attach`, separately from this function)
+/// let a self-ending actor (task 9: idle reap, adapter exit, a stopped
+/// cancel, or a start-failure kill grace) flip `is_ending` in the gap
+/// between them, so the first read's "not ending yet" and the second read's
+/// "not restartable any more" both looked safe to fall through to a launch —
+/// running a second adapter alongside the first while it was still tearing
+/// down (fix round 1). This closes that launch gap; `begin_ending` itself
+/// still does not take the sessions lock, so it can still land between the
+/// check below and `handle.send` — but that only ever answers a `Restart`
+/// `not_attached` (retryable), never launches a second adapter.
 fn spawn_or_restart(
     uplink: &Uplink,
     sessions: &Sessions,
@@ -344,10 +342,28 @@ fn spawn_or_restart(
         tracing::info!(session_id = %req.session_id, "host shutting down; not attaching");
         return;
     }
-    if let Some(handle) = map
+    // The old actor is ending — a park or close is queued ahead of this
+    // request, or it began ending by itself — and may still be killing its
+    // adapter: a `Restart` sent now would be answered `not_attached`, and
+    // launching a fresh adapter now would run it alongside the old one.
+    // Wait for it to finish, then re-decide from scratch under a fresh lock:
+    // by then the entry reads `is_ended` (the common case), or another
+    // attach already replaced it (handled the same way, recursively).
+    if let Some(old) = map
         .handles
         .get(&req.session_id)
-        .filter(|h| !h.is_ended() && !h.is_ending())
+        .filter(|h| h.is_ending() && !h.is_ended())
+        .cloned()
+    {
+        drop(map);
+        let (uplink, sessions) = (uplink.clone(), sessions.clone());
+        tokio::spawn(async move {
+            old.finished().await;
+            spawn_or_restart(&uplink, &sessions, req, command, options);
+        });
+        return;
+    }
+    if let Some(handle) = map.handles.get(&req.session_id).filter(|h| !h.is_ended())
         && handle.send(SessionCmd::Restart {
             request_id: req.request_id.clone(),
         })
