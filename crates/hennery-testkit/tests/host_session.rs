@@ -973,3 +973,207 @@ async fn replayed_history_never_leaks_under_a_multi_thread_runtime() {
         drop(handle);
     }
 }
+
+// Plan B2a: cancel (ACP core §3.3 `cancel_turn`, §4.4).
+
+fn cancel(request_id: &str, turn_id: &str) -> SessionCmd {
+    SessionCmd::Cancel {
+        request_id: request_id.into(),
+        turn_id: turn_id.into(),
+    }
+}
+
+/// Every `turn_ended` in the outbox: (turn id, outcome, error).
+fn turn_ends(frames: &[HostFrame]) -> Vec<(String, TurnOutcome, Option<String>)> {
+    frames
+        .iter()
+        .filter_map(|f| match f {
+            HostFrame::Session {
+                body:
+                    SessionBody::TurnEnded {
+                        turn_id,
+                        outcome,
+                        error,
+                        ..
+                    },
+                ..
+            } => Some((turn_id.clone(), *outcome, error.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_cancel_ends_the_turn_cancelled_and_the_session_stays_attached() {
+    let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let handle = session::start(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        fake_with(&slow_script()),
+        std::env::temp_dir(),
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    wait_until(&uplink, has("turn_started")).await;
+    // Twice, as a retried request would: one `session/cancel`, one end.
+    assert!(handle.send(cancel("rc1", "t1")));
+    assert!(handle.send(cancel("rc2", "t1")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    assert_eq!(turn_ends(&frames), [("t1".to_string(), TurnOutcome::Cancelled, None)]);
+    let stop_reasons: Vec<Option<String>> = frames
+        .iter()
+        .filter_map(|f| match f {
+            HostFrame::Session {
+                body: SessionBody::TurnEnded { stop_reason, .. },
+                ..
+            } => Some(stop_reason.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stop_reasons, [Some("cancelled".to_string())]);
+    assert!(
+        kinds(&frames).iter().filter(|k| k.starts_with("update:")).count() < 20,
+        "the turn ran to its end: {:?}",
+        kinds(&frames)
+    );
+    assert_eq!(handle.open_turn_id(), None);
+    // Still attached: the next prompt runs.
+    assert!(handle.send(SessionCmd::Prompt {
+        request_id: "r2".into(),
+        turn_id: "t2".into(),
+        content: vec![json!({"type":"text","text":"again"})],
+    }));
+    wait_until(&uplink, |f| turn_ends(f).len() == 2).await;
+    assert!(replies.try_recv().is_err(), "a cancel was answered with an error");
+}
+
+#[tokio::test]
+async fn a_cancel_for_a_turn_that_is_not_running_is_refused_not_running() {
+    let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let handle = session::start(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        fake_with(&FakeScript::default()),
+        std::env::temp_dir(),
+    );
+    wait_until(&uplink, has("session_started")).await;
+    // No turn at all, then a turn that has already ended.
+    assert!(handle.send(cancel("rc1", "t0")));
+    assert!(handle.send(prompt("r1", "t1")));
+    wait_until(&uplink, has("turn_ended")).await;
+    assert!(handle.send(cancel("rc2", "t1")));
+    let mut refused = Vec::new();
+    for _ in 0..2 {
+        match tokio::time::timeout(Duration::from_secs(5), replies.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            HostFrame::Error { request_id, code, .. } => refused.push((request_id, code)),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(
+        refused,
+        [
+            ("rc1".to_string(), "not_running".to_string()),
+            ("rc2".to_string(), "not_running".to_string())
+        ]
+    );
+    let frames = uplink.pending().unwrap();
+    assert_eq!(turn_ends(&frames), [("t1".to_string(), TurnOutcome::Completed, None)]);
+}
+
+#[tokio::test]
+async fn an_adapter_that_ignores_a_cancel_is_stopped_after_the_grace() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let pid_file = dir.path().join("grandchild.pid");
+    let script = FakeScript {
+        ignore_cancel: true,
+        grandchild_pid_file: Some(pid_file.to_string_lossy().into_owned()),
+        stderr_lines: vec!["auth header: Bearer secret-token-123".into()],
+        ..slow_script()
+    };
+    let handle = session::spawn(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        fake_with(&script),
+        std::env::temp_dir(),
+        SessionOptions {
+            cancel_grace: Duration::from_millis(300),
+            kill_grace: Duration::from_secs(1),
+            ..SessionOptions::default()
+        },
+    );
+    let grandchild = read_pid(&pid_file).await;
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    wait_until(&uplink, has("turn_started")).await;
+    assert!(handle.send(cancel("rc", "t1")));
+    let frames = wait_until(&uplink, has("session_parked:operator")).await;
+    let ends = turn_ends(&frames);
+    assert_eq!(ends.len(), 1, "{:?}", kinds(&frames));
+    assert_eq!((ends[0].0.as_str(), ends[0].1), ("t1", TurnOutcome::Cancelled));
+    let tail: Vec<String> = kinds(&frames)
+        .into_iter()
+        .filter(|k| !k.starts_with("update:"))
+        .collect();
+    assert_eq!(
+        tail,
+        [
+            "session_started",
+            "turn_started",
+            "turn_ended",
+            "host_note:cancel_unanswered",
+            "session_parked:operator"
+        ]
+    );
+    // No `adapter_exited` on this path: the note keeps the stderr tail,
+    // scrubbed.
+    let note = frames
+        .iter()
+        .find_map(|f| match f {
+            HostFrame::Session {
+                body: SessionBody::HostNote { text, .. },
+                ..
+            } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(note.contains("Last stderr:") && note.contains("auth header"), "{note}");
+    assert!(!note.contains("secret-token-123"), "{note}");
+    wait_dead(grandchild).await;
+    wait_ended(&handle).await;
+}
+
+/// An agent may answer an aborted prompt with an error rather than the
+/// `cancelled` stop reason: after a cancel that is still `cancelled`, with
+/// the error kept; without one it would be `failed`.
+#[tokio::test]
+async fn a_cancelled_prompt_answered_with_an_error_still_ends_cancelled() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        cancel_error: Some(-32603),
+        ..slow_script()
+    };
+    let handle = session::start(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        fake_with(&script),
+        std::env::temp_dir(),
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    wait_until(&uplink, has("turn_started")).await;
+    assert!(handle.send(cancel("rc", "t1")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    let ends = turn_ends(&frames);
+    assert_eq!(ends.len(), 1);
+    assert_eq!((ends[0].0.as_str(), ends[0].1), ("t1", TurnOutcome::Cancelled));
+    assert!(ends[0].2.as_deref().is_some_and(|e| e.contains("aborted")), "{ends:?}");
+}

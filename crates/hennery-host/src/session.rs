@@ -12,7 +12,8 @@ pub use crate::adapter::{AgentCommand, NESTING_VARS};
 use crate::uplink::Uplink;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse, SessionId,
+    CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
+    PromptResponse, SessionId, StopReason,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, ErrorCode, UntypedMessage};
 use hennery_proto::frames::{HostFrame, Indexed, ParkReason, SessionBody, TurnOutcome};
@@ -46,6 +47,12 @@ const DRAIN_QUIET: Duration = Duration::from_millis(100);
 
 /// Default idle window before the reaper parks a session (ACP core §4.7).
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// How long an adapter gets to end a turn after `session/cancel` before the
+/// host stops it. Well below the collector's 60 s cancel timeout (ACP core
+/// §3.4), so the collector hears the turn end, not a timeout that would
+/// drop the whole host connection.
+pub const CANCEL_GRACE: Duration = Duration::from_secs(20);
 
 /// Update kinds a `session/load` replays as history: dropped while the load
 /// is outstanding (ACP core §4.5).
@@ -84,6 +91,9 @@ pub enum SessionCmd {
     Park { request_id: String },
     /// Operator close: end any turn, kill the group, `session_closed`.
     Close { request_id: String },
+    /// Operator cancel of the turn in flight: `session/cancel` to the
+    /// adapter; the turn's `turn_ended` completes it (ACP core §4.4).
+    Cancel { request_id: String, turn_id: String },
 }
 
 /// How the actor creates its adapter session.
@@ -105,6 +115,8 @@ pub struct SessionOptions {
     /// Park the session after this long with no turn in flight
     /// (`session_parked{idle}`); `None` disables the reaper.
     pub idle_timeout: Option<Duration>,
+    /// How long a cancelled turn may run on before the adapter is stopped.
+    pub cancel_grace: Duration,
 }
 
 impl Default for SessionOptions {
@@ -113,6 +125,7 @@ impl Default for SessionOptions {
             start_timeout: START_TIMEOUT,
             kill_grace: KILL_GRACE,
             idle_timeout: Some(IDLE_TIMEOUT),
+            cancel_grace: CANCEL_GRACE,
         }
     }
 }
@@ -246,6 +259,9 @@ type Reply = Pin<Box<dyn Future<Output = agent_client_protocol::Result<PromptRes
 struct Turn {
     id: String,
     reply: Reply,
+    /// Set once `session/cancel` went out: the adapter must end the turn by
+    /// then, or it is stopped.
+    cancel_deadline: Option<Instant>,
 }
 
 /// Why a start or resume failed: the `start_failed` code and message.
@@ -378,7 +394,8 @@ impl Actor {
                 SessionCmd::Prompt { request_id, .. }
                 | SessionCmd::Restart { request_id }
                 | SessionCmd::Park { request_id }
-                | SessionCmd::Close { request_id } => {
+                | SessionCmd::Close { request_id }
+                | SessionCmd::Cancel { request_id, .. } => {
                     // Also covers a start that reached this actor while it was
                     // tearing down (park/close/reap/adapter exit): the
                     // connection routed it to `Restart` because the handle
@@ -493,6 +510,7 @@ impl Actor {
         // inside one) is in flight.
         let mut idle_since = Instant::now();
         loop {
+            let cancel_at = turn.as_ref().and_then(|t| t.cancel_deadline);
             tokio::select! {
                 // Biased: adapter output already received is emitted before
                 // the prompt reply it preceded on the wire.
@@ -527,8 +545,23 @@ impl Actor {
                         self.set_open_turn(Some(turn_id.clone()));
                         self.emit(SessionBody::TurnStarted { request_id, turn_id: turn_id.clone() });
                         let reply = conn.send_request(PromptRequest::new(agent_session.clone(), blocks)).block_task();
-                        turn = Some(Turn { id: turn_id, reply: Box::pin(reply) });
+                        turn = Some(Turn { id: turn_id, reply: Box::pin(reply), cancel_deadline: None });
                     }
+                    Some(SessionCmd::Cancel { request_id, turn_id }) => match turn.as_mut() {
+                        Some(running) if running.id == turn_id => {
+                            // A repeated cancel changes nothing: the one
+                            // already sent is still being honoured.
+                            if running.cancel_deadline.is_none() {
+                                if let Err(err) = conn.send_notification(CancelNotification::new(agent_session.clone())) {
+                                    tracing::warn!(session_id = %self.session_id, error = %err, "session/cancel not sent");
+                                }
+                                running.cancel_deadline = Some(Instant::now() + self.options.cancel_grace);
+                            }
+                        }
+                        // Not started here, or already ended: its end (if
+                        // any) is in the outbox ahead of this answer.
+                        _ => self.reject(request_id, "not_running", "that turn is not running".into()),
+                    },
                     Some(SessionCmd::Restart { request_id }) => self.emit(SessionBody::SessionStarted {
                         request_id,
                         agent_session_id: agent_session.to_string(),
@@ -544,13 +577,23 @@ impl Actor {
                 },
                 result = next_reply(&mut turn) => {
                     let ended = turn.take().expect("a reply implies a turn");
+                    let cancelling = ended.cancel_deadline.is_some();
                     idle_since = Instant::now();
                     // Closes the race described on `drain_updates`: a late
                     // update that arrived just as the reply resolved must be
                     // emitted before this turn's `turn_ended`.
                     self.drain_updates(&mut updates, Some(&ended.id));
                     match result {
-                        Ok(response) => self.end_turn(ended.id, TurnOutcome::Completed, stop_reason(&response), None),
+                        // The agent reports a cancelled turn by its stop
+                        // reason (ACP): anything else finished first.
+                        Ok(response) => {
+                            let outcome = if response.stop_reason == StopReason::Cancelled {
+                                TurnOutcome::Cancelled
+                            } else {
+                                TurnOutcome::Completed
+                            };
+                            self.end_turn(ended.id, outcome, stop_reason(&response), None);
+                        }
                         Err(err) => {
                             let exited = adapter.exited_within(EXIT_SETTLE).await;
                             // Updates that arrived during the wait above are
@@ -559,9 +602,16 @@ impl Actor {
                             if let Some(info) = exited {
                                 return self.adapter_exited(info, &mut adapter, &mut updates, Some(ended)).await;
                             }
-                            self.end_turn(ended.id, TurnOutcome::Failed, None, Some(err.to_string()));
+                            // An agent may answer an aborted prompt with an
+                            // error instead of `cancelled`.
+                            let outcome = if cancelling { TurnOutcome::Cancelled } else { TurnOutcome::Failed };
+                            self.end_turn(ended.id, outcome, None, Some(err.to_string()));
                         }
                     }
+                }
+                _ = cancel_deadline(cancel_at) => {
+                    let unanswered = turn.take().expect("a deadline implies a turn");
+                    return self.stop_after_unanswered_cancel(&mut adapter, &mut updates, unanswered).await;
                 }
                 _ = idle_deadline(self.options.idle_timeout, idle_since), if turn.is_none() => {
                     tracing::info!(session_id = %self.session_id, "reaping idle session");
@@ -616,6 +666,40 @@ impl Actor {
         adapter.terminate(self.options.kill_grace).await;
     }
 
+    /// The adapter kept running a turn past `cancel_grace` after
+    /// `session/cancel`. It cannot take another prompt while that one runs
+    /// (one turn at a time, ACP core §4.4), so it is stopped: the turn ends
+    /// `cancelled` (what the operator asked for), a `host_note` says why,
+    /// and the session parks.
+    async fn stop_after_unanswered_cancel(
+        &self,
+        adapter: &mut Adapter,
+        updates: &mut mpsc::UnboundedReceiver<Value>,
+        turn: Turn,
+    ) {
+        let grace = self.options.cancel_grace;
+        tracing::warn!(session_id = %self.session_id, ?grace, "adapter ignored session/cancel; stopping it");
+        self.drain_updates(updates, Some(&turn.id));
+        let message = format!("the adapter did not stop within {grace:?} of session/cancel");
+        self.end_turn(turn.id, TurnOutcome::Cancelled, None, Some(message.clone()));
+        adapter.terminate(self.options.kill_grace).await;
+        // No `adapter_exited` follows a stop the host asked for, so the
+        // note keeps the adapter's last words (already scrubbed, bounded).
+        let tail = last_lines(&adapter.stderr_tail().await, 5);
+        let text = if tail.is_empty() {
+            format!("{message}; it was stopped")
+        } else {
+            format!("{message}; it was stopped. Last stderr:\n{tail}")
+        };
+        self.emit(SessionBody::HostNote {
+            note: "cancel_unanswered".into(),
+            text: scrub(&text),
+        });
+        self.emit(SessionBody::SessionParked {
+            reason: ParkReason::Operator,
+        });
+    }
+
     /// The exit watcher's steps (ACP core §2.3): outstanding calls fail (the
     /// reply future is dropped), the turn ends `interrupted`, then
     /// `adapter_exited` and `session_parked{adapter_exited}`.
@@ -657,6 +741,14 @@ impl Actor {
 async fn idle_deadline(window: Option<Duration>, since: Instant) {
     match window {
         Some(window) => tokio::time::sleep_until(since + window).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolves when a cancelled turn's grace is up; never if no cancel is out.
+async fn cancel_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
     }
 }
