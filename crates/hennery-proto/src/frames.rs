@@ -30,7 +30,12 @@ pub enum Capability {
 
 /// `hello.capabilities`. Deserialized leniently: a capability this build
 /// does not know (a newer host, a minor protocol bump) is skipped, never a
-/// reason to refuse the whole `hello`.
+/// reason to refuse the whole `hello`. The generated schema still lists
+/// `Capability` as a closed `oneOf` (there is no open-ended JSON Schema
+/// equivalent), but that is a description of the known values, not a
+/// constraint hennery itself enforces: an entry outside it is ignored, not
+/// rejected, so a schema-validating client or proxy must not reject a
+/// `hello` on an unknown capability either.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, JsonSchema, TS)]
 pub struct Capabilities(pub Vec<Capability>);
 
