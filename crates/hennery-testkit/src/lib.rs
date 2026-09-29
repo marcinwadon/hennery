@@ -100,9 +100,16 @@ pub struct FakeScript {
     /// path only) — an agent that independently changes its own config
     /// right after answering a switch. For testing the race between a
     /// switch's own (now stale) read-back and a notification sent right
-    /// after it (fix round 1, F2).
+    /// after it (fix round 1 and 2, F2, case B: N postdates R).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub announce_after_switch: bool,
+    /// Send a `config_option_update` announcing the catalogue as it stood
+    /// *before* this switch, immediately before answering a
+    /// `session/set_config_option` request (the normal, fast path only). For
+    /// testing that a notification older than a switch's own read-back
+    /// (fix round 2, F2, case A: N0 predates R) never wins over it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub announce_before_switch: bool,
 }
 
 impl Default for FakeScript {
@@ -130,6 +137,7 @@ impl Default for FakeScript {
             config_in_update_only: false,
             model_switch_drops_option: None,
             announce_after_switch: false,
+            announce_before_switch: false,
         }
     }
 }

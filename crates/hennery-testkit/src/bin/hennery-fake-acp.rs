@@ -189,6 +189,17 @@ async fn main() -> agent_client_protocol::Result<()> {
                             answered
                         });
                     }
+                    if script.announce_before_switch {
+                        // Sent before this switch is applied at all, so it
+                        // lands on the wire before its response: exercises a
+                        // notification older than the switch's own (newer)
+                        // read-back (fix round 2, F2, case A).
+                        let before = catalogue.lock().unwrap().clone();
+                        cx.send_notification(SessionNotification::new(
+                            req.session_id.clone(),
+                            SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(before)),
+                        ))?;
+                    }
                     let switched = {
                         let mut options = catalogue.lock().unwrap();
                         switch(

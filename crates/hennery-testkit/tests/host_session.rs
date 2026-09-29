@@ -2176,3 +2176,74 @@ async fn the_idle_reaper_does_not_park_while_a_switch_is_out_or_orphaned() {
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert!(not_parked(&uplink.pending().unwrap()));
 }
+
+// Fix round 2.
+
+/// F2, case A (fix round 2): the adapter sends a `config_option_update`
+/// (N0) and only then answers the switch (R) — wire order N0, R, with N0
+/// strictly older. The stored catalogue must always end up as R's read-back
+/// (newer), never left at N0's (older) one: `send_next_switch` now delivers
+/// a switch's answer through the same ordered channel as live updates
+/// (`on_receiving_result`, not `block_task`), so both are handled by the
+/// actor strictly in the order the adapter's dispatch loop delivered them —
+/// no peeking or reordering needed, unlike case B below. Repeated under a
+/// multi-thread runtime for the same reason as
+/// `updates_never_land_outside_their_turn_under_a_multi_thread_runtime`: a
+/// single-thread runtime can't interleave the actor and the ACP connection
+/// task tightly enough to have a real chance of ever exercising the gap
+/// (this actor being briefly "behind" — busy elsewhere while both N0 and R
+/// pile up — is exactly the scheduling window fix round 1's `now_or_never`
+/// peek got wrong for this case, applying R as if it were always the newer
+/// one).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_update_sent_right_before_a_switch_answers_never_outlives_that_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        announce_before_switch: true,
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        SessionConfig::default(),
+        SessionOptions::default(),
+    );
+    wait_until(&uplink, has("session_started")).await;
+    for i in 0..60 {
+        // Alternates so N0 (the pre-switch snapshot) never accidentally
+        // matches R (this switch's own value), which would hide a wrong
+        // final value behind a coincidence.
+        let value = if i % 2 == 0 { "large" } else { "small" };
+        let rc = format!("rc{i}");
+        assert!(handle.send(set_config(&rc, "model", ConfigValue::Id(value.into()))));
+        let expected = i + 1;
+        let live_carries_catalogue = |f: &[HostFrame]| {
+            f.iter()
+                .filter(|frame| {
+                    matches!(frame, HostFrame::Session { body: SessionBody::AcpUpdate { indexed, .. }, .. } if indexed.config_options.is_some())
+                })
+                .count()
+        };
+        let frames = wait_until(&uplink, move |f| {
+            applied(f).len() == expected && live_carries_catalogue(f) == expected
+        })
+        .await;
+        // N0 is strictly older: whichever of it and R landed last for this
+        // round must be R.
+        assert_eq!(
+            kinds(&frames).pop().as_deref(),
+            Some("config_applied"),
+            "N0 (older) ended up after R (newer) on iteration {i}: {:?}",
+            kinds(&frames)
+        );
+        let (_, r) = applied(&frames).into_iter().next_back().unwrap();
+        assert_eq!(
+            r.current_config().unwrap().model.as_deref(),
+            Some(value),
+            "the stored catalogue must be R's read-back on iteration {i}"
+        );
+    }
+}
