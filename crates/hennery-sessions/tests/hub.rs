@@ -159,3 +159,24 @@ async fn capabilities_belong_to_the_hosts_current_connection() {
         "an older build of the host that cannot park reconnected"
     );
 }
+
+/// Decision 6: the hub owns every waiter's deadline. A handler dropped
+/// mid-request (its client left) must not leave its waiter behind, nor
+/// spare a connection that never answered.
+#[tokio::test]
+async fn a_dropped_requests_deadline_still_kicks_the_connection_and_frees_its_waiter() {
+    let hub = Arc::new(Hub::new());
+    let (conn, mut rx) = connect(&hub);
+    let call = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.request("h", "r1", prompt("r1"), Duration::from_millis(300)).await }
+    });
+    rx.recv().await.expect("r1 went out");
+    call.abort();
+    assert!(call.await.unwrap_err().is_cancelled());
+    assert_eq!(hub.pending_requests(), 1, "the waiter outlives its handler");
+    assert!(!conn.kicked.is_cancelled());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(conn.kicked.is_cancelled(), "a connection that never answered was kept");
+    assert_eq!(hub.pending_requests(), 0, "the waiter leaked");
+}

@@ -1,7 +1,7 @@
 //! Session REST and SSE endpoints (ACP core §9), walking-skeleton subset.
 
 use crate::AppState;
-use crate::hub::RequestError;
+use crate::hub::{RequestError, Undo};
 use crate::store::ResumeRequest;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -140,7 +140,14 @@ async fn start_session(State(state): State<AppState>, Json(req): Json<StartSessi
         agent: req.agent,
         cwd: req.cwd,
     };
-    match state.hub.request(&req.host_id, &request_id, frame, START_TIMEOUT).await {
+    let undo = Undo::Start {
+        session_id: session_id.clone(),
+    };
+    match state
+        .hub
+        .request_with_undo(&req.host_id, &request_id, frame, START_TIMEOUT, undo)
+        .await
+    {
         Ok(_) => (StatusCode::ACCEPTED, Json(StartSessionResponse { session_id })).into_response(),
         // The session was created and may still start; without its id here,
         // the caller would have no way to look it up (ACP core §3.4).
@@ -150,16 +157,16 @@ async fn start_session(State(state): State<AppState>, Json(req): Json<StartSessi
             "host disconnected; delivery unknown",
             session_id,
         ),
-        Err(err) => {
-            let reason = match &err {
-                RequestError::Rejected { code, .. } => code.clone(),
-                _ => "host_offline".into(),
-            };
-            if let Err(e) = state.store.mark_failed(&session_id, &reason) {
+        // Never sent.
+        Err(RequestError::NotConnected) => {
+            if let Err(e) = state.store.mark_failed(&session_id, "host_offline") {
                 return internal(e);
             }
-            request_failed(err)
+            request_failed(RequestError::NotConnected)
         }
+        // The socket task has already failed the session with the host's
+        // code (`Undo::Start`).
+        Err(err) => request_failed(err),
     }
 }
 
@@ -250,24 +257,25 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         cwd: session.cwd,
         agent_session_id,
     };
+    let undo = Undo::Start { session_id: id.clone() };
     match state
         .hub
-        .request(&session.host_id, &request_id, frame, START_TIMEOUT)
+        .request_with_undo(&session.host_id, &request_id, frame, START_TIMEOUT, undo)
         .await
     {
         Ok(_) => lifecycle_response(&state, &id),
         // Still `starting`: the next handshake reconciles it (ACP core §3.4).
         Err(RequestError::DeliveryUnknown) => request_failed(RequestError::DeliveryUnknown),
-        Err(err) => {
-            let reason = match &err {
-                RequestError::Rejected { code, .. } => code.clone(),
-                _ => "host_offline".into(),
-            };
-            if let Err(e) = state.store.mark_failed_if_starting(&id, &reason) {
+        // Never sent: the host went away since the check above.
+        Err(RequestError::NotConnected) => {
+            if let Err(e) = state.store.mark_failed_if_starting(&id, "host_offline") {
                 return internal(e);
             }
-            resume_failed(err)
+            resume_failed(RequestError::NotConnected)
         }
+        // The socket task has already failed the session with the host's
+        // code (`Undo::Start`).
+        Err(err) => resume_failed(err),
     }
 }
 
@@ -306,20 +314,27 @@ async fn prompt(State(state): State<AppState>, Path(id): Path<String>, Json(req)
         turn_id: turn_id.clone(),
         content: req.content,
     };
+    let undo = Undo::Prompt {
+        session_id: id.clone(),
+        turn_id: turn_id.clone(),
+    };
     match state
         .hub
-        .request(&session.host_id, &request_id, frame, PROMPT_TIMEOUT)
+        .request_with_undo(&session.host_id, &request_id, frame, PROMPT_TIMEOUT, undo)
         .await
     {
         Ok(_) => (StatusCode::ACCEPTED, Json(PromptResponse { turn_id })).into_response(),
         // Unknown delivery keeps the turn open; the outbox resolves it.
         Err(RequestError::DeliveryUnknown) => request_failed(RequestError::DeliveryUnknown),
-        Err(err) => {
+        // Never sent.
+        Err(RequestError::NotConnected) => {
             if let Err(e) = state.store.abandon_turn(&id, &turn_id) {
                 return internal(e);
             }
-            request_failed(err)
+            request_failed(RequestError::NotConnected)
         }
+        // The socket task has already removed the turn (`Undo::Prompt`).
+        Err(err) => request_failed(err),
     }
 }
 

@@ -1,6 +1,8 @@
 //! The host WebSocket endpoint (ACP core §3, §5).
 
 use crate::AppState;
+use crate::hub::Undo;
+use crate::store::Store;
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -227,7 +229,18 @@ async fn serve(socket: WebSocket, state: AppState) {
                         tracing::warn!(%host_id, %session_id, %code, %message, "reconcile close_session rejected");
                     }
                 } else {
-                    state.hub.reject(&request_id, code, message);
+                    // Take the waiter first, so no timeout can answer it any
+                    // more; undo what the request changed; then answer. The
+                    // HTTP answer and the store agree, and the store is
+                    // right even when no handler waits (decision 6).
+                    if let Some(rejection) = state.hub.take_rejected(&request_id) {
+                        if let Some(undo) = rejection.undo()
+                            && let Err(err) = undo_rejected(&state.store, undo, &code)
+                        {
+                            tracing::error!(%host_id, ?undo, error = %err, "undoing a rejected request failed");
+                        }
+                        rejection.answer(code, message);
+                    }
                 }
             }
             HostFrame::ResendComplete if !reconciled => {
@@ -263,4 +276,13 @@ async fn serve(socket: WebSocket, state: AppState) {
     state.hub.unregister(&host_id, conn_id);
     tracing::info!(%host_id, "host disconnected");
     crate::offline::after_disconnect(&state, host_id, conn_id);
+}
+
+/// Revert what a request the host rejected changed in the store: a start or
+/// resume fails with the host's code, a prompt's turn is removed.
+fn undo_rejected(store: &Store, undo: &Undo, code: &str) -> anyhow::Result<()> {
+    match undo {
+        Undo::Start { session_id } => store.mark_failed_if_starting(session_id, code),
+        Undo::Prompt { session_id, turn_id } => store.abandon_turn(session_id, turn_id),
+    }
 }

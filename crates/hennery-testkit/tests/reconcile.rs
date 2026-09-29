@@ -976,3 +976,92 @@ async fn a_hello_with_an_unknown_capability_is_accepted_with_the_known_ones() {
     assert!(collector.state.hub.has_capability(HOST, Capability::Park));
     assert!(!collector.state.hub.has_capability(HOST, Capability::Images));
 }
+
+// Plan B2a: a host's rejection reaches the store even when the HTTP caller
+// has given up (plan B1, "Execution status"). The client times out, hyper
+// drops the handler, and only then does the host answer.
+
+/// POST with a client that gives up after 300 ms; resolves once it has.
+fn post_and_give_up(url: String, body: Value) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let sent = client()
+            .post(url)
+            .json(&body)
+            .timeout(Duration::from_millis(300))
+            .send()
+            .await;
+        assert!(sent.is_err(), "the collector answered before the host did: {sent:?}");
+    })
+}
+
+/// Reject `request_id` once its caller is gone.
+async fn reject_after_the_caller_left(
+    host: &mut ScriptedHost,
+    caller: tokio::task::JoinHandle<()>,
+    request_id: String,
+) {
+    caller.await.unwrap();
+    // Let the server notice the closed connection and drop the handler.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    host.send(&HostFrame::Error {
+        request_id,
+        code: "unknown_agent".into(),
+        message: "rejected".into(),
+    })
+    .await;
+}
+
+fn failed_with(collector: &Collector, session: &str) -> Option<String> {
+    let row = collector.state.store.session(session).unwrap().unwrap();
+    (row.lifecycle == "failed").then_some(row.failure_reason).flatten()
+}
+
+#[tokio::test]
+async fn a_start_rejected_after_its_caller_gave_up_still_fails_the_session() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let caller = post_and_give_up(
+        collector.url("/api/sessions"),
+        json!({ "host_id": HOST, "agent": "fake", "cwd": "/tmp" }),
+    );
+    let CollectorFrame::StartSession {
+        request_id, session_id, ..
+    } = host.next().await
+    else {
+        panic!("expected start_session");
+    };
+    reject_after_the_caller_left(&mut host, caller, request_id).await;
+    let reason = wait_for("start failed", || async { failed_with(&collector, &session_id) }).await;
+    assert_eq!(reason, "unknown_agent");
+}
+
+#[tokio::test]
+async fn a_resume_rejected_after_its_caller_gave_up_still_fails_the_session() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = parked_session(&collector, &mut host).await;
+    let caller = post_and_give_up(resume_url(&collector, &session), json!({}));
+    let request_id = expect_resume(&mut host, &session).await;
+    reject_after_the_caller_left(&mut host, caller, request_id).await;
+    let reason = wait_for("resume failed", || async { failed_with(&collector, &session) }).await;
+    assert_eq!(reason, "unknown_agent");
+}
+
+#[tokio::test]
+async fn a_prompt_rejected_after_its_caller_gave_up_still_frees_the_turn_slot() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let caller = post_and_give_up(collector.url(&format!("/api/sessions/{session}/prompt")), prompt_body());
+    let CollectorFrame::Prompt { request_id, .. } = host.next().await else {
+        panic!("expected a prompt");
+    };
+    reject_after_the_caller_left(&mut host, caller, request_id).await;
+    wait_for("turn slot free", || async {
+        let row = collector.state.store.session(&session).unwrap().unwrap();
+        row.open_turn_id.is_none().then_some(())
+    })
+    .await;
+    // The next prompt is not refused `turn_in_progress`.
+    started_turn(&collector, &mut host, &session).await;
+}

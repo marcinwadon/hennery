@@ -3,8 +3,8 @@
 use hennery_proto::frames::{Capabilities, Capability, CollectorFrame, SessionBody};
 use hennery_proto::rest::EventDto;
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -33,11 +33,26 @@ enum CompletedBy {
     Turn(String),
 }
 
+/// What a request changed in the store before it was sent. A rejection
+/// means nothing happened on the host, so the socket task undoes it when
+/// the rejection arrives: it sees every rejection, even when the HTTP
+/// handler that sent the request is gone (its client disconnected).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Undo {
+    /// A start or resume left the session `starting`: it becomes `failed`
+    /// with the rejection's code.
+    Start { session_id: String },
+    /// A prompt holds the session's turn slot as `sent`: the turn is
+    /// removed.
+    Prompt { session_id: String, turn_id: String },
+}
+
 struct Waiter {
     /// The connection the request went out on: only its loss or its
     /// timeout concerns this waiter.
     conn_id: u64,
     completed_by: CompletedBy,
+    undo: Option<Undo>,
     tx: oneshot::Sender<Result<SessionBody, RequestError>>,
 }
 
@@ -67,7 +82,8 @@ pub struct Hub {
     /// The latest connection each host registered (kept after it ends), so
     /// an offline timer can tell whether the host came back since.
     last_conn: Mutex<HashMap<String, u64>>,
-    waiters: Mutex<HashMap<String, Waiter>>,
+    /// Shared with each waiter's watchdog (`expire`).
+    waiters: Arc<Mutex<HashMap<String, Waiter>>>,
     events: broadcast::Sender<EventDto>,
 }
 
@@ -83,7 +99,7 @@ impl Hub {
             next_conn: AtomicU64::new(1),
             hosts: Mutex::new(HashMap::new()),
             last_conn: Mutex::new(HashMap::new()),
-            waiters: Mutex::new(HashMap::new()),
+            waiters: Arc::new(Mutex::new(HashMap::new())),
             events: broadcast::channel(1024).0,
         }
     }
@@ -220,7 +236,21 @@ impl Hub {
         frame: CollectorFrame,
         timeout: Duration,
     ) -> Result<SessionBody, RequestError> {
-        self.wait(host_id, request_id, CompletedBy::Request, frame, timeout)
+        self.wait(host_id, request_id, CompletedBy::Request, None, frame, timeout)
+            .await
+    }
+
+    /// Like `request`, for a request whose store change `undo` reverts if
+    /// the host rejects it (`take_rejected`).
+    pub async fn request_with_undo(
+        &self,
+        host_id: &str,
+        request_id: &str,
+        frame: CollectorFrame,
+        timeout: Duration,
+        undo: Undo,
+    ) -> Result<SessionBody, RequestError> {
+        self.wait(host_id, request_id, CompletedBy::Request, Some(undo), frame, timeout)
             .await
     }
 
@@ -235,7 +265,7 @@ impl Hub {
         timeout: Duration,
     ) -> Result<SessionBody, RequestError> {
         let completed_by = CompletedBy::Session(session_id.to_string());
-        self.wait(host_id, request_id, completed_by, frame, timeout).await
+        self.wait(host_id, request_id, completed_by, None, frame, timeout).await
     }
 
     /// Like `request`, for a request completed by the end of `turn_id`
@@ -250,7 +280,7 @@ impl Hub {
         timeout: Duration,
     ) -> Result<SessionBody, RequestError> {
         let completed_by = CompletedBy::Turn(turn_id.to_string());
-        self.wait(host_id, request_id, completed_by, frame, timeout).await
+        self.wait(host_id, request_id, completed_by, None, frame, timeout).await
     }
 
     async fn wait(
@@ -258,14 +288,15 @@ impl Hub {
         host_id: &str,
         request_id: &str,
         completed_by: CompletedBy,
+        undo: Option<Undo>,
         frame: CollectorFrame,
         timeout: Duration,
     ) -> Result<SessionBody, RequestError> {
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel();
         // Registered before the frame leaves, so a fast answer finds it; the
         // hosts lock is held throughout so the connection cannot change in
         // between (lock order: hosts, then waiters, as in `unregister`).
-        let conn_id = {
+        let (conn_id, kicked) = {
             let hosts = self.hosts.lock().expect("hosts lock");
             let Some(host) = hosts.get(host_id).filter(|h| h.ready) else {
                 return Err(RequestError::NotConnected);
@@ -275,6 +306,7 @@ impl Hub {
                 Waiter {
                     conn_id: host.conn_id,
                     completed_by,
+                    undo,
                     tx,
                 },
             );
@@ -282,14 +314,30 @@ impl Hub {
                 self.waiters.lock().expect("waiters lock").remove(request_id);
                 return Err(RequestError::NotConnected);
             }
-            host.conn_id
+            (host.conn_id, host.kicked.clone())
         };
-        let result = tokio::time::timeout(timeout, rx).await;
-        self.waiters.lock().expect("waiters lock").remove(request_id);
+        // The deadline belongs to the hub, not to this future: the handler
+        // awaiting it is dropped when its client disconnects, and a host
+        // that never answers must still lose its connection and its waiter.
+        let watchdog = tokio::spawn(expire(
+            self.waiters.clone(),
+            request_id.to_string(),
+            conn_id,
+            kicked,
+            timeout,
+        ));
+        let result = tokio::time::timeout(timeout, &mut rx).await;
+        watchdog.abort();
         match result {
             Ok(Ok(outcome)) => outcome,
             Ok(Err(_)) => Err(RequestError::DeliveryUnknown),
             Err(_elapsed) => {
+                // Whoever removes the entry answers it. If a fact, a
+                // rejection or the watchdog took it just now, its answer is
+                // on the way: a rejection's undo is already in the store.
+                if self.waiters.lock().expect("waiters lock").remove(request_id).is_none() {
+                    return rx.await.unwrap_or(Err(RequestError::DeliveryUnknown));
+                }
                 // Every timeout is at least the read deadline, so a live
                 // connection that produced neither the fact nor a rejection
                 // is not to be trusted: drop it, and the next handshake
@@ -332,10 +380,25 @@ impl Hub {
         }
     }
 
+    /// Take the waiter of a request the host rejected out of the hub. From
+    /// here on nothing else can answer it (not its timeout, not the
+    /// watchdog), so the caller applies the undo, then `answer`s, and the
+    /// store and the HTTP answer always agree (decision 6). The waiter
+    /// outlives an HTTP handler that was dropped mid-request.
+    pub fn take_rejected(&self, request_id: &str) -> Option<Rejection> {
+        let w = self.waiters.lock().expect("waiters lock").remove(request_id)?;
+        Some(Rejection { undo: w.undo, tx: w.tx })
+    }
+
     pub fn reject(&self, request_id: &str, code: String, message: String) {
-        if let Some(w) = self.waiters.lock().expect("waiters lock").remove(request_id) {
-            let _ = w.tx.send(Err(RequestError::Rejected { code, message }));
+        if let Some(rejection) = self.take_rejected(request_id) {
+            rejection.answer(code, message);
         }
+    }
+
+    /// Requests still waiting for their answer.
+    pub fn pending_requests(&self) -> usize {
+        self.waiters.lock().expect("waiters lock").len()
     }
 
     pub fn publish(&self, event: EventDto) {
@@ -344,5 +407,51 @@ impl Hub {
 
     pub fn subscribe(&self) -> broadcast::Receiver<EventDto> {
         self.events.subscribe()
+    }
+}
+
+/// A waiter taken out of the hub by a host rejection (`Hub::take_rejected`).
+pub struct Rejection {
+    undo: Option<Undo>,
+    tx: oneshot::Sender<Result<SessionBody, RequestError>>,
+}
+
+impl Rejection {
+    /// What the request changed in the store, to revert first.
+    pub fn undo(&self) -> Option<&Undo> {
+        self.undo.as_ref()
+    }
+
+    /// Answer the request's caller, if it is still there.
+    pub fn answer(self, code: String, message: String) {
+        let _ = self.tx.send(Err(RequestError::Rejected { code, message }));
+    }
+}
+
+/// One waiter's deadline, owned by the hub. If the waiter is still there
+/// for the same connection when `timeout` has passed, nobody answered it:
+/// it is removed, its caller (if any) hears "delivery unknown", and the
+/// connection is dropped so the next handshake reconciles the request
+/// (ACP core §3.4). Idempotent with the handler's own timeout: whichever
+/// removes the entry acts.
+async fn expire(
+    waiters: Arc<Mutex<HashMap<String, Waiter>>>,
+    request_id: String,
+    conn_id: u64,
+    kicked: CancellationToken,
+    timeout: Duration,
+) {
+    tokio::time::sleep(timeout).await;
+    let expired = {
+        let mut waiters = waiters.lock().expect("waiters lock");
+        match waiters.get(&request_id) {
+            Some(w) if w.conn_id == conn_id => waiters.remove(&request_id),
+            _ => None,
+        }
+    };
+    if let Some(w) = expired {
+        tracing::warn!(%request_id, "request timed out with no handler left; dropping the host connection");
+        kicked.cancel();
+        let _ = w.tx.send(Err(RequestError::DeliveryUnknown));
     }
 }
