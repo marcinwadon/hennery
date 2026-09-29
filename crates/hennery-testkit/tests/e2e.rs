@@ -895,3 +895,127 @@ async fn a_cancel_mid_turn_ends_it_cancelled_once_and_the_next_prompt_runs() {
     let (status, body) = post_json(&c, url, json!({ "content": text("again") })).await;
     assert_eq!(status, 202, "{body}");
 }
+
+// Plan B2b: model, axes and mode end to end (ACP core §12 scenario 1 and
+// the fake-adapter half of its live gates).
+
+fn config_script(log: &Path) -> FakeScript {
+    FakeScript {
+        config_options: hennery_testkit::sample_config_options(),
+        model_switch_sets_mode: Some("default".into()),
+        config_log: Some(log.to_string_lossy().into_owned()),
+        ..FakeScript::default()
+    }
+}
+
+async fn catalog(c: &reqwest::Client, collector: &Collector, session: &str) -> Value {
+    let url = collector.url(&format!("/api/sessions/{session}/catalog"));
+    let resp = c.get(url).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    resp.json().await.unwrap()
+}
+
+fn current(catalog: &Value) -> (Value, Value, Value) {
+    (
+        catalog["model"].clone(),
+        catalog["mode"].clone(),
+        catalog["axes"].clone(),
+    )
+}
+
+/// Scenario 1: one request starts the session with model, mode and axes;
+/// the mode goes last, so the model's clamp cannot undo it, and the
+/// announced catalogue is the one after the switches.
+#[tokio::test]
+async fn a_start_with_model_mode_and_axes_announces_the_catalogue_after_the_switches() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    start_host(collector.addr, &dir.path().join("host"), &config_script(&log));
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let (status, body) = post_json(
+        &c,
+        collector.url("/api/sessions"),
+        json!({
+            "host_id": "host-1", "agent": "fake", "cwd": std::env::temp_dir(),
+            "model": "large", "mode": "plan", "axes": {"effort": "high"}
+        }),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    let session = body["session_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "model=large\neffort=high\nmode=plan\n"
+    );
+    let catalog = catalog(&c, &collector, &session).await;
+    assert_eq!(
+        current(&catalog),
+        (json!("large"), json!("plan"), json!({"effort": "high", "fast": false}))
+    );
+    assert_eq!(catalog["config_options"].as_array().map(Vec::len), Some(4));
+}
+
+/// The model-switch gate against the fake: the read-back is what the
+/// adapter reports, including the mode it clamped, and a model it refuses
+/// is never reported as current.
+#[tokio::test]
+async fn a_model_switch_answers_with_the_adapters_read_back_and_a_bogus_model_is_never_current() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    start_host(collector.addr, &dir.path().join("host"), &config_script(&log));
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    let url = collector.url(&format!("/api/sessions/{session}/config"));
+    let (status, body) = post_json(&c, url.clone(), json!({ "config_id": "mode", "value": "plan" })).await;
+    assert_eq!((status, body["mode"].as_str()), (202, Some("plan")), "{body}");
+    let (status, body) = post_json(&c, url.clone(), json!({ "config_id": "model", "value": "large" })).await;
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(
+        (body["model"].as_str(), body["mode"].as_str()),
+        (Some("large"), Some("default")),
+        "the adapter clamped the mode: {body}"
+    );
+    let (status, body) = post_json(&c, url, json!({ "config_id": "model", "value": "bogus" })).await;
+    assert_eq!((status, body["code"].as_str()), (502, Some("config_failed")), "{body}");
+    assert_eq!(catalog(&c, &collector, &session).await["model"], "large");
+    let evs = events(&c, &collector, &session).await;
+    assert_eq!(of_kind(&evs, "config_applied").len(), 2);
+}
+
+/// The resume gate against the fake: a mode the agent chose by itself mid
+/// turn is stored from its live update, and after a host restart the
+/// resume applies it to the new adapter, which starts from its default.
+#[tokio::test]
+async fn a_mode_the_agent_chose_survives_a_host_restart_and_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let script = FakeScript {
+        prompt_sets_mode: Some("bypass".into()),
+        ..config_script(&log)
+    };
+    let mut fake = AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    fake.env
+        .push((SCRIPT_ENV.into(), serde_json::to_string(&script).unwrap()));
+    let host = start_host_with(collector.addr, &dir.path().join("host"), fake.clone());
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    prompt_and_wait(&c, &collector, &session, 1).await;
+    assert_eq!(catalog(&c, &collector, &session).await["mode"], "bypass");
+    assert_eq!(std::fs::read_to_string(&log).unwrap_or_default(), "");
+
+    host.abort();
+    let _ = host.await;
+    start_host_with(collector.addr, &dir.path().join("host"), fake);
+    lifecycle_is(&collector, &session, "parked").await;
+    let (status, body) = resume(&c, &collector, &session).await;
+    assert_eq!((status, body["lifecycle"].as_str()), (202, Some("active")), "{body}");
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), "mode=bypass\n");
+    let catalog = catalog(&c, &collector, &session).await;
+    assert_eq!(current(&catalog).1, json!("bypass"));
+}
