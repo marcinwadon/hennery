@@ -742,3 +742,116 @@ async fn a_resume_queued_behind_a_close_attaches_a_fresh_adapter_after_the_close
     assert_eq!(started(frames.last().unwrap()).1, "r3");
     assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 2);
 }
+
+// Plan B2a: cancel and capabilities over the connection.
+
+#[tokio::test]
+async fn a_host_announces_that_it_can_park() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(host_with_fake(addr, "capabilities", slow_fake())));
+    let (tcp, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("host connects")
+        .unwrap();
+    let (_sink, mut stream) = tokio_tungstenite::accept_async(tcp).await.unwrap().split();
+    let HostFrame::Hello { capabilities, .. } = read_host_frame(&mut stream).await else {
+        panic!("expected hello");
+    };
+    assert_eq!(
+        capabilities,
+        hennery_proto::frames::Capabilities(vec![hennery_proto::frames::Capability::Park])
+    );
+}
+
+#[tokio::test]
+async fn cancel_turn_reaches_the_actor_and_a_cancel_for_a_detached_session_is_not_attached() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(host_with_fake(addr, "cancel", slow_fake())));
+
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    send_frame(&mut sink, &start("r1", "s1")).await;
+    read_until(&mut stream, body_is("s1", "session_started")).await;
+    send_frame(
+        &mut sink,
+        &CollectorFrame::Prompt {
+            request_id: "r2".into(),
+            session_id: "s1".into(),
+            turn_id: "t1".into(),
+            content: vec![serde_json::json!({"type": "text", "text": "go"})],
+        },
+    )
+    .await;
+    read_until(&mut stream, body_is("s1", "turn_started")).await;
+    let cancel = |request_id: &str, session_id: &str| CollectorFrame::CancelTurn {
+        request_id: request_id.into(),
+        session_id: session_id.into(),
+        turn_id: "t1".into(),
+    };
+    send_frame(&mut sink, &cancel("r3", "s1")).await;
+    let ended = read_until(&mut stream, body_is("s1", "turn_ended")).await;
+    let HostFrame::Session {
+        body: hennery_proto::frames::SessionBody::TurnEnded { turn_id, outcome, .. },
+        ..
+    } = ended
+    else {
+        panic!("expected turn_ended, got {ended:?}");
+    };
+    assert_eq!(
+        (turn_id.as_str(), outcome),
+        ("t1", hennery_proto::frames::TurnOutcome::Cancelled)
+    );
+    send_frame(&mut sink, &cancel("r4", "no-such-session")).await;
+    let refused = read_until(&mut stream, error_for("r4")).await;
+    assert!(
+        matches!(&refused, HostFrame::Error { code, .. } if code == "not_attached"),
+        "{refused:?}"
+    );
+}
+
+/// A resume waiting behind a close must not attach once host shutdown has
+/// taken the session map: shutdown would never wait for that adapter, and
+/// the runtime would SIGKILL it without its grace. The adapter ignores
+/// SIGTERM, so the close takes the whole 5 s kill grace, and shutdown
+/// begins while the resume still waits.
+#[tokio::test]
+async fn a_resume_waiting_behind_a_close_never_attaches_after_host_shutdown() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let spawns = dir.path().join("spawns");
+    let stubborn = counting_fake_with(&spawns, "trap '' TERM;");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let host = tokio::spawn(hennery_host::run_until(
+        host_with_fake(addr, "resume-after-shutdown", stubborn),
+        async {
+            let _ = stopped.await;
+        },
+    ));
+
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    send_frame(&mut sink, &start("r1", "s1")).await;
+    read_until(&mut stream, body_is("s1", "session_started")).await;
+    send_frame(
+        &mut sink,
+        &CollectorFrame::CloseSession {
+            request_id: "r2".into(),
+            session_id: "s1".into(),
+        },
+    )
+    .await;
+    send_frame(&mut sink, &resume("r3", "s1", 0, "fake-session-1")).await;
+    // Nothing on the wire says the resume is queued; the close has most of
+    // its 5 s grace left.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), host)
+        .await
+        .expect("the host shut down")
+        .unwrap()
+        .unwrap();
+    // Time for a wrongly attached adapter to launch.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 1);
+}

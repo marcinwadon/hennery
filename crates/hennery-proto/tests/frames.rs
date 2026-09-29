@@ -101,6 +101,11 @@ fn every_collector_frame_round_trips() {
             request_id: "r".into(),
             session_id: "s".into(),
         },
+        CollectorFrame::CancelTurn {
+            request_id: "r".into(),
+            session_id: "s".into(),
+            turn_id: "t".into(),
+        },
     ];
     for f in frames {
         let back: CollectorFrame = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
@@ -198,4 +203,54 @@ fn protocol_major_parses_only_well_formed_versions() {
     assert_eq!(protocol_major("1"), None);
     assert_eq!(protocol_major("x.0"), None);
     assert_eq!(protocol_major("1.x"), None);
+}
+
+#[test]
+fn cancel_turn_and_its_answer_use_the_spec_field_names() {
+    let cancel = CollectorFrame::CancelTurn {
+        request_id: "r".into(),
+        session_id: "s".into(),
+        turn_id: "t".into(),
+    };
+    assert_eq!(
+        serde_json::to_value(&cancel).unwrap(),
+        json!({"type": "cancel_turn", "request_id": "r", "session_id": "s", "turn_id": "t"})
+    );
+    let answer = hennery_proto::rest::CancelResponse {
+        turn_id: "t".into(),
+        outcome: TurnOutcome::Cancelled,
+    };
+    assert_eq!(
+        serde_json::to_value(&answer).unwrap(),
+        json!({"turn_id": "t", "outcome": "cancelled"})
+    );
+}
+
+#[test]
+fn hello_capabilities_skip_unknown_entries_and_default_to_none() {
+    use hennery_proto::frames::{Capabilities, Capability};
+    let hello = |extra: serde_json::Value| {
+        let mut v = json!({
+            "type": "hello", "protocol_version": "1.0", "host_version": "0", "host_id": "h",
+            "token": "t", "attached_sessions": []
+        });
+        v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        match serde_json::from_value::<HostFrame>(v).unwrap() {
+            HostFrame::Hello { capabilities, .. } => capabilities,
+            other => panic!("expected hello, got {other:?}"),
+        }
+    };
+    let newer = hello(json!({"capabilities": ["park", "teleport", "images"]}));
+    assert_eq!(newer, Capabilities(vec![Capability::Park, Capability::Images]));
+    assert!(newer.has(Capability::Park) && !newer.has(Capability::Projects));
+    assert_eq!(hello(json!({})), Capabilities::default());
+    let sent = HostFrame::Hello {
+        protocol_version: "1.0".into(),
+        host_version: "0".into(),
+        host_id: "h".into(),
+        token: "t".into(),
+        capabilities: Capabilities(vec![Capability::Park]),
+        attached_sessions: vec![],
+    };
+    assert_eq!(serde_json::to_value(&sent).unwrap()["capabilities"], json!(["park"]));
 }

@@ -239,3 +239,31 @@ fn no_load_session_withholds_the_capability() {
     let out = exchange_until(r#"{"chunks":[],"no_load_session":true}"#, &load_requests("a")[..1], 1);
     assert_eq!(out[0]["result"]["agentCapabilities"]["loadSession"], false, "{out:?}");
 }
+
+/// A prompt followed at once by `session/cancel`.
+fn cancelled_prompt_requests() -> Vec<Value> {
+    let mut requests = session_requests();
+    requests.push(json!({"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"fake-session-1"}}));
+    requests
+}
+
+#[test]
+fn session_cancel_stops_the_prompt_and_answers_cancelled() {
+    let script = r#"{"chunks":["a","b","c","d","e"],"chunk_delay_ms":300}"#;
+    let out = exchange_until(script, &cancelled_prompt_requests(), 3);
+    let chunks = out.iter().filter(|m| m["method"] == "session/update").count();
+    assert!(chunks < 5, "the prompt ran to its end: {out:?}");
+    assert_eq!(out.last().unwrap()["result"]["stopReason"], "cancelled", "{out:?}");
+    let script = r#"{"chunks":["a","b","c","d","e"],"chunk_delay_ms":300,"cancel_error":-32603}"#;
+    let out = exchange_until(script, &cancelled_prompt_requests(), 3);
+    assert_eq!(out.last().unwrap()["error"]["code"], -32603, "{out:?}");
+}
+
+#[test]
+fn ignore_cancel_runs_the_prompt_to_its_end() {
+    let script = r#"{"chunks":["a","b","c"],"chunk_delay_ms":50,"ignore_cancel":true}"#;
+    let out = exchange_until(script, &cancelled_prompt_requests(), 3);
+    let chunks = out.iter().filter(|m| m["method"] == "session/update").count();
+    assert_eq!(chunks, 3, "{out:?}");
+    assert_eq!(out.last().unwrap()["result"]["stopReason"], "end_turn", "{out:?}");
+}

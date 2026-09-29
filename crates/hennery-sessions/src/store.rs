@@ -2,7 +2,7 @@
 //! the connection mutex (kernel §1's writer thread replaces it later).
 
 use anyhow::Result;
-use hennery_proto::frames::{AttachedSession, SessionBody};
+use hennery_proto::frames::{AttachedSession, SessionBody, TurnOutcome};
 use hennery_proto::rest::EventDto;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
@@ -356,6 +356,24 @@ impl Store {
             .conn()
             .query_row("SELECT state FROM turns WHERE turn_id = ?1", [turn_id], |r| r.get(0))
             .optional()?)
+    }
+
+    /// How a turn ended, once it has (`None` while it is open, or if it was
+    /// never delivered).
+    pub fn ended_turn_outcome(&self, turn_id: &str) -> Result<Option<TurnOutcome>> {
+        let outcome: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT outcome FROM turns WHERE turn_id = ?1 AND state = 'ended'",
+                [turn_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(match outcome {
+            Some(outcome) => Some(serde_json::from_value(Value::String(outcome))?),
+            None => None,
+        })
     }
 
     /// Open a turn if the session is active and has none open. Returns false

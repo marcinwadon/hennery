@@ -1,6 +1,8 @@
 //! The host WebSocket endpoint (ACP core §3, §5).
 
 use crate::AppState;
+use crate::hub::Undo;
+use crate::store::Store;
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -44,6 +46,7 @@ async fn serve(socket: WebSocket, state: AppState) {
         protocol_version,
         host_id,
         token,
+        capabilities,
         attached_sessions,
         ..
     }) = hello
@@ -66,7 +69,7 @@ async fn serve(socket: WebSocket, state: AppState) {
         return;
     }
     let (tx, mut rx) = mpsc::unbounded_channel::<CollectorFrame>();
-    let Some(registration) = state.hub.register(&host_id, tx.clone()) else {
+    let Some(registration) = state.hub.register(&host_id, tx.clone(), capabilities) else {
         let _ = sink
             .send(text(&reject(
                 "already_connected",
@@ -188,6 +191,15 @@ async fn serve(socket: WebSocket, state: AppState) {
                             SessionBody::SessionParked { .. } | SessionBody::SessionClosed => {
                                 state.hub.resolve_session(&session_id, body.clone());
                             }
+                            // `cancel_turn` is completed by its turn's end,
+                            // scoped to the session it belongs to (final
+                            // review M1): this host already owns
+                            // `session_id` (checked above), but that must
+                            // not let it complete another session's waiter
+                            // by naming that session's turn_id here.
+                            SessionBody::TurnEnded { turn_id, .. } => {
+                                state.hub.resolve_turn(&session_id, turn_id, body.clone());
+                            }
                             _ => {}
                         }
                         let _ = tx.send(CollectorFrame::Ack {
@@ -222,7 +234,31 @@ async fn serve(socket: WebSocket, state: AppState) {
                         tracing::warn!(%host_id, %session_id, %code, %message, "reconcile close_session rejected");
                     }
                 } else {
-                    state.hub.reject(&request_id, code, message);
+                    // Take the waiter first, so no timeout can answer it any
+                    // more; undo what the request changed; then answer. The
+                    // HTTP answer and the store agree, and the store is
+                    // right even when no handler waits (decision 6). If the
+                    // undo itself fails, the store no longer matches what
+                    // the rejection says: answer delivery-unknown instead of
+                    // `Rejected`, and drop the connection so the next
+                    // handshake's reconciliation settles it (final review
+                    // F1) — never answer `Rejected` and then break.
+                    if let Some(rejection) = state.hub.take_rejected(&request_id) {
+                        let undo_failed = match rejection.undo() {
+                            Some(undo) => undo_rejected(&state.store, undo, &code)
+                                .err()
+                                .map(|err| (undo.clone(), err)),
+                            None => None,
+                        };
+                        match undo_failed {
+                            None => rejection.answer(code, message),
+                            Some((undo, err)) => {
+                                tracing::error!(%host_id, ?undo, error = %err, "undoing a rejected request failed; dropping connection");
+                                rejection.delivery_unknown();
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             HostFrame::ResendComplete if !reconciled => {
@@ -258,4 +294,13 @@ async fn serve(socket: WebSocket, state: AppState) {
     state.hub.unregister(&host_id, conn_id);
     tracing::info!(%host_id, "host disconnected");
     crate::offline::after_disconnect(&state, host_id, conn_id);
+}
+
+/// Revert what a request the host rejected changed in the store: a start or
+/// resume fails with the host's code, a prompt's turn is removed.
+fn undo_rejected(store: &Store, undo: &Undo, code: &str) -> anyhow::Result<()> {
+    match undo {
+        Undo::Start { session_id } => store.mark_failed_if_starting(session_id, code),
+        Undo::Prompt { session_id, turn_id } => store.abandon_turn(session_id, turn_id),
+    }
 }

@@ -14,6 +14,46 @@ pub struct AttachedSession {
     pub open_turn_id: Option<String>,
 }
 
+/// A feature a host implements, announced in `hello` (ACP core §3.3). The
+/// collector never sends a frame that needs a capability to a host that
+/// lacks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum Capability {
+    /// Project enumeration and browsing.
+    Projects,
+    /// Image content blocks in prompts.
+    Images,
+    /// Explicit park (`park_session`).
+    Park,
+}
+
+/// `hello.capabilities`. Deserialized leniently: a capability this build
+/// does not know (a newer host, a minor protocol bump) is skipped, never a
+/// reason to refuse the whole `hello`. The generated schema still lists
+/// `Capability` as a closed `oneOf` (there is no open-ended JSON Schema
+/// equivalent), but that is a description of the known values, not a
+/// constraint hennery itself enforces: an entry outside it is ignored, not
+/// rejected, so a schema-validating client or proxy must not reject a
+/// `hello` on an unknown capability either.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, JsonSchema, TS)]
+pub struct Capabilities(pub Vec<Capability>);
+
+impl Capabilities {
+    pub fn has(&self, capability: Capability) -> bool {
+        self.0.contains(&capability)
+    }
+}
+
+impl<'de> Deserialize<'de> for Capabilities {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw: Vec<Value> = Deserialize::deserialize(deserializer)?;
+        Ok(Self(
+            raw.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect(),
+        ))
+    }
+}
+
 /// How a turn ended. Exactly one `turn_ended` per accepted turn (ACP core §4.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
@@ -106,6 +146,10 @@ pub enum HostFrame {
         /// Walking skeleton only: a shared development token. Replaced by an
         /// Ed25519 proof of possession (ACP core §3.5).
         token: String,
+        /// What this host implements (a closed list, ACP core §3.3). Absent
+        /// means none.
+        #[serde(default)]
+        capabilities: Capabilities,
         attached_sessions: Vec<AttachedSession>,
     },
     /// Every state-bearing fact is a sequenced frame: it goes through the host
@@ -178,6 +222,14 @@ pub enum CollectorFrame {
         /// ACP ContentBlocks, built by the frontend.
         #[ts(type = "unknown[]")]
         content: Vec<Value>,
+    },
+    /// Stop the turn in flight: `session/cancel` to the adapter. Completed
+    /// by that turn's `turn_ended` (ACP core §3.3, §4.4), whatever its
+    /// outcome: a turn that finished first is not cancelled.
+    CancelTurn {
+        request_id: String,
+        session_id: String,
+        turn_id: String,
     },
     Ack {
         session_id: String,

@@ -42,6 +42,7 @@ pub fn render_schema() -> String {
         rest::ApiError,
         rest::LifecycleResponse,
         rest::SessionDetail,
+        rest::CancelResponse,
     );
     // `serde_json::Map` is a `BTreeMap` (always iterates sorted) by default,
     // or an `IndexMap` (iterates in insertion order) when serde_json's
@@ -98,6 +99,8 @@ pub fn render_ts() -> String {
         )*};
     }
     add!(
+        frames::Capability,
+        frames::Capabilities,
         frames::AttachedSession,
         frames::TurnOutcome,
         frames::ParkReason,
@@ -114,6 +117,7 @@ pub fn render_ts() -> String {
         rest::LifecycleResponse,
         rest::OpenTurn,
         rest::SessionDetail,
+        rest::CancelResponse,
     );
     out
 }

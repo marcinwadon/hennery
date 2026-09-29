@@ -351,7 +351,7 @@ async fn a_start_with_unknown_delivery_reports_503_with_the_session_id() {
     let conn_id = collector
         .state
         .hub
-        .register("host-1", tx)
+        .register("host-1", tx, Default::default())
         .expect("register fake host")
         .conn_id;
     collector.state.hub.mark_ready("host-1", conn_id);
@@ -853,4 +853,45 @@ async fn a_session_parked_by_a_host_restart_resumes_on_the_restarted_host() {
 #[tokio::test]
 async fn a_session_resumes_on_a_host_that_lost_its_outbox() {
     resume_after_a_host_restart(true).await;
+}
+
+// Plan B2a: cancel end to end (ACP core §3.3 `cancel_turn`, §4.4).
+
+#[tokio::test]
+async fn a_cancel_mid_turn_ends_it_cancelled_once_and_the_next_prompt_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    start_host(collector.addr, &dir.path().join("host"), &slow_script(20));
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    let url = collector.url(&format!("/api/sessions/{session}/prompt"));
+    let (status, body) = post_json(&c, url, json!({ "content": text("long") })).await;
+    assert_eq!(status, 202, "{body}");
+    let turn = body["turn_id"].as_str().unwrap().to_string();
+
+    let cancel_url = collector.url(&format!("/api/sessions/{session}/cancel"));
+    let (status, body) = post_json(&c, cancel_url.clone(), json!({})).await;
+    assert_eq!(
+        (status, body),
+        (202, json!({ "turn_id": turn, "outcome": "cancelled" }))
+    );
+    let evs = events(&c, &collector, &session).await;
+    let ends = turn_ends(&evs);
+    assert_eq!(ends.len(), 1, "{evs:?}");
+    assert_eq!(
+        (&ends[0].body["turn_id"], &ends[0].body["outcome"]),
+        (&json!(turn), &json!("cancelled"))
+    );
+    assert!(
+        agent_text(&evs).len() < "1.2.3.4.5.6.7.8.9.10.11.12.13.14.15.16.17.18.19.20.".len(),
+        "the turn ran to its end"
+    );
+    // Nothing left to cancel; the session takes the next prompt.
+    let (status, body) = post_json(&c, cancel_url, json!({})).await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("no_open_turn")));
+    lifecycle_is(&collector, &session, "active").await;
+    let url = collector.url(&format!("/api/sessions/{session}/prompt"));
+    let (status, body) = post_json(&c, url, json!({ "content": text("again") })).await;
+    assert_eq!(status, 202, "{body}");
 }

@@ -3,13 +3,15 @@
 //! wire format real adapters use.
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse, LoadSessionRequest,
-    LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionNotification,
-    SessionUpdate, StopReason, TextContent,
+    AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, InitializeRequest, InitializeResponse,
+    LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse,
+    SessionNotification, SessionUpdate, StopReason, TextContent,
 };
 use agent_client_protocol::{Agent, Stdio, UntypedMessage};
 use hennery_testkit::{CRASH_EXIT_CODE, FakeScript, SCRIPT_ENV};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::watch;
 
 #[tokio::main]
 async fn main() -> agent_client_protocol::Result<()> {
@@ -38,6 +40,10 @@ async fn main() -> agent_client_protocol::Result<()> {
     }
 
     let load_session = !script.no_load_session;
+    // `session/cancel` for the prompt in flight: set by the notification,
+    // cleared when a prompt starts. Handlers run in arrival order, so a
+    // cancel sent right after its prompt is never cleared by that prompt.
+    let cancel = Arc::new(watch::channel(false).0);
     Agent
         .builder()
         .name("hennery-fake-acp")
@@ -80,18 +86,44 @@ async fn main() -> agent_client_protocol::Result<()> {
             },
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_notification(
+            {
+                let cancel = cancel.clone();
+                let ignore = script.ignore_cancel;
+                async move |_n: CancelNotification, _cx| {
+                    if !ignore {
+                        cancel.send_replace(true);
+                    }
+                    Ok(())
+                }
+            },
+            agent_client_protocol::on_receive_notification!(),
+        )
         .on_receive_request(
             {
                 let script = script.clone();
                 async move |req: PromptRequest, responder, cx| {
                     let script = script.clone();
                     let cx2 = cx.clone();
+                    cancel.send_replace(false);
+                    let mut cancelled = cancel.subscribe();
                     cx.spawn(async move {
                         for (sent, chunk) in script.chunks.into_iter().enumerate() {
                             if script.exit_after_chunks == Some(sent) {
                                 crash().await;
                             }
-                            tokio::time::sleep(Duration::from_millis(script.chunk_delay_ms)).await;
+                            // A cancelled prompt stops streaming and answers
+                            // `cancelled`, as ACP asks of an agent.
+                            tokio::select! {
+                                _ = tokio::time::sleep(Duration::from_millis(script.chunk_delay_ms)) => {}
+                                _ = cancelled.wait_for(|c| *c) => {
+                                    return match script.cancel_error {
+                                        Some(code) => responder
+                                            .respond_with_error(agent_client_protocol::Error::new(code, "aborted")),
+                                        None => responder.respond(PromptResponse::new(StopReason::Cancelled)),
+                                    };
+                                }
+                            }
                             cx2.send_notification(SessionNotification::new(
                                 req.session_id.clone(),
                                 SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(

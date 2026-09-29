@@ -12,13 +12,18 @@
 use futures::{SinkExt, StreamExt};
 use hennery_kernel::auth::DevToken;
 use hennery_proto::PROTOCOL_VERSION;
-use hennery_proto::frames::{HostFrame, SessionBody};
+use hennery_proto::frames::{Capabilities, CollectorFrame, HostFrame, SessionBody};
 use hennery_sessions::AppState;
 use hennery_sessions::store::Store;
+use serde_json::json;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 
 const TOKEN: &str = "dev-token";
+
+fn bearer() -> String {
+    format!("Bearer {TOKEN}")
+}
 
 #[tokio::test]
 async fn a_failed_ingest_drops_the_connection_instead_of_acking_past_it() {
@@ -57,6 +62,7 @@ async fn a_failed_ingest_drops_the_connection_instead_of_acking_past_it() {
             host_version: "0".into(),
             host_id: "host-1".into(),
             token: TOKEN.into(),
+            capabilities: Default::default(),
             attached_sessions: vec![],
         })
         .unwrap(),
@@ -99,6 +105,169 @@ async fn a_failed_ingest_drops_the_connection_instead_of_acking_past_it() {
     assert!(outcome.is_ok(), "server kept the connection open after a failed ingest");
 
     drop(locker); // release the exclusive lock (rolls back, nothing was committed)
+    shutdown.cancel();
+    server.await.unwrap().unwrap();
+}
+
+/// A host rejection's undo (F1, final review) must not be answered as a
+/// plain `Rejected`: if applying the undo itself fails, the store's state no
+/// longer matches what the rejection announced, so the caller must see
+/// delivery-unknown (as for a dropped connection) and the socket must drop
+/// so the next handshake's reconciliation settles it.
+///
+/// Forced with the same second-SQLite-connection technique as the ingest
+/// test above: `mark_failed_if_starting` (the undo for a rejected
+/// `start_session`) blocks behind an exclusive write lock and, after the
+/// store's fixed 5s busy timeout, returns a real `SQLITE_BUSY` error.
+#[tokio::test]
+async fn an_undo_error_answers_delivery_unknown_and_drops_the_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    let store = Store::open(&db).unwrap();
+
+    let state = AppState::new(store, DevToken::new(TOKEN));
+    let shutdown = state.shutdown.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(hennery_sessions::serve(listener, state));
+
+    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/hosts/ws"))
+        .await
+        .unwrap();
+    let (mut sink, mut stream) = ws.split();
+    sink.send(Message::text(
+        serde_json::to_string(&HostFrame::Hello {
+            protocol_version: PROTOCOL_VERSION.into(),
+            host_version: "0".into(),
+            host_id: "host-1".into(),
+            token: TOKEN.into(),
+            capabilities: Capabilities::default(),
+            attached_sessions: vec![],
+        })
+        .unwrap(),
+    ))
+    .await
+    .unwrap();
+    assert!(
+        matches!(stream.next().await, Some(Ok(Message::Text(_)))),
+        "expected hello_ack"
+    );
+    sink.send(Message::text(
+        serde_json::to_string(&HostFrame::ResendComplete).unwrap(),
+    ))
+    .await
+    .unwrap();
+
+    // The host is not `ready` until `resend_complete` is processed: wait for
+    // it via `/api/hosts` rather than racing the HTTP call below against it.
+    let client = reqwest::Client::new();
+    let hosts_url = format!("http://{addr}/api/hosts");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let hosts: Vec<String> = client
+            .get(&hosts_url)
+            .header("authorization", bearer())
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if hosts.iter().any(|h| h == "host-1") {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "host never became ready");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let post = tokio::spawn({
+        let client = client.clone();
+        let url = format!("http://{addr}/api/sessions");
+        async move {
+            client
+                .post(url)
+                .header("authorization", bearer())
+                .json(&json!({ "host_id": "host-1", "agent": "fake", "cwd": "/tmp" }))
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+
+    // Only once `create_session` has committed and the request is on its
+    // way (proven by receiving the frame) does the lock go up: the start
+    // must already be in flight before the undo it exercises can block.
+    let request_id = match stream.next().await {
+        Some(Ok(Message::Text(t))) => match serde_json::from_str::<CollectorFrame>(&t).unwrap() {
+            CollectorFrame::StartSession { request_id, .. } => request_id,
+            other => panic!("expected start_session, got {other:?}"),
+        },
+        other => panic!("expected start_session frame, got {other:?}"),
+    };
+
+    let locker = tokio::task::spawn_blocking({
+        let db = db.clone();
+        move || {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+            conn
+        }
+    })
+    .await
+    .unwrap();
+
+    sink.send(Message::text(
+        serde_json::to_string(&HostFrame::Error {
+            request_id,
+            code: "unknown_agent".into(),
+            message: "no such agent".into(),
+        })
+        .unwrap(),
+    ))
+    .await
+    .unwrap();
+
+    let resp = post.await.unwrap();
+    assert_eq!(
+        resp.status(),
+        503,
+        "expected delivery_unknown, not the host's rejection"
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "delivery_unknown");
+    let session_id = body["session_id"]
+        .as_str()
+        .expect("delivery_unknown carries the session_id")
+        .to_string();
+
+    // The undo's failure must drop the connection, same as a failed ingest.
+    let outcome = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            match stream.next().await {
+                Some(Ok(Message::Text(t))) => panic!("unexpected frame after the undo failed: {t}"),
+                Some(Ok(_)) => continue,
+                Some(Err(_)) | None => return,
+            }
+        }
+    })
+    .await;
+    assert!(outcome.is_ok(), "server kept the connection open after a failed undo");
+
+    drop(locker); // release the exclusive lock (rolls back, nothing was committed)
+
+    // The undo never applied: the session is exactly as `create_session`
+    // left it, not failed with the host's (wrong) rejection code.
+    let detail: serde_json::Value = client
+        .get(format!("http://{addr}/api/sessions/{session_id}"))
+        .header("authorization", bearer())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(detail["lifecycle"], "starting");
+
     shutdown.cancel();
     server.await.unwrap().unwrap();
 }

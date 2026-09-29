@@ -2,7 +2,7 @@
 //! (plan A's "After this plan"): an old connection of a host that has
 //! already reconnected must not fail or kick what the new one carries.
 
-use hennery_proto::frames::{CollectorFrame, SessionBody};
+use hennery_proto::frames::{Capabilities, Capability, CollectorFrame, ParkReason, SessionBody, TurnOutcome};
 use hennery_sessions::hub::{Hub, Registration, RequestError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +27,9 @@ fn started(request_id: &str) -> SessionBody {
 /// Register and mark ready a connection for host `h`.
 fn connect(hub: &Hub) -> (Registration, mpsc::UnboundedReceiver<CollectorFrame>) {
     let (tx, rx) = mpsc::unbounded_channel();
-    let registration = hub.register("h", tx).expect("no live connection for h");
+    let registration = hub
+        .register("h", tx, Capabilities::default())
+        .expect("no live connection for h");
     hub.mark_ready("h", registration.conn_id);
     (registration, rx)
 }
@@ -76,4 +78,111 @@ async fn a_timeout_on_an_old_connection_does_not_kick_the_new_one() {
         !new.kicked.is_cancelled(),
         "the old request's timeout kicked the new connection"
     );
+}
+
+fn cancel(request_id: &str) -> CollectorFrame {
+    CollectorFrame::CancelTurn {
+        request_id: request_id.into(),
+        session_id: "s1".into(),
+        turn_id: "t1".into(),
+    }
+}
+
+fn ended(turn_id: &str, outcome: TurnOutcome) -> SessionBody {
+    SessionBody::TurnEnded {
+        turn_id: turn_id.into(),
+        outcome,
+        stop_reason: None,
+        error: None,
+    }
+}
+
+/// `cancel_turn` is completed by its turn's end, whatever the outcome; a
+/// fact about another turn, only about the session, or naming the right
+/// turn_id under the wrong session does not complete it. Without the
+/// session check a host could complete another session's cancel waiter with
+/// a fabricated outcome merely by naming that turn_id under a session it
+/// owns (final review M1).
+#[tokio::test]
+async fn a_turn_waiter_resolves_only_on_that_sessions_turn_end() {
+    let hub = Arc::new(Hub::new());
+    let (_conn, mut rx) = connect(&hub);
+    let call = tokio::spawn({
+        let hub = hub.clone();
+        async move {
+            hub.request_for_turn("h", "rc", "s1", "t1", cancel("rc"), Duration::from_secs(5))
+                .await
+        }
+    });
+    rx.recv().await.expect("the cancel went out");
+    hub.resolve_turn("s1", "t0", ended("t0", TurnOutcome::Completed));
+    // Same turn_id, but a different session: must not complete `s1`'s waiter.
+    hub.resolve_turn("s-other", "t1", ended("t1", TurnOutcome::Completed));
+    hub.resolve_session(
+        "s1",
+        SessionBody::SessionParked {
+            reason: ParkReason::Operator,
+        },
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!call.is_finished(), "completed by a fact about something else");
+    hub.resolve_turn("s1", "t1", ended("t1", TurnOutcome::Completed));
+    assert_eq!(call.await.unwrap(), Ok(ended("t1", TurnOutcome::Completed)));
+
+    // A rejection still matches the request id.
+    let call = tokio::spawn({
+        let hub = hub.clone();
+        async move {
+            hub.request_for_turn("h", "rc2", "s1", "t1", cancel("rc2"), Duration::from_secs(5))
+                .await
+        }
+    });
+    rx.recv().await.expect("the second cancel went out");
+    hub.reject("rc2", "not_running".into(), "no".into());
+    assert_eq!(
+        call.await.unwrap(),
+        Err(RequestError::Rejected {
+            code: "not_running".into(),
+            message: "no".into()
+        })
+    );
+}
+
+#[tokio::test]
+async fn capabilities_belong_to_the_hosts_current_connection() {
+    let hub = Hub::new();
+    assert!(!hub.has_capability("h", Capability::Park), "an unknown host has none");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let first = hub.register("h", tx, Capabilities(vec![Capability::Park])).unwrap();
+    assert!(hub.has_capability("h", Capability::Park));
+    assert!(!hub.has_capability("h", Capability::Images));
+    hub.unregister("h", first.conn_id);
+    assert!(!hub.has_capability("h", Capability::Park), "a gone host has none");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    hub.register("h", tx, Capabilities::default()).unwrap();
+    assert!(
+        !hub.has_capability("h", Capability::Park),
+        "an older build of the host that cannot park reconnected"
+    );
+}
+
+/// Decision 6: the hub owns every waiter's deadline. A handler dropped
+/// mid-request (its client left) must not leave its waiter behind, nor
+/// spare a connection that never answered.
+#[tokio::test]
+async fn a_dropped_requests_deadline_still_kicks_the_connection_and_frees_its_waiter() {
+    let hub = Arc::new(Hub::new());
+    let (conn, mut rx) = connect(&hub);
+    let call = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.request("h", "r1", prompt("r1"), Duration::from_millis(300)).await }
+    });
+    rx.recv().await.expect("r1 went out");
+    call.abort();
+    assert!(call.await.unwrap_err().is_cancelled());
+    assert_eq!(hub.pending_requests(), 1, "the waiter outlives its handler");
+    assert!(!conn.kicked.is_cancelled());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(conn.kicked.is_cancelled(), "a connection that never answered was kept");
+    assert_eq!(hub.pending_requests(), 0, "the waiter leaked");
 }
