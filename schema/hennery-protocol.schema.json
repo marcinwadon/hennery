@@ -47,7 +47,7 @@
       "type": "object"
     },
     "CancelResponse": {
-      "description": "`POST /api/sessions/{id}/cancel`: how the open turn ended. `cancelled`,\nunless it finished (or failed) before the cancel reached the agent.",
+      "description": "`POST /api/sessions/{id}/cancel`: how the open turn ended. Usually\n`cancelled`, but `completed` or `failed` if the turn ended before the\ncancel reached the agent, and `interrupted` if the session was parked or\nclosed while the cancel was outstanding, or its adapter exited.",
       "properties": {
         "outcome": {
           "$ref": "#/$defs/TurnOutcome"
