@@ -1555,3 +1555,61 @@ async fn options_announced_in_an_update_before_the_answer_are_the_ones_switched(
         assert_eq!(*indexed, Indexed::default(), "{attach:?}");
     }
 }
+
+// Fix round 1: a stale or seeded catalogue must never gate a skip decision.
+
+/// The model switch clamps the mode to "plan" (`model_switch_sets_mode`),
+/// but its own read-back is empty, so the host does not know that: the
+/// pre-switch catalogue (still showing mode=default) is now stale. The
+/// mode=default switch must still be sent — skipping it as "already
+/// current" would leave the session in the clamped "plan" mode the operator
+/// never asked for.
+#[tokio::test]
+async fn a_switch_without_a_read_back_does_not_skip_later_values_on_stale_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        empty_config_read_back: true,
+        ..config_script(&log)
+    };
+    let _handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        wanted(Some("large"), Some("default"), &[]),
+        SessionOptions::default(),
+    );
+    let frames = wait_until(&uplink, has("session_started")).await;
+    assert_eq!(switches(&log), "model=large\nmode=default\n");
+    assert_eq!(started_extracts(&frames), Indexed::default());
+    assert_eq!(kinds(&frames), ["session_started"]);
+}
+
+/// A catalogue seeded from a pre-answer `config_option_update` (decision 4)
+/// is not authoritative, even when it already happens to show the wanted
+/// value as current: the seed may be stale or incomplete, so the switch is
+/// sent anyway (a redundant switch is harmless; a skipped one lies).
+#[tokio::test]
+async fn a_seeded_catalogue_does_not_skip_a_switch_that_already_matches_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        config_in_update_only: true,
+        ..config_script(&log)
+    };
+    let _handle = launching(
+        &uplink,
+        &script,
+        Attach::Load {
+            agent_session_id: "agent-7".into(),
+        },
+        // "default" is already the seeded catalogue's current mode.
+        wanted(None, Some("default"), &[]),
+        SessionOptions::default(),
+    );
+    let frames = wait_until(&uplink, has("session_started")).await;
+    assert_eq!(switches(&log), "mode=default\n");
+    assert_eq!(started_extracts(&frames).current_mode.as_deref(), Some("default"));
+}

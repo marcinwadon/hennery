@@ -846,7 +846,7 @@ async fn negotiate(
     cwd: PathBuf,
     attach: &Attach,
     updates: &mut mpsc::UnboundedReceiver<Value>,
-) -> Result<(SessionId, Replay, Vec<SessionConfigOption>), StartError> {
+) -> Result<(SessionId, Replay, Announced), StartError> {
     // Advertised so that agents offer boolean options as booleans, not as
     // on/off selects (ACP `session.configOptions.boolean`).
     let capabilities = ClientCapabilities::new().session(
@@ -875,8 +875,8 @@ async fn negotiate(
                     Err(_) => break,
                 }
             }
-            let options = announced_options(created.config_options, &replay.kept);
-            return Ok((created.session_id, replay, options));
+            let catalogue = announced_options(created.config_options, &replay.kept);
+            return Ok((created.session_id, replay, catalogue));
         }
         Attach::Load { agent_session_id } => agent_session_id,
     };
@@ -907,21 +907,39 @@ async fn negotiate(
                     replay.observe(payload);
                 }
                 let loaded = result.map_err(|err| StartError::acp(err, true))?;
-                let options = announced_options(loaded.config_options, &replay.kept);
-                return Ok((id, replay, options));
+                let catalogue = announced_options(loaded.config_options, &replay.kept);
+                return Ok((id, replay, catalogue));
             }
         }
     }
+}
+
+/// The config options a new or loaded session starts with, and whether they
+/// are trustworthy for judging a switch's effect.
+struct Announced {
+    options: Vec<SessionConfigOption>,
+    /// `true` only for the adapter's own `session/new` | `session/load`
+    /// answer. `false` for a catalogue seeded from a pre-answer
+    /// `config_option_update` (decision 4, amended) or for no catalogue at
+    /// all: it may be stale or incomplete, so it must not gate whether a
+    /// switch is skipped or judged to not exist — only send can tell.
+    authoritative: bool,
 }
 
 /// The config options a new or loaded session starts with: the answer's,
 /// or, if it had none, those of the last `config_option_update` the adapter
 /// sent before it. That update still carries no extracts: it is older than
 /// the catalogue `session_started` announces.
-fn announced_options(answered: Option<Vec<SessionConfigOption>>, before: &[Value]) -> Vec<SessionConfigOption> {
+fn announced_options(answered: Option<Vec<SessionConfigOption>>, before: &[Value]) -> Announced {
     match answered {
-        Some(options) if !options.is_empty() => options,
-        _ => before.iter().rev().find_map(config_update).unwrap_or_default(),
+        Some(options) if !options.is_empty() => Announced {
+            options,
+            authoritative: true,
+        },
+        _ => Announced {
+            options: before.iter().rev().find_map(config_update).unwrap_or_default(),
+            authoritative: false,
+        },
     }
 }
 
@@ -938,8 +956,13 @@ fn config_update(payload: &Value) -> Option<Vec<SessionConfigOption>> {
 struct Applied {
     /// The options the last switch answered with (or the announced ones).
     options: Vec<SessionConfigOption>,
-    /// `false` if a switch went unanswered or was answered without a
-    /// catalogue: `options` may then be stale.
+    /// Whether `options` is trustworthy right now: `false` to start with a
+    /// catalogue seeded from a `config_option_update` (decision 4) rather
+    /// than an adapter answer, and whenever a switch went unanswered or was
+    /// answered without a catalogue; `true` again after any switch answers
+    /// with a fresh, non-empty one. Gates the "already current" skip and
+    /// the "no such option" judgement (never a false "does not need
+    /// sending"), and the final read-back mismatch check and announcement.
     current: bool,
     /// One line per requested value that did not take.
     failures: Vec<String>,
@@ -948,8 +971,11 @@ struct Applied {
 /// Apply `wanted` to a new or loaded session (ACP core §4.3): the model
 /// first, then the other axes, then the mode, each with
 /// `session/set_config_option`, so a model that clamps the mode cannot undo
-/// the requested mode. A value that is already current is not sent. Each
-/// switch has `timeout`, and none runs past `deadline`.
+/// the requested mode. A value already current in an authoritative
+/// catalogue is not sent — a stale or seeded one (`catalogue.authoritative`
+/// false) never gates that decision, so its switch is sent regardless (a
+/// redundant switch is harmless; a wrongly skipped one lies). Each switch
+/// has `timeout`, and none runs past `deadline`.
 ///
 /// Once a switch goes unanswered (or the deadline has passed), nothing more
 /// is sent: the adapter may still apply the late switch, and a late model
@@ -959,14 +985,14 @@ struct Applied {
 async fn apply_config(
     conn: &ConnectionTo<Agent>,
     session: &SessionId,
-    options: Vec<SessionConfigOption>,
+    catalogue: Announced,
     wanted: &SessionConfig,
     timeout: Duration,
     deadline: Instant,
 ) -> Applied {
     let mut applied = Applied {
-        options,
-        current: true,
+        options: catalogue.options,
+        current: catalogue.authoritative,
         failures: Vec::new(),
     };
     let mut switches: Vec<(String, ConfigValue)> = Vec::new();
@@ -975,7 +1001,7 @@ async fn apply_config(
             Some(id) => switches.push((id, ConfigValue::Id(model.clone()))),
             None => applied
                 .failures
-                .push(format!("model {model}: the adapter offers no model option")),
+                .push(format!("model={model}: the adapter offers no model option")),
         }
     }
     switches.extend(wanted.axes.iter().map(|(id, value)| (id.clone(), value.clone())));
@@ -990,23 +1016,28 @@ async fn apply_config(
         Some((Some(id), mode)) => switches.push((id, ConfigValue::Id(mode.clone()))),
         Some((None, mode)) => applied
             .failures
-            .push(format!("mode {mode}: the adapter offers no mode option")),
+            .push(format!("mode={mode}: the adapter offers no mode option")),
         None => {}
     }
     // Requested values that already have their own line in `failures`.
     let mut reported: HashSet<String> = HashSet::new();
     let mut unanswered = false;
     for (id, value) in &switches {
-        match current_value(&applied.options, id) {
-            None => {
-                applied
-                    .failures
-                    .push(format!("{id}: the adapter offers no such option"));
-                reported.insert(id.clone());
-                continue;
+        // Only an authoritative catalogue may decide "already current" or
+        // "no such option": a stale or seeded one is not proof of either, so
+        // its switch is sent regardless.
+        if applied.current {
+            match current_value(&applied.options, id) {
+                None => {
+                    applied
+                        .failures
+                        .push(format!("{id}: the adapter offers no such option"));
+                    reported.insert(id.clone());
+                    continue;
+                }
+                Some(current) if current == *value => continue,
+                Some(_) => {}
             }
-            Some(current) if current == *value => continue,
-            Some(_) => {}
         }
         let now = Instant::now();
         if unanswered || now >= deadline {
@@ -1023,8 +1054,14 @@ async fn apply_config(
         let cut_short = now + timeout > deadline;
         let until = (now + timeout).min(deadline);
         match tokio::time::timeout_at(until, conn.send_request(request).block_task()).await {
-            // The catalogue of the last successful switch is the one kept.
-            Ok(Ok(response)) if !response.config_options.is_empty() => applied.options = response.config_options,
+            // The catalogue of the last successful switch is the one kept,
+            // and it is a genuine, fresh read-back: authoritative again for
+            // whatever runs after it, even if an earlier switch in this same
+            // start was not (a seeded catalogue, or an earlier empty answer).
+            Ok(Ok(response)) if !response.config_options.is_empty() => {
+                applied.options = response.config_options;
+                applied.current = true;
+            }
             // An empty answer is no read-back, not an adapter without options.
             Ok(Ok(_)) => applied.current = false,
             Ok(Err(err)) => {
