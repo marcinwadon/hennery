@@ -10,10 +10,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
 use futures::stream::{self, Stream, StreamExt};
-use hennery_proto::frames::CollectorFrame;
+use hennery_proto::frames::{Capability, CollectorFrame, SessionBody};
 use hennery_proto::rest::{
-    ApiError, EventDto, LifecycleResponse, OpenTurn, PromptRequest, PromptResponse, SessionDetail, StartSessionRequest,
-    StartSessionResponse,
+    ApiError, CancelResponse, EventDto, LifecycleResponse, OpenTurn, PromptRequest, PromptResponse, SessionDetail,
+    StartSessionRequest, StartSessionResponse,
 };
 use serde::Deserialize;
 use std::convert::Infallible;
@@ -26,6 +26,9 @@ const START_TIMEOUT: Duration = Duration::from_secs(90);
 const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 /// `park_session` / `close_session` (ACP core §3.4).
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+/// `cancel_turn` (ACP core §3.4). The host stops an adapter that ignores the
+/// cancel well before this (`hennery_host::session::CANCEL_GRACE`).
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ACP core §3.4: every state-changing request waits at least the read
 // deadline, so on a live connection its fact or rejection arrives first and
@@ -34,7 +37,8 @@ const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 const _: () = assert!(
     START_TIMEOUT.as_millis() > crate::ws::READ_TIMEOUT.as_millis()
         && PROMPT_TIMEOUT.as_millis() > crate::ws::READ_TIMEOUT.as_millis()
-        && TEARDOWN_TIMEOUT.as_millis() > crate::ws::READ_TIMEOUT.as_millis(),
+        && TEARDOWN_TIMEOUT.as_millis() > crate::ws::READ_TIMEOUT.as_millis()
+        && CANCEL_TIMEOUT.as_millis() > crate::ws::READ_TIMEOUT.as_millis(),
     "every request timeout must exceed the host connection's read deadline"
 );
 
@@ -45,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/{id}", get(session_detail))
         .route("/api/sessions/{id}/resume", post(resume))
         .route("/api/sessions/{id}/prompt", post(prompt))
+        .route("/api/sessions/{id}/cancel", post(cancel))
         .route("/api/sessions/{id}/park", post(park))
         .route("/api/sessions/{id}/close", post(close))
         .route("/api/sessions/{id}/events", get(events))
@@ -93,7 +98,7 @@ fn request_failed(err: RequestError) -> Response {
         RequestError::NotConnected => error(StatusCode::CONFLICT, "host_offline", "the host is not connected"),
         RequestError::Rejected { code, message } => {
             let status = match code.as_str() {
-                "not_attached" | "turn_in_progress" => StatusCode::CONFLICT,
+                "not_attached" | "turn_in_progress" | "not_running" => StatusCode::CONFLICT,
                 "unknown_agent" | "start_failed" => StatusCode::BAD_GATEWAY,
                 "invalid" => StatusCode::BAD_REQUEST,
                 _ => StatusCode::BAD_GATEWAY,
@@ -338,6 +343,51 @@ async fn prompt(State(state): State<AppState>, Path(id): Path<String>, Json(req)
     }
 }
 
+/// Cancel the open turn (ACP core §9): 202 `CancelResponse` once that
+/// turn's `turn_ended` is ingested, with the outcome it really had: a turn
+/// that finished before the cancel reached the agent is not `cancelled`.
+/// That includes a turn whose end was ingested between reading the open
+/// turn and sending the cancel: the host then answers `not_running`, and
+/// the stored outcome is the answer.
+async fn cancel(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let session = match state.store.session(&id) {
+        Ok(Some(s)) => s,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) => return internal(err),
+    };
+    if session.lifecycle != "active" || !state.hub.is_ready(&session.host_id) {
+        return error(StatusCode::CONFLICT, "not_attached", "the session is not attached");
+    }
+    let Some(turn_id) = session.open_turn_id else {
+        return error(StatusCode::CONFLICT, "no_open_turn", "no turn is in flight");
+    };
+    let request_id = uuid::Uuid::now_v7().to_string();
+    let frame = CollectorFrame::CancelTurn {
+        request_id: request_id.clone(),
+        session_id: id.clone(),
+        turn_id: turn_id.clone(),
+    };
+    match state
+        .hub
+        .request_for_turn(&session.host_id, &request_id, &turn_id, frame, CANCEL_TIMEOUT)
+        .await
+    {
+        Ok(SessionBody::TurnEnded { turn_id, outcome, .. }) => {
+            (StatusCode::ACCEPTED, Json(CancelResponse { turn_id, outcome })).into_response()
+        }
+        Ok(other) => internal(anyhow::anyhow!("cancel completed by {other:?}")),
+        Err(RequestError::Rejected { code, message }) if code == "not_running" => {
+            match state.store.ended_turn_outcome(&turn_id) {
+                Ok(Some(outcome)) => (StatusCode::ACCEPTED, Json(CancelResponse { turn_id, outcome })).into_response(),
+                // The host has no such turn in flight, and it has not ended.
+                Ok(None) => request_failed(RequestError::Rejected { code, message }),
+                Err(err) => internal(err),
+            }
+        }
+        Err(err) => request_failed(err),
+    }
+}
+
 fn lifecycle_response(state: &AppState, id: &str) -> Response {
     match state.store.session(id) {
         Ok(Some(s)) => (
@@ -377,6 +427,14 @@ async fn park(State(state): State<AppState>, Path(id): Path<String>) -> Response
     };
     if session.lifecycle != "active" || !state.hub.is_ready(&session.host_id) {
         return error(StatusCode::CONFLICT, "not_attached", "the session is not attached");
+    }
+    // Only to hosts that announced it (ACP core §3.3).
+    if !state.hub.has_capability(&session.host_id, Capability::Park) {
+        return error(
+            StatusCode::CONFLICT,
+            "park_unsupported",
+            "this host cannot park sessions; close the session instead",
+        );
     }
     match state.store.record_park_request(&id) {
         Ok(event) => state.hub.publish(event),

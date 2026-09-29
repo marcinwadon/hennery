@@ -70,6 +70,16 @@ struct ScriptedHost {
 impl ScriptedHost {
     /// Connect and complete `hello` / `hello_ack`, without `resend_complete`.
     async fn hello(collector: &Collector, attached: Vec<AttachedSession>, seq: u64) -> Self {
+        Self::hello_with(collector, attached, seq, Capabilities(vec![Capability::Park])).await
+    }
+
+    /// `hello` announcing `capabilities`.
+    async fn hello_with(
+        collector: &Collector,
+        attached: Vec<AttachedSession>,
+        seq: u64,
+        capabilities: Capabilities,
+    ) -> Self {
         let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/api/hosts/ws", collector.addr))
             .await
             .unwrap();
@@ -79,7 +89,7 @@ impl ScriptedHost {
             host_version: "test".into(),
             host_id: HOST.into(),
             token: TOKEN.into(),
-            capabilities: Capabilities(vec![Capability::Park]),
+            capabilities,
             attached_sessions: attached,
         })
         .await;
@@ -91,7 +101,17 @@ impl ScriptedHost {
     /// `hello` then `resend_complete`, and wait until the collector lists
     /// the host as connected (reconciled).
     async fn connect(collector: &Collector, attached: Vec<AttachedSession>, seq: u64) -> Self {
-        let mut host = Self::hello(collector, attached, seq).await;
+        Self::connect_with(collector, attached, seq, Capabilities(vec![Capability::Park])).await
+    }
+
+    /// `connect` announcing `capabilities`.
+    async fn connect_with(
+        collector: &Collector,
+        attached: Vec<AttachedSession>,
+        seq: u64,
+        capabilities: Capabilities,
+    ) -> Self {
+        let mut host = Self::hello_with(collector, attached, seq, capabilities).await;
         host.send(&HostFrame::ResendComplete).await;
         wait_for("host ready", || async {
             collector
@@ -1064,4 +1084,190 @@ async fn a_prompt_rejected_after_its_caller_gave_up_still_frees_the_turn_slot() 
     .await;
     // The next prompt is not refused `turn_in_progress`.
     started_turn(&collector, &mut host, &session).await;
+}
+
+// Plan B2a: `POST /api/sessions/{id}/cancel` and the park gate.
+
+fn cancel_url(collector: &Collector, session: &str) -> String {
+    collector.url(&format!("/api/sessions/{session}/cancel"))
+}
+
+/// The next frame must be a `cancel_turn` for `turn`; returns its request id.
+async fn expect_cancel(host: &mut ScriptedHost, session: &str, turn: &str) -> String {
+    match host.next().await {
+        CollectorFrame::CancelTurn {
+            request_id,
+            session_id,
+            turn_id,
+        } => {
+            assert_eq!((session_id.as_str(), turn_id.as_str()), (session, turn));
+            request_id
+        }
+        other => panic!("expected cancel_turn, got {other:?}"),
+    }
+}
+
+fn turn_ended(turn: &str, outcome: hennery_proto::frames::TurnOutcome) -> SessionBody {
+    SessionBody::TurnEnded {
+        turn_id: turn.into(),
+        outcome,
+        stop_reason: None,
+        error: None,
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_ends_the_open_turn_and_answers_with_its_outcome() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let turn = started_turn(&collector, &mut host, &session).await;
+    let c = client();
+    let url = cancel_url(&collector, &session);
+    let call = tokio::spawn(async move { post(&c, url, json!({})).await });
+    expect_cancel(&mut host, &session, &turn).await;
+    host.emit(
+        &session,
+        turn_ended(&turn, hennery_proto::frames::TurnOutcome::Cancelled),
+    )
+    .await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!(status, 202, "{body}");
+    assert_eq!(body, json!({ "turn_id": turn, "outcome": "cancelled" }));
+    let row = collector.state.store.session(&session).unwrap().unwrap();
+    assert_eq!((row.open_turn_id, row.activity.as_deref()), (None, Some("idle")));
+}
+
+/// The turn finished just before the cancel reached the host: the host's
+/// `turn_ended{completed}` is on the wire ahead of its `not_running`
+/// rejection, and the cancel answers with that outcome.
+#[tokio::test]
+async fn a_cancel_that_loses_the_race_with_the_turns_end_answers_how_it_ended() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let turn = started_turn(&collector, &mut host, &session).await;
+    let c = client();
+    let url = cancel_url(&collector, &session);
+    let call = tokio::spawn(async move { post(&c, url, json!({})).await });
+    let request_id = expect_cancel(&mut host, &session, &turn).await;
+    host.emit(
+        &session,
+        turn_ended(&turn, hennery_proto::frames::TurnOutcome::Completed),
+    )
+    .await;
+    host.send(&HostFrame::Error {
+        request_id,
+        code: "not_running".into(),
+        message: "that turn is not running".into(),
+    })
+    .await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!(
+        (status, body),
+        (202, json!({ "turn_id": turn, "outcome": "completed" }))
+    );
+}
+
+#[tokio::test]
+async fn a_cancel_is_refused_without_a_turn_the_host_runs() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let (status, body) = post(&client(), cancel_url(&collector, &session), json!({})).await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("no_open_turn")));
+    let (status, _) = post(&client(), cancel_url(&collector, "no-such-session"), json!({})).await;
+    assert_eq!(status, 404);
+
+    // The host has no such turn in flight.
+    let turn = started_turn(&collector, &mut host, &session).await;
+    let c = client();
+    let url = cancel_url(&collector, &session);
+    let call = tokio::spawn(async move { post(&c, url, json!({})).await });
+    let request_id = expect_cancel(&mut host, &session, &turn).await;
+    host.send(&HostFrame::Error {
+        request_id,
+        code: "not_running".into(),
+        message: "that turn is not running".into(),
+    })
+    .await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!((status, body["code"].as_str()), (409, Some("not_running")));
+
+    let parked = parked_session(&collector, &mut host).await;
+    let (status, body) = post(&client(), cancel_url(&collector, &parked), json!({})).await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("not_attached")));
+}
+
+/// ACP core §3.3: `park_session` goes only to hosts with the `park`
+/// capability (this drops plan A's decision 12).
+#[tokio::test]
+async fn park_goes_only_to_a_host_that_announced_it_can_park() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect_with(&collector, vec![], 0, Capabilities::default()).await;
+    let session = started_session(&collector, &mut host).await;
+    let park_url = collector.url(&format!("/api/sessions/{session}/park"));
+    let (status, body) = post(&client(), park_url.clone(), json!({})).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("park_unsupported")),
+        "{body}"
+    );
+    assert_eq!(collector.lifecycle(&session), "active");
+    let more = tokio::time::timeout(Duration::from_millis(300), host.next()).await;
+    assert!(more.is_err(), "park reached a host that cannot park: {more:?}");
+
+    // The same host, upgraded: now it is asked.
+    let seq = host.seq;
+    host.drop_connection(&collector).await;
+    let mut host = ScriptedHost::connect(&collector, vec![attached(&session, seq)], seq).await;
+    let c = client();
+    let call = tokio::spawn(async move { post(&c, park_url, json!({})).await });
+    assert!(matches!(host.next().await, CollectorFrame::ParkSession { .. }));
+    host.emit(
+        &session,
+        SessionBody::SessionParked {
+            reason: hennery_proto::frames::ParkReason::Operator,
+        },
+    )
+    .await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!((status, body["lifecycle"].as_str()), (202, Some("parked")), "{body}");
+}
+
+/// The turn's end was ingested after the handler read the open turn but
+/// before its waiter existed, so nothing resolved the waiter: the host's
+/// `not_running` is answered with the stored outcome, not 409. The end is
+/// written straight into the store here to open exactly that window.
+#[tokio::test]
+async fn a_cancel_whose_turn_ended_before_it_was_sent_answers_the_stored_outcome() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let turn = started_turn(&collector, &mut host, &session).await;
+    let c = client();
+    let url = cancel_url(&collector, &session);
+    let call = tokio::spawn(async move { post(&c, url, json!({})).await });
+    let request_id = expect_cancel(&mut host, &session, &turn).await;
+    host.seq += 1;
+    collector
+        .state
+        .store
+        .ingest(
+            &session,
+            host.seq,
+            &turn_ended(&turn, hennery_proto::frames::TurnOutcome::Completed),
+        )
+        .unwrap();
+    host.send(&HostFrame::Error {
+        request_id,
+        code: "not_running".into(),
+        message: "that turn is not running".into(),
+    })
+    .await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!(
+        (status, body),
+        (202, json!({ "turn_id": turn, "outcome": "completed" }))
+    );
 }
