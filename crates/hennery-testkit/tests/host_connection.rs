@@ -858,3 +858,59 @@ async fn a_resume_waiting_behind_a_close_never_attaches_after_host_shutdown() {
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 1);
 }
+
+// Plan B2b: config over the connection.
+
+fn configurable_fake() -> hennery_host::AgentCommand {
+    let mut fake = hennery_host::AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    let script = hennery_testkit::FakeScript {
+        config_options: hennery_testkit::sample_config_options(),
+        ..Default::default()
+    };
+    fake.env.push((
+        hennery_testkit::SCRIPT_ENV.into(),
+        serde_json::to_string(&script).unwrap(),
+    ));
+    fake
+}
+
+fn current_mode(frame: &HostFrame) -> Option<String> {
+    match frame {
+        HostFrame::Session {
+            body: hennery_proto::frames::SessionBody::SessionStarted { indexed, .. },
+            ..
+        } => indexed.current_mode.clone(),
+        other => panic!("expected session_started, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn start_and_resume_carry_their_config_to_the_adapter() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(host_with_fake(addr, "start-config", configurable_fake())));
+
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    let plan = hennery_proto::frames::SessionConfig {
+        mode: Some("plan".into()),
+        ..Default::default()
+    };
+    let mut frame = start("r1", "s1");
+    if let CollectorFrame::StartSession { config, .. } = &mut frame {
+        *config = plan.clone();
+    }
+    send_frame(&mut sink, &frame).await;
+    let started = read_until(&mut stream, body_is("s1", "session_started")).await;
+    assert_eq!(current_mode(&started).as_deref(), Some("plan"));
+
+    let mut frame = resume("r2", "s2", 0, "agent-7");
+    if let CollectorFrame::ResumeSession { config, .. } = &mut frame {
+        *config = hennery_proto::frames::SessionConfig {
+            mode: Some("bypass".into()),
+            ..Default::default()
+        };
+    }
+    send_frame(&mut sink, &frame).await;
+    let resumed = read_until(&mut stream, body_is("s2", "session_started")).await;
+    assert_eq!(current_mode(&resumed).as_deref(), Some("bypass"));
+}

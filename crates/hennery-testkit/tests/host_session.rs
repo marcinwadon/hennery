@@ -3,9 +3,9 @@
 //! adapter's updates verbatim, and exactly one turn_ended, in that order.
 
 use hennery_host::outbox::Outbox;
-use hennery_host::session::{self, AgentCommand, SessionCmd, SessionHandle, SessionOptions};
+use hennery_host::session::{self, AgentCommand, Attach, Launch, SessionCmd, SessionHandle, SessionOptions};
 use hennery_host::uplink::Uplink;
-use hennery_proto::frames::{HostFrame, SessionBody, TurnOutcome};
+use hennery_proto::frames::{ConfigValue, HostFrame, Indexed, SessionBody, SessionConfig, TurnOutcome};
 use hennery_testkit::{FakeScript, SCRIPT_ENV, pid_alive};
 use serde_json::json;
 use std::path::Path;
@@ -1178,4 +1178,380 @@ async fn a_cancelled_prompt_answered_with_an_error_still_ends_cancelled() {
     assert_eq!(ends.len(), 1);
     assert_eq!((ends[0].0.as_str(), ends[0].1), ("t1", TurnOutcome::Cancelled));
     assert!(ends[0].2.as_deref().is_some_and(|e| e.contains("aborted")), "{ends:?}");
+}
+
+// Plan B2b: model, axes and mode (ACP core §4.3).
+
+/// A fake with the sample catalogue whose model switch resets the mode,
+/// logging every switch to `log`.
+fn config_script(log: &Path) -> FakeScript {
+    FakeScript {
+        config_options: hennery_testkit::sample_config_options(),
+        model_switch_sets_mode: Some("default".into()),
+        config_log: Some(log.to_string_lossy().into_owned()),
+        ..FakeScript::default()
+    }
+}
+
+fn wanted(model: Option<&str>, mode: Option<&str>, axes: &[(&str, ConfigValue)]) -> SessionConfig {
+    SessionConfig {
+        model: model.map(str::to_string),
+        mode: mode.map(str::to_string),
+        axes: axes.iter().map(|(id, v)| (id.to_string(), v.clone())).collect(),
+    }
+}
+
+fn launching(
+    uplink: &Uplink,
+    script: &FakeScript,
+    attach: Attach,
+    config: SessionConfig,
+    options: SessionOptions,
+) -> SessionHandle {
+    let launch = Launch {
+        request_id: "r0".into(),
+        session_id: "s1".into(),
+        attach,
+        config,
+        agent: fake_with(script),
+        cwd: std::env::temp_dir(),
+    };
+    session::launch(uplink.clone(), launch, options)
+}
+
+/// The catalogue extracts of the first `session_started`.
+fn started_extracts(frames: &[HostFrame]) -> Indexed {
+    frames
+        .iter()
+        .find_map(|f| match f {
+            HostFrame::Session {
+                body: SessionBody::SessionStarted { indexed, .. },
+                ..
+            } => Some(indexed.clone()),
+            _ => None,
+        })
+        .expect("a session_started")
+}
+
+fn note_text(frames: &[HostFrame], code: &str) -> String {
+    frames
+        .iter()
+        .find_map(|f| match f {
+            HostFrame::Session {
+                body: SessionBody::HostNote { note, text },
+                ..
+            } if note == code => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("no host_note {code}: {:?}", kinds(frames)))
+}
+
+fn switches(log: &Path) -> String {
+    std::fs::read_to_string(log).unwrap_or_default()
+}
+
+#[tokio::test]
+async fn a_start_applies_the_model_then_the_axes_then_the_mode_and_announces_the_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let config = wanted(
+        Some("large"),
+        Some("plan"),
+        &[
+            ("effort", ConfigValue::Id("high".into())),
+            ("fast", ConfigValue::Bool(true)),
+        ],
+    );
+    let _handle = launching(
+        &uplink,
+        &config_script(&log),
+        Attach::New,
+        config.clone(),
+        SessionOptions::default(),
+    );
+    let frames = wait_until(&uplink, has("session_started")).await;
+    // Mode last: the model switch reset it, and it is set again after.
+    assert_eq!(switches(&log), "model=large\neffort=high\nfast=true\nmode=plan\n");
+    let indexed = started_extracts(&frames);
+    assert_eq!(indexed.current_config(), Some(config));
+    assert_eq!(indexed.config_options.map(|o| o.len()), Some(4));
+    assert_eq!(kinds(&frames), ["session_started"]);
+}
+
+#[tokio::test]
+async fn values_already_current_are_not_switched_and_the_catalogue_is_still_announced() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let config = wanted(Some("small"), Some("default"), &[("fast", ConfigValue::Bool(false))]);
+    let _handle = launching(
+        &uplink,
+        &config_script(&log),
+        Attach::New,
+        config.clone(),
+        SessionOptions::default(),
+    );
+    let frames = wait_until(&uplink, has("session_started")).await;
+    assert_eq!(switches(&log), "");
+    let current = started_extracts(&frames).current_config().unwrap();
+    assert_eq!((current.model, current.mode), (config.model, config.mode));
+}
+
+/// A picker value the adapter does not offer (a stale catalogue) must not
+/// cost the operator the session: it starts, and a note says what did not
+/// take. The model the adapter refused is never announced as current.
+#[tokio::test]
+async fn a_start_whose_switches_fail_still_starts_and_says_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let config = wanted(Some("huge"), Some("plan"), &[("nope", ConfigValue::Id("x".into()))]);
+    let _handle = launching(
+        &uplink,
+        &config_script(&log),
+        Attach::New,
+        config,
+        SessionOptions::default(),
+    );
+    let frames = wait_until(&uplink, has("host_note:config_failed")).await;
+    assert_eq!(kinds(&frames), ["session_started", "host_note:config_failed"]);
+    // The adapter refused `huge`; `nope` was never sent.
+    assert_eq!(switches(&log), "model=huge\nmode=plan\n");
+    let current = started_extracts(&frames).current_config().unwrap();
+    assert_eq!(
+        (current.model.as_deref(), current.mode.as_deref()),
+        (Some("small"), Some("plan"))
+    );
+    let text = note_text(&frames, "config_failed");
+    assert!(text.contains("model=huge") && text.contains("nope"), "{text}");
+}
+
+#[tokio::test]
+async fn a_resume_re_applies_the_stored_config_and_a_failed_re_apply_is_only_a_note() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        replay: vec![json!({"sessionUpdate": "available_commands_update", "availableCommands": []})],
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::Load {
+            agent_session_id: "agent-7".into(),
+        },
+        wanted(Some("huge"), Some("bypass"), &[]),
+        SessionOptions::default(),
+    );
+    let frames = wait_until(&uplink, has("host_note:reapply_failed")).await;
+    assert_eq!(
+        kinds(&frames),
+        ["session_started", "update:?", "host_note:reapply_failed"]
+    );
+    assert_eq!(
+        started_extracts(&frames).current_mode.as_deref(),
+        Some("bypass"),
+        "the mode survived the resume"
+    );
+    // Still attached: the failed re-apply did not fail the resume.
+    assert!(handle.send(prompt("r1", "t1")));
+    wait_until(&uplink, has("turn_ended")).await;
+}
+
+/// An adapter that answers a switch without a catalogue, or never answers,
+/// leaves hennery not knowing the current values: it announces none, so
+/// the collector keeps what it stored (a resume's stored mode is not
+/// overwritten with a guess).
+#[tokio::test]
+async fn a_switch_without_a_read_back_announces_no_catalogue() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        empty_config_read_back: true,
+        ..config_script(&log)
+    };
+    let _handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        wanted(Some("large"), None, &[]),
+        SessionOptions::default(),
+    );
+    let frames = wait_until(&uplink, has("session_started")).await;
+    assert_eq!(switches(&log), "model=large\n");
+    assert_eq!(started_extracts(&frames), Indexed::default());
+    assert_eq!(kinds(&frames), ["session_started"]);
+}
+
+#[tokio::test]
+async fn a_hung_switch_is_reported_and_the_session_still_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        hang_config: true,
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        wanted(Some("large"), Some("plan"), &[]),
+        SessionOptions {
+            config_timeout: Duration::from_millis(200),
+            ..SessionOptions::default()
+        },
+    );
+    let frames = wait_until(&uplink, has("host_note:config_failed")).await;
+    assert_eq!(kinds(&frames), ["session_started", "host_note:config_failed"]);
+    assert_eq!(started_extracts(&frames), Indexed::default());
+    let text = note_text(&frames, "config_failed");
+    assert!(text.contains("model=large: no answer within"), "{text}");
+    // Nothing is sent after a switch that did not answer.
+    assert!(
+        text.contains("mode=plan: not sent: an earlier switch did not answer"),
+        "{text}"
+    );
+    assert_eq!(switches(&log), "model=large\n");
+    assert!(handle.send(prompt("r1", "t1")));
+    wait_until(&uplink, has("turn_ended")).await;
+}
+
+/// The real adapters handle requests concurrently. A model switch that
+/// answers after its timeout can still land, and clamp the mode, after a
+/// mode switch sent behind it has answered: model first and mode last would
+/// silently break. So nothing more is sent once a switch has not answered.
+#[tokio::test]
+async fn a_late_model_switch_stops_the_starts_switches_so_its_clamp_cannot_undo_the_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        slow_model_switch_ms: Some(600),
+        ..config_script(&log)
+    };
+    let _handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        wanted(Some("large"), Some("plan"), &[]),
+        SessionOptions {
+            config_timeout: Duration::from_millis(200),
+            ..SessionOptions::default()
+        },
+    );
+    let frames = wait_until(&uplink, has("host_note:config_failed")).await;
+    // Give a wrongly sent mode switch time to reach the fake.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        switches(&log),
+        "model=large\n",
+        "the mode switch went out behind a late model switch"
+    );
+    assert_eq!(started_extracts(&frames), Indexed::default(), "the values are unknown");
+    let text = note_text(&frames, "config_failed");
+    assert!(
+        text.contains("mode=plan: not sent: an earlier switch did not answer"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn a_switch_cut_off_by_the_start_deadline_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        hang_config: true,
+        ..config_script(&log)
+    };
+    let _handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        wanted(Some("large"), Some("plan"), &[]),
+        SessionOptions {
+            start_timeout: Duration::from_secs(1),
+            config_timeout: Duration::from_secs(10),
+            ..SessionOptions::default()
+        },
+    );
+    let frames = wait_until(&uplink, has("host_note:config_failed")).await;
+    assert_eq!(kinds(&frames), ["session_started", "host_note:config_failed"]);
+    let text = note_text(&frames, "config_failed");
+    assert!(
+        text.contains("model=large: no answer before the start deadline"),
+        "{text}"
+    );
+    assert!(text.contains("mode=plan: not sent"), "{text}");
+}
+
+/// An adapter may accept a value and report another. What it reports is
+/// what counts, so the note says so.
+#[tokio::test]
+async fn a_value_the_agent_accepts_but_does_not_report_is_noted() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        sticky_options: vec!["effort".into()],
+        ..config_script(&log)
+    };
+    let _handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        wanted(None, None, &[("effort", ConfigValue::Id("high".into()))]),
+        SessionOptions::default(),
+    );
+    let frames = wait_until(&uplink, has("host_note:config_failed")).await;
+    assert_eq!(switches(&log), "effort=high\n");
+    let text = note_text(&frames, "config_failed");
+    assert!(text.contains("effort: asked high, agent reports low"), "{text}");
+    let axes = started_extracts(&frames).current_axes.unwrap();
+    assert_eq!(axes.get("effort"), Some(&ConfigValue::Id("low".into())));
+}
+
+/// An adapter that announces its options in a `config_option_update` just
+/// before answering `session/new` or `session/load`, not in the answer:
+/// those options are the ones switched, and that update, older than the
+/// announced catalogue, carries none.
+#[tokio::test]
+async fn options_announced_in_an_update_before_the_answer_are_the_ones_switched() {
+    for attach in [
+        Attach::New,
+        Attach::Load {
+            agent_session_id: "agent-7".into(),
+        },
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("config.log");
+        let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+        let script = FakeScript {
+            config_in_update_only: true,
+            ..config_script(&log)
+        };
+        let _handle = launching(
+            &uplink,
+            &script,
+            attach.clone(),
+            wanted(None, Some("plan"), &[]),
+            SessionOptions::default(),
+        );
+        let frames = wait_until(&uplink, has("update:?")).await;
+        assert_eq!(kinds(&frames), ["session_started", "update:?"], "{attach:?}");
+        assert_eq!(switches(&log), "mode=plan\n", "{attach:?}");
+        assert_eq!(started_extracts(&frames).current_mode.as_deref(), Some("plan"));
+        let HostFrame::Session {
+            body: SessionBody::AcpUpdate { indexed, .. },
+            ..
+        } = &frames[1]
+        else {
+            panic!("{frames:?}");
+        };
+        assert_eq!(*indexed, Indexed::default(), "{attach:?}");
+    }
 }

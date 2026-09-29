@@ -5,12 +5,12 @@
 //! writing to the outbox, which is resent on the next connection.
 
 use crate::outbox::Outbox;
-use crate::session::{self, AgentCommand, Attach, SessionCmd, SessionHandle, SessionOptions};
+use crate::session::{self, AgentCommand, Attach, Launch, SessionCmd, SessionHandle, SessionOptions};
 use crate::uplink::Uplink;
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
 use hennery_proto::PROTOCOL_VERSION;
-use hennery_proto::frames::{AttachedSession, Capabilities, Capability, CollectorFrame, HostFrame};
+use hennery_proto::frames::{AttachedSession, Capabilities, Capability, CollectorFrame, HostFrame, SessionConfig};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -293,6 +293,7 @@ struct AttachRequest {
     agent: String,
     cwd: String,
     attach: Attach,
+    config: SessionConfig,
 }
 
 /// Start or resume a session (ACP core §4.3), idempotently (§2.2).
@@ -352,27 +353,16 @@ fn spawn_or_restart(
     {
         return;
     }
-    let cwd = PathBuf::from(req.cwd);
-    let handle = match req.attach {
-        Attach::New => session::spawn(
-            uplink.clone(),
-            req.request_id,
-            req.session_id.clone(),
-            command,
-            cwd,
-            options,
-        ),
-        Attach::Load { agent_session_id } => session::resume(
-            uplink.clone(),
-            req.request_id,
-            req.session_id.clone(),
-            agent_session_id,
-            command,
-            cwd,
-            options,
-        ),
+    let launch = Launch {
+        request_id: req.request_id,
+        session_id: req.session_id.clone(),
+        attach: req.attach,
+        config: req.config,
+        agent: command,
+        cwd: PathBuf::from(req.cwd),
     };
-    map.handles.insert(req.session_id, handle);
+    map.handles
+        .insert(req.session_id, session::launch(uplink.clone(), launch, options));
 }
 
 fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: CollectorFrame) -> Result<()> {
@@ -383,7 +373,7 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
             committed_seq,
             agent,
             cwd,
-            ..
+            config,
         } => attach(
             cfg,
             uplink,
@@ -395,6 +385,7 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
                 agent,
                 cwd,
                 attach: Attach::New,
+                config,
             },
         )?,
         CollectorFrame::ResumeSession {
@@ -404,7 +395,7 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
             agent,
             cwd,
             agent_session_id,
-            ..
+            config,
         } => attach(
             cfg,
             uplink,
@@ -416,6 +407,7 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
                 agent,
                 cwd,
                 attach: Attach::Load { agent_session_id },
+                config,
             },
         )?,
         CollectorFrame::Prompt {

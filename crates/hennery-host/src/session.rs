@@ -12,11 +12,13 @@ pub use crate::adapter::{AgentCommand, NESTING_VARS};
 use crate::uplink::Uplink;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
-    PromptResponse, SessionId, StopReason,
+    BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
+    InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigOptionsCapabilities,
+    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, ErrorCode, UntypedMessage};
-use hennery_proto::frames::{HostFrame, Indexed, ParkReason, SessionBody, TurnOutcome};
+use hennery_proto::frames::{ConfigValue, HostFrame, Indexed, ParkReason, SessionBody, SessionConfig, TurnOutcome};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
@@ -53,6 +55,12 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// §3.4), so the collector hears the turn end, not a timeout that would
 /// drop the whole host connection.
 pub const CANCEL_GRACE: Duration = Duration::from_secs(20);
+
+/// How long one `session/set_config_option` may take. A start's or a
+/// resume's switch that takes longer is reported, not fatal (ACP core
+/// §4.3); a `set_config` that takes longer is answered `config_failed`,
+/// well before the collector's 60 s timeout (§3.4).
+pub const CONFIG_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Update kinds a `session/load` replays as history: dropped while the load
 /// is outstanding (ACP core §4.5).
@@ -117,6 +125,8 @@ pub struct SessionOptions {
     pub idle_timeout: Option<Duration>,
     /// How long a cancelled turn may run on before the adapter is stopped.
     pub cancel_grace: Duration,
+    /// How long one config switch may take.
+    pub config_timeout: Duration,
 }
 
 impl Default for SessionOptions {
@@ -126,8 +136,21 @@ impl Default for SessionOptions {
             kill_grace: KILL_GRACE,
             idle_timeout: Some(IDLE_TIMEOUT),
             cancel_grace: CANCEL_GRACE,
+            config_timeout: CONFIG_TIMEOUT,
         }
     }
+}
+
+/// Everything a session actor needs to attach its session.
+#[derive(Debug, Clone)]
+pub struct Launch {
+    pub request_id: String,
+    pub session_id: String,
+    pub attach: Attach,
+    /// Applied once the adapter session exists (ACP core §4.3).
+    pub config: SessionConfig,
+    pub agent: AgentCommand,
+    pub cwd: PathBuf,
 }
 
 /// The connection task's handle on a session actor.
@@ -204,7 +227,15 @@ pub fn spawn(
     cwd: PathBuf,
     options: SessionOptions,
 ) -> SessionHandle {
-    spawn_actor(uplink, request_id, session_id, Attach::New, agent, cwd, options)
+    let launch = Launch {
+        request_id,
+        session_id,
+        attach: Attach::New,
+        config: SessionConfig::default(),
+        agent,
+        cwd,
+    };
+    self::launch(uplink, launch, options)
 }
 
 /// Spawn a session actor that resumes the agent's session
@@ -219,32 +250,34 @@ pub fn resume(
     cwd: PathBuf,
     options: SessionOptions,
 ) -> SessionHandle {
-    let attach = Attach::Load { agent_session_id };
-    spawn_actor(uplink, request_id, session_id, attach, agent, cwd, options)
+    let launch = Launch {
+        request_id,
+        session_id,
+        attach: Attach::Load { agent_session_id },
+        config: SessionConfig::default(),
+        agent,
+        cwd,
+    };
+    self::launch(uplink, launch, options)
 }
 
-fn spawn_actor(
-    uplink: Uplink,
-    request_id: String,
-    session_id: String,
-    attach: Attach,
-    agent: AgentCommand,
-    cwd: PathBuf,
-    options: SessionOptions,
-) -> SessionHandle {
+/// Spawn a session actor for `launch`: `session/new` or `session/load`,
+/// then its config. Otherwise like [`spawn`].
+pub fn launch(uplink: Uplink, launch: Launch, options: SessionOptions) -> SessionHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let open_turn = Arc::new(Mutex::new(None));
     let actor = Actor {
         uplink,
-        session_id,
+        session_id: launch.session_id.clone(),
         open_turn: open_turn.clone(),
         options,
+        catalogue: Mutex::new(Catalogue::default()),
     };
     let done = CancellationToken::new();
     let finished = done.clone().drop_guard();
     tokio::spawn(async move {
         let _finished = finished;
-        actor.run(request_id, attach, agent, cwd, rx).await;
+        actor.run(launch, rx).await;
     });
     SessionHandle {
         commands: tx,
@@ -345,9 +378,32 @@ struct Actor {
     session_id: String,
     open_turn: Arc<Mutex<Option<String>>>,
     options: SessionOptions,
+    /// The adapter's config options as last reported.
+    catalogue: Mutex<Catalogue>,
+}
+
+/// What the actor knows of its adapter's config options.
+#[derive(Default)]
+struct Catalogue {
+    options: Vec<SessionConfigOption>,
+    /// `false` once a switch went unanswered or was answered without a
+    /// catalogue: the options may be stale, so they are not announced
+    /// until the adapter reports them again.
+    current: bool,
 }
 
 impl Actor {
+    /// The catalogue extracts to announce: none while the options may be
+    /// stale.
+    fn catalogue_extracts(&self) -> Indexed {
+        let catalogue = self.catalogue.lock().expect("catalogue lock");
+        if catalogue.current {
+            catalogue_extracts(&catalogue.options)
+        } else {
+            Indexed::default()
+        }
+    }
+
     fn emit(&self, body: SessionBody) {
         if let Err(err) = self.uplink.emit(&self.session_id, body) {
             tracing::error!(session_id = %self.session_id, error = %err, "failed to persist a session frame");
@@ -367,15 +423,8 @@ impl Actor {
         });
     }
 
-    async fn run(
-        self,
-        request_id: String,
-        attach: Attach,
-        agent: AgentCommand,
-        cwd: PathBuf,
-        mut commands: mpsc::UnboundedReceiver<SessionCmd>,
-    ) {
-        self.drive(request_id, attach, agent, cwd, &mut commands).await;
+    async fn run(self, launch: Launch, mut commands: mpsc::UnboundedReceiver<SessionCmd>) {
+        self.drive(launch, &mut commands).await;
         // The session's last frame is in the outbox. Commands sent while the
         // actor was ending (killing its adapter can take the whole grace) are
         // answered, never dropped: the collector would otherwise wait out its
@@ -411,14 +460,15 @@ impl Actor {
 
     /// The actor's life: start, then serve until it parks, closes or ends.
     /// Every return leaves the session's final frame in the outbox.
-    async fn drive(
-        &self,
-        request_id: String,
-        attach: Attach,
-        agent: AgentCommand,
-        cwd: PathBuf,
-        commands: &mut mpsc::UnboundedReceiver<SessionCmd>,
-    ) {
+    async fn drive(&self, launch: Launch, commands: &mut mpsc::UnboundedReceiver<SessionCmd>) {
+        let Launch {
+            request_id,
+            attach,
+            config,
+            agent,
+            cwd,
+            ..
+        } = launch;
         let (mut adapter, io) = match Adapter::spawn(&agent, &cwd) {
             Ok(spawned) => spawned,
             Err(err) => {
@@ -464,40 +514,64 @@ impl Actor {
                 StartError::other("the ACP connection could not be set up".into()),
             );
         };
-        let negotiated = tokio::select! {
-            result = tokio::time::timeout(self.options.start_timeout, negotiate(&conn, cwd, &attach, &mut updates)) => {
-                match result {
-                    Ok(result) => result,
-                    Err(_) => Err(StartError::other(format!(
-                        "adapter did not start within {}s",
-                        self.options.start_timeout.as_secs()
-                    ))),
-                }
-            }
+        // One deadline for the whole start: the switches share it, so a slow
+        // one cannot push the answer past the collector's start timeout.
+        let deadline = Instant::now() + self.options.start_timeout;
+        let started = tokio::select! {
+            result = async {
+                let (session, replay, catalogue) =
+                    match tokio::time::timeout_at(deadline, negotiate(&conn, cwd, &attach, &mut updates)).await {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            return Err(StartError::other(format!(
+                                "adapter did not start within {}s",
+                                self.options.start_timeout.as_secs()
+                            )));
+                        }
+                    };
+                let applied = apply_config(&conn, &session, catalogue, &config, self.options.config_timeout, deadline).await;
+                Ok((session, replay, applied))
+            } => result,
             info = adapter.exited() => {
                 let tail = adapter.stderr_tail().await;
                 Err(StartError::other(format!("adapter exited during start ({}): {}", describe(info), last_lines(&tail, 5))))
             }
         };
-        let (agent_session, replay) = match negotiated {
-            Ok(negotiated) => negotiated,
+        let (agent_session, replay, applied) = match started {
+            Ok(started) => started,
             Err(error) => {
                 adapter.terminate(self.options.kill_grace).await;
                 return self.start_failed(request_id, error);
             }
         };
+        *self.catalogue.lock().expect("catalogue lock") = Catalogue {
+            options: applied.options,
+            current: applied.current,
+        };
+        // The catalogue after the switches, never the one before (P-13).
         self.emit(SessionBody::SessionStarted {
             request_id,
             agent_session_id: agent_session.to_string(),
-            indexed: Indexed::default(),
+            indexed: self.catalogue_extracts(),
         });
         // A load's state updates follow the start they belong to; then the
-        // note about what the load dropped (ACP core §4.5).
+        // note about what the load dropped (ACP core §4.5), then the one
+        // about switches that did not take.
         for payload in replay.kept.iter().cloned() {
             self.emit(update(payload, None));
         }
         if let Some(note) = replay.note() {
             self.emit(note);
+        }
+        if !applied.failures.is_empty() {
+            let (note, what) = match attach {
+                Attach::New => ("config_failed", "could not apply"),
+                Attach::Load { .. } => ("reapply_failed", "could not re-apply"),
+            };
+            self.emit(SessionBody::HostNote {
+                note: note.into(),
+                text: scrub(&format!("{what}: {}", applied.failures.join("; "))),
+            });
         }
 
         // Prompts are deduplicated by turn_id: a retried delivery after a
@@ -566,7 +640,7 @@ impl Actor {
                     Some(SessionCmd::Restart { request_id }) => self.emit(SessionBody::SessionStarted {
                         request_id,
                         agent_session_id: agent_session.to_string(),
-                        indexed: Indexed::default(),
+                        indexed: self.catalogue_extracts(),
                     }),
                     Some(SessionCmd::Park { .. }) => {
                         self.teardown(&mut adapter, &mut updates, turn.take()).await;
@@ -765,14 +839,22 @@ async fn next_reply(turn: &mut Option<Turn>) -> agent_client_protocol::Result<Pr
 
 /// `initialize`, then `session/new` or `session/load`. While a load is
 /// outstanding its replay is classified, never emitted (ACP core §4.5).
+/// Returns the config options the adapter announced (none if it announced
+/// none, or they did not parse).
 async fn negotiate(
     conn: &ConnectionTo<Agent>,
     cwd: PathBuf,
     attach: &Attach,
     updates: &mut mpsc::UnboundedReceiver<Value>,
-) -> Result<(SessionId, Replay), StartError> {
+) -> Result<(SessionId, Replay, Vec<SessionConfigOption>), StartError> {
+    // Advertised so that agents offer boolean options as booleans, not as
+    // on/off selects (ACP `session.configOptions.boolean`).
+    let capabilities = ClientCapabilities::new().session(
+        ClientSessionCapabilities::new()
+            .config_options(SessionConfigOptionsCapabilities::new().boolean(BooleanConfigOptionCapabilities::new())),
+    );
     let init = conn
-        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+        .send_request(InitializeRequest::new(ProtocolVersion::V1).client_capabilities(capabilities))
         .block_task()
         .await
         .map_err(|err| StartError::acp(err, false))?;
@@ -783,7 +865,18 @@ async fn negotiate(
                 .block_task()
                 .await
                 .map_err(|err| StartError::acp(err, false))?;
-            return Ok((created.session_id, Replay::default()));
+            // What the adapter sent before its answer (see
+            // `Actor::drain_updates` for the ordering argument) follows the
+            // start, like a load's kept updates.
+            let mut replay = Replay::default();
+            for _ in 0..updates.len() {
+                match updates.try_recv() {
+                    Ok(payload) => replay.kept.push(payload),
+                    Err(_) => break,
+                }
+            }
+            let options = announced_options(created.config_options, &replay.kept);
+            return Ok((created.session_id, replay, options));
         }
         Attach::Load { agent_session_id } => agent_session_id,
     };
@@ -813,10 +906,231 @@ async fn negotiate(
                 while let Ok(payload) = updates.try_recv() {
                     replay.observe(payload);
                 }
-                result.map_err(|err| StartError::acp(err, true))?;
-                return Ok((id, replay));
+                let loaded = result.map_err(|err| StartError::acp(err, true))?;
+                let options = announced_options(loaded.config_options, &replay.kept);
+                return Ok((id, replay, options));
             }
         }
+    }
+}
+
+/// The config options a new or loaded session starts with: the answer's,
+/// or, if it had none, those of the last `config_option_update` the adapter
+/// sent before it. That update still carries no extracts: it is older than
+/// the catalogue `session_started` announces.
+fn announced_options(answered: Option<Vec<SessionConfigOption>>, before: &[Value]) -> Vec<SessionConfigOption> {
+    match answered {
+        Some(options) if !options.is_empty() => options,
+        _ => before.iter().rev().find_map(config_update).unwrap_or_default(),
+    }
+}
+
+/// The options of a non-empty `config_option_update` notification.
+fn config_update(payload: &Value) -> Option<Vec<SessionConfigOption>> {
+    let notification = serde_json::from_value::<SessionNotification>(payload.clone()).ok()?;
+    match notification.update {
+        SessionUpdate::ConfigOptionUpdate(update) if !update.config_options.is_empty() => Some(update.config_options),
+        _ => None,
+    }
+}
+
+/// What a start's config switches left behind.
+struct Applied {
+    /// The options the last switch answered with (or the announced ones).
+    options: Vec<SessionConfigOption>,
+    /// `false` if a switch went unanswered or was answered without a
+    /// catalogue: `options` may then be stale.
+    current: bool,
+    /// One line per requested value that did not take.
+    failures: Vec<String>,
+}
+
+/// Apply `wanted` to a new or loaded session (ACP core §4.3): the model
+/// first, then the other axes, then the mode, each with
+/// `session/set_config_option`, so a model that clamps the mode cannot undo
+/// the requested mode. A value that is already current is not sent. Each
+/// switch has `timeout`, and none runs past `deadline`.
+///
+/// Once a switch goes unanswered (or the deadline has passed), nothing more
+/// is sent: the adapter may still apply the late switch, and a late model
+/// switch could clamp a mode sent after it. Finally every requested value is
+/// checked against the read-back. Whatever did not take is reported in
+/// `failures`; the start goes on.
+async fn apply_config(
+    conn: &ConnectionTo<Agent>,
+    session: &SessionId,
+    options: Vec<SessionConfigOption>,
+    wanted: &SessionConfig,
+    timeout: Duration,
+    deadline: Instant,
+) -> Applied {
+    let mut applied = Applied {
+        options,
+        current: true,
+        failures: Vec::new(),
+    };
+    let mut switches: Vec<(String, ConfigValue)> = Vec::new();
+    if let Some(model) = &wanted.model {
+        match axis_id(&applied.options, &SessionConfigOptionCategory::Model, "model") {
+            Some(id) => switches.push((id, ConfigValue::Id(model.clone()))),
+            None => applied
+                .failures
+                .push(format!("model {model}: the adapter offers no model option")),
+        }
+    }
+    switches.extend(wanted.axes.iter().map(|(id, value)| (id.clone(), value.clone())));
+    // Resolved now, and applied last: after the model and the other axes.
+    let mode = wanted.mode.as_ref().map(|mode| {
+        (
+            axis_id(&applied.options, &SessionConfigOptionCategory::Mode, "mode"),
+            mode,
+        )
+    });
+    match mode {
+        Some((Some(id), mode)) => switches.push((id, ConfigValue::Id(mode.clone()))),
+        Some((None, mode)) => applied
+            .failures
+            .push(format!("mode {mode}: the adapter offers no mode option")),
+        None => {}
+    }
+    // Requested values that already have their own line in `failures`.
+    let mut reported: HashSet<String> = HashSet::new();
+    let mut unanswered = false;
+    for (id, value) in &switches {
+        match current_value(&applied.options, id) {
+            None => {
+                applied
+                    .failures
+                    .push(format!("{id}: the adapter offers no such option"));
+                reported.insert(id.clone());
+                continue;
+            }
+            Some(current) if current == *value => continue,
+            Some(_) => {}
+        }
+        let now = Instant::now();
+        if unanswered || now >= deadline {
+            let why = if unanswered {
+                "an earlier switch did not answer"
+            } else {
+                "the start deadline passed"
+            };
+            applied.failures.push(format!("{id}={}: not sent: {why}", shown(value)));
+            reported.insert(id.clone());
+            continue;
+        }
+        let request = SetSessionConfigOptionRequest::new(session.clone(), id.clone(), acp_value(value));
+        let cut_short = now + timeout > deadline;
+        let until = (now + timeout).min(deadline);
+        match tokio::time::timeout_at(until, conn.send_request(request).block_task()).await {
+            // The catalogue of the last successful switch is the one kept.
+            Ok(Ok(response)) if !response.config_options.is_empty() => applied.options = response.config_options,
+            // An empty answer is no read-back, not an adapter without options.
+            Ok(Ok(_)) => applied.current = false,
+            Ok(Err(err)) => {
+                applied.failures.push(format!("{id}={}: {err}", shown(value)));
+                reported.insert(id.clone());
+            }
+            Err(_) => {
+                applied.current = false;
+                unanswered = true;
+                let wait = if cut_short {
+                    "no answer before the start deadline".to_string()
+                } else {
+                    format!("no answer within {timeout:?}")
+                };
+                applied.failures.push(format!("{id}={}: {wait}", shown(value)));
+                reported.insert(id.clone());
+            }
+        }
+    }
+    // What the agent reports is what counts: a value it accepted but does
+    // not report (or a later switch undid) did not take either.
+    if applied.current {
+        for (id, value) in switches.iter().filter(|(id, _)| !reported.contains(id)) {
+            match current_value(&applied.options, id) {
+                Some(current) if current == *value => {}
+                Some(current) => applied.failures.push(format!(
+                    "{id}: asked {}, agent reports {}",
+                    shown(value),
+                    shown(&current)
+                )),
+                None => applied
+                    .failures
+                    .push(format!("{id}: asked {}, agent no longer offers it", shown(value))),
+            }
+        }
+    }
+    applied
+}
+
+/// The id of the option for `category`. Categories are only a UX hint in
+/// ACP, so an option with the conventional id counts too, but only if it
+/// has no category, or a custom (`_`-prefixed) one: an option another
+/// category claims is not the model or the mode.
+fn axis_id(options: &[SessionConfigOption], category: &SessionConfigOptionCategory, id: &str) -> Option<String> {
+    let uncategorized = |o: &&SessionConfigOption| match &o.category {
+        None => true,
+        Some(SessionConfigOptionCategory::Other(custom)) => custom.starts_with('_'),
+        Some(_) => false,
+    };
+    options
+        .iter()
+        .find(|o| o.category.as_ref() == Some(category))
+        .or_else(|| options.iter().filter(uncategorized).find(|o| &*o.id.0 == id))
+        .map(|o| o.id.to_string())
+}
+
+/// The current value of option `id`, if the adapter offers it.
+fn current_value(options: &[SessionConfigOption], id: &str) -> Option<ConfigValue> {
+    let option = options.iter().find(|o| &*o.id.0 == id)?;
+    match &option.kind {
+        SessionConfigKind::Select(select) => Some(ConfigValue::Id(select.current_value.to_string())),
+        SessionConfigKind::Boolean(toggle) => Some(ConfigValue::Bool(toggle.current_value)),
+        _ => None,
+    }
+}
+
+fn acp_value(value: &ConfigValue) -> SessionConfigOptionValue {
+    match value {
+        ConfigValue::Bool(on) => SessionConfigOptionValue::boolean(*on),
+        ConfigValue::Id(id) => SessionConfigOptionValue::value_id(id.clone()),
+    }
+}
+
+fn shown(value: &ConfigValue) -> String {
+    match value {
+        ConfigValue::Bool(on) => on.to_string(),
+        ConfigValue::Id(id) => id.clone(),
+    }
+}
+
+/// The catalogue extracts (ACP core §3.2) of `options`: the options
+/// themselves, and the current model, mode and other axes. None for an
+/// empty list, which is no read-back.
+fn catalogue_extracts(options: &[SessionConfigOption]) -> Indexed {
+    if options.is_empty() {
+        return Indexed::default();
+    }
+    let model = axis_id(options, &SessionConfigOptionCategory::Model, "model");
+    let mode = axis_id(options, &SessionConfigOptionCategory::Mode, "mode");
+    let id_of = |id: &Option<String>| id.as_deref().and_then(|id| current_value(options, id));
+    let as_id = |value: Option<ConfigValue>| match value {
+        Some(ConfigValue::Id(id)) => Some(id),
+        _ => None,
+    };
+    let axes = options
+        .iter()
+        .map(|o| o.id.to_string())
+        .filter(|id| Some(id) != model.as_ref() && Some(id) != mode.as_ref())
+        .filter_map(|id| current_value(options, &id).map(|value| (id, value)))
+        .collect();
+    Indexed {
+        config_options: Some(options.iter().filter_map(|o| serde_json::to_value(o).ok()).collect()),
+        current_model: as_id(id_of(&model)),
+        current_mode: as_id(id_of(&mode)),
+        current_axes: Some(axes),
+        ..Indexed::default()
     }
 }
 
@@ -859,5 +1173,44 @@ fn parse_prompt(content: Vec<Value>) -> Result<Vec<ContentBlock>, String> {
         Ok(blocks) if !blocks.is_empty() => Ok(blocks),
         Ok(_) => Err("empty prompt".to_string()),
         Err(err) => Err(err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(json: Value) -> Vec<SessionConfigOption> {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn select(id: &str, category: Option<&str>) -> Value {
+        let mut option = serde_json::json!({
+            "id": id, "name": id, "type": "select", "currentValue": "a",
+            "options": [{"value": "a", "name": "a"}]
+        });
+        if let Some(category) = category {
+            option["category"] = category.into();
+        }
+        option
+    }
+
+    #[test]
+    fn the_model_is_its_category_or_else_an_uncategorized_option_named_model() {
+        let model = SessionConfigOptionCategory::Model;
+        let pick = |json| axis_id(&options(json), &model, "model");
+        let categorized = serde_json::json!([select("model", Some("thought_level")), select("brain", Some("model"))]);
+        assert_eq!(pick(categorized).as_deref(), Some("brain"));
+        assert_eq!(
+            pick(serde_json::json!([select("model", None)])).as_deref(),
+            Some("model")
+        );
+        assert_eq!(
+            pick(serde_json::json!([select("model", Some("_mine"))])).as_deref(),
+            Some("model")
+        );
+        // Another category claims it, even one this build does not know.
+        assert_eq!(pick(serde_json::json!([select("model", Some("thought_level"))])), None);
+        assert_eq!(pick(serde_json::json!([select("model", Some("future"))])), None);
     }
 }
