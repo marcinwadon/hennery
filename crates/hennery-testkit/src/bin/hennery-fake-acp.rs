@@ -175,7 +175,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                             tokio::time::sleep(Duration::from_millis(delay)).await;
                             let switched = {
                                 let mut options = catalogue.lock().unwrap();
-                                switch(&mut options, &req, None, &script.sticky_options).map(|()| options.clone())
+                                switch(&mut options, &req, None, None, &script.sticky_options).map(|()| options.clone())
                             };
                             let answered = match switched {
                                 Ok(options) => responder.respond(SetSessionConfigOptionResponse::new(options)),
@@ -195,6 +195,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                             &mut options,
                             &req,
                             script.model_switch_sets_mode.as_deref(),
+                            script.model_switch_drops_option.as_deref(),
                             &script.sticky_options,
                         )
                         .map(|()| options.clone())
@@ -203,7 +204,26 @@ async fn main() -> agent_client_protocol::Result<()> {
                         Ok(_) if script.empty_config_read_back => {
                             responder.respond(SetSessionConfigOptionResponse::new(Vec::new()))
                         }
-                        Ok(options) => responder.respond(SetSessionConfigOptionResponse::new(options)),
+                        Ok(options) => {
+                            let answered = responder.respond(SetSessionConfigOptionResponse::new(options));
+                            if script.announce_after_switch {
+                                // Sent right after the response above, so it
+                                // lands on the wire after it: exercises a
+                                // switch's answer racing a live notification
+                                // the agent sends right after it (fix round
+                                // 1, F2).
+                                let after = {
+                                    let mut options = catalogue.lock().unwrap();
+                                    set_select(&mut options, &SessionConfigOptionCategory::Mode, "bypass");
+                                    options.clone()
+                                };
+                                cx.send_notification(SessionNotification::new(
+                                    req.session_id.clone(),
+                                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(after)),
+                                ))?;
+                            }
+                            answered
+                        }
                         Err(message) => {
                             responder.respond_with_error(agent_client_protocol::Error::new(-32602, message))
                         }
@@ -302,9 +322,10 @@ fn log_switch(script: &FakeScript, req: &SetSessionConfigOptionRequest) {
 /// Apply one switch as a real adapter would, or say why it cannot. A switch
 /// of a `sticky` option is accepted and changes nothing.
 fn switch(
-    options: &mut [SessionConfigOption],
+    options: &mut Vec<SessionConfigOption>,
     req: &SetSessionConfigOptionRequest,
     model_switch_sets_mode: Option<&str>,
+    model_switch_drops_option: Option<&str>,
     sticky: &[String],
 ) -> Result<(), String> {
     let option = options
@@ -328,11 +349,13 @@ fn switch(
         }
         _ => return Err(format!("invalid value for {}", req.config_id)),
     }
-    if is_model
-        && !sticky
-        && let Some(mode) = model_switch_sets_mode
-    {
-        set_select(options, &SessionConfigOptionCategory::Mode, mode);
+    if is_model && !sticky {
+        if let Some(mode) = model_switch_sets_mode {
+            set_select(options, &SessionConfigOptionCategory::Mode, mode);
+        }
+        if let Some(drop_id) = model_switch_drops_option {
+            options.retain(|o| &*o.id.0 != drop_id);
+        }
     }
     Ok(())
 }

@@ -88,6 +88,21 @@ pub struct FakeScript {
     /// none.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub config_in_update_only: bool,
+    /// A switch of the model option also drops this option id from the
+    /// catalogue (a model that no longer offers some other option) — for
+    /// testing that a queued switch is validated against the catalogue
+    /// *after* the switch ahead of it, not the one in effect when it
+    /// arrived (fix round 1, F3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_switch_drops_option: Option<String>,
+    /// Send a `config_option_update` announcing mode `bypass`, right after
+    /// answering a `session/set_config_option` request (the normal, fast
+    /// path only) — an agent that independently changes its own config
+    /// right after answering a switch. For testing the race between a
+    /// switch's own (now stale) read-back and a notification sent right
+    /// after it (fix round 1, F2).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub announce_after_switch: bool,
 }
 
 impl Default for FakeScript {
@@ -113,6 +128,8 @@ impl Default for FakeScript {
             slow_model_switch_ms: None,
             sticky_options: Vec::new(),
             config_in_update_only: false,
+            model_switch_drops_option: None,
+            announce_after_switch: false,
         }
     }
 }

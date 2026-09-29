@@ -1647,6 +1647,24 @@ async fn refusal(replies: &mut tokio::sync::mpsc::UnboundedReceiver<HostFrame>) 
     }
 }
 
+/// Like `refusal`, but keeps the message too (fix round 1 tests need to
+/// tell "no answer within ..." apart from "an earlier switch is still
+/// out").
+async fn full_refusal(replies: &mut tokio::sync::mpsc::UnboundedReceiver<HostFrame>) -> (String, String, String) {
+    match tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .expect("a reply, not silence")
+        .unwrap()
+    {
+        HostFrame::Error {
+            request_id,
+            code,
+            message,
+        } => (request_id, code, message),
+        other => panic!("{other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn set_config_switches_during_a_turn_and_answers_with_the_adapters_read_back() {
     let dir = tempfile::tempdir().unwrap();
@@ -1777,7 +1795,7 @@ async fn only_a_live_config_option_update_carries_the_catalogue() {
 }
 
 #[tokio::test]
-async fn a_switch_that_never_answers_is_config_failed_and_one_still_out_at_the_end_is_not_attached() {
+async fn a_switch_still_out_when_the_session_ends_is_not_attached() {
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("config.log");
     let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
@@ -1791,24 +1809,22 @@ async fn a_switch_that_never_answers_is_config_failed_and_one_still_out_at_the_e
         Attach::New,
         SessionConfig::default(),
         SessionOptions {
-            config_timeout: Duration::from_millis(300),
+            // Long enough that rc1 is still genuinely out (not yet an
+            // orphan, fix round 1, F1) when the park below tears the
+            // session down.
+            config_timeout: Duration::from_secs(30),
             ..SessionOptions::default()
         },
     );
     wait_until(&uplink, has("session_started")).await;
     assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
-    assert_eq!(
-        refusal(&mut replies).await,
-        ("rc1".to_string(), "config_failed".to_string())
-    );
-    // Parked while a switch is out: it is answered, after the park.
-    assert!(handle.send(set_config("rc2", "model", ConfigValue::Id("large".into()))));
+    // Parked while the switch is out: it is answered, after the park.
     assert!(handle.send(SessionCmd::Park {
         request_id: "rp".into()
     }));
     assert_eq!(
         refusal(&mut replies).await,
-        ("rc2".to_string(), "not_attached".to_string())
+        ("rc1".to_string(), "not_attached".to_string())
     );
     wait_until(&uplink, has("session_parked:operator")).await;
     assert!(applied(&uplink.pending().unwrap()).is_empty());
@@ -1891,4 +1907,272 @@ async fn a_switch_waiting_behind_a_hung_one_is_answered_by_its_own_deadline() {
         "the second switch got a timeout of its own: {:?}",
         began.elapsed()
     );
+}
+
+// Fix round 1.
+
+/// F1: a switch queued behind one that just timed out (became an orphan)
+/// is refused for that reason, in one synchronous flush — not sent and
+/// then left to time out on its own, which would put it out at the same
+/// time as the (still possibly live) orphan.
+#[tokio::test]
+async fn a_switch_queued_behind_an_orphaned_one_is_refused_and_never_sent() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        hang_config: true,
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        SessionConfig::default(),
+        SessionOptions {
+            config_timeout: Duration::from_millis(200),
+            ..SessionOptions::default()
+        },
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
+    assert!(handle.send(set_config("rc2", "mode", ConfigValue::Id("plan".into()))));
+    let (id, code, message) = full_refusal(&mut replies).await;
+    assert_eq!((id.as_str(), code.as_str()), ("rc1", "config_failed"));
+    assert!(message.contains("no answer within"), "{message}");
+    let (id, code, message) = full_refusal(&mut replies).await;
+    assert_eq!((id.as_str(), code.as_str()), ("rc2", "config_failed"));
+    assert!(message.contains("an earlier switch is still out"), "{message}");
+    // rc2 was flushed with rc1's orphan: it never reached the adapter.
+    assert_eq!(switches(&log), "model=large\n");
+}
+
+/// F1: an orphaned switch's late answer still updates the catalogue
+/// (silently — its requester already has `config_failed`), and once it
+/// clears, a later switch is sent normally.
+#[tokio::test]
+async fn an_orphaned_switchs_late_answer_updates_the_catalogue_and_a_later_switch_is_sent_normally() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        // Well past `config_timeout` (so rc1 orphans), well short of the
+        // orphan's own grace (`config_timeout * ORPHAN_GRACE` = 400ms, so
+        // rc1's late answer still lands before it is given up on).
+        slow_model_switch_ms: Some(250),
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        SessionConfig::default(),
+        SessionOptions {
+            config_timeout: Duration::from_millis(100),
+            ..SessionOptions::default()
+        },
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
+    let (id, code, message) = full_refusal(&mut replies).await;
+    assert_eq!((id.as_str(), code.as_str()), ("rc1", "config_failed"));
+    assert!(message.contains("no answer within"), "{message}");
+    // Give rc1's late (250ms) answer time to land and update the catalogue.
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    assert!(handle.send(SessionCmd::Restart {
+        request_id: "r9".into()
+    }));
+    let frames = wait_until(&uplink, |f| {
+        kinds(f).iter().filter(|k| *k == "session_started").count() == 2
+    })
+    .await;
+    let last = frames
+        .iter()
+        .rev()
+        .find_map(|f| match f {
+            HostFrame::Session {
+                body: SessionBody::SessionStarted { indexed, .. },
+                ..
+            } => Some(indexed.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        last.current_config().unwrap().model.as_deref(),
+        Some("large"),
+        "the orphan's late read-back was not applied"
+    );
+    // A later switch is not still blocked by the (now resolved) orphan.
+    assert!(handle.send(set_config("rc2", "effort", ConfigValue::Id("high".into()))));
+    let frames = wait_until(&uplink, has("config_applied")).await;
+    let (_, indexed) = applied(&frames).remove(0);
+    assert_eq!(
+        indexed.current_config().unwrap().axes.get("effort").cloned(),
+        Some(ConfigValue::Id("high".into()))
+    );
+    assert_eq!(switches(&log), "model=large\neffort=high\n");
+}
+
+/// F2: the adapter answers a switch (R) and then, right after (no `.await`
+/// on its side in between), sends a live `config_option_update` (N) of its
+/// own. `agent-client-protocol` 2.2.0's dispatch loop processes incoming
+/// messages strictly in order (`concepts::ordering`: "the dispatch loop
+/// waits for each handler to complete before processing the next
+/// message"), so R's answer is always routed before N is ever dispatched to
+/// us. But this actor's own task can still be scheduled late enough to see
+/// both ready in the very same poll, and the select above checks the
+/// updates arm first. A single-thread runtime can never interleave the ACP
+/// connection's task and this actor's task tightly enough to hit that, so
+/// this needs `flavor = "multi_thread"`, repeated, for a real chance of
+/// exercising the gap — the same pattern as
+/// `updates_never_land_outside_their_turn_under_a_multi_thread_runtime`.
+/// Whenever it lands, the stored catalogue must end up as N, never
+/// overwritten back to R's now-stale one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_live_update_sent_right_after_a_switchs_answer_wins_over_that_answers_stale_read_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        announce_after_switch: true,
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        SessionConfig::default(),
+        SessionOptions::default(),
+    );
+    wait_until(&uplink, has("session_started")).await;
+    for i in 0..60 {
+        let rc = format!("rc{i}");
+        assert!(handle.send(set_config(&rc, "model", ConfigValue::Id("large".into()))));
+        let expected = i + 1;
+        let live_carries_catalogue = |f: &[HostFrame]| {
+            f.iter()
+                .filter(|frame| {
+                    matches!(frame, HostFrame::Session { body: SessionBody::AcpUpdate { indexed, .. }, .. } if indexed.config_options.is_some())
+                })
+                .count()
+        };
+        let frames = wait_until(&uplink, move |f| {
+            applied(f).len() == expected && live_carries_catalogue(f) == expected
+        })
+        .await;
+        // Whichever of R (`config_applied`) and N (the live update) this
+        // actor happened to process last for this round is what is now
+        // stored: it must be N, not R.
+        assert_eq!(
+            kinds(&frames).pop().as_deref(),
+            Some("update:?"),
+            "R was processed after N on iteration {i}: {:?}",
+            kinds(&frames)
+        );
+    }
+    assert!(handle.send(SessionCmd::Restart {
+        request_id: "r9".into()
+    }));
+    let frames = wait_until(&uplink, |f| {
+        kinds(f).iter().filter(|k| *k == "session_started").count() == 2
+    })
+    .await;
+    let last = frames
+        .iter()
+        .rev()
+        .find_map(|f| match f {
+            HostFrame::Session {
+                body: SessionBody::SessionStarted { indexed, .. },
+                ..
+            } => Some(indexed.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(
+        last.current_mode.as_deref(),
+        Some("bypass"),
+        "N, not R, must be the stored catalogue"
+    );
+}
+
+/// F3: a switch is checked against the catalogue only when it is actually
+/// popped for sending, not when it arrived — the switch ahead of it in the
+/// queue may have already changed what the catalogue offers by then.
+#[tokio::test]
+async fn a_queued_switch_is_checked_against_the_catalogue_after_the_switch_ahead_of_it_not_before() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        model_switch_drops_option: Some("effort".into()),
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        SessionConfig::default(),
+        SessionOptions::default(),
+    );
+    wait_until(&uplink, has("session_started")).await;
+    // "effort" exists when rc2 arrives; the model switch ahead of it drops
+    // it before rc2 is ever popped for sending.
+    assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
+    assert!(handle.send(set_config("rc2", "effort", ConfigValue::Id("high".into()))));
+    let frames = wait_until(&uplink, has("config_applied")).await;
+    assert_eq!(applied(&frames).len(), 1);
+    assert_eq!(
+        refusal(&mut replies).await,
+        ("rc2".to_string(), "unknown_option".to_string())
+    );
+    // Never reached the adapter: rejected at pop time, not sent and then
+    // refused by it.
+    assert_eq!(switches(&log), "model=large\n");
+}
+
+/// Cheap fix, same area: the idle reaper must not park a session out from
+/// under a switch that is out or orphaned — that would drop the adapter
+/// the collector is still waiting on an answer from.
+#[tokio::test]
+async fn the_idle_reaper_does_not_park_while_a_switch_is_out_or_orphaned() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        hang_config: true,
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        SessionConfig::default(),
+        SessionOptions {
+            config_timeout: Duration::from_millis(200),
+            idle_timeout: Some(Duration::from_millis(100)),
+            ..SessionOptions::default()
+        },
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
+    let not_parked = |frames: &[HostFrame]| {
+        !frames.iter().any(|f| {
+            matches!(
+                f,
+                HostFrame::Session {
+                    body: SessionBody::SessionParked { .. },
+                    ..
+                }
+            )
+        })
+    };
+    // The idle window (100ms) is shorter than the config timeout (200ms):
+    // if the reaper ignored the switch that is out, it would park here.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(not_parked(&uplink.pending().unwrap()));
+    // Still true once the switch has become an orphan.
+    let (id, code, _) = full_refusal(&mut replies).await;
+    assert_eq!((id.as_str(), code.as_str()), ("rc1", "config_failed"));
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert!(not_parked(&uplink.pending().unwrap()));
 }
