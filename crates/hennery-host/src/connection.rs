@@ -73,7 +73,18 @@ impl HostConfig {
     }
 }
 
-type Sessions = Arc<Mutex<HashMap<String, SessionHandle>>>;
+/// The host's session actors, by session id.
+#[derive(Default)]
+struct SessionMap {
+    handles: HashMap<String, SessionHandle>,
+    /// Set by host shutdown when it takes `handles`: from then on no actor
+    /// is spawned. A start or resume that was waiting behind an ending actor
+    /// would otherwise attach an adapter that shutdown never sees, and that
+    /// the runtime then SIGKILLs without its grace.
+    closing: bool,
+}
+
+type Sessions = Arc<Mutex<SessionMap>>;
 
 /// Run the host until the process exits. Reconnects with exponential backoff.
 pub async fn run(cfg: HostConfig) -> Result<()> {
@@ -85,7 +96,7 @@ pub async fn run_until(cfg: HostConfig, shutdown: impl Future<Output = ()>) -> R
     std::fs::create_dir_all(&cfg.data_dir)?;
     let outbox = Outbox::open(&cfg.data_dir.join("outbox.db"))?;
     let (uplink, mut replies) = Uplink::new(outbox);
-    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
+    let sessions: Sessions = Arc::new(Mutex::new(SessionMap::default()));
     let serve = async {
         let mut backoff = cfg.reconnect_min;
         loop {
@@ -111,10 +122,12 @@ pub async fn run_until(cfg: HostConfig, shutdown: impl Future<Output = ()>) -> R
 /// and `Adapter::drop` SIGKILLs at once. Bounded: an actor still starting
 /// does not read its commands and is left to that drop.
 async fn shut_down(sessions: &Sessions, bound: Duration) {
-    let actors: Vec<_> = std::mem::take(&mut *sessions.lock().expect("sessions lock"))
-        .into_values()
-        .map(|handle| handle.finished())
-        .collect();
+    let handles = {
+        let mut map = sessions.lock().expect("sessions lock");
+        map.closing = true;
+        std::mem::take(&mut map.handles)
+    };
+    let actors: Vec<_> = handles.into_values().map(|handle| handle.finished()).collect();
     if tokio::time::timeout(bound, futures::future::join_all(actors))
         .await
         .is_err()
@@ -238,8 +251,8 @@ async fn connect_once(
 fn attached_sessions(uplink: &Uplink, sessions: &Sessions) -> Result<Vec<AttachedSession>> {
     let live: Vec<(String, SessionHandle)> = {
         let mut map = sessions.lock().expect("sessions lock");
-        map.retain(|_, handle| !handle.is_ended());
-        map.iter().map(|(id, h)| (id.clone(), h.clone())).collect()
+        map.handles.retain(|_, handle| !handle.is_ended());
+        map.handles.iter().map(|(id, h)| (id.clone(), h.clone())).collect()
     };
     let mut out = Vec::new();
     for (session_id, handle) in live {
@@ -258,6 +271,7 @@ fn live_session(sessions: &Sessions, session_id: &str) -> Option<SessionHandle> 
     sessions
         .lock()
         .expect("sessions lock")
+        .handles
         .get(session_id)
         .filter(|h| !h.is_ended())
         .cloned()
@@ -322,7 +336,16 @@ fn spawn_or_restart(
     options: SessionOptions,
 ) {
     let mut map = sessions.lock().expect("sessions lock");
-    if let Some(handle) = map.get(&req.session_id).filter(|h| !h.is_ended() && !h.is_ending())
+    if map.closing {
+        // Host shutdown: the collector sees this connection end and
+        // reconciles the start after the next handshake (ACP core §5.1).
+        tracing::info!(session_id = %req.session_id, "host shutting down; not attaching");
+        return;
+    }
+    if let Some(handle) = map
+        .handles
+        .get(&req.session_id)
+        .filter(|h| !h.is_ended() && !h.is_ending())
         && handle.send(SessionCmd::Restart {
             request_id: req.request_id.clone(),
         })
@@ -349,7 +372,7 @@ fn spawn_or_restart(
             options,
         ),
     };
-    map.insert(req.session_id, handle);
+    map.handles.insert(req.session_id, handle);
 }
 
 fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: CollectorFrame) -> Result<()> {

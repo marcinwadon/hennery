@@ -809,3 +809,49 @@ async fn cancel_turn_reaches_the_actor_and_a_cancel_for_a_detached_session_is_no
         "{refused:?}"
     );
 }
+
+/// A resume waiting behind a close must not attach once host shutdown has
+/// taken the session map: shutdown would never wait for that adapter, and
+/// the runtime would SIGKILL it without its grace. The adapter ignores
+/// SIGTERM, so the close takes the whole 5 s kill grace, and shutdown
+/// begins while the resume still waits.
+#[tokio::test]
+async fn a_resume_waiting_behind_a_close_never_attaches_after_host_shutdown() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let spawns = dir.path().join("spawns");
+    let stubborn = counting_fake_with(&spawns, "trap '' TERM;");
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let host = tokio::spawn(hennery_host::run_until(
+        host_with_fake(addr, "resume-after-shutdown", stubborn),
+        async {
+            let _ = stopped.await;
+        },
+    ));
+
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    send_frame(&mut sink, &start("r1", "s1")).await;
+    read_until(&mut stream, body_is("s1", "session_started")).await;
+    send_frame(
+        &mut sink,
+        &CollectorFrame::CloseSession {
+            request_id: "r2".into(),
+            session_id: "s1".into(),
+        },
+    )
+    .await;
+    send_frame(&mut sink, &resume("r3", "s1", 0, "fake-session-1")).await;
+    // Nothing on the wire says the resume is queued; the close has most of
+    // its 5 s grace left.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), host)
+        .await
+        .expect("the host shut down")
+        .unwrap()
+        .unwrap();
+    // Time for a wrongly attached adapter to launch.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 1);
+}
