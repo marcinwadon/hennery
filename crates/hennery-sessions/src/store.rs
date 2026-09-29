@@ -2,11 +2,11 @@
 //! the connection mutex (kernel §1's writer thread replaces it later).
 
 use anyhow::Result;
-use hennery_proto::frames::{AttachedSession, SessionBody, TurnOutcome};
-use hennery_proto::rest::EventDto;
+use hennery_proto::frames::{AttachedSession, ConfigValue, Indexed, SessionBody, SessionConfig, TurnOutcome};
+use hennery_proto::rest::{EventDto, SessionCatalog};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -63,6 +63,18 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE sessions ADD COLUMN presumed_parked INTEGER NOT NULL DEFAULT 0;
 ",
+    // Model, axes and mode (ACP core §8): the current values from the last
+    // catalogue a host reported, which a resume re-applies, and the
+    // catalogue itself, off the session list (P-23).
+    "
+    ALTER TABLE sessions ADD COLUMN model TEXT;
+    ALTER TABLE sessions ADD COLUMN mode TEXT;
+    ALTER TABLE sessions ADD COLUMN config_axes TEXT;
+    CREATE TABLE session_catalog (
+        session_id TEXT PRIMARY KEY REFERENCES sessions(id),
+        config_options TEXT NOT NULL,
+        updated_at TEXT NOT NULL);
+",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -81,6 +93,9 @@ pub struct SessionRow {
     /// `parked` only because the host has been offline past the threshold
     /// (ACP core §5.3).
     pub presumed_parked: bool,
+    /// The model, mode and other axes the host last reported as current;
+    /// a resume re-applies them (ACP core §4.3).
+    pub config: SessionConfig,
 }
 
 /// The outcome of `Store::request_resume`.
@@ -92,6 +107,8 @@ pub enum ResumeRequest {
         events: Vec<EventDto>,
         agent_session_id: String,
         committed_seq: u64,
+        /// The stored config, re-applied by the host after the load.
+        config: SessionConfig,
     },
     /// Refused: the session is `starting` or `active` (this lifecycle).
     Busy(String),
@@ -251,6 +268,45 @@ fn close_in(tx: &Transaction<'_>, session_id: &str) -> Result<Vec<EventDto>> {
     Ok(events)
 }
 
+/// Store the catalogue snapshot a fact's extracts carry (ACP core §3.2,
+/// §8): the options for `GET …/catalog`, and the current values in the
+/// session's `model`, `mode` and `config_axes`, which a resume re-applies.
+/// Extracts without a snapshot (none, or an empty read-back) change
+/// nothing: the stored values are never replaced by a guess (P-13).
+fn store_catalogue(tx: &Transaction<'_>, session_id: &str, indexed: &Indexed, ts: &str) -> Result<()> {
+    let Some(current) = indexed.current_config() else {
+        return Ok(());
+    };
+    let options = indexed.config_options.clone().unwrap_or_default();
+    tx.execute(
+        "UPDATE sessions SET model = ?2, mode = ?3, config_axes = ?4 WHERE id = ?1",
+        params![
+            session_id,
+            current.model,
+            current.mode,
+            serde_json::to_string(&current.axes)?
+        ],
+    )?;
+    tx.execute(
+        "INSERT INTO session_catalog(session_id, config_options, updated_at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(session_id) DO UPDATE SET config_options = excluded.config_options, updated_at = excluded.updated_at",
+        params![session_id, serde_json::to_string(&options)?, ts],
+    )?;
+    Ok(())
+}
+
+/// A session's `model`, `mode` and `config_axes` columns.
+type ConfigColumns = (Option<String>, Option<String>, Option<String>);
+
+/// A session's stored config, from its `model`, `mode` and `config_axes`.
+fn stored_config((model, mode, axes): ConfigColumns) -> Result<SessionConfig> {
+    let axes: BTreeMap<String, ConfigValue> = match axes {
+        Some(axes) => serde_json::from_str(&axes)?,
+        None => BTreeMap::new(),
+    };
+    Ok(SessionConfig { model, mode, axes })
+}
+
 /// Keep a stored host fact that did not apply as the idempotency key only:
 /// it is hidden from `Store::events` (and so from SSE replay).
 fn mark_unapplied(tx: &Transaction<'_>, event_id: i64) -> Result<()> {
@@ -325,15 +381,16 @@ impl Store {
     }
 
     pub fn session(&self, id: &str) -> Result<Option<SessionRow>> {
-        Ok(self
+        let row = self
             .conn()
             .query_row(
                 "SELECT id, host_id, agent, cwd, lifecycle, activity, open_turn_id, failure_reason, close_requested,
-                        presumed_parked
+                        presumed_parked, model, mode, config_axes
                  FROM sessions WHERE id = ?1",
                 [id],
                 |r| {
-                    Ok(SessionRow {
+                    let config: ConfigColumns = (r.get(10)?, r.get(11)?, r.get(12)?);
+                    let row = SessionRow {
                         id: r.get(0)?,
                         host_id: r.get(1)?,
                         agent: r.get(2)?,
@@ -344,10 +401,43 @@ impl Store {
                         failure_reason: r.get(7)?,
                         close_requested: r.get(8)?,
                         presumed_parked: r.get(9)?,
-                    })
+                        config: SessionConfig::default(),
+                    };
+                    Ok((row, config))
                 },
             )
-            .optional()?)
+            .optional()?;
+        let Some((mut row, config)) = row else {
+            return Ok(None);
+        };
+        row.config = stored_config(config)?;
+        Ok(Some(row))
+    }
+
+    /// The session's config catalogue and current values (ACP core §9);
+    /// `None` for an unknown session, an empty catalogue for one whose
+    /// host has reported none.
+    pub fn catalog(&self, session_id: &str) -> Result<Option<SessionCatalog>> {
+        let row: Option<(ConfigColumns, Option<String>)> = self
+            .conn()
+            .query_row(
+                "SELECT s.model, s.mode, s.config_axes, c.config_options
+                 FROM sessions s LEFT JOIN session_catalog c ON c.session_id = s.id WHERE s.id = ?1",
+                [session_id],
+                |r| Ok(((r.get(0)?, r.get(1)?, r.get(2)?), r.get(3)?)),
+            )
+            .optional()?;
+        let Some((config, options)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(SessionCatalog {
+            session_id: session_id.to_string(),
+            config_options: match options {
+                Some(options) => serde_json::from_str(&options)?,
+                None => Vec::new(),
+            },
+            current: stored_config(config)?,
+        }))
     }
 
     /// A turn's state: `sent`, `started`, `ended` or `not_delivered`.
@@ -481,14 +571,14 @@ impl Store {
     pub fn request_resume(&self, session_id: &str) -> Result<ResumeRequest> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let row: Option<(String, Option<String>, Option<String>)> = tx
+        let row: Option<(String, Option<String>, Option<String>, ConfigColumns)> = tx
             .query_row(
-                "SELECT lifecycle, agent_session_id, open_turn_id FROM sessions WHERE id = ?1",
+                "SELECT lifecycle, agent_session_id, open_turn_id, model, mode, config_axes FROM sessions WHERE id = ?1",
                 [session_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, (r.get(3)?, r.get(4)?, r.get(5)?))),
             )
             .optional()?;
-        let Some((lifecycle, agent_session_id, open_turn)) = row else {
+        let Some((lifecycle, agent_session_id, open_turn, config)) = row else {
             return Ok(ResumeRequest::NotFound);
         };
         if !matches!(lifecycle.as_str(), "parked" | "closed" | "failed") {
@@ -519,6 +609,7 @@ impl Store {
             events,
             agent_session_id,
             committed_seq: committed.unwrap_or(0) as u64,
+            config: stored_config(config)?,
         })
     }
 
@@ -622,7 +713,11 @@ impl Store {
             ts: ts.clone(),
         }];
         match body {
-            SessionBody::SessionStarted { agent_session_id, .. } => {
+            SessionBody::SessionStarted {
+                agent_session_id,
+                indexed,
+                ..
+            } => {
                 // A re-emitted `session_started` for a session already
                 // active (a retried start or resume) changes nothing. It
                 // also clears a stale `failure_reason`: a start reconciled
@@ -637,6 +732,9 @@ impl Store {
                 if changed == 0 {
                     created.clear();
                     mark_unapplied(&tx, fact_id)?;
+                } else {
+                    // The catalogue after the start's switches (P-13).
+                    store_catalogue(&tx, session_id, indexed, &ts)?;
                 }
             }
             SessionBody::StartFailed { code, .. } => {
@@ -778,14 +876,33 @@ impl Store {
                 if !fact_applies(&tx, session_id, indexed.turn_id.as_deref())? {
                     created.clear();
                     mark_unapplied(&tx, fact_id)?;
+                } else {
+                    // A live `config_option_update` (the agent changed its
+                    // own config); the host never sends a replayed one
+                    // with extracts.
+                    store_catalogue(&tx, session_id, indexed, &ts)?;
+                }
+            }
+            SessionBody::ConfigApplied { indexed, .. } => {
+                // The read-back of a switch on an attached session. A late
+                // one for a session that has detached since changes nothing.
+                let (lifecycle, presumed): (String, bool) = tx.query_row(
+                    "SELECT lifecycle, presumed_parked FROM sessions WHERE id = ?1",
+                    [session_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                if lifecycle == "active" || presumed {
+                    store_catalogue(&tx, session_id, indexed, &ts)?;
+                } else {
+                    created.clear();
+                    mark_unapplied(&tx, fact_id)?;
                 }
             }
             // Diagnostics only, with no transition of their own: an
             // `adapter_exited` is followed by the `session_parked` that
             // detaches; a `host_note` (e.g. `replay_unknown_dropped` after a
-            // load) changes nothing; nor does a `config_applied` until the
-            // catalogue is stored.
-            SessionBody::AdapterExited { .. } | SessionBody::HostNote { .. } | SessionBody::ConfigApplied { .. } => {
+            // load) changes nothing.
+            SessionBody::AdapterExited { .. } | SessionBody::HostNote { .. } => {
                 if !fact_applies(&tx, session_id, None)? {
                     created.clear();
                     mark_unapplied(&tx, fact_id)?;

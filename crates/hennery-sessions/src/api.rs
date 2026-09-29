@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
 use futures::stream::{self, Stream, StreamExt};
-use hennery_proto::frames::{Capability, CollectorFrame, SessionBody, SessionConfig};
+use hennery_proto::frames::{Capability, CollectorFrame, SessionBody};
 use hennery_proto::rest::{
     ApiError, CancelResponse, EventDto, LifecycleResponse, OpenTurn, PromptRequest, PromptResponse, SessionDetail,
     StartSessionRequest, StartSessionResponse,
@@ -231,16 +231,17 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
     if !state.hub.is_ready(&session.host_id) {
         return request_failed(RequestError::NotConnected);
     }
-    let (agent_session_id, committed_seq) = match state.store.request_resume(&id) {
+    let (agent_session_id, committed_seq, config) = match state.store.request_resume(&id) {
         Ok(ResumeRequest::Starting {
             events,
             agent_session_id,
             committed_seq,
+            config,
         }) => {
             for event in events {
                 state.hub.publish(event);
             }
-            (agent_session_id, committed_seq)
+            (agent_session_id, committed_seq, config)
         }
         // A concurrent resume got there first (ACP core §12 scenario 11).
         Ok(ResumeRequest::Busy(lifecycle)) => return busy(&lifecycle),
@@ -262,7 +263,8 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         agent: session.agent,
         cwd: session.cwd,
         agent_session_id,
-        config: SessionConfig::default(),
+        // Re-applied after the load (ACP core §4.3).
+        config,
     };
     let undo = Undo::Start { session_id: id.clone() };
     match state

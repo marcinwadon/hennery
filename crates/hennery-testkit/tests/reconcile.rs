@@ -1235,3 +1235,79 @@ async fn a_cancel_whose_turn_ended_before_it_was_sent_answers_the_stored_outcome
         (202, json!({ "turn_id": turn, "outcome": "completed" }))
     );
 }
+
+// Plan B2b: the collector's side of model, axes and mode.
+
+/// Catalogue extracts whose current mode is `mode`.
+fn catalogue(mode: &str) -> hennery_proto::frames::Indexed {
+    hennery_proto::frames::Indexed {
+        config_options: Some(vec![json!({"id": "mode", "currentValue": mode})]),
+        current_mode: Some(mode.into()),
+        current_axes: Some(Default::default()),
+        ..Default::default()
+    }
+}
+
+/// The start request's config reaches the host; what the host then reports
+/// as current is what a resume re-applies, not what was asked for.
+#[tokio::test]
+async fn a_resume_re_sends_the_config_its_host_last_reported() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let c = client();
+    let url = collector.url("/api/sessions");
+    let call = tokio::spawn(async move {
+        post(
+            &c,
+            url,
+            json!({ "host_id": HOST, "agent": "fake", "cwd": "/tmp", "mode": "plan", "axes": {"fast": true} }),
+        )
+        .await
+    });
+    let CollectorFrame::StartSession {
+        request_id,
+        session_id,
+        config,
+        ..
+    } = host.next().await
+    else {
+        panic!("expected start_session");
+    };
+    assert_eq!(config.mode.as_deref(), Some("plan"));
+    assert_eq!(
+        config.axes.get("fast"),
+        Some(&hennery_proto::frames::ConfigValue::Bool(true))
+    );
+    // The adapter clamped the mode to `default`.
+    host.emit(
+        &session_id,
+        SessionBody::SessionStarted {
+            request_id,
+            agent_session_id: "agent-1".into(),
+            indexed: catalogue("default"),
+        },
+    )
+    .await;
+    assert_eq!(call.await.unwrap().0, 202);
+    host.emit(
+        &session_id,
+        SessionBody::SessionParked {
+            reason: hennery_proto::frames::ParkReason::Idle,
+        },
+    )
+    .await;
+    wait_for("parked", || async {
+        (collector.lifecycle(&session_id) == "parked").then_some(())
+    })
+    .await;
+    let c = client();
+    let url = resume_url(&collector, &session_id);
+    tokio::spawn(async move { post(&c, url, json!({})).await });
+    match host.next().await {
+        CollectorFrame::ResumeSession { config, .. } => {
+            assert_eq!(config.mode.as_deref(), Some("default"));
+            assert!(config.axes.is_empty(), "{config:?}");
+        }
+        other => panic!("expected resume_session, got {other:?}"),
+    }
+}

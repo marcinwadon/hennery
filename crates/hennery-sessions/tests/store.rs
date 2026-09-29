@@ -374,6 +374,10 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
              ALTER TABLE sessions DROP COLUMN close_requested;
              ALTER TABLE events DROP COLUMN applied;
              ALTER TABLE sessions DROP COLUMN presumed_parked;
+             ALTER TABLE sessions DROP COLUMN model;
+             ALTER TABLE sessions DROP COLUMN mode;
+             ALTER TABLE sessions DROP COLUMN config_axes;
+             DROP TABLE session_catalog;
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -381,6 +385,7 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
     let store = Store::open(&db).unwrap();
     assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("started"));
     assert!(!store.session("s1").unwrap().unwrap().close_requested);
+    assert!(store.session("s1").unwrap().unwrap().config.is_empty());
     // Rows written before migration 3 count as applied.
     assert_eq!(
         kinds(&store.events("s1", 0, 100).unwrap()),
@@ -1142,4 +1147,140 @@ fn an_old_actors_detach_after_a_resume_began_changes_nothing() {
         .ingest("s1", 5, &SessionBody::session_started("r9", "a1"))
         .unwrap();
     assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "active");
+}
+
+// Plan B2b: the catalogue and the stored config (ACP core §3.2, §8).
+
+use hennery_proto::frames::{ConfigValue, SessionConfig};
+
+/// Catalogue extracts reporting `model` and `mode`, with one other axis.
+fn catalogue(model: &str, mode: &str) -> Indexed {
+    Indexed {
+        config_options: Some(vec![
+            json!({"id": "model", "currentValue": model}),
+            json!({"id": "mode"}),
+        ]),
+        current_model: Some(model.into()),
+        current_mode: Some(mode.into()),
+        current_axes: Some([("fast".to_string(), ConfigValue::Bool(true))].into_iter().collect()),
+        ..Indexed::default()
+    }
+}
+
+fn config(model: &str, mode: &str) -> SessionConfig {
+    SessionConfig {
+        model: Some(model.into()),
+        mode: Some(mode.into()),
+        axes: [("fast".to_string(), ConfigValue::Bool(true))].into_iter().collect(),
+    }
+}
+
+fn started_with(store: &Store, indexed: Indexed) {
+    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store
+        .ingest(
+            "s1",
+            1,
+            &SessionBody::SessionStarted {
+                request_id: "r0".into(),
+                agent_session_id: "a1".into(),
+                indexed,
+            },
+        )
+        .unwrap();
+}
+
+fn applied(indexed: Indexed) -> SessionBody {
+    SessionBody::ConfigApplied {
+        request_id: "rc".into(),
+        indexed,
+    }
+}
+
+fn stored(store: &Store) -> SessionConfig {
+    store.session("s1").unwrap().unwrap().config
+}
+
+#[test]
+fn session_started_stores_the_announced_catalogue_and_its_current_values() {
+    let store = Store::open_in_memory().unwrap();
+    started_with(&store, catalogue("large", "plan"));
+    assert_eq!(stored(&store), config("large", "plan"));
+    let catalog = store.catalog("s1").unwrap().unwrap();
+    assert_eq!(catalog.config_options.len(), 2);
+    assert_eq!(catalog.current, config("large", "plan"));
+    assert_eq!(store.catalog("nope").unwrap(), None);
+}
+
+#[test]
+fn a_session_whose_host_reported_no_catalogue_has_an_empty_one() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    let catalog = store.catalog("s1").unwrap().unwrap();
+    assert!(
+        catalog.config_options.is_empty() && catalog.current.is_empty(),
+        "{catalog:?}"
+    );
+}
+
+#[test]
+fn a_config_applied_or_a_live_update_replaces_the_catalogue() {
+    let store = Store::open_in_memory().unwrap();
+    started_with(&store, catalogue("small", "default"));
+    let events = store.ingest("s1", 2, &applied(catalogue("large", "default"))).unwrap();
+    assert_eq!(kinds(&events), ["config_applied"]);
+    assert_eq!(stored(&store), config("large", "default"));
+    let live = SessionBody::AcpUpdate {
+        indexed: catalogue("large", "bypass"),
+        payload: json!({"update": {"sessionUpdate": "config_option_update"}}),
+    };
+    store.ingest("s1", 3, &live).unwrap();
+    assert_eq!(stored(&store), config("large", "bypass"));
+    // An update with no catalogue changes nothing.
+    store.ingest("s1", 4, &update(1)).unwrap();
+    assert_eq!(stored(&store), config("large", "bypass"));
+}
+
+/// An adapter's unparseable or empty answer is no read-back: the stored
+/// model and mode must survive it, or the next resume would re-apply
+/// nothing (P-13 through another door).
+#[test]
+fn an_empty_or_absent_read_back_keeps_the_stored_catalogue() {
+    let store = Store::open_in_memory().unwrap();
+    started_with(&store, catalogue("large", "plan"));
+    let empty = Indexed {
+        config_options: Some(vec![]),
+        ..Indexed::default()
+    };
+    let events = store.ingest("s1", 2, &applied(empty)).unwrap();
+    assert_eq!(
+        kinds(&events),
+        ["config_applied"],
+        "still listed: the switch was accepted"
+    );
+    store.ingest("s1", 3, &applied(Indexed::default())).unwrap();
+    assert_eq!(stored(&store), config("large", "plan"));
+    assert_eq!(store.catalog("s1").unwrap().unwrap().config_options.len(), 2);
+}
+
+#[test]
+fn a_late_config_applied_for_a_detached_session_is_not_applied() {
+    let store = Store::open_in_memory().unwrap();
+    started_with(&store, catalogue("small", "default"));
+    parked(&store, 2);
+    let events = store.ingest("s1", 3, &applied(catalogue("large", "plan"))).unwrap();
+    assert!(events.is_empty(), "{events:?}");
+    assert_eq!(stored(&store), config("small", "default"));
+    assert!(!kinds(&store.events("s1", 0, 100).unwrap()).contains(&"config_applied"));
+}
+
+#[test]
+fn a_resume_hands_back_the_config_to_re_apply() {
+    let store = Store::open_in_memory().unwrap();
+    started_with(&store, catalogue("large", "plan"));
+    parked(&store, 2);
+    let ResumeRequest::Starting { config: wanted, .. } = store.request_resume("s1").unwrap() else {
+        panic!("not resumable");
+    };
+    assert_eq!(wanted, config("large", "plan"));
 }
