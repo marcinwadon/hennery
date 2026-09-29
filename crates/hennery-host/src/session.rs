@@ -48,6 +48,12 @@ const EXIT_SETTLE: Duration = Duration::from_millis(500);
 /// notification stream has been quiet this long.
 const DRAIN_QUIET: Duration = Duration::from_millis(100);
 
+/// At most this many adapter updates are emitted in a row before the actor's
+/// other arms (commands, the prompt's reply, the cancel grace) get a turn:
+/// an adapter streaming faster than the outbox writes must not delay a
+/// cancel until its turn is over.
+const UPDATE_BURST: usize = 64;
+
 /// Default idle window before the reaper parks a session (ACP core §4.7).
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -680,12 +686,16 @@ impl Actor {
         // dropped (ACP core §4.5), then the one about switches that did not
         // take.
         let mut early = replay.kept.clone();
-        while let Ok(inbound) = updates.try_recv() {
+        // Only what is queued now: a flooding adapter must not hold up the
+        // start.
+        for _ in 0..updates.len() {
             // A `SwitchAnswer` here is impossible: `send_next_switch` is
             // only ever called from the main loop below, which has not
             // started yet.
-            if let Inbound::Update(payload) = inbound {
-                early.push(payload);
+            match updates.try_recv() {
+                Ok(Inbound::Update(payload)) => early.push(payload),
+                Ok(Inbound::SwitchAnswer { .. }) => {}
+                Err(_) => break,
             }
         }
         for payload in early {
@@ -722,20 +732,24 @@ impl Actor {
             orphan: None,
             next_token: 0,
         };
+        // Updates emitted in a row since another arm last had a turn.
+        let mut burst = 0;
         loop {
             let cancel_at = turn.as_ref().and_then(|t| t.cancel_deadline);
             let out_at = configs.out.as_ref().map(|out| out.deadline);
             let orphan_at = configs.orphan.as_ref().map(|orphan| orphan.drop_after);
             tokio::select! {
                 // Biased: adapter output already received is emitted before
-                // the prompt reply it preceded on the wire.
+                // the prompt reply it preceded on the wire (every arm that
+                // acts on the adapter drains what is queued first).
                 biased;
-                Some(inbound) = updates.recv() => {
+                Some(inbound) = updates.recv(), if burst < UPDATE_BURST => {
                     // Live updates and switch answers arrive on the same,
                     // wire-ordered channel (fix round 2, F2): handling
                     // exactly one item per poll, in receipt order, is
                     // correct for every interleaving — no peeking or
                     // reordering needed.
+                    burst += 1;
                     let is_answer = matches!(inbound, Inbound::SwitchAnswer { .. });
                     if self.handle_inbound(inbound, turn.as_ref().map(|t| t.id.as_str()), &mut configs) {
                         idle_since = Instant::now();
@@ -769,6 +783,8 @@ impl Actor {
                             self.reject(request_id, "turn_in_progress", "a turn is already running".into());
                             continue;
                         }
+                        // Updates from before this turn are not part of it.
+                        self.drain_updates(&mut updates, None, &mut configs);
                         seen_turns.insert(turn_id.clone());
                         self.set_open_turn(Some(turn_id.clone()));
                         self.emit(SessionBody::TurnStarted { request_id, turn_id: turn_id.clone() });
@@ -881,6 +897,8 @@ impl Actor {
                     self.teardown(&mut adapter, &mut updates, None, &mut configs).await;
                     return self.emit(SessionBody::SessionParked { reason: ParkReason::Idle });
                 }
+                // A burst is over and nothing else was ready: back to the updates.
+                _ = std::future::ready(()), if burst >= UPDATE_BURST => burst = 0,
             }
         }
     }
@@ -1124,8 +1142,13 @@ impl Actor {
         configs: &mut PendingConfigs,
     ) -> bool {
         let mut orphan_cleared = false;
-        while let Ok(inbound) = updates.try_recv() {
-            orphan_cleared |= self.handle_inbound(inbound, turn, configs);
+        // Only what is queued now: an adapter that keeps streaming cannot
+        // hold the actor here.
+        for _ in 0..updates.len() {
+            match updates.try_recv() {
+                Ok(inbound) => orphan_cleared |= self.handle_inbound(inbound, turn, configs),
+                Err(_) => break,
+            }
         }
         orphan_cleared
     }

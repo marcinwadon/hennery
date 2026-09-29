@@ -110,6 +110,10 @@ pub struct FakeScript {
     /// (fix round 2, F2, case A: N0 predates R) never wins over it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub announce_before_switch: bool,
+    /// Stream `chunks` over and over, back to back and without sleeping,
+    /// until the prompt is cancelled (an adapter flooding the host).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub flood: bool,
 }
 
 impl Default for FakeScript {
@@ -138,6 +142,7 @@ impl Default for FakeScript {
             model_switch_drops_option: None,
             announce_after_switch: false,
             announce_before_switch: false,
+            flood: false,
         }
     }
 }

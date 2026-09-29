@@ -520,3 +520,10 @@ fn a_hung_config_switch_never_answers_while_other_traffic_is_served() {
     // `child` drops here: SIGKILLs the group and reaps it (the hung switch's
     // task included), on this path and on any assertion failure above.
 }
+
+#[test]
+fn flood_streams_until_the_prompt_is_cancelled() {
+    let out = exchange_until(r#"{"chunks":["x"],"flood":true}"#, &cancelled_prompt_requests(), 3);
+    // It stops for the cancel, however many chunks it got out first.
+    assert_eq!(out.last().unwrap()["result"]["stopReason"], "cancelled", "{out:?}");
+}

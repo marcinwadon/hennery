@@ -2312,3 +2312,44 @@ async fn an_actor_ending_by_itself_marks_its_handle_ending_while_it_kills_the_ad
     wait_until(&uplink, has("session_parked:operator")).await;
     wait_ended(&stopped).await;
 }
+
+/// An adapter streaming faster than the outbox can write keeps the actor's
+/// update arm always ready. Without a cap on updates in a row, the Cancel
+/// behind them is never read, and the turn only ends when the agent does.
+/// The outbox is on disk, as on a real host, so the actor is the slow side.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_flooding_adapter_cannot_hold_off_a_cancel() {
+    let dir = tempfile::tempdir().unwrap();
+    let (uplink, _replies) = Uplink::new(Outbox::open(&dir.path().join("outbox.db")).unwrap());
+    let script = FakeScript {
+        chunks: vec!["flood".into()],
+        flood: true,
+        ..FakeScript::default()
+    };
+    let handle = session::start(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        fake_with(&script),
+        std::env::temp_dir(),
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while handle.open_turn_id().is_none() {
+        assert!(tokio::time::Instant::now() < deadline, "the turn never started");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(handle.send(cancel("rc", "t1")));
+    // Polled on the handle: reading a flooded outbox every few ms would
+    // itself slow the actor down.
+    while handle.open_turn_id().is_some() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cancel was never read: the flood held it off"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let ends = turn_ends(&uplink.pending().unwrap());
+    assert_eq!(ends, [("t1".to_string(), TurnOutcome::Cancelled, None)]);
+}

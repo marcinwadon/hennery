@@ -276,6 +276,22 @@ async fn main() -> agent_client_protocol::Result<()> {
                         ))?;
                     }
                     cx.spawn(async move {
+                        if script.flood {
+                            // Back to back until cancelled, yielding (never
+                            // sleeping) so the cancel can land.
+                            for chunk in script.chunks.iter().cycle() {
+                                if *cancelled.borrow() {
+                                    return responder.respond(PromptResponse::new(StopReason::Cancelled));
+                                }
+                                cx2.send_notification(SessionNotification::new(
+                                    req.session_id.clone(),
+                                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                                        TextContent::new(chunk.clone()),
+                                    ))),
+                                ))?;
+                                tokio::task::yield_now().await;
+                            }
+                        }
                         for (sent, chunk) in script.chunks.into_iter().enumerate() {
                             if script.exit_after_chunks == Some(sent) {
                                 crash().await;
