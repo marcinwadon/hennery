@@ -91,3 +91,11 @@ pub struct SessionDetail {
     #[ts(type = "OpenTurn | undefined", optional)]
     pub open_turn: Option<OpenTurn>,
 }
+
+/// `POST /api/sessions/{id}/cancel`: how the open turn ended. `cancelled`,
+/// unless it finished (or failed) before the cancel reached the agent.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct CancelResponse {
+    pub turn_id: String,
+    pub outcome: crate::frames::TurnOutcome,
+}

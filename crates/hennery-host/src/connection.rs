@@ -10,7 +10,7 @@ use crate::uplink::Uplink;
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
 use hennery_proto::PROTOCOL_VERSION;
-use hennery_proto::frames::{AttachedSession, CollectorFrame, HostFrame};
+use hennery_proto::frames::{AttachedSession, Capabilities, Capability, CollectorFrame, HostFrame};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -147,6 +147,9 @@ async fn connect_once(
             host_version: env!("CARGO_PKG_VERSION").into(),
             host_id: cfg.host_id.clone(),
             token: cfg.token.clone(),
+            // Every hennery host can park. `projects` and `images` come
+            // with the probes and with image prompts.
+            capabilities: Capabilities(vec![Capability::Park]),
             attached_sessions: attached,
         },
     )
@@ -418,6 +421,13 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
                 }) => {}
             _ => not_attached(uplink, request_id),
         },
+        // Wired to the session actor with cancel; until then it is refused,
+        // so the collector's waiter returns at once.
+        CollectorFrame::CancelTurn { request_id, .. } => uplink.reply(HostFrame::Error {
+            request_id,
+            code: "unsupported".into(),
+            message: "this host cannot cancel turns yet".into(),
+        }),
         CollectorFrame::Ack { session_id, ack_seq } => uplink.ack(&session_id, ack_seq)?,
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }

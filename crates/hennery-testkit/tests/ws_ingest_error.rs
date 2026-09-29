@@ -57,6 +57,7 @@ async fn a_failed_ingest_drops_the_connection_instead_of_acking_past_it() {
             host_version: "0".into(),
             host_id: "host-1".into(),
             token: TOKEN.into(),
+            capabilities: Default::default(),
             attached_sessions: vec![],
         })
         .unwrap(),

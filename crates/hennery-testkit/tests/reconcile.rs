@@ -5,7 +5,7 @@
 use futures::{SinkExt, StreamExt};
 use hennery_kernel::auth::DevToken;
 use hennery_proto::PROTOCOL_VERSION;
-use hennery_proto::frames::{AttachedSession, CollectorFrame, HostFrame, SessionBody};
+use hennery_proto::frames::{AttachedSession, Capabilities, Capability, CollectorFrame, HostFrame, SessionBody};
 use hennery_proto::rest::EventDto;
 use hennery_sessions::{AppState, store::Store};
 use serde_json::{Value, json};
@@ -79,6 +79,7 @@ impl ScriptedHost {
             host_version: "test".into(),
             host_id: HOST.into(),
             token: TOKEN.into(),
+            capabilities: Capabilities(vec![Capability::Park]),
             attached_sessions: attached,
         })
         .await;

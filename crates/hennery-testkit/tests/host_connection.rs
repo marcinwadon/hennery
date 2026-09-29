@@ -742,3 +742,24 @@ async fn a_resume_queued_behind_a_close_attaches_a_fresh_adapter_after_the_close
     assert_eq!(started(frames.last().unwrap()).1, "r3");
     assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 2);
 }
+
+// Plan B2a: cancel and capabilities over the connection.
+
+#[tokio::test]
+async fn a_host_announces_that_it_can_park() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(host_with_fake(addr, "capabilities", slow_fake())));
+    let (tcp, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("host connects")
+        .unwrap();
+    let (_sink, mut stream) = tokio_tungstenite::accept_async(tcp).await.unwrap().split();
+    let HostFrame::Hello { capabilities, .. } = read_host_frame(&mut stream).await else {
+        panic!("expected hello");
+    };
+    assert_eq!(
+        capabilities,
+        hennery_proto::frames::Capabilities(vec![hennery_proto::frames::Capability::Park])
+    );
+}

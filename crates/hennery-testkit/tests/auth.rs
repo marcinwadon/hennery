@@ -102,6 +102,7 @@ async fn a_host_hello_with_the_wrong_token_is_rejected_without_registering() {
             host_version: "0".into(),
             host_id: "host-1".into(),
             token: "not-the-token".into(),
+            capabilities: Default::default(),
             attached_sessions: vec![],
         })
         .unwrap(),
