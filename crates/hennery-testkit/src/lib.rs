@@ -36,6 +36,14 @@ pub struct FakeScript {
     /// Advertise `loadSession: false` in `initialize`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_load_session: bool,
+    /// Receive `session/cancel` but keep streaming the prompt as if it
+    /// never came (an adapter that does not honour cancellation).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ignore_cancel: bool,
+    /// Answer a cancelled prompt with this JSON-RPC error code instead of
+    /// the `cancelled` stop reason (an agent whose aborted work throws).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_error: Option<i32>,
 }
 
 impl Default for FakeScript {
@@ -50,6 +58,8 @@ impl Default for FakeScript {
             load_error: None,
             new_session_error: None,
             no_load_session: false,
+            ignore_cancel: false,
+            cancel_error: None,
         }
     }
 }
