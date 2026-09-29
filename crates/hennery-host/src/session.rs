@@ -15,12 +15,13 @@ use agent_client_protocol::schema::v1::{
     BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
     InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse, SessionConfigKind,
     SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigOptionsCapabilities,
-    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
+    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    StopReason,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, ErrorCode, UntypedMessage};
 use hennery_proto::frames::{ConfigValue, HostFrame, Indexed, ParkReason, SessionBody, SessionConfig, TurnOutcome};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -102,6 +103,13 @@ pub enum SessionCmd {
     /// Operator cancel of the turn in flight: `session/cancel` to the
     /// adapter; the turn's `turn_ended` completes it (ACP core §4.4).
     Cancel { request_id: String, turn_id: String },
+    /// Switch one config option (`session/set_config_option`): answered by
+    /// `config_applied`, or an error (ACP core §3.3).
+    SetConfig {
+        request_id: String,
+        config_id: String,
+        value: ConfigValue,
+    },
 }
 
 /// How the actor creates its adapter session.
@@ -289,6 +297,54 @@ pub fn launch(uplink: Uplink, launch: Launch, options: SessionOptions) -> Sessio
 
 type Reply = Pin<Box<dyn Future<Output = agent_client_protocol::Result<PromptResponse>> + Send>>;
 
+type ConfigReply = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    agent_client_protocol::Result<SetSessionConfigOptionResponse>,
+                    tokio::time::error::Elapsed,
+                >,
+            > + Send,
+    >,
+>;
+
+/// A `set_config` received and not sent yet.
+struct QueuedSwitch {
+    request_id: String,
+    config_id: String,
+    value: ConfigValue,
+    /// Receipt plus `config_timeout`: past it, the switch is answered
+    /// `config_failed`, sent or not.
+    deadline: Instant,
+}
+
+/// The actor's `set_config` switches. At most one is out at a time: the
+/// real adapters handle requests concurrently, so two switches in flight
+/// could land in either order (a model switch clamping a mode set after
+/// it). The rest wait, in the order they came. Those still waiting or out
+/// when the actor ends are answered `not_attached` then, after its last
+/// fact: the collector would otherwise wait out its timeout and drop the
+/// whole host connection.
+struct PendingConfigs {
+    uplink: Uplink,
+    queued: VecDeque<QueuedSwitch>,
+    out: Option<(String, ConfigReply)>,
+}
+
+impl Drop for PendingConfigs {
+    fn drop(&mut self) {
+        let out = self.out.take().map(|(request_id, _)| request_id);
+        let queued = self.queued.drain(..).map(|q| q.request_id);
+        for request_id in out.into_iter().chain(queued) {
+            self.uplink.reply(HostFrame::Error {
+                request_id,
+                code: "not_attached".into(),
+                message: "the session has ended on this host".into(),
+            });
+        }
+    }
+}
+
 struct Turn {
     id: String,
     reply: Reply,
@@ -444,7 +500,8 @@ impl Actor {
                 | SessionCmd::Restart { request_id }
                 | SessionCmd::Park { request_id }
                 | SessionCmd::Close { request_id }
-                | SessionCmd::Cancel { request_id, .. } => {
+                | SessionCmd::Cancel { request_id, .. }
+                | SessionCmd::SetConfig { request_id, .. } => {
                     // Also covers a start that reached this actor while it was
                     // tearing down (park/close/reap/adapter exit): the
                     // connection routed it to `Restart` because the handle
@@ -554,10 +611,17 @@ impl Actor {
             agent_session_id: agent_session.to_string(),
             indexed: self.catalogue_extracts(),
         });
-        // A load's state updates follow the start they belong to; then the
-        // note about what the load dropped (ACP core §4.5), then the one
-        // about switches that did not take.
-        for payload in replay.kept.iter().cloned() {
+        // A load's state updates follow the start they belong to, and so do
+        // updates the adapter sent while the start's switches ran. They are
+        // older than the catalogue just announced, so they carry no
+        // catalogue extracts (P-13). Then the note about what the load
+        // dropped (ACP core §4.5), then the one about switches that did not
+        // take.
+        let mut early = replay.kept.clone();
+        while let Ok(payload) = updates.try_recv() {
+            early.push(payload);
+        }
+        for payload in early {
             self.emit(update(payload, None));
         }
         if let Some(note) = replay.note() {
@@ -584,13 +648,20 @@ impl Actor {
         // turn ends; it never runs while a turn (or a pending question
         // inside one) is in flight.
         let mut idle_since = Instant::now();
+        let mut configs = PendingConfigs {
+            uplink: self.uplink.clone(),
+            queued: VecDeque::new(),
+            out: None,
+        };
         loop {
             let cancel_at = turn.as_ref().and_then(|t| t.cancel_deadline);
             tokio::select! {
                 // Biased: adapter output already received is emitted before
                 // the prompt reply it preceded on the wire.
                 biased;
-                Some(payload) = updates.recv() => self.emit(update(payload, turn.as_ref().map(|t| t.id.as_str()))),
+                Some(payload) = updates.recv() => {
+                    self.emit(self.live_update(payload, turn.as_ref().map(|t| t.id.as_str())));
+                }
                 info = adapter.exited() => {
                     return self.adapter_exited(info, &mut adapter, &mut updates, turn.take()).await;
                 }
@@ -642,6 +713,15 @@ impl Actor {
                         agent_session_id: agent_session.to_string(),
                         indexed: self.catalogue_extracts(),
                     }),
+                    // A switch may run during a turn; it is answered in order.
+                    Some(SessionCmd::SetConfig { request_id, config_id, value }) => match self.check_switch(&config_id, &value) {
+                        Err((code, message)) => self.reject(request_id, code, message),
+                        Ok(()) => {
+                            let deadline = Instant::now() + self.options.config_timeout;
+                            configs.queued.push_back(QueuedSwitch { request_id, config_id, value, deadline });
+                            self.send_next_switch(&conn, &agent_session, &mut configs);
+                        }
+                    },
                     Some(SessionCmd::Park { .. }) => {
                         self.teardown(&mut adapter, &mut updates, turn.take()).await;
                         return self.emit(SessionBody::SessionParked { reason: ParkReason::Operator });
@@ -685,6 +765,13 @@ impl Actor {
                         }
                     }
                 }
+                result = next_config(&mut configs) => {
+                    let (request_id, _) = configs.out.take().expect("an answer implies a switch");
+                    // Updates the adapter sent before its answer come first.
+                    self.drain_updates(&mut updates, turn.as_ref().map(|t| t.id.as_str()));
+                    self.config_answered(request_id, result);
+                    self.send_next_switch(&conn, &agent_session, &mut configs);
+                }
                 _ = cancel_deadline(cancel_at) => {
                     let unanswered = turn.take().expect("a deadline implies a turn");
                     return self.stop_after_unanswered_cancel(&mut adapter, &mut updates, unanswered).await;
@@ -704,6 +791,92 @@ impl Actor {
             code: code.into(),
             message,
         });
+    }
+
+    /// Refuse a `set_config` the adapter could not take: an option it does
+    /// not offer (`unknown_option`), or a value of the wrong kind for it
+    /// (`invalid`). Whether a select offers the value is the adapter's call.
+    fn check_switch(&self, config_id: &str, value: &ConfigValue) -> Result<(), (&'static str, String)> {
+        let catalogue = self.catalogue.lock().expect("catalogue lock");
+        let Some(option) = catalogue.options.iter().find(|o| &*o.id.0 == config_id) else {
+            return Err(("unknown_option", format!("the adapter offers no option {config_id}")));
+        };
+        match (&option.kind, value) {
+            (SessionConfigKind::Select(_), ConfigValue::Id(_))
+            | (SessionConfigKind::Boolean(_), ConfigValue::Bool(_)) => Ok(()),
+            _ => Err(("invalid", format!("{config_id} takes a different kind of value"))),
+        }
+    }
+
+    /// Answer a `set_config` from the adapter's answer: `config_applied`
+    /// with the catalogue it answered with (none if it answered without
+    /// one), or `config_failed`.
+    /// Send the oldest waiting switch, unless one is out. A switch whose
+    /// deadline passed while it waited is answered `config_failed`.
+    fn send_next_switch(&self, conn: &ConnectionTo<Agent>, session: &SessionId, configs: &mut PendingConfigs) {
+        while configs.out.is_none()
+            && let Some(next) = configs.queued.pop_front()
+        {
+            if Instant::now() >= next.deadline {
+                let message = "an earlier switch is still out".to_string();
+                self.reject(next.request_id, "config_failed", message);
+                continue;
+            }
+            let request = SetSessionConfigOptionRequest::new(session.clone(), next.config_id, acp_value(&next.value));
+            let reply = tokio::time::timeout_at(next.deadline, conn.send_request(request).block_task());
+            configs.out = Some((next.request_id, Box::pin(reply)));
+        }
+    }
+
+    fn config_answered(
+        &self,
+        request_id: String,
+        result: Result<agent_client_protocol::Result<SetSessionConfigOptionResponse>, tokio::time::error::Elapsed>,
+    ) {
+        match result {
+            Ok(Ok(response)) => {
+                {
+                    let mut catalogue = self.catalogue.lock().expect("catalogue lock");
+                    if response.config_options.is_empty() {
+                        catalogue.current = false;
+                    } else {
+                        *catalogue = Catalogue {
+                            options: response.config_options,
+                            current: true,
+                        };
+                    }
+                }
+                self.emit(SessionBody::ConfigApplied {
+                    request_id,
+                    indexed: self.catalogue_extracts(),
+                });
+            }
+            Ok(Err(err)) => self.reject(request_id, "config_failed", err.to_string()),
+            Err(_) => {
+                self.catalogue.lock().expect("catalogue lock").current = false;
+                let timeout = self.options.config_timeout;
+                let message = format!("no answer within {timeout:?} of the request");
+                self.reject(request_id, "config_failed", message);
+            }
+        }
+    }
+
+    /// A live adapter notification as a session frame. A
+    /// `config_option_update` (the agent changed its own config, e.g. left
+    /// plan mode) replaces the catalogue and carries its extracts.
+    fn live_update(&self, payload: Value, turn: Option<&str>) -> SessionBody {
+        let mut body = update(payload, turn);
+        if let SessionBody::AcpUpdate { indexed, payload } = &mut body
+            && let Some(options) = config_update(payload)
+        {
+            *self.catalogue.lock().expect("catalogue lock") = Catalogue { options, current: true };
+            let catalogue = self.catalogue_extracts();
+            indexed.config_options = catalogue.config_options;
+            indexed.current_model = catalogue.current_model;
+            indexed.current_mode = catalogue.current_mode;
+            indexed.current_axes = catalogue.current_axes;
+        }
+        body
     }
 
     fn end_turn(&self, turn_id: String, outcome: TurnOutcome, stop_reason: Option<String>, error: Option<String>) {
@@ -728,7 +901,7 @@ impl Actor {
     /// ordering gap.
     fn drain_updates(&self, updates: &mut mpsc::UnboundedReceiver<Value>, turn: Option<&str>) {
         while let Ok(payload) = updates.try_recv() {
-            self.emit(update(payload, turn));
+            self.emit(self.live_update(payload, turn));
         }
     }
 
@@ -789,7 +962,7 @@ impl Actor {
         tracing::warn!(session_id = %self.session_id, exit = %describe(info), "adapter exited");
         // Output the adapter wrote before dying is still in the pipe.
         while let Ok(Some(payload)) = tokio::time::timeout(DRAIN_QUIET, updates.recv()).await {
-            self.emit(update(payload, turn.as_ref().map(|t| t.id.as_str())));
+            self.emit(self.live_update(payload, turn.as_ref().map(|t| t.id.as_str())));
         }
         if let Some(turn) = turn {
             self.end_turn(
@@ -825,6 +998,16 @@ async fn idle_deadline(window: Option<Duration>, since: Instant) {
 async fn cancel_deadline(deadline: Option<Instant>) {
     match deadline {
         Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The answer to the `set_config` that is out, or never if none is.
+async fn next_config(
+    configs: &mut PendingConfigs,
+) -> Result<agent_client_protocol::Result<SetSessionConfigOptionResponse>, tokio::time::error::Elapsed> {
+    match configs.out.as_mut() {
+        Some((_, reply)) => reply.await,
         None => std::future::pending().await,
     }
 }

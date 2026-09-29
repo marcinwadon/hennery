@@ -914,3 +914,39 @@ async fn start_and_resume_carry_their_config_to_the_adapter() {
     let resumed = read_until(&mut stream, body_is("s2", "session_started")).await;
     assert_eq!(current_mode(&resumed).as_deref(), Some("bypass"));
 }
+
+#[tokio::test]
+async fn set_config_reaches_the_actor_and_one_for_a_detached_session_is_not_attached() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(host_with_fake(addr, "set-config", configurable_fake())));
+
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    send_frame(&mut sink, &start("r1", "s1")).await;
+    read_until(&mut stream, body_is("s1", "session_started")).await;
+    let set = |request_id: &str, session_id: &str| CollectorFrame::SetConfig {
+        request_id: request_id.into(),
+        session_id: session_id.into(),
+        config_id: "mode".into(),
+        value: hennery_proto::frames::ConfigValue::Id("plan".into()),
+    };
+    send_frame(&mut sink, &set("r2", "s1")).await;
+    let applied = read_until(&mut stream, body_is("s1", "config_applied")).await;
+    let HostFrame::Session {
+        body: hennery_proto::frames::SessionBody::ConfigApplied { request_id, indexed },
+        ..
+    } = applied
+    else {
+        panic!("expected config_applied, got {applied:?}");
+    };
+    assert_eq!(
+        (request_id.as_str(), indexed.current_mode.as_deref()),
+        ("r2", Some("plan"))
+    );
+    send_frame(&mut sink, &set("r3", "no-such-session")).await;
+    let refused = read_until(&mut stream, error_for("r3")).await;
+    assert!(
+        matches!(&refused, HostFrame::Error { code, .. } if code == "not_attached"),
+        "{refused:?}"
+    );
+}

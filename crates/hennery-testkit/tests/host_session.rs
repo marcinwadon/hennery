@@ -1613,3 +1613,282 @@ async fn a_seeded_catalogue_does_not_skip_a_switch_that_already_matches_it() {
     assert_eq!(switches(&log), "mode=default\n");
     assert_eq!(started_extracts(&frames).current_mode.as_deref(), Some("default"));
 }
+
+fn set_config(request_id: &str, config_id: &str, value: ConfigValue) -> SessionCmd {
+    SessionCmd::SetConfig {
+        request_id: request_id.into(),
+        config_id: config_id.into(),
+        value,
+    }
+}
+
+/// The catalogue extracts of every `config_applied`, with its request id.
+fn applied(frames: &[HostFrame]) -> Vec<(String, Indexed)> {
+    frames
+        .iter()
+        .filter_map(|f| match f {
+            HostFrame::Session {
+                body: SessionBody::ConfigApplied { request_id, indexed },
+                ..
+            } => Some((request_id.clone(), indexed.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+async fn refusal(replies: &mut tokio::sync::mpsc::UnboundedReceiver<HostFrame>) -> (String, String) {
+    match tokio::time::timeout(Duration::from_secs(10), replies.recv())
+        .await
+        .expect("a reply, not silence")
+        .unwrap()
+    {
+        HostFrame::Error { request_id, code, .. } => (request_id, code),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn set_config_switches_during_a_turn_and_answers_with_the_adapters_read_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        chunks: (1..=5).map(|n| n.to_string()).collect(),
+        chunk_delay_ms: 100,
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        wanted(None, Some("plan"), &[]),
+        SessionOptions::default(),
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    wait_until(&uplink, has("turn_started")).await;
+    // The model switch clamps the mode: the read-back says so.
+    assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
+    let frames = wait_until(&uplink, has("config_applied")).await;
+    let kinds = kinds(&frames);
+    let at = kinds.iter().position(|k| k == "config_applied").unwrap();
+    assert!(
+        at < kinds.iter().position(|k| k == "turn_ended").unwrap_or(usize::MAX),
+        "the switch waited for the turn: {kinds:?}"
+    );
+    let (request, indexed) = applied(&frames).remove(0);
+    let current = indexed.current_config().unwrap();
+    assert_eq!(
+        (request.as_str(), current.model.as_deref(), current.mode.as_deref()),
+        ("rc1", Some("large"), Some("default"))
+    );
+    // A value the adapter refuses, an option it does not have, a value of
+    // the wrong kind: each is answered, and only the first reaches it.
+    assert!(handle.send(set_config("rc2", "model", ConfigValue::Id("huge".into()))));
+    assert_eq!(
+        refusal(&mut replies).await,
+        ("rc2".to_string(), "config_failed".to_string())
+    );
+    assert!(handle.send(set_config("rc3", "nope", ConfigValue::Id("x".into()))));
+    assert_eq!(
+        refusal(&mut replies).await,
+        ("rc3".to_string(), "unknown_option".to_string())
+    );
+    assert!(handle.send(set_config("rc4", "fast", ConfigValue::Id("x".into()))));
+    assert_eq!(refusal(&mut replies).await, ("rc4".to_string(), "invalid".to_string()));
+    assert_eq!(switches(&log), "mode=plan\nmodel=large\nmodel=huge\n");
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    assert_eq!(applied(&frames).len(), 1);
+}
+
+/// P-13 at the source: a `config_option_update` replayed by `session/load`
+/// predates the switches, so it must not carry a catalogue that could
+/// overwrite the announced one. One the agent sends live (it left plan mode
+/// on its own) must: that is how its new mode gets stored.
+#[tokio::test]
+async fn only_a_live_config_option_update_carries_the_catalogue() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let mut stale = hennery_testkit::sample_config_options();
+    stale[0]["currentValue"] = json!("large");
+    let script = FakeScript {
+        replay: vec![json!({"sessionUpdate": "config_option_update", "configOptions": stale})],
+        prompt_sets_mode: Some("bypass".into()),
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::Load {
+            agent_session_id: "agent-7".into(),
+        },
+        wanted(None, Some("plan"), &[]),
+        SessionOptions::default(),
+    );
+    let frames = wait_until(&uplink, has("session_started")).await;
+    assert_eq!(kinds(&frames), ["session_started", "update:?"]);
+    assert_eq!(started_extracts(&frames).current_mode.as_deref(), Some("plan"));
+    let replayed = match &frames[1] {
+        HostFrame::Session {
+            body: SessionBody::AcpUpdate { indexed, .. },
+            ..
+        } => indexed.clone(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(replayed, Indexed::default(), "a replayed update carried a catalogue");
+
+    assert!(handle.send(prompt("r1", "t1")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    let live: Vec<Indexed> = frames
+        .iter()
+        .skip(2)
+        .filter_map(|f| match f {
+            HostFrame::Session {
+                body: SessionBody::AcpUpdate { indexed, .. },
+                ..
+            } if indexed.config_options.is_some() => Some(indexed.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(live.len(), 1, "{:?}", kinds(&frames));
+    assert_eq!(live[0].current_mode.as_deref(), Some("bypass"));
+    assert_eq!(live[0].turn_id.as_deref(), Some("t1"));
+    // A repeated start announces what the agent last reported.
+    assert!(handle.send(SessionCmd::Restart {
+        request_id: "r9".into()
+    }));
+    let frames = wait_until(&uplink, |f| {
+        kinds(f).iter().filter(|k| *k == "session_started").count() == 2
+    })
+    .await;
+    let last = frames
+        .iter()
+        .rev()
+        .find_map(|f| match f {
+            HostFrame::Session {
+                body: SessionBody::SessionStarted { indexed, .. },
+                ..
+            } => Some(indexed.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(last.current_mode.as_deref(), Some("bypass"));
+}
+
+#[tokio::test]
+async fn a_switch_that_never_answers_is_config_failed_and_one_still_out_at_the_end_is_not_attached() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        hang_config: true,
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        SessionConfig::default(),
+        SessionOptions {
+            config_timeout: Duration::from_millis(300),
+            ..SessionOptions::default()
+        },
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
+    assert_eq!(
+        refusal(&mut replies).await,
+        ("rc1".to_string(), "config_failed".to_string())
+    );
+    // Parked while a switch is out: it is answered, after the park.
+    assert!(handle.send(set_config("rc2", "model", ConfigValue::Id("large".into()))));
+    assert!(handle.send(SessionCmd::Park {
+        request_id: "rp".into()
+    }));
+    assert_eq!(
+        refusal(&mut replies).await,
+        ("rc2".to_string(), "not_attached".to_string())
+    );
+    wait_until(&uplink, has("session_parked:operator")).await;
+    assert!(applied(&uplink.pending().unwrap()).is_empty());
+}
+
+/// The real adapters handle requests concurrently. If both of these went
+/// out at once, the slow model switch would answer last and then clamp the
+/// mode the second switch had just set, while hennery showed `plan`. One
+/// switch at a time keeps them in the order the operator made them.
+#[tokio::test]
+async fn set_config_sends_one_switch_at_a_time_so_a_late_clamp_cannot_undo_a_later_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        slow_model_switch_ms: Some(300),
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        SessionConfig::default(),
+        SessionOptions::default(),
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
+    assert!(handle.send(set_config("rc2", "mode", ConfigValue::Id("plan".into()))));
+    let frames = wait_until(&uplink, |f| applied(f).len() == 2).await;
+    let answers: Vec<String> = applied(&frames).into_iter().map(|(r, _)| r).collect();
+    assert_eq!(answers, ["rc1", "rc2"]);
+    // A third switch reads back the agent's real state.
+    assert!(handle.send(set_config("rc3", "effort", ConfigValue::Id("high".into()))));
+    let frames = wait_until(&uplink, |f| applied(f).len() == 3).await;
+    let (_, last) = applied(&frames).remove(2);
+    let current = last.current_config().unwrap();
+    assert_eq!(
+        (current.model.as_deref(), current.mode.as_deref()),
+        (Some("large"), Some("plan")),
+        "the late clamp undid the later switch"
+    );
+}
+
+/// A switch's deadline runs from when the host received it, not from when
+/// it could be sent: one waiting behind a hung switch does not get a fresh
+/// `config_timeout` of its own.
+#[tokio::test]
+async fn a_switch_waiting_behind_a_hung_one_is_answered_by_its_own_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        hang_config: true,
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        SessionConfig::default(),
+        SessionOptions {
+            config_timeout: Duration::from_millis(300),
+            ..SessionOptions::default()
+        },
+    );
+    wait_until(&uplink, has("session_started")).await;
+    let began = std::time::Instant::now();
+    assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
+    assert!(handle.send(set_config("rc2", "mode", ConfigValue::Id("plan".into()))));
+    assert_eq!(
+        refusal(&mut replies).await,
+        ("rc1".to_string(), "config_failed".to_string())
+    );
+    assert_eq!(
+        refusal(&mut replies).await,
+        ("rc2".to_string(), "config_failed".to_string())
+    );
+    assert!(
+        began.elapsed() < Duration::from_millis(550),
+        "the second switch got a timeout of its own: {:?}",
+        began.elapsed()
+    );
+}

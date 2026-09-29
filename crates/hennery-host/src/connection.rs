@@ -450,11 +450,20 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
                 }) => {}
             _ => not_attached(uplink, request_id),
         },
-        CollectorFrame::SetConfig { request_id, .. } => uplink.reply(HostFrame::Error {
+        CollectorFrame::SetConfig {
             request_id,
-            code: "invalid".into(),
-            message: "this host does not support set_config yet".into(),
-        }),
+            session_id,
+            config_id,
+            value,
+        } => match live_session(sessions, &session_id) {
+            Some(handle)
+                if handle.send(SessionCmd::SetConfig {
+                    request_id: request_id.clone(),
+                    config_id,
+                    value,
+                }) => {}
+            _ => not_attached(uplink, request_id),
+        },
         CollectorFrame::Ack { session_id, ack_seq } => uplink.ack(&session_id, ack_seq)?,
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }
