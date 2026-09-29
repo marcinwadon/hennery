@@ -191,9 +191,14 @@ async fn serve(socket: WebSocket, state: AppState) {
                             SessionBody::SessionParked { .. } | SessionBody::SessionClosed => {
                                 state.hub.resolve_session(&session_id, body.clone());
                             }
-                            // `cancel_turn` is completed by its turn's end.
+                            // `cancel_turn` is completed by its turn's end,
+                            // scoped to the session it belongs to (final
+                            // review M1): this host already owns
+                            // `session_id` (checked above), but that must
+                            // not let it complete another session's waiter
+                            // by naming that session's turn_id here.
                             SessionBody::TurnEnded { turn_id, .. } => {
-                                state.hub.resolve_turn(turn_id, body.clone());
+                                state.hub.resolve_turn(&session_id, turn_id, body.clone());
                             }
                             _ => {}
                         }

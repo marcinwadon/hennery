@@ -369,7 +369,7 @@ async fn cancel(State(state): State<AppState>, Path(id): Path<String>) -> Respon
     };
     match state
         .hub
-        .request_for_turn(&session.host_id, &request_id, &turn_id, frame, CANCEL_TIMEOUT)
+        .request_for_turn(&session.host_id, &request_id, &id, &turn_id, frame, CANCEL_TIMEOUT)
         .await
     {
         Ok(SessionBody::TurnEnded { turn_id, outcome, .. }) => {

@@ -98,20 +98,26 @@ fn ended(turn_id: &str, outcome: TurnOutcome) -> SessionBody {
 }
 
 /// `cancel_turn` is completed by its turn's end, whatever the outcome; a
-/// fact about another turn or only about the session does not complete it.
+/// fact about another turn, only about the session, or naming the right
+/// turn_id under the wrong session does not complete it. Without the
+/// session check a host could complete another session's cancel waiter with
+/// a fabricated outcome merely by naming that turn_id under a session it
+/// owns (final review M1).
 #[tokio::test]
-async fn a_turn_waiter_resolves_only_on_that_turns_end() {
+async fn a_turn_waiter_resolves_only_on_that_sessions_turn_end() {
     let hub = Arc::new(Hub::new());
     let (_conn, mut rx) = connect(&hub);
     let call = tokio::spawn({
         let hub = hub.clone();
         async move {
-            hub.request_for_turn("h", "rc", "t1", cancel("rc"), Duration::from_secs(5))
+            hub.request_for_turn("h", "rc", "s1", "t1", cancel("rc"), Duration::from_secs(5))
                 .await
         }
     });
     rx.recv().await.expect("the cancel went out");
-    hub.resolve_turn("t0", ended("t0", TurnOutcome::Completed));
+    hub.resolve_turn("s1", "t0", ended("t0", TurnOutcome::Completed));
+    // Same turn_id, but a different session: must not complete `s1`'s waiter.
+    hub.resolve_turn("s-other", "t1", ended("t1", TurnOutcome::Completed));
     hub.resolve_session(
         "s1",
         SessionBody::SessionParked {
@@ -120,14 +126,14 @@ async fn a_turn_waiter_resolves_only_on_that_turns_end() {
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!call.is_finished(), "completed by a fact about something else");
-    hub.resolve_turn("t1", ended("t1", TurnOutcome::Completed));
+    hub.resolve_turn("s1", "t1", ended("t1", TurnOutcome::Completed));
     assert_eq!(call.await.unwrap(), Ok(ended("t1", TurnOutcome::Completed)));
 
     // A rejection still matches the request id.
     let call = tokio::spawn({
         let hub = hub.clone();
         async move {
-            hub.request_for_turn("h", "rc2", "t1", cancel("rc2"), Duration::from_secs(5))
+            hub.request_for_turn("h", "rc2", "s1", "t1", cancel("rc2"), Duration::from_secs(5))
                 .await
         }
     });

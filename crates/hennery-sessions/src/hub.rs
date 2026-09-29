@@ -29,8 +29,11 @@ enum CompletedBy {
     /// A fact that names only the session: `session_parked`,
     /// `session_closed` (`resolve_session`).
     Session(String),
-    /// The turn's `turn_ended` (`resolve_turn`): `cancel_turn`.
-    Turn(String),
+    /// The turn's `turn_ended` (`resolve_turn`): `cancel_turn`. Scoped to
+    /// its session too, so a host cannot complete another session's waiter
+    /// merely by naming that turn_id under a session it owns (final review
+    /// M1).
+    Turn { session_id: String, turn_id: String },
 }
 
 /// What a request changed in the store before it was sent. A rejection
@@ -269,17 +272,21 @@ impl Hub {
     }
 
     /// Like `request`, for a request completed by the end of `turn_id`
-    /// (`resolve_turn`), whatever its outcome. Rejections still match
-    /// `request_id`.
+    /// within `session_id` (`resolve_turn`), whatever its outcome.
+    /// Rejections still match `request_id`.
     pub async fn request_for_turn(
         &self,
         host_id: &str,
         request_id: &str,
+        session_id: &str,
         turn_id: &str,
         frame: CollectorFrame,
         timeout: Duration,
     ) -> Result<SessionBody, RequestError> {
-        let completed_by = CompletedBy::Turn(turn_id.to_string());
+        let completed_by = CompletedBy::Turn {
+            session_id: session_id.to_string(),
+            turn_id: turn_id.to_string(),
+        };
         self.wait(host_id, request_id, completed_by, None, frame, timeout).await
     }
 
@@ -361,9 +368,15 @@ impl Hub {
         self.resolve_where(|by| matches!(by, CompletedBy::Session(s) if s == session_id), fact);
     }
 
-    /// Resolve every waiter registered with `request_for_turn` for `turn_id`.
-    pub fn resolve_turn(&self, turn_id: &str, fact: SessionBody) {
-        self.resolve_where(|by| matches!(by, CompletedBy::Turn(t) if t == turn_id), fact);
+    /// Resolve every waiter registered with `request_for_turn` for `turn_id`
+    /// within `session_id`. A turn_id that matches under a different
+    /// session (however that came to be) resolves nothing (final review
+    /// M1).
+    pub fn resolve_turn(&self, session_id: &str, turn_id: &str, fact: SessionBody) {
+        self.resolve_where(
+            |by| matches!(by, CompletedBy::Turn { session_id: s, turn_id: t } if s == session_id && t == turn_id),
+            fact,
+        );
     }
 
     fn resolve_where(&self, completes: impl Fn(&CompletedBy) -> bool, fact: SessionBody) {
