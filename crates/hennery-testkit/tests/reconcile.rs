@@ -1311,3 +1311,166 @@ async fn a_resume_re_sends_the_config_its_host_last_reported() {
         other => panic!("expected resume_session, got {other:?}"),
     }
 }
+
+fn config_url(collector: &Collector, session: &str) -> String {
+    collector.url(&format!("/api/sessions/{session}/config"))
+}
+
+/// The next frame must be a `set_config` for `session`; returns its request
+/// id, config id and value.
+async fn expect_set_config(host: &mut ScriptedHost, session: &str) -> (String, String, Value) {
+    match host.next().await {
+        CollectorFrame::SetConfig {
+            request_id,
+            session_id,
+            config_id,
+            value,
+        } => {
+            assert_eq!(session_id, session);
+            (request_id, config_id, serde_json::to_value(value).unwrap())
+        }
+        other => panic!("expected set_config, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn set_config_answers_with_the_catalogue_the_host_read_back() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let c = client();
+    let url = config_url(&collector, &session);
+    let call = tokio::spawn(async move { post(&c, url, json!({ "config_id": "mode", "value": "plan" })).await });
+    let (request_id, config_id, value) = expect_set_config(&mut host, &session).await;
+    assert_eq!((config_id.as_str(), value), ("mode", json!("plan")));
+    host.emit(
+        &session,
+        SessionBody::ConfigApplied {
+            request_id,
+            indexed: catalogue("plan"),
+        },
+    )
+    .await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!((status, body["mode"].as_str()), (202, Some("plan")), "{body}");
+    assert_eq!(body["config_options"], json!([{"id": "mode", "currentValue": "plan"}]));
+    let (status, catalog) = get(&client(), collector.url(&format!("/api/sessions/{session}/catalog"))).await;
+    assert_eq!((status, catalog), (200, body));
+}
+
+#[tokio::test]
+async fn set_config_refusals_answer_with_their_codes() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    for (code, status) in [("unknown_option", 409), ("config_failed", 502), ("invalid", 400)] {
+        let c = client();
+        let url = config_url(&collector, &session);
+        let call = tokio::spawn(async move { post(&c, url, json!({ "config_id": "model", "value": "huge" })).await });
+        let (request_id, _, _) = expect_set_config(&mut host, &session).await;
+        host.send(&HostFrame::Error {
+            request_id,
+            code: code.into(),
+            message: "no".into(),
+        })
+        .await;
+        let (got, body) = call.await.unwrap();
+        assert_eq!((got, body["code"].as_str()), (status, Some(code)), "{body}");
+    }
+    // Not a string or a boolean: refused before anything is sent.
+    let (status, _) = post(
+        &client(),
+        config_url(&collector, &session),
+        json!({ "config_id": "x", "value": 3 }),
+    )
+    .await;
+    assert_eq!(status, 422);
+    let (status, _) = post(
+        &client(),
+        config_url(&collector, "nope"),
+        json!({ "config_id": "x", "value": "y" }),
+    )
+    .await;
+    assert_eq!(status, 404);
+    host.emit(
+        &session,
+        SessionBody::SessionParked {
+            reason: hennery_proto::frames::ParkReason::Idle,
+        },
+    )
+    .await;
+    wait_for("parked", || async {
+        (collector.lifecycle(&session) == "parked").then_some(())
+    })
+    .await;
+    let (status, body) = post(
+        &client(),
+        config_url(&collector, &session),
+        json!({ "config_id": "x", "value": "y" }),
+    )
+    .await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("not_attached")));
+    let more = tokio::time::timeout(Duration::from_millis(300), host.next()).await;
+    assert!(more.is_err(), "a request reached the host: {more:?}");
+}
+
+/// Read a session's SSE stream from its start until `pred` holds for the
+/// text received so far.
+async fn read_stream(collector: &Collector, session: &str, pred: impl Fn(&str) -> bool) -> String {
+    use futures::StreamExt;
+    let resp = client()
+        .get(collector.url(&format!("/api/stream/sessions/{session}")))
+        .send()
+        .await
+        .unwrap();
+    let mut body = resp.bytes_stream();
+    let mut buf = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !pred(&buf) {
+        let chunk = tokio::time::timeout_at(deadline, body.next())
+            .await
+            .unwrap_or_else(|_| panic!("stream stalled: {buf}"))
+            .unwrap()
+            .unwrap();
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    buf
+}
+
+#[tokio::test]
+async fn every_catalogue_change_is_also_a_catalog_changed_message_on_the_session_stream() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    // The agent changes its own mode: a live update with the catalogue.
+    host.emit(
+        &session,
+        SessionBody::AcpUpdate {
+            indexed: catalogue("bypass"),
+            payload: json!({"update": {"sessionUpdate": "config_option_update"}}),
+        },
+    )
+    .await;
+    // An update without one is only an event.
+    host.emit(
+        &session,
+        SessionBody::AcpUpdate {
+            indexed: Default::default(),
+            payload: json!({"update": {"sessionUpdate": "agent_message_chunk"}}),
+        },
+    )
+    .await;
+    let stream = read_stream(&collector, &session, |s| s.matches("event: event").count() >= 3).await;
+    let changed: Vec<&str> = stream
+        .split("\n\n")
+        .filter(|m| m.contains("event: catalog_changed"))
+        .collect();
+    assert_eq!(changed.len(), 1, "{stream}");
+    assert!(changed[0].contains(r#""mode":"bypass""#), "{}", changed[0]);
+    let id = |m: &str| m.lines().find(|l| l.starts_with("id: ")).map(str::to_string);
+    let update = stream
+        .split("\n\n")
+        .find(|m| m.contains("config_option_update"))
+        .unwrap();
+    assert_eq!(id(changed[0]), id(update), "catalog_changed carries its event's id");
+}
