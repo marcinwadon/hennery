@@ -426,6 +426,16 @@ impl Rejection {
     pub fn answer(self, code: String, message: String) {
         let _ = self.tx.send(Err(RequestError::Rejected { code, message }));
     }
+
+    /// Answer the request's caller as delivery-unknown, for when applying
+    /// this rejection's undo failed: the store no longer agrees with the
+    /// rejection it was supposed to reflect, so the caller must not be told
+    /// `Rejected` — that would say the store and the answer agree when they
+    /// do not. The socket task drops the connection right after this, same
+    /// as any other request whose outcome is not known.
+    pub fn delivery_unknown(self) {
+        let _ = self.tx.send(Err(RequestError::DeliveryUnknown));
+    }
 }
 
 /// One waiter's deadline, owned by the hub. If the waiter is still there

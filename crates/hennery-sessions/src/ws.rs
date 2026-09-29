@@ -232,14 +232,27 @@ async fn serve(socket: WebSocket, state: AppState) {
                     // Take the waiter first, so no timeout can answer it any
                     // more; undo what the request changed; then answer. The
                     // HTTP answer and the store agree, and the store is
-                    // right even when no handler waits (decision 6).
+                    // right even when no handler waits (decision 6). If the
+                    // undo itself fails, the store no longer matches what
+                    // the rejection says: answer delivery-unknown instead of
+                    // `Rejected`, and drop the connection so the next
+                    // handshake's reconciliation settles it (final review
+                    // F1) — never answer `Rejected` and then break.
                     if let Some(rejection) = state.hub.take_rejected(&request_id) {
-                        if let Some(undo) = rejection.undo()
-                            && let Err(err) = undo_rejected(&state.store, undo, &code)
-                        {
-                            tracing::error!(%host_id, ?undo, error = %err, "undoing a rejected request failed");
+                        let undo_failed = match rejection.undo() {
+                            Some(undo) => undo_rejected(&state.store, undo, &code)
+                                .err()
+                                .map(|err| (undo.clone(), err)),
+                            None => None,
+                        };
+                        match undo_failed {
+                            None => rejection.answer(code, message),
+                            Some((undo, err)) => {
+                                tracing::error!(%host_id, ?undo, error = %err, "undoing a rejected request failed; dropping connection");
+                                rejection.delivery_unknown();
+                                break;
+                            }
                         }
-                        rejection.answer(code, message);
                     }
                 }
             }
