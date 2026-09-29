@@ -267,3 +267,184 @@ fn ignore_cancel_runs_the_prompt_to_its_end() {
     assert_eq!(chunks, 3, "{out:?}");
     assert_eq!(out.last().unwrap()["result"]["stopReason"], "end_turn", "{out:?}");
 }
+
+// Plan B2b: config options.
+
+fn config_script(extra: Value) -> String {
+    let mut script = json!({ "chunks": [], "config_options": hennery_testkit::sample_config_options() });
+    script
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    script.to_string()
+}
+
+/// `session/set_config_option`; a boolean value carries ACP's `type` tag.
+fn set_config(id: i64, config_id: &str, value: Value) -> Value {
+    let mut params = json!({"sessionId": "fake-session-1", "configId": config_id, "value": value});
+    if value.is_boolean() {
+        params["type"] = json!("boolean");
+    }
+    json!({"jsonrpc": "2.0", "id": id, "method": "session/set_config_option", "params": params})
+}
+
+/// `requests` with an `initialize` that advertises boolean config options,
+/// as the hennery host does.
+fn with_booleans(mut requests: Vec<Value>) -> Vec<Value> {
+    requests[0]["params"]["clientCapabilities"] = json!({"session": {"configOptions": {"boolean": {}}}});
+    requests
+}
+
+/// The current value of every option in a `configOptions` list.
+fn current(options: &Value) -> Vec<(String, Value)> {
+    options
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| (o["id"].as_str().unwrap().to_string(), o["currentValue"].clone()))
+        .collect()
+}
+
+#[test]
+fn session_new_and_load_announce_the_scripted_config_options() {
+    let script = config_script(json!({}));
+    let out = exchange_until(&script, &with_booleans(session_requests()[..2].to_vec()), 2);
+    let options = &out.last().unwrap()["result"]["configOptions"];
+    assert_eq!(
+        current(options),
+        [
+            ("model".to_string(), json!("small")),
+            ("effort".to_string(), json!("low")),
+            ("fast".to_string(), json!(false)),
+            ("mode".to_string(), json!("default"))
+        ]
+    );
+    let out = exchange_until(&script, &with_booleans(load_requests("agent-7")), 2);
+    assert_eq!(out.last().unwrap()["result"]["configOptions"], *options);
+    // A client that cannot show a boolean option gets an on/off select.
+    let out = exchange_until(&script, &session_requests()[..2], 2);
+    let fast = &out.last().unwrap()["result"]["configOptions"][2];
+    assert_eq!(
+        (&fast["type"], &fast["currentValue"]),
+        (&json!("select"), &json!("off")),
+        "{fast}"
+    );
+    // No scripted options: none announced, like an adapter without them.
+    let out = exchange_until(r#"{"chunks":[]}"#, &session_requests()[..2], 2);
+    assert!(out.last().unwrap()["result"].get("configOptions").is_none(), "{out:?}");
+}
+
+#[test]
+fn set_config_option_switches_validates_and_clamps_the_mode_like_an_adapter() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let script = config_script(json!({ "model_switch_sets_mode": "default", "config_log": log }));
+    let mut requests = with_booleans(session_requests()[..2].to_vec());
+    requests.push(set_config(3, "mode", json!("plan")));
+    requests.push(set_config(4, "model", json!("large")));
+    requests.push(set_config(5, "fast", json!(true)));
+    requests.push(set_config(6, "model", json!("huge")));
+    requests.push(set_config(7, "nope", json!("x")));
+    let out = exchange_until(&script, &requests, 7);
+    let answer = |id: i64| out.iter().find(|m| m["id"] == json!(id)).unwrap();
+    assert_eq!(current(&answer(3)["result"]["configOptions"])[3].1, json!("plan"));
+    // The model switch resets the mode.
+    assert_eq!(
+        current(&answer(5)["result"]["configOptions"]),
+        [
+            ("model".to_string(), json!("large")),
+            ("effort".to_string(), json!("low")),
+            ("fast".to_string(), json!(true)),
+            ("mode".to_string(), json!("default"))
+        ]
+    );
+    assert_eq!(answer(6)["error"]["code"], -32602, "a value the option does not offer");
+    assert_eq!(answer(7)["error"]["code"], -32602, "an unknown option");
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        "mode=plan\nmodel=large\nfast=true\nmodel=huge\nnope=x\n"
+    );
+}
+
+#[test]
+fn an_empty_read_back_still_applies_the_switch() {
+    let script = config_script(json!({ "empty_config_read_back": true, "prompt_sets_mode": "bypass" }));
+    let mut requests = with_booleans(session_requests()[..2].to_vec());
+    requests.push(set_config(3, "model", json!("large")));
+    requests.push(json!({"jsonrpc":"2.0","id":4,"method":"session/prompt",
+                         "params":{"sessionId":"fake-session-1","prompt":[{"type":"text","text":"hi"}]}}));
+    let out = exchange_until(&script, &requests, 4);
+    let answer = out.iter().find(|m| m["id"] == json!(3)).unwrap();
+    assert_eq!(answer["result"]["configOptions"], json!([]), "{answer}");
+    // The prompt's own mode change shows the switch took effect.
+    let update = out
+        .iter()
+        .find(|m| m["params"]["update"]["sessionUpdate"] == "config_option_update")
+        .expect("a config_option_update");
+    assert_eq!(
+        current(&update["params"]["update"]["configOptions"]),
+        [
+            ("model".to_string(), json!("large")),
+            ("effort".to_string(), json!("low")),
+            ("fast".to_string(), json!(false)),
+            ("mode".to_string(), json!("bypass"))
+        ]
+    );
+}
+
+#[test]
+fn a_sticky_option_accepts_a_switch_and_keeps_its_value() {
+    let script = config_script(json!({ "sticky_options": ["effort"] }));
+    let mut requests = session_requests()[..2].to_vec();
+    requests.push(set_config(3, "effort", json!("high")));
+    let out = exchange_until(&script, &requests, 3);
+    let answer = out.last().unwrap();
+    assert_eq!(
+        current(&answer["result"]["configOptions"])[1].1,
+        json!("low"),
+        "{answer}"
+    );
+}
+
+#[test]
+fn config_in_update_only_announces_the_options_before_the_answer() {
+    let script = config_script(json!({ "config_in_update_only": true }));
+    let out = exchange_until(&script, &session_requests()[..2], 2);
+    let answer = out.last().unwrap();
+    assert!(answer["result"].get("configOptions").is_none(), "{answer}");
+    let update = out
+        .iter()
+        .find(|m| m["params"]["update"]["sessionUpdate"] == "config_option_update")
+        .expect("a config_option_update before the answer");
+    assert_eq!(
+        current(&update["params"]["update"]["configOptions"])[0].1,
+        json!("small")
+    );
+}
+
+/// The real adapters' SDK handles requests concurrently: a slow model
+/// switch does not hold back the mode switch sent after it, and its mode
+/// clamp lands after its own answer.
+#[test]
+fn a_slow_model_switch_is_answered_after_a_later_switch_and_clamps_after_answering() {
+    let script = config_script(json!({ "slow_model_switch_ms": 300, "model_switch_sets_mode": "default" }));
+    let mut requests = session_requests()[..2].to_vec();
+    requests.push(set_config(3, "model", json!("large")));
+    requests.push(set_config(4, "mode", json!("plan")));
+    let out = exchange_until(&script, &requests, 3);
+    let order: Vec<i64> = out
+        .iter()
+        .filter_map(|m| m["id"].as_i64())
+        .filter(|id| *id >= 3)
+        .collect();
+    assert_eq!(order, [4, 3], "{out:?}");
+    // Its answer still shows the mode the later switch set: the clamp came after.
+    let model = out.last().unwrap();
+    assert_eq!(
+        (
+            current(&model["result"]["configOptions"])[0].1.clone(),
+            current(&model["result"]["configOptions"])[3].1.clone()
+        ),
+        (json!("large"), json!("plan"))
+    );
+}
