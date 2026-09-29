@@ -5,14 +5,7 @@ use serde_json::json;
 fn started(store: &Store) {
     store.create_session("s1", "h1", "fake", "/tmp").unwrap();
     store
-        .ingest(
-            "s1",
-            1,
-            &SessionBody::SessionStarted {
-                request_id: "r0".into(),
-                agent_session_id: "a1".into(),
-            },
-        )
+        .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
         .unwrap();
 }
 
@@ -207,16 +200,7 @@ fn session_parked_and_session_closed_detach_an_active_session() {
     assert_eq!((s.lifecycle.as_str(), s.activity.as_deref()), ("parked", None));
 
     store.create_session("s2", "h1", "fake", "/tmp").unwrap();
-    store
-        .ingest(
-            "s2",
-            1,
-            &SessionBody::SessionStarted {
-                request_id: "r".into(),
-                agent_session_id: "a".into(),
-            },
-        )
-        .unwrap();
+    store.ingest("s2", 1, &SessionBody::session_started("r", "a")).unwrap();
     store.ingest("s2", 2, &SessionBody::SessionClosed).unwrap();
     assert_eq!(store.session("s2").unwrap().unwrap().lifecycle, "closed");
 }
@@ -358,29 +342,11 @@ fn reconcile_asks_to_close_attached_sessions_the_operator_closed() {
     store.close_now("s1").unwrap();
     // Close requested, delivery unknown, still attached.
     store.create_session("s2", "h1", "fake", "/tmp").unwrap();
-    store
-        .ingest(
-            "s2",
-            1,
-            &SessionBody::SessionStarted {
-                request_id: "r".into(),
-                agent_session_id: "a".into(),
-            },
-        )
-        .unwrap();
+    store.ingest("s2", 1, &SessionBody::session_started("r", "a")).unwrap();
     store.record_close_request("s2").unwrap();
     // Close requested, and the host restarted meanwhile.
     store.create_session("s3", "h1", "fake", "/tmp").unwrap();
-    store
-        .ingest(
-            "s3",
-            1,
-            &SessionBody::SessionStarted {
-                request_id: "r".into(),
-                agent_session_id: "a".into(),
-            },
-        )
-        .unwrap();
+    store.ingest("s3", 1, &SessionBody::session_started("r", "a")).unwrap();
     store.record_close_request("s3").unwrap();
 
     let r = store
@@ -626,6 +592,7 @@ fn a_resume_moves_a_parked_session_to_starting_with_what_the_host_needs() {
         events,
         agent_session_id,
         committed_seq,
+        ..
     } = store.request_resume("s1").unwrap()
     else {
         panic!("not resumable");
@@ -635,14 +602,7 @@ fn a_resume_moves_a_parked_session_to_starting_with_what_the_host_needs() {
     let s = store.session("s1").unwrap().unwrap();
     assert_eq!((s.lifecycle.as_str(), s.activity.as_deref()), ("starting", None));
     store
-        .ingest(
-            "s1",
-            4,
-            &SessionBody::SessionStarted {
-                request_id: "r9".into(),
-                agent_session_id: "a1".into(),
-            },
-        )
+        .ingest("s1", 4, &SessionBody::session_started("r9", "a1"))
         .unwrap();
     let s = store.session("s1").unwrap().unwrap();
     assert_eq!((s.lifecycle.as_str(), s.activity.as_deref()), ("active", Some("idle")));
@@ -749,16 +709,7 @@ fn detaching_releases_a_prompt_the_host_never_acknowledged() {
     assert_eq!(store.session("s1").unwrap().unwrap().open_turn_id, None);
 
     store.create_session("s2", "h1", "fake", "/tmp").unwrap();
-    store
-        .ingest(
-            "s2",
-            1,
-            &SessionBody::SessionStarted {
-                request_id: "r".into(),
-                agent_session_id: "a2".into(),
-            },
-        )
-        .unwrap();
+    store.ingest("s2", 1, &SessionBody::session_started("r", "a2")).unwrap();
     assert!(store.open_turn("s2", "t2", &prompt_text()).unwrap());
     let created = store.ingest("s2", 2, &SessionBody::SessionClosed).unwrap();
     assert_eq!(kinds(&created), ["session_closed", "turn_not_delivered"]);
@@ -812,10 +763,7 @@ fn turn_update(turn: Option<&str>) -> SessionBody {
 fn a_re_emitted_session_started_for_an_active_session_is_stored_but_not_listed() {
     let store = Store::open_in_memory().unwrap();
     started(&store);
-    let again = SessionBody::SessionStarted {
-        request_id: "r5".into(),
-        agent_session_id: "a1".into(),
-    };
+    let again = SessionBody::session_started("r5", "a1");
     assert!(store.ingest("s1", 2, &again).unwrap().is_empty());
     assert_eq!(listed(&store, "s1"), ["session_started"]);
     assert_eq!(store.committed_seq("s1").unwrap(), 2);
@@ -910,14 +858,7 @@ fn a_start_that_ran_after_all_revives_the_session_without_its_failure_reason() {
         Some("start_not_delivered")
     );
     let created = store
-        .ingest(
-            "s1",
-            1,
-            &SessionBody::SessionStarted {
-                request_id: "r0".into(),
-                agent_session_id: "a1".into(),
-            },
-        )
+        .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
         .unwrap();
     assert_eq!(kinds(&created), ["session_started"]);
     let s = store.session("s1").unwrap().unwrap();
@@ -965,16 +906,7 @@ fn two_hosts(store: &Store) {
     store.open_turn("s1", "t1", &prompt_text()).unwrap();
     store.ingest("s1", 2, &turn_started("t1")).unwrap();
     store.create_session("s2", "h2", "fake", "/tmp").unwrap();
-    store
-        .ingest(
-            "s2",
-            1,
-            &SessionBody::SessionStarted {
-                request_id: "r".into(),
-                agent_session_id: "a2".into(),
-            },
-        )
-        .unwrap();
+    store.ingest("s2", 1, &SessionBody::session_started("r", "a2")).unwrap();
 }
 
 #[test]
@@ -1207,14 +1139,7 @@ fn an_old_actors_detach_after_a_resume_began_changes_nothing() {
     assert_eq!(store.events("s1", 0, 100).unwrap(), before);
     assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "starting");
     store
-        .ingest(
-            "s1",
-            5,
-            &SessionBody::SessionStarted {
-                request_id: "r9".into(),
-                agent_session_id: "a1".into(),
-            },
-        )
+        .ingest("s1", 5, &SessionBody::session_started("r9", "a1"))
         .unwrap();
     assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "active");
 }

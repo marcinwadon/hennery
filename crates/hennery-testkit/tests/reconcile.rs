@@ -226,14 +226,8 @@ async fn started_session(collector: &Collector, host: &mut ScriptedHost) -> Stri
     else {
         panic!("expected start_session");
     };
-    host.emit(
-        &session_id,
-        SessionBody::SessionStarted {
-            request_id,
-            agent_session_id: "agent-1".into(),
-        },
-    )
-    .await;
+    host.emit(&session_id, SessionBody::session_started(request_id, "agent-1"))
+        .await;
     let (status, body) = call.await.unwrap();
     assert_eq!(status, 202, "{body}");
     session_id
@@ -478,14 +472,8 @@ async fn a_reconcile_close_rejected_after_a_resume_leaves_the_resume_alone() {
         message: "no such session".into(),
     })
     .await;
-    host.emit(
-        &session,
-        SessionBody::SessionStarted {
-            request_id: resume_request,
-            agent_session_id: "agent-1".into(),
-        },
-    )
-    .await;
+    host.emit(&session, SessionBody::session_started(resume_request, "agent-1"))
+        .await;
 
     let (status, body) = resume.await.unwrap();
     assert_eq!((status, body["lifecycle"].as_str()), (202, Some("active")), "{body}");
@@ -646,14 +634,7 @@ async fn a_host_that_never_returns_after_a_collector_restart_is_presumed_offline
         let store = Store::open(&dir.path().join("hennery.db")).unwrap();
         store.create_session("s1", HOST, "fake", "/tmp").unwrap();
         store
-            .ingest(
-                "s1",
-                1,
-                &SessionBody::SessionStarted {
-                    request_id: "r0".into(),
-                    agent_session_id: "a1".into(),
-                },
-            )
+            .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
             .unwrap();
     }
     let collector = Collector::start_in(dir, Duration::from_millis(300)).await;
@@ -668,14 +649,7 @@ async fn a_host_that_returns_after_a_collector_restart_is_not_presumed_offline()
         let store = Store::open(&dir.path().join("hennery.db")).unwrap();
         store.create_session("s1", HOST, "fake", "/tmp").unwrap();
         store
-            .ingest(
-                "s1",
-                1,
-                &SessionBody::SessionStarted {
-                    request_id: "r0".into(),
-                    agent_session_id: "a1".into(),
-                },
-            )
+            .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
             .unwrap();
     }
     let collector = Collector::start_in(dir, Duration::from_millis(300)).await;
@@ -727,6 +701,7 @@ async fn expect_resume(host: &mut ScriptedHost, session: &str) -> String {
             agent,
             cwd,
             agent_session_id,
+            ..
         } => {
             assert_eq!(
                 (
@@ -754,14 +729,8 @@ async fn a_resume_attaches_a_parked_session_again() {
     let call = tokio::spawn(async move { post(&c, url, json!({})).await });
     let request_id = expect_resume(&mut host, &session).await;
     assert_eq!(collector.lifecycle(&session), "starting");
-    host.emit(
-        &session,
-        SessionBody::SessionStarted {
-            request_id,
-            agent_session_id: "agent-1".into(),
-        },
-    )
-    .await;
+    host.emit(&session, SessionBody::session_started(request_id, "agent-1"))
+        .await;
     let (status, body) = call.await.unwrap();
     assert_eq!((status, body["lifecycle"].as_str()), (202, Some("active")), "{body}");
     let kinds = collector.event_kinds(&session);
@@ -784,14 +753,8 @@ async fn two_concurrent_resumes_attach_once() {
     let request_id = expect_resume(&mut host, &session).await;
     let (status, body) = post(&client(), resume_url(&collector, &session), json!({})).await;
     assert_eq!((status, body["code"].as_str()), (409, Some("starting")), "{body}");
-    host.emit(
-        &session,
-        SessionBody::SessionStarted {
-            request_id,
-            agent_session_id: "agent-1".into(),
-        },
-    )
-    .await;
+    host.emit(&session, SessionBody::session_started(request_id, "agent-1"))
+        .await;
     assert_eq!(first.await.unwrap().0, 202);
     let more = tokio::time::timeout(Duration::from_millis(300), host.next()).await;
     assert!(more.is_err(), "a second request reached the host: {more:?}");

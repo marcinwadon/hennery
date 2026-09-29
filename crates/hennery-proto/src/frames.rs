@@ -135,6 +135,17 @@ pub enum SessionBody {
     HostNote { note: String, text: String },
 }
 
+impl SessionBody {
+    /// A `session_started` with nothing but its ids, for tests and for
+    /// callers that have no catalogue to announce.
+    pub fn session_started(request_id: impl Into<String>, agent_session_id: impl Into<String>) -> Self {
+        Self::SessionStarted {
+            request_id: request_id.into(),
+            agent_session_id: agent_session_id.into(),
+        }
+    }
+}
+
 /// Host -> collector.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]

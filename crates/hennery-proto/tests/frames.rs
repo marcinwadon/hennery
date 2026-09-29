@@ -254,3 +254,12 @@ fn hello_capabilities_skip_unknown_entries_and_default_to_none() {
     };
     assert_eq!(serde_json::to_value(&sent).unwrap()["capabilities"], json!(["park"]));
 }
+
+#[test]
+fn session_started_names_the_request_and_the_agents_session() {
+    let body = serde_json::to_value(SessionBody::session_started("r", "a")).unwrap();
+    assert_eq!(
+        (&body["kind"], &body["request_id"], &body["agent_session_id"]),
+        (&json!("session_started"), &json!("r"), &json!("a"))
+    );
+}

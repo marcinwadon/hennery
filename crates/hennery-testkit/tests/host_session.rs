@@ -513,6 +513,7 @@ async fn a_repeated_start_re_emits_session_started_with_the_new_request_id() {
                     SessionBody::SessionStarted {
                         request_id,
                         agent_session_id,
+                        ..
                     },
                 ..
             } => Some((request_id.clone(), agent_session_id.clone())),

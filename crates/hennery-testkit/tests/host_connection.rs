@@ -646,6 +646,7 @@ fn started(frame: &HostFrame) -> (u64, String, String) {
                 hennery_proto::frames::SessionBody::SessionStarted {
                     request_id,
                     agent_session_id,
+                    ..
                 },
             ..
         } => (*seq, request_id.clone(), agent_session_id.clone()),
