@@ -328,6 +328,7 @@ impl Hub {
         // that never answers must still lose its connection and its waiter.
         let watchdog = tokio::spawn(expire(
             self.waiters.clone(),
+            host_id.to_string(),
             request_id.to_string(),
             conn_id,
             kicked,
@@ -459,6 +460,7 @@ impl Rejection {
 /// removes the entry acts.
 async fn expire(
     waiters: Arc<Mutex<HashMap<String, Waiter>>>,
+    host_id: String,
     request_id: String,
     conn_id: u64,
     kicked: CancellationToken,
@@ -473,7 +475,7 @@ async fn expire(
         }
     };
     if let Some(w) = expired {
-        tracing::warn!(%request_id, "request timed out with no handler left; dropping the host connection");
+        tracing::warn!(%host_id, %request_id, "request timed out with no handler left; dropping the host connection");
         kicked.cancel();
         let _ = w.tx.send(Err(RequestError::DeliveryUnknown));
     }
