@@ -168,8 +168,9 @@ pub struct SessionHandle {
     open_turn: Arc<Mutex<Option<String>>>,
     /// Cancelled when the actor's task has finished (its adapter is gone).
     done: CancellationToken,
-    /// A park or close has been queued: this actor will serve no further
-    /// start or resume, even before it has read that command.
+    /// This actor will serve no further start or resume: a park or close
+    /// has been queued (even before the actor has read it), or the actor
+    /// has begun ending by itself.
     ending: Arc<AtomicBool>,
 }
 
@@ -184,10 +185,12 @@ impl SessionHandle {
         sent
     }
 
-    /// A park or close has been queued through `send` (set only there; an
-    /// actor that ends by itself — an idle reap, an adapter exit — never
-    /// sets it, and shows only as `is_ended` once it is done): a `Restart`
-    /// sent now would be answered `not_attached` once the actor gets to it.
+    /// The actor is ending: a park or close has been queued through `send`,
+    /// or the actor began ending by itself (an idle reap, an adapter exit, an
+    /// adapter stopped for ignoring a cancel) and may still be killing its
+    /// adapter. A `Restart` sent now would be answered `not_attached` once
+    /// the actor gets to it, so a start or resume waits for `finished` and
+    /// attaches a fresh adapter instead.
     pub fn is_ending(&self) -> bool {
         self.ending.load(Ordering::SeqCst)
     }
@@ -274,12 +277,14 @@ pub fn resume(
 pub fn launch(uplink: Uplink, launch: Launch, options: SessionOptions) -> SessionHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let open_turn = Arc::new(Mutex::new(None));
+    let ending = Arc::new(AtomicBool::new(false));
     let actor = Actor {
         uplink,
         session_id: launch.session_id.clone(),
         open_turn: open_turn.clone(),
         options,
         catalogue: Mutex::new(Catalogue::default()),
+        ending: ending.clone(),
     };
     let done = CancellationToken::new();
     let finished = done.clone().drop_guard();
@@ -291,7 +296,7 @@ pub fn launch(uplink: Uplink, launch: Launch, options: SessionOptions) -> Sessio
         commands: tx,
         open_turn,
         done,
-        ending: Arc::new(AtomicBool::new(false)),
+        ending,
     }
 }
 
@@ -479,6 +484,8 @@ struct Actor {
     options: SessionOptions,
     /// The adapter's config options as last reported.
     catalogue: Mutex<Catalogue>,
+    /// Shared with the handle (`SessionHandle::is_ending`).
+    ending: Arc<AtomicBool>,
 }
 
 /// What the actor knows of its adapter's config options.
@@ -501,6 +508,12 @@ impl Actor {
         } else {
             Indexed::default()
         }
+    }
+
+    /// This actor is about to end by itself: from now on a start or resume
+    /// waits for it to finish instead of being routed to it.
+    fn begin_ending(&self) {
+        self.ending.store(true, Ordering::SeqCst);
     }
 
     fn emit(&self, body: SessionBody) {
@@ -862,6 +875,7 @@ impl Actor {
                     if turn.is_none() && configs.out.is_none() && configs.orphan.is_none() =>
                 {
                     tracing::info!(session_id = %self.session_id, "reaping idle session");
+                    self.begin_ending();
                     self.teardown(&mut adapter, &mut updates, None, &mut configs).await;
                     return self.emit(SessionBody::SessionParked { reason: ParkReason::Idle });
                 }
@@ -1144,6 +1158,7 @@ impl Actor {
     ) {
         let grace = self.options.cancel_grace;
         tracing::warn!(session_id = %self.session_id, ?grace, "adapter ignored session/cancel; stopping it");
+        self.begin_ending();
         self.drain_updates(updates, Some(&turn.id), configs);
         let message = format!("the adapter did not stop within {grace:?} of session/cancel");
         self.end_turn(turn.id, TurnOutcome::Cancelled, None, Some(message.clone()));
@@ -1177,6 +1192,7 @@ impl Actor {
         configs: &mut PendingConfigs,
     ) {
         tracing::warn!(session_id = %self.session_id, exit = %describe(info), "adapter exited");
+        self.begin_ending();
         // Output the adapter wrote before dying is still in the pipe.
         while let Ok(Some(inbound)) = tokio::time::timeout(DRAIN_QUIET, updates.recv()).await {
             self.handle_inbound(inbound, turn.as_ref().map(|t| t.id.as_str()), configs);

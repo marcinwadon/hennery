@@ -312,9 +312,10 @@ fn attach(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, req: AttachReq
     uplink.fast_forward(&req.session_id, req.committed_seq)?;
     let options = cfg.session_options();
     match live_session(sessions, &req.session_id).filter(SessionHandle::is_ending) {
-        // A park or close is queued ahead of this request, so a `Restart`
-        // would be answered `not_attached`: attach a fresh adapter once the
-        // old one is gone.
+        // The actor is ending (a park or close is queued ahead of this
+        // request, or it is ending by itself), so a `Restart` would be
+        // answered `not_attached`: attach a fresh adapter once the old one is
+        // gone.
         Some(old) => {
             let (uplink, sessions) = (uplink.clone(), sessions.clone());
             tokio::spawn(async move {

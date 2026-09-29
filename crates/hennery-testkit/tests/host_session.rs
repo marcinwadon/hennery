@@ -2247,3 +2247,68 @@ async fn a_live_update_sent_right_before_a_switch_answers_never_outlives_that_an
         );
     }
 }
+
+// Plan B2b: an actor that ends by itself says so at once (B2a's hand-off).
+
+async fn wait_ending(handle: &SessionHandle) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !handle.is_ending() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the handle never said it was ending"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// An idle reap or an adapter stopped for ignoring a cancel ends the actor
+/// by itself. Its handle must say so while the adapter is still being
+/// killed (here the whole 1 s grace: it ignores SIGTERM), or a resume
+/// arriving then is routed to the ending actor and answered `not_attached`.
+#[tokio::test]
+async fn an_actor_ending_by_itself_marks_its_handle_ending_while_it_kills_the_adapter() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let reaped = session::spawn(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        fake_ignoring_sigterm(&FakeScript::default()),
+        std::env::temp_dir(),
+        SessionOptions {
+            idle_timeout: Some(Duration::from_millis(300)),
+            kill_grace: Duration::from_secs(1),
+            ..SessionOptions::default()
+        },
+    );
+    wait_ending(&reaped).await;
+    assert!(!reaped.is_ended(), "still killing its adapter");
+    wait_until(&uplink, has("session_parked:idle")).await;
+    wait_ended(&reaped).await;
+
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        ignore_cancel: true,
+        ..slow_script()
+    };
+    let stopped = session::spawn(
+        uplink.clone(),
+        "r0".into(),
+        "s2".into(),
+        fake_ignoring_sigterm(&script),
+        std::env::temp_dir(),
+        SessionOptions {
+            cancel_grace: Duration::from_millis(300),
+            kill_grace: Duration::from_secs(1),
+            ..SessionOptions::default()
+        },
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(stopped.send(prompt("r1", "t1")));
+    wait_until(&uplink, has("turn_started")).await;
+    assert!(stopped.send(cancel("rc", "t1")));
+    assert!(!stopped.is_ending(), "a cancel alone does not end the actor");
+    wait_ending(&stopped).await;
+    assert!(!stopped.is_ended(), "still killing its adapter");
+    wait_until(&uplink, has("session_parked:operator")).await;
+    wait_ended(&stopped).await;
+}
