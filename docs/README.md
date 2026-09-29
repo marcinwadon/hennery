@@ -33,6 +33,8 @@ slice); everything else is design. The maintainer's decisions are recorded below
    - [Resume (B1)](plans/2026-09-28-resume.md) — plan B1 (10 tasks): `resume_session` with
      `session/load` and replay suppression, presumed park while a host is offline, conn_id-keyed
      waiters, one visibility rule for unapplied facts. Executed 2026-09-29 (see its "Execution status").
+   - [Cancel and capabilities (B2a)](plans/2026-09-29-cancel-capabilities.md) — `cancel_turn`,
+     `hello.capabilities` with the park gate, and B1's two carry-overs. Draft awaiting review.
 
 ## Maintainer decisions (2026-09-27)
 
