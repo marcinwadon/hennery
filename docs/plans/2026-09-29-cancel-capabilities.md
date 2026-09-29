@@ -20,6 +20,26 @@
 
 It builds on the executed [resume plan](2026-09-28-resume.md) (plan B1). Read its "Execution status" and "After this plan" first. Its code wins over its task text, and every anchor below was taken from that code (`main` at `a57a1dd`).
 
+## Execution status (2026-09-29)
+
+**Executed** on branch `feat/cancel-capabilities` (task-by-task with reviews, then a whole-branch review and one fix
+wave; 194+ tests). The plan's decisions were confirmed by a stronger-model review on the maintainer's behalf, with
+decision 6 amended (hub-owned deadlines, atomic rejection) and the cancel race folded into decision 4. Deviations
+found in review:
+
+| Area | As built | Why |
+|---|---|---|
+| Failed undo (final) | An undo that hits a store error answers `delivery_unknown` and drops the host connection | Otherwise HTTP said "rejected" while the store still showed `starting`/`sent` |
+| Turn waiters (final) | `CompletedBy::Turn { session_id, turn_id }`; still resolved by every ingested `turn_ended` | A host could complete another session's cancel with a fabricated outcome |
+| Docs (final) | `CancelResponse` names `interrupted`; `Capabilities` documents that unknown entries are ignored | Schema consumers must not reject a newer host's `hello` |
+
+**Spec drift to reconcile:** `CancelResponse`, the codes `no_open_turn` / `not_running` / `park_unsupported`, and
+answering a Stop that lost the race with the turn's real outcome (not `turn_ended{cancelled}`) are this plan's
+refinements of ACP core §3.3; the spec text should be amended to match.
+
+Still open: an adapter streaming updates faster than the outbox writes can delay the Cancel command and its grace
+(needs a per-iteration cap in the actor's biased select); the `hello.capabilities` field doc still says "a closed list".
+
 ## Scope
 
 This is **plan B2a**. B1's "After this plan" scoped plan B2 as cancel, capabilities and all of model, axes and mode. With B1's two carry-overs added, that does not fit one plan of right-sized tasks. The config half alone needs:
