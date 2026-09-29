@@ -44,6 +44,7 @@ async fn serve(socket: WebSocket, state: AppState) {
         protocol_version,
         host_id,
         token,
+        capabilities,
         attached_sessions,
         ..
     }) = hello
@@ -66,7 +67,7 @@ async fn serve(socket: WebSocket, state: AppState) {
         return;
     }
     let (tx, mut rx) = mpsc::unbounded_channel::<CollectorFrame>();
-    let Some(registration) = state.hub.register(&host_id, tx.clone()) else {
+    let Some(registration) = state.hub.register(&host_id, tx.clone(), capabilities) else {
         let _ = sink
             .send(text(&reject(
                 "already_connected",
@@ -187,6 +188,10 @@ async fn serve(socket: WebSocket, state: AppState) {
                             // name only the session (ACP core §3.2).
                             SessionBody::SessionParked { .. } | SessionBody::SessionClosed => {
                                 state.hub.resolve_session(&session_id, body.clone());
+                            }
+                            // `cancel_turn` is completed by its turn's end.
+                            SessionBody::TurnEnded { turn_id, .. } => {
+                                state.hub.resolve_turn(turn_id, body.clone());
                             }
                             _ => {}
                         }

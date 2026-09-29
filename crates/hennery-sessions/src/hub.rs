@@ -1,6 +1,6 @@
 //! Connected hosts and in-flight collector→host requests.
 
-use hennery_proto::frames::{CollectorFrame, SessionBody};
+use hennery_proto::frames::{Capabilities, Capability, CollectorFrame, SessionBody};
 use hennery_proto::rest::EventDto;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -21,13 +21,23 @@ pub enum RequestError {
     DeliveryUnknown,
 }
 
+/// The fact that completes a request, besides a rejection of its
+/// `request_id` (ACP core §3.2, §3.3).
+enum CompletedBy {
+    /// A fact that carries the `request_id` (`resolve`).
+    Request,
+    /// A fact that names only the session: `session_parked`,
+    /// `session_closed` (`resolve_session`).
+    Session(String),
+    /// The turn's `turn_ended` (`resolve_turn`): `cancel_turn`.
+    Turn(String),
+}
+
 struct Waiter {
     /// The connection the request went out on: only its loss or its
     /// timeout concerns this waiter.
     conn_id: u64,
-    /// Set for requests completed by a fact that names only the session
-    /// (`session_parked`, `session_closed`), not the request (§3.2).
-    session_id: Option<String>,
+    completed_by: CompletedBy,
     tx: oneshot::Sender<Result<SessionBody, RequestError>>,
 }
 
@@ -39,6 +49,8 @@ struct HostConn {
     /// something lost on the previous one (ACP core §5.1).
     ready: bool,
     kicked: CancellationToken,
+    /// From this connection's `hello` (ACP core §3.3).
+    capabilities: Capabilities,
 }
 
 /// A registered host connection.
@@ -76,10 +88,15 @@ impl Hub {
         }
     }
 
-    /// Register a host connection (not yet ready). A second live connection
-    /// for the same host id is refused, never allowed to supersede the
-    /// first silently.
-    pub fn register(&self, host_id: &str, tx: mpsc::UnboundedSender<CollectorFrame>) -> Option<Registration> {
+    /// Register a host connection (not yet ready) with the capabilities its
+    /// `hello` announced. A second live connection for the same host id is
+    /// refused, never allowed to supersede the first silently.
+    pub fn register(
+        &self,
+        host_id: &str,
+        tx: mpsc::UnboundedSender<CollectorFrame>,
+        capabilities: Capabilities,
+    ) -> Option<Registration> {
         let mut hosts = self.hosts.lock().expect("hosts lock");
         if hosts.get(host_id).is_some_and(|h| !h.tx.is_closed()) {
             return None;
@@ -93,6 +110,7 @@ impl Hub {
                 tx,
                 ready: false,
                 kicked: kicked.clone(),
+                capabilities,
             },
         );
         self.last_conn
@@ -182,6 +200,16 @@ impl Hub {
             .is_some_and(|h| h.ready)
     }
 
+    /// The host's current connection announced `capability`. A host that is
+    /// not connected has none.
+    pub fn has_capability(&self, host_id: &str, capability: Capability) -> bool {
+        self.hosts
+            .lock()
+            .expect("hosts lock")
+            .get(host_id)
+            .is_some_and(|h| h.capabilities.has(capability))
+    }
+
     /// Send a request and wait until the outboxed fact carrying `request_id`
     /// is ingested (`resolve`), the host rejects it (`reject`), the
     /// connection drops, or `timeout` passes.
@@ -192,7 +220,8 @@ impl Hub {
         frame: CollectorFrame,
         timeout: Duration,
     ) -> Result<SessionBody, RequestError> {
-        self.wait(host_id, request_id, None, frame, timeout).await
+        self.wait(host_id, request_id, CompletedBy::Request, frame, timeout)
+            .await
     }
 
     /// Like `request`, for requests completed by a fact that names only the
@@ -205,15 +234,30 @@ impl Hub {
         frame: CollectorFrame,
         timeout: Duration,
     ) -> Result<SessionBody, RequestError> {
-        self.wait(host_id, request_id, Some(session_id.to_string()), frame, timeout)
-            .await
+        let completed_by = CompletedBy::Session(session_id.to_string());
+        self.wait(host_id, request_id, completed_by, frame, timeout).await
+    }
+
+    /// Like `request`, for a request completed by the end of `turn_id`
+    /// (`resolve_turn`), whatever its outcome. Rejections still match
+    /// `request_id`.
+    pub async fn request_for_turn(
+        &self,
+        host_id: &str,
+        request_id: &str,
+        turn_id: &str,
+        frame: CollectorFrame,
+        timeout: Duration,
+    ) -> Result<SessionBody, RequestError> {
+        let completed_by = CompletedBy::Turn(turn_id.to_string());
+        self.wait(host_id, request_id, completed_by, frame, timeout).await
     }
 
     async fn wait(
         &self,
         host_id: &str,
         request_id: &str,
-        session_id: Option<String>,
+        completed_by: CompletedBy,
         frame: CollectorFrame,
         timeout: Duration,
     ) -> Result<SessionBody, RequestError> {
@@ -230,7 +274,7 @@ impl Hub {
                 request_id.to_string(),
                 Waiter {
                     conn_id: host.conn_id,
-                    session_id,
+                    completed_by,
                     tx,
                 },
             );
@@ -266,10 +310,19 @@ impl Hub {
     /// Resolve every waiter registered with `request_for_session` for
     /// `session_id`.
     pub fn resolve_session(&self, session_id: &str, fact: SessionBody) {
+        self.resolve_where(|by| matches!(by, CompletedBy::Session(s) if s == session_id), fact);
+    }
+
+    /// Resolve every waiter registered with `request_for_turn` for `turn_id`.
+    pub fn resolve_turn(&self, turn_id: &str, fact: SessionBody) {
+        self.resolve_where(|by| matches!(by, CompletedBy::Turn(t) if t == turn_id), fact);
+    }
+
+    fn resolve_where(&self, completes: impl Fn(&CompletedBy) -> bool, fact: SessionBody) {
         let mut waiters = self.waiters.lock().expect("waiters lock");
         let ids: Vec<String> = waiters
             .iter()
-            .filter(|(_, w)| w.session_id.as_deref() == Some(session_id))
+            .filter(|(_, w)| completes(&w.completed_by))
             .map(|(k, _)| k.clone())
             .collect();
         for id in ids {

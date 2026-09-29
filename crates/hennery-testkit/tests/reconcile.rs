@@ -950,3 +950,29 @@ async fn the_session_detail_shows_the_open_turn() {
     let (status, _) = get(&client(), collector.url("/api/sessions/no-such-session")).await;
     assert_eq!(status, 404);
 }
+
+// Plan B2a: capabilities (ACP core §3.3).
+
+/// A newer host may announce a capability this collector does not know: its
+/// `hello` is still accepted, and the capabilities it shares are kept.
+#[tokio::test]
+async fn a_hello_with_an_unknown_capability_is_accepted_with_the_known_ones() {
+    let collector = Collector::start().await;
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/api/hosts/ws", collector.addr))
+        .await
+        .unwrap();
+    let hello = json!({
+        "type": "hello", "protocol_version": PROTOCOL_VERSION, "host_version": "future",
+        "host_id": HOST, "token": TOKEN, "capabilities": ["teleport", "park"], "attached_sessions": []
+    });
+    ws.send(Message::text(hello.to_string())).await.unwrap();
+    let ack = tokio::time::timeout(Duration::from_secs(10), ws.next())
+        .await
+        .expect("an answer to hello")
+        .unwrap()
+        .unwrap();
+    let ack: CollectorFrame = serde_json::from_str(ack.to_text().unwrap()).unwrap();
+    assert!(matches!(ack, CollectorFrame::HelloAck { .. }), "{ack:?}");
+    assert!(collector.state.hub.has_capability(HOST, Capability::Park));
+    assert!(!collector.state.hub.has_capability(HOST, Capability::Images));
+}
