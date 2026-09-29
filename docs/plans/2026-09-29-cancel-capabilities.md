@@ -60,19 +60,19 @@ So B2 is split. **B2a** (this plan) is cancel, capabilities and the carry-overs.
 
 ## Decisions this plan makes where the spec is silent
 
-These are proposed by the plan author and were reviewed by an advisor model on 2026-09-29. The maintainer confirms them at plan review. The tasks implement them as written.
+Reviewed and confirmed (with the amendments below) on 2026-09-29 by a stronger-model review on the maintainer's behalf. Amended: decision 6 (the hub owns request deadlines; rejections are taken atomically), decision 4 (a `not_running` for an ended turn answers its stored outcome), decision 3 (the note keeps the stderr tail). The tasks implement them as written.
 
-1. **`cancel_turn` is completed by its turn's `turn_ended`, whatever the outcome.** The collector's waiter matches the turn (B1's hand-off), not a fact carrying the request id. `POST …/cancel` answers 202 `CancelResponse {turn_id, outcome}`. A turn that finished just before the cancel reached the agent answers `completed`. The host writes that end to the outbox before its `not_running` rejection, and outboxed facts go on the wire before every reply (plan A, "Wire order"). A cancel request writes no collector event: §8's list has no `operator_cancelled`, and the turn's `turn_ended{cancelled}` is the timeline's record.
+1. **`cancel_turn` is completed by its turn's `turn_ended`, whatever the outcome.** The collector's waiter matches the turn (B1's hand-off), not a fact carrying the request id. `POST …/cancel` answers 202 `CancelResponse {turn_id, outcome}`. A turn that finished just before the cancel reached the agent answers `completed`. The host writes that end to the outbox before its `not_running` rejection, and outboxed facts go on the wire before every reply (plan A, "Wire order"). If that end was ingested before the cancel's waiter existed, the `not_running` answer falls back to the stored outcome (decision 4). A cancel request writes no collector event: §8's list has no `operator_cancelled`, and the turn's `turn_ended{cancelled}` is the timeline's record.
 2. **The host takes the outcome from the prompt's answer.**
    - Stop reason `cancelled` → `turn_ended{cancelled}`, with or without a hennery cancel.
    - Any other stop reason → `completed`. The agent finished first.
    - An error after a cancel was sent → `cancelled`, with the error kept. An agent's aborted work may throw.
    - Without a cancel, an error is `failed`, as before.
-3. **An adapter that ignores `session/cancel` is stopped after `CANCEL_GRACE` (20 s).** The turn ends `cancelled`, with an error saying so. The adapter's process group is killed, a `host_note{note: "cancel_unanswered"}` explains why, and `session_parked{operator}` detaches the session. 20 s plus the 5 s kill grace stays below the collector's 60 s cancel timeout. Without this bound, that timeout would drop the whole host connection (plan A decision 1). The adapter cannot take another prompt while the old one runs, so leaving it attached is not an option. The spec's park reasons are a closed list, so the reason is `operator` (the operator asked to stop the turn) and the note carries the specifics.
+3. **An adapter that ignores `session/cancel` is stopped after `CANCEL_GRACE` (20 s).** The turn ends `cancelled`, with an error saying so. The adapter's process group is killed, and a `host_note{note: "cancel_unanswered"}` explains why. Its text carries the last lines of the adapter's scrubbed stderr tail: no `adapter_exited` is emitted on this path, so that is the only record of it. Then `session_parked{operator}` detaches the session. 20 s plus the 5 s kill grace stays below the collector's 60 s cancel timeout. Without this bound, that timeout would drop the whole host connection (plan A decision 1). The adapter cannot take another prompt while the old one runs, so leaving it attached is not an option. The spec's park reasons are a closed list, so the reason is `operator` (the operator asked to stop the turn) and the note carries the specifics.
 4. **Cancel refusals:**
    - 409 `not_attached`: the session is not `active` (presumed parked included), or its host is not ready.
    - 409 `no_open_turn`: no turn is open.
-   - 409 `not_running`: the host has no such turn in flight.
+   - 409 `not_running`: the host has no such turn in flight, and the store has not seen it end. If the store shows the turn ended (its end was ingested between reading the open turn and registering the cancel's waiter), the cancel answers 202 with the stored outcome instead.
    - 404: an unknown session.
    A cancel for a `sent` turn is sent: its prompt precedes it on the same socket, so the actor sees the turn first. A repeated cancel for a turn already being cancelled changes nothing on the host.
 5. **Capabilities.**
@@ -80,10 +80,10 @@ These are proposed by the plan author and were reviewed by an advisor model on 2
    - The hennery host announces only `park`. `projects` and `images` are not implemented yet, and the collector must never be told otherwise.
    - The collector keeps capabilities per connection in the hub, not in the store. A host that reconnects on an older build loses them at once.
    - `POST …/park` to a host without `park` answers 409 `park_unsupported`, and nothing is sent. This reverses plan A's decision 12.
-6. **A rejection is applied by the socket task, keyed by request id.** A start, resume or prompt registers an `Undo` with its waiter:
-   - `Undo::Start` is `mark_failed_if_starting` with the host's code;
-   - `Undo::Prompt` is `abandon_turn`.
-   `ws.rs` applies the undo when the host's `error` arrives, then signals the waiter. The HTTP answer and the store therefore agree, and the store is right even when hyper has dropped the handler because its client left. The waiter entry outlives a dropped handler; only its answer, its connection's loss or its timeout removes it. Handlers keep only the never-sent (`host_offline`) path. A start's rejection now fails the session only while it is still `starting`, like a resume.
+6. **The hub owns every waiter's deadline, and a rejection is applied by the socket task, keyed by request id.**
+   - **Deadlines.** When `wait` registers a waiter it spawns a watchdog. At the deadline, if the entry is still present for the same `conn_id`, the watchdog removes it, answers "delivery unknown" and kicks that connection (as `disconnect_conn` does). The handler keeps its own timeout, and both paths are idempotent: whichever removes the entry acts. A handler whose timeout finds the entry gone awaits the answer already on its way. This covers every waiter kind, including `request_for_turn`. Before this, the deadline lived in the handler's future, so when hyper dropped the handler, a host that stayed connected but never answered left the session `starting` (or the turn `sent`, a permanent 409) and leaked the waiter.
+   - **Rejections.** A start, resume or prompt registers an `Undo` with its waiter: `Undo::Start` is `mark_failed_if_starting` with the host's code, and `Undo::Prompt` is `abandon_turn`. When the host's `error` arrives, `ws.rs` removes the waiter under the waiters lock (`take_rejected`), applies its undo, then signals it. A concurrent timeout can therefore never leave the store failed while HTTP answers `delivery_unknown`, and the store is right even when no handler waits.
+   - Handlers keep only the never-sent (`host_offline`) path. A start's rejection now fails the session only while it is still `starting`, like a resume.
 7. **Host shutdown closes the session map.** `shut_down` sets `closing` and takes the handles under one lock. `spawn_or_restart` checks `closing` under that lock and drops a start or resume that arrives afterwards, without an answer. The connection is already gone, and the collector reconciles the start after the next handshake (`start_not_delivered`).
 
 ## Global Constraints
@@ -108,7 +108,7 @@ These are the five inputs most likely to bite a real user that the obvious tests
 
 1. **An agent stuck in a long tool call ignores Stop.** Expected: within the grace the turn ends `cancelled` once, the adapter's whole group is killed, a `host_note` says why, and the session parks. The operator is never left with a 60 s timeout that drops every session's connection. (Task 3: `an_adapter_that_ignores_a_cancel_is_stopped_after_the_grace`)
 2. **Stop clicked as the turn finishes, or clicked twice.** Expected: one end per turn. A cancel that lost the race answers how the turn really ended (`completed`), and a double click sends one `session/cancel`. An agent that answers an aborted prompt with an error still ends `cancelled`. (Task 3: `a_cancel_ends_the_turn_cancelled_and_the_session_stays_attached`, `a_cancel_for_a_turn_that_is_not_running_is_refused_not_running`, `a_cancelled_prompt_answered_with_an_error_still_ends_cancelled`; Task 8: `a_cancel_that_loses_the_race_with_the_turns_end_answers_how_it_ended`)
-3. **A browser tab closed, or a request that times out client-side, while the host rejects the start, resume or prompt.** Expected: the store still records the rejection. The session is `failed` with the host's code, never stuck `starting`, and the turn slot is freed, never a permanent 409 `turn_in_progress` while the host stays connected. (Task 7: the three `…_rejected_after_its_caller_gave_up_…` tests)
+3. **A browser tab closed, or a request that times out client-side, while the host rejects the start, resume or prompt, or never answers at all.** Expected: the store still records the rejection. The session is `failed` with the host's code, never stuck `starting`, and the turn slot is freed, never a permanent 409 `turn_in_progress` while the host stays connected. With no answer, the hub's deadline still kicks the connection so reconciliation settles it, and no waiter leaks. (Task 7: the three `…_rejected_after_its_caller_gave_up_…` tests, `a_dropped_requests_deadline_still_kicks_the_connection_and_frees_its_waiter`)
 4. **A newer host with a capability this collector does not know, or an older host with none.** Expected: the `hello` is accepted and the known capabilities are kept. Park to a host without `park` is refused 409 `park_unsupported`, and nothing reaches the host. (Task 1: `hello_capabilities_skip_unknown_entries_and_default_to_none`; Task 6: `a_hello_with_an_unknown_capability_is_accepted_with_the_known_ones`, `capabilities_belong_to_the_hosts_current_connection`; Task 8: `park_goes_only_to_a_host_that_announced_it_can_park`)
 5. **`systemctl stop` (or Ctrl-C) on a host while a resume waits behind a close.** Expected: no adapter is launched after shutdown began, so none is SIGKILLed without its grace or orphaned. (Task 5: `a_resume_waiting_behind_a_close_never_attaches_after_host_shutdown`, with an adapter that ignores SIGTERM so the close takes its whole grace)
 
@@ -120,8 +120,8 @@ These are the five inputs most likely to bite a real user that the obvious tests
 | `crates/hennery-testkit/src/lib.rs`, `src/bin/hennery-fake-acp.rs` | Fake adapter: `session/cancel`, `ignore_cancel`, `cancel_error` | 2 |
 | `crates/hennery-host/src/session.rs` | `SessionCmd::Cancel`, `CANCEL_GRACE`, outcome mapping, stopping an adapter that ignores a cancel | 3 |
 | `crates/hennery-host/src/connection.rs` | `hello.capabilities` (1); `cancel_turn` dispatch (4); `SessionMap` with `closing` (5) | 1, 4, 5 |
-| `crates/hennery-sessions/src/hub.rs`, `ws.rs` | Capabilities per connection, `CompletedBy`, `request_for_turn` / `resolve_turn` (6); `Undo`, `request_with_undo`, `undo_for`, `undo_rejected` (7) | 6, 7 |
-| `crates/hennery-sessions/src/api.rs` | Handlers without rejection writes (7); `POST …/cancel`, the park gate (8) | 7, 8 |
+| `crates/hennery-sessions/src/hub.rs`, `ws.rs` | Capabilities per connection, `CompletedBy`, `request_for_turn` / `resolve_turn` (6); `Undo`, `request_with_undo`, the deadline watchdog `expire`, `take_rejected` / `Rejection`, `undo_rejected` (7) | 6, 7 |
+| `crates/hennery-sessions/src/api.rs`, `store.rs` | Handlers without rejection writes (7); `POST …/cancel` with the stored-outcome fallback, the park gate, `ended_turn_outcome` (8) | 7, 8 |
 | `crates/hennery-proto/tests/frames.rs`, `crates/hennery-testkit/tests/{fake_acp,host_session,host_connection,reconcile,e2e,auth,ws_ingest_error}.rs`, `crates/hennery-sessions/tests/hub.rs` | Tests | all |
 
 All commands run from the repository root inside the dev shell (`nix develop`, or direnv). Work on a feature branch off `main` (e.g. `feat/cancel-capabilities`). Each task leaves the workspace compiling, clippy-clean and green.
@@ -785,7 +785,7 @@ git commit -m "test(testkit): fake adapter honours session/cancel"
   - stop reason `cancelled` → `TurnOutcome::Cancelled` (with `stop_reason: Some("cancelled")`);
   - an error after a cancel was sent → `Cancelled`, with the error;
   - otherwise as before.
-- Produces: past the grace, the actor emits `turn_ended{cancelled, error}`, kills the adapter's group, then emits `host_note{note: "cancel_unanswered"}` and `session_parked{operator}`, and ends (decision 3).
+- Produces: past the grace, the actor emits `turn_ended{cancelled, error}`, kills the adapter's group, then emits `host_note{note: "cancel_unanswered"}` and `session_parked{operator}`, and ends (decision 3). No `adapter_exited` follows a stop the host asked for, so the note's text carries the last 5 lines of the adapter's stderr tail (already bounded and scrubbed).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -912,6 +912,7 @@ async fn an_adapter_that_ignores_a_cancel_is_stopped_after_the_grace() {
     let script = FakeScript {
         ignore_cancel: true,
         grandchild_pid_file: Some(pid_file.to_string_lossy().into_owned()),
+        stderr_lines: vec!["auth header: Bearer secret-token-123".into()],
         ..slow_script()
     };
     let handle = session::spawn(
@@ -949,6 +950,20 @@ async fn an_adapter_that_ignores_a_cancel_is_stopped_after_the_grace() {
             "session_parked:operator"
         ]
     );
+    // No `adapter_exited` on this path: the note keeps the stderr tail,
+    // scrubbed.
+    let note = frames
+        .iter()
+        .find_map(|f| match f {
+            HostFrame::Session {
+                body: SessionBody::HostNote { text, .. },
+                ..
+            } => Some(text.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(note.contains("Last stderr:") && note.contains("auth header"), "{note}");
+    assert!(!note.contains("secret-token-123"), "{note}");
     wait_dead(grandchild).await;
     wait_ended(&handle).await;
 }
@@ -1267,9 +1282,17 @@ with:
         let message = format!("the adapter did not stop within {grace:?} of session/cancel");
         self.end_turn(turn.id, TurnOutcome::Cancelled, None, Some(message.clone()));
         adapter.terminate(self.options.kill_grace).await;
+        // No `adapter_exited` follows a stop the host asked for, so the
+        // note keeps the adapter's last words (already scrubbed, bounded).
+        let tail = last_lines(&adapter.stderr_tail().await, 5);
+        let text = if tail.is_empty() {
+            format!("{message}; it was stopped")
+        } else {
+            format!("{message}; it was stopped. Last stderr:\n{tail}")
+        };
         self.emit(SessionBody::HostNote {
             note: "cancel_unanswered".into(),
-            text: scrub(&format!("{message}; it was stopped")),
+            text: scrub(&text),
         });
         self.emit(SessionBody::SessionParked {
             reason: ParkReason::Operator,
@@ -2112,22 +2135,27 @@ git commit -m "feat(sessions): keep host capabilities and complete requests by a
 
 ---
 
-### Task 7: A host's rejection reaches the store without a waiting handler
+### Task 7: A host's rejection and a request's deadline reach the store without a waiting handler
 
 **Files:**
 - Modify: `crates/hennery-sessions/src/hub.rs`, `crates/hennery-sessions/src/ws.rs`, `crates/hennery-sessions/src/api.rs`
-- Test: `crates/hennery-testkit/tests/reconcile.rs`
+- Test: `crates/hennery-testkit/tests/reconcile.rs`, `crates/hennery-sessions/tests/hub.rs`
 
 **Interfaces:**
 - Consumes: `CompletedBy` and `wait` (Task 6).
 - Produces: `pub enum hennery_sessions::hub::Undo { Start { session_id: String }, Prompt { session_id: String, turn_id: String } }` (`Debug, Clone, PartialEq`).
-- Produces: `Hub::request_with_undo(&self, host_id, request_id, frame, timeout, undo: Undo) -> Result<SessionBody, RequestError>` and `Hub::undo_for(&self, request_id: &str) -> Option<Undo>`. `Hub::request` keeps its signature and registers no undo.
-- Produces: on a host `error`, `ws.rs` applies the waiter's undo before `reject` signals it (decision 6):
+- Produces: `Hub::request_with_undo(&self, host_id, request_id, frame, timeout, undo: Undo) -> Result<SessionBody, RequestError>`. `Hub::request` keeps its signature and registers no undo.
+- Produces: `Hub::take_rejected(&self, request_id: &str) -> Option<Rejection>`. It removes the waiter from the map, so nothing else can answer it. `pub struct Rejection` has `fn undo(&self) -> Option<&Undo>` and `fn answer(self, code: String, message: String)`. `Hub::reject` is `take_rejected` + `answer`.
+- Produces: `Hub::pending_requests(&self) -> usize` (waiters still unanswered).
+- Produces: the hub owns every waiter's deadline (decision 6). `wait` spawns a watchdog (`expire`) when it registers a waiter. At the deadline, if the entry is still there for the same connection, the watchdog removes it, answers `DeliveryUnknown` and kicks that connection. The handler keeps its own timeout, and whichever removes the entry acts. A handler whose timeout finds the entry already gone awaits the answer that is on its way. This covers every waiter kind, including `request_for_turn` and `request_for_session`.
+- Produces: on a host `error`, `ws.rs` takes the waiter, applies its undo, then answers (decision 6):
   - `Start` → `Store::mark_failed_if_starting(session_id, code)`;
   - `Prompt` → `Store::abandon_turn(session_id, turn_id)`.
 - Produces: `start_session`, `resume` and `prompt` send with `request_with_undo`. They write to the store themselves only when the request was never sent (`RequestError::NotConnected`).
 
 The carry-over (B1 "Execution status"): when a client disconnects, hyper drops the in-flight handler future. The waiter entry stays in the hub, so the host's later rejection still finds it, but the handler that would have written `failed` (or removed the turn) is gone. While the host stays connected, nothing else resolves it: the session sits in `starting`, or every prompt gets 409 `turn_in_progress`. The tests reproduce this with a client that gives up after 300 ms. Checked on hyper 1.x: the handler is dropped when the client closes the connection.
+
+The same drop also skips the deadline. `wait` used to run the timeout, and the `disconnect_conn` behind it, inside the handler's future. A host that stays connected and never answers a dropped request therefore kept its connection, the waiter leaked, and nothing ever reconciled the session or turn. The watchdog moves the deadline into the hub. Taking the waiter out before applying the undo keeps a concurrent timeout from answering `delivery_unknown` for a request whose rejection is already in the store.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -2224,12 +2252,76 @@ async fn a_prompt_rejected_after_its_caller_gave_up_still_frees_the_turn_slot() 
 }
 ```
 
+Append to `crates/hennery-sessions/tests/hub.rs`:
+
+```rust
+/// Decision 6: the hub owns every waiter's deadline. A handler dropped
+/// mid-request (its client left) must not leave its waiter behind, nor
+/// spare a connection that never answered.
+#[tokio::test]
+async fn a_dropped_requests_deadline_still_kicks_the_connection_and_frees_its_waiter() {
+    let hub = Arc::new(Hub::new());
+    let (conn, mut rx) = connect(&hub);
+    let call = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.request("h", "r1", prompt("r1"), Duration::from_millis(300)).await }
+    });
+    rx.recv().await.expect("r1 went out");
+    call.abort();
+    assert!(call.await.unwrap_err().is_cancelled());
+    assert_eq!(hub.pending_requests(), 1, "the waiter outlives its handler");
+    assert!(!conn.kicked.is_cancelled());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(conn.kicked.is_cancelled(), "a connection that never answered was kept");
+    assert_eq!(hub.pending_requests(), 0, "the waiter leaked");
+}
+```
+
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `cargo test -p hennery-testkit --test reconcile gave_up`
-Expected: all three FAIL with "timed out waiting for start failed" / "resume failed" / "turn slot free". The rejection found the waiter, but nobody wrote the store.
+Run: `cargo test -p hennery-testkit --test reconcile gave_up && cargo test -p hennery-sessions --test hub`
+Expected: all three reconcile tests FAIL with "timed out waiting for start failed" / "resume failed" / "turn slot free". The rejection found the waiter, but nobody wrote the store. The hub test does not compile yet: there is no `pending_requests`.
 
 - [ ] **Step 3: Implement**
+
+In `crates/hennery-sessions/src/hub.rs`, replace:
+
+```rust
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+```
+
+with:
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+```
+
+In `crates/hennery-sessions/src/hub.rs`, replace:
+
+```rust
+    waiters: Mutex<HashMap<String, Waiter>>,
+```
+
+with:
+
+```rust
+    /// Shared with each waiter's watchdog (`expire`).
+    waiters: Arc<Mutex<HashMap<String, Waiter>>>,
+```
+
+In `crates/hennery-sessions/src/hub.rs`, replace:
+
+```rust
+            waiters: Mutex::new(HashMap::new()),
+```
+
+with:
+
+```rust
+            waiters: Arc::new(Mutex::new(HashMap::new())),
+```
 
 In `crates/hennery-sessions/src/hub.rs`, replace:
 
@@ -2286,7 +2378,7 @@ with:
     }
 
     /// Like `request`, for a request whose store change `undo` reverts if
-    /// the host rejects it (`undo_for`).
+    /// the host rejects it (`take_rejected`).
     pub async fn request_with_undo(
         &self,
         host_id: &str,
@@ -2346,7 +2438,63 @@ with:
         frame: CollectorFrame,
         timeout: Duration,
     ) -> Result<SessionBody, RequestError> {
-        let (tx, rx) = oneshot::channel();
+        let (tx, mut rx) = oneshot::channel();
+```
+
+In `crates/hennery-sessions/src/hub.rs`, replace:
+
+```rust
+        let conn_id = {
+            let hosts = self.hosts.lock().expect("hosts lock");
+```
+
+with:
+
+```rust
+        let (conn_id, kicked) = {
+            let hosts = self.hosts.lock().expect("hosts lock");
+```
+
+In `crates/hennery-sessions/src/hub.rs`, replace:
+
+```rust
+            host.conn_id
+        };
+        let result = tokio::time::timeout(timeout, rx).await;
+        self.waiters.lock().expect("waiters lock").remove(request_id);
+        match result {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => Err(RequestError::DeliveryUnknown),
+            Err(_elapsed) => {
+```
+
+with:
+
+```rust
+            (host.conn_id, host.kicked.clone())
+        };
+        // The deadline belongs to the hub, not to this future: the handler
+        // awaiting it is dropped when its client disconnects, and a host
+        // that never answers must still lose its connection and its waiter.
+        let watchdog = tokio::spawn(expire(
+            self.waiters.clone(),
+            request_id.to_string(),
+            conn_id,
+            kicked,
+            timeout,
+        ));
+        let result = tokio::time::timeout(timeout, &mut rx).await;
+        watchdog.abort();
+        match result {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => Err(RequestError::DeliveryUnknown),
+            Err(_elapsed) => {
+                // Whoever removes the entry answers it. If a fact, a
+                // rejection or the watchdog took it just now, its answer is
+                // on the way: a rejection's undo is already in the store.
+                if self.waiters.lock().expect("waiters lock").remove(request_id).is_none() {
+                    return rx.await.unwrap_or(Err(RequestError::DeliveryUnknown));
+                }
 ```
 
 In `crates/hennery-sessions/src/hub.rs`, replace:
@@ -2370,23 +2518,85 @@ In `crates/hennery-sessions/src/hub.rs`, replace:
 
 ```rust
     pub fn reject(&self, request_id: &str, code: String, message: String) {
+        if let Some(w) = self.waiters.lock().expect("waiters lock").remove(request_id) {
+            let _ = w.tx.send(Err(RequestError::Rejected { code, message }));
+        }
+    }
 ```
 
 with:
 
 ```rust
-    /// The undo registered with a request still waiting for its answer.
-    /// The waiter outlives an HTTP handler that was dropped mid-request:
-    /// only its answer, the connection's loss or its timeout removes it.
-    pub fn undo_for(&self, request_id: &str) -> Option<Undo> {
-        self.waiters
-            .lock()
-            .expect("waiters lock")
-            .get(request_id)
-            .and_then(|w| w.undo.clone())
+    /// Take the waiter of a request the host rejected out of the hub. From
+    /// here on nothing else can answer it (not its timeout, not the
+    /// watchdog), so the caller applies the undo, then `answer`s, and the
+    /// store and the HTTP answer always agree (decision 6). The waiter
+    /// outlives an HTTP handler that was dropped mid-request.
+    pub fn take_rejected(&self, request_id: &str) -> Option<Rejection> {
+        let w = self.waiters.lock().expect("waiters lock").remove(request_id)?;
+        Some(Rejection { undo: w.undo, tx: w.tx })
     }
 
     pub fn reject(&self, request_id: &str, code: String, message: String) {
+        if let Some(rejection) = self.take_rejected(request_id) {
+            rejection.answer(code, message);
+        }
+    }
+
+    /// Requests still waiting for their answer.
+    pub fn pending_requests(&self) -> usize {
+        self.waiters.lock().expect("waiters lock").len()
+    }
+```
+
+Append to `crates/hennery-sessions/src/hub.rs`:
+
+```rust
+/// A waiter taken out of the hub by a host rejection (`Hub::take_rejected`).
+pub struct Rejection {
+    undo: Option<Undo>,
+    tx: oneshot::Sender<Result<SessionBody, RequestError>>,
+}
+
+impl Rejection {
+    /// What the request changed in the store, to revert first.
+    pub fn undo(&self) -> Option<&Undo> {
+        self.undo.as_ref()
+    }
+
+    /// Answer the request's caller, if it is still there.
+    pub fn answer(self, code: String, message: String) {
+        let _ = self.tx.send(Err(RequestError::Rejected { code, message }));
+    }
+}
+
+/// One waiter's deadline, owned by the hub. If the waiter is still there
+/// for the same connection when `timeout` has passed, nobody answered it:
+/// it is removed, its caller (if any) hears "delivery unknown", and the
+/// connection is dropped so the next handshake reconciles the request
+/// (ACP core §3.4). Idempotent with the handler's own timeout: whichever
+/// removes the entry acts.
+async fn expire(
+    waiters: Arc<Mutex<HashMap<String, Waiter>>>,
+    request_id: String,
+    conn_id: u64,
+    kicked: CancellationToken,
+    timeout: Duration,
+) {
+    tokio::time::sleep(timeout).await;
+    let expired = {
+        let mut waiters = waiters.lock().expect("waiters lock");
+        match waiters.get(&request_id) {
+            Some(w) if w.conn_id == conn_id => waiters.remove(&request_id),
+            _ => None,
+        }
+    };
+    if let Some(w) = expired {
+        tracing::warn!(%request_id, "request timed out with no handler left; dropping the host connection");
+        kicked.cancel();
+        let _ = w.tx.send(Err(RequestError::DeliveryUnknown));
+    }
+}
 ```
 
 In `crates/hennery-sessions/src/ws.rs`, replace:
@@ -2415,15 +2625,18 @@ with:
 
 ```rust
                 } else {
-                    // Undo what the request changed before its waiter hears
-                    // of the rejection, so the HTTP answer and the store
-                    // agree, and the store is right even with no waiter.
-                    if let Some(undo) = state.hub.undo_for(&request_id)
-                        && let Err(err) = undo_rejected(&state.store, &undo, &code)
-                    {
-                        tracing::error!(%host_id, ?undo, error = %err, "undoing a rejected request failed");
+                    // Take the waiter first, so no timeout can answer it any
+                    // more; undo what the request changed; then answer. The
+                    // HTTP answer and the store agree, and the store is
+                    // right even when no handler waits (decision 6).
+                    if let Some(rejection) = state.hub.take_rejected(&request_id) {
+                        if let Some(undo) = rejection.undo()
+                            && let Err(err) = undo_rejected(&state.store, undo, &code)
+                        {
+                            tracing::error!(%host_id, ?undo, error = %err, "undoing a rejected request failed");
+                        }
+                        rejection.answer(code, message);
                     }
-                    state.hub.reject(&request_id, code, message);
                 }
 ```
 
@@ -2603,15 +2816,15 @@ with:
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `cargo test -p hennery-testkit --test reconcile && cargo test -p hennery-testkit --test e2e`
-Expected: all 23 reconcile tests pass, including the three new ones. The existing `a_resume_the_host_rejects_is_a_502_with_its_code` still passes, so when the caller waits, the 502 and the stored failure agree. The e2e `a_start_that_fails_on_the_host_is_reported_as_502` still answers 502 `unknown_agent`.
+Run: `cargo test -p hennery-testkit --test reconcile && cargo test -p hennery-testkit --test e2e && cargo test -p hennery-sessions --test hub`
+Expected: all 23 reconcile tests pass, including the three new ones, and all 5 hub tests pass. Check the watchdog test is a real guard: replace `tokio::spawn(expire(` with a spawn of an empty future, watch `a_dropped_requests_deadline_still_kicks_the_connection_and_frees_its_waiter` fail, then restore it. The existing `a_resume_the_host_rejects_is_a_502_with_its_code` still passes, so when the caller waits, the 502 and the stored failure agree. The e2e `a_start_that_fails_on_the_host_is_reported_as_502` still answers 502 `unknown_agent`.
 
 - [ ] **Step 5: Lint and commit**
 
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
-git add crates/hennery-sessions/src crates/hennery-testkit/tests/reconcile.rs
-git commit -m "fix(sessions): apply a host's rejection even when no handler waits"
+git add crates/hennery-sessions crates/hennery-testkit/tests/reconcile.rs
+git commit -m "fix(sessions): own request deadlines in the hub and apply rejections without a handler"
 ```
 
 ---
@@ -2619,7 +2832,7 @@ git commit -m "fix(sessions): apply a host's rejection even when no handler wait
 ### Task 8: `POST /api/sessions/{id}/cancel` and the park gate
 
 **Files:**
-- Modify: `crates/hennery-sessions/src/api.rs`
+- Modify: `crates/hennery-sessions/src/api.rs`, `crates/hennery-sessions/src/store.rs`
 - Test: `crates/hennery-testkit/tests/reconcile.rs`
 
 **Interfaces:**
@@ -2628,9 +2841,10 @@ git commit -m "fix(sessions): apply a host's rejection even when no handler wait
   - 202 `CancelResponse {turn_id, outcome}` once that turn's `turn_ended` is ingested;
   - 409 `not_attached` when the session is not `active` or its host is not ready;
   - 409 `no_open_turn`;
-  - 409 `not_running` when the host rejects it;
+  - on the host's `not_running`: 202 with the stored outcome if that turn has already ended (its end was ingested before the waiter existed), otherwise 409 `not_running`;
   - 404 for an unknown session;
   - 503 `delivery_unknown`.
+- Produces: `Store::ended_turn_outcome(&self, turn_id: &str) -> Result<Option<TurnOutcome>>` (`Some` only for an `ended` turn).
 - Produces: `request_failed` maps `not_running` to 409.
 - Produces: `POST …/park` answers 409 `park_unsupported`, and sends nothing, when the host's connection did not announce `park` (decision 5).
 - Test support: `ScriptedHost::hello_with` / `connect_with` take the capabilities to announce. `hello` / `connect` announce `park`, as before.
@@ -2850,12 +3064,49 @@ async fn park_goes_only_to_a_host_that_announced_it_can_park() {
     let (status, body) = call.await.unwrap();
     assert_eq!((status, body["lifecycle"].as_str()), (202, Some("parked")), "{body}");
 }
+
+/// The turn's end was ingested after the handler read the open turn but
+/// before its waiter existed, so nothing resolved the waiter: the host's
+/// `not_running` is answered with the stored outcome, not 409. The end is
+/// written straight into the store here to open exactly that window.
+#[tokio::test]
+async fn a_cancel_whose_turn_ended_before_it_was_sent_answers_the_stored_outcome() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let turn = started_turn(&collector, &mut host, &session).await;
+    let c = client();
+    let url = cancel_url(&collector, &session);
+    let call = tokio::spawn(async move { post(&c, url, json!({})).await });
+    let request_id = expect_cancel(&mut host, &session, &turn).await;
+    host.seq += 1;
+    collector
+        .state
+        .store
+        .ingest(
+            &session,
+            host.seq,
+            &turn_ended(&turn, hennery_proto::frames::TurnOutcome::Completed),
+        )
+        .unwrap();
+    host.send(&HostFrame::Error {
+        request_id,
+        code: "not_running".into(),
+        message: "that turn is not running".into(),
+    })
+    .await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!(
+        (status, body),
+        (202, json!({ "turn_id": turn, "outcome": "completed" }))
+    );
+}
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
 Run: `cargo test -p hennery-testkit --test reconcile -- cancel park_goes`
-Expected: the three cancel tests FAIL. There is no such route yet, so the answer is 404 and no `cancel_turn` reaches the host ("a collector frame within 10s"). `park_goes_only_to_a_host_that_announced_it_can_park` FAILS after 15 s: the park reaches the host that cannot park, the scripted host never answers it, and the client times out.
+Expected: the four cancel tests FAIL. There is no such route yet, so the answer is 404 and no `cancel_turn` reaches the host ("a collector frame within 10s"). `park_goes_only_to_a_host_that_announced_it_can_park` FAILS after 15 s: the park reaches the host that cannot park, the scripted host never answers it, and the client times out.
 
 - [ ] **Step 3: Implement**
 
@@ -2946,6 +3197,9 @@ with:
 /// Cancel the open turn (ACP core §9): 202 `CancelResponse` once that
 /// turn's `turn_ended` is ingested, with the outcome it really had: a turn
 /// that finished before the cancel reached the agent is not `cancelled`.
+/// That includes a turn whose end was ingested between reading the open
+/// turn and sending the cancel: the host then answers `not_running`, and
+/// the stored outcome is the answer.
 async fn cancel(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let session = match state.store.session(&id) {
         Ok(Some(s)) => s,
@@ -2973,7 +3227,14 @@ async fn cancel(State(state): State<AppState>, Path(id): Path<String>) -> Respon
             (StatusCode::ACCEPTED, Json(CancelResponse { turn_id, outcome })).into_response()
         }
         Ok(other) => internal(anyhow::anyhow!("cancel completed by {other:?}")),
-        // `not_running`: the host has no such turn in flight (409).
+        Err(RequestError::Rejected { code, message }) if code == "not_running" => {
+            match state.store.ended_turn_outcome(&turn_id) {
+                Ok(Some(outcome)) => (StatusCode::ACCEPTED, Json(CancelResponse { turn_id, outcome })).into_response(),
+                // The host has no such turn in flight, and it has not ended.
+                Ok(None) => request_failed(RequestError::Rejected { code, message }),
+                Err(err) => internal(err),
+            }
+        }
         Err(err) => request_failed(err),
     }
 }
@@ -3005,16 +3266,58 @@ with:
     match state.store.record_park_request(&id) {
 ```
 
+In `crates/hennery-sessions/src/store.rs`, replace:
+
+```rust
+use hennery_proto::frames::{AttachedSession, SessionBody};
+```
+
+with:
+
+```rust
+use hennery_proto::frames::{AttachedSession, SessionBody, TurnOutcome};
+```
+
+In `crates/hennery-sessions/src/store.rs`, replace:
+
+```rust
+    /// Open a turn if the session is active and has none open. Returns false
+```
+
+with:
+
+```rust
+    /// How a turn ended, once it has (`None` while it is open, or if it was
+    /// never delivered).
+    pub fn ended_turn_outcome(&self, turn_id: &str) -> Result<Option<TurnOutcome>> {
+        let outcome: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT outcome FROM turns WHERE turn_id = ?1 AND state = 'ended'",
+                [turn_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(match outcome {
+            Some(outcome) => Some(serde_json::from_value(Value::String(outcome))?),
+            None => None,
+        })
+    }
+
+    /// Open a turn if the session is active and has none open. Returns false
+```
+
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p hennery-testkit --test reconcile`
-Expected: all 27 pass.
+Expected: all 28 pass.
 
 - [ ] **Step 5: Lint and commit**
 
 ```bash
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
-git add crates/hennery-sessions/src/api.rs crates/hennery-testkit/tests/reconcile.rs
+git add crates/hennery-sessions/src crates/hennery-testkit/tests/reconcile.rs
 git commit -m "feat(sessions): add POST /api/sessions/{id}/cancel and gate park on the park capability"
 ```
 
@@ -3088,7 +3391,7 @@ git add crates/hennery-testkit/tests/e2e.rs
 git commit -m "test(e2e): cancel a running turn over a real host and adapter"
 ```
 
-Expected: 192 tests pass in the workspace.
+Expected: 194 tests pass in the workspace.
 
 ---
 
@@ -3120,7 +3423,6 @@ Expected: 192 tests pass in the workspace.
 - **`images` and `projects` capabilities.** The host announces them only once image prompts (with §7's collector validation and storage) and the project probes exist. The collector then refuses an image prompt to a host without `images`, and the probes to one without `projects`.
 - **The unanswered-cancel park does not set the handle's `ending` mark.** It ends the actor by itself, like an idle reap or an adapter exit. A resume that arrives during that actor's kill grace is answered `not_attached`, so the session becomes `failed` (it can be resumed again). This is the same class as B1's "Operator park and close only" obligation, and it has the same fix: mark the handle from inside the actor.
 - **Cancel grace is not configurable.** `CANCEL_GRACE` (20 s) is a constant, and `HostConfig` does not expose it. If real adapters need longer, expose it next to `idle_timeout`, keeping grace plus kill grace below the collector's 60 s.
-- **A narrow cancel race.** A turn whose `turn_ended` is ingested after the handler read `open_turn_id`, but before its waiter was registered, answers 409 `not_running` instead of 202 with the real outcome. The window is between two lines of `cancel`. If the UI ever shows it, look the ended turn's outcome up on `not_running`.
 
 Then, in order (unchanged from plan B1):
 - **(2) Permission and elicitation.** The pending set and the answer queue, including the teardown hooks plan A left out and `turn_cancelled` above.
