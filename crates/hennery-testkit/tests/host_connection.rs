@@ -763,3 +763,49 @@ async fn a_host_announces_that_it_can_park() {
         hennery_proto::frames::Capabilities(vec![hennery_proto::frames::Capability::Park])
     );
 }
+
+#[tokio::test]
+async fn cancel_turn_reaches_the_actor_and_a_cancel_for_a_detached_session_is_not_attached() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(host_with_fake(addr, "cancel", slow_fake())));
+
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    send_frame(&mut sink, &start("r1", "s1")).await;
+    read_until(&mut stream, body_is("s1", "session_started")).await;
+    send_frame(
+        &mut sink,
+        &CollectorFrame::Prompt {
+            request_id: "r2".into(),
+            session_id: "s1".into(),
+            turn_id: "t1".into(),
+            content: vec![serde_json::json!({"type": "text", "text": "go"})],
+        },
+    )
+    .await;
+    read_until(&mut stream, body_is("s1", "turn_started")).await;
+    let cancel = |request_id: &str, session_id: &str| CollectorFrame::CancelTurn {
+        request_id: request_id.into(),
+        session_id: session_id.into(),
+        turn_id: "t1".into(),
+    };
+    send_frame(&mut sink, &cancel("r3", "s1")).await;
+    let ended = read_until(&mut stream, body_is("s1", "turn_ended")).await;
+    let HostFrame::Session {
+        body: hennery_proto::frames::SessionBody::TurnEnded { turn_id, outcome, .. },
+        ..
+    } = ended
+    else {
+        panic!("expected turn_ended, got {ended:?}");
+    };
+    assert_eq!(
+        (turn_id.as_str(), outcome),
+        ("t1", hennery_proto::frames::TurnOutcome::Cancelled)
+    );
+    send_frame(&mut sink, &cancel("r4", "no-such-session")).await;
+    let refused = read_until(&mut stream, error_for("r4")).await;
+    assert!(
+        matches!(&refused, HostFrame::Error { code, .. } if code == "not_attached"),
+        "{refused:?}"
+    );
+}

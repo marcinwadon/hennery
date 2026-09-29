@@ -421,13 +421,18 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
                 }) => {}
             _ => not_attached(uplink, request_id),
         },
-        // Wired to the session actor with cancel; until then it is refused,
-        // so the collector's waiter returns at once.
-        CollectorFrame::CancelTurn { request_id, .. } => uplink.reply(HostFrame::Error {
+        CollectorFrame::CancelTurn {
             request_id,
-            code: "unsupported".into(),
-            message: "this host cannot cancel turns yet".into(),
-        }),
+            session_id,
+            turn_id,
+        } => match live_session(sessions, &session_id) {
+            Some(handle)
+                if handle.send(SessionCmd::Cancel {
+                    request_id: request_id.clone(),
+                    turn_id,
+                }) => {}
+            _ => not_attached(uplink, request_id),
+        },
         CollectorFrame::Ack { session_id, ack_seq } => uplink.ack(&session_id, ack_seq)?,
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }
