@@ -25,7 +25,7 @@
 
 It builds on the executed [cancel and capabilities plan](2026-09-29-cancel-capabilities.md) (plan B2a). Read its "Execution status" and "After this plan" first. Its code wins over its task text, and every anchor below was taken from that code (`main` at `75b2fc0`).
 
-**Status:** not executed. Every code block below was built and tested in a scratch copy of `75b2fc0`. The plan was then replayed from its own text, task by task, onto a fresh copy of `75b2fc0`, with fmt, clippy, the workspace tests and the codegen check after every task (231 tests at the end, from 195). The decisions below await the maintainer's review.
+**Status:** not executed. Every code block below was built and tested in a scratch copy of `75b2fc0`. The plan was then replayed from its own text, task by task, onto a fresh copy of `75b2fc0`, with fmt, clippy, the workspace tests and the codegen check after every task (241 tests at the end, from 195). The decisions were reviewed on 2026-09-30, and amended as marked.
 
 ## Scope
 
@@ -73,15 +73,25 @@ This is **plan B2b**, the config half of B2 as B2a's "After this plan" scoped it
 
 ## Decisions this plan makes where the spec is silent
 
+Reviewed and confirmed (with the amendments above) on 2026-09-30 by a stronger-model review on the maintainer's behalf. The review checked them against agent-client-protocol-schema 1.9.1, claude-agent-acp 0.81.0 and codex-acp 1.7.0, confirmed decisions 3, 5, 7, 8, 9, 10 and 11 as written, and amended decisions 1, 2, 4 and 6 (marked **Amended** below). What it found:
+- The TypeScript SDK the pinned adapters use handles JSON-RPC requests concurrently: it does not await one request's handler before reading the next.
+- An agent offers boolean options only to a client that advertises `clientCapabilities.session.configOptions.boolean`; to any other it offers an `on` / `off` select instead (Claude turns `fast` into one).
+- Both pinned adapters return `configOptions` on `session/new` and `session/load`.
+
+The tasks implement the decisions as written here.
+
 1. **Axes are ACP config options, and model and mode are two of them.**
-   - The model is the option in category `model`, or, without one, the option whose id is `model`. The same goes for `mode`. ACP makes categories a UX hint only, so an adapter without them must still work.
+   - The model is the option in category `model`. Without one, it is the option whose id is `model`, but only if that option has no category or a custom (`_`-prefixed) one: an option another category claims (even one this build does not know) is not the model. The same goes for `mode`. ACP makes categories a UX hint only, so an adapter without them must still work. **Amended.**
+   - The host's `initialize` advertises `clientCapabilities.session.configOptions.boolean = {}`, so agents offer boolean options as booleans. **Amended.**
    - `axes` holds every other option, by config id. A value is a select's value id or a boolean (`ConfigValue`, an untagged `bool | string`).
    - `SessionConfig { model?, mode?, axes{} }` is `#[serde(flatten)]`ed into the frames and the start request, so the wire stays §3.3's flat `model?, mode?, axes{}`.
    - A requested model or mode with no option to match is a failed switch, reported like any other (decision 2). It is never dropped silently.
 2. **A switch that does not take never fails a start or a resume.**
    - Start and resume apply the same way: the model, then each axis (in config-id order), then the mode, each with `session/set_config_option`. A value that is already current is not sent.
    - Each switch gets `CONFIG_TIMEOUT` (15 s), and none runs past the start's own 75 s deadline. So the collector's 90 s start timeout still fires after the host's answer, never before it.
-   - Every failure lands in one `host_note` after `session_started`: a refused value, an option the adapter does not offer, or a switch with no answer in time. The code is `config_failed` on a start and `reapply_failed` on a resume.
+   - **Amended.** Once a switch gets no answer in time, or the start deadline has passed, no further switch is sent for that start. The adapter may still apply the late switch, and it handles requests concurrently, so a late model switch could clamp a mode sent after it: model first and mode last would silently break. The rest are listed as `not sent: an earlier switch did not answer` (or `not sent: the start deadline passed`). A switch the deadline cut off says `no answer before the start deadline`, not `no answer within 15s`.
+   - **Amended.** After the switches, each requested value is compared with the final read-back. A mismatch (the agent accepted a value and reports another, or a later switch undid it) is a failure too: `effort: asked high, agent reports low`.
+   - Every failure lands in one `host_note` after `session_started`: a refused value, an option the adapter does not offer, a switch with no answer in time, one not sent, a mismatch. The code is `config_failed` on a start and `reapply_failed` on a resume.
    - The spec leaves the fresh-start case open. A start is not failed either: the picker's value may be stale (another pin, another host), and the note plus the real current values tell the operator what to change. Failing would throw the started adapter away for a setting the operator can fix in one click.
 3. **An empty or missing read-back is not a catalogue.**
    - The crate parses `configOptions` leniently, so an answer that does not parse arrives as an empty list, not as an error. The host treats an empty list, or a switch that timed out, as "the current values are unknown". Until the adapter reports its options again, it announces no catalogue at all: `session_started` or `config_applied` then has no extracts.
@@ -91,13 +101,16 @@ This is **plan B2b**, the config half of B2 as B2a's "After this plan" scoped it
    - The extracts are `config_options` (the adapter's option objects, re-serialized from the crate's types), `current_model`, `current_mode`, and a new `current_axes`. When `config_options` is present and non-empty, the four describe the same moment.
    - `current_axes` refines §3.2's closed list. Without it, the collector would have to read ACP option objects to learn the other axes, which §3.2 forbids.
    - The host fills them on `session_started`, on `config_applied`, and on live `config_option_update` notifications (the agent changing its own config, e.g. leaving plan mode).
-   - It never fills them on updates replayed by `session/load`, nor on updates the adapter sent while the start's switches ran. Those are older than the catalogue `session_started` announces (P-13).
+   - It never fills them on updates replayed by `session/load`, nor on updates the adapter sent before its `session/new` answer or while the start's switches ran. Those are older than the catalogue `session_started` announces (P-13).
+   - **Amended.** If the `session/new` or `session/load` answer has no (or an empty) `configOptions`, the pre-switch catalogue is seeded from the last non-empty `config_option_update` the adapter sent before that answer. That update itself still carries no extracts.
+   - `config_options` holds the options hennery can parse: the crate skips an option it cannot read.
 5. **The stored config is what the agent last reported, not what was asked for.**
    - `sessions.model`, `mode` and `config_axes` hold the current values of the last snapshot, and `session_catalog.config_options` holds the options. Every snapshot that applies overwrites them.
    - A resume re-sends them whole, and the host skips whatever is already current. So a mode the agent chose itself mid-turn survives a host restart, and a mode an adapter clamped is not forced back.
 6. **`set_config` on the host:**
    - The option must exist in the actor's catalogue (else `unknown_option`), and the value must be of the option's kind (else `invalid`). Whether a select offers the value is the adapter's call: its refusal, or no answer within `CONFIG_TIMEOUT`, is `config_failed`.
-   - Switches may run during a turn, and are answered in the order they were sent.
+   - **Amended.** The actor queues `set_config` requests and sends at most one `session/set_config_option` at a time: the next goes out only once the previous one is answered or has timed out. The adapter handles requests concurrently, so two switches in flight could land in either order. Each request's deadline is its receipt on the host plus `CONFIG_TIMEOUT`: one still waiting when it passes is answered `config_failed` (`an earlier switch is still out`), one sent and unanswered by then `config_failed` (`no answer within …`).
+   - Switches may run during a turn, and are answered in the order they came.
    - A switch still out when the actor ends is answered `not_attached`, after the actor's last fact, so the collector never sits out its 60 s timeout for it.
    - A `config_applied` that reaches the store after the session detached is stored but not applied (plan B1 decision 7).
 7. **The REST and SSE surface:**
@@ -115,8 +128,11 @@ This is **plan B2b**, the config half of B2 as B2a's "After this plan" scoped it
 **Spec drift to reconcile after review:** these are refinements of ACP core §3.2, §3.3 and §9, and the spec text should be amended to match:
 - the `current_axes` extract;
 - the `SessionCatalog` shape;
-- the codes `unknown_option` / `config_failed` and the notes `config_failed` / `reapply_failed`;
-- 202 with the catalogue on `POST …/config`.
+- the codes `unknown_option` / `config_failed` and the notes `config_failed` / `reapply_failed`, with their line texts `not sent: an earlier switch did not answer` and `asked X, agent reports Y`;
+- 202 with the catalogue on `POST …/config`;
+- the host advertises `session.configOptions.boolean` in `initialize` (§2.5, §6);
+- one `session/set_config_option` at a time per session (§4.3, §3.3);
+- `config_options` extracts are "the options hennery can parse" (§3.2).
 
 ## Global Constraints
 
@@ -143,7 +159,7 @@ These are the five inputs most likely to bite a real user that the obvious tests
 1. **A stale or bogus value from the New-session picker** (a model another pin offered, an option this adapter lacks). Expected: the session still starts, and a `host_note{config_failed}` says what did not take. The values shown are the adapter's real ones. The refused model is never reported as current, not on start and not after a later `set_config`. (Task 4: `a_start_whose_switches_fail_still_starts_and_says_why`; Task 8: `a_model_switch_answers_with_the_adapters_read_back_and_a_bogus_model_is_never_current`)
 2. **The agent changes its own mode mid-turn** (leaves plan mode). Expected: the live `config_option_update` carries the catalogue, and the store keeps the new mode. After a host restart, the resume applies it to the fresh adapter, which starts from its default. (Task 5: `only_a_live_config_option_update_carries_the_catalogue`; Task 8: `a_mode_the_agent_chose_survives_a_host_restart_and_resume`)
 3. **A resume whose `session/load` replays an old `config_option_update`,** or an adapter that sends updates while the start's switches run. Expected: those updates carry no catalogue, so the post-switch catalogue in `session_started` is what is stored (P-13). (Task 5: `only_a_live_config_option_update_carries_the_catalogue`; Task 6: `a_config_applied_or_a_live_update_replaces_the_catalogue`)
-4. **An adapter that answers a switch with an empty or unparseable catalogue, or never answers.** Expected: the start or resume still succeeds, and the stored model and mode survive. A hung switch costs at most `CONFIG_TIMEOUT` and answers `config_failed` well before the collector's 60 s timeout would drop the host connection. (Task 4: `a_switch_without_a_read_back_announces_no_catalogue`, `a_hung_switch_is_reported_and_the_session_still_starts`; Task 5: `a_switch_that_never_answers_is_config_failed_and_one_still_out_at_the_end_is_not_attached`; Task 6: `an_empty_or_absent_read_back_keeps_the_stored_catalogue`)
+4. **An adapter that answers a switch with an empty or unparseable catalogue, answers late, or never answers** (it handles requests concurrently). Expected: the start or resume still succeeds, and the stored model and mode survive. A hung switch costs at most `CONFIG_TIMEOUT` and answers `config_failed` well before the collector's 60 s timeout would drop the host connection. A late model switch cannot clamp a mode switched after it: nothing more is sent at start, and live switches go out one at a time. (Task 4: `a_switch_without_a_read_back_announces_no_catalogue`, `a_hung_switch_is_reported_and_the_session_still_starts`, `a_late_model_switch_stops_the_starts_switches_so_its_clamp_cannot_undo_the_mode`; Task 5: `set_config_sends_one_switch_at_a_time_so_a_late_clamp_cannot_undo_a_later_switch`; Task 5: `a_switch_that_never_answers_is_config_failed_and_one_still_out_at_the_end_is_not_attached`; Task 6: `an_empty_or_absent_read_back_keeps_the_stored_catalogue`)
 5. **A resume onto an adapter that no longer offers a stored value** (a pin bump dropped a model). Expected: the resume succeeds with a `host_note{reapply_failed}`, and the session takes prompts. (Task 4: `a_resume_re_applies_the_stored_config_and_a_failed_re_apply_is_only_a_note`)
 
 ## File structure
@@ -1238,12 +1254,15 @@ Expected: 201 tests pass.
 **Interfaces:**
 - Consumes: agent-client-protocol-schema 1.9.1 `SessionConfigOption`, `SetSessionConfigOptionRequest` / `Response`, `ConfigOptionUpdate`.
 - Produces: new `FakeScript` fields, all `#[serde(default)]`:
-  - `config_options: Vec<Value>`: ACP option JSON, announced by `session/new` and `session/load` (absent when empty), and switched by `session/set_config_option`. An unknown id, or a value the option does not offer, is refused with `-32602`, like a real adapter;
+  - `config_options: Vec<Value>`: ACP option JSON, announced by `session/new` and `session/load` (absent when empty), and switched by `session/set_config_option`. An unknown id, or a value the option does not offer, is refused with `-32602`, like a real adapter. A boolean option is announced as a boolean only if `initialize` advertised `session.configOptions.boolean`; otherwise it becomes an `on` / `off` select;
   - `model_switch_sets_mode: Option<String>`: a model switch also sets the mode option to this value (§12 scenario 1's clamp);
   - `prompt_sets_mode: Option<String>`: every prompt first sets the mode and sends a `config_option_update`;
   - `config_log: Option<String>`: a file that gets one `id=value` line per call, refused calls included;
   - `empty_config_read_back: bool`: apply, but answer `configOptions: []`;
-  - `hang_config: bool`: never answer a switch.
+  - `hang_config: bool`: never answer a switch;
+  - `slow_model_switch_ms: Option<u64>`: answer a model switch this late, from a task of its own so other requests are handled meanwhile (like the adapters' TS SDK), and apply `model_switch_sets_mode` only after that answer;
+  - `sticky_options: Vec<String>`: switches of these ids are accepted and change nothing;
+  - `config_in_update_only: bool`: announce the options in a `config_option_update` sent just before the `session/new` / `session/load` answer, which has none.
 - Produces: `hennery_testkit::sample_config_options() -> Vec<Value>`:
   - `model` (category `model`: `small` | `large`, current `small`);
   - `effort` (category `thought_level`: `low` | `high`, current `low`);
@@ -1275,6 +1294,13 @@ fn set_config(id: i64, config_id: &str, value: Value) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "method": "session/set_config_option", "params": params})
 }
 
+/// `requests` with an `initialize` that advertises boolean config options,
+/// as the hennery host does.
+fn with_booleans(mut requests: Vec<Value>) -> Vec<Value> {
+    requests[0]["params"]["clientCapabilities"] = json!({"session": {"configOptions": {"boolean": {}}}});
+    requests
+}
+
 /// The current value of every option in a `configOptions` list.
 fn current(options: &Value) -> Vec<(String, Value)> {
     options
@@ -1288,7 +1314,7 @@ fn current(options: &Value) -> Vec<(String, Value)> {
 #[test]
 fn session_new_and_load_announce_the_scripted_config_options() {
     let script = config_script(json!({}));
-    let out = exchange_until(&script, &session_requests()[..2], 2);
+    let out = exchange_until(&script, &with_booleans(session_requests()[..2].to_vec()), 2);
     let options = &out.last().unwrap()["result"]["configOptions"];
     assert_eq!(
         current(options),
@@ -1299,8 +1325,16 @@ fn session_new_and_load_announce_the_scripted_config_options() {
             ("mode".to_string(), json!("default"))
         ]
     );
-    let out = exchange_until(&script, &load_requests("agent-7"), 2);
+    let out = exchange_until(&script, &with_booleans(load_requests("agent-7")), 2);
     assert_eq!(out.last().unwrap()["result"]["configOptions"], *options);
+    // A client that cannot show a boolean option gets an on/off select.
+    let out = exchange_until(&script, &session_requests()[..2], 2);
+    let fast = &out.last().unwrap()["result"]["configOptions"][2];
+    assert_eq!(
+        (&fast["type"], &fast["currentValue"]),
+        (&json!("select"), &json!("off")),
+        "{fast}"
+    );
     // No scripted options: none announced, like an adapter without them.
     let out = exchange_until(r#"{"chunks":[]}"#, &session_requests()[..2], 2);
     assert!(out.last().unwrap()["result"].get("configOptions").is_none(), "{out:?}");
@@ -1311,7 +1345,7 @@ fn set_config_option_switches_validates_and_clamps_the_mode_like_an_adapter() {
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("config.log");
     let script = config_script(json!({ "model_switch_sets_mode": "default", "config_log": log }));
-    let mut requests = session_requests()[..2].to_vec();
+    let mut requests = with_booleans(session_requests()[..2].to_vec());
     requests.push(set_config(3, "mode", json!("plan")));
     requests.push(set_config(4, "model", json!("large")));
     requests.push(set_config(5, "fast", json!(true)));
@@ -1341,7 +1375,7 @@ fn set_config_option_switches_validates_and_clamps_the_mode_like_an_adapter() {
 #[test]
 fn an_empty_read_back_still_applies_the_switch() {
     let script = config_script(json!({ "empty_config_read_back": true, "prompt_sets_mode": "bypass" }));
-    let mut requests = session_requests()[..2].to_vec();
+    let mut requests = with_booleans(session_requests()[..2].to_vec());
     requests.push(set_config(3, "model", json!("large")));
     requests.push(json!({"jsonrpc":"2.0","id":4,"method":"session/prompt",
                          "params":{"sessionId":"fake-session-1","prompt":[{"type":"text","text":"hi"}]}}));
@@ -1361,6 +1395,63 @@ fn an_empty_read_back_still_applies_the_switch() {
             ("fast".to_string(), json!(false)),
             ("mode".to_string(), json!("bypass"))
         ]
+    );
+}
+
+#[test]
+fn a_sticky_option_accepts_a_switch_and_keeps_its_value() {
+    let script = config_script(json!({ "sticky_options": ["effort"] }));
+    let mut requests = session_requests()[..2].to_vec();
+    requests.push(set_config(3, "effort", json!("high")));
+    let out = exchange_until(&script, &requests, 3);
+    let answer = out.last().unwrap();
+    assert_eq!(
+        current(&answer["result"]["configOptions"])[1].1,
+        json!("low"),
+        "{answer}"
+    );
+}
+
+#[test]
+fn config_in_update_only_announces_the_options_before_the_answer() {
+    let script = config_script(json!({ "config_in_update_only": true }));
+    let out = exchange_until(&script, &session_requests()[..2], 2);
+    let answer = out.last().unwrap();
+    assert!(answer["result"].get("configOptions").is_none(), "{answer}");
+    let update = out
+        .iter()
+        .find(|m| m["params"]["update"]["sessionUpdate"] == "config_option_update")
+        .expect("a config_option_update before the answer");
+    assert_eq!(
+        current(&update["params"]["update"]["configOptions"])[0].1,
+        json!("small")
+    );
+}
+
+/// The real adapters' SDK handles requests concurrently: a slow model
+/// switch does not hold back the mode switch sent after it, and its mode
+/// clamp lands after its own answer.
+#[test]
+fn a_slow_model_switch_is_answered_after_a_later_switch_and_clamps_after_answering() {
+    let script = config_script(json!({ "slow_model_switch_ms": 300, "model_switch_sets_mode": "default" }));
+    let mut requests = session_requests()[..2].to_vec();
+    requests.push(set_config(3, "model", json!("large")));
+    requests.push(set_config(4, "mode", json!("plan")));
+    let out = exchange_until(&script, &requests, 3);
+    let order: Vec<i64> = out
+        .iter()
+        .filter_map(|m| m["id"].as_i64())
+        .filter(|id| *id >= 3)
+        .collect();
+    assert_eq!(order, [4, 3], "{out:?}");
+    // Its answer still shows the mode the later switch set: the clamp came after.
+    let model = out.last().unwrap();
+    assert_eq!(
+        (
+            current(&model["result"]["configOptions"])[0].1.clone(),
+            current(&model["result"]["configOptions"])[3].1.clone()
+        ),
+        (json!("large"), json!("plan"))
     );
 }
 ```
@@ -1389,7 +1480,10 @@ with:
     /// `session/new` and `session/load` and switched by
     /// `session/set_config_option`. A switch is validated like a real
     /// adapter does: an unknown id, or a value the option does not offer, is
-    /// refused with `-32602`.
+    /// refused with `-32602`. A boolean option is announced as a boolean
+    /// only to a client whose `initialize` advertises
+    /// `session.configOptions.boolean`; any other client gets an `on` /
+    /// `off` select instead.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config_options: Vec<serde_json::Value>,
     /// A switch of the model option also sets the mode option to this value
@@ -1412,6 +1506,20 @@ with:
     /// Never answer `session/set_config_option` (a hung switch).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hang_config: bool,
+    /// Answer a switch of the model option only after this many
+    /// milliseconds, while other requests are handled meanwhile, and apply
+    /// `model_switch_sets_mode` only after that answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slow_model_switch_ms: Option<u64>,
+    /// Switches of these option ids are accepted but change nothing (an
+    /// adapter that reports a value other than the one it was given).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sticky_options: Vec<String>,
+    /// Announce the config options in a `config_option_update` sent just
+    /// before the `session/new` / `session/load` answer, which then has
+    /// none.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub config_in_update_only: bool,
 }
 ```
 
@@ -1434,6 +1542,9 @@ with:
             config_log: None,
             empty_config_read_back: false,
             hang_config: false,
+            slow_model_switch_ms: None,
+            sticky_options: Vec::new(),
+            config_in_update_only: false,
         }
 ```
 
@@ -1476,8 +1587,9 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ConfigOptionUpdate, ContentBlock, ContentChunk, InitializeRequest,
     InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
     PromptResponse, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigSelectOptions, SessionConfigValueId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
+    SessionConfigSelect, SessionConfigSelectOption, SessionConfigSelectOptions, SessionConfigValueId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
+    TextContent,
 };
 use agent_client_protocol::{Agent, Stdio, UntypedMessage};
 use hennery_testkit::{CRASH_EXIT_CODE, FakeScript, SCRIPT_ENV};
@@ -1537,11 +1649,26 @@ async fn main() -> agent_client_protocol::Result<()> {
         .builder()
         .name("hennery-fake-acp")
         .on_receive_request(
-            async move |req: InitializeRequest, responder, _cx| {
-                responder.respond(
-                    InitializeResponse::new(req.protocol_version)
-                        .agent_capabilities(AgentCapabilities::new().load_session(load_session)),
-                )
+            {
+                let catalogue = catalogue.clone();
+                async move |req: InitializeRequest, responder, _cx| {
+                    // A boolean option is announced as one only to a client
+                    // that says it can show one; any other gets an on/off
+                    // select, as the real adapters do.
+                    let booleans = req
+                        .client_capabilities
+                        .session
+                        .as_ref()
+                        .and_then(|session| session.config_options.as_ref())
+                        .is_some_and(|options| options.boolean.is_some());
+                    if !booleans {
+                        booleans_as_selects(&mut catalogue.lock().unwrap());
+                    }
+                    responder.respond(
+                        InitializeResponse::new(req.protocol_version)
+                            .agent_capabilities(AgentCapabilities::new().load_session(load_session)),
+                    )
+                }
             },
             agent_client_protocol::on_receive_request!(),
         )
@@ -1549,8 +1676,17 @@ async fn main() -> agent_client_protocol::Result<()> {
             {
                 let script = script.clone();
                 let announced = announced.clone();
-                async move |_req: NewSessionRequest, responder, _cx| match script.new_session_error {
+                async move |_req: NewSessionRequest, responder, cx| match script.new_session_error {
                     Some(code) => responder.respond_with_error(agent_client_protocol::Error::new(code, "scripted")),
+                    None if script.config_in_update_only => {
+                        if let Some(options) = announced() {
+                            cx.send_notification(SessionNotification::new(
+                                "fake-session-1",
+                                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
+                            ))?;
+                        }
+                        responder.respond(NewSessionResponse::new("fake-session-1"))
+                    }
                     None => responder.respond(NewSessionResponse::new("fake-session-1").config_options(announced())),
                 }
             },
@@ -1571,6 +1707,15 @@ async fn main() -> agent_client_protocol::Result<()> {
                     }
                     match script.load_error {
                         Some(code) => responder.respond_with_error(agent_client_protocol::Error::new(code, "scripted")),
+                        None if script.config_in_update_only => {
+                            if let Some(options) = announced() {
+                                cx.send_notification(SessionNotification::new(
+                                    req.session_id.clone(),
+                                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
+                                ))?;
+                            }
+                            responder.respond(LoadSessionResponse::new())
+                        }
                         None => responder.respond(LoadSessionResponse::new().config_options(announced())),
                     }
                 }
@@ -1591,9 +1736,46 @@ async fn main() -> agent_client_protocol::Result<()> {
                             Ok(())
                         });
                     }
+                    let is_model = catalogue
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|o| o.id == req.config_id && o.category == Some(SessionConfigOptionCategory::Model));
+                    if let (Some(delay), true) = (script.slow_model_switch_ms, is_model) {
+                        // Answered late, from a task of its own, so other
+                        // requests are handled meanwhile (the TS SDK the real
+                        // adapters use does not await one request before
+                        // reading the next). The mode clamp lands only after
+                        // the answer: the client cannot see it coming.
+                        let script = script.clone();
+                        let catalogue = catalogue.clone();
+                        return cx.spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(delay)).await;
+                            let switched = {
+                                let mut options = catalogue.lock().unwrap();
+                                switch(&mut options, &req, None, &script.sticky_options).map(|()| options.clone())
+                            };
+                            let answered = match switched {
+                                Ok(options) => responder.respond(SetSessionConfigOptionResponse::new(options)),
+                                Err(message) => {
+                                    responder.respond_with_error(agent_client_protocol::Error::new(-32602, message))
+                                }
+                            };
+                            if let Some(mode) = &script.model_switch_sets_mode {
+                                set_select(&mut catalogue.lock().unwrap(), &SessionConfigOptionCategory::Mode, mode);
+                            }
+                            answered
+                        });
+                    }
                     let switched = {
                         let mut options = catalogue.lock().unwrap();
-                        switch(&mut options, &req, script.model_switch_sets_mode.as_deref()).map(|()| options.clone())
+                        switch(
+                            &mut options,
+                            &req,
+                            script.model_switch_sets_mode.as_deref(),
+                            &script.sticky_options,
+                        )
+                        .map(|()| options.clone())
                     };
                     match switched {
                         Ok(_) if script.empty_config_read_back => {
@@ -1695,29 +1877,39 @@ fn log_switch(script: &FakeScript, req: &SetSessionConfigOptionRequest) {
     writeln!(log, "{}={value}", req.config_id).expect("write the config log");
 }
 
-/// Apply one switch as a real adapter would, or say why it cannot.
+/// Apply one switch as a real adapter would, or say why it cannot. A switch
+/// of a `sticky` option is accepted and changes nothing.
 fn switch(
     options: &mut [SessionConfigOption],
     req: &SetSessionConfigOptionRequest,
     model_switch_sets_mode: Option<&str>,
+    sticky: &[String],
 ) -> Result<(), String> {
     let option = options
         .iter_mut()
         .find(|o| o.id == req.config_id)
         .ok_or_else(|| format!("unknown config option {}", req.config_id))?;
     let is_model = option.category == Some(SessionConfigOptionCategory::Model);
+    let sticky = sticky.iter().any(|id| **id == *req.config_id.0);
     match (&mut option.kind, &req.value) {
         (SessionConfigKind::Select(select), SessionConfigOptionValue::ValueId { value })
             if offers(&select.options, value) =>
         {
-            select.current_value = value.clone();
+            if !sticky {
+                select.current_value = value.clone();
+            }
         }
         (SessionConfigKind::Boolean(toggle), SessionConfigOptionValue::Boolean { value }) => {
-            toggle.current_value = *value;
+            if !sticky {
+                toggle.current_value = *value;
+            }
         }
         _ => return Err(format!("invalid value for {}", req.config_id)),
     }
-    if is_model && let Some(mode) = model_switch_sets_mode {
+    if is_model
+        && !sticky
+        && let Some(mode) = model_switch_sets_mode
+    {
         set_select(options, &SessionConfigOptionCategory::Mode, mode);
     }
     Ok(())
@@ -1730,6 +1922,21 @@ fn offers(options: &SessionConfigSelectOptions, value: &SessionConfigValueId) ->
             groups.iter().flat_map(|g| &g.options).any(|o| &o.value == value)
         }
         _ => false,
+    }
+}
+
+/// Turn every boolean option into an `on` / `off` select, for a client that
+/// did not advertise boolean config options.
+fn booleans_as_selects(options: &mut [SessionConfigOption]) {
+    for option in options.iter_mut() {
+        if let SessionConfigKind::Boolean(toggle) = &option.kind {
+            let current = if toggle.current_value { "on" } else { "off" };
+            let values = vec![
+                SessionConfigSelectOption::new("on", "on"),
+                SessionConfigSelectOption::new("off", "off"),
+            ];
+            option.kind = SessionConfigKind::Select(SessionConfigSelect::new(current, values));
+        }
     }
 }
 
@@ -1754,7 +1961,7 @@ async fn crash() -> ! {
 - [ ] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p hennery-testkit --test fake_acp`
-Expected: all 12 pass.
+Expected: all 15 pass.
 
 - [ ] **Step 5: Lint, test and commit**
 
@@ -1764,7 +1971,7 @@ git add crates/hennery-testkit
 git commit -m "test(testkit): fake adapter config options and switches"
 ```
 
-Expected: 204 tests pass.
+Expected: 207 tests pass.
 
 ---
 
@@ -1772,7 +1979,7 @@ Expected: 204 tests pass.
 
 **Files:**
 - Modify: `crates/hennery-host/src/session.rs`, `crates/hennery-host/src/connection.rs`
-- Test: `crates/hennery-testkit/tests/host_session.rs`, `crates/hennery-testkit/tests/host_connection.rs`
+- Test: `crates/hennery-testkit/tests/host_session.rs`, `crates/hennery-testkit/tests/host_connection.rs`, and a unit test at the end of `crates/hennery-host/src/session.rs` (the last block of Step 3)
 
 **Interfaces:**
 - Consumes: `SessionConfig`, `ConfigValue`, `Indexed`'s catalogue extracts (Task 2); the fake's config fields and `sample_config_options` (Task 3).
@@ -1781,7 +1988,10 @@ Expected: 204 tests pass.
   - `pub fn launch(uplink: Uplink, launch: Launch, options: SessionOptions) -> SessionHandle`. `spawn` and `resume` keep their signatures and launch with an empty config;
   - `pub const CONFIG_TIMEOUT: Duration` (15 s) and `SessionOptions.config_timeout`.
 - Produces (behaviour):
-  - after `session/new` or `session/load`, the switches of decision 2, under the start's one deadline;
+  - `initialize` advertises `session.configOptions.boolean` (decision 1). Without it, the fake offers `fast` as a select and the first test below fails;
+  - the model and mode options found by decision 1's rule (`axis_id`, unit-tested in `session.rs`);
+  - the pre-switch catalogue seeded from a `config_option_update` sent before the answer, if the answer has none (decision 4); after `session/new`, whatever the adapter sent before its answer is kept and emitted after `session_started`, like a load's kept updates;
+  - after `session/new` or `session/load`, the switches of decision 2, under the start's one deadline, stopping at the first that does not answer, then the read-back comparison;
   - `session_started.indexed` holds the post-switch catalogue, or nothing if a switch left it unknown (decision 3);
   - then the replay's kept updates, the replay note, and at most one `host_note` whose `note` is `config_failed` (start) or `reapply_failed` (resume), scrubbed;
   - a repeated start announces the actor's current catalogue.
@@ -2042,9 +2252,152 @@ async fn a_hung_switch_is_reported_and_the_session_still_starts() {
     let frames = wait_until(&uplink, has("host_note:config_failed")).await;
     assert_eq!(kinds(&frames), ["session_started", "host_note:config_failed"]);
     assert_eq!(started_extracts(&frames), Indexed::default());
-    assert!(note_text(&frames, "config_failed").contains("no answer"));
+    let text = note_text(&frames, "config_failed");
+    assert!(text.contains("model=large: no answer within"), "{text}");
+    // Nothing is sent after a switch that did not answer.
+    assert!(
+        text.contains("mode=plan: not sent: an earlier switch did not answer"),
+        "{text}"
+    );
+    assert_eq!(switches(&log), "model=large\n");
     assert!(handle.send(prompt("r1", "t1")));
     wait_until(&uplink, has("turn_ended")).await;
+}
+
+/// The real adapters handle requests concurrently. A model switch that
+/// answers after its timeout can still land, and clamp the mode, after a
+/// mode switch sent behind it has answered: model first and mode last would
+/// silently break. So nothing more is sent once a switch has not answered.
+#[tokio::test]
+async fn a_late_model_switch_stops_the_starts_switches_so_its_clamp_cannot_undo_the_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        slow_model_switch_ms: Some(600),
+        ..config_script(&log)
+    };
+    let _handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        wanted(Some("large"), Some("plan"), &[]),
+        SessionOptions {
+            config_timeout: Duration::from_millis(200),
+            ..SessionOptions::default()
+        },
+    );
+    let frames = wait_until(&uplink, has("host_note:config_failed")).await;
+    // Give a wrongly sent mode switch time to reach the fake.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        switches(&log),
+        "model=large\n",
+        "the mode switch went out behind a late model switch"
+    );
+    assert_eq!(started_extracts(&frames), Indexed::default(), "the values are unknown");
+    let text = note_text(&frames, "config_failed");
+    assert!(
+        text.contains("mode=plan: not sent: an earlier switch did not answer"),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn a_switch_cut_off_by_the_start_deadline_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        hang_config: true,
+        ..config_script(&log)
+    };
+    let _handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        wanted(Some("large"), Some("plan"), &[]),
+        SessionOptions {
+            start_timeout: Duration::from_secs(1),
+            config_timeout: Duration::from_secs(10),
+            ..SessionOptions::default()
+        },
+    );
+    let frames = wait_until(&uplink, has("host_note:config_failed")).await;
+    assert_eq!(kinds(&frames), ["session_started", "host_note:config_failed"]);
+    let text = note_text(&frames, "config_failed");
+    assert!(
+        text.contains("model=large: no answer before the start deadline"),
+        "{text}"
+    );
+    assert!(text.contains("mode=plan: not sent"), "{text}");
+}
+
+/// An adapter may accept a value and report another. What it reports is
+/// what counts, so the note says so.
+#[tokio::test]
+async fn a_value_the_agent_accepts_but_does_not_report_is_noted() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        sticky_options: vec!["effort".into()],
+        ..config_script(&log)
+    };
+    let _handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        wanted(None, None, &[("effort", ConfigValue::Id("high".into()))]),
+        SessionOptions::default(),
+    );
+    let frames = wait_until(&uplink, has("host_note:config_failed")).await;
+    assert_eq!(switches(&log), "effort=high\n");
+    let text = note_text(&frames, "config_failed");
+    assert!(text.contains("effort: asked high, agent reports low"), "{text}");
+    let axes = started_extracts(&frames).current_axes.unwrap();
+    assert_eq!(axes.get("effort"), Some(&ConfigValue::Id("low".into())));
+}
+
+/// An adapter that announces its options in a `config_option_update` just
+/// before answering `session/new` or `session/load`, not in the answer:
+/// those options are the ones switched, and that update, older than the
+/// announced catalogue, carries none.
+#[tokio::test]
+async fn options_announced_in_an_update_before_the_answer_are_the_ones_switched() {
+    for attach in [
+        Attach::New,
+        Attach::Load {
+            agent_session_id: "agent-7".into(),
+        },
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("config.log");
+        let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+        let script = FakeScript {
+            config_in_update_only: true,
+            ..config_script(&log)
+        };
+        let _handle = launching(
+            &uplink,
+            &script,
+            attach.clone(),
+            wanted(None, Some("plan"), &[]),
+            SessionOptions::default(),
+        );
+        let frames = wait_until(&uplink, has("update:?")).await;
+        assert_eq!(kinds(&frames), ["session_started", "update:?"], "{attach:?}");
+        assert_eq!(switches(&log), "mode=plan\n", "{attach:?}");
+        assert_eq!(started_extracts(&frames).current_mode.as_deref(), Some("plan"));
+        let HostFrame::Session {
+            body: SessionBody::AcpUpdate { indexed, .. },
+            ..
+        } = &frames[1]
+        else {
+            panic!("{frames:?}");
+        };
+        assert_eq!(*indexed, Indexed::default(), "{attach:?}");
+    }
 }
 ```
 
@@ -2118,6 +2471,7 @@ Expected: does not compile: `unresolved import 'hennery_host::session::Launch'`,
 In `crates/hennery-host/src/session.rs`, replace:
 
 ```rust
+use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
     PromptResponse, SessionId, StopReason,
@@ -2130,10 +2484,12 @@ use serde_json::Value;
 with:
 
 ```rust
+use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
-    PromptResponse, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionId, SetSessionConfigOptionRequest, StopReason,
+    BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
+    InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigOptionsCapabilities,
+    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, ErrorCode, UntypedMessage};
 use hennery_proto::frames::{ConfigValue, HostFrame, Indexed, ParkReason, SessionBody, SessionConfig, TurnOutcome};
@@ -2597,6 +2953,8 @@ In `crates/hennery-host/src/session.rs`, replace:
     updates: &mut mpsc::UnboundedReceiver<Value>,
 ) -> Result<(SessionId, Replay), StartError> {
     let init = conn
+        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+        .block_task()
 ```
 
 with:
@@ -2605,7 +2963,15 @@ with:
     attach: &Attach,
     updates: &mut mpsc::UnboundedReceiver<Value>,
 ) -> Result<(SessionId, Replay, Vec<SessionConfigOption>), StartError> {
+    // Advertised so that agents offer boolean options as booleans, not as
+    // on/off selects (ACP `session.configOptions.boolean`).
+    let capabilities = ClientCapabilities::new().session(
+        ClientSessionCapabilities::new()
+            .config_options(SessionConfigOptionsCapabilities::new().boolean(BooleanConfigOptionCapabilities::new())),
+    );
     let init = conn
+        .send_request(InitializeRequest::new(ProtocolVersion::V1).client_capabilities(capabilities))
+        .block_task()
 ```
 
 In `crates/hennery-host/src/session.rs`, replace:
@@ -2622,11 +2988,18 @@ with:
 ```rust
                 .await
                 .map_err(|err| StartError::acp(err, false))?;
-            return Ok((
-                created.session_id,
-                Replay::default(),
-                created.config_options.unwrap_or_default(),
-            ));
+            // What the adapter sent before its answer (see
+            // `Actor::drain_updates` for the ordering argument) follows the
+            // start, like a load's kept updates.
+            let mut replay = Replay::default();
+            for _ in 0..updates.len() {
+                match updates.try_recv() {
+                    Ok(payload) => replay.kept.push(payload),
+                    Err(_) => break,
+                }
+            }
+            let options = announced_options(created.config_options, &replay.kept);
+            return Ok((created.session_id, replay, options));
         }
 ```
 
@@ -2648,9 +3021,30 @@ with:
                     replay.observe(payload);
                 }
                 let loaded = result.map_err(|err| StartError::acp(err, true))?;
-                return Ok((id, replay, loaded.config_options.unwrap_or_default()));
+                let options = announced_options(loaded.config_options, &replay.kept);
+                return Ok((id, replay, options));
             }
         }
+    }
+}
+
+/// The config options a new or loaded session starts with: the answer's,
+/// or, if it had none, those of the last `config_option_update` the adapter
+/// sent before it. That update still carries no extracts: it is older than
+/// the catalogue `session_started` announces.
+fn announced_options(answered: Option<Vec<SessionConfigOption>>, before: &[Value]) -> Vec<SessionConfigOption> {
+    match answered {
+        Some(options) if !options.is_empty() => options,
+        _ => before.iter().rev().find_map(config_update).unwrap_or_default(),
+    }
+}
+
+/// The options of a non-empty `config_option_update` notification.
+fn config_update(payload: &Value) -> Option<Vec<SessionConfigOption>> {
+    let notification = serde_json::from_value::<SessionNotification>(payload.clone()).ok()?;
+    match notification.update {
+        SessionUpdate::ConfigOptionUpdate(update) if !update.config_options.is_empty() => Some(update.config_options),
+        _ => None,
     }
 }
 
@@ -2669,8 +3063,13 @@ struct Applied {
 /// first, then the other axes, then the mode, each with
 /// `session/set_config_option`, so a model that clamps the mode cannot undo
 /// the requested mode. A value that is already current is not sent. Each
-/// switch has `timeout`, and none runs past `deadline`. Whatever fails is
-/// reported in `failures`; the start goes on.
+/// switch has `timeout`, and none runs past `deadline`.
+///
+/// Once a switch goes unanswered (or the deadline has passed), nothing more
+/// is sent: the adapter may still apply the late switch, and a late model
+/// switch could clamp a mode sent after it. Finally every requested value is
+/// checked against the read-back. Whatever did not take is reported in
+/// `failures`; the start goes on.
 async fn apply_config(
     conn: &ConnectionTo<Agent>,
     session: &SessionId,
@@ -2708,30 +3107,71 @@ async fn apply_config(
             .push(format!("mode {mode}: the adapter offers no mode option")),
         None => {}
     }
-    for (id, value) in switches {
-        match current_value(&applied.options, &id) {
+    // Requested values that already have their own line in `failures`.
+    let mut reported: HashSet<String> = HashSet::new();
+    let mut unanswered = false;
+    for (id, value) in &switches {
+        match current_value(&applied.options, id) {
             None => {
                 applied
                     .failures
                     .push(format!("{id}: the adapter offers no such option"));
+                reported.insert(id.clone());
                 continue;
             }
-            Some(current) if current == value => continue,
+            Some(current) if current == *value => continue,
             Some(_) => {}
         }
-        let request = SetSessionConfigOptionRequest::new(session.clone(), id.clone(), acp_value(&value));
-        let until = (Instant::now() + timeout).min(deadline);
+        let now = Instant::now();
+        if unanswered || now >= deadline {
+            let why = if unanswered {
+                "an earlier switch did not answer"
+            } else {
+                "the start deadline passed"
+            };
+            applied.failures.push(format!("{id}={}: not sent: {why}", shown(value)));
+            reported.insert(id.clone());
+            continue;
+        }
+        let request = SetSessionConfigOptionRequest::new(session.clone(), id.clone(), acp_value(value));
+        let cut_short = now + timeout > deadline;
+        let until = (now + timeout).min(deadline);
         match tokio::time::timeout_at(until, conn.send_request(request).block_task()).await {
             // The catalogue of the last successful switch is the one kept.
             Ok(Ok(response)) if !response.config_options.is_empty() => applied.options = response.config_options,
             // An empty answer is no read-back, not an adapter without options.
             Ok(Ok(_)) => applied.current = false,
-            Ok(Err(err)) => applied.failures.push(format!("{id}={}: {err}", shown(&value))),
+            Ok(Err(err)) => {
+                applied.failures.push(format!("{id}={}: {err}", shown(value)));
+                reported.insert(id.clone());
+            }
             Err(_) => {
                 applied.current = false;
-                applied
+                unanswered = true;
+                let wait = if cut_short {
+                    "no answer before the start deadline".to_string()
+                } else {
+                    format!("no answer within {timeout:?}")
+                };
+                applied.failures.push(format!("{id}={}: {wait}", shown(value)));
+                reported.insert(id.clone());
+            }
+        }
+    }
+    // What the agent reports is what counts: a value it accepted but does
+    // not report (or a later switch undid) did not take either.
+    if applied.current {
+        for (id, value) in switches.iter().filter(|(id, _)| !reported.contains(id)) {
+            match current_value(&applied.options, id) {
+                Some(current) if current == *value => {}
+                Some(current) => applied.failures.push(format!(
+                    "{id}: asked {}, agent reports {}",
+                    shown(value),
+                    shown(&current)
+                )),
+                None => applied
                     .failures
-                    .push(format!("{id}={}: no answer within {timeout:?}", shown(&value)));
+                    .push(format!("{id}: asked {}, agent no longer offers it", shown(value))),
             }
         }
     }
@@ -2739,12 +3179,19 @@ async fn apply_config(
 }
 
 /// The id of the option for `category`. Categories are only a UX hint in
-/// ACP, so an option with the conventional id counts too.
+/// ACP, so an option with the conventional id counts too, but only if it
+/// has no category, or a custom (`_`-prefixed) one: an option another
+/// category claims is not the model or the mode.
 fn axis_id(options: &[SessionConfigOption], category: &SessionConfigOptionCategory, id: &str) -> Option<String> {
+    let uncategorized = |o: &&SessionConfigOption| match &o.category {
+        None => true,
+        Some(SessionConfigOptionCategory::Other(custom)) => custom.starts_with('_'),
+        Some(_) => false,
+    };
     options
         .iter()
         .find(|o| o.category.as_ref() == Some(category))
-        .or_else(|| options.iter().find(|o| &*o.id.0 == id))
+        .or_else(|| options.iter().filter(uncategorized).find(|o| &*o.id.0 == id))
         .map(|o| o.id.to_string())
 }
 
@@ -2799,6 +3246,49 @@ fn catalogue_extracts(options: &[SessionConfigOption]) -> Indexed {
         current_axes: Some(axes),
         ..Indexed::default()
     }
+```
+
+Append to `crates/hennery-host/src/session.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(json: Value) -> Vec<SessionConfigOption> {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn select(id: &str, category: Option<&str>) -> Value {
+        let mut option = serde_json::json!({
+            "id": id, "name": id, "type": "select", "currentValue": "a",
+            "options": [{"value": "a", "name": "a"}]
+        });
+        if let Some(category) = category {
+            option["category"] = category.into();
+        }
+        option
+    }
+
+    #[test]
+    fn the_model_is_its_category_or_else_an_uncategorized_option_named_model() {
+        let model = SessionConfigOptionCategory::Model;
+        let pick = |json| axis_id(&options(json), &model, "model");
+        let categorized = serde_json::json!([select("model", Some("thought_level")), select("brain", Some("model"))]);
+        assert_eq!(pick(categorized).as_deref(), Some("brain"));
+        assert_eq!(
+            pick(serde_json::json!([select("model", None)])).as_deref(),
+            Some("model")
+        );
+        assert_eq!(
+            pick(serde_json::json!([select("model", Some("_mine"))])).as_deref(),
+            Some("model")
+        );
+        // Another category claims it, even one this build does not know.
+        assert_eq!(pick(serde_json::json!([select("model", Some("thought_level"))])), None);
+        assert_eq!(pick(serde_json::json!([select("model", Some("future"))])), None);
+    }
+}
 ```
 
 - [ ] **Step 4: Pass the config through the connection**
@@ -2976,7 +3466,7 @@ with:
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p hennery-testkit --test host_session --test host_connection`
-Expected: `host_session` 36 pass, `host_connection` 16 pass. The two B1 resume tests that count frames after a load still pass: without a requested config nothing is switched, and no note is added.
+Expected: `host_session` 40 pass, `host_connection` 16 pass, and `cargo test -p hennery-host --lib` 2 pass. The two B1 resume tests that count frames after a load still pass: without a requested config nothing is switched, and no note is added.
 
 - [ ] **Step 6: Lint, test and commit**
 
@@ -2986,7 +3476,7 @@ git add crates/hennery-host crates/hennery-testkit
 git commit -m "feat(host): apply model, axes and mode on start and resume"
 ```
 
-Expected: 211 tests pass.
+Expected: 219 tests pass.
 
 ---
 
@@ -2998,10 +3488,10 @@ Expected: 211 tests pass.
 
 **Interfaces:**
 - Consumes: `Launch`, `launch`, the actor's `Catalogue` (Task 4); `CollectorFrame::SetConfig`, `SessionBody::ConfigApplied` (Task 2).
-- Produces: `SessionCmd::SetConfig { request_id: String, config_id: String, value: ConfigValue }`. It is answered by `config_applied` (with the read-back's extracts, or none for an empty read-back), or by `error` with code:
+- Produces: `SessionCmd::SetConfig { request_id: String, config_id: String, value: ConfigValue }`. The actor queues it and sends one switch at a time (decision 6); its deadline is its receipt plus `config_timeout`. It is answered by `config_applied` (with the read-back's extracts, or none for an empty read-back), or by `error` with code:
   - `unknown_option`, `invalid` (checked on the host);
-  - `config_failed` (the adapter refused, or did not answer within `config_timeout`);
-  - `not_attached` (still out when the actor ended).
+  - `config_failed` (the adapter refused; no answer by the deadline; or the deadline passed while it waited: `an earlier switch is still out`);
+  - `not_attached` (still waiting or out when the actor ended).
 - Produces (behaviour):
   - a live `config_option_update` replaces the actor's catalogue and carries the catalogue extracts;
   - updates queued before the main loop (the load's kept ones, and any sent during the switches) carry none;
@@ -3211,6 +3701,85 @@ async fn a_switch_that_never_answers_is_config_failed_and_one_still_out_at_the_e
     wait_until(&uplink, has("session_parked:operator")).await;
     assert!(applied(&uplink.pending().unwrap()).is_empty());
 }
+
+/// The real adapters handle requests concurrently. If both of these went
+/// out at once, the slow model switch would answer last and then clamp the
+/// mode the second switch had just set, while hennery showed `plan`. One
+/// switch at a time keeps them in the order the operator made them.
+#[tokio::test]
+async fn set_config_sends_one_switch_at_a_time_so_a_late_clamp_cannot_undo_a_later_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        slow_model_switch_ms: Some(300),
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        SessionConfig::default(),
+        SessionOptions::default(),
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
+    assert!(handle.send(set_config("rc2", "mode", ConfigValue::Id("plan".into()))));
+    let frames = wait_until(&uplink, |f| applied(f).len() == 2).await;
+    let answers: Vec<String> = applied(&frames).into_iter().map(|(r, _)| r).collect();
+    assert_eq!(answers, ["rc1", "rc2"]);
+    // A third switch reads back the agent's real state.
+    assert!(handle.send(set_config("rc3", "effort", ConfigValue::Id("high".into()))));
+    let frames = wait_until(&uplink, |f| applied(f).len() == 3).await;
+    let (_, last) = applied(&frames).remove(2);
+    let current = last.current_config().unwrap();
+    assert_eq!(
+        (current.model.as_deref(), current.mode.as_deref()),
+        (Some("large"), Some("plan")),
+        "the late clamp undid the later switch"
+    );
+}
+
+/// A switch's deadline runs from when the host received it, not from when
+/// it could be sent: one waiting behind a hung switch does not get a fresh
+/// `config_timeout` of its own.
+#[tokio::test]
+async fn a_switch_waiting_behind_a_hung_one_is_answered_by_its_own_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        hang_config: true,
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        SessionConfig::default(),
+        SessionOptions {
+            config_timeout: Duration::from_millis(300),
+            ..SessionOptions::default()
+        },
+    );
+    wait_until(&uplink, has("session_started")).await;
+    let began = std::time::Instant::now();
+    assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
+    assert!(handle.send(set_config("rc2", "mode", ConfigValue::Id("plan".into()))));
+    assert_eq!(
+        refusal(&mut replies).await,
+        ("rc1".to_string(), "config_failed".to_string())
+    );
+    assert_eq!(
+        refusal(&mut replies).await,
+        ("rc2".to_string(), "config_failed".to_string())
+    );
+    assert!(
+        began.elapsed() < Duration::from_millis(550),
+        "the second switch got a timeout of its own: {:?}",
+        began.elapsed()
+    );
+}
 ```
 
 Append to `crates/hennery-testkit/tests/host_connection.rs`:
@@ -3263,17 +3832,17 @@ Expected: does not compile: `no variant named 'SetConfig' found for enum 'Sessio
 In `crates/hennery-host/src/session.rs`, replace:
 
 ```rust
-    CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
-    PromptResponse, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionId, SetSessionConfigOptionRequest, StopReason,
+    InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigOptionsCapabilities,
+    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, StopReason,
 };
 ```
 
 with:
 
 ```rust
-    CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
-    PromptResponse, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
+    InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigOptionsCapabilities,
     SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
     StopReason,
 };
@@ -3344,18 +3913,34 @@ type ConfigReply = Pin<
     >,
 >;
 
-/// `set_config` switches sent to the adapter and not answered yet, in the
-/// order they were sent. Those still out when the actor ends are answered
-/// `not_attached` then, after its last fact: the collector would otherwise
-/// wait out its timeout and drop the whole host connection.
+/// A `set_config` received and not sent yet.
+struct QueuedSwitch {
+    request_id: String,
+    config_id: String,
+    value: ConfigValue,
+    /// Receipt plus `config_timeout`: past it, the switch is answered
+    /// `config_failed`, sent or not.
+    deadline: Instant,
+}
+
+/// The actor's `set_config` switches. At most one is out at a time: the
+/// real adapters handle requests concurrently, so two switches in flight
+/// could land in either order (a model switch clamping a mode set after
+/// it). The rest wait, in the order they came. Those still waiting or out
+/// when the actor ends are answered `not_attached` then, after its last
+/// fact: the collector would otherwise wait out its timeout and drop the
+/// whole host connection.
 struct PendingConfigs {
     uplink: Uplink,
-    queue: VecDeque<(String, ConfigReply)>,
+    queued: VecDeque<QueuedSwitch>,
+    out: Option<(String, ConfigReply)>,
 }
 
 impl Drop for PendingConfigs {
     fn drop(&mut self) {
-        for (request_id, _) in self.queue.drain(..) {
+        let out = self.out.take().map(|(request_id, _)| request_id);
+        let queued = self.queued.drain(..).map(|q| q.request_id);
+        for request_id in out.into_iter().chain(queued) {
             self.uplink.reply(HostFrame::Error {
                 request_id,
                 code: "not_attached".into(),
@@ -3433,7 +4018,8 @@ with:
         let mut idle_since = Instant::now();
         let mut configs = PendingConfigs {
             uplink: self.uplink.clone(),
-            queue: VecDeque::new(),
+            queued: VecDeque::new(),
+            out: None,
         };
         loop {
 ```
@@ -3475,9 +4061,9 @@ with:
                     Some(SessionCmd::SetConfig { request_id, config_id, value }) => match self.check_switch(&config_id, &value) {
                         Err((code, message)) => self.reject(request_id, code, message),
                         Ok(()) => {
-                            let request = SetSessionConfigOptionRequest::new(agent_session.clone(), config_id, acp_value(&value));
-                            let reply = tokio::time::timeout(self.options.config_timeout, conn.send_request(request).block_task());
-                            configs.queue.push_back((request_id, Box::pin(reply)));
+                            let deadline = Instant::now() + self.options.config_timeout;
+                            configs.queued.push_back(QueuedSwitch { request_id, config_id, value, deadline });
+                            self.send_next_switch(&conn, &agent_session, &mut configs);
                         }
                     },
                     Some(SessionCmd::Park { .. }) => {
@@ -3497,10 +4083,11 @@ with:
                     }
                 }
                 result = next_config(&mut configs) => {
-                    let (request_id, _) = configs.queue.pop_front().expect("an answer implies a switch");
+                    let (request_id, _) = configs.out.take().expect("an answer implies a switch");
                     // Updates the adapter sent before its answer come first.
                     self.drain_updates(&mut updates, turn.as_ref().map(|t| t.id.as_str()));
                     self.config_answered(request_id, result);
+                    self.send_next_switch(&conn, &agent_session, &mut configs);
                 }
                 _ = cancel_deadline(cancel_at) => {
 ```
@@ -3538,6 +4125,23 @@ with:
     /// Answer a `set_config` from the adapter's answer: `config_applied`
     /// with the catalogue it answered with (none if it answered without
     /// one), or `config_failed`.
+    /// Send the oldest waiting switch, unless one is out. A switch whose
+    /// deadline passed while it waited is answered `config_failed`.
+    fn send_next_switch(&self, conn: &ConnectionTo<Agent>, session: &SessionId, configs: &mut PendingConfigs) {
+        while configs.out.is_none()
+            && let Some(next) = configs.queued.pop_front()
+        {
+            if Instant::now() >= next.deadline {
+                let message = "an earlier switch is still out".to_string();
+                self.reject(next.request_id, "config_failed", message);
+                continue;
+            }
+            let request = SetSessionConfigOptionRequest::new(session.clone(), next.config_id, acp_value(&next.value));
+            let reply = tokio::time::timeout_at(next.deadline, conn.send_request(request).block_task());
+            configs.out = Some((next.request_id, Box::pin(reply)));
+        }
+    }
+
     fn config_answered(
         &self,
         request_id: String,
@@ -3565,7 +4169,8 @@ with:
             Err(_) => {
                 self.catalogue.lock().expect("catalogue lock").current = false;
                 let timeout = self.options.config_timeout;
-                self.reject(request_id, "config_failed", format!("no answer within {timeout:?}"));
+                let message = format!("no answer within {timeout:?} of the request");
+                self.reject(request_id, "config_failed", message);
             }
         }
     }
@@ -3576,14 +4181,9 @@ with:
     fn live_update(&self, payload: Value, turn: Option<&str>) -> SessionBody {
         let mut body = update(payload, turn);
         if let SessionBody::AcpUpdate { indexed, payload } = &mut body
-            && let Ok(notification) = serde_json::from_value::<SessionNotification>(payload.clone())
-            && let SessionUpdate::ConfigOptionUpdate(changed) = notification.update
-            && !changed.config_options.is_empty()
+            && let Some(options) = config_update(payload)
         {
-            *self.catalogue.lock().expect("catalogue lock") = Catalogue {
-                options: changed.config_options,
-                current: true,
-            };
+            *self.catalogue.lock().expect("catalogue lock") = Catalogue { options, current: true };
             let catalogue = self.catalogue_extracts();
             indexed.config_options = catalogue.config_options;
             indexed.current_model = catalogue.current_model;
@@ -3647,11 +4247,11 @@ with:
     }
 }
 
-/// The answer to the oldest `set_config` still out, or never if none is.
+/// The answer to the `set_config` that is out, or never if none is.
 async fn next_config(
     configs: &mut PendingConfigs,
 ) -> Result<agent_client_protocol::Result<SetSessionConfigOptionResponse>, tokio::time::error::Elapsed> {
-    match configs.queue.front_mut() {
+    match configs.out.as_mut() {
         Some((_, reply)) => reply.await,
         None => std::future::pending().await,
 ```
@@ -3696,7 +4296,7 @@ with:
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p hennery-testkit --test host_session --test host_connection`
-Expected: `host_session` 39 pass, `host_connection` 17 pass.
+Expected: `host_session` 45 pass, `host_connection` 17 pass.
 
 - [ ] **Step 6: Lint, test and commit**
 
@@ -3706,7 +4306,7 @@ git add crates/hennery-host crates/hennery-testkit
 git commit -m "feat(host): set_config and the agent's own config changes"
 ```
 
-Expected: 215 tests pass.
+Expected: 225 tests pass.
 
 ---
 
@@ -4495,7 +5095,7 @@ git add crates/hennery-sessions crates/hennery-testkit
 git commit -m "feat(sessions): store the catalogue from extracts and re-apply it on resume"
 ```
 
-Expected: 222 tests pass.
+Expected: 232 tests pass.
 
 ---
 
@@ -4965,7 +5565,7 @@ git add crates/hennery-sessions crates/hennery-testkit
 git commit -m "feat(sessions): POST config, GET catalog and SSE catalog_changed"
 ```
 
-Expected: 225 tests pass.
+Expected: 235 tests pass.
 
 ---
 
@@ -5122,7 +5722,7 @@ git add crates/hennery-testkit
 git commit -m "test(e2e): model, axes and mode over a real host and adapter"
 ```
 
-Expected: 228 tests pass.
+Expected: 238 tests pass.
 
 ---
 
@@ -5429,7 +6029,7 @@ with:
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `cargo test -p hennery-testkit --test host_session`
-Expected: all 40 pass.
+Expected: all 46 pass.
 
 - [ ] **Step 5: Lint, test and commit**
 
@@ -5439,7 +6039,7 @@ git add crates/hennery-host crates/hennery-testkit
 git commit -m "fix(host): an actor ending by itself marks its handle ending"
 ```
 
-Expected: 229 tests pass.
+Expected: 239 tests pass.
 
 ---
 
@@ -5520,7 +6120,7 @@ In `crates/hennery-testkit/src/lib.rs`, replace:
 
 ```rust
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub hang_config: bool,
+    pub config_in_update_only: bool,
 }
 ```
 
@@ -5528,7 +6128,7 @@ with:
 
 ```rust
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub hang_config: bool,
+    pub config_in_update_only: bool,
     /// Stream `chunks` over and over, back to back and without sleeping,
     /// until the prompt is cancelled (an adapter flooding the host).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -5539,16 +6139,16 @@ with:
 In `crates/hennery-testkit/src/lib.rs`, replace:
 
 ```rust
-            empty_config_read_back: false,
-            hang_config: false,
+            sticky_options: Vec::new(),
+            config_in_update_only: false,
         }
 ```
 
 with:
 
 ```rust
-            empty_config_read_back: false,
-            hang_config: false,
+            sticky_options: Vec::new(),
+            config_in_update_only: false,
             flood: false,
         }
 ```
@@ -5640,7 +6240,7 @@ with:
 In `crates/hennery-host/src/session.rs`, replace:
 
 ```rust
-            queue: VecDeque::new(),
+            out: None,
         };
         loop {
 ```
@@ -5648,7 +6248,7 @@ In `crates/hennery-host/src/session.rs`, replace:
 with:
 
 ```rust
-            queue: VecDeque::new(),
+            out: None,
         };
         // Updates emitted in a row since another arm last had a turn.
         let mut burst = 0;
@@ -5743,7 +6343,7 @@ with:
 - [ ] **Step 5: Run the tests to verify they pass**
 
 Run: `cargo test -p hennery-testkit --test fake_acp --test host_session`
-Expected: `fake_acp` 13 pass, `host_session` 41 pass. The two multi-thread ordering tests (`updates_never_land_outside_their_turn…`, `replayed_history_never_leaks…`) still pass: every arm that acts on the adapter still drains what was queued before it.
+Expected: `fake_acp` 16 pass, `host_session` 47 pass. The two multi-thread ordering tests (`updates_never_land_outside_their_turn…`, `replayed_history_never_leaks…`) still pass: every arm that acts on the adapter still drains what was queued before it.
 
 - [ ] **Step 6: Lint, test and commit**
 
@@ -5754,7 +6354,7 @@ git add crates/hennery-host crates/hennery-testkit
 git commit -m "fix(host): cap updates in a row so a flooding adapter cannot hold off a cancel"
 ```
 
-Expected: 231 tests pass.
+Expected: 241 tests pass.
 
 ---
 
@@ -5766,7 +6366,8 @@ Expected: 231 tests pass.
 - **The rest of the catalogue.** `GET …/catalog` gains commands, plan and usage, with their extracts, and `session_catalog` gains its `commands` / `usage` columns (§7, §8).
 - **List and detail items.** The session list item and `SessionDetail` gain `model` / `mode` once the frontend plan fixes the list item (§8's 1 KiB bound).
 - **Live gates with real adapters.** "Model switch read-back" and "resume re-applies mode" (§12) still need a logged-in CI account and the pinned adapters. Task 8's tests are their fake-adapter stand-ins.
-- **An adapter that answers switches without a catalogue** keeps its announced values stale until it sends a `config_option_update` (decision 3). If a real adapter does this routinely, reconsider applying the requested value to the host's copy.
+- **An adapter that answers switches without a catalogue** keeps its announced values stale until it sends a `config_option_update` (decision 3). If a real adapter does this routinely, reconsider applying the requested value to the host's copy. `POST …/config` with an empty read-back answers the stored catalogue, which then does not show the switch.
+- **A timed-out live switch may still land.** After one, the next successful read-back is announced as current, although the late switch may still change the agent's config afterwards. Cover this in the live gate against the pinned adapters.
 - **Spec amendments** listed under the decisions.
 - **Carried from B2a:**
   - cancel and pending requests (`turn_cancelled`);
