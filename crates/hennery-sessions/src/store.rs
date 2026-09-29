@@ -783,8 +783,9 @@ impl Store {
             // Diagnostics only, with no transition of their own: an
             // `adapter_exited` is followed by the `session_parked` that
             // detaches; a `host_note` (e.g. `replay_unknown_dropped` after a
-            // load) changes nothing.
-            SessionBody::AdapterExited { .. } | SessionBody::HostNote { .. } => {
+            // load) changes nothing; nor does a `config_applied` until the
+            // catalogue is stored.
+            SessionBody::AdapterExited { .. } | SessionBody::HostNote { .. } | SessionBody::ConfigApplied { .. } => {
                 if !fact_applies(&tx, session_id, None)? {
                     created.clear();
                     mark_unapplied(&tx, fact_id)?;
@@ -923,6 +924,7 @@ fn body_kind(body: &SessionBody) -> &'static str {
         SessionBody::SessionClosed => "session_closed",
         SessionBody::AdapterExited { .. } => "adapter_exited",
         SessionBody::HostNote { .. } => "host_note",
+        SessionBody::ConfigApplied { .. } => "config_applied",
     }
 }
 

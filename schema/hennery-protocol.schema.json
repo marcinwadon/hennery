@@ -143,9 +143,16 @@
           "type": "object"
         },
         {
+          "description": "Model, mode and the other config axes of a session (ACP core §3.3,\n§4.3): what a start asks for, and what a resume re-applies. `model` and\n`mode` are the values of the adapter's model and mode options; `axes`\nholds every other option, by config id. Flattened into the frames and\nthe start request, so the wire stays `model?, mode?, axes{}`.",
           "properties": {
             "agent": {
               "type": "string"
+            },
+            "axes": {
+              "additionalProperties": {
+                "$ref": "#/$defs/ConfigValue"
+              },
+              "type": "object"
             },
             "committed_seq": {
               "description": "The collector's highest committed seq for this session; the host\ncontinues from the larger of this and its own counter (§5.1).",
@@ -155,6 +162,18 @@
             },
             "cwd": {
               "type": "string"
+            },
+            "mode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "request_id": {
               "type": "string"
@@ -187,6 +206,12 @@
               "description": "The adapter's own session id, from the stored `session_started`:\nthe host keeps no copy across restarts.",
               "type": "string"
             },
+            "axes": {
+              "additionalProperties": {
+                "$ref": "#/$defs/ConfigValue"
+              },
+              "type": "object"
+            },
             "committed_seq": {
               "description": "Fast-forward the host's counter before the first frame (§5.1).",
               "format": "uint64",
@@ -195,6 +220,18 @@
             },
             "cwd": {
               "type": "string"
+            },
+            "mode": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "model": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "request_id": {
               "type": "string"
@@ -274,6 +311,35 @@
           "type": "object"
         },
         {
+          "description": "Switch one config option of an attached session (`session/set_config_option`).\nCompleted by `config_applied` | `error` (ACP core §3.3).",
+          "properties": {
+            "config_id": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "set_config",
+              "type": "string"
+            },
+            "value": {
+              "$ref": "#/$defs/ConfigValue"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "session_id",
+            "config_id",
+            "value"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "ack_seq": {
               "format": "uint64",
@@ -338,6 +404,33 @@
           "type": "object"
         }
       ]
+    },
+    "ConfigRequest": {
+      "description": "`POST /api/sessions/{id}/config`: switch one config option.",
+      "properties": {
+        "config_id": {
+          "type": "string"
+        },
+        "value": {
+          "$ref": "#/$defs/ConfigValue"
+        }
+      },
+      "required": [
+        "config_id",
+        "value"
+      ],
+      "type": "object"
+    },
+    "ConfigValue": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "string"
+        }
+      ],
+      "description": "The value of one config option (ACP `session/set_config_option`): a\nselect's value id, or a boolean toggle's state."
     },
     "EventDto": {
       "description": "One stored timeline event, as served by REST and SSE.",
@@ -486,8 +579,40 @@
       ]
     },
     "Indexed": {
-      "description": "Fields the collector may read from a session event. Closed set (ACP core §3.2).",
+      "description": "Fields the collector may read from a session event. Closed set (ACP core §3.2).\n\nThe catalogue extracts (`config_options`, `current_model`,\n`current_mode`, `current_axes`) travel together: when `config_options`\nis present and not empty, the four are one snapshot of the adapter's\nconfig. An absent or empty `config_options` means \"no read-back\", never\n\"the adapter has no config\" (a response that failed to parse looks\nempty).",
       "properties": {
+        "config_options": {
+          "description": "The full config catalogue: the adapter's ACP `SessionConfigOption`\nobjects, for the UI. The collector stores it and never reads it.",
+          "items": true,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "current_axes": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ConfigValue"
+          },
+          "description": "The current value of every other option, by config id.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "current_mode": {
+          "description": "The current value of the mode option.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "current_model": {
+          "description": "The current value of the model option.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "title": {
           "type": [
             "string",
@@ -572,10 +697,14 @@
       "description": "The body of a sequenced, outboxed session frame.",
       "oneOf": [
         {
-          "description": "The adapter session exists. Resolves the collector's start waiter.",
+          "description": "The adapter session exists. Resolves the collector's start waiter.\n`indexed` carries the catalogue after the start's config switches\n(ACP core §4.3, P-13).",
           "properties": {
             "agent_session_id": {
               "type": "string"
+            },
+            "indexed": {
+              "$ref": "#/$defs/Indexed",
+              "default": {}
             },
             "kind": {
               "const": "session_started",
@@ -770,8 +899,65 @@
             "text"
           ],
           "type": "object"
+        },
+        {
+          "description": "A `set_config` took effect: the catalogue the adapter answered with,\nthe authoritative read-back (ACP core §3.2). Resolves the collector's\nconfig waiter.",
+          "properties": {
+            "indexed": {
+              "$ref": "#/$defs/Indexed",
+              "default": {}
+            },
+            "kind": {
+              "const": "config_applied",
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "request_id"
+          ],
+          "type": "object"
         }
       ]
+    },
+    "SessionCatalog": {
+      "description": "A session's config catalogue and its current values: `GET\n/api/sessions/{id}/catalog`, the answer to `POST …/config`, and the data\nof the SSE `catalog_changed` message (ACP core §9). Commands, plan and\nusage join it with the plans that produce them.",
+      "properties": {
+        "axes": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ConfigValue"
+          },
+          "type": "object"
+        },
+        "config_options": {
+          "description": "The adapter's ACP `SessionConfigOption` objects, as last reported.",
+          "items": true,
+          "type": "array"
+        },
+        "mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "config_options"
+      ],
+      "type": "object"
     },
     "SessionDetail": {
       "description": "`GET /api/sessions/{id}` (ACP core §9): the list item plus the open turn.\nPending requests join it with permission handling.",
@@ -829,15 +1015,34 @@
       "type": "object"
     },
     "StartSessionRequest": {
+      "description": "`POST /api/sessions` (ACP core §9): `{host_id, agent, cwd, model?, mode?, axes?}`.",
       "properties": {
         "agent": {
           "type": "string"
+        },
+        "axes": {
+          "additionalProperties": {
+            "$ref": "#/$defs/ConfigValue"
+          },
+          "type": "object"
         },
         "cwd": {
           "type": "string"
         },
         "host_id": {
           "type": "string"
+        },
+        "mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
 use futures::stream::{self, Stream, StreamExt};
-use hennery_proto::frames::{Capability, CollectorFrame, SessionBody};
+use hennery_proto::frames::{Capability, CollectorFrame, SessionBody, SessionConfig};
 use hennery_proto::rest::{
     ApiError, CancelResponse, EventDto, LifecycleResponse, OpenTurn, PromptRequest, PromptResponse, SessionDetail,
     StartSessionRequest, StartSessionResponse,
@@ -144,6 +144,7 @@ async fn start_session(State(state): State<AppState>, Json(req): Json<StartSessi
         committed_seq: 0,
         agent: req.agent,
         cwd: req.cwd,
+        config: req.config,
     };
     let undo = Undo::Start {
         session_id: session_id.clone(),
@@ -261,6 +262,7 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         agent: session.agent,
         cwd: session.cwd,
         agent_session_id,
+        config: SessionConfig::default(),
     };
     let undo = Undo::Start { session_id: id.clone() };
     match state

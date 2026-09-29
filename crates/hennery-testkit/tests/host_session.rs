@@ -35,6 +35,7 @@ fn kinds(frames: &[HostFrame]) -> Vec<String> {
                 SessionBody::SessionClosed => "session_closed".to_string(),
                 SessionBody::AdapterExited { .. } => "adapter_exited".to_string(),
                 SessionBody::HostNote { note, .. } => format!("host_note:{note}"),
+                SessionBody::ConfigApplied { .. } => "config_applied".to_string(),
             },
             other => format!("{other:?}"),
         })

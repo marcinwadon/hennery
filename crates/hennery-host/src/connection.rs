@@ -383,6 +383,7 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
             committed_seq,
             agent,
             cwd,
+            ..
         } => attach(
             cfg,
             uplink,
@@ -403,6 +404,7 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
             agent,
             cwd,
             agent_session_id,
+            ..
         } => attach(
             cfg,
             uplink,
@@ -456,6 +458,11 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
                 }) => {}
             _ => not_attached(uplink, request_id),
         },
+        CollectorFrame::SetConfig { request_id, .. } => uplink.reply(HostFrame::Error {
+            request_id,
+            code: "invalid".into(),
+            message: "this host does not support set_config yet".into(),
+        }),
         CollectorFrame::Ack { session_id, ack_seq } => uplink.ack(&session_id, ack_seq)?,
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }

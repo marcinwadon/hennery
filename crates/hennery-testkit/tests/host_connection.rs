@@ -320,6 +320,7 @@ fn start(request_id: &str, session_id: &str) -> CollectorFrame {
         committed_seq: 0,
         agent: "fake".into(),
         cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+        config: Default::default(),
     }
 }
 
@@ -612,6 +613,7 @@ fn resume(request_id: &str, session_id: &str, committed_seq: u64, agent_session_
         agent: "fake".into(),
         cwd: std::env::temp_dir().to_string_lossy().into_owned(),
         agent_session_id: agent_session_id.into(),
+        config: Default::default(),
     }
 }
 

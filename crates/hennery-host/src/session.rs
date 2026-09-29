@@ -489,6 +489,7 @@ impl Actor {
         self.emit(SessionBody::SessionStarted {
             request_id,
             agent_session_id: agent_session.to_string(),
+            indexed: Indexed::default(),
         });
         // A load's state updates follow the start they belong to; then the
         // note about what the load dropped (ACP core §4.5).
@@ -565,6 +566,7 @@ impl Actor {
                     Some(SessionCmd::Restart { request_id }) => self.emit(SessionBody::SessionStarted {
                         request_id,
                         agent_session_id: agent_session.to_string(),
+                        indexed: Indexed::default(),
                     }),
                     Some(SessionCmd::Park { .. }) => {
                         self.teardown(&mut adapter, &mut updates, turn.take()).await;

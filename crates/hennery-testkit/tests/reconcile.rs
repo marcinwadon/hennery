@@ -496,6 +496,7 @@ async fn a_request_that_times_out_on_a_live_connection_drops_it() {
         committed_seq: 0,
         agent: "fake".into(),
         cwd: "/tmp".into(),
+        config: Default::default(),
     };
     let outcome = collector
         .state

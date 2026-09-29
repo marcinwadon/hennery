@@ -73,13 +73,80 @@ pub enum ParkReason {
     Operator,
 }
 
+/// The value of one config option (ACP `session/set_config_option`): a
+/// select's value id, or a boolean toggle's state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(untagged)]
+pub enum ConfigValue {
+    Bool(bool),
+    Id(String),
+}
+
+/// Model, mode and the other config axes of a session (ACP core §3.3,
+/// §4.3): what a start asks for, and what a resume re-applies. `model` and
+/// `mode` are the values of the adapter's model and mode options; `axes`
+/// holds every other option, by config id. Flattened into the frames and
+/// the start request, so the wire stays `model?, mode?, axes{}`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SessionConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub axes: BTreeMap<String, ConfigValue>,
+}
+
+impl SessionConfig {
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none() && self.mode.is_none() && self.axes.is_empty()
+    }
+}
+
 /// Fields the collector may read from a session event. Closed set (ACP core §3.2).
+///
+/// The catalogue extracts (`config_options`, `current_model`,
+/// `current_mode`, `current_axes`) travel together: when `config_options`
+/// is present and not empty, the four are one snapshot of the adapter's
+/// config. An absent or empty `config_options` means "no read-back", never
+/// "the adapter has no config" (a response that failed to parse looks
+/// empty).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct Indexed {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// The full config catalogue: the adapter's ACP `SessionConfigOption`
+    /// objects, for the UI. The collector stores it and never reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "unknown[] | undefined", optional)]
+    pub config_options: Option<Vec<Value>>,
+    /// The current value of the model option.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_model: Option<String>,
+    /// The current value of the mode option.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_mode: Option<String>,
+    /// The current value of every other option, by config id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_axes: Option<BTreeMap<String, ConfigValue>>,
+}
+
+impl Indexed {
+    /// The config this event reports as current, if it carries a catalogue
+    /// snapshot (see the type's doc).
+    pub fn current_config(&self) -> Option<SessionConfig> {
+        let options = self.config_options.as_ref()?;
+        if options.is_empty() {
+            return None;
+        }
+        Some(SessionConfig {
+            model: self.current_model.clone(),
+            mode: self.current_mode.clone(),
+            axes: self.current_axes.clone().unwrap_or_default(),
+        })
+    }
 }
 
 /// The body of a sequenced, outboxed session frame.
@@ -87,9 +154,13 @@ pub struct Indexed {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionBody {
     /// The adapter session exists. Resolves the collector's start waiter.
+    /// `indexed` carries the catalogue after the start's config switches
+    /// (ACP core §4.3, P-13).
     SessionStarted {
         request_id: String,
         agent_session_id: String,
+        #[serde(default)]
+        indexed: Indexed,
     },
     /// The host accepted a start but could not create the adapter session
     /// (spawn, `initialize` or `session/new` failed). Rejects the start waiter.
@@ -133,6 +204,14 @@ pub enum SessionBody {
     /// re-apply, or update kinds dropped during `session/load` (§4.5).
     /// `note` is a machine code; `text` is scrubbed.
     HostNote { note: String, text: String },
+    /// A `set_config` took effect: the catalogue the adapter answered with,
+    /// the authoritative read-back (ACP core §3.2). Resolves the collector's
+    /// config waiter.
+    ConfigApplied {
+        request_id: String,
+        #[serde(default)]
+        indexed: Indexed,
+    },
 }
 
 impl SessionBody {
@@ -142,6 +221,7 @@ impl SessionBody {
         Self::SessionStarted {
             request_id: request_id.into(),
             agent_session_id: agent_session_id.into(),
+            indexed: Indexed::default(),
         }
     }
 }
@@ -210,6 +290,10 @@ pub enum CollectorFrame {
         committed_seq: u64,
         agent: String,
         cwd: String,
+        /// Applied after `session/new`: model, then the other axes, then
+        /// mode (ACP core §4.3).
+        #[serde(flatten)]
+        config: SessionConfig,
     },
     /// Attach a parked, closed or failed session again: spawn the adapter and
     /// `session/load` it with replay suppression (ACP core §4.3, §4.5).
@@ -225,6 +309,10 @@ pub enum CollectorFrame {
         /// The adapter's own session id, from the stored `session_started`:
         /// the host keeps no copy across restarts.
         agent_session_id: String,
+        /// The stored config, re-applied after `session/load` (ACP core
+        /// §4.3). A switch that fails is a `host_note`, not a failed resume.
+        #[serde(flatten)]
+        config: SessionConfig,
     },
     Prompt {
         request_id: String,
@@ -241,6 +329,14 @@ pub enum CollectorFrame {
         request_id: String,
         session_id: String,
         turn_id: String,
+    },
+    /// Switch one config option of an attached session (`session/set_config_option`).
+    /// Completed by `config_applied` | `error` (ACP core §3.3).
+    SetConfig {
+        request_id: String,
+        session_id: String,
+        config_id: String,
+        value: ConfigValue,
     },
     Ack {
         session_id: String,
