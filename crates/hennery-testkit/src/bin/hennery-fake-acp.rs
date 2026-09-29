@@ -151,6 +151,9 @@ async fn main() -> agent_client_protocol::Result<()> {
                         // Keep the responder alive, unanswered, for good.
                         return cx.spawn(async move {
                             std::future::pending::<()>().await;
+                            // Unreachable: `pending()` never resolves, so this task
+                            // (and the responder it holds open) only ever ends when
+                            // the process is killed.
                             drop(responder);
                             Ok(())
                         });

@@ -448,3 +448,75 @@ fn a_slow_model_switch_is_answered_after_a_later_switch_and_clamps_after_answeri
         (json!("large"), json!("plan"))
     );
 }
+
+/// A hung switch must never answer, and must not hold up other traffic: the
+/// framework handles requests concurrently, so a prompt sent right after it
+/// still gets its answer.
+#[test]
+fn a_hung_config_switch_never_answers_while_other_traffic_is_served() {
+    use std::os::unix::process::CommandExt;
+    let script = config_script(json!({ "hang_config": true }));
+    let mut child = KillGroupOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_hennery-fake-acp"))
+            .env(hennery_testkit::SCRIPT_ENV, &script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdin = child.0.stdin.take().unwrap();
+    let mut requests = session_requests()[..2].to_vec();
+    requests.push(set_config(3, "model", json!("large")));
+    requests.push(json!({"jsonrpc":"2.0","id":4,"method":"session/prompt",
+                         "params":{"sessionId":"fake-session-1","prompt":[{"type":"text","text":"hi"}]}}));
+    for r in &requests {
+        writeln!(stdin, "{r}").unwrap();
+    }
+    drop(stdin);
+
+    // Read replies on a background thread so the main thread can enforce a
+    // wall-clock window on the switch without also timing out the process's
+    // own (unrelated, and locally observed to vary by hundreds of ms) start-up
+    // latency: blocking on a plain iterator (like `exchange_until` does)
+    // would hang the test forever if the hang branch regressed and the
+    // switch never gets an id 4 to unblock on.
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                break;
+            };
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+
+    // Other traffic sent right after the hung switch must still be served.
+    // Wait generously for it (this leg is dominated by process start-up, not
+    // by the switch), while watching that id 3 never sneaks in alongside it.
+    let mut out = Vec::new();
+    loop {
+        let msg = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the prompt was never answered while the switch hung");
+        assert_ne!(msg["id"], json!(3), "the hung switch answered: {msg}");
+        let done = msg["id"] == json!(4);
+        out.push(msg);
+        if done {
+            break;
+        }
+    }
+    assert_eq!(out.last().map(|m| &m["id"]), Some(&json!(4)), "{out:?}");
+    // The prompt has already answered, so the process is fully up and
+    // running: a further short, quiet window now means the switch is truly
+    // hung, not merely slower than the prompt.
+    if let Ok(msg) = rx.recv_timeout(std::time::Duration::from_millis(500)) {
+        panic!("the hung switch answered after all: {msg}");
+    }
+    // `child` drops here: SIGKILLs the group and reaps it (the hung switch's
+    // task included), on this path and on any assertion failure above.
+}
