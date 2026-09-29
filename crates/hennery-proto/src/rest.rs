@@ -60,3 +60,34 @@ pub struct LifecycleResponse {
     pub session_id: String,
     pub lifecycle: String,
 }
+
+/// A session's open turn, for the detail view.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct OpenTurn {
+    pub turn_id: String,
+    /// `sent` (not yet acknowledged by the adapter) or `started`.
+    pub state: String,
+}
+
+/// `GET /api/sessions/{id}` (ACP core §9): the list item plus the open turn.
+/// Pending requests join it with permission handling.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SessionDetail {
+    pub session_id: String,
+    pub host_id: String,
+    pub agent: String,
+    pub cwd: String,
+    pub lifecycle: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub activity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub failure_reason: Option<String>,
+    /// Parked only because its host has been offline past the threshold
+    /// (ACP core §5.3); the host may still be running it.
+    pub presumed_parked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "OpenTurn | undefined", optional)]
+    pub open_turn: Option<OpenTurn>,
+}

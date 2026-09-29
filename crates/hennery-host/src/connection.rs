@@ -5,7 +5,7 @@
 //! writing to the outbox, which is resent on the next connection.
 
 use crate::outbox::Outbox;
-use crate::session::{self, AgentCommand, SessionCmd, SessionHandle, SessionOptions};
+use crate::session::{self, AgentCommand, Attach, SessionCmd, SessionHandle, SessionOptions};
 use crate::uplink::Uplink;
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
@@ -268,43 +268,128 @@ fn not_attached(uplink: &Uplink, request_id: String) {
     });
 }
 
+/// A `start_session` or `resume_session`.
+struct AttachRequest {
+    request_id: String,
+    session_id: String,
+    committed_seq: u64,
+    agent: String,
+    cwd: String,
+    attach: Attach,
+}
+
+/// Start or resume a session (ACP core §4.3), idempotently (§2.2).
+fn attach(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, req: AttachRequest) -> Result<()> {
+    let Some(command) = cfg.agents.get(&req.agent).cloned() else {
+        uplink.reply(HostFrame::Error {
+            request_id: req.request_id,
+            code: "unknown_agent".into(),
+            message: format!("agent {} is not configured on this host", req.agent),
+        });
+        return Ok(());
+    };
+    // Before anything can be enqueued for this session: continue from the
+    // larger of this host's counter and the collector's (ACP core §5.1), so
+    // a session resumed after the outbox was lost never reuses a seq.
+    uplink.fast_forward(&req.session_id, req.committed_seq)?;
+    let options = cfg.session_options();
+    match live_session(sessions, &req.session_id).filter(SessionHandle::is_ending) {
+        // A park or close is queued ahead of this request, so a `Restart`
+        // would be answered `not_attached`: attach a fresh adapter once the
+        // old one is gone.
+        Some(old) => {
+            let (uplink, sessions) = (uplink.clone(), sessions.clone());
+            tokio::spawn(async move {
+                old.finished().await;
+                spawn_or_restart(&uplink, &sessions, req, command, options);
+            });
+        }
+        None => spawn_or_restart(uplink, sessions, req, command, options),
+    }
+    Ok(())
+}
+
+/// Re-emit `session_started` from a live actor (never a second adapter), or
+/// spawn a fresh one.
+fn spawn_or_restart(
+    uplink: &Uplink,
+    sessions: &Sessions,
+    req: AttachRequest,
+    command: AgentCommand,
+    options: SessionOptions,
+) {
+    let mut map = sessions.lock().expect("sessions lock");
+    if let Some(handle) = map.get(&req.session_id).filter(|h| !h.is_ended() && !h.is_ending())
+        && handle.send(SessionCmd::Restart {
+            request_id: req.request_id.clone(),
+        })
+    {
+        return;
+    }
+    let cwd = PathBuf::from(req.cwd);
+    let handle = match req.attach {
+        Attach::New => session::spawn(
+            uplink.clone(),
+            req.request_id,
+            req.session_id.clone(),
+            command,
+            cwd,
+            options,
+        ),
+        Attach::Load { agent_session_id } => session::resume(
+            uplink.clone(),
+            req.request_id,
+            req.session_id.clone(),
+            agent_session_id,
+            command,
+            cwd,
+            options,
+        ),
+    };
+    map.insert(req.session_id, handle);
+}
+
 fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: CollectorFrame) -> Result<()> {
     match frame {
         CollectorFrame::StartSession {
             request_id,
             session_id,
+            committed_seq,
             agent,
             cwd,
-        } => {
-            let Some(command) = cfg.agents.get(&agent).cloned() else {
-                uplink.reply(HostFrame::Error {
-                    request_id,
-                    code: "unknown_agent".into(),
-                    message: format!("agent {agent} is not configured on this host"),
-                });
-                return Ok(());
-            };
-            let mut map = sessions.lock().expect("sessions lock");
-            // Idempotent (ACP core §2.2): a repeated start for an attached
-            // session re-emits `session_started` with the new request id and
-            // never spawns a second adapter.
-            if let Some(handle) = map.get(&session_id).filter(|h| !h.is_ended())
-                && handle.send(SessionCmd::Restart {
-                    request_id: request_id.clone(),
-                })
-            {
-                return Ok(());
-            }
-            let handle = session::spawn(
-                uplink.clone(),
+        } => attach(
+            cfg,
+            uplink,
+            sessions,
+            AttachRequest {
                 request_id,
-                session_id.clone(),
-                command,
-                PathBuf::from(cwd),
-                cfg.session_options(),
-            );
-            map.insert(session_id, handle);
-        }
+                session_id,
+                committed_seq,
+                agent,
+                cwd,
+                attach: Attach::New,
+            },
+        )?,
+        CollectorFrame::ResumeSession {
+            request_id,
+            session_id,
+            committed_seq,
+            agent,
+            cwd,
+            agent_session_id,
+        } => attach(
+            cfg,
+            uplink,
+            sessions,
+            AttachRequest {
+                request_id,
+                session_id,
+                committed_seq,
+                agent,
+                cwd,
+                attach: Attach::Load { agent_session_id },
+            },
+        )?,
         CollectorFrame::Prompt {
             request_id,
             session_id,

@@ -317,6 +317,7 @@ fn start(request_id: &str, session_id: &str) -> CollectorFrame {
     CollectorFrame::StartSession {
         request_id: request_id.into(),
         session_id: session_id.into(),
+        committed_seq: 0,
         agent: "fake".into(),
         cwd: std::env::temp_dir().to_string_lossy().into_owned(),
     }
@@ -601,4 +602,143 @@ async fn a_collector_that_never_completes_the_handshake_is_retried() {
             .unwrap();
         held.push(tcp);
     }
+}
+
+fn resume(request_id: &str, session_id: &str, committed_seq: u64, agent_session_id: &str) -> CollectorFrame {
+    CollectorFrame::ResumeSession {
+        request_id: request_id.into(),
+        session_id: session_id.into(),
+        committed_seq,
+        agent: "fake".into(),
+        cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+        agent_session_id: agent_session_id.into(),
+    }
+}
+
+/// The fake adapter behind a shell that appends a line to `spawns` per launch.
+fn counting_fake(spawns: &std::path::Path) -> hennery_host::AgentCommand {
+    counting_fake_with(spawns, "")
+}
+
+/// `counting_fake` running `prelude` first (e.g. `trap '' TERM;`, which
+/// survives the `exec`).
+fn counting_fake_with(spawns: &std::path::Path, prelude: &str) -> hennery_host::AgentCommand {
+    hennery_host::AgentCommand {
+        program: "sh".into(),
+        args: vec![
+            "-c".into(),
+            format!(
+                "{prelude} echo spawned >> {}; exec {}",
+                spawns.display(),
+                env!("CARGO_BIN_EXE_hennery-fake-acp")
+            ),
+        ],
+        env: Vec::new(),
+    }
+}
+
+/// `(seq, request_id, agent_session_id)` of a `session_started` frame.
+fn started(frame: &HostFrame) -> (u64, String, String) {
+    match frame {
+        HostFrame::Session {
+            seq,
+            body:
+                hennery_proto::frames::SessionBody::SessionStarted {
+                    request_id,
+                    agent_session_id,
+                },
+            ..
+        } => (*seq, request_id.clone(), agent_session_id.clone()),
+        other => panic!("expected session_started, got {other:?}"),
+    }
+}
+
+/// Read frames until one matches (10 s bound), returning all of them.
+async fn read_through(stream: &mut ServerStream, pred: impl Fn(&HostFrame) -> bool) -> Vec<HostFrame> {
+    let mut seen = Vec::new();
+    loop {
+        let frame = read_until(stream, |_| true).await;
+        let done = pred(&frame);
+        seen.push(frame);
+        if done {
+            return seen;
+        }
+    }
+}
+
+/// ACP core §5.1 and §12 scenario 17: a host whose outbox is gone (a fresh
+/// data dir) resumes a session the collector has committed 40 frames of.
+/// Its first frame must be 41, or the collector would discard it as a
+/// duplicate of a frame it already has.
+#[tokio::test]
+async fn a_resume_after_the_outbox_was_lost_continues_past_the_collectors_seq() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(host_with_fake(addr, "resume-fast-forward", slow_fake())));
+
+    let (mut sink, mut stream, attached) = accept_host(&listener).await;
+    assert!(attached.is_empty());
+    send_frame(&mut sink, &resume("r1", "s9", 40, "agent-7")).await;
+    let frame = read_until(&mut stream, body_is("s9", "session_started")).await;
+    assert_eq!(started(&frame), (41, "r1".to_string(), "agent-7".to_string()));
+}
+
+#[tokio::test]
+async fn a_resume_for_an_attached_session_re_emits_session_started_without_a_second_adapter() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let spawns = dir.path().join("spawns");
+    tokio::spawn(run(host_with_fake(addr, "resume-attached", counting_fake(&spawns))));
+
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    send_frame(&mut sink, &start("r1", "s1")).await;
+    let first = read_until(&mut stream, body_is("s1", "session_started")).await;
+    send_frame(&mut sink, &resume("r2", "s1", 0, "fake-session-1")).await;
+    let second = read_until(&mut stream, body_is("s1", "session_started")).await;
+    assert_eq!(started(&first).1, "r1");
+    assert_eq!(started(&second).1, "r2");
+    assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 1);
+}
+
+/// A resume that arrives right behind a close for the same session (the
+/// reconciliation's `close_session`, then an operator's resume) must not be
+/// routed to the closing actor, which would answer `not_attached`. Nor may
+/// it start a second adapter while the first is still being killed: the new
+/// actor's `session_started` would overtake the old one's `session_closed`
+/// and the collector would close the session it just resumed. It waits for
+/// the old actor to finish. The adapter ignores SIGTERM, so that takes the
+/// whole 5 s kill grace.
+#[tokio::test]
+async fn a_resume_queued_behind_a_close_attaches_a_fresh_adapter_after_the_close() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let spawns = dir.path().join("spawns");
+    let stubborn = counting_fake_with(&spawns, "trap '' TERM;");
+    tokio::spawn(run(host_with_fake(addr, "resume-after-close", stubborn)));
+
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    send_frame(&mut sink, &start("r1", "s1")).await;
+    read_until(&mut stream, body_is("s1", "session_started")).await;
+    send_frame(
+        &mut sink,
+        &CollectorFrame::CloseSession {
+            request_id: "r2".into(),
+            session_id: "s1".into(),
+        },
+    )
+    .await;
+    send_frame(&mut sink, &resume("r3", "s1", 0, "fake-session-1")).await;
+    let frames = read_through(&mut stream, body_is("s1", "session_started")).await;
+    assert!(
+        frames.iter().any(body_is("s1", "session_closed")),
+        "the close ran first: {frames:?}"
+    );
+    assert!(
+        !frames.iter().any(|f| matches!(f, HostFrame::Error { .. })),
+        "the resume was refused: {frames:?}"
+    );
+    assert_eq!(started(frames.last().unwrap()).1, "r3");
+    assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 2);
 }

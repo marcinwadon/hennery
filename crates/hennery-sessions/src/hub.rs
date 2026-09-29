@@ -22,7 +22,9 @@ pub enum RequestError {
 }
 
 struct Waiter {
-    host_id: String,
+    /// The connection the request went out on: only its loss or its
+    /// timeout concerns this waiter.
+    conn_id: u64,
     /// Set for requests completed by a fact that names only the session
     /// (`session_parked`, `session_closed`), not the request (§3.2).
     session_id: Option<String>,
@@ -50,6 +52,9 @@ pub struct Registration {
 pub struct Hub {
     next_conn: AtomicU64,
     hosts: Mutex<HashMap<String, HostConn>>,
+    /// The latest connection each host registered (kept after it ends), so
+    /// an offline timer can tell whether the host came back since.
+    last_conn: Mutex<HashMap<String, u64>>,
     waiters: Mutex<HashMap<String, Waiter>>,
     events: broadcast::Sender<EventDto>,
 }
@@ -65,6 +70,7 @@ impl Hub {
         Self {
             next_conn: AtomicU64::new(1),
             hosts: Mutex::new(HashMap::new()),
+            last_conn: Mutex::new(HashMap::new()),
             waiters: Mutex::new(HashMap::new()),
             events: broadcast::channel(1024).0,
         }
@@ -89,7 +95,20 @@ impl Hub {
                 kicked: kicked.clone(),
             },
         );
+        self.last_conn
+            .lock()
+            .expect("last_conn lock")
+            .insert(host_id.to_string(), conn_id);
         Some(Registration { conn_id, kicked })
+    }
+
+    /// Run `f` only if `host_id` has registered no connection since `since`
+    /// (`None`: none since this collector started). The lock is held while
+    /// `f` runs, so a reconnect waits for it and its reconciliation sees
+    /// whatever `f` wrote (ACP core §5.3).
+    pub fn if_offline_since<R>(&self, host_id: &str, since: Option<u64>, f: impl FnOnce() -> R) -> Option<R> {
+        let last = self.last_conn.lock().expect("last_conn lock");
+        (last.get(host_id).copied() == since).then(f)
     }
 
     /// Reconciliation for this connection is done: requests may flow.
@@ -102,6 +121,7 @@ impl Hub {
     }
 
     /// Drop a connection and fail its in-flight requests as delivery-unknown.
+    /// Requests a newer connection of the same host carries are untouched.
     pub fn unregister(&self, host_id: &str, conn_id: u64) {
         let mut hosts = self.hosts.lock().expect("hosts lock");
         if hosts.get(host_id).is_some_and(|h| h.conn_id == conn_id) {
@@ -111,7 +131,7 @@ impl Hub {
         let mut waiters = self.waiters.lock().expect("waiters lock");
         let ids: Vec<String> = waiters
             .iter()
-            .filter(|(_, w)| w.host_id == host_id)
+            .filter(|(_, w)| w.conn_id == conn_id)
             .map(|(k, _)| k.clone())
             .collect();
         for id in ids {
@@ -125,6 +145,16 @@ impl Hub {
     /// reconnects, and the handshake reconciles whatever was in doubt.
     pub fn disconnect(&self, host_id: &str) {
         if let Some(h) = self.hosts.lock().expect("hosts lock").get(host_id) {
+            h.kicked.cancel();
+        }
+    }
+
+    /// Like `disconnect`, but only if `conn_id` is still the host's current
+    /// connection.
+    pub fn disconnect_conn(&self, host_id: &str, conn_id: u64) {
+        if let Some(h) = self.hosts.lock().expect("hosts lock").get(host_id)
+            && h.conn_id == conn_id
+        {
             h.kicked.cancel();
         }
     }
@@ -150,15 +180,6 @@ impl Hub {
             .expect("hosts lock")
             .get(host_id)
             .is_some_and(|h| h.ready)
-    }
-
-    /// Send a frame to a ready host without waiting for anything.
-    pub fn send(&self, host_id: &str, frame: CollectorFrame) -> bool {
-        self.hosts
-            .lock()
-            .expect("hosts lock")
-            .get(host_id)
-            .is_some_and(|h| h.ready && h.tx.send(frame).is_ok())
     }
 
     /// Send a request and wait until the outboxed fact carrying `request_id`
@@ -197,18 +218,28 @@ impl Hub {
         timeout: Duration,
     ) -> Result<SessionBody, RequestError> {
         let (tx, rx) = oneshot::channel();
-        self.waiters.lock().expect("waiters lock").insert(
-            request_id.to_string(),
-            Waiter {
-                host_id: host_id.to_string(),
-                session_id,
-                tx,
-            },
-        );
-        if !self.send(host_id, frame) {
-            self.waiters.lock().expect("waiters lock").remove(request_id);
-            return Err(RequestError::NotConnected);
-        }
+        // Registered before the frame leaves, so a fast answer finds it; the
+        // hosts lock is held throughout so the connection cannot change in
+        // between (lock order: hosts, then waiters, as in `unregister`).
+        let conn_id = {
+            let hosts = self.hosts.lock().expect("hosts lock");
+            let Some(host) = hosts.get(host_id).filter(|h| h.ready) else {
+                return Err(RequestError::NotConnected);
+            };
+            self.waiters.lock().expect("waiters lock").insert(
+                request_id.to_string(),
+                Waiter {
+                    conn_id: host.conn_id,
+                    session_id,
+                    tx,
+                },
+            );
+            if host.tx.send(frame).is_err() {
+                self.waiters.lock().expect("waiters lock").remove(request_id);
+                return Err(RequestError::NotConnected);
+            }
+            host.conn_id
+        };
         let result = tokio::time::timeout(timeout, rx).await;
         self.waiters.lock().expect("waiters lock").remove(request_id);
         match result {
@@ -220,7 +251,7 @@ impl Hub {
                 // is not to be trusted: drop it, and the next handshake
                 // reconciles this request (ACP core §3.4).
                 tracing::warn!(%host_id, %request_id, "request timed out; dropping the host connection");
-                self.disconnect(host_id);
+                self.disconnect_conn(host_id, conn_id);
                 Err(RequestError::DeliveryUnknown)
             }
         }

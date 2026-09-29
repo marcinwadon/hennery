@@ -30,6 +30,9 @@ slice); everything else is design. The maintainer's decisions are recorded below
      plan A of the resume work (9 tasks): adapter supervisor and exit watcher, park/close,
      idle reaper, conflict events and reconciliation after reconnect. Executed 2026-09-27 (see its
      "Execution status").
+   - [Resume (B1)](plans/2026-09-28-resume.md) — plan B1 (10 tasks): `resume_session` with
+     `session/load` and replay suppression, presumed park while a host is offline, conn_id-keyed
+     waiters, one visibility rule for unapplied facts. Executed 2026-09-29 (see its "Execution status").
 
 ## Maintainer decisions (2026-09-27)
 

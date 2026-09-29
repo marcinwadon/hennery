@@ -407,6 +407,7 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
             "ALTER TABLE turns DROP COLUMN state;
              ALTER TABLE sessions DROP COLUMN close_requested;
              ALTER TABLE events DROP COLUMN applied;
+             ALTER TABLE sessions DROP COLUMN presumed_parked;
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -597,4 +598,623 @@ fn an_unapplied_late_turn_started_is_not_listed() {
         kinds(&listed)
     );
     assert!(store.ingest("s1", 2, &turn_started("t1")).unwrap().is_empty());
+}
+
+// Plan B: resume, and no turn left open across a detach.
+
+use hennery_sessions::store::ResumeRequest;
+
+fn parked(store: &Store, seq: u64) {
+    store
+        .ingest(
+            "s1",
+            seq,
+            &SessionBody::SessionParked {
+                reason: ParkReason::Operator,
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_resume_moves_a_parked_session_to_starting_with_what_the_host_needs() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.ingest("s1", 2, &update(1)).unwrap();
+    parked(&store, 3);
+    let ResumeRequest::Starting {
+        events,
+        agent_session_id,
+        committed_seq,
+    } = store.request_resume("s1").unwrap()
+    else {
+        panic!("not resumable");
+    };
+    assert_eq!(kinds(&events), ["operator_resumed"]);
+    assert_eq!((agent_session_id.as_str(), committed_seq), ("a1", 3));
+    let s = store.session("s1").unwrap().unwrap();
+    assert_eq!((s.lifecycle.as_str(), s.activity.as_deref()), ("starting", None));
+    store
+        .ingest(
+            "s1",
+            4,
+            &SessionBody::SessionStarted {
+                request_id: "r9".into(),
+                agent_session_id: "a1".into(),
+            },
+        )
+        .unwrap();
+    let s = store.session("s1").unwrap().unwrap();
+    assert_eq!((s.lifecycle.as_str(), s.activity.as_deref()), ("active", Some("idle")));
+}
+
+#[test]
+fn a_second_concurrent_resume_is_refused_while_the_first_is_starting() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    assert_eq!(
+        store.request_resume("s1").unwrap(),
+        ResumeRequest::Busy("active".into())
+    );
+    parked(&store, 2);
+    assert!(matches!(
+        store.request_resume("s1").unwrap(),
+        ResumeRequest::Starting { .. }
+    ));
+    assert_eq!(
+        store.request_resume("s1").unwrap(),
+        ResumeRequest::Busy("starting".into())
+    );
+    assert_eq!(
+        kinds(&store.events("s1", 0, 100).unwrap())
+            .iter()
+            .filter(|k| **k == "operator_resumed")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_resume_of_a_failed_or_closed_session_clears_what_stopped_it() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store
+        .ingest(
+            "s1",
+            2,
+            &SessionBody::StartFailed {
+                request_id: "r".into(),
+                code: "agent_not_logged_in".into(),
+                message: "log in".into(),
+            },
+        )
+        .unwrap();
+    // Not applied: the session is active, not starting.
+    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "active");
+    store.close_now("s1").unwrap();
+    assert!(matches!(
+        store.request_resume("s1").unwrap(),
+        ResumeRequest::Starting { .. }
+    ));
+    store
+        .ingest(
+            "s1",
+            3,
+            &SessionBody::StartFailed {
+                request_id: "r2".into(),
+                code: "agent_has_no_record".into(),
+                message: "gone".into(),
+            },
+        )
+        .unwrap();
+    let s = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (s.lifecycle.as_str(), s.failure_reason.as_deref()),
+        ("failed", Some("agent_has_no_record"))
+    );
+    assert!(matches!(
+        store.request_resume("s1").unwrap(),
+        ResumeRequest::Starting { .. }
+    ));
+    assert_eq!(store.session("s1").unwrap().unwrap().failure_reason, None);
+}
+
+#[test]
+fn a_session_the_agent_never_created_cannot_be_resumed() {
+    let store = Store::open_in_memory().unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store.mark_failed("s1", "start_not_delivered").unwrap();
+    assert_eq!(store.request_resume("s1").unwrap(), ResumeRequest::NoRecord);
+    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "failed");
+    assert_eq!(store.request_resume("nope").unwrap(), ResumeRequest::NotFound);
+}
+
+#[test]
+fn detaching_releases_a_prompt_the_host_never_acknowledged() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    // The prompt went out; the host's `not_attached` answer was lost.
+    assert!(store.open_turn("s1", "t1", &prompt_text()).unwrap());
+    let created = store
+        .ingest(
+            "s1",
+            2,
+            &SessionBody::SessionParked {
+                reason: ParkReason::AdapterExited,
+            },
+        )
+        .unwrap();
+    assert_eq!(kinds(&created), ["session_parked", "turn_not_delivered"]);
+    assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("not_delivered"));
+    assert_eq!(store.session("s1").unwrap().unwrap().open_turn_id, None);
+
+    store.create_session("s2", "h1", "fake", "/tmp").unwrap();
+    store
+        .ingest(
+            "s2",
+            1,
+            &SessionBody::SessionStarted {
+                request_id: "r".into(),
+                agent_session_id: "a2".into(),
+            },
+        )
+        .unwrap();
+    assert!(store.open_turn("s2", "t2", &prompt_text()).unwrap());
+    let created = store.ingest("s2", 2, &SessionBody::SessionClosed).unwrap();
+    assert_eq!(kinds(&created), ["session_closed", "turn_not_delivered"]);
+    assert_eq!(store.session("s2").unwrap().unwrap().open_turn_id, None);
+}
+
+#[test]
+fn a_resume_releases_a_turn_an_older_database_left_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    {
+        let store = Store::open(&db).unwrap();
+        started(&store);
+        assert!(store.open_turn("s1", "t1", &prompt_text()).unwrap());
+    }
+    // What plan A could leave behind: parked with a `sent` turn still open.
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute("UPDATE sessions SET lifecycle = 'parked', activity = NULL", [])
+        .unwrap();
+    let store = Store::open(&db).unwrap();
+    let ResumeRequest::Starting { events, .. } = store.request_resume("s1").unwrap() else {
+        panic!("not resumable");
+    };
+    assert_eq!(kinds(&events), ["turn_not_delivered", "operator_resumed"]);
+    assert_eq!(store.session("s1").unwrap().unwrap().open_turn_id, None);
+}
+
+// Plan B: one rule for every stored-but-unapplied host fact (decision 7).
+
+fn listed(store: &Store, session: &str) -> Vec<String> {
+    store
+        .events(session, 0, 1000)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.kind)
+        .collect()
+}
+
+fn turn_update(turn: Option<&str>) -> SessionBody {
+    SessionBody::AcpUpdate {
+        indexed: Indexed {
+            turn_id: turn.map(str::to_string),
+            ..Indexed::default()
+        },
+        payload: json!({ "update": { "sessionUpdate": "agent_message_chunk" } }),
+    }
+}
+
+#[test]
+fn a_re_emitted_session_started_for_an_active_session_is_stored_but_not_listed() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    let again = SessionBody::SessionStarted {
+        request_id: "r5".into(),
+        agent_session_id: "a1".into(),
+    };
+    assert!(store.ingest("s1", 2, &again).unwrap().is_empty());
+    assert_eq!(listed(&store, "s1"), ["session_started"]);
+    assert_eq!(store.committed_seq("s1").unwrap(), 2);
+    // Still the idempotency key: the resend is a duplicate, not a conflict.
+    assert!(store.ingest("s1", 2, &again).unwrap().is_empty());
+}
+
+#[test]
+fn a_start_failed_that_changes_nothing_is_not_listed() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    let failed = SessionBody::StartFailed {
+        request_id: "r".into(),
+        code: "start_failed".into(),
+        message: "late".into(),
+    };
+    assert!(store.ingest("s1", 2, &failed).unwrap().is_empty());
+    assert_eq!(listed(&store, "s1"), ["session_started"]);
+    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "active");
+}
+
+#[test]
+fn a_hosts_detach_of_a_session_already_closed_is_not_listed() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    // Closed while its host was offline; the host comes back, is sent
+    // `close_session`, and confirms. Or its adapter had died meanwhile.
+    store.close_now("s1").unwrap();
+    let before = listed(&store, "s1");
+    for (seq, body) in [
+        (2, SessionBody::SessionClosed),
+        (
+            3,
+            SessionBody::AdapterExited {
+                code: Some(1),
+                signal: None,
+                stderr_tail: String::new(),
+            },
+        ),
+        (
+            4,
+            SessionBody::SessionParked {
+                reason: ParkReason::AdapterExited,
+            },
+        ),
+        (
+            5,
+            SessionBody::HostNote {
+                note: "n".into(),
+                text: "t".into(),
+            },
+        ),
+        (6, turn_update(None)),
+    ] {
+        assert!(store.ingest("s1", seq, &body).unwrap().is_empty(), "seq {seq}");
+    }
+    assert_eq!(listed(&store, "s1"), before);
+    assert_eq!(store.committed_seq("s1").unwrap(), 6);
+}
+
+#[test]
+fn a_late_update_after_a_synthesized_end_is_not_listed() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.ingest("s1", 2, &turn_started("t1")).unwrap();
+    assert_eq!(
+        kinds(&store.ingest("s1", 3, &turn_update(Some("t1"))).unwrap()),
+        ["acp_update"]
+    );
+    // The host's snapshot missed the turn (decision 3 of plan A): the
+    // collector ends it; the session stays active.
+    store.reconcile_host("h1", &[attached("s1", None)]).unwrap();
+    assert!(store.ingest("s1", 4, &turn_update(Some("t1"))).unwrap().is_empty());
+    // An update outside any turn on the active session is still listed.
+    assert_eq!(
+        kinds(&store.ingest("s1", 5, &turn_update(None)).unwrap()),
+        ["acp_update"]
+    );
+    let listed = listed(&store, "s1");
+    let end = listed.iter().position(|k| k == "turn_ended_synthesized").unwrap();
+    assert_eq!(listed[end + 1..], ["acp_update"], "{listed:?}");
+}
+
+#[test]
+fn a_start_that_ran_after_all_revives_the_session_without_its_failure_reason() {
+    let store = Store::open_in_memory().unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store.reconcile_host("h1", &[]).unwrap();
+    assert_eq!(
+        store.session("s1").unwrap().unwrap().failure_reason.as_deref(),
+        Some("start_not_delivered")
+    );
+    let created = store
+        .ingest(
+            "s1",
+            1,
+            &SessionBody::SessionStarted {
+                request_id: "r0".into(),
+                agent_session_id: "a1".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(kinds(&created), ["session_started"]);
+    let s = store.session("s1").unwrap().unwrap();
+    assert_eq!((s.lifecycle.as_str(), s.failure_reason), ("active", None));
+}
+
+// Controller ruling on the Task 6 review, folded into this same task: the
+// collector's `start_not_delivered` guess (reconciliation never having heard
+// back) is only ever a guess. When the host's real answer to that same start
+// finally arrives, it must replace the guess, not be swallowed as a fact
+// that "changes nothing" because the session is already `failed`.
+#[test]
+fn a_start_failed_replaces_a_reconciled_guess_of_start_not_delivered() {
+    let store = Store::open_in_memory().unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store.reconcile_host("h1", &[]).unwrap();
+    assert_eq!(
+        store.session("s1").unwrap().unwrap().failure_reason.as_deref(),
+        Some("start_not_delivered")
+    );
+    let created = store
+        .ingest(
+            "s1",
+            1,
+            &SessionBody::StartFailed {
+                request_id: "r0".into(),
+                code: "agent_not_logged_in".into(),
+                message: "please log in".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(kinds(&created), ["start_failed"]);
+    let s = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (s.lifecycle.as_str(), s.failure_reason.as_deref()),
+        ("failed", Some("agent_not_logged_in"))
+    );
+}
+
+// Plan B: host offline, presumed park, reattached (ACP core §5.3).
+
+/// s1 active on h1 with a started turn t1, s2 active on another host.
+fn two_hosts(store: &Store) {
+    started(store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.ingest("s1", 2, &turn_started("t1")).unwrap();
+    store.create_session("s2", "h2", "fake", "/tmp").unwrap();
+    store
+        .ingest(
+            "s2",
+            1,
+            &SessionBody::SessionStarted {
+                request_id: "r".into(),
+                agent_session_id: "a2".into(),
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn presume_parked_parks_the_hosts_active_sessions_and_keeps_their_open_turn() {
+    let store = Store::open_in_memory().unwrap();
+    two_hosts(&store);
+    assert_eq!(store.hosts_with_active_sessions().unwrap(), ["h1", "h2"]);
+    let events = store.presume_parked("h1").unwrap();
+    assert_eq!(kinds(&events), ["presumed_parked"]);
+    assert_eq!(events[0].body["reason"], "host_offline");
+    let s1 = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (s1.lifecycle.as_str(), s1.presumed_parked, s1.open_turn_id.as_deref()),
+        ("parked", true, Some("t1"))
+    );
+    assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("started"));
+    assert_eq!(store.session("s2").unwrap().unwrap().lifecycle, "active");
+    // Idempotent: nothing is active on h1 any more.
+    assert!(store.presume_parked("h1").unwrap().is_empty());
+    assert_eq!(store.hosts_with_active_sessions().unwrap(), ["h2"]);
+}
+
+#[test]
+fn reconcile_reattaches_a_presumed_session_the_host_still_has() {
+    let store = Store::open_in_memory().unwrap();
+    two_hosts(&store);
+    store.presume_parked("h1").unwrap();
+    let done = store.reconcile_host("h1", &[attached("s1", Some("t1"))]).unwrap();
+    assert_eq!(kinds(&done.events), ["reattached"]);
+    let s1 = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (s1.lifecycle.as_str(), s1.presumed_parked, s1.open_turn_id.as_deref()),
+        ("active", false, Some("t1"))
+    );
+    // The turn the host kept running ends for real.
+    assert_eq!(kinds(&store.ingest("s1", 3, &ended("t1")).unwrap()), ["turn_ended"]);
+}
+
+#[test]
+fn reconcile_of_a_presumed_session_the_host_lost_is_a_host_restart() {
+    let store = Store::open_in_memory().unwrap();
+    two_hosts(&store);
+    store.presume_parked("h1").unwrap();
+    let done = store.reconcile_host("h1", &[]).unwrap();
+    assert_eq!(kinds(&done.events), ["host_restarted", "turn_ended_synthesized"]);
+    let s1 = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (s1.lifecycle.as_str(), s1.presumed_parked, s1.open_turn_id),
+        ("parked", false, None)
+    );
+}
+
+#[test]
+fn facts_a_returning_host_resends_still_apply_to_a_presumed_session() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    // A prompt went out just before the host dropped off.
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.presume_parked("h1").unwrap();
+    // The resend: the prompt had reached the adapter, and the host reaped
+    // the session while it was away.
+    assert_eq!(
+        kinds(&store.ingest("s1", 2, &turn_started("t1")).unwrap()),
+        ["turn_started", "user_turn"]
+    );
+    store.ingest("s1", 3, &ended("t1")).unwrap();
+    let parked = store
+        .ingest(
+            "s1",
+            4,
+            &SessionBody::SessionParked {
+                reason: ParkReason::Idle,
+            },
+        )
+        .unwrap();
+    assert_eq!(kinds(&parked), ["session_parked"]);
+    let s1 = store.session("s1").unwrap().unwrap();
+    assert_eq!((s1.lifecycle.as_str(), s1.presumed_parked), ("parked", false));
+    // Reconciliation leaves a real park alone.
+    assert!(store.reconcile_host("h1", &[]).unwrap().events.is_empty());
+}
+
+#[test]
+fn closing_or_resuming_a_presumed_session_ends_the_presumption() {
+    let store = Store::open_in_memory().unwrap();
+    two_hosts(&store);
+    store.presume_parked("h1").unwrap();
+    assert!(matches!(
+        store.request_resume("s1").unwrap(),
+        ResumeRequest::Starting { .. }
+    ));
+    assert!(!store.session("s1").unwrap().unwrap().presumed_parked);
+
+    store.presume_parked("h2").unwrap();
+    store.close_now("s2").unwrap();
+    let s2 = store.session("s2").unwrap().unwrap();
+    assert_eq!((s2.lifecycle.as_str(), s2.presumed_parked), ("closed", false));
+}
+
+// The brief's tests above never send `presume_parked` a session whose open
+// turn is still genuinely open when a *real* detach fact later arrives (the
+// only test that reaches `session_parked` with `presumed_parked = 1` first
+// ends the turn for real, so `release_turn_on_detach` finds nothing to
+// release). Cover that path directly: `release_turn_on_detach`,
+// `SessionParked`'s guard, `SessionClosed`'s guard and `fact_applies` must
+// all treat a presumed-parked session as attached, not just `reconcile_host`
+// and the explicitly-listed store methods.
+
+#[test]
+fn a_real_session_parked_fact_still_releases_a_presumed_sessions_open_turn() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.ingest("s1", 2, &turn_started("t1")).unwrap();
+    store.presume_parked("h1").unwrap();
+    // The host, still holding the turn the presumption left it, reports a
+    // real park before any reconciliation happens.
+    let events = store
+        .ingest(
+            "s1",
+            3,
+            &SessionBody::SessionParked {
+                reason: ParkReason::Idle,
+            },
+        )
+        .unwrap();
+    assert_eq!(kinds(&events), ["session_parked", "turn_ended_synthesized"]);
+    let s1 = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (s1.lifecycle.as_str(), s1.presumed_parked, s1.open_turn_id),
+        ("parked", false, None)
+    );
+    assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("ended"));
+}
+
+#[test]
+fn a_real_session_closed_fact_still_applies_to_a_presumed_session() {
+    let store = Store::open_in_memory().unwrap();
+    two_hosts(&store);
+    store.presume_parked("h2").unwrap();
+    let events = store.ingest("s2", 2, &SessionBody::SessionClosed).unwrap();
+    assert_eq!(kinds(&events), ["session_closed"]);
+    let s2 = store.session("s2").unwrap().unwrap();
+    assert_eq!((s2.lifecycle.as_str(), s2.presumed_parked), ("closed", false));
+}
+
+#[test]
+fn an_acp_update_for_its_open_turn_still_applies_to_a_presumed_session() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.ingest("s1", 2, &turn_started("t1")).unwrap();
+    store.presume_parked("h1").unwrap();
+    let update = turn_update(Some("t1"));
+    assert_eq!(kinds(&store.ingest("s1", 3, &update).unwrap()), ["acp_update"]);
+}
+
+// Final review fix wave.
+
+#[test]
+fn a_rejected_reconcile_close_closes_only_a_session_still_waiting_on_that_close() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.record_close_request("s1").unwrap();
+    assert_eq!(
+        kinds(&store.close_after_rejected_reconcile_close("s1").unwrap()),
+        Vec::<&str>::new(),
+        "operator_closed is already recorded"
+    );
+    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "closed");
+
+    // Closed, then resumed: the late rejection must leave the start alone.
+    assert!(matches!(
+        store.request_resume("s1").unwrap(),
+        ResumeRequest::Starting { .. }
+    ));
+    let before = store.events("s1", 0, 100).unwrap();
+    assert!(store.close_after_rejected_reconcile_close("s1").unwrap().is_empty());
+    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "starting");
+    assert_eq!(store.events("s1", 0, 100).unwrap(), before);
+}
+
+#[test]
+fn a_failed_resume_fails_only_a_session_still_starting() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.mark_failed_if_starting("s1", "not_attached").unwrap();
+    let s = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (s.lifecycle.as_str(), s.failure_reason.as_deref()),
+        ("active", None),
+        "an active session was overwritten"
+    );
+    parked(&store, 2);
+    store.request_resume("s1").unwrap();
+    store.mark_failed_if_starting("s1", "not_attached").unwrap();
+    let s = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (s.lifecycle.as_str(), s.failure_reason.as_deref()),
+        ("failed", Some("not_attached"))
+    );
+}
+
+/// Review Focus 1, collector half: the old actor's detach facts landing
+/// after a resume has begun change nothing, and the fresh start still
+/// attaches.
+#[test]
+fn an_old_actors_detach_after_a_resume_began_changes_nothing() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    parked(&store, 2);
+    assert!(matches!(
+        store.request_resume("s1").unwrap(),
+        ResumeRequest::Starting { .. }
+    ));
+    let before = store.events("s1", 0, 100).unwrap();
+    assert!(store.ingest("s1", 3, &SessionBody::SessionClosed).unwrap().is_empty());
+    assert!(
+        store
+            .ingest(
+                "s1",
+                4,
+                &SessionBody::SessionParked {
+                    reason: ParkReason::Idle,
+                },
+            )
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.events("s1", 0, 100).unwrap(), before);
+    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "starting");
+    store
+        .ingest(
+            "s1",
+            5,
+            &SessionBody::SessionStarted {
+                request_id: "r9".into(),
+                agent_session_id: "a1".into(),
+            },
+        )
+        .unwrap();
+    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "active");
 }

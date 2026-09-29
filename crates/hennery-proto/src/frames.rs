@@ -89,6 +89,10 @@ pub enum SessionBody {
         signal: Option<i32>,
         stderr_tail: String,
     },
+    /// hennery's own diagnostic that is not state (ACP core §3.2): a failed
+    /// re-apply, or update kinds dropped during `session/load` (§4.5).
+    /// `note` is a machine code; `text` is scrubbed.
+    HostNote { note: String, text: String },
 }
 
 /// Host -> collector.
@@ -145,8 +149,27 @@ pub enum CollectorFrame {
     StartSession {
         request_id: String,
         session_id: String,
+        /// The collector's highest committed seq for this session; the host
+        /// continues from the larger of this and its own counter (§5.1).
+        #[ts(type = "number")]
+        committed_seq: u64,
         agent: String,
         cwd: String,
+    },
+    /// Attach a parked, closed or failed session again: spawn the adapter and
+    /// `session/load` it with replay suppression (ACP core §4.3, §4.5).
+    /// Completed by `session_started` | `start_failed`, like a start.
+    ResumeSession {
+        request_id: String,
+        session_id: String,
+        /// Fast-forward the host's counter before the first frame (§5.1).
+        #[ts(type = "number")]
+        committed_seq: u64,
+        agent: String,
+        cwd: String,
+        /// The adapter's own session id, from the stored `session_started`:
+        /// the host keeps no copy across restarts.
+        agent_session_id: String,
     },
     Prompt {
         request_id: String,

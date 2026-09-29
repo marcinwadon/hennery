@@ -46,6 +46,9 @@ struct CollectorArgs {
     /// Development token for hosts and API clients (skeleton only).
     #[arg(long, env = "HENNERY_DEV_TOKEN", hide_env_values = true)]
     dev_token: String,
+    /// Presume a host's sessions parked once it has been offline this long.
+    #[arg(long, default_value_t = hennery_sessions::offline::OFFLINE_THRESHOLD.as_secs())]
+    host_offline_secs: u64,
 }
 
 #[derive(Args, Clone)]
@@ -107,7 +110,9 @@ async fn main() -> Result<()> {
 async fn run_collector(args: CollectorArgs) -> Result<()> {
     std::fs::create_dir_all(&args.data_dir)?;
     let store = Store::open(&args.data_dir.join("hennery.db"))?;
-    let state = AppState::new(store, DevToken::new(args.dev_token));
+    let mut state = AppState::new(store, DevToken::new(args.dev_token));
+    state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
+    hennery_sessions::offline::after_startup(&state);
     let listener = tokio::net::TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("bind {}", args.listen))?;

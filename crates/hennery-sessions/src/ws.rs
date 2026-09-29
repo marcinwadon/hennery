@@ -91,6 +91,7 @@ async fn serve(socket: WebSocket, state: AppState) {
     let conn_id = registration.conn_id;
     if sink.send(text(&ack)).await.is_err() {
         state.hub.unregister(&host_id, conn_id);
+        crate::offline::after_disconnect(&state, host_id, conn_id);
         return;
     }
     tracing::info!(%host_id, "host connected");
@@ -119,7 +120,9 @@ async fn serve(socket: WebSocket, state: AppState) {
     // rejection for one still has to close the session collector-side
     // (decision 7): the host no longer has it attached, but the store would
     // otherwise keep it `active` with `close_requested = 1` (until the host's
-    // next reconnect reconciles it).
+    // next reconnect reconciles it). Only while the session is still what
+    // reconciliation asked to close: the answer can arrive after the operator
+    // has resumed it, and must not close that fresh start (final review F1).
     let mut reconcile_closes: HashMap<String, String> = HashMap::new();
     loop {
         let next = tokio::select! {
@@ -205,14 +208,14 @@ async fn serve(socket: WebSocket, state: AppState) {
             } => {
                 if let Some(session_id) = reconcile_closes.remove(&request_id) {
                     if code == "not_attached" {
-                        match state.store.close_now(&session_id) {
+                        match state.store.close_after_rejected_reconcile_close(&session_id) {
                             Ok(events) => {
                                 for event in events {
                                     state.hub.publish(event);
                                 }
                             }
                             Err(err) => {
-                                tracing::error!(%host_id, %session_id, error = %err, "close_now failed after a reconcile close was rejected");
+                                tracing::error!(%host_id, %session_id, error = %err, "closing after a rejected reconcile close failed");
                             }
                         }
                     } else {
@@ -254,4 +257,5 @@ async fn serve(socket: WebSocket, state: AppState) {
     writer.abort();
     state.hub.unregister(&host_id, conn_id);
     tracing::info!(%host_id, "host disconnected");
+    crate::offline::after_disconnect(&state, host_id, conn_id);
 }
