@@ -914,9 +914,16 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
 /// (`HENNERY_DEV_TOKEN`, from before 3b removed it) must not hand it to the
 /// host child, nor through it to any agent.
 ///
-/// The agent is a shell script that dumps its environment, and whether it
-/// holds a descriptor 3 (the pairing pipe's number in the host child), then
-/// exits. A fresh data directory, so this run pairs through that pipe.
+/// The agent is a shell script that dumps its environment, and which of the
+/// descriptors 3 and 4 it holds (3 is the pairing pipe's number in the host
+/// child, 4 the listening socket's in the collector child), then exits.
+///
+/// Only those two: on macOS, std makes a pipe or socket close-on-exec only
+/// after creating it, so under parallel tests a descriptor another thread
+/// of this test binary is making leaks into `up` (and on to its agent) at
+/// some higher number now and then. Checking 3 to 9 caught such leaks, and
+/// in the control too, which this binary spawns directly: in 3 of 48 runs
+/// with four copies at once. A fresh data directory, so this run pairs through that pipe.
 #[test]
 fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     const TOKEN: &str = "operator-token-from-the-environment";
@@ -932,29 +939,30 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     std::fs::write(
         &script,
         format!(
-            "if ( : <&3 ) 2>/dev/null; then echo open > {fd}.tmp; else echo closed > {fd}.tmp; fi\n\
+            "for n in 3 4; do if ( eval \": <&$n\" ) 2>/dev/null; then echo $n; fi; done > {fd}.tmp\n\
              env > {env}.tmp\nmv {fd}.tmp {fd}\nmv {env}.tmp {env}\n",
-            fd = report("fd3.txt").display(),
+            fd = report("fds.txt").display(),
             env = report("env.txt").display(),
         ),
     )
     .unwrap();
 
-    // Control: the probe does see a descriptor 3 that is open.
+    // Control: the probe does see descriptors 3 and 4 that are open, and
+    // only those.
     let mut control = Command::new("/bin/sh");
     control.arg(&script);
     // SAFETY: dup2 in the forked child, before exec; async-signal-safe.
     unsafe {
         control.pre_exec(|| {
-            if libc::dup2(1, 3) < 0 {
+            if libc::dup2(1, 3) < 0 || libc::dup2(1, 4) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
     }
     assert!(control.status().unwrap().success());
-    assert_eq!(std::fs::read_to_string(report("fd3.txt")).unwrap().trim(), "open");
-    std::fs::remove_file(report("fd3.txt")).unwrap();
+    assert_eq!(std::fs::read_to_string(report("fds.txt")).unwrap(), "3\n4\n");
+    std::fs::remove_file(report("fds.txt")).unwrap();
     std::fs::remove_file(report("env.txt")).unwrap();
 
     let log = dir.join("up.log");
@@ -1002,7 +1010,11 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
         "the agent inherited the operator token"
     );
     assert!(!env.contains(TOKEN), "the agent inherited the operator token");
-    assert_eq!(std::fs::read_to_string(report("fd3.txt")).unwrap().trim(), "closed");
+    assert_eq!(
+        std::fs::read_to_string(report("fds.txt")).unwrap(),
+        "",
+        "the agent inherited descriptors"
+    );
 
     unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
     assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
@@ -1160,9 +1172,10 @@ fn up_warns_about_a_loose_existing_data_root() {
 /// `up` on `dir` and its children, found also once they are orphaned.
 fn processes_naming(dir: &std::path::Path) -> Vec<(i32, String)> {
     let out = Command::new("ps")
-        .args(["-ax", "-ww", "-o", "pid=,command="])
+        .args(["-A", "-ww", "-o", "pid=,command="])
         .output()
         .unwrap();
+    assert!(out.status.success(), "ps failed: {out:?}");
     let dir = dir.display().to_string();
     String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -1191,18 +1204,44 @@ impl Drop for KillNaming {
 /// by the default action and leave its collector running with nobody to
 /// stop it.
 ///
-/// The window was short (from the collector's spawn to `up`'s first wait
-/// for a signal, a few milliseconds), so each attempt sends SIGTERM a little
-/// later (0 to 3.6 ms) after `up`'s warning about its loose data root,
-/// logged just before it binds and spawns. Without the fix, attempts in the
-/// first 2 ms or so left an orphaned collector (four or five of 20 when
-/// calibrated in 250 µs steps), and every run failed.
+/// Each attempt sends SIGTERM a little later (0 to 1 ms) after `up`'s
+/// warning about its loose data root, which it logs just before it spawns.
+/// Deterministic: `up` must exit 0, having caught the signal, on every
+/// attempt; a `up` that installs its handlers only later dies of the
+/// signal whenever it comes first. And no process naming the data root may
+/// outlive `up`, by a `ps` scan first shown to see such a process.
 #[test]
 fn a_sigterm_as_up_starts_leaves_no_child_running() {
     use std::os::unix::fs::PermissionsExt;
     let dir = scratch_dir("earlyterm");
     let _cleanup = RemoveDir(dir.clone());
-    for attempt in 0..25 {
+    // The scan below must not pass for want of seeing anything: it does see
+    // a live process whose command line names a directory here. Checked
+    // apart from `up`, as a `ps` between the warning and the signal would
+    // take longer than the window.
+    let probe_dir = dir.join("probe");
+    let mut probe = Command::new("/bin/sh")
+        // Not a lone command, which the shell would exec, losing its $0.
+        .args(["-c", "sleep 30; exit 0"])
+        .arg(&probe_dir)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    // Polled: until it has exec'd, the probe's command line is this binary's.
+    while !seen.iter().any(|&(pid, _)| pid == probe.id() as i32) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        seen = processes_naming(&probe_dir);
+    }
+    // The whole group: the shell's `sleep` too.
+    unsafe { libc::kill(-(probe.id() as i32), libc::SIGKILL) };
+    let _ = probe.wait();
+    assert!(
+        seen.iter().any(|&(pid, _)| pid == probe.id() as i32),
+        "ps does not see the probe: {seen:?}"
+    );
+    for attempt in 0..5 {
         let root = dir.join(format!("data-{attempt}"));
         std::fs::create_dir(&root).unwrap();
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1215,15 +1254,16 @@ fn a_sigterm_as_up_starts_leaves_no_child_running() {
             assert!(Instant::now() < deadline, "timed out waiting for the warning");
             std::thread::sleep(Duration::from_micros(100));
         }
-        let offset = Duration::from_micros(150 * attempt);
+        let offset = Duration::from_micros(250 * attempt);
         let start = Instant::now();
         while start.elapsed() < offset {
             std::hint::spin_loop();
         }
         unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
+        let status = wait_with_timeout(&mut up.up, Duration::from_secs(30)).expect("up did not exit");
         assert!(
-            wait_with_timeout(&mut up.up, Duration::from_secs(30)).is_some(),
-            "up did not exit"
+            status.success(),
+            "attempt {attempt}: up did not catch the SIGTERM: {status}"
         );
         // `up` waits for its children before it exits: none may be left.
         let deadline = Instant::now() + Duration::from_secs(2);
