@@ -40,6 +40,14 @@ pub struct FakeScript {
     /// never came (an adapter that does not honour cancellation).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ignore_cancel: bool,
+    /// Append a line to this file the instant `session/cancel` is received
+    /// on the wire — before deciding whether to honour or (`ignore_cancel`)
+    /// ignore it. A marker of when the notification *arrived*, independent
+    /// of how long streaming then takes to actually stop: lets a test prove
+    /// the host forwarded a cancel promptly without waiting out however
+    /// much backlog is left to drain afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cancel_received_file: Option<String>,
     /// Answer a cancelled prompt with this JSON-RPC error code instead of
     /// the `cancelled` stop reason (an agent whose aborted work throws).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,6 +205,7 @@ impl Default for FakeScript {
             new_session_error: None,
             no_load_session: false,
             ignore_cancel: false,
+            cancel_received_file: None,
             cancel_error: None,
             config_options: Vec::new(),
             model_switch_sets_mode: None,

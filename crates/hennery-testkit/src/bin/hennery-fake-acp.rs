@@ -327,7 +327,19 @@ async fn main() -> agent_client_protocol::Result<()> {
             {
                 let cancel = cancel.clone();
                 let ignore = script.ignore_cancel;
+                let cancel_received_file = script.cancel_received_file.clone();
                 async move |_n: CancelNotification, _cx| {
+                    if let Some(path) = &cancel_received_file {
+                        // Marks arrival regardless of `ignore`: this is a
+                        // signal for "the host forwarded it", not "the
+                        // adapter obeyed it".
+                        let mut log = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                            .expect("open cancel_received_file");
+                        writeln!(log, "cancel").expect("write cancel_received_file");
+                    }
                     if !ignore {
                         cancel.send_replace(true);
                     }

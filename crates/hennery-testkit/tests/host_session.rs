@@ -2677,24 +2677,51 @@ async fn a_switch_queued_behind_one_the_pre_turn_drain_answers_is_sent_without_w
 /// a synchronous drain-then-decide would have made worst, since draining
 /// ties up the actor for exactly as long as it takes to work through
 /// whatever has accumulated by the time the deadline fires.
+///
+/// "Read promptly" is measured directly rather than by waiting for the turn
+/// to fully end: the fake appends to `cancel_received_file` the instant
+/// `session/cancel` reaches it on the wire, which happens as soon as the
+/// actor's `commands` arm processes the `Cancel` — that arm sends the
+/// notification synchronously, in the same `select!` iteration, so this is
+/// a direct signal for "the actor read the command", not an inference from
+/// how long everything downstream then takes. The old assertion
+/// (`while handle.open_turn_id().is_some() { .. 20s .. }`) instead waited
+/// for the turn to fully end, which requires draining however much of the
+/// literally-never-ending flood is left — a quantity that scales with
+/// system load, not with whether the cancel was read promptly, and flaked
+/// under heavy concurrent stress for exactly that reason.
+///
+/// `config_timeout` (1s) is longer than it needs to be for the fix to pass
+/// quickly, deliberately: it gives the flood a real window to build a
+/// substantial backlog before `out_deadline` fires, so a reinstated
+/// synchronous drain there is slow enough to fail reliably, not just
+/// "sometimes measurably slower". Measured empirically (revert-probe:
+/// reinstating `self.drain_updates(..)` in `out_deadline`'s orphan branch,
+/// the round-1 bug this test exists to catch): with the fix, the fake sees
+/// `session/cancel` in 20-130ms even under 4-way concurrent stress; with
+/// the bug reinstated, it consistently takes 2.1-2.6s (four standalone
+/// runs). The budget below sits well clear of both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancel_is_read_promptly_even_though_a_switch_deadline_fires_mid_flood() {
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("config.log");
+    let cancel_received = dir.path().join("cancel_received");
     let (uplink, mut replies) = Uplink::new(Outbox::open(&dir.path().join("outbox.db")).unwrap());
     let script = FakeScript {
         chunks: vec!["flood".into()],
         flood: true,
         hang_config: true,
+        cancel_received_file: Some(cancel_received.to_string_lossy().into_owned()),
         ..config_script(&log)
     };
+    let config_timeout = Duration::from_secs(1);
     let handle = launching(
         &uplink,
         &script,
         Attach::New,
         SessionConfig::default(),
         SessionOptions {
-            config_timeout: Duration::from_millis(200),
+            config_timeout,
             ..SessionOptions::default()
         },
     );
@@ -2706,22 +2733,21 @@ async fn a_cancel_is_read_promptly_even_though_a_switch_deadline_fires_mid_flood
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
-    // Well past `config_timeout` (200ms): `out_deadline` has certainly
-    // fired by now, mid-flood, and (since `hang_config` never answers)
-    // certainly orphaned rc1 rather than disarmed it.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Well past `config_timeout`: `out_deadline` has certainly fired by
+    // now, mid-flood (with a real backlog built up behind it), and (since
+    // `hang_config` never answers) certainly orphaned rc1 rather than
+    // disarmed it.
+    tokio::time::sleep(config_timeout + Duration::from_millis(200)).await;
     assert!(handle.send(cancel("rc2", "t1")));
-    // A synchronous drain in `out_deadline` would tie the actor up for as
-    // long as it takes to work through everything the flood produced by
-    // the time the deadline fired — unbounded, in practice (a bare few
-    // hundred ms of flood was already observed to take 10s+ to recover
-    // from under the drain-based round-1 fix). Without any drain there,
-    // the cancel gets its fair turn within one burst cycle. The budget also
-    // covers draining the flood's backlog before the cancelled turn ends,
-    // slow on a loaded macOS runner: 20s, like the sibling
-    // `a_flooding_adapter_cannot_hold_off_a_cancel` (final review M3).
-    let cancel_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while handle.open_turn_id().is_some() {
+    // The property under test: reading the `Cancel` command (and so
+    // forwarding `session/cancel`) does not wait on the flood. See the doc
+    // comment above for the measured fixed-vs-buggy gap this budget sits
+    // between.
+    let cancel_deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+    loop {
+        if std::fs::metadata(&cancel_received).is_ok_and(|meta| meta.len() > 0) {
+            break;
+        }
         assert!(
             tokio::time::Instant::now() < cancel_deadline,
             "the cancel was held off by the switch's own deadline arm"
