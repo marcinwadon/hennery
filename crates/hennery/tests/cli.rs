@@ -1235,6 +1235,77 @@ fn a_sigterm_as_up_starts_leaves_no_child_running() {
     }
 }
 
+/// `--listen-fd` (`up`'s hand-over) adopts only a listening TCP socket: a
+/// closed descriptor, a file, a UDP socket or a TCP socket that does not
+/// listen is refused at once with a message naming it, before the data
+/// directory is made, not adopted to abort or hang later. Also refused: a
+/// standard stream's number, and `--listen` with it.
+#[test]
+fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
+    use std::os::fd::{AsRawFd, OwnedFd};
+    let dir = scratch_dir("badlistenfd");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let file: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+    let udp: OwnedFd = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into();
+    // SAFETY: socket(2), owned at once.
+    let tcp = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    assert!(tcp >= 0);
+    let tcp: OwnedFd = unsafe { std::os::fd::FromRawFd::from_raw_fd(tcp) };
+    let listening: OwnedFd = std::net::TcpListener::bind("127.0.0.1:0").unwrap().into();
+    let collector = |fd: Option<&OwnedFd>, args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
+        cmd.arg("collector").args(args).arg("--data-dir").arg(&data);
+        if let Some(fd) = fd {
+            let fd = fd.as_raw_fd();
+            // SAFETY: dup2 in the forked child, before exec; async-signal-safe.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::dup2(fd, 50) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut child = cmd
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let status = wait_with_timeout(&mut child, Duration::from_secs(15));
+        let _ = child.kill();
+        let _ = child.wait();
+        let mut stderr = String::new();
+        child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+        (status, stderr)
+    };
+    for (what, fd, expected) in [
+        ("a closed descriptor", None, "is not an open descriptor"),
+        ("a file", Some(&file), "is not a socket"),
+        ("a UDP socket", Some(&udp), "is not a stream (TCP) socket"),
+        (
+            "a TCP socket that does not listen",
+            Some(&tcp),
+            "is not a listening socket",
+        ),
+    ] {
+        // 50: well above what the collector's own runtime opens at start.
+        let (status, stderr) = collector(fd, &["--listen-fd", "50"]);
+        let status = status.unwrap_or_else(|| panic!("{what}: the collector hung"));
+        assert!(!status.success(), "{what}: adopted");
+        assert!(stderr.contains(expected), "{what}: {stderr}");
+        assert!(!data.exists(), "{what}: the data directory was made");
+    }
+    for args in [
+        &["--listen-fd", "2"][..],
+        &["--listen-fd", "50", "--listen", "127.0.0.1:0"],
+    ] {
+        let (status, stderr) = collector(Some(&listening), args);
+        assert!(!status.unwrap().success(), "{args:?} was taken: {stderr}");
+    }
+}
+
 /// Kernel spec §3.1: a collector that is not set up writes its one-time
 /// setup link to `setup-url` (0600, under `umask 022` too) and, its output
 /// not being a terminal, logs only that file's path: the token itself must
