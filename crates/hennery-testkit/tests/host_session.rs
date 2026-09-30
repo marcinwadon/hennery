@@ -13,6 +13,7 @@ use hennery_proto::frames::{
 use hennery_testkit::{FakeAsk, FakeScript, SCRIPT_ENV, pid_alive};
 use serde_json::json;
 use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 
 fn kinds(frames: &[HostFrame]) -> Vec<String> {
@@ -548,9 +549,24 @@ async fn a_repeated_start_re_emits_session_started_with_the_new_request_id() {
     );
 }
 
-/// The adapter's stdout reaches EOF 300 ms before its process exits, so the
-/// prompt fails before the exit watcher sees the exit. The turn must still
-/// end `interrupted` (the adapter is gone), not `failed`.
+/// The adapter's stdout reaches EOF before its process actually exits, so
+/// the prompt fails before the exit watcher sees the exit. The turn must
+/// still end `interrupted` (the adapter is gone), not `failed`.
+///
+/// This used to be set up with a fixed `sleep 0.3` in the wrapper, racing
+/// `EXIT_SETTLE`'s fixed 500 ms budget: under load (several copies of this
+/// test binary at once) either timer can outrun the other for reasons that
+/// have nothing to do with the code under test, flaking the assertion.
+/// Instead the wrapper closes stdout and then blocks reading a FIFO, so it
+/// physically cannot exit until this test says so, and the actor is held
+/// (`test_hooks::HoldAt::PromptErrored`) right where it is about to check
+/// whether the adapter has already exited. Only once `hooks.holding()`
+/// proves the actor is parked there does the test let the wrapper read the
+/// FIFO and exit; the actor is released only after that. So the real exit
+/// can never happen before the actor starts waiting for it (which would
+/// silently turn this into a test of the "already exited" path instead),
+/// and by the time `exited_within` is released to look, the wrapper is
+/// already exiting — no fixed sleep has to out-race anything.
 #[tokio::test]
 async fn a_prompt_that_fails_because_the_adapter_is_dying_ends_interrupted() {
     let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
@@ -559,17 +575,49 @@ async fn a_prompt_that_fails_because_the_adapter_is_dying_ends_interrupted() {
         exit_after_chunks: Some(1),
         ..FakeScript::default()
     };
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("go");
+    assert!(
+        Command::new("mkfifo").arg(&fifo).status().unwrap().success(),
+        "mkfifo failed"
+    );
     let wrapper = AgentCommand {
         program: "sh".into(),
         args: vec![
             "-c".into(),
-            format!("{} ; exec >&- ; sleep 0.3", env!("CARGO_BIN_EXE_hennery-fake-acp")),
+            format!(
+                "{} ; exec >&- ; read _ < {}",
+                env!("CARGO_BIN_EXE_hennery-fake-acp"),
+                fifo.display()
+            ),
         ],
         env: vec![(SCRIPT_ENV.into(), serde_json::to_string(&script).unwrap())],
     };
-    let handle = session::start(uplink.clone(), "r0".into(), "s1".into(), wrapper, std::env::temp_dir());
+    let hooks = TestHooks::hold_after_prompt_errors();
+    let handle = session::spawn(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        wrapper,
+        std::env::temp_dir(),
+        SessionOptions {
+            test_hooks: Some(hooks.clone()),
+            ..SessionOptions::default()
+        },
+    );
     wait_until(&uplink, has("session_started")).await;
     assert!(handle.send(prompt("r1", "t1")));
+    // Provably waiting right before the exit check: only now can the
+    // wrapper's real exit be released without racing anything.
+    tokio::time::timeout(Duration::from_secs(30), hooks.holding())
+        .await
+        .expect("the actor never reached the prompt-errored hold");
+    let go = fifo.clone();
+    tokio::task::spawn_blocking(move || std::fs::write(&go, b"go\n"))
+        .await
+        .unwrap()
+        .expect("writing to the fifo failed");
+    hooks.release();
     let frames = wait_until(&uplink, has("session_parked:adapter_exited")).await;
     let outcomes: Vec<TurnOutcome> = frames
         .iter()

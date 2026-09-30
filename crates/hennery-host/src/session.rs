@@ -1127,6 +1127,10 @@ impl Actor {
                             self.end_turn(ended.id, outcome, stop_reason(&response), None);
                         }
                         Err(err) => {
+                            #[cfg(feature = "test-hooks")]
+                            if let Some(hooks) = &self.options.test_hooks {
+                                hooks.hold_if_armed(test_hooks::HoldAt::PromptErrored).await;
+                            }
                             let exited = adapter.exited_within(EXIT_SETTLE).await;
                             // Updates that arrived during the wait above are
                             // also ahead of this turn's end.
