@@ -1947,9 +1947,11 @@ async fn a_switch_queued_behind_an_orphaned_one_is_refused_and_never_sent() {
     assert_eq!(switches(&log), "model=large\n");
 }
 
-/// F1: an orphaned switch's late answer still updates the catalogue
-/// (silently — its requester already has `config_failed`), and once it
-/// clears, a later switch is sent normally.
+/// F1: an orphaned switch's late answer still updates the catalogue, and
+/// once it clears, a later switch is sent normally. Final review I2: that
+/// late read-back is also a `config_applied` fact under the orphan's own
+/// request id, so the collector stores it (its requester already has its
+/// `config_failed`; the collector has no waiter left to answer twice).
 #[tokio::test]
 async fn an_orphaned_switchs_late_answer_updates_the_catalogue_and_a_later_switch_is_sent_normally() {
     let dir = tempfile::tempdir().unwrap();
@@ -2004,11 +2006,26 @@ async fn an_orphaned_switchs_late_answer_updates_the_catalogue_and_a_later_switc
     );
     // A later switch is not still blocked by the (now resolved) orphan.
     assert!(handle.send(set_config("rc2", "effort", ConfigValue::Id("high".into()))));
-    let frames = wait_until(&uplink, has("config_applied")).await;
-    let (_, indexed) = applied(&frames).remove(0);
+    let frames = wait_until(&uplink, |f| applied(f).len() >= 2).await;
+    let applied = applied(&frames);
+    let answers: Vec<(&str, Option<&str>, Option<ConfigValue>)> = applied
+        .iter()
+        .map(|(id, indexed)| {
+            let current = indexed.current_config().unwrap();
+            (
+                id.as_str(),
+                indexed.current_model.as_deref(),
+                current.axes.get("effort").cloned(),
+            )
+        })
+        .collect();
     assert_eq!(
-        indexed.current_config().unwrap().axes.get("effort").cloned(),
-        Some(ConfigValue::Id("high".into()))
+        answers,
+        [
+            ("rc1", Some("large"), Some(ConfigValue::Id("low".into()))),
+            ("rc2", Some("large"), Some(ConfigValue::Id("high".into()))),
+        ],
+        "the orphan's late read-back is not a config_applied fact"
     );
     assert_eq!(switches(&log), "model=large\neffort=high\n");
 }

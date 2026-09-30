@@ -358,14 +358,20 @@ struct OutSwitch {
 /// two requests out at once (the real adapters handle them concurrently, so
 /// a late one could land after, and clamp, one sent behind it): fix round 1
 /// (F1) tracks it by its `token` instead of sending anything else behind
-/// it. Its own requester has already been answered `config_failed`, so a
-/// late answer (matched by `token`, fix round 2) only ever updates the
-/// catalogue, silently. Given up on, unanswered, `config_timeout *
+/// it. Its own requester has already been answered `config_failed`; a late
+/// answer (matched by `token`, fix round 2) with a non-empty read-back
+/// updates the catalogue and is announced as a `config_applied` under its
+/// original `request_id` (final review I2), so the collector stores what
+/// the agent now runs with — it has no waiter left for that id, so this is
+/// never a second answer. Given up on, unanswered, `config_timeout *
 /// ORPHAN_GRACE` after it was sent, in case the adapter never answers at
 /// all — the catalogue then simply stays not current, as it already was
-/// made at the timeout.
+/// made at the timeout. A start switch that got no answer in time is an
+/// orphan too (final review I1), with no `request_id` and `NO_TOKEN`: its
+/// answer was dropped with the start, so only its grace clears it.
 struct Orphan {
     token: u64,
+    request_id: Option<String>,
     drop_after: Instant,
 }
 
@@ -759,6 +765,7 @@ impl Actor {
             // so `NO_TOKEN` matches nothing: only the grace clears it.
             orphan: applied_hung.map(|sent_at| Orphan {
                 token: NO_TOKEN,
+                request_id: None,
                 drop_after: sent_at + self.options.config_timeout * ORPHAN_GRACE,
             }),
             next_token: NO_TOKEN + 1,
@@ -1104,7 +1111,7 @@ impl Actor {
         self.catalogue.lock().expect("catalogue lock").current = false;
         let timeout = self.options.config_timeout;
         self.reject(
-            out.request_id,
+            out.request_id.clone(),
             "config_failed",
             format!("no answer within {timeout:?} of the request"),
         );
@@ -1117,16 +1124,31 @@ impl Actor {
         }
         configs.orphan = Some(Orphan {
             token: out.token,
+            request_id: Some(out.request_id),
             drop_after: out.sent_at + self.options.config_timeout * ORPHAN_GRACE,
         });
     }
 
-    /// An orphaned switch's late answer: its requester already has its
-    /// `config_failed`, so this only ever updates the catalogue, silently
-    /// (fix round 1, F1).
-    fn orphan_answered(&self, result: agent_client_protocol::Result<SetSessionConfigOptionResponse>) {
-        if let Ok(response) = result {
-            self.apply_read_back(response);
+    /// An orphaned switch's late answer (fix round 1, F1): its requester
+    /// already has its `config_failed`, but a non-empty read-back is what
+    /// the agent now runs with, so it is announced as a `config_applied`
+    /// under the orphan's own request id (final review I2). The collector
+    /// stores it while the session is attached; with no waiter left for
+    /// that id, it answers no one. An empty read-back or a refusal is not
+    /// announced: neither tells the collector anything new.
+    fn orphan_answered(
+        &self,
+        request_id: Option<String>,
+        result: agent_client_protocol::Result<SetSessionConfigOptionResponse>,
+    ) {
+        let Ok(response) = result else { return };
+        let announced = !response.config_options.is_empty();
+        self.apply_read_back(response);
+        if announced && let Some(request_id) = request_id {
+            self.emit(SessionBody::ConfigApplied {
+                request_id,
+                indexed: self.catalogue_extracts(),
+            });
         }
     }
 
@@ -1159,9 +1181,8 @@ impl Actor {
             let out = configs.out.take().expect("just matched");
             self.config_answered(out.request_id, result);
             false
-        } else if configs.orphan.as_ref().is_some_and(|orphan| orphan.token == token) {
-            configs.orphan = None;
-            self.orphan_answered(result);
+        } else if let Some(orphan) = configs.orphan.take_if(|orphan| orphan.token == token) {
+            self.orphan_answered(orphan.request_id, result);
             true
         } else {
             false

@@ -1414,6 +1414,45 @@ async fn set_config_refusals_answer_with_their_codes() {
     assert!(more.is_err(), "a request reached the host: {more:?}");
 }
 
+/// Final review I2: a switch the host gave up on (502) may still land at
+/// the adapter. The host then announces its late read-back as a
+/// `config_applied` under the same request id: the store applies it, and
+/// the request, already answered, is not answered again.
+#[tokio::test]
+async fn a_late_config_applied_for_a_failed_switch_still_updates_the_stored_catalogue() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let c = client();
+    let url = config_url(&collector, &session);
+    let call = tokio::spawn(async move { post(&c, url, json!({ "config_id": "mode", "value": "plan" })).await });
+    let (request_id, _, _) = expect_set_config(&mut host, &session).await;
+    host.send(&HostFrame::Error {
+        request_id: request_id.clone(),
+        code: "config_failed".into(),
+        message: "no answer within 15s of the request".into(),
+    })
+    .await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!((status, body["code"].as_str()), (502, Some("config_failed")), "{body}");
+    let url = collector.url(&format!("/api/sessions/{session}/catalog"));
+    let (_, before) = get(&client(), url.clone()).await;
+    assert_ne!(before["mode"], "plan", "{before}");
+    host.emit(
+        &session,
+        SessionBody::ConfigApplied {
+            request_id,
+            indexed: catalogue("plan"),
+        },
+    )
+    .await;
+    wait_for("the late read-back stored", || async {
+        let (status, catalog) = get(&client(), url.clone()).await;
+        (status == 200 && catalog["mode"] == "plan").then_some(())
+    })
+    .await;
+}
+
 /// Read a session's SSE stream from its start until `pred` holds for the
 /// text received so far.
 async fn read_stream(collector: &Collector, session: &str, pred: impl Fn(&str) -> bool) -> String {
