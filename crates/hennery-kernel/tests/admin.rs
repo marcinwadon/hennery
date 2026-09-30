@@ -166,6 +166,30 @@ async fn a_malformed_or_oversized_request_is_refused() {
     assert!(hosts.list().unwrap().is_empty());
 }
 
+/// M1: a connection closed before a single byte of the answer arrives (the
+/// collector stopped mid-request, or dropped the peer for a uid mismatch)
+/// is reported plainly, not as serde's opaque "EOF while parsing a value".
+#[tokio::test]
+async fn a_connection_closed_before_an_answer_is_reported_plainly() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("raw.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        // Closed without writing a byte: what a cancelled `answer` task, or
+        // a uid-mismatch drop, leaves the client with.
+        drop(stream);
+    });
+    let mut client = tokio::net::UnixStream::connect(&path).await.unwrap();
+    let err = read_answer(&mut client)
+        .await
+        .expect_err("no answer, and no error either");
+    let shown = format!("{err:#}");
+    assert!(shown.contains("closed the connection without answering"), "{shown}");
+    assert!(shown.contains("outcome is unknown"), "{shown}");
+    server.await.unwrap();
+}
+
 /// One collector per data directory: a socket that answers is refused; a
 /// stale one (its collector killed) is replaced; the socket is removed at
 /// shutdown.
@@ -235,8 +259,8 @@ fn a_setup_link_or_pairing_code_answer_does_not_show_it_in_debug() {
 /// Only a socket that refuses the connection is taken for stale: one that
 /// cannot be checked (here, a socket its own user may not connect to) stops
 /// the start, named, and is left where it is.
-#[test]
-fn a_socket_that_cannot_be_checked_stops_the_start() {
+#[tokio::test]
+async fn a_socket_that_cannot_be_checked_stops_the_start() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join(ADMIN_SOCKET);
     drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());

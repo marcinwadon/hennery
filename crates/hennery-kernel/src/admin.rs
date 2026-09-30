@@ -428,9 +428,19 @@ pub async fn request(socket: &Path, request: &AdminRequest) -> Result<AdminRespo
 /// One `AdminResponse` line from `stream`, at most `MAX_RESPONSE_BYTES`.
 pub async fn read_answer(stream: &mut tokio::net::UnixStream) -> Result<AdminResponse> {
     let mut answer = String::new();
-    BufReader::new(stream.take(MAX_RESPONSE_BYTES))
+    let read = BufReader::new(stream.take(MAX_RESPONSE_BYTES))
         .read_line(&mut answer)
         .await
         .context("read the collector's answer")?;
+    // The connection closed before a single byte arrived: a reset in flight
+    // when the collector stopped, or a peer dropped for a uid mismatch.
+    // Serde's own message for an empty input ("EOF while parsing a value")
+    // reads like a parse bug, not like what happened.
+    if read == 0 {
+        bail!(
+            "the collector closed the connection without answering (it may have stopped); \
+             the command's outcome is unknown"
+        );
+    }
     serde_json::from_str(&answer).context("the collector's answer")
 }
