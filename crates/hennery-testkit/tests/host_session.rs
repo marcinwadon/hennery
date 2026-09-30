@@ -2489,3 +2489,66 @@ async fn a_switch_queued_behind_one_the_pre_turn_drain_answers_is_sent_without_w
         "rc2 (effort=high) was not applied"
     );
 }
+
+/// Fix round 2: `out_deadline` must never drain, in either branch — an
+/// adapter's own (unthrottled, in this test literally never-ending) output
+/// must not hold off a `Cancel` sitting behind it in `commands` merely
+/// because a config switch's deadline also happens to fire mid-flood.
+/// `hang_config` guarantees `rc1` is never answered, so `out_deadline`
+/// definitely takes the orphan branch (not the disarm one) here — the one
+/// a synchronous drain-then-decide would have made worst, since draining
+/// ties up the actor for exactly as long as it takes to work through
+/// whatever has accumulated by the time the deadline fires.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancel_is_read_promptly_even_though_a_switch_deadline_fires_mid_flood() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, mut replies) = Uplink::new(Outbox::open(&dir.path().join("outbox.db")).unwrap());
+    let script = FakeScript {
+        chunks: vec!["flood".into()],
+        flood: true,
+        hang_config: true,
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        SessionConfig::default(),
+        SessionOptions {
+            config_timeout: Duration::from_millis(200),
+            ..SessionOptions::default()
+        },
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let start_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while handle.open_turn_id().is_none() {
+        assert!(tokio::time::Instant::now() < start_deadline, "the turn never started");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
+    // Well past `config_timeout` (200ms): `out_deadline` has certainly
+    // fired by now, mid-flood, and (since `hang_config` never answers)
+    // certainly orphaned rc1 rather than disarmed it.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(handle.send(cancel("rc2", "t1")));
+    // A synchronous drain in `out_deadline` would tie the actor up for as
+    // long as it takes to work through everything the flood produced by
+    // the time the deadline fired — unbounded, in practice (a bare few
+    // hundred ms of flood was already observed to take 10s+ to recover
+    // from under the drain-based round-1 fix). Without any drain there,
+    // the cancel gets its fair turn within one burst cycle: a few seconds
+    // is a generous, but still bounded, budget.
+    let cancel_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while handle.open_turn_id().is_some() {
+        assert!(
+            tokio::time::Instant::now() < cancel_deadline,
+            "the cancel was held off by the switch's own deadline arm"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // rc1 really was orphaned (config_failed), not silently dropped.
+    let (id, code) = refusal(&mut replies).await;
+    assert_eq!((id.as_str(), code.as_str()), ("rc1", "config_failed"));
+}

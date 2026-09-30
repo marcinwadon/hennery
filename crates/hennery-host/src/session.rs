@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
@@ -345,8 +345,13 @@ struct OutSwitch {
     /// not to `deadline` (which is relative to receipt, decision 6).
     sent_at: Instant,
     /// Receipt plus `config_timeout`: past it while still out, the switch
-    /// becomes an orphan (below).
-    deadline: Instant,
+    /// becomes an orphan (below) — unless its answer has already been
+    /// flagged (`PendingConfigs::answered_token`), in which case
+    /// `out_deadline` disarms it (sets this to `None`) instead: the answer
+    /// is already in flight on the wire-ordered channel, so no drain is
+    /// needed to find it, and a cleared deadline can never re-fire in a
+    /// busy loop the way an unchanged, already-past one would.
+    deadline: Option<Instant>,
 }
 
 /// A timed-out switch may still answer, and decision 6 forbids ever having
@@ -383,7 +388,23 @@ struct PendingConfigs {
     /// is matched against `out`/`orphan` by this, never by arrival order
     /// (fix round 2).
     next_token: u64,
+    /// The token of the switch whose answer has begun arriving: set (fix
+    /// round 2) inside `send_next_switch`'s `on_receiving_result` callback,
+    /// *before* the answer is pushed onto the wire-ordered `updates`
+    /// channel — so once `out_deadline` observes a match, the answer is
+    /// already either in that channel or about to be, and no drain is
+    /// needed to find it (a flooding adapter's own backlog must never hold
+    /// up `out_deadline` itself, or it becomes another way to hold off a
+    /// cancel). Set from the connection task, possibly a different worker
+    /// thread, hence atomic. `NO_TOKEN` (never issued) until the first
+    /// answer starts arriving.
+    answered_token: Arc<AtomicU64>,
 }
+
+/// Sentinel for `PendingConfigs::answered_token`: no switch's answer has
+/// begun arriving yet. Tokens are issued from 0 upward, so this can never
+/// collide with a real one.
+const NO_TOKEN: u64 = u64::MAX;
 
 impl Drop for PendingConfigs {
     fn drop(&mut self) {
@@ -731,13 +752,14 @@ impl Actor {
             out: None,
             orphan: None,
             next_token: 0,
+            answered_token: Arc::new(AtomicU64::new(NO_TOKEN)),
         };
         // Updates handled since the burst last reset: reset only once a
         // full pass over the other arms (below) finds none of them ready.
         let mut burst = 0;
         loop {
             let cancel_at = turn.as_ref().and_then(|t| t.cancel_deadline);
-            let out_at = configs.out.as_ref().map(|out| out.deadline);
+            let out_at = configs.out.as_ref().and_then(|out| out.deadline);
             let orphan_at = configs.orphan.as_ref().map(|orphan| orphan.drop_after);
             tokio::select! {
                 // Biased: adapter output already received is emitted before
@@ -879,20 +901,25 @@ impl Actor {
                     }
                 }
                 _ = out_deadline(out_at) => {
-                    // The genuine answer may already be queued, undrained,
-                    // behind an adapter's flood backlog (the burst cap can
-                    // leave the updates arm disabled long enough for this
-                    // deadline to fire first): drain before deciding, so a
-                    // switch that did answer in time is never reported
-                    // `config_failed` and then applied again, silently, as
-                    // an orphan.
-                    if self.drain_updates(&mut updates, turn.as_ref().map(|t| t.id.as_str()), &mut configs) {
-                        idle_since = Instant::now();
-                    }
-                    match configs.out.take() {
-                        Some(out) => self.orphan_switch(out, &mut configs),
-                        // The drain above answered it: send whatever waits behind it.
-                        None => self.send_next_switch(&conn, &agent_session, &switch_tx, &mut configs),
+                    // Never drains: an adapter's own flood backlog must
+                    // never hold up this arm either, or it becomes just
+                    // another way to hold off a cancel sitting behind it in
+                    // `commands` (fix round 2). Whether the answer is
+                    // already in flight is decided from the flag alone
+                    // (set, ordered, before the answer is pushed onto the
+                    // channel — see `send_next_switch`), never by looking.
+                    let out = configs.out.as_ref().expect("a deadline implies an out switch");
+                    if configs.answered_token.load(Ordering::SeqCst) == out.token {
+                        // Disarm rather than orphan: the answer is already
+                        // in flight (or sitting in `updates`) and will be
+                        // handled in wire order by the ordinary arm above,
+                        // whenever the actor gets to it. Cleared, not left
+                        // at its old (now past) instant, so this arm can
+                        // never re-fire for it in a busy loop.
+                        configs.out.as_mut().expect("just matched").deadline = None;
+                    } else {
+                        let out = configs.out.take().expect("just matched");
+                        self.orphan_switch(out, &mut configs);
                     }
                 }
                 _ = orphan_deadline(orphan_at) => {
@@ -977,6 +1004,7 @@ impl Actor {
             configs.next_token += 1;
             let request = SetSessionConfigOptionRequest::new(session.clone(), next.config_id, acp_value(&next.value));
             let tx = updates_tx.clone();
+            let answered_token = configs.answered_token.clone();
             // Ordered (`on_receiving_result`, not `block_task`): the
             // dispatch loop holds any later notification until this
             // callback returns, so the answer lands in `updates` in true
@@ -984,6 +1012,12 @@ impl Actor {
             // itself must never fail (an `Err` here would shut the whole
             // ACP connection down) — it only ever forwards the result.
             if let Err(err) = conn.send_request(request).on_receiving_result(move |result| {
+                // Flagged *before* the answer is pushed onto the channel
+                // (fix round 2): `out_deadline`, on a different task, can
+                // only ever observe this after the answer is there (or
+                // about to be), never before — so it is safe to disarm on
+                // the strength of this flag alone, with no drain to confirm.
+                answered_token.store(token, Ordering::SeqCst);
                 let _ = tx.send(Inbound::SwitchAnswer { token, result });
                 std::future::ready(Ok(()))
             }) {
@@ -993,7 +1027,7 @@ impl Actor {
                 request_id: next.request_id,
                 token,
                 sent_at: Instant::now(),
-                deadline: next.deadline,
+                deadline: Some(next.deadline),
             });
         }
     }
