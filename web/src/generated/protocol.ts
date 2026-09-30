@@ -208,3 +208,11 @@ connected: boolean,
  * RFC 3339.
  */
 created_at: string, last_seen_at?: string | undefined, revoked_at?: string | undefined, };
+
+export type SetupRequest = { token: string, password: string, 
+/**
+ * `https://…`, or `http://` to a loopback address; an origin only.
+ */
+public_url: string, };
+
+export type SetupResponse = { public_url: string, };

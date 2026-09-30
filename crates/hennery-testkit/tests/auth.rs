@@ -9,6 +9,7 @@ use futures::{SinkExt, StreamExt};
 use hennery_host::identity::HostKey;
 use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::{Enrollment, Hosts};
+use hennery_kernel::operator::Operator;
 use hennery_proto::frames::{CollectorFrame, HostFrame};
 use hennery_proto::rest::HostItem;
 use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION};
@@ -39,6 +40,7 @@ impl Collector {
         let state = AppState::new(
             Store::open(&dir.path().join("hennery.db")).unwrap(),
             Hosts::open(&dir.path().join("hennery.db")).unwrap(),
+            Operator::open(&dir.path().join("hennery.db")).unwrap(),
             DevToken::new(TOKEN).unwrap(),
         );
         let enrollment = Enrollment {

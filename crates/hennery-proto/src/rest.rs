@@ -261,3 +261,28 @@ pub struct HostItem {
     #[ts(type = "string | undefined", optional)]
     pub revoked_at: Option<String>,
 }
+
+/// `POST /api/setup` (kernel spec §3.1): the one-time owner setup, with the
+/// token from the setup link. `Debug` leaves the password out.
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SetupRequest {
+    pub token: String,
+    pub password: String,
+    /// `https://…`, or `http://` to a loopback address; an origin only.
+    pub public_url: String,
+}
+
+impl std::fmt::Debug for SetupRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetupRequest")
+            .field("public_url", &self.public_url)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 201 to a setup: the owner is created and signed in (the session cookie
+/// is set), and `public_url` is stored as this origin.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SetupResponse {
+    pub public_url: String,
+}

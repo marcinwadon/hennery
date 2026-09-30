@@ -56,7 +56,8 @@ fn joining_over_http_ignores_a_configured_proxy() {
         let store = hennery_sessions::store::Store::open(&db).unwrap();
         let hosts = hennery_kernel::hosts::Hosts::open(&db).unwrap();
         let token = hennery_kernel::auth::DevToken::new("dev-token-for-tests").unwrap();
-        let state = hennery_sessions::AppState::new(store, hosts, token);
+        let operator = hennery_kernel::operator::Operator::open(&db).unwrap();
+        let state = hennery_sessions::AppState::new(store, hosts, operator, token);
         let code = state
             .hosts
             .mint_pairing_code(hennery_kernel::secret::unix_now())
@@ -1075,4 +1076,44 @@ fn up_warns_about_a_loose_existing_data_root() {
     assert_eq!(mode_of(&root), 0o755, "the operator's directory was changed");
     unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
     assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
+}
+
+/// Kernel spec §3.1: a collector that is not set up writes its one-time
+/// setup link to `setup-url` (0600, under `umask 022` too) and, its output
+/// not being a terminal, logs only that file's path: the token itself must
+/// never reach a log collector.
+#[test]
+fn an_unset_collector_writes_its_setup_link_to_a_private_file_and_never_to_its_output() {
+    let listen = free_listen();
+    let dir = std::env::temp_dir().join(format!(
+        "hennery-cli-setup-{}-{}",
+        std::process::id(),
+        listen.replace(':', "-")
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    let log = dir.join("collector.log");
+
+    let mut collector = collector_under_umask_022(&listen, &data, &log);
+    let file = data.join("setup-url");
+    assert_eq!(mode_of(&file), 0o600);
+    let url = std::fs::read_to_string(&file).unwrap();
+    let port = listen.rsplit(':').next().unwrap();
+    let token = url
+        .trim_end()
+        .strip_prefix(&format!("http://localhost:{port}/setup#"))
+        .unwrap_or_else(|| panic!("{url}"));
+    assert_eq!(token.len(), 64, "{url}");
+    unsafe { libc::kill(collector.up.id() as i32, libc::SIGTERM) };
+    assert!(wait_with_timeout(&mut collector.up, Duration::from_secs(15)).is_some());
+
+    let stdout = std::fs::read_to_string(&log).unwrap();
+    let stderr = std::fs::read_to_string(log.with_extension("err")).unwrap();
+    assert!(
+        !stdout.contains(token) && !stderr.contains(token),
+        "the setup token was logged"
+    );
+    assert!(stdout.contains(&file.display().to_string()), "{stdout}");
 }

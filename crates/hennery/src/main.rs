@@ -15,6 +15,7 @@ use hennery_host::session::IDLE_TIMEOUT;
 use hennery_host::{AgentCommand, HostConfig};
 use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::Hosts;
+use hennery_kernel::operator::{Operator, SetupLink};
 use hennery_sessions::{AppState, store::Store};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -169,13 +170,23 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     let db = args.data_dir.join("hennery.db");
     let store = Store::open(&db)?;
     let hosts = Hosts::open(&db)?;
-    let mut state = AppState::new(store, hosts, token);
+    let operator = Operator::open(&db)?;
+    let mut state = AppState::new(store, hosts, operator, token);
     state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
     hennery_sessions::offline::after_startup(&state);
     let listener = tokio::net::TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("bind {}", args.listen))?;
-    tracing::info!(address = %listener.local_addr()?, "collector listening");
+    let address = listener.local_addr()?;
+    tracing::info!(%address, "collector listening");
+    // Only once listening: the link names the port (kernel spec §3.1).
+    let base_url = format!("http://localhost:{}", address.port());
+    if let Some(link) = state
+        .operator
+        .announce_setup(&args.data_dir, &base_url, hennery_kernel::secret::unix_now())?
+    {
+        announce_setup(&link);
+    }
     if let Some(fd) = args.pairing_code_fd {
         // Only once migrated and listening: the host enrolls right away.
         let code = state.hosts.mint_pairing_code(hennery_kernel::secret::unix_now())?;
@@ -197,6 +208,24 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
         .with_graceful_shutdown(state.shutdown.clone().cancelled_owned())
         .await?;
     Ok(())
+}
+
+/// Tell the operator where the setup link is (kernel spec §3.1): the link
+/// itself only to a terminal, so the token never lands in a log collector;
+/// otherwise only the path of the file that holds it.
+fn announce_setup(link: &SetupLink) {
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        println!(
+            "hennery is not set up yet. Open this link within the hour to set it up:\n  {}",
+            link.url
+        );
+    } else {
+        tracing::info!(
+            file = %link.file.display(),
+            "hennery is not set up yet; the one-time setup link (valid for an hour) is in this file"
+        );
+    }
 }
 
 /// Create `dir`, and any parent it lacks, 0700 whatever the umask: the

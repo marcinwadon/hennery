@@ -7,6 +7,7 @@ use hennery_host::identity::{KEY_FILE, Paired};
 use hennery_host::pairing::{Joined, join};
 use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::{EnrollOutcome, Enrollment, HelloCheck, Hosts};
+use hennery_kernel::operator::Operator;
 use hennery_proto::PROTOCOL_VERSION;
 use hennery_proto::rest::PairingCodeResponse;
 use hennery_sessions::AppState;
@@ -30,6 +31,7 @@ impl Collector {
         let state = AppState::new(
             Store::open(&db).unwrap(),
             Hosts::open(&db).unwrap(),
+            Operator::open(&db).unwrap(),
             DevToken::new(TOKEN).unwrap(),
         );
         tokio::spawn(hennery_sessions::serve(listener, state.clone()));

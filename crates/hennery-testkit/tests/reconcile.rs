@@ -6,6 +6,7 @@ use futures::{SinkExt, StreamExt};
 use hennery_host::identity::HostKey;
 use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::{Enrollment, Hosts};
+use hennery_kernel::operator::Operator;
 use hennery_proto::frames::{AttachedSession, Capabilities, Capability, CollectorFrame, HostFrame, SessionBody};
 use hennery_proto::rest::EventDto;
 use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION};
@@ -55,6 +56,7 @@ impl Collector {
         let mut state = AppState::new(
             Store::open(&dir.path().join("hennery.db")).unwrap(),
             hosts,
+            Operator::open(&dir.path().join("hennery.db")).unwrap(),
             DevToken::new(TOKEN).unwrap(),
         );
         state.offline_threshold = offline;

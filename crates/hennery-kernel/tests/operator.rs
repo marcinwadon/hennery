@@ -1,7 +1,10 @@
 //! The operator and their setup (kernel spec §3.1, §3.2, §11): the
 //! one-time setup token, the owner's password and the `public_url`.
 
-use hennery_kernel::operator::{MAX_PASSWORD_BYTES, Operator, PublicUrl, SETUP_TOKEN_TTL_SECS, SetupOutcome};
+use hennery_kernel::operator::{
+    MAX_PASSWORD_BYTES, Operator, PublicUrl, SETUP_TOKEN_TTL_SECS, SETUP_URL_FILE, SetupOutcome,
+};
+use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 
 const NOW: i64 = 1_800_000_000;
@@ -151,4 +154,90 @@ async fn concurrent_checks_each_verify_once_and_answer_their_own_password() {
     }
     assert_eq!(results, [true, false, true, false]);
     assert_eq!(op.verifications(), 4);
+}
+
+fn mode(path: &std::path::Path) -> u32 {
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+/// Kernel spec §3.1: the link goes to `setup-url`, 0600, and is gone once
+/// setup is done.
+#[test]
+fn the_setup_link_is_written_privately_and_removed_by_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let op = Operator::open(&dir.path().join("hennery.db")).unwrap();
+    let link = op
+        .announce_setup(dir.path(), "http://localhost:7117", NOW)
+        .unwrap()
+        .unwrap();
+    assert_eq!(link.file, dir.path().join(SETUP_URL_FILE));
+    assert_eq!(mode(&link.file), 0o600);
+    assert_eq!(std::fs::read_to_string(&link.file).unwrap(), format!("{}\n", link.url));
+    let token = link.url.strip_prefix("http://localhost:7117/setup#").unwrap();
+    assert!(
+        token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()),
+        "{token}"
+    );
+    // No temporary file is left behind.
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        4,
+        "hennery.db, -wal, -shm and setup-url"
+    );
+
+    assert!(matches!(
+        op.set_up(token, PASSWORD, "https://hennery.example", NOW).unwrap(),
+        SetupOutcome::Done { .. }
+    ));
+    assert!(!link.file.exists());
+    // Set up: nothing is written, and a stale link is removed.
+    std::fs::write(&link.file, "stale").unwrap();
+    assert_eq!(
+        op.announce_setup(dir.path(), "http://localhost:7117", NOW).unwrap(),
+        None
+    );
+    assert!(!link.file.exists());
+}
+
+/// A second announcement replaces the first link, and only its token works.
+#[test]
+fn a_new_setup_link_replaces_the_old_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let op = Operator::open_in_memory().unwrap();
+    let first = op
+        .announce_setup(dir.path(), "http://localhost:1", NOW)
+        .unwrap()
+        .unwrap();
+    let second = op
+        .announce_setup(dir.path(), "http://localhost:1/", NOW)
+        .unwrap()
+        .unwrap();
+    assert_ne!(first.url, second.url);
+    assert_eq!(
+        std::fs::read_to_string(&second.file).unwrap(),
+        format!("{}\n", second.url)
+    );
+    let old = first.url.rsplit('#').next().unwrap();
+    assert_eq!(
+        op.set_up(old, PASSWORD, "https://hennery.example", NOW).unwrap(),
+        SetupOutcome::InvalidToken
+    );
+}
+
+/// A symlink planted at `setup-url` is replaced, never written through: the
+/// token must not land in a file someone else chose.
+#[test]
+fn a_symlink_at_the_setup_link_is_replaced_and_its_target_left_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("elsewhere");
+    std::fs::write(&target, "untouched").unwrap();
+    std::os::unix::fs::symlink(&target, dir.path().join(SETUP_URL_FILE)).unwrap();
+    let op = Operator::open_in_memory().unwrap();
+    let link = op
+        .announce_setup(dir.path(), "http://localhost:1", NOW)
+        .unwrap()
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+    assert!(!std::fs::symlink_metadata(&link.file).unwrap().file_type().is_symlink());
+    assert_eq!(mode(&link.file), 0o600);
 }

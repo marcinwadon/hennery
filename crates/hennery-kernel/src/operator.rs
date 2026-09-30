@@ -15,7 +15,9 @@ use crate::secret::{random_bytes, sha256_hex};
 use crate::{db, schema};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::path::Path;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -30,6 +32,10 @@ pub const MAX_PASSWORD_BYTES: usize = 1024;
 
 /// Argon2 runs at most this many at once, whatever the number of clients.
 pub const MAX_CONCURRENT_HASHES: usize = 2;
+
+/// The file in the data directory that holds the setup link until setup
+/// (kernel spec §1, §3.1).
+pub const SETUP_URL_FILE: &str = "setup-url";
 
 /// The `settings` key of the public URL.
 const PUBLIC_URL_KEY: &str = "public_url";
@@ -105,11 +111,22 @@ struct SetupToken {
     expires_at: i64,
 }
 
+/// Where the setup link was written (`Operator::announce_setup`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetupLink {
+    /// `<base>/setup#<token>`: the token in the fragment (3b decision 16).
+    pub url: String,
+    /// The 0600 file holding `url`.
+    pub file: PathBuf,
+}
+
 pub struct Operator {
     conn: Mutex<Connection>,
     /// Loaded at open and replaced by setup: read on every browser request.
     public_url: RwLock<Option<PublicUrl>>,
     setup: Mutex<Option<SetupToken>>,
+    /// The `setup-url` file, removed once setup is done.
+    setup_file: Mutex<Option<PathBuf>>,
     /// `check_password`'s slots, each held until its verify ends.
     hashing: Arc<tokio::sync::Semaphore>,
     verifications: AtomicU64,
@@ -139,6 +156,7 @@ impl Operator {
             conn: Mutex::new(conn),
             public_url: RwLock::new(public_url),
             setup: Mutex::new(None),
+            setup_file: Mutex::new(None),
             hashing: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HASHES)),
             verifications: AtomicU64::new(0),
             #[cfg(test)]
@@ -181,6 +199,38 @@ impl Operator {
             expires_at: now + SETUP_TOKEN_TTL_SECS,
         });
         Ok(Some(token))
+    }
+
+    /// Before setup: issue a fresh setup token and write its link,
+    /// `<base_url>/setup#<token>`, to `dir/setup-url` (kernel spec §3.1).
+    /// The file is created 0600 under a temporary name and renamed into
+    /// place, so an existing `setup-url` (even a symlink) is replaced, never
+    /// written through. Once set up: remove a stale `setup-url` and return
+    /// `None`.
+    pub fn announce_setup(&self, dir: &Path, base_url: &str, now: i64) -> Result<Option<SetupLink>> {
+        let file = dir.join(SETUP_URL_FILE);
+        let Some(token) = self.issue_setup_token(now)? else {
+            remove_setup_file(&file);
+            return Ok(None);
+        };
+        let url = format!("{}/setup#{token}", base_url.trim_end_matches('/'));
+        let temp = dir.join(format!(".{SETUP_URL_FILE}.{}.tmp", hex::encode(random_bytes::<8>())));
+        let written = (|| {
+            let mut out = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp)?;
+            writeln!(out, "{url}")?;
+            out.sync_all()?;
+            std::fs::rename(&temp, &file)
+        })();
+        if let Err(err) = written {
+            let _ = std::fs::remove_file(&temp);
+            return Err(err).with_context(|| format!("write {}", file.display()));
+        }
+        *self.setup_file.lock().expect("setup file lock") = Some(file.clone());
+        Ok(Some(SetupLink { url, file }))
     }
 
     /// Create the owner with `password` and store `public_url` (kernel spec
@@ -227,6 +277,9 @@ impl Operator {
             tx.commit()?;
         }
         *setup = None;
+        if let Some(file) = self.setup_file.lock().expect("setup file lock").take() {
+            remove_setup_file(&file);
+        }
         *self.public_url.write().expect("public_url lock") = Some(public_url);
         Ok(SetupOutcome::Done { owner_id })
     }
@@ -281,6 +334,14 @@ impl Operator {
     /// failure path), which tests pin with this.
     pub fn verifications(&self) -> u64 {
         self.verifications.load(Ordering::Relaxed)
+    }
+}
+
+fn remove_setup_file(file: &Path) {
+    match std::fs::remove_file(file) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => tracing::warn!(file = %file.display(), error = %err, "could not remove the setup link"),
     }
 }
 

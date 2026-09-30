@@ -13,6 +13,7 @@ use futures::{SinkExt, StreamExt};
 use hennery_host::identity::HostKey;
 use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::{Enrollment, Hosts};
+use hennery_kernel::operator::Operator;
 use hennery_proto::frames::{Capabilities, CollectorFrame, HostFrame, SessionBody};
 use hennery_proto::rest::HostItem;
 use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION};
@@ -53,7 +54,12 @@ async fn a_failed_ingest_drops_the_connection_instead_of_acking_past_it() {
     let store = Store::open(&db).unwrap();
     store.create_session("s1", "host-1", "fake", "/tmp").unwrap();
 
-    let state = AppState::new(store, paired_hosts(), DevToken::new(TOKEN).unwrap());
+    let state = AppState::new(
+        store,
+        paired_hosts(),
+        Operator::open_in_memory().unwrap(),
+        DevToken::new(TOKEN).unwrap(),
+    );
     let shutdown = state.shutdown.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -144,7 +150,12 @@ async fn an_undo_error_answers_delivery_unknown_and_drops_the_connection() {
     let db = dir.path().join("hennery.db");
     let store = Store::open(&db).unwrap();
 
-    let state = AppState::new(store, paired_hosts(), DevToken::new(TOKEN).unwrap());
+    let state = AppState::new(
+        store,
+        paired_hosts(),
+        Operator::open_in_memory().unwrap(),
+        DevToken::new(TOKEN).unwrap(),
+    );
     let shutdown = state.shutdown.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

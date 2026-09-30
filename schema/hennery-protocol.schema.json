@@ -1493,6 +1493,39 @@
       ],
       "type": "object"
     },
+    "SetupRequest": {
+      "description": "`POST /api/setup` (kernel spec §3.1): the one-time owner setup, with the\ntoken from the setup link. `Debug` leaves the password out.",
+      "properties": {
+        "password": {
+          "type": "string"
+        },
+        "public_url": {
+          "description": "`https://…`, or `http://` to a loopback address; an origin only.",
+          "type": "string"
+        },
+        "token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "token",
+        "password",
+        "public_url"
+      ],
+      "type": "object"
+    },
+    "SetupResponse": {
+      "description": "201 to a setup: the owner is created and signed in (the session cookie\nis set), and `public_url` is stored as this origin.",
+      "properties": {
+        "public_url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "public_url"
+      ],
+      "type": "object"
+    },
     "StartSessionRequest": {
       "description": "`POST /api/sessions` (ACP core §9): `{host_id, agent, cwd, model?, mode?, axes?}`.",
       "properties": {

@@ -5,6 +5,7 @@ use hennery_host::identity::HostKey;
 use hennery_host::{AgentCommand, HostConfig};
 use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::{Enrollment, Hosts};
+use hennery_kernel::operator::Operator;
 use hennery_proto::rest::{EventDto, HostItem, PromptResponse, StartSessionResponse};
 use hennery_sessions::{AppState, store::Store};
 use hennery_testkit::{FakeScript, SCRIPT_ENV};
@@ -51,7 +52,12 @@ impl Collector {
         let addr = listener.local_addr().unwrap();
         let hosts = Hosts::open(db).unwrap();
         pair_host(&hosts);
-        let mut state = AppState::new(Store::open(db).unwrap(), hosts, DevToken::new(TOKEN).unwrap());
+        let mut state = AppState::new(
+            Store::open(db).unwrap(),
+            hosts,
+            Operator::open(db).unwrap(),
+            DevToken::new(TOKEN).unwrap(),
+        );
         state.offline_threshold = offline;
         let task = tokio::spawn(hennery_sessions::serve(listener, state.clone()));
         Self { addr, state, task }
