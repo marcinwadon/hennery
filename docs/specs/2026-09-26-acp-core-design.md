@@ -558,20 +558,60 @@ ingest in `seq` order (host facts) or when the collector writes its own event
 | From | Trigger | To |
 |---|---|---|
 | — | `POST /api/sessions` (after hat resolution, §4.3) | `starting` |
-| `starting` | `session_started` | `active/idle` (or `active/running` once a first prompt's `turn_started` arrives) |
+| `starting` | `session_started` | `active/idle` (or `active/running` once a first prompt's `turn_started` arrives); clears any `failure_reason` |
 | `starting` | `start_failed` | `failed` (reason stored) |
+| `starting` | host rejects the start/resume | `failed` (the host's code) |
+| `starting` | start with the host offline | `failed` (`host_offline`) |
 | `starting` | reconciliation finds no trace of the start | `failed` (`start_not_delivered`) |
-| `parked`, `closed`, `failed` | resume requested | `starting` |
+| `failed` | a late `session_started` | `active` (the real fact wins, e.g. over a `start_not_delivered` guess) |
+| `failed{start_not_delivered}` | a late `start_failed` | `failed` (the host's code replaces the guess) |
+| `parked`, `closed`, `failed` | resume requested (atomic) | `starting` |
 | `active/idle` | `turn_started` | `active/running` |
 | `active/running` | `pending_opened` | `active/blocked` |
 | `active/blocked` | last pending resolved | `active/running` |
 | `active/running`, `active/blocked` | `turn_ended` | `active/idle` |
-| `active/*` | `session_parked` | `parked` |
+| `active/*` | `session_parked` | `parked` (`closed` if a close was requested) |
 | `active/*` | host offline > threshold | `parked` (presumed; §5.3) |
 | `active/*` | host revoked (kernel spec §4.3) | `parked` (presumed) |
-| `active/*` | host restarted (§5.2) | `parked` |
+| `active/*` | host restarted (§5.2) | `parked` (`closed` if a close was requested) |
 | `active/*` (attached) | `session_closed` after operator close | `closed` |
-| `parked`, `failed`, unattached | operator close | `closed` (immediately) |
+| `active/*` (attached) | the host answers a close `not_attached` | `closed` (collector-side) |
+| `parked`, `failed`, unattached, presumed parked | operator close | `closed` (immediately) |
+| `starting`, host connected and reconciled | operator close | refused, 409 `starting` |
+
+A question asked **outside a turn** leaves `activity` alone: `blocked` means
+a running turn waits on the operator. `turn_ended` makes the session `idle`
+whatever questions remain open.
+
+**A presumed-parked session counts as attached for its host's facts.** It
+keeps its open turn and activity; resent or late facts from its host (a turn
+end, a reap, a question) apply to it as to an `active` one. It refuses
+prompts (409 `not_attached`) and closes at once.
+
+**One visibility rule for host facts** (`events.applied`, §8):
+
+- a fact **with** a transition is listed iff its guarded update changed a
+  row;
+- a fact **without** one (`acp_update`, `adapter_exited`, `host_note`) is
+  listed unless the session is `closed`; an `acp_update` that names a turn is
+  listed only while that turn is `started`;
+- `pending_opened` applies only to an attached session and, if it names a
+  turn, a `started` one; `pending_resolved` only to an open question;
+  `config_applied` only while attached; `answer_result` only when it changes
+  the verdict (§4.6).
+
+An unlisted fact keeps its idempotency key and counts towards
+`committed_seq`, and the waiter it completes still resolves from its body: a
+re-emitted `session_started` still completes a retried start or resume.
+
+**Open turns are released on detach.** When `session_parked` or
+`session_closed` detaches an active (or presumed-parked) session, and again
+when a resume begins, a turn still open is released: a `started` turn gets
+`turn_ended_synthesized{interrupted}`, any other `turn_not_delivered`. The
+host always ends its own turns before it detaches, so an open turn at that
+point is one it never acknowledged. Likewise an unattached close first
+resolves an open turn, and the questions left open go with the session
+(`pending_cancelled`, §4.6).
 
 `starting` blocks a second resume: the collector answers 409 to a resume or
 prompt while the session is `starting`. The host also refuses to attach a
@@ -580,7 +620,9 @@ session it already has attached and re-emits the current state instead (§2.2).
 and orphaned an adapter process.)*
 
 **Prompt or config on a session that is not attached** (parked, closed,
-failed, or its host offline) → 409 `not_attached`; the UI offers resume.
+failed, or its host offline) → 409 `not_attached`; the UI offers resume. A
+prompt to an `active` session whose host has just gone, or is not yet
+reconciled, gets 409 `host_offline` (§9).
 
 ### 4.3 Start and resume
 
@@ -621,14 +663,92 @@ adapter default, and the next resume applied the default for real.)*
 A failed re-apply is logged on the timeline as a `host_note` and does not fail
 the resume.
 
+**Built so far:** hat resolution, `mcp_servers`, `_meta` and the first prompt
+are not built yet; start and resume carry agent, cwd and the config.
+
+**Config axes.** Axes are ACP config options, and model and mode are two of
+them. The model is the option in category `model`; without one, the option
+whose id is `model`, but only if it has no category or a custom (`_`-prefixed)
+one. The same goes for `mode`. `axes` holds every other option by config id,
+each value a select's value id or a boolean.
+
+**Switches** (step 4, the same on start and resume):
+
+- The model, then each axis in config-id order, then the mode. A value
+  already current is not sent — decided only from a catalogue that is current
+  and came from an adapter answer, never a stale or seeded one.
+- A requested model or mode with no option to match is a failed switch, never
+  dropped silently.
+- Each switch gets 15 s, and none runs past the start's 75 s bound. Once a
+  switch gets no answer in time, or the bound has passed, **no further switch
+  is sent**: the adapter handles requests concurrently, so a late model switch
+  could clamp a mode sent after it. The rest are listed as `not sent: an
+  earlier switch did not answer` (or `not sent: the start deadline passed`).
+- After the switches, each requested value is compared with the final
+  read-back; a mismatch is a failure too (`effort: asked high, agent reports
+  low`).
+- Every failure lands in **one** `host_note` after `session_started`: code
+  `config_failed` on a start, `reapply_failed` on a resume, text `could not
+  apply: …` / `could not re-apply: …` with the lines joined by `; `.
+- **A switch that does not take never fails a start or a resume** (decision,
+  2026-09-30; the fresh-start case was open here). The picker's value may be
+  stale (another pin, another host); the note plus the real current values
+  tell the operator what to change, and failing would throw away a started
+  adapter for a setting fixable in one click.
+- An empty or missing read-back is no catalogue: until the adapter reports
+  its options again, the host announces none, and the stored values survive.
+  If the `session/new`/`load` answer has no `configOptions`, the pre-switch
+  catalogue is seeded from the last non-empty `config_option_update` the
+  adapter sent before it (that update itself carries no extracts).
+- A start switch that timed out becomes an **orphan**: `set_config` is refused
+  (`config_failed`, "an earlier switch is still out") until its grace (four
+  switch timeouts after it was sent) passes.
+
+**Live `set_config`** on an attached session is one more switch:
+
+- One `session/set_config_option` at a time per session. Requests queue on
+  the host and are answered in the order they came; they may run during a
+  turn. Each one's deadline is its receipt plus 15 s: one still queued then is
+  `config_failed` ("an earlier switch is still out"), one sent and unanswered
+  `config_failed` ("no answer within …"). A timed-out switch is an orphan
+  (above): what is queued behind it is refused, nothing is sent behind it.
+- An orphan's late non-empty read-back is emitted as a sequenced
+  `config_applied` under its request's id: the agent now runs with it, and
+  without the fact a later resume would revert it. It answers no one.
+- A switch still out when the actor ends is answered `not_attached`, after the
+  actor's last fact.
+- The actor also tracks the catalogue from the agent's own
+  `config_option_update`s (e.g. leaving plan mode); those carry the extracts
+  (§3.2).
+- Not built yet: Codex's legacy `session/set_model` and `modes` /
+  `session/set_mode` (Codex profile, §6).
+
+**Questions during start-up.** Permissions and elicitations the adapter asks
+before `session_started` (during `initialize`, `session/new`/`load` or the
+switches) are held, then opened right after it, in wire order with the
+start's early updates. An adapter that blocks its load on such a question
+costs the start its 75 s bound; the `start_failed` then names the questions
+it held back.
+
+**Resume, collector side.** A session with no `agent_session_id` (its start
+never produced one) cannot be resumed: 409 `agent_has_no_record` without
+contacting the host. The host being offline is checked before any
+transition (409 `host_offline`, nothing changes). The resume transition is
+atomic, so of two concurrent resumes one gets 409 `starting`. A failed resume
+leaves the session `failed` like a failed start, and `failed` is resumable.
+
 **Known load failures** (reported as `start_failed`):
 
 - `-32002 Resource not found` means the agent has no record of the session,
   typically because it never completed a turn. The session becomes `failed`
   with reason `agent_has_no_record`, and the UI offers "start a new session in
-  the same project". *(P-14.)*
+  the same project". *(P-14.)* Mapped so on `session/load` only.
 - `-32000 Authentication required` means the agent CLI on that host is not
-  logged in. Reason `agent_not_logged_in`; `hennery doctor` names the fix.
+  logged in. Reason `agent_not_logged_in`, on any start call (`session/new`
+  included); `hennery doctor` names the fix.
+- An adapter without the `loadSession` capability: `load_unsupported`.
+- Anything else (spawn, `initialize`, an exit during start, the 75 s bound):
+  `start_failed`.
 
 ### 4.4 Turns
 
@@ -648,18 +768,51 @@ the resume.
   *(P-16: an empty prompt reached the adapter and produced a `-32602 Invalid
   params` error on the session.)*
 - **Every started turn ends with exactly one `turn_ended`**, outcome one of:
-  - `completed` — the adapter returned a stop reason (stored as `stop_reason`);
-  - `cancelled` — after `cancel_turn`;
-  - `failed` — `session/prompt` returned an error (stored);
+  - `completed` — the adapter returned a stop reason other than `cancelled`
+    (stored as `stop_reason`), even after a cancel: the agent finished first;
+  - `cancelled` — the stop reason is `cancelled` (with or without a hennery
+    cancel), or `session/prompt` returned an error after a cancel was sent
+    (the error is kept: an agent's aborted work may throw), or the adapter
+    ignored the cancel (below);
+  - `failed` — `session/prompt` returned an error with no cancel sent (stored);
   - `interrupted` — adapter exit, session close or park mid-turn, or a host
     restart.
 
   The host emits it in every case it can observe, including adapter exit and
-  close mid-turn. The collector synthesises `turn_ended{interrupted}` only when
-  a host restart is detected (§5.2). A `turn_ended` for a turn that has already
+  close mid-turn. The collector synthesises `turn_ended{interrupted}`
+  (`turn_ended_synthesized`) only for a `started` turn the host can no longer
+  end: a host restart (§5.2), a started turn the host no longer reports after
+  a full resend (§5.1), and the releases of §4.2 (detach, unattached close,
+  resume). A turn that never started gets `turn_not_delivered` instead: the
+  agent never saw it. A `turn_ended` for a turn that has already
   ended is stored but not applied and never pushes. *(P-17: an error, a lost
   result or a disconnect left the predecessor's sessions `running` forever.)*
 - Turn-in-flight covers `blocked`: a pending permission is inside a turn.
+- **A late `turn_started` wins over `not_delivered`**: the adapter really has
+  the turn. It takes the slot back only from a turn still `sent` (which then
+  becomes `turn_not_delivered`), and never reopens a turn that has ended. A
+  real `turn_ended` ends only a `started` turn.
+- **Cancel** (`cancel_turn`, `POST …/cancel`). The host sends ACP
+  `session/cancel` for the turn in flight and answers every open question
+  cancelled (§4.6). A cancel for a `sent` turn is sent too: its prompt
+  precedes it on the same socket, so the actor sees the turn first. A cancel
+  writes no collector event; the turn's `turn_ended` is the timeline's
+  record.
+  - **An adapter that ignores the cancel is stopped** after 20 s
+    (`CANCEL_GRACE`): the turn ends `cancelled` with an error saying so, the
+    remaining questions are cancelled, the process group is killed, a
+    `host_note{cancel_unanswered}` carries the last lines of the scrubbed
+    stderr tail (no `adapter_exited` is emitted on this path), and
+    `session_parked{operator}` detaches the session. It cannot take another
+    prompt while the old one runs, so it cannot stay attached; 20 s + the 5 s
+    kill grace stays below the collector's 60 s cancel timeout, which would
+    otherwise drop the whole host connection (§3.4).
+  - **Refusals:** 409 `not_attached` (not `active`, presumed parked included,
+    or its host not ready), 409 `no_open_turn`, 409 `not_running` (the host has
+    no such turn in flight and the store has not seen it end), 404 for an
+    unknown session. If the store shows the turn ended (its end was ingested
+    between reading the open turn and registering the cancel's waiter), the
+    cancel answers 202 with the stored outcome instead of `not_running`.
 
 ### 4.5 Replay suppression
 
@@ -679,6 +832,10 @@ rather than history:
 Unknown update kinds received during load are dropped and counted in a
 `host_note` so a new history-bearing kind cannot silently duplicate history.
 
+After a load the frames go: `session_started`, then the kept state updates in
+arrival order (without catalogue extracts, §3.2), then at most one
+`host_note{replay_unknown_dropped}` naming each unknown kind with its count.
+
 *(P-18: without suppression every resume re-persisted the whole transcript
 and a new "session started" row; ~50 sessions were affected before a fix and a
 database cleanup. The predecessor's fix, in the collector, also dropped the
@@ -691,12 +848,46 @@ post-switch-catalogue rule of §4.3.)*
   cancelled, the session closes or parks, or the adapter is lost. **No
   timeout.** *(Umbrella §6.5. The predecessor had a 5-minute permission
   timeout and none for elicitation; hennery removes the asymmetry. Cost: an
-  unanswered question pins one adapter process. The idle reaper never touches
-  a turn in flight.)*
-- The host assigns each request a **`pending_id`** (random UUID, globally
-  unique), emits `pending_opened{pending_id, kind, payload}` with
-  `indexed.pending = {id, kind, option_ids}`, and keeps the waiter. The name
-  `request_id` is reserved for request/response correlation.
+  unanswered question pins one adapter process. The idle reaper never parks
+  a session with a question open, in a turn or not, §4.7.)*
+- Questions reach the actor on its ordered inbound channel, so a question is
+  opened in wire order with the updates around it. One asked outside any turn
+  is opened too (no `turn_id`); it leaves `activity` alone (§4.2).
+- The host assigns each request a **`pending_id`** (a UUIDv7: globally unique,
+  random beyond its time prefix), emits `pending_opened{pending_id, indexed,
+  payload}` with `indexed.pending = {id, kind, option_ids}`, and keeps the
+  waiter. The name `request_id` is reserved for request/response correlation.
+- **A permission's `option_ids` are read from the raw request**: every string
+  `options[i].optionId`, skipping an entry without one. A typed copy (§2.4)
+  would fail on one option of a kind this build does not know, and then every
+  answer would be refused. When `options` is missing or not an array, or no
+  entry has an id, the question still opens but the collector accepts no
+  answer to it (400 `invalid`, "stop, park or close the session").
+- **Cancellation, host side.** Every open question is answered cancelled (a
+  permission gets the `cancelled` outcome, an elicitation the `cancel`
+  action) and announced as `pending_resolved{cancelled, reason}`:
+  - on the first `session/cancel` of a turn: `turn_cancelled` (ACP asks this
+    of a client after `session/cancel`). This cancels **every** open question,
+    including one asked outside the turn. A question the same turn asks after
+    the cancel is cancelled as it opens;
+  - on park and idle reap: `session_parked`; on close: `session_closed`; on
+    adapter exit: `adapter_lost` (§4.8 for the order);
+  - **the adapter withdrawing its own question** (`$/cancel_request`):
+    `agent_withdrew`. The host answers the request with the standard
+    `-32800` cancellation error. Without this the card would stay answerable,
+    an answer would report `delivered: true` to nobody, and the open question
+    would keep the reaper away for good.
+
+  Host shutdown emits nothing: the collector cancels those questions
+  `host_restarted` after the next handshake (§5.2).
+- **Cancellation, collector side** (`pending_cancelled{pending_id, reason}`,
+  one event per question), for questions the host will never resolve: a host
+  restart, including one found through a presumed-parked session
+  (`host_restarted`); a close of an unattached session (`session_closed`); and,
+  as a backstop, a host `session_parked`/`session_closed` that applies while a
+  question is still open (`adapter_exited` gives `adapter_lost`, idle or
+  operator `session_parked`, a close `session_closed`). A presumed park leaves
+  questions `open` (§5.3).
 - **The elicitation client capability is advertised as `{"form": {}}`**, never
   a boolean. *(P-19: a boolean is silently discarded by the adapter's schema
   validator and looks exactly like not advertising the capability; the agent
@@ -704,41 +895,99 @@ post-switch-catalogue rule of §4.3.)*
 - **Answers.** The collector validates `action ∈ {accept, decline, cancel}`
   and the option id against the stored `option_ids`, writes an
   `answer_submitted` event and stores the answer in a **durable answer queue**
-  keyed by `pending_id`, then returns 202. The queue is drained to the host
-  immediately if it is connected, otherwise on its next connection (after
-  `resend_complete`). The host dedupes by `pending_id` and replies with
-  `answer_result{pending_id, request_id, delivered}`: `true` if a waiter was
-  still registered; a delivered answer is followed by
-  `pending_resolved{delivered}`.
+  keyed by `pending_id`, then returns 202 `{pending_id, request_id}`. It
+  accepts an answer to any `open` question of the session, whatever the
+  lifecycle and whether the host is connected. Content is allowed only with
+  `accept` and must be an object; it is not checked against the requested
+  schema (that is the adapter's call). The check and the insert are one
+  transaction, and the queue's key is the pending id, so two concurrent
+  answers queue exactly one.
+- **Sending.** The endpoint sends the answer at once to a host that is
+  connected and reconciled. After every reconciliation (and only after the
+  host is marked ready) the queue sends every answer with no verdict whose
+  question is still open, oldest first; so an answer lost with a connection
+  goes again after the next handshake, and one racing a reconciliation is
+  sent by one path or both, never by neither. The host dedupes by
+  `pending_id`.
+- **On the host** an answer for a question the actor holds is delivered:
+  `answer_result{delivered: true}`, then `pending_resolved{delivered}`. Any
+  other answer (already answered, cancelled, asked of an earlier adapter, of
+  another kind) changes nothing and is `answer_result{delivered: false}`. An
+  answer the adapter connection can no longer take is `delivered: false`,
+  then `pending_resolved{cancelled, adapter_lost}`. An answer for a session
+  with no live actor is refused `error{not_attached}`; the host emits no
+  outboxed `answer_result` for it (after an outbox loss its seq could collide
+  with a committed one, since `hello_ack` fast-forwards only attached
+  sessions).
 - An answer for a pending that is not `open`, or that already has a queued
-  answer, → 409 (`not_open` / `already_answered`).
+  answer, → 409 (`not_open` / `already_answered`). Unknown pending → 404; an
+  option the question does not offer, the wrong kind of answer, or content on
+  anything but `accept` → 400 `invalid`.
 - **The pending set is canonical in the collector** (`pending` table). The
   frontend drives actionability from it, not from timeline position. States:
   `open → delivered | cancelled(reason)`, reasons `turn_cancelled`,
-  `session_closed`, `session_parked`, `adapter_lost`, `host_restarted`.
-- Verdicts from several clients are folded monotonically: `delivered` sticks
-  and a later `delivered: false` never overwrites it (umbrella §6.8).
+  `session_closed`, `session_parked`, `adapter_lost`, `host_restarted`,
+  `agent_withdrew`.
+- **The verdict** (`answer_queue.delivered`) is NULL until one comes, and
+  comes only from `answer_result`, folded monotonically (`delivered` sticks
+  and a later `delivered: false` never overwrites it, umbrella §6.8), or from
+  the question's cancellation, which gives `false` (nobody will take it). **A
+  host's refusal of the answer's request is logged and is no verdict**: the
+  answer goes again after the next handshake while its question is open. An
+  `answer_result` applies only when it changes the verdict (NULL → any,
+  `false` → `true`); a question can therefore end `cancelled` with
+  `delivered: true`, and the frontend must render that.
+- Facts that come too late are stored, not applied: a `pending_opened` for a
+  detached session or an ended turn, a `pending_resolved` for a question that
+  is not open.
 
 ### 4.7 Idle reaper
 
-Host-side, default 30 minutes, configurable, off with `0`. Reaps only sessions
-with no turn in flight and no activity for the window. Emits
+Host-side, default 30 minutes, configurable (`--idle-timeout-secs`), off with
+`0`. Reaps only sessions with no turn in flight, **no question open** (in a
+turn or not: a question has no timeout), no config switch out and no orphaned
+switch pending, and no activity for the window. Its clock restarts at session
+start, at each turn end, on a `set_config`, on an answer, when an orphaned
+switch clears and when the adapter withdraws a question; other adapter
+notifications outside a turn do not count as activity. Emits
 `session_parked{reason: idle}` and kills the process group.
 
 ### 4.8 Park and close
 
-- **Park** (`POST …/park`, `park_session`): the host ends any turn
-  (`interrupted`), cancels pending requests (`session_parked`), kills the
-  process group and emits `session_parked{reason: operator}`.
-- **Close, attached session:** the collector writes `operator_closed` and sends
-  `close_session`; the host ends any turn (`interrupted`), cancels pending
-  requests (`session_closed`), kills the process group and emits
-  `session_closed`. The lifecycle becomes `closed` when that fact is
-  ingested.
-- **Close, unattached session** (parked, failed, host offline): closed
-  immediately collector-side. On the host's next `hello`, any attached session
-  that the collector has closed — or whose host or hat was revoked or
-  re-assigned — receives `close_session`.
+**Teardown order** on park, close, idle reap and adapter exit: whatever the
+adapter already sent is forwarded, then the turn's `turn_ended`, then the
+`pending_resolved` of every open question, then (on an exit only)
+`adapter_exited`, then `session_parked` / `session_closed`. The process group
+is killed before the final fact.
+
+- **Park** (`POST …/park`, `park_session`): the collector writes
+  `operator_parked` and sends `park_session`, **only to a host that announced
+  the `park` capability** (otherwise 409 `park_unsupported`, nothing sent).
+  The host ends any turn (`interrupted`), cancels pending requests
+  (`session_parked`), kills the process group and emits
+  `session_parked{reason: operator}`.
+- **Close, attached session:** the collector writes `operator_closed`, records
+  a **durable close intent** and sends `close_session`; the host ends any turn
+  (`interrupted`), cancels pending requests (`session_closed`), kills the
+  process group and emits `session_closed`. The lifecycle becomes `closed`
+  when that fact is ingested. A `session_parked` that overtakes the close
+  (an idle reap, an exit) makes the session `closed` too. A close the host
+  answers `not_attached`, or whose host went away, is closed collector-side.
+  A close whose delivery is unknown stays requested and is re-sent after the
+  next handshake.
+- **Close, `starting` session:** 409 `starting` while its host is connected
+  and reconciled (close it once the start settles); if the host is not
+  connected, it is closed immediately.
+- **Close, unattached session** (parked, presumed parked, failed, host
+  offline): closed immediately collector-side, resolving an open turn and
+  cancelling open questions first (§4.2). On the host's next `hello`, any
+  attached session that the collector has closed — or whose host or hat was
+  revoked or re-assigned — receives `close_session`. A `not_attached` answer
+  to that close closes the session only while it is still what
+  reconciliation asked to close (a resume that began since is left alone).
+- **Start or resume behind an ending actor:** waits for it to finish, then
+  attaches a fresh adapter (§2.2). The reachable case is reconciliation's
+  `close_session` followed at once by an operator's resume.
 - The session's gateway token is revoked on host-reported `session_parked`
   and `session_closed`, on adapter exit, on a close of an unattached session
   and on host revoke (`SessionMcp::revoke`). A presumed park
@@ -787,16 +1036,33 @@ spec §5.5) deletes every session of the hat the same way.
 4. **Only after `resend_complete`** the collector reconciles:
    - sessions it believes `active` on that host but not in
      `attached_sessions` are parked as described in §5.2;
-   - sessions `presumed` parked but listed return to `active`;
+   - sessions `presumed` parked but listed return to `active` (`reattached`);
+     presumed but not listed are a host restart (§5.2);
    - starts and turns left awaiting reconciliation (§3.4) are resolved: a
      start with neither `session_started` nor `start_failed` ingested becomes
-     `failed{start_not_delivered}`; a turn with no `turn_started` becomes
-     `not_delivered`;
+     `failed{start_not_delivered}`; an open turn the host does not report as
+     its `open_turn_id` becomes `turn_not_delivered` if it never started, or
+     `turn_ended_synthesized{interrupted}` if it did (reachable with a lost
+     outbox, or a `turn_started` emitted between the `hello` snapshot and the
+     resend; leaving it open would wedge the session at 409);
    - attached sessions the collector has closed, or whose hat was re-assigned,
      receive `close_session` (§4.8);
-   - the answer queue for that host is drained.
+   - the host is marked ready; then the answer queue for that host is drained
+     (§4.6).
 
    Reconciling earlier would park sessions whose facts were still in flight.
+   **Nothing is sent to a host before its reconciliation**: a request made
+   between a reconnect's `hello` and its `resend_complete` is refused (409
+   `host_offline`), never sent, or reconciliation would mistake it for one lost
+   on the previous connection. `GET /api/hosts` lists only reconciled hosts. A
+   repeated `resend_complete` or `hello` on one connection is logged and
+   ignored.
+
+   `hello.attached_sessions` carries each attached session's `open_turn_id`;
+   actors that have ended are pruned from it. The host resets its reconnect
+   backoff (500 ms – 30 s) only after the first `ack` of a connection, or
+   after a healthy period (60 s); a `hello_ack` alone does not prove the
+   collector can commit. Connecting is bounded (10 s).
 
 ### 5.2 Host restart
 
@@ -806,10 +1072,11 @@ frames from before the restart, which it resends first (§5.1). After
 view of that host and, for sessions it believed `active` but not listed,
 writes a `host_restarted` event that:
 
-- parks the session;
+- parks the session (closes it, if a close was requested);
 - if it had an open turn, synthesises `turn_ended{interrupted}`
-  (`turn_ended_synthesized` event);
-- cancels its pending requests with `host_restarted`.
+  (`turn_ended_synthesized` event) for a started one, or `turn_not_delivered`
+  for one that never started (the agent never saw it);
+- cancels its pending requests with `host_restarted` (`pending_cancelled`).
 
 Resume is explicit (operator or UI action). **No eager re-spawn on
 reconnect.** *(P-20: the predecessor re-spawned every recently active session
@@ -825,12 +1092,22 @@ note. Pending requests stay `open` — the host may still hold them. After the
 next handshake, listed sessions return to `active` (`reattached` event) with
 their pending requests intact.
 
+- The timer is armed per dropped connection and fires only if the host has
+  registered no connection since; it checks and writes under the hub's lock,
+  so a reconnect's reconciliation always sees the presumption, and an older
+  drop never presumes a host that came back.
+- A collector start arms it for every host with `active` sessions (§5.4).
+- A presumed-parked session keeps its open turn and activity and counts as
+  attached for its host's resent facts (§4.2). Nothing is revoked.
+- `hennery collector --host-offline-secs` sets the threshold (default 600).
+
 ### 5.4 Collector restart
 
 Indistinguishable from 5.1 from the host's side. The collector rebuilds its
 view from SQLite; sessions stay in whatever state was last committed until
 the host's handshake completes. `starting` sessions are reconciled then
-(§3.4).
+(§3.4). A host that never returns is presumed offline after the threshold
+(§5.3).
 
 ### 5.5 Outbox
 
@@ -850,6 +1127,8 @@ the host's handshake completes. `starting` sessions are reconciled then
   the last dropped seq, so acks keep advancing. If only state-bearing frames
   remain, the outbox grows past the bound and the host reports it (Hosts view,
   `doctor`); loss is allowed only if it is visible.
+
+**Built so far:** the outbox without coalescing, bounds or `transcript_gap`.
 
 ---
 
