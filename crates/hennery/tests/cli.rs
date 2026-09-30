@@ -915,15 +915,15 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
 /// host child, nor through it to any agent.
 ///
 /// The agent is a shell script that dumps its environment, and which of the
-/// descriptors 3 and 4 it holds (3 is the pairing pipe's number in the host
+/// descriptors 3 to 9 it holds (3 is the pairing pipe's number in the host
 /// child, 4 the listening socket's in the collector child), then exits.
 ///
-/// Only those two: on macOS, std makes a pipe or socket close-on-exec only
-/// after creating it, so under parallel tests a descriptor another thread
-/// of this test binary is making leaks into `up` (and on to its agent) at
-/// some higher number now and then. Checking 3 to 9 caught such leaks, and
-/// in the control too, which this binary spawns directly: in 3 of 48 runs
-/// with four copies at once. A fresh data directory, so this run pairs through that pipe.
+/// `up` and the control start with no inherited descriptor above 2: on
+/// macOS, std makes a pipe or socket close-on-exec only after creating it,
+/// so under parallel tests one another thread of this binary is making can
+/// leak into a spawn (in 4 of 96 runs with four copies at once, the
+/// control included). Those are this binary's, not `up`'s, and would pass
+/// on to the agent. A fresh data directory, so this run pairs through that pipe.
 #[test]
 fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     const TOKEN: &str = "operator-token-from-the-environment";
@@ -939,7 +939,7 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     std::fs::write(
         &script,
         format!(
-            "for n in 3 4; do if ( eval \": <&$n\" ) 2>/dev/null; then echo $n; fi; done > {fd}.tmp\n\
+            "for n in 3 4 5 6 7 8 9; do if ( eval \": <&$n\" ) 2>/dev/null; then echo $n; fi; done > {fd}.tmp\n\
              env > {env}.tmp\nmv {fd}.tmp {fd}\nmv {env}.tmp {env}\n",
             fd = report("fds.txt").display(),
             env = report("env.txt").display(),
@@ -951,9 +951,11 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     // only those.
     let mut control = Command::new("/bin/sh");
     control.arg(&script);
-    // SAFETY: dup2 in the forked child, before exec; async-signal-safe.
+    // SAFETY: fcntl, close and dup2 in the forked child, before exec;
+    // async-signal-safe.
     unsafe {
         control.pre_exec(|| {
+            close_leaked_descriptors();
             if libc::dup2(1, 3) < 0 || libc::dup2(1, 4) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -971,6 +973,13 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
         .env("HENNERY_DEV_TOKEN", TOKEN)
         .env("HENNERY_AGENT_MAY_SEE", "yes")
         .env("RUST_LOG", "info");
+    // SAFETY: as for the control above.
+    unsafe {
+        command.pre_exec(|| {
+            close_leaked_descriptors();
+            Ok(())
+        });
+    }
     let mut up = up_logging_to_with(
         command,
         &dir.join("data"),
@@ -1023,6 +1032,22 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     let output = std::fs::read_to_string(&log).unwrap() + &std::fs::read_to_string(log.with_extension("err")).unwrap();
     assert_eq!(output.matches(DEV_TOKEN_WARNING).count(), 1, "{output}");
     assert!(!output.contains(TOKEN), "up printed the operator token: {output}");
+}
+
+/// In a forked child before `exec`: close every descriptor above 2 that is
+/// not close-on-exec, which only a leak from another thread can be here
+/// (std's own descriptors for the spawn are close-on-exec). Only fcntl and
+/// close: async-signal-safe.
+fn close_leaked_descriptors() {
+    for fd in 3..1024 {
+        // SAFETY: fcntl and close on a descriptor number in this process.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::close(fd);
+            }
+        }
+    }
 }
 
 /// `hennery` under `umask 022`, the usual default, which would leave a new
