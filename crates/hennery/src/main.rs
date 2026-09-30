@@ -157,6 +157,7 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run_collector(args: CollectorArgs) -> Result<()> {
+    warn_if_dev_token();
     private_data_dir(&args.data_dir)?;
     let db = args.data_dir.join("hennery.db");
     let store = Store::open(&db)?;
@@ -199,6 +200,22 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
         .with_graceful_shutdown(state.shutdown.clone().cancelled_owned())
         .await?;
     Ok(())
+}
+
+/// The development bearer's variable, from before 3b-i. Nothing reads it
+/// now; it is still stripped from every child (`HOST_SECRET_VARS`).
+const DEV_TOKEN_VAR: &str = "HENNERY_DEV_TOKEN";
+
+/// Warn, once at start, that `HENNERY_DEV_TOKEN` does nothing any more: a
+/// service definition that still sets it would otherwise look like it
+/// protects something. Its value is never logged.
+fn warn_if_dev_token() {
+    if std::env::var_os(DEV_TOKEN_VAR).is_some() {
+        tracing::warn!(
+            "{DEV_TOKEN_VAR} is set but no longer used: since operator auth (3b-i), operators sign in through \
+             the setup link and a password; remove it from the environment"
+        );
+    }
 }
 
 /// Tell the operator where the setup link is (kernel spec §3.1): the link
@@ -267,6 +284,7 @@ fn read_code_from_stdin() -> Result<String> {
 }
 
 async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
+    warn_if_dev_token();
     let paired = match Paired::load(&args.data_dir)? {
         Some(paired) => {
             // Paired already (kernel spec §4.2): the code is not needed.
@@ -388,6 +406,7 @@ fn host_command(
 /// 11, A1) — restart policy for a genuine crash comes with the distribution
 /// work.
 async fn run_up(args: UpArgs) -> Result<()> {
+    warn_if_dev_token();
     let exe = std::env::current_exe()?;
     let host_dir = args.data_dir.join("host");
     // Computed and validated before any child starts: a non-loopback
@@ -413,6 +432,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
         .args(["collector", "--listen", &args.listen])
         .arg("--data-dir")
         .arg(args.data_dir.join("collector"))
+        // `up` has warned about it already; the collector has no use for it.
+        .env_remove(DEV_TOKEN_VAR)
         .kill_on_drop(true)
         .process_group(0);
     if let Some((_, writer)) = &pairing {

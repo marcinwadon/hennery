@@ -128,6 +128,66 @@ fn the_development_token_flag_is_gone() {
     }
 }
 
+/// What `collector`, `up` and `host run` log once when `HENNERY_DEV_TOKEN`
+/// is still set.
+const DEV_TOKEN_WARNING: &str = "HENNERY_DEV_TOKEN is set but no longer used";
+
+/// Plan 3b: an operator whose shell or service still sets the old bearer is
+/// told once, at start, that it does nothing now, and its value is never
+/// printed. Each command here stops early (no data directory can be made,
+/// the listen address is refused, no pairing is stored), so none binds a
+/// port: the warning comes before any of that.
+#[test]
+fn the_development_token_in_the_environment_is_warned_about_and_never_printed() {
+    const TOKEN: &str = "old-dev-token-still-exported";
+    let dir = std::env::temp_dir().join(format!("hennery-cli-devtokenwarn-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveDir(dir.clone());
+    let host_dir = dir.join("host");
+    std::fs::create_dir_all(&host_dir).unwrap();
+    let runs: [(&str, Vec<std::ffi::OsString>); 3] = [
+        (
+            "collector",
+            vec![
+                "collector".into(),
+                "--data-dir".into(),
+                "/nonexistent/hennery-cli-devtokenwarn".into(),
+            ],
+        ),
+        (
+            "up",
+            vec![
+                "up".into(),
+                "--listen".into(),
+                "203.0.113.5:7117".into(),
+                "--data-dir".into(),
+                dir.join("up").into(),
+            ],
+        ),
+        (
+            "host run",
+            vec!["host".into(), "run".into(), "--data-dir".into(), host_dir.into()],
+        ),
+    ];
+    for (name, args) in runs {
+        let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+            .args(args)
+            .env("HENNERY_DEV_TOKEN", TOKEN)
+            .env("RUST_LOG", "info")
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!out.status.success(), "{name} was meant to stop early: {text}");
+        assert_eq!(text.matches(DEV_TOKEN_WARNING).count(), 1, "{name}: {text}");
+        assert!(!text.contains(TOKEN), "{name} printed the token: {text}");
+    }
+}
+
 /// Kills this test's `up` process tree and removes its scratch dir
 /// unconditionally, including on an assertion panic mid-test — nothing below
 /// is allowed to leave a process running just because a `assert!` fired
@@ -868,6 +928,7 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
         .arg(format!("envdump=/bin/sh {}", script.display()))
         .env("HENNERY_DEV_TOKEN", TOKEN)
         .env("HENNERY_AGENT_MAY_SEE", "yes")
+        .env("RUST_LOG", "info")
         .stdout(std::fs::File::create(&log).unwrap())
         .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
         .spawn()
@@ -913,6 +974,11 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
 
     unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
     assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
+    // `up` warns once; its collector child is not handed the variable, so
+    // it does not warn again; and neither prints the value.
+    let output = std::fs::read_to_string(&log).unwrap() + &std::fs::read_to_string(log.with_extension("err")).unwrap();
+    assert_eq!(output.matches(DEV_TOKEN_WARNING).count(), 1, "{output}");
+    assert!(!output.contains(TOKEN), "up printed the operator token: {output}");
 }
 
 /// `hennery` under `umask 022`, the usual default, which would leave a new
