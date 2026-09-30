@@ -1975,3 +1975,71 @@ async fn a_connection_that_ends_after_its_host_was_revoked_parks_its_sessions() 
     .await;
     assert!(collector.event_kinds(&session).contains(&"presumed_parked".to_string()));
 }
+
+// Fix round 1: F1 (defence in depth) and F2.
+
+/// F1, defence in depth: a revoke whose wait for the connection timed out
+/// already parked the session, but that connection is still live and about
+/// to reconcile. Its `resend_complete` must never reattach what the revoke
+/// parked, or mark the connection ready — `Store::revoke_host` converges the
+/// session either way (pinned above), but the socket task must not hand a
+/// revoked host's zombie connection a window to look reconciled in the
+/// meantime.
+#[tokio::test]
+async fn a_revoked_hosts_resend_complete_does_not_reattach_what_the_revoke_already_parked() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let seq = host.seq;
+    host.drop_connection(&collector).await;
+    // Back, still holding the session; resend not sent yet.
+    let mut host = ScriptedHost::hello(&collector, vec![attached(&session, seq)], seq).await;
+    // A revoke whose wait for this very connection timed out: the registry
+    // refuses it and the session is already parked for it, but this
+    // connection was never actually kicked.
+    collector.state.hosts.revoke(HOST, 1).unwrap();
+    collector.state.store.revoke_host(HOST).unwrap();
+    host.send(&HostFrame::ResendComplete).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let row = collector.state.store.session(&session).unwrap().unwrap();
+    assert_eq!((row.lifecycle.as_str(), row.presumed_parked), ("parked", true));
+    assert!(!collector.event_kinds(&session).contains(&"reattached".to_string()));
+    assert!(collector.state.hub.connected_hosts().is_empty(), "never marked ready");
+    host.closed().await;
+}
+
+/// F2: the common case is a host that is already offline (no live
+/// connection at all) when the operator revokes it. `disconnect_and_wait`
+/// finds nothing to kick and returns at once; nothing but the handler's own
+/// `on_host_revoked` call parks the session — the socket task's exit-path
+/// hook never runs, because there is no socket task left to run it.
+#[tokio::test]
+async fn a_revoke_of_an_already_offline_host_still_parks_its_sessions_and_cancels_its_question() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let (session, _) = asking_session(&collector, &mut host).await;
+    let (status, _) = post(
+        &client(),
+        answer_url(&collector, &session, "p1"),
+        json!({"option_id": "allow"}),
+    )
+    .await;
+    assert_eq!(status, 202);
+    expect_answer(&mut host, &session, "allow").await;
+    host.drop_connection(&collector).await;
+    assert!(collector.state.hub.connected_hosts().is_empty());
+
+    let (status, body) = revoke(&collector, HOST).await;
+    assert_eq!(status, 200, "{body}");
+
+    let row = collector.state.store.session(&session).unwrap().unwrap();
+    assert_eq!(
+        (row.lifecycle.as_str(), row.presumed_parked, row.open_turn_id),
+        ("parked", true, None)
+    );
+    let item = collector.state.store.pending_item("p1").unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value((item.state, item.reason, item.delivered)).unwrap(),
+        json!(["cancelled", "host_revoked", false])
+    );
+}

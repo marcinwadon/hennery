@@ -325,6 +325,15 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                 }
             }
             HostFrame::ResendComplete if !reconciled => {
+                // A revoke whose wait for this very connection timed out:
+                // it is still live and about to reconcile, but nothing it
+                // reports must ever reattach what the revoke already
+                // parked, or mark it ready (kernel spec §4.3, fix round 1
+                // F1 defence in depth). Fail closed if the check errors.
+                if !matches!(state.hosts.is_revoked(&host_id), Ok(false)) {
+                    tracing::warn!(%host_id, "revoked host reached resend_complete; closing without reconciling");
+                    break;
+                }
                 // Everything the host had in its outbox is ingested: only now
                 // is anything still unresolved known to be lost (ACP core
                 // §5.1 step 4).

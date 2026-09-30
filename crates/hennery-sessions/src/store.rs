@@ -994,27 +994,46 @@ impl Store {
     ///   queued answer its `delivered: false`;
     /// - one the operator had asked to close is closed instead.
     ///
-    /// Idempotent: a session already presumed parked for the revocation is
-    /// left as it is.
+    /// Idempotent, but only a session that is *currently* converged (still
+    /// `parked`, presumed for this revoke, with no open question) is left as
+    /// it is. A revoke whose wait for the connection timed out can still be
+    /// reconciled by that connection's late `resend_complete` before it is
+    /// gone — `reconcile_host` treats a presumed park as the active session
+    /// it may still be and reattaches it — or that connection can still
+    /// deliver a turnless question on top of it (fix round 1, F1): either
+    /// leaves the session looking "already parked for this revoke" by its
+    /// last `presumed_parked` event alone, so a repeated revoke must check
+    /// its current state, not just that event, and (re)park it if it does
+    /// not actually match.
     pub fn revoke_host(&self, host_id: &str) -> Result<Vec<EventDto>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let ts = now();
-        tx.execute(
-            "UPDATE sessions SET lifecycle = 'failed', failure_reason = 'host_revoked'
-             WHERE host_id = ?1 AND lifecycle = 'starting'",
-            [host_id],
-        )?;
-        let rows: Vec<(String, Option<String>)> = {
-            let mut stmt = tx.prepare(
-                "SELECT id, open_turn_id FROM sessions
-                 WHERE host_id = ?1 AND (lifecycle = 'active' OR presumed_parked = 1) ORDER BY id",
-            )?;
-            let rows = stmt.query_map([host_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let starting: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM sessions WHERE host_id = ?1 AND lifecycle = 'starting'")?;
+            let rows = stmt.query_map([host_id], |r| r.get(0))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
         let mut events = Vec::new();
-        for (id, open_turn) in rows {
+        for id in &starting {
+            // Consistent with how reconciliation reports its own analogous
+            // `starting` failure (`start_not_delivered`): the timeline gets
+            // an event, not just a silent column change.
+            events.push(collector_event(&tx, id, "start_not_delivered", json!({}), &ts)?);
+            tx.execute(
+                "UPDATE sessions SET lifecycle = 'failed', failure_reason = 'host_revoked' WHERE id = ?1",
+                [id],
+            )?;
+        }
+        let rows: Vec<(String, Option<String>, String, bool)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, open_turn_id, lifecycle, presumed_parked FROM sessions
+                 WHERE host_id = ?1 AND (lifecycle = 'active' OR presumed_parked = 1) ORDER BY id",
+            )?;
+            let rows = stmt.query_map([host_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for (id, open_turn, lifecycle, presumed_parked) in rows {
             let presumed_for: Option<Option<String>> = tx
                 .query_row(
                     "SELECT json_extract(body, '$.reason') FROM events
@@ -1023,7 +1042,16 @@ impl Store {
                     |r| r.get(0),
                 )
                 .optional()?;
-            if presumed_for.flatten().as_deref() == Some("host_revoked") {
+            let has_open_pending: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pending WHERE session_id = ?1 AND state = 'open')",
+                [&id],
+                |r| r.get(0),
+            )?;
+            let already_converged = lifecycle == "parked"
+                && presumed_parked
+                && presumed_for.flatten().as_deref() == Some("host_revoked")
+                && !has_open_pending;
+            if already_converged {
                 continue;
             }
             events.push(collector_event(

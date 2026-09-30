@@ -1703,6 +1703,10 @@ fn a_revoked_hosts_sessions_are_parked_for_good_and_what_they_held_is_cancelled(
     assert_eq!(
         kinds(&events),
         [
+            // s2 (`starting`) fails first (minor 3): the timeline gets an
+            // event too, consistent with reconciliation's own
+            // `start_not_delivered`.
+            "start_not_delivered",
             "presumed_parked",
             "turn_ended_synthesized",
             "pending_cancelled",
@@ -1711,7 +1715,7 @@ fn a_revoked_hosts_sessions_are_parked_for_good_and_what_they_held_is_cancelled(
             "presumed_parked"
         ]
     );
-    assert_eq!(events[0].body, json!({ "reason": "host_revoked" }));
+    assert_eq!(events[1].body, json!({ "reason": "host_revoked" }));
     for id in ["s1", "s3"] {
         let row = store.session(id).unwrap().unwrap();
         assert_eq!(
@@ -1741,4 +1745,64 @@ fn a_revoked_hosts_sessions_are_parked_for_good_and_what_they_held_is_cancelled(
 
     // A repeated revoke finds nothing left to do.
     assert!(store.revoke_host("h1").unwrap().is_empty());
+}
+
+/// Fix round 1 (F1): `revoke_host`'s idempotency check must look at the
+/// session's *current* state, not just the reason its last `presumed_parked`
+/// event carries. If a revoke's wait for the connection times out, that
+/// connection is still live for a little longer: its `resend_complete` can
+/// reconcile the session it was told to park right back to `active`
+/// (`reconcile_host` treats `presumed_parked` as reattachable), and it can
+/// still deliver a turnless question on top of that. A repeated revoke must
+/// still converge both.
+fn turnless_permission(pending_id: &str) -> SessionBody {
+    SessionBody::PendingOpened {
+        pending_id: pending_id.into(),
+        indexed: Indexed {
+            turn_id: None,
+            pending: Some(PendingExtract {
+                id: pending_id.into(),
+                kind: PendingKind::Permission,
+                option_ids: Some(vec!["allow".into(), "reject".into()]),
+            }),
+            ..Indexed::default()
+        },
+        payload: json!({"toolCall": {"toolCallId": "call-1"}}),
+    }
+}
+
+#[test]
+fn a_revoke_converges_even_after_its_wait_timed_out_and_reconciliation_reattached_it() {
+    let store = Store::open_in_memory().unwrap();
+    running(&store);
+    let events = store.revoke_host("h1").unwrap();
+    assert_eq!(kinds(&events), ["presumed_parked", "turn_ended_synthesized"]);
+
+    // The wait for the connection to close timed out: it is still live, and
+    // its resend_complete reconciles the session back as the active one it
+    // once was.
+    store.reconcile_host("h1", &[attached("s1", None)]).unwrap();
+    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "active");
+
+    // The zombie connection keeps talking: a turnless question opens.
+    store.ingest("s1", 3, &turnless_permission("p1")).unwrap();
+    assert!(matches!(
+        store.submit_answer("s1", "p1", &choose("allow")).unwrap(),
+        AnswerSubmission::Queued(_)
+    ));
+
+    // A repeated revoke must still converge it: parked for good, its
+    // question cancelled and its queued answer given up as undelivered.
+    let events = store.revoke_host("h1").unwrap();
+    assert!(kinds(&events).contains(&"pending_cancelled"), "{:?}", kinds(&events));
+    let row = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (row.lifecycle.as_str(), row.presumed_parked, row.open_turn_id),
+        ("parked", true, None)
+    );
+    assert_eq!(
+        state_of(&store, "p1"),
+        (PendingState::Cancelled, Some(PendingReason::HostRevoked))
+    );
+    assert_eq!(store.pending_item("p1").unwrap().unwrap().delivered, Some(false));
 }
