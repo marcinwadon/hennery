@@ -286,3 +286,16 @@ impl std::fmt::Debug for SetupRequest {
 pub struct SetupResponse {
     pub public_url: String,
 }
+
+/// `POST /api/auth/login` (kernel spec §3.2): the owner's password. 204 and
+/// the session cookie on success. `Debug` leaves the password out.
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct LoginRequest {
+    pub password: String,
+}
+
+impl std::fmt::Debug for LoginRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginRequest").finish_non_exhaustive()
+    }
+}

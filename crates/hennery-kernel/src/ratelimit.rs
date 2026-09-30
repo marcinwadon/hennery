@@ -30,12 +30,19 @@
 //! - **In memory only:** a collector restart clears every count and
 //!   lockout, including the shared overflow entry. Each *tracked* address
 //!   still has its own separate budget; only addresses past capacity share
-//!   the overflow entry's. There is no exemption for loopback.
+//!   the overflow entry's.
+//! - **Loopback is one address with its own entry (3b decision 9).** Every
+//!   `127.0.0.0/8` address counts as `127.0.0.1` (on Linux the whole block
+//!   reaches `lo`, so per-address entries would give a local process
+//!   millions of budgets), and loopback always gets its own entry, past
+//!   capacity too: `hennery up`'s own host and a reverse proxy on the same
+//!   machine are never pushed into the shared overflow budget by a flood
+//!   from elsewhere. It is not exempt: its budget is the same as anyone's.
 //!
 //! Callers pass `now`, so the policy is testable without sleeping.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -57,6 +64,15 @@ impl Policy {
     pub const ENROLL: Policy = Policy {
         free_failures: 5,
         window: Duration::from_secs(10 * 60),
+        first_lockout: Duration::from_secs(60),
+        max_lockout: Duration::from_secs(60 * 60),
+    };
+
+    /// Operator login and step-up: 5 wrong passwords per minute, then
+    /// exponential backoff (kernel spec §3.2).
+    pub const LOGIN: Policy = Policy {
+        free_failures: 5,
+        window: Duration::from_secs(60),
         first_lockout: Duration::from_secs(60),
         max_lockout: Duration::from_secs(60 * 60),
     };
@@ -88,10 +104,14 @@ impl Entry {
 }
 
 /// What a client address is counted as: its IPv4 address (also when it
-/// arrives IPv4-mapped), or its IPv6 /64.
+/// arrives IPv4-mapped), or its IPv6 /64. Every IPv4 loopback address is
+/// `127.0.0.1`, and `::1` is itself.
 pub fn key(addr: IpAddr) -> IpAddr {
     match addr.to_canonical() {
+        IpAddr::V4(v4) if v4.is_loopback() => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V4(v4) => IpAddr::V4(v4),
+        // Not masked: its /64 would be `::`, which is not loopback.
+        IpAddr::V6(v6) if v6.is_loopback() => IpAddr::V6(v6),
         IpAddr::V6(v6) => {
             let s = v6.segments();
             IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
@@ -139,9 +159,10 @@ impl Limiter {
             return record_attempt(entry, &policy, now);
         }
         // A new address: forgotten entries are pruned to make room, but a
-        // live one is never evicted for it (amendment 2026-10-01).
+        // live one is never evicted for it (amendment 2026-10-01). Loopback
+        // gets its own entry regardless (3b decision 9).
         state.entries.retain(|_, e| !e.forgotten(&policy, now));
-        if state.entries.len() < self.capacity {
+        if state.entries.len() < self.capacity || addr.is_loopback() {
             let entry = state.entries.entry(addr).or_insert(Entry {
                 failures: 0,
                 last_failure: now,
@@ -375,6 +396,35 @@ mod tests {
             );
         }
         assert_eq!(limiter.tracked(), 3);
+    }
+
+    /// 3b decision 9 (M3 of 3a's final review): past capacity, loopback
+    /// still gets its own entry, so a flood from elsewhere cannot use up
+    /// `hennery up`'s own budget; and the whole of `127.0.0.0/8` is that
+    /// one entry, so a local process cannot rotate through it.
+    #[test]
+    fn loopback_keeps_one_entry_of_its_own_past_capacity() {
+        let limiter = Limiter::with_capacity(Policy::ENROLL, 1);
+        let t0 = Instant::now();
+        limiter.attempt(A, t0).unwrap();
+        // The table is full of a live entry: a new address overflows.
+        for _ in 0..5 {
+            limiter.attempt(B, t0).unwrap();
+        }
+        assert!(limiter.attempt(B, t0).is_err(), "the overflow budget is used up");
+        let lo = |d: u8| IpAddr::V4(std::net::Ipv4Addr::new(127, d, 0, 1));
+        assert_eq!(key(lo(9)), IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        for d in 0..5 {
+            assert_eq!(
+                limiter.attempt(lo(d), t0),
+                Ok(()),
+                "loopback shared the overflow budget"
+            );
+        }
+        assert!(limiter.attempt(lo(200), t0).is_err(), "127/8 is one address");
+        assert_eq!(limiter.tracked(), 2);
+        // `::1` is loopback too, with its own entry.
+        assert_eq!(limiter.attempt(IpAddr::V6(Ipv6Addr::LOCALHOST), t0), Ok(()));
     }
 
     /// The all-locked case: every tracked address is already locked out

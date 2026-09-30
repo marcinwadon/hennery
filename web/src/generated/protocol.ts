@@ -216,3 +216,5 @@ export type SetupRequest = { token: string, password: string,
 public_url: string, };
 
 export type SetupResponse = { public_url: string, };
+
+export type LoginRequest = { password: string, };

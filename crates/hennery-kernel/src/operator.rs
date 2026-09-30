@@ -11,6 +11,7 @@
 //!
 //! Every time is seconds since the Unix epoch, passed in by the caller.
 
+use crate::ratelimit::{Limiter, Policy};
 use crate::secret::{random_bytes, sha256_hex};
 use crate::{db, schema};
 use anyhow::{Context, Result};
@@ -141,6 +142,9 @@ pub struct Operator {
     /// `check_password`'s slots, each held until its verify ends.
     hashing: Arc<tokio::sync::Semaphore>,
     verifications: AtomicU64,
+    /// Wrong passwords per client address, at login and step-up (kernel
+    /// spec §3.2).
+    pub login_limiter: Limiter,
     /// Verifies running now, and the most ever at once (`check_password`'s
     /// bound, pinned by the unit tests below).
     #[cfg(test)]
@@ -170,6 +174,7 @@ impl Operator {
             setup_file: Mutex::new(None),
             hashing: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HASHES)),
             verifications: AtomicU64::new(0),
+            login_limiter: Limiter::new(Policy::LOGIN),
             #[cfg(test)]
             in_flight: Default::default(),
             #[cfg(test)]

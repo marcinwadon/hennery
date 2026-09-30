@@ -860,6 +860,18 @@
       ],
       "type": "object"
     },
+    "LoginRequest": {
+      "description": "`POST /api/auth/login` (kernel spec §3.2): the owner's password. 204 and\nthe session cookie on success. `Debug` leaves the password out.",
+      "properties": {
+        "password": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "password"
+      ],
+      "type": "object"
+    },
     "OpenTurn": {
       "description": "A session's open turn, for the detail view.",
       "properties": {
