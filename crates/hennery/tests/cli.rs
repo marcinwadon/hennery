@@ -1,3 +1,4 @@
+use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
@@ -104,8 +105,6 @@ fn a_malformed_agent_flag_is_rejected() {
         .args([
             "host",
             "run",
-            "--collector",
-            "ws://x",
             "--data-dir",
             "/tmp/x",
             "--dev-token",
@@ -319,4 +318,94 @@ fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> Opti
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// `GET path` on the collector with the development bearer: the JSON body
+/// of a 200, else `None`.
+fn get_json(listen: &str, path: &str, token: &str) -> Option<serde_json::Value> {
+    let mut stream = TcpStream::connect(listen).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {listen}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    if !head.starts_with("HTTP/1.1 200") {
+        return None;
+    }
+    serde_json::from_str(body).ok()
+}
+
+fn free_listen() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    format!("127.0.0.1:{port}")
+}
+
+/// Removes a scratch directory on drop, however the test ends.
+struct RemoveDir(std::path::PathBuf);
+
+impl Drop for RemoveDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Start `up`, wait until its host is connected, and return the connected
+/// host ids. The returned guard stops the whole tree (and leaves `dir`).
+fn up_until_connected(listen: &str, dir: &std::path::Path) -> (KillTree, Vec<String>) {
+    let up = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["up", "--listen", listen])
+        .arg("--data-dir")
+        .arg(dir)
+        .args(["--dev-token", "dev-token-for-tests"])
+        .spawn()
+        .unwrap();
+    let guard = KillTree {
+        up,
+        dir: std::path::PathBuf::new(),
+        children: Vec::new(),
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Some(serde_json::Value::Array(hosts)) = get_json(listen, "/api/hosts", "dev-token-for-tests")
+            && !hosts.is_empty()
+        {
+            let ids = hosts.iter().filter_map(|h| h.as_str().map(str::to_string)).collect();
+            return (guard, ids);
+        }
+        assert!(Instant::now() < deadline, "the all-in-one host never connected");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `hennery up` pairs its own host on first start, through the pipe the
+/// supervisor hands both children (kernel spec §4.2), and a restart reuses
+/// that pairing instead of minting another, also on another port.
+#[test]
+fn up_pairs_its_own_host_once() {
+    let listen = free_listen();
+    let dir = std::env::temp_dir().join(format!(
+        "hennery-cli-pair-{}-{}",
+        std::process::id(),
+        listen.replace(':', "-")
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _cleanup = RemoveDir(dir.clone());
+    let host_dir = dir.join("host");
+
+    let (mut first, ids) = up_until_connected(&listen, &dir);
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    assert!(ids[0].starts_with("host-"), "{ids:?}");
+    let key = std::fs::read(host_dir.join("host.key")).unwrap();
+    // SIGTERM, not a kill: `up` stops the host, then the collector.
+    unsafe { libc::kill(first.up.id() as i32, libc::SIGTERM) };
+    assert!(wait_with_timeout(&mut first.up, Duration::from_secs(15)).is_some());
+
+    let (_second, again) = up_until_connected(&free_listen(), &dir);
+    assert_eq!(again, ids, "the restart paired a second host");
+    assert_eq!(std::fs::read(host_dir.join("host.key")).unwrap(), key);
 }

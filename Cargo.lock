@@ -995,6 +995,7 @@ dependencies = [
  "hennery-kernel",
  "hennery-sessions",
  "libc",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

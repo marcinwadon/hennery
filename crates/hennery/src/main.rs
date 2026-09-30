@@ -1,10 +1,13 @@
 //! The `hennery` binary (distribution spec §1). Walking skeleton: collector,
 //! host and an all-in-one mode, with a shared development token.
 
-use anyhow::{Context, Result};
+mod inherit;
+
+use anyhow::{Context, Result, bail};
 use axum::response::Html;
 use axum::routing::get;
 use clap::{Args, Parser, Subcommand};
+use hennery_host::identity::Paired;
 use hennery_host::pairing::Joined;
 use hennery_host::session::IDLE_TIMEOUT;
 use hennery_host::{AgentCommand, HostConfig};
@@ -67,15 +70,15 @@ struct CollectorArgs {
     /// Presume a host's sessions parked once it has been offline this long.
     #[arg(long, default_value_t = hennery_sessions::offline::OFFLINE_THRESHOLD.as_secs())]
     host_offline_secs: u64,
+    /// `hennery up` only: once listening, write one pairing code to this
+    /// inherited descriptor (kernel spec §4.2).
+    #[arg(long, hide = true)]
+    pairing_code_fd: Option<i32>,
 }
 
 #[derive(Args, Clone)]
 struct HostArgs {
-    /// e.g. ws://127.0.0.1:7117/api/hosts/ws
-    #[arg(long)]
-    collector: String,
-    #[arg(long, default_value = "local")]
-    host_id: String,
+    /// Holds the pairing `hennery host join` stored (`host.key`, `host.toml`).
     #[arg(long, env = "HENNERY_HOST_DATA_DIR")]
     data_dir: PathBuf,
     #[arg(long, env = "HENNERY_DEV_TOKEN", hide_env_values = true)]
@@ -86,6 +89,16 @@ struct HostArgs {
     /// Park sessions idle for this many seconds; 0 turns the reaper off.
     #[arg(long, default_value_t = IDLE_TIMEOUT.as_secs())]
     idle_timeout_secs: u64,
+    /// `hennery up` only: join this collector first if the host is not
+    /// paired, with the code read from `--join-code-fd`.
+    #[arg(long, hide = true, requires = "join_code_fd")]
+    join_url: Option<String>,
+    #[arg(long, hide = true, requires = "join_url")]
+    join_code_fd: Option<i32>,
+    /// `hennery up` only: the collector's host WebSocket as it listens now,
+    /// in place of the stored one (its port may have changed).
+    #[arg(long, hide = true)]
+    collector_url: Option<String>,
 }
 
 #[derive(Args)]
@@ -142,6 +155,11 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
         .await
         .with_context(|| format!("bind {}", args.listen))?;
     tracing::info!(address = %listener.local_addr()?, "collector listening");
+    if let Some(fd) = args.pairing_code_fd {
+        // Only once migrated and listening: the host enrolls right away.
+        let code = state.hosts.mint_pairing_code(hennery_kernel::secret::unix_now())?;
+        inherit::write_code(fd, &code.code)?;
+    }
     let shutdown = state.shutdown.clone();
     tokio::spawn(async move {
         terminated().await;
@@ -164,7 +182,29 @@ async fn join_host(args: JoinArgs) -> Result<()> {
 }
 
 async fn run_host(args: HostArgs) -> Result<()> {
-    let mut cfg = HostConfig::new(args.collector, args.host_id, args.dev_token, args.data_dir);
+    let paired = match Paired::load(&args.data_dir)? {
+        Some(paired) => {
+            // Paired already (kernel spec §4.2): the code is not needed.
+            if let Some(fd) = args.join_code_fd {
+                inherit::close(fd);
+            }
+            paired
+        }
+        None => {
+            let (Some(url), Some(fd)) = (&args.join_url, args.join_code_fd) else {
+                bail!(
+                    "{} holds no pairing; run `hennery host join <url> <code>` first",
+                    args.data_dir.display()
+                );
+            };
+            let code = inherit::read_code(fd).await?;
+            let name = hennery_host::pairing::default_name();
+            hennery_host::pairing::join(url, &code, &args.data_dir, &name).await?;
+            Paired::load(&args.data_dir)?.context("the pairing just stored")?
+        }
+    };
+    let collector_url = args.collector_url.unwrap_or(paired.collector_url);
+    let mut cfg = HostConfig::new(collector_url, paired.host_id, args.dev_token, args.data_dir);
     cfg.agents = args.agents.into_iter().collect();
     cfg.idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
     // On SIGINT/SIGTERM the host stops its connection and waits (bounded)
@@ -192,6 +232,16 @@ fn sigterm(child: &tokio::process::Child) {
     }
 }
 
+/// The collector's URL as its own host child reaches it: over loopback,
+/// also when it listens on every interface.
+fn loopback_url(listen: &str) -> String {
+    match listen.parse::<SocketAddr>() {
+        Ok(addr) if addr.ip().is_unspecified() && addr.is_ipv6() => format!("http://[::1]:{}", addr.port()),
+        Ok(addr) if addr.ip().is_unspecified() => format!("http://127.0.0.1:{}", addr.port()),
+        _ => format!("http://{listen}"),
+    }
+}
+
 /// Two child processes of this binary, exchanging the same frames as a
 /// remote host (architecture spec §3.3). The supervisor exits when either
 /// child exits; restart policy comes with the distribution work.
@@ -199,29 +249,41 @@ async fn run_up(args: UpArgs) -> Result<()> {
     // Checked here too, so a bad token stops `up` before any child starts.
     DevToken::new(args.dev_token.clone())?;
     let exe = std::env::current_exe()?;
+    let host_dir = args.data_dir.join("host");
+    // The host pairs itself on first start only; a pairing that was revoked
+    // is not replaced (kernel spec §4.2).
+    let pairing = match Paired::load(&host_dir)? {
+        Some(_) => None,
+        None => Some(std::io::pipe()?),
+    };
     // Keep both children out of the terminal's foreground process group: a
     // Ctrl-C there delivers SIGINT to every process in that group at once,
     // which would race each child's own signal handler against the ordered
     // shutdown below. With their own group, only this supervisor is signalled
     // and it alone decides the order (host, then collector).
-    let mut collector = tokio::process::Command::new(&exe)
+    let mut collector_cmd = tokio::process::Command::new(&exe);
+    collector_cmd
         .args(["collector", "--listen", &args.listen])
         .arg("--data-dir")
         .arg(args.data_dir.join("collector"))
         .env("HENNERY_DEV_TOKEN", &args.dev_token)
         .kill_on_drop(true)
-        .process_group(0)
-        .spawn()?;
+        .process_group(0);
+    if let Some((_, writer)) = &pairing {
+        inherit::pass_to_child(&mut collector_cmd, writer);
+        collector_cmd
+            .arg("--pairing-code-fd")
+            .arg(inherit::CHILD_FD.to_string());
+    }
+    let mut collector = collector_cmd.spawn()?;
+    let collector_url = loopback_url(&args.listen);
     let mut host_cmd = tokio::process::Command::new(&exe);
     host_cmd
-        .args([
-            "host",
-            "run",
-            "--collector",
-            &format!("ws://{}/api/hosts/ws", args.listen),
-        ])
+        .args(["host", "run"])
         .arg("--data-dir")
-        .arg(args.data_dir.join("host"))
+        .arg(&host_dir)
+        .arg("--collector-url")
+        .arg(hennery_host::pairing::collector_ws_url(&collector_url)?)
         .arg("--idle-timeout-secs")
         .arg(args.idle_timeout_secs.to_string())
         .env("HENNERY_DEV_TOKEN", &args.dev_token)
@@ -235,7 +297,18 @@ async fn run_up(args: UpArgs) -> Result<()> {
         }
         host_cmd.arg("--agent").arg(spec);
     }
+    if let Some((reader, _)) = &pairing {
+        inherit::pass_to_child(&mut host_cmd, reader);
+        host_cmd
+            .arg("--join-url")
+            .arg(&collector_url)
+            .arg("--join-code-fd")
+            .arg(inherit::CHILD_FD.to_string());
+    }
     let mut host = host_cmd.spawn()?;
+    // Both children hold their ends now; with the supervisor's copies
+    // closed, the host sees end-of-file if the collector dies first.
+    drop(pairing);
     tokio::select! {
         status = collector.wait() => tracing::warn!(?status, "collector exited"),
         status = host.wait() => tracing::warn!(?status, "host exited"),
