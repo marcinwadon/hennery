@@ -1475,6 +1475,42 @@ fn an_answer_is_queued_once_and_only_if_it_fits_the_question() {
 }
 
 #[test]
+fn an_empty_option_ids_is_treated_like_no_option_ids() {
+    // Decision 4: every option lacked a string optionId, so the extract's
+    // `option_ids` is `Some(&[])` rather than `None`. That must still steer
+    // the operator to "stop, park or close the session" -- not report that
+    // the request offers no option "allow", which would suggest a retry
+    // with a different option id would help.
+    let store = Store::open_in_memory().unwrap();
+    running(&store);
+    let empty_options = SessionBody::PendingOpened {
+        pending_id: "p1".into(),
+        indexed: Indexed {
+            turn_id: Some("t1".into()),
+            pending: Some(PendingExtract {
+                id: "p1".into(),
+                kind: PendingKind::Permission,
+                option_ids: Some(vec![]),
+            }),
+            ..Indexed::default()
+        },
+        payload: json!({"toolCall": {"toolCallId": "call-1"}}),
+    };
+    store.ingest("s1", 3, &empty_options).unwrap();
+    let AnswerSubmission::Invalid(why) = store.submit_answer("s1", "p1", &choose("allow")).unwrap() else {
+        panic!("expected Invalid");
+    };
+    assert!(
+        why.contains("stop, park or close the session"),
+        "expected the stop/park/close guidance, got: {why}"
+    );
+    assert!(
+        !why.contains("offers no option"),
+        "should not blame the option id: {why}"
+    );
+}
+
+#[test]
 fn a_delivered_verdict_sticks_and_a_later_false_does_not_overwrite_it() {
     let store = Store::open_in_memory().unwrap();
     running(&store);

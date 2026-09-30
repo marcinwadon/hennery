@@ -442,8 +442,12 @@ fn check_answer(kind: PendingKind, option_ids: Option<&[String]>, answer: &Answe
     match (kind, answer) {
         (PendingKind::Permission, AnswerRequest::Permission { option_id }) => match option_ids {
             Some(ids) if ids.contains(option_id) => Ok(()),
-            Some(_) => Err(format!("the request offers no option {option_id}")),
-            None => Err("the request's options could not be read; stop, park or close the session".into()),
+            Some(ids) if !ids.is_empty() => Err(format!("the request offers no option {option_id}")),
+            // `None`, or `Some(&[])` (every option lacked a string optionId,
+            // decision 4): either way there is nothing to validate against,
+            // so this is the same "stop, park or close" case, not "no option
+            // X".
+            _ => Err("the request's options could not be read; stop, park or close the session".into()),
         },
         (PendingKind::Elicitation, AnswerRequest::Elicitation { action, content }) => match (action, content) {
             (_, None) => Ok(()),
