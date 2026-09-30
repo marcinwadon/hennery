@@ -21,11 +21,18 @@ struct Collector {
 
 impl Collector {
     async fn start(db: &Path, addr: Option<SocketAddr>) -> Self {
+        Self::start_with(db, addr, hennery_sessions::offline::OFFLINE_THRESHOLD).await
+    }
+
+    /// A collector that presumes a host's sessions parked once it has been
+    /// offline for `offline`.
+    async fn start_with(db: &Path, addr: Option<SocketAddr>, offline: Duration) -> Self {
         let listener = tokio::net::TcpListener::bind(addr.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap()))
             .await
             .expect("bind collector");
         let addr = listener.local_addr().unwrap();
-        let state = AppState::new(Store::open(db).unwrap(), DevToken::new(TOKEN));
+        let mut state = AppState::new(Store::open(db).unwrap(), DevToken::new(TOKEN));
+        state.offline_threshold = offline;
         let task = tokio::spawn(hennery_sessions::serve(listener, state.clone()));
         Self { addr, state, task }
     }
@@ -1018,4 +1025,252 @@ async fn a_mode_the_agent_chose_survives_a_host_restart_and_resume() {
     assert_eq!(std::fs::read_to_string(&log).unwrap(), "mode=bypass\n");
     let catalog = catalog(&c, &collector, &session).await;
     assert_eq!(current(&catalog).1, json!("bypass"));
+}
+
+// Plan (2): permission and elicitation end to end (ACP core §4.6, §12
+// scenarios 5 and 7 to 10, and the elicitation live gate against the fake).
+
+fn asking(asks: Vec<hennery_testkit::FakeAsk>) -> FakeScript {
+    FakeScript {
+        asks,
+        ..FakeScript::default()
+    }
+}
+
+async fn detail(c: &reqwest::Client, collector: &Collector, session: &str) -> Value {
+    let resp = c
+        .get(collector.url(&format!("/api/sessions/{session}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    resp.json().await.unwrap()
+}
+
+/// The id of the question the session is blocked on, once it is.
+async fn open_question(c: &reqwest::Client, collector: &Collector, session: &str) -> String {
+    wait_for("an open question", || async {
+        let detail = detail(c, collector, session).await;
+        let pending = detail["pending"].as_array()?.first()?.clone();
+        (detail["activity"] == "blocked").then(|| pending["pending_id"].as_str().unwrap().to_string())
+    })
+    .await
+}
+
+async fn answer(c: &reqwest::Client, collector: &Collector, session: &str, pending: &str, body: Value) -> (u16, Value) {
+    let url = collector.url(&format!("/api/sessions/{session}/pending/{pending}/answer"));
+    post_json(c, url, body).await
+}
+
+async fn prompt(c: &reqwest::Client, collector: &Collector, session: &str) {
+    let url = collector.url(&format!("/api/sessions/{session}/prompt"));
+    let (status, body) = post_json(c, url, json!({ "content": text("go") })).await;
+    assert_eq!(status, 202, "{body}");
+}
+
+fn delivered(collector: &Collector, pending: &str) -> Option<bool> {
+    collector.state.store.pending_item(pending).unwrap().unwrap().delivered
+}
+
+/// Both kinds of question through the API, and the elicitation gate: the
+/// form's content reaches the agent and the answer is reported delivered.
+#[tokio::test]
+async fn questions_answered_through_the_api_reach_the_agent_and_are_reported_delivered() {
+    use hennery_testkit::FakeAsk;
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let script = asking(vec![FakeAsk::Permission, FakeAsk::Elicitation]);
+    start_host(collector.addr, &dir.path().join("host"), &script);
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    prompt(&c, &collector, &session).await;
+
+    let first = open_question(&c, &collector, &session).await;
+    let (status, body) = answer(&c, &collector, &session, &first, json!({"option_id": "allow"})).await;
+    assert_eq!(status, 202, "{body}");
+    let second = wait_for("the second question", || async {
+        let detail = detail(&c, &collector, &session).await;
+        let id = detail["pending"].as_array()?.first()?["pending_id"]
+            .as_str()?
+            .to_string();
+        (id != first).then_some(id)
+    })
+    .await;
+    let form = json!({"action": "accept", "content": {"name": "notes.txt"}});
+    assert_eq!(answer(&c, &collector, &session, &second, form).await.0, 202);
+
+    let evs = wait_for("turn end", || async {
+        let evs = events(&c, &collector, &session).await;
+        (!turn_ends(&evs).is_empty()).then_some(evs)
+    })
+    .await;
+    assert_eq!(
+        agent_text(&evs),
+        r#"permission:selected:allowelicitation:accept:{"name":"notes.txt"}Hello world"#
+    );
+    let results = of_kind(&evs, "answer_result");
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|e| e.body["delivered"] == true), "{results:?}");
+    assert_eq!(
+        (delivered(&collector, &first), delivered(&collector, &second)),
+        (Some(true), Some(true))
+    );
+    let detail = detail(&c, &collector, &session).await;
+    assert_eq!(
+        (detail["activity"].as_str(), &detail["pending"]),
+        (Some("idle"), &json!([]))
+    );
+}
+
+#[tokio::test]
+async fn stop_with_a_question_open_ends_the_turn_cancelled_and_closes_the_question() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let script = asking(vec![hennery_testkit::FakeAsk::Permission]);
+    start_host(collector.addr, &dir.path().join("host"), &script);
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    prompt(&c, &collector, &session).await;
+    let pending = open_question(&c, &collector, &session).await;
+
+    let url = collector.url(&format!("/api/sessions/{session}/cancel"));
+    let (status, body) = post_json(&c, url, json!({})).await;
+    assert_eq!((status, body["outcome"].as_str()), (202, Some("cancelled")), "{body}");
+    let item = collector.state.store.pending_item(&pending).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value((item.state, item.reason)).unwrap(),
+        json!(["cancelled", "turn_cancelled"])
+    );
+    let (status, body) = answer(&c, &collector, &session, &pending, json!({"option_id": "allow"})).await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("not_open")));
+    assert!(agent_text(&events(&c, &collector, &session).await).contains("permission:cancelled"));
+}
+
+/// Scenario 5, with a question open.
+#[tokio::test]
+async fn an_adapter_crash_with_a_question_open_cancels_it_adapter_lost() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let script = FakeScript {
+        crash_while_asking: true,
+        ..asking(vec![hennery_testkit::FakeAsk::Permission])
+    };
+    start_host(collector.addr, &dir.path().join("host"), &script);
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    prompt(&c, &collector, &session).await;
+    lifecycle_is(&collector, &session, "parked").await;
+
+    let evs = events(&c, &collector, &session).await;
+    let kinds: Vec<&str> = evs.iter().map(|e| e.kind.as_str()).collect();
+    let at = kinds
+        .iter()
+        .position(|k| *k == "pending_opened")
+        .expect("the question was recorded");
+    assert_eq!(
+        kinds[at..],
+        [
+            "pending_opened",
+            "turn_ended",
+            "pending_resolved",
+            "adapter_exited",
+            "session_parked"
+        ]
+    );
+    assert_eq!(evs[at + 2].body["reason"], "adapter_lost");
+    let pending = evs[at].body["pending_id"].as_str().unwrap();
+    let (status, body) = answer(&c, &collector, &session, pending, json!({"option_id": "allow"})).await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("not_open")));
+}
+
+/// Scenario 7, with a question open: the restarted host holds none, so it
+/// is cancelled after the resend, and nothing is re-spawned.
+#[tokio::test]
+async fn a_host_restart_with_a_question_open_cancels_it_host_restarted() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let script = asking(vec![hennery_testkit::FakeAsk::Permission]);
+    let mut fake = AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    fake.env
+        .push((SCRIPT_ENV.into(), serde_json::to_string(&script).unwrap()));
+    let host = start_host_with(collector.addr, &dir.path().join("host"), fake.clone());
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    prompt(&c, &collector, &session).await;
+    let pending = open_question(&c, &collector, &session).await;
+
+    host.abort();
+    let _ = host.await;
+    start_host_with(collector.addr, &dir.path().join("host"), fake);
+    lifecycle_is(&collector, &session, "parked").await;
+    let evs = events(&c, &collector, &session).await;
+    let cancelled = of_kind(&evs, "pending_cancelled");
+    assert_eq!(cancelled.len(), 1, "{evs:?}");
+    assert_eq!(
+        cancelled[0].body,
+        json!({"pending_id": pending, "reason": "host_restarted"})
+    );
+    let (status, body) = answer(&c, &collector, &session, &pending, json!({"option_id": "allow"})).await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("not_open")));
+}
+
+/// Scenarios 8 and 9: while its host is away past the offline threshold
+/// the session is presumed parked with its question still open, and an
+/// answer given then is delivered once the host is back, the adapter still
+/// waiting for it.
+#[tokio::test]
+async fn a_question_outlasts_its_host_being_away_and_an_answer_given_meanwhile_is_delivered() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    let collector = Collector::start(&db, None).await;
+    let addr = collector.addr;
+    start_host(
+        addr,
+        &dir.path().join("host"),
+        &asking(vec![hennery_testkit::FakeAsk::Permission]),
+    );
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    prompt(&c, &collector, &session).await;
+    let pending = open_question(&c, &collector, &session).await;
+    collector.stop().await;
+
+    // A collector the host cannot reach (another address) presumes its
+    // sessions parked, and takes the answer.
+    let away = Collector::start_with(&db, None, Duration::from_millis(200)).await;
+    wait_for("presumed parked", || async {
+        let row = away.state.store.session(&session).unwrap().unwrap();
+        (row.lifecycle == "parked" && row.presumed_parked).then_some(())
+    })
+    .await;
+    let item = away.state.store.pending_item(&pending).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(item.state).unwrap(),
+        "open",
+        "the host may still hold it"
+    );
+    let (status, body) = answer(&c, &away, &session, &pending, json!({"option_id": "allow"})).await;
+    assert_eq!(status, 202, "{body}");
+    away.stop().await;
+
+    // Back where the host looks for it: reattached, then the queue drains.
+    let collector = Collector::start(&db, Some(addr)).await;
+    lifecycle_is(&collector, &session, "active").await;
+    let evs = wait_for("turn end", || async {
+        let evs = events(&c, &collector, &session).await;
+        (!turn_ends(&evs).is_empty()).then_some(evs)
+    })
+    .await;
+    assert!(!of_kind(&evs, "reattached").is_empty());
+    assert!(
+        agent_text(&evs).starts_with("permission:selected:allow"),
+        "{}",
+        agent_text(&evs)
+    );
+    assert_eq!(delivered(&collector, &pending), Some(true));
 }
