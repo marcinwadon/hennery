@@ -1639,3 +1639,126 @@ fn up_hands_every_listen_address_to_its_collector() {
         )
     });
 }
+
+/// Kernel spec §2: `config.toml` gives `listen` and `public_url` when
+/// neither a flag nor the environment does; `HENNERY_LISTEN` and
+/// `HENNERY_PUBLIC_URL` win over the file, and flags over both. Counted by
+/// the collector's listeners (the file names three, the environment two, a
+/// flag one) and by the setup link, which names `public_url`.
+#[test]
+fn config_toml_yields_to_the_environment_and_the_environment_to_flags() {
+    let dir = scratch_dir("config");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        data.join("config.toml"),
+        "listen = [\"127.0.0.1:0\", \"127.0.0.1:0\", \"127.0.0.1:0\"]\npublic_url = \"https://file.example\"\n",
+    )
+    .unwrap();
+    // Private whatever the umask: a file others can write is refused.
+    std::fs::set_permissions(
+        data.join("config.toml"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .unwrap();
+    let run = |env: &[(&str, &str)], args: &[&str], name: &str| {
+        let log = dir.join(format!("{name}.log"));
+        let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+            .arg("collector")
+            .args(args)
+            .arg("--data-dir")
+            .arg(&data)
+            .envs(env.iter().copied())
+            .stdout(std::fs::File::create(&log).unwrap())
+            .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
+            .spawn()
+            .unwrap();
+        let mut collector = KillTree::new(collector, &log);
+        let file = data.join("setup-url");
+        // Written after every listener's line is logged.
+        collector.wait_until("the setup link", || file.exists());
+        let link = std::fs::read_to_string(&file).unwrap();
+        let listeners = listening_addresses(&std::fs::read_to_string(&log).unwrap()).len();
+        unsafe { libc::kill(collector.up.id() as i32, libc::SIGTERM) };
+        assert!(wait_with_timeout(&mut collector.up, Duration::from_secs(15)).is_some());
+        let _ = std::fs::remove_file(&file);
+        let origin = link.split("/setup#").next().unwrap().to_string();
+        (listeners, origin)
+    };
+    assert_eq!(run(&[], &[], "file"), (3, "https://file.example".to_string()));
+    let env = [
+        ("HENNERY_LISTEN", "127.0.0.1:0,127.0.0.1:0"),
+        ("HENNERY_PUBLIC_URL", "https://env.example"),
+    ];
+    assert_eq!(run(&env, &[], "env"), (2, "https://env.example".to_string()));
+    assert_eq!(
+        run(
+            &env,
+            &["--listen", "127.0.0.1:0", "--public-url", "https://flag.example"],
+            "flag"
+        ),
+        (1, "https://flag.example".to_string())
+    );
+}
+
+/// A `config.toml` that does not parse, names a key hennery does not know,
+/// or that other users can write, stops the start with the file's name,
+/// before anything is bound or created.
+#[test]
+fn a_bad_config_toml_stops_the_start() {
+    let dir = scratch_dir("badconfig");
+    let _cleanup = RemoveDir(dir.clone());
+    for (name, text, mode, expected) in [
+        ("typo", "listens = [\"127.0.0.1:0\"]\n", 0o644, "unknown field"),
+        (
+            "public_url",
+            "public_url = \"http://hennery.example\"\n",
+            0o644,
+            "public_url must be https://",
+        ),
+        ("writable", "listen = [\"127.0.0.1:0\"]\n", 0o666, "chmod go-w"),
+    ] {
+        use std::os::unix::fs::PermissionsExt;
+        let data = dir.join(name);
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("config.toml"), text).unwrap();
+        std::fs::set_permissions(data.join("config.toml"), std::fs::Permissions::from_mode(mode)).unwrap();
+        // On port 0, and bounded: a collector that ignored the file would
+        // serve rather than stop, and never on the default port.
+        let mut child = Command::new(env!("CARGO_BIN_EXE_hennery"))
+            .args(["collector", "--listen", "127.0.0.1:0", "--data-dir"])
+            .arg(&data)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let status = wait_with_timeout(&mut child, Duration::from_secs(15));
+        let _ = child.kill();
+        let _ = child.wait();
+        let mut stderr = String::new();
+        child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+        assert!(status.is_some_and(|s| !s.success()), "{name}: started: {stderr}");
+        assert!(stderr.contains(expected), "{name}: {stderr}");
+        assert!(!data.join("hennery.db").exists(), "{name}: the database was made");
+    }
+}
+
+/// `up --public-url` reaches its collector child, whose setup link names it
+/// (kernel spec §3.1).
+#[test]
+fn up_hands_its_public_url_to_its_collector() {
+    let dir = scratch_dir("uppublicurl");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let mut up = up_logging_to_with(
+        Command::new(env!("CARGO_BIN_EXE_hennery")),
+        &data,
+        &dir.join("up.log"),
+        &["--public-url", "https://up.example"],
+    );
+    let file = data.join("collector").join("setup-url");
+    up.wait_until("the setup link", || file.exists());
+    let link = std::fs::read_to_string(&file).unwrap();
+    assert!(link.starts_with("https://up.example/setup#"), "{link}");
+}
