@@ -7,6 +7,7 @@
 
 use futures::{SinkExt, StreamExt};
 use hennery_kernel::auth::DevToken;
+use hennery_kernel::hosts::Hosts;
 use hennery_proto::PROTOCOL_VERSION;
 use hennery_proto::frames::{CollectorFrame, HostFrame};
 use hennery_sessions::AppState;
@@ -14,7 +15,7 @@ use hennery_sessions::store::Store;
 use std::net::SocketAddr;
 use tokio_tungstenite::tungstenite::Message;
 
-const TOKEN: &str = "dev-token";
+const TOKEN: &str = "dev-token-for-tests";
 
 struct Collector {
     addr: SocketAddr,
@@ -30,7 +31,8 @@ impl Collector {
         let addr = listener.local_addr().unwrap();
         let state = AppState::new(
             Store::open(&dir.path().join("hennery.db")).unwrap(),
-            DevToken::new(TOKEN),
+            Hosts::open(&dir.path().join("hennery.db")).unwrap(),
+            DevToken::new(TOKEN).unwrap(),
         );
         let task = tokio::spawn(hennery_sessions::serve(listener, state.clone()));
         Self {

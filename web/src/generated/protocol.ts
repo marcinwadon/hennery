@@ -174,3 +174,21 @@ export type AnswerResponse = { pending_id: string,
  * Carried by the host's `answer_result` for this answer.
  */
 request_id: string, };
+
+export type PairingCodeResponse = { 
+/**
+ * `XXXX-XXXX`, Crockford base32.
+ */
+code: string, 
+/**
+ * RFC 3339.
+ */
+expires_at: string, };
+
+export type EnrollRequest = { code: string, 
+/**
+ * Ed25519 public key, 64 hex characters.
+ */
+public_key: string, name: string, host_version: string, platform: string, };
+
+export type EnrollResponse = { host_id: string, };

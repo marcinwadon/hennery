@@ -3,6 +3,7 @@
 
 use hennery_host::{AgentCommand, HostConfig};
 use hennery_kernel::auth::DevToken;
+use hennery_kernel::hosts::Hosts;
 use hennery_proto::rest::{EventDto, PromptResponse, StartSessionResponse};
 use hennery_sessions::{AppState, store::Store};
 use hennery_testkit::{FakeScript, SCRIPT_ENV};
@@ -11,7 +12,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-const TOKEN: &str = "dev-token";
+const TOKEN: &str = "dev-token-for-tests";
 
 struct Collector {
     addr: SocketAddr,
@@ -31,7 +32,11 @@ impl Collector {
             .await
             .expect("bind collector");
         let addr = listener.local_addr().unwrap();
-        let mut state = AppState::new(Store::open(db).unwrap(), DevToken::new(TOKEN));
+        let mut state = AppState::new(
+            Store::open(db).unwrap(),
+            Hosts::open(db).unwrap(),
+            DevToken::new(TOKEN).unwrap(),
+        );
         state.offline_threshold = offline;
         let task = tokio::spawn(hennery_sessions::serve(listener, state.clone()));
         Self { addr, state, task }

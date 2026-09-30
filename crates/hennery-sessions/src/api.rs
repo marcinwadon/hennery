@@ -69,7 +69,7 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+pub(crate) fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
     (
         status,
         Json(ApiError {
@@ -96,7 +96,7 @@ fn error_with_session(status: StatusCode, code: &str, message: impl Into<String>
         .into_response()
 }
 
-fn internal(err: anyhow::Error) -> Response {
+pub(crate) fn internal(err: anyhow::Error) -> Response {
     tracing::error!(error = %err, "internal error");
     error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error")
 }

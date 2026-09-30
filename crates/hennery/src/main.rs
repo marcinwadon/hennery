@@ -8,7 +8,9 @@ use clap::{Args, Parser, Subcommand};
 use hennery_host::session::IDLE_TIMEOUT;
 use hennery_host::{AgentCommand, HostConfig};
 use hennery_kernel::auth::DevToken;
+use hennery_kernel::hosts::Hosts;
 use hennery_sessions::{AppState, store::Store};
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -109,8 +111,10 @@ async fn main() -> Result<()> {
 
 async fn run_collector(args: CollectorArgs) -> Result<()> {
     std::fs::create_dir_all(&args.data_dir)?;
-    let store = Store::open(&args.data_dir.join("hennery.db"))?;
-    let mut state = AppState::new(store, DevToken::new(args.dev_token));
+    let db = args.data_dir.join("hennery.db");
+    let store = Store::open(&db)?;
+    let hosts = Hosts::open(&db)?;
+    let mut state = AppState::new(store, hosts, DevToken::new(args.dev_token)?);
     state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
     hennery_sessions::offline::after_startup(&state);
     let listener = tokio::net::TcpListener::bind(&args.listen)
@@ -123,7 +127,7 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
         shutdown.cancel();
     });
     let app = hennery_sessions::router(state.clone()).route("/", get(|| async { Html(PLACEHOLDER) }));
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(state.shutdown.clone().cancelled_owned())
         .await?;
     Ok(())
@@ -162,6 +166,8 @@ fn sigterm(child: &tokio::process::Child) {
 /// remote host (architecture spec §3.3). The supervisor exits when either
 /// child exits; restart policy comes with the distribution work.
 async fn run_up(args: UpArgs) -> Result<()> {
+    // Checked here too, so a bad token stops `up` before any child starts.
+    DevToken::new(args.dev_token.clone())?;
     let exe = std::env::current_exe()?;
     // Keep both children out of the terminal's foreground process group: a
     // Ctrl-C there delivers SIGINT to every process in that group at once,

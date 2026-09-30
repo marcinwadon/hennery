@@ -545,6 +545,47 @@
       ],
       "type": "string"
     },
+    "EnrollRequest": {
+      "description": "`POST /api/hosts/enroll` (kernel spec §4.1): a host pairs itself with a\ncode and the public half of the key it generated.",
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "host_version": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "public_key": {
+          "description": "Ed25519 public key, 64 hex characters.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "public_key",
+        "name",
+        "host_version",
+        "platform"
+      ],
+      "type": "object"
+    },
+    "EnrollResponse": {
+      "description": "201 to an enrollment: the id the host names itself by in `hello`.",
+      "properties": {
+        "host_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "host_id"
+      ],
+      "type": "object"
+    },
     "EventDto": {
       "description": "One stored timeline event, as served by REST and SSE.",
       "properties": {
@@ -782,6 +823,24 @@
       "required": [
         "turn_id",
         "state"
+      ],
+      "type": "object"
+    },
+    "PairingCodeResponse": {
+      "description": "201 to `POST /api/hosts/pairing-codes` (kernel spec §4.1): a single-use\ncode for `hennery host join`, shown once.",
+      "properties": {
+        "code": {
+          "description": "`XXXX-XXXX`, Crockford base32.",
+          "type": "string"
+        },
+        "expires_at": {
+          "description": "RFC 3339.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "expires_at"
       ],
       "type": "object"
     },

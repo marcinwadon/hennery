@@ -36,6 +36,23 @@ fn a_malformed_agent_flag_is_rejected() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("name=command"));
 }
 
+#[test]
+fn a_short_dev_token_is_refused_at_start() {
+    let dir = std::env::temp_dir().join(format!("hennery-cli-short-token-{}", std::process::id()));
+    for command in ["collector", "up"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+            .args([command, "--listen", "127.0.0.1:0", "--dev-token", "short"])
+            .arg("--data-dir")
+            .arg(&dir)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{command} started with a short token");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("at least 16 characters"), "{command}: {stderr}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Kills this test's `up` process tree and removes its scratch dir
 /// unconditionally, including on an assertion panic mid-test — nothing below
 /// is allowed to leave a process running just because a `assert!` fired
@@ -112,7 +129,7 @@ fn sigint_to_ups_process_group_still_shuts_down_cleanly() {
         .args(["up", "--listen", &listen])
         .arg("--data-dir")
         .arg(&dir)
-        .args(["--dev-token", "t"]);
+        .args(["--dev-token", "dev-token-for-tests"]);
     // SAFETY: setpgid(0, 0) in the child, right after fork and before exec,
     // just makes it (and so `up`) the leader of a brand-new process group —
     // async-signal-safe and exactly what a shell does for a foreground job.

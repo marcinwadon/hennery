@@ -48,6 +48,9 @@ pub fn render_schema() -> String {
         rest::PendingItem,
         rest::AnswerRequest,
         rest::AnswerResponse,
+        rest::PairingCodeResponse,
+        rest::EnrollRequest,
+        rest::EnrollResponse,
     );
     // `serde_json::Map` is a `BTreeMap` (always iterates sorted) by default,
     // or an `IndexMap` (iterates in insertion order) when serde_json's
@@ -136,6 +139,9 @@ pub fn render_ts() -> String {
         rest::PendingItem,
         rest::AnswerRequest,
         rest::AnswerResponse,
+        rest::PairingCodeResponse,
+        rest::EnrollRequest,
+        rest::EnrollResponse,
     );
     out
 }

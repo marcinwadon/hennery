@@ -4,6 +4,7 @@
 
 use futures::{SinkExt, StreamExt};
 use hennery_kernel::auth::DevToken;
+use hennery_kernel::hosts::Hosts;
 use hennery_proto::PROTOCOL_VERSION;
 use hennery_proto::frames::{AttachedSession, Capabilities, Capability, CollectorFrame, HostFrame, SessionBody};
 use hennery_proto::rest::EventDto;
@@ -13,7 +14,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 
-const TOKEN: &str = "dev-token";
+const TOKEN: &str = "dev-token-for-tests";
 const HOST: &str = "host-1";
 
 struct Collector {
@@ -38,7 +39,8 @@ impl Collector {
         let addr = listener.local_addr().unwrap();
         let mut state = AppState::new(
             Store::open(&dir.path().join("hennery.db")).unwrap(),
-            DevToken::new(TOKEN),
+            Hosts::open(&dir.path().join("hennery.db")).unwrap(),
+            DevToken::new(TOKEN).unwrap(),
         );
         state.offline_threshold = offline;
         tokio::spawn(hennery_sessions::serve(listener, state.clone()));
