@@ -5,35 +5,14 @@
 //! caller (`secret::unix_now()` in production), so expiry is testable
 //! without sleeping.
 
-use crate::db;
 use crate::secret::{random_bytes, sha256_hex};
+use crate::{db, schema};
 use anyhow::Result;
 use ed25519_dalek::{Signature, VerifyingKey};
 use hennery_proto::frames::Capabilities;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::Mutex;
-
-/// The kernel's component name in `schema_versions`.
-const COMPONENT: &str = "kernel";
-
-const MIGRATIONS: &[&str] = &["
-    CREATE TABLE hosts (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        public_key TEXT NOT NULL UNIQUE,
-        platform TEXT NOT NULL,
-        host_version TEXT NOT NULL,
-        capabilities TEXT NOT NULL DEFAULT '[]',
-        created_at INTEGER NOT NULL,
-        last_seen_at INTEGER,
-        revoked_at INTEGER);
-    CREATE TABLE pairing_codes (
-        code_hash TEXT PRIMARY KEY,
-        created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL,
-        used_at INTEGER);
-"];
 
 /// A pairing code is valid this long (kernel spec §4.1).
 pub const PAIRING_CODE_TTL_SECS: i64 = 10 * 60;
@@ -238,7 +217,7 @@ impl Hosts {
     }
 
     fn init(mut conn: Connection) -> Result<Self> {
-        db::migrate_component(&mut conn, COMPONENT, MIGRATIONS)?;
+        db::migrate_component(&mut conn, schema::COMPONENT, schema::MIGRATIONS)?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 

@@ -14,10 +14,13 @@ getrandom.workspace = true
 hennery-proto.workspace = true
 hex.workspace = true
 libc = "0.2"
+password-auth.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tokio.workspace = true
 tracing.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
