@@ -37,10 +37,24 @@ fn kinds(frames: &[HostFrame]) -> Vec<String> {
                 SessionBody::AdapterExited { .. } => "adapter_exited".to_string(),
                 SessionBody::HostNote { note, .. } => format!("host_note:{note}"),
                 SessionBody::ConfigApplied { .. } => "config_applied".to_string(),
+                SessionBody::PendingOpened { indexed, .. } => match &indexed.pending {
+                    Some(pending) => format!("pending_opened:{}", tag(pending.kind)),
+                    None => "pending_opened:?".to_string(),
+                },
+                SessionBody::PendingResolved { resolution, reason, .. } => match reason {
+                    Some(reason) => format!("pending_resolved:{}:{}", tag(resolution), tag(reason)),
+                    None => format!("pending_resolved:{}", tag(resolution)),
+                },
+                SessionBody::AnswerResult { delivered, .. } => format!("answer_result:{delivered}"),
             },
             other => format!("{other:?}"),
         })
         .collect()
+}
+
+/// A wire enum's snake_case name.
+fn tag(value: impl serde::Serialize) -> String {
+    serde_json::to_value(value).unwrap().as_str().unwrap().to_string()
 }
 
 async fn wait_until(uplink: &Uplink, pred: impl Fn(&[HostFrame]) -> bool) -> Vec<HostFrame> {

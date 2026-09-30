@@ -14,6 +14,21 @@ export type TurnOutcome = "completed" | "cancelled" | "failed" | "interrupted";
 
 export type ParkReason = "idle" | "adapter_exited" | "operator";
 
+export type PendingKind = "permission" | "elicitation";
+
+export type PendingResolution = "delivered" | "cancelled";
+
+export type PendingReason = "turn_cancelled" | "session_closed" | "session_parked" | "adapter_lost" | "host_restarted" | "agent_withdrew";
+
+export type ElicitationAction = "accept" | "decline" | "cancel";
+
+export type PendingExtract = { id: string, kind: PendingKind, 
+/**
+ * The permission's option ids. Absent for an elicitation, and for a
+ * permission request whose options hennery could not parse.
+ */
+option_ids?: Array<string> | null, };
+
 export type Indexed = { turn_id?: string | null, title?: string | null, 
 /**
  * The full config catalogue: the adapter's ACP `SessionConfigOption`
@@ -31,9 +46,13 @@ current_mode?: string | null,
 /**
  * The current value of every other option, by config id.
  */
-current_axes?: { [key in string]: ConfigValue } | null, };
+current_axes?: { [key in string]: ConfigValue } | null, 
+/**
+ * On `pending_opened`: the request's id, kind and option ids.
+ */
+pending?: PendingExtract | null, };
 
-export type SessionBody = { "kind": "session_started", request_id: string, agent_session_id: string, indexed: Indexed, } | { "kind": "start_failed", request_id: string, code: string, message: string, } | { "kind": "turn_started", request_id: string, turn_id: string, } | { "kind": "acp_update", indexed: Indexed, payload: unknown, } | { "kind": "turn_ended", turn_id: string, outcome: TurnOutcome, stop_reason?: string | null, error?: string | null, } | { "kind": "session_parked", reason: ParkReason, } | { "kind": "session_closed" } | { "kind": "adapter_exited", code?: number | null, signal?: number | null, stderr_tail: string, } | { "kind": "host_note", note: string, text: string, } | { "kind": "config_applied", request_id: string, indexed: Indexed, };
+export type SessionBody = { "kind": "session_started", request_id: string, agent_session_id: string, indexed: Indexed, } | { "kind": "start_failed", request_id: string, code: string, message: string, } | { "kind": "turn_started", request_id: string, turn_id: string, } | { "kind": "acp_update", indexed: Indexed, payload: unknown, } | { "kind": "turn_ended", turn_id: string, outcome: TurnOutcome, stop_reason?: string | null, error?: string | null, } | { "kind": "session_parked", reason: ParkReason, } | { "kind": "session_closed" } | { "kind": "adapter_exited", code?: number | null, signal?: number | null, stderr_tail: string, } | { "kind": "host_note", note: string, text: string, } | { "kind": "config_applied", request_id: string, indexed: Indexed, } | { "kind": "pending_opened", pending_id: string, indexed: Indexed, payload: unknown, } | { "kind": "pending_resolved", pending_id: string, resolution: PendingResolution, reason?: PendingReason | null, } | { "kind": "answer_result", pending_id: string, request_id: string, delivered: boolean, };
 
 export type HostFrame = { "type": "hello", protocol_version: string, host_version: string, host_id: string, 
 /**
@@ -70,7 +89,7 @@ agent_session_id: string, model?: string | null, mode?: string | null, axes?: { 
 /**
  * ACP ContentBlocks, built by the frontend.
  */
-content: unknown[], } | { "type": "cancel_turn", request_id: string, session_id: string, turn_id: string, } | { "type": "set_config", request_id: string, session_id: string, config_id: string, value: ConfigValue, } | { "type": "ack", session_id: string, ack_seq: number, } | { "type": "park_session", request_id: string, session_id: string, } | { "type": "close_session", request_id: string, session_id: string, };
+content: unknown[], } | { "type": "cancel_turn", request_id: string, session_id: string, turn_id: string, } | { "type": "set_config", request_id: string, session_id: string, config_id: string, value: ConfigValue, } | { "type": "answer_permission", request_id: string, session_id: string, pending_id: string, option_id: string, } | { "type": "answer_elicitation", request_id: string, session_id: string, pending_id: string, action: ElicitationAction, content?: unknown, } | { "type": "ack", session_id: string, ack_seq: number, } | { "type": "park_session", request_id: string, session_id: string, } | { "type": "close_session", request_id: string, session_id: string, };
 
 export type StartSessionRequest = { host_id: string, agent: string, cwd: string, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, };
 
@@ -103,7 +122,11 @@ export type SessionDetail = { session_id: string, host_id: string, agent: string
  * Parked only because its host has been offline past the threshold
  * (ACP core §5.3); the host may still be running it.
  */
-presumed_parked: boolean, open_turn?: OpenTurn | undefined, };
+presumed_parked: boolean, open_turn?: OpenTurn | undefined, 
+/**
+ * Open pending requests, oldest first: what the operator can answer.
+ */
+pending: Array<PendingItem>, };
 
 export type CancelResponse = { turn_id: string, outcome: TurnOutcome, };
 
@@ -114,3 +137,40 @@ export type SessionCatalog = { session_id: string,
  * The adapter's ACP `SessionConfigOption` objects, as last reported.
  */
 config_options: unknown[], model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, };
+
+export type PendingState = "open" | "delivered" | "cancelled";
+
+export type PendingItem = { pending_id: string, session_id: string, kind: PendingKind, state: PendingState, 
+/**
+ * Why it was cancelled.
+ */
+reason?: PendingReason | undefined, 
+/**
+ * The turn it was asked in.
+ */
+turn_id?: string | undefined, 
+/**
+ * A permission's option ids: the only valid answers.
+ */
+option_ids?: string[] | undefined, 
+/**
+ * The adapter's ACP request, verbatim.
+ */
+payload: unknown, 
+/**
+ * An answer has been accepted for it (at most one is).
+ */
+answered: boolean, 
+/**
+ * The host's verdict on that answer, once one arrived. `true` sticks
+ * (umbrella §6.8): a card shows "answered" only then.
+ */
+delivered?: boolean | undefined, };
+
+export type AnswerRequest = { option_id: string, } | { action: ElicitationAction, content?: unknown, };
+
+export type AnswerResponse = { pending_id: string, 
+/**
+ * Carried by the host's `answer_result` for this answer.
+ */
+request_id: string, };

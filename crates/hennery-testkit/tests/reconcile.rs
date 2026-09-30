@@ -928,7 +928,7 @@ async fn the_session_detail_shows_the_open_turn() {
         json!({
             "session_id": session, "host_id": HOST, "agent": "fake", "cwd": "/tmp",
             "lifecycle": "active", "activity": "running", "presumed_parked": false,
-            "open_turn": { "turn_id": turn, "state": "started" }
+            "open_turn": { "turn_id": turn, "state": "started" }, "pending": []
         })
     );
     let (status, _) = get(&client(), collector.url("/api/sessions/no-such-session")).await;

@@ -481,6 +481,14 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
                 }) => {}
             _ => not_attached(uplink, request_id),
         },
+        // Answers reach the session actor once it keeps its pending requests.
+        CollectorFrame::AnswerPermission { request_id, .. } | CollectorFrame::AnswerElicitation { request_id, .. } => {
+            uplink.reply(HostFrame::Error {
+                request_id,
+                code: "unsupported".into(),
+                message: "this host does not take answers yet".into(),
+            })
+        }
         CollectorFrame::Ack { session_id, ack_seq } => uplink.ack(&session_id, ack_seq)?,
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }

@@ -73,6 +73,60 @@ pub enum ParkReason {
     Operator,
 }
 
+/// What a pending request asks the operator (ACP core §4.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingKind {
+    /// `session/request_permission`: pick one of the offered options.
+    Permission,
+    /// `elicitation/create`: fill in a form, or decline.
+    Elicitation,
+}
+
+/// How a pending request ended (ACP core §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingResolution {
+    /// The operator's answer reached the waiting adapter.
+    Delivered,
+    /// The adapter was told the question is off (see `PendingReason`).
+    Cancelled,
+}
+
+/// Why a pending request was cancelled (ACP core §4.6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingReason {
+    TurnCancelled,
+    SessionClosed,
+    SessionParked,
+    AdapterLost,
+    HostRestarted,
+    /// The adapter withdrew its own question (`$/cancel_request`).
+    AgentWithdrew,
+}
+
+/// The operator's answer to an elicitation (ACP `elicitation/create`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ElicitationAction {
+    Accept,
+    Decline,
+    Cancel,
+}
+
+/// The `pending` extract (ACP core §3.2): what the collector needs to hold
+/// a pending request and validate its answer, without reading the payload.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PendingExtract {
+    pub id: String,
+    pub kind: PendingKind,
+    /// The permission's option ids. Absent for an elicitation, and for a
+    /// permission request whose options hennery could not parse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option_ids: Option<Vec<String>>,
+}
+
 /// The value of one config option (ACP `session/set_config_option`): a
 /// select's value id, or a boolean toggle's state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
@@ -131,6 +185,9 @@ pub struct Indexed {
     /// The current value of every other option, by config id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_axes: Option<BTreeMap<String, ConfigValue>>,
+    /// On `pending_opened`: the request's id, kind and option ids.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingExtract>,
 }
 
 impl Indexed {
@@ -211,6 +268,33 @@ pub enum SessionBody {
         request_id: String,
         #[serde(default)]
         indexed: Indexed,
+    },
+    /// The adapter asked the operator something (ACP core §4.6): its ACP
+    /// request verbatim in `payload`, with `indexed.pending`. It waits, with
+    /// no timeout, until it is answered or cancelled. Its kind is
+    /// `indexed.pending.kind` (the body's own `kind` is its tag).
+    PendingOpened {
+        pending_id: String,
+        #[serde(default)]
+        indexed: Indexed,
+        #[ts(type = "unknown")]
+        payload: Value,
+    },
+    /// A pending request is over: answered (`delivered`), or cancelled for
+    /// `reason`.
+    PendingResolved {
+        pending_id: String,
+        resolution: PendingResolution,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<PendingReason>,
+    },
+    /// The host's verdict on one answer (umbrella §6.8): `delivered` if the
+    /// adapter was still waiting for it. A delivered answer is followed by
+    /// `pending_resolved{delivered}`.
+    AnswerResult {
+        pending_id: String,
+        request_id: String,
+        delivered: bool,
     },
 }
 
@@ -340,6 +424,25 @@ pub enum CollectorFrame {
         session_id: String,
         config_id: String,
         value: ConfigValue,
+    },
+    /// The operator's choice for a permission request. Completed by
+    /// `answer_result` (ACP core §4.6); it has no collector waiter.
+    AnswerPermission {
+        request_id: String,
+        session_id: String,
+        pending_id: String,
+        option_id: String,
+    },
+    /// The operator's answer to an elicitation; `content` only with
+    /// `accept`. Completed by `answer_result`, like a permission's.
+    AnswerElicitation {
+        request_id: String,
+        session_id: String,
+        pending_id: String,
+        action: ElicitationAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "unknown")]
+        content: Option<Value>,
     },
     Ack {
         session_id: String,

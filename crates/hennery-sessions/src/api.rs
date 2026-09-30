@@ -210,6 +210,7 @@ async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -
         failure_reason: session.failure_reason,
         presumed_parked: session.presumed_parked,
         open_turn,
+        pending: Vec::new(),
     })
     .into_response()
 }

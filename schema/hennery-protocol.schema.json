@@ -1,5 +1,50 @@
 {
   "$defs": {
+    "AnswerRequest": {
+      "anyOf": [
+        {
+          "properties": {
+            "option_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "option_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/ElicitationAction"
+            },
+            "content": true
+          },
+          "required": [
+            "action"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "`POST /api/sessions/{id}/pending/{pending_id}/answer` (ACP core §9): an\noption for a permission request, or an action for an elicitation, with\nthe form's content when it accepts."
+    },
+    "AnswerResponse": {
+      "description": "202 to an answer: it is queued for the session's host, and delivered now\nor on the host's next connection (ACP core §4.6). The verdict follows on\nthe session stream as `pending_changed`.",
+      "properties": {
+        "pending_id": {
+          "type": "string"
+        },
+        "request_id": {
+          "description": "Carried by the host's `answer_result` for this answer.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "pending_id",
+        "request_id"
+      ],
+      "type": "object"
+    },
     "ApiError": {
       "properties": {
         "code": {
@@ -340,6 +385,65 @@
           "type": "object"
         },
         {
+          "description": "The operator's choice for a permission request. Completed by\n`answer_result` (ACP core §4.6); it has no collector waiter.",
+          "properties": {
+            "option_id": {
+              "type": "string"
+            },
+            "pending_id": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "answer_permission",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "session_id",
+            "pending_id",
+            "option_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The operator's answer to an elicitation; `content` only with\n`accept`. Completed by `answer_result`, like a permission's.",
+          "properties": {
+            "action": {
+              "$ref": "#/$defs/ElicitationAction"
+            },
+            "content": true,
+            "pending_id": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "session_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "answer_elicitation",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "session_id",
+            "pending_id",
+            "action"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "ack_seq": {
               "format": "uint64",
@@ -431,6 +535,15 @@
         }
       ],
       "description": "The value of one config option (ACP `session/set_config_option`): a\nselect's value id, or a boolean toggle's state."
+    },
+    "ElicitationAction": {
+      "description": "The operator's answer to an elicitation (ACP `elicitation/create`).",
+      "enum": [
+        "accept",
+        "decline",
+        "cancel"
+      ],
+      "type": "string"
     },
     "EventDto": {
       "description": "One stored timeline event, as served by REST and SSE.",
@@ -613,6 +726,17 @@
             "null"
           ]
         },
+        "pending": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PendingExtract"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "On `pending_opened`: the request's id, kind and option ids."
+        },
         "title": {
           "type": [
             "string",
@@ -667,6 +791,159 @@
         "idle",
         "adapter_exited",
         "operator"
+      ],
+      "type": "string"
+    },
+    "PendingExtract": {
+      "description": "The `pending` extract (ACP core §3.2): what the collector needs to hold\na pending request and validate its answer, without reading the payload.",
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/PendingKind"
+        },
+        "option_ids": {
+          "description": "The permission's option ids. Absent for an elicitation, and for a\npermission request whose options hennery could not parse.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "PendingItem": {
+      "description": "One pending request, as the collector holds it: an entry of\n`SessionDetail.pending`, and the data of SSE `pending_changed`.",
+      "properties": {
+        "answered": {
+          "description": "An answer has been accepted for it (at most one is).",
+          "type": "boolean"
+        },
+        "delivered": {
+          "description": "The host's verdict on that answer, once one arrived. `true` sticks\n(umbrella §6.8): a card shows \"answered\" only then.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/PendingKind"
+        },
+        "option_ids": {
+          "description": "A permission's option ids: the only valid answers.",
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
+        "payload": {
+          "description": "The adapter's ACP request, verbatim."
+        },
+        "pending_id": {
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PendingReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why it was cancelled."
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/PendingState"
+        },
+        "turn_id": {
+          "description": "The turn it was asked in.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "pending_id",
+        "session_id",
+        "kind",
+        "state",
+        "payload",
+        "answered"
+      ],
+      "type": "object"
+    },
+    "PendingKind": {
+      "description": "What a pending request asks the operator (ACP core §4.6).",
+      "oneOf": [
+        {
+          "const": "permission",
+          "description": "`session/request_permission`: pick one of the offered options.",
+          "type": "string"
+        },
+        {
+          "const": "elicitation",
+          "description": "`elicitation/create`: fill in a form, or decline.",
+          "type": "string"
+        }
+      ]
+    },
+    "PendingReason": {
+      "description": "Why a pending request was cancelled (ACP core §4.6).",
+      "oneOf": [
+        {
+          "enum": [
+            "turn_cancelled",
+            "session_closed",
+            "session_parked",
+            "adapter_lost",
+            "host_restarted"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "agent_withdrew",
+          "description": "The adapter withdrew its own question (`$/cancel_request`).",
+          "type": "string"
+        }
+      ]
+    },
+    "PendingResolution": {
+      "description": "How a pending request ended (ACP core §3.2).",
+      "oneOf": [
+        {
+          "const": "delivered",
+          "description": "The operator's answer reached the waiting adapter.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "The adapter was told the question is off (see `PendingReason`).",
+          "type": "string"
+        }
+      ]
+    },
+    "PendingState": {
+      "description": "Where a pending request stands (ACP core §4.6): `open`, then\n`delivered` or `cancelled`.",
+      "enum": [
+        "open",
+        "delivered",
+        "cancelled"
       ],
       "type": "string"
     },
@@ -920,6 +1197,85 @@
             "request_id"
           ],
           "type": "object"
+        },
+        {
+          "description": "The adapter asked the operator something (ACP core §4.6): its ACP\nrequest verbatim in `payload`, with `indexed.pending`. It waits, with\nno timeout, until it is answered or cancelled. Its kind is\n`indexed.pending.kind` (the body's own `kind` is its tag).",
+          "properties": {
+            "indexed": {
+              "$ref": "#/$defs/Indexed",
+              "default": {}
+            },
+            "kind": {
+              "const": "pending_opened",
+              "type": "string"
+            },
+            "payload": true,
+            "pending_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "pending_id",
+            "payload"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A pending request is over: answered (`delivered`), or cancelled for\n`reason`.",
+          "properties": {
+            "kind": {
+              "const": "pending_resolved",
+              "type": "string"
+            },
+            "pending_id": {
+              "type": "string"
+            },
+            "reason": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/PendingReason"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "resolution": {
+              "$ref": "#/$defs/PendingResolution"
+            }
+          },
+          "required": [
+            "kind",
+            "pending_id",
+            "resolution"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The host's verdict on one answer (umbrella §6.8): `delivered` if the\nadapter was still waiting for it. A delivered answer is followed by\n`pending_resolved{delivered}`.",
+          "properties": {
+            "delivered": {
+              "type": "boolean"
+            },
+            "kind": {
+              "const": "answer_result",
+              "type": "string"
+            },
+            "pending_id": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "pending_id",
+            "request_id",
+            "delivered"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -960,7 +1316,7 @@
       "type": "object"
     },
     "SessionDetail": {
-      "description": "`GET /api/sessions/{id}` (ACP core §9): the list item plus the open turn.\nPending requests join it with permission handling.",
+      "description": "`GET /api/sessions/{id}` (ACP core §9): the list item, the open turn and\nthe pending requests still open.",
       "properties": {
         "activity": {
           "type": [
@@ -995,6 +1351,14 @@
               "type": "null"
             }
           ]
+        },
+        "pending": {
+          "default": [],
+          "description": "Open pending requests, oldest first: what the operator can answer.",
+          "items": {
+            "$ref": "#/$defs/PendingItem"
+          },
+          "type": "array"
         },
         "presumed_parked": {
           "description": "Parked only because its host has been offline past the threshold\n(ACP core §5.3); the host may still be running it.",

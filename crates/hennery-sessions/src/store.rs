@@ -901,8 +901,13 @@ impl Store {
             // Diagnostics only, with no transition of their own: an
             // `adapter_exited` is followed by the `session_parked` that
             // detaches; a `host_note` (e.g. `replay_unknown_dropped` after a
-            // load) changes nothing.
-            SessionBody::AdapterExited { .. } | SessionBody::HostNote { .. } => {
+            // load) changes nothing. Pending requests and answer verdicts
+            // are stored the same way until the store keeps a pending set.
+            SessionBody::AdapterExited { .. }
+            | SessionBody::HostNote { .. }
+            | SessionBody::PendingOpened { .. }
+            | SessionBody::PendingResolved { .. }
+            | SessionBody::AnswerResult { .. } => {
                 if !fact_applies(&tx, session_id, None)? {
                     created.clear();
                     mark_unapplied(&tx, fact_id)?;
@@ -1042,6 +1047,9 @@ fn body_kind(body: &SessionBody) -> &'static str {
         SessionBody::AdapterExited { .. } => "adapter_exited",
         SessionBody::HostNote { .. } => "host_note",
         SessionBody::ConfigApplied { .. } => "config_applied",
+        SessionBody::PendingOpened { .. } => "pending_opened",
+        SessionBody::PendingResolved { .. } => "pending_resolved",
+        SessionBody::AnswerResult { .. } => "answer_result",
     }
 }
 
