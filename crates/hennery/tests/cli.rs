@@ -11,7 +11,7 @@ fn help_lists_the_skeleton_commands() {
         .output()
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
-    for cmd in ["collector", "host", "up"] {
+    for cmd in ["collector", "host", "up", "admin"] {
         assert!(text.contains(cmd), "missing {cmd} in help:\n{text}");
     }
 }
@@ -1734,4 +1734,237 @@ fn a_bad_config_toml_stops_the_start() {
         assert!(stderr.contains(expected), "{name}: {stderr}");
         assert!(!data.join("hennery.db").exists(), "{name}: the database was made");
     }
+}
+
+/// A collector on port 0 in `data`, logging to `log`, once it serves: the
+/// guard, and the address it listens on.
+fn collector_on(data: &std::path::Path, log: &std::path::Path) -> (KillTree, String) {
+    let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["collector", "--listen", "127.0.0.1:0"])
+        .arg("--data-dir")
+        .arg(data)
+        .stdout(std::fs::File::create(log).unwrap())
+        .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
+        .spawn()
+        .unwrap();
+    let mut guard = KillTree::new(collector, log);
+    let listen = guard.listening();
+    guard.wait_until("the admin socket", || data.join("admin.sock").exists());
+    (guard, listen)
+}
+
+/// `hennery admin --data-dir <data> <args…>` with no terminal: standard
+/// input is empty.
+fn admin(data: &std::path::Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .arg("admin")
+        .arg("--data-dir")
+        .arg(data)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap()
+}
+
+/// Like `admin`, with a terminal (a pty) as standard input, into which
+/// `typed` is typed ahead: the confirmations' path. A command still
+/// waiting for input after 20 seconds (typed-ahead input lost, say) is
+/// killed and fails the test.
+fn admin_on_a_terminal(data: &std::path::Path, args: &[&str], typed: &str) -> std::process::Output {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let (mut master, mut slave) = (-1, -1);
+    // SAFETY: openpty(3) into two local ints, with no name and the default
+    // settings; both ends are made close-on-exec at once, so no other
+    // test's child inherits them, and owned.
+    let (master, slave) = unsafe {
+        let rc = libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        for fd in [master, slave] {
+            libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+        }
+        (std::fs::File::from_raw_fd(master), OwnedFd::from_raw_fd(slave))
+    };
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .arg("admin")
+        .arg("--data-dir")
+        .arg(data)
+        .args(args)
+        .stdin(std::process::Stdio::from(slave))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    (&master).write_all(typed.as_bytes()).unwrap();
+    let Some(status) = wait_with_timeout(&mut child, Duration::from_secs(20)) else {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("`hennery admin {args:?}` still waited for input");
+    };
+    drop(master);
+    // Its output is a few lines: it fit the pipes while it ran.
+    let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+    child.stdout.take().unwrap().read_to_end(&mut stdout).unwrap();
+    child.stderr.take().unwrap().read_to_end(&mut stderr).unwrap();
+    std::process::Output { status, stdout, stderr }
+}
+
+/// `POST /api/auth/login` with `password`, from `origin`: the status.
+fn login(listen: &str, origin: &str, password: &str) -> Option<u16> {
+    let body = serde_json::json!({ "password": password }).to_string();
+    let mut stream = TcpStream::connect(listen).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(15))).ok()?;
+    write!(
+        stream,
+        "POST /api/auth/login HTTP/1.1\r\nHost: {listen}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    response.split(' ').nth(1)?.parse().ok()
+}
+
+/// Kernel spec §4.2: the commands that change state or hand out a
+/// credential ask for confirmation on a terminal, and without one they
+/// refuse and send nothing. Printing the setup link and listing hosts
+/// need none; the setup link printed is the one in `setup-url`.
+#[test]
+fn admin_commands_that_change_state_need_a_terminal() {
+    let dir = scratch_dir("adminnotty");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    let (mut collector, listen) = collector_on(&data, &dir.join("collector.log"));
+    collector.wait_until("the setup link", || data.join("setup-url").exists());
+    let out = admin(&data, &["setup-url"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        std::fs::read_to_string(data.join("setup-url")).unwrap()
+    );
+    let session = sign_in(&mut collector, &listen, &data);
+
+    for args in [
+        &["reset-password"][..],
+        &["pairing-code"],
+        &["reset-public-url", "https://moved.example"],
+    ] {
+        let out = admin(&data, args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?} ran without a terminal");
+        assert!(stderr.contains("on a terminal"), "{args:?}: {stderr}");
+        assert!(!contains_a_pairing_code_shape(&String::from_utf8_lossy(&out.stdout)));
+    }
+    // Nothing reached the collector: the session and the origin still hold.
+    assert!(get_json(&listen, "/api/hosts", &session).is_some());
+    assert_eq!(
+        post_from(&listen, "/api/auth/logout", &session, &format!("http://{listen}")),
+        Some(204)
+    );
+
+    let out = admin(&data, &["hosts"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+    let out = admin(&data, &["setup-url"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("set up already"));
+}
+
+/// 3b decision 4's lock-out, recovered live: a collector set up at one
+/// origin and then reached at another refuses every login from the new one.
+/// `hennery admin reset-public-url`, confirmed on a terminal, moves it
+/// without a restart: the new origin signs in, the old one no longer does,
+/// and the sessions of the old are gone.
+#[test]
+fn a_moved_collector_is_recovered_over_the_admin_socket() {
+    let dir = scratch_dir("adminmove");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    let (mut collector, listen) = collector_on(&data, &dir.join("collector.log"));
+    // Set up at `http://127.0.0.1:<port>`, then reached as `localhost`.
+    let session = sign_in(&mut collector, &listen, &data);
+    let old = format!("http://{listen}");
+    let new = format!("http://localhost:{}", listen.rsplit(':').next().unwrap());
+    assert_eq!(login(&listen, &new, PASSWORD), Some(403), "not locked out");
+
+    let refused = admin_on_a_terminal(&data, &["reset-public-url", &new], "no\n");
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("not confirmed"));
+    assert_eq!(login(&listen, &new, PASSWORD), Some(403), "moved without a yes");
+
+    let out = admin_on_a_terminal(&data, &["reset-public-url", &new], "yes\n");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains(&format!("public_url is now {new}")),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert_eq!(login(&listen, &new, PASSWORD), Some(204));
+    assert_eq!(login(&listen, &old, PASSWORD), Some(403));
+    assert!(
+        get_json(&listen, "/api/hosts", &session).is_none(),
+        "an old session survived"
+    );
+}
+
+/// `hennery admin reset-password` reads the new password twice from the
+/// terminal and, confirmed, replaces it and signs every session out. Two
+/// different entries change nothing.
+#[test]
+fn a_password_reset_over_the_admin_socket_signs_everyone_out() {
+    const NEW: &str = "a new long password";
+    let dir = scratch_dir("adminpassword");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    let (mut collector, listen) = collector_on(&data, &dir.join("collector.log"));
+    let session = sign_in(&mut collector, &listen, &data);
+    let origin = format!("http://{listen}");
+
+    let differ = admin_on_a_terminal(&data, &["reset-password"], &format!("{NEW}\nsomething else\n"));
+    assert!(!differ.status.success());
+    assert!(String::from_utf8_lossy(&differ.stderr).contains("differ"));
+    assert!(get_json(&listen, "/api/hosts", &session).is_some());
+
+    let out = admin_on_a_terminal(&data, &["reset-password"], &format!("{NEW}\n{NEW}\nyes\n"));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains("1 session(s) signed out"), "{stdout}");
+    assert!(!stdout.contains(NEW) && !String::from_utf8_lossy(&out.stderr).contains(NEW));
+    assert!(
+        get_json(&listen, "/api/hosts", &session).is_none(),
+        "a session survived"
+    );
+    assert_eq!(login(&listen, &origin, PASSWORD), Some(401));
+    assert_eq!(login(&listen, &origin, NEW), Some(204));
+}
+
+/// `hennery admin pairing-code`, confirmed on a terminal, prints a code
+/// that `host join` pairs with; `hennery admin hosts` then lists the host,
+/// also given `hennery up`'s data directory rather than the collector's.
+#[test]
+fn a_pairing_code_from_the_admin_socket_pairs_a_host() {
+    let dir = scratch_dir("admincode");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    let (_collector, listen) = collector_on(&data, &dir.join("collector.log"));
+    let out = admin_on_a_terminal(&data, &["pairing-code"], "yes\n");
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(contains_a_pairing_code_shape(&code), "{code}");
+    let join = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["host", "join", &format!("http://{listen}"), &code, "--name", "laptop"])
+        .arg("--data-dir")
+        .arg(dir.join("host"))
+        .output()
+        .unwrap();
+    assert!(join.status.success(), "{}", String::from_utf8_lossy(&join.stderr));
+    let out = admin(&dir, &["hosts"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let listed = String::from_utf8_lossy(&out.stdout);
+    assert!(listed.contains("\tlaptop\t") && listed.contains("\tpaired"), "{listed}");
 }
