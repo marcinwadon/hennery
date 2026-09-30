@@ -730,15 +730,29 @@ fn a_failed_pairing_code_write_is_logged_without_the_code_and_does_not_kill_the_
         .args(["--pairing-code-fd", "3"])
         .stdout(std::fs::File::create(&log).unwrap())
         .stderr(std::fs::File::create(log.with_extension("err")).unwrap());
-    let (reader, writer) = std::io::pipe().unwrap();
-    drop(reader); // Nobody will ever read: every write is EPIPE.
-    let writer_fd = std::os::fd::AsRawFd::as_raw_fd(&writer);
-    // SAFETY: dup2 in the forked child, before exec, of a descriptor this
-    // process owns; async-signal-safe.
+    // The pipe is made in the forked child, not here: on macOS a pipe is
+    // made close-on-exec only after it exists (`pipe`, then `fcntl`), so a
+    // process another test spawns in between inherits its read end and
+    // keeps it open, and the collector's write then succeeds.
+    //
+    // SAFETY: pipe, dup2 and close in the forked child, before exec;
+    // async-signal-safe.
     unsafe {
-        cmd.pre_exec(move || {
-            if libc::dup2(writer_fd, 3) < 0 {
+        cmd.pre_exec(|| {
+            let mut fds = [0; 2];
+            if libc::pipe(fds.as_mut_ptr()) < 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            let [reader, writer] = fds;
+            // Nobody will ever read: every write is EPIPE. A `dup2` onto
+            // the reader's number closes it too.
+            if writer != 3 && libc::dup2(writer, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for fd in [reader, writer] {
+                if fd != 3 {
+                    libc::close(fd);
+                }
             }
             Ok(())
         });
@@ -746,7 +760,6 @@ fn a_failed_pairing_code_write_is_logged_without_the_code_and_does_not_kill_the_
     // A `KillTree` guard, as `up_logging_to` uses for `up` itself: an
     // assertion below that panics must still not leak this process.
     let mut guard = KillTree::new(cmd.spawn().unwrap(), &log);
-    drop(writer); // This process's own copy; the child dup'd its own.
 
     let listen = guard.listening();
     let session = sign_in(&mut guard, &listen, &dir.join("data"));
