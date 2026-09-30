@@ -46,7 +46,27 @@ It also relies on:
 
 It builds on the executed [permission and elicitation plan](2026-10-01-permissions.md) (plan 2). Read its "Execution status" and "After this plan" first. Its code wins over its task text, and every anchor below was taken from that code (`main` at `9bcbbcb`, which merged it; its code is identical to `c6315b2`).
 
-**Status:** not executed. Amended after the security review of 2026-10-01 (see "Decisions"). Every code block below was built and tested in a scratch copy of `9bcbbcb`. Every block was generated from the scratch commits. The plan was then replayed from its own text, task by task, onto a fresh copy of `9bcbbcb`: each block applied exactly as "Reading the steps" says, and after every task the tree matched the scratch commit byte for byte. After every task the replay ran fmt, clippy (also on the shipped binary with test hooks off), the workspace tests and the codegen check. It ends with 368 tests, up from 309. Every new timing-sensitive test passed with four copies of its test binary running at once.
+**Status:** executed (see "Execution status"). Amended after the security review of 2026-10-01 (see "Decisions"). Every code block below was built and tested in a scratch copy of `9bcbbcb`. Every block was generated from the scratch commits. The plan was then replayed from its own text, task by task, onto a fresh copy of `9bcbbcb`: each block applied exactly as "Reading the steps" says, and after every task the tree matched the scratch commit byte for byte. After every task the replay ran fmt, clippy (also on the shipped binary with test hooks off), the workspace tests and the codegen check. It ends with 368 tests, up from 309. Every new timing-sensitive test passed with four copies of its test binary running at once.
+
+## Execution status (2026-10-01)
+
+**Executed** on branch `feat/host-pairing`: one subagent per task, each followed by a review; then a whole-branch security review ("ready with fixes") and a fix wave, which was re-reviewed. The plan's decisions were confirmed by a stronger-model security review on the maintainer's behalf. That review added amendments A1–A6, and decisions 6 and 11 were amended during execution. Deviations found in review:
+
+| Area | As built | Why |
+|---|---|---|
+| Rate limiter, decision 6 (T2) | A full table never evicts a live entry. A new address counts against one shared overflow entry, with its own budget and lockout. | Eviction let an attacker who rotates addresses reset their own budget |
+| SQL guards (T1) | The spend and the revoke carry `AND used_at IS NULL` and `AND revoked_at IS NULL`. `hello` validates `host_version`. | Defence in depth against a double spend or a double revoke |
+| Enroll client (T3) | `.no_proxy()`; `host.key.pending` is renamed into place and the parent directory fsynced; the collector's `host_id` is shape-checked; collector messages are escaped | A proxy could see the code; there is only ever one key copy; a hostile collector can't pick a path or control terminal output |
+| Revoke (T6) | The idempotency skip is state-based. A revoked host is never reconciled or marked ready. `starting` → `failed{host_revoked}` writes an event. | A late reconcile could have reattached a revoked host's sessions |
+| Exit (T7) | `main` returns an `ExitCode` (78 when revoked) after the runtime drops. `process::exit` is gone from the runtime. | `process::exit` skipped drop, so an adapter that was still starting outlived its host |
+| Decision 11 (T7) | A non-revoke host exit still ends `up`. Only a revoked host leaves the collector serving. | A crash should reach the service manager, but a revoke must not lock the operator out (A1) |
+| Operator token (final) | `HENNERY_DEV_TOKEN` is stripped from `up`'s host child and from every adapter's environment | Inheritance handed the operator bearer to the agents |
+| Collector data (final) | The data directories are created 0700. `hennery.db`, `-wal` and `-shm` are made 0600 on every open, through the file descriptor, without following symlinks. A loose existing directory is warned about. | Under umask 022 other local users could read the pairing-code hashes |
+| Kicked connection (final) | Routable means `ready && !kicked` | A socket stuck during a revoke stayed routable, and `connected` read true |
+
+Tests: 392 in the workspace, up from 309 before this plan.
+
+Still open: the spec amendments listed in this plan, and the hand-offs in "After this plan".
 
 ## Scope
 
