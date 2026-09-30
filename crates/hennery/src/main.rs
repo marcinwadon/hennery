@@ -2,6 +2,7 @@
 //! run) and an all-in-one mode. Hosts authenticate with the key they paired
 //! with; the operator with the session the setup link or a login opened.
 
+mod admin;
 mod config;
 mod inherit;
 
@@ -38,6 +39,8 @@ enum Command {
     },
     /// Run a collector and a host together (two processes).
     Up(UpArgs),
+    /// Recovery commands for a running collector, over its admin socket.
+    Admin(admin::AdminArgs),
 }
 
 #[derive(Subcommand)]
@@ -204,6 +207,7 @@ async fn main() -> std::process::ExitCode {
             command: HostCommand::Run(args),
         } => run_host(args).await,
         Command::Up(args) => run_up(args).await.map(|()| std::process::ExitCode::SUCCESS),
+        Command::Admin(args) => admin::run(args).await.map(|()| std::process::ExitCode::SUCCESS),
     };
     match result {
         Ok(code) => code,
@@ -462,7 +466,7 @@ fn warn_if_public_url_differs(stored: Option<&PublicUrl>, configured: Option<&Pu
             stored = stored.origin(),
             configured = configured.origin(),
             "the configured public_url is not the one setup stored, which stays in effect; \
-             `hennery admin reset-public-url`, coming with `hennery admin`, will move it"
+             run `hennery admin reset-public-url` to move it"
         );
     }
 }
