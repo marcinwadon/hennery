@@ -232,6 +232,35 @@ impl Default for FakeScript {
     }
 }
 
+/// The `public_url` every test collector is set up with, and so the
+/// `Origin` its state-changing requests carry.
+pub const PUBLIC_URL: &str = "https://hennery.example";
+
+/// The owner's password in test collectors.
+pub const OWNER_PASSWORD: &str = "correct horse battery";
+
+/// A client signed in as the owner of `operator`'s collector (kernel spec
+/// §3.2), which is set up first if it is not: every request carries the
+/// session cookie and the `public_url`'s `Origin`. The session is opened
+/// through the operator directly, as a login would.
+pub fn operator_client(operator: &hennery_kernel::operator::Operator) -> reqwest::Client {
+    let now = hennery_kernel::secret::unix_now();
+    if !operator.is_set_up().unwrap() {
+        let token = operator.issue_setup_token(now).unwrap().unwrap();
+        operator.set_up(&token, OWNER_PASSWORD, PUBLIC_URL, now).unwrap();
+    }
+    let token = operator.open_session("hennery-testkit", now).unwrap().unwrap();
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::COOKIE,
+        format!("{}={token}", hennery_kernel::operator::SESSION_COOKIE)
+            .parse()
+            .unwrap(),
+    );
+    headers.insert(reqwest::header::ORIGIN, PUBLIC_URL.parse().unwrap());
+    reqwest::Client::builder().default_headers(headers).build().unwrap()
+}
+
 /// Environment variable carrying the script.
 pub const SCRIPT_ENV: &str = "HENNERY_FAKE_ACP_SCRIPT";
 

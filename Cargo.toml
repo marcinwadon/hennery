@@ -18,6 +18,7 @@ ed25519-dalek = "=2.2.0"
 futures = "0.3"
 getrandom = "=0.3.4"
 hex = "=0.4.3"
+password-auth = "=1.0.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 schemars = "1.2"
@@ -34,8 +35,16 @@ toml = "=1.1.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ts-rs = { version = "12", features = ["serde-json-impl"] }
+url = "=2.5.8"
 uuid = { version = "1", features = ["v7", "serde"] }
 hennery-proto = { path = "crates/hennery-proto" }
 hennery-kernel = { path = "crates/hennery-kernel" }
 hennery-sessions = { path = "crates/hennery-sessions" }
 hennery-host = { path = "crates/hennery-host" }
+
+# Argon2 is unusably slow unoptimised; every test that logs in pays for it.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3

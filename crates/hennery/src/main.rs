@@ -1,7 +1,6 @@
 //! The `hennery` binary (distribution spec §1): collector, host (join and
 //! run) and an all-in-one mode. Hosts authenticate with the key they paired
-//! with; the REST API still takes a development bearer token until operator
-//! auth lands.
+//! with; the operator with the session the setup link or a login opened.
 
 mod inherit;
 
@@ -13,8 +12,8 @@ use hennery_host::identity::Paired;
 use hennery_host::pairing::Joined;
 use hennery_host::session::IDLE_TIMEOUT;
 use hennery_host::{AgentCommand, HostConfig};
-use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::Hosts;
+use hennery_kernel::operator::{Operator, SetupLink};
 use hennery_sessions::{AppState, store::Store};
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -51,8 +50,10 @@ enum HostCommand {
 struct JoinArgs {
     /// The collector's public URL, e.g. https://hennery.example.
     url: String,
-    /// The pairing code shown by the collector (`XXXX-XXXX`).
-    code: String,
+    /// The pairing code shown by the collector (`XXXX-XXXX`). Leave it out
+    /// to type it, or pipe it, on standard input instead: that keeps it out
+    /// of the process list and the shell history.
+    code: Option<String>,
     /// How the collector lists this host; defaults to the host name.
     #[arg(long)]
     name: Option<String>,
@@ -66,10 +67,6 @@ struct CollectorArgs {
     listen: String,
     #[arg(long, env = "HENNERY_DATA_DIR")]
     data_dir: PathBuf,
-    /// Development bearer token for REST clients, until operator auth.
-    /// Hosts authenticate with their paired key instead.
-    #[arg(long, env = "HENNERY_DEV_TOKEN", hide_env_values = true)]
-    dev_token: String,
     /// Presume a host's sessions parked once it has been offline this long.
     #[arg(long, default_value_t = hennery_sessions::offline::OFFLINE_THRESHOLD.as_secs())]
     host_offline_secs: u64,
@@ -108,9 +105,6 @@ struct UpArgs {
     listen: String,
     #[arg(long, env = "HENNERY_DATA_DIR")]
     data_dir: PathBuf,
-    /// The collector's development bearer token for REST clients.
-    #[arg(long, env = "HENNERY_DEV_TOKEN", hide_env_values = true)]
-    dev_token: String,
     #[arg(long = "agent", value_parser = parse_agent)]
     agents: Vec<(String, AgentCommand)>,
     /// Park sessions idle for this many seconds; 0 turns the reaper off.
@@ -163,19 +157,28 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run_collector(args: CollectorArgs) -> Result<()> {
-    // Checked before anything touches the data dir, like `run_up` does.
-    let token = DevToken::new(args.dev_token)?;
+    warn_if_dev_token();
     private_data_dir(&args.data_dir)?;
     let db = args.data_dir.join("hennery.db");
     let store = Store::open(&db)?;
     let hosts = Hosts::open(&db)?;
-    let mut state = AppState::new(store, hosts, token);
+    let operator = Operator::open(&db)?;
+    let mut state = AppState::new(store, hosts, operator);
     state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
     hennery_sessions::offline::after_startup(&state);
     let listener = tokio::net::TcpListener::bind(&args.listen)
         .await
         .with_context(|| format!("bind {}", args.listen))?;
-    tracing::info!(address = %listener.local_addr()?, "collector listening");
+    let address = listener.local_addr()?;
+    tracing::info!(%address, "collector listening");
+    // Only once listening: the link names the port (kernel spec §3.1).
+    let base_url = format!("http://localhost:{}", address.port());
+    if let Some(link) = state
+        .operator
+        .announce_setup(&args.data_dir, &base_url, hennery_kernel::secret::unix_now())?
+    {
+        announce_setup(&link);
+    }
     if let Some(fd) = args.pairing_code_fd {
         // Only once migrated and listening: the host enrolls right away.
         let code = state.hosts.mint_pairing_code(hennery_kernel::secret::unix_now())?;
@@ -199,6 +202,40 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     Ok(())
 }
 
+/// The development bearer's variable, from before 3b-i. Nothing reads it
+/// now; it is still stripped from every child (`HOST_SECRET_VARS`).
+const DEV_TOKEN_VAR: &str = "HENNERY_DEV_TOKEN";
+
+/// Warn, once at start, that `HENNERY_DEV_TOKEN` does nothing any more: a
+/// service definition that still sets it would otherwise look like it
+/// protects something. Its value is never logged.
+fn warn_if_dev_token() {
+    if std::env::var_os(DEV_TOKEN_VAR).is_some() {
+        tracing::warn!(
+            "{DEV_TOKEN_VAR} is set but no longer used: since operator auth (3b-i), operators sign in through \
+             the setup link and a password; remove it from the environment"
+        );
+    }
+}
+
+/// Tell the operator where the setup link is (kernel spec §3.1): the link
+/// itself only to a terminal, so the token never lands in a log collector;
+/// otherwise only the path of the file that holds it.
+fn announce_setup(link: &SetupLink) {
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() {
+        println!(
+            "hennery is not set up yet. Open this link within the hour to set it up:\n  {}",
+            link.url
+        );
+    } else {
+        tracing::info!(
+            file = %link.file.display(),
+            "hennery is not set up yet; the one-time setup link (valid for an hour) is in this file"
+        );
+    }
+}
+
 /// Create `dir`, and any parent it lacks, 0700 whatever the umask: the
 /// collector's database holds what only its user may read (decision 5). A
 /// directory that already exists is the operator's and is left as it is,
@@ -216,14 +253,38 @@ fn private_data_dir(dir: &std::path::Path) -> Result<()> {
 
 async fn join_host(args: JoinArgs) -> Result<()> {
     let name = args.name.unwrap_or_else(hennery_host::pairing::default_name);
-    match hennery_host::pairing::join(&args.url, &args.code, &args.data_dir, &name).await? {
+    let code = match args.code {
+        Some(code) => code,
+        None => read_code_from_stdin()?,
+    };
+    match hennery_host::pairing::join(&args.url, &code, &args.data_dir, &name).await? {
         Joined::Paired { host_id } => println!("paired as {host_id}"),
         Joined::AlreadyPaired { host_id } => println!("already paired as {host_id}; nothing to do"),
     }
     Ok(())
 }
 
+/// One line of standard input, prompted for on a terminal.
+fn read_code_from_stdin() -> Result<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if std::io::stdin().is_terminal() {
+        eprint!("Pairing code: ");
+        std::io::stderr().flush()?;
+    }
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("read the pairing code from standard input")?;
+    let code = line.trim().to_string();
+    if code.is_empty() {
+        bail!("no pairing code: give it after the URL, or on standard input");
+    }
+    Ok(code)
+}
+
 async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
+    warn_if_dev_token();
     let paired = match Paired::load(&args.data_dir)? {
         Some(paired) => {
             // Paired already (kernel spec §4.2): the code is not needed.
@@ -320,9 +381,10 @@ fn host_command(
         .arg(args.idle_timeout_secs.to_string())
         .kill_on_drop(true)
         .process_group(0);
-    // `up` may have the operator's bearer in its own environment; the host
-    // needs none, and its agents must never see it. The adapter spawn strips
-    // the same list again, for a host started by hand.
+    // `up` may still have the old development token in its environment (a
+    // shell set up before it was removed); the host needs none, and its
+    // agents must never see it. The adapter spawn strips the same list
+    // again, for a host started by hand.
     for var in hennery_host::adapter::HOST_SECRET_VARS {
         host_cmd.env_remove(var);
     }
@@ -344,8 +406,7 @@ fn host_command(
 /// 11, A1) — restart policy for a genuine crash comes with the distribution
 /// work.
 async fn run_up(args: UpArgs) -> Result<()> {
-    // Checked here too, so a bad token stops `up` before any child starts.
-    DevToken::new(args.dev_token.clone())?;
+    warn_if_dev_token();
     let exe = std::env::current_exe()?;
     let host_dir = args.data_dir.join("host");
     // Computed and validated before any child starts: a non-loopback
@@ -371,7 +432,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
         .args(["collector", "--listen", &args.listen])
         .arg("--data-dir")
         .arg(args.data_dir.join("collector"))
-        .env("HENNERY_DEV_TOKEN", &args.dev_token)
+        // `up` has warned about it already; the collector has no use for it.
+        .env_remove(DEV_TOKEN_VAR)
         .kill_on_drop(true)
         .process_group(0);
     if let Some((_, writer)) = &pairing {
@@ -434,15 +496,15 @@ async fn run_up(args: UpArgs) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Final review I1: `up` may itself have been given the operator's
-    /// bearer in its environment (`HENNERY_DEV_TOKEN`); its host child must
-    /// not inherit it, so neither can any agent that host runs.
+    /// Final review I1: `up` may itself have the old operator bearer in its
+    /// environment (`HENNERY_DEV_TOKEN`, left in a shell from before 3b);
+    /// its host child must not inherit it, so neither can any agent that
+    /// host runs.
     #[test]
     fn ups_host_child_does_not_inherit_the_operator_token() {
         let args = UpArgs {
             listen: "127.0.0.1:7117".into(),
             data_dir: "/nonexistent".into(),
-            dev_token: "dev-token-for-tests".into(),
             agents: Vec::new(),
             idle_timeout_secs: 0,
         };

@@ -11,8 +11,8 @@
 
 use futures::{SinkExt, StreamExt};
 use hennery_host::identity::HostKey;
-use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::{Enrollment, Hosts};
+use hennery_kernel::operator::Operator;
 use hennery_proto::frames::{Capabilities, CollectorFrame, HostFrame, SessionBody};
 use hennery_proto::rest::HostItem;
 use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION};
@@ -21,12 +21,6 @@ use hennery_sessions::store::Store;
 use serde_json::json;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
-
-const TOKEN: &str = "dev-token-for-tests";
-
-fn bearer() -> String {
-    format!("Bearer {TOKEN}")
-}
 
 fn host_key() -> HostKey {
     HostKey::from_seed([1; 32])
@@ -53,7 +47,7 @@ async fn a_failed_ingest_drops_the_connection_instead_of_acking_past_it() {
     let store = Store::open(&db).unwrap();
     store.create_session("s1", "host-1", "fake", "/tmp").unwrap();
 
-    let state = AppState::new(store, paired_hosts(), DevToken::new(TOKEN).unwrap());
+    let state = AppState::new(store, paired_hosts(), Operator::open_in_memory().unwrap());
     let shutdown = state.shutdown.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -144,10 +138,11 @@ async fn an_undo_error_answers_delivery_unknown_and_drops_the_connection() {
     let db = dir.path().join("hennery.db");
     let store = Store::open(&db).unwrap();
 
-    let state = AppState::new(store, paired_hosts(), DevToken::new(TOKEN).unwrap());
+    let state = AppState::new(store, paired_hosts(), Operator::open_in_memory().unwrap());
     let shutdown = state.shutdown.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let client = hennery_testkit::operator_client(&state.operator);
     let server = tokio::spawn(hennery_sessions::serve(listener, state));
 
     let (ws, response) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/hosts/ws"))
@@ -180,19 +175,10 @@ async fn an_undo_error_answers_delivery_unknown_and_drops_the_connection() {
 
     // The host is not `ready` until `resend_complete` is processed: wait for
     // it via `/api/hosts` rather than racing the HTTP call below against it.
-    let client = reqwest::Client::new();
     let hosts_url = format!("http://{addr}/api/hosts");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let hosts: Vec<HostItem> = client
-            .get(&hosts_url)
-            .header("authorization", bearer())
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
+        let hosts: Vec<HostItem> = client.get(&hosts_url).send().await.unwrap().json().await.unwrap();
         if hosts.iter().any(|h| h.host_id == "host-1" && h.connected) {
             break;
         }
@@ -206,7 +192,6 @@ async fn an_undo_error_answers_delivery_unknown_and_drops_the_connection() {
         async move {
             client
                 .post(url)
-                .header("authorization", bearer())
                 .json(&json!({ "host_id": "host-1", "agent": "fake", "cwd": "/tmp" }))
                 .send()
                 .await
@@ -279,7 +264,6 @@ async fn an_undo_error_answers_delivery_unknown_and_drops_the_connection() {
     // left it, not failed with the host's (wrong) rejection code.
     let detail: serde_json::Value = client
         .get(format!("http://{addr}/api/sessions/{session_id}"))
-        .header("authorization", bearer())
         .send()
         .await
         .unwrap()

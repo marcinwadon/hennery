@@ -208,3 +208,30 @@ connected: boolean,
  * RFC 3339.
  */
 created_at: string, last_seen_at?: string | undefined, revoked_at?: string | undefined, };
+
+export type SetupRequest = { token: string, password: string, 
+/**
+ * `https://…`, or `http://` to a loopback address; an origin only.
+ */
+public_url: string, };
+
+export type SetupResponse = { public_url: string, };
+
+export type LoginRequest = { password: string, };
+
+export type StepUpRequest = { password: string, };
+
+export type AuthSessionItem = { 
+/**
+ * What `DELETE /api/auth/sessions/{id}` takes: the SHA-256 of the
+ * session's token, never the token.
+ */
+id: string, user_agent: string, 
+/**
+ * RFC 3339.
+ */
+created_at: string, last_seen_at: string, expires_at: string, 
+/**
+ * The session this request came with.
+ */
+current: boolean, };

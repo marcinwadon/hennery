@@ -3,13 +3,14 @@
 use crate::AppState;
 use crate::hub::{RequestError, Undo};
 use crate::store::{AnswerSubmission, ResumeRequest, Store};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router, middleware};
+use axum::{Json, Router};
 use futures::stream::{self, Stream, StreamExt};
+use hennery_kernel::operator::Authenticated;
 use hennery_proto::frames::{Capability, CollectorFrame, Indexed, SessionBody};
 use hennery_proto::rest::{
     AnswerRequest, AnswerResponse, ApiError, CancelResponse, ConfigRequest, EventDto, LifecycleResponse, OpenTurn,
@@ -47,8 +48,9 @@ const _: () = assert!(
     "every request timeout must exceed the host connection's read deadline"
 );
 
+/// Every route here is an operator's (kernel spec §3.3).
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let routes = Router::new()
         .route("/api/sessions", post(start_session))
         .route("/api/sessions/{id}", get(session_detail))
         .route("/api/sessions/{id}/resume", post(resume))
@@ -60,12 +62,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/{id}/config", post(set_config))
         .route("/api/sessions/{id}/pending/{pending_id}/answer", post(answer))
         .route("/api/sessions/{id}/events", get(events))
-        .route("/api/stream/sessions/{id}", get(stream_session))
-        .layer(middleware::from_fn_with_state(
-            state.token.clone(),
-            hennery_kernel::auth::require_bearer,
-        ))
-        .with_state(state)
+        .route("/api/stream/sessions/{id}", get(stream_session));
+    hennery_kernel::auth::operator_only(routes, state.operator.clone()).with_state(state)
 }
 
 pub(crate) fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
@@ -661,9 +659,12 @@ fn catalog_in(e: &EventDto) -> Option<SessionCatalog> {
     SessionCatalog::from_indexed(&e.session_id, &indexed)
 }
 
-/// Session stream: replays from `Last-Event-ID`, then follows live events.
+/// The session's events as SSE: replays from `Last-Event-ID`, then follows
+/// live events, until the collector shuts down or the operator's session
+/// that opened it ends (3b decision 7).
 async fn stream_session(
     State(state): State<AppState>,
+    Extension(operator_session): Extension<Authenticated>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -700,6 +701,10 @@ async fn stream_session(
         .flat_map(stream::iter);
     let stream = replay
         .chain(follow)
-        .take_until(state.shutdown.clone().cancelled_owned());
+        .take_until(state.shutdown.clone().cancelled_owned())
+        .take_until(hennery_kernel::auth::session_ended(
+            state.operator.clone(),
+            operator_session,
+        ));
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }

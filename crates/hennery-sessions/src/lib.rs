@@ -8,8 +8,8 @@ pub mod store;
 pub mod ws;
 
 use axum::Router;
-use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::Hosts;
+use hennery_kernel::operator::Operator;
 use hennery_kernel::ratelimit::{Limiter, Policy};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,10 +21,11 @@ pub struct AppState {
     pub store: Arc<store::Store>,
     /// The kernel's host registry (kernel spec §4).
     pub hosts: Arc<Hosts>,
+    /// The owner, their sessions and setup (kernel spec §3).
+    pub operator: Arc<Operator>,
     /// Wrong pairing codes per client address (kernel spec §4.1).
     pub enroll_limiter: Arc<Limiter>,
     pub hub: Arc<hub::Hub>,
-    pub token: DevToken,
     /// Cancelled on shutdown; long-lived handlers (host sockets, SSE) end
     /// when it fires so graceful shutdown completes.
     pub shutdown: CancellationToken,
@@ -33,13 +34,13 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(store: store::Store, hosts: Hosts, token: DevToken) -> Self {
+    pub fn new(store: store::Store, hosts: Hosts, operator: Operator) -> Self {
         Self {
             store: Arc::new(store),
             hosts: Arc::new(hosts),
+            operator: Arc::new(operator),
             enroll_limiter: Arc::new(Limiter::new(Policy::ENROLL)),
             hub: Arc::new(hub::Hub::new()),
-            token,
             shutdown: CancellationToken::new(),
             offline_threshold: offline::OFFLINE_THRESHOLD,
         }
@@ -70,11 +71,12 @@ pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> std::i
     .await
 }
 
-/// Every session and host route plus the host WebSocket. Serve it with
+/// Every session, host and operator route plus the host WebSocket. Serve it with
 /// `into_make_service_with_connect_info::<SocketAddr>()`: enrollment reads
 /// the client's address.
 pub fn router(state: AppState) -> Router {
     api::router(state.clone())
         .merge(hosts::router(state.clone()))
+        .merge(hennery_kernel::auth_api::router(state.operator.clone()))
         .merge(ws::router(state))
 }

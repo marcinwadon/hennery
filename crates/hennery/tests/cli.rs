@@ -55,8 +55,8 @@ fn joining_over_http_ignores_a_configured_proxy() {
         let db = dir.join("hennery.db");
         let store = hennery_sessions::store::Store::open(&db).unwrap();
         let hosts = hennery_kernel::hosts::Hosts::open(&db).unwrap();
-        let token = hennery_kernel::auth::DevToken::new("dev-token-for-tests").unwrap();
-        let state = hennery_sessions::AppState::new(store, hosts, token);
+        let operator = hennery_kernel::operator::Operator::open(&db).unwrap();
+        let state = hennery_sessions::AppState::new(store, hosts, operator);
         let code = state
             .hosts
             .mint_pairing_code(hennery_kernel::secret::unix_now())
@@ -109,39 +109,83 @@ fn a_malformed_agent_flag_is_rejected() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("name=command"));
 }
 
+/// Plan 3b: the development bearer is gone. `--dev-token` is refused, not
+/// ignored, so a service still configured with it fails loudly.
 #[test]
-fn a_short_dev_token_is_refused_at_start() {
-    let dir = std::env::temp_dir().join(format!("hennery-cli-short-token-{}", std::process::id()));
+fn the_development_token_flag_is_gone() {
     for command in ["collector", "up"] {
         let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
-            .args([command, "--listen", "127.0.0.1:0", "--dev-token", "short"])
-            .arg("--data-dir")
-            .arg(&dir)
+            .args([command, "--dev-token", "dev-token-for-tests"])
+            .args(["--data-dir", "/nonexistent/hennery-cli-dev-token"])
             .output()
             .unwrap();
-        assert!(!out.status.success(), "{command} started with a short token");
+        assert!(!out.status.success(), "{command} took --dev-token");
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("at least 16 characters"), "{command}: {stderr}");
+        assert!(
+            stderr.contains("unexpected argument '--dev-token'"),
+            "{command}: {stderr}"
+        );
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// `collector` must reject a short dev token before it does anything to the
-/// data directory: `run_up` already validates first (checked above), and
-/// `run_collector` must too, the same way — not only after opening the
-/// store and the host registry there.
+/// What `collector`, `up` and `host run` log once when `HENNERY_DEV_TOKEN`
+/// is still set.
+const DEV_TOKEN_WARNING: &str = "HENNERY_DEV_TOKEN is set but no longer used";
+
+/// Plan 3b: an operator whose shell or service still sets the old bearer is
+/// told once, at start, that it does nothing now, and its value is never
+/// printed. Each command here stops early (no data directory can be made,
+/// the listen address is refused, no pairing is stored), so none binds a
+/// port: the warning comes before any of that.
 #[test]
-fn a_short_dev_token_stops_the_collector_before_it_touches_the_data_dir() {
-    let dir = std::env::temp_dir().join(format!("hennery-cli-token-first-{}", std::process::id()));
+fn the_development_token_in_the_environment_is_warned_about_and_never_printed() {
+    const TOKEN: &str = "old-dev-token-still-exported";
+    let dir = std::env::temp_dir().join(format!("hennery-cli-devtokenwarn-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
-        .args(["collector", "--listen", "127.0.0.1:0", "--dev-token", "short"])
-        .arg("--data-dir")
-        .arg(&dir)
-        .output()
-        .unwrap();
-    assert!(!out.status.success());
-    assert!(!dir.exists(), "the data dir was created before the token was validated");
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveDir(dir.clone());
+    let host_dir = dir.join("host");
+    std::fs::create_dir_all(&host_dir).unwrap();
+    // A data directory under a regular file cannot be made by any user,
+    // root included (ENOTDIR), so the collector stops before it binds.
+    let not_a_dir = dir.join("file");
+    std::fs::write(&not_a_dir, b"").unwrap();
+    let runs: [(&str, Vec<std::ffi::OsString>); 3] = [
+        (
+            "collector",
+            vec!["collector".into(), "--data-dir".into(), not_a_dir.join("data").into()],
+        ),
+        (
+            "up",
+            vec![
+                "up".into(),
+                "--listen".into(),
+                "203.0.113.5:7117".into(),
+                "--data-dir".into(),
+                dir.join("up").into(),
+            ],
+        ),
+        (
+            "host run",
+            vec!["host".into(), "run".into(), "--data-dir".into(), host_dir.into()],
+        ),
+    ];
+    for (name, args) in runs {
+        let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+            .args(args)
+            .env("HENNERY_DEV_TOKEN", TOKEN)
+            .env("RUST_LOG", "info")
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!out.status.success(), "{name} was meant to stop early: {text}");
+        assert_eq!(text.matches(DEV_TOKEN_WARNING).count(), 1, "{name}: {text}");
+        assert!(!text.contains(TOKEN), "{name} printed the token: {text}");
+    }
 }
 
 /// Kills this test's `up` process tree and removes its scratch dir
@@ -216,11 +260,7 @@ fn sigint_to_ups_process_group_still_shuts_down_cleanly() {
     std::fs::create_dir_all(&dir).unwrap();
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
-    command
-        .args(["up", "--listen", &listen])
-        .arg("--data-dir")
-        .arg(&dir)
-        .args(["--dev-token", "dev-token-for-tests"]);
+    command.args(["up", "--listen", &listen]).arg("--data-dir").arg(&dir);
     // SAFETY: setpgid(0, 0) in the child, right after fork and before exec,
     // just makes it (and so `up`) the leader of a brand-new process group —
     // async-signal-safe and exactly what a shell does for a foreground job.
@@ -311,14 +351,50 @@ fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> Opti
     }
 }
 
-/// `GET path` on the collector with the development bearer: the JSON body
-/// of a 200, else `None`.
-fn get_json(listen: &str, path: &str, token: &str) -> Option<serde_json::Value> {
+/// The owner's password in these tests' collectors.
+const PASSWORD: &str = "correct horse battery";
+
+/// Set up the collector whose data directory is `collector_dir` through its
+/// `setup-url` (kernel spec §3.1), with `http://<listen>` as `public_url`,
+/// and return the session token the setup signed the owner in with.
+fn sign_in(listen: &str, collector_dir: &std::path::Path) -> String {
+    let file = collector_dir.join("setup-url");
+    wait_until("the setup link", || file.exists());
+    let url = std::fs::read_to_string(&file).unwrap();
+    // `…/setup#<token>`: the token is the fragment (3b decision 16).
+    let token = url.trim_end().rsplit_once('#').unwrap().1;
+    let origin = format!("http://{listen}");
+    let body = serde_json::json!({ "token": token, "password": PASSWORD, "public_url": origin }).to_string();
+    let mut stream = TcpStream::connect(listen).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    write!(
+        stream,
+        "POST /api/setup HTTP/1.1\r\nHost: {listen}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    assert!(response.starts_with("HTTP/1.1 201"), "{response}");
+    response
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            let value = value.trim().strip_prefix("hennery_session=")?;
+            name.eq_ignore_ascii_case("set-cookie")
+                .then(|| value.split(';').next().unwrap().to_string())
+        })
+        .unwrap_or_else(|| panic!("no session cookie: {response}"))
+}
+
+/// `GET path` on the collector with the owner's `session`: the JSON body of
+/// a 200, else `None`.
+fn get_json(listen: &str, path: &str, session: &str) -> Option<serde_json::Value> {
     let mut stream = TcpStream::connect(listen).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     write!(
         stream,
-        "GET {path} HTTP/1.1\r\nHost: {listen}\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {listen}\r\nCookie: hennery_session={session}\r\nConnection: close\r\n\r\n"
     )
     .ok()?;
     let mut response = String::new();
@@ -346,13 +422,14 @@ impl Drop for RemoveDir {
 }
 
 /// Start `up`, wait until its host is connected, and return the connected
-/// host ids. The returned guard stops the whole tree (and leaves `dir`).
-fn up_until_connected(listen: &str, dir: &std::path::Path) -> (KillTree, Vec<String>) {
+/// host ids and the owner's session: `session`, or else a new one from
+/// setting the collector up. The returned guard stops the whole tree (and
+/// leaves `dir`).
+fn up_until_connected(listen: &str, dir: &std::path::Path, session: Option<&str>) -> (KillTree, Vec<String>, String) {
     let up = Command::new(env!("CARGO_BIN_EXE_hennery"))
         .args(["up", "--listen", listen])
         .arg("--data-dir")
         .arg(dir)
-        .args(["--dev-token", "dev-token-for-tests"])
         .spawn()
         .unwrap();
     let guard = KillTree {
@@ -360,16 +437,20 @@ fn up_until_connected(listen: &str, dir: &std::path::Path) -> (KillTree, Vec<Str
         dir: std::path::PathBuf::new(),
         children: Vec::new(),
     };
+    let session = match session {
+        Some(session) => session.to_string(),
+        None => sign_in(listen, &dir.join("collector")),
+    };
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if let Some(serde_json::Value::Array(hosts)) = get_json(listen, "/api/hosts", "dev-token-for-tests")
+        if let Some(serde_json::Value::Array(hosts)) = get_json(listen, "/api/hosts", &session)
             && hosts.iter().any(|h| h["connected"] == true)
         {
             let ids = hosts
                 .iter()
                 .filter_map(|h| h["host_id"].as_str().map(str::to_string))
                 .collect();
-            return (guard, ids);
+            return (guard, ids, session);
         }
         assert!(Instant::now() < deadline, "the all-in-one host never connected");
         std::thread::sleep(Duration::from_millis(50));
@@ -391,7 +472,7 @@ fn up_pairs_its_own_host_once() {
     let _cleanup = RemoveDir(dir.clone());
     let host_dir = dir.join("host");
 
-    let (mut first, ids) = up_until_connected(&listen, &dir);
+    let (mut first, ids, session) = up_until_connected(&listen, &dir, None);
     assert_eq!(ids.len(), 1, "{ids:?}");
     assert!(ids[0].starts_with("host-"), "{ids:?}");
     let key = std::fs::read(host_dir.join("host.key")).unwrap();
@@ -399,24 +480,25 @@ fn up_pairs_its_own_host_once() {
     unsafe { libc::kill(first.up.id() as i32, libc::SIGTERM) };
     assert!(wait_with_timeout(&mut first.up, Duration::from_secs(15)).is_some());
 
-    let (_second, again) = up_until_connected(&free_listen(), &dir);
+    // Set up already: the session from the first run still holds.
+    let (_second, again, _) = up_until_connected(&free_listen(), &dir, Some(&session));
     assert_eq!(again, ids, "the restart paired a second host");
     assert_eq!(std::fs::read(host_dir.join("host.key")).unwrap(), key);
 }
 
-/// `POST path` with a JSON body, on the collector with the development
-/// bearer. The response is never read past a short timeout: a session start
+/// `POST path` with a JSON body, on the collector with the owner's
+/// `session`, from its `public_url` (`http://<listen>`). The response is never read past a short timeout: a session start
 /// that never finishes (the point of the slow-starting-adapter test below)
 /// may hold the request open, and the pid files it writes are this test's
 /// real readiness signal, not the HTTP response.
-fn post_json(listen: &str, path: &str, token: &str, body: &str) {
+fn post_json(listen: &str, path: &str, session: &str, body: &str) {
     let Ok(mut stream) = TcpStream::connect(listen) else {
         return;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
     let _ = write!(
         stream,
-        "POST {path} HTTP/1.1\r\nHost: {listen}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nHost: {listen}\r\nCookie: hennery_session={session}\r\nOrigin: http://{listen}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let mut discard = [0u8; 1];
@@ -427,13 +509,14 @@ fn pid_from(path: &std::path::Path) -> Option<i32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
-/// `DELETE path` on the collector with the development bearer: the status.
-fn delete(listen: &str, path: &str) -> Option<u16> {
+/// `DELETE path` on the collector with the owner's `session`, from its
+/// `public_url`: the status.
+fn delete(listen: &str, path: &str, session: &str) -> Option<u16> {
     let mut stream = TcpStream::connect(listen).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(15))).ok()?;
     write!(
         stream,
-        "DELETE {path} HTTP/1.1\r\nHost: {listen}\r\nAuthorization: Bearer dev-token-for-tests\r\nConnection: close\r\n\r\n"
+        "DELETE {path} HTTP/1.1\r\nHost: {listen}\r\nCookie: hennery_session={session}\r\nOrigin: http://{listen}\r\nConnection: close\r\n\r\n"
     )
     .ok()?;
     let mut response = String::new();
@@ -452,7 +535,6 @@ fn up_logging_to_with(listen: &str, dir: &std::path::Path, log: &std::path::Path
         .args(["up", "--listen", listen])
         .arg("--data-dir")
         .arg(dir)
-        .args(["--dev-token", "dev-token-for-tests"])
         .args(extra)
         .stdout(std::fs::File::create(log).unwrap())
         .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
@@ -507,9 +589,10 @@ fn a_revoked_all_in_one_host_leaves_the_collector_serving() {
 
     let log = dir.join("first.log");
     let mut first = up_logging_to(&listen, &dir.join("data"), &log);
+    let session = sign_in(&listen, &dir.join("data").join("collector"));
     let mut host_id = String::new();
     wait_until("the host connected", || {
-        let Some(serde_json::Value::Array(hosts)) = get_json(&listen, "/api/hosts", "dev-token-for-tests") else {
+        let Some(serde_json::Value::Array(hosts)) = get_json(&listen, "/api/hosts", &session) else {
             return false;
         };
         match hosts.first() {
@@ -520,10 +603,10 @@ fn a_revoked_all_in_one_host_leaves_the_collector_serving() {
             _ => false,
         }
     });
-    assert_eq!(delete(&listen, &format!("/api/hosts/{host_id}")), Some(200));
+    assert_eq!(delete(&listen, &format!("/api/hosts/{host_id}"), &session), Some(200));
     wait_until("the revoke logged", || revoked_logged(&log));
     assert!(first.up.try_wait().unwrap().is_none(), "up exited with its host");
-    let hosts = get_json(&listen, "/api/hosts", "dev-token-for-tests").expect("the collector still serves");
+    let hosts = get_json(&listen, "/api/hosts", &session).expect("the collector still serves");
     assert!(hosts[0]["revoked_at"].is_string(), "{hosts}");
     let text = std::fs::read_to_string(&log).unwrap();
     assert!(text.contains("host.key") && text.contains("host.toml"), "{text}");
@@ -534,7 +617,7 @@ fn a_revoked_all_in_one_host_leaves_the_collector_serving() {
     let log = dir.join("second.log");
     let mut second = up_logging_to(&listen, &dir.join("data"), &log);
     wait_until("the revoke logged again", || revoked_logged(&log));
-    assert!(get_json(&listen, "/api/hosts", "dev-token-for-tests").is_some());
+    assert!(get_json(&listen, "/api/hosts", &session).is_some());
     assert!(second.up.try_wait().unwrap().is_none());
 }
 
@@ -567,7 +650,6 @@ fn a_non_loopback_listen_is_refused_and_touches_neither_data_dir() {
         .args(["up", "--listen", "203.0.113.5:7117"])
         .arg("--data-dir")
         .arg(&dir)
-        .args(["--dev-token", "dev-token-for-tests"])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -610,7 +692,6 @@ fn a_failed_pairing_code_write_is_logged_without_the_code_and_does_not_kill_the_
     cmd.args(["collector", "--listen", &listen])
         .arg("--data-dir")
         .arg(dir.join("data"))
-        .args(["--dev-token", "dev-token-for-tests"])
         .args(["--pairing-code-fd", "3"])
         .stdout(std::fs::File::create(&log).unwrap())
         .stderr(std::fs::File::create(log.with_extension("err")).unwrap());
@@ -634,8 +715,9 @@ fn a_failed_pairing_code_write_is_logged_without_the_code_and_does_not_kill_the_
         children: Vec::new(),
     };
 
+    let session = sign_in(&listen, &dir.join("data"));
     wait_until("the collector serving", || {
-        get_json(&listen, "/api/hosts", "dev-token-for-tests").is_some()
+        get_json(&listen, "/api/hosts", &session).is_some()
     });
     assert!(
         guard.up.try_wait().unwrap().is_none(),
@@ -723,10 +805,11 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
         &log,
         &["--agent", &format!("slow=/bin/sh {}", script.display())],
     );
+    let session = sign_in(&listen, &dir.join("data").join("collector"));
 
     let mut host_id = String::new();
     wait_until("the host connected", || {
-        let Some(serde_json::Value::Array(hosts)) = get_json(&listen, "/api/hosts", "dev-token-for-tests") else {
+        let Some(serde_json::Value::Array(hosts)) = get_json(&listen, "/api/hosts", &session) else {
             return false;
         };
         match hosts.first() {
@@ -741,7 +824,7 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
     post_json(
         &listen,
         "/api/sessions",
-        "dev-token-for-tests",
+        &session,
         &serde_json::json!({ "host_id": host_id, "agent": "slow", "cwd": dir }).to_string(),
     );
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -754,7 +837,7 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
     };
     assert!(pid_alive(grandchild), "the grandchild died before the revoke");
 
-    assert_eq!(delete(&listen, &format!("/api/hosts/{host_id}")), Some(200));
+    assert_eq!(delete(&listen, &format!("/api/hosts/{host_id}"), &session), Some(200));
     // Generous: a reconnect (up to ~1s of backoff) plus `shut_down`'s ~6s
     // bound, with slack for four parallel copies of this binary.
     let deadline = Instant::now() + Duration::from_secs(40);
@@ -782,10 +865,9 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
     assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
 }
 
-/// Final review I1: an operator who gives `up` its bearer through the
-/// environment (`HENNERY_DEV_TOKEN`, as the flag's `env` allows) must not
-/// hand it to the host child, nor through it to any agent. Every other CLI
-/// test passes `--dev-token`, which is why nothing caught this before.
+/// Final review I1: an operator whose shell still exports the old bearer
+/// (`HENNERY_DEV_TOKEN`, from before 3b removed it) must not hand it to the
+/// host child, nor through it to any agent.
 ///
 /// The agent is a shell script that dumps its environment, and whether it
 /// holds a descriptor 3 (the pairing pipe's number in the host child), then
@@ -846,6 +928,7 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
         .arg(format!("envdump=/bin/sh {}", script.display()))
         .env("HENNERY_DEV_TOKEN", TOKEN)
         .env("HENNERY_AGENT_MAY_SEE", "yes")
+        .env("RUST_LOG", "info")
         .stdout(std::fs::File::create(&log).unwrap())
         .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
         .spawn()
@@ -856,9 +939,10 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
         children: Vec::new(),
     };
 
+    let session = sign_in(&listen, &dir.join("data").join("collector"));
     let mut host_id = String::new();
     wait_until("the host connected", || {
-        let Some(serde_json::Value::Array(hosts)) = get_json(&listen, "/api/hosts", TOKEN) else {
+        let Some(serde_json::Value::Array(hosts)) = get_json(&listen, "/api/hosts", &session) else {
             return false;
         };
         match hosts.first() {
@@ -872,7 +956,7 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     post_json(
         &listen,
         "/api/sessions",
-        TOKEN,
+        &session,
         &serde_json::json!({ "host_id": host_id, "agent": "envdump", "cwd": dir }).to_string(),
     );
     wait_until("the agent's report", || report("env.txt").exists());
@@ -890,6 +974,11 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
 
     unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
     assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
+    // `up` warns once; its collector child is not handed the variable, so
+    // it does not warn again; and neither prints the value.
+    let output = std::fs::read_to_string(&log).unwrap() + &std::fs::read_to_string(log.with_extension("err")).unwrap();
+    assert_eq!(output.matches(DEV_TOKEN_WARNING).count(), 1, "{output}");
+    assert!(!output.contains(TOKEN), "up printed the operator token: {output}");
 }
 
 /// `hennery` under `umask 022`, the usual default, which would leave a new
@@ -911,13 +1000,13 @@ fn mode_of(path: &std::path::Path) -> u32 {
 }
 
 /// Start `hennery collector` under `umask 022` on `data`, logging to `log`,
-/// and wait until it serves.
+/// and wait until it serves: a new collector writes its setup link once it
+/// listens.
 fn collector_under_umask_022(listen: &str, data: &std::path::Path, log: &std::path::Path) -> KillTree {
     let collector = under_umask_022()
         .args(["collector", "--listen", listen])
         .arg("--data-dir")
         .arg(data)
-        .args(["--dev-token", "dev-token-for-tests"])
         .stdout(std::fs::File::create(log).unwrap())
         .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
         .spawn()
@@ -928,7 +1017,7 @@ fn collector_under_umask_022(listen: &str, data: &std::path::Path, log: &std::pa
         children: Vec::new(),
     };
     wait_until("the collector serving", || {
-        get_json(listen, "/api/hosts", "dev-token-for-tests").is_some()
+        data.join("setup-url").exists() && TcpStream::connect(listen).is_ok()
     });
     guard
 }
@@ -1020,7 +1109,6 @@ fn ups_data_root_is_private_to_its_user() {
         .args(["up", "--listen", &listen])
         .arg("--data-dir")
         .arg(&root)
-        .args(["--dev-token", "dev-token-for-tests"])
         .stdout(std::fs::File::create(&log).unwrap())
         .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
         .spawn()
@@ -1030,8 +1118,9 @@ fn ups_data_root_is_private_to_its_user() {
         dir: std::path::PathBuf::new(),
         children: Vec::new(),
     };
+    let session = sign_in(&listen, &root.join("collector"));
     wait_until("the host connected", || {
-        get_json(&listen, "/api/hosts", "dev-token-for-tests").is_some_and(|hosts| {
+        get_json(&listen, "/api/hosts", &session).is_some_and(|hosts| {
             hosts
                 .as_array()
                 .is_some_and(|h| h.iter().any(|h| h["connected"] == true))
@@ -1075,4 +1164,99 @@ fn up_warns_about_a_loose_existing_data_root() {
     assert_eq!(mode_of(&root), 0o755, "the operator's directory was changed");
     unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
     assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
+}
+
+/// Kernel spec §3.1: a collector that is not set up writes its one-time
+/// setup link to `setup-url` (0600, under `umask 022` too) and, its output
+/// not being a terminal, logs only that file's path: the token itself must
+/// never reach a log collector.
+#[test]
+fn an_unset_collector_writes_its_setup_link_to_a_private_file_and_never_to_its_output() {
+    let listen = free_listen();
+    let dir = std::env::temp_dir().join(format!(
+        "hennery-cli-setup-{}-{}",
+        std::process::id(),
+        listen.replace(':', "-")
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    let log = dir.join("collector.log");
+
+    let mut collector = collector_under_umask_022(&listen, &data, &log);
+    let file = data.join("setup-url");
+    assert_eq!(mode_of(&file), 0o600);
+    let url = std::fs::read_to_string(&file).unwrap();
+    let port = listen.rsplit(':').next().unwrap();
+    let token = url
+        .trim_end()
+        .strip_prefix(&format!("http://localhost:{port}/setup#"))
+        .unwrap_or_else(|| panic!("{url}"));
+    assert_eq!(token.len(), 64, "{url}");
+    unsafe { libc::kill(collector.up.id() as i32, libc::SIGTERM) };
+    assert!(wait_with_timeout(&mut collector.up, Duration::from_secs(15)).is_some());
+
+    let stdout = std::fs::read_to_string(&log).unwrap();
+    let stderr = std::fs::read_to_string(log.with_extension("err")).unwrap();
+    assert!(
+        !stdout.contains(token) && !stderr.contains(token),
+        "the setup token was logged"
+    );
+    assert!(stdout.contains(&file.display().to_string()), "{stdout}");
+}
+
+/// 3a's deferred M5: a pairing code on the command line is in the process
+/// list and the shell history, so `host join` also takes it on standard
+/// input when it is left out, and refuses an empty one.
+#[test]
+fn join_reads_the_code_from_standard_input_when_it_is_left_out() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = std::env::temp_dir().join(format!("hennery-cli-stdin-code-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveDir(dir.clone());
+    let (addr, code) = rt.block_on(async {
+        let db = dir.join("hennery.db");
+        let state = hennery_sessions::AppState::new(
+            hennery_sessions::store::Store::open(&db).unwrap(),
+            hennery_kernel::hosts::Hosts::open(&db).unwrap(),
+            hennery_kernel::operator::Operator::open(&db).unwrap(),
+        );
+        let code = state
+            .hosts
+            .mint_pairing_code(hennery_kernel::secret::unix_now())
+            .unwrap()
+            .code;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(hennery_sessions::serve(listener, state));
+        (addr, code)
+    });
+    let join = |stdin: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_hennery"))
+            .args(["host", "join", &format!("http://{addr}"), "--name", "laptop"])
+            .arg("--data-dir")
+            .arg(dir.join("host"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    let empty = join("\n");
+    assert!(!empty.status.success());
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("no pairing code"));
+
+    let out = join(&format!("{code}\n"));
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("paired as"));
 }

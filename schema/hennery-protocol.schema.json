@@ -91,6 +91,41 @@
       ],
       "type": "object"
     },
+    "AuthSessionItem": {
+      "description": "One entry of `GET /api/auth/sessions` (kernel spec §3.2): a signed-in\ndevice, most recently used first.",
+      "properties": {
+        "created_at": {
+          "description": "RFC 3339.",
+          "type": "string"
+        },
+        "current": {
+          "description": "The session this request came with.",
+          "type": "boolean"
+        },
+        "expires_at": {
+          "type": "string"
+        },
+        "id": {
+          "description": "What `DELETE /api/auth/sessions/{id}` takes: the SHA-256 of the\nsession's token, never the token.",
+          "type": "string"
+        },
+        "last_seen_at": {
+          "type": "string"
+        },
+        "user_agent": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "user_agent",
+        "created_at",
+        "last_seen_at",
+        "expires_at",
+        "current"
+      ],
+      "type": "object"
+    },
     "CancelResponse": {
       "description": "`POST /api/sessions/{id}/cancel`: how the open turn ended. Usually\n`cancelled`, but `completed` or `failed` if the turn ended before the\ncancel reached the agent, and `interrupted` if the session was parked or\nclosed while the cancel was outstanding, or its adapter exited.",
       "properties": {
@@ -860,6 +895,18 @@
       ],
       "type": "object"
     },
+    "LoginRequest": {
+      "description": "`POST /api/auth/login` (kernel spec §3.2): the owner's password. 204 and\nthe session cookie on success. `Debug` leaves the password out.",
+      "properties": {
+        "password": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "password"
+      ],
+      "type": "object"
+    },
     "OpenTurn": {
       "description": "A session's open turn, for the detail view.",
       "properties": {
@@ -1493,6 +1540,39 @@
       ],
       "type": "object"
     },
+    "SetupRequest": {
+      "description": "`POST /api/setup` (kernel spec §3.1): the one-time owner setup, with the\ntoken from the setup link. `Debug` leaves the password out.",
+      "properties": {
+        "password": {
+          "type": "string"
+        },
+        "public_url": {
+          "description": "`https://…`, or `http://` to a loopback address; an origin only.",
+          "type": "string"
+        },
+        "token": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "token",
+        "password",
+        "public_url"
+      ],
+      "type": "object"
+    },
+    "SetupResponse": {
+      "description": "201 to a setup: the owner is created and signed in (the session cookie\nis set), and `public_url` is stored as this origin.",
+      "properties": {
+        "public_url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "public_url"
+      ],
+      "type": "object"
+    },
     "StartSessionRequest": {
       "description": "`POST /api/sessions` (ACP core §9): `{host_id, agent, cwd, model?, mode?, axes?}`.",
       "properties": {
@@ -1539,6 +1619,18 @@
       },
       "required": [
         "session_id"
+      ],
+      "type": "object"
+    },
+    "StepUpRequest": {
+      "description": "`POST /api/auth/step-up/password` (kernel spec §3.4): the owner's\npassword again, within a session. 204 on success. `Debug` leaves the\npassword out.",
+      "properties": {
+        "password": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "password"
       ],
       "type": "object"
     },

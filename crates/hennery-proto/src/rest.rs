@@ -261,3 +261,71 @@ pub struct HostItem {
     #[ts(type = "string | undefined", optional)]
     pub revoked_at: Option<String>,
 }
+
+/// `POST /api/setup` (kernel spec §3.1): the one-time owner setup, with the
+/// token from the setup link. `Debug` leaves the password out.
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SetupRequest {
+    pub token: String,
+    pub password: String,
+    /// `https://…`, or `http://` to a loopback address; an origin only.
+    pub public_url: String,
+}
+
+impl std::fmt::Debug for SetupRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SetupRequest")
+            .field("public_url", &self.public_url)
+            .finish_non_exhaustive()
+    }
+}
+
+/// 201 to a setup: the owner is created and signed in (the session cookie
+/// is set), and `public_url` is stored as this origin.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SetupResponse {
+    pub public_url: String,
+}
+
+/// `POST /api/auth/login` (kernel spec §3.2): the owner's password. 204 and
+/// the session cookie on success. `Debug` leaves the password out.
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct LoginRequest {
+    pub password: String,
+}
+
+impl std::fmt::Debug for LoginRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginRequest").finish_non_exhaustive()
+    }
+}
+
+/// `POST /api/auth/step-up/password` (kernel spec §3.4): the owner's
+/// password again, within a session. 204 on success. `Debug` leaves the
+/// password out.
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct StepUpRequest {
+    pub password: String,
+}
+
+impl std::fmt::Debug for StepUpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StepUpRequest").finish_non_exhaustive()
+    }
+}
+
+/// One entry of `GET /api/auth/sessions` (kernel spec §3.2): a signed-in
+/// device, most recently used first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct AuthSessionItem {
+    /// What `DELETE /api/auth/sessions/{id}` takes: the SHA-256 of the
+    /// session's token, never the token.
+    pub id: String,
+    pub user_agent: String,
+    /// RFC 3339.
+    pub created_at: String,
+    pub last_seen_at: String,
+    pub expires_at: String,
+    /// The session this request came with.
+    pub current: bool,
+}

@@ -43,6 +43,11 @@ slice); everything else is design. The maintainer's decisions are recorded below
      pairing codes and enrollment, `hennery host join`, the Ed25519 `hello` proof, `up` pairing its
      own host, and host revoke. Operator auth (3b) and passkeys (3c) follow. Reviewed and amended
      2026-10-01; executed 2026-10-01 (see its "Execution status").
+   - [Operator auth (3b-i)](plans/2026-10-02-operator-auth.md) — the first part of plan 3b (7 tasks):
+     the setup link, the owner's password and `public_url`, login and sessions behind the cookie, the
+     `Origin` rules, step-up, and the development bearer removed. Listeners, `config.toml`, the admin
+     socket and `owner_id` everywhere (3b-ii) follow. Amended after the security review of 2026-10-02;
+     executed 2026-10-02 (see its "Execution status").
 
 ## Maintainer decisions (2026-09-27)
 
