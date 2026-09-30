@@ -918,12 +918,13 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
 /// descriptors 3 to 9 it holds (3 is the pairing pipe's number in the host
 /// child, 4 the listening socket's in the collector child), then exits.
 ///
-/// `up` and the control start with no inherited descriptor above 2: on
-/// macOS, std makes a pipe or socket close-on-exec only after creating it,
-/// so under parallel tests one another thread of this binary is making can
-/// leak into a spawn (in 4 of 96 runs with four copies at once, the
-/// control included). Those are this binary's, not `up`'s, and would pass
-/// on to the agent. A fresh data directory, so this run pairs through that pipe.
+/// `up` itself is started holding descriptor 7 open across `exec`, as a
+/// service manager or a shell can leave one: the host's adapter spawn must
+/// close it too. The control starts with no inherited descriptor above 2:
+/// on macOS, std makes a pipe or socket close-on-exec only after creating
+/// it, so under parallel tests one another thread of this binary is making
+/// can leak into a spawn. A fresh data directory, so this run pairs through
+/// that pipe.
 #[test]
 fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     const TOKEN: &str = "operator-token-from-the-environment";
@@ -977,6 +978,9 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     unsafe {
         command.pre_exec(|| {
             close_leaked_descriptors();
+            if libc::dup2(2, 7) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
