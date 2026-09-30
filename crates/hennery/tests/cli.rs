@@ -781,3 +781,111 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
     unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
     assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
 }
+
+/// Final review I1: an operator who gives `up` its bearer through the
+/// environment (`HENNERY_DEV_TOKEN`, as the flag's `env` allows) must not
+/// hand it to the host child, nor through it to any agent. Every other CLI
+/// test passes `--dev-token`, which is why nothing caught this before.
+///
+/// The agent is a shell script that dumps its environment, and whether it
+/// holds a descriptor 3 (the pairing pipe's number in the host child), then
+/// exits. A fresh data directory, so this run pairs through that pipe.
+#[test]
+fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
+    const TOKEN: &str = "operator-token-from-the-environment";
+    let listen = free_listen();
+    let dir = std::env::temp_dir().join(format!(
+        "hennery-cli-agentenv-{}-{}",
+        std::process::id(),
+        listen.replace(':', "-")
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveDir(dir.clone());
+
+    // Written to temporary names and moved into place, so a reader never
+    // sees half a file.
+    let script = dir.join("envdump.sh");
+    let report = |name: &str| dir.join(name);
+    std::fs::write(
+        &script,
+        format!(
+            "if {{ : <&3; }} 2>/dev/null; then echo open > {fd}.tmp; else echo closed > {fd}.tmp; fi\n\
+             env > {env}.tmp\nmv {fd}.tmp {fd}\nmv {env}.tmp {env}\n",
+            fd = report("fd3.txt").display(),
+            env = report("env.txt").display(),
+        ),
+    )
+    .unwrap();
+
+    // Control: the probe does see a descriptor 3 that is open.
+    let mut control = Command::new("/bin/sh");
+    control.arg(&script);
+    // SAFETY: dup2 in the forked child, before exec; async-signal-safe.
+    unsafe {
+        control.pre_exec(|| {
+            if libc::dup2(1, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    assert!(control.status().unwrap().success());
+    assert_eq!(std::fs::read_to_string(report("fd3.txt")).unwrap().trim(), "open");
+    std::fs::remove_file(report("fd3.txt")).unwrap();
+    std::fs::remove_file(report("env.txt")).unwrap();
+
+    let log = dir.join("up.log");
+    let up = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["up", "--listen", &listen])
+        .arg("--data-dir")
+        .arg(dir.join("data"))
+        .arg("--agent")
+        .arg(format!("envdump=/bin/sh {}", script.display()))
+        .env("HENNERY_DEV_TOKEN", TOKEN)
+        .env("HENNERY_AGENT_MAY_SEE", "yes")
+        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
+        .spawn()
+        .unwrap();
+    let mut up = KillTree {
+        up,
+        dir: std::path::PathBuf::new(),
+        children: Vec::new(),
+    };
+
+    let mut host_id = String::new();
+    wait_until("the host connected", || {
+        let Some(serde_json::Value::Array(hosts)) = get_json(&listen, "/api/hosts", TOKEN) else {
+            return false;
+        };
+        match hosts.first() {
+            Some(h) if h["connected"] == true => {
+                host_id = h["host_id"].as_str().unwrap().to_string();
+                true
+            }
+            _ => false,
+        }
+    });
+    post_json(
+        &listen,
+        "/api/sessions",
+        TOKEN,
+        &serde_json::json!({ "host_id": host_id, "agent": "envdump", "cwd": dir }).to_string(),
+    );
+    wait_until("the agent's report", || report("env.txt").exists());
+
+    let env = std::fs::read_to_string(report("env.txt")).unwrap();
+    // Positive controls: the agent got an environment, `up`'s included.
+    assert!(env.contains("PATH="), "{env}");
+    assert!(env.contains("HENNERY_AGENT_MAY_SEE=yes"), "{env}");
+    assert!(
+        !env.contains("HENNERY_DEV_TOKEN="),
+        "the agent inherited the operator token"
+    );
+    assert!(!env.contains(TOKEN), "the agent inherited the operator token");
+    assert_eq!(std::fs::read_to_string(report("fd3.txt")).unwrap().trim(), "closed");
+
+    unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
+    assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
+}

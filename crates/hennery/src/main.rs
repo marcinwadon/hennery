@@ -287,6 +287,41 @@ fn loopback_url(listen: &str) -> String {
     }
 }
 
+/// `up`'s host child, but for the pairing descriptor (`run_up` adds it).
+fn host_command(
+    exe: &std::path::Path,
+    host_dir: &std::path::Path,
+    collector_ws_url: &str,
+    args: &UpArgs,
+) -> tokio::process::Command {
+    let mut host_cmd = tokio::process::Command::new(exe);
+    host_cmd
+        .args(["host", "run"])
+        .arg("--data-dir")
+        .arg(host_dir)
+        .arg("--collector-url")
+        .arg(collector_ws_url)
+        .arg("--idle-timeout-secs")
+        .arg(args.idle_timeout_secs.to_string())
+        .kill_on_drop(true)
+        .process_group(0);
+    // `up` may have the operator's bearer in its own environment; the host
+    // needs none, and its agents must never see it. The adapter spawn strips
+    // the same list again, for a host started by hand.
+    for var in hennery_host::adapter::HOST_SECRET_VARS {
+        host_cmd.env_remove(var);
+    }
+    for (name, command) in &args.agents {
+        let mut spec = format!("{name}={}", command.program);
+        for a in &command.args {
+            spec.push(' ');
+            spec.push_str(a);
+        }
+        host_cmd.arg("--agent").arg(spec);
+    }
+    host_cmd
+}
+
 /// Two child processes of this binary, exchanging the same frames as a
 /// remote host (architecture spec §3.3). The supervisor exits when the
 /// collector exits, or when the host exits for any reason *other* than a
@@ -329,25 +364,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
             .arg(inherit::CHILD_FD.to_string());
     }
     let mut collector = collector_cmd.spawn()?;
-    let mut host_cmd = tokio::process::Command::new(&exe);
-    host_cmd
-        .args(["host", "run"])
-        .arg("--data-dir")
-        .arg(&host_dir)
-        .arg("--collector-url")
-        .arg(&collector_ws_url)
-        .arg("--idle-timeout-secs")
-        .arg(args.idle_timeout_secs.to_string())
-        .kill_on_drop(true)
-        .process_group(0);
-    for (name, command) in &args.agents {
-        let mut spec = format!("{name}={}", command.program);
-        for a in &command.args {
-            spec.push(' ');
-            spec.push_str(a);
-        }
-        host_cmd.arg("--agent").arg(spec);
-    }
+    let mut host_cmd = host_command(&exe, &host_dir, &collector_ws_url, &args);
     if let Some((reader, _)) = &pairing {
         inherit::pass_to_child(&mut host_cmd, reader);
         host_cmd
@@ -394,4 +411,34 @@ async fn run_up(args: UpArgs) -> Result<()> {
     sigterm(&collector);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), collector.wait()).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Final review I1: `up` may itself have been given the operator's
+    /// bearer in its environment (`HENNERY_DEV_TOKEN`); its host child must
+    /// not inherit it, so neither can any agent that host runs.
+    #[test]
+    fn ups_host_child_does_not_inherit_the_operator_token() {
+        let args = UpArgs {
+            listen: "127.0.0.1:7117".into(),
+            data_dir: "/nonexistent".into(),
+            dev_token: "dev-token-for-tests".into(),
+            agents: Vec::new(),
+            idle_timeout_secs: 0,
+        };
+        let cmd = host_command(
+            std::path::Path::new("/bin/hennery"),
+            std::path::Path::new("/nonexistent/host"),
+            "ws://127.0.0.1:7117/api/hosts/ws",
+            &args,
+        );
+        let removed = cmd
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == "HENNERY_DEV_TOKEN" && value.is_none());
+        assert!(removed, "the host child inherits HENNERY_DEV_TOKEN");
+    }
 }
