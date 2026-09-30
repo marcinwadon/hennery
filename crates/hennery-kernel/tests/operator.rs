@@ -241,3 +241,18 @@ fn a_symlink_at_the_setup_link_is_replaced_and_its_target_left_alone() {
     assert!(!std::fs::symlink_metadata(&link.file).unwrap().file_type().is_symlink());
     assert_eq!(mode(&link.file), 0o600);
 }
+
+/// A failing assertion or a log line that shows a `SetupLink` must not
+/// show the live setup token.
+#[test]
+fn a_setup_link_does_not_show_its_token_in_debug() {
+    let dir = tempfile::tempdir().unwrap();
+    let op = Operator::open_in_memory().unwrap();
+    let link = op
+        .announce_setup(dir.path(), "http://localhost:1", NOW)
+        .unwrap()
+        .unwrap();
+    let token = link.url.rsplit('#').next().unwrap();
+    let shown = format!("{link:?}");
+    assert!(!shown.contains(token) && shown.contains(SETUP_URL_FILE), "{shown}");
+}

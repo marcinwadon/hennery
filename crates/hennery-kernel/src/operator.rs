@@ -111,13 +111,24 @@ struct SetupToken {
     expires_at: i64,
 }
 
-/// Where the setup link was written (`Operator::announce_setup`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Where the setup link was written (`Operator::announce_setup`). `Debug`
+/// leaves the token out: a failing assertion or a log line must not show it.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SetupLink {
     /// `<base>/setup#<token>`: the token in the fragment (3b decision 16).
     pub url: String,
     /// The 0600 file holding `url`.
     pub file: PathBuf,
+}
+
+impl std::fmt::Debug for SetupLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let base = self.url.split('#').next().unwrap_or_default();
+        f.debug_struct("SetupLink")
+            .field("url", &format_args!("{base}#<redacted>"))
+            .field("file", &self.file)
+            .finish()
+    }
 }
 
 pub struct Operator {
