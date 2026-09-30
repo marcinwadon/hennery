@@ -315,6 +315,185 @@ fn dummy_hash() -> &'static str {
     HASH.get_or_init(|| password_auth::generate_hash(hex::encode(random_bytes::<16>())))
 }
 
+/// A signed-in session lives this long past its last use (kernel spec §3.2).
+pub const SESSION_TTL_SECS: i64 = 30 * 24 * 60 * 60;
+
+/// A session's expiry slides at most this often, so a busy client does
+/// not write to the database on every request.
+pub const SESSION_SLIDE_SECS: i64 = 60;
+
+/// A password check is fresh enough for step-up this long (kernel spec
+/// §3.4).
+pub const STEP_UP_SECS: i64 = 5 * 60;
+
+/// The session cookie's name (kernel spec §3.2).
+pub const SESSION_COOKIE: &str = "hennery_session";
+
+/// The longest `User-Agent` kept with a session, in characters.
+const MAX_USER_AGENT: usize = 256;
+
+/// A request's session, once its cookie checks out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Authenticated {
+    /// The session's id: the SHA-256 of its token, as stored.
+    pub session_id: String,
+    pub owner_id: String,
+    pub last_step_up_at: Option<i64>,
+    pub expires_at: i64,
+    /// This request slid the expiry: the cookie is sent again with it.
+    pub slid: bool,
+}
+
+impl Authenticated {
+    /// Whether the last password check was within `STEP_UP_SECS`.
+    pub fn stepped_up(&self, now: i64) -> bool {
+        self.last_step_up_at.is_some_and(|at| now - at < STEP_UP_SECS)
+    }
+}
+
+/// One signed-in session, as Settings lists them (kernel spec §3.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthSession {
+    pub id: String,
+    pub user_agent: String,
+    pub created_at: i64,
+    pub last_seen_at: i64,
+    pub last_step_up_at: Option<i64>,
+    pub expires_at: i64,
+}
+
+impl Operator {
+    /// Open a session for the owner and return its token, the cookie's
+    /// value. Only the token's hash is stored. The password was just
+    /// checked, so the session starts stepped up. `None` before setup.
+    pub fn open_session(&self, user_agent: &str, now: i64) -> Result<Option<String>> {
+        let Some(owner_id) = self.owner_id()? else {
+            return Ok(None);
+        };
+        let token = hex::encode(random_bytes::<32>());
+        let user_agent: String = user_agent
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(MAX_USER_AGENT)
+            .collect();
+        let conn = self.conn();
+        conn.execute("DELETE FROM auth_sessions WHERE expires_at <= ?1", [now])?;
+        conn.execute(
+            "INSERT INTO auth_sessions(id_hash, owner_id, user_agent, created_at, last_seen_at, last_step_up_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?4, ?5)",
+            params![
+                sha256_hex(token.as_bytes()),
+                owner_id,
+                user_agent,
+                now,
+                now + SESSION_TTL_SECS
+            ],
+        )?;
+        Ok(Some(token))
+    }
+
+    /// The live session `token` names, if any. Its expiry slides to
+    /// `SESSION_TTL_SECS` from now, at most every `SESSION_SLIDE_SECS`.
+    pub fn authenticate(&self, token: &str, now: i64) -> Result<Option<Authenticated>> {
+        if token.len() != 64 {
+            return Ok(None);
+        }
+        let id = sha256_hex(token.as_bytes());
+        let conn = self.conn();
+        let row: Option<(String, i64, Option<i64>, i64)> = conn
+            .query_row(
+                "SELECT owner_id, last_seen_at, last_step_up_at, expires_at FROM auth_sessions
+                 WHERE id_hash = ?1 AND expires_at > ?2",
+                params![id, now],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((owner_id, last_seen_at, last_step_up_at, mut expires_at)) = row else {
+            return Ok(None);
+        };
+        let slid = now - last_seen_at >= SESSION_SLIDE_SECS;
+        if slid {
+            expires_at = now + SESSION_TTL_SECS;
+            conn.execute(
+                "UPDATE auth_sessions SET last_seen_at = ?2, expires_at = ?3 WHERE id_hash = ?1",
+                params![id, now, expires_at],
+            )?;
+        }
+        Ok(Some(Authenticated {
+            session_id: id,
+            owner_id,
+            last_step_up_at,
+            expires_at,
+            slid,
+        }))
+    }
+
+    /// Record a fresh password check on a session (kernel spec §3.4).
+    /// Whether the session still exists.
+    pub fn step_up(&self, session_id: &str, now: i64) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE auth_sessions SET last_step_up_at = ?2 WHERE id_hash = ?1",
+            params![session_id, now],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Every live session, most recently used first.
+    pub fn sessions(&self, now: i64) -> Result<Vec<AuthSession>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id_hash, user_agent, created_at, last_seen_at, last_step_up_at, expires_at
+             FROM auth_sessions WHERE expires_at > ?1 ORDER BY last_seen_at DESC, id_hash",
+        )?;
+        let rows = stmt.query_map([now], |r| {
+            Ok(AuthSession {
+                id: r.get(0)?,
+                user_agent: r.get(1)?,
+                created_at: r.get(2)?,
+                last_seen_at: r.get(3)?,
+                last_step_up_at: r.get(4)?,
+                expires_at: r.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// End a session. Whether there was one.
+    pub fn revoke_session(&self, session_id: &str) -> Result<bool> {
+        let changed = self
+            .conn()
+            .execute("DELETE FROM auth_sessions WHERE id_hash = ?1", [session_id])?;
+        Ok(changed > 0)
+    }
+}
+
+/// `Set-Cookie` for a session (kernel spec §3.2): `HttpOnly`,
+/// `SameSite=Strict`, `Path=/`, for `SESSION_TTL_SECS`, and `Secure`
+/// unless `public_url` is loopback `http://`.
+pub fn session_cookie(token: &str, secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}{secure}")
+}
+
+/// `Set-Cookie` that removes the session cookie.
+pub fn cleared_cookie(secure: bool) -> String {
+    let secure = if secure { "; Secure" } else { "" };
+    format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}")
+}
+
+/// The session token in a request's `Cookie` headers, if there is one.
+pub fn session_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get_all(axum::http::header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|pair| {
+            let (name, value) = pair.trim().split_once('=')?;
+            (name == SESSION_COOKIE).then_some(value)
+        })
+}
+
 /// Counts one verify in `Operator::in_flight` for as long as it lives.
 #[cfg(test)]
 struct InFlight<'a>(&'a Operator);
