@@ -3,7 +3,9 @@
 
 pub mod adapter;
 pub mod connection;
+pub mod identity;
 pub mod outbox;
+pub mod pairing;
 pub mod session;
 pub mod uplink;
 

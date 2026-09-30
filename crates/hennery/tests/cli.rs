@@ -16,6 +16,18 @@ fn help_lists_the_skeleton_commands() {
 }
 
 #[test]
+fn host_help_lists_join_and_run() {
+    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["host", "--help"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    for cmd in ["join", "run"] {
+        assert!(text.contains(cmd), "missing {cmd} in help:\n{text}");
+    }
+}
+
+#[test]
 fn a_malformed_agent_flag_is_rejected() {
     let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
         .args([

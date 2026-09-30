@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use axum::response::Html;
 use axum::routing::get;
 use clap::{Args, Parser, Subcommand};
+use hennery_host::pairing::Joined;
 use hennery_host::session::IDLE_TIMEOUT;
 use hennery_host::{AgentCommand, HostConfig};
 use hennery_kernel::auth::DevToken;
@@ -35,8 +36,23 @@ enum Command {
 
 #[derive(Subcommand)]
 enum HostCommand {
+    /// Pair this machine with a collector (kernel spec §4.1).
+    Join(JoinArgs),
     /// Run a host.
     Run(HostArgs),
+}
+
+#[derive(Args)]
+struct JoinArgs {
+    /// The collector's public URL, e.g. https://hennery.example.
+    url: String,
+    /// The pairing code shown by the collector (`XXXX-XXXX`).
+    code: String,
+    /// How the collector lists this host; defaults to the host name.
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(long, env = "HENNERY_HOST_DATA_DIR")]
+    data_dir: PathBuf,
 }
 
 #[derive(Args, Clone)]
@@ -103,6 +119,9 @@ async fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Collector(args) => run_collector(args).await,
         Command::Host {
+            command: HostCommand::Join(args),
+        } => join_host(args).await,
+        Command::Host {
             command: HostCommand::Run(args),
         } => run_host(args).await,
         Command::Up(args) => run_up(args).await,
@@ -132,6 +151,15 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(state.shutdown.clone().cancelled_owned())
         .await?;
+    Ok(())
+}
+
+async fn join_host(args: JoinArgs) -> Result<()> {
+    let name = args.name.unwrap_or_else(hennery_host::pairing::default_name);
+    match hennery_host::pairing::join(&args.url, &args.code, &args.data_dir, &name).await? {
+        Joined::Paired { host_id } => println!("paired as {host_id}"),
+        Joined::AlreadyPaired { host_id } => println!("already paired as {host_id}; nothing to do"),
+    }
     Ok(())
 }
 
