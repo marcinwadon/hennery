@@ -2,6 +2,7 @@
 //! run) and an all-in-one mode. Hosts authenticate with the key they paired
 //! with; the operator with the session the setup link or a login opened.
 
+mod config;
 mod inherit;
 
 use anyhow::{Context, Result, bail};
@@ -13,7 +14,7 @@ use hennery_host::pairing::Joined;
 use hennery_host::session::IDLE_TIMEOUT;
 use hennery_host::{AgentCommand, HostConfig};
 use hennery_kernel::hosts::Hosts;
-use hennery_kernel::operator::{Operator, SetupLink};
+use hennery_kernel::operator::{Operator, PublicUrl, SetupLink};
 use hennery_sessions::{AppState, store::Store};
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
@@ -66,11 +67,17 @@ struct JoinArgs {
 struct CollectorArgs {
     /// An address to listen on, e.g. `127.0.0.1:7117`. Repeatable, or
     /// comma-separated in `HENNERY_LISTEN`; the collector serves the same
-    /// routes on each (kernel spec §7). Default: 127.0.0.1:7117.
+    /// routes on each (kernel spec §7). Else `listen` in `config.toml`, else
+    /// 127.0.0.1:7117.
     #[arg(long = "listen", env = "HENNERY_LISTEN", value_delimiter = ',')]
     listen: Vec<String>,
     #[arg(long, env = "HENNERY_DATA_DIR")]
     data_dir: PathBuf,
+    /// Where browsers reach the collector, for the setup link until setup
+    /// stores its own (kernel spec §3.1). Else `public_url` in
+    /// `config.toml`.
+    #[arg(long, env = "HENNERY_PUBLIC_URL")]
+    public_url: Option<String>,
     /// Presume a host's sessions parked once it has been offline this long.
     #[arg(long, default_value_t = hennery_sessions::offline::OFFLINE_THRESHOLD.as_secs())]
     host_offline_secs: u64,
@@ -109,10 +116,14 @@ struct HostArgs {
 
 #[derive(Args)]
 struct UpArgs {
-    /// An address to listen on, as for `collector`; repeatable. The host
-    /// child connects over the first one that loopback reaches.
+    /// An address to listen on, as for `collector`; repeatable, else
+    /// `listen` in the collector's `config.toml` (`<data-dir>/collector`).
+    /// The host child connects over the first one that loopback reaches.
     #[arg(long = "listen", env = "HENNERY_LISTEN", value_delimiter = ',')]
     listen: Vec<String>,
+    /// As for `collector`, handed on to the collector child.
+    #[arg(long, env = "HENNERY_PUBLIC_URL")]
+    public_url: Option<String>,
     #[arg(long, env = "HENNERY_DATA_DIR")]
     data_dir: PathBuf,
     #[arg(long = "agent", value_parser = parse_agent)]
@@ -208,10 +219,15 @@ async fn main() -> std::process::ExitCode {
 
 async fn run_collector(args: CollectorArgs) -> Result<()> {
     warn_if_dev_token();
+    let file = config::FileConfig::load(&args.data_dir)?;
+    let public_url = file
+        .public_url(args.public_url.as_deref())
+        .map(|url| PublicUrl::parse(&url).map_err(|why| anyhow::anyhow!("{why}")))
+        .transpose()?;
     // Before anything is created: a descriptor that is not a listening TCP
     // socket, or an address that is taken, must fail here, and clearly.
     let listeners = if args.listen_fd.is_empty() {
-        bind_all(&listen_addresses(&args.listen)?)?
+        bind_all(&listen_addresses(&file.listen(&args.listen))?)?
     } else {
         if args.listen_fd.len() > MAX_LISTENERS {
             bail!("more than {MAX_LISTENERS} --listen-fd");
@@ -247,8 +263,13 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
         tracing::info!(%address, "collector listening");
         addresses.push(address);
     }
-    // Only once listening: the link names the port (kernel spec §3.1).
-    let base_url = format!("http://localhost:{}", addresses[0].port());
+    // Only once listening: the link names the first listener's port, unless
+    // there is a `public_url` to name (kernel spec §3.1).
+    let base_url = match &public_url {
+        Some(url) => url.origin().to_string(),
+        None => format!("http://localhost:{}", addresses[0].port()),
+    };
+    warn_if_public_url_differs(state.operator.public_url().as_ref(), public_url.as_ref());
     if let Some(link) = state
         .operator
         .announce_setup(&args.data_dir, &base_url, hennery_kernel::secret::unix_now())?
@@ -389,6 +410,21 @@ fn warn_if_dev_token() {
         tracing::warn!(
             "{DEV_TOKEN_VAR} is set but no longer used: since operator auth (3b-i), operators sign in through \
              the setup link and a password; remove it from the environment"
+        );
+    }
+}
+
+/// Once set up, the stored `public_url` is the one in effect (kernel spec
+/// §2): a configured one that differs is named in a warning, not used.
+fn warn_if_public_url_differs(stored: Option<&PublicUrl>, configured: Option<&PublicUrl>) {
+    if let (Some(stored), Some(configured)) = (stored, configured)
+        && stored != configured
+    {
+        tracing::warn!(
+            stored = stored.origin(),
+            configured = configured.origin(),
+            "the configured public_url is not the one setup stored, which stays in effect; \
+             to move hennery, reset it with `hennery admin reset-public-url`"
         );
     }
 }
@@ -616,7 +652,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
     warn_if_dev_token();
     let exe = std::env::current_exe()?;
     let host_dir = args.data_dir.join("host");
-    let addresses = listen_addresses(&args.listen)?;
+    let file = config::FileConfig::load(&args.data_dir.join("collector"))?;
+    let addresses = listen_addresses(&file.listen(&args.listen))?;
     // Validated before any child starts: with no address that loopback
     // reaches (or only schemes it cannot make sense of) `up` fails here,
     // not after the collector is already up and serving.
@@ -663,6 +700,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
         .env_remove("HENNERY_LISTEN")
         .kill_on_drop(true)
         .process_group(0);
+    if let Some(public_url) = &args.public_url {
+        collector_cmd.arg("--public-url").arg(public_url);
+    }
     if let Some((_, writer)) = &pairing {
         fds.push((writer.as_raw_fd(), inherit::CHILD_FD));
         collector_cmd
@@ -735,6 +775,7 @@ mod tests {
     fn ups_host_child_does_not_inherit_the_operator_token() {
         let args = UpArgs {
             listen: vec!["127.0.0.1:7117".into()],
+            public_url: None,
             data_dir: "/nonexistent".into(),
             agents: Vec::new(),
             idle_timeout_secs: 0,
