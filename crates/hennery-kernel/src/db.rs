@@ -59,10 +59,19 @@ pub fn open_in_memory() -> Result<Connection> {
     configure(Connection::open_in_memory()?)
 }
 
-fn configure(conn: Connection) -> Result<Connection> {
+/// Every transaction is `IMMEDIATE`: it takes the write lock when it
+/// begins, waiting out the busy timeout if another connection holds it.
+/// Several connections write to `hennery.db` (the sessions store, the host
+/// registry), and a deferred transaction that reads first
+/// fails on its first write, at once and without the busy timeout
+/// (`SQLITE_BUSY_SNAPSHOT`), whenever another connection committed after
+/// its read. Until one writer thread owns the database (kernel spec §1),
+/// this is what serialises them.
+fn configure(mut conn: Connection) -> Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
     Ok(conn)
 }
 
@@ -170,6 +179,33 @@ mod tests {
         assert!(format!("{err:#}").contains("a symlink is refused"), "{err:#}");
         assert_eq!(mode(&target), 0o644);
         assert_eq!(std::fs::read(&target).unwrap(), b"not a database");
+    }
+
+    /// A transaction holds the write lock from its start, so
+    /// another connection's write waits for it (here, with no busy timeout,
+    /// is refused) instead of committing between the transaction's read and
+    /// its write and failing that write with `SQLITE_BUSY_SNAPSHOT`.
+    #[test]
+    fn a_transaction_holds_the_write_lock_from_its_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hennery.db");
+        let mut first = open(&path).unwrap();
+        first.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
+        let second = open(&path).unwrap();
+        second.busy_timeout(std::time::Duration::ZERO).unwrap();
+
+        let tx = first.transaction().unwrap();
+        let count: i64 = tx.query_row("SELECT count(*) FROM t", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 0);
+        let err = second.execute("INSERT INTO t VALUES (1)", []).unwrap_err();
+        assert_eq!(
+            err.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy),
+            "{err}"
+        );
+        tx.execute("INSERT INTO t VALUES (2)", []).unwrap();
+        tx.commit().unwrap();
+        second.execute("INSERT INTO t VALUES (3)", []).unwrap();
     }
 
     #[test]
