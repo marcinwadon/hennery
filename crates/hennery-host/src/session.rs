@@ -402,9 +402,10 @@ struct PendingConfigs {
 }
 
 /// Sentinel for `PendingConfigs::answered_token`: no switch's answer has
-/// begun arriving yet. Tokens are issued from 0 upward, so this can never
-/// collide with a real one.
-const NO_TOKEN: u64 = u64::MAX;
+/// begun arriving yet. Tokens are issued from 1 upward, so this can never
+/// collide with a real one, and it is below every real one, so the flag can
+/// only ever be raised (`fetch_max`, final review M1).
+const NO_TOKEN: u64 = 0;
 
 impl Drop for PendingConfigs {
     fn drop(&mut self) {
@@ -751,7 +752,7 @@ impl Actor {
             queued: VecDeque::new(),
             out: None,
             orphan: None,
-            next_token: 0,
+            next_token: NO_TOKEN + 1,
             answered_token: Arc::new(AtomicU64::new(NO_TOKEN)),
         };
         // Updates handled since the burst last reset: reset only once a
@@ -1017,7 +1018,10 @@ impl Actor {
                 // only ever observe this after the answer is there (or
                 // about to be), never before — so it is safe to disarm on
                 // the strength of this flag alone, with no drain to confirm.
-                answered_token.store(token, Ordering::SeqCst);
+                // Raised, never overwritten (final review M1): tokens only
+                // increase, so a late answer for an orphan already given up
+                // on cannot lower a newer switch's flag.
+                answered_token.fetch_max(token, Ordering::SeqCst);
                 let _ = tx.send(Inbound::SwitchAnswer { token, result });
                 std::future::ready(Ok(()))
             }) {
