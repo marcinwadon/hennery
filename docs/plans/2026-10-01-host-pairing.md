@@ -7691,6 +7691,7 @@ git push
 **Obligations plan 3a hands on:**
 - **`wss://` for remote hosts** (decision 10). Enable `tokio-tungstenite`'s rustls feature (with the ring provider reqwest already pulls in), and lift `join`'s refusal of `https://`. Test it live behind a TLS terminator.
   - Live-check that the `hennery-hello-nonce` header survives the `101 Switching Protocols` through Caddy, nginx and `tailscale serve`. Without it, a host sends no `hello`.
+  - Shrink the 32 MiB frame limit for the first, unauthenticated frame: any peer can make the collector buffer that much before its `hello` is checked.
 - **`PATCH /api/hosts/{id}`** (rename, default hat), with hats.
 - **`hello.agents`, `workspace_roots` and `probe_agents`**, and storing them from `hello` (kernel §4.3).
 - **A revoked host's sessions.** They stay presumed parked under the dead host id for good, and a resume answers 409 `host_offline`. The frontend should say "host revoked" (the `presumed_parked` event's reason) and offer delete (§4.10) once it exists.
@@ -7703,6 +7704,17 @@ git push
 - **Enrollment lockouts live in memory:** a collector restart clears them (decision 6). Past capacity, addresses already share one overflow budget (decision 6, round 2); a *global* budget across every tracked address too, if abuse ever shows it's needed, belongs with 3b's login limit.
 - **Orphaned outboxes** (`outbox.db.orphaned-*`) are kept for inspection and never read. `doctor` should list them.
 - **Spec amendments** listed under the decisions.
+
+**Deferred by the final security review** (the fix wave closed I1, I2 and M1):
+- **M2, the exit hook fails open.** When a socket task ends, it re-parks a revoked host's sessions only if `is_revoked` answers `Ok(true)`. A registry error skips the second pass silently. Retry it, bounded, or log what the operator must re-run (a repeated `DELETE`).
+- **M3, the overflow bucket catches loopback too.** Past capacity, `up`'s own loopback enrollment shares the overflow budget with everyone else, so a flood from many addresses can stall the all-in-one pairing. Decide whether loopback keeps its own entry.
+- **M4, the re-pair crash window.** `join` renames `host.key.pending` into place, then writes `host.toml`. A crash in between after a revoke leaves the new key beside the old `host.toml`, whose revoked host id the collector then refuses as `bad_proof`. Write `host.toml.pending` first, then rename both.
+- **M5, secrets in argv.** `--dev-token` stays on the command line until 3b removes it. `host join <code>` puts the code in argv and the shell history: also accept it on stdin.
+- **`pairing_codes` is never pruned or capped.** Delete spent and expired rows, and cap the live ones, so a flood of mints cannot grow the table.
+- **Host names' Unicode format characters.** `is_format_char` covers a hand-picked set, not the whole `Cf` category (nor `Zl`/`Zp`). The frontend must escape host names fully when it renders them.
+- **`orphan_outbox` does not fsync the parent directory** after its renames, so a crash can undo them.
+- **Task 4's untested paths.** No test pins the EOF fail-safe (the collector dies before it writes the code) or that the code never reaches argv or the environment. The hidden `--pairing-code-fd`/`--join-code-fd` flags take any descriptor unchecked (`from_raw_fd`). Agents not inheriting descriptor 3 is pinned now (`ups_agents_never_see_the_operator_token_or_the_pairing_pipe`).
+- **Unknown host id timing.** An unknown id is refused without a signature check, faster than a known id with a bad proof. Run a dummy verify on that path if it ever matters.
 
 **Carried from plan (2), unchanged:**
 - the frontend's question cards;
