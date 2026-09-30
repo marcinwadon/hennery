@@ -33,6 +33,9 @@ use tokio::time::Instant;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks;
+
 /// How long `start` waits for spawn → `initialize` → `session/new` (or
 /// `session/load`) → `session_started` before giving up. Kept below the
 /// collector's 90s start timeout (ACP core §3.4) so the host's
@@ -141,6 +144,9 @@ pub struct SessionOptions {
     pub cancel_grace: Duration,
     /// How long one config switch may take.
     pub config_timeout: Duration,
+    /// Test seams (see `test_hooks`).
+    #[cfg(feature = "test-hooks")]
+    pub test_hooks: Option<test_hooks::TestHooks>,
 }
 
 impl Default for SessionOptions {
@@ -151,6 +157,8 @@ impl Default for SessionOptions {
             idle_timeout: Some(IDLE_TIMEOUT),
             cancel_grace: CANCEL_GRACE,
             config_timeout: CONFIG_TIMEOUT,
+            #[cfg(feature = "test-hooks")]
+            test_hooks: None,
         }
     }
 }
@@ -869,6 +877,12 @@ impl Actor {
                             let deadline = Instant::now() + self.options.config_timeout;
                             configs.queued.push_back(QueuedSwitch { request_id, config_id, value, deadline });
                             self.send_next_switch(&conn, &agent_session, &switch_tx, &mut configs);
+                            #[cfg(feature = "test-hooks")]
+                            if configs.out.is_some()
+                                && let Some(hooks) = &self.options.test_hooks
+                            {
+                                hooks.hold_if_armed().await;
+                            }
                         }
                     }
                     Some(SessionCmd::Park { .. }) => {
@@ -1022,6 +1036,8 @@ impl Actor {
             let request = SetSessionConfigOptionRequest::new(session.clone(), next.config_id, acp_value(&next.value));
             let tx = updates_tx.clone();
             let answered_token = configs.answered_token.clone();
+            #[cfg(feature = "test-hooks")]
+            let hooks = self.options.test_hooks.clone();
             // Ordered (`on_receiving_result`, not `block_task`): the
             // dispatch loop holds any later notification until this
             // callback returns, so the answer lands in `updates` in true
@@ -1039,6 +1055,10 @@ impl Actor {
                 // on cannot lower a newer switch's flag.
                 answered_token.fetch_max(token, Ordering::SeqCst);
                 let _ = tx.send(Inbound::SwitchAnswer { token, result });
+                #[cfg(feature = "test-hooks")]
+                if let Some(hooks) = &hooks {
+                    hooks.answer_queued();
+                }
                 std::future::ready(Ok(()))
             }) {
                 // Never sent (the connection is shutting down), so nothing
