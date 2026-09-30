@@ -1402,8 +1402,9 @@ impl Actor {
     /// One item off the inbound channel (fix round 2): a live update,
     /// emitted (`live_update` carries a `config_option_update`'s catalogue
     /// extracts), or a switch's answer, routed by `route_switch_answer`.
-    /// Returns whether this cleared the orphan (the idle reaper's clock
-    /// resets then, ACP core §4.7).
+    /// Returns whether the idle reaper's clock should restart: an orphan
+    /// cleared, or the adapter withdrew one of its own questions (ACP core
+    /// §4.7) — either is activity, not just an orphan clearing.
     fn handle_inbound(&self, inbound: Inbound, turn: Option<&str>, configs: &mut PendingConfigs) -> bool {
         match inbound {
             Inbound::Update(payload) => {
@@ -1627,26 +1628,26 @@ impl Actor {
     /// the same wire-ordered channel (fix round 2, F2), so handling them one
     /// at a time, in receipt order, right before acting on a reply (or
     /// before ending a torn-down turn) is correct — no reordering needed.
-    /// Returns whether an orphan cleared during the drain (the idle
-    /// reaper's clock resets then, ACP core §4.7); callers that are ending
-    /// the actor regardless (teardown, an unanswered cancel, an adapter
-    /// exit) can ignore it.
+    /// Returns whether the idle reaper's clock should restart: an orphan
+    /// cleared, or a question was withdrawn, during the drain (ACP core
+    /// §4.7); callers that are ending the actor regardless (teardown, an
+    /// unanswered cancel, an adapter exit) can ignore it.
     fn drain_updates(
         &self,
         updates: &mut mpsc::UnboundedReceiver<Inbound>,
         turn: Option<&str>,
         configs: &mut PendingConfigs,
     ) -> bool {
-        let mut orphan_cleared = false;
+        let mut restart_idle_clock = false;
         // Only what is queued now: an adapter that keeps streaming cannot
         // hold the actor here.
         for _ in 0..updates.len() {
             match updates.try_recv() {
-                Ok(inbound) => orphan_cleared |= self.handle_inbound(inbound, turn, configs),
+                Ok(inbound) => restart_idle_clock |= self.handle_inbound(inbound, turn, configs),
                 Err(_) => break,
             }
         }
-        orphan_cleared
+        restart_idle_clock
     }
 
     /// Park or close: forward any output already queued, end the turn as
