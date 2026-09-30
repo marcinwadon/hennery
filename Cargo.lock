@@ -1017,8 +1017,11 @@ dependencies = [
  "hennery-kernel",
  "hennery-sessions",
  "libc",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]

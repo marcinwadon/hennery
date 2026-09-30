@@ -249,29 +249,42 @@ impl KillTree {
     /// its "collector listening" log line: the tests start it on port 0, so
     /// no other process can take the port between choosing and binding it.
     fn listening(&mut self) -> String {
+        self.listening_on(1).remove(0)
+    }
+
+    /// The addresses of the collector's first `n` "collector listening"
+    /// lines, one per listener, in the order it was given them.
+    fn listening_on(&mut self, n: usize) -> Vec<String> {
         let log = self.log.clone().expect("the process's output is captured");
-        let mut address = None;
+        let mut addresses = Vec::new();
         self.wait_until("the collector listening", || {
-            address = std::fs::read_to_string(&log)
-                .ok()
-                .and_then(|text| listening_address(&text));
-            address.is_some()
+            addresses = std::fs::read_to_string(&log)
+                .map(|text| listening_addresses(&text))
+                .unwrap_or_default();
+            addresses.len() >= n
         });
-        address.unwrap()
+        addresses.truncate(n);
+        addresses
     }
 }
 
-/// The `address` of the first complete "collector listening" line in `log`.
-fn listening_address(log: &str) -> Option<String> {
+/// The `address` of every complete "collector listening" line in `log`.
+fn listening_addresses(log: &str) -> Vec<String> {
     // Complete lines only: a line still being written could end mid-port.
-    let complete = &log[..log.rfind('\n')?];
-    complete.lines().map(strip_ansi).find_map(|line| {
-        let fields = line.split_once("collector listening")?.1;
-        let address = fields
-            .split_whitespace()
-            .find_map(|field| field.strip_prefix("address="))?;
-        Some(address.to_string())
-    })
+    let Some(end) = log.rfind('\n') else {
+        return Vec::new();
+    };
+    log[..end]
+        .lines()
+        .map(strip_ansi)
+        .filter_map(|line| {
+            let fields = line.split_once("collector listening")?.1;
+            let address = fields
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("address="))?;
+            Some(address.to_string())
+        })
+        .collect()
 }
 
 /// `line` without its terminal colour codes (`ESC [ … m`), which the log
@@ -918,12 +931,13 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
 /// descriptors 3 to 9 it holds (3 is the pairing pipe's number in the host
 /// child, 4 the listening socket's in the collector child), then exits.
 ///
-/// `up` and the control start with no inherited descriptor above 2: on
-/// macOS, std makes a pipe or socket close-on-exec only after creating it,
-/// so under parallel tests one another thread of this binary is making can
-/// leak into a spawn (in 4 of 96 runs with four copies at once, the
-/// control included). Those are this binary's, not `up`'s, and would pass
-/// on to the agent. A fresh data directory, so this run pairs through that pipe.
+/// `up` itself is started holding descriptor 7 open across `exec`, as a
+/// service manager or a shell can leave one: the host's adapter spawn must
+/// close it too. The control starts with no inherited descriptor above 2:
+/// on macOS, std makes a pipe or socket close-on-exec only after creating
+/// it, so under parallel tests one another thread of this binary is making
+/// can leak into a spawn. A fresh data directory, so this run pairs through
+/// that pipe.
 #[test]
 fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     const TOKEN: &str = "operator-token-from-the-environment";
@@ -977,6 +991,9 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     unsafe {
         command.pre_exec(|| {
             close_leaked_descriptors();
+            if libc::dup2(2, 7) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             Ok(())
         });
     }
@@ -1305,10 +1322,12 @@ fn a_sigterm_as_up_starts_leaves_no_child_running() {
 }
 
 /// `--listen-fd` (`up`'s hand-over) adopts only a listening TCP socket: a
-/// closed descriptor, a file, a UDP socket or a TCP socket that does not
-/// listen is refused at once with a message naming it, before the data
-/// directory is made, not adopted to abort or hang later. Also refused: a
-/// standard stream's number, and `--listen` with it.
+/// closed descriptor, a file, a UDP socket, a TCP socket that does not
+/// listen (never bound, or bound and never listened on) and a listening
+/// Unix socket are refused at once with a message naming it, before the
+/// data directory is made, not adopted to abort, hang or serve later. Also
+/// refused: a standard stream's number, `--listen` with it, and one
+/// descriptor given twice.
 #[test]
 fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
     use std::os::fd::{AsRawFd, OwnedFd};
@@ -1321,6 +1340,24 @@ fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
     let tcp = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
     assert!(tcp >= 0);
     let tcp: OwnedFd = unsafe { std::os::fd::FromRawFd::from_raw_fd(tcp) };
+    // Bound to a port (port 0: the system picks one), never listened on:
+    // macOS used to take this one.
+    // SAFETY: socket(2) and bind(2) on a local address, owned at once.
+    let bound: OwnedFd = unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        assert!(fd >= 0);
+        let mut addr: libc::sockaddr_in = std::mem::zeroed();
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
+        let rc = libc::bind(
+            fd,
+            (&raw const addr).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        );
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        std::os::fd::FromRawFd::from_raw_fd(fd)
+    };
+    let unix: OwnedFd = std::os::unix::net::UnixListener::bind(dir.join("s")).unwrap().into();
     let listening: OwnedFd = std::net::TcpListener::bind("127.0.0.1:0").unwrap().into();
     let collector = |fd: Option<&OwnedFd>, args: &[&str]| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
@@ -1365,6 +1402,12 @@ fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
             Some(&tcp),
             "is not a listening socket",
         ),
+        (
+            "a TCP socket bound and never listened on",
+            Some(&bound),
+            "is not a listening socket",
+        ),
+        ("a listening Unix socket", Some(&unix), "is not a TCP socket"),
     ] {
         // 50: well above what the collector's own runtime opens at start.
         let (status, stderr) = collector(fd, &["--listen-fd", "50"]);
@@ -1380,6 +1423,15 @@ fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
         let (status, stderr) = collector(Some(&listening), args);
         assert!(!status.unwrap().success(), "{args:?} was taken: {stderr}");
     }
+    // A descriptor given twice would be adopted as two listeners sharing one
+    // socket: refused before anything is created (decision 14, A6). Without
+    // the guard this stays green on Linux (the second `TcpListener::from_std`
+    // still fails, but only after `private_data_dir` ran), so both the
+    // message and "nothing was made" are pinned here, not just `!success()`.
+    let (status, stderr) = collector(Some(&listening), &["--listen-fd", "50", "--listen-fd", "50"]);
+    assert!(!status.unwrap().success(), "was taken: {stderr}");
+    assert!(stderr.contains("--listen-fd 50 is given twice"), "{stderr}");
+    assert!(!data.exists(), "the data directory was made");
 }
 
 /// Kernel spec §3.1: a collector that is not set up writes its one-time
@@ -1473,4 +1525,249 @@ fn join_reads_the_code_from_standard_input_when_it_is_left_out() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("paired as"));
+}
+
+/// `POST path` with no body on the collector at `listen`, with the owner's
+/// `session` and `Origin: origin`: the status.
+fn post_from(listen: &str, path: &str, session: &str, origin: &str) -> Option<u16> {
+    let mut stream = TcpStream::connect(listen).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(15))).ok()?;
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: {listen}\r\nCookie: hennery_session={session}\r\nOrigin: {origin}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    response.split(' ').nth(1)?.parse().ok()
+}
+
+/// `GET path` on the collector at `listen`, without a session: the status
+/// and the body.
+fn get_plain(listen: &str, path: &str) -> Option<(u16, String)> {
+    let mut stream = TcpStream::connect(listen).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(15))).ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {listen}\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    Some((head.split(' ').nth(1)?.parse().ok()?, body.to_string()))
+}
+
+/// Kernel spec §7: a collector given several addresses serves the same
+/// routes and the same state on each, with the same browser rules, and
+/// browser access stays bound to `public_url`: a state-changing request on
+/// the second listener needs the first's origin, the one set up as
+/// `public_url`, not the second's own.
+#[test]
+fn every_listen_address_serves_the_same_collector() {
+    let dir = scratch_dir("listeners");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    let log = dir.join("collector.log");
+    let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["collector", "--listen", "127.0.0.1:0", "--listen", "127.0.0.1:0"])
+        .arg("--data-dir")
+        .arg(&data)
+        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
+        .spawn()
+        .unwrap();
+    let mut collector = KillTree::new(collector, &log);
+    let addresses = collector.listening_on(2);
+    assert_ne!(addresses[0], addresses[1]);
+    let (first, second) = (&addresses[0], &addresses[1]);
+    // `public_url` is `http://<first>`.
+    let session = sign_in(&mut collector, first, &data);
+    for address in &addresses {
+        assert_eq!(get_plain(address, "/healthz"), Some((200, "ok".into())), "{address}");
+        assert!(get_json(address, "/api/hosts", &session).is_some(), "{address}");
+    }
+    assert_eq!(
+        post_from(second, "/api/auth/logout", &session, &format!("http://{second}")),
+        Some(403),
+        "the second listener's own origin was taken for public_url"
+    );
+    assert_eq!(
+        post_from(second, "/api/auth/logout", &session, &format!("http://{first}")),
+        Some(204)
+    );
+    // The logout on the second listener ended the session on the first.
+    assert!(get_json(first, "/api/hosts", &session).is_none());
+}
+
+/// Kernel spec §7, §11: start fails when any one of several addresses is
+/// taken, for `collector` and for `up`, before either touches its data
+/// directory.
+#[test]
+fn a_taken_listen_address_fails_the_start_before_the_data_dir_is_touched() {
+    let dir = scratch_dir("taken");
+    let _cleanup = RemoveDir(dir.clone());
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = taken.local_addr().unwrap().to_string();
+    for command in ["collector", "up"] {
+        let data = dir.join(command);
+        let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+            .args([command, "--listen", "127.0.0.1:0", "--listen", &taken])
+            .arg("--data-dir")
+            .arg(&data)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{command} started: {stderr}");
+        assert!(stderr.contains(&format!("bind {taken}")), "{command}: {stderr}");
+        assert!(!data.exists(), "{command} made its data directory");
+    }
+}
+
+/// `up` binds every address and hands each to its collector child (kernel
+/// spec §7): its host connects over the first, and the second serves the
+/// same collector. A `HENNERY_LISTEN` in `up`'s environment (which its
+/// flags override) does not reach the child, which would otherwise refuse
+/// it beside `--listen-fd`.
+#[test]
+fn up_hands_every_listen_address_to_its_collector() {
+    let dir = scratch_dir("uplisteners");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let log = dir.join("up.log");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
+    command.env("HENNERY_LISTEN", "127.0.0.1:0");
+    let mut up = up_logging_to_with(command, &data, &log, &["--listen", "127.0.0.1:0"]);
+    let addresses = up.listening_on(2);
+    let session = sign_in(&mut up, &addresses[0], &data.join("collector"));
+    up.wait_until("the host connected, seen on the second listener", || {
+        matches!(
+            get_json(&addresses[1], "/api/hosts", &session),
+            Some(serde_json::Value::Array(hosts)) if hosts.iter().any(|h| h["connected"] == true)
+        )
+    });
+}
+
+/// Kernel spec §2: `config.toml` gives `listen` and `public_url` when
+/// neither a flag nor the environment does; `HENNERY_LISTEN` and
+/// `HENNERY_PUBLIC_URL` win over the file, and flags over both. Counted by
+/// the collector's listeners (the file names three, the environment two, a
+/// flag one) and by the setup link, which names `public_url`.
+#[test]
+fn config_toml_yields_to_the_environment_and_the_environment_to_flags() {
+    let dir = scratch_dir("config");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::write(
+        data.join("config.toml"),
+        "listen = [\"127.0.0.1:0\", \"127.0.0.1:0\", \"127.0.0.1:0\"]\npublic_url = \"https://file.example\"\n",
+    )
+    .unwrap();
+    // Private whatever the umask: a file others can write is refused.
+    std::fs::set_permissions(
+        data.join("config.toml"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o644),
+    )
+    .unwrap();
+    let run = |env: &[(&str, &str)], args: &[&str], name: &str| {
+        let log = dir.join(format!("{name}.log"));
+        let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+            .arg("collector")
+            .args(args)
+            .arg("--data-dir")
+            .arg(&data)
+            .envs(env.iter().copied())
+            .stdout(std::fs::File::create(&log).unwrap())
+            .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
+            .spawn()
+            .unwrap();
+        let mut collector = KillTree::new(collector, &log);
+        let file = data.join("setup-url");
+        // Written after every listener's line is logged.
+        collector.wait_until("the setup link", || file.exists());
+        let link = std::fs::read_to_string(&file).unwrap();
+        let listeners = listening_addresses(&std::fs::read_to_string(&log).unwrap()).len();
+        unsafe { libc::kill(collector.up.id() as i32, libc::SIGTERM) };
+        assert!(wait_with_timeout(&mut collector.up, Duration::from_secs(15)).is_some());
+        let _ = std::fs::remove_file(&file);
+        let origin = link.split("/setup#").next().unwrap().to_string();
+        (listeners, origin)
+    };
+    assert_eq!(run(&[], &[], "file"), (3, "https://file.example".to_string()));
+    let env = [
+        ("HENNERY_LISTEN", "127.0.0.1:0,127.0.0.1:0"),
+        ("HENNERY_PUBLIC_URL", "https://env.example"),
+    ];
+    assert_eq!(run(&env, &[], "env"), (2, "https://env.example".to_string()));
+    assert_eq!(
+        run(
+            &env,
+            &["--listen", "127.0.0.1:0", "--public-url", "https://flag.example"],
+            "flag"
+        ),
+        (1, "https://flag.example".to_string())
+    );
+}
+
+/// A `config.toml` that does not parse, names a key hennery does not know,
+/// or that other users can write, stops the start with the file's name,
+/// before anything is bound or created.
+#[test]
+fn a_bad_config_toml_stops_the_start() {
+    let dir = scratch_dir("badconfig");
+    let _cleanup = RemoveDir(dir.clone());
+    for (name, text, mode, expected) in [
+        ("typo", "listens = [\"127.0.0.1:0\"]\n", 0o644, "unknown field"),
+        (
+            "public_url",
+            "public_url = \"http://hennery.example\"\n",
+            0o644,
+            "public_url must be https://",
+        ),
+        ("writable", "listen = [\"127.0.0.1:0\"]\n", 0o666, "chmod go-w"),
+    ] {
+        use std::os::unix::fs::PermissionsExt;
+        let data = dir.join(name);
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("config.toml"), text).unwrap();
+        std::fs::set_permissions(data.join("config.toml"), std::fs::Permissions::from_mode(mode)).unwrap();
+        // On port 0, and bounded: a collector that ignored the file would
+        // serve rather than stop, and never on the default port.
+        let mut child = Command::new(env!("CARGO_BIN_EXE_hennery"))
+            .args(["collector", "--listen", "127.0.0.1:0", "--data-dir"])
+            .arg(&data)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let status = wait_with_timeout(&mut child, Duration::from_secs(15));
+        let _ = child.kill();
+        let _ = child.wait();
+        let mut stderr = String::new();
+        child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+        assert!(status.is_some_and(|s| !s.success()), "{name}: started: {stderr}");
+        assert!(stderr.contains(expected), "{name}: {stderr}");
+        assert!(stderr.contains("config.toml"), "{name}: {stderr}");
+        assert!(!data.join("hennery.db").exists(), "{name}: the database was made");
+    }
+}
+
+/// `up --public-url` reaches its collector child, whose setup link names it
+/// (kernel spec §3.1).
+#[test]
+fn up_hands_its_public_url_to_its_collector() {
+    let dir = scratch_dir("uppublicurl");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let mut up = up_logging_to_with(
+        Command::new(env!("CARGO_BIN_EXE_hennery")),
+        &data,
+        &dir.join("up.log"),
+        &["--public-url", "https://up.example"],
+    );
+    let file = data.join("collector").join("setup-url");
+    up.wait_until("the setup link", || file.exists());
+    let link = std::fs::read_to_string(&file).unwrap();
+    assert!(link.starts_with("https://up.example/setup#"), "{link}");
 }

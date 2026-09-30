@@ -2,6 +2,7 @@
 //! run) and an all-in-one mode. Hosts authenticate with the key they paired
 //! with; the operator with the session the setup link or a login opened.
 
+mod config;
 mod inherit;
 
 use anyhow::{Context, Result, bail};
@@ -13,7 +14,7 @@ use hennery_host::pairing::Joined;
 use hennery_host::session::IDLE_TIMEOUT;
 use hennery_host::{AgentCommand, HostConfig};
 use hennery_kernel::hosts::Hosts;
-use hennery_kernel::operator::{Operator, SetupLink};
+use hennery_kernel::operator::{Operator, PublicUrl, SetupLink};
 use hennery_sessions::{AppState, store::Store};
 use std::net::SocketAddr;
 use std::os::fd::AsRawFd;
@@ -64,10 +65,19 @@ struct JoinArgs {
 
 #[derive(Args, Clone)]
 struct CollectorArgs {
-    #[arg(long, default_value = "127.0.0.1:7117")]
-    listen: String,
+    /// An address to listen on, e.g. `127.0.0.1:7117`. Repeatable, or
+    /// comma-separated in `HENNERY_LISTEN`; the collector serves the same
+    /// routes on each (kernel spec §7). Else `listen` in `config.toml`, else
+    /// 127.0.0.1:7117.
+    #[arg(long = "listen", env = "HENNERY_LISTEN", value_delimiter = ',')]
+    listen: Vec<String>,
     #[arg(long, env = "HENNERY_DATA_DIR")]
     data_dir: PathBuf,
+    /// Where browsers reach the collector, for the setup link until setup
+    /// stores its own (kernel spec §3.1). Else `public_url` in
+    /// `config.toml`.
+    #[arg(long, env = "HENNERY_PUBLIC_URL")]
+    public_url: Option<String>,
     /// Presume a host's sessions parked once it has been offline this long.
     #[arg(long, default_value_t = hennery_sessions::offline::OFFLINE_THRESHOLD.as_secs())]
     host_offline_secs: u64,
@@ -76,9 +86,9 @@ struct CollectorArgs {
     #[arg(long, hide = true)]
     pairing_code_fd: Option<i32>,
     /// `hennery up` only: serve on this inherited listening socket, which
-    /// `up` bound, in place of binding `--listen`.
-    #[arg(long, hide = true, conflicts_with = "listen", value_parser = clap::value_parser!(i32).range(3..))]
-    listen_fd: Option<i32>,
+    /// `up` bound, in place of binding `--listen`. Repeatable.
+    #[arg(long = "listen-fd", hide = true, conflicts_with = "listen", value_parser = clap::value_parser!(i32).range(3..))]
+    listen_fd: Vec<i32>,
 }
 
 #[derive(Args, Clone)]
@@ -106,8 +116,14 @@ struct HostArgs {
 
 #[derive(Args)]
 struct UpArgs {
-    #[arg(long, default_value = "127.0.0.1:7117")]
-    listen: String,
+    /// An address to listen on, as for `collector`; repeatable, else
+    /// `listen` in the collector's `config.toml` (`<data-dir>/collector`).
+    /// The host child connects over the first one that loopback reaches.
+    #[arg(long = "listen", env = "HENNERY_LISTEN", value_delimiter = ',')]
+    listen: Vec<String>,
+    /// As for `collector`, handed on to the collector child.
+    #[arg(long, env = "HENNERY_PUBLIC_URL")]
+    public_url: Option<String>,
     #[arg(long, env = "HENNERY_DATA_DIR")]
     data_dir: PathBuf,
     #[arg(long = "agent", value_parser = parse_agent)]
@@ -121,6 +137,46 @@ fn parse_agent(s: &str) -> Result<(String, AgentCommand), String> {
     let (name, command) = s.split_once('=').ok_or("expected name=command")?;
     let command = AgentCommand::parse(command).ok_or("empty command")?;
     Ok((name.to_string(), command))
+}
+
+/// Where the collector listens when nothing says otherwise (kernel spec §7).
+const DEFAULT_LISTEN: &str = "127.0.0.1:7117";
+
+/// The most addresses one collector listens on: `up` hands each to its
+/// collector child as a descriptor of its own.
+pub(crate) const MAX_LISTENERS: usize = 8;
+
+/// The addresses to listen on: those given, else `DEFAULT_LISTEN`. An empty
+/// one, or more than `MAX_LISTENERS`, is refused.
+fn listen_addresses(given: &[String]) -> Result<Vec<String>> {
+    let addresses: Vec<String> = if given.is_empty() {
+        vec![DEFAULT_LISTEN.to_string()]
+    } else {
+        given.iter().map(|a| a.trim().to_string()).collect()
+    };
+    if addresses.iter().any(String::is_empty) {
+        bail!("an empty listen address: give each as host:port");
+    }
+    if addresses.len() > MAX_LISTENERS {
+        bail!(
+            "{} listen addresses; at most {MAX_LISTENERS} are supported",
+            addresses.len()
+        );
+    }
+    Ok(addresses)
+}
+
+/// Bind every address, in order (kernel spec §7): one that cannot be bound
+/// fails the start, before anything else is done.
+fn bind_all(addresses: &[String]) -> Result<Vec<std::net::TcpListener>> {
+    addresses
+        .iter()
+        .map(|address| {
+            let listener = std::net::TcpListener::bind(address).with_context(|| format!("bind {address}"))?;
+            listener.set_nonblocking(true)?;
+            Ok(listener)
+        })
+        .collect()
 }
 
 const PLACEHOLDER: &str = "<!doctype html><meta charset=utf-8><title>hennery</title><h1>hennery</h1><p>Walking skeleton. The UI is not built yet.</p>";
@@ -163,9 +219,41 @@ async fn main() -> std::process::ExitCode {
 
 async fn run_collector(args: CollectorArgs) -> Result<()> {
     warn_if_dev_token();
-    // Checked before anything is created: a descriptor that is not a
-    // listening TCP socket must fail here, and clearly.
-    let inherited = args.listen_fd.map(inherited_listener).transpose()?;
+    let file = config::FileConfig::load(&args.data_dir)?;
+    // Named by its source: an operator cannot otherwise tell whether a flag,
+    // `HENNERY_PUBLIC_URL` or the file gave the bad value.
+    let public_url_source = if args.public_url.is_some() {
+        "--public-url or HENNERY_PUBLIC_URL".to_string()
+    } else {
+        args.data_dir.join(config::CONFIG_FILE).display().to_string()
+    };
+    let public_url = file
+        .public_url(args.public_url.as_deref())
+        .map(|url| {
+            PublicUrl::parse(&url)
+                .map_err(|why| anyhow::anyhow!("{why}"))
+                .with_context(|| public_url_source.clone())
+        })
+        .transpose()?;
+    // Before anything is created: a descriptor that is not a listening TCP
+    // socket, or an address that is taken, must fail here, and clearly.
+    let listeners = if args.listen_fd.is_empty() {
+        bind_all(&listen_addresses(&file.listen(&args.listen)?)?)?
+    } else {
+        if args.listen_fd.len() > MAX_LISTENERS {
+            bail!("more than {MAX_LISTENERS} --listen-fd");
+        }
+        // One socket adopted twice would be two owners of one descriptor.
+        for (i, fd) in args.listen_fd.iter().enumerate() {
+            if args.listen_fd[..i].contains(fd) {
+                bail!("--listen-fd {fd} is given twice");
+            }
+        }
+        args.listen_fd
+            .iter()
+            .map(|&fd| inherited_listener(fd))
+            .collect::<Result<_>>()?
+    };
     private_data_dir(&args.data_dir)?;
     let db = args.data_dir.join("hennery.db");
     let store = Store::open(&db)?;
@@ -174,18 +262,25 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     let mut state = AppState::new(store, hosts, operator);
     state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
     hennery_sessions::offline::after_startup(&state);
-    let listener = match inherited {
-        Some(listener) => {
-            tokio::net::TcpListener::from_std(listener).context("the listening socket `up` handed over")?
-        }
-        None => tokio::net::TcpListener::bind(&args.listen)
-            .await
-            .with_context(|| format!("bind {}", args.listen))?,
+    let listeners = listeners
+        .into_iter()
+        .map(tokio::net::TcpListener::from_std)
+        .collect::<std::io::Result<Vec<_>>>()
+        .context("serve the listening sockets")?;
+    // One line per listener, in order: the first names the setup link's port.
+    let mut addresses = Vec::new();
+    for listener in &listeners {
+        let address = listener.local_addr()?;
+        tracing::info!(%address, "collector listening");
+        addresses.push(address);
+    }
+    // Only once listening: the link names the first listener's port, unless
+    // there is a `public_url` to name (kernel spec §3.1).
+    let base_url = match &public_url {
+        Some(url) => url.origin().to_string(),
+        None => format!("http://localhost:{}", addresses[0].port()),
     };
-    let address = listener.local_addr()?;
-    tracing::info!(%address, "collector listening");
-    // Only once listening: the link names the port (kernel spec §3.1).
-    let base_url = format!("http://localhost:{}", address.port());
+    warn_if_public_url_differs(state.operator.public_url().as_ref(), public_url.as_ref());
     if let Some(link) = state
         .operator
         .announce_setup(&args.data_dir, &base_url, hennery_kernel::secret::unix_now())?
@@ -209,16 +304,15 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
         shutdown.cancel();
     });
     let app = hennery_sessions::router(state.clone()).route("/", get(|| async { Html(PLACEHOLDER) }));
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-        .with_graceful_shutdown(state.shutdown.clone().cancelled_owned())
-        .await?;
+    hennery_sessions::serve_all(listeners, app, state.shutdown.clone()).await?;
     Ok(())
 }
 
 /// Adopt `--listen-fd`: `fd` must be an open, listening TCP socket. Anything
 /// else is refused, not adopted: a closed descriptor would abort the process
-/// on first use, and a UDP or unconnected socket would hang it. The socket
-/// is made close-on-exec and non-blocking.
+/// on first use, a UDP or unconnected socket would hang it, and a Unix
+/// socket would be served as if it were TCP. The socket is made
+/// close-on-exec and non-blocking.
 fn inherited_listener(fd: i32) -> Result<std::net::TcpListener> {
     let option = |name: libc::c_int| -> std::io::Result<libc::c_int> {
         let mut value: libc::c_int = 0;
@@ -243,27 +337,15 @@ fn inherited_listener(fd: i32) -> Result<std::net::TcpListener> {
     if kind != libc::SOCK_STREAM {
         bail!("--listen-fd {fd} is not a stream (TCP) socket");
     }
+    let family = socket_family(fd).with_context(|| format!("--listen-fd {fd}: getsockname"))?;
+    if family != libc::AF_INET && family != libc::AF_INET6 {
+        bail!("--listen-fd {fd} is not a TCP socket (address family {family}, not IPv4 or IPv6)");
+    }
     let listening = match option(libc::SO_ACCEPTCONN) {
         Ok(value) => value == 1,
-        // macOS has no `SO_ACCEPTCONN` to read. There, a socket bound to a
-        // port and without a peer is taken to listen: that refuses one never
-        // bound and a connected one, but not one bound and never listened on.
+        // macOS has no `SO_ACCEPTCONN` to read; its TCP state tells.
         Err(err) if err.raw_os_error() == Some(libc::ENOPROTOOPT) => {
-            // SAFETY: getsockname/getpeername(2) into local storage of the
-            // size they are told.
-            unsafe {
-                let mut addr: libc::sockaddr_storage = std::mem::zeroed();
-                let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-                let bound = libc::getsockname(fd, (&raw mut addr).cast(), &mut len) == 0
-                    && match libc::c_int::from(addr.ss_family) {
-                        libc::AF_INET => (*(&raw const addr).cast::<libc::sockaddr_in>()).sin_port != 0,
-                        libc::AF_INET6 => (*(&raw const addr).cast::<libc::sockaddr_in6>()).sin6_port != 0,
-                        _ => false,
-                    };
-                let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-                let peer = libc::getpeername(fd, (&raw mut addr).cast(), &mut len) == 0;
-                bound && !peer
-            }
+            listens_by_tcp_state(fd).with_context(|| format!("--listen-fd {fd}: TCP_CONNECTION_INFO"))?
         }
         Err(err) => return Err(err).with_context(|| format!("--listen-fd {fd}: SO_ACCEPTCONN")),
     };
@@ -281,6 +363,52 @@ fn inherited_listener(fd: i32) -> Result<std::net::TcpListener> {
     Ok(listener)
 }
 
+/// The address family of socket `fd`, from getsockname(2).
+fn socket_family(fd: i32) -> std::io::Result<libc::c_int> {
+    // SAFETY: getsockname(2) into local storage of the size it is told;
+    // all-zero bytes are a valid `sockaddr_storage`.
+    unsafe {
+        let mut addr: libc::sockaddr_storage = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        if libc::getsockname(fd, (&raw mut addr).cast(), &mut len) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(libc::c_int::from(addr.ss_family))
+    }
+}
+
+/// Whether TCP socket `fd` listens, from its TCP state (`TCPS_LISTEN`):
+/// macOS's stand-in for `SO_ACCEPTCONN`. A socket bound and never listened
+/// on is refused, as is one never bound and a connected one.
+#[cfg(target_vendor = "apple")]
+fn listens_by_tcp_state(fd: i32) -> std::io::Result<bool> {
+    /// `TCPS_LISTEN` in `<netinet/tcp_fsm.h>`.
+    const TCPS_LISTEN: u8 = 1;
+    // SAFETY: all-zero bytes are a valid `tcp_connection_info` (integers).
+    let mut info: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+    // SAFETY: getsockopt(2) into a local struct of the size it is told.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONNECTION_INFO,
+            (&raw mut info).cast(),
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(info.tcpi_state == TCPS_LISTEN)
+}
+
+/// Elsewhere `SO_ACCEPTCONN` answers, so this is never reached.
+#[cfg(not(target_vendor = "apple"))]
+fn listens_by_tcp_state(_fd: i32) -> std::io::Result<bool> {
+    Err(std::io::Error::from_raw_os_error(libc::ENOPROTOOPT))
+}
+
 /// The development bearer's variable, from before 3b-i. Nothing reads it
 /// now; it is still stripped from every child (`HOST_SECRET_VARS`).
 const DEV_TOKEN_VAR: &str = "HENNERY_DEV_TOKEN";
@@ -293,6 +421,21 @@ fn warn_if_dev_token() {
         tracing::warn!(
             "{DEV_TOKEN_VAR} is set but no longer used: since operator auth (3b-i), operators sign in through \
              the setup link and a password; remove it from the environment"
+        );
+    }
+}
+
+/// Once set up, the stored `public_url` is the one in effect (kernel spec
+/// §2): a configured one that differs is named in a warning, not used.
+fn warn_if_public_url_differs(stored: Option<&PublicUrl>, configured: Option<&PublicUrl>) {
+    if let (Some(stored), Some(configured)) = (stored, configured)
+        && stored != configured
+    {
+        tracing::warn!(
+            stored = stored.origin(),
+            configured = configured.origin(),
+            "the configured public_url is not the one setup stored, which stays in effect; \
+             `hennery admin reset-public-url`, coming with `hennery admin`, will move it"
         );
     }
 }
@@ -520,15 +663,24 @@ async fn run_up(args: UpArgs) -> Result<()> {
     warn_if_dev_token();
     let exe = std::env::current_exe()?;
     let host_dir = args.data_dir.join("host");
-    // Validated before any child starts: a non-loopback `--listen` (or
-    // another scheme it cannot make sense of) must fail here, not after the
-    // collector is already up and serving.
-    hennery_host::pairing::collector_ws_url(&loopback_url(&args.listen))?;
+    let file = config::FileConfig::load(&args.data_dir.join("collector"))?;
+    let addresses = listen_addresses(&file.listen(&args.listen)?)?;
+    // Validated before any child starts: with no address that loopback
+    // reaches (or only schemes it cannot make sense of) `up` fails here,
+    // not after the collector is already up and serving.
+    let Some(host_listener) = addresses
+        .iter()
+        .position(|address| hennery_host::pairing::collector_ws_url(&loopback_url(address)).is_ok())
+    else {
+        let err = hennery_host::pairing::collector_ws_url(&loopback_url(&addresses[0]))
+            .expect_err("no address passed the check");
+        return Err(err.context("the all-in-one host reaches its collector over loopback"));
+    };
     // Bound here and handed to the collector child, so the host's URL names
     // the port the collector serves on, also for `--listen` port 0. Before
     // the data root is touched: a busy port leaves nothing behind.
-    let listener = std::net::TcpListener::bind(&args.listen).with_context(|| format!("bind {}", args.listen))?;
-    let collector_url = loopback_url(&listener.local_addr()?.to_string());
+    let listeners = bind_all(&addresses)?;
+    let collector_url = loopback_url(&listeners[host_listener].local_addr()?.to_string());
     let collector_ws_url = hennery_host::pairing::collector_ws_url(&collector_url)?;
     // Before either child creates its own directory in it.
     private_data_dir(&args.data_dir)?;
@@ -544,15 +696,24 @@ async fn run_up(args: UpArgs) -> Result<()> {
     // shutdown below. With their own group, only this supervisor is signalled
     // and it alone decides the order (host, then collector).
     let mut collector_cmd = tokio::process::Command::new(&exe);
+    collector_cmd.arg("collector");
+    let mut fds = Vec::new();
+    for (listener, to) in listeners.iter().zip(inherit::LISTENER_FD..) {
+        collector_cmd.arg("--listen-fd").arg(to.to_string());
+        fds.push((listener.as_raw_fd(), to));
+    }
     collector_cmd
-        .args(["collector", "--listen-fd", &inherit::LISTENER_FD.to_string()])
         .arg("--data-dir")
         .arg(args.data_dir.join("collector"))
         // `up` has warned about it already; the collector has no use for it.
         .env_remove(DEV_TOKEN_VAR)
+        // `up` bound these addresses already; the child takes the sockets.
+        .env_remove("HENNERY_LISTEN")
         .kill_on_drop(true)
         .process_group(0);
-    let mut fds = vec![(listener.as_raw_fd(), inherit::LISTENER_FD)];
+    if let Some(public_url) = &args.public_url {
+        collector_cmd.arg("--public-url").arg(public_url);
+    }
     if let Some((_, writer)) = &pairing {
         fds.push((writer.as_raw_fd(), inherit::CHILD_FD));
         collector_cmd
@@ -560,10 +721,15 @@ async fn run_up(args: UpArgs) -> Result<()> {
             .arg(inherit::CHILD_FD.to_string());
     }
     inherit::pass_to_child(&mut collector_cmd, &fds);
-    let mut collector = collector_cmd.spawn()?;
-    // The collector holds the socket now. Kept open here, it would hold the
-    // port after the collector exits.
-    drop(listener);
+    // A low `ulimit -n` can make `pass_to_child`'s `F_DUPFD_CLOEXEC` at
+    // `MOVE_FLOOR` fail with a bare "Invalid argument (os error 22)": named
+    // here so that is not left a mystery.
+    let mut collector = collector_cmd
+        .spawn()
+        .context("pass the listening sockets to the collector")?;
+    // The collector holds the sockets now. Kept open here, they would hold
+    // the ports after the collector exits.
+    drop(listeners);
     let mut host_cmd = host_command(&exe, &host_dir, &collector_ws_url, &args);
     if let Some((reader, _)) = &pairing {
         inherit::pass_to_child(&mut host_cmd, &[(reader.as_raw_fd(), inherit::CHILD_FD)]);
@@ -624,7 +790,8 @@ mod tests {
     #[test]
     fn ups_host_child_does_not_inherit_the_operator_token() {
         let args = UpArgs {
-            listen: "127.0.0.1:7117".into(),
+            listen: vec!["127.0.0.1:7117".into()],
+            public_url: None,
             data_dir: "/nonexistent".into(),
             agents: Vec::new(),
             idle_timeout_secs: 0,
