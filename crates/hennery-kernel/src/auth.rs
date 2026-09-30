@@ -71,11 +71,18 @@ pub async fn require_step_up(req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
+/// The longest a stream waits before it re-checks its session, however far
+/// off the expiry is. Tokio's clock is monotonic and does not count time the
+/// machine is suspended, so a sleep until the expiry could wake long after
+/// it: a laptop asleep for a week would keep a stream past its session.
+pub const SESSION_RECHECK: Duration = Duration::from_secs(60 * 60);
+
 /// Resolves once `session` has ended: revoked, signed out, or expired. A
 /// stream a session holds open must not outlive it (3b decision 7), so
 /// long-lived responses end with this. It re-checks the session whenever
-/// the operator announces an ending, and at its expiry (which may have
-/// slid since, through the session's other requests).
+/// the operator announces an ending, at its expiry (which may have slid
+/// since, through the session's other requests), and at least every
+/// `SESSION_RECHECK`, against the wall clock.
 pub async fn session_ended(operator: Arc<Operator>, session: Authenticated) {
     let mut ends = operator.session_ends();
     // Whatever ended before this subscription is checked here.
@@ -90,7 +97,7 @@ pub async fn session_ended(operator: Arc<Operator>, session: Authenticated) {
                     return;
                 }
             }
-            () = tokio::time::sleep(left) => {}
+            () = tokio::time::sleep(left.min(SESSION_RECHECK)) => {}
         }
         match operator.session_expires_at(&session.session_id, unix_now()) {
             Ok(Some(later)) => expires_at = later,
