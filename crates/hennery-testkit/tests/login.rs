@@ -2,7 +2,6 @@
 //! opens a session, rate limited per client address with one password
 //! check per attempt, and only from the `public_url`'s origin.
 
-use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::Operator;
 use hennery_kernel::secret::unix_now;
@@ -27,7 +26,6 @@ impl Collector {
             Store::open_in_memory().unwrap(),
             Hosts::open_in_memory().unwrap(),
             Operator::open_in_memory().unwrap(),
-            DevToken::new("dev-token-for-tests").unwrap(),
         );
         if set_up {
             let token = state.operator.issue_setup_token(unix_now()).unwrap().unwrap();

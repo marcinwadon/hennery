@@ -4,7 +4,6 @@
 
 use futures::{SinkExt, StreamExt};
 use hennery_host::identity::HostKey;
-use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::{Enrollment, Hosts};
 use hennery_kernel::operator::Operator;
 use hennery_proto::frames::{AttachedSession, Capabilities, Capability, CollectorFrame, HostFrame, SessionBody};
@@ -16,7 +15,6 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio_tungstenite::tungstenite::Message;
 
-const TOKEN: &str = "dev-token-for-tests";
 const HOST: &str = "host-1";
 
 /// The key `HOST` is paired with.
@@ -57,7 +55,6 @@ impl Collector {
             Store::open(&dir.path().join("hennery.db")).unwrap(),
             hosts,
             Operator::open(&dir.path().join("hennery.db")).unwrap(),
-            DevToken::new(TOKEN).unwrap(),
         );
         state.offline_threshold = offline;
         tokio::spawn(hennery_sessions::serve(listener, state.clone()));
@@ -239,10 +236,8 @@ where
     }
 }
 
-fn client() -> reqwest::Client {
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
-    reqwest::Client::builder().default_headers(headers).build().unwrap()
+fn client(collector: &Collector) -> reqwest::Client {
+    hennery_testkit::operator_client(&collector.state.operator)
 }
 
 fn attached(session_id: &str, last_seq: u64) -> AttachedSession {
@@ -269,7 +264,7 @@ async fn post(c: &reqwest::Client, url: String, body: Value) -> (u16, Value) {
 
 /// Start a session through the API, answering the host side by hand.
 async fn started_session(collector: &Collector, host: &mut ScriptedHost) -> String {
-    let c = client();
+    let c = client(collector);
     let url = collector.url("/api/sessions");
     let call =
         tokio::spawn(async move { post(&c, url, json!({ "host_id": HOST, "agent": "fake", "cwd": "/tmp" })).await });
@@ -299,7 +294,7 @@ async fn nothing_is_sent_to_a_host_before_its_reconciliation() {
     // ...and a start is refused rather than sent, so it cannot be mistaken
     // for a start lost on an earlier connection.
     let (status, body) = post(
-        &client(),
+        &client(&collector),
         collector.url("/api/sessions"),
         json!({ "host_id": HOST, "agent": "fake", "cwd": "/tmp" }),
     )
@@ -323,7 +318,7 @@ async fn nothing_is_sent_to_a_host_before_its_reconciliation() {
 async fn a_start_lost_in_a_drop_fails_as_not_delivered_after_the_next_handshake() {
     let collector = Collector::start().await;
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
-    let c = client();
+    let c = client(&collector);
     let url = collector.url("/api/sessions");
     let call =
         tokio::spawn(async move { post(&c, url, json!({ "host_id": HOST, "agent": "fake", "cwd": "/tmp" })).await });
@@ -354,7 +349,7 @@ async fn a_prompt_lost_in_a_drop_is_released_and_the_next_prompt_runs() {
     let session = started_session(&collector, &mut host).await;
     let prompt_url = collector.url(&format!("/api/sessions/{session}/prompt"));
 
-    let c = client();
+    let c = client(&collector);
     let url = prompt_url.clone();
     let call = tokio::spawn(async move { post(&c, url, prompt_body()).await });
     assert!(matches!(host.next().await, CollectorFrame::Prompt { .. }));
@@ -362,7 +357,10 @@ async fn a_prompt_lost_in_a_drop_is_released_and_the_next_prompt_runs() {
     host.drop_connection(&collector).await; // the prompt never reached the adapter
     assert_eq!(call.await.unwrap().0, 503);
     // Still wedged until the host is back: one turn at a time.
-    assert_eq!(post(&client(), prompt_url.clone(), prompt_body()).await.0, 409);
+    assert_eq!(
+        post(&client(&collector), prompt_url.clone(), prompt_body()).await.0,
+        409
+    );
 
     let mut host = ScriptedHost::connect(&collector, vec![attached(&session, seq)], seq).await;
     assert!(
@@ -370,7 +368,7 @@ async fn a_prompt_lost_in_a_drop_is_released_and_the_next_prompt_runs() {
             .event_kinds(&session)
             .contains(&"turn_not_delivered".to_string())
     );
-    let c = client();
+    let c = client(&collector);
     let url = prompt_url.clone();
     let call = tokio::spawn(async move { post(&c, url, prompt_body()).await });
     let CollectorFrame::Prompt {
@@ -389,7 +387,7 @@ async fn a_restarted_host_parks_its_sessions_and_interrupts_the_open_turn_only_a
     let collector = Collector::start().await;
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = started_session(&collector, &mut host).await;
-    let c = client();
+    let c = client(&collector);
     let url = collector.url(&format!("/api/sessions/{session}/prompt"));
     let call = tokio::spawn(async move { post(&c, url, prompt_body()).await });
     let CollectorFrame::Prompt {
@@ -419,7 +417,7 @@ async fn a_restarted_host_parks_its_sessions_and_interrupts_the_open_turn_only_a
         "{kinds:?}"
     );
     let (status, body) = post(
-        &client(),
+        &client(&collector),
         collector.url(&format!("/api/sessions/{session}/prompt")),
         prompt_body(),
     )
@@ -437,7 +435,7 @@ async fn a_reconcile_close_rejected_not_attached_still_closes_it_collector_side(
     // connection before it answers: the close stays `close_requested` and is
     // re-sent by the reconciliation loop itself (`ws.rs`, outside
     // `Hub::request_for_session` — no waiter is registered for it).
-    let c = client();
+    let c = client(&collector);
     let url = collector.url(&format!("/api/sessions/{session}/close"));
     let call = tokio::spawn(async move { post(&c, url, json!({})).await });
     assert!(matches!(host.next().await, CollectorFrame::CloseSession { .. }));
@@ -484,7 +482,7 @@ async fn a_reconcile_close_rejected_after_a_resume_leaves_the_resume_alone() {
     let collector = Collector::start().await;
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = started_session(&collector, &mut host).await;
-    let c = client();
+    let c = client(&collector);
     let url = collector.url(&format!("/api/sessions/{session}/close"));
     let call = tokio::spawn(async move { post(&c, url, json!({})).await });
     assert!(matches!(host.next().await, CollectorFrame::CloseSession { .. }));
@@ -514,7 +512,7 @@ async fn a_reconcile_close_rejected_after_a_resume_leaves_the_resume_alone() {
     })
     .await;
 
-    let c = client();
+    let c = client(&collector);
     let url = resume_url(&collector, &session);
     let resume = tokio::spawn(async move { post(&c, url, json!({})).await });
     let resume_request = expect_resume(&mut host, &session).await;
@@ -578,7 +576,7 @@ async fn presumed_parked(collector: &Collector, session: &str) {
 
 /// A prompt the host has started; returns its turn id.
 async fn started_turn(collector: &Collector, host: &mut ScriptedHost, session: &str) -> String {
-    let c = client();
+    let c = client(collector);
     let url = collector.url(&format!("/api/sessions/{session}/prompt"));
     let call = tokio::spawn(async move { post(&c, url, prompt_body()).await });
     let CollectorFrame::Prompt {
@@ -616,7 +614,7 @@ async fn a_host_offline_past_the_threshold_is_presumed_parked_and_reattached_on_
             .ends_with(&["presumed_parked".to_string()])
     );
     let (status, body) = post(
-        &client(),
+        &client(&collector),
         collector.url(&format!("/api/sessions/{session}/prompt")),
         prompt_body(),
     )
@@ -778,7 +776,7 @@ async fn a_resume_attaches_a_parked_session_again() {
     let collector = Collector::start().await;
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = parked_session(&collector, &mut host).await;
-    let c = client();
+    let c = client(&collector);
     let url = resume_url(&collector, &session);
     let call = tokio::spawn(async move { post(&c, url, json!({})).await });
     let request_id = expect_resume(&mut host, &session).await;
@@ -801,11 +799,11 @@ async fn two_concurrent_resumes_attach_once() {
     let collector = Collector::start().await;
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = parked_session(&collector, &mut host).await;
-    let c = client();
+    let c = client(&collector);
     let url = resume_url(&collector, &session);
     let first = tokio::spawn(async move { post(&c, url, json!({})).await });
     let request_id = expect_resume(&mut host, &session).await;
-    let (status, body) = post(&client(), resume_url(&collector, &session), json!({})).await;
+    let (status, body) = post(&client(&collector), resume_url(&collector, &session), json!({})).await;
     assert_eq!((status, body["code"].as_str()), (409, Some("starting")), "{body}");
     host.emit(&session, SessionBody::session_started(request_id, "agent-1"))
         .await;
@@ -821,7 +819,7 @@ async fn a_resume_the_agent_cannot_load_fails_with_its_reason_and_can_be_retried
     let collector = Collector::start().await;
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = parked_session(&collector, &mut host).await;
-    let c = client();
+    let c = client(&collector);
     let url = resume_url(&collector, &session);
     let call = tokio::spawn(async move { post(&c, url, json!({})).await });
     let request_id = expect_resume(&mut host, &session).await;
@@ -842,7 +840,7 @@ async fn a_resume_the_agent_cannot_load_fails_with_its_reason_and_can_be_retried
         ("failed", Some("agent_has_no_record"))
     );
     // Failed is resumable: the operator may try again.
-    let c = client();
+    let c = client(&collector);
     let url = resume_url(&collector, &session);
     let _retry = tokio::spawn(async move { post(&c, url, json!({})).await });
     expect_resume(&mut host, &session).await;
@@ -858,7 +856,7 @@ async fn a_resume_the_host_rejects_is_a_502_with_its_code() {
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = parked_session(&collector, &mut host).await;
     for code in ["not_attached", "invalid"] {
-        let c = client();
+        let c = client(&collector);
         let url = resume_url(&collector, &session);
         let call = tokio::spawn(async move { post(&c, url, json!({})).await });
         let request_id = expect_resume(&mut host, &session).await;
@@ -883,11 +881,11 @@ async fn a_resume_is_refused_while_active_offline_or_without_agent_history() {
     let collector = Collector::start().await;
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let active = started_session(&collector, &mut host).await;
-    let (status, body) = post(&client(), resume_url(&collector, &active), json!({})).await;
+    let (status, body) = post(&client(&collector), resume_url(&collector, &active), json!({})).await;
     assert_eq!((status, body["code"].as_str()), (409, Some("active")));
 
     // A start the host failed: the agent never created a session.
-    let c = client();
+    let c = client(&collector);
     let url = collector.url("/api/sessions");
     let call =
         tokio::spawn(async move { post(&c, url, json!({ "host_id": HOST, "agent": "fake", "cwd": "/tmp" })).await });
@@ -907,19 +905,24 @@ async fn a_resume_is_refused_while_active_offline_or_without_agent_history() {
     )
     .await;
     assert_eq!(call.await.unwrap().0, 502);
-    let (status, body) = post(&client(), resume_url(&collector, &session_id), json!({})).await;
+    let (status, body) = post(&client(&collector), resume_url(&collector, &session_id), json!({})).await;
     assert_eq!((status, body["code"].as_str()), (409, Some("agent_has_no_record")));
 
     let parked = parked_session(&collector, &mut host).await;
     host.drop_connection(&collector).await;
-    let (status, body) = post(&client(), resume_url(&collector, &parked), json!({})).await;
+    let (status, body) = post(&client(&collector), resume_url(&collector, &parked), json!({})).await;
     assert_eq!((status, body["code"].as_str()), (409, Some("host_offline")));
     assert_eq!(
         collector.lifecycle(&parked),
         "parked",
         "an offline resume changed the session"
     );
-    let (status, _) = post(&client(), resume_url(&collector, "no-such-session"), json!({})).await;
+    let (status, _) = post(
+        &client(&collector),
+        resume_url(&collector, "no-such-session"),
+        json!({}),
+    )
+    .await;
     assert_eq!(status, 404);
 }
 
@@ -936,7 +939,7 @@ async fn a_resume_is_refused_while_the_host_is_connected_but_not_yet_reconciled(
     let _host = ScriptedHost::hello(&collector, vec![attached(&session, seq)], seq).await;
     // Connected, but its resend is not complete: a resume must be refused,
     // never sent, so it cannot race the resend (ACP core §5.1).
-    let (status, body) = post(&client(), resume_url(&collector, &session), json!({})).await;
+    let (status, body) = post(&client(&collector), resume_url(&collector, &session), json!({})).await;
     assert_eq!((status, body["code"].as_str()), (409, Some("host_offline")));
     assert_eq!(
         collector.lifecycle(&session),
@@ -950,7 +953,7 @@ async fn a_resume_lost_in_a_drop_is_reconciled_like_a_start() {
     let collector = Collector::start().await;
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = parked_session(&collector, &mut host).await;
-    let c = client();
+    let c = client(&collector);
     let url = resume_url(&collector, &session);
     let call = tokio::spawn(async move { post(&c, url, json!({})).await });
     expect_resume(&mut host, &session).await;
@@ -974,7 +977,7 @@ async fn the_session_detail_shows_the_open_turn() {
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = started_session(&collector, &mut host).await;
     let turn = started_turn(&collector, &mut host, &session).await;
-    let (status, body) = get(&client(), collector.url(&format!("/api/sessions/{session}"))).await;
+    let (status, body) = get(&client(&collector), collector.url(&format!("/api/sessions/{session}"))).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(
         body,
@@ -984,7 +987,7 @@ async fn the_session_detail_shows_the_open_turn() {
             "open_turn": { "turn_id": turn, "state": "started" }, "pending": []
         })
     );
-    let (status, _) = get(&client(), collector.url("/api/sessions/no-such-session")).await;
+    let (status, _) = get(&client(&collector), collector.url("/api/sessions/no-such-session")).await;
     assert_eq!(status, 404);
 }
 
@@ -1021,14 +1024,9 @@ async fn a_hello_with_an_unknown_capability_is_accepted_with_the_known_ones() {
 // drops the handler, and only then does the host answer.
 
 /// POST with a client that gives up after 300 ms; resolves once it has.
-fn post_and_give_up(url: String, body: Value) -> tokio::task::JoinHandle<()> {
+fn post_and_give_up(c: reqwest::Client, url: String, body: Value) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let sent = client()
-            .post(url)
-            .json(&body)
-            .timeout(Duration::from_millis(300))
-            .send()
-            .await;
+        let sent = c.post(url).json(&body).timeout(Duration::from_millis(300)).send().await;
         assert!(sent.is_err(), "the collector answered before the host did: {sent:?}");
     })
 }
@@ -1060,6 +1058,7 @@ async fn a_start_rejected_after_its_caller_gave_up_still_fails_the_session() {
     let collector = Collector::start().await;
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let caller = post_and_give_up(
+        client(&collector),
         collector.url("/api/sessions"),
         json!({ "host_id": HOST, "agent": "fake", "cwd": "/tmp" }),
     );
@@ -1079,7 +1078,7 @@ async fn a_resume_rejected_after_its_caller_gave_up_still_fails_the_session() {
     let collector = Collector::start().await;
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = parked_session(&collector, &mut host).await;
-    let caller = post_and_give_up(resume_url(&collector, &session), json!({}));
+    let caller = post_and_give_up(client(&collector), resume_url(&collector, &session), json!({}));
     let request_id = expect_resume(&mut host, &session).await;
     reject_after_the_caller_left(&mut host, caller, request_id).await;
     let reason = wait_for("resume failed", || async { failed_with(&collector, &session) }).await;
@@ -1091,7 +1090,11 @@ async fn a_prompt_rejected_after_its_caller_gave_up_still_frees_the_turn_slot() 
     let collector = Collector::start().await;
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = started_session(&collector, &mut host).await;
-    let caller = post_and_give_up(collector.url(&format!("/api/sessions/{session}/prompt")), prompt_body());
+    let caller = post_and_give_up(
+        client(&collector),
+        collector.url(&format!("/api/sessions/{session}/prompt")),
+        prompt_body(),
+    );
     let CollectorFrame::Prompt { request_id, .. } = host.next().await else {
         panic!("expected a prompt");
     };
@@ -1141,7 +1144,7 @@ async fn a_cancel_ends_the_open_turn_and_answers_with_its_outcome() {
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = started_session(&collector, &mut host).await;
     let turn = started_turn(&collector, &mut host, &session).await;
-    let c = client();
+    let c = client(&collector);
     let url = cancel_url(&collector, &session);
     let call = tokio::spawn(async move { post(&c, url, json!({})).await });
     expect_cancel(&mut host, &session, &turn).await;
@@ -1166,7 +1169,7 @@ async fn a_cancel_that_loses_the_race_with_the_turns_end_answers_how_it_ended() 
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = started_session(&collector, &mut host).await;
     let turn = started_turn(&collector, &mut host, &session).await;
-    let c = client();
+    let c = client(&collector);
     let url = cancel_url(&collector, &session);
     let call = tokio::spawn(async move { post(&c, url, json!({})).await });
     let request_id = expect_cancel(&mut host, &session, &turn).await;
@@ -1193,14 +1196,19 @@ async fn a_cancel_is_refused_without_a_turn_the_host_runs() {
     let collector = Collector::start().await;
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = started_session(&collector, &mut host).await;
-    let (status, body) = post(&client(), cancel_url(&collector, &session), json!({})).await;
+    let (status, body) = post(&client(&collector), cancel_url(&collector, &session), json!({})).await;
     assert_eq!((status, body["code"].as_str()), (409, Some("no_open_turn")));
-    let (status, _) = post(&client(), cancel_url(&collector, "no-such-session"), json!({})).await;
+    let (status, _) = post(
+        &client(&collector),
+        cancel_url(&collector, "no-such-session"),
+        json!({}),
+    )
+    .await;
     assert_eq!(status, 404);
 
     // The host has no such turn in flight.
     let turn = started_turn(&collector, &mut host, &session).await;
-    let c = client();
+    let c = client(&collector);
     let url = cancel_url(&collector, &session);
     let call = tokio::spawn(async move { post(&c, url, json!({})).await });
     let request_id = expect_cancel(&mut host, &session, &turn).await;
@@ -1214,7 +1222,7 @@ async fn a_cancel_is_refused_without_a_turn_the_host_runs() {
     assert_eq!((status, body["code"].as_str()), (409, Some("not_running")));
 
     let parked = parked_session(&collector, &mut host).await;
-    let (status, body) = post(&client(), cancel_url(&collector, &parked), json!({})).await;
+    let (status, body) = post(&client(&collector), cancel_url(&collector, &parked), json!({})).await;
     assert_eq!((status, body["code"].as_str()), (409, Some("not_attached")));
 }
 
@@ -1226,7 +1234,7 @@ async fn park_goes_only_to_a_host_that_announced_it_can_park() {
     let mut host = ScriptedHost::connect_with(&collector, vec![], 0, Capabilities::default()).await;
     let session = started_session(&collector, &mut host).await;
     let park_url = collector.url(&format!("/api/sessions/{session}/park"));
-    let (status, body) = post(&client(), park_url.clone(), json!({})).await;
+    let (status, body) = post(&client(&collector), park_url.clone(), json!({})).await;
     assert_eq!(
         (status, body["code"].as_str()),
         (409, Some("park_unsupported")),
@@ -1240,7 +1248,7 @@ async fn park_goes_only_to_a_host_that_announced_it_can_park() {
     let seq = host.seq;
     host.drop_connection(&collector).await;
     let mut host = ScriptedHost::connect(&collector, vec![attached(&session, seq)], seq).await;
-    let c = client();
+    let c = client(&collector);
     let call = tokio::spawn(async move { post(&c, park_url, json!({})).await });
     assert!(matches!(host.next().await, CollectorFrame::ParkSession { .. }));
     host.emit(
@@ -1264,7 +1272,7 @@ async fn a_cancel_whose_turn_ended_before_it_was_sent_answers_the_stored_outcome
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = started_session(&collector, &mut host).await;
     let turn = started_turn(&collector, &mut host, &session).await;
-    let c = client();
+    let c = client(&collector);
     let url = cancel_url(&collector, &session);
     let call = tokio::spawn(async move { post(&c, url, json!({})).await });
     let request_id = expect_cancel(&mut host, &session, &turn).await;
@@ -1309,7 +1317,7 @@ fn catalogue(mode: &str) -> hennery_proto::frames::Indexed {
 async fn a_resume_re_sends_the_config_its_host_last_reported() {
     let collector = Collector::start().await;
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
-    let c = client();
+    let c = client(&collector);
     let url = collector.url("/api/sessions");
     let call = tokio::spawn(async move {
         post(
@@ -1355,7 +1363,7 @@ async fn a_resume_re_sends_the_config_its_host_last_reported() {
         (collector.lifecycle(&session_id) == "parked").then_some(())
     })
     .await;
-    let c = client();
+    let c = client(&collector);
     let url = resume_url(&collector, &session_id);
     tokio::spawn(async move { post(&c, url, json!({})).await });
     match host.next().await {
@@ -1393,7 +1401,7 @@ async fn set_config_answers_with_the_catalogue_the_host_read_back() {
     let collector = Collector::start().await;
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = started_session(&collector, &mut host).await;
-    let c = client();
+    let c = client(&collector);
     let url = config_url(&collector, &session);
     let call = tokio::spawn(async move { post(&c, url, json!({ "config_id": "mode", "value": "plan" })).await });
     let (request_id, config_id, value) = expect_set_config(&mut host, &session).await;
@@ -1409,7 +1417,11 @@ async fn set_config_answers_with_the_catalogue_the_host_read_back() {
     let (status, body) = call.await.unwrap();
     assert_eq!((status, body["mode"].as_str()), (202, Some("plan")), "{body}");
     assert_eq!(body["config_options"], json!([{"id": "mode", "currentValue": "plan"}]));
-    let (status, catalog) = get(&client(), collector.url(&format!("/api/sessions/{session}/catalog"))).await;
+    let (status, catalog) = get(
+        &client(&collector),
+        collector.url(&format!("/api/sessions/{session}/catalog")),
+    )
+    .await;
     assert_eq!((status, catalog), (200, body));
 }
 
@@ -1419,7 +1431,7 @@ async fn set_config_refusals_answer_with_their_codes() {
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = started_session(&collector, &mut host).await;
     for (code, status) in [("unknown_option", 409), ("config_failed", 502), ("invalid", 400)] {
-        let c = client();
+        let c = client(&collector);
         let url = config_url(&collector, &session);
         let call = tokio::spawn(async move { post(&c, url, json!({ "config_id": "model", "value": "huge" })).await });
         let (request_id, _, _) = expect_set_config(&mut host, &session).await;
@@ -1434,14 +1446,14 @@ async fn set_config_refusals_answer_with_their_codes() {
     }
     // Not a string or a boolean: refused before anything is sent.
     let (status, _) = post(
-        &client(),
+        &client(&collector),
         config_url(&collector, &session),
         json!({ "config_id": "x", "value": 3 }),
     )
     .await;
     assert_eq!(status, 422);
     let (status, _) = post(
-        &client(),
+        &client(&collector),
         config_url(&collector, "nope"),
         json!({ "config_id": "x", "value": "y" }),
     )
@@ -1459,7 +1471,7 @@ async fn set_config_refusals_answer_with_their_codes() {
     })
     .await;
     let (status, body) = post(
-        &client(),
+        &client(&collector),
         config_url(&collector, &session),
         json!({ "config_id": "x", "value": "y" }),
     )
@@ -1478,7 +1490,7 @@ async fn a_late_config_applied_for_a_failed_switch_still_updates_the_stored_cata
     let collector = Collector::start().await;
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = started_session(&collector, &mut host).await;
-    let c = client();
+    let c = client(&collector);
     let url = config_url(&collector, &session);
     let call = tokio::spawn(async move { post(&c, url, json!({ "config_id": "mode", "value": "plan" })).await });
     let (request_id, _, _) = expect_set_config(&mut host, &session).await;
@@ -1491,7 +1503,7 @@ async fn a_late_config_applied_for_a_failed_switch_still_updates_the_stored_cata
     let (status, body) = call.await.unwrap();
     assert_eq!((status, body["code"].as_str()), (502, Some("config_failed")), "{body}");
     let url = collector.url(&format!("/api/sessions/{session}/catalog"));
-    let (_, before) = get(&client(), url.clone()).await;
+    let (_, before) = get(&client(&collector), url.clone()).await;
     assert_ne!(before["mode"], "plan", "{before}");
     host.emit(
         &session,
@@ -1502,7 +1514,7 @@ async fn a_late_config_applied_for_a_failed_switch_still_updates_the_stored_cata
     )
     .await;
     wait_for("the late read-back stored", || async {
-        let (status, catalog) = get(&client(), url.clone()).await;
+        let (status, catalog) = get(&client(&collector), url.clone()).await;
         (status == 200 && catalog["mode"] == "plan").then_some(())
     })
     .await;
@@ -1512,7 +1524,7 @@ async fn a_late_config_applied_for_a_failed_switch_still_updates_the_stored_cata
 /// text received so far.
 async fn read_stream(collector: &Collector, session: &str, pred: impl Fn(&str) -> bool) -> String {
     use futures::StreamExt;
-    let resp = client()
+    let resp = client(collector)
         .get(collector.url(&format!("/api/stream/sessions/{session}")))
         .send()
         .await
@@ -1634,18 +1646,18 @@ async fn an_answer_is_queued_sent_to_the_host_and_its_verdict_recorded() {
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let (session, _) = asking_session(&collector, &mut host).await;
     let detail_url = collector.url(&format!("/api/sessions/{session}"));
-    let (_, detail) = get(&client(), detail_url.clone()).await;
+    let (_, detail) = get(&client(&collector), detail_url.clone()).await;
     assert_eq!(detail["activity"], "blocked");
     assert_eq!(detail["pending"][0]["pending_id"], "p1");
     assert_eq!(detail["pending"][0]["option_ids"], json!(["allow", "reject"]));
 
     let url = answer_url(&collector, &session, "p1");
-    let (status, body) = post(&client(), url.clone(), json!({"option_id": "allow"})).await;
+    let (status, body) = post(&client(&collector), url.clone(), json!({"option_id": "allow"})).await;
     assert_eq!(status, 202, "{body}");
     let request_id = expect_answer(&mut host, &session, "allow").await;
     assert_eq!(body, json!({"pending_id": "p1", "request_id": request_id}));
     // One answer per question, even before its verdict.
-    let (status, body) = post(&client(), url.clone(), json!({"option_id": "reject"})).await;
+    let (status, body) = post(&client(&collector), url.clone(), json!({"option_id": "reject"})).await;
     assert_eq!((status, body["code"].as_str()), (409, Some("already_answered")));
 
     host.emit(
@@ -1670,12 +1682,12 @@ async fn an_answer_is_queued_sent_to_the_host_and_its_verdict_recorded() {
         (verdict_of(&collector) == Some(true)).then_some(())
     })
     .await;
-    let (_, detail) = get(&client(), detail_url).await;
+    let (_, detail) = get(&client(&collector), detail_url).await;
     assert_eq!(
         (detail["activity"].as_str(), &detail["pending"]),
         (Some("running"), &json!([]))
     );
-    let (status, body) = post(&client(), url, json!({"option_id": "allow"})).await;
+    let (status, body) = post(&client(&collector), url, json!({"option_id": "allow"})).await;
     assert_eq!((status, body["code"].as_str()), (409, Some("not_open")));
 }
 
@@ -1685,14 +1697,14 @@ async fn answers_are_checked_against_the_stored_request() {
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let (session, _) = asking_session(&collector, &mut host).await;
     let url = answer_url(&collector, &session, "p1");
-    let (status, body) = post(&client(), url.clone(), json!({"option_id": "maybe"})).await;
+    let (status, body) = post(&client(&collector), url.clone(), json!({"option_id": "maybe"})).await;
     assert_eq!((status, body["code"].as_str()), (400, Some("invalid")), "{body}");
-    let (status, _) = post(&client(), url.clone(), json!({"action": "accept"})).await;
+    let (status, _) = post(&client(&collector), url.clone(), json!({"action": "accept"})).await;
     assert_eq!(status, 400, "an elicitation's answer to a permission request");
-    let (status, _) = post(&client(), url, json!({"action": "whatever"})).await;
+    let (status, _) = post(&client(&collector), url, json!({"action": "whatever"})).await;
     assert_eq!(status, 422);
     let (status, body) = post(
-        &client(),
+        &client(&collector),
         answer_url(&collector, &session, "no-such-question"),
         json!({"option_id": "allow"}),
     )
@@ -1712,7 +1724,7 @@ async fn an_answer_given_while_the_host_is_offline_is_sent_after_its_next_handsh
     let seq = host.seq;
     host.drop_connection(&collector).await;
     let (status, body) = post(
-        &client(),
+        &client(&collector),
         answer_url(&collector, &session, "p1"),
         json!({"option_id": "allow"}),
     )
@@ -1750,7 +1762,7 @@ async fn a_refused_answer_gets_its_verdict_from_its_questions_resolution() {
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let (session, _) = asking_session(&collector, &mut host).await;
     post(
-        &client(),
+        &client(&collector),
         answer_url(&collector, &session, "p1"),
         json!({"option_id": "allow"}),
     )
@@ -1803,7 +1815,7 @@ async fn a_host_restart_cancels_the_open_questions_and_drops_their_queued_answer
     let (session, _) = asking_session(&collector, &mut host).await;
     host.drop_connection(&collector).await;
     post(
-        &client(),
+        &client(&collector),
         answer_url(&collector, &session, "p1"),
         json!({"option_id": "allow"}),
     )
@@ -1829,7 +1841,7 @@ async fn every_step_of_a_question_is_a_pending_changed_message_on_the_session_st
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let (session, _) = asking_session(&collector, &mut host).await;
     post(
-        &client(),
+        &client(&collector),
         answer_url(&collector, &session, "p1"),
         json!({"option_id": "allow"}),
     )
@@ -1865,7 +1877,7 @@ async fn every_step_of_a_question_is_a_pending_changed_message_on_the_session_st
 // Plan 3a: host revoke (kernel spec §4.3).
 
 async fn revoke(collector: &Collector, host_id: &str) -> (u16, Value) {
-    let resp = client()
+    let resp = client(collector)
         .delete(collector.url(&format!("/api/hosts/{host_id}")))
         .timeout(Duration::from_secs(15))
         .send()
@@ -1882,7 +1894,7 @@ async fn a_revoke_closes_the_hosts_connection_and_parks_its_sessions_for_good() 
     let (session, _) = asking_session(&collector, &mut host).await;
     // An answer the host has, with no verdict yet.
     let (status, _) = post(
-        &client(),
+        &client(&collector),
         answer_url(&collector, &session, "p1"),
         json!({"option_id": "allow"}),
     )
@@ -2021,7 +2033,7 @@ async fn a_revoke_of_an_already_offline_host_still_parks_its_sessions_and_cancel
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let (session, _) = asking_session(&collector, &mut host).await;
     let (status, _) = post(
-        &client(),
+        &client(&collector),
         answer_url(&collector, &session, "p1"),
         json!({"option_id": "allow"}),
     )

@@ -8,7 +8,6 @@ pub mod store;
 pub mod ws;
 
 use axum::Router;
-use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::Operator;
 use hennery_kernel::ratelimit::{Limiter, Policy};
@@ -27,7 +26,6 @@ pub struct AppState {
     /// Wrong pairing codes per client address (kernel spec §4.1).
     pub enroll_limiter: Arc<Limiter>,
     pub hub: Arc<hub::Hub>,
-    pub token: DevToken,
     /// Cancelled on shutdown; long-lived handlers (host sockets, SSE) end
     /// when it fires so graceful shutdown completes.
     pub shutdown: CancellationToken,
@@ -36,14 +34,13 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(store: store::Store, hosts: Hosts, operator: Operator, token: DevToken) -> Self {
+    pub fn new(store: store::Store, hosts: Hosts, operator: Operator) -> Self {
         Self {
             store: Arc::new(store),
             hosts: Arc::new(hosts),
             operator: Arc::new(operator),
             enroll_limiter: Arc::new(Limiter::new(Policy::ENROLL)),
             hub: Arc::new(hub::Hub::new()),
-            token,
             shutdown: CancellationToken::new(),
             offline_threshold: offline::OFFLINE_THRESHOLD,
         }

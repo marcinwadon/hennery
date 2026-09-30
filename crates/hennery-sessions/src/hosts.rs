@@ -9,7 +9,7 @@ use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
-use axum::{Json, Router, middleware};
+use axum::{Json, Router};
 use hennery_kernel::hosts::{EnrollOutcome, Enrollment, HostRecord, Revoke};
 use hennery_kernel::lifecycle::LifecycleHooks;
 use hennery_kernel::secret::unix_now;
@@ -20,18 +20,17 @@ use std::time::{Duration, Instant};
 /// How long a revoke waits for the host's socket task to let go.
 const REVOKE_DISCONNECT_BOUND: Duration = Duration::from_secs(10);
 
-/// Routes that need an operator (the development bearer until operator
-/// auth replaces it), and enrollment, which is authenticated by its code
-/// alone and so sits outside that layer (kernel spec §3.3).
+/// Routes that need the operator's session, and enrollment, which is
+/// authenticated by its code alone and so sits outside that layer (kernel
+/// spec §3.3).
 pub fn router(state: AppState) -> Router {
-    let operator = Router::new()
-        .route("/api/hosts", get(list_hosts))
-        .route("/api/hosts/pairing-codes", post(mint_pairing_code))
-        .route("/api/hosts/{id}", delete(revoke_host))
-        .layer(middleware::from_fn_with_state(
-            state.token.clone(),
-            hennery_kernel::auth::require_bearer,
-        ));
+    let operator = hennery_kernel::auth::operator_only(
+        Router::new()
+            .route("/api/hosts", get(list_hosts))
+            .route("/api/hosts/pairing-codes", post(mint_pairing_code))
+            .route("/api/hosts/{id}", delete(revoke_host)),
+        state.operator.clone(),
+    );
     let code_authenticated = Router::new().route("/api/hosts/enroll", post(enroll));
     operator.merge(code_authenticated).with_state(state)
 }

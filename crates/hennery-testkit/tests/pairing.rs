@@ -2,7 +2,6 @@
 //! operator, enrollment needs only the code, and wrong codes lock the
 //! client's address out without spoiling the codes that are still valid.
 
-use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::{EnrollOutcome, Enrollment, Hosts};
 use hennery_kernel::operator::Operator;
 use hennery_proto::rest::{ApiError, EnrollRequest, EnrollResponse, PairingCodeResponse};
@@ -10,7 +9,6 @@ use hennery_sessions::AppState;
 use hennery_sessions::store::Store;
 use std::net::SocketAddr;
 
-const TOKEN: &str = "dev-token-for-tests";
 /// Valid Ed25519 public keys (RFC 8032 §7.1, tests 1 to 3).
 const KEYS: [&str; 3] = [
     "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
@@ -34,7 +32,6 @@ impl Collector {
             Store::open(&db).unwrap(),
             Hosts::open(&db).unwrap(),
             Operator::open(&db).unwrap(),
-            DevToken::new(TOKEN).unwrap(),
         );
         tokio::spawn(hennery_sessions::serve(listener, state.clone()));
         Self { addr, state, _dir: dir }
@@ -45,9 +42,8 @@ impl Collector {
     }
 
     async fn mint(&self) -> String {
-        let resp = reqwest::Client::new()
+        let resp = hennery_testkit::operator_client(&self.state.operator)
             .post(self.url("/api/hosts/pairing-codes"))
-            .bearer_auth(TOKEN)
             .send()
             .await
             .unwrap();
@@ -97,7 +93,7 @@ async fn code_of(resp: reqwest::Response) -> (u16, String) {
 }
 
 #[tokio::test]
-async fn a_minted_code_pairs_a_host_without_the_operator_bearer_once() {
+async fn a_minted_code_pairs_a_host_without_the_operators_session_once() {
     let collector = Collector::start().await;
     let code = collector.mint().await;
     let resp = collector.enroll(&code, KEYS[0]).await;
@@ -118,14 +114,18 @@ async fn a_minted_code_pairs_a_host_without_the_operator_bearer_once() {
 #[tokio::test]
 async fn minting_needs_the_operator_and_enrollment_does_not() {
     let collector = Collector::start().await;
+    // Set up, so the browser rules let the request through to the session
+    // check; an `Origin` but no session cookie.
+    hennery_testkit::operator_client(&collector.state.operator);
     let mint = reqwest::Client::new()
         .post(collector.url("/api/hosts/pairing-codes"))
+        .header("origin", hennery_testkit::PUBLIC_URL)
         .send()
         .await
         .unwrap();
-    assert_eq!(mint.status(), 401);
-    // Enrollment is reached without a bearer: the 401 is the code's, with
-    // an API error body, not the bearer layer's.
+    assert_eq!(code_of(mint).await, (401, "unauthenticated".into()));
+    // Enrollment is reached without a session or an `Origin`: the 401 is
+    // the code's, not the session layer's.
     assert_eq!(
         code_of(collector.enroll("0000-0000", KEYS[0]).await).await,
         (401, "invalid_code".into())

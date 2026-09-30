@@ -3,7 +3,6 @@
 
 use hennery_host::identity::HostKey;
 use hennery_host::{AgentCommand, HostConfig};
-use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::{Enrollment, Hosts};
 use hennery_kernel::operator::Operator;
 use hennery_proto::rest::{EventDto, HostItem, PromptResponse, StartSessionResponse};
@@ -13,8 +12,6 @@ use serde_json::{Value, json};
 use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
-
-const TOKEN: &str = "dev-token-for-tests";
 
 /// The key `host-1` is paired with in every collector here.
 fn host_key() -> HostKey {
@@ -52,12 +49,7 @@ impl Collector {
         let addr = listener.local_addr().unwrap();
         let hosts = Hosts::open(db).unwrap();
         pair_host(&hosts);
-        let mut state = AppState::new(
-            Store::open(db).unwrap(),
-            hosts,
-            Operator::open(db).unwrap(),
-            DevToken::new(TOKEN).unwrap(),
-        );
+        let mut state = AppState::new(Store::open(db).unwrap(), hosts, Operator::open(db).unwrap());
         state.offline_threshold = offline;
         let task = tokio::spawn(hennery_sessions::serve(listener, state.clone()));
         Self { addr, state, task }
@@ -107,10 +99,8 @@ fn host_config(collector: SocketAddr, data_dir: &Path, fake: AgentCommand) -> Ho
     cfg
 }
 
-fn client() -> reqwest::Client {
-    let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
-    reqwest::Client::builder().default_headers(headers).build().unwrap()
+fn client(collector: &Collector) -> reqwest::Client {
+    hennery_testkit::operator_client(&collector.state.operator)
 }
 
 async fn wait_for<T, F, Fut>(what: &str, mut probe: F) -> T
@@ -180,7 +170,7 @@ async fn a_prompt_streams_the_agents_reply_and_ends_the_turn_once() {
     let dir = tempfile::tempdir().unwrap();
     let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
     start_host(collector.addr, &dir.path().join("host"), &FakeScript::default());
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
 
     let session = start_session(&c, &collector).await;
@@ -223,7 +213,7 @@ async fn empty_prompts_and_overlapping_prompts_are_refused() {
         ..FakeScript::default()
     };
     start_host(collector.addr, &dir.path().join("host"), &slow);
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     let prompt_url = collector.url(&format!("/api/sessions/{session}/prompt"));
@@ -265,7 +255,7 @@ async fn a_collector_restart_mid_turn_loses_nothing_and_duplicates_nothing() {
         ..FakeScript::default()
     };
     start_host(addr, &dir.path().join("host"), &script);
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     let resp = c
@@ -304,7 +294,7 @@ async fn the_session_stream_replays_from_last_event_id() {
     let dir = tempfile::tempdir().unwrap();
     let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
     start_host(collector.addr, &dir.path().join("host"), &FakeScript::default());
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     c.post(collector.url(&format!("/api/sessions/{session}/prompt")))
@@ -352,7 +342,7 @@ async fn a_start_that_fails_on_the_host_is_reported_as_502() {
     let dir = tempfile::tempdir().unwrap();
     let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
     start_host(collector.addr, &dir.path().join("host"), &FakeScript::default());
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
 
     for (agent, expected) in [("broken", "start_failed"), ("not-configured", "unknown_agent")] {
@@ -374,7 +364,7 @@ async fn a_start_that_fails_on_the_host_is_reported_as_502() {
 async fn a_start_with_unknown_delivery_reports_503_with_the_session_id() {
     let dir = tempfile::tempdir().unwrap();
     let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
-    let c = client();
+    let c = client(&collector);
 
     // Register a fake host connection directly (no real socket): once the
     // collector sends `start_session` on it, drop the connection before any
@@ -461,7 +451,7 @@ async fn an_adapter_crash_mid_turn_parks_the_session_with_a_scrubbed_stderr_tail
         ..FakeScript::default()
     };
     start_host(collector.addr, &dir.path().join("host"), &script);
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     let prompt_url = collector.url(&format!("/api/sessions/{session}/prompt"));
@@ -499,7 +489,7 @@ async fn park_then_close_through_the_api_kill_the_adapters_whole_group() {
         ..slow_script(20)
     };
     start_host(collector.addr, &dir.path().join("host"), &script);
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     let grandchild = wait_for("grandchild pid", || async { pid_from(&pid_file) }).await;
@@ -531,7 +521,7 @@ async fn closing_an_attached_session_waits_for_the_host_to_close_it() {
     let dir = tempfile::tempdir().unwrap();
     let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
     start_host(collector.addr, &dir.path().join("host"), &FakeScript::default());
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     let (status, body) = post_json(&c, collector.url(&format!("/api/sessions/{session}/close")), json!({})).await;
@@ -567,7 +557,7 @@ async fn a_host_restart_mid_turn_parks_and_interrupts_without_respawning() {
         env: vec![(SCRIPT_ENV.into(), serde_json::to_string(&script).unwrap())],
     };
     let host = start_host_with(collector.addr, &dir.path().join("host"), counting.clone());
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     let prompt_url = collector.url(&format!("/api/sessions/{session}/prompt"));
@@ -608,7 +598,7 @@ async fn a_dropped_connection_mid_turn_parks_nothing_and_loses_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
     start_host(collector.addr, &dir.path().join("host"), &slow_script(6));
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     let prompt_url = collector.url(&format!("/api/sessions/{session}/prompt"));
@@ -685,7 +675,7 @@ async fn host_shutdown_gives_every_adapter_its_sigterm_grace() {
     let host = tokio::spawn(hennery_host::run_until(cfg, async {
         let _ = stopped.await;
     }));
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     lifecycle_is(&collector, &session, "active").await;
@@ -755,7 +745,7 @@ async fn a_parked_session_resumes_without_replaying_its_history() {
     let dir = tempfile::tempdir().unwrap();
     let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
     start_host(collector.addr, &dir.path().join("host"), &history_and_state());
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     prompt_and_wait(&c, &collector, &session, 1).await;
@@ -813,7 +803,7 @@ async fn resuming_a_session_the_agent_has_no_record_of_fails_agent_has_no_record
         ..FakeScript::default()
     };
     start_host(collector.addr, &dir.path().join("host"), &script);
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     post_json(&c, collector.url(&format!("/api/sessions/{session}/park")), json!({})).await;
@@ -852,7 +842,7 @@ async fn resume_after_a_host_restart(lose_outbox: bool) {
         serde_json::to_string(&FakeScript::default()).unwrap(),
     ));
     let host = start_host_with(collector.addr, &dir.path().join("host"), fake.clone());
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     prompt_and_wait(&c, &collector, &session, 1).await;
@@ -895,7 +885,7 @@ async fn a_cancel_mid_turn_ends_it_cancelled_once_and_the_next_prompt_runs() {
     let dir = tempfile::tempdir().unwrap();
     let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
     start_host(collector.addr, &dir.path().join("host"), &slow_script(20));
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     let url = collector.url(&format!("/api/sessions/{session}/prompt"));
@@ -965,7 +955,7 @@ async fn a_start_with_model_mode_and_axes_announces_the_catalogue_after_the_swit
     let log = dir.path().join("config.log");
     let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
     start_host(collector.addr, &dir.path().join("host"), &config_script(&log));
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let (status, body) = post_json(
         &c,
@@ -999,7 +989,7 @@ async fn a_model_switch_answers_with_the_adapters_read_back_and_a_bogus_model_is
     let log = dir.path().join("config.log");
     let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
     start_host(collector.addr, &dir.path().join("host"), &config_script(&log));
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     let url = collector.url(&format!("/api/sessions/{session}/config"));
@@ -1035,7 +1025,7 @@ async fn a_mode_the_agent_chose_survives_a_host_restart_and_resume() {
     fake.env
         .push((SCRIPT_ENV.into(), serde_json::to_string(&script).unwrap()));
     let host = start_host_with(collector.addr, &dir.path().join("host"), fake.clone());
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     prompt_and_wait(&c, &collector, &session, 1).await;
@@ -1107,7 +1097,7 @@ async fn questions_answered_through_the_api_reach_the_agent_and_are_reported_del
     let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
     let script = asking(vec![FakeAsk::Permission, FakeAsk::Elicitation]);
     start_host(collector.addr, &dir.path().join("host"), &script);
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     prompt(&c, &collector, &session).await;
@@ -1155,7 +1145,7 @@ async fn stop_with_a_question_open_ends_the_turn_cancelled_and_closes_the_questi
     let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
     let script = asking(vec![hennery_testkit::FakeAsk::Permission]);
     start_host(collector.addr, &dir.path().join("host"), &script);
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     prompt(&c, &collector, &session).await;
@@ -1184,7 +1174,7 @@ async fn an_adapter_crash_with_a_question_open_cancels_it_adapter_lost() {
         ..asking(vec![hennery_testkit::FakeAsk::Permission])
     };
     start_host(collector.addr, &dir.path().join("host"), &script);
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     prompt(&c, &collector, &session).await;
@@ -1223,7 +1213,7 @@ async fn a_host_restart_with_a_question_open_cancels_it_host_restarted() {
     fake.env
         .push((SCRIPT_ENV.into(), serde_json::to_string(&script).unwrap()));
     let host = start_host_with(collector.addr, &dir.path().join("host"), fake.clone());
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     prompt(&c, &collector, &session).await;
@@ -1259,7 +1249,7 @@ async fn a_question_outlasts_its_host_being_away_and_an_answer_given_meanwhile_i
         &dir.path().join("host"),
         &asking(vec![hennery_testkit::FakeAsk::Permission]),
     );
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     prompt(&c, &collector, &session).await;
@@ -1320,7 +1310,7 @@ async fn a_revoked_host_stops_its_adapters_and_exits() {
         &dir.path().join("host"),
         fake,
     )));
-    let c = client();
+    let c = client(&collector);
     wait_host_connected(&c, &collector).await;
     let session = start_session(&c, &collector).await;
     let grandchild = wait_for("grandchild pid", || async { pid_from(&pid_file) }).await;

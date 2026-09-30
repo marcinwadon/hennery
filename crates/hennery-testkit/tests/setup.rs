@@ -2,7 +2,6 @@
 //! the setup link creates the owner and signs them in, once, from the
 //! origin being stored as `public_url`.
 
-use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::Operator;
 use hennery_proto::rest::{ApiError, SetupRequest, SetupResponse};
@@ -26,7 +25,6 @@ impl Collector {
             Store::open_in_memory().unwrap(),
             Hosts::open_in_memory().unwrap(),
             Operator::open_in_memory().unwrap(),
-            DevToken::new("dev-token-for-tests").unwrap(),
         );
         let token = state
             .operator

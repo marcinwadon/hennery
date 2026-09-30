@@ -1,7 +1,6 @@
 //! The `hennery` binary (distribution spec §1): collector, host (join and
 //! run) and an all-in-one mode. Hosts authenticate with the key they paired
-//! with; the REST API still takes a development bearer token until operator
-//! auth lands.
+//! with; the operator with the session the setup link or a login opened.
 
 mod inherit;
 
@@ -13,7 +12,6 @@ use hennery_host::identity::Paired;
 use hennery_host::pairing::Joined;
 use hennery_host::session::IDLE_TIMEOUT;
 use hennery_host::{AgentCommand, HostConfig};
-use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::{Operator, SetupLink};
 use hennery_sessions::{AppState, store::Store};
@@ -67,10 +65,6 @@ struct CollectorArgs {
     listen: String,
     #[arg(long, env = "HENNERY_DATA_DIR")]
     data_dir: PathBuf,
-    /// Development bearer token for REST clients, until operator auth.
-    /// Hosts authenticate with their paired key instead.
-    #[arg(long, env = "HENNERY_DEV_TOKEN", hide_env_values = true)]
-    dev_token: String,
     /// Presume a host's sessions parked once it has been offline this long.
     #[arg(long, default_value_t = hennery_sessions::offline::OFFLINE_THRESHOLD.as_secs())]
     host_offline_secs: u64,
@@ -109,9 +103,6 @@ struct UpArgs {
     listen: String,
     #[arg(long, env = "HENNERY_DATA_DIR")]
     data_dir: PathBuf,
-    /// The collector's development bearer token for REST clients.
-    #[arg(long, env = "HENNERY_DEV_TOKEN", hide_env_values = true)]
-    dev_token: String,
     #[arg(long = "agent", value_parser = parse_agent)]
     agents: Vec<(String, AgentCommand)>,
     /// Park sessions idle for this many seconds; 0 turns the reaper off.
@@ -164,14 +155,12 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run_collector(args: CollectorArgs) -> Result<()> {
-    // Checked before anything touches the data dir, like `run_up` does.
-    let token = DevToken::new(args.dev_token)?;
     private_data_dir(&args.data_dir)?;
     let db = args.data_dir.join("hennery.db");
     let store = Store::open(&db)?;
     let hosts = Hosts::open(&db)?;
     let operator = Operator::open(&db)?;
-    let mut state = AppState::new(store, hosts, operator, token);
+    let mut state = AppState::new(store, hosts, operator);
     state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
     hennery_sessions::offline::after_startup(&state);
     let listener = tokio::net::TcpListener::bind(&args.listen)
@@ -349,9 +338,10 @@ fn host_command(
         .arg(args.idle_timeout_secs.to_string())
         .kill_on_drop(true)
         .process_group(0);
-    // `up` may have the operator's bearer in its own environment; the host
-    // needs none, and its agents must never see it. The adapter spawn strips
-    // the same list again, for a host started by hand.
+    // `up` may still have the old development token in its environment (a
+    // shell set up before it was removed); the host needs none, and its
+    // agents must never see it. The adapter spawn strips the same list
+    // again, for a host started by hand.
     for var in hennery_host::adapter::HOST_SECRET_VARS {
         host_cmd.env_remove(var);
     }
@@ -373,8 +363,6 @@ fn host_command(
 /// 11, A1) — restart policy for a genuine crash comes with the distribution
 /// work.
 async fn run_up(args: UpArgs) -> Result<()> {
-    // Checked here too, so a bad token stops `up` before any child starts.
-    DevToken::new(args.dev_token.clone())?;
     let exe = std::env::current_exe()?;
     let host_dir = args.data_dir.join("host");
     // Computed and validated before any child starts: a non-loopback
@@ -400,7 +388,6 @@ async fn run_up(args: UpArgs) -> Result<()> {
         .args(["collector", "--listen", &args.listen])
         .arg("--data-dir")
         .arg(args.data_dir.join("collector"))
-        .env("HENNERY_DEV_TOKEN", &args.dev_token)
         .kill_on_drop(true)
         .process_group(0);
     if let Some((_, writer)) = &pairing {
@@ -463,15 +450,15 @@ async fn run_up(args: UpArgs) -> Result<()> {
 mod tests {
     use super::*;
 
-    /// Final review I1: `up` may itself have been given the operator's
-    /// bearer in its environment (`HENNERY_DEV_TOKEN`); its host child must
-    /// not inherit it, so neither can any agent that host runs.
+    /// Final review I1: `up` may itself have the old operator bearer in its
+    /// environment (`HENNERY_DEV_TOKEN`, left in a shell from before 3b);
+    /// its host child must not inherit it, so neither can any agent that
+    /// host runs.
     #[test]
     fn ups_host_child_does_not_inherit_the_operator_token() {
         let args = UpArgs {
             listen: "127.0.0.1:7117".into(),
             data_dir: "/nonexistent".into(),
-            dev_token: "dev-token-for-tests".into(),
             agents: Vec::new(),
             idle_timeout_secs: 0,
         };

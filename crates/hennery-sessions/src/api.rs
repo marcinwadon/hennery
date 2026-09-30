@@ -8,7 +8,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router, middleware};
+use axum::{Json, Router};
 use futures::stream::{self, Stream, StreamExt};
 use hennery_proto::frames::{Capability, CollectorFrame, Indexed, SessionBody};
 use hennery_proto::rest::{
@@ -47,8 +47,9 @@ const _: () = assert!(
     "every request timeout must exceed the host connection's read deadline"
 );
 
+/// Every route here is an operator's (kernel spec §3.3).
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let routes = Router::new()
         .route("/api/sessions", post(start_session))
         .route("/api/sessions/{id}", get(session_detail))
         .route("/api/sessions/{id}/resume", post(resume))
@@ -60,12 +61,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/{id}/config", post(set_config))
         .route("/api/sessions/{id}/pending/{pending_id}/answer", post(answer))
         .route("/api/sessions/{id}/events", get(events))
-        .route("/api/stream/sessions/{id}", get(stream_session))
-        .layer(middleware::from_fn_with_state(
-            state.token.clone(),
-            hennery_kernel::auth::require_bearer,
-        ))
-        .with_state(state)
+        .route("/api/stream/sessions/{id}", get(stream_session));
+    hennery_kernel::auth::operator_only(routes, state.operator.clone()).with_state(state)
 }
 
 pub(crate) fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {

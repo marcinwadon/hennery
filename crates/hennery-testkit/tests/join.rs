@@ -5,7 +5,6 @@
 use hennery_host::HostConfig;
 use hennery_host::identity::{KEY_FILE, Paired};
 use hennery_host::pairing::{Joined, join};
-use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::{EnrollOutcome, Enrollment, HelloCheck, Hosts};
 use hennery_kernel::operator::Operator;
 use hennery_proto::PROTOCOL_VERSION;
@@ -13,8 +12,6 @@ use hennery_proto::rest::PairingCodeResponse;
 use hennery_sessions::AppState;
 use hennery_sessions::store::Store;
 use std::net::SocketAddr;
-
-const TOKEN: &str = "dev-token-for-tests";
 
 struct Collector {
     addr: SocketAddr,
@@ -32,7 +29,6 @@ impl Collector {
             Store::open(&db).unwrap(),
             Hosts::open(&db).unwrap(),
             Operator::open(&db).unwrap(),
-            DevToken::new(TOKEN).unwrap(),
         );
         tokio::spawn(hennery_sessions::serve(listener, state.clone()));
         Self { addr, state, _dir: dir }
@@ -43,9 +39,8 @@ impl Collector {
     }
 
     async fn mint(&self) -> String {
-        let resp = reqwest::Client::new()
+        let resp = hennery_testkit::operator_client(&self.state.operator)
             .post(format!("{}/api/hosts/pairing-codes", self.public_url()))
-            .bearer_auth(TOKEN)
             .send()
             .await
             .unwrap();
