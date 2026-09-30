@@ -211,6 +211,19 @@ impl Drop for AdminSocket {
     }
 }
 
+/// Removes the file at the given path when dropped. Used between
+/// `UnixListener::bind` and the `AdminSocket` it will become: a failure in
+/// between (permissions, non-blocking, the tokio handoff) would otherwise
+/// leave the just-bound socket file behind, with no `AdminSocket` yet to
+/// remove it.
+struct RemoveOnDrop<'a>(&'a Path);
+
+impl Drop for RemoveOnDrop<'_> {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(self.0);
+    }
+}
+
 /// The longest path a Unix socket address holds, its terminating NUL
 /// included (104 bytes on macOS, 108 on Linux).
 fn max_socket_path() -> usize {
@@ -254,10 +267,12 @@ pub fn bind(dir: &Path) -> Result<Option<AdminSocket>> {
         }
     }
     let listener = std::os::unix::net::UnixListener::bind(&path).with_context(|| format!("bind {}", path.display()))?;
+    let cleanup = RemoveOnDrop(&path);
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("make {} private", path.display()))?;
     listener.set_nonblocking(true)?;
     let listener = tokio::net::UnixListener::from_std(listener)?;
+    std::mem::forget(cleanup);
     Ok(Some(AdminSocket { listener, path }))
 }
 

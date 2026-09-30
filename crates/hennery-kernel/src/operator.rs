@@ -151,7 +151,8 @@ impl std::fmt::Debug for SetupLink {
 
 pub struct Operator {
     conn: Mutex<Connection>,
-    /// Loaded at open and replaced by setup: read on every browser request.
+    /// Loaded at open and replaced by setup and by `reset_public_url`: read
+    /// on every browser request.
     public_url: RwLock<Option<PublicUrl>>,
     setup: Mutex<Option<SetupToken>>,
     /// The link last written to `setup-url` (and so the file), removed
@@ -166,8 +167,10 @@ pub struct Operator {
     /// (3b decision 10): a login flood from a shared address does not stop
     /// a signed-in owner stepping up, nor step-up guesses lock out login.
     pub step_up_limiter: Limiter,
-    /// Bumped whenever a session ends (revoked or signed out): streams
-    /// held open by a session re-check it on every bump (3b decision 7).
+    /// Bumped whenever a session ends (revoked or signed out), and by
+    /// `reset_password` and `reset_public_url`, each of which ends every
+    /// session: streams held open by a session re-check it on every bump
+    /// (3b decision 7).
     ended: tokio::sync::watch::Sender<u64>,
     /// Verifies running now, and the most ever at once (`check_password`'s
     /// bound, pinned by the unit tests below).
@@ -350,12 +353,14 @@ impl Operator {
                 params![owner_id, PUBLIC_URL_KEY, public_url.origin()],
             )?;
             tx.commit()?;
+            // Still under the connection's lock: no reset lands between
+            // the row and the cache (as `reset_public_url` does it too).
+            *self.public_url.write().expect("public_url lock") = Some(public_url);
         }
         *setup = None;
         if let Some(link) = self.announced.lock().expect("announced lock").take() {
             remove_setup_file(&link.file);
         }
-        *self.public_url.write().expect("public_url lock") = Some(public_url);
         Ok(SetupOutcome::Done { owner_id, phc })
     }
 
