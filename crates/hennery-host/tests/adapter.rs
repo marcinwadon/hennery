@@ -1,10 +1,13 @@
 //! The adapter supervisor against plain shell processes: group kill reaches
 //! grandchildren, SIGTERM escalates to SIGKILL, dropping an adapter kills its
-//! group, stderr is bounded and scrubbed, nesting variables are stripped.
+//! group, stderr is bounded and scrubbed, nesting variables are stripped,
+//! and no descriptor but its stdio reaches the agent.
 
 use hennery_host::adapter::{Adapter, AgentCommand, STDERR_TAIL_BYTES, scrub};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 
 fn sh(script: &str) -> AgentCommand {
     AgentCommand {
@@ -201,4 +204,56 @@ fn scrub_redacts_token_like_strings_and_leaves_words_alone() {
     for (input, expected) in cases {
         assert_eq!(scrub(input), expected, "input {input:?}");
     }
+}
+
+/// Closes a raw descriptor on drop, however the test ends.
+struct CloseOnDrop(i32);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: close(2) on a descriptor this test opened.
+        unsafe { libc::close(self.0) };
+    }
+}
+
+/// The descriptor numbers `ls /dev/fd` printed.
+fn listed(out: &[u8]) -> Vec<i32> {
+    String::from_utf8_lossy(out)
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect()
+}
+
+/// A descriptor the host holds open across `exec` (inherited from `hennery
+/// up`, a service manager or a shell, or opened by another thread without
+/// close-on-exec) never reaches an agent: it gets its stdio and nothing
+/// else of the host's.
+#[tokio::test]
+async fn an_adapter_inherits_no_descriptor_but_its_stdio() {
+    let file = std::fs::File::open("/dev/null").unwrap();
+    // SAFETY: fcntl(2) on an open descriptor: a copy at 64 or above,
+    // without close-on-exec, as a leaked one would be.
+    let leaked = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 64) };
+    assert!(leaked >= 64, "{}", std::io::Error::last_os_error());
+    let _close = CloseOnDrop(leaked);
+    // Control: a plain spawn passes it on.
+    let control = std::process::Command::new("ls").arg("/dev/fd").output().unwrap();
+    assert!(listed(&control.stdout).contains(&leaked), "{control:?}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let ls = AgentCommand {
+        program: "ls".into(),
+        args: vec!["/dev/fd".into()],
+        env: Vec::new(),
+    };
+    let (mut adapter, mut io) = Adapter::spawn(&ls, dir.path()).unwrap();
+    let mut out = Vec::new();
+    io.stdout.read_to_end(&mut out).await.unwrap();
+    adapter.exited().await;
+    let fds = listed(&out);
+    assert!(fds.contains(&0) && fds.contains(&1), "{fds:?}");
+    assert!(
+        !fds.contains(&leaked),
+        "the agent inherited descriptor {leaked}: {fds:?}"
+    );
 }
