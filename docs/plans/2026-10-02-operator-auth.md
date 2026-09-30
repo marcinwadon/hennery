@@ -59,7 +59,7 @@ It builds on the executed [host pairing plan](2026-10-01-host-pairing.md) (plan 
 - after every task the tree matched the scratch commit byte for byte, `Cargo.lock` and the generated files included;
 - after every task the replay ran fmt, both clippy runs (the second on the shipped binary, with test hooks off), the workspace tests and both codegen checks.
 
-It ends with 431 tests, up from 393. The timing-sensitive tests passed with four copies of their test binary running at once.
+The replay ended with 431 tests, up from 393; execution ended with 439 (see "Execution status"). The timing-sensitive tests passed with four copies of their test binary running at once.
 
 ## Execution status (2026-10-02)
 

@@ -146,14 +146,14 @@ fn the_development_token_in_the_environment_is_warned_about_and_never_printed() 
     let _cleanup = RemoveDir(dir.clone());
     let host_dir = dir.join("host");
     std::fs::create_dir_all(&host_dir).unwrap();
+    // A data directory under a regular file cannot be made by any user,
+    // root included (ENOTDIR), so the collector stops before it binds.
+    let not_a_dir = dir.join("file");
+    std::fs::write(&not_a_dir, b"").unwrap();
     let runs: [(&str, Vec<std::ffi::OsString>); 3] = [
         (
             "collector",
-            vec![
-                "collector".into(),
-                "--data-dir".into(),
-                "/nonexistent/hennery-cli-devtokenwarn".into(),
-            ],
+            vec!["collector".into(), "--data-dir".into(), not_a_dir.join("data").into()],
         ),
         (
             "up",
