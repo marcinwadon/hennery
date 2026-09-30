@@ -81,9 +81,9 @@ impl Collector {
 
 type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-/// Open a host socket; the nonce is the one in the upgrade response.
-async fn connect(collector: &Collector) -> (Ws, Vec<u8>) {
-    let (ws, response) = tokio_tungstenite::connect_async(format!("ws://{}/api/hosts/ws", collector.addr))
+/// Open a host socket on `addr`; the nonce is the one in the upgrade response.
+async fn connect(addr: SocketAddr) -> (Ws, Vec<u8>) {
+    let (ws, response) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/hosts/ws"))
         .await
         .unwrap();
     let nonce = hex::decode(response.headers()[HELLO_NONCE_HEADER].to_str().unwrap()).unwrap();
@@ -319,27 +319,32 @@ async fn the_browser_rules_run_before_the_session_check() {
 
 /// Enrollment and the host WebSocket are authenticated otherwise and are
 /// exempt from the browser rules (kernel spec §3.3): no cookie, any origin.
+/// On every listener (kernel spec §7, §11): the same router is cloned onto
+/// each, and these two routes are the ones the layer-order comment at the
+/// top of this file warns about escaping the browser rules altogether.
 #[tokio::test]
 async fn enrollment_and_the_host_socket_need_neither_a_session_nor_an_origin() {
     let collector = Collector::start().await;
     hennery_testkit::operator_client(&collector.state.operator);
-    let enroll = reqwest::Client::new()
-        .post(collector.url("/api/hosts/enroll"))
-        .header("origin", "https://evil.example")
-        .json(&serde_json::json!({
-            "code": "0000-0000", "public_key": host_key().public_key_hex(),
-            "name": "x", "host_version": "x", "platform": "x"
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(code_of(enroll).await, (401, "invalid_code".into()));
-    let (mut ws, nonce) = connect(&collector).await;
-    let proof = host_key().sign_hello(&nonce, HOST, PROTOCOL_VERSION);
-    assert!(matches!(
-        hello(&mut ws, HOST, proof).await,
-        CollectorFrame::HelloAck { .. }
-    ));
+    let plain = reqwest::Client::new();
+    for &addr in &collector.addrs {
+        let enroll = request(&plain, addr, "POST", "/api/hosts/enroll")
+            .header("origin", "https://evil.example")
+            .json(&serde_json::json!({
+                "code": "0000-0000", "public_key": host_key().public_key_hex(),
+                "name": "x", "host_version": "x", "platform": "x"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(code_of(enroll).await, (401, "invalid_code".into()), "{addr}");
+        let (mut ws, nonce) = connect(addr).await;
+        let proof = host_key().sign_hello(&nonce, HOST, PROTOCOL_VERSION);
+        assert!(
+            matches!(hello(&mut ws, HOST, proof).await, CollectorFrame::HelloAck { .. }),
+            "{addr}"
+        );
+    }
     collector.stop().await;
 }
 
@@ -448,7 +453,7 @@ async fn a_tossed_session_cookie_before_the_real_one_does_not_sign_the_owner_out
 #[tokio::test]
 async fn a_hello_signed_by_another_key_is_rejected_without_registering() {
     let collector = Collector::start().await;
-    let (mut ws, nonce) = connect(&collector).await;
+    let (mut ws, nonce) = connect(collector.addr).await;
     let forged = HostKey::from_seed([2; 32]).sign_hello(&nonce, HOST, PROTOCOL_VERSION);
     let reply = hello(&mut ws, HOST, forged).await;
     assert_eq!(hello_error(&reply), "bad_proof");
@@ -462,14 +467,14 @@ async fn a_hello_signed_by_another_key_is_rejected_without_registering() {
 #[tokio::test]
 async fn a_proof_is_good_on_its_own_connection_only() {
     let collector = Collector::start().await;
-    let (_first, first_nonce) = connect(&collector).await;
-    let (mut second, second_nonce) = connect(&collector).await;
+    let (_first, first_nonce) = connect(collector.addr).await;
+    let (mut second, second_nonce) = connect(collector.addr).await;
     assert_ne!(first_nonce, second_nonce);
     // Replaying the first connection's proof on the second is refused.
     let replayed = host_key().sign_hello(&first_nonce, HOST, PROTOCOL_VERSION);
     assert_eq!(hello_error(&hello(&mut second, HOST, replayed).await), "bad_proof");
 
-    let (mut third, nonce) = connect(&collector).await;
+    let (mut third, nonce) = connect(collector.addr).await;
     let proof = host_key().sign_hello(&nonce, HOST, PROTOCOL_VERSION);
     let reply = hello(&mut third, HOST, proof).await;
     assert!(matches!(reply, CollectorFrame::HelloAck { .. }), "{reply:?}");
@@ -482,7 +487,7 @@ async fn a_proof_is_good_on_its_own_connection_only() {
 #[tokio::test]
 async fn an_unknown_host_is_refused_like_a_bad_proof() {
     let collector = Collector::start().await;
-    let (mut ws, nonce) = connect(&collector).await;
+    let (mut ws, nonce) = connect(collector.addr).await;
     let proof = host_key().sign_hello(&nonce, "host-9", PROTOCOL_VERSION);
     assert_eq!(hello_error(&hello(&mut ws, "host-9", proof).await), "bad_proof");
     collector.stop().await;
@@ -493,11 +498,11 @@ async fn a_revoked_host_is_told_so_but_only_with_a_valid_proof() {
     let collector = Collector::start().await;
     collector.state.hosts.revoke(HOST, 1).unwrap();
 
-    let (mut ws, nonce) = connect(&collector).await;
+    let (mut ws, nonce) = connect(collector.addr).await;
     let forged = HostKey::from_seed([2; 32]).sign_hello(&nonce, HOST, PROTOCOL_VERSION);
     assert_eq!(hello_error(&hello(&mut ws, HOST, forged).await), "bad_proof");
 
-    let (mut ws, nonce) = connect(&collector).await;
+    let (mut ws, nonce) = connect(collector.addr).await;
     let proof = host_key().sign_hello(&nonce, HOST, PROTOCOL_VERSION);
     assert_eq!(hello_error(&hello(&mut ws, HOST, proof).await), "revoked");
     assert!(collector.connected().is_empty());
