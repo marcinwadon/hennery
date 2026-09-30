@@ -2377,8 +2377,10 @@ async fn a_flooding_adapter_cannot_hold_off_a_cancel() {
 /// output (the burst cap can leave the updates arm disabled long enough for
 /// the deadline to win the race) — reporting `config_failed` to the
 /// requester and then silently applying the same answer as an orphan.
-/// `out_deadline` must drain first and only orphan the switch if it is
-/// still out afterward.
+/// `out_deadline` never drains (fix round 2): the answer's callback flags
+/// its token before pushing it onto the wire-ordered channel, so a deadline
+/// that finds the flag set disarms the switch and leaves the answer to the
+/// ordinary update arm; only a switch whose flag is not set is orphaned.
 ///
 /// No prompt runs here: `model_switch_chunks_first` gives the switch's own
 /// answer a known, deterministic backlog ahead of it (sent inline, no sleep,
@@ -2409,8 +2411,8 @@ async fn a_switch_answered_just_in_time_is_applied_not_orphaned_under_a_backlog(
     assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
     // No prompt is running, so `next_reply` (which never preempts
     // `out_deadline` in the biased select otherwise) cannot resolve either:
-    // whatever answers this switch, answers it via `out_deadline`'s own
-    // drain or the ordinary update arm, never a turn ending underneath it.
+    // whatever answers this switch, answers it via the ordinary update arm
+    // (after `out_deadline` disarmed it), never a turn ending underneath it.
     let frames = wait_until(&uplink, has("config_applied")).await;
     let (request, indexed) = applied(&frames).remove(0);
     assert_eq!(request.as_str(), "rc1");
@@ -2420,7 +2422,9 @@ async fn a_switch_answered_just_in_time_is_applied_not_orphaned_under_a_backlog(
         "the answer that came in time was not applied"
     );
     // Nothing else answered rc1 (in particular, not a `config_failed` from
-    // the deadline firing before the drain saw the real answer).
+    // the deadline orphaning it). This is the check that tells the two
+    // apart: an orphan's late read-back is a `config_applied` for rc1 too
+    // (final review I2), but only after its `config_failed`.
     match replies.try_recv() {
         Err(_) => {}
         Ok(frame) => panic!("rc1 was answered a second time: {frame:?}"),
@@ -2436,7 +2440,7 @@ async fn a_switch_answered_just_in_time_is_applied_not_orphaned_under_a_backlog(
 ///
 /// `model_switch_chunks_first` gives `rc1` (the model switch) a known
 /// backlog ahead of its own answer (calibrated at ~850ms to drain 5000 items
-/// on a disk-backed outbox): a brief sleep (30ms) lets the answer reach the
+/// on a disk-backed outbox): a brief sleep (200ms) lets the answer reach the
 /// host (fast: the connection task's own read is not disk-bound) while the
 /// actor's own consumption is still far from reaching it. `rc2` (a plain,
 /// fast switch) is sent right behind `rc1` and queues, since only one switch
@@ -2555,9 +2559,11 @@ async fn a_cancel_is_read_promptly_even_though_a_switch_deadline_fires_mid_flood
     // the time the deadline fired — unbounded, in practice (a bare few
     // hundred ms of flood was already observed to take 10s+ to recover
     // from under the drain-based round-1 fix). Without any drain there,
-    // the cancel gets its fair turn within one burst cycle: a few seconds
-    // is a generous, but still bounded, budget.
-    let cancel_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // the cancel gets its fair turn within one burst cycle. The budget also
+    // covers draining the flood's backlog before the cancelled turn ends,
+    // slow on a loaded macOS runner: 20s, like the sibling
+    // `a_flooding_adapter_cannot_hold_off_a_cancel` (final review M3).
+    let cancel_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while handle.open_turn_id().is_some() {
         assert!(
             tokio::time::Instant::now() < cancel_deadline,
