@@ -160,7 +160,13 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     if let Some(fd) = args.pairing_code_fd {
         // Only once migrated and listening: the host enrolls right away.
         let code = state.hosts.mint_pairing_code(hennery_kernel::secret::unix_now())?;
-        inherit::write_code(fd, &code.code)?;
+        // The host child may have died already (e.g. it could not bind, or
+        // was killed) — closing its end of the pipe before this write. That
+        // is the host's problem, not the collector's: it must keep serving
+        // every other route regardless. Logged without the code itself.
+        if let Err(err) = inherit::write_code(fd, &code.code) {
+            tracing::warn!(error = %err, "could not hand the pairing code to the host child");
+        }
     }
     let shutdown = state.shutdown.clone();
     tokio::spawn(async move {
@@ -212,8 +218,19 @@ async fn run_host(args: HostArgs) -> Result<()> {
     // On SIGINT/SIGTERM the host stops its connection and waits (bounded)
     // for every session actor to SIGTERM its adapter's group and SIGKILL it
     // after the grace; only then does returning drop the runtime.
-    hennery_host::run_until(cfg, terminated()).await
+    match hennery_host::run_until(cfg, terminated()).await {
+        // Its own exit code, so `hennery up` can tell a revoke apart.
+        Err(err) if hennery_host::connection::revoked(&err) => {
+            eprintln!("Error: {err:#}");
+            std::process::exit(REVOKED_EXIT);
+        }
+        other => other,
+    }
 }
+
+/// `hennery host run`'s exit code once the collector says the host was
+/// revoked (sysexits' `EX_CONFIG`).
+const REVOKED_EXIT: i32 = 78;
 
 /// Resolves on SIGINT or SIGTERM.
 async fn terminated() {
@@ -252,6 +269,11 @@ async fn run_up(args: UpArgs) -> Result<()> {
     DevToken::new(args.dev_token.clone())?;
     let exe = std::env::current_exe()?;
     let host_dir = args.data_dir.join("host");
+    // Computed and validated before any child starts: a non-loopback
+    // `--listen` (or another scheme it cannot make sense of) must fail here,
+    // not after the collector is already up and serving.
+    let collector_url = loopback_url(&args.listen);
+    let collector_ws_url = hennery_host::pairing::collector_ws_url(&collector_url)?;
     // The host pairs itself on first start only; a pairing that was revoked
     // is not replaced (kernel spec §4.2).
     let pairing = match Paired::load(&host_dir)? {
@@ -278,14 +300,13 @@ async fn run_up(args: UpArgs) -> Result<()> {
             .arg(inherit::CHILD_FD.to_string());
     }
     let mut collector = collector_cmd.spawn()?;
-    let collector_url = loopback_url(&args.listen);
     let mut host_cmd = tokio::process::Command::new(&exe);
     host_cmd
         .args(["host", "run"])
         .arg("--data-dir")
         .arg(&host_dir)
         .arg("--collector-url")
-        .arg(hennery_host::pairing::collector_ws_url(&collector_url)?)
+        .arg(&collector_ws_url)
         .arg("--idle-timeout-secs")
         .arg(args.idle_timeout_secs.to_string())
         .kill_on_drop(true)
@@ -310,10 +331,31 @@ async fn run_up(args: UpArgs) -> Result<()> {
     // Both children hold their ends now; with the supervisor's copies
     // closed, the host sees end-of-file if the collector dies first.
     drop(pairing);
-    tokio::select! {
-        status = collector.wait() => tracing::warn!(?status, "collector exited"),
-        status = host.wait() => tracing::warn!(?status, "host exited"),
-        _ = terminated() => {}
+    // Only a collector exit (or a signal) ends `up`. A revoked host exits
+    // for good, and the collector keeps serving the operator and every
+    // remote host.
+    let mut host_running = true;
+    loop {
+        tokio::select! {
+            status = collector.wait() => {
+                tracing::warn!(?status, "collector exited");
+                break;
+            }
+            status = host.wait(), if host_running => {
+                host_running = false;
+                if status.as_ref().ok().and_then(|s| s.code()) == Some(REVOKED_EXIT) {
+                    tracing::warn!(
+                        "the all-in-one host was revoked; the collector keeps serving. To pair it again, stop `hennery up`, remove {} and {}, and start it again",
+                        host_dir.join(hennery_host::identity::KEY_FILE).display(),
+                        host_dir.join(hennery_host::identity::CONFIG_FILE).display()
+                    );
+                    continue;
+                }
+                tracing::warn!(?status, "host exited");
+                break;
+            }
+            _ = terminated() => break,
+        }
     }
     // Host first (it stops its adapters), then the collector.
     sigterm(&host);

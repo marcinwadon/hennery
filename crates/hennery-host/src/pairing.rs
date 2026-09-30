@@ -1,7 +1,8 @@
 //! `hennery host join <url> <code>` (kernel spec §4.1): generate the host's
 //! key, enroll it with a pairing code, and store the pairing.
 
-use crate::identity::{HostKey, KEY_FILE, Paired, create_private_dir, fsync_parent, write_config};
+use crate::connection::{Standing, probe};
+use crate::identity::{CONFIG_FILE, HostKey, KEY_FILE, Paired, create_private_dir, fsync_parent, write_config};
 use crate::outbox::FILE as OUTBOX_FILE;
 use anyhow::{Context, Result, bail};
 use hennery_proto::rest::{ApiError, EnrollRequest, EnrollResponse};
@@ -17,7 +18,8 @@ const ENROLL_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum Joined {
     /// Enrolled now, under this id.
     Paired { host_id: String },
-    /// The data directory holds a pairing already; nothing was sent.
+    /// The collector still accepts the stored pairing; the code was not
+    /// used.
     AlreadyPaired { host_id: String },
 }
 
@@ -105,15 +107,32 @@ pub fn orphan_outbox(data_dir: &Path, label: &str) -> Result<Option<PathBuf>> {
     Ok(Some(base))
 }
 
+/// Whether two host WebSocket URLs name the same collector: equal, or both
+/// on loopback (the all-in-one host's collector may listen on another port,
+/// or be reached as `localhost` instead of `127.0.0.1`).
+pub fn same_collector(a: &str, b: &str) -> bool {
+    let loopback = |u: &str| {
+        Url::parse(u)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .is_some_and(|h| {
+                h.eq_ignore_ascii_case("localhost")
+                    || h.trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            })
+    };
+    a == b || (loopback(a) && loopback(b))
+}
+
 /// Pair the host whose data directory is `data_dir` with the collector at
-/// `public_url`. Idempotent: a directory that is paired already is left as
-/// it is, and the code is not spent.
+/// `public_url` (kernel spec §4.1). Idempotent: if the collector still
+/// accepts the stored key, nothing changes and the code is not spent. A
+/// pairing it revoked is replaced by a new key and a new host id, and the
+/// outbox of the old identity is moved aside (`orphan_outbox`). A pairing
+/// it does not know is refused: that needs the operator's decision.
 pub async fn join(public_url: &str, code: &str, data_dir: &Path, name: &str) -> Result<Joined> {
-    if let Some(paired) = Paired::load(data_dir)? {
-        return Ok(Joined::AlreadyPaired {
-            host_id: paired.host_id,
-        });
-    }
     let base = parse_public_url(public_url)?;
     if base.scheme() == "https" {
         // Enrolling would spend the code on a host that cannot connect.
@@ -122,6 +141,39 @@ pub async fn join(public_url: &str, code: &str, data_dir: &Path, name: &str) -> 
         );
     }
     let collector_url = collector_ws_url(public_url)?;
+    if let Some(paired) = Paired::load(data_dir)? {
+        if !same_collector(&paired.collector_url, &collector_url) {
+            bail!(
+                "{} is paired with {} already; remove {} and {} to pair it with {public_url} instead",
+                data_dir.display(),
+                paired.collector_url,
+                data_dir.join(KEY_FILE).display(),
+                data_dir.join(CONFIG_FILE).display()
+            );
+        }
+        match probe(&collector_url, &paired.host_id, &paired.key).await? {
+            Standing::Accepted => {
+                return Ok(Joined::AlreadyPaired {
+                    host_id: paired.host_id,
+                });
+            }
+            // Only a revoke is certain: the collector checked the key and
+            // refused it for good.
+            Standing::Revoked => {
+                orphan_outbox(data_dir, &paired.host_id)?;
+            }
+            // A collector that no longer knows the key may be one whose
+            // database was reset or restored; re-pairing on a guess could
+            // strand sessions that are only waiting for it to come back.
+            Standing::Unknown => bail!(
+                "the collector at {public_url} does not know host {} (its database may have been reset or restored). \
+                 If this host should be paired anew, remove {} and {} and run `hennery host join` again",
+                paired.host_id,
+                data_dir.join(KEY_FILE).display(),
+                data_dir.join(CONFIG_FILE).display()
+            ),
+        }
+    }
     create_private_dir(data_dir)?;
     let key = HostKey::generate();
     // Written before enrolling, so a directory that cannot hold the key
@@ -292,6 +344,30 @@ mod tests {
         ] {
             assert!(!is_valid_host_id(id), "{id}");
         }
+    }
+
+    #[test]
+    fn any_two_loopback_urls_name_the_same_collector() {
+        assert!(same_collector(
+            "ws://127.0.0.1:7117/api/hosts/ws",
+            "ws://localhost:7200/api/hosts/ws"
+        ));
+        assert!(same_collector(
+            "ws://[::1]:7117/api/hosts/ws",
+            "ws://127.0.0.2:7117/api/hosts/ws"
+        ));
+        assert!(same_collector(
+            "wss://c.example/api/hosts/ws",
+            "wss://c.example/api/hosts/ws"
+        ));
+        assert!(!same_collector(
+            "wss://c.example/api/hosts/ws",
+            "wss://d.example/api/hosts/ws"
+        ));
+        assert!(!same_collector(
+            "ws://127.0.0.1:7117/api/hosts/ws",
+            "wss://c.example/api/hosts/ws"
+        ));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! `hennery host join` against a real collector (kernel spec §4.1): the host
 //! generates its key, enrolls it with a code and stores the pairing; a host
-//! that is paired already is left alone.
+//! the collector still accepts is left alone, and one it revoked pairs anew.
 
+use hennery_host::HostConfig;
 use hennery_host::identity::{KEY_FILE, Paired};
 use hennery_host::pairing::{Joined, join};
 use hennery_kernel::auth::DevToken;
@@ -158,4 +159,94 @@ async fn joining_next_to_an_old_outbox_moves_it_aside() {
         std::fs::read(dir.path().join("outbox.db.orphaned-unpaired")).unwrap(),
         b"frames of an unpaired host"
     );
+}
+
+async fn joined(collector: &Collector, dir: &std::path::Path) -> String {
+    let code = collector.mint().await;
+    match join(&collector.public_url(), &code, dir, "laptop").await.unwrap() {
+        Joined::Paired { host_id } => host_id,
+        other => panic!("expected a new pairing, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn joining_again_while_the_host_runs_leaves_it_running() {
+    let collector = Collector::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let host_id = joined(&collector, dir.path()).await;
+    let paired = Paired::load(dir.path()).unwrap().unwrap();
+    let host = tokio::spawn(hennery_host::run(HostConfig::new(
+        paired.collector_url,
+        paired.host_id,
+        paired.key,
+        dir.path().to_path_buf(),
+    )));
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !collector.state.hub.is_ready(&host_id) {
+        assert!(tokio::time::Instant::now() < deadline, "host never connected");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    // The probe is refused `already_connected`, which the collector says
+    // only of a valid proof: still paired.
+    let code = collector.mint().await;
+    assert_eq!(
+        join(&collector.public_url(), &code, dir.path(), "laptop")
+            .await
+            .unwrap(),
+        Joined::AlreadyPaired {
+            host_id: host_id.clone()
+        }
+    );
+    assert!(collector.state.hub.is_ready(&host_id));
+    host.abort();
+}
+
+#[tokio::test]
+async fn joining_again_after_a_revoke_pairs_anew_and_moves_the_old_outbox_aside() {
+    let collector = Collector::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let old_id = joined(&collector, dir.path()).await;
+    let old_key = std::fs::read(dir.path().join(KEY_FILE)).unwrap();
+    std::fs::write(dir.path().join("outbox.db"), b"frames of the old identity").unwrap();
+    collector
+        .state
+        .hosts
+        .revoke(&old_id, hennery_kernel::secret::unix_now())
+        .unwrap();
+
+    let new_id = joined(&collector, dir.path()).await;
+    assert_ne!(new_id, old_id);
+    assert_ne!(std::fs::read(dir.path().join(KEY_FILE)).unwrap(), old_key);
+    assert!(!dir.path().join("outbox.db").exists());
+    assert_eq!(
+        std::fs::read(dir.path().join(format!("outbox.db.orphaned-{old_id}"))).unwrap(),
+        b"frames of the old identity"
+    );
+    assert_eq!(Paired::load(dir.path()).unwrap().unwrap().host_id, new_id);
+    let hosts = collector.state.hosts.list().unwrap();
+    assert_eq!(hosts.len(), 2);
+    assert!(hosts.iter().any(|h| h.id == old_id && h.revoked_at.is_some()));
+}
+
+/// Two collectors on loopback count as one (the all-in-one collector may
+/// come back on another port), so the second is asked about the key: it
+/// does not know it, and that is refused rather than guessed at.
+#[tokio::test]
+async fn joining_a_collector_that_does_not_know_the_key_is_refused() {
+    let first = Collector::start().await;
+    let second = Collector::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    joined(&first, dir.path()).await;
+    std::fs::write(dir.path().join("outbox.db"), b"frames of the first pairing").unwrap();
+    let code = second.mint().await;
+    let err = join(&second.public_url(), &code, dir.path(), "laptop")
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not know host"), "{err}");
+    assert!(err.contains(&dir.path().join(KEY_FILE).display().to_string()), "{err}");
+    assert!(second.state.hosts.list().unwrap().is_empty());
+    // Nothing was touched.
+    assert!(dir.path().join("outbox.db").exists());
+    assert!(Paired::load(dir.path()).unwrap().is_some());
 }

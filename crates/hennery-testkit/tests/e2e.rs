@@ -1294,3 +1294,41 @@ async fn a_question_outlasts_its_host_being_away_and_an_answer_given_meanwhile_i
     );
     assert_eq!(delivered(&collector, &pending), Some(true));
 }
+
+// Plan 3a: a revoked host stops its adapters (ACP core §3.5, kernel spec §4.3).
+
+#[tokio::test]
+async fn a_revoked_host_stops_its_adapters_and_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let pid_file = dir.path().join("grandchild.pid");
+    let script = FakeScript {
+        grandchild_pid_file: Some(pid_file.to_string_lossy().into_owned()),
+        ..slow_script(20)
+    };
+    let mut fake = AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    fake.env
+        .push((SCRIPT_ENV.into(), serde_json::to_string(&script).unwrap()));
+    let host = tokio::spawn(hennery_host::run(host_config(
+        collector.addr,
+        &dir.path().join("host"),
+        fake,
+    )));
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    let grandchild = wait_for("grandchild pid", || async { pid_from(&pid_file) }).await;
+
+    let revoked = c.delete(collector.url("/api/hosts/host-1")).send().await.unwrap();
+    assert_eq!(revoked.status(), 200);
+    // Kicked, the host reconnects, is told it is revoked, and stops.
+    let outcome = tokio::time::timeout(Duration::from_secs(30), host)
+        .await
+        .expect("the revoked host stops")
+        .unwrap();
+    let err = outcome.expect_err("a revoked host ends with an error");
+    assert!(format!("{err:#}").contains("revoked"), "{err:#}");
+    wait_dead(grandchild).await;
+    let row = collector.state.store.session(&session).unwrap().unwrap();
+    assert_eq!((row.lifecycle.as_str(), row.presumed_parked), ("parked", true));
+}
