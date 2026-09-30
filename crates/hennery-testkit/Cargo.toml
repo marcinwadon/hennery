@@ -24,6 +24,7 @@ hennery-host = { workspace = true, features = ["test-hooks"] }
 hennery-kernel.workspace = true
 hennery-proto.workspace = true
 hennery-sessions.workspace = true
+hex.workspace = true
 reqwest.workspace = true
 rusqlite.workspace = true
 tempfile = "3"

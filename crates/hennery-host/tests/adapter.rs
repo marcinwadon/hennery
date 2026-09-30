@@ -163,6 +163,25 @@ async fn nesting_variables_are_removed_from_the_adapter_environment() {
     assert!(!env.contains("CLAUDECODE="), "{env}");
 }
 
+/// Final review I1: the operator's bearer never reaches an agent, which
+/// could otherwise answer its own permission questions, mint a pairing code
+/// and enroll again after a revoke. Other `HENNERY_` variables still pass.
+#[tokio::test]
+async fn the_operator_token_is_removed_from_the_adapter_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("env.txt");
+    let mut cmd = sh(&format!("env > {}", out.display()));
+    cmd.env
+        .push(("HENNERY_DEV_TOKEN".into(), "operator-token-never-for-agents".into()));
+    cmd.env.push(("HENNERY_KEEP".into(), "yes".into()));
+    let (mut adapter, _io) = Adapter::spawn(&cmd, dir.path()).unwrap();
+    adapter.exited().await;
+    let env = std::fs::read_to_string(&out).unwrap();
+    assert!(env.contains("HENNERY_KEEP=yes"), "{env}");
+    assert!(!env.contains("HENNERY_DEV_TOKEN="), "{env}");
+    assert!(!env.contains("operator-token-never-for-agents"), "{env}");
+}
+
 #[test]
 fn scrub_redacts_token_like_strings_and_leaves_words_alone() {
     let cases = [

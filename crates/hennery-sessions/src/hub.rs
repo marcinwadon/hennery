@@ -67,8 +67,22 @@ struct HostConn {
     /// something lost on the previous one (ACP core §5.1).
     ready: bool,
     kicked: CancellationToken,
+    /// Cancelled once this connection is unregistered (or replaced).
+    ended: CancellationToken,
     /// From this connection's `hello` (ACP core §3.3).
     capabilities: Capabilities,
+}
+
+impl HostConn {
+    /// Reconciled and not kicked. A kicked connection may linger until its
+    /// socket task notices (a stuck socket, a revoke whose wait timed out),
+    /// but nothing is routed to it any more, and it is not listed as
+    /// connected (final review M1). Read from the token, not cleared in
+    /// `ready`, so every kick counts, the watchdog's included (`expire`
+    /// holds no hosts lock), and a `mark_ready` landing after it too.
+    fn routable(&self) -> bool {
+        self.ready && !self.kicked.is_cancelled()
+    }
 }
 
 /// A registered host connection.
@@ -122,16 +136,20 @@ impl Hub {
         }
         let conn_id = self.next_conn.fetch_add(1, Ordering::Relaxed);
         let kicked = CancellationToken::new();
-        hosts.insert(
+        let replaced = hosts.insert(
             host_id.to_string(),
             HostConn {
                 conn_id,
                 tx,
                 ready: false,
                 kicked: kicked.clone(),
+                ended: CancellationToken::new(),
                 capabilities,
             },
         );
+        if let Some(old) = replaced {
+            old.ended.cancel();
+        }
         self.last_conn
             .lock()
             .expect("last_conn lock")
@@ -161,8 +179,10 @@ impl Hub {
     /// Requests a newer connection of the same host carries are untouched.
     pub fn unregister(&self, host_id: &str, conn_id: u64) {
         let mut hosts = self.hosts.lock().expect("hosts lock");
-        if hosts.get(host_id).is_some_and(|h| h.conn_id == conn_id) {
-            hosts.remove(host_id);
+        if hosts.get(host_id).is_some_and(|h| h.conn_id == conn_id)
+            && let Some(gone) = hosts.remove(host_id)
+        {
+            gone.ended.cancel();
         }
         drop(hosts);
         let mut waiters = self.waiters.lock().expect("waiters lock");
@@ -186,6 +206,21 @@ impl Hub {
         }
     }
 
+    /// Close the host's connection and wait, at most `bound`, until its
+    /// socket task has unregistered it: then nothing that connection reads
+    /// can change the store any more. `true` once no connection is left.
+    pub async fn disconnect_and_wait(&self, host_id: &str, bound: Duration) -> bool {
+        let ended = {
+            let hosts = self.hosts.lock().expect("hosts lock");
+            let Some(h) = hosts.get(host_id) else {
+                return true;
+            };
+            h.kicked.cancel();
+            h.ended.clone()
+        };
+        tokio::time::timeout(bound, ended.cancelled()).await.is_ok()
+    }
+
     /// Like `disconnect`, but only if `conn_id` is still the host's current
     /// connection.
     pub fn disconnect_conn(&self, host_id: &str, conn_id: u64) {
@@ -196,27 +231,27 @@ impl Hub {
         }
     }
 
-    /// Hosts that are connected and reconciled, sorted.
+    /// Hosts that are connected, reconciled and not kicked, sorted.
     pub fn connected_hosts(&self) -> Vec<String> {
         let mut ids: Vec<String> = self
             .hosts
             .lock()
             .expect("hosts lock")
             .iter()
-            .filter(|(_, h)| h.ready)
+            .filter(|(_, h)| h.routable())
             .map(|(id, _)| id.clone())
             .collect();
         ids.sort();
         ids
     }
 
-    /// The host is connected and reconciled.
+    /// The host is connected, reconciled and not kicked.
     pub fn is_ready(&self, host_id: &str) -> bool {
         self.hosts
             .lock()
             .expect("hosts lock")
             .get(host_id)
-            .is_some_and(|h| h.ready)
+            .is_some_and(HostConn::routable)
     }
 
     /// The host's current connection announced `capability`. A host that is
@@ -237,7 +272,7 @@ impl Hub {
             .lock()
             .expect("hosts lock")
             .get(host_id)
-            .filter(|h| h.ready)
+            .filter(|h| h.routable())
             .is_some_and(|h| h.tx.send(frame).is_ok())
     }
 
@@ -317,7 +352,7 @@ impl Hub {
         // between (lock order: hosts, then waiters, as in `unregister`).
         let (conn_id, kicked) = {
             let hosts = self.hosts.lock().expect("hosts lock");
-            let Some(host) = hosts.get(host_id).filter(|h| h.ready) else {
+            let Some(host) = hosts.get(host_id).filter(|h| h.routable()) else {
                 return Err(RequestError::NotConnected);
             };
             self.waiters.lock().expect("waiters lock").insert(

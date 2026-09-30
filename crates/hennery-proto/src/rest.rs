@@ -211,3 +211,53 @@ impl SessionCatalog {
         })
     }
 }
+
+/// 201 to `POST /api/hosts/pairing-codes` (kernel spec §4.1): a single-use
+/// code for `hennery host join`, shown once.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PairingCodeResponse {
+    /// `XXXX-XXXX`, Crockford base32.
+    pub code: String,
+    /// RFC 3339.
+    pub expires_at: String,
+}
+
+/// `POST /api/hosts/enroll` (kernel spec §4.1): a host pairs itself with a
+/// code and the public half of the key it generated.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct EnrollRequest {
+    pub code: String,
+    /// Ed25519 public key, 64 hex characters.
+    pub public_key: String,
+    pub name: String,
+    pub host_version: String,
+    pub platform: String,
+}
+
+/// 201 to an enrollment: the id the host names itself by in `hello`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct EnrollResponse {
+    pub host_id: String,
+}
+
+/// One entry of `GET /api/hosts` (kernel spec §8): a paired host, revoked
+/// ones included.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HostItem {
+    pub host_id: String,
+    pub name: String,
+    pub platform: String,
+    pub host_version: String,
+    /// From its latest accepted `hello`.
+    pub capabilities: crate::frames::Capabilities,
+    /// Connected and reconciled: requests reach it now.
+    pub connected: bool,
+    /// RFC 3339.
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub last_seen_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub revoked_at: Option<String>,
+}

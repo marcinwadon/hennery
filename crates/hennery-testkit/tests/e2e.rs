@@ -1,9 +1,11 @@
 //! End to end: a real collector (in process), a real host (in process) and the
 //! fake ACP adapter as a real child process, talking over real sockets.
 
+use hennery_host::identity::HostKey;
 use hennery_host::{AgentCommand, HostConfig};
 use hennery_kernel::auth::DevToken;
-use hennery_proto::rest::{EventDto, PromptResponse, StartSessionResponse};
+use hennery_kernel::hosts::{Enrollment, Hosts};
+use hennery_proto::rest::{EventDto, HostItem, PromptResponse, StartSessionResponse};
 use hennery_sessions::{AppState, store::Store};
 use hennery_testkit::{FakeScript, SCRIPT_ENV};
 use serde_json::{Value, json};
@@ -11,7 +13,23 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-const TOKEN: &str = "dev-token";
+const TOKEN: &str = "dev-token-for-tests";
+
+/// The key `host-1` is paired with in every collector here.
+fn host_key() -> HostKey {
+    HostKey::from_seed([1; 32])
+}
+
+/// Pair `host-1` (a no-op for a collector restarted over the same database).
+fn pair_host(hosts: &Hosts) {
+    let enrollment = Enrollment {
+        public_key: host_key().public_key_hex(),
+        name: "test".into(),
+        host_version: "test".into(),
+        platform: "test".into(),
+    };
+    hosts.register("host-1", &enrollment, 0).unwrap();
+}
 
 struct Collector {
     addr: SocketAddr,
@@ -31,7 +49,9 @@ impl Collector {
             .await
             .expect("bind collector");
         let addr = listener.local_addr().unwrap();
-        let mut state = AppState::new(Store::open(db).unwrap(), DevToken::new(TOKEN));
+        let hosts = Hosts::open(db).unwrap();
+        pair_host(&hosts);
+        let mut state = AppState::new(Store::open(db).unwrap(), hosts, DevToken::new(TOKEN).unwrap());
         state.offline_threshold = offline;
         let task = tokio::spawn(hennery_sessions::serve(listener, state.clone()));
         Self { addr, state, task }
@@ -68,7 +88,7 @@ fn host_config(collector: SocketAddr, data_dir: &Path, fake: AgentCommand) -> Ho
     let mut cfg = HostConfig::new(
         format!("ws://{collector}/api/hosts/ws"),
         "host-1",
-        TOKEN,
+        host_key(),
         data_dir.to_path_buf(),
     );
     cfg.reconnect_min = Duration::from_millis(100);
@@ -105,8 +125,8 @@ where
 async fn wait_host_connected(c: &reqwest::Client, collector: &Collector) {
     let url = collector.url("/api/hosts");
     wait_for("host connection", || async {
-        let hosts: Vec<String> = c.get(&url).send().await.ok()?.json().await.ok()?;
-        hosts.contains(&"host-1".to_string()).then_some(())
+        let hosts: Vec<HostItem> = c.get(&url).send().await.ok()?.json().await.ok()?;
+        hosts.iter().any(|h| h.host_id == "host-1" && h.connected).then_some(())
     })
     .await;
 }
@@ -1273,4 +1293,42 @@ async fn a_question_outlasts_its_host_being_away_and_an_answer_given_meanwhile_i
         agent_text(&evs)
     );
     assert_eq!(delivered(&collector, &pending), Some(true));
+}
+
+// Plan 3a: a revoked host stops its adapters (ACP core §3.5, kernel spec §4.3).
+
+#[tokio::test]
+async fn a_revoked_host_stops_its_adapters_and_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let pid_file = dir.path().join("grandchild.pid");
+    let script = FakeScript {
+        grandchild_pid_file: Some(pid_file.to_string_lossy().into_owned()),
+        ..slow_script(20)
+    };
+    let mut fake = AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    fake.env
+        .push((SCRIPT_ENV.into(), serde_json::to_string(&script).unwrap()));
+    let host = tokio::spawn(hennery_host::run(host_config(
+        collector.addr,
+        &dir.path().join("host"),
+        fake,
+    )));
+    let c = client();
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    let grandchild = wait_for("grandchild pid", || async { pid_from(&pid_file) }).await;
+
+    let revoked = c.delete(collector.url("/api/hosts/host-1")).send().await.unwrap();
+    assert_eq!(revoked.status(), 200);
+    // Kicked, the host reconnects, is told it is revoked, and stops.
+    let outcome = tokio::time::timeout(Duration::from_secs(30), host)
+        .await
+        .expect("the revoked host stops")
+        .unwrap();
+    let err = outcome.expect_err("a revoked host ends with an error");
+    assert!(format!("{err:#}").contains("revoked"), "{err:#}");
+    wait_dead(grandchild).await;
+    let row = collector.state.store.session(&session).unwrap().unwrap();
+    assert_eq!((row.lifecycle.as_str(), row.presumed_parked), ("parked", true));
 }

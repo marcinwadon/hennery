@@ -984,6 +984,100 @@ impl Store {
         Ok(events)
     }
 
+    /// The host was revoked (kernel spec §4.3). It never connects again, so
+    /// nothing will ever reconcile its sessions:
+    /// - a start or resume still in flight fails `host_revoked`;
+    /// - every session it ran (`active`, or presumed parked while it was
+    ///   away) is presumed parked for good (`presumed_parked{host_revoked}`),
+    ///   its open turn ends (`interrupted` if the adapter had it) and its
+    ///   open questions are cancelled `host_revoked`, which also gives any
+    ///   queued answer its `delivered: false`;
+    /// - one the operator had asked to close is closed instead.
+    ///
+    /// Idempotent, but only a session that is *currently* converged (still
+    /// `parked`, presumed for this revoke, with no open question) is left as
+    /// it is. A revoke whose wait for the connection timed out can still be
+    /// reconciled by that connection's late `resend_complete` before it is
+    /// gone — `reconcile_host` treats a presumed park as the active session
+    /// it may still be and reattaches it — or that connection can still
+    /// deliver a turnless question on top of it (fix round 1, F1): either
+    /// leaves the session looking "already parked for this revoke" by its
+    /// last `presumed_parked` event alone, so a repeated revoke must check
+    /// its current state, not just that event, and (re)park it if it does
+    /// not actually match.
+    pub fn revoke_host(&self, host_id: &str) -> Result<Vec<EventDto>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let ts = now();
+        let starting: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT id FROM sessions WHERE host_id = ?1 AND lifecycle = 'starting'")?;
+            let rows = stmt.query_map([host_id], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut events = Vec::new();
+        for id in &starting {
+            // Consistent with how reconciliation reports its own analogous
+            // `starting` failure (`start_not_delivered`): the timeline gets
+            // an event, not just a silent column change.
+            events.push(collector_event(&tx, id, "start_not_delivered", json!({}), &ts)?);
+            tx.execute(
+                "UPDATE sessions SET lifecycle = 'failed', failure_reason = 'host_revoked' WHERE id = ?1",
+                [id],
+            )?;
+        }
+        let rows: Vec<(String, Option<String>, String, bool)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, open_turn_id, lifecycle, presumed_parked FROM sessions
+                 WHERE host_id = ?1 AND (lifecycle = 'active' OR presumed_parked = 1) ORDER BY id",
+            )?;
+            let rows = stmt.query_map([host_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        for (id, open_turn, lifecycle, presumed_parked) in rows {
+            let presumed_for: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT json_extract(body, '$.reason') FROM events
+                     WHERE session_id = ?1 AND kind = 'presumed_parked' ORDER BY event_id DESC LIMIT 1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let has_open_pending: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pending WHERE session_id = ?1 AND state = 'open')",
+                [&id],
+                |r| r.get(0),
+            )?;
+            let already_converged = lifecycle == "parked"
+                && presumed_parked
+                && presumed_for.flatten().as_deref() == Some("host_revoked")
+                && !has_open_pending;
+            if already_converged {
+                continue;
+            }
+            events.push(collector_event(
+                &tx,
+                &id,
+                "presumed_parked",
+                json!({ "reason": "host_revoked" }),
+                &ts,
+            )?);
+            if let Some(turn) = open_turn {
+                events.push(resolve_open_turn(&tx, &id, &turn, &ts)?);
+            }
+            events.extend(cancel_open_pending(&tx, &id, PendingReason::HostRevoked, &ts)?);
+            tx.execute(
+                "UPDATE sessions SET
+                     lifecycle = CASE WHEN close_requested = 1 THEN 'closed' ELSE 'parked' END,
+                     presumed_parked = CASE WHEN close_requested = 1 THEN 0 ELSE 1 END,
+                     activity = NULL, open_turn_id = NULL, close_requested = 0
+                 WHERE id = ?1",
+                [&id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(events)
+    }
+
     /// Hosts the collector believes are running at least one session.
     pub fn hosts_with_active_sessions(&self) -> Result<Vec<String>> {
         let conn = self.conn();

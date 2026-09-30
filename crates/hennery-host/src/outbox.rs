@@ -9,6 +9,9 @@ use hennery_proto::frames::{HostFrame, SessionBody};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 
+/// The outbox's file in the host's data directory.
+pub const FILE: &str = "outbox.db";
+
 pub struct Outbox {
     conn: Connection,
 }

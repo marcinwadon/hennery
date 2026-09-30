@@ -1,12 +1,58 @@
 //! SQLite helpers (kernel spec §1).
 
-use anyhow::{Result, bail};
-use rusqlite::Connection;
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, OptionalExtension};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 /// Open (or create) a database with the pragmas every hennery database uses.
+///
+/// The database is private to its user (mode 0600), whatever the umask: it
+/// holds what only the collector may read (pairing-code hashes, decision 5,
+/// among them). SQLite gives a new `-wal` and `-shm` the database file's
+/// own mode, so the file is made private before it is opened. A `-wal` or
+/// `-shm` already there, from an install before this, is made private too.
+///
+/// None of the three is followed if it is a symlink: the mode is changed
+/// through the descriptor of the file itself, never through a path that
+/// could name some other file of this user's.
 pub fn open(path: &Path) -> Result<Connection> {
-    configure(Connection::open(path)?)
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("open {} (a symlink is refused)", path.display()))?;
+    make_private(&file, path)?;
+    drop(file);
+    let conn = configure(Connection::open(path)?)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        let sidecar = Path::new(&name);
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(sidecar)
+        {
+            Ok(file) => make_private(&file, sidecar)?,
+            // Gone already is fine: the last connection to close removes them.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| format!("open {} (a symlink is refused)", sidecar.display()));
+            }
+        }
+    }
+    Ok(conn)
+}
+
+/// `fchmod`, through the open file rather than its path.
+fn make_private(file: &std::fs::File, path: &Path) -> Result<()> {
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("make {} private", path.display()))
 }
 
 pub fn open_in_memory() -> Result<Connection> {
@@ -39,9 +85,92 @@ pub fn migrate(conn: &mut Connection, migrations: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Like `migrate`, for one component of a database that several own
+/// (kernel spec §1): the kernel's tables share `hennery.db` with the
+/// sessions module, which keeps `user_version` for itself. Each component's
+/// version is a row of `schema_versions`, and a component newer than this
+/// binary is refused the same way.
+pub fn migrate_component(conn: &mut Connection, component: &str, migrations: &[&str]) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_versions (component TEXT PRIMARY KEY, version INTEGER NOT NULL);",
+    )?;
+    let current: usize = conn
+        .query_row(
+            "SELECT version FROM schema_versions WHERE component = ?1",
+            [component],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()?
+        .unwrap_or(0) as usize;
+    if current > migrations.len() {
+        bail!(
+            "{component} schema version {current} is newer than this binary supports ({})",
+            migrations.len()
+        );
+    }
+    for (index, sql) in migrations.iter().enumerate().skip(current) {
+        let tx = conn.transaction()?;
+        tx.execute_batch(sql)?;
+        tx.execute(
+            "INSERT INTO schema_versions(component, version) VALUES (?1, ?2)
+             ON CONFLICT(component) DO UPDATE SET version = excluded.version",
+            rusqlite::params![component, (index + 1) as i64],
+        )?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Final review I2, an install from before the fix: a database and its
+    /// WAL files left readable by others become private when opened.
+    #[test]
+    fn opening_makes_an_existing_database_and_its_wal_files_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hennery.db");
+        // Held open, so the `-wal` and `-shm` stay there.
+        let first = open(&path).unwrap();
+        first
+            .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        let files = [
+            path.clone(),
+            dir.path().join("hennery.db-wal"),
+            dir.path().join("hennery.db-shm"),
+        ];
+        for file in &files {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let _second = open(&path).unwrap();
+        for file in &files {
+            assert_eq!(mode(file), 0o600, "{}", file.display());
+        }
+    }
+
+    /// Review of the fix wave: `open` changes the mode of the file it is
+    /// given, so it must never follow a symlink to some other file of its
+    /// user's and make that one 0600, or open it as a database.
+    #[test]
+    fn a_symlinked_database_is_refused_and_its_target_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, b"not a database").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let db = dir.path().join("hennery.db");
+        std::os::unix::fs::symlink(&target, &db).unwrap();
+        let err = open(&db).expect_err("a symlinked database was opened");
+        assert!(format!("{err:#}").contains("a symlink is refused"), "{err:#}");
+        assert_eq!(mode(&target), 0o644);
+        assert_eq!(std::fs::read(&target).unwrap(), b"not a database");
+    }
 
     #[test]
     fn migrations_apply_once_and_record_the_version() {
@@ -63,5 +192,48 @@ mod tests {
         .unwrap();
         let err = migrate(&mut conn, &["CREATE TABLE a (x INTEGER);"]).unwrap_err();
         assert!(err.to_string().contains("newer"), "{err}");
+    }
+
+    #[test]
+    fn components_keep_their_own_versions_beside_user_version() {
+        let mut conn = open_in_memory().unwrap();
+        migrate(&mut conn, &["CREATE TABLE a (x INTEGER);"]).unwrap();
+        migrate_component(
+            &mut conn,
+            "kernel",
+            &["CREATE TABLE k1 (x INTEGER);", "CREATE TABLE k2 (x INTEGER);"],
+        )
+        .unwrap();
+        migrate_component(
+            &mut conn,
+            "kernel",
+            &["CREATE TABLE k1 (x INTEGER);", "CREATE TABLE k2 (x INTEGER);"],
+        )
+        .unwrap();
+        migrate_component(&mut conn, "other", &["CREATE TABLE o1 (x INTEGER);"]).unwrap();
+        let user_version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        let kernel: i64 = conn
+            .query_row(
+                "SELECT version FROM schema_versions WHERE component = 'kernel'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!((user_version, kernel), (1, 2));
+        // `migrate` still sees its own version, untouched by the components.
+        migrate(&mut conn, &["CREATE TABLE a (x INTEGER);"]).unwrap();
+    }
+
+    #[test]
+    fn a_newer_component_is_refused() {
+        let mut conn = open_in_memory().unwrap();
+        migrate_component(
+            &mut conn,
+            "kernel",
+            &["CREATE TABLE k1 (x INTEGER);", "CREATE TABLE k2 (x INTEGER);"],
+        )
+        .unwrap();
+        let err = migrate_component(&mut conn, "kernel", &["CREATE TABLE k1 (x INTEGER);"]).unwrap_err();
+        assert!(err.to_string().contains("kernel schema version 2 is newer"), "{err}");
     }
 }

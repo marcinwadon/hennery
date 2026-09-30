@@ -186,3 +186,59 @@ async fn a_dropped_requests_deadline_still_kicks_the_connection_and_frees_its_wa
     assert!(conn.kicked.is_cancelled(), "a connection that never answered was kept");
     assert_eq!(hub.pending_requests(), 0, "the waiter leaked");
 }
+
+// Plan 3a: a revoke waits for the host's socket task to let go.
+
+#[tokio::test]
+async fn disconnect_and_wait_returns_once_the_socket_task_has_let_go() {
+    let hub = Arc::new(Hub::new());
+    assert!(
+        hub.disconnect_and_wait("h", Duration::from_millis(10)).await,
+        "no connection: nothing to wait for"
+    );
+    let (registration, _rx) = connect(&hub);
+    // The socket task: it notices the kick, and unregisters a little later.
+    let socket_task = tokio::spawn({
+        let hub = hub.clone();
+        async move {
+            registration.kicked.cancelled().await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            hub.unregister("h", registration.conn_id);
+        }
+    });
+    assert!(hub.disconnect_and_wait("h", Duration::from_secs(10)).await);
+    assert!(!hub.is_ready("h"));
+    socket_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn disconnect_and_wait_gives_up_after_its_bound() {
+    let hub = Hub::new();
+    let (registration, _rx) = connect(&hub);
+    assert!(!hub.disconnect_and_wait("h", Duration::from_millis(50)).await);
+    assert!(registration.kicked.is_cancelled());
+}
+
+/// Final review M1: once kicked, a connection is not routable, even while
+/// its socket task has not let go (a stuck socket, a revoke whose wait timed
+/// out): the revoke's `connected` reads false, and no request, answer or
+/// listing reaches it. A reconciliation that finishes after the kick does
+/// not make it routable again.
+#[tokio::test]
+async fn a_kicked_connection_is_not_routed_to_while_it_lingers() {
+    let hub = Hub::new();
+    let (registration, mut rx) = connect(&hub);
+    assert!(!hub.disconnect_and_wait("h", Duration::from_millis(10)).await);
+    assert!(registration.kicked.is_cancelled());
+    assert!(!hub.is_ready("h"));
+    assert!(hub.connected_hosts().is_empty());
+    assert!(!hub.notify("h", prompt("n1")));
+    assert_eq!(
+        hub.request("h", "r1", prompt("r1"), Duration::from_secs(5)).await,
+        Err(RequestError::NotConnected)
+    );
+    hub.mark_ready("h", registration.conn_id);
+    assert!(!hub.is_ready("h"), "a late mark_ready revived a kicked connection");
+    assert!(rx.try_recv().is_err(), "a frame went out on the kicked connection");
+    assert_eq!(hub.pending_requests(), 0);
+}

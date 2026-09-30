@@ -38,7 +38,11 @@ slice); everything else is design. The maintainer's decisions are recorded below
    - [Session config (B2b)](plans/2026-09-30-session-config.md) — model, axes and mode on start
      and resume, `set_config`, the session catalogue, and B2a's two folds. Executed 2026-09-30 (see its "Execution status").
    - [Permission and elicitation](plans/2026-10-01-permissions.md) — plan (2) (7 tasks): the
-     pending set and answer queue, teardown hooks, answer endpoint. Draft awaiting review.
+     pending set and answer queue, teardown hooks, answer endpoint. Executed 2026-10-01 (see its "Execution status").
+   - [Host pairing (3a)](plans/2026-10-01-host-pairing.md) — the first part of plan (3) (7 tasks):
+     pairing codes and enrollment, `hennery host join`, the Ed25519 `hello` proof, `up` pairing its
+     own host, and host revoke. Operator auth (3b) and passkeys (3c) follow. Reviewed and amended
+     2026-10-01; executed 2026-10-01 (see its "Execution status").
 
 ## Maintainer decisions (2026-09-27)
 

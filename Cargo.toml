@@ -14,18 +14,23 @@ agent-client-protocol = "=2.2.0"
 anyhow = "1"
 axum = { version = "0.8.9", features = ["ws"] }
 clap = { version = "4", features = ["derive", "env"] }
+ed25519-dalek = "=2.2.0"
 futures = "0.3"
+getrandom = "=0.3.4"
+hex = "=0.4.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sha2 = "=0.10.9"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }
 tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tokio-tungstenite = "0.29"
 tokio-util = { version = "0.7", features = ["compat"] }
+toml = "=1.1.6"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ts-rs = { version = "12", features = ["serde-json-impl"] }

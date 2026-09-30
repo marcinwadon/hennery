@@ -49,7 +49,6 @@ const _: () = assert!(
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/api/hosts", get(list_hosts))
         .route("/api/sessions", post(start_session))
         .route("/api/sessions/{id}", get(session_detail))
         .route("/api/sessions/{id}/resume", post(resume))
@@ -69,7 +68,7 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
+pub(crate) fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
     (
         status,
         Json(ApiError {
@@ -96,7 +95,7 @@ fn error_with_session(status: StatusCode, code: &str, message: impl Into<String>
         .into_response()
 }
 
-fn internal(err: anyhow::Error) -> Response {
+pub(crate) fn internal(err: anyhow::Error) -> Response {
     tracing::error!(error = %err, "internal error");
     error(StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error")
 }
@@ -130,10 +129,6 @@ fn resume_failed(err: RequestError) -> Response {
         RequestError::Rejected { code, message } => error(StatusCode::BAD_GATEWAY, &code, message),
         other => request_failed(other),
     }
-}
-
-async fn list_hosts(State(state): State<AppState>) -> Json<Vec<String>> {
-    Json(state.hub.connected_hosts())
 }
 
 async fn start_session(State(state): State<AppState>, Json(req): Json<StartSessionRequest>) -> Response {

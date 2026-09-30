@@ -16,6 +16,13 @@ use tokio::sync::watch;
 /// when hennery itself runs inside an agent session (ACP core §2.3).
 pub const NESTING_VARS: &[&str] = &["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_SSE_PORT"];
 
+/// The host's own secrets, which no agent may inherit: with the operator's
+/// bearer an agent could answer its own permission questions, mint a
+/// pairing code and enroll again after a revoke. Named one by one, not by
+/// the `HENNERY_` prefix: other `HENNERY_` variables (the fake adapter's
+/// script, say) are an agent's to read.
+pub const HOST_SECRET_VARS: &[&str] = &["HENNERY_DEV_TOKEN"];
+
 /// Bytes of adapter stderr kept for `adapter_exited` (ACP core §11).
 pub const STDERR_TAIL_BYTES: usize = 64 * 1024;
 
@@ -93,7 +100,9 @@ impl Adapter {
             .stderr(Stdio::piped())
             .process_group(0)
             .kill_on_drop(true);
-        for var in NESTING_VARS {
+        // After `envs`: a secret is stripped even if the agent's own
+        // configuration names it.
+        for var in NESTING_VARS.iter().chain(HOST_SECRET_VARS) {
             command.env_remove(var);
         }
         let mut child = command.spawn()?;

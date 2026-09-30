@@ -1,0 +1,160 @@
+//! Host endpoints (kernel spec §4, §8): the host list, minting pairing
+//! codes, enrollment and revoke. They live beside the session API because the collector's
+//! only HTTP router is here for now; the registry itself is the kernel's
+//! (`hennery_kernel::hosts`).
+
+use crate::AppState;
+use crate::api::{error, internal};
+use axum::extract::{ConnectInfo, Path, State};
+use axum::http::{HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{delete, get, post};
+use axum::{Json, Router, middleware};
+use hennery_kernel::hosts::{EnrollOutcome, Enrollment, HostRecord, Revoke};
+use hennery_kernel::lifecycle::LifecycleHooks;
+use hennery_kernel::secret::unix_now;
+use hennery_proto::rest::{EnrollRequest, EnrollResponse, HostItem, PairingCodeResponse};
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+
+/// How long a revoke waits for the host's socket task to let go.
+const REVOKE_DISCONNECT_BOUND: Duration = Duration::from_secs(10);
+
+/// Routes that need an operator (the development bearer until operator
+/// auth replaces it), and enrollment, which is authenticated by its code
+/// alone and so sits outside that layer (kernel spec §3.3).
+pub fn router(state: AppState) -> Router {
+    let operator = Router::new()
+        .route("/api/hosts", get(list_hosts))
+        .route("/api/hosts/pairing-codes", post(mint_pairing_code))
+        .route("/api/hosts/{id}", delete(revoke_host))
+        .layer(middleware::from_fn_with_state(
+            state.token.clone(),
+            hennery_kernel::auth::require_bearer,
+        ));
+    let code_authenticated = Router::new().route("/api/hosts/enroll", post(enroll));
+    operator.merge(code_authenticated).with_state(state)
+}
+
+/// RFC 3339 for a kernel timestamp (seconds since the epoch).
+pub(crate) fn rfc3339(unix: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(unix)
+        .ok()
+        .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
+        .unwrap_or_default()
+}
+
+/// `POST /api/hosts/pairing-codes`: 201 with a fresh code.
+async fn mint_pairing_code(State(state): State<AppState>) -> Response {
+    match state.hosts.mint_pairing_code(unix_now()) {
+        Ok(code) => (
+            StatusCode::CREATED,
+            Json(PairingCodeResponse {
+                code: code.code,
+                expires_at: rfc3339(code.expires_at),
+            }),
+        )
+            .into_response(),
+        Err(err) => internal(err),
+    }
+}
+
+/// `POST /api/hosts/enroll`: 201 `{host_id}`. Every attempt counts against
+/// the client's address until it pairs a host (kernel spec §4.1); once that
+/// address is locked out, attempts are answered 429 without the code being
+/// looked at.
+async fn enroll(
+    State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Json(req): Json<EnrollRequest>,
+) -> Response {
+    let now = Instant::now();
+    if let Err(retry_after) = state.enroll_limiter.attempt(peer.ip(), now) {
+        let mut response = error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            "too many wrong pairing codes from this address; try again later",
+        );
+        let secs = retry_after.as_secs() + u64::from(retry_after.subsec_nanos() > 0);
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+        return response;
+    }
+    let enrollment = Enrollment {
+        public_key: req.public_key,
+        name: req.name,
+        host_version: req.host_version,
+        platform: req.platform,
+    };
+    match state.hosts.enroll(&req.code, &enrollment, unix_now()) {
+        Ok(EnrollOutcome::Enrolled { host_id }) => {
+            state.enroll_limiter.succeeded(peer.ip());
+            tracing::info!(%host_id, name = %enrollment.name, "host paired");
+            (StatusCode::CREATED, Json(EnrollResponse { host_id })).into_response()
+        }
+        Ok(EnrollOutcome::InvalidCode) => error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_code",
+            "the pairing code is unknown, used or expired",
+        ),
+        Ok(EnrollOutcome::AlreadyPaired { .. }) => error(
+            StatusCode::CONFLICT,
+            "already_paired",
+            "a host with this key is paired already",
+        ),
+        Ok(EnrollOutcome::Invalid(why)) => error(StatusCode::BAD_REQUEST, "invalid", why),
+        Err(err) => internal(err),
+    }
+}
+
+/// `DELETE /api/hosts/{id}`: revoke a host (kernel spec §4.3), 200 with its
+/// entry. In this order: the registry refuses its `hello`s from now on,
+/// its live connection is closed and gone, and only then are its sessions
+/// parked, so no reconciliation on that connection can bring them back.
+/// Repeating it repeats the steps, which heals a revoke cut short.
+async fn revoke_host(State(state): State<AppState>, Path(host_id): Path<String>) -> Response {
+    match state.hosts.revoke(&host_id, unix_now()) {
+        Ok(Revoke::NotFound) => return error(StatusCode::NOT_FOUND, "not_found", "no such host"),
+        Ok(Revoke::Revoked | Revoke::AlreadyRevoked) => {}
+        Err(err) => return internal(err),
+    }
+    if !state.hub.disconnect_and_wait(&host_id, REVOKE_DISCONNECT_BOUND).await {
+        tracing::warn!(%host_id, "the revoked host's connection did not close in time");
+    }
+    if let Err(err) = state.on_host_revoked(&host_id) {
+        return internal(err);
+    }
+    tracing::info!(%host_id, "host revoked");
+    match state.hosts.host(&host_id) {
+        Ok(Some(record)) => Json(host_item(&state, record)).into_response(),
+        Ok(None) => error(StatusCode::NOT_FOUND, "not_found", "no such host"),
+        Err(err) => internal(err),
+    }
+}
+
+/// A registry entry as the API shows it, with whether it is connected.
+pub(crate) fn host_item(state: &AppState, record: HostRecord) -> HostItem {
+    HostItem {
+        connected: state.hub.is_ready(&record.id),
+        host_id: record.id,
+        name: record.name,
+        platform: record.platform,
+        host_version: record.host_version,
+        capabilities: record.capabilities,
+        created_at: rfc3339(record.created_at),
+        last_seen_at: record.last_seen_at.map(rfc3339),
+        revoked_at: record.revoked_at.map(rfc3339),
+    }
+}
+
+/// `GET /api/hosts`: every paired host, oldest first.
+async fn list_hosts(State(state): State<AppState>) -> Response {
+    match state.hosts.list() {
+        Ok(records) => {
+            let items: Vec<HostItem> = records.into_iter().map(|r| host_item(&state, r)).collect();
+            Json(items).into_response()
+        }
+        Err(err) => internal(err),
+    }
+}

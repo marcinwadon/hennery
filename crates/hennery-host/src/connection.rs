@@ -4,13 +4,14 @@
 //! socket only ends `connect_once`; session actors keep running and keep
 //! writing to the outbox, which is resent on the next connection.
 
+use crate::identity::HostKey;
 use crate::outbox::Outbox;
 use crate::session::{self, AgentCommand, Answer, Attach, Launch, SessionCmd, SessionHandle, SessionOptions};
 use crate::uplink::Uplink;
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
-use hennery_proto::PROTOCOL_VERSION;
 use hennery_proto::frames::{AttachedSession, Capabilities, Capability, CollectorFrame, HostFrame, SessionConfig};
+use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -24,8 +25,8 @@ pub struct HostConfig {
     /// e.g. `ws://127.0.0.1:7117/api/hosts/ws`
     pub collector_url: String,
     pub host_id: String,
-    /// Walking skeleton: shared development token (ACP core §3.5 replaces it).
-    pub token: String,
+    /// The key this host paired with; it signs every `hello` (ACP core §3.5).
+    pub key: HostKey,
     pub data_dir: PathBuf,
     pub agents: HashMap<String, AgentCommand>,
     pub reconnect_min: Duration,
@@ -42,16 +43,11 @@ pub struct HostConfig {
 }
 
 impl HostConfig {
-    pub fn new(
-        collector_url: impl Into<String>,
-        host_id: impl Into<String>,
-        token: impl Into<String>,
-        data_dir: PathBuf,
-    ) -> Self {
+    pub fn new(collector_url: impl Into<String>, host_id: impl Into<String>, key: HostKey, data_dir: PathBuf) -> Self {
         Self {
             collector_url: collector_url.into(),
             host_id: host_id.into(),
-            token: token.into(),
+            key,
             data_dir,
             agents: HashMap::new(),
             reconnect_min: Duration::from_millis(500),
@@ -86,7 +82,9 @@ struct SessionMap {
 
 type Sessions = Arc<Mutex<SessionMap>>;
 
-/// Run the host until the process exits. Reconnects with exponential backoff.
+/// Run the host forever, reconnecting with exponential backoff — except that
+/// this returns `Err` the moment the collector says this host is revoked,
+/// after stopping every adapter it runs.
 pub async fn run(cfg: HostConfig) -> Result<()> {
     run_until(cfg, std::future::pending()).await
 }
@@ -94,25 +92,164 @@ pub async fn run(cfg: HostConfig) -> Result<()> {
 /// Run the host until `shutdown` resolves.
 pub async fn run_until(cfg: HostConfig, shutdown: impl Future<Output = ()>) -> Result<()> {
     std::fs::create_dir_all(&cfg.data_dir)?;
-    let outbox = Outbox::open(&cfg.data_dir.join("outbox.db"))?;
+    let outbox = Outbox::open(&cfg.data_dir.join(crate::outbox::FILE))?;
     let (uplink, mut replies) = Uplink::new(outbox);
     let sessions: Sessions = Arc::new(Mutex::new(SessionMap::default()));
+    // Ends only when the collector says this host is revoked.
     let serve = async {
         let mut backoff = cfg.reconnect_min;
         loop {
             if let Err(err) = connect_once(&cfg, &uplink, &sessions, &mut replies, &mut backoff).await {
-                tracing::warn!(error = %err, "collector connection ended");
+                if revoked(&err) {
+                    return err;
+                }
+                if err
+                    .downcast_ref::<HelloRejected>()
+                    .is_some_and(|r| r.code == "bad_proof")
+                {
+                    tracing::warn!(
+                        error = %err,
+                        data_dir = %cfg.data_dir.display(),
+                        "the collector does not know this host's key; if it should be paired anew, remove host.key and host.toml from the data directory and run `hennery host join`"
+                    );
+                } else {
+                    tracing::warn!(error = %err, "collector connection ended");
+                }
             }
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(cfg.reconnect_max);
         }
     };
-    tokio::select! {
-        _ = serve => unreachable!("the connection loop never ends"),
-        _ = shutdown => {}
-    }
+    let revocation = tokio::select! {
+        err = serve => Some(err),
+        _ = shutdown => None,
+    };
+    // A revoked host stops every adapter it runs (ACP core §3.5), the same
+    // way a shutdown does.
     shut_down(&sessions, cfg.session_options().kill_grace + Duration::from_secs(1)).await;
-    Ok(())
+    match revocation {
+        Some(err) => Err(err.context("this host was revoked; pair it again with `hennery host join`")),
+        None => Ok(()),
+    }
+}
+
+/// A `hello_error` (ACP core §3.3): the collector refused this host's
+/// `hello`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HelloRejected {
+    pub code: String,
+    pub message: String,
+}
+
+impl std::fmt::Display for HelloRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "hello rejected: {}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for HelloRejected {}
+
+/// Whether `err` is the collector saying this host is revoked.
+pub fn revoked(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<HelloRejected>().is_some_and(|r| r.code == "revoked")
+}
+
+/// What the collector makes of a stored pairing (`hennery host join`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Standing {
+    /// It accepts the key (the host may be connected right now).
+    Accepted,
+    Revoked,
+    /// It does not know this host, or not with this key.
+    Unknown,
+}
+
+/// Bound on each step of a probe.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Ask the collector whether it still accepts this host's key: one `hello`
+/// with nothing attached, then the connection is closed.
+///
+/// A successful probe still passes the collector's proof check like any
+/// other `hello`, so for the moment the socket is open it briefly registers
+/// this host id as connected (ACP core §4.3) before the probe closes it —
+/// the real host reconnecting at the same moment sees `already_connected`
+/// rather than being displaced by a probe that never sends `resend_complete`
+/// and holds nothing open.
+pub async fn probe(collector_url: &str, host_id: &str, key: &HostKey) -> Result<Standing> {
+    let (mut sink, _stream, answer) = handshake(
+        collector_url,
+        host_id,
+        key,
+        || Ok(Vec::new()),
+        PROBE_TIMEOUT,
+        PROBE_TIMEOUT,
+    )
+    .await?;
+    let _ = sink.close().await;
+    Ok(match answer {
+        CollectorFrame::HelloAck { .. } => Standing::Accepted,
+        // Refused only after the proof checked out (ACP core §3.5).
+        CollectorFrame::HelloError { code, .. } if code == "already_connected" => Standing::Accepted,
+        CollectorFrame::HelloError { code, .. } if code == "revoked" => Standing::Revoked,
+        CollectorFrame::HelloError { code, .. } if code == "bad_proof" => Standing::Unknown,
+        CollectorFrame::HelloError { code, message } => return Err(HelloRejected { code, message }.into()),
+        other => bail!("expected hello_ack, got {other:?}"),
+    })
+}
+
+type WsSink = futures::stream::SplitSink<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    Message,
+>;
+type WsStream = futures::stream::SplitStream<
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+>;
+
+/// Connect, send a `hello` signed over this connection's nonce (ACP core
+/// §3.5), and read the collector's answer. `attached` is read once the
+/// socket is up, right before the `hello` goes out.
+async fn handshake(
+    collector_url: &str,
+    host_id: &str,
+    key: &HostKey,
+    attached: impl FnOnce() -> Result<Vec<AttachedSession>>,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+) -> Result<(WsSink, WsStream, CollectorFrame)> {
+    let (ws, response) = tokio::time::timeout(connect_timeout, tokio_tungstenite::connect_async(collector_url))
+        .await
+        .map_err(|_| anyhow::anyhow!("no WebSocket handshake within {connect_timeout:?}"))?
+        .context("connect to collector")?;
+    // The proof is over this connection's nonce, so it cannot be replayed on
+    // another one. Without one there is nothing to sign.
+    let nonce = response
+        .headers()
+        .get(HELLO_NONCE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| hex::decode(v).ok())
+        .filter(|n| n.len() == 32)
+        .context("the collector sent no hello nonce")?;
+    let (mut sink, mut stream) = ws.split();
+    send(
+        &mut sink,
+        &HostFrame::Hello {
+            protocol_version: PROTOCOL_VERSION.into(),
+            host_version: env!("CARGO_PKG_VERSION").into(),
+            host_id: host_id.to_string(),
+            proof: key.sign_hello(&nonce, host_id, PROTOCOL_VERSION),
+            // Every hennery host can park. `projects` and `images` come
+            // with the probes and with image prompts.
+            capabilities: Capabilities(vec![Capability::Park]),
+            attached_sessions: attached()?,
+        },
+    )
+    .await?;
+    let answer = match tokio::time::timeout(read_timeout, stream.next()).await {
+        Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str::<CollectorFrame>(&text)?,
+        other => bail!("no hello_ack: {other:?}"),
+    };
+    Ok((sink, stream, answer))
 }
 
 /// Host shutdown (ACP core §2.3): the connection loop is already stopped;
@@ -143,42 +280,23 @@ async fn connect_once(
     replies: &mut mpsc::UnboundedReceiver<HostFrame>,
     backoff: &mut Duration,
 ) -> Result<()> {
-    let (ws, _) = tokio::time::timeout(
+    let (mut sink, mut stream, answer) = handshake(
+        &cfg.collector_url,
+        &cfg.host_id,
+        &cfg.key,
+        || attached_sessions(uplink, sessions),
         cfg.connect_timeout,
-        tokio_tungstenite::connect_async(&cfg.collector_url),
-    )
-    .await
-    .map_err(|_| anyhow::anyhow!("no WebSocket handshake within {:?}", cfg.connect_timeout))?
-    .context("connect to collector")?;
-    let (mut sink, mut stream) = ws.split();
-
-    let attached = attached_sessions(uplink, sessions)?;
-    send(
-        &mut sink,
-        &HostFrame::Hello {
-            protocol_version: PROTOCOL_VERSION.into(),
-            host_version: env!("CARGO_PKG_VERSION").into(),
-            host_id: cfg.host_id.clone(),
-            token: cfg.token.clone(),
-            // Every hennery host can park. `projects` and `images` come
-            // with the probes and with image prompts.
-            capabilities: Capabilities(vec![Capability::Park]),
-            attached_sessions: attached,
-        },
+        cfg.read_timeout,
     )
     .await?;
-
-    match tokio::time::timeout(cfg.read_timeout, stream.next()).await {
-        Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<CollectorFrame>(&text)? {
-            CollectorFrame::HelloAck { committed, .. } => {
-                for (session_id, seq) in committed {
-                    uplink.fast_forward(&session_id, seq)?;
-                }
+    match answer {
+        CollectorFrame::HelloAck { committed, .. } => {
+            for (session_id, seq) in committed {
+                uplink.fast_forward(&session_id, seq)?;
             }
-            CollectorFrame::HelloError { code, message } => bail!("hello rejected: {code}: {message}"),
-            other => bail!("expected hello_ack, got {other:?}"),
-        },
-        other => bail!("no hello_ack: {other:?}"),
+        }
+        CollectorFrame::HelloError { code, message } => return Err(HelloRejected { code, message }.into()),
+        other => bail!("expected hello_ack, got {other:?}"),
     }
     // A bare handshake is not proof the collector is actually committing
     // anything: a persistently failing collector (e.g. disk full) can still

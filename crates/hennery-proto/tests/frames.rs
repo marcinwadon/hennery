@@ -257,7 +257,7 @@ fn hello_capabilities_skip_unknown_entries_and_default_to_none() {
     let hello = |extra: serde_json::Value| {
         let mut v = json!({
             "type": "hello", "protocol_version": "1.0", "host_version": "0", "host_id": "h",
-            "token": "t", "attached_sessions": []
+            "proof": "p", "attached_sessions": []
         });
         v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         match serde_json::from_value::<HostFrame>(v).unwrap() {
@@ -273,7 +273,7 @@ fn hello_capabilities_skip_unknown_entries_and_default_to_none() {
         protocol_version: "1.0".into(),
         host_version: "0".into(),
         host_id: "h".into(),
-        token: "t".into(),
+        proof: "p".into(),
         capabilities: Capabilities(vec![Capability::Park]),
         attached_sessions: vec![],
     };

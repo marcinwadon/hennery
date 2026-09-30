@@ -6,9 +6,10 @@
 //! be hammered at `reconnect_min` forever.
 
 use futures::{SinkExt, StreamExt};
+use hennery_host::identity::HostKey;
 use hennery_host::{HostConfig, run};
-use hennery_proto::PROTOCOL_VERSION;
 use hennery_proto::frames::{CollectorFrame, HostFrame};
+use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION};
 use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -23,6 +24,30 @@ fn hello_ack() -> CollectorFrame {
         collector_version: "test".into(),
         committed: BTreeMap::new(),
     }
+}
+
+/// Accept a host's WebSocket the way the collector does: the upgrade
+/// response carries a hello nonce (ACP core §3.5). These fake collectors
+/// check no proof, so any nonce does.
+async fn accept(
+    tcp: tokio::net::TcpStream,
+) -> Result<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>, tokio_tungstenite::tungstenite::Error> {
+    tokio_tungstenite::accept_hdr_async(tcp, with_nonce).await
+}
+
+/// The signature tungstenite's handshake callback requires.
+#[allow(clippy::result_large_err)]
+fn with_nonce(
+    _: &tokio_tungstenite::tungstenite::handshake::server::Request,
+    mut response: tokio_tungstenite::tungstenite::handshake::server::Response,
+) -> Result<
+    tokio_tungstenite::tungstenite::handshake::server::Response,
+    tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+> {
+    response
+        .headers_mut()
+        .insert(HELLO_NONCE_HEADER, hex::encode([5u8; 32]).parse().unwrap());
+    Ok(response)
 }
 
 type ServerStream = futures::stream::SplitStream<tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>>;
@@ -60,7 +85,7 @@ async fn silent_after_ack_server(listener: TcpListener, hellos: mpsc::UnboundedS
         };
         let hellos = hellos.clone();
         tokio::spawn(async move {
-            let Ok(ws) = tokio_tungstenite::accept_async(tcp).await else {
+            let Ok(ws) = accept(tcp).await else {
                 return;
             };
             let (mut sink, mut stream) = ws.split();
@@ -87,7 +112,7 @@ async fn a_silent_connection_is_dropped_and_reconnected_within_the_read_deadline
     let mut cfg = HostConfig::new(
         format!("ws://{addr}/api/hosts/ws"),
         "host1",
-        "token",
+        HostKey::from_seed([1; 32]),
         unique_data_dir("read-deadline"),
     );
     cfg.ping_interval = Duration::from_millis(50);
@@ -123,7 +148,7 @@ async fn ack_then_close_server(listener: TcpListener, hellos: mpsc::UnboundedSen
         };
         let hellos = hellos.clone();
         tokio::spawn(async move {
-            let Ok(ws) = tokio_tungstenite::accept_async(tcp).await else {
+            let Ok(ws) = accept(tcp).await else {
                 return;
             };
             let (mut sink, mut stream) = ws.split();
@@ -158,7 +183,7 @@ async fn ack_hello_only_then_close_server(listener: TcpListener, hellos: mpsc::U
         };
         let hellos = hellos.clone();
         tokio::spawn(async move {
-            let Ok(ws) = tokio_tungstenite::accept_async(tcp).await else {
+            let Ok(ws) = accept(tcp).await else {
                 return;
             };
             let (mut sink, mut stream) = ws.split();
@@ -183,7 +208,7 @@ async fn backoff_resets_to_reconnect_min_after_every_acked_frame() {
     let mut cfg = HostConfig::new(
         format!("ws://{addr}/api/hosts/ws"),
         "host1",
-        "token",
+        HostKey::from_seed([1; 32]),
         unique_data_dir("backoff-reset"),
     );
     cfg.reconnect_min = Duration::from_millis(20);
@@ -227,7 +252,7 @@ async fn backoff_keeps_growing_when_the_collector_never_acks_a_frame() {
     let mut cfg = HostConfig::new(
         format!("ws://{addr}/api/hosts/ws"),
         "host1",
-        "token",
+        HostKey::from_seed([1; 32]),
         unique_data_dir("backoff-no-ack"),
     );
     cfg.reconnect_min = Duration::from_millis(20);
@@ -262,7 +287,7 @@ async fn accept_host(
         .await
         .expect("host connects")
         .unwrap();
-    let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+    let ws = accept(tcp).await.unwrap();
     let (mut sink, mut stream) = ws.split();
     let HostFrame::Hello { attached_sessions, .. } = read_host_frame(&mut stream).await else {
         panic!("expected hello");
@@ -329,7 +354,7 @@ fn host_with_fake(addr: std::net::SocketAddr, name: &str, program: hennery_host:
     let mut cfg = HostConfig::new(
         format!("ws://{addr}/api/hosts/ws"),
         "host1",
-        "token",
+        HostKey::from_seed([1; 32]),
         unique_data_dir(name),
     );
     cfg.reconnect_min = Duration::from_millis(50);
@@ -529,7 +554,7 @@ async fn hold_then_close_server(listener: TcpListener, hold: Duration, hellos: m
         };
         let hellos = hellos.clone();
         tokio::spawn(async move {
-            let Ok(ws) = tokio_tungstenite::accept_async(tcp).await else {
+            let Ok(ws) = accept(tcp).await else {
                 return;
             };
             let (mut sink, mut stream) = ws.split();
@@ -556,7 +581,7 @@ async fn backoff_resets_after_a_healthy_connection_even_without_acks() {
     let mut cfg = HostConfig::new(
         format!("ws://{addr}/api/hosts/ws"),
         "host1",
-        "token",
+        HostKey::from_seed([1; 32]),
         unique_data_dir("healthy-reset"),
     );
     cfg.reconnect_min = Duration::from_millis(20);
@@ -587,7 +612,7 @@ async fn a_collector_that_never_completes_the_handshake_is_retried() {
     let mut cfg = HostConfig::new(
         format!("ws://{addr}/api/hosts/ws"),
         "host1",
-        "token",
+        HostKey::from_seed([1; 32]),
         unique_data_dir("connect-timeout"),
     );
     cfg.connect_timeout = Duration::from_millis(200);
@@ -757,7 +782,7 @@ async fn a_host_announces_that_it_can_park() {
         .await
         .expect("host connects")
         .unwrap();
-    let (_sink, mut stream) = tokio_tungstenite::accept_async(tcp).await.unwrap().split();
+    let (_sink, mut stream) = accept(tcp).await.unwrap().split();
     let HostFrame::Hello { capabilities, .. } = read_host_frame(&mut stream).await else {
         panic!("expected hello");
     };
@@ -1104,4 +1129,44 @@ async fn answers_reach_the_actor_and_one_for_a_detached_session_is_not_attached(
         matches!(&refused, HostFrame::Error { code, .. } if code == "not_attached"),
         "{refused:?}"
     );
+}
+
+// Plan 3a: the hello proof.
+
+#[tokio::test]
+async fn a_host_signs_its_hello_over_the_connections_nonce() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(host_with_fake(addr, "proof", slow_fake())));
+    let (tcp, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("host connects")
+        .unwrap();
+    let (_sink, mut stream) = accept(tcp).await.unwrap().split();
+    let HostFrame::Hello { host_id, proof, .. } = read_host_frame(&mut stream).await else {
+        panic!("expected hello");
+    };
+    let key = HostKey::from_seed([1; 32]);
+    assert_eq!(proof, key.sign_hello(&[5u8; 32], &host_id, PROTOCOL_VERSION));
+}
+
+#[tokio::test]
+async fn a_collector_that_sends_no_nonce_gets_no_hello() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let host = tokio::spawn(run(host_with_fake(addr, "no-nonce", slow_fake())));
+    let (tcp, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("host connects")
+        .unwrap();
+    // A plain upgrade, without the nonce header.
+    let (_sink, mut stream) = tokio_tungstenite::accept_async(tcp).await.unwrap().split();
+    let first = tokio::time::timeout(Duration::from_secs(10), stream.next())
+        .await
+        .expect("the host gives up on the connection");
+    assert!(
+        !matches!(first, Some(Ok(Message::Text(_)))),
+        "the host sent a frame without a nonce to sign: {first:?}"
+    );
+    host.abort();
 }
