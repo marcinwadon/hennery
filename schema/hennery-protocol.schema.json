@@ -1030,6 +1030,11 @@
           "const": "agent_withdrew",
           "description": "The adapter withdrew its own question (`$/cancel_request`).",
           "type": "string"
+        },
+        {
+          "const": "host_revoked",
+          "description": "The operator revoked the session's host (kernel spec §4.3): it will\nnever connect again to deliver an answer.",
+          "type": "string"
         }
       ]
     },

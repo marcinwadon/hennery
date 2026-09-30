@@ -104,6 +104,9 @@ pub enum PendingReason {
     HostRestarted,
     /// The adapter withdrew its own question (`$/cancel_request`).
     AgentWithdrew,
+    /// The operator revoked the session's host (kernel spec §4.3): it will
+    /// never connect again to deliver an answer.
+    HostRevoked,
 }
 
 /// The operator's answer to an elicitation (ACP `elicitation/create`).

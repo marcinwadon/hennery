@@ -984,6 +984,72 @@ impl Store {
         Ok(events)
     }
 
+    /// The host was revoked (kernel spec §4.3). It never connects again, so
+    /// nothing will ever reconcile its sessions:
+    /// - a start or resume still in flight fails `host_revoked`;
+    /// - every session it ran (`active`, or presumed parked while it was
+    ///   away) is presumed parked for good (`presumed_parked{host_revoked}`),
+    ///   its open turn ends (`interrupted` if the adapter had it) and its
+    ///   open questions are cancelled `host_revoked`, which also gives any
+    ///   queued answer its `delivered: false`;
+    /// - one the operator had asked to close is closed instead.
+    ///
+    /// Idempotent: a session already presumed parked for the revocation is
+    /// left as it is.
+    pub fn revoke_host(&self, host_id: &str) -> Result<Vec<EventDto>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let ts = now();
+        tx.execute(
+            "UPDATE sessions SET lifecycle = 'failed', failure_reason = 'host_revoked'
+             WHERE host_id = ?1 AND lifecycle = 'starting'",
+            [host_id],
+        )?;
+        let rows: Vec<(String, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT id, open_turn_id FROM sessions
+                 WHERE host_id = ?1 AND (lifecycle = 'active' OR presumed_parked = 1) ORDER BY id",
+            )?;
+            let rows = stmt.query_map([host_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut events = Vec::new();
+        for (id, open_turn) in rows {
+            let presumed_for: Option<Option<String>> = tx
+                .query_row(
+                    "SELECT json_extract(body, '$.reason') FROM events
+                     WHERE session_id = ?1 AND kind = 'presumed_parked' ORDER BY event_id DESC LIMIT 1",
+                    [&id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if presumed_for.flatten().as_deref() == Some("host_revoked") {
+                continue;
+            }
+            events.push(collector_event(
+                &tx,
+                &id,
+                "presumed_parked",
+                json!({ "reason": "host_revoked" }),
+                &ts,
+            )?);
+            if let Some(turn) = open_turn {
+                events.push(resolve_open_turn(&tx, &id, &turn, &ts)?);
+            }
+            events.extend(cancel_open_pending(&tx, &id, PendingReason::HostRevoked, &ts)?);
+            tx.execute(
+                "UPDATE sessions SET
+                     lifecycle = CASE WHEN close_requested = 1 THEN 'closed' ELSE 'parked' END,
+                     presumed_parked = CASE WHEN close_requested = 1 THEN 0 ELSE 1 END,
+                     activity = NULL, open_turn_id = NULL, close_requested = 0
+                 WHERE id = ?1",
+                [&id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(events)
+    }
+
     /// Hosts the collector believes are running at least one session.
     pub fn hosts_with_active_sessions(&self) -> Result<Vec<String>> {
         let conn = self.conn();

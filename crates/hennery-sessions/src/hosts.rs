@@ -1,20 +1,24 @@
-//! Host pairing endpoints (kernel spec §4.1, §8): minting pairing codes and
-//! enrollment. They live beside the session API because the collector's
+//! Host endpoints (kernel spec §4, §8): the host list, minting pairing
+//! codes, enrollment and revoke. They live beside the session API because the collector's
 //! only HTTP router is here for now; the registry itself is the kernel's
 //! (`hennery_kernel::hosts`).
 
 use crate::AppState;
 use crate::api::{error, internal};
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router, middleware};
-use hennery_kernel::hosts::{EnrollOutcome, Enrollment, HostRecord};
+use hennery_kernel::hosts::{EnrollOutcome, Enrollment, HostRecord, Revoke};
+use hennery_kernel::lifecycle::LifecycleHooks;
 use hennery_kernel::secret::unix_now;
 use hennery_proto::rest::{EnrollRequest, EnrollResponse, HostItem, PairingCodeResponse};
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+/// How long a revoke waits for the host's socket task to let go.
+const REVOKE_DISCONNECT_BOUND: Duration = Duration::from_secs(10);
 
 /// Routes that need an operator (the development bearer until operator
 /// auth replaces it), and enrollment, which is authenticated by its code
@@ -23,6 +27,7 @@ pub fn router(state: AppState) -> Router {
     let operator = Router::new()
         .route("/api/hosts", get(list_hosts))
         .route("/api/hosts/pairing-codes", post(mint_pairing_code))
+        .route("/api/hosts/{id}", delete(revoke_host))
         .layer(middleware::from_fn_with_state(
             state.token.clone(),
             hennery_kernel::auth::require_bearer,
@@ -99,6 +104,31 @@ async fn enroll(
             "a host with this key is paired already",
         ),
         Ok(EnrollOutcome::Invalid(why)) => error(StatusCode::BAD_REQUEST, "invalid", why),
+        Err(err) => internal(err),
+    }
+}
+
+/// `DELETE /api/hosts/{id}`: revoke a host (kernel spec §4.3), 200 with its
+/// entry. In this order: the registry refuses its `hello`s from now on,
+/// its live connection is closed and gone, and only then are its sessions
+/// parked, so no reconciliation on that connection can bring them back.
+/// Repeating it repeats the steps, which heals a revoke cut short.
+async fn revoke_host(State(state): State<AppState>, Path(host_id): Path<String>) -> Response {
+    match state.hosts.revoke(&host_id, unix_now()) {
+        Ok(Revoke::NotFound) => return error(StatusCode::NOT_FOUND, "not_found", "no such host"),
+        Ok(Revoke::Revoked | Revoke::AlreadyRevoked) => {}
+        Err(err) => return internal(err),
+    }
+    if !state.hub.disconnect_and_wait(&host_id, REVOKE_DISCONNECT_BOUND).await {
+        tracing::warn!(%host_id, "the revoked host's connection did not close in time");
+    }
+    if let Err(err) = state.on_host_revoked(&host_id) {
+        return internal(err);
+    }
+    tracing::info!(%host_id, "host revoked");
+    match state.hosts.host(&host_id) {
+        Ok(Some(record)) => Json(host_item(&state, record)).into_response(),
+        Ok(None) => error(StatusCode::NOT_FOUND, "not_found", "no such host"),
         Err(err) => internal(err),
     }
 }

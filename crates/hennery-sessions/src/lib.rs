@@ -46,6 +46,17 @@ impl AppState {
     }
 }
 
+/// The session module's part of a host revoke (kernel spec §4.3, §5.5).
+/// The revoke endpoint calls it once the host's connection is gone.
+impl hennery_kernel::lifecycle::LifecycleHooks for AppState {
+    fn on_host_revoked(&self, host_id: &str) -> anyhow::Result<()> {
+        for event in self.store.revoke_host(host_id)? {
+            self.hub.publish(event);
+        }
+        Ok(())
+    }
+}
+
 /// Serve until `state.shutdown` is cancelled.
 pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> std::io::Result<()> {
     offline::after_startup(&state);

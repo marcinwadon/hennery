@@ -67,6 +67,8 @@ struct HostConn {
     /// something lost on the previous one (ACP core §5.1).
     ready: bool,
     kicked: CancellationToken,
+    /// Cancelled once this connection is unregistered (or replaced).
+    ended: CancellationToken,
     /// From this connection's `hello` (ACP core §3.3).
     capabilities: Capabilities,
 }
@@ -122,16 +124,20 @@ impl Hub {
         }
         let conn_id = self.next_conn.fetch_add(1, Ordering::Relaxed);
         let kicked = CancellationToken::new();
-        hosts.insert(
+        let replaced = hosts.insert(
             host_id.to_string(),
             HostConn {
                 conn_id,
                 tx,
                 ready: false,
                 kicked: kicked.clone(),
+                ended: CancellationToken::new(),
                 capabilities,
             },
         );
+        if let Some(old) = replaced {
+            old.ended.cancel();
+        }
         self.last_conn
             .lock()
             .expect("last_conn lock")
@@ -161,8 +167,10 @@ impl Hub {
     /// Requests a newer connection of the same host carries are untouched.
     pub fn unregister(&self, host_id: &str, conn_id: u64) {
         let mut hosts = self.hosts.lock().expect("hosts lock");
-        if hosts.get(host_id).is_some_and(|h| h.conn_id == conn_id) {
-            hosts.remove(host_id);
+        if hosts.get(host_id).is_some_and(|h| h.conn_id == conn_id)
+            && let Some(gone) = hosts.remove(host_id)
+        {
+            gone.ended.cancel();
         }
         drop(hosts);
         let mut waiters = self.waiters.lock().expect("waiters lock");
@@ -184,6 +192,21 @@ impl Hub {
         if let Some(h) = self.hosts.lock().expect("hosts lock").get(host_id) {
             h.kicked.cancel();
         }
+    }
+
+    /// Close the host's connection and wait, at most `bound`, until its
+    /// socket task has unregistered it: then nothing that connection reads
+    /// can change the store any more. `true` once no connection is left.
+    pub async fn disconnect_and_wait(&self, host_id: &str, bound: Duration) -> bool {
+        let ended = {
+            let hosts = self.hosts.lock().expect("hosts lock");
+            let Some(h) = hosts.get(host_id) else {
+                return true;
+            };
+            h.kicked.cancel();
+            h.ended.clone()
+        };
+        tokio::time::timeout(bound, ended.cancelled()).await.is_ok()
     }
 
     /// Like `disconnect`, but only if `conn_id` is still the host's current

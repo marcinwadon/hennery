@@ -186,3 +186,35 @@ async fn a_dropped_requests_deadline_still_kicks_the_connection_and_frees_its_wa
     assert!(conn.kicked.is_cancelled(), "a connection that never answered was kept");
     assert_eq!(hub.pending_requests(), 0, "the waiter leaked");
 }
+
+// Plan 3a: a revoke waits for the host's socket task to let go.
+
+#[tokio::test]
+async fn disconnect_and_wait_returns_once_the_socket_task_has_let_go() {
+    let hub = Arc::new(Hub::new());
+    assert!(
+        hub.disconnect_and_wait("h", Duration::from_millis(10)).await,
+        "no connection: nothing to wait for"
+    );
+    let (registration, _rx) = connect(&hub);
+    // The socket task: it notices the kick, and unregisters a little later.
+    let socket_task = tokio::spawn({
+        let hub = hub.clone();
+        async move {
+            registration.kicked.cancelled().await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            hub.unregister("h", registration.conn_id);
+        }
+    });
+    assert!(hub.disconnect_and_wait("h", Duration::from_secs(10)).await);
+    assert!(!hub.is_ready("h"));
+    socket_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn disconnect_and_wait_gives_up_after_its_bound() {
+    let hub = Hub::new();
+    let (registration, _rx) = connect(&hub);
+    assert!(!hub.disconnect_and_wait("h", Duration::from_millis(50)).await);
+    assert!(registration.kicked.is_cancelled());
+}

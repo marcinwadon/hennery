@@ -116,6 +116,39 @@ impl ScriptedHost {
         host
     }
 
+    /// Connect and send `hello` (no sessions attached): the collector's
+    /// answer, whatever it is.
+    async fn hello_reply(collector: &Collector) -> CollectorFrame {
+        let (ws, response) = tokio_tungstenite::connect_async(format!("ws://{}/api/hosts/ws", collector.addr))
+            .await
+            .unwrap();
+        let nonce = hex::decode(response.headers()[HELLO_NONCE_HEADER].to_str().unwrap()).unwrap();
+        let mut host = Self { ws, seq: 0 };
+        host.send(&HostFrame::Hello {
+            protocol_version: PROTOCOL_VERSION.into(),
+            host_version: "test".into(),
+            host_id: HOST.into(),
+            proof: host_key().sign_hello(&nonce, HOST, PROTOCOL_VERSION),
+            capabilities: Capabilities::default(),
+            attached_sessions: vec![],
+        })
+        .await;
+        host.next().await
+    }
+
+    /// Wait until the collector has closed this connection.
+    async fn closed(mut self) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(Ok(msg)) = self.ws.next().await {
+                if matches!(msg, Message::Close(_)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the collector closes the connection");
+    }
+
     /// `hello` then `resend_complete`, and wait until the collector lists
     /// the host as connected (reconciled).
     async fn connect(collector: &Collector, attached: Vec<AttachedSession>, seq: u64) -> Self {
@@ -1825,4 +1858,120 @@ async fn every_step_of_a_question_is_a_pending_changed_message_on_the_session_st
         assert_eq!(id(changed), id(messages[at]), "pending_changed carries its event's id");
         assert!(changed.contains(r#""pending_id":"p1""#), "{changed}");
     }
+}
+
+// Plan 3a: host revoke (kernel spec §4.3).
+
+async fn revoke(collector: &Collector, host_id: &str) -> (u16, Value) {
+    let resp = client()
+        .delete(collector.url(&format!("/api/hosts/{host_id}")))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn a_revoke_closes_the_hosts_connection_and_parks_its_sessions_for_good() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let (session, _) = asking_session(&collector, &mut host).await;
+    // An answer the host has, with no verdict yet.
+    let (status, _) = post(
+        &client(),
+        answer_url(&collector, &session, "p1"),
+        json!({"option_id": "allow"}),
+    )
+    .await;
+    assert_eq!(status, 202);
+    expect_answer(&mut host, &session, "allow").await;
+
+    let (status, body) = revoke(&collector, HOST).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        (body["host_id"].as_str(), body["connected"].as_bool()),
+        (Some(HOST), Some(false))
+    );
+    assert!(body["revoked_at"].is_string(), "{body}");
+    host.closed().await;
+
+    let row = collector.state.store.session(&session).unwrap().unwrap();
+    assert_eq!(
+        (row.lifecycle.as_str(), row.presumed_parked, row.open_turn_id),
+        ("parked", true, None)
+    );
+    let kinds = collector.event_kinds(&session);
+    assert!(
+        kinds.ends_with(&[
+            "presumed_parked".to_string(),
+            "turn_ended_synthesized".to_string(),
+            "pending_cancelled".to_string()
+        ]),
+        "{kinds:?}"
+    );
+    let item = collector.state.store.pending_item("p1").unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value((item.state, item.reason, item.delivered)).unwrap(),
+        json!(["cancelled", "host_revoked", false])
+    );
+    // Refused from now on, and told why.
+    let reply = ScriptedHost::hello_reply(&collector).await;
+    assert!(
+        matches!(&reply, CollectorFrame::HelloError { code, .. } if code == "revoked"),
+        "{reply:?}"
+    );
+    // A repeated revoke changes nothing more; an unknown host is 404.
+    let before = collector.event_kinds(&session).len();
+    assert_eq!(revoke(&collector, HOST).await.0, 200);
+    assert_eq!(collector.event_kinds(&session).len(), before);
+    assert_eq!(revoke(&collector, "host-9").await.0, 404);
+}
+
+/// A revoke that interrupts a handshake: the connection is closed before
+/// the session is parked, and a kicked connection reads nothing more, so
+/// the `resend_complete` the host sends afterwards never reconciles the
+/// session back to `active` (`reattached`).
+#[tokio::test]
+async fn a_revoke_during_a_handshake_is_not_undone_by_its_reconciliation() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let seq = host.seq;
+    host.drop_connection(&collector).await;
+    // Back, still running the session, its resend not complete yet.
+    let mut host = ScriptedHost::hello(&collector, vec![attached(&session, seq)], seq).await;
+    assert_eq!(revoke(&collector, HOST).await.0, 200);
+    let _ = host
+        .ws
+        .send(Message::text(
+            serde_json::to_string(&HostFrame::ResendComplete).unwrap(),
+        ))
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let row = collector.state.store.session(&session).unwrap().unwrap();
+    assert_eq!((row.lifecycle.as_str(), row.presumed_parked), ("parked", true));
+    assert!(!collector.event_kinds(&session).contains(&"reattached".to_string()));
+    assert!(collector.state.hub.connected_hosts().is_empty());
+}
+
+/// A revoke whose wait for the connection ran out has already parked the
+/// sessions while the connection could still apply a frame. The socket
+/// task parks them again once it is gone: here the registry is marked
+/// revoked and the connection kicked, with no hook run by anyone else.
+#[tokio::test]
+async fn a_connection_that_ends_after_its_host_was_revoked_parks_its_sessions() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    collector.state.hosts.revoke(HOST, 1).unwrap();
+    collector.state.hub.disconnect(HOST);
+    host.closed().await;
+    wait_for("the session parked", || async {
+        let row = collector.state.store.session(&session).unwrap().unwrap();
+        (row.lifecycle == "parked" && row.presumed_parked).then_some(())
+    })
+    .await;
+    assert!(collector.event_kinds(&session).contains(&"presumed_parked".to_string()));
 }

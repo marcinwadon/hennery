@@ -18,7 +18,7 @@ export type PendingKind = "permission" | "elicitation";
 
 export type PendingResolution = "delivered" | "cancelled";
 
-export type PendingReason = "turn_cancelled" | "session_closed" | "session_parked" | "adapter_lost" | "host_restarted" | "agent_withdrew";
+export type PendingReason = "turn_cancelled" | "session_closed" | "session_parked" | "adapter_lost" | "host_restarted" | "agent_withdrew" | "host_revoked";
 
 export type ElicitationAction = "accept" | "decline" | "cancel";
 

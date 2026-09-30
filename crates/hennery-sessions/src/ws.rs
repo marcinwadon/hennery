@@ -11,6 +11,7 @@ use axum::response::Response;
 use axum::routing::get;
 use futures::{SinkExt, StreamExt};
 use hennery_kernel::hosts::HelloCheck;
+use hennery_kernel::lifecycle::LifecycleHooks;
 use hennery_kernel::secret::{random_bytes, unix_now};
 use hennery_proto::frames::{CollectorFrame, HostFrame, SessionBody};
 use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION, protocol_major};
@@ -112,6 +113,19 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
             .await;
         return;
     };
+    // A revoke that landed after the proof was checked but before this
+    // registration found no connection to close: this one must not live
+    // on to reconcile what the revoke parked (kernel spec §4.3).
+    if !matches!(state.hosts.is_revoked(&host_id), Ok(false)) {
+        state.hub.unregister(&host_id, registration.conn_id);
+        let _ = sink
+            .send(text(&reject(
+                "revoked",
+                "this host was revoked; pair it again with `hennery host join`",
+            )))
+            .await;
+        return;
+    }
 
     let mut committed = BTreeMap::new();
     for a in &attached_sessions {
@@ -168,7 +182,10 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
     // has resumed it, and must not close that fresh start (final review F1).
     let mut reconcile_closes: HashMap<String, String> = HashMap::new();
     loop {
+        // Biased: a kicked connection (a timed-out request, a revoke) reads
+        // no further frame, however many are waiting.
         let next = tokio::select! {
+            biased;
             _ = state.shutdown.cancelled() => break,
             _ = registration.kicked.cancelled() => break,
             next = tokio::time::timeout(READ_TIMEOUT, stream.next()) => next,
@@ -355,6 +372,14 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
     writer.abort();
     state.hub.unregister(&host_id, conn_id);
     tracing::info!(%host_id, "host disconnected");
+    // A revoke that gave up waiting for this connection parked the sessions
+    // while it could still apply frames. Parking again now that it is gone
+    // converges them (the hook is idempotent).
+    if matches!(state.hosts.is_revoked(&host_id), Ok(true))
+        && let Err(err) = state.on_host_revoked(&host_id)
+    {
+        tracing::error!(%host_id, error = %err, "parking a revoked host's sessions failed");
+    }
     crate::offline::after_disconnect(&state, host_id, conn_id);
 }
 
