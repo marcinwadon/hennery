@@ -527,3 +527,26 @@ fn flood_streams_until_the_prompt_is_cancelled() {
     // It stops for the cancel, however many chunks it got out first.
     assert_eq!(out.last().unwrap()["result"]["stopReason"], "cancelled", "{out:?}");
 }
+
+/// F1 (review round 1): `model_switch_chunks_first` gives a model switch's
+/// own answer a known, deterministic backlog ahead of it — sent inline, no
+/// sleep, so the notifications land on the wire strictly before the switch
+/// answers, instead of a backlog whose size depends on racing another
+/// task's own timing.
+#[test]
+fn a_model_switch_can_send_a_known_backlog_of_chunks_before_answering() {
+    let script = config_script(json!({ "model_switch_chunks_first": 5 }));
+    let mut requests = session_requests()[..2].to_vec();
+    requests.push(set_config(3, "model", json!("large")));
+    let out = exchange_until(&script, &requests, 3);
+    let notifications: Vec<&Value> = out.iter().filter(|m| m["method"] == "session/update").collect();
+    assert_eq!(notifications.len(), 5, "{out:?}");
+    let answer_pos = out.iter().position(|m| m["id"] == json!(3)).unwrap();
+    let last_notification_pos = out.iter().rposition(|m| m["method"] == "session/update").unwrap();
+    assert!(last_notification_pos < answer_pos, "{out:?}");
+    assert_eq!(
+        out[answer_pos]["result"]["configOptions"][0]["currentValue"],
+        json!("large"),
+        "{out:?}"
+    );
+}

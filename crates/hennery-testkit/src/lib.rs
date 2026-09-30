@@ -114,6 +114,14 @@ pub struct FakeScript {
     /// until the prompt is cancelled (an adapter flooding the host).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub flood: bool,
+    /// Before answering a switch of the model option, send this many
+    /// `agent_message_chunk` notifications with no sleep between them, then
+    /// answer. Sent inline (not from a spawned task), so they land on the
+    /// wire strictly before the switch's own answer: the host sees a known,
+    /// deterministic backlog ahead of the answer, rather than one whose size
+    /// depends on racing another task's timing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_switch_chunks_first: Option<usize>,
 }
 
 impl Default for FakeScript {
@@ -143,6 +151,7 @@ impl Default for FakeScript {
             announce_after_switch: false,
             announce_before_switch: false,
             flood: false,
+            model_switch_chunks_first: None,
         }
     }
 }

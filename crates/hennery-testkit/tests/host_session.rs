@@ -2335,21 +2335,157 @@ async fn a_flooding_adapter_cannot_hold_off_a_cancel() {
     );
     wait_until(&uplink, has("session_started")).await;
     assert!(handle.send(prompt("r1", "t1")));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let start_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     while handle.open_turn_id().is_none() {
-        assert!(tokio::time::Instant::now() < deadline, "the turn never started");
+        assert!(tokio::time::Instant::now() < start_deadline, "the turn never started");
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(handle.send(cancel("rc", "t1")));
+    let cancel_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
     // Polled on the handle: reading a flooded outbox every few ms would
     // itself slow the actor down.
     while handle.open_turn_id().is_some() {
         assert!(
-            tokio::time::Instant::now() < deadline,
+            tokio::time::Instant::now() < cancel_deadline,
             "the cancel was never read: the flood held it off"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let ends = turn_ends(&uplink.pending().unwrap());
     assert_eq!(ends, [("t1".to_string(), TurnOutcome::Cancelled, None)]);
+}
+
+/// F1 (review round 1): `out_deadline` could fire while the switch's
+/// genuine answer was already queued, undrained, behind the adapter's own
+/// output (the burst cap can leave the updates arm disabled long enough for
+/// the deadline to win the race) — reporting `config_failed` to the
+/// requester and then silently applying the same answer as an orphan.
+/// `out_deadline` must drain first and only orphan the switch if it is
+/// still out afterward.
+///
+/// No prompt runs here: `model_switch_chunks_first` gives the switch's own
+/// answer a known, deterministic backlog ahead of it (sent inline, no sleep,
+/// so it queues at the host within milliseconds), independent of any other
+/// task's timing. Calibrated at ~850ms to drain 5000 items on a disk-backed
+/// outbox; `config_timeout` (300ms) is well under a third of that, so the
+/// deadline reliably fires while the answer is still undrained.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_switch_answered_just_in_time_is_applied_not_orphaned_under_a_backlog() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, mut replies) = Uplink::new(Outbox::open(&dir.path().join("outbox.db")).unwrap());
+    let script = FakeScript {
+        model_switch_chunks_first: Some(5000),
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        SessionConfig::default(),
+        SessionOptions {
+            config_timeout: Duration::from_millis(300),
+            ..SessionOptions::default()
+        },
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
+    // No prompt is running, so `next_reply` (which never preempts
+    // `out_deadline` in the biased select otherwise) cannot resolve either:
+    // whatever answers this switch, answers it via `out_deadline`'s own
+    // drain or the ordinary update arm, never a turn ending underneath it.
+    let frames = wait_until(&uplink, has("config_applied")).await;
+    let (request, indexed) = applied(&frames).remove(0);
+    assert_eq!(request.as_str(), "rc1");
+    assert_eq!(
+        indexed.current_config().unwrap().model.as_deref(),
+        Some("large"),
+        "the answer that came in time was not applied"
+    );
+    // Nothing else answered rc1 (in particular, not a `config_failed` from
+    // the deadline firing before the drain saw the real answer).
+    match replies.try_recv() {
+        Err(_) => {}
+        Ok(frame) => panic!("rc1 was answered a second time: {frame:?}"),
+    }
+}
+
+/// F2 (review round 1): the pre-turn drain (run right before a new turn
+/// starts, so updates from before it are never tagged with the new turn)
+/// can answer a switch that was out without a follow-up `send_next_switch`
+/// — leaving whatever waits behind it in `configs.queued` unsent until
+/// something else happens to call it, in the worst case the new turn's own
+/// end.
+///
+/// `model_switch_chunks_first` gives `rc1` (the model switch) a known
+/// backlog ahead of its own answer (calibrated at ~850ms to drain 5000 items
+/// on a disk-backed outbox): a brief sleep (30ms) lets the answer reach the
+/// host (fast: the connection task's own read is not disk-bound) while the
+/// actor's own consumption is still far from reaching it. `rc2` (a plain,
+/// fast switch) is sent right behind `rc1` and queues, since only one switch
+/// is ever out at a time. `config_timeout` is generous so `out_deadline`
+/// never fires here — this is about the *pre-turn* drain specifically, not
+/// F1's `out_deadline` drain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_switch_queued_behind_one_the_pre_turn_drain_answers_is_sent_without_waiting_for_the_new_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, _replies) = Uplink::new(Outbox::open(&dir.path().join("outbox.db")).unwrap());
+    let script = FakeScript {
+        model_switch_chunks_first: Some(5000),
+        chunks: (1..=5).map(|n| n.to_string()).collect(),
+        chunk_delay_ms: 200,
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        SessionConfig::default(),
+        SessionOptions {
+            config_timeout: Duration::from_secs(10),
+            ..SessionOptions::default()
+        },
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
+    assert!(handle.send(set_config("rc2", "effort", ConfigValue::Id("high".into()))));
+    // rc1's answer (behind its 5000-notification backlog) has reached the
+    // host by now, but the disk-bound actor's own consumption is nowhere
+    // near it yet (calibrated at ~850ms to get there on its own).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    let kinds = kinds(&frames);
+    // `kinds` collapses every `config_applied` to the same string, so
+    // finding rc1's or rc2's own position (not just "the first one") needs
+    // the frames themselves, matched by request id.
+    let index_of = |request_id: &str| {
+        frames.iter().position(|f| {
+            matches!(
+                f,
+                HostFrame::Session {
+                    body: SessionBody::ConfigApplied { request_id: id, .. },
+                    ..
+                } if id == request_id
+            )
+        })
+    };
+    let turn_ended_at = kinds.iter().position(|k| k == "turn_ended").unwrap();
+    assert!(
+        index_of("rc2").is_some_and(|at| at < turn_ended_at),
+        "rc2 waited for the turn to end instead of being sent by the pre-turn drain: {kinds:?}"
+    );
+    let applied = applied(&frames);
+    assert_eq!(applied.len(), 2, "expected both rc1 and rc2 answered: {kinds:?}");
+    assert_eq!(
+        applied.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+        ["rc1", "rc2"]
+    );
+    let (_, indexed) = &applied[1];
+    assert_eq!(
+        indexed.current_config().unwrap().axes.get("effort").cloned(),
+        Some(ConfigValue::Id("high".into())),
+        "rc2 (effort=high) was not applied"
+    );
 }

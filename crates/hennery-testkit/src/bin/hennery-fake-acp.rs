@@ -163,6 +163,21 @@ async fn main() -> agent_client_protocol::Result<()> {
                         .unwrap()
                         .iter()
                         .any(|o| o.id == req.config_id && o.category == Some(SessionConfigOptionCategory::Model));
+                    if is_model && let Some(n) = script.model_switch_chunks_first {
+                        // Sent inline, with no sleep, so they land on the
+                        // wire strictly before this switch's own answer
+                        // (below): a known, deterministic backlog ahead of
+                        // the answer, for testing `out_deadline` without
+                        // racing another task's timing.
+                        for i in 0..n {
+                            cx.send_notification(SessionNotification::new(
+                                req.session_id.clone(),
+                                SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                                    TextContent::new(format!("backlog{i}")),
+                                ))),
+                            ))?;
+                        }
+                    }
                     if let (Some(delay), true) = (script.slow_model_switch_ms, is_model) {
                         // Answered late, from a task of its own, so other
                         // requests are handled meanwhile (the TS SDK the real

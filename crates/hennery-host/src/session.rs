@@ -732,7 +732,8 @@ impl Actor {
             orphan: None,
             next_token: 0,
         };
-        // Updates emitted in a row since another arm last had a turn.
+        // Updates handled since the burst last reset: reset only once a
+        // full pass over the other arms (below) finds none of them ready.
         let mut burst = 0;
         loop {
             let cancel_at = turn.as_ref().and_then(|t| t.cancel_deadline);
@@ -785,6 +786,11 @@ impl Actor {
                         }
                         // Updates from before this turn are not part of it.
                         self.drain_updates(&mut updates, None, &mut configs);
+                        // The drain above may have answered a switch that
+                        // was out, freeing whatever waits behind it: sent
+                        // now, not left for this new turn's own reply to
+                        // discover (same pattern as the reply arm below).
+                        self.send_next_switch(&conn, &agent_session, &switch_tx, &mut configs);
                         seen_turns.insert(turn_id.clone());
                         self.set_open_turn(Some(turn_id.clone()));
                         self.emit(SessionBody::TurnStarted { request_id, turn_id: turn_id.clone() });
@@ -873,12 +879,20 @@ impl Actor {
                     }
                 }
                 _ = out_deadline(out_at) => {
-                    let out = configs.out.take().expect("a deadline implies an out switch");
-                    self.orphan_switch(out, &mut configs);
-                    // A late answer for the orphan just created above could
-                    // already be sitting in `updates`.
+                    // The genuine answer may already be queued, undrained,
+                    // behind an adapter's flood backlog (the burst cap can
+                    // leave the updates arm disabled long enough for this
+                    // deadline to fire first): drain before deciding, so a
+                    // switch that did answer in time is never reported
+                    // `config_failed` and then applied again, silently, as
+                    // an orphan.
                     if self.drain_updates(&mut updates, turn.as_ref().map(|t| t.id.as_str()), &mut configs) {
                         idle_since = Instant::now();
+                    }
+                    match configs.out.take() {
+                        Some(out) => self.orphan_switch(out, &mut configs),
+                        // The drain above answered it: send whatever waits behind it.
+                        None => self.send_next_switch(&conn, &agent_session, &switch_tx, &mut configs),
                     }
                 }
                 _ = orphan_deadline(orphan_at) => {
