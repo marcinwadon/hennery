@@ -468,15 +468,6 @@ fn loopback_url(listen: &str) -> String {
     }
 }
 
-/// `listen` (`host:port`) with its port replaced by `port`, the one it was
-/// bound on: `listen` may name port 0.
-fn with_port(listen: &str, port: u16) -> String {
-    match listen.rsplit_once(':') {
-        Some((host, _)) => format!("{host}:{port}"),
-        None => listen.to_string(),
-    }
-}
-
 /// `up`'s host child, but for the pairing descriptor (`run_up` adds it).
 fn host_command(
     exe: &std::path::Path,
@@ -533,6 +524,12 @@ async fn run_up(args: UpArgs) -> Result<()> {
     // another scheme it cannot make sense of) must fail here, not after the
     // collector is already up and serving.
     hennery_host::pairing::collector_ws_url(&loopback_url(&args.listen))?;
+    // Bound here and handed to the collector child, so the host's URL names
+    // the port the collector serves on, also for `--listen` port 0. Before
+    // the data root is touched: a busy port leaves nothing behind.
+    let listener = std::net::TcpListener::bind(&args.listen).with_context(|| format!("bind {}", args.listen))?;
+    let collector_url = loopback_url(&listener.local_addr()?.to_string());
+    let collector_ws_url = hennery_host::pairing::collector_ws_url(&collector_url)?;
     // Before either child creates its own directory in it.
     private_data_dir(&args.data_dir)?;
     // The host pairs itself on first start only; a pairing that was revoked
@@ -541,11 +538,6 @@ async fn run_up(args: UpArgs) -> Result<()> {
         Some(_) => None,
         None => Some(std::io::pipe()?),
     };
-    // Bound here and handed to the collector child, so the host's URL names
-    // the port the collector serves on, also for `--listen` port 0.
-    let listener = std::net::TcpListener::bind(&args.listen).with_context(|| format!("bind {}", args.listen))?;
-    let collector_url = loopback_url(&with_port(&args.listen, listener.local_addr()?.port()));
-    let collector_ws_url = hennery_host::pairing::collector_ws_url(&collector_url)?;
     // Keep both children out of the terminal's foreground process group: a
     // Ctrl-C there delivers SIGINT to every process in that group at once,
     // which would race each child's own signal handler against the ordered

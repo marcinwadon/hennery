@@ -495,14 +495,15 @@ impl Drop for RemoveDir {
 }
 
 /// Start `up` on `dir`, logging to `log`, wait until its host is connected,
-/// and return the connected host ids and the owner's session: `session`, or
-/// else a new one from setting the collector up. The returned guard stops
+/// and return the address it listens on, the connected host ids and the
+/// owner's session: `session`, or else a new one from setting the collector
+/// up. The returned guard stops
 /// the whole tree (and leaves `dir`).
 fn up_until_connected(
     dir: &std::path::Path,
     log: &std::path::Path,
     session: Option<&str>,
-) -> (KillTree, Vec<String>, String) {
+) -> (KillTree, String, Vec<String>, String) {
     let mut guard = up_logging_to(dir, log);
     let listen = guard.listening();
     let session = match session {
@@ -520,7 +521,7 @@ fn up_until_connected(
             .collect();
         hosts.iter().any(|h| h["connected"] == true)
     });
-    (guard, ids, session)
+    (guard, listen, ids, session)
 }
 
 /// `hennery up` pairs its own host on first start, through the pipe the
@@ -533,16 +534,19 @@ fn up_pairs_its_own_host_once() {
     let data = dir.join("data");
     let host_dir = data.join("host");
 
-    let (mut first, ids, session) = up_until_connected(&data, &dir.join("first.log"), None);
+    let (mut first, first_listen, ids, session) = up_until_connected(&data, &dir.join("first.log"), None);
     assert_eq!(ids.len(), 1, "{ids:?}");
     assert!(ids[0].starts_with("host-"), "{ids:?}");
     let key = std::fs::read(host_dir.join("host.key")).unwrap();
     // SIGTERM, not a kill: `up` stops the host, then the collector.
     unsafe { libc::kill(first.up.id() as i32, libc::SIGTERM) };
     assert!(wait_with_timeout(&mut first.up, Duration::from_secs(15)).is_some());
+    // Held, so the restart cannot get the same port back by chance.
+    let _held = std::net::TcpListener::bind(&first_listen);
 
     // Set up already: the session from the first run still holds.
-    let (_second, again, _) = up_until_connected(&data, &dir.join("second.log"), Some(&session));
+    let (_second, second_listen, again, _) = up_until_connected(&data, &dir.join("second.log"), Some(&session));
+    assert_ne!(second_listen, first_listen, "the restart was not on another port");
     assert_eq!(again, ids, "the restart paired a second host");
     assert_eq!(std::fs::read(host_dir.join("host.key")).unwrap(), key);
 }
