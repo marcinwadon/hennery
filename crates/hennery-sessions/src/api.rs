@@ -659,9 +659,9 @@ fn catalog_in(e: &EventDto) -> Option<SessionCatalog> {
     SessionCatalog::from_indexed(&e.session_id, &indexed)
 }
 
-/// Session stream: replays from `Last-Event-ID`, then follows live events.
-/// The session's events as SSE, until the collector shuts down or the
-/// operator's session that opened it ends (3b decision 7).
+/// The session's events as SSE: replays from `Last-Event-ID`, then follows
+/// live events, until the collector shuts down or the operator's session
+/// that opened it ends (3b decision 7).
 async fn stream_session(
     State(state): State<AppState>,
     Extension(operator_session): Extension<Authenticated>,

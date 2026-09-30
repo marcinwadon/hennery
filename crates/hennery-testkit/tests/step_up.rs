@@ -149,10 +149,13 @@ async fn wrong_step_ups_lock_out_step_up_only() {
     for _ in 0..5 {
         assert_eq!(c.step_up(&session, "wrong password").await.status(), 401);
     }
+    // A locked-out step-up runs no password check.
+    let checked = c.state.operator.verifications();
     assert_eq!(
         code_of(c.step_up(&session, OWNER_PASSWORD).await).await,
         (429, "rate_limited".into())
     );
+    assert_eq!(c.state.operator.verifications(), checked);
     assert_eq!(c.login(OWNER_PASSWORD).await.status(), 204);
 }
 
