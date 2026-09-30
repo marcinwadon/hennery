@@ -17,7 +17,7 @@
   - `POST …/pending/{pending_id}/answer` queues the answer and sends it at once to a ready host. Every reconciliation drains whatever is still owed.
   - SSE `pending_changed` follows every step.
 
-**Tech Stack:** Rust (edition 2024, MSRV 1.88), tokio, axum 0.8, agent-client-protocol 2.2.0 / schema 1.9.1 (`Responder`, `UntypedMessage`, `RequestPermissionRequest`, `ElicitationCapabilities`), rusqlite 0.40, uuid 1 (v7), schemars/ts-rs codegen. The only dependency change is the workspace's own `uuid`, added to `hennery-host`. Nix flake dev shell.
+**Tech Stack:** Rust (edition 2024, MSRV 1.88), tokio, axum 0.8, agent-client-protocol 2.2.0 / schema 1.9.1 (`Responder`, `RequestCancellation`, `UntypedMessage`, `ElicitationCapabilities`), rusqlite 0.40, uuid 1 (v7), schemars/ts-rs codegen. The only dependency change is the workspace's own `uuid`, added to `hennery-host`. Nix flake dev shell.
 
 **Spec:** [`docs/specs/2026-09-26-acp-core-design.md`](../specs/2026-09-26-acp-core-design.md). The relevant sections are:
 - §2.3 (the exit watcher resolves every pending request `adapter_lost`, after the turn's end and before `adapter_exited`);
@@ -36,9 +36,9 @@
 - §12 (scenarios 5, 7, 8, 9 and 10; the live gate "form elicitation round trip with `answer_result{delivered: true}`", as far as the fake adapter can stand in for a real one).
 - It also relies on the umbrella spec [`2026-09-25-hennery-architecture-design.md`](../specs/2026-09-25-hennery-architecture-design.md): §6.5 (no timeout; the cancellation is explicit on the card) and §6.8 (delivery acknowledgement, the monotonic fold).
 
-It builds on the executed [session config plan](2026-09-30-session-config.md) (plan B2b). Read its "Execution status" and "After this plan" first. Its code wins over its task text, and every anchor below was taken from that code (`feat/session-config` at `7e5bcc1`, about to merge to `main`).
+It builds on the executed [session config plan](2026-09-30-session-config.md) (plan B2b). Read its "Execution status" and "After this plan" first. Its code wins over its task text, and every anchor below was taken from that code (`main` at `4659c27`, which merged it).
 
-**Status:** not executed. Every code block below was built and tested in a scratch copy of `7e5bcc1`. The plan was then replayed from its own text, task by task, onto a fresh copy of `7e5bcc1`. After every task the replay ran fmt, clippy (also on the shipped binary with test hooks off), the workspace tests and the codegen check. It ends with 299 tests, up from 258. Every new timing-sensitive test passed with four copies of its test binary running at once.
+**Status:** not executed. Every code block below was built and tested in a scratch copy of `4659c27`. The plan was then replayed from its own text, task by task, onto a fresh copy of `4659c27`. After every task the replay ran fmt, clippy (also on the shipped binary with test hooks off), the workspace tests and the codegen check. It ends with 304 tests, up from 258. The review amendments of 2026-10-01 were replayed the same way. Every new timing-sensitive test passed with four copies of its test binary running at once.
 
 ## Scope
 
@@ -46,12 +46,13 @@ This is **plan (2)**, permission and elicitation, as plans A, B1, B2a and B2b sc
 
 **In:**
 - Wire: the three bodies, the two frames, the `pending` extract, the REST answer types, `PendingItem` and `SessionDetail.pending`.
-- Fake adapter: scripted `session/request_permission` and `elicitation/create` asks, answered one at a time or all open at once. Each answer is echoed as a chunk. Elicitation is asked only of a client that advertised `elicitation.form` (P-19). It can ask during a load, crash with a question open, and send a method no client serves.
+- Fake adapter: scripted `session/request_permission` and `elicitation/create` asks, answered one at a time or all open at once. Each answer is echoed as a chunk. Elicitation is asked only of a client that advertised `elicitation.form` (P-19). It can ask during a load (and make the load wait for the answer), crash with a question open, withdraw its question, offer an option kind the schema does not know, and send a method no client serves.
 - Host:
   - the elicitation capability;
   - the untyped request handler, with `-32601` for everything else;
   - questions in wire order, held back until `session_started`;
   - answers, at most one delivered per question;
+  - a question the adapter withdraws (`$/cancel_request`);
   - cancellation on stop, park, close, idle reap and adapter exit;
   - no reap with a question open.
 - Collector:
@@ -84,23 +85,31 @@ This is **plan (2)**, permission and elicitation, as plans A, B1, B2a and B2b sc
 
 ## Decisions this plan makes where the spec is silent
 
-These have not been reviewed yet. Previous plans had their decisions confirmed by a stronger-model review on the maintainer's behalf, and that is the next step here. They were checked against agent-client-protocol 2.2.0 and schema 1.9.1, and three facts about the crate shaped them:
+**Amendments (2026-10-01 review):**
+- Decision 4: a permission's `option_ids` are read from the raw request, not from a typed copy. The 400 text for a request without them says "stop, park or close the session".
+- Decision 7 and decision 10: a host's refusal of an answer is logged and is no verdict.
+- Decision 2: a start that runs out of time names the questions it held back.
+- Decision 15 is new: the adapter withdrawing its own question (`$/cancel_request`).
+- "After this plan" gains three hand-offs: push for questions asked outside a turn, host revoke, and `elicitation/complete`.
+
+Reviewed and confirmed (with the amendments above) on 2026-10-01 by a stronger-model review on the maintainer's behalf. It checked the decisions against agent-client-protocol 2.2.0 and schema 1.9.1. Four facts about the crate shaped them:
 - `Responder` sends nothing when an individual request's responder is dropped. The adapter then waits for good.
 - An `UntypedMessage` request handler sees every method.
 - The crate's default handler for the agent side answers `Handled::No { retry: true }` for any message that names a session, so the message is held for a per-session handler that hennery never registers. Today an adapter's `fs/read_text_file` or `terminal/create` therefore hangs instead of getting §2.5's `-32601` (decision 3).
+- `PermissionOptionKind` is `#[non_exhaustive]` with no catch-all, and `RequestPermissionRequest.options` is a plain `Vec`: one option of a new kind fails the whole typed parse (decision 4). A peer's `$/cancel_request` reaches the request's `RequestCancellation`, which `Responder::cancellation()` exposes (decision 15).
 
 The tasks implement the decisions as written here.
 
 1. **The kind of a question rides in its `pending` extract.** §3.2 lists `kind` as a field of `pending_opened`, but `kind` is already the tag of every session body. So `pending_opened` is `{pending_id, indexed, payload}`, and `indexed.pending = {id, kind, option_ids?}` carries the kind, as §4.6 describes the extract. The host always fills the extract: it knows the id and the kind without parsing anything.
 2. **Questions that arrive before `session_started` are held, then opened right after it.** That covers `initialize`, `session/new`, `session/load` and the start's switches.
    - They are opened in wire order, together with the start's early updates. The collector has no attached session to hang them on before then.
-   - An adapter that blocks its load on such a question costs the start its 75 s deadline and ends `start_failed`. That is visible, not silent; see "After this plan".
+   - An adapter that blocks its load on such a question costs the start its 75 s deadline and ends `start_failed`. **Amended:** that `start_failed` names what was held back: "…; the agent asked N question(s) during start-up (permission/elicitation) that hennery cannot show before the session exists". See "After this plan".
 3. **hennery answers every other adapter request itself, with `-32601 Method not found`.**
    - This is §2.5's "anything else". Falling through to the crate is not enough: it would hold any request carrying a `sessionId` forever (see above).
    - This also fixes today's hang for `fs/*` and `terminal/*` until those methods are implemented.
 4. **Ids and extracts.**
    - `pending_id` is a UUIDv7 from the workspace's `uuid` crate. It is globally unique, random beyond its time prefix, and orders by creation. §4.6 says "random UUID"; v7 satisfies it, and it needs no new dependency or feature.
-   - A permission's `option_ids` come from a typed copy of the request (§2.4). If that copy does not parse, the question still opens, without `option_ids`. The collector then accepts no answer to it (400 `invalid`, "cancel the turn instead"): it can validate only against stored option ids (§3.2).
+   - **Amended.** A permission's `option_ids` are read from the raw params: every string `options[i].optionId`, skipping an entry without one. A typed copy (§2.4) would fail on a single option of a kind this build does not know, and then every answer would be refused. There are no `option_ids` only when `options` is missing or not an array. The question still opens then, but the collector accepts no answer to it (400 `invalid`, "stop, park or close the session"): it can validate only against stored option ids (§3.2).
 5. **A stop answers every open question `cancelled`.**
    - On the first `session/cancel` for a turn, every open question is answered cancelled: a permission gets the `cancelled` outcome, an elicitation the `cancel` action. Each is announced as `pending_resolved{cancelled, turn_cancelled}`. ACP asks this of a client after `session/cancel`.
    - A question the same turn asks after the cancel is cancelled the moment it opens: the operator asked to stop.
@@ -112,7 +121,7 @@ The tasks implement the decisions as written here.
 7. **Answers on the host.**
    - An answer for a question the actor holds is delivered: `answer_result{delivered: true}`, then `pending_resolved{delivered}`.
    - Any other answer changes nothing and is `answer_result{delivered: false}`. That covers one already answered, one cancelled, one asked of an earlier adapter, or a kind mismatch the collector's validation makes unreachable.
-   - An answer for a session with no live actor is refused with a correlated `error{not_attached}`, like a prompt. The collector records that refusal as the answer's verdict.
+   - An answer for a session with no live actor is refused with a correlated `error{not_attached}`, like a prompt. **Amended:** the collector logs that refusal; it is not a verdict (decision 10).
    - The connection task does not emit an outboxed `answer_result` for such a session. `hello_ack` fast-forwards only attached sessions, so after an outbox loss that frame's seq could collide with a committed one.
 8. **`blocked`, and the push edge.**
    - `activity` becomes `blocked` when a `pending_opened` applies to a `running` session, and returns to `running` when its last open question resolves. `turn_ended` makes it `idle` as before.
@@ -125,10 +134,11 @@ The tasks implement the decisions as written here.
 
    A presumed park leaves questions `open` (§5.3).
 10. **The answer queue's verdict.**
-    - `answer_queue.delivered` is NULL until a verdict, which folds §8's `state` column into it. A verdict comes from:
+    - `answer_queue.delivered` is NULL until a verdict, which folds §8's `state` column into it. **Amended:** a verdict comes only from:
       - `answer_result`, folded so `true` sticks;
-      - a host's refusal of the answer's request (`false`);
-      - the question's cancellation (`false`: nobody will take it).
+      - the question's resolution: cancellation gives `false` (nobody will take it).
+
+      A host's refusal of the answer's request is logged and leaves `delivered` NULL, so the answer goes again after the next handshake while its question is open.
     - After every reconciliation, and only after `mark_ready`, the queue sends every answer still NULL whose question is still open, oldest first. So an answer lost with a connection goes again after the next handshake. The host dedupes by `pending_id`.
     - The endpoint also sends the answer at once to a host that is ready. An answer racing a reconciliation is therefore sent by one path or by both, never by neither.
 11. **The answer endpoint.**
@@ -149,6 +159,11 @@ The tasks implement the decisions as written here.
     - A `pending_opened` for a detached session, or for a turn that has ended, is not applied.
     - A `pending_resolved` or `answer_result` for a question that is not open, or has no queued answer, is not applied either.
 
+15. **The adapter may withdraw its own question** (`$/cancel_request`, new with the review).
+    - `open_question` takes the responder's `RequestCancellation` and spawns a watcher. When the peer cancels the request, the watcher sends `QuestionWithdrawn{pending_id}` into the actor's ordered channel. The watcher is aborted when the question is answered or cancelled.
+    - The actor removes the question, answers the request with the standard `-32800` cancellation error, and emits `pending_resolved{cancelled, reason: agent_withdrew}`. `agent_withdrew` is a new reason.
+    - Without this the card would stay answerable, an answer would report `delivered: true` to nobody, and the open question would keep the reaper away for good.
+
 **Spec drift to reconcile after review:** these are refinements of ACP core §3.2, §3.3, §4.6, §8 and §9, and the spec text should be amended to match:
 - `pending_opened` without a body `kind`;
 - the `pending_cancelled` collector event;
@@ -157,7 +172,9 @@ The tasks implement the decisions as written here.
 - `error{not_attached}` for an answer to a session with no live actor;
 - hennery's own `-32601` handler;
 - `pending_changed` carrying the current `PendingItem`;
-- `pending_id` as UUIDv7.
+- `pending_id` as UUIDv7;
+- the reason `agent_withdrew` (decision 15);
+- `option_ids` read from the raw request (decision 4).
 
 ## Global Constraints
 
@@ -182,8 +199,8 @@ These are the five inputs most likely to bite a real user that the obvious tests
 1. **Stop pressed while the agent waits for an answer, or an agent that asks again after the stop.** Expected: the question closes at once as `cancelled` (`turn_cancelled`), and the adapter hears `cancelled`, so the turn ends `cancelled` without waiting out the cancel grace. A question asked after the stop is cancelled as it opens. A late answer is refused 409 `not_open`, and the host reports `delivered: false`. (Task 4: `a_cancel_answers_the_open_questions_cancelled_and_the_turn_ends_cancelled`, `a_question_asked_after_the_cancel_is_cancelled_at_once`; Task 7: `stop_with_a_question_open_ends_the_turn_cancelled_and_closes_the_question`)
 2. **The same question answered from two tabs, or an answer resent after a reconnect.** Expected: the second submit is 409 `already_answered`. An answer that arrives twice reaches the agent once, and `delivered: true` is never overwritten by a later `false`. (Task 3: `an_answer_is_delivered_once_and_one_for_a_question_not_open_is_not`; Task 5: `a_delivered_verdict_sticks_and_a_later_false_does_not_overwrite_it`; Task 6: `an_answer_is_queued_sent_to_the_host_and_its_verdict_recorded`, `an_answer_given_while_the_host_is_offline_is_sent_after_its_next_handshake`)
 3. **An answer given while the host is offline, presumed parked, or still reconciling.** Expected: 202, queued. It is sent only after the host's `resend_complete`, and resent after each handshake until a verdict comes. The adapter still waiting for it gets it (scenarios 8, 9). (Task 6: `an_answer_given_while_the_host_is_offline_is_sent_after_its_next_handshake`; Task 7: `a_question_outlasts_its_host_being_away_and_an_answer_given_meanwhile_is_delivered`)
-4. **The adapter crashes, or the host restarts, while a question is open, maybe with its answer already queued.** Expected: the question is cancelled `adapter_lost` or `host_restarted`, in §2.3's order. A queued answer for it is never sent and gets `delivered: false`, and a new answer is 409 `not_open`. Nothing is re-spawned. (Task 4: `an_adapter_lost_with_a_question_open_cancels_it_adapter_lost`; Task 5: `a_host_restart_cancels_open_questions_and_a_presumed_park_keeps_them`, `a_detach_or_an_unattached_close_cancels_whatever_is_still_open`; Task 6: `a_host_restart_cancels_the_open_questions_and_drops_their_queued_answers`; Task 7: `an_adapter_crash_with_a_question_open_cancels_it_adapter_lost`, `a_host_restart_with_a_question_open_cancels_it_host_restarted`)
-5. **An adapter request hennery does not serve (`fs/*`, `terminal/*`, a method newer than this build), or a question asked while the session loads.** Expected: the unserved request is answered `-32601` at once and the turn goes on; nothing hangs. A question asked during the load opens right after `session_started`, outside any turn, and can be answered. It keeps the reaper away however long it waits (scenario 10). (Task 3: `a_request_the_host_does_not_serve_is_refused_method_not_found`, `a_question_asked_while_the_session_loads_opens_after_session_started`; Task 4: `the_reaper_never_parks_a_session_with_a_question_open`)
+4. **The adapter crashes, the host restarts, or the agent withdraws its question, while a question is open, maybe with its answer already queued.** Expected: the question is cancelled `adapter_lost` or `host_restarted`, in §2.3's order. A queued answer for it is never sent and gets `delivered: false`, and a new answer is 409 `not_open`. Nothing is re-spawned. A withdrawn question closes `agent_withdrew`, and an answer to it reaches nobody. (Task 4: `an_adapter_lost_with_a_question_open_cancels_it_adapter_lost`, `a_question_the_agent_withdraws_closes_and_an_answer_reaches_nobody`; Task 5: `a_host_restart_cancels_open_questions_and_a_presumed_park_keeps_them`, `a_detach_or_an_unattached_close_cancels_whatever_is_still_open`; Task 6: `a_host_restart_cancels_the_open_questions_and_drops_their_queued_answers`; Task 7: `an_adapter_crash_with_a_question_open_cancels_it_adapter_lost`, `a_host_restart_with_a_question_open_cancels_it_host_restarted`)
+5. **An adapter request hennery does not serve (`fs/*`, `terminal/*`, a method newer than this build), a permission option of a kind this build does not know, or a question asked while the session loads.** Expected: the unserved request is answered `-32601` at once and the turn goes on; nothing hangs. The unknown option kind keeps every option id answerable. A question asked during the load opens right after `session_started`, outside any turn, and can be answered. It keeps the reaper away however long it waits (scenario 10). (Task 3: `a_request_the_host_does_not_serve_is_refused_method_not_found`, `a_permission_with_an_option_kind_this_build_does_not_know_keeps_its_option_ids`, `option_ids_are_read_from_the_raw_request`, `a_question_asked_while_the_session_loads_opens_after_session_started`, `a_start_that_runs_out_of_time_says_which_questions_it_held_back`; Task 4: `the_reaper_never_parks_a_session_with_a_question_open`)
 
 ## File structure
 
@@ -191,12 +208,12 @@ These are the five inputs most likely to bite a real user that the obvious tests
 |---|---|---|
 | `crates/hennery-proto/src/frames.rs` | `PendingKind`, `PendingResolution`, `PendingReason`, `ElicitationAction`, `PendingExtract`, `Indexed.pending`; `PendingOpened`, `PendingResolved`, `AnswerResult`; `AnswerPermission`, `AnswerElicitation` | 1 |
 | `crates/hennery-proto/src/rest.rs`, `codegen.rs` | `PendingState`, `PendingItem`, `AnswerRequest`, `AnswerResponse`, `SessionDetail.pending` | 1 |
-| `crates/hennery-testkit/src/lib.rs`, `src/bin/hennery-fake-acp.rs` | `FakeAsk`, `asks`, `asks_at_once`, `crash_while_asking`, `ask_on_load` | 2 |
+| `crates/hennery-testkit/src/lib.rs`, `src/bin/hennery-fake-acp.rs` | `FakeAsk` (with `FuturePermission`), `asks`, `asks_at_once`, `crash_while_asking`, `ask_on_load`, `ask_on_load_waits`, `withdraw_asks` | 2 |
 | `crates/hennery-host/Cargo.toml`, `Cargo.lock` | `uuid` for `hennery-host` | 3 |
-| `crates/hennery-host/src/session.rs` | `Answer`, `SessionCmd::Answer`, `Inbound::Question`, `Early`, `Questions`, `client_capabilities`, `open_question`, `answer` (3); `cancel_questions`, `resolve_cancelled`, the teardown and reaper hooks (4) | 3, 4 |
+| `crates/hennery-host/src/session.rs` | `Answer`, `SessionCmd::Answer`, `Inbound::Question`, `Early`, `Questions`, `client_capabilities`, `option_ids`, `held_questions`, `open_question`, `answer` (3); `cancel_questions`, `resolve_cancelled`, the teardown and reaper hooks, `Inbound::QuestionWithdrawn`, `Watcher`, `withdraw_question` (4) | 3, 4 |
 | `crates/hennery-host/src/connection.rs` | `answer_*` dispatch | 1, 3 |
-| `crates/hennery-sessions/src/store.rs` | Migration 6, `AnswerSubmission`, `QueuedAnswer`, `resolve_pending`, `cancel_open_pending`, the three ingest arms, `open_pending`, `pending_item`, `submit_answer`, `answers_to_send`, `answer_rejected` | 1, 5 |
-| `crates/hennery-sessions/src/hub.rs`, `ws.rs`, `api.rs` | `Hub::notify`; the drain after reconciliation and refused answers; `POST …/answer`, `SessionDetail.pending`, `pending_changed` | 1, 6 |
+| `crates/hennery-sessions/src/store.rs` | Migration 6, `AnswerSubmission`, `QueuedAnswer`, `resolve_pending`, `cancel_open_pending`, the three ingest arms, `open_pending`, `pending_item`, `submit_answer`, `answers_to_send` | 1, 5 |
+| `crates/hennery-sessions/src/hub.rs`, `ws.rs`, `api.rs` | `Hub::notify`; the drain after reconciliation, and logging refused answers; `POST …/answer`, `SessionDetail.pending`, `pending_changed` | 1, 6 |
 | `crates/hennery-proto/tests/frames.rs`, `crates/hennery-testkit/tests/{fake_acp,host_session,host_connection,reconcile,e2e}.rs`, `crates/hennery-sessions/tests/store.rs` | Tests | all |
 
 All commands run from the repository root inside the dev shell (`nix develop`, or direnv). Work on a feature branch off `main` (e.g. `feat/permissions`), once `feat/session-config` has merged. Each task leaves the workspace compiling, clippy-clean and green.
@@ -208,7 +225,7 @@ All commands run from the repository root inside the dev shell (`nix develop`, o
 - "In `path`, replace:" is followed by a block that occurs **exactly once** in the file at that point (earlier blocks of the same task already applied, in order), then "with:" and its replacement.
 - "Run this rewrite:" is followed by a shell block that edits files mechanically; run it from the repository root.
 
-Other "Run:" lines only check; they change nothing. The plan was replayed exactly this way, from its own text, onto `7e5bcc1`.
+Other "Run:" lines only check; they change nothing. The plan was replayed exactly this way, from its own text, onto `4659c27`.
 
 ---
 
@@ -221,11 +238,11 @@ Other "Run:" lines only check; they change nothing. The plan was replayed exactl
 - Test: `crates/hennery-proto/tests/frames.rs`, `crates/hennery-testkit/tests/reconcile.rs`
 
 **Interfaces:**
-- Consumes: `SessionBody`, `CollectorFrame`, `Indexed`, `SessionDetail` as `7e5bcc1` has them.
+- Consumes: `SessionBody`, `CollectorFrame`, `Indexed`, `SessionDetail` as `4659c27` has them.
 - Produces (`hennery_proto::frames`):
   - `enum PendingKind { Permission, Elicitation }`
   - `enum PendingResolution { Delivered, Cancelled }`
-  - `enum PendingReason { TurnCancelled, SessionClosed, SessionParked, AdapterLost, HostRestarted }`
+  - `enum PendingReason { TurnCancelled, SessionClosed, SessionParked, AdapterLost, HostRestarted, AgentWithdrew }`
   - `enum ElicitationAction { Accept, Decline, Cancel }`
   - `struct PendingExtract { id: String, kind: PendingKind, option_ids: Option<Vec<String>> }`
 
@@ -497,6 +514,8 @@ pub enum PendingReason {
     SessionParked,
     AdapterLost,
     HostRestarted,
+    /// The adapter withdrew its own question (`$/cancel_request`).
+    AgentWithdrew,
 }
 
 /// The operator's answer to an elicitation (ACP `elicitation/create`).
@@ -955,15 +974,18 @@ git push -u origin HEAD
 
 **Interfaces:**
 - Consumes: nothing new (the fake speaks raw ACP).
-- Produces: `enum FakeAsk { Permission, Elicitation, Unknown }` (snake_case). Also new `FakeScript` fields:
+- Produces: `enum FakeAsk { Permission, Elicitation, Unknown, FuturePermission }` (snake_case). Also new `FakeScript` fields:
   - `asks: Vec<FakeAsk>`: asked at the start of every prompt, one at a time;
   - `asks_at_once: bool`: all sent, then awaited in order;
   - `crash_while_asking: bool`: sent, then exit status 3 with no answer awaited;
-  - `ask_on_load: bool`: the first ask goes out right before the `session/load` answer.
+  - `ask_on_load: bool`: the first ask goes out right before the `session/load` answer;
+  - `ask_on_load_waits: bool`: with `ask_on_load`, the load is answered only once that ask is;
+  - `withdraw_asks: bool`: every ask is withdrawn with `$/cancel_request` right after it is sent.
 - Produces: the requests and their echoes:
   - `Permission` sends `session/request_permission` for `toolCallId: "call-1"`, with options `allow` / `reject`;
   - `Elicitation` sends `elicitation/create` in form mode, asking for a `name`, but only to a client whose `initialize` advertised `elicitation.form`. It parses that typed, so a boolean does not count (P-19);
-  - `Unknown` sends `_fake/unknown`.
+  - `Unknown` sends `_fake/unknown`;
+  - `FuturePermission` is `Permission` with options `allow` and `allow_session` (kind `allow_for_session`, unknown to the schema).
 
   Each answer is echoed as one `agent_message_chunk`: `permission:selected:<id>` | `permission:cancelled`, `elicitation:accept:<content JSON>` | `elicitation:decline` | `elicitation:cancel` | `elicitation:unsupported`, `<name>:error:<code>`.
 - Produces: cancellation. A prompt cancelled while it asks sends nothing more, and ends `cancelled` once its open asks are answered.
@@ -1218,6 +1240,26 @@ fn ask_on_load_asks_before_the_load_is_answered() {
 }
 
 #[test]
+fn a_withdrawn_ask_is_cancelled_on_the_wire() {
+    let script = FakeScript {
+        withdraw_asks: true,
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let mut asked = Vec::new();
+    let talk = converse(&script, json!({}), |req| {
+        asked.push(req.clone());
+        vec![json!({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32800, "message": "Request cancelled"}})]
+    });
+    let withdrawn = talk
+        .messages
+        .iter()
+        .find(|m| m["method"] == "$/cancel_request")
+        .expect("the ask was withdrawn");
+    assert_eq!(withdrawn["params"]["requestId"], asked[0]["id"]);
+    assert_eq!(texts(&talk.messages)[0], "permission:error:-32800");
+}
+
+#[test]
 fn crash_while_asking_exits_with_the_question_unanswered() {
     let script = FakeScript {
         crash_while_asking: true,
@@ -1274,6 +1316,15 @@ with:
     /// while the host is still attaching the session.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub ask_on_load: bool,
+    /// With `ask_on_load`: answer `session/load` only once that ask is
+    /// answered (an adapter that blocks its load on a question).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ask_on_load_waits: bool,
+    /// Withdraw every ask right after sending it (`$/cancel_request`), as an
+    /// agent that no longer needs the answer does. The echo is whatever the
+    /// client answers then, usually `<name>:error:-32800`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub withdraw_asks: bool,
 }
 
 /// One question the fake asks its client during a prompt, and the chunk it
@@ -1294,6 +1345,10 @@ pub enum FakeAsk {
     /// `_fake/unknown`, a method no client serves. Echoed as
     /// `unknown:error:<JSON-RPC code>`.
     Unknown,
+    /// Like `Permission`, with a second option `allow_session` of a kind
+    /// this build's schema does not know (`allow_for_session`): an adapter
+    /// newer than hennery. Echoed like `Permission`.
+    FuturePermission,
 }
 ```
 
@@ -1312,6 +1367,8 @@ with:
             asks_at_once: false,
             crash_while_asking: false,
             ask_on_load: false,
+            ask_on_load_waits: false,
+            withdraw_asks: false,
         }
 ```
 
@@ -1474,6 +1531,18 @@ fn ask_request(
             }),
         )
         .map(Some),
+        FakeAsk::FuturePermission => UntypedMessage::new(
+            "session/request_permission",
+            serde_json::json!({
+                "sessionId": session,
+                "toolCall": {"toolCallId": "call-1", "title": "Write notes.txt", "kind": "edit"},
+                "options": [
+                    {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "allow_session", "name": "Allow for this session", "kind": "allow_for_session"}
+                ]
+            }),
+        )
+        .map(Some),
         FakeAsk::Elicitation if forms => UntypedMessage::new(
             "elicitation/create",
             serde_json::json!({
@@ -1518,6 +1587,9 @@ async fn ask_all(
             continue;
         };
         let sent = cx.send_request(request);
+        if script.withdraw_asks {
+            sent.cancel()?;
+        }
         asked.push(if script.asks_at_once {
             Asked::Out(*ask, sent)
         } else {
@@ -1537,7 +1609,7 @@ async fn ask_all(
 /// The answer to one ask, as the agent understood it.
 fn echo(ask: FakeAsk, answer: agent_client_protocol::Result<serde_json::Value>) -> String {
     let name = match ask {
-        FakeAsk::Permission => "permission",
+        FakeAsk::Permission | FakeAsk::FuturePermission => "permission",
         FakeAsk::Elicitation => "elicitation",
         FakeAsk::Unknown => "unknown",
     };
@@ -1546,7 +1618,7 @@ fn echo(ask: FakeAsk, answer: agent_client_protocol::Result<serde_json::Value>) 
         Err(err) => return format!("{name}:error:{}", i32::from(err.code)),
     };
     match ask {
-        FakeAsk::Permission => match answer["outcome"]["outcome"].as_str() {
+        FakeAsk::Permission | FakeAsk::FuturePermission => match answer["outcome"]["outcome"].as_str() {
             Some("selected") => format!(
                 "permission:selected:{}",
                 answer["outcome"]["optionId"].as_str().unwrap_or("?")
@@ -1600,6 +1672,13 @@ with:
                         // On the wire before the load's answer; awaited
                         // from a task of its own.
                         let sent = cx.send_request(request);
+                        if script.ask_on_load_waits {
+                            // The load is answered only once the question is.
+                            return cx.spawn(async move {
+                                let _ = sent.block_task().await;
+                                responder.respond(LoadSessionResponse::new())
+                            });
+                        }
                         let (cx2, session) = (cx.clone(), req.session_id.clone());
                         cx.spawn(async move {
                             let echo = echo(ask, sent.block_task().await);
@@ -1613,7 +1692,7 @@ with:
 - [ ] **Step 4: Run them to verify they pass**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
-Expected: all 268 tests pass, including the seven new `fake_acp` tests. The watchdog in `converse` means a question nobody answers fails its test after 20 s instead of hanging it.
+Expected: all 269 tests pass, including the eight new `fake_acp` tests. The watchdog in `converse` means a question nobody answers fails its test after 20 s instead of hanging it.
 
 - [ ] **Step 5: Commit**
 
@@ -1637,10 +1716,12 @@ git push
 - Produces: the untyped request handler:
   - `session/request_permission` and `elicitation/create` become `Inbound::Question(Box<Question>)`, on the same ordered channel as the notifications;
   - anything else is answered `-32601` right there (decision 3).
+- Produces: `fn option_ids(params: &Value) -> Option<Vec<String>>`, read from the raw request (decision 4).
 - Produces: `Actor::open_question`:
   - it mints a `pending_id` (UUIDv7) and emits `pending_opened`, with `indexed.turn_id` and `indexed.pending`;
   - it keeps the responder in `Questions::open`;
-  - questions that arrive before `session_started` are held in `Early` and opened right after it, in wire order (decision 2).
+  - questions that arrive before `session_started` are held in `Early` and opened right after it, in wire order (decision 2);
+  - `negotiate` fills a `Replay` owned by `drive`, so a start that runs out of time can name what it held back (`fn held_questions`).
 - Produces: `Actor::answer`. A held question gets `answer_result{true}`, then `pending_resolved{delivered}`. Anything else gets `answer_result{false}`.
 - Produces: the connection routes `answer_*` to the live actor. With none, it answers `error{not_attached}` (decision 7).
 
@@ -1919,6 +2000,66 @@ async fn a_question_asked_while_the_session_loads_opens_after_session_started() 
     assert!(handle.send(choose("ra", &pending, "allow")));
     wait_until(&uplink, has("update:permission:selected:allow")).await;
 }
+
+/// A newer adapter may offer an option of a kind this build's schema does
+/// not know: the question keeps every option id, and each can be chosen.
+#[tokio::test]
+async fn a_permission_with_an_option_kind_this_build_does_not_know_keeps_its_option_ids() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        chunks: vec![],
+        ..asking(vec![FakeAsk::FuturePermission])
+    };
+    let handle = starting(&uplink, &script);
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let pending = nth_pending(&uplink, 0).await;
+    let frames = uplink.pending().unwrap();
+    assert_eq!(
+        opened(&frames)[0].0.option_ids,
+        Some(vec!["allow".to_string(), "allow_session".to_string()])
+    );
+    assert!(handle.send(choose("ra", &pending, "allow_session")));
+    wait_until(&uplink, has("update:permission:selected:allow_session")).await;
+}
+
+/// A question held back during the load, which the load then waits for:
+/// the start runs out of time, and its failure says why.
+#[tokio::test]
+async fn a_start_that_runs_out_of_time_says_which_questions_it_held_back() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        ask_on_load: true,
+        ask_on_load_waits: true,
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let _handle = session::resume(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        "agent-7".into(),
+        fake_with(&script),
+        std::env::temp_dir(),
+        SessionOptions {
+            start_timeout: Duration::from_secs(3),
+            ..SessionOptions::default()
+        },
+    );
+    let frames = wait_until(&uplink, has("start_failed")).await;
+    let HostFrame::Session {
+        body: SessionBody::StartFailed { message, .. },
+        ..
+    } = &frames[0]
+    else {
+        panic!("{:?}", kinds(&frames));
+    };
+    assert!(
+        message.contains(
+            "the agent asked 1 question(s) during start-up (permission) that hennery cannot show before the session exists"
+        ),
+        "{message}"
+    );
+}
 ```
 
 In `crates/hennery-host/src/session.rs`, replace:
@@ -1942,6 +2083,18 @@ mod tests {
     fn form_elicitation_is_advertised_as_an_object() {
         let advertised = serde_json::to_value(client_capabilities()).unwrap();
         assert_eq!(advertised["elicitation"], serde_json::json!({"form": {}}));
+    }
+
+    /// Read raw: one option of a kind this build does not know must not
+    /// cost the whole list.
+    #[test]
+    fn option_ids_are_read_from_the_raw_request() {
+        let options = serde_json::json!({"options": [
+            {"optionId": "a", "kind": "from_the_future"}, {"name": "no id"}, {"optionId": 3}, {"optionId": "b"}
+        ]});
+        assert_eq!(option_ids(&options), Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(option_ids(&serde_json::json!({})), None);
+        assert_eq!(option_ids(&serde_json::json!({"options": {"optionId": "a"}})), None);
     }
 ```
 
@@ -2079,9 +2232,9 @@ with:
 use agent_client_protocol::schema::v1::{
     BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
     ElicitationCapabilities, ElicitationFormCapabilities, InitializeRequest, LoadSessionRequest, NewSessionRequest,
-    PromptRequest, PromptResponse, RequestPermissionRequest, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
+    PromptRequest, PromptResponse, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, ErrorCode, Responder, UntypedMessage};
 use hennery_proto::frames::{
@@ -2216,6 +2369,22 @@ fn question_kind(method: &str) -> Option<PendingKind> {
         "elicitation/create" => Some(PendingKind::Elicitation),
         _ => None,
     }
+}
+
+/// A permission request's option ids, read from its raw params (ACP core
+/// §3.2): every string `options[i].optionId`, skipping an entry without
+/// one. A typed parse would fail on a single option of a kind this build
+/// does not know (`PermissionOptionKind` has no catch-all), and then no
+/// answer could be validated. `None` only if `options` is missing or not
+/// an array.
+fn option_ids(params: &Value) -> Option<Vec<String>> {
+    let options = params.get("options")?.as_array()?;
+    Some(
+        options
+            .iter()
+            .filter_map(|option| option.get("optionId")?.as_str().map(str::to_string))
+            .collect(),
+    )
 }
 
 /// The adapter's questions waiting for the operator (ACP core §4.6), oldest
@@ -2422,7 +2591,7 @@ In `crates/hennery-host/src/session.rs`, replace:
 with:
 
 ```rust
-        let (agent_session, mut replay, applied) = match started {
+        let (agent_session, applied) = match started {
 ```
 
 In `crates/hennery-host/src/session.rs`, replace:
@@ -2534,9 +2703,8 @@ with:
 
     /// Announce an adapter's question as `pending_opened` and keep its
     /// responder until the operator answers (ACP core §4.6). `turn` is the
-    /// turn it was asked in. A permission's option ids come from a typed
-    /// copy of the request; one that does not parse opens without them,
-    /// never not at all (§2.4).
+    /// turn it was asked in. A permission's option ids are read from the
+    /// raw request (`option_ids`).
     fn open_question(&self, question: Box<Question>, turn: Option<&str>) {
         let Question {
             kind,
@@ -2545,9 +2713,7 @@ with:
         } = *question;
         let pending_id = uuid::Uuid::now_v7().to_string();
         let option_ids = match kind {
-            PendingKind::Permission => serde_json::from_value::<RequestPermissionRequest>(params.clone())
-                .ok()
-                .map(|request| request.options.into_iter().map(|o| o.option_id.0.to_string()).collect()),
+            PendingKind::Permission => option_ids(&params),
             PendingKind::Elicitation => None,
         };
         self.emit(SessionBody::PendingOpened {
@@ -2650,7 +2816,6 @@ In `crates/hennery-host/src/session.rs`, replace:
 with:
 
 ```rust
-            let mut replay = Replay::default();
             for _ in 0..updates.len() {
                 match updates.try_recv() {
                     Ok(Inbound::Update(payload)) => replay.kept.push(Early::Update(payload)),
@@ -2750,6 +2915,43 @@ fn client_capabilities() -> ClientCapabilities {
         )
         .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()))
 }
+
+/// What a start that ran out of time was holding back (decision 2): the
+/// questions the agent asked before the session existed, which nobody could
+/// see or answer. Empty if there were none.
+fn held_questions(replay: &Replay, updates: &mut mpsc::UnboundedReceiver<Inbound>) -> String {
+    let mut kinds: Vec<PendingKind> = replay
+        .kept
+        .iter()
+        .filter_map(|early| match early {
+            Early::Question(question) => Some(question.kind),
+            Early::Update(_) => None,
+        })
+        .collect();
+    while let Ok(inbound) = updates.try_recv() {
+        if let Inbound::Question(question) = inbound {
+            kinds.push(question.kind);
+        }
+    }
+    if kinds.is_empty() {
+        return String::new();
+    }
+    let mut names: Vec<&str> = Vec::new();
+    for kind in &kinds {
+        let name = match kind {
+            PendingKind::Permission => "permission",
+            PendingKind::Elicitation => "elicitation",
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    format!(
+        "; the agent asked {} question(s) during start-up ({}) that hennery cannot show before the session exists",
+        kinds.len(),
+        names.join("/")
+    )
+}
 ```
 
 In `crates/hennery-host/src/connection.rs`, replace:
@@ -2844,10 +3046,122 @@ with:
 use crate::session::{self, AgentCommand, Answer, Attach, Launch, SessionCmd, SessionHandle, SessionOptions};
 ```
 
+In `crates/hennery-host/src/session.rs`, replace:
+
+```rust
+        let started = tokio::select! {
+            result = async {
+                let (session, replay, catalogue) =
+                    match tokio::time::timeout_at(deadline, negotiate(&conn, cwd, &attach, &mut updates)).await {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            return Err(StartError::other(format!(
+                                "adapter did not start within {}s",
+                                self.options.start_timeout.as_secs()
+                            )));
+                        }
+                    };
+                let applied = apply_config(&conn, &session, catalogue, &config, self.options.config_timeout, deadline).await;
+                Ok((session, replay, applied))
+            } => result,
+```
+
+with:
+
+```rust
+        // What the adapter sends before `session_started`, emitted after it.
+        // Outside the start's future, so a start that runs out of time can
+        // still say which questions it was holding back.
+        let mut replay = Replay::default();
+        let started = tokio::select! {
+            result = async {
+                let (session, catalogue) =
+                    match tokio::time::timeout_at(deadline, negotiate(&conn, cwd, &attach, &mut updates, &mut replay)).await {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            return Err(StartError::other(format!(
+                                "adapter did not start within {}s{}",
+                                self.options.start_timeout.as_secs(),
+                                held_questions(&replay, &mut updates)
+                            )));
+                        }
+                    };
+                let applied = apply_config(&conn, &session, catalogue, &config, self.options.config_timeout, deadline).await;
+                Ok((session, applied))
+            } => result,
+```
+
+In `crates/hennery-host/src/session.rs`, replace:
+
+```rust
+/// Returns the config options the adapter announced (none if it announced
+/// none, or they did not parse).
+async fn negotiate(
+    conn: &ConnectionTo<Agent>,
+    cwd: PathBuf,
+    attach: &Attach,
+    updates: &mut mpsc::UnboundedReceiver<Inbound>,
+) -> Result<(SessionId, Replay, Announced), StartError> {
+```
+
+with:
+
+```rust
+/// Returns the config options the adapter announced (none if it announced
+/// none, or they did not parse). What the adapter sends meanwhile goes into
+/// `replay`.
+async fn negotiate(
+    conn: &ConnectionTo<Agent>,
+    cwd: PathBuf,
+    attach: &Attach,
+    updates: &mut mpsc::UnboundedReceiver<Inbound>,
+    replay: &mut Replay,
+) -> Result<(SessionId, Announced), StartError> {
+```
+
+In `crates/hennery-host/src/session.rs`, replace:
+
+```rust
+            return Ok((created.session_id, replay, catalogue));
+```
+
+with:
+
+```rust
+            return Ok((created.session_id, catalogue));
+```
+
+In `crates/hennery-host/src/session.rs`, replace:
+
+```rust
+    tokio::pin!(load);
+    let mut replay = Replay::default();
+    loop {
+```
+
+with:
+
+```rust
+    tokio::pin!(load);
+    loop {
+```
+
+In `crates/hennery-host/src/session.rs`, replace:
+
+```rust
+                return Ok((id, replay, catalogue));
+```
+
+with:
+
+```rust
+                return Ok((id, catalogue));
+```
+
 - [ ] **Step 4: Run them to verify they pass**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo clippy -p hennery --locked -- -D warnings && cargo test --workspace --locked`
-Expected: all 276 tests pass. That includes six new `host_session` tests, `answers_reach_the_actor_and_one_for_a_detached_session_is_not_attached` and the unit test `form_elicitation_is_advertised_as_an_object`.
+Expected: all 280 tests pass. That includes eight new `host_session` tests, `answers_reach_the_actor_and_one_for_a_detached_session_is_not_attached` and the unit tests `form_elicitation_is_advertised_as_an_object` and `option_ids_are_read_from_the_raw_request`.
 
 Check that `a_request_the_host_does_not_serve_is_refused_method_not_found` is a real guard. Replace the `None =>` arm of the request handler with `None => Ok(())`, which drops the responder. The test fails: it times out with the outbox stuck at `["session_started", "turn_started"]`. Restore the arm.
 
@@ -2876,6 +3190,7 @@ git push
   - the unanswered-cancel stop: `turn_cancelled`;
   - adapter exit: `adapter_lost`, after `turn_ended` and before `adapter_exited`;
   - the idle reaper's arm also requires `!self.has_questions()`.
+- Produces: `Inbound::QuestionWithdrawn { pending_id }`, `struct Watcher` (aborted on drop), `OpenQuestion::_withdrawal`, `Actor::inbound: OnceLock<UnboundedSender<Inbound>>` and `Actor::withdraw_question` (decision 15).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -3048,16 +3363,47 @@ async fn the_reaper_never_parks_a_session_with_a_question_open() {
     // Answered, the session is idle again: now the reaper parks it.
     wait_until(&uplink, has("session_parked:idle")).await;
 }
+
+/// The adapter may withdraw its own question (`$/cancel_request`): the
+/// question closes, the adapter hears the cancellation error, and an answer
+/// given afterwards reaches nobody.
+#[tokio::test]
+async fn a_question_the_agent_withdraws_closes_and_an_answer_reaches_nobody() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        withdraw_asks: true,
+        chunks: vec![],
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let handle = starting(&uplink, &script);
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    assert_eq!(
+        from_the_question(&frames),
+        [
+            "pending_opened:permission",
+            "pending_resolved:cancelled:agent_withdrew",
+            "update:permission:error:-32800",
+            "turn_ended"
+        ]
+    );
+    let pending = opened(&frames)[0].0.id.clone();
+    assert!(handle.send(choose("ra", &pending, "allow")));
+    let frames = wait_until(&uplink, |f| !verdicts(f).is_empty()).await;
+    assert_eq!(verdicts(&frames), [("ra".to_string(), pending, false)]);
+}
 ```
 
 - [ ] **Step 2: Run them to verify they fail**
 
 Run: `cargo test -p hennery-testkit --test host_session --locked`
-Expected: 5 FAIL (66 pass):
+Expected: 6 FAIL (68 pass):
 - `a_cancel_…` and `a_question_asked_after_the_cancel_…` time out waiting for `turn_ended`: nothing answers the question, so the fake waits.
 - `park_and_close_…` is missing `pending_resolved:cancelled:session_parked`.
 - `an_adapter_lost_…` is missing `pending_resolved:cancelled:adapter_lost`.
 - `the_reaper_never_parks_…` finds `session_parked:idle` after the question.
+- `a_question_the_agent_withdraws_…` times out waiting for `turn_ended`: the withdrawal is ignored, and the fake waits for the answer to the request it withdrew.
 
 - [ ] **Step 3: Cancel the open questions**
 
@@ -3357,10 +3703,260 @@ with:
         let stderr_tail = adapter.stderr_tail().await;
 ```
 
+In `crates/hennery-host/src/session.rs`, replace:
+
+```rust
+use std::sync::{Arc, Mutex};
+```
+
+with:
+
+```rust
+use std::sync::{Arc, Mutex, OnceLock};
+```
+
+In `crates/hennery-host/src/session.rs`, replace:
+
+```rust
+    /// A question for the operator, in wire order with the notifications
+    /// around it: it follows the tool call it asks about.
+    Question(Box<Question>),
+}
+```
+
+with:
+
+```rust
+    /// A question for the operator, in wire order with the notifications
+    /// around it: it follows the tool call it asks about.
+    Question(Box<Question>),
+    /// The adapter withdrew question `pending_id` (`$/cancel_request`).
+    QuestionWithdrawn {
+        pending_id: String,
+    },
+}
+```
+
+In `crates/hennery-host/src/session.rs`, replace:
+
+```rust
+struct OpenQuestion {
+    pending_id: String,
+    kind: PendingKind,
+    responder: Responder<Value>,
+}
+```
+
+with:
+
+```rust
+struct OpenQuestion {
+    pending_id: String,
+    kind: PendingKind,
+    responder: Responder<Value>,
+    /// Watches for the adapter withdrawing the question; stops with it.
+    _withdrawal: Option<Watcher>,
+}
+
+/// A task that is aborted when its owner is dropped.
+struct Watcher(tokio::task::JoinHandle<()>);
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+```
+
+In `crates/hennery-host/src/session.rs`, replace:
+
+```rust
+            // No switch is sent before the actor's main loop starts.
+            Inbound::SwitchAnswer { .. } => {}
+```
+
+with:
+
+```rust
+            // No switch is sent, and no question is open, before the
+            // actor's main loop starts.
+            Inbound::SwitchAnswer { .. } | Inbound::QuestionWithdrawn { .. } => {}
+```
+
+In `crates/hennery-host/src/session.rs`, replace:
+
+```rust
+    /// The adapter's questions waiting for the operator.
+    questions: Mutex<Questions>,
+```
+
+with:
+
+```rust
+    /// The adapter's questions waiting for the operator.
+    questions: Mutex<Questions>,
+    /// The inbound channel, for the questions' withdrawal watchers.
+    inbound: OnceLock<mpsc::UnboundedSender<Inbound>>,
+```
+
+In `crates/hennery-host/src/session.rs`, replace:
+
+```rust
+        questions: Mutex::new(Questions::default()),
+```
+
+with:
+
+```rust
+        questions: Mutex::new(Questions::default()),
+        inbound: OnceLock::new(),
+```
+
+In `crates/hennery-host/src/session.rs`, replace:
+
+```rust
+        let switch_tx = updates_tx.clone();
+        let questions_tx = updates_tx.clone();
+```
+
+with:
+
+```rust
+        let switch_tx = updates_tx.clone();
+        let questions_tx = updates_tx.clone();
+        let _ = self.inbound.set(updates_tx.clone());
+```
+
+In `crates/hennery-host/src/session.rs`, replace:
+
+```rust
+                Ok(Inbound::Question(question)) => early.push(Early::Question(question)),
+                Ok(Inbound::SwitchAnswer { .. }) => {}
+```
+
+with:
+
+```rust
+                Ok(Inbound::Question(question)) => early.push(Early::Question(question)),
+                Ok(Inbound::SwitchAnswer { .. } | Inbound::QuestionWithdrawn { .. }) => {}
+```
+
+In `crates/hennery-host/src/session.rs`, replace:
+
+```rust
+                    Ok(Inbound::Question(question)) => replay.kept.push(Early::Question(question)),
+                    Ok(Inbound::SwitchAnswer { .. }) => {}
+```
+
+with:
+
+```rust
+                    Ok(Inbound::Question(question)) => replay.kept.push(Early::Question(question)),
+                    Ok(Inbound::SwitchAnswer { .. } | Inbound::QuestionWithdrawn { .. }) => {}
+```
+
+In `crates/hennery-host/src/session.rs`, replace:
+
+```rust
+            Inbound::Question(question) => {
+                self.open_question(question, turn);
+                false
+            }
+        }
+    }
+```
+
+with:
+
+```rust
+            Inbound::Question(question) => {
+                self.open_question(question, turn);
+                false
+            }
+            // The session may be idle now: the reaper's clock restarts.
+            Inbound::QuestionWithdrawn { pending_id } => {
+                self.withdraw_question(pending_id);
+                true
+            }
+        }
+    }
+```
+
+In `crates/hennery-host/src/session.rs`, replace:
+
+```rust
+        let question = OpenQuestion {
+            pending_id,
+            kind,
+            responder,
+        };
+```
+
+with:
+
+```rust
+        // The adapter may withdraw its question (`$/cancel_request`): a
+        // watcher reports that through the ordered channel, and stops when
+        // the question is answered or cancelled.
+        let cancellation = responder.cancellation();
+        let withdrawal = self.inbound.get().cloned().map(|inbound| {
+            let pending_id = pending_id.clone();
+            Watcher(tokio::spawn(async move {
+                cancellation.cancelled().await;
+                let _ = inbound.send(Inbound::QuestionWithdrawn { pending_id });
+            }))
+        });
+        let question = OpenQuestion {
+            pending_id,
+            kind,
+            responder,
+            _withdrawal: withdrawal,
+        };
+```
+
+In `crates/hennery-host/src/session.rs`, replace:
+
+```rust
+    fn has_questions(&self) -> bool {
+```
+
+with:
+
+```rust
+    /// The adapter withdrew a question (`$/cancel_request`): nobody waits
+    /// for its answer any more, so the operator can no longer give one
+    /// (`pending_resolved{cancelled, agent_withdrew}`). The request is
+    /// answered with the standard cancellation error, as JSON-RPC expects.
+    fn withdraw_question(&self, pending_id: String) {
+        let question = {
+            let mut questions = self.questions.lock().expect("questions lock");
+            let at = questions.open.iter().position(|q| q.pending_id == pending_id);
+            at.map(|at| questions.open.remove(at))
+        };
+        // Already answered or cancelled: nothing is left to withdraw.
+        let Some(question) = question else {
+            return;
+        };
+        let cancelled = agent_client_protocol::Error::request_cancelled();
+        if let Err(err) = question.responder.respond_with_error(cancelled) {
+            tracing::debug!(session_id = %self.session_id, error = %err, "withdrawal not acknowledged to the adapter");
+        }
+        self.emit(SessionBody::PendingResolved {
+            pending_id,
+            resolution: PendingResolution::Cancelled,
+            reason: Some(PendingReason::AgentWithdrew),
+        });
+    }
+
+    fn has_questions(&self) -> bool {
+```
+
 - [ ] **Step 4: Run them to verify they pass**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo clippy -p hennery --locked -- -D warnings && cargo test --workspace --locked`
-Expected: all 281 tests pass. `the_reaper_never_parks_a_session_with_a_question_open` is scenario 10 on the host: ten idle windows with a question open, then the answer is still delivered. The only thing it measures against the clock is the absence of a park.
+Expected: all 286 tests pass. `the_reaper_never_parks_a_session_with_a_question_open` is scenario 10 on the host: ten idle windows with a question open, then the answer is still delivered. The only thing it measures against the clock is the absence of a park.
+
+Check that `a_question_the_agent_withdraws_closes_and_an_answer_reaches_nobody` is a real guard. In the watcher, replace `let _ = inbound.send(Inbound::QuestionWithdrawn { pending_id });` with `let _ = (inbound, pending_id);`: the test times out with the outbox at `[…, "pending_opened:permission"]`. Restore it.
 
 - [ ] **Step 5: Commit**
 
@@ -3393,7 +3989,6 @@ git push
   - `pub struct QueuedAnswer { event: EventDto, host_id: String, request_id: String, frame: CollectorFrame }`
   - `Store::submit_answer(&self, session_id: &str, pending_id: &str, answer: &AnswerRequest) -> Result<AnswerSubmission>`
   - `Store::answers_to_send(&self, host_id: &str) -> Result<Vec<CollectorFrame>>`
-  - `Store::answer_rejected(&self, request_id: &str) -> Result<bool>`
   - `Store::open_pending(&self, session_id: &str) -> Result<Vec<PendingItem>>`
   - `Store::pending_item(&self, pending_id: &str) -> Result<Option<PendingItem>>`
 
@@ -3610,12 +4205,9 @@ fn only_answers_still_waiting_for_a_verdict_on_an_open_question_are_sent() {
     store.ingest("s1", 3, &permission("p1")).unwrap();
     store.ingest("s1", 4, &permission("p2")).unwrap();
     store.ingest("s1", 5, &permission("p3")).unwrap();
-    let mut request_ids = Vec::new();
     for p in ["p1", "p2", "p3"] {
-        let AnswerSubmission::Queued(queued) = store.submit_answer("s1", p, &choose("allow")).unwrap() else {
-            panic!("{p} not queued");
-        };
-        request_ids.push(queued.request_id);
+        let queued = store.submit_answer("s1", p, &choose("allow")).unwrap();
+        assert!(matches!(queued, AnswerSubmission::Queued(_)), "{p} not queued");
     }
     let pending_ids = |frames: Vec<CollectorFrame>| -> Vec<String> {
         frames
@@ -3636,11 +4228,8 @@ fn only_answers_still_waiting_for_a_verdict_on_an_open_question_are_sent() {
         .unwrap();
     assert_eq!(pending_ids(store.answers_to_send("h1").unwrap()), ["p3"]);
     assert_eq!(store.pending_item("p2").unwrap().unwrap().delivered, Some(false));
-    // A host that refused p3's answer (not attached) decides it too.
-    assert!(store.answer_rejected(&request_ids[2]).unwrap());
-    assert!(!store.answer_rejected("not-an-answer").unwrap());
-    assert!(store.answers_to_send("h1").unwrap().is_empty());
-    assert_eq!(store.pending_item("p3").unwrap().unwrap().delivered, Some(false));
+    // p3's goes again after every handshake until its verdict comes.
+    assert_eq!(pending_ids(store.answers_to_send("h1").unwrap()), ["p3"]);
 }
 
 #[test]
@@ -3923,7 +4512,7 @@ fn check_answer(kind: PendingKind, option_ids: Option<&[String]>, answer: &Answe
         (PendingKind::Permission, AnswerRequest::Permission { option_id }) => match option_ids {
             Some(ids) if ids.contains(option_id) => Ok(()),
             Some(_) => Err(format!("the request offers no option {option_id}")),
-            None => Err("the request's options could not be read; cancel the turn instead".into()),
+            None => Err("the request's options could not be read; stop, park or close the session".into()),
         },
         (PendingKind::Elicitation, AnswerRequest::Elicitation { action, content }) => match (action, content) {
             (_, None) => Ok(()),
@@ -4156,23 +4745,6 @@ with:
         Ok(out)
     }
 
-    /// A host refused the request `request_id` (`error`): if it is an
-    /// answer's, no adapter took that answer, and it gets its verdict
-    /// (never over a `delivered` one). Returns whether it was an answer.
-    pub fn answer_rejected(&self, request_id: &str) -> Result<bool> {
-        let conn = self.conn();
-        let known: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM answer_queue WHERE request_id = ?1)",
-            [request_id],
-            |r| r.get(0),
-        )?;
-        conn.execute(
-            "UPDATE answer_queue SET delivered = 0 WHERE request_id = ?1 AND delivered IS NULL",
-            [request_id],
-        )?;
-        Ok(known)
-    }
-
     /// A turn's state: `sent`, `started`, `ended` or `not_delivered`.
 ```
 
@@ -4377,7 +4949,7 @@ with:
 - [ ] **Step 4: Run them to verify they pass**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
-Expected: all 288 tests pass, including the seven new `store` tests.
+Expected: all 293 tests pass, including the seven new `store` tests.
 
 Check that the fold is a real guard. In the `AnswerResult` arm, replace `CASE WHEN delivered = 1 THEN 1 ELSE ?3 END` with `?3`: `a_delivered_verdict_sticks_and_a_later_false_does_not_overwrite_it` fails with `Some(false)`. Restore it.
 
@@ -4396,11 +4968,11 @@ git push
 - Test: `crates/hennery-testkit/tests/reconcile.rs`
 
 **Interfaces:**
-- Consumes (Task 5): `Store::{submit_answer, answers_to_send, answer_rejected, open_pending, pending_item}`, `AnswerSubmission`, `QueuedAnswer`.
+- Consumes (Task 5): `Store::{submit_answer, answers_to_send, open_pending, pending_item}`, `AnswerSubmission`, `QueuedAnswer`.
 - Produces: `Hub::notify(&self, host_id: &str, frame: CollectorFrame) -> bool`. It sends a frame nobody waits for to a host that is connected and reconciled, and returns `false` otherwise.
 - Produces (`ws.rs`):
   - After `mark_ready`, the reconciliation sends `answers_to_send`. A store error there drops the connection, like a failed reconciliation.
-  - A host `error` whose request id is neither a waiter's nor a reconcile close's goes to `answer_rejected`.
+  - A host `error` whose request id is neither a waiter's nor a reconcile close's is logged. For an answer it is no verdict (decision 10).
 - Produces (`api.rs`):
   - `POST /api/sessions/{id}/pending/{pending_id}/answer` (decision 11);
   - `SessionDetail.pending` from `open_pending`;
@@ -4584,8 +5156,10 @@ async fn an_answer_given_while_the_host_is_offline_is_sent_after_its_next_handsh
     assert!(verdict_of(&collector).is_none());
 }
 
+/// A host's refusal (no live actor for the session) is logged, not a
+/// verdict: the answer waits for its question's resolution.
 #[tokio::test]
-async fn an_answer_the_host_refuses_is_not_delivered() {
+async fn a_refused_answer_gets_its_verdict_from_its_questions_resolution() {
     let collector = Collector::start().await;
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let (session, _) = asking_session(&collector, &mut host).await;
@@ -4602,7 +5176,33 @@ async fn an_answer_the_host_refuses_is_not_delivered() {
         message: "session is not attached on this host".into(),
     })
     .await;
-    wait_for("refused", || async {
+    // Frames are read in order: once this note is in, so is the refusal.
+    host.emit(
+        &session,
+        SessionBody::HostNote {
+            note: "marker".into(),
+            text: String::new(),
+        },
+    )
+    .await;
+    wait_for("the marker", || async {
+        collector
+            .event_kinds(&session)
+            .contains(&"host_note".to_string())
+            .then_some(())
+    })
+    .await;
+    assert_eq!(verdict_of(&collector), None, "a refusal is logged, not a verdict");
+    host.emit(
+        &session,
+        SessionBody::PendingResolved {
+            pending_id: "p1".into(),
+            resolution: hennery_proto::frames::PendingResolution::Cancelled,
+            reason: Some(hennery_proto::frames::PendingReason::AdapterLost),
+        },
+    )
+    .await;
+    wait_for("the verdict", || async {
         (verdict_of(&collector) == Some(false)).then_some(())
     })
     .await;
@@ -4778,9 +5378,11 @@ with:
                                 break;
                             }
                         }
-                    } else if let Err(err) = state.store.answer_rejected(&request_id) {
-                        // An answer has no waiter: a refusal is its verdict.
-                        tracing::error!(%host_id, %request_id, error = %err, "recording a refused answer failed");
+                    } else {
+                        // No waiter: an answer (its verdict comes from
+                        // `answer_result` or its question's resolution),
+                        // or a request whose caller already gave up.
+                        tracing::warn!(%host_id, %request_id, %code, %message, "host refused a request nobody waits for");
                     }
 ```
 
@@ -5011,7 +5613,7 @@ with:
 - [ ] **Step 4: Run them to verify they pass**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
-Expected: all 294 tests pass, including the six new `reconcile` tests. `an_answer_given_while_the_host_is_offline_is_sent_after_its_next_handshake` also checks that nothing is sent before `resend_complete`. `a_host_restart_cancels_the_open_questions_and_drops_their_queued_answers` checks that the drain runs after the reconciliation's cancellations. Each asserts 300 ms of silence, which holds under load: the thing it rules out would arrive at once.
+Expected: all 299 tests pass, including the six new `reconcile` tests. `an_answer_given_while_the_host_is_offline_is_sent_after_its_next_handshake` also checks that nothing is sent before `resend_complete`. `a_host_restart_cancels_the_open_questions_and_drops_their_queued_answers` checks that the drain runs after the reconciliation's cancellations. Each asserts 300 ms of silence, which holds under load: the thing it rules out would arrive at once.
 
 - [ ] **Step 5: Commit**
 
@@ -5337,7 +5939,7 @@ In `crates/hennery-sessions/src/ws.rs`, replace the drain's `for frame in answer
 - [ ] **Step 3: Run everything**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo clippy -p hennery --locked -- -D warnings && cargo test --workspace --locked && cargo run -p hennery-proto --bin gen -- --check`
-Expected: all 299 tests pass; `--check` exits 0.
+Expected: all 304 tests pass; `--check` exits 0.
 
 - [ ] **Step 4: Commit**
 
@@ -5356,8 +5958,11 @@ git push
   - A permission card is rendered from the ACP payload's `toolCall` and `options`; an elicitation form from `requestedSchema`.
   - The frontend plan settles the TS optionals of `PendingItem`, as for the rest of `rest.rs`.
 - **Push for `activity → blocked`** (§10). The edge is the ingest of the `pending_opened` that sets `blocked` (decision 8). Recovery and reconciliation must not push it.
+- **Push for a question asked outside a turn.** `activity` stays `idle` then (decision 8), so there is no "needs your answer" edge. The push plan must trigger on the `pending_opened` itself for such a question.
+- **Host revoke must cancel open questions** (kernel §4.3). `presumed_parked{host_revoked}` keeps them `open` like an offline presumption, but a revoked host never reconnects, so nothing would ever cancel them. The real-auth plan cancels them with a new reason (`host_revoked`, for the spec's list).
+- **`elicitation/complete` is swallowed today.** The notification handler ignores everything but `session/update`. That is fine while URL-mode elicitation is not advertised; the plan that advertises it must forward the notification and resolve its question.
 - **`fs/*` and `terminal/*`** (§2.5, §6). Until they exist, the host answers `-32601`, so an adapter that relies on them fails the tool call instead of hanging. Each needs its own arm in the request handler, ahead of the `-32601` fallback.
-- **A question that blocks a start.** An adapter that awaits an answer inside `session/new` or `session/load` (an MCP server asking for OAuth during session setup, for example) waits for a question that opens only after `session_started`, so the start fails after 75 s (decision 2). If a real adapter does this, open such questions before `session_started`. The collector would then need to accept a `pending_opened` on a `starting` session.
+- **A question that blocks a start.** An adapter that awaits an answer inside `session/new` or `session/load` (an MCP server asking for OAuth during session setup, for example) waits for a question that opens only after `session_started`, so the start fails after 75 s, naming the questions (decision 2). If a real adapter does this, open such questions before `session_started`. The collector would then need to accept a `pending_opened` on a `starting` session.
 - **Delete** (§4.10) must also delete the session's `pending` and `answer_queue` rows.
 - **Live gate with real adapters:** the form elicitation round trip with `answer_result{delivered: true}` (§12) still needs a logged-in CI account and the pinned adapters. `questions_answered_through_the_api_reach_the_agent_and_are_reported_delivered` is its stand-in against the fake.
 - **Spec amendments** listed under the decisions.
@@ -5367,7 +5972,7 @@ git push
   - `a_silent_connection_is_dropped_and_reconnected_within_the_read_deadline`;
   - `backoff_*`, `hello_reports_live_sessions_…`, `a_collector_that_never_completes_the_handshake_is_retried`.
 
-  They fail on `7e5bcc1` itself when sixteen full test binaries run at once on a loaded machine. Four copies of one binary, the CI-like load, pass. They are not affected by this plan. Hold them with the `test-hooks` seam, or poll, when they next need touching.
+  They fail on `7e5bcc1` (the B2b head, content-identical to `4659c27`) itself when sixteen full test binaries run at once on a loaded machine. Four copies of one binary, the CI-like load, pass. They are not affected by this plan. Hold them with the `test-hooks` seam, or poll, when they next need touching.
 - **Carried from B2b, unchanged:**
   - legacy model and mode switching;
   - the New-session pickers before a session exists;
