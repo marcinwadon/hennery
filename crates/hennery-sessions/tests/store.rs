@@ -1482,10 +1482,27 @@ fn a_delivered_verdict_sticks_and_a_later_false_does_not_overwrite_it() {
     store.submit_answer("s1", "p1", &choose("allow")).unwrap();
     store.ingest("s1", 4, &verdict("p1", true)).unwrap();
     store.ingest("s1", 5, &resolved("p1", None)).unwrap();
-    // A resent answer the host no longer had a waiter for.
-    store.ingest("s1", 6, &verdict("p1", false)).unwrap();
+    // A resent answer the host no longer had a waiter for: a verdict that
+    // changes nothing is stored but not applied (decision 14).
+    assert!(store.ingest("s1", 6, &verdict("p1", false)).unwrap().is_empty());
     let item = store.pending_item("p1").unwrap().unwrap();
     assert_eq!((item.state, item.delivered), (PendingState::Delivered, Some(true)));
+}
+
+#[test]
+fn a_later_true_verdict_upgrades_an_earlier_false_one() {
+    let store = Store::open_in_memory().unwrap();
+    running(&store);
+    store.ingest("s1", 3, &permission("p1")).unwrap();
+    store.submit_answer("s1", "p1", &choose("allow")).unwrap();
+    // The first verdict finds no live waiter (an earlier adapter, say).
+    let created = store.ingest("s1", 4, &verdict("p1", false)).unwrap();
+    assert_eq!(kinds(&created), ["answer_result"]);
+    assert_eq!(store.pending_item("p1").unwrap().unwrap().delivered, Some(false));
+    // A later one does reach a waiter: `false` is not a verdict that sticks.
+    let created = store.ingest("s1", 5, &verdict("p1", true)).unwrap();
+    assert_eq!(kinds(&created), ["answer_result"]);
+    assert_eq!(store.pending_item("p1").unwrap().unwrap().delivered, Some(true));
 }
 
 #[test]

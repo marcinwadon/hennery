@@ -80,8 +80,11 @@ const MIGRATIONS: &[&str] = &[
 ",
     // Permission and elicitation (ACP core §4.6, §8): the pending set, which
     // is canonical here, and the durable answer queue, keyed by pending_id.
-    // `delivered` stays NULL until a verdict: `answer_result`, a host's
-    // refusal, or the question's cancellation.
+    // `delivered` stays NULL until a verdict: `answer_result`, or the
+    // question's cancellation (which gives `false`, decision 10). A host's
+    // refusal of the answer's request is logged and is no verdict (amended
+    // decision 10): `delivered` stays NULL, and the answer goes again after
+    // the next handshake while the question is open.
     "
     CREATE TABLE pending (
         pending_id TEXT PRIMARY KEY,
@@ -1302,10 +1305,16 @@ impl Store {
                 pending_id, delivered, ..
             } => {
                 // Folded monotonically: `delivered` sticks, a later `false`
-                // never overwrites it (umbrella §6.8).
+                // never overwrites it (umbrella §6.8). The guard makes that
+                // a real no-op check, not just a match on the row: SQLite's
+                // changed-row count is rows matched, not rows whose value
+                // moved, so a WHERE on the id alone would call a same-value
+                // resend "applied" (decision 14 says a verdict that changes
+                // nothing is stored but not applied).
                 let changed = tx.execute(
                     "UPDATE answer_queue SET delivered = CASE WHEN delivered = 1 THEN 1 ELSE ?3 END
-                     WHERE pending_id = ?1 AND session_id = ?2",
+                     WHERE pending_id = ?1 AND session_id = ?2
+                         AND (delivered IS NULL OR (delivered = 0 AND ?3 = 1))",
                     params![pending_id, session_id, delivered],
                 )?;
                 if changed == 0 {
