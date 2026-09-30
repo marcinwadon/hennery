@@ -13,13 +13,16 @@ use crate::uplink::Uplink;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
-    InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse, SessionConfigKind,
-    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigOptionsCapabilities,
-    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
-    StopReason,
+    ElicitationCapabilities, ElicitationFormCapabilities, InitializeRequest, LoadSessionRequest, NewSessionRequest,
+    PromptRequest, PromptResponse, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
+    SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
 };
-use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, ErrorCode, UntypedMessage};
-use hennery_proto::frames::{ConfigValue, HostFrame, Indexed, ParkReason, SessionBody, SessionConfig, TurnOutcome};
+use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, ErrorCode, Responder, UntypedMessage};
+use hennery_proto::frames::{
+    ConfigValue, ElicitationAction, HostFrame, Indexed, ParkReason, PendingExtract, PendingKind, PendingReason,
+    PendingResolution, SessionBody, SessionConfig, TurnOutcome,
+};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
@@ -119,6 +122,50 @@ pub enum SessionCmd {
         config_id: String,
         value: ConfigValue,
     },
+    /// The operator's answer to one of the adapter's questions: answered by
+    /// `answer_result` (ACP core §4.6).
+    Answer {
+        request_id: String,
+        pending_id: String,
+        answer: Answer,
+    },
+}
+
+/// An operator's answer to a pending request, as the connection hands it on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Answer {
+    /// One of a permission request's options.
+    Permission { option_id: String },
+    /// An elicitation's action; `content` only when it accepts.
+    Elicitation {
+        action: ElicitationAction,
+        content: Option<Value>,
+    },
+}
+
+impl Answer {
+    fn kind(&self) -> PendingKind {
+        match self {
+            Answer::Permission { .. } => PendingKind::Permission,
+            Answer::Elicitation { .. } => PendingKind::Elicitation,
+        }
+    }
+
+    /// The ACP response to the adapter's request.
+    fn response(&self) -> Value {
+        match self {
+            Answer::Permission { option_id } => {
+                serde_json::json!({"outcome": {"outcome": "selected", "optionId": option_id}})
+            }
+            Answer::Elicitation { action, content } => {
+                let mut response = serde_json::json!({ "action": action });
+                if let (ElicitationAction::Accept, Some(content)) = (action, content) {
+                    response["content"] = content.clone();
+                }
+                response
+            }
+        }
+    }
 }
 
 /// How the actor creates its adapter session.
@@ -298,6 +345,7 @@ pub fn launch(uplink: Uplink, launch: Launch, options: SessionOptions) -> Sessio
         open_turn: open_turn.clone(),
         options,
         catalogue: Mutex::new(Catalogue::default()),
+        questions: Mutex::new(Questions::default()),
         ending: ending.clone(),
     };
     let done = CancellationToken::new();
@@ -331,6 +379,57 @@ enum Inbound {
         token: u64,
         result: agent_client_protocol::Result<SetSessionConfigOptionResponse>,
     },
+    /// A question for the operator, in wire order with the notifications
+    /// around it: it follows the tool call it asks about.
+    Question(Box<Question>),
+}
+
+/// A `session/request_permission` or `elicitation/create` from the adapter
+/// (ACP core §2.5). Its responder must be kept until the question is
+/// answered or cancelled: a dropped responder sends nothing, and the adapter
+/// would wait for good.
+struct Question {
+    kind: PendingKind,
+    params: Value,
+    responder: Responder<Value>,
+}
+
+/// The kind of question an adapter request is, if it is one.
+fn question_kind(method: &str) -> Option<PendingKind> {
+    match method {
+        "session/request_permission" => Some(PendingKind::Permission),
+        "elicitation/create" => Some(PendingKind::Elicitation),
+        _ => None,
+    }
+}
+
+/// A permission request's option ids, read from its raw params (ACP core
+/// §3.2): every string `options[i].optionId`, skipping an entry without
+/// one. A typed parse would fail on a single option of a kind this build
+/// does not know (`PermissionOptionKind` has no catch-all), and then no
+/// answer could be validated. `None` only if `options` is missing or not
+/// an array.
+fn option_ids(params: &Value) -> Option<Vec<String>> {
+    let options = params.get("options")?.as_array()?;
+    Some(
+        options
+            .iter()
+            .filter_map(|option| option.get("optionId")?.as_str().map(str::to_string))
+            .collect(),
+    )
+}
+
+/// The adapter's questions waiting for the operator (ACP core §4.6), oldest
+/// first. No timeout: each waits until it is answered or cancelled.
+#[derive(Default)]
+struct Questions {
+    open: Vec<OpenQuestion>,
+}
+
+struct OpenQuestion {
+    pending_id: String,
+    kind: PendingKind,
+    responder: Responder<Value>,
 }
 
 /// A `set_config` received and not sent yet.
@@ -478,11 +577,20 @@ impl StartError {
     }
 }
 
-/// What a `session/load` replayed: state updates to pass through, and the
-/// unknown kinds that were dropped (ACP core §4.5).
+/// What the adapter sent before `session_started`, in wire order: emitted
+/// right after it.
+enum Early {
+    Update(Value),
+    /// Opened once the session is announced, never before (the collector
+    /// has no session to attach it to yet).
+    Question(Box<Question>),
+}
+
+/// What a `session/load` replayed: state updates to pass through, questions
+/// to open, and the unknown kinds that were dropped (ACP core §4.5).
 #[derive(Default)]
 struct Replay {
-    kept: Vec<Value>,
+    kept: Vec<Early>,
     unknown: BTreeMap<String, usize>,
 }
 
@@ -493,10 +601,29 @@ impl Replay {
             .unwrap_or("<none>")
             .to_string();
         if STATE_KINDS.contains(&kind.as_str()) {
-            self.kept.push(payload);
+            self.kept.push(Early::Update(payload));
         } else if !HISTORY_KINDS.contains(&kind.as_str()) {
             *self.unknown.entry(kind).or_default() += 1;
         }
+    }
+
+    /// Whatever the adapter sent while the session was being attached: an
+    /// update is replay (`observe`), a question is live and kept.
+    fn inbound(&mut self, inbound: Inbound) {
+        match inbound {
+            Inbound::Update(payload) => self.observe(payload),
+            Inbound::Question(question) => self.kept.push(Early::Question(question)),
+            // No switch is sent before the actor's main loop starts.
+            Inbound::SwitchAnswer { .. } => {}
+        }
+    }
+
+    /// The updates kept, in order.
+    fn updates(&self) -> impl DoubleEndedIterator<Item = &Value> {
+        self.kept.iter().filter_map(|early| match early {
+            Early::Update(payload) => Some(payload),
+            Early::Question(_) => None,
+        })
     }
 
     /// The `host_note` for dropped unknown kinds, if any were dropped.
@@ -532,6 +659,8 @@ struct Actor {
     options: SessionOptions,
     /// The adapter's config options as last reported.
     catalogue: Mutex<Catalogue>,
+    /// The adapter's questions waiting for the operator.
+    questions: Mutex<Questions>,
     /// Shared with the handle (`SessionHandle::is_ending`).
     ending: Arc<AtomicBool>,
 }
@@ -605,7 +734,8 @@ impl Actor {
                 | SessionCmd::Park { request_id }
                 | SessionCmd::Close { request_id }
                 | SessionCmd::Cancel { request_id, .. }
-                | SessionCmd::SetConfig { request_id, .. } => {
+                | SessionCmd::SetConfig { request_id, .. }
+                | SessionCmd::Answer { request_id, .. } => {
                     // Also covers a start that reached this actor while it was
                     // tearing down (park/close/reap/adapter exit): the
                     // connection routed it to `Restart` because the handle
@@ -641,6 +771,7 @@ impl Actor {
         // (fix round 2): the notification handler below moves its own clone
         // into the connection task.
         let switch_tx = updates_tx.clone();
+        let questions_tx = updates_tx.clone();
         let (conn_tx, conn_rx) = oneshot::channel::<ConnectionTo<Agent>>();
         let (_stop_tx, stop_rx) = oneshot::channel::<()>();
         let transport = ByteStreams::new(io.stdin.compat_write(), io.stdout.compat());
@@ -659,6 +790,29 @@ impl Actor {
                         Ok(())
                     },
                     agent_client_protocol::on_receive_notification!(),
+                )
+                // Questions for the operator join the same ordered channel.
+                // Every other request is refused `-32601 Method not found`
+                // here (ACP core §2.5): left unhandled, the crate would hold
+                // any request that names a session (`fs/*`, `terminal/*`)
+                // for a session handler that never comes, and the adapter
+                // would wait for good.
+                .on_receive_request(
+                    async move |msg: UntypedMessage, responder: Responder<Value>, _cx| match question_kind(&msg.method)
+                    {
+                        Some(kind) => {
+                            let question = Question {
+                                kind,
+                                params: msg.params,
+                                responder,
+                            };
+                            let _ = questions_tx.send(Inbound::Question(Box::new(question)));
+                            Ok(())
+                        }
+                        None => responder
+                            .respond_with_error(agent_client_protocol::Error::method_not_found().data(msg.method)),
+                    },
+                    agent_client_protocol::on_receive_request!(),
                 )
                 .connect_with(transport, async move |conn: ConnectionTo<Agent>| {
                     let _ = conn_tx.send(conn);
@@ -683,27 +837,32 @@ impl Actor {
         // One deadline for the whole start: the switches share it, so a slow
         // one cannot push the answer past the collector's start timeout.
         let deadline = Instant::now() + self.options.start_timeout;
+        // What the adapter sends before `session_started`, emitted after it.
+        // Outside the start's future, so a start that runs out of time can
+        // still say which questions it was holding back.
+        let mut replay = Replay::default();
         let started = tokio::select! {
             result = async {
-                let (session, replay, catalogue) =
-                    match tokio::time::timeout_at(deadline, negotiate(&conn, cwd, &attach, &mut updates)).await {
+                let (session, catalogue) =
+                    match tokio::time::timeout_at(deadline, negotiate(&conn, cwd, &attach, &mut updates, &mut replay)).await {
                         Ok(result) => result?,
                         Err(_) => {
                             return Err(StartError::other(format!(
-                                "adapter did not start within {}s",
-                                self.options.start_timeout.as_secs()
+                                "adapter did not start within {}s{}",
+                                self.options.start_timeout.as_secs(),
+                                held_questions(&replay, &mut updates)
                             )));
                         }
                     };
                 let applied = apply_config(&conn, &session, catalogue, &config, self.options.config_timeout, deadline).await;
-                Ok((session, replay, applied))
+                Ok((session, applied))
             } => result,
             info = adapter.exited() => {
                 let tail = adapter.stderr_tail().await;
                 Err(StartError::other(format!("adapter exited during start ({}): {}", describe(info), last_lines(&tail, 5))))
             }
         };
-        let (agent_session, replay, applied) = match started {
+        let (agent_session, applied) = match started {
             Ok(started) => started,
             Err(error) => {
                 self.begin_ending();
@@ -725,10 +884,10 @@ impl Actor {
         // A load's state updates follow the start they belong to, and so do
         // updates the adapter sent while the start's switches ran. They are
         // older than the catalogue just announced, so they carry no
-        // catalogue extracts (P-13). Then the note about what the load
-        // dropped (ACP core §4.5), then the one about switches that did not
-        // take.
-        let mut early = replay.kept.clone();
+        // catalogue extracts (P-13). Questions asked meanwhile open here, in
+        // wire order. Then the note about what the load dropped (ACP core
+        // §4.5), then the one about switches that did not take.
+        let mut early = std::mem::take(&mut replay.kept);
         // Only what is queued now: a flooding adapter must not hold up the
         // start.
         for _ in 0..updates.len() {
@@ -736,13 +895,17 @@ impl Actor {
             // only ever called from the main loop below, which has not
             // started yet.
             match updates.try_recv() {
-                Ok(Inbound::Update(payload)) => early.push(payload),
+                Ok(Inbound::Update(payload)) => early.push(Early::Update(payload)),
+                Ok(Inbound::Question(question)) => early.push(Early::Question(question)),
                 Ok(Inbound::SwitchAnswer { .. }) => {}
                 Err(_) => break,
             }
         }
-        for payload in early {
-            self.emit(update(payload, None));
+        for early in early {
+            match early {
+                Early::Update(payload) => self.emit(update(payload, None)),
+                Early::Question(question) => self.open_question(question, None),
+            }
         }
         if let Some(note) = replay.note() {
             self.emit(note);
@@ -890,6 +1053,10 @@ impl Actor {
                                 hooks.hold_if_armed(test_hooks::HoldAt::SwitchSent).await;
                             }
                         }
+                    }
+                    Some(SessionCmd::Answer { request_id, pending_id, answer }) => {
+                        idle_since = Instant::now();
+                        self.answer(request_id, pending_id, answer);
                     }
                     Some(SessionCmd::Park { .. }) => {
                         self.teardown(&mut adapter, &mut updates, turn.take(), &mut configs).await;
@@ -1204,7 +1371,88 @@ impl Actor {
                 false
             }
             Inbound::SwitchAnswer { token, result } => self.route_switch_answer(token, result, configs),
+            Inbound::Question(question) => {
+                self.open_question(question, turn);
+                false
+            }
         }
+    }
+
+    /// Announce an adapter's question as `pending_opened` and keep its
+    /// responder until the operator answers (ACP core §4.6). `turn` is the
+    /// turn it was asked in. A permission's option ids are read from the
+    /// raw request (`option_ids`).
+    fn open_question(&self, question: Box<Question>, turn: Option<&str>) {
+        let Question {
+            kind,
+            params,
+            responder,
+        } = *question;
+        let pending_id = uuid::Uuid::now_v7().to_string();
+        let option_ids = match kind {
+            PendingKind::Permission => option_ids(&params),
+            PendingKind::Elicitation => None,
+        };
+        self.emit(SessionBody::PendingOpened {
+            pending_id: pending_id.clone(),
+            indexed: Indexed {
+                turn_id: turn.map(str::to_string),
+                pending: Some(PendingExtract {
+                    id: pending_id.clone(),
+                    kind,
+                    option_ids,
+                }),
+                ..Indexed::default()
+            },
+            payload: params,
+        });
+        self.questions.lock().expect("questions lock").open.push(OpenQuestion {
+            pending_id,
+            kind,
+            responder,
+        });
+    }
+
+    /// Deliver an operator's answer if its question is still open here
+    /// (ACP core §4.6): `answer_result{delivered: true}`, then
+    /// `pending_resolved{delivered}`. An answer nobody waits for (already
+    /// answered, cancelled, asked of an earlier adapter, or of another kind)
+    /// is `answer_result{delivered: false}` and changes nothing.
+    fn answer(&self, request_id: String, pending_id: String, answer: Answer) {
+        let question = {
+            let mut questions = self.questions.lock().expect("questions lock");
+            let at = questions
+                .open
+                .iter()
+                .position(|q| q.pending_id == pending_id && q.kind == answer.kind());
+            at.map(|at| questions.open.remove(at))
+        };
+        let Some(question) = question else {
+            return self.emit(SessionBody::AnswerResult {
+                pending_id,
+                request_id,
+                delivered: false,
+            });
+        };
+        let sent = question.responder.respond(answer.response());
+        self.emit(SessionBody::AnswerResult {
+            pending_id: pending_id.clone(),
+            request_id,
+            delivered: sent.is_ok(),
+        });
+        let (resolution, reason) = match sent {
+            Ok(()) => (PendingResolution::Delivered, None),
+            // The connection to the adapter is gone: so is the question.
+            Err(err) => {
+                tracing::warn!(session_id = %self.session_id, error = %err, "answer not sent to the adapter");
+                (PendingResolution::Cancelled, Some(PendingReason::AdapterLost))
+            }
+        };
+        self.emit(SessionBody::PendingResolved {
+            pending_id,
+            resolution,
+            reason,
+        });
     }
 
     /// Apply a switch's answer if its `token` matches the switch that is out
@@ -1421,21 +1669,17 @@ async fn next_reply(turn: &mut Option<Turn>) -> agent_client_protocol::Result<Pr
 /// `initialize`, then `session/new` or `session/load`. While a load is
 /// outstanding its replay is classified, never emitted (ACP core §4.5).
 /// Returns the config options the adapter announced (none if it announced
-/// none, or they did not parse).
+/// none, or they did not parse). What the adapter sends meanwhile goes into
+/// `replay`.
 async fn negotiate(
     conn: &ConnectionTo<Agent>,
     cwd: PathBuf,
     attach: &Attach,
     updates: &mut mpsc::UnboundedReceiver<Inbound>,
-) -> Result<(SessionId, Replay, Announced), StartError> {
-    // Advertised so that agents offer boolean options as booleans, not as
-    // on/off selects (ACP `session.configOptions.boolean`).
-    let capabilities = ClientCapabilities::new().session(
-        ClientSessionCapabilities::new()
-            .config_options(SessionConfigOptionsCapabilities::new().boolean(BooleanConfigOptionCapabilities::new())),
-    );
+    replay: &mut Replay,
+) -> Result<(SessionId, Announced), StartError> {
     let init = conn
-        .send_request(InitializeRequest::new(ProtocolVersion::V1).client_capabilities(capabilities))
+        .send_request(InitializeRequest::new(ProtocolVersion::V1).client_capabilities(client_capabilities()))
         .block_task()
         .await
         .map_err(|err| StartError::acp(err, false))?;
@@ -1451,16 +1695,16 @@ async fn negotiate(
             // start, like a load's kept updates. A `SwitchAnswer` here is
             // impossible: no switch is sent before this actor's main loop
             // starts, well after this function returns.
-            let mut replay = Replay::default();
             for _ in 0..updates.len() {
                 match updates.try_recv() {
-                    Ok(Inbound::Update(payload)) => replay.kept.push(payload),
+                    Ok(Inbound::Update(payload)) => replay.kept.push(Early::Update(payload)),
+                    Ok(Inbound::Question(question)) => replay.kept.push(Early::Question(question)),
                     Ok(Inbound::SwitchAnswer { .. }) => {}
                     Err(_) => break,
                 }
             }
-            let catalogue = announced_options(created.config_options, &replay.kept);
-            return Ok((created.session_id, replay, catalogue));
+            let catalogue = announced_options(created.config_options, replay.updates());
+            return Ok((created.session_id, catalogue));
         }
         Attach::Load { agent_session_id } => agent_session_id,
     };
@@ -1473,17 +1717,10 @@ async fn negotiate(
     let id = SessionId::new(agent_session_id.clone());
     let load = conn.send_request(LoadSessionRequest::new(id.clone(), cwd)).block_task();
     tokio::pin!(load);
-    let mut replay = Replay::default();
     loop {
         tokio::select! {
             biased;
-            Some(inbound) = updates.recv() => {
-                // A `SwitchAnswer` here is impossible, same reasoning as
-                // above.
-                if let Inbound::Update(payload) = inbound {
-                    replay.observe(payload);
-                }
-            }
+            Some(inbound) = updates.recv() => replay.inbound(inbound),
             result = &mut load => {
                 // Everything the adapter sent before its answer is replay,
                 // even if this select saw the answer first (see
@@ -1494,13 +1731,11 @@ async fn negotiate(
                 // classified as replay too — dropped if a history kind,
                 // passed through if a state kind.
                 while let Ok(inbound) = updates.try_recv() {
-                    if let Inbound::Update(payload) = inbound {
-                        replay.observe(payload);
-                    }
+                    replay.inbound(inbound);
                 }
                 let loaded = result.map_err(|err| StartError::acp(err, true))?;
-                let catalogue = announced_options(loaded.config_options, &replay.kept);
-                return Ok((id, replay, catalogue));
+                let catalogue = announced_options(loaded.config_options, replay.updates());
+                return Ok((id, catalogue));
             }
         }
     }
@@ -1522,17 +1757,70 @@ struct Announced {
 /// or, if it had none, those of the last `config_option_update` the adapter
 /// sent before it. That update still carries no extracts: it is older than
 /// the catalogue `session_started` announces.
-fn announced_options(answered: Option<Vec<SessionConfigOption>>, before: &[Value]) -> Announced {
+fn announced_options<'a>(
+    answered: Option<Vec<SessionConfigOption>>,
+    before: impl DoubleEndedIterator<Item = &'a Value>,
+) -> Announced {
     match answered {
         Some(options) if !options.is_empty() => Announced {
             options,
             authoritative: true,
         },
         _ => Announced {
-            options: before.iter().rev().find_map(config_update).unwrap_or_default(),
+            options: before.rev().find_map(config_update).unwrap_or_default(),
             authoritative: false,
         },
     }
+}
+
+/// What the host tells the adapter it can do (ACP core §2.5, §6): boolean
+/// config options, so agents offer them as booleans rather than on/off
+/// selects, and form elicitation as `{"form": {}}`, never a boolean (P-19).
+fn client_capabilities() -> ClientCapabilities {
+    ClientCapabilities::new()
+        .session(
+            ClientSessionCapabilities::new().config_options(
+                SessionConfigOptionsCapabilities::new().boolean(BooleanConfigOptionCapabilities::new()),
+            ),
+        )
+        .elicitation(ElicitationCapabilities::new().form(ElicitationFormCapabilities::new()))
+}
+
+/// What a start that ran out of time was holding back (decision 2): the
+/// questions the agent asked before the session existed, which nobody could
+/// see or answer. Empty if there were none.
+fn held_questions(replay: &Replay, updates: &mut mpsc::UnboundedReceiver<Inbound>) -> String {
+    let mut kinds: Vec<PendingKind> = replay
+        .kept
+        .iter()
+        .filter_map(|early| match early {
+            Early::Question(question) => Some(question.kind),
+            Early::Update(_) => None,
+        })
+        .collect();
+    while let Ok(inbound) = updates.try_recv() {
+        if let Inbound::Question(question) = inbound {
+            kinds.push(question.kind);
+        }
+    }
+    if kinds.is_empty() {
+        return String::new();
+    }
+    let mut names: Vec<&str> = Vec::new();
+    for kind in &kinds {
+        let name = match kind {
+            PendingKind::Permission => "permission",
+            PendingKind::Elicitation => "elicitation",
+        };
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    format!(
+        "; the agent asked {} question(s) during start-up ({}) that hennery cannot show before the session exists",
+        kinds.len(),
+        names.join("/")
+    )
 }
 
 /// The options of a non-empty `config_option_update` notification.
@@ -1816,6 +2104,26 @@ fn parse_prompt(content: Vec<Value>) -> Result<Vec<ContentBlock>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A boolean would be discarded by the adapter's schema validator,
+    /// which looks exactly like not advertising it (P-19).
+    #[test]
+    fn form_elicitation_is_advertised_as_an_object() {
+        let advertised = serde_json::to_value(client_capabilities()).unwrap();
+        assert_eq!(advertised["elicitation"], serde_json::json!({"form": {}}));
+    }
+
+    /// Read raw: one option of a kind this build does not know must not
+    /// cost the whole list.
+    #[test]
+    fn option_ids_are_read_from_the_raw_request() {
+        let options = serde_json::json!({"options": [
+            {"optionId": "a", "kind": "from_the_future"}, {"name": "no id"}, {"optionId": 3}, {"optionId": "b"}
+        ]});
+        assert_eq!(option_ids(&options), Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(option_ids(&serde_json::json!({})), None);
+        assert_eq!(option_ids(&serde_json::json!({"options": {"optionId": "a"}})), None);
+    }
 
     fn options(json: Value) -> Vec<SessionConfigOption> {
         serde_json::from_value(json).unwrap()

@@ -5,7 +5,7 @@
 //! writing to the outbox, which is resent on the next connection.
 
 use crate::outbox::Outbox;
-use crate::session::{self, AgentCommand, Attach, Launch, SessionCmd, SessionHandle, SessionOptions};
+use crate::session::{self, AgentCommand, Answer, Attach, Launch, SessionCmd, SessionHandle, SessionOptions};
 use crate::uplink::Uplink;
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
@@ -481,18 +481,60 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
                 }) => {}
             _ => not_attached(uplink, request_id),
         },
-        // Answers reach the session actor once it keeps its pending requests.
-        CollectorFrame::AnswerPermission { request_id, .. } | CollectorFrame::AnswerElicitation { request_id, .. } => {
-            uplink.reply(HostFrame::Error {
-                request_id,
-                code: "unsupported".into(),
-                message: "this host does not take answers yet".into(),
-            })
-        }
+        CollectorFrame::AnswerPermission {
+            request_id,
+            session_id,
+            pending_id,
+            option_id,
+        } => answer(
+            uplink,
+            sessions,
+            request_id,
+            &session_id,
+            pending_id,
+            Answer::Permission { option_id },
+        ),
+        CollectorFrame::AnswerElicitation {
+            request_id,
+            session_id,
+            pending_id,
+            action,
+            content,
+        } => answer(
+            uplink,
+            sessions,
+            request_id,
+            &session_id,
+            pending_id,
+            Answer::Elicitation { action, content },
+        ),
         CollectorFrame::Ack { session_id, ack_seq } => uplink.ack(&session_id, ack_seq)?,
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }
     Ok(())
+}
+
+/// An operator's answer goes to the session's live actor, which reports
+/// `answer_result`. With no live actor there is no question to answer: the
+/// rejection is correlated, like a prompt's, and the collector records the
+/// answer as not delivered.
+fn answer(
+    uplink: &Uplink,
+    sessions: &Sessions,
+    request_id: String,
+    session_id: &str,
+    pending_id: String,
+    answer: Answer,
+) {
+    match live_session(sessions, session_id) {
+        Some(handle)
+            if handle.send(SessionCmd::Answer {
+                request_id: request_id.clone(),
+                pending_id,
+                answer,
+            }) => {}
+        _ => not_attached(uplink, request_id),
+    }
 }
 
 async fn send_pending<S>(sink: &mut S, uplink: &Uplink, sent: &mut HashMap<String, u64>) -> Result<()>

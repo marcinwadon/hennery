@@ -4,10 +4,13 @@
 
 use hennery_host::outbox::Outbox;
 use hennery_host::session::test_hooks::{self, TestHooks};
-use hennery_host::session::{self, AgentCommand, Attach, Launch, SessionCmd, SessionHandle, SessionOptions};
+use hennery_host::session::{self, AgentCommand, Answer, Attach, Launch, SessionCmd, SessionHandle, SessionOptions};
 use hennery_host::uplink::Uplink;
-use hennery_proto::frames::{ConfigValue, HostFrame, Indexed, SessionBody, SessionConfig, TurnOutcome};
-use hennery_testkit::{FakeScript, SCRIPT_ENV, pid_alive};
+use hennery_proto::frames::{
+    ConfigValue, ElicitationAction, HostFrame, Indexed, PendingExtract, PendingKind, SessionBody, SessionConfig,
+    TurnOutcome,
+};
+use hennery_testkit::{FakeAsk, FakeScript, SCRIPT_ENV, pid_alive};
 use serde_json::json;
 use std::path::Path;
 use std::time::Duration;
@@ -2719,4 +2722,314 @@ async fn a_start_switch_that_timed_out_blocks_set_config_until_its_grace_passes(
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+// Plan (2): permission and elicitation (ACP core §2.5, §4.6).
+
+fn asking(asks: Vec<FakeAsk>) -> FakeScript {
+    FakeScript {
+        asks,
+        ..FakeScript::default()
+    }
+}
+
+/// A new session `s1` of the fake with `script`, default options.
+fn starting(uplink: &Uplink, script: &FakeScript) -> SessionHandle {
+    session::start(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        fake_with(script),
+        std::env::temp_dir(),
+    )
+}
+
+/// Every `pending_opened`: its extract, turn and ACP payload.
+fn opened(frames: &[HostFrame]) -> Vec<(PendingExtract, Option<String>, serde_json::Value)> {
+    frames
+        .iter()
+        .filter_map(|f| match f {
+            HostFrame::Session {
+                body: SessionBody::PendingOpened { indexed, payload, .. },
+                ..
+            } => Some((
+                indexed.pending.clone().unwrap(),
+                indexed.turn_id.clone(),
+                payload.clone(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The id of the `n`th pending request opened, once it is.
+async fn nth_pending(uplink: &Uplink, n: usize) -> String {
+    let frames = wait_until(uplink, |f| opened(f).len() > n).await;
+    opened(&frames)[n].0.id.clone()
+}
+
+fn choose(request_id: &str, pending_id: &str, option_id: &str) -> SessionCmd {
+    SessionCmd::Answer {
+        request_id: request_id.into(),
+        pending_id: pending_id.into(),
+        answer: Answer::Permission {
+            option_id: option_id.into(),
+        },
+    }
+}
+
+/// Every `answer_result`: (request id, pending id, delivered).
+fn verdicts(frames: &[HostFrame]) -> Vec<(String, String, bool)> {
+    frames
+        .iter()
+        .filter_map(|f| match f {
+            HostFrame::Session {
+                body:
+                    SessionBody::AnswerResult {
+                        pending_id,
+                        request_id,
+                        delivered,
+                    },
+                ..
+            } => Some((request_id.clone(), pending_id.clone(), *delivered)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_permission_request_waits_for_the_operator_and_the_answer_reaches_the_agent() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let handle = starting(&uplink, &asking(vec![FakeAsk::Permission]));
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let pending = nth_pending(&uplink, 0).await;
+    // Nothing moves until the operator answers: the turn stays open.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let frames = uplink.pending().unwrap();
+    assert_eq!(
+        kinds(&frames),
+        ["session_started", "turn_started", "pending_opened:permission"]
+    );
+    assert_eq!(handle.open_turn_id().as_deref(), Some("t1"));
+    let (extract, turn, payload) = opened(&frames).remove(0);
+    assert_eq!(
+        (extract.kind, extract.option_ids, turn.as_deref()),
+        (
+            PendingKind::Permission,
+            Some(vec!["allow".to_string(), "reject".to_string()]),
+            Some("t1")
+        )
+    );
+    // Verbatim, `_meta` and all.
+    assert_eq!(payload["toolCall"]["toolCallId"], "call-1");
+
+    assert!(handle.send(choose("ra", &pending, "allow")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    assert_eq!(
+        kinds(&frames)[3..],
+        [
+            "answer_result:true",
+            "pending_resolved:delivered",
+            "update:permission:selected:allow",
+            "update:Hello",
+            "update: world",
+            "turn_ended"
+        ]
+    );
+    assert_eq!(verdicts(&frames), [("ra".to_string(), pending, true)]);
+}
+
+#[tokio::test]
+async fn an_answer_is_delivered_once_and_one_for_a_question_not_open_is_not() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        chunks: vec![],
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let handle = starting(&uplink, &script);
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let pending = nth_pending(&uplink, 0).await;
+    assert!(handle.send(choose("ra", &pending, "reject")));
+    // A resent answer (a reconnect, a second client) and one for a question
+    // this actor never asked: neither has anyone waiting for it.
+    assert!(handle.send(choose("rb", &pending, "allow")));
+    assert!(handle.send(choose("rc", "no-such-question", "allow")));
+    let frames = wait_until(&uplink, |f| verdicts(f).len() == 3).await;
+    assert_eq!(
+        verdicts(&frames),
+        [
+            ("ra".to_string(), pending.clone(), true),
+            ("rb".to_string(), pending, false),
+            ("rc".to_string(), "no-such-question".to_string(), false),
+        ]
+    );
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    let resolved = kinds(&frames)
+        .iter()
+        .filter(|k| k.starts_with("pending_resolved"))
+        .count();
+    assert_eq!(resolved, 1, "{:?}", kinds(&frames));
+    assert!(kinds(&frames).contains(&"update:permission:selected:reject".to_string()));
+}
+
+#[tokio::test]
+async fn an_elicitation_reaches_the_operator_and_the_form_content_reaches_the_agent() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    // The fake asks only a client that advertised form elicitation (P-19).
+    let handle = starting(&uplink, &asking(vec![FakeAsk::Elicitation]));
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let pending = nth_pending(&uplink, 0).await;
+    let frames = uplink.pending().unwrap();
+    let (extract, _, payload) = opened(&frames).remove(0);
+    assert_eq!((extract.kind, extract.option_ids), (PendingKind::Elicitation, None));
+    assert_eq!(payload["mode"], "form");
+    assert!(handle.send(SessionCmd::Answer {
+        request_id: "ra".into(),
+        pending_id: pending,
+        answer: Answer::Elicitation {
+            action: ElicitationAction::Accept,
+            content: Some(json!({"name": "notes.txt"})),
+        },
+    }));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    assert!(
+        kinds(&frames).contains(&r#"update:elicitation:accept:{"name":"notes.txt"}"#.to_string()),
+        "{:?}",
+        kinds(&frames)
+    );
+}
+
+#[tokio::test]
+async fn several_open_questions_each_take_their_own_answer() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        asks_at_once: true,
+        chunks: vec![],
+        ..asking(vec![FakeAsk::Permission, FakeAsk::Elicitation])
+    };
+    let handle = starting(&uplink, &script);
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let first = nth_pending(&uplink, 0).await;
+    let second = nth_pending(&uplink, 1).await;
+    assert!(handle.send(SessionCmd::Answer {
+        request_id: "rb".into(),
+        pending_id: second,
+        answer: Answer::Elicitation {
+            action: ElicitationAction::Decline,
+            content: None,
+        },
+    }));
+    assert!(handle.send(choose("ra", &first, "allow")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    let echoes: Vec<String> = kinds(&frames)
+        .into_iter()
+        .filter(|k| k.starts_with("update:"))
+        .collect();
+    assert_eq!(
+        echoes,
+        ["update:permission:selected:allow", "update:elicitation:decline"]
+    );
+    assert_eq!(verdicts(&frames).iter().filter(|v| v.2).count(), 2);
+}
+
+#[tokio::test]
+async fn a_request_the_host_does_not_serve_is_refused_method_not_found() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        chunks: vec![],
+        ..asking(vec![FakeAsk::Unknown])
+    };
+    let handle = starting(&uplink, &script);
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    assert_eq!(
+        kinds(&frames),
+        [
+            "session_started",
+            "turn_started",
+            "update:unknown:error:-32601",
+            "turn_ended"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_question_asked_while_the_session_loads_opens_after_session_started() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        ask_on_load: true,
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let handle = resuming(&uplink, &script);
+    let pending = nth_pending(&uplink, 0).await;
+    let frames = uplink.pending().unwrap();
+    assert_eq!(kinds(&frames), ["session_started", "pending_opened:permission"]);
+    assert_eq!(opened(&frames)[0].1, None, "asked outside any turn");
+    assert!(handle.send(choose("ra", &pending, "allow")));
+    wait_until(&uplink, has("update:permission:selected:allow")).await;
+}
+
+/// A newer adapter may offer an option of a kind this build's schema does
+/// not know: the question keeps every option id, and each can be chosen.
+#[tokio::test]
+async fn a_permission_with_an_option_kind_this_build_does_not_know_keeps_its_option_ids() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        chunks: vec![],
+        ..asking(vec![FakeAsk::FuturePermission])
+    };
+    let handle = starting(&uplink, &script);
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let pending = nth_pending(&uplink, 0).await;
+    let frames = uplink.pending().unwrap();
+    assert_eq!(
+        opened(&frames)[0].0.option_ids,
+        Some(vec!["allow".to_string(), "allow_session".to_string()])
+    );
+    assert!(handle.send(choose("ra", &pending, "allow_session")));
+    wait_until(&uplink, has("update:permission:selected:allow_session")).await;
+}
+
+/// A question held back during the load, which the load then waits for:
+/// the start runs out of time, and its failure says why.
+#[tokio::test]
+async fn a_start_that_runs_out_of_time_says_which_questions_it_held_back() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        ask_on_load: true,
+        ask_on_load_waits: true,
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let _handle = session::resume(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        "agent-7".into(),
+        fake_with(&script),
+        std::env::temp_dir(),
+        SessionOptions {
+            start_timeout: Duration::from_secs(3),
+            ..SessionOptions::default()
+        },
+    );
+    let frames = wait_until(&uplink, has("start_failed")).await;
+    let HostFrame::Session {
+        body: SessionBody::StartFailed { message, .. },
+        ..
+    } = &frames[0]
+    else {
+        panic!("{:?}", kinds(&frames));
+    };
+    assert!(
+        message.contains(
+            "the agent asked 1 question(s) during start-up (permission) that hennery cannot show before the session exists"
+        ),
+        "{message}"
+    );
 }
