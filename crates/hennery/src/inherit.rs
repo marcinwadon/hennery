@@ -2,7 +2,7 @@
 //! pairing code travels over one pipe from the collector child to the host
 //! child, each end inherited as a file descriptor, so the code is never on a
 //! command line or in the environment; and the collector child inherits the
-//! listening socket `up` bound for it.
+//! listening sockets `up` bound for it.
 
 use anyhow::{Context, Result, bail};
 use std::io::{Read, Write};
@@ -11,15 +11,24 @@ use std::os::fd::{FromRawFd, RawFd};
 /// The descriptor number each child finds its end of the pairing pipe at.
 pub const CHILD_FD: RawFd = 3;
 
-/// The descriptor number the collector child finds its listening socket at.
+/// The descriptor number the collector child finds its first listening
+/// socket at; the others follow it, in order.
 pub const LISTENER_FD: RawFd = 4;
+
+/// The most descriptors one child is handed: the pairing pipe's end and a
+/// listening socket for each of up to `MAX_LISTENERS` addresses.
+pub const MAX_PASSED: usize = 1 + crate::MAX_LISTENERS;
+
+/// Each source is first copied to a number at or above this one, clear of
+/// every target.
+const MOVE_FLOOR: RawFd = 64;
 
 /// Make each `(fd, child_fd)`'s `fd` (one of this process's descriptors) the
 /// child's `child_fd`, open across `exec`. The sources are close-on-exec, so
 /// the child inherits nothing else of them.
 pub fn pass_to_child(cmd: &mut tokio::process::Command, fds: &[(RawFd, RawFd)]) {
     // Checked here, not in the child: nothing may panic after the fork.
-    assert!(fds.len() <= 2 && fds.iter().all(|&(_, to)| to < 10));
+    assert!(fds.len() <= MAX_PASSED && fds.iter().all(|&(_, to)| (3..MOVE_FLOOR).contains(&to)));
     let fds = fds.to_vec();
     // SAFETY: the closure runs in the forked child before `exec` and calls
     // only async-signal-safe functions (`fcntl`, `dup2`, `close`), and
@@ -30,9 +39,9 @@ pub fn pass_to_child(cmd: &mut tokio::process::Command, fds: &[(RawFd, RawFd)]) 
             // say): moving every source above the targets first means no
             // `dup2` below closes a descriptor still to be passed. The copies
             // are close-on-exec, so none is left open in the program.
-            let mut moved = [0; 2];
+            let mut moved = [0; MAX_PASSED];
             for (slot, &(fd, _)) in moved.iter_mut().zip(&fds) {
-                *slot = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10);
+                *slot = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, MOVE_FLOOR);
                 if *slot < 0 {
                     return Err(std::io::Error::last_os_error());
                 }

@@ -206,6 +206,12 @@ impl Operator {
         Ok(self.owner_id()?.is_some())
     }
 
+    /// Whether the database answers a query (`/readyz`).
+    pub fn ping(&self) -> Result<()> {
+        self.conn().query_row("SELECT 1", [], |_| Ok(()))?;
+        Ok(())
+    }
+
     pub fn public_url(&self) -> Option<PublicUrl> {
         self.public_url.read().expect("public_url lock").clone()
     }
