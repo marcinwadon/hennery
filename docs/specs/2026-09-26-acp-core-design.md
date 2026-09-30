@@ -1,7 +1,10 @@
 # hennery — ACP core (subsystem spec)
 
 - **Date:** 2026-09-26
-- **Status:** Draft, awaiting review
+- **Status:** Draft. Amended 2026-10-01 to match what plans A (teardown), B1
+  (resume), B2a (cancel, capabilities), B2b (config) and 2 (permission and
+  elicitation) built, and the decisions confirmed with them. Where a section
+  still describes something not built yet, it says so.
 - **Refines:** [architecture spec](2026-09-25-hennery-architecture-design.md)
   §5 (protocol), §6 (sessions), §11 (browser API) and §13 (frontend data
   flow). This document is the authoritative home of the frame catalogue
@@ -111,8 +114,27 @@ is serialised through it. Consequences:
 - **Idempotency.** The host dedupes `start_session`/`resume_session` by
   `session_id` (already attached → re-emit the current state as a
   `session_started` carrying the new `request_id`; never a second adapter),
-  `prompt` by `turn_id` (already seen → no second turn), and answers by
+  `prompt` by `turn_id` (already seen → no second turn; a prompt is validated
+  first, so an invalid one never blocks its corrected retry), and answers by
   `pending_id` (already resolved → `answer_result{delivered: false}`).
+- **One ordered emitter.** The actor's `select!` loop is the only code that
+  emits the session's frames. Adapter notifications, switch answers and
+  adapter requests reach it on one wire-ordered channel; the ACP connection
+  runs in its own task, so a turn runs concurrently with cancel, park, close,
+  exit and the reaper. Whatever is queued is drained before every
+  `turn_ended`. At most 64 updates in a row (`UPDATE_BURST`) are handled
+  before the other arms get a pass, so a flooding adapter cannot hold off a
+  cancel.
+- **An ending actor.** Once a park or close is queued, or the actor begins to
+  end by itself (idle reap, adapter exit, a stopped cancel), its handle is
+  marked ending. A start or resume that meets it waits for it to finish, then
+  attaches a fresh adapter; two adapters never run side by side for one
+  session. A command that reaches an ended actor is answered `not_attached`.
+- **Host shutdown** closes the session map under the lock it takes the
+  handles with: a start or resume arriving afterwards is dropped unanswered
+  (the collector reconciles it as `start_not_delivered`). Shutdown waits for
+  the actors (bounded by the kill grace + 1 s), so adapters get SIGTERM first,
+  and emits nothing: the collector handles the rest as a host restart (§5.2).
 
 ### 2.3 Adapter supervisor
 
@@ -134,12 +156,19 @@ is serialised through it. Consequences:
   *(P-4: the predecessor never watched the child. After a mid-turn crash the
   prompt call blocked until the socket died, the session showed `running`
   forever and the reaper could not free it.)*
+  The exit watcher first drains what the adapter wrote before dying. Step 2
+  comes before step 3, and step 3 before step 4: the order is turn end,
+  then questions, then the exit, then the detach (§4.8).
 - **Close, park and reap kill the whole process group** (SIGTERM, then SIGKILL
   after 5 s). *(P-5: killing only the direct child left the agent CLI subtree
-  alive; accumulated trees once exhausted a host's memory.)*
+  alive; accumulated trees once exhausted a host's memory.)* After an
+  unexpected exit, the rest of the group is SIGKILLed right after the leader
+  is reaped: descendants of a crashed adapter are orphans nothing else reaps.
 - **Scrubbing.** Stderr tails and `host_note` text are scrubbed of token-like
   patterns (`Bearer …`, `sk-…`, `ghp_…`, `github_pat_…`, `xox[abp]-…` and
-  similar) before they are emitted. ACP payloads are **not** scrubbed: they
+  similar) before they are emitted. Once the stderr ring has truncated, its
+  partial first line is dropped before scrubbing, so a token cut at the
+  ring's edge cannot slip past the patterns. ACP payloads are **not** scrubbed: they
   stay verbatim (§3.2), which means tool output that contains a secret is
   stored as-is in the collector. The documentation says so.
 
@@ -169,7 +198,19 @@ is serialised through it. Consequences:
     crate's byte-stream transport. The crate's own spawner uses a second async
     runtime and does not expose what §2.3 needs.
   - Methods absent from the Rust schema (e.g. Codex's legacy
-    `session/set_model`) are sent as `UntypedMessage`.
+    `session/set_model`) are sent as `UntypedMessage`. Not built yet: it
+    belongs to the Codex adapter profile (§6).
+  - **One untyped request handler answers every adapter request itself**
+    (§2.5). Falling through to the crate is not enough: its default handler
+    holds any message that names a session for a per-session handler hennery
+    never registers, so the adapter would wait forever.
+  - The crate's `Responder` sends nothing when dropped, so every question the
+    host holds is answered explicitly (answer, cancellation or withdrawal,
+    §4.6). A peer's `$/cancel_request` reaches the responder's cancellation
+    handle, which the host watches.
+  - Switch answers (`session/set_config_option`) arrive on the actor's
+    ordered channel with the notifications, so a read-back never overtakes,
+    or is overtaken by, the agent's own `config_option_update`.
 
 ### 2.5 ACP client-side capabilities
 
@@ -183,7 +224,21 @@ The host implements, for adapters that ask:
 | `terminal/output`, `wait_for_exit`, `kill`, `release` | Standard. `kill`/`release` signal the terminal's process group. |
 | `session/request_permission` | §4.6. |
 | `elicitation/create` | §4.6. |
-| anything else | JSON-RPC `-32601 Method not found`. |
+| anything else | JSON-RPC `-32601 Method not found`, answered at once by hennery's own handler (§2.4). |
+
+**Built so far:** only the two question methods are served; `fs/*` and
+`terminal/*` are answered `-32601` until they are implemented (never left
+hanging).
+
+`initialize` advertises, besides the profile's rows (§6):
+
+- `session.configOptions.boolean = {}`. An agent offers boolean options only to
+  a client that advertises this; to any other it offers an `on`/`off` select
+  instead (Claude turns `fast` into one).
+- `elicitation = {"form": {}}`, never a boolean (§4.6, P-19). Only form
+  elicitation is advertised. An adapter that sends another mode anyway still
+  reaches the operator (the payload is opaque) and can be accepted, declined
+  or cancelled.
 
 ---
 
@@ -220,6 +275,10 @@ the collector resolves the waiting HTTP call when it **ingests** that fact.
 socket drop at the wrong moment leaves the collector guessing; on the outbox it
 is resent until acknowledged.)*
 
+**Wire order.** The host sends every outboxed fact it has before each
+correlated reply, so a rejection never overtakes the fact that preceded it
+(e.g. a `turn_ended` written just before a `not_running`, §3.3).
+
 Maximum frame size **32 MiB**. A frame that would exceed it is rejected at the
 sender with a visible error; it never closes the socket. *(P-7: an oversized
 update closed the predecessor's socket, which tore down every session on the
@@ -229,21 +288,21 @@ host.)*
 
 | `body.kind` | Fields | Notes |
 |---|---|---|
-| `acp_update` | `indexed`, `payload` | One ACP `session/update`, verbatim. |
-| `session_started` | `request_id`, `agent_session_id`, `indexed` (catalogue extracts) | Catalogue is the **post-switch** one (§4.3). |
-| `start_failed` | `request_id`, `code`, `reason`, `message` | Any failure after the host accepted a start/resume (spawn, `initialize`, `session/new`/`load`). |
-| `turn_started` | `turn_id`, `request_id?` | The prompt reached the adapter. |
+| `acp_update` | `indexed`, `payload` | One ACP `session/update`, verbatim. `indexed.turn_id` names the turn in flight when it arrived. |
+| `session_started` | `request_id`, `agent_session_id`, `indexed` (catalogue extracts) | Catalogue is the **post-switch** one (§4.3). Also completes a retried start or resume (§2.2). |
+| `start_failed` | `request_id`, `code`, `message` | Any failure after the host accepted a start/resume (spawn, `initialize`, `session/new`/`load`, the 75 s start bound). `code` is the stored failure reason (§4.3). |
+| `turn_started` | `request_id`, `turn_id` | The prompt reached the adapter. |
 | `turn_ended` | `turn_id`, `outcome`, `stop_reason?`, `error?` | Exactly one per started turn (§4.4). |
-| `pending_opened` | `pending_id`, `kind` (`permission` \| `elicitation`), `indexed`, `payload` | ACP request verbatim in `payload`. |
-| `pending_resolved` | `pending_id`, `resolution` (`delivered` \| `cancelled`), `reason?` | |
-| `answer_result` | `pending_id`, `request_id`, `delivered` | Umbrella §6.8. |
-| `config_applied` | `request_id`, `indexed` (catalogue extracts) | Authoritative read-back after `set_config`. |
-| `session_parked` | `reason` (`idle` \| `adapter_exited` \| `operator`) | |
+| `pending_opened` | `pending_id`, `indexed`, `payload` | ACP request verbatim in `payload`. Its kind rides in `indexed.pending.kind`: the body's own `kind` is the body tag. `indexed.turn_id` names the turn it was asked in, if any. |
+| `pending_resolved` | `pending_id`, `resolution` (`delivered` \| `cancelled`), `reason?` | `reason` only with `cancelled` (§4.6). |
+| `answer_result` | `pending_id`, `request_id`, `delivered` | Umbrella §6.8. A delivered answer is followed by `pending_resolved{delivered}`. |
+| `config_applied` | `request_id`, `indexed` (catalogue extracts) | Authoritative read-back after `set_config`. Also emitted, under the failed request's id, for a timed-out switch that answers late (§4.3). |
+| `session_parked` | `reason` (`idle` \| `adapter_exited` \| `operator`) | `operator` also covers an adapter stopped for ignoring a cancel (§4.4). |
 | `session_closed` | — | |
-| `transcript_gap` | `from_seq`, `to_seq` | Its own `seq` is `to_seq` (§5.5). |
-| `adapter_exited` | `code`, `signal`, `stderr_tail` | Stderr tail scrubbed (§2.3). |
-| `git_state` | `branch`, `dirty`, `worktree`, `head`, `base_commit?` | After start and after each turn; bounded to 3 s. |
-| `host_note` | `note`, `text` | hennery's own diagnostics that are not state (failed re-apply, dropped unknown kinds during load). Text scrubbed. |
+| `transcript_gap` | `from_seq`, `to_seq` | Its own `seq` is `to_seq` (§5.5). Not built yet. |
+| `adapter_exited` | `code?`, `signal?`, `stderr_tail` | Stderr tail scrubbed (§2.3). |
+| `git_state` | `branch`, `dirty`, `worktree`, `head`, `base_commit?` | After start and after each turn; bounded to 3 s. Not built yet. |
+| `host_note` | `note`, `text` | hennery's own diagnostics that are not state. `note` is a machine code, `text` is scrubbed. Codes so far: `replay_unknown_dropped` (§4.5), `config_failed` / `reapply_failed` (§4.3), `cancel_unanswered` (§4.4). |
 
 - `payload` is the ACP message exactly as received from the adapter, including
   unknown fields and `_meta`. The collector stores it as opaque JSON and
@@ -255,19 +314,32 @@ host.)*
   |---|---|
   | `activity` | `running` \| `idle` |
   | `title` | Session title reported by the agent |
-  | `turn_id` | Turn the update belongs to |
-  | `pending` | `{id, kind, option_ids?}` (`option_ids` for permissions) |
+  | `turn_id` | Turn the update or question belongs to (filled on every update) |
+  | `pending` | `{id, kind, option_ids?}` (`option_ids` for permissions, read from the raw request, §4.6) |
   | `commands` | Available slash commands (full list) |
-  | `config_options` | Config catalogue (full) |
-  | `current_model`, `current_mode` | Current values |
+  | `config_options` | Config catalogue: the adapter's ACP option objects that hennery can parse (the crate skips one it cannot read) |
+  | `current_model`, `current_mode` | Current values of the model and mode options |
+  | `current_axes` | Current value of every other option, by config id |
   | `plan` | Plan entries (latest snapshot) |
   | `agent_failure` | `{severity}` |
   | `usage` | Context/token usage |
   | `text_projection` | Plain text of message chunks, for future search |
 
-- `session_catalog`, `plans` and the `model`/`mode` columns (§8) are filled
-  **from extracts only**. The collector validates answers against the stored
-  `option_ids`, never against the payload.
+- `session_catalog`, `plans` and the `model`/`mode`/`config_axes` columns
+  (§8) are filled **from extracts only**. The collector validates answers
+  against the stored `option_ids`, never against the payload.
+- **The catalogue extracts are one snapshot.** When `config_options` is
+  present and not empty, it and `current_model`, `current_mode` and
+  `current_axes` describe the same moment. An absent or empty
+  `config_options` means "no read-back" (an answer that failed to parse
+  arrives empty), never "the adapter has no config": the collector ignores
+  it and keeps what it stored. The host fills them on `session_started`,
+  `config_applied` and live `config_option_update`s only, never on updates
+  replayed by `session/load`, sent before the `session/new`/`load` answer, or
+  sent while the start's switches ran (those are older than the catalogue
+  `session_started` announces, P-13).
+- **Built so far:** `turn_id`, `pending` and the four catalogue extracts. The
+  others arrive with the plans that use them.
 
 ### 3.3 Frame catalogue
 
@@ -275,15 +347,15 @@ host.)*
 
 | Type | Key fields | Completed by |
 |---|---|---|
-| `start_session` | session_id (collector-minted), committed_seq, agent, cwd (canonical), model?, mode?, axes{}, first_prompt?{turn_id, content[]}, mcp_servers[], hat | `session_started` \| `start_failed` |
-| `resume_session` | session_id, committed_seq, agent, cwd, model?, mode?, axes{}, mcp_servers[], hat | `session_started` \| `start_failed` |
+| `start_session` | session_id (collector-minted), committed_seq, agent, cwd (canonical), model?, mode?, axes{}, first_prompt?{turn_id, content[]}, mcp_servers[], hat | `session_started` \| `start_failed` \| `error{unknown_agent}` |
+| `resume_session` | session_id, committed_seq, agent, cwd, agent_session_id, model?, mode?, axes{}, mcp_servers[], hat | `session_started` \| `start_failed` \| `error` (as a start) |
 | `prompt` | session_id, turn_id, content[] (ACP ContentBlocks) | `turn_started` \| `error{turn_in_progress \| not_attached \| invalid}` |
-| `cancel_turn` | session_id, turn_id | `turn_ended{cancelled}` for that turn |
-| `park_session` | session_id | `session_parked{reason: operator}` (only to hosts with the `park` capability) |
-| `close_session` | session_id | `session_closed` |
-| `set_config` | session_id, config_id, value | `config_applied` \| `error` |
-| `answer_permission` | session_id, pending_id, option_id | `answer_result` |
-| `answer_elicitation` | session_id, pending_id, action, content? | `answer_result` |
+| `cancel_turn` | session_id, turn_id | That turn's `turn_ended`, **whatever its outcome** \| `error{not_running \| not_attached}` |
+| `park_session` | session_id | `session_parked{reason: operator}` \| `error{not_attached}` (only to hosts with the `park` capability) |
+| `close_session` | session_id | `session_closed` \| `error{not_attached}` |
+| `set_config` | session_id, config_id, value (a select's value id or a boolean) | `config_applied` \| `error{unknown_option \| invalid \| config_failed \| not_attached}` |
+| `answer_permission` | session_id, pending_id, option_id | `answer_result` \| `error{not_attached}` |
+| `answer_elicitation` | session_id, pending_id, action, content? (only with `accept`) | `answer_result` \| `error{not_attached}` |
 | `list_projects` | — (roots come from the host's config, §7) | `projects{items[], partial}` |
 | `browse_directory` | path | `directory{entries[]}` \| `error` |
 | `resolve_path` | path | `resolved_path{canonical, exists, is_dir}` \| `error` (kernel spec §5.4) |
@@ -294,7 +366,7 @@ host.)*
 | Type | Key fields | Notes |
 |---|---|---|
 | `hello_ack` | protocol_version, collector_version, server_time, committed{session_id: seq} | Reply to `hello`; `committed` holds the collector's highest committed seq for every session listed in `attached_sessions` (§5.1). |
-| `hello_error` | code (`incompatible` \| `revoked` \| `already_connected` \| `bad_proof`), message | Then the socket closes. |
+| `hello_error` | code (`incompatible` \| `revoked` \| `already_connected` \| `bad_proof`), message | Then the socket closes. `incompatible`: another protocol major; `bad_proof`: the credential does not verify. |
 | `ack` | session_id, ack_seq | Highest seq committed for that session (§3.6). |
 | `forget_hat` | hat_id | Sent after each handshake for recently purged hats; the host deletes that hat's composed agent home once no process of the hat runs. Idempotent (kernel spec §5.5). |
 
@@ -308,12 +380,52 @@ host.)*
 | `error` | request_id, code, message | Rejection of a request. |
 | `projects`, `directory`, `resolved_path`, `agents` | request_id, … | Probe responses. |
 
+**Request details and error codes:**
+
+- `start_session` / `resume_session` carry `model?, mode?, axes{}` flat on the
+  frame (one `SessionConfig`, flattened). `resume_session` carries the
+  adapter's own `agent_session_id`, from the stored `session_started`: the
+  host keeps no copy across a restart, and `session/load` needs it. A resume
+  re-sends the **stored** config, which is what the agent last reported
+  (§4.3, §8), not what was once asked for.
+- `cancel_turn` is completed by its turn's `turn_ended`, matched by session and
+  turn, not by a fact carrying the request id. A turn that finished before the
+  cancel reached the agent answers with its real outcome (`completed`,
+  `failed`), not `cancelled`. `not_running`: the host has no such turn in
+  flight; its end, if any, is already in the outbox ahead of the rejection
+  (wire order, §3.1). A repeated cancel for a turn already being cancelled
+  changes nothing.
+- `set_config`: `unknown_option` — the option is not in the actor's
+  catalogue; `invalid` — the value is of the wrong kind for it;
+  `config_failed` — the adapter refused it, did not answer within 15 s, or an
+  earlier switch is still out (§4.3).
+- `prompt`: `invalid` — the content is not ACP ContentBlocks.
+- `start_session`: `unknown_agent` — the agent is not configured on the host.
+- Answers to a session with no live actor are refused `not_attached`. The
+  collector logs that refusal; it is no verdict (§4.6).
+- A command queued behind an ending actor is answered `not_attached` at once,
+  never left to the collector's timeout (§2.2).
+
+**Not on the wire yet** (they arrive with their subsystems): `first_prompt`,
+`mcp_servers[]` and `hat` on start/resume (gateway, hats); `hello.proof`
+(the skeleton sends a shared development `token`), `hello.agents[]` and
+`workspace_roots[]`; the probes and their responses; `forget_hat`;
+`hello_error{revoked}`.
+
 `hello` fields:
 
-- `capabilities` is a closed list: `projects` (project enumeration and
-  browsing), `images` (image content blocks in prompts), `park` (explicit
-  park). The collector never sends a frame, or a prompt containing images, to a
-  host that lacks the capability; the UI hides the feature for that host.
+- `capabilities`: `projects` (project enumeration and browsing), `images`
+  (image content blocks in prompts), `park` (explicit park). The collector
+  never sends a frame, or a prompt containing images, to a host that lacks the
+  capability; the UI hides the feature for that host. **Deserialized
+  leniently:** an entry this build does not know (a newer host) is skipped,
+  never a reason to refuse the `hello`; an absent field means none. The
+  generated JSON Schema still lists the known values as a closed set, but that
+  describes them, it does not constrain: a schema-validating client or proxy
+  must not reject a `hello` on an unknown capability either. The collector
+  keeps capabilities per connection (in the hub, not the store), so a host
+  that reconnects on an older build loses them at once. The hennery host
+  announces only `park` so far.
 - `agents[]`: per agent `{id, version, available, auth, catalog}` where
   `catalog` is the profile's **static default catalogue** (§6), so the
   New-session pickers work before the first session on a host exists.
@@ -324,7 +436,10 @@ Unknown frame types and unknown body kinds in either direction are logged
 answered with `error{code: invalid}` if it had a `request_id`. Adding a type
 without a handler does not compile (umbrella §5.4). *(P-8: the predecessor
 dropped unknown frames silently and once shipped a result type with no
-collector handler; its tests passed on a timeout.)*
+collector handler; its tests passed on a timeout.)* **Not built yet:** both
+ends log and skip a frame that fails to parse, a known type that fails
+validation included; the `error{invalid}` answer for it is still to come.
+A host frame for a session that host does not own is logged and skipped.
 
 ### 3.4 Timeouts and disconnects
 
@@ -337,13 +452,39 @@ collector handler; its tests passed on a timeout.)*
 
 - Every timeout for a state-changing request is **at least the WebSocket read
   deadline** (45 s, umbrella §5.8), so while the connection is alive the fact
-  or a rejection arrives first.
+  or a rejection arrives first. The collector's build asserts it.
+- **The host bounds its own side below these:** a start or resume at 75 s
+  (then `start_failed`); each config switch at 15 s (`CONFIG_TIMEOUT`); a
+  cancel the adapter ignores at 20 s (`CANCEL_GRACE`) plus the 5 s kill grace.
+  So on a live connection the host's answer always beats the collector's
+  timeout. The collector waits 10 s for a new connection's `hello`.
 - **When the host connection drops**, the collector immediately fails every
   in-flight HTTP waiter for that host with "host disconnected; delivery
-  unknown" and marks the affected start or turn as **awaiting
-  reconciliation** — never as failed. Reconciliation happens after the host's
-  resend and `hello.attached_sessions` (§5.1). A timeout on a live connection
-  is reported the same way.
+  unknown" (503 `delivery_unknown`, §9) and leaves the affected start or turn
+  **awaiting reconciliation** — never failed. Reconciliation happens after
+  the host's resend and `hello.attached_sessions` (§5.1). Waiters belong to a
+  connection: a drop fails only the waiters of that connection, never those
+  of a newer one of the same host.
+- **A timeout on a live connection drops that connection.** It is reported
+  the same way ("delivery unknown"), and because reconciliation runs only at a
+  handshake, forcing a reconnect is what makes the timed-out start or turn
+  reconcile at all. The other sessions on that host see a reconnect; their
+  adapters are unaffected (§2.1).
+- **The hub owns every waiter's deadline.** Registering a waiter arms a
+  watchdog: at the deadline, if the waiter is still there for the same
+  connection, the watchdog removes it, answers "delivery unknown" and drops
+  that connection. So a request whose HTTP handler is gone (the client
+  disconnected) still cannot leave a session `starting` or a turn `sent`
+  forever.
+- **A rejection is applied by the socket task.** A start, resume or prompt
+  registers an undo with its waiter (start/resume: `failed` with the host's
+  code, only while still `starting`; prompt: the turn is removed). When the
+  host's `error` arrives, the socket task takes the waiter, applies its undo,
+  then answers it, so the store is right even when no handler waits, and HTTP
+  and store agree. If the undo itself fails, the answer is "delivery unknown"
+  and the connection is dropped.
+- **A host that is connected but not yet reconciled** is treated as offline:
+  requests to it are refused, never queued (§5.1 step 4, §9).
 - A `starting` session found in SQLite after a **collector restart** is
   reconciled the same way when its host next connects.
 - Every rejection, including a failed resume, is correlated by `request_id`
@@ -377,13 +518,21 @@ one of the three supported topologies (umbrella §7.5).
 - The host stamps every session frame with a per-session monotonic `seq` when
   it enters the outbox; `seq` counters are persisted with the outbox.
 - **Idempotent ingest on `(session_id, seq)`.** A duplicate with the same
-  payload hash is acknowledged and discarded. A duplicate with a **different**
-  payload hash is stored as a `conflict` event (§8) and acknowledged; it is
-  never silently dropped.
+  body is acknowledged and discarded. A duplicate with a **different** body is
+  stored as a `conflict` event `{seq, received}` (§8) and acknowledged; it is
+  never silently dropped. A re-sent conflicting frame whose `received` body is
+  already on record adds no second `conflict`.
+- **Bodies are compared structurally** (stored vs received JSON), not by a
+  stored hash: key order is not stable across builds (`serde_json`'s
+  `preserve_order` is feature-unified), and a Rust-std hash is not stable
+  across releases.
+- **An ingest error drops the host connection without acking.** Acks are
+  cumulative, so acking a later frame would tell the host an uncommitted one
+  is safe to delete.
 - **Ack = the highest seq the collector has committed for that session** (not
   necessarily contiguous). The host deletes outbox rows with `seq ≤ ack_seq`.
 - The collector groups ingest commits (at most every 50 ms) and acks after the
-  commit.
+  commit. *(Built so far: one commit per frame, acked after it.)*
 - `seq` exists only for host → collector delivery; the browser's cursor is the
   collector's `event_id` (§9).
 
