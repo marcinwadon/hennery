@@ -51,7 +51,8 @@ slice); everything else is design. The maintainer's decisions are recorded below
    - [Operator auth (3b-ii)](plans/2026-10-03-operator-auth-2.md) — the second part of plan 3b (7 tasks):
      several listeners and the health checks, `config.toml`, the admin socket with `hennery admin`
      (setup link, password and `public_url` resets, hosts, pairing codes), and agents no longer
-     inheriting stray descriptors. `owner_id` everywhere (3b-iii) and passkeys (3c) follow. Not executed yet.
+     inheriting stray descriptors. `owner_id` everywhere (3b-iii) and passkeys (3c) follow. Amended after
+     the security review of 2026-10-03; executed 2026-10-01 as PRs #14 and #15 (see its "Execution status").
 
 ## Maintainer decisions (2026-09-27)
 
