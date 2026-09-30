@@ -1309,10 +1309,11 @@ fn a_sigterm_as_up_starts_leaves_no_child_running() {
 }
 
 /// `--listen-fd` (`up`'s hand-over) adopts only a listening TCP socket: a
-/// closed descriptor, a file, a UDP socket or a TCP socket that does not
-/// listen is refused at once with a message naming it, before the data
-/// directory is made, not adopted to abort or hang later. Also refused: a
-/// standard stream's number, and `--listen` with it.
+/// closed descriptor, a file, a UDP socket, a TCP socket that does not
+/// listen (never bound, or bound and never listened on) and a listening
+/// Unix socket are refused at once with a message naming it, before the
+/// data directory is made, not adopted to abort, hang or serve later. Also
+/// refused: a standard stream's number, and `--listen` with it.
 #[test]
 fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
     use std::os::fd::{AsRawFd, OwnedFd};
@@ -1325,6 +1326,24 @@ fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
     let tcp = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
     assert!(tcp >= 0);
     let tcp: OwnedFd = unsafe { std::os::fd::FromRawFd::from_raw_fd(tcp) };
+    // Bound to a port (port 0: the system picks one), never listened on:
+    // macOS used to take this one.
+    // SAFETY: socket(2) and bind(2) on a local address, owned at once.
+    let bound: OwnedFd = unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        assert!(fd >= 0);
+        let mut addr: libc::sockaddr_in = std::mem::zeroed();
+        addr.sin_family = libc::AF_INET as libc::sa_family_t;
+        addr.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
+        let rc = libc::bind(
+            fd,
+            (&raw const addr).cast(),
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        );
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        std::os::fd::FromRawFd::from_raw_fd(fd)
+    };
+    let unix: OwnedFd = std::os::unix::net::UnixListener::bind(dir.join("s")).unwrap().into();
     let listening: OwnedFd = std::net::TcpListener::bind("127.0.0.1:0").unwrap().into();
     let collector = |fd: Option<&OwnedFd>, args: &[&str]| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
@@ -1369,6 +1388,12 @@ fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
             Some(&tcp),
             "is not a listening socket",
         ),
+        (
+            "a TCP socket bound and never listened on",
+            Some(&bound),
+            "is not a listening socket",
+        ),
+        ("a listening Unix socket", Some(&unix), "is not a TCP socket"),
     ] {
         // 50: well above what the collector's own runtime opens at start.
         let (status, stderr) = collector(fd, &["--listen-fd", "50"]);

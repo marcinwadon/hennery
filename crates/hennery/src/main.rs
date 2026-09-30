@@ -217,8 +217,9 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
 
 /// Adopt `--listen-fd`: `fd` must be an open, listening TCP socket. Anything
 /// else is refused, not adopted: a closed descriptor would abort the process
-/// on first use, and a UDP or unconnected socket would hang it. The socket
-/// is made close-on-exec and non-blocking.
+/// on first use, a UDP or unconnected socket would hang it, and a Unix
+/// socket would be served as if it were TCP. The socket is made
+/// close-on-exec and non-blocking.
 fn inherited_listener(fd: i32) -> Result<std::net::TcpListener> {
     let option = |name: libc::c_int| -> std::io::Result<libc::c_int> {
         let mut value: libc::c_int = 0;
@@ -243,27 +244,15 @@ fn inherited_listener(fd: i32) -> Result<std::net::TcpListener> {
     if kind != libc::SOCK_STREAM {
         bail!("--listen-fd {fd} is not a stream (TCP) socket");
     }
+    let family = socket_family(fd).with_context(|| format!("--listen-fd {fd}: getsockname"))?;
+    if family != libc::AF_INET && family != libc::AF_INET6 {
+        bail!("--listen-fd {fd} is not a TCP socket (address family {family}, not IPv4 or IPv6)");
+    }
     let listening = match option(libc::SO_ACCEPTCONN) {
         Ok(value) => value == 1,
-        // macOS has no `SO_ACCEPTCONN` to read. There, a socket bound to a
-        // port and without a peer is taken to listen: that refuses one never
-        // bound and a connected one, but not one bound and never listened on.
+        // macOS has no `SO_ACCEPTCONN` to read; its TCP state tells.
         Err(err) if err.raw_os_error() == Some(libc::ENOPROTOOPT) => {
-            // SAFETY: getsockname/getpeername(2) into local storage of the
-            // size they are told.
-            unsafe {
-                let mut addr: libc::sockaddr_storage = std::mem::zeroed();
-                let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-                let bound = libc::getsockname(fd, (&raw mut addr).cast(), &mut len) == 0
-                    && match libc::c_int::from(addr.ss_family) {
-                        libc::AF_INET => (*(&raw const addr).cast::<libc::sockaddr_in>()).sin_port != 0,
-                        libc::AF_INET6 => (*(&raw const addr).cast::<libc::sockaddr_in6>()).sin6_port != 0,
-                        _ => false,
-                    };
-                let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-                let peer = libc::getpeername(fd, (&raw mut addr).cast(), &mut len) == 0;
-                bound && !peer
-            }
+            listens_by_tcp_state(fd).with_context(|| format!("--listen-fd {fd}: TCP_CONNECTION_INFO"))?
         }
         Err(err) => return Err(err).with_context(|| format!("--listen-fd {fd}: SO_ACCEPTCONN")),
     };
@@ -279,6 +268,52 @@ fn inherited_listener(fd: i32) -> Result<std::net::TcpListener> {
     let listener = unsafe { <std::net::TcpListener as std::os::fd::FromRawFd>::from_raw_fd(fd) };
     listener.set_nonblocking(true)?;
     Ok(listener)
+}
+
+/// The address family of socket `fd`, from getsockname(2).
+fn socket_family(fd: i32) -> std::io::Result<libc::c_int> {
+    // SAFETY: getsockname(2) into local storage of the size it is told;
+    // all-zero bytes are a valid `sockaddr_storage`.
+    unsafe {
+        let mut addr: libc::sockaddr_storage = std::mem::zeroed();
+        let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        if libc::getsockname(fd, (&raw mut addr).cast(), &mut len) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(libc::c_int::from(addr.ss_family))
+    }
+}
+
+/// Whether TCP socket `fd` listens, from its TCP state (`TCPS_LISTEN`):
+/// macOS's stand-in for `SO_ACCEPTCONN`. A socket bound and never listened
+/// on is refused, as is one never bound and a connected one.
+#[cfg(target_vendor = "apple")]
+fn listens_by_tcp_state(fd: i32) -> std::io::Result<bool> {
+    /// `TCPS_LISTEN` in `<netinet/tcp_fsm.h>`.
+    const TCPS_LISTEN: u8 = 1;
+    // SAFETY: all-zero bytes are a valid `tcp_connection_info` (integers).
+    let mut info: libc::tcp_connection_info = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::tcp_connection_info>() as libc::socklen_t;
+    // SAFETY: getsockopt(2) into a local struct of the size it is told.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONNECTION_INFO,
+            (&raw mut info).cast(),
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(info.tcpi_state == TCPS_LISTEN)
+}
+
+/// Elsewhere `SO_ACCEPTCONN` answers, so this is never reached.
+#[cfg(not(target_vendor = "apple"))]
+fn listens_by_tcp_state(_fd: i32) -> std::io::Result<bool> {
+    Err(std::io::Error::from_raw_os_error(libc::ENOPROTOOPT))
 }
 
 /// The development bearer's variable, from before 3b-i. Nothing reads it
