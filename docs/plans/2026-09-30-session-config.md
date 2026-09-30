@@ -27,6 +27,25 @@ It builds on the executed [cancel and capabilities plan](2026-09-29-cancel-capab
 
 **Status:** not executed. Every code block below was built and tested in a scratch copy of `75b2fc0`. The plan was then replayed from its own text, task by task, onto a fresh copy of `75b2fc0`, with fmt, clippy, the workspace tests and the codegen check after every task (241 tests at the end, from 195). The decisions were reviewed on 2026-09-30, and amended as marked.
 
+## Execution status (2026-09-30)
+
+**Executed** on branch `feat/session-config` (task-by-task with reviews, then a whole-branch review and one fix
+wave). The plan's decisions were confirmed by a stronger-model review on the maintainer's behalf (D1, D2, D4, D6
+amended). Where review found the plan's code wrong, the **code and the spec win**; the task bodies below are kept as
+written. Deviations:
+
+| Area | As built | Why |
+|---|---|---|
+| Start/resume switches (T4) | The "already current" skip and "no such option" verdict use the catalogue only when it is current and came from an adapter answer, never a seeded one | A stale or seeded catalogue silently dropped a requested value |
+| Live `set_config` (T5) | A timed-out switch becomes an orphan: later switches are refused "an earlier switch is still out", never sent; switches are checked when sent; answers arrive through the same ordered channel as notifications (`on_receiving_result`) | Concurrent switches could clamp each other; an older read-back could overwrite a newer agent update, or vice versa |
+| Self-ending actor (T9) | One locked decision in `spawn_or_restart` waits behind an ending actor; start-failure kill graces also mark ending | A resume could launch a second adapter while the first was ending |
+| Update cap (T10) | Switch deadlines are disarmed by an "answered" flag set before the answer is queued; no deadline arm drains; `send_next_switch` after every drain | Under a flood, an in-time answer was reported failed, a queued switch waited a whole turn, or a drain held off a Cancel |
+| Start orphan (final) | A start switch that timed out is carried into the main loop as an unmatched orphan (blocks `set_config` until its grace) | Otherwise a `set_config` right after `session_started` could run concurrently with it |
+| Late orphan answer (final) | Emitted as a sequenced `config_applied` under the failed request's id | The store and UI kept the old value while the agent had switched; a later resume would have reverted it |
+
+**Decision 6 amended in execution:** the orphan's late non-empty read-back is announced as `config_applied` (a
+sequenced fact, not a second HTTP answer), and a timed-out start switch blocks live switches until its grace passes.
+
 ## Scope
 
 This is **plan B2b**, the config half of B2 as B2a's "After this plan" scoped it. It fits in ten right-sized tasks, including both B2a carry-overs, so it is not split further.
