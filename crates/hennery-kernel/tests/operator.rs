@@ -130,7 +130,7 @@ fn public_urls_are_normalised_to_their_browser_origin() {
 }
 
 #[tokio::test]
-async fn check_password_verifies_on_a_blocking_thread() {
+async fn concurrent_checks_each_verify_once_and_answer_their_own_password() {
     let op = Arc::new(Operator::open_in_memory().unwrap());
     let token = op.issue_setup_token(NOW).unwrap().unwrap();
     op.set_up(&token, PASSWORD, "https://hennery.example", NOW).unwrap();

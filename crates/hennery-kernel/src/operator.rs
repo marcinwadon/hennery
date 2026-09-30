@@ -110,8 +110,15 @@ pub struct Operator {
     /// Loaded at open and replaced by setup: read on every browser request.
     public_url: RwLock<Option<PublicUrl>>,
     setup: Mutex<Option<SetupToken>>,
-    hashing: tokio::sync::Semaphore,
+    /// `check_password`'s slots, each held until its verify ends.
+    hashing: Arc<tokio::sync::Semaphore>,
     verifications: AtomicU64,
+    /// Verifies running now, and the most ever at once (`check_password`'s
+    /// bound, pinned by the unit tests below).
+    #[cfg(test)]
+    in_flight: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    max_in_flight: std::sync::atomic::AtomicUsize,
 }
 
 impl Operator {
@@ -132,8 +139,12 @@ impl Operator {
             conn: Mutex::new(conn),
             public_url: RwLock::new(public_url),
             setup: Mutex::new(None),
-            hashing: tokio::sync::Semaphore::new(MAX_CONCURRENT_HASHES),
+            hashing: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HASHES)),
             verifications: AtomicU64::new(0),
+            #[cfg(test)]
+            in_flight: Default::default(),
+            #[cfg(test)]
+            max_in_flight: Default::default(),
         })
     }
 
@@ -175,7 +186,8 @@ impl Operator {
     /// Create the owner with `password` and store `public_url` (kernel spec
     /// §3.1), if `token` is the live setup token. The token is used up only
     /// once the owner is committed. Hashes the password: call it on a
-    /// blocking thread.
+    /// blocking thread. It takes no `check_password` slot: only the token's
+    /// holder gets as far as the hash, and the setup lock serialises it.
     pub fn set_up(&self, token: &str, password: &str, public_url: &str, now: i64) -> Result<SetupOutcome> {
         // Held throughout, so two setups cannot both pass the checks.
         let mut setup = self.setup.lock().expect("setup lock");
@@ -223,6 +235,9 @@ impl Operator {
     /// against a dummy hash, so the answer takes as long either way.
     /// Blocking: prefer `check_password`.
     pub fn verify_password(&self, password: &str) -> Result<bool> {
+        // First, so it is counted before `verifications` and dropped last.
+        #[cfg(test)]
+        let _gauge = InFlight::enter(self);
         self.verifications.fetch_add(1, Ordering::Relaxed);
         let phc: Option<String> = self
             .conn()
@@ -243,15 +258,22 @@ impl Operator {
     }
 
     /// `verify_password` on a blocking thread, at most
-    /// `MAX_CONCURRENT_HASHES` at once; others wait their turn.
+    /// `MAX_CONCURRENT_HASHES` at once; others wait their turn. The slot
+    /// moves into the blocking closure: a caller that goes away (a client
+    /// disconnect, a timeout) cannot free it while its verify still runs.
     pub async fn check_password(self: &Arc<Self>, password: String) -> Result<bool> {
-        let _permit = self
+        let permit = self
             .hashing
-            .acquire()
+            .clone()
+            .acquire_owned()
             .await
             .context("the hashing semaphore is closed")?;
         let this = self.clone();
-        tokio::task::spawn_blocking(move || this.verify_password(&password)).await?
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            this.verify_password(&password)
+        })
+        .await?
     }
 
     /// How many password checks have run: every login attempt that is not
@@ -291,4 +313,87 @@ fn password_problem(password: &str) -> Option<String> {
 fn dummy_hash() -> &'static str {
     static HASH: OnceLock<String> = OnceLock::new();
     HASH.get_or_init(|| password_auth::generate_hash(hex::encode(random_bytes::<16>())))
+}
+
+/// Counts one verify in `Operator::in_flight` for as long as it lives.
+#[cfg(test)]
+struct InFlight<'a>(&'a Operator);
+
+#[cfg(test)]
+impl<'a> InFlight<'a> {
+    fn enter(op: &'a Operator) -> Self {
+        let now = op.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        op.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        Self(op)
+    }
+}
+
+#[cfg(test)]
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    const NOW: i64 = 1_800_000_000;
+    const PASSWORD: &str = "correct horse battery";
+
+    fn set_up() -> Arc<Operator> {
+        let op = Arc::new(Operator::open_in_memory().unwrap());
+        let token = op.issue_setup_token(NOW).unwrap().unwrap();
+        op.set_up(&token, PASSWORD, "https://hennery.example", NOW).unwrap();
+        op
+    }
+
+    /// Wait (bounded) until `done` holds.
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting until {what}");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn at_most_two_checks_verify_at_once() {
+        let op = set_up();
+        let checks: Vec<_> = (0..8)
+            .map(|_| {
+                let op = op.clone();
+                tokio::spawn(async move { op.check_password(PASSWORD.to_string()).await.unwrap() })
+            })
+            .collect();
+        for check in checks {
+            assert!(check.await.unwrap());
+        }
+        assert_eq!(op.verifications(), 8);
+        assert!(op.max_in_flight.load(Ordering::SeqCst) <= MAX_CONCURRENT_HASHES);
+    }
+
+    /// A check whose caller goes away (a client disconnect, a timeout)
+    /// keeps its slot until its verify ends: the verify runs on regardless.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_abandoned_check_keeps_its_slot_until_its_verify_ends() {
+        let op = set_up();
+        for round in 1..=8u64 {
+            let checks: Vec<_> = (0..2)
+                .map(|_| {
+                    let op = op.clone();
+                    tokio::spawn(async move { op.check_password(PASSWORD.to_string()).await })
+                })
+                .collect();
+            until("both checks of the round verify", || op.verifications() == 2 * round).await;
+            for check in &checks {
+                check.abort();
+            }
+        }
+        until("every verify ends", || op.in_flight.load(Ordering::SeqCst) == 0).await;
+        let max = op.max_in_flight.load(Ordering::SeqCst);
+        assert!(max <= MAX_CONCURRENT_HASHES, "{max} verifies ran at once");
+    }
 }
