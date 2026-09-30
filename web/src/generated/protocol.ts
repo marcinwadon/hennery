@@ -56,10 +56,12 @@ export type SessionBody = { "kind": "session_started", request_id: string, agent
 
 export type HostFrame = { "type": "hello", protocol_version: string, host_version: string, host_id: string, 
 /**
- * Walking skeleton only: a shared development token. Replaced by an
- * Ed25519 proof of possession (ACP core §3.5).
+ * Proof of possession of the host's key (ACP core §3.5): its
+ * Ed25519 signature, hex, over `hello_proof_message(nonce, host_id,
+ * protocol_version)`, where the nonce is the one the collector sent
+ * in the upgrade response's `hennery-hello-nonce` header.
  */
-token: string, 
+proof: string, 
 /**
  * What this host implements (a closed list, ACP core §3.3). Absent
  * means none.
@@ -192,3 +194,17 @@ export type EnrollRequest = { code: string,
 public_key: string, name: string, host_version: string, platform: string, };
 
 export type EnrollResponse = { host_id: string, };
+
+export type HostItem = { host_id: string, name: string, platform: string, host_version: string, 
+/**
+ * From its latest accepted `hello`.
+ */
+capabilities: Capabilities, 
+/**
+ * Connected and reconciled: requests reach it now.
+ */
+connected: boolean, 
+/**
+ * RFC 3339.
+ */
+created_at: string, last_seen_at?: string | undefined, revoked_at?: string | undefined, };

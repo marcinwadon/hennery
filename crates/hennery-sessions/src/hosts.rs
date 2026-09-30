@@ -8,11 +8,11 @@ use crate::api::{error, internal};
 use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
-use hennery_kernel::hosts::{EnrollOutcome, Enrollment};
+use hennery_kernel::hosts::{EnrollOutcome, Enrollment, HostRecord};
 use hennery_kernel::secret::unix_now;
-use hennery_proto::rest::{EnrollRequest, EnrollResponse, PairingCodeResponse};
+use hennery_proto::rest::{EnrollRequest, EnrollResponse, HostItem, PairingCodeResponse};
 use std::net::SocketAddr;
 use std::time::Instant;
 
@@ -21,6 +21,7 @@ use std::time::Instant;
 /// alone and so sits outside that layer (kernel spec §3.3).
 pub fn router(state: AppState) -> Router {
     let operator = Router::new()
+        .route("/api/hosts", get(list_hosts))
         .route("/api/hosts/pairing-codes", post(mint_pairing_code))
         .layer(middleware::from_fn_with_state(
             state.token.clone(),
@@ -98,6 +99,32 @@ async fn enroll(
             "a host with this key is paired already",
         ),
         Ok(EnrollOutcome::Invalid(why)) => error(StatusCode::BAD_REQUEST, "invalid", why),
+        Err(err) => internal(err),
+    }
+}
+
+/// A registry entry as the API shows it, with whether it is connected.
+pub(crate) fn host_item(state: &AppState, record: HostRecord) -> HostItem {
+    HostItem {
+        connected: state.hub.is_ready(&record.id),
+        host_id: record.id,
+        name: record.name,
+        platform: record.platform,
+        host_version: record.host_version,
+        capabilities: record.capabilities,
+        created_at: rfc3339(record.created_at),
+        last_seen_at: record.last_seen_at.map(rfc3339),
+        revoked_at: record.revoked_at.map(rfc3339),
+    }
+}
+
+/// `GET /api/hosts`: every paired host, oldest first.
+async fn list_hosts(State(state): State<AppState>) -> Response {
+    match state.hosts.list() {
+        Ok(records) => {
+            let items: Vec<HostItem> = records.into_iter().map(|r| host_item(&state, r)).collect();
+            Json(items).into_response()
+        }
         Err(err) => internal(err),
     }
 }

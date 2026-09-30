@@ -318,9 +318,11 @@ pub enum HostFrame {
         protocol_version: String,
         host_version: String,
         host_id: String,
-        /// Walking skeleton only: a shared development token. Replaced by an
-        /// Ed25519 proof of possession (ACP core §3.5).
-        token: String,
+        /// Proof of possession of the host's key (ACP core §3.5): its
+        /// Ed25519 signature, hex, over `hello_proof_message(nonce, host_id,
+        /// protocol_version)`, where the nonce is the one the collector sent
+        /// in the upgrade response's `hennery-hello-nonce` header.
+        proof: String,
         /// What this host implements (a closed list, ACP core §3.3). Absent
         /// means none.
         #[serde(default)]

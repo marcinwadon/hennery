@@ -6,11 +6,14 @@ use crate::store::Store;
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::http::HeaderValue;
 use axum::response::Response;
 use axum::routing::get;
 use futures::{SinkExt, StreamExt};
+use hennery_kernel::hosts::HelloCheck;
+use hennery_kernel::secret::{random_bytes, unix_now};
 use hennery_proto::frames::{CollectorFrame, HostFrame, SessionBody};
-use hennery_proto::{PROTOCOL_VERSION, protocol_major};
+use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION, protocol_major};
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -24,17 +27,26 @@ pub fn router(state: AppState) -> Router {
     Router::new().route("/api/hosts/ws", get(upgrade)).with_state(state)
 }
 
+/// The upgrade response carries this connection's nonce: the host signs it
+/// in `hello` (ACP core §3.5), so a proof is good for one connection only.
 async fn upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
-    ws.max_message_size(MAX_FRAME)
+    let nonce = random_bytes::<32>();
+    let mut response = ws
+        .max_message_size(MAX_FRAME)
         .max_frame_size(MAX_FRAME)
-        .on_upgrade(move |socket| serve(socket, state))
+        .on_upgrade(move |socket| serve(socket, state, nonce));
+    response.headers_mut().insert(
+        HELLO_NONCE_HEADER,
+        HeaderValue::from_str(&hex::encode(nonce)).expect("hex is a valid header value"),
+    );
+    response
 }
 
 fn text(frame: &CollectorFrame) -> Message {
     Message::Text(serde_json::to_string(frame).expect("frame serializes").into())
 }
 
-async fn serve(socket: WebSocket, state: AppState) {
+async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
     let (mut sink, mut stream) = socket.split();
 
     // 1. hello: first frame, authenticated.
@@ -44,11 +56,11 @@ async fn serve(socket: WebSocket, state: AppState) {
     };
     let Some(HostFrame::Hello {
         protocol_version,
+        host_version,
         host_id,
-        token,
+        proof,
         capabilities,
         attached_sessions,
-        ..
     }) = hello
     else {
         return;
@@ -63,13 +75,35 @@ async fn serve(socket: WebSocket, state: AppState) {
             .await;
         return;
     }
-    if !state.token.matches(&token) {
-        // The dev token stands in for ACP core §3.3's proof of identity.
-        let _ = sink.send(text(&reject("bad_proof", "invalid host credential"))).await;
-        return;
+    // The host id is never taken on its word (ACP core §3.5). Until the
+    // proof checks out it is logged `Debug`-escaped (`?host_id`): an
+    // unauthenticated peer chose it.
+    match state.hosts.check_hello(&host_id, &nonce, &protocol_version, &proof) {
+        Ok(HelloCheck::Accepted) => {}
+        Ok(HelloCheck::Revoked) => {
+            tracing::warn!(%host_id, "revoked host tried to connect");
+            let _ = sink
+                .send(text(&reject(
+                    "revoked",
+                    "this host was revoked; pair it again with `hennery host join`",
+                )))
+                .await;
+            return;
+        }
+        Ok(HelloCheck::BadProof) => {
+            tracing::warn!(?host_id, "hello with an unknown host id or an invalid proof");
+            let _ = sink
+                .send(text(&reject("bad_proof", "unknown host or invalid proof")))
+                .await;
+            return;
+        }
+        Err(err) => {
+            tracing::error!(?host_id, error = %err, "checking a hello failed");
+            return;
+        }
     }
     let (tx, mut rx) = mpsc::unbounded_channel::<CollectorFrame>();
-    let Some(registration) = state.hub.register(&host_id, tx.clone(), capabilities) else {
+    let Some(registration) = state.hub.register(&host_id, tx.clone(), capabilities.clone()) else {
         let _ = sink
             .send(text(&reject(
                 "already_connected",
@@ -96,6 +130,12 @@ async fn serve(socket: WebSocket, state: AppState) {
         state.hub.unregister(&host_id, conn_id);
         crate::offline::after_disconnect(&state, host_id, conn_id);
         return;
+    }
+    if let Err(err) = state
+        .hosts
+        .record_hello(&host_id, &host_version, &capabilities, unix_now())
+    {
+        tracing::warn!(%host_id, error = %err, "recording the host's hello failed");
     }
     tracing::info!(%host_id, "host connected");
 

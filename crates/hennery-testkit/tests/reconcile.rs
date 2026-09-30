@@ -3,11 +3,12 @@
 //! frame, so it controls exactly what was delivered before a drop.
 
 use futures::{SinkExt, StreamExt};
+use hennery_host::identity::HostKey;
 use hennery_kernel::auth::DevToken;
-use hennery_kernel::hosts::Hosts;
-use hennery_proto::PROTOCOL_VERSION;
+use hennery_kernel::hosts::{Enrollment, Hosts};
 use hennery_proto::frames::{AttachedSession, Capabilities, Capability, CollectorFrame, HostFrame, SessionBody};
 use hennery_proto::rest::EventDto;
+use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION};
 use hennery_sessions::{AppState, store::Store};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
@@ -16,6 +17,11 @@ use tokio_tungstenite::tungstenite::Message;
 
 const TOKEN: &str = "dev-token-for-tests";
 const HOST: &str = "host-1";
+
+/// The key `HOST` is paired with.
+fn host_key() -> HostKey {
+    HostKey::from_seed([1; 32])
+}
 
 struct Collector {
     addr: SocketAddr,
@@ -37,9 +43,18 @@ impl Collector {
     async fn start_in(dir: tempfile::TempDir, offline: Duration) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let hosts = Hosts::open(&dir.path().join("hennery.db")).unwrap();
+        let enrollment = Enrollment {
+            public_key: host_key().public_key_hex(),
+            name: "test".into(),
+            host_version: "test".into(),
+            platform: "test".into(),
+        };
+        // A no-op when the directory is reused (a collector restart).
+        hosts.register(HOST, &enrollment, 0).unwrap();
         let mut state = AppState::new(
             Store::open(&dir.path().join("hennery.db")).unwrap(),
-            Hosts::open(&dir.path().join("hennery.db")).unwrap(),
+            hosts,
             DevToken::new(TOKEN).unwrap(),
         );
         state.offline_threshold = offline;
@@ -82,15 +97,16 @@ impl ScriptedHost {
         seq: u64,
         capabilities: Capabilities,
     ) -> Self {
-        let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/api/hosts/ws", collector.addr))
+        let (ws, response) = tokio_tungstenite::connect_async(format!("ws://{}/api/hosts/ws", collector.addr))
             .await
             .unwrap();
+        let nonce = hex::decode(response.headers()[HELLO_NONCE_HEADER].to_str().unwrap()).unwrap();
         let mut host = Self { ws, seq };
         host.send(&HostFrame::Hello {
             protocol_version: PROTOCOL_VERSION.into(),
             host_version: "test".into(),
             host_id: HOST.into(),
-            token: TOKEN.into(),
+            proof: host_key().sign_hello(&nonce, HOST, PROTOCOL_VERSION),
             capabilities,
             attached_sessions: attached,
         })
@@ -944,12 +960,14 @@ async fn the_session_detail_shows_the_open_turn() {
 #[tokio::test]
 async fn a_hello_with_an_unknown_capability_is_accepted_with_the_known_ones() {
     let collector = Collector::start().await;
-    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{}/api/hosts/ws", collector.addr))
+    let (mut ws, response) = tokio_tungstenite::connect_async(format!("ws://{}/api/hosts/ws", collector.addr))
         .await
         .unwrap();
+    let nonce = hex::decode(response.headers()[HELLO_NONCE_HEADER].to_str().unwrap()).unwrap();
     let hello = json!({
         "type": "hello", "protocol_version": PROTOCOL_VERSION, "host_version": "future",
-        "host_id": HOST, "token": TOKEN, "capabilities": ["teleport", "park"], "attached_sessions": []
+        "host_id": HOST, "proof": host_key().sign_hello(&nonce, HOST, PROTOCOL_VERSION),
+        "capabilities": ["teleport", "park"], "attached_sessions": []
     });
     ws.send(Message::text(hello.to_string())).await.unwrap();
     let ack = tokio::time::timeout(Duration::from_secs(10), ws.next())

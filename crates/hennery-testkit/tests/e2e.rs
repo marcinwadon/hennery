@@ -1,10 +1,11 @@
 //! End to end: a real collector (in process), a real host (in process) and the
 //! fake ACP adapter as a real child process, talking over real sockets.
 
+use hennery_host::identity::HostKey;
 use hennery_host::{AgentCommand, HostConfig};
 use hennery_kernel::auth::DevToken;
-use hennery_kernel::hosts::Hosts;
-use hennery_proto::rest::{EventDto, PromptResponse, StartSessionResponse};
+use hennery_kernel::hosts::{Enrollment, Hosts};
+use hennery_proto::rest::{EventDto, HostItem, PromptResponse, StartSessionResponse};
 use hennery_sessions::{AppState, store::Store};
 use hennery_testkit::{FakeScript, SCRIPT_ENV};
 use serde_json::{Value, json};
@@ -13,6 +14,22 @@ use std::path::Path;
 use std::time::Duration;
 
 const TOKEN: &str = "dev-token-for-tests";
+
+/// The key `host-1` is paired with in every collector here.
+fn host_key() -> HostKey {
+    HostKey::from_seed([1; 32])
+}
+
+/// Pair `host-1` (a no-op for a collector restarted over the same database).
+fn pair_host(hosts: &Hosts) {
+    let enrollment = Enrollment {
+        public_key: host_key().public_key_hex(),
+        name: "test".into(),
+        host_version: "test".into(),
+        platform: "test".into(),
+    };
+    hosts.register("host-1", &enrollment, 0).unwrap();
+}
 
 struct Collector {
     addr: SocketAddr,
@@ -32,11 +49,9 @@ impl Collector {
             .await
             .expect("bind collector");
         let addr = listener.local_addr().unwrap();
-        let mut state = AppState::new(
-            Store::open(db).unwrap(),
-            Hosts::open(db).unwrap(),
-            DevToken::new(TOKEN).unwrap(),
-        );
+        let hosts = Hosts::open(db).unwrap();
+        pair_host(&hosts);
+        let mut state = AppState::new(Store::open(db).unwrap(), hosts, DevToken::new(TOKEN).unwrap());
         state.offline_threshold = offline;
         let task = tokio::spawn(hennery_sessions::serve(listener, state.clone()));
         Self { addr, state, task }
@@ -73,7 +88,7 @@ fn host_config(collector: SocketAddr, data_dir: &Path, fake: AgentCommand) -> Ho
     let mut cfg = HostConfig::new(
         format!("ws://{collector}/api/hosts/ws"),
         "host-1",
-        TOKEN,
+        host_key(),
         data_dir.to_path_buf(),
     );
     cfg.reconnect_min = Duration::from_millis(100);
@@ -110,8 +125,8 @@ where
 async fn wait_host_connected(c: &reqwest::Client, collector: &Collector) {
     let url = collector.url("/api/hosts");
     wait_for("host connection", || async {
-        let hosts: Vec<String> = c.get(&url).send().await.ok()?.json().await.ok()?;
-        hosts.contains(&"host-1".to_string()).then_some(())
+        let hosts: Vec<HostItem> = c.get(&url).send().await.ok()?.json().await.ok()?;
+        hosts.iter().any(|h| h.host_id == "host-1" && h.connected).then_some(())
     })
     .await;
 }

@@ -1,5 +1,7 @@
-//! The `hennery` binary (distribution spec §1). Walking skeleton: collector,
-//! host and an all-in-one mode, with a shared development token.
+//! The `hennery` binary (distribution spec §1): collector, host (join and
+//! run) and an all-in-one mode. Hosts authenticate with the key they paired
+//! with; the REST API still takes a development bearer token until operator
+//! auth lands.
 
 mod inherit;
 
@@ -64,7 +66,8 @@ struct CollectorArgs {
     listen: String,
     #[arg(long, env = "HENNERY_DATA_DIR")]
     data_dir: PathBuf,
-    /// Development token for hosts and API clients (skeleton only).
+    /// Development bearer token for REST clients, until operator auth.
+    /// Hosts authenticate with their paired key instead.
     #[arg(long, env = "HENNERY_DEV_TOKEN", hide_env_values = true)]
     dev_token: String,
     /// Presume a host's sessions parked once it has been offline this long.
@@ -81,8 +84,6 @@ struct HostArgs {
     /// Holds the pairing `hennery host join` stored (`host.key`, `host.toml`).
     #[arg(long, env = "HENNERY_HOST_DATA_DIR")]
     data_dir: PathBuf,
-    #[arg(long, env = "HENNERY_DEV_TOKEN", hide_env_values = true)]
-    dev_token: String,
     /// Agent adapter, as `name=command args…`. Repeatable.
     #[arg(long = "agent", value_parser = parse_agent)]
     agents: Vec<(String, AgentCommand)>,
@@ -107,6 +108,7 @@ struct UpArgs {
     listen: String,
     #[arg(long, env = "HENNERY_DATA_DIR")]
     data_dir: PathBuf,
+    /// The collector's development bearer token for REST clients.
     #[arg(long, env = "HENNERY_DEV_TOKEN", hide_env_values = true)]
     dev_token: String,
     #[arg(long = "agent", value_parser = parse_agent)]
@@ -204,7 +206,7 @@ async fn run_host(args: HostArgs) -> Result<()> {
         }
     };
     let collector_url = args.collector_url.unwrap_or(paired.collector_url);
-    let mut cfg = HostConfig::new(collector_url, paired.host_id, args.dev_token, args.data_dir);
+    let mut cfg = HostConfig::new(collector_url, paired.host_id, paired.key, args.data_dir);
     cfg.agents = args.agents.into_iter().collect();
     cfg.idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
     // On SIGINT/SIGTERM the host stops its connection and waits (bounded)
@@ -286,7 +288,6 @@ async fn run_up(args: UpArgs) -> Result<()> {
         .arg(hennery_host::pairing::collector_ws_url(&collector_url)?)
         .arg("--idle-timeout-secs")
         .arg(args.idle_timeout_secs.to_string())
-        .env("HENNERY_DEV_TOKEN", &args.dev_token)
         .kill_on_drop(true)
         .process_group(0);
     for (name, command) in &args.agents {

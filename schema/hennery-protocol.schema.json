@@ -643,11 +643,11 @@
             "host_version": {
               "type": "string"
             },
-            "protocol_version": {
+            "proof": {
+              "description": "Proof of possession of the host's key (ACP core §3.5): its\nEd25519 signature, hex, over `hello_proof_message(nonce, host_id,\nprotocol_version)`, where the nonce is the one the collector sent\nin the upgrade response's `hennery-hello-nonce` header.",
               "type": "string"
             },
-            "token": {
-              "description": "Walking skeleton only: a shared development token. Replaced by an\nEd25519 proof of possession (ACP core §3.5).",
+            "protocol_version": {
               "type": "string"
             },
             "type": {
@@ -660,7 +660,7 @@
             "protocol_version",
             "host_version",
             "host_id",
-            "token",
+            "proof",
             "attached_sessions"
           ],
           "type": "object"
@@ -731,6 +731,57 @@
           "type": "object"
         }
       ]
+    },
+    "HostItem": {
+      "description": "One entry of `GET /api/hosts` (kernel spec §8): a paired host, revoked\nones included.",
+      "properties": {
+        "capabilities": {
+          "$ref": "#/$defs/Capabilities",
+          "description": "From its latest accepted `hello`."
+        },
+        "connected": {
+          "description": "Connected and reconciled: requests reach it now.",
+          "type": "boolean"
+        },
+        "created_at": {
+          "description": "RFC 3339.",
+          "type": "string"
+        },
+        "host_id": {
+          "type": "string"
+        },
+        "host_version": {
+          "type": "string"
+        },
+        "last_seen_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        },
+        "platform": {
+          "type": "string"
+        },
+        "revoked_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "host_id",
+        "name",
+        "platform",
+        "host_version",
+        "capabilities",
+        "connected",
+        "created_at"
+      ],
+      "type": "object"
     },
     "Indexed": {
       "description": "Fields the collector may read from a session event. Closed set (ACP core §3.2).\n\nThe catalogue extracts (`config_options`, `current_model`,\n`current_mode`, `current_axes`) travel together: when `config_options`\nis present and not empty, the four are one snapshot of the adapter's\nconfig. An absent or empty `config_options` means \"no read-back\", never\n\"the adapter has no config\" (a response that failed to parse looks\nempty).",

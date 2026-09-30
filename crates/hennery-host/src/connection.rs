@@ -4,13 +4,14 @@
 //! socket only ends `connect_once`; session actors keep running and keep
 //! writing to the outbox, which is resent on the next connection.
 
+use crate::identity::HostKey;
 use crate::outbox::Outbox;
 use crate::session::{self, AgentCommand, Answer, Attach, Launch, SessionCmd, SessionHandle, SessionOptions};
 use crate::uplink::Uplink;
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
-use hennery_proto::PROTOCOL_VERSION;
 use hennery_proto::frames::{AttachedSession, Capabilities, Capability, CollectorFrame, HostFrame, SessionConfig};
+use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -24,8 +25,8 @@ pub struct HostConfig {
     /// e.g. `ws://127.0.0.1:7117/api/hosts/ws`
     pub collector_url: String,
     pub host_id: String,
-    /// Walking skeleton: shared development token (ACP core §3.5 replaces it).
-    pub token: String,
+    /// The key this host paired with; it signs every `hello` (ACP core §3.5).
+    pub key: HostKey,
     pub data_dir: PathBuf,
     pub agents: HashMap<String, AgentCommand>,
     pub reconnect_min: Duration,
@@ -42,16 +43,11 @@ pub struct HostConfig {
 }
 
 impl HostConfig {
-    pub fn new(
-        collector_url: impl Into<String>,
-        host_id: impl Into<String>,
-        token: impl Into<String>,
-        data_dir: PathBuf,
-    ) -> Self {
+    pub fn new(collector_url: impl Into<String>, host_id: impl Into<String>, key: HostKey, data_dir: PathBuf) -> Self {
         Self {
             collector_url: collector_url.into(),
             host_id: host_id.into(),
-            token: token.into(),
+            key,
             data_dir,
             agents: HashMap::new(),
             reconnect_min: Duration::from_millis(500),
@@ -143,13 +139,22 @@ async fn connect_once(
     replies: &mut mpsc::UnboundedReceiver<HostFrame>,
     backoff: &mut Duration,
 ) -> Result<()> {
-    let (ws, _) = tokio::time::timeout(
+    let (ws, response) = tokio::time::timeout(
         cfg.connect_timeout,
         tokio_tungstenite::connect_async(&cfg.collector_url),
     )
     .await
     .map_err(|_| anyhow::anyhow!("no WebSocket handshake within {:?}", cfg.connect_timeout))?
     .context("connect to collector")?;
+    // The proof is over this connection's nonce, so it cannot be replayed on
+    // another one (ACP core §3.5). Without one there is nothing to sign.
+    let nonce = response
+        .headers()
+        .get(HELLO_NONCE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| hex::decode(v).ok())
+        .filter(|n| n.len() == 32)
+        .context("the collector sent no hello nonce")?;
     let (mut sink, mut stream) = ws.split();
 
     let attached = attached_sessions(uplink, sessions)?;
@@ -159,7 +164,7 @@ async fn connect_once(
             protocol_version: PROTOCOL_VERSION.into(),
             host_version: env!("CARGO_PKG_VERSION").into(),
             host_id: cfg.host_id.clone(),
-            token: cfg.token.clone(),
+            proof: cfg.key.sign_hello(&nonce, &cfg.host_id, PROTOCOL_VERSION),
             // Every hennery host can park. `projects` and `images` come
             // with the probes and with image prompts.
             capabilities: Capabilities(vec![Capability::Park]),

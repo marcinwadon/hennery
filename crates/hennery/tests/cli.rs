@@ -102,16 +102,7 @@ fn joining_over_http_ignores_a_configured_proxy() {
 #[test]
 fn a_malformed_agent_flag_is_rejected() {
     let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
-        .args([
-            "host",
-            "run",
-            "--data-dir",
-            "/tmp/x",
-            "--dev-token",
-            "t",
-            "--agent",
-            "noequals",
-        ])
+        .args(["host", "run", "--data-dir", "/tmp/x", "--agent", "noequals"])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -372,9 +363,12 @@ fn up_until_connected(listen: &str, dir: &std::path::Path) -> (KillTree, Vec<Str
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
         if let Some(serde_json::Value::Array(hosts)) = get_json(listen, "/api/hosts", "dev-token-for-tests")
-            && !hosts.is_empty()
+            && hosts.iter().any(|h| h["connected"] == true)
         {
-            let ids = hosts.iter().filter_map(|h| h.as_str().map(str::to_string)).collect();
+            let ids = hosts
+                .iter()
+                .filter_map(|h| h["host_id"].as_str().map(str::to_string))
+                .collect();
             return (guard, ids);
         }
         assert!(Instant::now() < deadline, "the all-in-one host never connected");

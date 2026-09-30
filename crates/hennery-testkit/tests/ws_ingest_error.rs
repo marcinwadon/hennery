@@ -10,10 +10,12 @@
 //! `SQLITE_BUSY` error — no invasive hook into `Store` required.
 
 use futures::{SinkExt, StreamExt};
+use hennery_host::identity::HostKey;
 use hennery_kernel::auth::DevToken;
-use hennery_kernel::hosts::Hosts;
-use hennery_proto::PROTOCOL_VERSION;
+use hennery_kernel::hosts::{Enrollment, Hosts};
 use hennery_proto::frames::{Capabilities, CollectorFrame, HostFrame, SessionBody};
+use hennery_proto::rest::HostItem;
+use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION};
 use hennery_sessions::AppState;
 use hennery_sessions::store::Store;
 use serde_json::json;
@@ -26,6 +28,24 @@ fn bearer() -> String {
     format!("Bearer {TOKEN}")
 }
 
+fn host_key() -> HostKey {
+    HostKey::from_seed([1; 32])
+}
+
+/// A registry with `host-1` paired, in memory: the tests below lock the
+/// session database, and the registry must not wait on that lock.
+fn paired_hosts() -> Hosts {
+    let hosts = Hosts::open_in_memory().unwrap();
+    let enrollment = Enrollment {
+        public_key: host_key().public_key_hex(),
+        name: "test".into(),
+        host_version: "test".into(),
+        platform: "test".into(),
+    };
+    hosts.register("host-1", &enrollment, 0).unwrap();
+    hosts
+}
+
 #[tokio::test]
 async fn a_failed_ingest_drops_the_connection_instead_of_acking_past_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -33,7 +53,7 @@ async fn a_failed_ingest_drops_the_connection_instead_of_acking_past_it() {
     let store = Store::open(&db).unwrap();
     store.create_session("s1", "host-1", "fake", "/tmp").unwrap();
 
-    let state = AppState::new(store, Hosts::open_in_memory().unwrap(), DevToken::new(TOKEN).unwrap());
+    let state = AppState::new(store, paired_hosts(), DevToken::new(TOKEN).unwrap());
     let shutdown = state.shutdown.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -53,16 +73,17 @@ async fn a_failed_ingest_drops_the_connection_instead_of_acking_past_it() {
     .await
     .unwrap();
 
-    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/hosts/ws"))
+    let (ws, response) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/hosts/ws"))
         .await
         .unwrap();
+    let nonce = hex::decode(response.headers()[HELLO_NONCE_HEADER].to_str().unwrap()).unwrap();
     let (mut sink, mut stream) = ws.split();
     sink.send(Message::text(
         serde_json::to_string(&HostFrame::Hello {
             protocol_version: PROTOCOL_VERSION.into(),
             host_version: "0".into(),
             host_id: "host-1".into(),
-            token: TOKEN.into(),
+            proof: host_key().sign_hello(&nonce, "host-1", PROTOCOL_VERSION),
             capabilities: Default::default(),
             attached_sessions: vec![],
         })
@@ -123,22 +144,23 @@ async fn an_undo_error_answers_delivery_unknown_and_drops_the_connection() {
     let db = dir.path().join("hennery.db");
     let store = Store::open(&db).unwrap();
 
-    let state = AppState::new(store, Hosts::open_in_memory().unwrap(), DevToken::new(TOKEN).unwrap());
+    let state = AppState::new(store, paired_hosts(), DevToken::new(TOKEN).unwrap());
     let shutdown = state.shutdown.clone();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let server = tokio::spawn(hennery_sessions::serve(listener, state));
 
-    let (ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/hosts/ws"))
+    let (ws, response) = tokio_tungstenite::connect_async(format!("ws://{addr}/api/hosts/ws"))
         .await
         .unwrap();
+    let nonce = hex::decode(response.headers()[HELLO_NONCE_HEADER].to_str().unwrap()).unwrap();
     let (mut sink, mut stream) = ws.split();
     sink.send(Message::text(
         serde_json::to_string(&HostFrame::Hello {
             protocol_version: PROTOCOL_VERSION.into(),
             host_version: "0".into(),
             host_id: "host-1".into(),
-            token: TOKEN.into(),
+            proof: host_key().sign_hello(&nonce, "host-1", PROTOCOL_VERSION),
             capabilities: Capabilities::default(),
             attached_sessions: vec![],
         })
@@ -162,7 +184,7 @@ async fn an_undo_error_answers_delivery_unknown_and_drops_the_connection() {
     let hosts_url = format!("http://{addr}/api/hosts");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let hosts: Vec<String> = client
+        let hosts: Vec<HostItem> = client
             .get(&hosts_url)
             .header("authorization", bearer())
             .send()
@@ -171,7 +193,7 @@ async fn an_undo_error_answers_delivery_unknown_and_drops_the_connection() {
             .json()
             .await
             .unwrap();
-        if hosts.iter().any(|h| h == "host-1") {
+        if hosts.iter().any(|h| h.host_id == "host-1" && h.connected) {
             break;
         }
         assert!(tokio::time::Instant::now() < deadline, "host never became ready");
