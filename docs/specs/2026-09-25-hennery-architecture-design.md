@@ -250,9 +250,10 @@ frame.
   state in the Hosts view. Never a silent half-working connection.
 - **Unknown frame types** are logged with a warning (rate-limited) and ignored.
   They are never silently lost and never crash the connection.
-- `capabilities` is a closed list (ACP core §3.3). The collector does not send
-  a frame a host's capabilities do not cover, and the UI hides features the
-  host lacks.
+- `capabilities` lists the known features (ACP core §3.3). An entry the
+  collector does not know is skipped, never a reason to refuse the `hello`.
+  The collector does not send a frame a host's capabilities do not cover, and
+  the UI hides features the host lacks.
 - The collector reconciles the host's sessions (parks missing ones, ends their
   turns, cancels their pending requests) only after `resend_complete`, so facts
   still in the outbox are never overtaken by a guess.
@@ -390,8 +391,10 @@ dedicated fix plus a database cleanup across dozens of sessions.
 
 **Activity** (meaningful only when `active`): `running | idle | blocked`.
 
-- `blocked` = at least one pending permission or elicitation. This is what
-  triggers Web Push and the blocked marker in lists.
+- `blocked` = a running turn waits on at least one pending permission or
+  elicitation. This is what triggers Web Push and the blocked marker in lists.
+  A question the agent asks outside a turn is pending too, but leaves the
+  activity alone (ACP core §4.2).
 
 *Rejected:* one flat status enum. The predecessor mixed "what the adapter is
 doing" with "whether the adapter exists" in one field, which produced states
@@ -411,11 +414,11 @@ the kind name.
 - A permission or elicitation request has **no timeout**. A question asked at
   night waits until morning.
 - It is cancelled only when the turn is cancelled, the session is parked or
-  closed, or the adapter is lost (host restart, adapter crash), and the
-  cancellation is shown explicitly on the card ("the agent is no longer
-  waiting — resume to continue").
-- The idle reaper **never** parks a `blocked` session: a pending request is by
-  definition mid-turn.
+  closed, the adapter is lost (host restart, adapter crash), or the agent
+  withdraws the question itself, and the cancellation is shown explicitly on
+  the card ("the agent is no longer waiting — resume to continue").
+- The idle reaper **never** parks a session with a pending request open, in a
+  turn or not (ACP core §4.7).
 
 ### 6.6 Failure scenarios
 
@@ -425,7 +428,7 @@ the kind name.
 | Collector restarts | Same as above from the host's side. Nothing is parked; `starting` sessions are reconciled on the host's next handshake. |
 | Host restarts (crash, upgrade, reboot) | Adapters die with it. After `resend_complete`, sessions that had a turn in flight get a `turn_ended{interrupted}` synthesised by the collector (the restarted host cannot emit it); all previously attached sessions become `parked`. Pending requests become `cancelled` with a visible reason. Resume = `session/load`. |
 | Host offline longer than the offline threshold (default 10 min, configurable) | Collector marks its sessions `parked` with a visible "host offline" note (presumed, not reported). On reconnect, `hello.attached_sessions` is authoritative: sessions whose adapter is still attached go `parked → active` without a resume, pending requests intact; the rest stay `parked`. |
-| Idle (default 30 min, configurable, never mid-turn, never `blocked`) | Host's reaper releases the adapter; session becomes `parked`. |
+| Idle (default 30 min, configurable, never mid-turn, never with a pending request open) | Host's reaper releases the adapter; session becomes `parked`. |
 | `session/load` fails | Session becomes `failed` with a readable reason (e.g. the agent CLI has no record of that session). |
 | Adapter crashes mid-turn | Host emits `turn_ended{interrupted}` and parks the session; the scrubbed stderr tail is attached for diagnosis. |
 
@@ -439,10 +442,12 @@ close or park mid-turn); the collector synthesises it only for host restarts.
   re-resolves the session's hat from its path and refuses the resume if it no
   longer matches (the operator must re-assign explicitly, §8.2); then the host
   spawns the adapter, calls `session/load` with replay suppression, re-applies
-  the stored model then mode (model first: switching model can clamp the
-  available modes), and reports the resulting configuration. The collector
-  stores what the host reports after the switch, never the pre-switch
-  catalogue.
+  the stored model, then the other config axes, then the mode (model first:
+  switching model can clamp the available modes), and reports the resulting
+  configuration. The stored values are what the agent last reported, not what
+  was once asked for. The collector stores what the host reports after the
+  switch, never the pre-switch catalogue. A switch that does not take is a
+  visible note, never a failed start or resume (ACP core §4.3).
 - **Park** is available explicitly (a button and an API call); it is also what
   the reaper does.
 - **Prompt or config** on a session that is not attached (parked, or its host
@@ -1084,3 +1089,7 @@ Still open — measurements, not decisions:
 1. Operator review of the umbrella and subsystem specs (all drafts).
 2. Implementation plans, starting with the walking skeleton
    (`docs/plans/`).
+
+---
+
+_Generated with Claude AI — please review before distribution._
