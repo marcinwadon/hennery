@@ -16,6 +16,7 @@ use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::{Operator, SetupLink};
 use hennery_sessions::{AppState, store::Store};
 use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -74,6 +75,10 @@ struct CollectorArgs {
     /// inherited descriptor (kernel spec §4.2).
     #[arg(long, hide = true)]
     pairing_code_fd: Option<i32>,
+    /// `hennery up` only: serve on this inherited listening socket, which
+    /// `up` bound, in place of binding `--listen`.
+    #[arg(long, hide = true, conflicts_with = "listen", value_parser = clap::value_parser!(i32).range(3..))]
+    listen_fd: Option<i32>,
 }
 
 #[derive(Args, Clone)]
@@ -158,6 +163,9 @@ async fn main() -> std::process::ExitCode {
 
 async fn run_collector(args: CollectorArgs) -> Result<()> {
     warn_if_dev_token();
+    // Checked before anything is created: a descriptor that is not a
+    // listening TCP socket must fail here, and clearly.
+    let inherited = args.listen_fd.map(inherited_listener).transpose()?;
     private_data_dir(&args.data_dir)?;
     let db = args.data_dir.join("hennery.db");
     let store = Store::open(&db)?;
@@ -166,9 +174,14 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     let mut state = AppState::new(store, hosts, operator);
     state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
     hennery_sessions::offline::after_startup(&state);
-    let listener = tokio::net::TcpListener::bind(&args.listen)
-        .await
-        .with_context(|| format!("bind {}", args.listen))?;
+    let listener = match inherited {
+        Some(listener) => {
+            tokio::net::TcpListener::from_std(listener).context("the listening socket `up` handed over")?
+        }
+        None => tokio::net::TcpListener::bind(&args.listen)
+            .await
+            .with_context(|| format!("bind {}", args.listen))?,
+    };
     let address = listener.local_addr()?;
     tracing::info!(%address, "collector listening");
     // Only once listening: the link names the port (kernel spec §3.1).
@@ -200,6 +213,72 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
         .with_graceful_shutdown(state.shutdown.clone().cancelled_owned())
         .await?;
     Ok(())
+}
+
+/// Adopt `--listen-fd`: `fd` must be an open, listening TCP socket. Anything
+/// else is refused, not adopted: a closed descriptor would abort the process
+/// on first use, and a UDP or unconnected socket would hang it. The socket
+/// is made close-on-exec and non-blocking.
+fn inherited_listener(fd: i32) -> Result<std::net::TcpListener> {
+    let option = |name: libc::c_int| -> std::io::Result<libc::c_int> {
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: getsockopt(2) into a local int of the size it is told.
+        let rc = unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, name, (&raw mut value).cast(), &mut len) };
+        if rc < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(value)
+        }
+    };
+    // SAFETY: fcntl(2) on a descriptor number; it only reads its flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 {
+        bail!(
+            "--listen-fd {fd} is not an open descriptor: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    let kind = option(libc::SO_TYPE).with_context(|| format!("--listen-fd {fd} is not a socket"))?;
+    if kind != libc::SOCK_STREAM {
+        bail!("--listen-fd {fd} is not a stream (TCP) socket");
+    }
+    let listening = match option(libc::SO_ACCEPTCONN) {
+        Ok(value) => value == 1,
+        // macOS has no `SO_ACCEPTCONN` to read. There, a socket bound to a
+        // port and without a peer is taken to listen: that refuses one never
+        // bound and a connected one, but not one bound and never listened on.
+        Err(err) if err.raw_os_error() == Some(libc::ENOPROTOOPT) => {
+            // SAFETY: getsockname/getpeername(2) into local storage of the
+            // size they are told.
+            unsafe {
+                let mut addr: libc::sockaddr_storage = std::mem::zeroed();
+                let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                let bound = libc::getsockname(fd, (&raw mut addr).cast(), &mut len) == 0
+                    && match libc::c_int::from(addr.ss_family) {
+                        libc::AF_INET => (*(&raw const addr).cast::<libc::sockaddr_in>()).sin_port != 0,
+                        libc::AF_INET6 => (*(&raw const addr).cast::<libc::sockaddr_in6>()).sin6_port != 0,
+                        _ => false,
+                    };
+                let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                let peer = libc::getpeername(fd, (&raw mut addr).cast(), &mut len) == 0;
+                bound && !peer
+            }
+        }
+        Err(err) => return Err(err).with_context(|| format!("--listen-fd {fd}: SO_ACCEPTCONN")),
+    };
+    if !listening {
+        bail!("--listen-fd {fd} is not a listening socket");
+    }
+    // SAFETY: as above; the flags just read, plus close-on-exec.
+    if unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error()).context("make --listen-fd close-on-exec");
+    }
+    // SAFETY: `fd` is an open listening socket, inherited for exactly this;
+    // nothing else in this process owns it.
+    let listener = unsafe { <std::net::TcpListener as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    listener.set_nonblocking(true)?;
+    Ok(listener)
 }
 
 /// The development bearer's variable, from before 3b-i. Nothing reads it
@@ -343,6 +422,32 @@ async fn terminated() {
     }
 }
 
+/// `up`'s SIGINT and SIGTERM, caught from the moment it is made: unlike
+/// `terminated`, whose handlers exist only once it is first polled.
+struct Signals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).context("SIGINT handler")?,
+            terminate: signal(SignalKind::terminate()).context("SIGTERM handler")?,
+        })
+    }
+
+    /// Resolves on the next SIGINT or SIGTERM, also one sent before it was
+    /// called.
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
+}
+
 /// Ask a child to shut down cleanly.
 fn sigterm(child: &tokio::process::Child) {
     if let Some(pid) = child.id() {
@@ -406,13 +511,24 @@ fn host_command(
 /// 11, A1) — restart policy for a genuine crash comes with the distribution
 /// work.
 async fn run_up(args: UpArgs) -> Result<()> {
+    // First, before any child exists: from here on a SIGINT or SIGTERM is
+    // caught and waits for the loop below, which stops both children. Caught
+    // only once the loop first ran, one sent just after the collector's
+    // spawn killed `up` by the default action and left that collector
+    // running with nobody to stop it.
+    let mut signals = Signals::new()?;
     warn_if_dev_token();
     let exe = std::env::current_exe()?;
     let host_dir = args.data_dir.join("host");
-    // Computed and validated before any child starts: a non-loopback
-    // `--listen` (or another scheme it cannot make sense of) must fail here,
-    // not after the collector is already up and serving.
-    let collector_url = loopback_url(&args.listen);
+    // Validated before any child starts: a non-loopback `--listen` (or
+    // another scheme it cannot make sense of) must fail here, not after the
+    // collector is already up and serving.
+    hennery_host::pairing::collector_ws_url(&loopback_url(&args.listen))?;
+    // Bound here and handed to the collector child, so the host's URL names
+    // the port the collector serves on, also for `--listen` port 0. Before
+    // the data root is touched: a busy port leaves nothing behind.
+    let listener = std::net::TcpListener::bind(&args.listen).with_context(|| format!("bind {}", args.listen))?;
+    let collector_url = loopback_url(&listener.local_addr()?.to_string());
     let collector_ws_url = hennery_host::pairing::collector_ws_url(&collector_url)?;
     // Before either child creates its own directory in it.
     private_data_dir(&args.data_dir)?;
@@ -429,23 +545,28 @@ async fn run_up(args: UpArgs) -> Result<()> {
     // and it alone decides the order (host, then collector).
     let mut collector_cmd = tokio::process::Command::new(&exe);
     collector_cmd
-        .args(["collector", "--listen", &args.listen])
+        .args(["collector", "--listen-fd", &inherit::LISTENER_FD.to_string()])
         .arg("--data-dir")
         .arg(args.data_dir.join("collector"))
         // `up` has warned about it already; the collector has no use for it.
         .env_remove(DEV_TOKEN_VAR)
         .kill_on_drop(true)
         .process_group(0);
+    let mut fds = vec![(listener.as_raw_fd(), inherit::LISTENER_FD)];
     if let Some((_, writer)) = &pairing {
-        inherit::pass_to_child(&mut collector_cmd, writer);
+        fds.push((writer.as_raw_fd(), inherit::CHILD_FD));
         collector_cmd
             .arg("--pairing-code-fd")
             .arg(inherit::CHILD_FD.to_string());
     }
+    inherit::pass_to_child(&mut collector_cmd, &fds);
     let mut collector = collector_cmd.spawn()?;
+    // The collector holds the socket now. Kept open here, it would hold the
+    // port after the collector exits.
+    drop(listener);
     let mut host_cmd = host_command(&exe, &host_dir, &collector_ws_url, &args);
     if let Some((reader, _)) = &pairing {
-        inherit::pass_to_child(&mut host_cmd, reader);
+        inherit::pass_to_child(&mut host_cmd, &[(reader.as_raw_fd(), inherit::CHILD_FD)]);
         host_cmd
             .arg("--join-url")
             .arg(&collector_url)
@@ -481,7 +602,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
                 tracing::warn!(?status, "host exited");
                 break;
             }
-            _ = terminated() => break,
+            () = signals.recv() => break,
         }
     }
     // Host first (it stops its adapters), then the collector.

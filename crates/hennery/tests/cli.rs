@@ -203,6 +203,94 @@ struct KillTree {
     /// only reliable way to reach it; a fresh query is kept only as a
     /// fallback for a panic that happened before anything was recorded.
     children: Vec<i32>,
+    /// Where `up`'s standard output goes, with its standard error next to it
+    /// (`.err`): printed when it dies while a test waits on it.
+    log: Option<std::path::PathBuf>,
+}
+
+impl KillTree {
+    /// `process`, whose standard output goes to `log` (and its standard
+    /// error to `log`'s `.err`).
+    fn new(process: std::process::Child, log: &std::path::Path) -> Self {
+        Self {
+            up: process,
+            dir: std::path::PathBuf::new(),
+            children: Vec::new(),
+            log: Some(log.to_path_buf()),
+        }
+    }
+
+    /// Fail at once, with its output, if the process has exited: a test
+    /// waiting on a dead collector would otherwise time out and not say why.
+    fn assert_running(&mut self, what: &str) {
+        let Ok(Some(status)) = self.up.try_wait() else {
+            return;
+        };
+        let read = |path: std::path::PathBuf| std::fs::read_to_string(&path).unwrap_or_else(|err| format!("({err})"));
+        let (stdout, stderr) = match &self.log {
+            Some(log) => (read(log.clone()), read(log.with_extension("err"))),
+            None => ("(not captured)".into(), "(not captured)".into()),
+        };
+        panic!("waiting for {what}, the process exited ({status}):\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    }
+
+    /// Poll `probe` until it holds, failing at once if the process exits
+    /// first, and after 20 seconds.
+    fn wait_until(&mut self, what: &str, mut probe: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !probe() {
+            self.assert_running(what);
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// The address the collector (itself, or `up`'s child) listens on, from
+    /// its "collector listening" log line: the tests start it on port 0, so
+    /// no other process can take the port between choosing and binding it.
+    fn listening(&mut self) -> String {
+        let log = self.log.clone().expect("the process's output is captured");
+        let mut address = None;
+        self.wait_until("the collector listening", || {
+            address = std::fs::read_to_string(&log)
+                .ok()
+                .and_then(|text| listening_address(&text));
+            address.is_some()
+        });
+        address.unwrap()
+    }
+}
+
+/// The `address` of the first complete "collector listening" line in `log`.
+fn listening_address(log: &str) -> Option<String> {
+    // Complete lines only: a line still being written could end mid-port.
+    let complete = &log[..log.rfind('\n')?];
+    complete.lines().map(strip_ansi).find_map(|line| {
+        let fields = line.split_once("collector listening")?.1;
+        let address = fields
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("address="))?;
+        Some(address.to_string())
+    })
+}
+
+/// `line` without its terminal colour codes (`ESC [ … m`), which the log
+/// carries also when written to a file.
+fn strip_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 impl Drop for KillTree {
@@ -248,19 +336,16 @@ impl Drop for KillTree {
 /// whole tree and removes the scratch dir on the way out.
 #[test]
 fn sigint_to_ups_process_group_still_shuts_down_cleanly() {
-    let free_port = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        port
-    };
-    let listen = format!("127.0.0.1:{free_port}");
-
-    let dir = std::env::temp_dir().join(format!("hennery-cli-pgtest-{}-{free_port}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("pgtest");
+    let log = dir.join("up.log");
 
     let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
-    command.args(["up", "--listen", &listen]).arg("--data-dir").arg(&dir);
+    command
+        .args(["up", "--listen", "127.0.0.1:0"])
+        .arg("--data-dir")
+        .arg(dir.join("data"))
+        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(std::fs::File::create(log.with_extension("err")).unwrap());
     // SAFETY: setpgid(0, 0) in the child, right after fork and before exec,
     // just makes it (and so `up`) the leader of a brand-new process group —
     // async-signal-safe and exactly what a shell does for a foreground job.
@@ -274,38 +359,23 @@ fn sigint_to_ups_process_group_still_shuts_down_cleanly() {
     }
     let up = command.spawn().unwrap();
     let up_pgid = up.id() as i32;
-    let mut guard = KillTree {
-        up,
-        dir,
-        children: Vec::new(),
-    };
+    let guard_pid = up_pgid;
+    let mut guard = KillTree::new(up, &log);
+    guard.dir = dir;
 
     // Wait for the collector to be listening.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        if TcpStream::connect(&listen).is_ok() {
-            break;
-        }
-        assert!(Instant::now() < deadline, "collector never started listening");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let listen = guard.listening();
+    guard.wait_until("the collector serving", || TcpStream::connect(&listen).is_ok());
     // Wait for the host child to spawn too (it's launched right after the
     // collector, independent of the collector's readiness). Poll instead of
     // a fixed sleep: fork/exec/setpgid latency under load (this test must
     // stay green with several copies of the binary running concurrently)
     // can exceed any fixed budget short enough to keep the common case fast.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let children = loop {
-        let children = children_of(guard.up.id() as i32);
-        if children.len() >= 2 {
-            break children;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "expected up to have spawned a collector and a host child within 10s, found {children:?}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
+    let mut children = Vec::new();
+    guard.wait_until("up's collector and host children", || {
+        children = children_of(guard_pid);
+        children.len() >= 2
+    });
     guard.children = children.clone();
 
     // Simulate a terminal delivering SIGINT to the whole foreground group.
@@ -354,12 +424,13 @@ fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> Opti
 /// The owner's password in these tests' collectors.
 const PASSWORD: &str = "correct horse battery";
 
-/// Set up the collector whose data directory is `collector_dir` through its
+/// Set up the collector `process` runs (or `up` runs), whose data directory
+/// is `collector_dir`, through its
 /// `setup-url` (kernel spec §3.1), with `http://<listen>` as `public_url`,
 /// and return the session token the setup signed the owner in with.
-fn sign_in(listen: &str, collector_dir: &std::path::Path) -> String {
+fn sign_in(process: &mut KillTree, listen: &str, collector_dir: &std::path::Path) -> String {
     let file = collector_dir.join("setup-url");
-    wait_until("the setup link", || file.exists());
+    process.wait_until("the setup link", || file.exists());
     let url = std::fs::read_to_string(&file).unwrap();
     // `…/setup#<token>`: the token is the fragment (3b decision 16).
     let token = url.trim_end().rsplit_once('#').unwrap().1;
@@ -406,10 +477,12 @@ fn get_json(listen: &str, path: &str, session: &str) -> Option<serde_json::Value
     serde_json::from_str(body).ok()
 }
 
-fn free_listen() -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    format!("127.0.0.1:{port}")
+/// A fresh scratch directory for the test `name`; the caller removes it.
+fn scratch_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("hennery-cli-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 /// Removes a scratch directory on drop, however the test ends.
@@ -421,40 +494,34 @@ impl Drop for RemoveDir {
     }
 }
 
-/// Start `up`, wait until its host is connected, and return the connected
-/// host ids and the owner's session: `session`, or else a new one from
-/// setting the collector up. The returned guard stops the whole tree (and
-/// leaves `dir`).
-fn up_until_connected(listen: &str, dir: &std::path::Path, session: Option<&str>) -> (KillTree, Vec<String>, String) {
-    let up = Command::new(env!("CARGO_BIN_EXE_hennery"))
-        .args(["up", "--listen", listen])
-        .arg("--data-dir")
-        .arg(dir)
-        .spawn()
-        .unwrap();
-    let guard = KillTree {
-        up,
-        dir: std::path::PathBuf::new(),
-        children: Vec::new(),
-    };
+/// Start `up` on `dir`, logging to `log`, wait until its host is connected,
+/// and return the address it listens on, the connected host ids and the
+/// owner's session: `session`, or else a new one from setting the collector
+/// up. The returned guard stops
+/// the whole tree (and leaves `dir`).
+fn up_until_connected(
+    dir: &std::path::Path,
+    log: &std::path::Path,
+    session: Option<&str>,
+) -> (KillTree, String, Vec<String>, String) {
+    let mut guard = up_logging_to(dir, log);
+    let listen = guard.listening();
     let session = match session {
         Some(session) => session.to_string(),
-        None => sign_in(listen, &dir.join("collector")),
+        None => sign_in(&mut guard, &listen, &dir.join("collector")),
     };
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(serde_json::Value::Array(hosts)) = get_json(listen, "/api/hosts", &session)
-            && hosts.iter().any(|h| h["connected"] == true)
-        {
-            let ids = hosts
-                .iter()
-                .filter_map(|h| h["host_id"].as_str().map(str::to_string))
-                .collect();
-            return (guard, ids, session);
-        }
-        assert!(Instant::now() < deadline, "the all-in-one host never connected");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let mut ids = Vec::new();
+    guard.wait_until("the all-in-one host connected", || {
+        let Some(serde_json::Value::Array(hosts)) = get_json(&listen, "/api/hosts", &session) else {
+            return false;
+        };
+        ids = hosts
+            .iter()
+            .filter_map(|h| h["host_id"].as_str().map(str::to_string))
+            .collect();
+        hosts.iter().any(|h| h["connected"] == true)
+    });
+    (guard, listen, ids, session)
 }
 
 /// `hennery up` pairs its own host on first start, through the pipe the
@@ -462,26 +529,24 @@ fn up_until_connected(listen: &str, dir: &std::path::Path, session: Option<&str>
 /// that pairing instead of minting another, also on another port.
 #[test]
 fn up_pairs_its_own_host_once() {
-    let listen = free_listen();
-    let dir = std::env::temp_dir().join(format!(
-        "hennery-cli-pair-{}-{}",
-        std::process::id(),
-        listen.replace(':', "-")
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = scratch_dir("pair");
     let _cleanup = RemoveDir(dir.clone());
-    let host_dir = dir.join("host");
+    let data = dir.join("data");
+    let host_dir = data.join("host");
 
-    let (mut first, ids, session) = up_until_connected(&listen, &dir, None);
+    let (mut first, first_listen, ids, session) = up_until_connected(&data, &dir.join("first.log"), None);
     assert_eq!(ids.len(), 1, "{ids:?}");
     assert!(ids[0].starts_with("host-"), "{ids:?}");
     let key = std::fs::read(host_dir.join("host.key")).unwrap();
     // SIGTERM, not a kill: `up` stops the host, then the collector.
     unsafe { libc::kill(first.up.id() as i32, libc::SIGTERM) };
     assert!(wait_with_timeout(&mut first.up, Duration::from_secs(15)).is_some());
+    // Held, so the restart cannot get the same port back by chance.
+    let _held = std::net::TcpListener::bind(&first_listen);
 
     // Set up already: the session from the first run still holds.
-    let (_second, again, _) = up_until_connected(&free_listen(), &dir, Some(&session));
+    let (_second, second_listen, again, _) = up_until_connected(&data, &dir.join("second.log"), Some(&session));
+    assert_ne!(second_listen, first_listen, "the restart was not on another port");
     assert_eq!(again, ids, "the restart paired a second host");
     assert_eq!(std::fs::read(host_dir.join("host.key")).unwrap(), key);
 }
@@ -524,15 +589,16 @@ fn delete(listen: &str, path: &str, session: &str) -> Option<u16> {
     response.split(' ').nth(1)?.parse().ok()
 }
 
-/// Start `up` with its log in `log`.
-fn up_logging_to(listen: &str, dir: &std::path::Path, log: &std::path::Path) -> KillTree {
-    up_logging_to_with(listen, dir, log, &[])
+/// Start `up` on port 0 with its log in `log`.
+fn up_logging_to(dir: &std::path::Path, log: &std::path::Path) -> KillTree {
+    up_logging_to_with(Command::new(env!("CARGO_BIN_EXE_hennery")), dir, log, &[])
 }
 
-/// Like `up_logging_to`, with extra CLI arguments appended (e.g. `--agent`).
-fn up_logging_to_with(listen: &str, dir: &std::path::Path, log: &std::path::Path, extra: &[&str]) -> KillTree {
-    let up = Command::new(env!("CARGO_BIN_EXE_hennery"))
-        .args(["up", "--listen", listen])
+/// Like `up_logging_to`, from `command` (`hennery` itself, or a shell in
+/// front of it), with `extra` arguments appended (e.g. `--agent`).
+fn up_logging_to_with(mut command: Command, dir: &std::path::Path, log: &std::path::Path, extra: &[&str]) -> KillTree {
+    let up = command
+        .args(["up", "--listen", "127.0.0.1:0"])
         .arg("--data-dir")
         .arg(dir)
         .args(extra)
@@ -540,19 +606,7 @@ fn up_logging_to_with(listen: &str, dir: &std::path::Path, log: &std::path::Path
         .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
         .spawn()
         .unwrap();
-    KillTree {
-        up,
-        dir: std::path::PathBuf::new(),
-        children: Vec::new(),
-    }
-}
-
-fn wait_until(what: &str, mut probe: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while !probe() {
-        assert!(Instant::now() < deadline, "timed out waiting for {what}");
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    KillTree::new(up, log)
 }
 
 /// Whether `text` contains a run shaped like a pairing code
@@ -574,24 +628,18 @@ fn contains_a_pairing_code_shape(text: &str) -> bool {
 /// again, and does the same on every later start until that is done.
 #[test]
 fn a_revoked_all_in_one_host_leaves_the_collector_serving() {
-    let listen = free_listen();
-    let dir = std::env::temp_dir().join(format!(
-        "hennery-cli-revoke-{}-{}",
-        std::process::id(),
-        listen.replace(':', "-")
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("revoke");
     let _cleanup = RemoveDir(dir.clone());
     let revoked_logged = |log: &std::path::Path| {
         std::fs::read_to_string(log).is_ok_and(|text| text.contains("the all-in-one host was revoked"))
     };
 
     let log = dir.join("first.log");
-    let mut first = up_logging_to(&listen, &dir.join("data"), &log);
-    let session = sign_in(&listen, &dir.join("data").join("collector"));
+    let mut first = up_logging_to(&dir.join("data"), &log);
+    let listen = first.listening();
+    let session = sign_in(&mut first, &listen, &dir.join("data").join("collector"));
     let mut host_id = String::new();
-    wait_until("the host connected", || {
+    first.wait_until("the host connected", || {
         let Some(serde_json::Value::Array(hosts)) = get_json(&listen, "/api/hosts", &session) else {
             return false;
         };
@@ -604,7 +652,7 @@ fn a_revoked_all_in_one_host_leaves_the_collector_serving() {
         }
     });
     assert_eq!(delete(&listen, &format!("/api/hosts/{host_id}"), &session), Some(200));
-    wait_until("the revoke logged", || revoked_logged(&log));
+    first.wait_until("the revoke logged", || revoked_logged(&log));
     assert!(first.up.try_wait().unwrap().is_none(), "up exited with its host");
     let hosts = get_json(&listen, "/api/hosts", &session).expect("the collector still serves");
     assert!(hosts[0]["revoked_at"].is_string(), "{hosts}");
@@ -615,8 +663,9 @@ fn a_revoked_all_in_one_host_leaves_the_collector_serving() {
 
     // Started again: the host is refused again, and the collector serves.
     let log = dir.join("second.log");
-    let mut second = up_logging_to(&listen, &dir.join("data"), &log);
-    wait_until("the revoke logged again", || revoked_logged(&log));
+    let mut second = up_logging_to(&dir.join("data"), &log);
+    let listen = second.listening();
+    second.wait_until("the revoke logged again", || revoked_logged(&log));
     assert!(get_json(&listen, "/api/hosts", &session).is_some());
     assert!(second.up.try_wait().unwrap().is_none());
 }
@@ -674,49 +723,51 @@ fn a_non_loopback_listen_is_refused_and_touches_neither_data_dir() {
 /// on some unlucky timing.
 #[test]
 fn a_failed_pairing_code_write_is_logged_without_the_code_and_does_not_kill_the_collector() {
-    let listen = free_listen();
-    let dir = std::env::temp_dir().join(format!(
-        "hennery-cli-badpipe-{}-{}",
-        std::process::id(),
-        listen.replace(':', "-")
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("badpipe");
     let _cleanup = RemoveDir(dir.clone());
     let log = dir.join("collector.log");
 
-    let (reader, writer) = std::io::pipe().unwrap();
-    drop(reader); // Nobody will ever read: every write is EPIPE.
-    let writer_fd = std::os::fd::AsRawFd::as_raw_fd(&writer);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
-    cmd.args(["collector", "--listen", &listen])
+    cmd.args(["collector", "--listen", "127.0.0.1:0"])
         .arg("--data-dir")
         .arg(dir.join("data"))
         .args(["--pairing-code-fd", "3"])
         .stdout(std::fs::File::create(&log).unwrap())
         .stderr(std::fs::File::create(log.with_extension("err")).unwrap());
-    // SAFETY: dup2 in the forked child, before exec, of a descriptor this
-    // process owns; async-signal-safe.
+    // The pipe is made in the forked child, not here: on macOS a pipe is
+    // made close-on-exec only after it exists (`pipe`, then `fcntl`), so a
+    // process another test spawns in between inherits its read end and
+    // keeps it open, and the collector's write then succeeds.
+    //
+    // SAFETY: pipe, dup2 and close in the forked child, before exec;
+    // async-signal-safe.
     unsafe {
-        cmd.pre_exec(move || {
-            if libc::dup2(writer_fd, 3) < 0 {
+        cmd.pre_exec(|| {
+            let mut fds = [0; 2];
+            if libc::pipe(fds.as_mut_ptr()) < 0 {
                 return Err(std::io::Error::last_os_error());
+            }
+            let [reader, writer] = fds;
+            // Nobody will ever read: every write is EPIPE. A `dup2` onto
+            // the reader's number closes it too.
+            if writer != 3 && libc::dup2(writer, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            for fd in [reader, writer] {
+                if fd != 3 {
+                    libc::close(fd);
+                }
             }
             Ok(())
         });
     }
-    let collector = cmd.spawn().unwrap();
-    drop(writer); // This process's own copy; the child dup'd its own.
     // A `KillTree` guard, as `up_logging_to` uses for `up` itself: an
     // assertion below that panics must still not leak this process.
-    let mut guard = KillTree {
-        up: collector,
-        dir: std::path::PathBuf::new(),
-        children: Vec::new(),
-    };
+    let mut guard = KillTree::new(cmd.spawn().unwrap(), &log);
 
-    let session = sign_in(&listen, &dir.join("data"));
-    wait_until("the collector serving", || {
+    let listen = guard.listening();
+    let session = sign_in(&mut guard, &listen, &dir.join("data"));
+    guard.wait_until("the collector serving", || {
         get_json(&listen, "/api/hosts", &session).is_some()
     });
     assert!(
@@ -768,14 +819,7 @@ impl Drop for KillAdapter {
 /// bug is specifically in `main`'s own exit path.
 #[test]
 fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
-    let listen = free_listen();
-    let dir = std::env::temp_dir().join(format!(
-        "hennery-cli-slowstart-{}-{}",
-        std::process::id(),
-        listen.replace(':', "-")
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("slowstart");
     let _cleanup = RemoveDir(dir.clone());
 
     // A shell script, not `hennery-fake-acp` (a binary of another crate this
@@ -800,15 +844,16 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
 
     let log = dir.join("up.log");
     let mut up = up_logging_to_with(
-        &listen,
+        Command::new(env!("CARGO_BIN_EXE_hennery")),
         &dir.join("data"),
         &log,
         &["--agent", &format!("slow=/bin/sh {}", script.display())],
     );
-    let session = sign_in(&listen, &dir.join("data").join("collector"));
+    let listen = up.listening();
+    let session = sign_in(&mut up, &listen, &dir.join("data").join("collector"));
 
     let mut host_id = String::new();
-    wait_until("the host connected", || {
+    up.wait_until("the host connected", || {
         let Some(serde_json::Value::Array(hosts)) = get_json(&listen, "/api/hosts", &session) else {
             return false;
         };
@@ -827,14 +872,12 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
         &session,
         &serde_json::json!({ "host_id": host_id, "agent": "slow", "cwd": dir }).to_string(),
     );
-    let deadline = Instant::now() + Duration::from_secs(20);
-    let grandchild = loop {
-        if let Some(pid) = pid_from(&grandchild_pid_file) {
-            break pid;
-        }
-        assert!(Instant::now() < deadline, "the slow adapter never started");
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let mut grandchild = None;
+    up.wait_until("the slow adapter started", || {
+        grandchild = pid_from(&grandchild_pid_file);
+        grandchild.is_some()
+    });
+    let grandchild = grandchild.unwrap();
     assert!(pid_alive(grandchild), "the grandchild died before the revoke");
 
     assert_eq!(delete(&listen, &format!("/api/hosts/{host_id}"), &session), Some(200));
@@ -842,6 +885,7 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
     // bound, with slack for four parallel copies of this binary.
     let deadline = Instant::now() + Duration::from_secs(40);
     while !std::fs::read_to_string(&log).is_ok_and(|text| text.contains("the all-in-one host was revoked")) {
+        up.assert_running("the revoke logged");
         assert!(Instant::now() < deadline, "timed out waiting for the revoke logged");
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -854,6 +898,7 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
     );
     let deadline = Instant::now() + Duration::from_secs(15);
     while pid_alive(grandchild) {
+        up.assert_running("the still-starting adapter reaped");
         assert!(
             Instant::now() < deadline,
             "the still-starting adapter's grandchild outlived the revoked host"
@@ -869,20 +914,20 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
 /// (`HENNERY_DEV_TOKEN`, from before 3b removed it) must not hand it to the
 /// host child, nor through it to any agent.
 ///
-/// The agent is a shell script that dumps its environment, and whether it
-/// holds a descriptor 3 (the pairing pipe's number in the host child), then
-/// exits. A fresh data directory, so this run pairs through that pipe.
+/// The agent is a shell script that dumps its environment, and which of the
+/// descriptors 3 to 9 it holds (3 is the pairing pipe's number in the host
+/// child, 4 the listening socket's in the collector child), then exits.
+///
+/// `up` and the control start with no inherited descriptor above 2: on
+/// macOS, std makes a pipe or socket close-on-exec only after creating it,
+/// so under parallel tests one another thread of this binary is making can
+/// leak into a spawn (in 4 of 96 runs with four copies at once, the
+/// control included). Those are this binary's, not `up`'s, and would pass
+/// on to the agent. A fresh data directory, so this run pairs through that pipe.
 #[test]
 fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     const TOKEN: &str = "operator-token-from-the-environment";
-    let listen = free_listen();
-    let dir = std::env::temp_dir().join(format!(
-        "hennery-cli-agentenv-{}-{}",
-        std::process::id(),
-        listen.replace(':', "-")
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("agentenv");
     let _cleanup = RemoveDir(dir.clone());
 
     // Written to temporary names and moved into place, so a reader never
@@ -894,54 +939,58 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     std::fs::write(
         &script,
         format!(
-            "if ( : <&3 ) 2>/dev/null; then echo open > {fd}.tmp; else echo closed > {fd}.tmp; fi\n\
+            "for n in 3 4 5 6 7 8 9; do if ( eval \": <&$n\" ) 2>/dev/null; then echo $n; fi; done > {fd}.tmp\n\
              env > {env}.tmp\nmv {fd}.tmp {fd}\nmv {env}.tmp {env}\n",
-            fd = report("fd3.txt").display(),
+            fd = report("fds.txt").display(),
             env = report("env.txt").display(),
         ),
     )
     .unwrap();
 
-    // Control: the probe does see a descriptor 3 that is open.
+    // Control: the probe does see descriptors 3 and 4 that are open, and
+    // only those.
     let mut control = Command::new("/bin/sh");
     control.arg(&script);
-    // SAFETY: dup2 in the forked child, before exec; async-signal-safe.
+    // SAFETY: fcntl, close and dup2 in the forked child, before exec;
+    // async-signal-safe.
     unsafe {
         control.pre_exec(|| {
-            if libc::dup2(1, 3) < 0 {
+            close_leaked_descriptors();
+            if libc::dup2(1, 3) < 0 || libc::dup2(1, 4) < 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
     }
     assert!(control.status().unwrap().success());
-    assert_eq!(std::fs::read_to_string(report("fd3.txt")).unwrap().trim(), "open");
-    std::fs::remove_file(report("fd3.txt")).unwrap();
+    assert_eq!(std::fs::read_to_string(report("fds.txt")).unwrap(), "3\n4\n");
+    std::fs::remove_file(report("fds.txt")).unwrap();
     std::fs::remove_file(report("env.txt")).unwrap();
 
     let log = dir.join("up.log");
-    let up = Command::new(env!("CARGO_BIN_EXE_hennery"))
-        .args(["up", "--listen", &listen])
-        .arg("--data-dir")
-        .arg(dir.join("data"))
-        .arg("--agent")
-        .arg(format!("envdump=/bin/sh {}", script.display()))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
+    command
         .env("HENNERY_DEV_TOKEN", TOKEN)
         .env("HENNERY_AGENT_MAY_SEE", "yes")
-        .env("RUST_LOG", "info")
-        .stdout(std::fs::File::create(&log).unwrap())
-        .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
-        .spawn()
-        .unwrap();
-    let mut up = KillTree {
-        up,
-        dir: std::path::PathBuf::new(),
-        children: Vec::new(),
-    };
+        .env("RUST_LOG", "info");
+    // SAFETY: as for the control above.
+    unsafe {
+        command.pre_exec(|| {
+            close_leaked_descriptors();
+            Ok(())
+        });
+    }
+    let mut up = up_logging_to_with(
+        command,
+        &dir.join("data"),
+        &log,
+        &["--agent", &format!("envdump=/bin/sh {}", script.display())],
+    );
 
-    let session = sign_in(&listen, &dir.join("data").join("collector"));
+    let listen = up.listening();
+    let session = sign_in(&mut up, &listen, &dir.join("data").join("collector"));
     let mut host_id = String::new();
-    wait_until("the host connected", || {
+    up.wait_until("the host connected", || {
         let Some(serde_json::Value::Array(hosts)) = get_json(&listen, "/api/hosts", &session) else {
             return false;
         };
@@ -959,7 +1008,7 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
         &session,
         &serde_json::json!({ "host_id": host_id, "agent": "envdump", "cwd": dir }).to_string(),
     );
-    wait_until("the agent's report", || report("env.txt").exists());
+    up.wait_until("the agent's report", || report("env.txt").exists());
 
     let env = std::fs::read_to_string(report("env.txt")).unwrap();
     // Positive controls: the agent got an environment, `up`'s included.
@@ -970,7 +1019,11 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
         "the agent inherited the operator token"
     );
     assert!(!env.contains(TOKEN), "the agent inherited the operator token");
-    assert_eq!(std::fs::read_to_string(report("fd3.txt")).unwrap().trim(), "closed");
+    assert_eq!(
+        std::fs::read_to_string(report("fds.txt")).unwrap(),
+        "",
+        "the agent inherited descriptors"
+    );
 
     unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
     assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
@@ -979,6 +1032,22 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     let output = std::fs::read_to_string(&log).unwrap() + &std::fs::read_to_string(log.with_extension("err")).unwrap();
     assert_eq!(output.matches(DEV_TOKEN_WARNING).count(), 1, "{output}");
     assert!(!output.contains(TOKEN), "up printed the operator token: {output}");
+}
+
+/// In a forked child before `exec`: close every descriptor above 2 that is
+/// not close-on-exec, which only a leak from another thread can be here
+/// (std's own descriptors for the spawn are close-on-exec). Only fcntl and
+/// close: async-signal-safe.
+fn close_leaked_descriptors() {
+    for fd in 3..1024 {
+        // SAFETY: fcntl and close on a descriptor number in this process.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::close(fd);
+            }
+        }
+    }
 }
 
 /// `hennery` under `umask 022`, the usual default, which would leave a new
@@ -1001,25 +1070,22 @@ fn mode_of(path: &std::path::Path) -> u32 {
 
 /// Start `hennery collector` under `umask 022` on `data`, logging to `log`,
 /// and wait until it serves: a new collector writes its setup link once it
-/// listens.
-fn collector_under_umask_022(listen: &str, data: &std::path::Path, log: &std::path::Path) -> KillTree {
+/// listens. Returns the address it listens on.
+fn collector_under_umask_022(data: &std::path::Path, log: &std::path::Path) -> (KillTree, String) {
     let collector = under_umask_022()
-        .args(["collector", "--listen", listen])
+        .args(["collector", "--listen", "127.0.0.1:0"])
         .arg("--data-dir")
         .arg(data)
         .stdout(std::fs::File::create(log).unwrap())
         .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
         .spawn()
         .unwrap();
-    let guard = KillTree {
-        up: collector,
-        dir: std::path::PathBuf::new(),
-        children: Vec::new(),
-    };
-    wait_until("the collector serving", || {
-        data.join("setup-url").exists() && TcpStream::connect(listen).is_ok()
+    let mut guard = KillTree::new(collector, log);
+    let listen = guard.listening();
+    guard.wait_until("the collector serving", || {
+        data.join("setup-url").exists() && TcpStream::connect(&listen).is_ok()
     });
-    guard
+    (guard, listen)
 }
 
 /// Final review I2: pairing-code hashes (decision 5) and everything else in
@@ -1028,18 +1094,11 @@ fn collector_under_umask_022(listen: &str, data: &std::path::Path, log: &std::pa
 /// and its WAL files 0600, whatever the umask.
 #[test]
 fn the_collectors_data_is_private_to_its_user() {
-    let listen = free_listen();
-    let dir = std::env::temp_dir().join(format!(
-        "hennery-cli-private-{}-{}",
-        std::process::id(),
-        listen.replace(':', "-")
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("private");
     let _cleanup = RemoveDir(dir.clone());
     let data = dir.join("root").join("collector");
 
-    let mut collector = collector_under_umask_022(&listen, &data, &dir.join("collector.log"));
+    let (mut collector, _) = collector_under_umask_022(&data, &dir.join("collector.log"));
     // Checked while it serves: a clean shutdown checkpoints the WAL and
     // removes the `-wal` and `-shm`.
     assert_eq!(mode_of(&dir.join("root")), 0o700);
@@ -1058,14 +1117,7 @@ fn the_collectors_data_is_private_to_its_user() {
 #[test]
 fn an_existing_readable_database_is_made_private_and_a_loose_directory_is_warned_about() {
     use std::os::unix::fs::PermissionsExt;
-    let listen = free_listen();
-    let dir = std::env::temp_dir().join(format!(
-        "hennery-cli-loose-{}-{}",
-        std::process::id(),
-        listen.replace(':', "-")
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("loose");
     let _cleanup = RemoveDir(dir.clone());
     let data = dir.join("collector");
     std::fs::create_dir(&data).unwrap();
@@ -1075,7 +1127,7 @@ fn an_existing_readable_database_is_made_private_and_a_loose_directory_is_warned
     std::fs::set_permissions(data.join("hennery.db"), std::fs::Permissions::from_mode(0o644)).unwrap();
 
     let log = dir.join("collector.log");
-    let mut collector = collector_under_umask_022(&listen, &data, &log);
+    let (mut collector, _) = collector_under_umask_022(&data, &log);
     assert_eq!(mode_of(&data.join("hennery.db")), 0o600);
     assert_eq!(mode_of(&data), 0o755, "the operator's directory was changed");
     let text = std::fs::read_to_string(&log).unwrap();
@@ -1093,33 +1145,15 @@ fn an_existing_readable_database_is_made_private_and_a_loose_directory_is_warned
 /// of that line alone still passes; it fails without the collector's.
 #[test]
 fn ups_data_root_is_private_to_its_user() {
-    let listen = free_listen();
-    let dir = std::env::temp_dir().join(format!(
-        "hennery-cli-uproot-{}-{}",
-        std::process::id(),
-        listen.replace(':', "-")
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("uproot");
     let _cleanup = RemoveDir(dir.clone());
     let root = dir.join("data");
 
     let log = dir.join("up.log");
-    let up = under_umask_022()
-        .args(["up", "--listen", &listen])
-        .arg("--data-dir")
-        .arg(&root)
-        .stdout(std::fs::File::create(&log).unwrap())
-        .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
-        .spawn()
-        .unwrap();
-    let mut up = KillTree {
-        up,
-        dir: std::path::PathBuf::new(),
-        children: Vec::new(),
-    };
-    let session = sign_in(&listen, &root.join("collector"));
-    wait_until("the host connected", || {
+    let mut up = up_logging_to_with(under_umask_022(), &root, &log, &[]);
+    let listen = up.listening();
+    let session = sign_in(&mut up, &listen, &root.join("collector"));
+    up.wait_until("the host connected", || {
         get_json(&listen, "/api/hosts", &session).is_some_and(|hosts| {
             hosts
                 .as_array()
@@ -1140,22 +1174,15 @@ fn ups_data_root_is_private_to_its_user() {
 #[test]
 fn up_warns_about_a_loose_existing_data_root() {
     use std::os::unix::fs::PermissionsExt;
-    let listen = free_listen();
-    let dir = std::env::temp_dir().join(format!(
-        "hennery-cli-looseroot-{}-{}",
-        std::process::id(),
-        listen.replace(':', "-")
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("looseroot");
     let _cleanup = RemoveDir(dir.clone());
     let root = dir.join("data");
     std::fs::create_dir(&root).unwrap();
     std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let log = dir.join("up.log");
-    let mut up = up_logging_to(&listen, &root, &log);
-    wait_until("the warning about the data root", || {
+    let mut up = up_logging_to(&root, &log);
+    up.wait_until("the warning about the data root", || {
         std::fs::read_to_string(&log).is_ok_and(|text| {
             text.lines()
                 .any(|line| line.contains("readable by other users") && line.contains(&root.display().to_string()))
@@ -1166,26 +1193,213 @@ fn up_warns_about_a_loose_existing_data_root() {
     assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
 }
 
+/// The processes (pid and command line) whose command line names `dir`: an
+/// `up` on `dir` and its children, found also once they are orphaned.
+fn processes_naming(dir: &std::path::Path) -> Vec<(i32, String)> {
+    let out = Command::new("ps")
+        .args(["-A", "-ww", "-o", "pid=,command="])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "ps failed: {out:?}");
+    let dir = dir.display().to_string();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| line.contains(&dir))
+        .filter_map(|line| {
+            let (pid, command) = line.trim().split_once(' ')?;
+            Some((pid.parse().ok()?, command.to_string()))
+        })
+        .collect()
+}
+
+/// SIGKILLs, on drop, every process whose command line names this
+/// directory: only processes this test started name it.
+struct KillNaming(std::path::PathBuf);
+
+impl Drop for KillNaming {
+    fn drop(&mut self) {
+        for (pid, _) in processes_naming(&self.0) {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// `up` catches SIGTERM from before it starts a child: one that comes just
+/// after the collector's spawn must still stop the collector, not kill `up`
+/// by the default action and leave its collector running with nobody to
+/// stop it.
+///
+/// Each attempt sends SIGTERM a little later (0 to 1 ms) after `up`'s
+/// warning about its loose data root, which it logs just before it spawns.
+/// Deterministic: `up` must exit 0, having caught the signal, on every
+/// attempt; a `up` that installs its handlers only later dies of the
+/// signal whenever it comes first. And no process naming the data root may
+/// outlive `up`, by a `ps` scan first shown to see such a process.
+#[test]
+fn a_sigterm_as_up_starts_leaves_no_child_running() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch_dir("earlyterm");
+    let _cleanup = RemoveDir(dir.clone());
+    // The scan below must not pass for want of seeing anything: it does see
+    // a live process whose command line names a directory here. Checked
+    // apart from `up`, as a `ps` between the warning and the signal would
+    // take longer than the window.
+    let probe_dir = dir.join("probe");
+    let mut probe = Command::new("/bin/sh")
+        // Not a lone command, which the shell would exec, losing its $0.
+        .args(["-c", "sleep 30; exit 0"])
+        .arg(&probe_dir)
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    // Polled: until it has exec'd, the probe's command line is this binary's.
+    while !seen.iter().any(|&(pid, _)| pid == probe.id() as i32) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+        seen = processes_naming(&probe_dir);
+    }
+    // The whole group: the shell's `sleep` too.
+    unsafe { libc::kill(-(probe.id() as i32), libc::SIGKILL) };
+    let _ = probe.wait();
+    assert!(
+        seen.iter().any(|&(pid, _)| pid == probe.id() as i32),
+        "ps does not see the probe: {seen:?}"
+    );
+    for attempt in 0..5 {
+        let root = dir.join(format!("data-{attempt}"));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _orphans = KillNaming(root.clone());
+        let log = dir.join(format!("up-{attempt}.log"));
+        let mut up = up_logging_to(&root, &log);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !std::fs::read_to_string(&log).is_ok_and(|text| text.contains("readable by other users")) {
+            up.assert_running("the warning about the data root");
+            assert!(Instant::now() < deadline, "timed out waiting for the warning");
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        let offset = Duration::from_micros(250 * attempt);
+        let start = Instant::now();
+        while start.elapsed() < offset {
+            std::hint::spin_loop();
+        }
+        unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
+        let status = wait_with_timeout(&mut up.up, Duration::from_secs(30)).expect("up did not exit");
+        assert!(
+            status.success(),
+            "attempt {attempt}: up did not catch the SIGTERM: {status}"
+        );
+        // `up` waits for its children before it exits: none may be left.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut left = processes_naming(&root);
+        while !left.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            left = processes_naming(&root);
+        }
+        assert!(
+            left.is_empty(),
+            "attempt {attempt}: still running after up exited: {left:?}"
+        );
+    }
+}
+
+/// `--listen-fd` (`up`'s hand-over) adopts only a listening TCP socket: a
+/// closed descriptor, a file, a UDP socket or a TCP socket that does not
+/// listen is refused at once with a message naming it, before the data
+/// directory is made, not adopted to abort or hang later. Also refused: a
+/// standard stream's number, and `--listen` with it.
+#[test]
+fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
+    use std::os::fd::{AsRawFd, OwnedFd};
+    let dir = scratch_dir("badlistenfd");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let file: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+    let udp: OwnedFd = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into();
+    // SAFETY: socket(2), owned at once.
+    let tcp = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+    assert!(tcp >= 0);
+    let tcp: OwnedFd = unsafe { std::os::fd::FromRawFd::from_raw_fd(tcp) };
+    let listening: OwnedFd = std::net::TcpListener::bind("127.0.0.1:0").unwrap().into();
+    let collector = |fd: Option<&OwnedFd>, args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
+        cmd.arg("collector").args(args).arg("--data-dir").arg(&data);
+        if let Some(fd) = fd {
+            let fd = fd.as_raw_fd();
+            // SAFETY: dup2 in the forked child, before exec; async-signal-safe.
+            unsafe {
+                cmd.pre_exec(move || {
+                    // Already 50 (a busy test binary has that many open):
+                    // `dup2` onto itself would keep close-on-exec set.
+                    let rc = if fd == 50 {
+                        libc::fcntl(fd, libc::F_SETFD, 0)
+                    } else {
+                        libc::dup2(fd, 50)
+                    };
+                    if rc < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        let mut child = cmd
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let status = wait_with_timeout(&mut child, Duration::from_secs(15));
+        let _ = child.kill();
+        let _ = child.wait();
+        let mut stderr = String::new();
+        child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+        (status, stderr)
+    };
+    for (what, fd, expected) in [
+        ("a closed descriptor", None, "is not an open descriptor"),
+        ("a file", Some(&file), "is not a socket"),
+        ("a UDP socket", Some(&udp), "is not a stream (TCP) socket"),
+        (
+            "a TCP socket that does not listen",
+            Some(&tcp),
+            "is not a listening socket",
+        ),
+    ] {
+        // 50: well above what the collector's own runtime opens at start.
+        let (status, stderr) = collector(fd, &["--listen-fd", "50"]);
+        let status = status.unwrap_or_else(|| panic!("{what}: the collector hung"));
+        assert!(!status.success(), "{what}: adopted");
+        assert!(stderr.contains(expected), "{what}: {stderr}");
+        assert!(!data.exists(), "{what}: the data directory was made");
+    }
+    for args in [
+        &["--listen-fd", "2"][..],
+        &["--listen-fd", "50", "--listen", "127.0.0.1:0"],
+    ] {
+        let (status, stderr) = collector(Some(&listening), args);
+        assert!(!status.unwrap().success(), "{args:?} was taken: {stderr}");
+    }
+}
+
 /// Kernel spec §3.1: a collector that is not set up writes its one-time
 /// setup link to `setup-url` (0600, under `umask 022` too) and, its output
 /// not being a terminal, logs only that file's path: the token itself must
 /// never reach a log collector.
 #[test]
 fn an_unset_collector_writes_its_setup_link_to_a_private_file_and_never_to_its_output() {
-    let listen = free_listen();
-    let dir = std::env::temp_dir().join(format!(
-        "hennery-cli-setup-{}-{}",
-        std::process::id(),
-        listen.replace(':', "-")
-    ));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = scratch_dir("setup");
     let _cleanup = RemoveDir(dir.clone());
     let data = dir.join("collector");
     let log = dir.join("collector.log");
 
-    let mut collector = collector_under_umask_022(&listen, &data, &log);
+    let (mut collector, listen) = collector_under_umask_022(&data, &log);
     let file = data.join("setup-url");
+    // The file is written before the line naming it is logged; that line
+    // must be in the log before the collector is stopped.
+    collector.wait_until("the setup link announced", || {
+        std::fs::read_to_string(&log).is_ok_and(|text| text.contains(&file.display().to_string()))
+    });
     assert_eq!(mode_of(&file), 0o600);
     let url = std::fs::read_to_string(&file).unwrap();
     let port = listen.rsplit(':').next().unwrap();
