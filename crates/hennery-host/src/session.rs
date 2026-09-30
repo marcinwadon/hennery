@@ -691,6 +691,7 @@ impl Actor {
                 return self.start_failed(request_id, error);
             }
         };
+        let applied_hung = applied.hung;
         *self.catalogue.lock().expect("catalogue lock") = Catalogue {
             options: applied.options,
             current: applied.current,
@@ -751,7 +752,15 @@ impl Actor {
             uplink: self.uplink.clone(),
             queued: VecDeque::new(),
             out: None,
-            orphan: None,
+            // A start switch that got no answer in time may still land, and
+            // a late model switch would clamp a mode switched after it
+            // (decision 6): nothing is sent until its grace passes (final
+            // review I1). Its answer was dropped with the start's future,
+            // so `NO_TOKEN` matches nothing: only the grace clears it.
+            orphan: applied_hung.map(|sent_at| Orphan {
+                token: NO_TOKEN,
+                drop_after: sent_at + self.options.config_timeout * ORPHAN_GRACE,
+            }),
             next_token: NO_TOKEN + 1,
             answered_token: Arc::new(AtomicU64::new(NO_TOKEN)),
         };
@@ -1030,7 +1039,11 @@ impl Actor {
                 // every switch behind it until its deadline (final review
                 // M2).
                 tracing::warn!(session_id = %self.session_id, error = %err, "set_config not sent");
-                self.reject(next.request_id, "config_failed", format!("not sent to the adapter: {err}"));
+                self.reject(
+                    next.request_id,
+                    "config_failed",
+                    format!("not sent to the adapter: {err}"),
+                );
                 continue;
             }
             configs.out = Some(OutSwitch {
@@ -1484,6 +1497,10 @@ struct Applied {
     current: bool,
     /// One line per requested value that did not take.
     failures: Vec<String>,
+    /// When the switch that got no answer in time was sent, if one did
+    /// not. Its request is still live at the adapter, which may apply it
+    /// late, so the main loop starts with it as an orphan (final review I1).
+    hung: Option<Instant>,
 }
 
 /// Apply `wanted` to a new or loaded session (ACP core §4.3): the model
@@ -1497,7 +1514,9 @@ struct Applied {
 ///
 /// Once a switch goes unanswered (or the deadline has passed), nothing more
 /// is sent: the adapter may still apply the late switch, and a late model
-/// switch could clamp a mode sent after it. Finally every requested value is
+/// switch could clamp a mode sent after it (`Applied::hung` carries it
+/// into the main loop, which sends no `set_config` behind it either).
+/// Finally every requested value is
 /// checked against the read-back. Whatever did not take is reported in
 /// `failures`; the start goes on.
 async fn apply_config(
@@ -1512,6 +1531,7 @@ async fn apply_config(
         options: catalogue.options,
         current: catalogue.authoritative,
         failures: Vec::new(),
+        hung: None,
     };
     let mut switches: Vec<(String, ConfigValue)> = Vec::new();
     if let Some(model) = &wanted.model {
@@ -1589,6 +1609,7 @@ async fn apply_config(
             Err(_) => {
                 applied.current = false;
                 unanswered = true;
+                applied.hung = Some(now);
                 let wait = if cut_short {
                     "no answer before the start deadline".to_string()
                 } else {

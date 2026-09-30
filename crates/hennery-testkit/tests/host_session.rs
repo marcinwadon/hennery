@@ -2552,3 +2552,50 @@ async fn a_cancel_is_read_promptly_even_though_a_switch_deadline_fires_mid_flood
     let (id, code) = refusal(&mut replies).await;
     assert_eq!((id.as_str(), code.as_str()), ("rc1", "config_failed"));
 }
+
+// Final review.
+
+/// I1: a start's switch that got no answer in time is still live at the
+/// adapter, which may apply it late (and a late model switch clamps the
+/// mode). So the main loop starts with it as an orphan: a `set_config`
+/// right after `session_started` is refused, never sent, until its grace
+/// (`config_timeout * ORPHAN_GRACE` from when it was sent) has passed.
+#[tokio::test]
+async fn a_start_switch_that_timed_out_blocks_set_config_until_its_grace_passes() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        hang_config: true,
+        ..config_script(&log)
+    };
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        wanted(Some("large"), Some("plan"), &[]),
+        SessionOptions {
+            config_timeout: Duration::from_millis(500),
+            ..SessionOptions::default()
+        },
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(set_config("rc1", "mode", ConfigValue::Id("plan".into()))));
+    let (id, code, message) = full_refusal(&mut replies).await;
+    assert_eq!((id.as_str(), code.as_str()), ("rc1", "config_failed"));
+    assert_eq!(message, "an earlier switch is still out");
+    assert_eq!(switches(&log), "model=large\n", "rc1 reached the adapter");
+    // The grace (2s from the start's model switch) passes: switches go out
+    // again.
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    assert!(handle.send(set_config("rc2", "mode", ConfigValue::Id("plan".into()))));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while switches(&log) != "model=large\nmode=plan\n" {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rc2 was never sent: {:?}",
+            switches(&log)
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
