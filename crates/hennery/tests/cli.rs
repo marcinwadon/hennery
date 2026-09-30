@@ -889,3 +889,156 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
     assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
 }
+
+/// `hennery` under `umask 022`, the usual default, which would leave a new
+/// directory 0755 and a new file 0644. Set in a shell in front of it, never
+/// in this process: the umask is process-wide.
+fn under_umask_022() -> Command {
+    let mut cmd = Command::new("/bin/sh");
+    cmd.args(["-c", "umask 022; exec \"$0\" \"$@\"", env!("CARGO_BIN_EXE_hennery")]);
+    cmd
+}
+
+fn mode_of(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .unwrap_or_else(|err| panic!("{}: {err}", path.display()))
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+/// Start `hennery collector` under `umask 022` on `data`, logging to `log`,
+/// and wait until it serves.
+fn collector_under_umask_022(listen: &str, data: &std::path::Path, log: &std::path::Path) -> KillTree {
+    let collector = under_umask_022()
+        .args(["collector", "--listen", listen])
+        .arg("--data-dir")
+        .arg(data)
+        .args(["--dev-token", "dev-token-for-tests"])
+        .stdout(std::fs::File::create(log).unwrap())
+        .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
+        .spawn()
+        .unwrap();
+    let guard = KillTree {
+        up: collector,
+        dir: std::path::PathBuf::new(),
+        children: Vec::new(),
+    };
+    wait_until("the collector serving", || {
+        get_json(listen, "/api/hosts", "dev-token-for-tests").is_some()
+    });
+    guard
+}
+
+/// Final review I2: pairing-code hashes (decision 5) and everything else in
+/// `hennery.db` rely on nobody but the collector's user reading it. Its data
+/// directory is created 0700 (every missing parent too) and the database
+/// and its WAL files 0600, whatever the umask.
+#[test]
+fn the_collectors_data_is_private_to_its_user() {
+    let listen = free_listen();
+    let dir = std::env::temp_dir().join(format!(
+        "hennery-cli-private-{}-{}",
+        std::process::id(),
+        listen.replace(':', "-")
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("root").join("collector");
+
+    let mut collector = collector_under_umask_022(&listen, &data, &dir.join("collector.log"));
+    // Checked while it serves: a clean shutdown checkpoints the WAL and
+    // removes the `-wal` and `-shm`.
+    assert_eq!(mode_of(&dir.join("root")), 0o700);
+    assert_eq!(mode_of(&data), 0o700);
+    for file in ["hennery.db", "hennery.db-wal", "hennery.db-shm"] {
+        assert_eq!(mode_of(&data.join(file)), 0o600, "{file}");
+    }
+    unsafe { libc::kill(collector.up.id() as i32, libc::SIGTERM) };
+    assert!(wait_with_timeout(&mut collector.up, Duration::from_secs(15)).is_some());
+}
+
+/// Final review I2, an install from before the fix: a database others can
+/// read is made private when the collector opens it. A data directory others
+/// can enter is the operator's to fix: it is named in a warning, and left
+/// as it is.
+#[test]
+fn an_existing_readable_database_is_made_private_and_a_loose_directory_is_warned_about() {
+    use std::os::unix::fs::PermissionsExt;
+    let listen = free_listen();
+    let dir = std::env::temp_dir().join(format!(
+        "hennery-cli-loose-{}-{}",
+        std::process::id(),
+        listen.replace(':', "-")
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // An empty file is a new, empty SQLite database.
+    std::fs::write(data.join("hennery.db"), b"").unwrap();
+    std::fs::set_permissions(data.join("hennery.db"), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let log = dir.join("collector.log");
+    let mut collector = collector_under_umask_022(&listen, &data, &log);
+    assert_eq!(mode_of(&data.join("hennery.db")), 0o600);
+    assert_eq!(mode_of(&data), 0o755, "the operator's directory was changed");
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(
+        text.contains("readable by other users") && text.contains(&data.display().to_string()),
+        "{text}"
+    );
+    unsafe { libc::kill(collector.up.id() as i32, libc::SIGTERM) };
+    assert!(wait_with_timeout(&mut collector.up, Duration::from_secs(15)).is_some());
+}
+
+/// Final review I2: `up`'s data root, and both children's directories in
+/// it, are private. This pins the outcome, not `up`'s own creation of the
+/// root: each child also creates any missing parent 0700, so a revert-probe
+/// of that line alone still passes; it fails without the collector's.
+#[test]
+fn ups_data_root_is_private_to_its_user() {
+    let listen = free_listen();
+    let dir = std::env::temp_dir().join(format!(
+        "hennery-cli-uproot-{}-{}",
+        std::process::id(),
+        listen.replace(':', "-")
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveDir(dir.clone());
+    let root = dir.join("data");
+
+    let log = dir.join("up.log");
+    let up = under_umask_022()
+        .args(["up", "--listen", &listen])
+        .arg("--data-dir")
+        .arg(&root)
+        .args(["--dev-token", "dev-token-for-tests"])
+        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
+        .spawn()
+        .unwrap();
+    let mut up = KillTree {
+        up,
+        dir: std::path::PathBuf::new(),
+        children: Vec::new(),
+    };
+    wait_until("the host connected", || {
+        get_json(&listen, "/api/hosts", "dev-token-for-tests").is_some_and(|hosts| {
+            hosts
+                .as_array()
+                .is_some_and(|h| h.iter().any(|h| h["connected"] == true))
+        })
+    });
+    for dir in [root.clone(), root.join("collector"), root.join("host")] {
+        assert_eq!(mode_of(&dir), 0o700, "{}", dir.display());
+    }
+    assert_eq!(mode_of(&root.join("collector").join("hennery.db")), 0o600);
+    unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
+    assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
+}

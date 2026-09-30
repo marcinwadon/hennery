@@ -165,7 +165,7 @@ async fn main() -> std::process::ExitCode {
 async fn run_collector(args: CollectorArgs) -> Result<()> {
     // Checked before anything touches the data dir, like `run_up` does.
     let token = DevToken::new(args.dev_token)?;
-    std::fs::create_dir_all(&args.data_dir)?;
+    private_data_dir(&args.data_dir)?;
     let db = args.data_dir.join("hennery.db");
     let store = Store::open(&db)?;
     let hosts = Hosts::open(&db)?;
@@ -196,6 +196,21 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(state.shutdown.clone().cancelled_owned())
         .await?;
+    Ok(())
+}
+
+/// Create `dir`, and any parent it lacks, 0700 whatever the umask: the
+/// collector's database holds what only its user may read (decision 5). A
+/// directory that already exists is the operator's and is left as it is,
+/// but named in a warning if other users can reach into it.
+fn private_data_dir(dir: &std::path::Path) -> Result<()> {
+    hennery_host::identity::create_private_dir(dir)?;
+    if !hennery_host::identity::is_private(dir)? {
+        tracing::warn!(
+            dir = %dir.display(),
+            "the data directory is readable by other users; `chmod 700` it"
+        );
+    }
     Ok(())
 }
 
@@ -338,6 +353,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
     // not after the collector is already up and serving.
     let collector_url = loopback_url(&args.listen);
     let collector_ws_url = hennery_host::pairing::collector_ws_url(&collector_url)?;
+    // Before either child creates its own directory in it.
+    private_data_dir(&args.data_dir)?;
     // The host pairs itself on first start only; a pairing that was revoked
     // is not replaced (kernel spec §4.2).
     let pairing = match Paired::load(&host_dir)? {

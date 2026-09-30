@@ -1,12 +1,42 @@
 //! SQLite helpers (kernel spec §1).
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OptionalExtension};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 /// Open (or create) a database with the pragmas every hennery database uses.
+///
+/// The database is private to its user (mode 0600), whatever the umask: it
+/// holds what only the collector may read (pairing-code hashes, decision 5,
+/// among them). SQLite gives a new `-wal` and `-shm` the database file's
+/// own mode, so the file is made private before it is opened. A `-wal` or
+/// `-shm` already there, from an install before this, is made private too.
 pub fn open(path: &Path) -> Result<Connection> {
-    configure(Connection::open(path)?)
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("open {}", path.display()))?;
+    make_private(path)?;
+    let conn = configure(Connection::open(path)?)?;
+    for suffix in ["-wal", "-shm"] {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(suffix);
+        // Gone already is fine: the last connection to close removes them.
+        match std::fs::set_permissions(Path::new(&name), std::fs::Permissions::from_mode(0o600)) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            other => other.with_context(|| format!("make {} private", Path::new(&name).display()))?,
+        }
+    }
+    Ok(conn)
+}
+
+fn make_private(path: &Path) -> Result<()> {
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("make {} private", path.display()))
 }
 
 pub fn open_in_memory() -> Result<Connection> {
@@ -78,6 +108,36 @@ pub fn migrate_component(conn: &mut Connection, component: &str, migrations: &[&
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// Final review I2, an install from before the fix: a database and its
+    /// WAL files left readable by others become private when opened.
+    #[test]
+    fn opening_makes_an_existing_database_and_its_wal_files_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hennery.db");
+        // Held open, so the `-wal` and `-shm` stay there.
+        let first = open(&path).unwrap();
+        first
+            .execute_batch("CREATE TABLE t (x INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        let files = [
+            path.clone(),
+            dir.path().join("hennery.db-wal"),
+            dir.path().join("hennery.db-shm"),
+        ];
+        for file in &files {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let _second = open(&path).unwrap();
+        for file in &files {
+            assert_eq!(mode(file), 0o600, "{}", file.display());
+        }
+    }
 
     #[test]
     fn migrations_apply_once_and_record_the_version() {
