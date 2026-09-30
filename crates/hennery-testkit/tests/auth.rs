@@ -74,6 +74,13 @@ impl Collector {
         format!("http://{}{path}", self.addr)
     }
 
+    /// A new session of the owner's, last checked at `at`, opened as a
+    /// login would.
+    fn session_at(&self, at: i64) -> String {
+        let phc = hennery_testkit::owner_phc(&self.state.operator);
+        self.state.operator.open_session("test", &phc, at).unwrap().unwrap()
+    }
+
     fn connected(&self) -> Vec<String> {
         self.state.hub.connected_hosts()
     }
@@ -216,12 +223,7 @@ async fn every_operator_route_needs_the_session_cookie() {
 async fn every_operator_route_applies_the_browser_rules() {
     let collector = Collector::start().await;
     hennery_testkit::operator_client(&collector.state.operator);
-    let token = collector
-        .state
-        .operator
-        .open_session("test", hennery_kernel::secret::unix_now())
-        .unwrap()
-        .unwrap();
+    let token = collector.session_at(hennery_kernel::secret::unix_now());
     let cookie = format!("hennery_session={token}");
     let plain = reqwest::Client::new();
     for (addr, method, path) in every_route(&collector) {
@@ -377,7 +379,7 @@ async fn a_request_that_slides_the_session_sends_its_cookie_again() {
     hennery_testkit::operator_client(&collector.state.operator);
     let now = hennery_kernel::secret::unix_now();
     let url = collector.url("/api/hosts");
-    let fresh = collector.state.operator.open_session("test", now).unwrap().unwrap();
+    let fresh = collector.session_at(now);
     let resp = reqwest::Client::new()
         .get(&url)
         .header("cookie", format!("hennery_session={fresh}"))
@@ -387,12 +389,7 @@ async fn a_request_that_slides_the_session_sends_its_cookie_again() {
     assert_eq!(resp.status(), 200);
     assert!(resp.headers().get("set-cookie").is_none());
 
-    let stale = collector
-        .state
-        .operator
-        .open_session("test", now - 120)
-        .unwrap()
-        .unwrap();
+    let stale = collector.session_at(now - 120);
     let resp = reqwest::Client::new()
         .get(&url)
         .header("cookie", format!("hennery_session={stale}"))
@@ -417,7 +414,7 @@ async fn a_tossed_session_cookie_before_the_real_one_does_not_sign_the_owner_out
     let url = collector.url("/api/hosts");
     // Shaped like a real token, so it costs a lookup and fails it.
     let tossed = "0".repeat(64);
-    let real = collector.state.operator.open_session("test", now).unwrap().unwrap();
+    let real = collector.session_at(now);
     let resp = reqwest::Client::new()
         .get(&url)
         .header("cookie", format!("hennery_session={tossed}; hennery_session={real}"))
@@ -426,12 +423,7 @@ async fn a_tossed_session_cookie_before_the_real_one_does_not_sign_the_owner_out
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    let stale = collector
-        .state
-        .operator
-        .open_session("test", now - 120)
-        .unwrap()
-        .unwrap();
+    let stale = collector.session_at(now - 120);
     let resp = reqwest::Client::new()
         .get(&url)
         .header("cookie", format!("hennery_session={tossed}"))

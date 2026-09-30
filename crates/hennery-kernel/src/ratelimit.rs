@@ -188,6 +188,13 @@ impl Limiter {
         self.state.lock().expect("limiter lock").entries.remove(&key(addr));
     }
 
+    /// Forget every address and the overflow budget: a lockout ends now.
+    pub fn clear(&self) {
+        let mut state = self.state.lock().expect("limiter lock");
+        state.entries.clear();
+        state.overflow = None;
+    }
+
     /// Addresses currently tracked with their own entry (not counting the
     /// shared overflow budget, which is not itself an address).
     pub fn tracked(&self) -> usize {
