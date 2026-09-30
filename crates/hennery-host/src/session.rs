@@ -1025,7 +1025,13 @@ impl Actor {
                 let _ = tx.send(Inbound::SwitchAnswer { token, result });
                 std::future::ready(Ok(()))
             }) {
+                // Never sent (the connection is shutting down), so nothing
+                // can answer it: answered now, and not left out to block
+                // every switch behind it until its deadline (final review
+                // M2).
                 tracing::warn!(session_id = %self.session_id, error = %err, "set_config not sent");
+                self.reject(next.request_id, "config_failed", format!("not sent to the adapter: {err}"));
+                continue;
             }
             configs.out = Some(OutSwitch {
                 request_id: next.request_id,
