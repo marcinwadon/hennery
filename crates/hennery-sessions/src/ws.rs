@@ -176,7 +176,8 @@ async fn serve(socket: WebSocket, state: AppState) {
                         }
                         match &body {
                             SessionBody::SessionStarted { request_id, .. }
-                            | SessionBody::TurnStarted { request_id, .. } => {
+                            | SessionBody::TurnStarted { request_id, .. }
+                            | SessionBody::ConfigApplied { request_id, .. } => {
                                 state.hub.resolve(request_id, body.clone());
                             }
                             SessionBody::StartFailed {

@@ -3,11 +3,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
+use crate::frames::{ConfigValue, Indexed, SessionConfig};
+
+/// `POST /api/sessions` (ACP core §9): `{host_id, agent, cwd, model?, mode?, axes?}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct StartSessionRequest {
     pub host_id: String,
     pub agent: String,
     pub cwd: String,
+    #[serde(flatten)]
+    pub config: SessionConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -100,4 +105,37 @@ pub struct SessionDetail {
 pub struct CancelResponse {
     pub turn_id: String,
     pub outcome: crate::frames::TurnOutcome,
+}
+
+/// `POST /api/sessions/{id}/config`: switch one config option.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct ConfigRequest {
+    pub config_id: String,
+    pub value: ConfigValue,
+}
+
+/// A session's config catalogue and its current values: `GET
+/// /api/sessions/{id}/catalog`, the answer to `POST …/config`, and the data
+/// of the SSE `catalog_changed` message (ACP core §9). Commands, plan and
+/// usage join it with the plans that produce them.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SessionCatalog {
+    pub session_id: String,
+    /// The adapter's ACP `SessionConfigOption` objects, as last reported.
+    #[ts(type = "unknown[]")]
+    pub config_options: Vec<Value>,
+    #[serde(flatten)]
+    pub current: SessionConfig,
+}
+
+impl SessionCatalog {
+    /// The catalogue an event's extracts report, if they carry a snapshot.
+    pub fn from_indexed(session_id: &str, indexed: &Indexed) -> Option<Self> {
+        let current = indexed.current_config()?;
+        Some(Self {
+            session_id: session_id.to_string(),
+            config_options: indexed.config_options.clone().unwrap_or_default(),
+            current,
+        })
+    }
 }

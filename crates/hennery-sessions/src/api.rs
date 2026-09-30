@@ -10,10 +10,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
 use futures::stream::{self, Stream, StreamExt};
-use hennery_proto::frames::{Capability, CollectorFrame, SessionBody};
+use hennery_proto::frames::{Capability, CollectorFrame, Indexed, SessionBody};
 use hennery_proto::rest::{
-    ApiError, CancelResponse, EventDto, LifecycleResponse, OpenTurn, PromptRequest, PromptResponse, SessionDetail,
-    StartSessionRequest, StartSessionResponse,
+    ApiError, CancelResponse, ConfigRequest, EventDto, LifecycleResponse, OpenTurn, PromptRequest, PromptResponse,
+    SessionCatalog, SessionDetail, StartSessionRequest, StartSessionResponse,
 };
 use serde::Deserialize;
 use std::convert::Infallible;
@@ -29,6 +29,9 @@ const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 /// `cancel_turn` (ACP core §3.4). The host stops an adapter that ignores the
 /// cancel well before this (`hennery_host::session::CANCEL_GRACE`).
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(60);
+/// `set_config` (ACP core §3.4). The host answers a switch the adapter
+/// leaves hanging well before this (`hennery_host::session::CONFIG_TIMEOUT`).
+const CONFIG_TIMEOUT: Duration = Duration::from_secs(60);
 
 // ACP core §3.4: every state-changing request waits at least the read
 // deadline, so on a live connection its fact or rejection arrives first and
@@ -38,7 +41,8 @@ const _: () = assert!(
     START_TIMEOUT.as_millis() > crate::ws::READ_TIMEOUT.as_millis()
         && PROMPT_TIMEOUT.as_millis() > crate::ws::READ_TIMEOUT.as_millis()
         && TEARDOWN_TIMEOUT.as_millis() > crate::ws::READ_TIMEOUT.as_millis()
-        && CANCEL_TIMEOUT.as_millis() > crate::ws::READ_TIMEOUT.as_millis(),
+        && CANCEL_TIMEOUT.as_millis() > crate::ws::READ_TIMEOUT.as_millis()
+        && CONFIG_TIMEOUT.as_millis() > crate::ws::READ_TIMEOUT.as_millis(),
     "every request timeout must exceed the host connection's read deadline"
 );
 
@@ -52,6 +56,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/{id}/cancel", post(cancel))
         .route("/api/sessions/{id}/park", post(park))
         .route("/api/sessions/{id}/close", post(close))
+        .route("/api/sessions/{id}/catalog", get(catalog))
+        .route("/api/sessions/{id}/config", post(set_config))
         .route("/api/sessions/{id}/events", get(events))
         .route("/api/stream/sessions/{id}", get(stream_session))
         .layer(middleware::from_fn_with_state(
@@ -98,7 +104,7 @@ fn request_failed(err: RequestError) -> Response {
         RequestError::NotConnected => error(StatusCode::CONFLICT, "host_offline", "the host is not connected"),
         RequestError::Rejected { code, message } => {
             let status = match code.as_str() {
-                "not_attached" | "turn_in_progress" | "not_running" => StatusCode::CONFLICT,
+                "not_attached" | "turn_in_progress" | "not_running" | "unknown_option" => StatusCode::CONFLICT,
                 "unknown_agent" | "start_failed" => StatusCode::BAD_GATEWAY,
                 "invalid" => StatusCode::BAD_REQUEST,
                 _ => StatusCode::BAD_GATEWAY,
@@ -144,6 +150,7 @@ async fn start_session(State(state): State<AppState>, Json(req): Json<StartSessi
         committed_seq: 0,
         agent: req.agent,
         cwd: req.cwd,
+        config: req.config,
     };
     let undo = Undo::Start {
         session_id: session_id.clone(),
@@ -230,16 +237,17 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
     if !state.hub.is_ready(&session.host_id) {
         return request_failed(RequestError::NotConnected);
     }
-    let (agent_session_id, committed_seq) = match state.store.request_resume(&id) {
+    let (agent_session_id, committed_seq, config) = match state.store.request_resume(&id) {
         Ok(ResumeRequest::Starting {
             events,
             agent_session_id,
             committed_seq,
+            config,
         }) => {
             for event in events {
                 state.hub.publish(event);
             }
-            (agent_session_id, committed_seq)
+            (agent_session_id, committed_seq, config)
         }
         // A concurrent resume got there first (ACP core §12 scenario 11).
         Ok(ResumeRequest::Busy(lifecycle)) => return busy(&lifecycle),
@@ -261,6 +269,8 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         agent: session.agent,
         cwd: session.cwd,
         agent_session_id,
+        // Re-applied after the load (ACP core §4.3).
+        config,
     };
     let undo = Undo::Start { session_id: id.clone() };
     match state
@@ -384,6 +394,48 @@ async fn cancel(State(state): State<AppState>, Path(id): Path<String>) -> Respon
                 Err(err) => internal(err),
             }
         }
+        Err(err) => request_failed(err),
+    }
+}
+
+/// The session's config catalogue and current values (ACP core §9).
+async fn catalog(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    catalog_response(&state, &id, StatusCode::OK)
+}
+
+fn catalog_response(state: &AppState, id: &str, status: StatusCode) -> Response {
+    match state.store.catalog(id) {
+        Ok(Some(catalog)) => (status, Json(catalog)).into_response(),
+        Ok(None) => error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) => internal(err),
+    }
+}
+
+/// Switch one config option of an attached session (ACP core §9): 202
+/// with the session's catalogue once the host's `config_applied` is
+/// ingested. Every viewer sees the change as SSE `catalog_changed`.
+async fn set_config(State(state): State<AppState>, Path(id): Path<String>, Json(req): Json<ConfigRequest>) -> Response {
+    let session = match state.store.session(&id) {
+        Ok(Some(s)) => s,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) => return internal(err),
+    };
+    if session.lifecycle != "active" || !state.hub.is_ready(&session.host_id) {
+        return error(StatusCode::CONFLICT, "not_attached", "resume the session first");
+    }
+    let request_id = uuid::Uuid::now_v7().to_string();
+    let frame = CollectorFrame::SetConfig {
+        request_id: request_id.clone(),
+        session_id: id.clone(),
+        config_id: req.config_id,
+        value: req.value,
+    };
+    match state
+        .hub
+        .request(&session.host_id, &request_id, frame, CONFIG_TIMEOUT)
+        .await
+    {
+        Ok(_) => catalog_response(&state, &id, StatusCode::ACCEPTED),
         Err(err) => request_failed(err),
     }
 }
@@ -527,6 +579,31 @@ fn sse_event(e: &EventDto) -> Event {
         .data(serde_json::to_string(e).expect("event serializes"))
 }
 
+/// The SSE messages for one stored event: the event, then `catalog_changed`
+/// with the same id if it carries a catalogue snapshot (ACP core §9). A
+/// listed event with a snapshot is one that changed the stored catalogue,
+/// and both come from the stored row, so a replay from `Last-Event-ID`
+/// sends them too.
+fn sse_messages(e: &EventDto) -> Vec<Result<Event, Infallible>> {
+    let mut out = vec![Ok(sse_event(e))];
+    if let Some(catalog) = catalog_in(e) {
+        out.push(Ok(Event::default()
+            .id(e.event_id.to_string())
+            .event("catalog_changed")
+            .data(serde_json::to_string(&catalog).expect("catalog serializes"))));
+    }
+    out
+}
+
+/// The catalogue snapshot a stored host fact carries in its extracts.
+fn catalog_in(e: &EventDto) -> Option<SessionCatalog> {
+    if !matches!(e.kind.as_str(), "session_started" | "config_applied" | "acp_update") {
+        return None;
+    }
+    let indexed: Indexed = serde_json::from_value(e.body.get("indexed")?.clone()).ok()?;
+    SessionCatalog::from_indexed(&e.session_id, &indexed)
+}
+
 /// Session stream: replays from `Last-Event-ID`, then follows live events.
 async fn stream_session(
     State(state): State<AppState>,
@@ -542,19 +619,21 @@ async fn stream_session(
     let live = BroadcastStream::new(state.hub.subscribe());
     let backlog = state.store.events(&id, after, u32::MAX).unwrap_or_default();
     let last = backlog.last().map(|e| e.event_id).unwrap_or(after);
-    let replay = stream::iter(backlog.into_iter().map(|e| Ok(sse_event(&e))));
+    let replay = stream::iter(backlog.iter().flat_map(sse_messages).collect::<Vec<_>>());
     let session = id.clone();
-    let follow = live.filter_map(move |item| {
-        let session = session.clone();
-        async move {
-            match item {
-                Ok(e) if e.session_id == session && e.event_id > last => Some(Ok(sse_event(&e))),
-                Ok(_) => None,
-                // Lagged: tell the client to refetch instead of skipping silently.
-                Err(_) => Some(Ok(Event::default().event("resync_required").data("{}"))),
+    let follow = live
+        .filter_map(move |item| {
+            let session = session.clone();
+            async move {
+                match item {
+                    Ok(e) if e.session_id == session && e.event_id > last => Some(sse_messages(&e)),
+                    Ok(_) => None,
+                    // Lagged: tell the client to refetch instead of skipping silently.
+                    Err(_) => Some(vec![Ok(Event::default().event("resync_required").data("{}"))]),
+                }
             }
-        }
-    });
+        })
+        .flat_map(stream::iter);
     let stream = replay
         .chain(follow)
         .take_until(state.shutdown.clone().cancelled_owned());

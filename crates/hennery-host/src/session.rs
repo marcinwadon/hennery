@@ -12,23 +12,29 @@ pub use crate::adapter::{AgentCommand, NESTING_VARS};
 use crate::uplink::Uplink;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest,
-    PromptResponse, SessionId, StopReason,
+    BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
+    InitializeRequest, LoadSessionRequest, NewSessionRequest, PromptRequest, PromptResponse, SessionConfigKind,
+    SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigOptionsCapabilities,
+    SessionId, SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse,
+    StopReason,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, ErrorCode, UntypedMessage};
-use hennery_proto::frames::{HostFrame, Indexed, ParkReason, SessionBody, TurnOutcome};
+use hennery_proto::frames::{ConfigValue, HostFrame, Indexed, ParkReason, SessionBody, SessionConfig, TurnOutcome};
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
+
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks;
 
 /// How long `start` waits for spawn → `initialize` → `session/new` (or
 /// `session/load`) → `session_started` before giving up. Kept below the
@@ -45,6 +51,12 @@ const EXIT_SETTLE: Duration = Duration::from_millis(500);
 /// notification stream has been quiet this long.
 const DRAIN_QUIET: Duration = Duration::from_millis(100);
 
+/// At most this many adapter updates are emitted in a row before the actor's
+/// other arms (commands, the prompt's reply, the cancel grace) get a turn:
+/// an adapter streaming faster than the outbox writes must not delay a
+/// cancel until its turn is over.
+const UPDATE_BURST: usize = 64;
+
 /// Default idle window before the reaper parks a session (ACP core §4.7).
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -53,6 +65,12 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// §3.4), so the collector hears the turn end, not a timeout that would
 /// drop the whole host connection.
 pub const CANCEL_GRACE: Duration = Duration::from_secs(20);
+
+/// How long one `session/set_config_option` may take. A start's or a
+/// resume's switch that takes longer is reported, not fatal (ACP core
+/// §4.3); a `set_config` that takes longer is answered `config_failed`,
+/// well before the collector's 60 s timeout (§3.4).
+pub const CONFIG_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Update kinds a `session/load` replays as history: dropped while the load
 /// is outstanding (ACP core §4.5).
@@ -94,6 +112,13 @@ pub enum SessionCmd {
     /// Operator cancel of the turn in flight: `session/cancel` to the
     /// adapter; the turn's `turn_ended` completes it (ACP core §4.4).
     Cancel { request_id: String, turn_id: String },
+    /// Switch one config option (`session/set_config_option`): answered by
+    /// `config_applied`, or an error (ACP core §3.3).
+    SetConfig {
+        request_id: String,
+        config_id: String,
+        value: ConfigValue,
+    },
 }
 
 /// How the actor creates its adapter session.
@@ -117,6 +142,11 @@ pub struct SessionOptions {
     pub idle_timeout: Option<Duration>,
     /// How long a cancelled turn may run on before the adapter is stopped.
     pub cancel_grace: Duration,
+    /// How long one config switch may take.
+    pub config_timeout: Duration,
+    /// Test seams (see `test_hooks`).
+    #[cfg(feature = "test-hooks")]
+    pub test_hooks: Option<test_hooks::TestHooks>,
 }
 
 impl Default for SessionOptions {
@@ -126,8 +156,23 @@ impl Default for SessionOptions {
             kill_grace: KILL_GRACE,
             idle_timeout: Some(IDLE_TIMEOUT),
             cancel_grace: CANCEL_GRACE,
+            config_timeout: CONFIG_TIMEOUT,
+            #[cfg(feature = "test-hooks")]
+            test_hooks: None,
         }
     }
+}
+
+/// Everything a session actor needs to attach its session.
+#[derive(Debug, Clone)]
+pub struct Launch {
+    pub request_id: String,
+    pub session_id: String,
+    pub attach: Attach,
+    /// Applied once the adapter session exists (ACP core §4.3).
+    pub config: SessionConfig,
+    pub agent: AgentCommand,
+    pub cwd: PathBuf,
 }
 
 /// The connection task's handle on a session actor.
@@ -137,8 +182,9 @@ pub struct SessionHandle {
     open_turn: Arc<Mutex<Option<String>>>,
     /// Cancelled when the actor's task has finished (its adapter is gone).
     done: CancellationToken,
-    /// A park or close has been queued: this actor will serve no further
-    /// start or resume, even before it has read that command.
+    /// This actor will serve no further start or resume: a park or close
+    /// has been queued (even before the actor has read it), or the actor
+    /// has begun ending by itself.
     ending: Arc<AtomicBool>,
 }
 
@@ -153,10 +199,12 @@ impl SessionHandle {
         sent
     }
 
-    /// A park or close has been queued through `send` (set only there; an
-    /// actor that ends by itself — an idle reap, an adapter exit — never
-    /// sets it, and shows only as `is_ended` once it is done): a `Restart`
-    /// sent now would be answered `not_attached` once the actor gets to it.
+    /// The actor is ending: a park or close has been queued through `send`,
+    /// or the actor began ending by itself (an idle reap, an adapter exit, an
+    /// adapter stopped for ignoring a cancel) and may still be killing its
+    /// adapter. A `Restart` sent now would be answered `not_attached` once
+    /// the actor gets to it, so a start or resume waits for `finished` and
+    /// attaches a fresh adapter instead.
     pub fn is_ending(&self) -> bool {
         self.ending.load(Ordering::SeqCst)
     }
@@ -204,7 +252,15 @@ pub fn spawn(
     cwd: PathBuf,
     options: SessionOptions,
 ) -> SessionHandle {
-    spawn_actor(uplink, request_id, session_id, Attach::New, agent, cwd, options)
+    let launch = Launch {
+        request_id,
+        session_id,
+        attach: Attach::New,
+        config: SessionConfig::default(),
+        agent,
+        cwd,
+    };
+    self::launch(uplink, launch, options)
 }
 
 /// Spawn a session actor that resumes the agent's session
@@ -219,42 +275,171 @@ pub fn resume(
     cwd: PathBuf,
     options: SessionOptions,
 ) -> SessionHandle {
-    let attach = Attach::Load { agent_session_id };
-    spawn_actor(uplink, request_id, session_id, attach, agent, cwd, options)
+    let launch = Launch {
+        request_id,
+        session_id,
+        attach: Attach::Load { agent_session_id },
+        config: SessionConfig::default(),
+        agent,
+        cwd,
+    };
+    self::launch(uplink, launch, options)
 }
 
-fn spawn_actor(
-    uplink: Uplink,
-    request_id: String,
-    session_id: String,
-    attach: Attach,
-    agent: AgentCommand,
-    cwd: PathBuf,
-    options: SessionOptions,
-) -> SessionHandle {
+/// Spawn a session actor for `launch`: `session/new` or `session/load`,
+/// then its config. Otherwise like [`spawn`].
+pub fn launch(uplink: Uplink, launch: Launch, options: SessionOptions) -> SessionHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let open_turn = Arc::new(Mutex::new(None));
+    let ending = Arc::new(AtomicBool::new(false));
     let actor = Actor {
         uplink,
-        session_id,
+        session_id: launch.session_id.clone(),
         open_turn: open_turn.clone(),
         options,
+        catalogue: Mutex::new(Catalogue::default()),
+        ending: ending.clone(),
     };
     let done = CancellationToken::new();
     let finished = done.clone().drop_guard();
     tokio::spawn(async move {
         let _finished = finished;
-        actor.run(request_id, attach, agent, cwd, rx).await;
+        actor.run(launch, rx).await;
     });
     SessionHandle {
         commands: tx,
         open_turn,
         done,
-        ending: Arc::new(AtomicBool::new(false)),
+        ending,
     }
 }
 
 type Reply = Pin<Box<dyn Future<Output = agent_client_protocol::Result<PromptResponse>> + Send>>;
+
+/// One message from the ACP connection task to the actor: a live adapter
+/// notification (forwarded verbatim), or a config switch's answer. Both are
+/// delivered into the same channel, from the same connection-managed
+/// dispatch loop, so `updates.recv()` yields them in true wire order (fix
+/// round 2, F2). A switch's answer is routed here — via an ordered
+/// `on_receiving_result` callback, never `block_task` (used everywhere
+/// else in this file) — precisely because `block_task` does not hold up
+/// the dispatch loop, so it gives no ordering guarantee relative to
+/// notifications the adapter sends right before or after answering.
+enum Inbound {
+    Update(Value),
+    SwitchAnswer {
+        token: u64,
+        result: agent_client_protocol::Result<SetSessionConfigOptionResponse>,
+    },
+}
+
+/// A `set_config` received and not sent yet.
+struct QueuedSwitch {
+    request_id: String,
+    config_id: String,
+    value: ConfigValue,
+    /// Receipt plus `config_timeout`: past it, the switch is answered
+    /// `config_failed`, sent or not.
+    deadline: Instant,
+}
+
+/// A switch sent to the adapter, awaiting its answer. The answer itself is
+/// never held here (fix round 2): it arrives as an `Inbound::SwitchAnswer`
+/// matched to this switch by `token`.
+struct OutSwitch {
+    request_id: String,
+    token: u64,
+    /// When it was sent: an orphan (below) is given up on relative to this,
+    /// not to `deadline` (which is relative to receipt, decision 6).
+    sent_at: Instant,
+    /// Receipt plus `config_timeout`: past it while still out, the switch
+    /// becomes an orphan (below) — unless its answer has already been
+    /// flagged (`PendingConfigs::answered_token`), in which case
+    /// `out_deadline` disarms it (sets this to `None`) instead: the answer
+    /// is already in flight on the wire-ordered channel, so no drain is
+    /// needed to find it, and a cleared deadline can never re-fire in a
+    /// busy loop the way an unchanged, already-past one would.
+    deadline: Option<Instant>,
+}
+
+/// A timed-out switch may still answer, and decision 6 forbids ever having
+/// two requests out at once (the real adapters handle them concurrently, so
+/// a late one could land after, and clamp, one sent behind it): fix round 1
+/// (F1) tracks it by its `token` instead of sending anything else behind
+/// it. Its own requester has already been answered `config_failed`; a late
+/// answer (matched by `token`, fix round 2) with a non-empty read-back
+/// updates the catalogue and is announced as a `config_applied` under its
+/// original `request_id` (final review I2), so the collector stores what
+/// the agent now runs with — it has no waiter left for that id, so this is
+/// never a second answer. Given up on, unanswered, `config_timeout *
+/// ORPHAN_GRACE` after it was sent, in case the adapter never answers at
+/// all — the catalogue then simply stays not current, as it already was
+/// made at the timeout — unless its answer is already flagged
+/// (`PendingConfigs::answered_token`), in which case the grace is disarmed
+/// instead, exactly like `OutSwitch::deadline`: the answer is already on
+/// the wire-ordered channel and is handled (and announced) in order. A
+/// start switch that got no answer in time is an
+/// orphan too (final review I1), with no `request_id` and `NO_TOKEN`: its
+/// answer was dropped with the start, so only its grace clears it.
+struct Orphan {
+    token: u64,
+    request_id: Option<String>,
+    /// `None` once disarmed (its answer is already queued): a cleared grace
+    /// can never re-fire in a busy loop.
+    drop_after: Option<Instant>,
+}
+
+/// How many `config_timeout`s an orphaned switch is still tracked for.
+const ORPHAN_GRACE: u32 = 4;
+
+/// The actor's `set_config` switches: at most one is ever out (`out`) or
+/// orphaned (`orphan`) at a time, never both, and nothing in `queued` is
+/// sent while either is set — the rest wait, in the order they came.
+/// Everything still queued or out when the actor ends is answered
+/// `not_attached` then, after its last fact: the collector would otherwise
+/// wait out its timeout and drop the whole host connection. An orphan is
+/// not answered again on drop: its requester already has its answer.
+struct PendingConfigs {
+    uplink: Uplink,
+    queued: VecDeque<QueuedSwitch>,
+    out: Option<OutSwitch>,
+    orphan: Option<Orphan>,
+    /// The token the next switch sent will carry; `Inbound::SwitchAnswer`
+    /// is matched against `out`/`orphan` by this, never by arrival order
+    /// (fix round 2).
+    next_token: u64,
+    /// The token of the switch whose answer has begun arriving: set (fix
+    /// round 2) inside `send_next_switch`'s `on_receiving_result` callback,
+    /// *before* the answer is pushed onto the wire-ordered `updates`
+    /// channel — so once `out_deadline` observes a match, the answer is
+    /// already either in that channel or about to be, and no drain is
+    /// needed to find it (a flooding adapter's own backlog must never hold
+    /// up `out_deadline` itself, or it becomes another way to hold off a
+    /// cancel). Set from the connection task, possibly a different worker
+    /// thread, hence atomic. `NO_TOKEN` (never issued) until the first
+    /// answer starts arriving.
+    answered_token: Arc<AtomicU64>,
+}
+
+/// Sentinel for `PendingConfigs::answered_token`: no switch's answer has
+/// begun arriving yet. Tokens are issued from 1 upward, so this can never
+/// collide with a real one, and it is below every real one, so the flag can
+/// only ever be raised (`fetch_max`, final review M1).
+const NO_TOKEN: u64 = 0;
+
+impl Drop for PendingConfigs {
+    fn drop(&mut self) {
+        let out = self.out.take().map(|out| out.request_id);
+        let queued = self.queued.drain(..).map(|q| q.request_id);
+        for request_id in out.into_iter().chain(queued) {
+            self.uplink.reply(HostFrame::Error {
+                request_id,
+                code: "not_attached".into(),
+                message: "the session has ended on this host".into(),
+            });
+        }
+    }
+}
 
 struct Turn {
     id: String,
@@ -345,9 +530,40 @@ struct Actor {
     session_id: String,
     open_turn: Arc<Mutex<Option<String>>>,
     options: SessionOptions,
+    /// The adapter's config options as last reported.
+    catalogue: Mutex<Catalogue>,
+    /// Shared with the handle (`SessionHandle::is_ending`).
+    ending: Arc<AtomicBool>,
+}
+
+/// What the actor knows of its adapter's config options.
+#[derive(Default)]
+struct Catalogue {
+    options: Vec<SessionConfigOption>,
+    /// `false` once a switch went unanswered or was answered without a
+    /// catalogue: the options may be stale, so they are not announced
+    /// until the adapter reports them again.
+    current: bool,
 }
 
 impl Actor {
+    /// The catalogue extracts to announce: none while the options may be
+    /// stale.
+    fn catalogue_extracts(&self) -> Indexed {
+        let catalogue = self.catalogue.lock().expect("catalogue lock");
+        if catalogue.current {
+            catalogue_extracts(&catalogue.options)
+        } else {
+            Indexed::default()
+        }
+    }
+
+    /// This actor is about to end by itself: from now on a start or resume
+    /// waits for it to finish instead of being routed to it.
+    fn begin_ending(&self) {
+        self.ending.store(true, Ordering::SeqCst);
+    }
+
     fn emit(&self, body: SessionBody) {
         if let Err(err) = self.uplink.emit(&self.session_id, body) {
             tracing::error!(session_id = %self.session_id, error = %err, "failed to persist a session frame");
@@ -367,15 +583,8 @@ impl Actor {
         });
     }
 
-    async fn run(
-        self,
-        request_id: String,
-        attach: Attach,
-        agent: AgentCommand,
-        cwd: PathBuf,
-        mut commands: mpsc::UnboundedReceiver<SessionCmd>,
-    ) {
-        self.drive(request_id, attach, agent, cwd, &mut commands).await;
+    async fn run(self, launch: Launch, mut commands: mpsc::UnboundedReceiver<SessionCmd>) {
+        self.drive(launch, &mut commands).await;
         // The session's last frame is in the outbox. Commands sent while the
         // actor was ending (killing its adapter can take the whole grace) are
         // answered, never dropped: the collector would otherwise wait out its
@@ -395,7 +604,8 @@ impl Actor {
                 | SessionCmd::Restart { request_id }
                 | SessionCmd::Park { request_id }
                 | SessionCmd::Close { request_id }
-                | SessionCmd::Cancel { request_id, .. } => {
+                | SessionCmd::Cancel { request_id, .. }
+                | SessionCmd::SetConfig { request_id, .. } => {
                     // Also covers a start that reached this actor while it was
                     // tearing down (park/close/reap/adapter exit): the
                     // connection routed it to `Restart` because the handle
@@ -411,21 +621,26 @@ impl Actor {
 
     /// The actor's life: start, then serve until it parks, closes or ends.
     /// Every return leaves the session's final frame in the outbox.
-    async fn drive(
-        &self,
-        request_id: String,
-        attach: Attach,
-        agent: AgentCommand,
-        cwd: PathBuf,
-        commands: &mut mpsc::UnboundedReceiver<SessionCmd>,
-    ) {
+    async fn drive(&self, launch: Launch, commands: &mut mpsc::UnboundedReceiver<SessionCmd>) {
+        let Launch {
+            request_id,
+            attach,
+            config,
+            agent,
+            cwd,
+            ..
+        } = launch;
         let (mut adapter, io) = match Adapter::spawn(&agent, &cwd) {
             Ok(spawned) => spawned,
             Err(err) => {
                 return self.start_failed(request_id, StartError::other(format!("spawn {}: {err}", agent.program)));
             }
         };
-        let (updates_tx, mut updates) = mpsc::unbounded_channel::<Value>();
+        let (updates_tx, mut updates) = mpsc::unbounded_channel::<Inbound>();
+        // Kept for `send_next_switch`'s own `on_receiving_result` callbacks
+        // (fix round 2): the notification handler below moves its own clone
+        // into the connection task.
+        let switch_tx = updates_tx.clone();
         let (conn_tx, conn_rx) = oneshot::channel::<ConnectionTo<Agent>>();
         let (_stop_tx, stop_rx) = oneshot::channel::<()>();
         let transport = ByteStreams::new(io.stdin.compat_write(), io.stdout.compat());
@@ -439,7 +654,7 @@ impl Actor {
                 .on_receive_notification(
                     async move |msg: UntypedMessage, _cx| {
                         if msg.method == "session/update" {
-                            let _ = updates_tx.send(msg.params);
+                            let _ = updates_tx.send(Inbound::Update(msg.params));
                         }
                         Ok(())
                     },
@@ -458,45 +673,89 @@ impl Actor {
         }));
 
         let Ok(conn) = conn_rx.await else {
+            self.begin_ending();
             adapter.terminate(self.options.kill_grace).await;
             return self.start_failed(
                 request_id,
                 StartError::other("the ACP connection could not be set up".into()),
             );
         };
-        let negotiated = tokio::select! {
-            result = tokio::time::timeout(self.options.start_timeout, negotiate(&conn, cwd, &attach, &mut updates)) => {
-                match result {
-                    Ok(result) => result,
-                    Err(_) => Err(StartError::other(format!(
-                        "adapter did not start within {}s",
-                        self.options.start_timeout.as_secs()
-                    ))),
-                }
-            }
+        // One deadline for the whole start: the switches share it, so a slow
+        // one cannot push the answer past the collector's start timeout.
+        let deadline = Instant::now() + self.options.start_timeout;
+        let started = tokio::select! {
+            result = async {
+                let (session, replay, catalogue) =
+                    match tokio::time::timeout_at(deadline, negotiate(&conn, cwd, &attach, &mut updates)).await {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            return Err(StartError::other(format!(
+                                "adapter did not start within {}s",
+                                self.options.start_timeout.as_secs()
+                            )));
+                        }
+                    };
+                let applied = apply_config(&conn, &session, catalogue, &config, self.options.config_timeout, deadline).await;
+                Ok((session, replay, applied))
+            } => result,
             info = adapter.exited() => {
                 let tail = adapter.stderr_tail().await;
                 Err(StartError::other(format!("adapter exited during start ({}): {}", describe(info), last_lines(&tail, 5))))
             }
         };
-        let (agent_session, replay) = match negotiated {
-            Ok(negotiated) => negotiated,
+        let (agent_session, replay, applied) = match started {
+            Ok(started) => started,
             Err(error) => {
+                self.begin_ending();
                 adapter.terminate(self.options.kill_grace).await;
                 return self.start_failed(request_id, error);
             }
         };
+        let applied_hung = applied.hung;
+        *self.catalogue.lock().expect("catalogue lock") = Catalogue {
+            options: applied.options,
+            current: applied.current,
+        };
+        // The catalogue after the switches, never the one before (P-13).
         self.emit(SessionBody::SessionStarted {
             request_id,
             agent_session_id: agent_session.to_string(),
+            indexed: self.catalogue_extracts(),
         });
-        // A load's state updates follow the start they belong to; then the
-        // note about what the load dropped (ACP core §4.5).
-        for payload in replay.kept.iter().cloned() {
+        // A load's state updates follow the start they belong to, and so do
+        // updates the adapter sent while the start's switches ran. They are
+        // older than the catalogue just announced, so they carry no
+        // catalogue extracts (P-13). Then the note about what the load
+        // dropped (ACP core §4.5), then the one about switches that did not
+        // take.
+        let mut early = replay.kept.clone();
+        // Only what is queued now: a flooding adapter must not hold up the
+        // start.
+        for _ in 0..updates.len() {
+            // A `SwitchAnswer` here is impossible: `send_next_switch` is
+            // only ever called from the main loop below, which has not
+            // started yet.
+            match updates.try_recv() {
+                Ok(Inbound::Update(payload)) => early.push(payload),
+                Ok(Inbound::SwitchAnswer { .. }) => {}
+                Err(_) => break,
+            }
+        }
+        for payload in early {
             self.emit(update(payload, None));
         }
         if let Some(note) = replay.note() {
             self.emit(note);
+        }
+        if !applied.failures.is_empty() {
+            let (note, what) = match attach {
+                Attach::New => ("config_failed", "could not apply"),
+                Attach::Load { .. } => ("reapply_failed", "could not re-apply"),
+            };
+            self.emit(SessionBody::HostNote {
+                note: note.into(),
+                text: scrub(&format!("{what}: {}", applied.failures.join("; "))),
+            });
         }
 
         // Prompts are deduplicated by turn_id: a retried delivery after a
@@ -509,15 +768,52 @@ impl Actor {
         // turn ends; it never runs while a turn (or a pending question
         // inside one) is in flight.
         let mut idle_since = Instant::now();
+        let mut configs = PendingConfigs {
+            uplink: self.uplink.clone(),
+            queued: VecDeque::new(),
+            out: None,
+            // A start switch that got no answer in time may still land, and
+            // a late model switch would clamp a mode switched after it
+            // (decision 6): nothing is sent until its grace passes (final
+            // review I1). Its answer was dropped with the start's future,
+            // so `NO_TOKEN` matches nothing: only the grace clears it.
+            orphan: applied_hung.map(|sent_at| Orphan {
+                token: NO_TOKEN,
+                request_id: None,
+                drop_after: Some(sent_at + self.options.config_timeout * ORPHAN_GRACE),
+            }),
+            next_token: NO_TOKEN + 1,
+            answered_token: Arc::new(AtomicU64::new(NO_TOKEN)),
+        };
+        // Updates handled since the burst last reset: reset only once a
+        // full pass over the other arms (below) finds none of them ready.
+        let mut burst = 0;
         loop {
             let cancel_at = turn.as_ref().and_then(|t| t.cancel_deadline);
+            let out_at = configs.out.as_ref().and_then(|out| out.deadline);
+            let orphan_at = configs.orphan.as_ref().and_then(|orphan| orphan.drop_after);
             tokio::select! {
                 // Biased: adapter output already received is emitted before
-                // the prompt reply it preceded on the wire.
+                // the prompt reply it preceded on the wire (every arm that
+                // acts on the adapter drains what is queued first).
                 biased;
-                Some(payload) = updates.recv() => self.emit(update(payload, turn.as_ref().map(|t| t.id.as_str()))),
+                Some(inbound) = updates.recv(), if burst < UPDATE_BURST => {
+                    // Live updates and switch answers arrive on the same,
+                    // wire-ordered channel (fix round 2, F2): handling
+                    // exactly one item per poll, in receipt order, is
+                    // correct for every interleaving — no peeking or
+                    // reordering needed.
+                    burst += 1;
+                    let is_answer = matches!(inbound, Inbound::SwitchAnswer { .. });
+                    if self.handle_inbound(inbound, turn.as_ref().map(|t| t.id.as_str()), &mut configs) {
+                        idle_since = Instant::now();
+                    }
+                    if is_answer {
+                        self.send_next_switch(&conn, &agent_session, &switch_tx, &mut configs);
+                    }
+                }
                 info = adapter.exited() => {
-                    return self.adapter_exited(info, &mut adapter, &mut updates, turn.take()).await;
+                    return self.adapter_exited(info, &mut adapter, &mut updates, turn.take(), &mut configs).await;
                 }
                 cmd = commands.recv() => match cmd {
                     // Every handle dropped: the host is shutting down.
@@ -541,6 +837,13 @@ impl Actor {
                             self.reject(request_id, "turn_in_progress", "a turn is already running".into());
                             continue;
                         }
+                        // Updates from before this turn are not part of it.
+                        self.drain_updates(&mut updates, None, &mut configs);
+                        // The drain above may have answered a switch that
+                        // was out, freeing whatever waits behind it: sent
+                        // now, not left for this new turn's own reply to
+                        // discover (same pattern as the reply arm below).
+                        self.send_next_switch(&conn, &agent_session, &switch_tx, &mut configs);
                         seen_turns.insert(turn_id.clone());
                         self.set_open_turn(Some(turn_id.clone()));
                         self.emit(SessionBody::TurnStarted { request_id, turn_id: turn_id.clone() });
@@ -565,13 +868,35 @@ impl Actor {
                     Some(SessionCmd::Restart { request_id }) => self.emit(SessionBody::SessionStarted {
                         request_id,
                         agent_session_id: agent_session.to_string(),
+                        indexed: self.catalogue_extracts(),
                     }),
+                    // A switch may run during a turn; it is answered in order.
+                    Some(SessionCmd::SetConfig { request_id, config_id, value }) => {
+                        idle_since = Instant::now();
+                        if configs.orphan.is_some() {
+                            // Nothing is sent while an orphan's fate is
+                            // unknown: it may still answer, and decision 6
+                            // forbids two switches ever being (possibly)
+                            // out at once (fix round 1, F1).
+                            self.reject(request_id, "config_failed", "an earlier switch is still out".into());
+                        } else {
+                            let deadline = Instant::now() + self.options.config_timeout;
+                            configs.queued.push_back(QueuedSwitch { request_id, config_id, value, deadline });
+                            self.send_next_switch(&conn, &agent_session, &switch_tx, &mut configs);
+                            #[cfg(feature = "test-hooks")]
+                            if configs.out.is_some()
+                                && let Some(hooks) = &self.options.test_hooks
+                            {
+                                hooks.hold_if_armed(test_hooks::HoldAt::SwitchSent).await;
+                            }
+                        }
+                    }
                     Some(SessionCmd::Park { .. }) => {
-                        self.teardown(&mut adapter, &mut updates, turn.take()).await;
+                        self.teardown(&mut adapter, &mut updates, turn.take(), &mut configs).await;
                         return self.emit(SessionBody::SessionParked { reason: ParkReason::Operator });
                     }
                     Some(SessionCmd::Close { .. }) => {
-                        self.teardown(&mut adapter, &mut updates, turn.take()).await;
+                        self.teardown(&mut adapter, &mut updates, turn.take(), &mut configs).await;
                         return self.emit(SessionBody::SessionClosed);
                     }
                 },
@@ -580,9 +905,11 @@ impl Actor {
                     let cancelling = ended.cancel_deadline.is_some();
                     idle_since = Instant::now();
                     // Closes the race described on `drain_updates`: a late
-                    // update that arrived just as the reply resolved must be
-                    // emitted before this turn's `turn_ended`.
-                    self.drain_updates(&mut updates, Some(&ended.id));
+                    // update (or switch answer) that arrived just as the
+                    // reply resolved must be handled before this turn's
+                    // `turn_ended`.
+                    self.drain_updates(&mut updates, Some(&ended.id), &mut configs);
+                    self.send_next_switch(&conn, &agent_session, &switch_tx, &mut configs);
                     match result {
                         // The agent reports a cancelled turn by its stop
                         // reason (ACP): anything else finished first.
@@ -598,9 +925,10 @@ impl Actor {
                             let exited = adapter.exited_within(EXIT_SETTLE).await;
                             // Updates that arrived during the wait above are
                             // also ahead of this turn's end.
-                            self.drain_updates(&mut updates, Some(&ended.id));
+                            self.drain_updates(&mut updates, Some(&ended.id), &mut configs);
+                            self.send_next_switch(&conn, &agent_session, &switch_tx, &mut configs);
                             if let Some(info) = exited {
-                                return self.adapter_exited(info, &mut adapter, &mut updates, Some(ended)).await;
+                                return self.adapter_exited(info, &mut adapter, &mut updates, Some(ended), &mut configs).await;
                             }
                             // An agent may answer an aborted prompt with an
                             // error instead of `cancelled`.
@@ -609,15 +937,60 @@ impl Actor {
                         }
                     }
                 }
+                _ = out_deadline(out_at) => {
+                    // Never drains: an adapter's own flood backlog must
+                    // never hold up this arm either, or it becomes just
+                    // another way to hold off a cancel sitting behind it in
+                    // `commands` (fix round 2). Whether the answer is
+                    // already in flight is decided from the flag alone
+                    // (set, ordered, before the answer is pushed onto the
+                    // channel — see `send_next_switch`), never by looking.
+                    let out = configs.out.as_ref().expect("a deadline implies an out switch");
+                    if configs.answered_token.load(Ordering::SeqCst) == out.token {
+                        // Disarm rather than orphan: the answer is already
+                        // in flight (or sitting in `updates`) and will be
+                        // handled in wire order by the ordinary arm above,
+                        // whenever the actor gets to it. Cleared, not left
+                        // at its old (now past) instant, so this arm can
+                        // never re-fire for it in a busy loop.
+                        configs.out.as_mut().expect("just matched").deadline = None;
+                    } else {
+                        let out = configs.out.take().expect("just matched");
+                        self.orphan_switch(out, &mut configs);
+                        #[cfg(feature = "test-hooks")]
+                        if let Some(hooks) = &self.options.test_hooks {
+                            hooks.hold_if_armed(test_hooks::HoldAt::Orphaned).await;
+                        }
+                    }
+                }
+                _ = orphan_deadline(orphan_at) => {
+                    // Never drains, like `out_deadline`: an orphan whose
+                    // answer is already flagged (so on the channel, or about
+                    // to be) keeps waiting for it, grace disarmed, and the
+                    // ordinary arm handles it in wire order. A start's
+                    // orphan (`NO_TOKEN`) has no answer to wait for.
+                    let orphan = configs.orphan.as_mut().expect("a grace implies an orphan");
+                    if orphan.token != NO_TOKEN && configs.answered_token.load(Ordering::SeqCst) == orphan.token {
+                        orphan.drop_after = None;
+                    } else {
+                        configs.orphan = None;
+                        idle_since = Instant::now();
+                    }
+                }
                 _ = cancel_deadline(cancel_at) => {
                     let unanswered = turn.take().expect("a deadline implies a turn");
-                    return self.stop_after_unanswered_cancel(&mut adapter, &mut updates, unanswered).await;
+                    return self.stop_after_unanswered_cancel(&mut adapter, &mut updates, unanswered, &mut configs).await;
                 }
-                _ = idle_deadline(self.options.idle_timeout, idle_since), if turn.is_none() => {
+                _ = idle_deadline(self.options.idle_timeout, idle_since),
+                    if turn.is_none() && configs.out.is_none() && configs.orphan.is_none() =>
+                {
                     tracing::info!(session_id = %self.session_id, "reaping idle session");
-                    self.teardown(&mut adapter, &mut updates, None).await;
+                    self.begin_ending();
+                    self.teardown(&mut adapter, &mut updates, None, &mut configs).await;
                     return self.emit(SessionBody::SessionParked { reason: ParkReason::Idle });
                 }
+                // A burst is over and nothing else was ready: back to the updates.
+                _ = std::future::ready(()), if burst >= UPDATE_BURST => burst = 0,
             }
         }
     }
@@ -630,6 +1003,250 @@ impl Actor {
         });
     }
 
+    /// Refuse a `set_config` the adapter could not take: an option it does
+    /// not offer (`unknown_option`), or a value of the wrong kind for it
+    /// (`invalid`). Whether a select offers the value is the adapter's call.
+    fn check_switch(&self, config_id: &str, value: &ConfigValue) -> Result<(), (&'static str, String)> {
+        let catalogue = self.catalogue.lock().expect("catalogue lock");
+        let Some(option) = catalogue.options.iter().find(|o| &*o.id.0 == config_id) else {
+            return Err(("unknown_option", format!("the adapter offers no option {config_id}")));
+        };
+        match (&option.kind, value) {
+            (SessionConfigKind::Select(_), ConfigValue::Id(_))
+            | (SessionConfigKind::Boolean(_), ConfigValue::Bool(_)) => Ok(()),
+            _ => Err(("invalid", format!("{config_id} takes a different kind of value"))),
+        }
+    }
+
+    /// Send the oldest waiting switch, unless one is already out or an
+    /// earlier one is orphaned (fix round 1, F1): decision 6 allows at most
+    /// one switch in flight, and an orphan's fate is unknown until it
+    /// answers or its grace passes. A switch whose deadline passed while it
+    /// waited is answered `config_failed` without being sent. Checked
+    /// against the catalogue only now, when it is actually about to go out
+    /// (fix round 1, F3): checking it at arrival would judge a queued
+    /// switch against options a switch ahead of it in the queue is about to
+    /// replace, and could answer a refusal before an earlier, still-pending
+    /// switch's own answer — out of the order the operator sent them in.
+    fn send_next_switch(
+        &self,
+        conn: &ConnectionTo<Agent>,
+        session: &SessionId,
+        updates_tx: &mpsc::UnboundedSender<Inbound>,
+        configs: &mut PendingConfigs,
+    ) {
+        while configs.out.is_none()
+            && configs.orphan.is_none()
+            && let Some(next) = configs.queued.pop_front()
+        {
+            if Instant::now() >= next.deadline {
+                self.reject(
+                    next.request_id,
+                    "config_failed",
+                    "an earlier switch is still out".into(),
+                );
+                continue;
+            }
+            if let Err((code, message)) = self.check_switch(&next.config_id, &next.value) {
+                self.reject(next.request_id, code, message);
+                continue;
+            }
+            let token = configs.next_token;
+            configs.next_token += 1;
+            let request = SetSessionConfigOptionRequest::new(session.clone(), next.config_id, acp_value(&next.value));
+            let tx = updates_tx.clone();
+            let answered_token = configs.answered_token.clone();
+            #[cfg(feature = "test-hooks")]
+            let hooks = self.options.test_hooks.clone();
+            // Ordered (`on_receiving_result`, not `block_task`): the
+            // dispatch loop holds any later notification until this
+            // callback returns, so the answer lands in `updates` in true
+            // wire order relative to it (fix round 2, F2). The callback
+            // itself must never fail (an `Err` here would shut the whole
+            // ACP connection down) — it only ever forwards the result.
+            if let Err(err) = conn.send_request(request).on_receiving_result(move |result| {
+                // Flagged *before* the answer is pushed onto the channel
+                // (fix round 2): `out_deadline`, on a different task, can
+                // only ever observe this after the answer is there (or
+                // about to be), never before — so it is safe to disarm on
+                // the strength of this flag alone, with no drain to confirm.
+                // Raised, never overwritten (final review M1): tokens only
+                // increase, so a late answer for an orphan already given up
+                // on cannot lower a newer switch's flag.
+                answered_token.fetch_max(token, Ordering::SeqCst);
+                let _ = tx.send(Inbound::SwitchAnswer { token, result });
+                #[cfg(feature = "test-hooks")]
+                if let Some(hooks) = &hooks {
+                    hooks.answer_queued();
+                }
+                std::future::ready(Ok(()))
+            }) {
+                // Never sent (the connection is shutting down), so nothing
+                // can answer it: answered now, and not left out to block
+                // every switch behind it until its deadline (final review
+                // M2).
+                tracing::warn!(session_id = %self.session_id, error = %err, "set_config not sent");
+                self.reject(
+                    next.request_id,
+                    "config_failed",
+                    format!("not sent to the adapter: {err}"),
+                );
+                continue;
+            }
+            configs.out = Some(OutSwitch {
+                request_id: next.request_id,
+                token,
+                sent_at: Instant::now(),
+                deadline: Some(next.deadline),
+            });
+        }
+    }
+
+    /// A switch's read-back becomes the catalogue if it is non-empty; an
+    /// empty one means the current values are unknown, not that the adapter
+    /// has no options (decision 3).
+    fn apply_read_back(&self, response: SetSessionConfigOptionResponse) {
+        let mut catalogue = self.catalogue.lock().expect("catalogue lock");
+        if response.config_options.is_empty() {
+            catalogue.current = false;
+        } else {
+            *catalogue = Catalogue {
+                options: response.config_options,
+                current: true,
+            };
+        }
+    }
+
+    /// Answer a `set_config` from the adapter's genuine, timely answer:
+    /// `config_applied` with the catalogue it answered with (none if it
+    /// answered without one), or `config_failed` if it refused. A switch
+    /// that instead ran out its deadline is handled by `orphan_switch`
+    /// below, never here.
+    fn config_answered(
+        &self,
+        request_id: String,
+        result: agent_client_protocol::Result<SetSessionConfigOptionResponse>,
+    ) {
+        match result {
+            Ok(response) => {
+                self.apply_read_back(response);
+                self.emit(SessionBody::ConfigApplied {
+                    request_id,
+                    indexed: self.catalogue_extracts(),
+                });
+            }
+            Err(err) => self.reject(request_id, "config_failed", err.to_string()),
+        }
+    }
+
+    /// A switch whose deadline passed while it was still out (fix round 1,
+    /// F1). Its requester is answered now, but the real adapters handle
+    /// requests concurrently, so it may still answer late — with a fresher
+    /// read-back than anything sent behind it, which is why nothing is sent
+    /// behind an orphan either. Everything already queued behind it is
+    /// answered the same way, in order, rather than each waiting out its
+    /// own deadline (which would still leave two requests briefly out at
+    /// once, the moment the next one's turn came).
+    fn orphan_switch(&self, out: OutSwitch, configs: &mut PendingConfigs) {
+        self.catalogue.lock().expect("catalogue lock").current = false;
+        let timeout = self.options.config_timeout;
+        self.reject(
+            out.request_id.clone(),
+            "config_failed",
+            format!("no answer within {timeout:?} of the request"),
+        );
+        for queued in configs.queued.drain(..) {
+            self.reject(
+                queued.request_id,
+                "config_failed",
+                "an earlier switch is still out".into(),
+            );
+        }
+        configs.orphan = Some(Orphan {
+            token: out.token,
+            request_id: Some(out.request_id),
+            drop_after: Some(out.sent_at + self.options.config_timeout * ORPHAN_GRACE),
+        });
+    }
+
+    /// An orphaned switch's late answer (fix round 1, F1): its requester
+    /// already has its `config_failed`, but a non-empty read-back is what
+    /// the agent now runs with, so it is announced as a `config_applied`
+    /// under the orphan's own request id (final review I2). The collector
+    /// stores it while the session is attached; with no waiter left for
+    /// that id, it answers no one. An empty read-back or a refusal is not
+    /// announced: neither tells the collector anything new.
+    fn orphan_answered(
+        &self,
+        request_id: Option<String>,
+        result: agent_client_protocol::Result<SetSessionConfigOptionResponse>,
+    ) {
+        let Ok(response) = result else { return };
+        let announced = !response.config_options.is_empty();
+        self.apply_read_back(response);
+        if announced && let Some(request_id) = request_id {
+            self.emit(SessionBody::ConfigApplied {
+                request_id,
+                indexed: self.catalogue_extracts(),
+            });
+        }
+    }
+
+    /// One item off the inbound channel (fix round 2): a live update,
+    /// emitted (`live_update` carries a `config_option_update`'s catalogue
+    /// extracts), or a switch's answer, routed by `route_switch_answer`.
+    /// Returns whether this cleared the orphan (the idle reaper's clock
+    /// resets then, ACP core §4.7).
+    fn handle_inbound(&self, inbound: Inbound, turn: Option<&str>, configs: &mut PendingConfigs) -> bool {
+        match inbound {
+            Inbound::Update(payload) => {
+                self.emit(self.live_update(payload, turn));
+                false
+            }
+            Inbound::SwitchAnswer { token, result } => self.route_switch_answer(token, result, configs),
+        }
+    }
+
+    /// Apply a switch's answer if its `token` matches the switch that is out
+    /// or orphaned; a stray answer for anything else (e.g. an orphan already
+    /// given up on past its grace) matches neither and is discarded. Returns
+    /// whether this cleared the orphan.
+    fn route_switch_answer(
+        &self,
+        token: u64,
+        result: agent_client_protocol::Result<SetSessionConfigOptionResponse>,
+        configs: &mut PendingConfigs,
+    ) -> bool {
+        if configs.out.as_ref().is_some_and(|out| out.token == token) {
+            let out = configs.out.take().expect("just matched");
+            self.config_answered(out.request_id, result);
+            false
+        } else if let Some(orphan) = configs.orphan.take_if(|orphan| orphan.token == token) {
+            self.orphan_answered(orphan.request_id, result);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A live adapter notification as a session frame. A
+    /// `config_option_update` (the agent changed its own config, e.g. left
+    /// plan mode) replaces the catalogue and carries its extracts.
+    fn live_update(&self, payload: Value, turn: Option<&str>) -> SessionBody {
+        let mut body = update(payload, turn);
+        if let SessionBody::AcpUpdate { indexed, payload } = &mut body
+            && let Some(options) = config_update(payload)
+        {
+            *self.catalogue.lock().expect("catalogue lock") = Catalogue { options, current: true };
+            let catalogue = self.catalogue_extracts();
+            indexed.config_options = catalogue.config_options;
+            indexed.current_model = catalogue.current_model;
+            indexed.current_mode = catalogue.current_mode;
+            indexed.current_axes = catalogue.current_axes;
+        }
+        body
+    }
+
     fn end_turn(&self, turn_id: String, outcome: TurnOutcome, stop_reason: Option<String>, error: Option<String>) {
         self.emit(SessionBody::TurnEnded {
             turn_id,
@@ -640,26 +1257,44 @@ impl Actor {
         self.set_open_turn(None);
     }
 
-    /// Emit whatever updates are already queued, without waiting, as part of
-    /// `turn` (if any). The ACP connection task and this actor run on
-    /// different worker threads: it can push a notification and then resolve
-    /// the matching reply in quick succession, and this actor's `select!` can
-    /// observe the reply as ready before it happens to observe the
-    /// notification, in the same poll. ACP delivers messages in order, so the
-    /// notification's send always completes-before the reply resolves — a
-    /// non-blocking drain right before acting on a reply (or before ending a
-    /// torn-down turn) is therefore guaranteed to see it, closing that
-    /// ordering gap.
-    fn drain_updates(&self, updates: &mut mpsc::UnboundedReceiver<Value>, turn: Option<&str>) {
-        while let Ok(payload) = updates.try_recv() {
-            self.emit(update(payload, turn));
+    /// Handle whatever is already queued on the inbound channel, without
+    /// waiting, as part of `turn` (if any): a live update is emitted; a
+    /// switch's answer is routed by `route_switch_answer`. Both arrive on
+    /// the same wire-ordered channel (fix round 2, F2), so handling them one
+    /// at a time, in receipt order, right before acting on a reply (or
+    /// before ending a torn-down turn) is correct — no reordering needed.
+    /// Returns whether an orphan cleared during the drain (the idle
+    /// reaper's clock resets then, ACP core §4.7); callers that are ending
+    /// the actor regardless (teardown, an unanswered cancel, an adapter
+    /// exit) can ignore it.
+    fn drain_updates(
+        &self,
+        updates: &mut mpsc::UnboundedReceiver<Inbound>,
+        turn: Option<&str>,
+        configs: &mut PendingConfigs,
+    ) -> bool {
+        let mut orphan_cleared = false;
+        // Only what is queued now: an adapter that keeps streaming cannot
+        // hold the actor here.
+        for _ in 0..updates.len() {
+            match updates.try_recv() {
+                Ok(inbound) => orphan_cleared |= self.handle_inbound(inbound, turn, configs),
+                Err(_) => break,
+            }
         }
+        orphan_cleared
     }
 
     /// Park or close: forward any output already queued, end the turn as
     /// interrupted, then kill the group.
-    async fn teardown(&self, adapter: &mut Adapter, updates: &mut mpsc::UnboundedReceiver<Value>, turn: Option<Turn>) {
-        self.drain_updates(updates, turn.as_ref().map(|t| t.id.as_str()));
+    async fn teardown(
+        &self,
+        adapter: &mut Adapter,
+        updates: &mut mpsc::UnboundedReceiver<Inbound>,
+        turn: Option<Turn>,
+        configs: &mut PendingConfigs,
+    ) {
+        self.drain_updates(updates, turn.as_ref().map(|t| t.id.as_str()), configs);
         if let Some(turn) = turn {
             self.end_turn(turn.id, TurnOutcome::Interrupted, None, None);
         }
@@ -674,12 +1309,14 @@ impl Actor {
     async fn stop_after_unanswered_cancel(
         &self,
         adapter: &mut Adapter,
-        updates: &mut mpsc::UnboundedReceiver<Value>,
+        updates: &mut mpsc::UnboundedReceiver<Inbound>,
         turn: Turn,
+        configs: &mut PendingConfigs,
     ) {
         let grace = self.options.cancel_grace;
         tracing::warn!(session_id = %self.session_id, ?grace, "adapter ignored session/cancel; stopping it");
-        self.drain_updates(updates, Some(&turn.id));
+        self.begin_ending();
+        self.drain_updates(updates, Some(&turn.id), configs);
         let message = format!("the adapter did not stop within {grace:?} of session/cancel");
         self.end_turn(turn.id, TurnOutcome::Cancelled, None, Some(message.clone()));
         adapter.terminate(self.options.kill_grace).await;
@@ -707,13 +1344,15 @@ impl Actor {
         &self,
         info: ExitInfo,
         adapter: &mut Adapter,
-        updates: &mut mpsc::UnboundedReceiver<Value>,
+        updates: &mut mpsc::UnboundedReceiver<Inbound>,
         turn: Option<Turn>,
+        configs: &mut PendingConfigs,
     ) {
         tracing::warn!(session_id = %self.session_id, exit = %describe(info), "adapter exited");
+        self.begin_ending();
         // Output the adapter wrote before dying is still in the pipe.
-        while let Ok(Some(payload)) = tokio::time::timeout(DRAIN_QUIET, updates.recv()).await {
-            self.emit(update(payload, turn.as_ref().map(|t| t.id.as_str())));
+        while let Ok(Some(inbound)) = tokio::time::timeout(DRAIN_QUIET, updates.recv()).await {
+            self.handle_inbound(inbound, turn.as_ref().map(|t| t.id.as_str()), configs);
         }
         if let Some(turn) = turn {
             self.end_turn(
@@ -753,6 +1392,24 @@ async fn cancel_deadline(deadline: Option<Instant>) {
     }
 }
 
+/// Resolves once the switch that is out has waited past its deadline; never
+/// if none is out.
+async fn out_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolves once an orphaned switch's grace has passed; never if none is
+/// orphaned.
+async fn orphan_deadline(drop_after: Option<Instant>) {
+    match drop_after {
+        Some(drop_after) => tokio::time::sleep_until(drop_after).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// The in-flight prompt's reply, or never if no turn is running.
 async fn next_reply(turn: &mut Option<Turn>) -> agent_client_protocol::Result<PromptResponse> {
     match turn {
@@ -763,14 +1420,22 @@ async fn next_reply(turn: &mut Option<Turn>) -> agent_client_protocol::Result<Pr
 
 /// `initialize`, then `session/new` or `session/load`. While a load is
 /// outstanding its replay is classified, never emitted (ACP core §4.5).
+/// Returns the config options the adapter announced (none if it announced
+/// none, or they did not parse).
 async fn negotiate(
     conn: &ConnectionTo<Agent>,
     cwd: PathBuf,
     attach: &Attach,
-    updates: &mut mpsc::UnboundedReceiver<Value>,
-) -> Result<(SessionId, Replay), StartError> {
+    updates: &mut mpsc::UnboundedReceiver<Inbound>,
+) -> Result<(SessionId, Replay, Announced), StartError> {
+    // Advertised so that agents offer boolean options as booleans, not as
+    // on/off selects (ACP `session.configOptions.boolean`).
+    let capabilities = ClientCapabilities::new().session(
+        ClientSessionCapabilities::new()
+            .config_options(SessionConfigOptionsCapabilities::new().boolean(BooleanConfigOptionCapabilities::new())),
+    );
     let init = conn
-        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+        .send_request(InitializeRequest::new(ProtocolVersion::V1).client_capabilities(capabilities))
         .block_task()
         .await
         .map_err(|err| StartError::acp(err, false))?;
@@ -781,7 +1446,21 @@ async fn negotiate(
                 .block_task()
                 .await
                 .map_err(|err| StartError::acp(err, false))?;
-            return Ok((created.session_id, Replay::default()));
+            // What the adapter sent before its answer (see
+            // `Actor::drain_updates` for the ordering argument) follows the
+            // start, like a load's kept updates. A `SwitchAnswer` here is
+            // impossible: no switch is sent before this actor's main loop
+            // starts, well after this function returns.
+            let mut replay = Replay::default();
+            for _ in 0..updates.len() {
+                match updates.try_recv() {
+                    Ok(Inbound::Update(payload)) => replay.kept.push(payload),
+                    Ok(Inbound::SwitchAnswer { .. }) => {}
+                    Err(_) => break,
+                }
+            }
+            let catalogue = announced_options(created.config_options, &replay.kept);
+            return Ok((created.session_id, replay, catalogue));
         }
         Attach::Load { agent_session_id } => agent_session_id,
     };
@@ -798,7 +1477,13 @@ async fn negotiate(
     loop {
         tokio::select! {
             biased;
-            Some(payload) = updates.recv() => replay.observe(payload),
+            Some(inbound) = updates.recv() => {
+                // A `SwitchAnswer` here is impossible, same reasoning as
+                // above.
+                if let Inbound::Update(payload) = inbound {
+                    replay.observe(payload);
+                }
+            }
             result = &mut load => {
                 // Everything the adapter sent before its answer is replay,
                 // even if this select saw the answer first (see
@@ -808,13 +1493,281 @@ async fn negotiate(
                 // its load answer, already queued when this drain runs, is
                 // classified as replay too — dropped if a history kind,
                 // passed through if a state kind.
-                while let Ok(payload) = updates.try_recv() {
-                    replay.observe(payload);
+                while let Ok(inbound) = updates.try_recv() {
+                    if let Inbound::Update(payload) = inbound {
+                        replay.observe(payload);
+                    }
                 }
-                result.map_err(|err| StartError::acp(err, true))?;
-                return Ok((id, replay));
+                let loaded = result.map_err(|err| StartError::acp(err, true))?;
+                let catalogue = announced_options(loaded.config_options, &replay.kept);
+                return Ok((id, replay, catalogue));
             }
         }
+    }
+}
+
+/// The config options a new or loaded session starts with, and whether they
+/// are trustworthy for judging a switch's effect.
+struct Announced {
+    options: Vec<SessionConfigOption>,
+    /// `true` only for the adapter's own `session/new` | `session/load`
+    /// answer. `false` for a catalogue seeded from a pre-answer
+    /// `config_option_update` (decision 4, amended) or for no catalogue at
+    /// all: it may be stale or incomplete, so it must not gate whether a
+    /// switch is skipped or judged to not exist — only send can tell.
+    authoritative: bool,
+}
+
+/// The config options a new or loaded session starts with: the answer's,
+/// or, if it had none, those of the last `config_option_update` the adapter
+/// sent before it. That update still carries no extracts: it is older than
+/// the catalogue `session_started` announces.
+fn announced_options(answered: Option<Vec<SessionConfigOption>>, before: &[Value]) -> Announced {
+    match answered {
+        Some(options) if !options.is_empty() => Announced {
+            options,
+            authoritative: true,
+        },
+        _ => Announced {
+            options: before.iter().rev().find_map(config_update).unwrap_or_default(),
+            authoritative: false,
+        },
+    }
+}
+
+/// The options of a non-empty `config_option_update` notification.
+fn config_update(payload: &Value) -> Option<Vec<SessionConfigOption>> {
+    let notification = serde_json::from_value::<SessionNotification>(payload.clone()).ok()?;
+    match notification.update {
+        SessionUpdate::ConfigOptionUpdate(update) if !update.config_options.is_empty() => Some(update.config_options),
+        _ => None,
+    }
+}
+
+/// What a start's config switches left behind.
+struct Applied {
+    /// The options the last switch answered with (or the announced ones).
+    options: Vec<SessionConfigOption>,
+    /// Whether `options` is trustworthy right now: `false` to start with a
+    /// catalogue seeded from a `config_option_update` (decision 4) rather
+    /// than an adapter answer, and whenever a switch went unanswered or was
+    /// answered without a catalogue; `true` again after any switch answers
+    /// with a fresh, non-empty one. Gates the "already current" skip and
+    /// the "no such option" judgement (never a false "does not need
+    /// sending"), and the final read-back mismatch check and announcement.
+    current: bool,
+    /// One line per requested value that did not take.
+    failures: Vec<String>,
+    /// When the switch that got no answer in time was sent, if one did
+    /// not. Its request is still live at the adapter, which may apply it
+    /// late, so the main loop starts with it as an orphan (final review I1).
+    hung: Option<Instant>,
+}
+
+/// Apply `wanted` to a new or loaded session (ACP core §4.3): the model
+/// first, then the other axes, then the mode, each with
+/// `session/set_config_option`, so a model that clamps the mode cannot undo
+/// the requested mode. A value already current in an authoritative
+/// catalogue is not sent — a stale or seeded one (`catalogue.authoritative`
+/// false) never gates that decision, so its switch is sent regardless (a
+/// redundant switch is harmless; a wrongly skipped one lies). Each switch
+/// has `timeout`, and none runs past `deadline`.
+///
+/// Once a switch goes unanswered (or the deadline has passed), nothing more
+/// is sent: the adapter may still apply the late switch, and a late model
+/// switch could clamp a mode sent after it (`Applied::hung` carries it
+/// into the main loop, which sends no `set_config` behind it either).
+/// Finally every requested value is
+/// checked against the read-back. Whatever did not take is reported in
+/// `failures`; the start goes on.
+async fn apply_config(
+    conn: &ConnectionTo<Agent>,
+    session: &SessionId,
+    catalogue: Announced,
+    wanted: &SessionConfig,
+    timeout: Duration,
+    deadline: Instant,
+) -> Applied {
+    let mut applied = Applied {
+        options: catalogue.options,
+        current: catalogue.authoritative,
+        failures: Vec::new(),
+        hung: None,
+    };
+    let mut switches: Vec<(String, ConfigValue)> = Vec::new();
+    if let Some(model) = &wanted.model {
+        match axis_id(&applied.options, &SessionConfigOptionCategory::Model, "model") {
+            Some(id) => switches.push((id, ConfigValue::Id(model.clone()))),
+            None => applied
+                .failures
+                .push(format!("model={model}: the adapter offers no model option")),
+        }
+    }
+    switches.extend(wanted.axes.iter().map(|(id, value)| (id.clone(), value.clone())));
+    // Resolved now, and applied last: after the model and the other axes.
+    let mode = wanted.mode.as_ref().map(|mode| {
+        (
+            axis_id(&applied.options, &SessionConfigOptionCategory::Mode, "mode"),
+            mode,
+        )
+    });
+    match mode {
+        Some((Some(id), mode)) => switches.push((id, ConfigValue::Id(mode.clone()))),
+        Some((None, mode)) => applied
+            .failures
+            .push(format!("mode={mode}: the adapter offers no mode option")),
+        None => {}
+    }
+    // Requested values that already have their own line in `failures`.
+    let mut reported: HashSet<String> = HashSet::new();
+    let mut unanswered = false;
+    for (id, value) in &switches {
+        // Only an authoritative catalogue may decide "already current" or
+        // "no such option": a stale or seeded one is not proof of either, so
+        // its switch is sent regardless.
+        if applied.current {
+            match current_value(&applied.options, id) {
+                None => {
+                    applied
+                        .failures
+                        .push(format!("{id}: the adapter offers no such option"));
+                    reported.insert(id.clone());
+                    continue;
+                }
+                Some(current) if current == *value => continue,
+                Some(_) => {}
+            }
+        }
+        let now = Instant::now();
+        if unanswered || now >= deadline {
+            let why = if unanswered {
+                "an earlier switch did not answer"
+            } else {
+                "the start deadline passed"
+            };
+            applied.failures.push(format!("{id}={}: not sent: {why}", shown(value)));
+            reported.insert(id.clone());
+            continue;
+        }
+        let request = SetSessionConfigOptionRequest::new(session.clone(), id.clone(), acp_value(value));
+        let cut_short = now + timeout > deadline;
+        let until = (now + timeout).min(deadline);
+        match tokio::time::timeout_at(until, conn.send_request(request).block_task()).await {
+            // The catalogue of the last successful switch is the one kept,
+            // and it is a genuine, fresh read-back: authoritative again for
+            // whatever runs after it, even if an earlier switch in this same
+            // start was not (a seeded catalogue, or an earlier empty answer).
+            Ok(Ok(response)) if !response.config_options.is_empty() => {
+                applied.options = response.config_options;
+                applied.current = true;
+            }
+            // An empty answer is no read-back, not an adapter without options.
+            Ok(Ok(_)) => applied.current = false,
+            Ok(Err(err)) => {
+                applied.failures.push(format!("{id}={}: {err}", shown(value)));
+                reported.insert(id.clone());
+            }
+            Err(_) => {
+                applied.current = false;
+                unanswered = true;
+                applied.hung = Some(now);
+                let wait = if cut_short {
+                    "no answer before the start deadline".to_string()
+                } else {
+                    format!("no answer within {timeout:?}")
+                };
+                applied.failures.push(format!("{id}={}: {wait}", shown(value)));
+                reported.insert(id.clone());
+            }
+        }
+    }
+    // What the agent reports is what counts: a value it accepted but does
+    // not report (or a later switch undid) did not take either.
+    if applied.current {
+        for (id, value) in switches.iter().filter(|(id, _)| !reported.contains(id)) {
+            match current_value(&applied.options, id) {
+                Some(current) if current == *value => {}
+                Some(current) => applied.failures.push(format!(
+                    "{id}: asked {}, agent reports {}",
+                    shown(value),
+                    shown(&current)
+                )),
+                None => applied
+                    .failures
+                    .push(format!("{id}: asked {}, agent no longer offers it", shown(value))),
+            }
+        }
+    }
+    applied
+}
+
+/// The id of the option for `category`. Categories are only a UX hint in
+/// ACP, so an option with the conventional id counts too, but only if it
+/// has no category, or a custom (`_`-prefixed) one: an option another
+/// category claims is not the model or the mode.
+fn axis_id(options: &[SessionConfigOption], category: &SessionConfigOptionCategory, id: &str) -> Option<String> {
+    let uncategorized = |o: &&SessionConfigOption| match &o.category {
+        None => true,
+        Some(SessionConfigOptionCategory::Other(custom)) => custom.starts_with('_'),
+        Some(_) => false,
+    };
+    options
+        .iter()
+        .find(|o| o.category.as_ref() == Some(category))
+        .or_else(|| options.iter().filter(uncategorized).find(|o| &*o.id.0 == id))
+        .map(|o| o.id.to_string())
+}
+
+/// The current value of option `id`, if the adapter offers it.
+fn current_value(options: &[SessionConfigOption], id: &str) -> Option<ConfigValue> {
+    let option = options.iter().find(|o| &*o.id.0 == id)?;
+    match &option.kind {
+        SessionConfigKind::Select(select) => Some(ConfigValue::Id(select.current_value.to_string())),
+        SessionConfigKind::Boolean(toggle) => Some(ConfigValue::Bool(toggle.current_value)),
+        _ => None,
+    }
+}
+
+fn acp_value(value: &ConfigValue) -> SessionConfigOptionValue {
+    match value {
+        ConfigValue::Bool(on) => SessionConfigOptionValue::boolean(*on),
+        ConfigValue::Id(id) => SessionConfigOptionValue::value_id(id.clone()),
+    }
+}
+
+fn shown(value: &ConfigValue) -> String {
+    match value {
+        ConfigValue::Bool(on) => on.to_string(),
+        ConfigValue::Id(id) => id.clone(),
+    }
+}
+
+/// The catalogue extracts (ACP core §3.2) of `options`: the options
+/// themselves, and the current model, mode and other axes. None for an
+/// empty list, which is no read-back.
+fn catalogue_extracts(options: &[SessionConfigOption]) -> Indexed {
+    if options.is_empty() {
+        return Indexed::default();
+    }
+    let model = axis_id(options, &SessionConfigOptionCategory::Model, "model");
+    let mode = axis_id(options, &SessionConfigOptionCategory::Mode, "mode");
+    let id_of = |id: &Option<String>| id.as_deref().and_then(|id| current_value(options, id));
+    let as_id = |value: Option<ConfigValue>| match value {
+        Some(ConfigValue::Id(id)) => Some(id),
+        _ => None,
+    };
+    let axes = options
+        .iter()
+        .map(|o| o.id.to_string())
+        .filter(|id| Some(id) != model.as_ref() && Some(id) != mode.as_ref())
+        .filter_map(|id| current_value(options, &id).map(|value| (id, value)))
+        .collect();
+    Indexed {
+        config_options: Some(options.iter().filter_map(|o| serde_json::to_value(o).ok()).collect()),
+        current_model: as_id(id_of(&model)),
+        current_mode: as_id(id_of(&mode)),
+        current_axes: Some(axes),
+        ..Indexed::default()
     }
 }
 
@@ -857,5 +1810,44 @@ fn parse_prompt(content: Vec<Value>) -> Result<Vec<ContentBlock>, String> {
         Ok(blocks) if !blocks.is_empty() => Ok(blocks),
         Ok(_) => Err("empty prompt".to_string()),
         Err(err) => Err(err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(json: Value) -> Vec<SessionConfigOption> {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn select(id: &str, category: Option<&str>) -> Value {
+        let mut option = serde_json::json!({
+            "id": id, "name": id, "type": "select", "currentValue": "a",
+            "options": [{"value": "a", "name": "a"}]
+        });
+        if let Some(category) = category {
+            option["category"] = category.into();
+        }
+        option
+    }
+
+    #[test]
+    fn the_model_is_its_category_or_else_an_uncategorized_option_named_model() {
+        let model = SessionConfigOptionCategory::Model;
+        let pick = |json| axis_id(&options(json), &model, "model");
+        let categorized = serde_json::json!([select("model", Some("thought_level")), select("brain", Some("model"))]);
+        assert_eq!(pick(categorized).as_deref(), Some("brain"));
+        assert_eq!(
+            pick(serde_json::json!([select("model", None)])).as_deref(),
+            Some("model")
+        );
+        assert_eq!(
+            pick(serde_json::json!([select("model", Some("_mine"))])).as_deref(),
+            Some("model")
+        );
+        // Another category claims it, even one this build does not know.
+        assert_eq!(pick(serde_json::json!([select("model", Some("thought_level"))])), None);
+        assert_eq!(pick(serde_json::json!([select("model", Some("future"))])), None);
     }
 }

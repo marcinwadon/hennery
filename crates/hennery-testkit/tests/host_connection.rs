@@ -320,6 +320,7 @@ fn start(request_id: &str, session_id: &str) -> CollectorFrame {
         committed_seq: 0,
         agent: "fake".into(),
         cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+        config: Default::default(),
     }
 }
 
@@ -612,6 +613,7 @@ fn resume(request_id: &str, session_id: &str, committed_seq: u64, agent_session_
         agent: "fake".into(),
         cwd: std::env::temp_dir().to_string_lossy().into_owned(),
         agent_session_id: agent_session_id.into(),
+        config: Default::default(),
     }
 }
 
@@ -646,6 +648,7 @@ fn started(frame: &HostFrame) -> (u64, String, String) {
                 hennery_proto::frames::SessionBody::SessionStarted {
                     request_id,
                     agent_session_id,
+                    ..
                 },
             ..
         } => (*seq, request_id.clone(), agent_session_id.clone()),
@@ -854,4 +857,190 @@ async fn a_resume_waiting_behind_a_close_never_attaches_after_host_shutdown() {
     // Time for a wrongly attached adapter to launch.
     tokio::time::sleep(Duration::from_secs(1)).await;
     assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 1);
+}
+
+// Plan B2b: config over the connection.
+
+fn configurable_fake() -> hennery_host::AgentCommand {
+    let mut fake = hennery_host::AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    let script = hennery_testkit::FakeScript {
+        config_options: hennery_testkit::sample_config_options(),
+        ..Default::default()
+    };
+    fake.env.push((
+        hennery_testkit::SCRIPT_ENV.into(),
+        serde_json::to_string(&script).unwrap(),
+    ));
+    fake
+}
+
+fn current_mode(frame: &HostFrame) -> Option<String> {
+    match frame {
+        HostFrame::Session {
+            body: hennery_proto::frames::SessionBody::SessionStarted { indexed, .. },
+            ..
+        } => indexed.current_mode.clone(),
+        other => panic!("expected session_started, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn start_and_resume_carry_their_config_to_the_adapter() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(host_with_fake(addr, "start-config", configurable_fake())));
+
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    let plan = hennery_proto::frames::SessionConfig {
+        mode: Some("plan".into()),
+        ..Default::default()
+    };
+    let mut frame = start("r1", "s1");
+    if let CollectorFrame::StartSession { config, .. } = &mut frame {
+        *config = plan.clone();
+    }
+    send_frame(&mut sink, &frame).await;
+    let started = read_until(&mut stream, body_is("s1", "session_started")).await;
+    assert_eq!(current_mode(&started).as_deref(), Some("plan"));
+
+    let mut frame = resume("r2", "s2", 0, "agent-7");
+    if let CollectorFrame::ResumeSession { config, .. } = &mut frame {
+        *config = hennery_proto::frames::SessionConfig {
+            mode: Some("bypass".into()),
+            ..Default::default()
+        };
+    }
+    send_frame(&mut sink, &frame).await;
+    let resumed = read_until(&mut stream, body_is("s2", "session_started")).await;
+    assert_eq!(current_mode(&resumed).as_deref(), Some("bypass"));
+}
+
+#[tokio::test]
+async fn set_config_reaches_the_actor_and_one_for_a_detached_session_is_not_attached() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(host_with_fake(addr, "set-config", configurable_fake())));
+
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    send_frame(&mut sink, &start("r1", "s1")).await;
+    read_until(&mut stream, body_is("s1", "session_started")).await;
+    let set = |request_id: &str, session_id: &str| CollectorFrame::SetConfig {
+        request_id: request_id.into(),
+        session_id: session_id.into(),
+        config_id: "mode".into(),
+        value: hennery_proto::frames::ConfigValue::Id("plan".into()),
+    };
+    send_frame(&mut sink, &set("r2", "s1")).await;
+    let applied = read_until(&mut stream, body_is("s1", "config_applied")).await;
+    let HostFrame::Session {
+        body: hennery_proto::frames::SessionBody::ConfigApplied { request_id, indexed },
+        ..
+    } = applied
+    else {
+        panic!("expected config_applied, got {applied:?}");
+    };
+    assert_eq!(
+        (request_id.as_str(), indexed.current_mode.as_deref()),
+        ("r2", Some("plan"))
+    );
+    send_frame(&mut sink, &set("r3", "no-such-session")).await;
+    let refused = read_until(&mut stream, error_for("r3")).await;
+    assert!(
+        matches!(&refused, HostFrame::Error { code, .. } if code == "not_attached"),
+        "{refused:?}"
+    );
+}
+
+// Plan B2b, review fix round 1: launching while the old actor is still
+// ending by itself.
+
+/// A `session_parked` frame with this `reason`, matched via its plain JSON
+/// (`SessionBody`/`ParkReason` are not otherwise imported here).
+fn parked_reason(session: &str, reason: &str) -> impl Fn(&HostFrame) -> bool {
+    let (session, reason) = (session.to_string(), reason.to_string());
+    move |f| match f {
+        HostFrame::Session { session_id, body, .. } => {
+            let value = serde_json::to_value(body).unwrap();
+            session_id == &session && value["kind"] == "session_parked" && value["reason"] == reason.as_str()
+        }
+        _ => false,
+    }
+}
+
+/// An idle reap ends the actor by itself (task 9: `begin_ending` fires
+/// before the adapter is killed, not only behind a queued park/close). A
+/// resume arriving while it is still killing its adapter (ignoring SIGTERM,
+/// so it needs the whole 5 s kill grace) must not be routed to it and
+/// answered `not_attached`, nor start a second adapter alongside the one
+/// still being killed.
+///
+/// Fix round 1: `attach`'s own `is_ending` check and `spawn_or_restart`'s
+/// launch decision used to be two separate locked reads of the session map.
+/// The actor's own `begin_ending` (set with no lock held, from inside the
+/// actor's task) could land in the gap between them: `attach` read
+/// `is_ending() == false` and took the direct path into `spawn_or_restart`,
+/// which then re-read the map and found the handle no longer restartable
+/// (`is_ending() == true` by then) — falling through to a launch while the
+/// old actor was still tearing down. Collapsing both checks into
+/// `spawn_or_restart`'s single locked read closes that *launch* gap — a
+/// `Restart` send can still race `begin_ending` (it takes no lock), but that
+/// only ever costs a retryable `not_attached`, never a second adapter.
+///
+/// The ordering assertion below (`session_parked` before the new
+/// `session_started`) is the one that actually proves "one adapter at a
+/// time": the idle-reap arm only emits `session_parked{idle}` after
+/// `teardown` has killed the old adapter, so seeing it first means the old
+/// adapter was already dead before the new one started.
+#[tokio::test]
+async fn a_resume_during_an_idle_reaps_kill_grace_waits_for_the_old_actor_to_finish() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let spawns = dir.path().join("spawns");
+    let stubborn = counting_fake_with(&spawns, "trap '' TERM;");
+    let mut cfg = host_with_fake(addr, "resume-during-idle-reap", stubborn);
+    cfg.idle_timeout = Duration::from_millis(200);
+    tokio::spawn(run(cfg));
+
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    send_frame(&mut sink, &start("r1", "s1")).await;
+    read_until(&mut stream, body_is("s1", "session_started")).await;
+
+    // Past the idle timeout: the actor has begun reaping and (ignoring
+    // SIGTERM) is still killing its adapter, well within the 5 s grace.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    send_frame(&mut sink, &resume("r3", "s1", 0, "fake-session-1")).await;
+
+    // A direct sample well inside the kill grace (it runs 5 s; the old
+    // actor's SIGTERM-ignoring adapter cannot possibly be dead yet): a
+    // launch racing the old actor's teardown would already show a second
+    // spawn here, long before either frame below lands.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        std::fs::read_to_string(&spawns).unwrap().lines().count(),
+        1,
+        "a second adapter was spawned while the first was still being killed"
+    );
+
+    let frames = read_through(&mut stream, body_is("s1", "session_started")).await;
+    assert!(
+        !frames.iter().any(|f| matches!(f, HostFrame::Error { .. })),
+        "the resume must not be answered not_attached while the old actor is still ending: {frames:?}"
+    );
+    let parked_at = frames
+        .iter()
+        .position(parked_reason("s1", "idle"))
+        .unwrap_or_else(|| panic!("the new session_started arrived before the old actor's session_parked: {frames:?}"));
+    let started_at = frames.len() - 1;
+    assert_eq!(started(frames.last().unwrap()).1, "r3");
+    assert!(
+        parked_at < started_at,
+        "the old actor's session_parked must land before the new session_started: {frames:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&spawns).unwrap().lines().count(),
+        2,
+        "one spawn for the start, one for the resume — a launch racing the old \
+         actor's teardown would show a third"
+    );
 }

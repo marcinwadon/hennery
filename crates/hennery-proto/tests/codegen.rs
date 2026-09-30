@@ -93,3 +93,14 @@ fn collect_unresolved_refs(
         _ => {}
     }
 }
+
+#[test]
+fn config_fields_are_flat_in_typescript() {
+    let ts = render_ts();
+    assert!(ts.contains("export type ConfigValue = boolean | string;"), "{ts}");
+    let start = ts
+        .lines()
+        .find(|l| l.starts_with("export type StartSessionRequest ="))
+        .expect("StartSessionRequest");
+    assert!(start.contains("model?") && start.contains("axes?"), "{start}");
+}

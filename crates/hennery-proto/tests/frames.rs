@@ -1,4 +1,6 @@
-use hennery_proto::frames::{CollectorFrame, HostFrame, Indexed, ParkReason, SessionBody, TurnOutcome};
+use hennery_proto::frames::{
+    CollectorFrame, ConfigValue, HostFrame, Indexed, ParkReason, SessionBody, SessionConfig, TurnOutcome,
+};
 use serde_json::json;
 
 #[test]
@@ -74,6 +76,7 @@ fn every_collector_frame_round_trips() {
             committed_seq: 0,
             agent: "claude".into(),
             cwd: "/tmp".into(),
+            config: Default::default(),
         },
         CollectorFrame::ResumeSession {
             request_id: "r".into(),
@@ -82,6 +85,7 @@ fn every_collector_frame_round_trips() {
             agent: "claude".into(),
             cwd: "/tmp".into(),
             agent_session_id: "a1".into(),
+            config: Default::default(),
         },
         CollectorFrame::Prompt {
             request_id: "r".into(),
@@ -105,6 +109,12 @@ fn every_collector_frame_round_trips() {
             request_id: "r".into(),
             session_id: "s".into(),
             turn_id: "t".into(),
+        },
+        CollectorFrame::SetConfig {
+            request_id: "r".into(),
+            session_id: "s".into(),
+            config_id: "model".into(),
+            value: ConfigValue::Id("large".into()),
         },
     ];
     for f in frames {
@@ -147,6 +157,7 @@ fn resume_frames_and_host_notes_use_the_spec_field_names() {
         agent: "claude".into(),
         cwd: "/tmp".into(),
         agent_session_id: "a1".into(),
+        config: Default::default(),
     };
     assert_eq!(
         serde_json::to_value(&resume).unwrap(),
@@ -253,4 +264,129 @@ fn hello_capabilities_skip_unknown_entries_and_default_to_none() {
         attached_sessions: vec![],
     };
     assert_eq!(serde_json::to_value(&sent).unwrap()["capabilities"], json!(["park"]));
+}
+
+#[test]
+fn session_started_names_the_request_and_the_agents_session() {
+    let body = serde_json::to_value(SessionBody::session_started("r", "a")).unwrap();
+    assert_eq!(
+        (&body["kind"], &body["request_id"], &body["agent_session_id"]),
+        (&json!("session_started"), &json!("r"), &json!("a"))
+    );
+}
+
+// Plan B2b: model, axes and mode (ACP core §3.2, §3.3).
+
+fn config() -> SessionConfig {
+    SessionConfig {
+        model: Some("large".into()),
+        mode: Some("plan".into()),
+        axes: [
+            ("effort".to_string(), ConfigValue::Id("high".into())),
+            ("fast".to_string(), ConfigValue::Bool(true)),
+        ]
+        .into_iter()
+        .collect(),
+    }
+}
+
+#[test]
+fn start_and_resume_carry_model_mode_and_axes_as_flat_fields() {
+    let start = CollectorFrame::StartSession {
+        request_id: "r".into(),
+        session_id: "s".into(),
+        committed_seq: 0,
+        agent: "claude".into(),
+        cwd: "/tmp".into(),
+        config: config(),
+    };
+    let expected = json!({
+        "type": "start_session", "request_id": "r", "session_id": "s", "committed_seq": 0,
+        "agent": "claude", "cwd": "/tmp",
+        "model": "large", "mode": "plan", "axes": {"effort": "high", "fast": true}
+    });
+    assert_eq!(serde_json::to_value(&start).unwrap(), expected);
+    assert_eq!(serde_json::from_value::<CollectorFrame>(expected).unwrap(), start);
+    // Absent fields are an empty config, for a collector that sends none.
+    let bare: CollectorFrame = serde_json::from_value(json!({
+        "type": "resume_session", "request_id": "r", "session_id": "s", "committed_seq": 3,
+        "agent": "claude", "cwd": "/tmp", "agent_session_id": "a1"
+    }))
+    .unwrap();
+    let CollectorFrame::ResumeSession { config, .. } = bare else {
+        panic!("{bare:?}");
+    };
+    assert!(config.is_empty());
+}
+
+#[test]
+fn config_frames_use_the_spec_field_names() {
+    let set = CollectorFrame::SetConfig {
+        request_id: "r".into(),
+        session_id: "s".into(),
+        config_id: "fast".into(),
+        value: ConfigValue::Bool(false),
+    };
+    assert_eq!(
+        serde_json::to_value(&set).unwrap(),
+        json!({"type": "set_config", "request_id": "r", "session_id": "s", "config_id": "fast", "value": false})
+    );
+    let applied = SessionBody::ConfigApplied {
+        request_id: "r".into(),
+        indexed: Indexed {
+            config_options: Some(vec![json!({"id": "model"})]),
+            current_model: Some("large".into()),
+            current_mode: Some("plan".into()),
+            current_axes: Some(config().axes),
+            ..Indexed::default()
+        },
+    };
+    let expected = json!({
+        "kind": "config_applied", "request_id": "r",
+        "indexed": {
+            "config_options": [{"id": "model"}], "current_model": "large", "current_mode": "plan",
+            "current_axes": {"effort": "high", "fast": true}
+        }
+    });
+    assert_eq!(serde_json::to_value(&applied).unwrap(), expected);
+    assert_eq!(serde_json::from_value::<SessionBody>(expected).unwrap(), applied);
+    // A `session_started` from an older host has no extracts.
+    let old: SessionBody =
+        serde_json::from_value(json!({"kind": "session_started", "request_id": "r", "agent_session_id": "a"})).unwrap();
+    assert_eq!(old, SessionBody::session_started("r", "a"));
+}
+
+#[test]
+fn only_a_non_empty_catalogue_is_a_snapshot_of_the_current_config() {
+    let mut indexed = Indexed {
+        current_model: Some("large".into()),
+        ..Indexed::default()
+    };
+    assert_eq!(indexed.current_config(), None, "no catalogue");
+    indexed.config_options = Some(vec![]);
+    assert_eq!(indexed.current_config(), None, "an empty read-back");
+    indexed.config_options = Some(vec![json!({"id": "model"})]);
+    assert_eq!(
+        indexed.current_config(),
+        Some(SessionConfig {
+            model: Some("large".into()),
+            ..SessionConfig::default()
+        })
+    );
+}
+
+#[test]
+fn rest_config_requests_take_a_value_id_or_a_boolean() {
+    use hennery_proto::rest::{ConfigRequest, StartSessionRequest};
+    let start: StartSessionRequest =
+        serde_json::from_value(json!({"host_id": "h", "agent": "claude", "cwd": "/tmp", "mode": "plan"})).unwrap();
+    assert_eq!(start.config.mode.as_deref(), Some("plan"));
+    let plain: StartSessionRequest =
+        serde_json::from_value(json!({"host_id": "h", "agent": "claude", "cwd": "/tmp"})).unwrap();
+    assert!(plain.config.is_empty());
+    let id: ConfigRequest = serde_json::from_value(json!({"config_id": "model", "value": "large"})).unwrap();
+    assert_eq!(id.value, ConfigValue::Id("large".into()));
+    let toggle: ConfigRequest = serde_json::from_value(json!({"config_id": "fast", "value": true})).unwrap();
+    assert_eq!(toggle.value, ConfigValue::Bool(true));
+    assert!(serde_json::from_value::<ConfigRequest>(json!({"config_id": "fast", "value": 3})).is_err());
 }

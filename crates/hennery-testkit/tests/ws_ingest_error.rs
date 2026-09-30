@@ -80,10 +80,7 @@ async fn a_failed_ingest_drops_the_connection_instead_of_acking_past_it() {
         serde_json::to_string(&HostFrame::Session {
             session_id: "s1".into(),
             seq: 1,
-            body: SessionBody::SessionStarted {
-                request_id: "r0".into(),
-                agent_session_id: "a1".into(),
-            },
+            body: SessionBody::session_started("r0", "a1"),
         })
         .unwrap(),
     ))

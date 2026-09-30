@@ -35,6 +35,8 @@ slice); everything else is design. The maintainer's decisions are recorded below
      waiters, one visibility rule for unapplied facts. Executed 2026-09-29 (see its "Execution status").
    - [Cancel and capabilities (B2a)](plans/2026-09-29-cancel-capabilities.md) — `cancel_turn`,
      `hello.capabilities` with the park gate, and B1's two carry-overs. Executed 2026-09-29 (see its "Execution status").
+   - [Session config (B2b)](plans/2026-09-30-session-config.md) — model, axes and mode on start
+     and resume, `set_config`, the session catalogue, and B2a's two folds. Executed 2026-09-30 (see its "Execution status").
 
 ## Maintainer decisions (2026-09-27)
 

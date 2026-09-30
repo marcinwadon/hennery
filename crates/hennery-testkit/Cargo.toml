@@ -20,7 +20,7 @@ tokio.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 futures.workspace = true
-hennery-host.workspace = true
+hennery-host = { workspace = true, features = ["test-hooks"] }
 hennery-kernel.workspace = true
 hennery-proto.workspace = true
 hennery-sessions.workspace = true

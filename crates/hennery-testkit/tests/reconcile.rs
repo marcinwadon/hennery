@@ -226,14 +226,8 @@ async fn started_session(collector: &Collector, host: &mut ScriptedHost) -> Stri
     else {
         panic!("expected start_session");
     };
-    host.emit(
-        &session_id,
-        SessionBody::SessionStarted {
-            request_id,
-            agent_session_id: "agent-1".into(),
-        },
-    )
-    .await;
+    host.emit(&session_id, SessionBody::session_started(request_id, "agent-1"))
+        .await;
     let (status, body) = call.await.unwrap();
     assert_eq!(status, 202, "{body}");
     session_id
@@ -478,14 +472,8 @@ async fn a_reconcile_close_rejected_after_a_resume_leaves_the_resume_alone() {
         message: "no such session".into(),
     })
     .await;
-    host.emit(
-        &session,
-        SessionBody::SessionStarted {
-            request_id: resume_request,
-            agent_session_id: "agent-1".into(),
-        },
-    )
-    .await;
+    host.emit(&session, SessionBody::session_started(resume_request, "agent-1"))
+        .await;
 
     let (status, body) = resume.await.unwrap();
     assert_eq!((status, body["lifecycle"].as_str()), (202, Some("active")), "{body}");
@@ -508,6 +496,7 @@ async fn a_request_that_times_out_on_a_live_connection_drops_it() {
         committed_seq: 0,
         agent: "fake".into(),
         cwd: "/tmp".into(),
+        config: Default::default(),
     };
     let outcome = collector
         .state
@@ -646,14 +635,7 @@ async fn a_host_that_never_returns_after_a_collector_restart_is_presumed_offline
         let store = Store::open(&dir.path().join("hennery.db")).unwrap();
         store.create_session("s1", HOST, "fake", "/tmp").unwrap();
         store
-            .ingest(
-                "s1",
-                1,
-                &SessionBody::SessionStarted {
-                    request_id: "r0".into(),
-                    agent_session_id: "a1".into(),
-                },
-            )
+            .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
             .unwrap();
     }
     let collector = Collector::start_in(dir, Duration::from_millis(300)).await;
@@ -668,14 +650,7 @@ async fn a_host_that_returns_after_a_collector_restart_is_not_presumed_offline()
         let store = Store::open(&dir.path().join("hennery.db")).unwrap();
         store.create_session("s1", HOST, "fake", "/tmp").unwrap();
         store
-            .ingest(
-                "s1",
-                1,
-                &SessionBody::SessionStarted {
-                    request_id: "r0".into(),
-                    agent_session_id: "a1".into(),
-                },
-            )
+            .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
             .unwrap();
     }
     let collector = Collector::start_in(dir, Duration::from_millis(300)).await;
@@ -727,6 +702,7 @@ async fn expect_resume(host: &mut ScriptedHost, session: &str) -> String {
             agent,
             cwd,
             agent_session_id,
+            ..
         } => {
             assert_eq!(
                 (
@@ -754,14 +730,8 @@ async fn a_resume_attaches_a_parked_session_again() {
     let call = tokio::spawn(async move { post(&c, url, json!({})).await });
     let request_id = expect_resume(&mut host, &session).await;
     assert_eq!(collector.lifecycle(&session), "starting");
-    host.emit(
-        &session,
-        SessionBody::SessionStarted {
-            request_id,
-            agent_session_id: "agent-1".into(),
-        },
-    )
-    .await;
+    host.emit(&session, SessionBody::session_started(request_id, "agent-1"))
+        .await;
     let (status, body) = call.await.unwrap();
     assert_eq!((status, body["lifecycle"].as_str()), (202, Some("active")), "{body}");
     let kinds = collector.event_kinds(&session);
@@ -784,14 +754,8 @@ async fn two_concurrent_resumes_attach_once() {
     let request_id = expect_resume(&mut host, &session).await;
     let (status, body) = post(&client(), resume_url(&collector, &session), json!({})).await;
     assert_eq!((status, body["code"].as_str()), (409, Some("starting")), "{body}");
-    host.emit(
-        &session,
-        SessionBody::SessionStarted {
-            request_id,
-            agent_session_id: "agent-1".into(),
-        },
-    )
-    .await;
+    host.emit(&session, SessionBody::session_started(request_id, "agent-1"))
+        .await;
     assert_eq!(first.await.unwrap().0, 202);
     let more = tokio::time::timeout(Duration::from_millis(300), host.next()).await;
     assert!(more.is_err(), "a second request reached the host: {more:?}");
@@ -1270,4 +1234,282 @@ async fn a_cancel_whose_turn_ended_before_it_was_sent_answers_the_stored_outcome
         (status, body),
         (202, json!({ "turn_id": turn, "outcome": "completed" }))
     );
+}
+
+// Plan B2b: the collector's side of model, axes and mode.
+
+/// Catalogue extracts whose current mode is `mode`.
+fn catalogue(mode: &str) -> hennery_proto::frames::Indexed {
+    hennery_proto::frames::Indexed {
+        config_options: Some(vec![json!({"id": "mode", "currentValue": mode})]),
+        current_mode: Some(mode.into()),
+        current_axes: Some(Default::default()),
+        ..Default::default()
+    }
+}
+
+/// The start request's config reaches the host; what the host then reports
+/// as current is what a resume re-applies, not what was asked for.
+#[tokio::test]
+async fn a_resume_re_sends_the_config_its_host_last_reported() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let c = client();
+    let url = collector.url("/api/sessions");
+    let call = tokio::spawn(async move {
+        post(
+            &c,
+            url,
+            json!({ "host_id": HOST, "agent": "fake", "cwd": "/tmp", "mode": "plan", "axes": {"fast": true} }),
+        )
+        .await
+    });
+    let CollectorFrame::StartSession {
+        request_id,
+        session_id,
+        config,
+        ..
+    } = host.next().await
+    else {
+        panic!("expected start_session");
+    };
+    assert_eq!(config.mode.as_deref(), Some("plan"));
+    assert_eq!(
+        config.axes.get("fast"),
+        Some(&hennery_proto::frames::ConfigValue::Bool(true))
+    );
+    // The adapter clamped the mode to `default`.
+    host.emit(
+        &session_id,
+        SessionBody::SessionStarted {
+            request_id,
+            agent_session_id: "agent-1".into(),
+            indexed: catalogue("default"),
+        },
+    )
+    .await;
+    assert_eq!(call.await.unwrap().0, 202);
+    host.emit(
+        &session_id,
+        SessionBody::SessionParked {
+            reason: hennery_proto::frames::ParkReason::Idle,
+        },
+    )
+    .await;
+    wait_for("parked", || async {
+        (collector.lifecycle(&session_id) == "parked").then_some(())
+    })
+    .await;
+    let c = client();
+    let url = resume_url(&collector, &session_id);
+    tokio::spawn(async move { post(&c, url, json!({})).await });
+    match host.next().await {
+        CollectorFrame::ResumeSession { config, .. } => {
+            assert_eq!(config.mode.as_deref(), Some("default"));
+            assert!(config.axes.is_empty(), "{config:?}");
+        }
+        other => panic!("expected resume_session, got {other:?}"),
+    }
+}
+
+fn config_url(collector: &Collector, session: &str) -> String {
+    collector.url(&format!("/api/sessions/{session}/config"))
+}
+
+/// The next frame must be a `set_config` for `session`; returns its request
+/// id, config id and value.
+async fn expect_set_config(host: &mut ScriptedHost, session: &str) -> (String, String, Value) {
+    match host.next().await {
+        CollectorFrame::SetConfig {
+            request_id,
+            session_id,
+            config_id,
+            value,
+        } => {
+            assert_eq!(session_id, session);
+            (request_id, config_id, serde_json::to_value(value).unwrap())
+        }
+        other => panic!("expected set_config, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn set_config_answers_with_the_catalogue_the_host_read_back() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let c = client();
+    let url = config_url(&collector, &session);
+    let call = tokio::spawn(async move { post(&c, url, json!({ "config_id": "mode", "value": "plan" })).await });
+    let (request_id, config_id, value) = expect_set_config(&mut host, &session).await;
+    assert_eq!((config_id.as_str(), value), ("mode", json!("plan")));
+    host.emit(
+        &session,
+        SessionBody::ConfigApplied {
+            request_id,
+            indexed: catalogue("plan"),
+        },
+    )
+    .await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!((status, body["mode"].as_str()), (202, Some("plan")), "{body}");
+    assert_eq!(body["config_options"], json!([{"id": "mode", "currentValue": "plan"}]));
+    let (status, catalog) = get(&client(), collector.url(&format!("/api/sessions/{session}/catalog"))).await;
+    assert_eq!((status, catalog), (200, body));
+}
+
+#[tokio::test]
+async fn set_config_refusals_answer_with_their_codes() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    for (code, status) in [("unknown_option", 409), ("config_failed", 502), ("invalid", 400)] {
+        let c = client();
+        let url = config_url(&collector, &session);
+        let call = tokio::spawn(async move { post(&c, url, json!({ "config_id": "model", "value": "huge" })).await });
+        let (request_id, _, _) = expect_set_config(&mut host, &session).await;
+        host.send(&HostFrame::Error {
+            request_id,
+            code: code.into(),
+            message: "no".into(),
+        })
+        .await;
+        let (got, body) = call.await.unwrap();
+        assert_eq!((got, body["code"].as_str()), (status, Some(code)), "{body}");
+    }
+    // Not a string or a boolean: refused before anything is sent.
+    let (status, _) = post(
+        &client(),
+        config_url(&collector, &session),
+        json!({ "config_id": "x", "value": 3 }),
+    )
+    .await;
+    assert_eq!(status, 422);
+    let (status, _) = post(
+        &client(),
+        config_url(&collector, "nope"),
+        json!({ "config_id": "x", "value": "y" }),
+    )
+    .await;
+    assert_eq!(status, 404);
+    host.emit(
+        &session,
+        SessionBody::SessionParked {
+            reason: hennery_proto::frames::ParkReason::Idle,
+        },
+    )
+    .await;
+    wait_for("parked", || async {
+        (collector.lifecycle(&session) == "parked").then_some(())
+    })
+    .await;
+    let (status, body) = post(
+        &client(),
+        config_url(&collector, &session),
+        json!({ "config_id": "x", "value": "y" }),
+    )
+    .await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("not_attached")));
+    let more = tokio::time::timeout(Duration::from_millis(300), host.next()).await;
+    assert!(more.is_err(), "a request reached the host: {more:?}");
+}
+
+/// Final review I2: a switch the host gave up on (502) may still land at
+/// the adapter. The host then announces its late read-back as a
+/// `config_applied` under the same request id: the store applies it, and
+/// the request, already answered, is not answered again.
+#[tokio::test]
+async fn a_late_config_applied_for_a_failed_switch_still_updates_the_stored_catalogue() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let c = client();
+    let url = config_url(&collector, &session);
+    let call = tokio::spawn(async move { post(&c, url, json!({ "config_id": "mode", "value": "plan" })).await });
+    let (request_id, _, _) = expect_set_config(&mut host, &session).await;
+    host.send(&HostFrame::Error {
+        request_id: request_id.clone(),
+        code: "config_failed".into(),
+        message: "no answer within 15s of the request".into(),
+    })
+    .await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!((status, body["code"].as_str()), (502, Some("config_failed")), "{body}");
+    let url = collector.url(&format!("/api/sessions/{session}/catalog"));
+    let (_, before) = get(&client(), url.clone()).await;
+    assert_ne!(before["mode"], "plan", "{before}");
+    host.emit(
+        &session,
+        SessionBody::ConfigApplied {
+            request_id,
+            indexed: catalogue("plan"),
+        },
+    )
+    .await;
+    wait_for("the late read-back stored", || async {
+        let (status, catalog) = get(&client(), url.clone()).await;
+        (status == 200 && catalog["mode"] == "plan").then_some(())
+    })
+    .await;
+}
+
+/// Read a session's SSE stream from its start until `pred` holds for the
+/// text received so far.
+async fn read_stream(collector: &Collector, session: &str, pred: impl Fn(&str) -> bool) -> String {
+    use futures::StreamExt;
+    let resp = client()
+        .get(collector.url(&format!("/api/stream/sessions/{session}")))
+        .send()
+        .await
+        .unwrap();
+    let mut body = resp.bytes_stream();
+    let mut buf = String::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !pred(&buf) {
+        let chunk = tokio::time::timeout_at(deadline, body.next())
+            .await
+            .unwrap_or_else(|_| panic!("stream stalled: {buf}"))
+            .unwrap()
+            .unwrap();
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+    }
+    buf
+}
+
+#[tokio::test]
+async fn every_catalogue_change_is_also_a_catalog_changed_message_on_the_session_stream() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    // The agent changes its own mode: a live update with the catalogue.
+    host.emit(
+        &session,
+        SessionBody::AcpUpdate {
+            indexed: catalogue("bypass"),
+            payload: json!({"update": {"sessionUpdate": "config_option_update"}}),
+        },
+    )
+    .await;
+    // An update without one is only an event.
+    host.emit(
+        &session,
+        SessionBody::AcpUpdate {
+            indexed: Default::default(),
+            payload: json!({"update": {"sessionUpdate": "agent_message_chunk"}}),
+        },
+    )
+    .await;
+    let stream = read_stream(&collector, &session, |s| s.matches("event: event").count() >= 3).await;
+    let changed: Vec<&str> = stream
+        .split("\n\n")
+        .filter(|m| m.contains("event: catalog_changed"))
+        .collect();
+    assert_eq!(changed.len(), 1, "{stream}");
+    assert!(changed[0].contains(r#""mode":"bypass""#), "{}", changed[0]);
+    let id = |m: &str| m.lines().find(|l| l.starts_with("id: ")).map(str::to_string);
+    let update = stream
+        .split("\n\n")
+        .find(|m| m.contains("config_option_update"))
+        .unwrap();
+    assert_eq!(id(changed[0]), id(update), "catalog_changed carries its event's id");
 }
