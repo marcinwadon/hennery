@@ -3033,3 +3033,200 @@ async fn a_start_that_runs_out_of_time_says_which_questions_it_held_back() {
         "{message}"
     );
 }
+
+// Plan (2): the host cancels open questions (ACP core §2.3, §4.6, §4.8).
+
+/// The kinds from the first `pending_opened` on.
+fn from_the_question(frames: &[HostFrame]) -> Vec<String> {
+    let kinds = kinds(frames);
+    let at = kinds
+        .iter()
+        .position(|k| k.starts_with("pending_opened"))
+        .expect("a question");
+    kinds[at..].to_vec()
+}
+
+#[tokio::test]
+async fn a_cancel_answers_the_open_questions_cancelled_and_the_turn_ends_cancelled() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let handle = starting(&uplink, &asking(vec![FakeAsk::Permission]));
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let pending = nth_pending(&uplink, 0).await;
+    assert!(handle.send(cancel("rc", "t1")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    assert_eq!(
+        from_the_question(&frames),
+        [
+            "pending_opened:permission",
+            "pending_resolved:cancelled:turn_cancelled",
+            "update:permission:cancelled",
+            "turn_ended"
+        ]
+    );
+    assert_eq!(turn_ends(&frames)[0].1, TurnOutcome::Cancelled);
+    // The question is gone: a late answer reaches nobody.
+    assert!(handle.send(choose("ra", &pending, "allow")));
+    let frames = wait_until(&uplink, |f| !verdicts(f).is_empty()).await;
+    assert_eq!(verdicts(&frames), [("ra".to_string(), pending, false)]);
+}
+
+#[tokio::test]
+async fn a_question_asked_after_the_cancel_is_cancelled_at_once() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    // An adapter that keeps going after `session/cancel`: its second
+    // question comes in after the cancel was sent.
+    let script = FakeScript {
+        ignore_cancel: true,
+        chunks: vec![],
+        ..asking(vec![FakeAsk::Permission, FakeAsk::Permission])
+    };
+    let handle = starting(&uplink, &script);
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    nth_pending(&uplink, 0).await;
+    assert!(handle.send(cancel("rc", "t1")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    assert_eq!(
+        from_the_question(&frames),
+        [
+            "pending_opened:permission",
+            "pending_resolved:cancelled:turn_cancelled",
+            "pending_opened:permission",
+            "pending_resolved:cancelled:turn_cancelled",
+            "update:permission:cancelled",
+            "update:permission:cancelled",
+            "turn_ended"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn park_and_close_cancel_the_open_questions_before_the_session_detaches() {
+    for (cmd, last) in [
+        (
+            SessionCmd::Park {
+                request_id: "rp".into(),
+            },
+            "session_parked:operator",
+        ),
+        (
+            SessionCmd::Close {
+                request_id: "rp".into(),
+            },
+            "session_closed",
+        ),
+    ] {
+        let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+        let handle = starting(&uplink, &asking(vec![FakeAsk::Permission]));
+        wait_until(&uplink, has("session_started")).await;
+        assert!(handle.send(prompt("r1", "t1")));
+        nth_pending(&uplink, 0).await;
+        let reason = if last == "session_closed" {
+            "session_closed"
+        } else {
+            "session_parked"
+        };
+        assert!(handle.send(cmd));
+        let frames = wait_until(&uplink, has(last)).await;
+        assert_eq!(
+            from_the_question(&frames),
+            [
+                "pending_opened:permission".to_string(),
+                "turn_ended".to_string(),
+                format!("pending_resolved:cancelled:{reason}"),
+                last.to_string()
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_adapter_lost_with_a_question_open_cancels_it_adapter_lost() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        crash_while_asking: true,
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let handle = starting(&uplink, &script);
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let frames = wait_until(&uplink, has("session_parked:adapter_exited")).await;
+    // The exit watcher's order (ACP core §2.3).
+    assert_eq!(
+        from_the_question(&frames),
+        [
+            "pending_opened:permission",
+            "turn_ended",
+            "pending_resolved:cancelled:adapter_lost",
+            "adapter_exited",
+            "session_parked:adapter_exited"
+        ]
+    );
+    wait_ended(&handle).await;
+}
+
+/// No timeout on a question (ACP core §4.6, scenario 10): one asked
+/// outside any turn keeps the session through many idle windows, and is
+/// still answered.
+#[tokio::test]
+async fn the_reaper_never_parks_a_session_with_a_question_open() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        ask_on_load: true,
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let handle = session::resume(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        "agent-7".into(),
+        fake_with(&script),
+        std::env::temp_dir(),
+        SessionOptions {
+            idle_timeout: Some(Duration::from_millis(100)),
+            ..SessionOptions::default()
+        },
+    );
+    let pending = nth_pending(&uplink, 0).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        kinds(&uplink.pending().unwrap()),
+        ["session_started", "pending_opened:permission"],
+        "ten idle windows passed with the question open"
+    );
+    assert!(handle.send(choose("ra", &pending, "allow")));
+    wait_until(&uplink, has("update:permission:selected:allow")).await;
+    // Answered, the session is idle again: now the reaper parks it.
+    wait_until(&uplink, has("session_parked:idle")).await;
+}
+
+/// The adapter may withdraw its own question (`$/cancel_request`): the
+/// question closes, the adapter hears the cancellation error, and an answer
+/// given afterwards reaches nobody.
+#[tokio::test]
+async fn a_question_the_agent_withdraws_closes_and_an_answer_reaches_nobody() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        withdraw_asks: true,
+        chunks: vec![],
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let handle = starting(&uplink, &script);
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    assert_eq!(
+        from_the_question(&frames),
+        [
+            "pending_opened:permission",
+            "pending_resolved:cancelled:agent_withdrew",
+            "update:permission:error:-32800",
+            "turn_ended"
+        ]
+    );
+    let pending = opened(&frames)[0].0.id.clone();
+    assert!(handle.send(choose("ra", &pending, "allow")));
+    let frames = wait_until(&uplink, |f| !verdicts(f).is_empty()).await;
+    assert_eq!(verdicts(&frames), [("ra".to_string(), pending, false)]);
+}

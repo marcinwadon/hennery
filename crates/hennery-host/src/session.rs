@@ -29,7 +29,7 @@ use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -346,6 +346,7 @@ pub fn launch(uplink: Uplink, launch: Launch, options: SessionOptions) -> Sessio
         options,
         catalogue: Mutex::new(Catalogue::default()),
         questions: Mutex::new(Questions::default()),
+        inbound: OnceLock::new(),
         ending: ending.clone(),
     };
     let done = CancellationToken::new();
@@ -382,6 +383,10 @@ enum Inbound {
     /// A question for the operator, in wire order with the notifications
     /// around it: it follows the tool call it asks about.
     Question(Box<Question>),
+    /// The adapter withdrew question `pending_id` (`$/cancel_request`).
+    QuestionWithdrawn {
+        pending_id: String,
+    },
 }
 
 /// A `session/request_permission` or `elicitation/create` from the adapter
@@ -424,12 +429,35 @@ fn option_ids(params: &Value) -> Option<Vec<String>> {
 #[derive(Default)]
 struct Questions {
     open: Vec<OpenQuestion>,
+    /// The turn a `session/cancel` went out for: a question it asks from
+    /// then on is cancelled as soon as it opens.
+    cancelled_turn: Option<String>,
+}
+
+/// The ACP answer that tells the adapter a question is off: a permission's
+/// `cancelled` outcome, an elicitation's `cancel` action.
+fn cancelled_response(kind: PendingKind) -> Value {
+    match kind {
+        PendingKind::Permission => serde_json::json!({"outcome": {"outcome": "cancelled"}}),
+        PendingKind::Elicitation => serde_json::json!({"action": "cancel"}),
+    }
 }
 
 struct OpenQuestion {
     pending_id: String,
     kind: PendingKind,
     responder: Responder<Value>,
+    /// Watches for the adapter withdrawing the question; stops with it.
+    _withdrawal: Option<Watcher>,
+}
+
+/// A task that is aborted when its owner is dropped.
+struct Watcher(tokio::task::JoinHandle<()>);
+
+impl Drop for Watcher {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 /// A `set_config` received and not sent yet.
@@ -613,8 +641,9 @@ impl Replay {
         match inbound {
             Inbound::Update(payload) => self.observe(payload),
             Inbound::Question(question) => self.kept.push(Early::Question(question)),
-            // No switch is sent before the actor's main loop starts.
-            Inbound::SwitchAnswer { .. } => {}
+            // No switch is sent, and no question is open, before the
+            // actor's main loop starts.
+            Inbound::SwitchAnswer { .. } | Inbound::QuestionWithdrawn { .. } => {}
         }
     }
 
@@ -661,6 +690,8 @@ struct Actor {
     catalogue: Mutex<Catalogue>,
     /// The adapter's questions waiting for the operator.
     questions: Mutex<Questions>,
+    /// The inbound channel, for the questions' withdrawal watchers.
+    inbound: OnceLock<mpsc::UnboundedSender<Inbound>>,
     /// Shared with the handle (`SessionHandle::is_ending`).
     ending: Arc<AtomicBool>,
 }
@@ -772,6 +803,7 @@ impl Actor {
         // into the connection task.
         let switch_tx = updates_tx.clone();
         let questions_tx = updates_tx.clone();
+        let _ = self.inbound.set(updates_tx.clone());
         let (conn_tx, conn_rx) = oneshot::channel::<ConnectionTo<Agent>>();
         let (_stop_tx, stop_rx) = oneshot::channel::<()>();
         let transport = ByteStreams::new(io.stdin.compat_write(), io.stdout.compat());
@@ -897,7 +929,7 @@ impl Actor {
             match updates.try_recv() {
                 Ok(Inbound::Update(payload)) => early.push(Early::Update(payload)),
                 Ok(Inbound::Question(question)) => early.push(Early::Question(question)),
-                Ok(Inbound::SwitchAnswer { .. }) => {}
+                Ok(Inbound::SwitchAnswer { .. } | Inbound::QuestionWithdrawn { .. }) => {}
                 Err(_) => break,
             }
         }
@@ -1022,6 +1054,10 @@ impl Actor {
                                     tracing::warn!(session_id = %self.session_id, error = %err, "session/cancel not sent");
                                 }
                                 running.cancel_deadline = Some(Instant::now() + self.options.cancel_grace);
+                                // ACP: after `session/cancel`, every pending
+                                // request is answered cancelled.
+                                self.questions.lock().expect("questions lock").cancelled_turn = Some(turn_id);
+                                self.cancel_questions(PendingReason::TurnCancelled);
                             }
                         }
                         // Not started here, or already ended: its end (if
@@ -1059,11 +1095,13 @@ impl Actor {
                         self.answer(request_id, pending_id, answer);
                     }
                     Some(SessionCmd::Park { .. }) => {
-                        self.teardown(&mut adapter, &mut updates, turn.take(), &mut configs).await;
+                        let reason = PendingReason::SessionParked;
+                        self.teardown(&mut adapter, &mut updates, turn.take(), &mut configs, reason).await;
                         return self.emit(SessionBody::SessionParked { reason: ParkReason::Operator });
                     }
                     Some(SessionCmd::Close { .. }) => {
-                        self.teardown(&mut adapter, &mut updates, turn.take(), &mut configs).await;
+                        let reason = PendingReason::SessionClosed;
+                        self.teardown(&mut adapter, &mut updates, turn.take(), &mut configs, reason).await;
                         return self.emit(SessionBody::SessionClosed);
                     }
                 },
@@ -1148,12 +1186,14 @@ impl Actor {
                     let unanswered = turn.take().expect("a deadline implies a turn");
                     return self.stop_after_unanswered_cancel(&mut adapter, &mut updates, unanswered, &mut configs).await;
                 }
+                // Never with a question open, in a turn or not: it has no
+                // timeout (ACP core §4.6).
                 _ = idle_deadline(self.options.idle_timeout, idle_since),
-                    if turn.is_none() && configs.out.is_none() && configs.orphan.is_none() =>
+                    if turn.is_none() && configs.out.is_none() && configs.orphan.is_none() && !self.has_questions() =>
                 {
                     tracing::info!(session_id = %self.session_id, "reaping idle session");
                     self.begin_ending();
-                    self.teardown(&mut adapter, &mut updates, None, &mut configs).await;
+                    self.teardown(&mut adapter, &mut updates, None, &mut configs, PendingReason::SessionParked).await;
                     return self.emit(SessionBody::SessionParked { reason: ParkReason::Idle });
                 }
                 // A burst is over and nothing else was ready: back to the updates.
@@ -1375,6 +1415,11 @@ impl Actor {
                 self.open_question(question, turn);
                 false
             }
+            // The session may be idle now: the reaper's clock restarts.
+            Inbound::QuestionWithdrawn { pending_id } => {
+                self.withdraw_question(pending_id);
+                true
+            }
         }
     }
 
@@ -1406,10 +1451,81 @@ impl Actor {
             },
             payload: params,
         });
-        self.questions.lock().expect("questions lock").open.push(OpenQuestion {
+        // The adapter may withdraw its question (`$/cancel_request`): a
+        // watcher reports that through the ordered channel, and stops when
+        // the question is answered or cancelled.
+        let cancellation = responder.cancellation();
+        let withdrawal = self.inbound.get().cloned().map(|inbound| {
+            let pending_id = pending_id.clone();
+            Watcher(tokio::spawn(async move {
+                cancellation.cancelled().await;
+                let _ = inbound.send(Inbound::QuestionWithdrawn { pending_id });
+            }))
+        });
+        let question = OpenQuestion {
             pending_id,
             kind,
             responder,
+            _withdrawal: withdrawal,
+        };
+        let mut questions = self.questions.lock().expect("questions lock");
+        if turn.is_some() && questions.cancelled_turn.as_deref() == turn {
+            // Asked in a turn the operator already stopped.
+            drop(questions);
+            self.resolve_cancelled(question, PendingReason::TurnCancelled);
+        } else {
+            questions.open.push(question);
+        }
+    }
+
+    fn has_questions(&self) -> bool {
+        !self.questions.lock().expect("questions lock").open.is_empty()
+    }
+
+    /// Tell the adapter every open question is off, and the collector why
+    /// (ACP core §4.6): `pending_resolved{cancelled, reason}` each, oldest
+    /// first.
+    fn cancel_questions(&self, reason: PendingReason) {
+        let open = std::mem::take(&mut self.questions.lock().expect("questions lock").open);
+        for question in open {
+            self.resolve_cancelled(question, reason);
+        }
+    }
+
+    fn resolve_cancelled(&self, question: OpenQuestion, reason: PendingReason) {
+        // An adapter that is gone cannot hear it; the collector still must.
+        if let Err(err) = question.responder.respond(cancelled_response(question.kind)) {
+            tracing::debug!(session_id = %self.session_id, error = %err, "cancellation not sent to the adapter");
+        }
+        self.emit(SessionBody::PendingResolved {
+            pending_id: question.pending_id,
+            resolution: PendingResolution::Cancelled,
+            reason: Some(reason),
+        });
+    }
+
+    /// The adapter withdrew a question (`$/cancel_request`): nobody waits
+    /// for its answer any more, so the operator can no longer give one
+    /// (`pending_resolved{cancelled, agent_withdrew}`). The request is
+    /// answered with the standard cancellation error, as JSON-RPC expects.
+    fn withdraw_question(&self, pending_id: String) {
+        let question = {
+            let mut questions = self.questions.lock().expect("questions lock");
+            let at = questions.open.iter().position(|q| q.pending_id == pending_id);
+            at.map(|at| questions.open.remove(at))
+        };
+        // Already answered or cancelled: nothing is left to withdraw.
+        let Some(question) = question else {
+            return;
+        };
+        let cancelled = agent_client_protocol::Error::request_cancelled();
+        if let Err(err) = question.responder.respond_with_error(cancelled) {
+            tracing::debug!(session_id = %self.session_id, error = %err, "withdrawal not acknowledged to the adapter");
+        }
+        self.emit(SessionBody::PendingResolved {
+            pending_id,
+            resolution: PendingResolution::Cancelled,
+            reason: Some(PendingReason::AgentWithdrew),
         });
     }
 
@@ -1534,18 +1650,21 @@ impl Actor {
     }
 
     /// Park or close: forward any output already queued, end the turn as
-    /// interrupted, then kill the group.
+    /// interrupted, cancel the open questions for `reason` (ACP core §4.8),
+    /// then kill the group.
     async fn teardown(
         &self,
         adapter: &mut Adapter,
         updates: &mut mpsc::UnboundedReceiver<Inbound>,
         turn: Option<Turn>,
         configs: &mut PendingConfigs,
+        reason: PendingReason,
     ) {
         self.drain_updates(updates, turn.as_ref().map(|t| t.id.as_str()), configs);
         if let Some(turn) = turn {
             self.end_turn(turn.id, TurnOutcome::Interrupted, None, None);
         }
+        self.cancel_questions(reason);
         adapter.terminate(self.options.kill_grace).await;
     }
 
@@ -1567,6 +1686,9 @@ impl Actor {
         self.drain_updates(updates, Some(&turn.id), configs);
         let message = format!("the adapter did not stop within {grace:?} of session/cancel");
         self.end_turn(turn.id, TurnOutcome::Cancelled, None, Some(message.clone()));
+        // The cancel already answered the turn's questions; any asked
+        // outside it go the same way.
+        self.cancel_questions(PendingReason::TurnCancelled);
         adapter.terminate(self.options.kill_grace).await;
         // No `adapter_exited` follows a stop the host asked for, so the
         // note keeps the adapter's last words (already scrubbed, bounded).
@@ -1586,8 +1708,9 @@ impl Actor {
     }
 
     /// The exit watcher's steps (ACP core §2.3): outstanding calls fail (the
-    /// reply future is dropped), the turn ends `interrupted`, then
-    /// `adapter_exited` and `session_parked{adapter_exited}`.
+    /// reply future is dropped), the turn ends `interrupted`, the open
+    /// questions are cancelled `adapter_lost`, then `adapter_exited` and
+    /// `session_parked{adapter_exited}`.
     async fn adapter_exited(
         &self,
         info: ExitInfo,
@@ -1610,6 +1733,7 @@ impl Actor {
                 Some("the adapter exited".into()),
             );
         }
+        self.cancel_questions(PendingReason::AdapterLost);
         let stderr_tail = adapter.stderr_tail().await;
         adapter.kill_group();
         self.emit(SessionBody::AdapterExited {
@@ -1699,7 +1823,7 @@ async fn negotiate(
                 match updates.try_recv() {
                     Ok(Inbound::Update(payload)) => replay.kept.push(Early::Update(payload)),
                     Ok(Inbound::Question(question)) => replay.kept.push(Early::Question(question)),
-                    Ok(Inbound::SwitchAnswer { .. }) => {}
+                    Ok(Inbound::SwitchAnswer { .. } | Inbound::QuestionWithdrawn { .. }) => {}
                     Err(_) => break,
                 }
             }
