@@ -356,6 +356,32 @@ async fn terminated() {
     }
 }
 
+/// `up`'s SIGINT and SIGTERM, caught from the moment it is made: unlike
+/// `terminated`, whose handlers exist only once it is first polled.
+struct Signals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl Signals {
+    fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt()).context("SIGINT handler")?,
+            terminate: signal(SignalKind::terminate()).context("SIGTERM handler")?,
+        })
+    }
+
+    /// Resolves on the next SIGINT or SIGTERM, also one sent before it was
+    /// called.
+    async fn recv(&mut self) {
+        tokio::select! {
+            _ = self.interrupt.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
+}
+
 /// Ask a child to shut down cleanly.
 fn sigterm(child: &tokio::process::Child) {
     if let Some(pid) = child.id() {
@@ -428,6 +454,12 @@ fn host_command(
 /// 11, A1) — restart policy for a genuine crash comes with the distribution
 /// work.
 async fn run_up(args: UpArgs) -> Result<()> {
+    // First, before any child exists: from here on a SIGINT or SIGTERM is
+    // caught and waits for the loop below, which stops both children. Caught
+    // only once the loop first ran, one sent just after the collector's
+    // spawn killed `up` by the default action and left that collector
+    // running with nobody to stop it.
+    let mut signals = Signals::new()?;
     warn_if_dev_token();
     let exe = std::env::current_exe()?;
     let host_dir = args.data_dir.join("host");
@@ -512,7 +544,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
                 tracing::warn!(?status, "host exited");
                 break;
             }
-            _ = terminated() => break,
+            () = signals.recv() => break,
         }
     }
     // Host first (it stops its adapters), then the collector.

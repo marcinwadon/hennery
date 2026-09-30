@@ -1152,6 +1152,89 @@ fn up_warns_about_a_loose_existing_data_root() {
     assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
 }
 
+/// The processes (pid and command line) whose command line names `dir`: an
+/// `up` on `dir` and its children, found also once they are orphaned.
+fn processes_naming(dir: &std::path::Path) -> Vec<(i32, String)> {
+    let out = Command::new("ps")
+        .args(["-ax", "-ww", "-o", "pid=,command="])
+        .output()
+        .unwrap();
+    let dir = dir.display().to_string();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|line| line.contains(&dir))
+        .filter_map(|line| {
+            let (pid, command) = line.trim().split_once(' ')?;
+            Some((pid.parse().ok()?, command.to_string()))
+        })
+        .collect()
+}
+
+/// SIGKILLs, on drop, every process whose command line names this
+/// directory: only processes this test started name it.
+struct KillNaming(std::path::PathBuf);
+
+impl Drop for KillNaming {
+    fn drop(&mut self) {
+        for (pid, _) in processes_naming(&self.0) {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// `up` catches SIGTERM from before it starts a child: one that comes just
+/// after the collector's spawn must still stop the collector, not kill `up`
+/// by the default action and leave its collector running with nobody to
+/// stop it.
+///
+/// The window was short (from the collector's spawn to `up`'s first wait
+/// for a signal, a few milliseconds), so each attempt sends SIGTERM a little
+/// later (0 to 3.6 ms) after `up`'s warning about its loose data root,
+/// logged just before it binds and spawns. Without the fix, attempts in the
+/// first 2 ms or so left an orphaned collector (four or five of 20 when
+/// calibrated in 250 µs steps), and every run failed.
+#[test]
+fn a_sigterm_as_up_starts_leaves_no_child_running() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch_dir("earlyterm");
+    let _cleanup = RemoveDir(dir.clone());
+    for attempt in 0..25 {
+        let root = dir.join(format!("data-{attempt}"));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _orphans = KillNaming(root.clone());
+        let log = dir.join(format!("up-{attempt}.log"));
+        let mut up = up_logging_to(&root, &log);
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !std::fs::read_to_string(&log).is_ok_and(|text| text.contains("readable by other users")) {
+            up.assert_running("the warning about the data root");
+            assert!(Instant::now() < deadline, "timed out waiting for the warning");
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        let offset = Duration::from_micros(150 * attempt);
+        let start = Instant::now();
+        while start.elapsed() < offset {
+            std::hint::spin_loop();
+        }
+        unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
+        assert!(
+            wait_with_timeout(&mut up.up, Duration::from_secs(30)).is_some(),
+            "up did not exit"
+        );
+        // `up` waits for its children before it exits: none may be left.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut left = processes_naming(&root);
+        while !left.is_empty() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+            left = processes_naming(&root);
+        }
+        assert!(
+            left.is_empty(),
+            "attempt {attempt}: still running after up exited: {left:?}"
+        );
+    }
+}
+
 /// Kernel spec §3.1: a collector that is not set up writes its one-time
 /// setup link to `setup-url` (0600, under `umask 022` too) and, its output
 /// not being a terminal, logs only that file's path: the token itself must
