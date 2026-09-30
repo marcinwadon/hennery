@@ -258,6 +258,33 @@ async fn every_operator_route_applies_the_browser_rules() {
     collector.stop().await;
 }
 
+/// The browser rules wrap the session check (3b decision 8): a cross-origin
+/// or cross-site request is refused 403 before its missing cookie would get
+/// a 401.
+#[tokio::test]
+async fn the_browser_rules_run_before_the_session_check() {
+    let collector = Collector::start().await;
+    hennery_testkit::operator_client(&collector.state.operator);
+    let plain = reqwest::Client::new();
+    for &(method, path) in OPERATOR_ROUTES {
+        let evil = request(&plain, &collector, method, path)
+            .header("origin", "https://evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(code_of(evil).await, (403, "origin_mismatch".into()), "{method} {path}");
+        if method == "GET" {
+            let cross = request(&plain, &collector, method, path)
+                .header("sec-fetch-site", "cross-site")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(code_of(cross).await, (403, "cross_site".into()), "{method} {path}");
+        }
+    }
+    collector.stop().await;
+}
+
 /// Enrollment and the host WebSocket are authenticated otherwise and are
 /// exempt from the browser rules (kernel spec §3.3): no cookie, any origin.
 #[tokio::test]
