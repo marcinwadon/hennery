@@ -13,6 +13,7 @@ ed25519-dalek.workspace = true
 getrandom.workspace = true
 hennery-proto.workspace = true
 hex.workspace = true
+libc = "0.2"
 rusqlite.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

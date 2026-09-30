@@ -12,30 +12,46 @@ use std::path::Path;
 /// among them). SQLite gives a new `-wal` and `-shm` the database file's
 /// own mode, so the file is made private before it is opened. A `-wal` or
 /// `-shm` already there, from an install before this, is made private too.
+///
+/// None of the three is followed if it is a symlink: the mode is changed
+/// through the descriptor of the file itself, never through a path that
+/// could name some other file of this user's.
 pub fn open(path: &Path) -> Result<Connection> {
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
-        .with_context(|| format!("open {}", path.display()))?;
-    make_private(path)?;
+        .with_context(|| format!("open {} (a symlink is refused)", path.display()))?;
+    make_private(&file, path)?;
+    drop(file);
     let conn = configure(Connection::open(path)?)?;
     for suffix in ["-wal", "-shm"] {
         let mut name = path.as_os_str().to_os_string();
         name.push(suffix);
-        // Gone already is fine: the last connection to close removes them.
-        match std::fs::set_permissions(Path::new(&name), std::fs::Permissions::from_mode(0o600)) {
+        let sidecar = Path::new(&name);
+        match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(sidecar)
+        {
+            Ok(file) => make_private(&file, sidecar)?,
+            // Gone already is fine: the last connection to close removes them.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            other => other.with_context(|| format!("make {} private", Path::new(&name).display()))?,
+            Err(err) => {
+                return Err(err).with_context(|| format!("open {} (a symlink is refused)", sidecar.display()));
+            }
         }
     }
     Ok(conn)
 }
 
-fn make_private(path: &Path) -> Result<()> {
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+/// `fchmod`, through the open file rather than its path.
+fn make_private(file: &std::fs::File, path: &Path) -> Result<()> {
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("make {} private", path.display()))
 }
 
@@ -137,6 +153,23 @@ mod tests {
         for file in &files {
             assert_eq!(mode(file), 0o600, "{}", file.display());
         }
+    }
+
+    /// Review of the fix wave: `open` changes the mode of the file it is
+    /// given, so it must never follow a symlink to some other file of its
+    /// user's and make that one 0600, or open it as a database.
+    #[test]
+    fn a_symlinked_database_is_refused_and_its_target_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, b"not a database").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let db = dir.path().join("hennery.db");
+        std::os::unix::fs::symlink(&target, &db).unwrap();
+        let err = open(&db).expect_err("a symlinked database was opened");
+        assert!(format!("{err:#}").contains("a symlink is refused"), "{err:#}");
+        assert_eq!(mode(&target), 0o644);
+        assert_eq!(std::fs::read(&target).unwrap(), b"not a database");
     }
 
     #[test]
