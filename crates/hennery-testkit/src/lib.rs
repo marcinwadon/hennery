@@ -129,6 +129,59 @@ pub struct FakeScript {
     /// so, instead of after a delay that races the host's own deadlines.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_switch_answer_on_file: Option<String>,
+    /// Questions asked at the start of every prompt, before its chunks, in
+    /// order, each awaited before the next. Each answer is echoed as an
+    /// `agent_message_chunk` (see `FakeAsk`), so a test sees what reached
+    /// the agent. A prompt cancelled meanwhile asks nothing more and ends
+    /// `cancelled` once its open questions are answered.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub asks: Vec<FakeAsk>,
+    /// Send every ask at once, then await the answers in the asks' order
+    /// (several questions open together).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub asks_at_once: bool,
+    /// Send the asks, then crash (exit status 3) without awaiting their
+    /// answers: an adapter lost with its questions open.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub crash_while_asking: bool,
+    /// Send the first ask right before answering `session/load`, and echo
+    /// its answer once it comes, outside any turn: a question that arrives
+    /// while the host is still attaching the session.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ask_on_load: bool,
+    /// With `ask_on_load`: answer `session/load` only once that ask is
+    /// answered (an adapter that blocks its load on a question).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ask_on_load_waits: bool,
+    /// Withdraw every ask right after sending it (`$/cancel_request`), as an
+    /// agent that no longer needs the answer does. The echo is whatever the
+    /// client answers then, usually `<name>:error:-32800`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub withdraw_asks: bool,
+}
+
+/// One question the fake asks its client during a prompt, and the chunk it
+/// echoes the answer as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FakeAsk {
+    /// `session/request_permission` for tool call `call-1`, with options
+    /// `allow` (`allow_once`) and `reject` (`reject_once`). Echoed as
+    /// `permission:selected:<option>` or `permission:cancelled`.
+    Permission,
+    /// `elicitation/create` in form mode, asking for a `name` string: only
+    /// of a client whose `initialize` advertised `elicitation.form`, as the
+    /// real adapters do (P-19). Echoed as `elicitation:accept:<content>`,
+    /// `elicitation:decline`, `elicitation:cancel`, or, when not asked,
+    /// `elicitation:unsupported`.
+    Elicitation,
+    /// `_fake/unknown`, a method no client serves. Echoed as
+    /// `unknown:error:<JSON-RPC code>`.
+    Unknown,
+    /// Like `Permission`, with a second option `allow_session` of a kind
+    /// this build's schema does not know (`allow_for_session`): an adapter
+    /// newer than hennery. Echoed like `Permission`.
+    FuturePermission,
 }
 
 impl Default for FakeScript {
@@ -160,6 +213,12 @@ impl Default for FakeScript {
             flood: false,
             model_switch_chunks_first: None,
             model_switch_answer_on_file: None,
+            asks: Vec::new(),
+            asks_at_once: false,
+            crash_while_asking: false,
+            ask_on_load: false,
+            ask_on_load_waits: false,
+            withdraw_asks: false,
         }
     }
 }
