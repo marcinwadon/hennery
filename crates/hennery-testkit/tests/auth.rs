@@ -350,6 +350,46 @@ async fn a_request_that_slides_the_session_sends_its_cookie_again() {
     collector.stop().await;
 }
 
+/// A cookie tossed in from a sibling subdomain (`Domain=` set there, same
+/// name) can land before the real one in `Cookie`. Every candidate is
+/// tried, so it does not sign the owner out; and when the real session
+/// slides, the cookie sent again is the real one, not the tossed value.
+#[tokio::test]
+async fn a_tossed_session_cookie_before_the_real_one_does_not_sign_the_owner_out() {
+    let collector = Collector::start().await;
+    hennery_testkit::operator_client(&collector.state.operator);
+    let now = hennery_kernel::secret::unix_now();
+    let url = collector.url("/api/hosts");
+    // Shaped like a real token, so it costs a lookup and fails it.
+    let tossed = "0".repeat(64);
+    let real = collector.state.operator.open_session("test", now).unwrap().unwrap();
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("cookie", format!("hennery_session={tossed}; hennery_session={real}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let stale = collector
+        .state
+        .operator
+        .open_session("test", now - 120)
+        .unwrap()
+        .unwrap();
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("cookie", format!("hennery_session={tossed}"))
+        .header("cookie", format!("hennery_session={stale}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let cookie = resp.headers()["set-cookie"].to_str().unwrap();
+    assert!(cookie.starts_with(&format!("hennery_session={stale};")), "{cookie}");
+    collector.stop().await;
+}
+
 #[tokio::test]
 async fn a_hello_signed_by_another_key_is_rejected_without_registering() {
     let collector = Collector::start().await;

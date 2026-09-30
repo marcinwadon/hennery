@@ -573,6 +573,22 @@ impl Operator {
             )
             .optional()?)
     }
+
+    /// The first of the request's session cookies (`session_tokens`) that
+    /// authenticates, with its token; `None` when none does. Like
+    /// `authenticate`, it slides the session it finds.
+    pub fn authenticate_cookies(
+        &self,
+        headers: &axum::http::HeaderMap,
+        now: i64,
+    ) -> Result<Option<(String, Authenticated)>> {
+        for token in session_tokens(headers) {
+            if let Some(session) = self.authenticate(token, now)? {
+                return Ok(Some((token.to_string(), session)));
+            }
+        }
+        Ok(None)
+    }
 }
 
 /// `Set-Cookie` for a session (kernel spec §3.2): `HttpOnly`,
@@ -589,17 +605,26 @@ pub fn cleared_cookie(secure: bool) -> String {
     format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}")
 }
 
-/// The session token in a request's `Cookie` headers, if there is one.
-pub fn session_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+/// At most this many `hennery_session` cookies of a request are tried, so
+/// one request cannot cost many session lookups.
+pub const MAX_SESSION_COOKIES: usize = 4;
+
+/// Every session token in a request's `Cookie` headers, in order, at most
+/// `MAX_SESSION_COOKIES`. There can be more than one: a sibling subdomain
+/// can set a cookie of the same name for the parent domain, and the browser
+/// may send it first. Taking only the first would let it sign the owner out.
+pub fn session_tokens(headers: &axum::http::HeaderMap) -> Vec<&str> {
     headers
         .get_all(axum::http::header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
-        .find_map(|pair| {
+        .filter_map(|pair| {
             let (name, value) = pair.trim().split_once('=')?;
             (name == SESSION_COOKIE).then_some(value)
         })
+        .take(MAX_SESSION_COOKIES)
+        .collect()
 }
 
 /// Counts one verify in `Operator::in_flight` for as long as it lives.

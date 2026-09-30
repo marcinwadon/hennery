@@ -3,7 +3,7 @@
 //! development bearer token.
 
 use crate::auth_api::{error, internal, secure_cookies, with_cookie};
-use crate::operator::{Authenticated, Operator, session_cookie, session_token};
+use crate::operator::{Authenticated, Operator, session_cookie};
 use crate::secret::unix_now;
 use axum::Router;
 use axum::extract::{Request, State};
@@ -30,11 +30,8 @@ pub fn operator_only<S: Clone + Send + Sync + 'static>(router: Router<S>, operat
 /// request that revokes its own session): the browser keeps the last
 /// `Set-Cookie`, and that must not be the dead token.
 pub async fn require_operator(State(operator): State<Arc<Operator>>, mut req: Request, next: Next) -> Response {
-    let Some(token) = session_token(req.headers()).map(str::to_string) else {
-        return unauthenticated();
-    };
-    let session = match operator.authenticate(&token, unix_now()) {
-        Ok(Some(session)) => session,
+    let (token, session) = match operator.authenticate_cookies(req.headers(), unix_now()) {
+        Ok(Some(found)) => found,
         Ok(None) => return unauthenticated(),
         Err(err) => return internal(err),
     };

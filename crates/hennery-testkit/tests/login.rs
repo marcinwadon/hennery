@@ -97,6 +97,23 @@ async fn the_owners_password_opens_a_session_and_logout_ends_it() {
     assert_eq!(again.status(), 204);
 }
 
+/// Logout ends the real session even behind a tossed cookie of the same
+/// name: otherwise it would answer 204 and leave the session alive.
+#[tokio::test]
+async fn logout_behind_a_tossed_cookie_ends_the_real_session() {
+    let c = Collector::start(true).await;
+    let token = cookie_token(&c.login(PASSWORD).await);
+    let tossed = "0".repeat(64);
+    let out = c
+        .post("/api/auth/logout")
+        .header("cookie", format!("hennery_session={tossed}; hennery_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(out.status(), 204);
+    assert!(c.state.operator.authenticate(&token, unix_now()).unwrap().is_none());
+}
+
 /// Kernel spec §3.2: 5 wrong passwords a minute per address, then backoff,
 /// and every attempt that gets in runs exactly one password check (the
 /// constant-time failure path); a refused one runs none, and a right

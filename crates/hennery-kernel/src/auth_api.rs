@@ -1,9 +1,7 @@
 //! Operator auth over HTTP (kernel spec §3, §8): the one-time setup, login
 //! and logout, step-up, and the signed-in sessions.
 
-use crate::operator::{
-    Authenticated, Operator, PublicUrl, SetupOutcome, cleared_cookie, session_cookie, session_token,
-};
+use crate::operator::{Authenticated, Operator, PublicUrl, SetupOutcome, cleared_cookie, session_cookie};
 use crate::secret::unix_now;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -191,16 +189,14 @@ async fn login(
 /// `POST /api/auth/logout`: 204, the request's session (if any) ended and
 /// its cookie cleared.
 async fn logout(State(operator): State<Arc<Operator>>, headers: HeaderMap) -> Response {
-    if let Some(token) = session_token(&headers) {
-        match operator.authenticate(token, unix_now()) {
-            Ok(Some(session)) => {
-                if let Err(err) = operator.revoke_session(&session.session_id, unix_now()) {
-                    return internal(err);
-                }
+    match operator.authenticate_cookies(&headers, unix_now()) {
+        Ok(Some((_, session))) => {
+            if let Err(err) = operator.revoke_session(&session.session_id, unix_now()) {
+                return internal(err);
             }
-            Ok(None) => {}
-            Err(err) => return internal(err),
         }
+        Ok(None) => {}
+        Err(err) => return internal(err),
     }
     with_cookie(
         StatusCode::NO_CONTENT.into_response(),

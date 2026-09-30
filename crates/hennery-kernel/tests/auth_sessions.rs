@@ -3,7 +3,8 @@
 
 use axum::http::{HeaderMap, HeaderValue, header};
 use hennery_kernel::operator::{
-    Operator, SESSION_SLIDE_SECS, SESSION_TTL_SECS, STEP_UP_SECS, cleared_cookie, session_cookie, session_token,
+    MAX_SESSION_COOKIES, Operator, SESSION_SLIDE_SECS, SESSION_TTL_SECS, STEP_UP_SECS, cleared_cookie, session_cookie,
+    session_tokens,
 };
 
 const NOW: i64 = 1_800_000_000;
@@ -116,11 +117,17 @@ fn the_cookie_is_http_only_strict_and_secure_except_on_loopback() {
 }
 
 #[test]
-fn the_session_token_is_found_among_other_cookies() {
+fn the_session_tokens_are_found_among_other_cookies_in_order_and_bounded() {
     let mut headers = HeaderMap::new();
-    assert_eq!(session_token(&headers), None);
+    assert!(session_tokens(&headers).is_empty());
     headers.append(header::COOKIE, HeaderValue::from_static("theme=dark; other_session=x"));
-    assert_eq!(session_token(&headers), None);
+    assert!(session_tokens(&headers).is_empty());
     headers.append(header::COOKIE, HeaderValue::from_static("a=1;hennery_session=tok; b=2"));
-    assert_eq!(session_token(&headers), Some("tok"));
+    assert_eq!(session_tokens(&headers), ["tok"]);
+    headers.append(
+        header::COOKIE,
+        HeaderValue::from_static("hennery_session=t2; hennery_session=t3; hennery_session=t4; hennery_session=t5"),
+    );
+    assert_eq!(MAX_SESSION_COOKIES, 4);
+    assert_eq!(session_tokens(&headers), ["tok", "t2", "t3", "t4"]);
 }
