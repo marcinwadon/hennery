@@ -10,7 +10,7 @@ use agent_client_protocol::schema::v1::{
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
     TextContent,
 };
-use agent_client_protocol::{Agent, Client, ConnectionTo, SentRequest, Stdio, UntypedMessage};
+use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, SentRequest, Stdio, UntypedMessage};
 use hennery_testkit::{CRASH_EXIT_CODE, FakeAsk, FakeScript, SCRIPT_ENV};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -130,6 +130,14 @@ async fn main() -> agent_client_protocol::Result<()> {
                 let announced = announced.clone();
                 let forms = forms.clone();
                 async move |req: LoadSessionRequest, responder, cx| {
+                    // Owned locals: the captured fields sit behind `&mut
+                    // self` (this handler is called via a shared/mut
+                    // reference, reused for every `session/load`), so
+                    // anything moved later (into a nested `cx.spawn`, or
+                    // into `answer_load`) must be its own clone first.
+                    let script = script.clone();
+                    let announced = announced.clone();
+                    let forms = forms.load(Ordering::SeqCst);
                     // History first, then the answer: an ACP agent replays a
                     // loaded session as `session/update`s before it responds.
                     for update in &script.replay {
@@ -140,16 +148,21 @@ async fn main() -> agent_client_protocol::Result<()> {
                     }
                     if script.ask_on_load
                         && let Some(ask) = script.asks.first().copied()
-                        && let Some(request) = ask_request(ask, &req.session_id, forms.load(Ordering::SeqCst))?
+                        && let Some(request) = ask_request(ask, &req.session_id, forms)?
                     {
                         // On the wire before the load's answer; awaited
                         // from a task of its own.
                         let sent = cx.send_request(request);
                         if script.ask_on_load_waits {
-                            // The load is answered only once the question is.
+                            // The load is answered only once the question is,
+                            // then exactly as the non-waiting path below:
+                            // `load_error` / `config_in_update_only` still
+                            // apply, just deferred until the answer is in.
+                            let (cx2, session, script2, announced2) =
+                                (cx.clone(), req.session_id.clone(), script.clone(), announced.clone());
                             return cx.spawn(async move {
                                 let _ = sent.block_task().await;
-                                responder.respond(LoadSessionResponse::new())
+                                answer_load(&script2, announced2, &session, &cx2, responder)
                             });
                         }
                         let (cx2, session) = (cx.clone(), req.session_id.clone());
@@ -158,19 +171,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                             cx2.send_notification(chunk(&session, echo))
                         })?;
                     }
-                    match script.load_error {
-                        Some(code) => responder.respond_with_error(agent_client_protocol::Error::new(code, "scripted")),
-                        None if script.config_in_update_only => {
-                            if let Some(options) = announced() {
-                                cx.send_notification(SessionNotification::new(
-                                    req.session_id.clone(),
-                                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
-                                ))?;
-                            }
-                            responder.respond(LoadSessionResponse::new())
-                        }
-                        None => responder.respond(LoadSessionResponse::new().config_options(announced())),
-                    }
+                    answer_load(&script, announced, &req.session_id, &cx, responder)
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -425,6 +426,33 @@ async fn main() -> agent_client_protocol::Result<()> {
         )
         .connect_to(Stdio::new())
         .await
+}
+
+/// Answer `session/load` as the script asks: the scripted error, options
+/// announced only in a preceding update, or a normal read-back. Shared by
+/// the immediate path and the `ask_on_load_waits` path, which only defers
+/// reaching this until the load-time question is answered — the same rules
+/// apply either way.
+fn answer_load(
+    script: &FakeScript,
+    announced: impl FnOnce() -> Option<Vec<SessionConfigOption>>,
+    session: &SessionId,
+    cx: &ConnectionTo<Client>,
+    responder: Responder<LoadSessionResponse>,
+) -> agent_client_protocol::Result<()> {
+    match script.load_error {
+        Some(code) => responder.respond_with_error(agent_client_protocol::Error::new(code, "scripted")),
+        None if script.config_in_update_only => {
+            if let Some(options) = announced() {
+                cx.send_notification(SessionNotification::new(
+                    session.clone(),
+                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
+                ))?;
+            }
+            responder.respond(LoadSessionResponse::new())
+        }
+        None => responder.respond(LoadSessionResponse::new().config_options(announced())),
+    }
 }
 
 /// One text chunk of the agent's reply.

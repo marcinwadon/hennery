@@ -810,3 +810,113 @@ fn crash_while_asking_exits_with_the_question_unanswered() {
     assert_eq!(talk.exit, Some(hennery_testkit::CRASH_EXIT_CODE));
     assert!(texts(&talk.messages).is_empty(), "{:?}", talk.messages);
 }
+
+// Fix round 1 (review): compose `ask_on_load_waits` with the load's own
+// answer, and cover `FuturePermission` at the fake level.
+
+/// Drive `initialize` + `session/load` for a script with `ask_on_load` and
+/// `ask_on_load_waits` set: read the load-time ask, confirm the load has not
+/// answered yet, answer the ask, then return the load's own answer.
+fn ask_on_load_waits_drive(script: &FakeScript) -> Value {
+    use std::os::unix::process::CommandExt;
+    let mut child = KillGroupOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_hennery-fake-acp"))
+            .env(hennery_testkit::SCRIPT_ENV, serde_json::to_string(script).unwrap())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdin = child.0.stdin.take().unwrap();
+    for r in &load_requests("agent-7") {
+        writeln!(stdin, "{r}").unwrap();
+    }
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                break;
+            };
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+    let init = rx.recv_timeout(Duration::from_secs(5)).expect("initialize answered");
+    assert_eq!(init["id"], json!(1), "{init}");
+    let ask = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("asked before the load answered");
+    assert_eq!(ask["method"], "session/request_permission", "{ask}");
+    // Nothing else follows until we answer: in particular not the load.
+    if let Ok(msg) = rx.recv_timeout(Duration::from_millis(300)) {
+        panic!("the load answered before its question was: {msg}");
+    }
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "id": ask["id"], "result": {"outcome": {"outcome": "selected", "optionId": "allow"}}})
+    )
+    .unwrap();
+    let loaded = rx.recv_timeout(Duration::from_secs(5)).expect("the load answered");
+    assert_eq!(loaded["id"], json!(2), "{loaded:?}");
+    loaded
+    // `child` drops here: SIGKILLs the group and reaps it, on this path and
+    // on any assertion failure above.
+}
+
+#[test]
+fn ask_on_load_waits_defers_the_loads_answer_until_the_question_is() {
+    let script = FakeScript {
+        ask_on_load: true,
+        ask_on_load_waits: true,
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let loaded = ask_on_load_waits_drive(&script);
+    assert!(loaded.get("error").is_none(), "{loaded}");
+}
+
+/// Fix round 1, finding 1: the waited path must apply `load_error` exactly
+/// as the non-waiting path does, not bypass it with a bare success.
+#[test]
+fn ask_on_load_waits_still_answers_a_scripted_load_error_after_the_question() {
+    let script = FakeScript {
+        ask_on_load: true,
+        ask_on_load_waits: true,
+        load_error: Some(-32002),
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let loaded = ask_on_load_waits_drive(&script);
+    assert_eq!(loaded["error"]["code"], -32002, "{loaded}");
+}
+
+/// Fix round 1, finding 2: `FuturePermission` at the fake level — the
+/// request on the wire carries an option of a kind outside the schema
+/// (`allow_for_session`), and its `optionId`s are still there raw for a
+/// client (or, at the host, the collector) that reads them without typed
+/// validation.
+#[test]
+fn a_future_permission_option_kind_reaches_the_wire_raw_and_is_still_answerable() {
+    let mut asked = Vec::new();
+    let talk = converse(&asking(vec![FakeAsk::FuturePermission]), json!({}), |req| {
+        asked.push(req.clone());
+        vec![result(
+            req,
+            json!({"outcome": {"outcome": "selected", "optionId": "allow_session"}}),
+        )]
+    });
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0]["method"], "session/request_permission");
+    let options = asked[0]["params"]["options"].as_array().unwrap();
+    let option_ids: Vec<&str> = options.iter().map(|o| o["optionId"].as_str().unwrap()).collect();
+    assert_eq!(option_ids, ["allow", "allow_session"]);
+    let future = options.iter().find(|o| o["optionId"] == "allow_session").unwrap();
+    assert_eq!(
+        future["kind"], "allow_for_session",
+        "a kind outside the schema: {future}"
+    );
+    assert_eq!(texts(&talk.messages)[0], "permission:selected:allow_session");
+}
