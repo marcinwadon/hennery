@@ -1639,3 +1639,29 @@ fn a_detach_or_an_unattached_close_cancels_whatever_is_still_open() {
         (PendingState::Cancelled, Some(PendingReason::SessionClosed))
     );
 }
+
+// Plan 3a: the kernel's tables share `hennery.db` with this store.
+
+#[test]
+fn the_session_store_and_the_host_registry_share_one_database_in_either_order() {
+    use hennery_kernel::hosts::Hosts;
+    for kernel_first in [true, false] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hennery.db");
+        let (store, hosts) = if kernel_first {
+            let hosts = Hosts::open(&db).unwrap();
+            (Store::open(&db).unwrap(), hosts)
+        } else {
+            let store = Store::open(&db).unwrap();
+            (store, Hosts::open(&db).unwrap())
+        };
+        started(&store);
+        hosts.mint_pairing_code(0).unwrap();
+        drop((store, hosts));
+        // Reopened, each finds its own tables and migrates nothing twice.
+        let store = Store::open(&db).unwrap();
+        let hosts = Hosts::open(&db).unwrap();
+        assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "active");
+        assert!(hosts.list().unwrap().is_empty());
+    }
+}
