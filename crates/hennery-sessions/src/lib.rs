@@ -60,23 +60,55 @@ impl hennery_kernel::lifecycle::LifecycleHooks for AppState {
 
 /// Serve until `state.shutdown` is cancelled.
 pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> std::io::Result<()> {
-    offline::after_startup(&state);
-    let shutdown = state.shutdown.clone();
-    // The peer address is what enrollment rate-limits on (kernel spec §4.1).
-    axum::serve(
-        listener,
-        router(state).into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .with_graceful_shutdown(shutdown.cancelled_owned())
-    .await
+    serve_on(vec![listener], state).await
 }
 
-/// Every session, host and operator route plus the host WebSocket. Serve it with
+/// Serve `router(state)` on every listener until `state.shutdown` is
+/// cancelled (kernel spec §7).
+pub async fn serve_on(listeners: Vec<tokio::net::TcpListener>, state: AppState) -> std::io::Result<()> {
+    offline::after_startup(&state);
+    serve_all(listeners, router(state.clone()), state.shutdown.clone()).await
+}
+
+/// Serve `app` on every listener, the same router and the same state on
+/// each (kernel spec §7), each with its peer's address: enrollment and
+/// login rate-limit on it. Until `shutdown` is cancelled; a listener that
+/// fails cancels it for the others too.
+pub async fn serve_all(
+    listeners: Vec<tokio::net::TcpListener>,
+    app: Router,
+    shutdown: CancellationToken,
+) -> std::io::Result<()> {
+    let mut serving = tokio::task::JoinSet::new();
+    for listener in listeners {
+        let app = app.clone().into_make_service_with_connect_info::<SocketAddr>();
+        let shutdown = shutdown.clone();
+        serving.spawn(async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown.cancelled_owned())
+                .await
+        });
+    }
+    let mut result = Ok(());
+    while let Some(done) = serving.join_next().await {
+        if let Err(err) = done.map_err(std::io::Error::other).and_then(|served| served) {
+            shutdown.cancel();
+            if result.is_ok() {
+                result = Err(err);
+            }
+        }
+    }
+    result
+}
+
+/// Every session, host and operator route, the health checks and the host
+/// WebSocket. Serve it with
 /// `into_make_service_with_connect_info::<SocketAddr>()`: enrollment reads
 /// the client's address.
 pub fn router(state: AppState) -> Router {
     api::router(state.clone())
         .merge(hosts::router(state.clone()))
         .merge(hennery_kernel::auth_api::router(state.operator.clone()))
+        .merge(hennery_kernel::health::router(state.operator.clone()))
         .merge(ws::router(state))
 }

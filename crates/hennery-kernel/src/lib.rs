@@ -4,6 +4,7 @@
 pub mod auth;
 pub mod auth_api;
 pub mod db;
+pub mod health;
 pub mod hosts;
 pub mod lifecycle;
 pub mod operator;

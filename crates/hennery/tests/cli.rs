@@ -249,29 +249,42 @@ impl KillTree {
     /// its "collector listening" log line: the tests start it on port 0, so
     /// no other process can take the port between choosing and binding it.
     fn listening(&mut self) -> String {
+        self.listening_on(1).remove(0)
+    }
+
+    /// The addresses of the collector's first `n` "collector listening"
+    /// lines, one per listener, in the order it was given them.
+    fn listening_on(&mut self, n: usize) -> Vec<String> {
         let log = self.log.clone().expect("the process's output is captured");
-        let mut address = None;
+        let mut addresses = Vec::new();
         self.wait_until("the collector listening", || {
-            address = std::fs::read_to_string(&log)
-                .ok()
-                .and_then(|text| listening_address(&text));
-            address.is_some()
+            addresses = std::fs::read_to_string(&log)
+                .map(|text| listening_addresses(&text))
+                .unwrap_or_default();
+            addresses.len() >= n
         });
-        address.unwrap()
+        addresses.truncate(n);
+        addresses
     }
 }
 
-/// The `address` of the first complete "collector listening" line in `log`.
-fn listening_address(log: &str) -> Option<String> {
+/// The `address` of every complete "collector listening" line in `log`.
+fn listening_addresses(log: &str) -> Vec<String> {
     // Complete lines only: a line still being written could end mid-port.
-    let complete = &log[..log.rfind('\n')?];
-    complete.lines().map(strip_ansi).find_map(|line| {
-        let fields = line.split_once("collector listening")?.1;
-        let address = fields
-            .split_whitespace()
-            .find_map(|field| field.strip_prefix("address="))?;
-        Some(address.to_string())
-    })
+    let Some(end) = log.rfind('\n') else {
+        return Vec::new();
+    };
+    log[..end]
+        .lines()
+        .map(strip_ansi)
+        .filter_map(|line| {
+            let fields = line.split_once("collector listening")?.1;
+            let address = fields
+                .split_whitespace()
+                .find_map(|field| field.strip_prefix("address="))?;
+            Some(address.to_string())
+        })
+        .collect()
 }
 
 /// `line` without its terminal colour codes (`ESC [ … m`), which the log
@@ -1313,7 +1326,8 @@ fn a_sigterm_as_up_starts_leaves_no_child_running() {
 /// listen (never bound, or bound and never listened on) and a listening
 /// Unix socket are refused at once with a message naming it, before the
 /// data directory is made, not adopted to abort, hang or serve later. Also
-/// refused: a standard stream's number, and `--listen` with it.
+/// refused: a standard stream's number, `--listen` with it, and one
+/// descriptor given twice.
 #[test]
 fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
     use std::os::fd::{AsRawFd, OwnedFd};
@@ -1405,6 +1419,7 @@ fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
     for args in [
         &["--listen-fd", "2"][..],
         &["--listen-fd", "50", "--listen", "127.0.0.1:0"],
+        &["--listen-fd", "50", "--listen-fd", "50"],
     ] {
         let (status, stderr) = collector(Some(&listening), args);
         assert!(!status.unwrap().success(), "{args:?} was taken: {stderr}");
@@ -1502,4 +1517,125 @@ fn join_reads_the_code_from_standard_input_when_it_is_left_out() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("paired as"));
+}
+
+/// `POST path` with no body on the collector at `listen`, with the owner's
+/// `session` and `Origin: origin`: the status.
+fn post_from(listen: &str, path: &str, session: &str, origin: &str) -> Option<u16> {
+    let mut stream = TcpStream::connect(listen).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(15))).ok()?;
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: {listen}\r\nCookie: hennery_session={session}\r\nOrigin: {origin}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    response.split(' ').nth(1)?.parse().ok()
+}
+
+/// `GET path` on the collector at `listen`, without a session: the status
+/// and the body.
+fn get_plain(listen: &str, path: &str) -> Option<(u16, String)> {
+    let mut stream = TcpStream::connect(listen).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(15))).ok()?;
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {listen}\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    Some((head.split(' ').nth(1)?.parse().ok()?, body.to_string()))
+}
+
+/// Kernel spec §7: a collector given several addresses serves the same
+/// routes and the same state on each, with the same browser rules, and
+/// browser access stays bound to `public_url`: a state-changing request on
+/// the second listener needs the first's origin, the one set up as
+/// `public_url`, not the second's own.
+#[test]
+fn every_listen_address_serves_the_same_collector() {
+    let dir = scratch_dir("listeners");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    let log = dir.join("collector.log");
+    let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["collector", "--listen", "127.0.0.1:0", "--listen", "127.0.0.1:0"])
+        .arg("--data-dir")
+        .arg(&data)
+        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
+        .spawn()
+        .unwrap();
+    let mut collector = KillTree::new(collector, &log);
+    let addresses = collector.listening_on(2);
+    assert_ne!(addresses[0], addresses[1]);
+    let (first, second) = (&addresses[0], &addresses[1]);
+    // `public_url` is `http://<first>`.
+    let session = sign_in(&mut collector, first, &data);
+    for address in &addresses {
+        assert_eq!(get_plain(address, "/healthz"), Some((200, "ok".into())), "{address}");
+        assert!(get_json(address, "/api/hosts", &session).is_some(), "{address}");
+    }
+    assert_eq!(
+        post_from(second, "/api/auth/logout", &session, &format!("http://{second}")),
+        Some(403),
+        "the second listener's own origin was taken for public_url"
+    );
+    assert_eq!(
+        post_from(second, "/api/auth/logout", &session, &format!("http://{first}")),
+        Some(204)
+    );
+    // The logout on the second listener ended the session on the first.
+    assert!(get_json(first, "/api/hosts", &session).is_none());
+}
+
+/// Kernel spec §7, §11: start fails when any one of several addresses is
+/// taken, for `collector` and for `up`, before either touches its data
+/// directory.
+#[test]
+fn a_taken_listen_address_fails_the_start_before_the_data_dir_is_touched() {
+    let dir = scratch_dir("taken");
+    let _cleanup = RemoveDir(dir.clone());
+    let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = taken.local_addr().unwrap().to_string();
+    for command in ["collector", "up"] {
+        let data = dir.join(command);
+        let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+            .args([command, "--listen", "127.0.0.1:0", "--listen", &taken])
+            .arg("--data-dir")
+            .arg(&data)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{command} started: {stderr}");
+        assert!(stderr.contains(&format!("bind {taken}")), "{command}: {stderr}");
+        assert!(!data.exists(), "{command} made its data directory");
+    }
+}
+
+/// `up` binds every address and hands each to its collector child (kernel
+/// spec §7): its host connects over the first, and the second serves the
+/// same collector. A `HENNERY_LISTEN` in `up`'s environment (which its
+/// flags override) does not reach the child, which would otherwise refuse
+/// it beside `--listen-fd`.
+#[test]
+fn up_hands_every_listen_address_to_its_collector() {
+    let dir = scratch_dir("uplisteners");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let log = dir.join("up.log");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
+    command.env("HENNERY_LISTEN", "127.0.0.1:0");
+    let mut up = up_logging_to_with(command, &data, &log, &["--listen", "127.0.0.1:0"]);
+    let addresses = up.listening_on(2);
+    let session = sign_in(&mut up, &addresses[0], &data.join("collector"));
+    up.wait_until("the host connected, seen on the second listener", || {
+        matches!(
+            get_json(&addresses[1], "/api/hosts", &session),
+            Some(serde_json::Value::Array(hosts)) if hosts.iter().any(|h| h["connected"] == true)
+        )
+    });
 }
