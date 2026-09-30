@@ -237,6 +237,33 @@ fn an_accepted_hello_updates_the_hosts_version_capabilities_and_last_seen() {
     );
 }
 
+#[test]
+fn a_malformed_host_version_on_hello_is_ignored_but_last_seen_and_capabilities_still_update() {
+    let hosts = Hosts::open_in_memory().unwrap();
+    hosts.register("host-1", &enrollment(&key(1)), NOW).unwrap();
+    hosts
+        .record_hello("host-1", "0.1.0", &Capabilities::default(), NOW + 1)
+        .unwrap();
+
+    // Too long, and hiding characters: neither is a version a host should
+    // be able to make the registry display.
+    let too_long = "0.".to_string() + &"9".repeat(64);
+    for bad_version in [too_long.as_str(), "lap\u{202E}top"] {
+        hosts
+            .record_hello("host-1", bad_version, &Capabilities(vec![Capability::Park]), NOW + 2)
+            .unwrap();
+        let record = hosts.host("host-1").unwrap().unwrap();
+        // The stored version is untouched by the bad report...
+        assert_eq!(record.host_version, "0.1.0", "{bad_version:?}");
+        // ...but this hello still counts: capabilities and last_seen_at move.
+        assert_eq!(
+            (record.capabilities, record.last_seen_at),
+            (Capabilities(vec![Capability::Park]), Some(NOW + 2)),
+            "{bad_version:?}"
+        );
+    }
+}
+
 /// The vector `hennery-host`'s signer is checked against too: a fixed key,
 /// nonce and host id give this exact signature (Ed25519 is deterministic).
 const VECTOR_SIGNATURE: &str = "bd2b7388413c333e9ed69c330b4a8be8ffb6228609979b30607236fcdefab259\

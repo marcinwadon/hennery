@@ -73,16 +73,24 @@ impl Enrollment {
             ("host_version", &self.host_version),
             ("platform", &self.platform),
         ] {
-            let value = value.trim();
-            if value.is_empty()
-                || value.chars().count() > MAX_FIELD
-                || value.chars().any(|c| c.is_control() || is_format_char(c))
-            {
+            if !is_valid_display_field(value) {
                 return Some(format!("{field} must be 1 to {MAX_FIELD} printable characters"));
             }
         }
         None
     }
+}
+
+/// Whether `value` is 1 to `MAX_FIELD` printable characters once trimmed:
+/// the shape required of a host's `name`, `host_version` and `platform`
+/// (kernel spec §4.1), and re-checked on every `hello` (kernel spec §4.3) so
+/// an authenticated host cannot later overwrite a good value with a
+/// disguised or oversized one.
+fn is_valid_display_field(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value.chars().count() <= MAX_FIELD
+        && !value.chars().any(|c| c.is_control() || is_format_char(c))
 }
 
 /// The outcome of `Hosts::enroll`.
@@ -254,6 +262,17 @@ impl Hosts {
     /// Pair a host with a code (kernel spec §4.1): check the code, create the
     /// host with a fresh id, and use the code up, in one transaction. A
     /// wrong code changes nothing, so other outstanding codes stay valid.
+    ///
+    /// The spend at the end repeats the same guard as the read at the start
+    /// (`used_at IS NULL AND expires_at > now`), so a second writer that
+    /// raced past the read still cannot double-spend the code: whichever
+    /// commits first wins, and the loser's `UPDATE` matches zero rows and is
+    /// rolled back along with the host it tentatively inserted. Today the
+    /// per-`Hosts` mutex already serializes every call through one
+    /// connection, so this only matters across two `Hosts` instances (or
+    /// connections) open on the same file — which is already possible (the
+    /// sessions store opens its own) — and matters more once §1's single
+    /// writer thread is not the only thing standing between two writers.
     pub fn enroll(&self, code: &str, enrollment: &Enrollment, now: i64) -> Result<EnrollOutcome> {
         if let Some(problem) = enrollment.problem() {
             return Ok(EnrollOutcome::Invalid(problem));
@@ -280,10 +299,16 @@ impl Hosts {
             Registered::Created => {}
             Registered::AlreadyPaired { host_id } => return Ok(EnrollOutcome::AlreadyPaired { host_id }),
         }
-        tx.execute(
-            "UPDATE pairing_codes SET used_at = ?2 WHERE code_hash = ?1",
+        let spent = tx.execute(
+            "UPDATE pairing_codes SET used_at = ?2 WHERE code_hash = ?1 AND used_at IS NULL AND expires_at > ?2",
             params![hash, now],
         )?;
+        if spent == 0 {
+            // Someone else spent it between our read and our write: drop
+            // this transaction (rolling back the host we just inserted)
+            // rather than commit a second host onto a single-use code.
+            return Ok(EnrollOutcome::InvalidCode);
+        }
         tx.commit()?;
         Ok(EnrollOutcome::Enrolled { host_id })
     }
@@ -329,11 +354,35 @@ impl Hosts {
     }
 
     /// Update what an accepted `hello` reports (kernel spec §4.3).
+    ///
+    /// `host_version` is checked against the same shape enrollment requires
+    /// (kernel spec §4.1) before it is stored. The host is authenticated at
+    /// this point, but its self-reported version string is still its own
+    /// words, not ours: a host misbehaving or compromised after pairing
+    /// should not be able to overwrite a good version with an oversized one
+    /// or one hiding characters, the same way a name could (decision 5). A
+    /// `hello` failing only this check is not otherwise refused — the
+    /// signature is genuine, `capabilities` and `last_seen_at` still move —
+    /// the least surprising reading of a hello that is real but reports a
+    /// version nobody should have to display.
     pub fn record_hello(&self, host_id: &str, host_version: &str, capabilities: &Capabilities, now: i64) -> Result<()> {
-        self.conn().execute(
-            "UPDATE hosts SET host_version = ?2, capabilities = ?3, last_seen_at = ?4 WHERE id = ?1",
-            params![host_id, host_version, serde_json::to_string(capabilities)?, now],
-        )?;
+        let capabilities = serde_json::to_string(capabilities)?;
+        if is_valid_display_field(host_version) {
+            self.conn().execute(
+                "UPDATE hosts SET host_version = ?2, capabilities = ?3, last_seen_at = ?4 WHERE id = ?1",
+                params![host_id, host_version.trim(), capabilities, now],
+            )?;
+        } else {
+            tracing::warn!(
+                %host_id,
+                ?host_version,
+                "hello reported a malformed host_version; keeping the one already stored"
+            );
+            self.conn().execute(
+                "UPDATE hosts SET capabilities = ?2, last_seen_at = ?3 WHERE id = ?1",
+                params![host_id, capabilities, now],
+            )?;
+        }
         Ok(())
     }
 
@@ -348,6 +397,14 @@ impl Hosts {
     /// Mark a host revoked (kernel spec §4.3). Its future `hello`s get
     /// `revoked`; closing its connection and parking its sessions is the
     /// caller's part.
+    ///
+    /// The read above `try_revoke` is only ever a hint, not a guarantee:
+    /// unlike `enroll`'s check-then-spend, this is two separate statements
+    /// on an autocommit connection, not one transaction, so nothing but
+    /// `try_revoke`'s own guard stops a second writer that already read
+    /// "not revoked" from overwriting a revoke that has since landed. If it
+    /// matches nothing for that reason, that is exactly `AlreadyRevoked` — a
+    /// repeated revoke is harmless either way.
     pub fn revoke(&self, host_id: &str, now: i64) -> Result<Revoke> {
         let conn = self.conn();
         let revoked: Option<Option<i64>> = conn
@@ -357,8 +414,11 @@ impl Hosts {
             None => Revoke::NotFound,
             Some(Some(_)) => Revoke::AlreadyRevoked,
             Some(None) => {
-                conn.execute("UPDATE hosts SET revoked_at = ?2 WHERE id = ?1", params![host_id, now])?;
-                Revoke::Revoked
+                if try_revoke(&conn, host_id, now)? {
+                    Revoke::Revoked
+                } else {
+                    Revoke::AlreadyRevoked
+                }
             }
         })
     }
@@ -422,4 +482,60 @@ fn insert_host(tx: &rusqlite::Transaction<'_>, host_id: &str, e: &Enrollment, no
         ],
     )?;
     Ok(Registered::Created)
+}
+
+/// The guarded write at the heart of `revoke`: matches a host that is not
+/// yet revoked, and nothing otherwise — including a host another writer
+/// revoked since the caller's own read. Returns whether it matched. Kept as
+/// its own function so a test can call the exact statement `revoke` runs
+/// without going through `revoke`'s own read first, which is the only way
+/// to exercise this guard: a second, freshly-called `revoke` would simply
+/// see the row already revoked and never reach this write at all.
+fn try_revoke(conn: &Connection, host_id: &str, now: i64) -> Result<bool> {
+    let changed = conn.execute(
+        "UPDATE hosts SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
+        params![host_id, now],
+    )?;
+    Ok(changed > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::SigningKey;
+
+    const NOW: i64 = 1_800_000_000;
+
+    fn enrollment(seed: u8) -> Enrollment {
+        Enrollment {
+            public_key: hex::encode(SigningKey::from_bytes(&[seed; 32]).verifying_key().as_bytes()),
+            name: "laptop".into(),
+            host_version: "0.0.0".into(),
+            platform: "macos-aarch64".into(),
+        }
+    }
+
+    /// `revoke`'s read and its write are not one transaction (unlike
+    /// `enroll`'s check-then-spend), so a second writer that already read
+    /// "not revoked" — mirrored here by calling `try_revoke` directly,
+    /// the only way to reach it without `revoke`'s own up-to-date read
+    /// short-circuiting first — must not be able to overwrite a revoke
+    /// that has since landed with its own, different timestamp.
+    #[test]
+    fn try_revoke_matches_nothing_once_another_writer_already_revoked() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hennery.db");
+        let hosts = Hosts::open(&path).unwrap();
+        hosts.register("host-1", &enrollment(1), NOW).unwrap();
+
+        // A second, independent connection: not the in-process mutex.
+        let second = db::open(&path).unwrap();
+
+        assert_eq!(hosts.revoke("host-1", 100).unwrap(), Revoke::Revoked);
+
+        // The second writer's own attempt, after the fact, must match
+        // nothing rather than stamp over the timestamp already committed.
+        assert!(!try_revoke(&second, "host-1", 200).unwrap());
+        assert_eq!(hosts.host("host-1").unwrap().unwrap().revoked_at, Some(100));
+    }
 }
