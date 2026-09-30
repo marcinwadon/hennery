@@ -1131,6 +1131,50 @@ fn the_collectors_data_is_private_to_its_user() {
     );
 }
 
+/// Review I1: `the_collectors_data_is_private_to_its_user` only sends its
+/// SIGTERM once `setup-url` exists and the port accepts a connection — by
+/// then the old code (the shutdown task spawned on a bare `terminated()`,
+/// with no `Signals` created up front) was already well past the only
+/// window a SIGTERM could hit it in, so that test's own revert-probe never
+/// caught the regression `Signals::new()` fixes. This test sends SIGTERM the
+/// instant `admin.sock` exists, which is created right after `bind`, before
+/// the database is opened, migrated or a setup link is written — pinning the
+/// window directly instead of relying on how long start-up happens to take.
+#[test]
+fn a_sigterm_during_the_start_leaves_no_admin_socket() {
+    let dir = scratch_dir("sigterm-start");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let log = dir.join("collector.log");
+
+    let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["collector", "--listen", "127.0.0.1:0"])
+        .arg("--data-dir")
+        .arg(&data)
+        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
+        .spawn()
+        .unwrap();
+    // Created before any assertion that could panic: a failure below must
+    // still SIGKILL the collector and remove the scratch dir on the way out.
+    let mut guard = KillTree::new(collector, &log);
+    guard.dir = dir.clone();
+
+    let socket = data.join("admin.sock");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !socket.exists() {
+        guard.assert_running("admin.sock to appear");
+        assert!(Instant::now() < deadline, "timed out waiting for admin.sock");
+        std::thread::sleep(Duration::from_micros(200));
+    }
+
+    unsafe { libc::kill(guard.up.id() as i32, libc::SIGTERM) };
+    let status =
+        wait_with_timeout(&mut guard.up, Duration::from_secs(15)).expect("the collector did not exit after SIGTERM");
+    assert!(status.success(), "the collector exited with {status:?}");
+    assert!(!socket.exists(), "the admin socket outlived the collector");
+}
+
 /// Final review I2, an install from before the fix: a database others can
 /// read is made private when the collector opens it. A data directory others
 /// can enter is the operator's to fix: it is named in a warning, and left
