@@ -4,7 +4,8 @@
 //! registering the host (ACP core §3.5, kernel spec §3.3, §11). `axum`'s
 //! `.layer()` only wraps routes added *before* it in the router builder, so
 //! a route added after would silently escape auth — the route table below
-//! pins that every operator route is actually covered.
+//! pins that every operator route is actually covered, on every listener
+//! (kernel spec §7, §11): the test collector listens on two.
 
 use futures::{SinkExt, StreamExt};
 use hennery_host::identity::HostKey;
@@ -25,7 +26,10 @@ fn host_key() -> HostKey {
 }
 
 struct Collector {
+    /// The first of `addrs`.
     addr: SocketAddr,
+    /// Every address it listens on, the same router on each.
+    addrs: Vec<SocketAddr>,
     state: AppState,
     task: tokio::task::JoinHandle<std::io::Result<()>>,
     _dir: tempfile::TempDir,
@@ -34,8 +38,11 @@ struct Collector {
 impl Collector {
     async fn start() -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let mut listeners = Vec::new();
+        for _ in 0..2 {
+            listeners.push(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+        }
+        let addrs: Vec<SocketAddr> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
         let state = AppState::new(
             Store::open(&dir.path().join("hennery.db")).unwrap(),
             Hosts::open(&dir.path().join("hennery.db")).unwrap(),
@@ -48,9 +55,10 @@ impl Collector {
             platform: "test".into(),
         };
         state.hosts.register(HOST, &enrollment, 0).unwrap();
-        let task = tokio::spawn(hennery_sessions::serve(listener, state.clone()));
+        let task = tokio::spawn(hennery_sessions::serve_on(listeners, state.clone()));
         Self {
-            addr,
+            addr: addrs[0],
+            addrs,
             state,
             task,
             _dir: dir,
@@ -134,11 +142,17 @@ const OPERATOR_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/api/auth/sessions/0000"),
 ];
 
+/// Every operator route on every listener of `collector`.
+fn every_route(collector: &Collector) -> Vec<(SocketAddr, &'static str, &'static str)> {
+    let on = |addr: SocketAddr| OPERATOR_ROUTES.iter().map(move |&(method, path)| (addr, method, path));
+    collector.addrs.iter().copied().flat_map(on).collect()
+}
+
 /// Bounded, so a route that escaped the layer and streams (SSE) fails the
-/// test instead of hanging it.
-fn request(client: &reqwest::Client, collector: &Collector, method: &str, path: &str) -> reqwest::RequestBuilder {
+/// test instead of hanging it. To the collector's listener at `addr`.
+fn request(client: &reqwest::Client, addr: SocketAddr, method: &str, path: &str) -> reqwest::RequestBuilder {
     client
-        .request(method.parse().unwrap(), collector.url(path))
+        .request(method.parse().unwrap(), format!("http://{addr}{path}"))
         .timeout(std::time::Duration::from_secs(10))
 }
 
@@ -155,28 +169,32 @@ async fn every_operator_route_needs_the_session_cookie() {
     let collector = Collector::start().await;
     let signed_in = hennery_testkit::operator_client(&collector.state.operator);
     let plain = reqwest::Client::new();
-    for &(method, path) in OPERATOR_ROUTES {
-        let none = request(&plain, &collector, method, path)
+    for (addr, method, path) in every_route(&collector) {
+        let none = request(&plain, addr, method, path)
             .header("origin", hennery_testkit::PUBLIC_URL)
             .send()
             .await
             .unwrap();
-        assert_eq!(code_of(none).await, (401, "unauthenticated".into()), "{method} {path}");
-        let wrong = request(&plain, &collector, method, path)
+        assert_eq!(
+            code_of(none).await,
+            (401, "unauthenticated".into()),
+            "{addr} {method} {path}"
+        );
+        let wrong = request(&plain, addr, method, path)
             .header("origin", hennery_testkit::PUBLIC_URL)
             .header("cookie", format!("hennery_session={}", "0".repeat(64)))
             .send()
             .await
             .unwrap();
-        assert_eq!(code_of(wrong).await, (401, "unauthenticated".into()), "{method} {path}");
+        assert_eq!(
+            code_of(wrong).await,
+            (401, "unauthenticated".into()),
+            "{addr} {method} {path}"
+        );
         // Sanity: the owner's session gets through, proving the 401s above
         // are about the cookie and not a broken harness.
-        let status = request(&signed_in, &collector, method, path)
-            .send()
-            .await
-            .unwrap()
-            .status();
-        assert!(status != 401 && status != 403, "{method} {path}: {status}");
+        let status = request(&signed_in, addr, method, path).send().await.unwrap().status();
+        assert!(status != 401 && status != 403, "{addr} {method} {path}: {status}");
     }
     let hosts: Vec<HostItem> = signed_in
         .get(collector.url("/api/hosts"))
@@ -206,9 +224,9 @@ async fn every_operator_route_applies_the_browser_rules() {
         .unwrap();
     let cookie = format!("hennery_session={token}");
     let plain = reqwest::Client::new();
-    for &(method, path) in OPERATOR_ROUTES {
+    for (addr, method, path) in every_route(&collector) {
         let send = |origin: Option<&str>, site: Option<&str>| {
-            let mut req = request(&plain, &collector, method, path).header("cookie", &cookie);
+            let mut req = request(&plain, addr, method, path).header("cookie", &cookie);
             if let Some(origin) = origin {
                 req = req.header("origin", origin);
             }
@@ -218,28 +236,31 @@ async fn every_operator_route_applies_the_browser_rules() {
             req.send()
         };
         let evil = code_of(send(Some("https://evil.example"), None).await.unwrap()).await;
-        assert_eq!(evil, (403, "origin_mismatch".into()), "{method} {path}");
+        assert_eq!(evil, (403, "origin_mismatch".into()), "{addr} {method} {path}");
         if method == "GET" {
             for site in ["cross-site", "same-site"] {
                 let resp = send(None, Some(site)).await.unwrap();
                 assert_eq!(
                     code_of(resp).await,
                     (403, "cross_site".into()),
-                    "{method} {path} {site}"
+                    "{addr} {method} {path} {site}"
                 );
             }
             for site in [Some("same-origin"), Some("none"), None] {
                 let status = send(None, site).await.unwrap().status();
-                assert!(status != 401 && status != 403, "{method} {path} {site:?}: {status}");
+                assert!(
+                    status != 401 && status != 403,
+                    "{addr} {method} {path} {site:?}: {status}"
+                );
             }
         } else {
             let missing = code_of(send(None, None).await.unwrap()).await;
-            assert_eq!(missing, (403, "origin_mismatch".into()), "{method} {path}");
+            assert_eq!(missing, (403, "origin_mismatch".into()), "{addr} {method} {path}");
             // From the right origin, the body must still be JSON: the rules
             // refuse any other type (the code proves it is them, not an
             // extractor), and accept `application/json` with parameters.
             let with_body = |content_type: &'static str, body: &'static str| {
-                request(&plain, &collector, method, path)
+                request(&plain, addr, method, path)
                     .header("cookie", &cookie)
                     .header("origin", hennery_testkit::PUBLIC_URL)
                     .header("content-type", content_type)
@@ -247,14 +268,14 @@ async fn every_operator_route_applies_the_browser_rules() {
                     .send()
             };
             let text = code_of(with_body("text/plain", "hello").await.unwrap()).await;
-            assert_eq!(text, (415, "unsupported_media_type".into()), "{method} {path}");
+            assert_eq!(text, (415, "unsupported_media_type".into()), "{addr} {method} {path}");
             let status = with_body("application/json; charset=utf-8", "{}")
                 .await
                 .unwrap()
                 .status();
             assert!(
                 status != 401 && status != 403 && status != 415,
-                "{method} {path} application/json; charset=utf-8: {status}"
+                "{addr} {method} {path} application/json; charset=utf-8: {status}"
             );
         }
     }
@@ -269,20 +290,28 @@ async fn the_browser_rules_run_before_the_session_check() {
     let collector = Collector::start().await;
     hennery_testkit::operator_client(&collector.state.operator);
     let plain = reqwest::Client::new();
-    for &(method, path) in OPERATOR_ROUTES {
-        let evil = request(&plain, &collector, method, path)
+    for (addr, method, path) in every_route(&collector) {
+        let evil = request(&plain, addr, method, path)
             .header("origin", "https://evil.example")
             .send()
             .await
             .unwrap();
-        assert_eq!(code_of(evil).await, (403, "origin_mismatch".into()), "{method} {path}");
+        assert_eq!(
+            code_of(evil).await,
+            (403, "origin_mismatch".into()),
+            "{addr} {method} {path}"
+        );
         if method == "GET" {
-            let cross = request(&plain, &collector, method, path)
+            let cross = request(&plain, addr, method, path)
                 .header("sec-fetch-site", "cross-site")
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(code_of(cross).await, (403, "cross_site".into()), "{method} {path}");
+            assert_eq!(
+                code_of(cross).await,
+                (403, "cross_site".into()),
+                "{addr} {method} {path}"
+            );
         }
     }
     collector.stop().await;
@@ -311,6 +340,32 @@ async fn enrollment_and_the_host_socket_need_neither_a_session_nor_an_origin() {
         hello(&mut ws, HOST, proof).await,
         CollectorFrame::HelloAck { .. }
     ));
+    collector.stop().await;
+}
+
+/// `/healthz` and `/readyz` (kernel spec §3.3, §8) answer on every listener
+/// without a session, from any origin, and say nothing but a fixed word:
+/// no cookie, no data.
+#[tokio::test]
+async fn the_health_checks_are_exempt_and_carry_no_data() {
+    let collector = Collector::start().await;
+    hennery_testkit::operator_client(&collector.state.operator);
+    let plain = reqwest::Client::new();
+    for &addr in &collector.addrs {
+        for (path, word) in [("/healthz", "ok"), ("/readyz", "ready")] {
+            let resp = request(&plain, addr, "GET", path)
+                .header("origin", "https://evil.example")
+                .header("sec-fetch-site", "cross-site")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{addr} {path}");
+            assert!(resp.headers().get("set-cookie").is_none(), "{addr} {path}");
+            assert_eq!(resp.text().await.unwrap(), word, "{addr} {path}");
+            let post = request(&plain, addr, "POST", path).send().await.unwrap();
+            assert_eq!(post.status(), 405, "{addr} POST {path}");
+        }
+    }
     collector.stop().await;
 }
 
