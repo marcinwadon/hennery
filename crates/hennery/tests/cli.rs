@@ -1305,7 +1305,14 @@ fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
             // SAFETY: dup2 in the forked child, before exec; async-signal-safe.
             unsafe {
                 cmd.pre_exec(move || {
-                    if libc::dup2(fd, 50) < 0 {
+                    // Already 50 (a busy test binary has that many open):
+                    // `dup2` onto itself would keep close-on-exec set.
+                    let rc = if fd == 50 {
+                        libc::fcntl(fd, libc::F_SETFD, 0)
+                    } else {
+                        libc::dup2(fd, 50)
+                    };
+                    if rc < 0 {
                         return Err(std::io::Error::last_os_error());
                     }
                     Ok(())
