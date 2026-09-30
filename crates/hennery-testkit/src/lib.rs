@@ -239,6 +239,15 @@ pub const PUBLIC_URL: &str = "https://hennery.example";
 /// The owner's password in test collectors.
 pub const OWNER_PASSWORD: &str = "correct horse battery";
 
+/// The owner's PHC string, from a check of `OWNER_PASSWORD` as a login
+/// makes: what `Operator::open_session` opens a session on.
+pub fn owner_phc(operator: &hennery_kernel::operator::Operator) -> String {
+    operator
+        .verify_password(OWNER_PASSWORD)
+        .unwrap()
+        .expect("the owner's password")
+}
+
 /// A client signed in as the owner of `operator`'s collector (kernel spec
 /// §3.2), which is set up first if it is not: every request carries the
 /// session cookie and the `public_url`'s `Origin`. The session is opened
@@ -249,7 +258,10 @@ pub fn operator_client(operator: &hennery_kernel::operator::Operator) -> reqwest
         let token = operator.issue_setup_token(now).unwrap().unwrap();
         operator.set_up(&token, OWNER_PASSWORD, PUBLIC_URL, now).unwrap();
     }
-    let token = operator.open_session("hennery-testkit", now).unwrap().unwrap();
+    let token = operator
+        .open_session("hennery-testkit", &owner_phc(operator), now)
+        .unwrap()
+        .unwrap();
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::COOKIE,

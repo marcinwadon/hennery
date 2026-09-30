@@ -121,9 +121,10 @@ async fn setup(State(operator): State<Arc<Operator>>, headers: HeaderMap, Json(r
     let op = operator.clone();
     let outcome =
         tokio::task::spawn_blocking(move || op.set_up(&req.token, &req.password, &req.public_url, unix_now())).await;
-    match outcome {
-        Ok(Ok(SetupOutcome::Done { owner_id })) => {
+    let phc = match outcome {
+        Ok(Ok(SetupOutcome::Done { owner_id, phc })) => {
             tracing::info!(%owner_id, public_url = %public_url.origin(), "hennery set up");
+            phc
         }
         Ok(Ok(SetupOutcome::AlreadySetUp)) => {
             return error(StatusCode::CONFLICT, "already_set_up", "hennery is set up already");
@@ -138,10 +139,10 @@ async fn setup(State(operator): State<Arc<Operator>>, headers: HeaderMap, Json(r
         Ok(Ok(SetupOutcome::Invalid(why))) => return error(StatusCode::BAD_REQUEST, "invalid", why),
         Ok(Err(err)) => return internal(err),
         Err(err) => return internal(err.into()),
-    }
-    let token = match operator.open_session(&user_agent(&headers), unix_now()) {
+    };
+    let token = match operator.open_session(&user_agent(&headers), &phc, unix_now()) {
         Ok(Some(token)) => token,
-        Ok(None) => return internal(anyhow::anyhow!("no owner right after setup")),
+        Ok(None) => return internal(anyhow::anyhow!("the password changed right after setup")),
         Err(err) => return internal(err),
     };
     let response = (
@@ -170,13 +171,14 @@ async fn login(
             "too many wrong passwords from this address; try again later",
         );
     }
-    match operator.check_password(req.password).await {
-        Ok(true) => {}
-        Ok(false) => return error(StatusCode::UNAUTHORIZED, "invalid_password", "wrong password"),
+    let phc = match operator.check_password(req.password).await {
+        Ok(Some(phc)) => phc,
+        Ok(None) => return error(StatusCode::UNAUTHORIZED, "invalid_password", "wrong password"),
         Err(err) => return internal(err),
-    }
+    };
     operator.login_limiter.succeeded(peer.ip());
-    match operator.open_session(&user_agent(&headers), unix_now()) {
+    // Bound to the password just checked: a reset since then wins.
+    match operator.open_session(&user_agent(&headers), &phc, unix_now()) {
         Ok(Some(token)) => with_cookie(
             StatusCode::NO_CONTENT.into_response(),
             &session_cookie(&token, secure_cookies(&operator)),
@@ -220,8 +222,8 @@ async fn step_up(
         );
     }
     match operator.check_password(req.password).await {
-        Ok(true) => {}
-        Ok(false) => return error(StatusCode::UNAUTHORIZED, "invalid_password", "wrong password"),
+        Ok(Some(_)) => {}
+        Ok(None) => return error(StatusCode::UNAUTHORIZED, "invalid_password", "wrong password"),
         Err(err) => return internal(err),
     }
     operator.step_up_limiter.succeeded(peer.ip());

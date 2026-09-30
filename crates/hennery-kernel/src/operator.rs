@@ -8,6 +8,8 @@
 //! - **Passwords are Argon2id PHC strings** (`password-auth`). Hashing and
 //!   verifying are CPU- and memory-heavy (about 19 MiB each), so they run
 //!   on a blocking thread and at most `MAX_CONCURRENT_HASHES` at once.
+//! - **Recovery** (the admin socket, kernel spec §4.2): a password reset
+//!   and a `public_url` reset each end every session, and so its streams.
 //!
 //! Every time is seconds since the Unix epoch, passed in by the caller.
 
@@ -97,6 +99,9 @@ fn is_loopback_host(url: &url::Url) -> bool {
 pub enum SetupOutcome {
     Done {
         owner_id: String,
+        /// The PHC string just stored: the session setup opens is bound to
+        /// it (`open_session`).
+        phc: String,
     },
     /// There is an owner already.
     AlreadySetUp,
@@ -104,6 +109,18 @@ pub enum SetupOutcome {
     InvalidToken,
     /// The password or `public_url` is not acceptable (why); the token is
     /// not used up.
+    Invalid(String),
+}
+
+/// The outcome of `Operator::reset_password` and `reset_public_url`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reset {
+    /// Done; this many signed-in sessions were ended.
+    Done { sessions_ended: usize },
+    /// There is no owner to reset yet: setup is the way in.
+    NotSetUp,
+    /// The new password or `public_url` is not acceptable (why); nothing
+    /// changed.
     Invalid(String),
 }
 
@@ -137,8 +154,9 @@ pub struct Operator {
     /// Loaded at open and replaced by setup: read on every browser request.
     public_url: RwLock<Option<PublicUrl>>,
     setup: Mutex<Option<SetupToken>>,
-    /// The `setup-url` file, removed once setup is done.
-    setup_file: Mutex<Option<PathBuf>>,
+    /// The link last written to `setup-url` (and so the file), removed
+    /// once setup is done.
+    announced: Mutex<Option<SetupLink>>,
     /// `check_password`'s slots, each held until its verify ends.
     hashing: Arc<tokio::sync::Semaphore>,
     verifications: AtomicU64,
@@ -157,6 +175,10 @@ pub struct Operator {
     in_flight: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     max_in_flight: std::sync::atomic::AtomicUsize,
+    /// Password resets that have started hashing (`reset_password`'s
+    /// permit, pinned by the unit tests below).
+    #[cfg(test)]
+    reset_hashes: AtomicU64,
 }
 
 impl Operator {
@@ -177,7 +199,7 @@ impl Operator {
             conn: Mutex::new(conn),
             public_url: RwLock::new(public_url),
             setup: Mutex::new(None),
-            setup_file: Mutex::new(None),
+            announced: Mutex::new(None),
             hashing: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HASHES)),
             verifications: AtomicU64::new(0),
             login_limiter: Limiter::new(Policy::LOGIN),
@@ -187,6 +209,8 @@ impl Operator {
             in_flight: Default::default(),
             #[cfg(test)]
             max_in_flight: Default::default(),
+            #[cfg(test)]
+            reset_hashes: Default::default(),
         })
     }
 
@@ -259,8 +283,29 @@ impl Operator {
             let _ = std::fs::remove_file(&temp);
             return Err(err).with_context(|| format!("write {}", file.display()));
         }
-        *self.setup_file.lock().expect("setup file lock") = Some(file.clone());
-        Ok(Some(SetupLink { url, file }))
+        let link = SetupLink { url, file };
+        *self.announced.lock().expect("announced lock") = Some(link.clone());
+        Ok(Some(link))
+    }
+
+    /// The setup link for the admin socket's `setup-url` (kernel spec
+    /// §4.2): the one last announced while its token is live, else a fresh
+    /// one, announced as `announce_setup` does (the old token dies). `None`
+    /// once set up.
+    pub fn setup_link(&self, dir: &Path, base_url: &str, now: i64) -> Result<Option<SetupLink>> {
+        if self.is_set_up()? {
+            return Ok(None);
+        }
+        let live = self
+            .setup
+            .lock()
+            .expect("setup lock")
+            .as_ref()
+            .is_some_and(|t| t.expires_at > now);
+        if live && let Some(link) = self.announced.lock().expect("announced lock").clone() {
+            return Ok(Some(link));
+        }
+        self.announce_setup(dir, base_url, now)
     }
 
     /// Create the owner with `password` and store `public_url` (kernel spec
@@ -307,17 +352,20 @@ impl Operator {
             tx.commit()?;
         }
         *setup = None;
-        if let Some(file) = self.setup_file.lock().expect("setup file lock").take() {
-            remove_setup_file(&file);
+        if let Some(link) = self.announced.lock().expect("announced lock").take() {
+            remove_setup_file(&link.file);
         }
         *self.public_url.write().expect("public_url lock") = Some(public_url);
-        Ok(SetupOutcome::Done { owner_id })
+        Ok(SetupOutcome::Done { owner_id, phc })
     }
 
-    /// Whether `password` is the owner's. Before setup it is checked
-    /// against a dummy hash, so the answer takes as long either way.
-    /// Blocking: prefer `check_password`.
-    pub fn verify_password(&self, password: &str) -> Result<bool> {
+    /// Whether `password` is the owner's: the PHC string it verified
+    /// against, or `None`. Before setup it is checked against a dummy hash,
+    /// so the answer takes as long either way. A session opened on the
+    /// strength of it passes the PHC to `open_session`, so a reset landing
+    /// in between wins (3b-ii decision 11). Blocking: prefer
+    /// `check_password`.
+    pub fn verify_password(&self, password: &str) -> Result<Option<String>> {
         // First, so it is counted before `verifications` and dropped last.
         #[cfg(test)]
         let _gauge = InFlight::enter(self);
@@ -328,7 +376,7 @@ impl Operator {
             .optional()?;
         let Some(phc) = phc else {
             let _ = password_auth::verify_password(password, dummy_hash());
-            return Ok(false);
+            return Ok(None);
         };
         // An oversized password is still verified (and fails), so its
         // answer takes as long as any other.
@@ -337,14 +385,14 @@ impl Operator {
         } else {
             password
         };
-        Ok(password_auth::verify_password(password, &phc).is_ok())
+        Ok(password_auth::verify_password(password, &phc).is_ok().then_some(phc))
     }
 
     /// `verify_password` on a blocking thread, at most
     /// `MAX_CONCURRENT_HASHES` at once; others wait their turn. The slot
     /// moves into the blocking closure: a caller that goes away (a client
     /// disconnect, a timeout) cannot free it while its verify still runs.
-    pub async fn check_password(self: &Arc<Self>, password: String) -> Result<bool> {
+    pub async fn check_password(self: &Arc<Self>, password: String) -> Result<Option<String>> {
         let permit = self
             .hashing
             .clone()
@@ -364,6 +412,87 @@ impl Operator {
     /// failure path), which tests pin with this.
     pub fn verifications(&self) -> u64 {
         self.verifications.load(Ordering::Relaxed)
+    }
+
+    /// Replace the owner's password (the admin socket's reset, kernel spec
+    /// §4.2) and end every signed-in session, so their streams end too. The
+    /// hash runs on a blocking thread and takes a `check_password` slot like
+    /// any other, so a reset cannot add a third Argon2 run to a login
+    /// flood. The limiters are cleared: the operator proved local access.
+    pub async fn reset_password(self: &Arc<Self>, password: String, now: i64) -> Result<Reset> {
+        if let Some(problem) = password_problem(&password) {
+            return Ok(Reset::Invalid(problem));
+        }
+        let Some(owner_id) = self.owner_id()? else {
+            return Ok(Reset::NotSetUp);
+        };
+        let permit = self
+            .hashing
+            .clone()
+            .acquire_owned()
+            .await
+            .context("the hashing semaphore is closed")?;
+        #[cfg(test)]
+        let this = self.clone();
+        let phc = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            #[cfg(test)]
+            this.reset_hashes.fetch_add(1, Ordering::SeqCst);
+            password_auth::generate_hash(password)
+        })
+        .await?;
+        let ended = {
+            let mut conn = self.conn();
+            let tx = conn.transaction()?;
+            tx.execute(
+                "UPDATE password_credentials SET phc = ?2, updated_at = ?3 WHERE owner_id = ?1",
+                params![owner_id, phc, now],
+            )?;
+            let ended = tx.execute("DELETE FROM auth_sessions WHERE owner_id = ?1", [&owner_id])?;
+            tx.commit()?;
+            ended
+        };
+        self.sessions_ended();
+        self.login_limiter.clear();
+        self.step_up_limiter.clear();
+        Ok(Reset::Done { sessions_ended: ended })
+    }
+
+    /// Replace `public_url` (the admin socket's recovery when the collector
+    /// moved, 3b decision 4): the stored row and the origin every browser
+    /// request is checked against, which is cached here. Every signed-in
+    /// session ends: they were opened at the old origin, and the new one
+    /// signs in afresh.
+    pub fn reset_public_url(&self, input: &str) -> Result<Reset> {
+        let public_url = match PublicUrl::parse(input) {
+            Ok(url) => url,
+            Err(problem) => return Ok(Reset::Invalid(problem)),
+        };
+        let Some(owner_id) = self.owner_id()? else {
+            return Ok(Reset::NotSetUp);
+        };
+        let ended = {
+            let mut conn = self.conn();
+            let tx = conn.transaction()?;
+            tx.execute(
+                "INSERT INTO settings(owner_id, key, value) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value",
+                params![owner_id, PUBLIC_URL_KEY, public_url.origin()],
+            )?;
+            let ended = tx.execute("DELETE FROM auth_sessions WHERE owner_id = ?1", [&owner_id])?;
+            tx.commit()?;
+            // Still under the connection's lock: no other reset lands
+            // between the row and the cache.
+            *self.public_url.write().expect("public_url lock") = Some(public_url);
+            ended
+        };
+        self.sessions_ended();
+        Ok(Reset::Done { sessions_ended: ended })
+    }
+
+    /// Wake every stream held open by a session: some have ended.
+    fn sessions_ended(&self) {
+        self.ended.send_modify(|generation| *generation += 1);
     }
 }
 
@@ -456,8 +585,12 @@ pub struct AuthSession {
 impl Operator {
     /// Open a session for the owner and return its token, the cookie's
     /// value. Only the token's hash is stored. The password was just
-    /// checked, so the session starts stepped up. `None` before setup.
-    pub fn open_session(&self, user_agent: &str, now: i64) -> Result<Option<String>> {
+    /// checked, so the session starts stepped up. `verified` is the PHC
+    /// string that check verified against (`verify_password`): the session
+    /// is opened only while it is still the owner's, so a login whose check
+    /// raced a password reset gets no session (`None`), like one before
+    /// setup.
+    pub fn open_session(&self, user_agent: &str, verified: &str, now: i64) -> Result<Option<String>> {
         let Some(owner_id) = self.owner_id()? else {
             return Ok(None);
         };
@@ -469,18 +602,20 @@ impl Operator {
             .collect();
         let conn = self.conn();
         conn.execute("DELETE FROM auth_sessions WHERE expires_at <= ?1", [now])?;
-        conn.execute(
+        let opened = conn.execute(
             "INSERT INTO auth_sessions(id_hash, owner_id, user_agent, created_at, last_seen_at, last_step_up_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?4, ?4, ?5)",
+             SELECT ?1, ?2, ?3, ?4, ?4, ?4, ?5
+             WHERE EXISTS (SELECT 1 FROM password_credentials WHERE owner_id = ?2 AND phc = ?6)",
             params![
                 sha256_hex(token.as_bytes()),
                 owner_id,
                 user_agent,
                 now,
-                now + SESSION_TTL_SECS
+                now + SESSION_TTL_SECS,
+                verified
             ],
         )?;
-        Ok(Some(token))
+        Ok((opened > 0).then_some(token))
     }
 
     /// The live session `token` names, if any. Its expiry slides to
@@ -557,12 +692,13 @@ impl Operator {
             params![session_id, now],
         )?;
         if changed > 0 {
-            self.ended.send_modify(|generation| *generation += 1);
+            self.sessions_ended();
         }
         Ok(changed > 0)
     }
 
-    /// Changes whenever a session ends (`revoke_session`, and so logout).
+    /// Changes whenever a session ends (`revoke_session`, and so logout,
+    /// and the resets).
     pub fn session_ends(&self) -> tokio::sync::watch::Receiver<u64> {
         self.ended.subscribe()
     }
@@ -687,10 +823,35 @@ mod tests {
             })
             .collect();
         for check in checks {
-            assert!(check.await.unwrap());
+            assert!(check.await.unwrap().is_some());
         }
         assert_eq!(op.verifications(), 8);
         assert!(op.max_in_flight.load(Ordering::SeqCst) <= MAX_CONCURRENT_HASHES);
+    }
+
+    /// A password reset hashes only once it holds a slot: with both taken
+    /// (two verifies of a login flood, say) it waits, and runs once one is
+    /// free.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_password_reset_hashes_only_with_a_hashing_slot() {
+        let op = set_up();
+        let held = op
+            .hashing
+            .clone()
+            .acquire_many_owned(MAX_CONCURRENT_HASHES as u32)
+            .await
+            .unwrap();
+        let reset = {
+            let op = op.clone();
+            tokio::spawn(async move { op.reset_password("a new long password".into(), NOW).await })
+        };
+        // Load can only make this pass falsely (the reset not yet started),
+        // never fail falsely.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(op.reset_hashes.load(Ordering::SeqCst), 0, "hashed without a slot");
+        drop(held);
+        assert_eq!(reset.await.unwrap().unwrap(), Reset::Done { sessions_ended: 0 });
+        assert_eq!(op.reset_hashes.load(Ordering::SeqCst), 1);
     }
 
     /// A check whose caller goes away (a client disconnect, a timeout)
