@@ -67,6 +67,26 @@ impl Collector {
             .await
             .unwrap()
     }
+
+    /// Like `enroll`, but with a caller-supplied `X-Forwarded-For`: the
+    /// limiter must key on the real peer address, not this header — a proxy
+    /// header is forgeable, and trusting it would let a single real address
+    /// spend a fresh budget on every request just by changing it.
+    async fn enroll_claiming(&self, code: &str, key: &str, forwarded_for: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(self.url("/api/hosts/enroll"))
+            .header("x-forwarded-for", forwarded_for)
+            .json(&EnrollRequest {
+                code: code.into(),
+                public_key: key.into(),
+                name: "laptop".into(),
+                host_version: "0.0.0".into(),
+                platform: "linux-x86_64".into(),
+            })
+            .send()
+            .await
+            .unwrap()
+    }
 }
 
 async fn code_of(resp: reqwest::Response) -> (u16, String) {
@@ -167,4 +187,24 @@ async fn a_malformed_or_already_paired_enrollment_is_refused_and_keeps_the_code(
     );
     assert_eq!(collector.enroll(&code, KEYS[2]).await.status(), 201);
     assert_eq!(collector.state.hosts.list().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_spoofed_x_forwarded_for_does_not_evade_the_rate_limit() {
+    let collector = Collector::start().await;
+    // Every one of the 5 free attempts claims a different address; since
+    // the real peer is the same loopback socket every time, they all count
+    // against the same limiter entry, and the 6th is still locked out.
+    for n in 0..5 {
+        assert_eq!(
+            collector
+                .enroll_claiming("0000-0000", KEYS[0], &format!("203.0.113.{n}"))
+                .await
+                .status(),
+            401
+        );
+    }
+    let locked = collector.enroll_claiming("0000-0000", KEYS[0], "203.0.113.99").await;
+    assert_eq!(locked.status(), 429);
+    assert!(locked.headers().contains_key("retry-after"));
 }

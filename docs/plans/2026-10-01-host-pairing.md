@@ -88,6 +88,7 @@ This is **plan (3), real auth and pairing**, as every earlier plan handed it on.
 - Decision 11: revoking the all-in-one host no longer takes `up` down. `host run` exits 78 when it is revoked; `up` logs how to pair it again and keeps the collector serving. Only a collector exit ends `up` (A1).
 - Decision 11: `up` hands its host the collector's current loopback URL (`--collector-url`), and `join` treats any two loopback URLs as the same collector, so a new port or `localhost` for `127.0.0.1` is not "another collector" (A2).
 - Decision 6: the limiter counts every attempt as a failure the moment it starts (`attempt`), so a parallel burst cannot exceed five guesses. It keys on the canonical address with IPv6 grouped per /64, keeps at most 4096 addresses, and lives in memory (A3).
+- Decision 6 (amended again, 2026-10-01, round 2 of the same review): past capacity, a live (not yet forgotten) entry is never evicted to make room for a new address. Forgotten entries are still pruned first; if the table is still full of live ones, the new address's attempt is counted against one shared overflow entry with its own five-per-window budget and lockout, instead of evicting an unrelated address's real count. The first version of this amendment evicted the oldest not-locked-out entry, then the oldest of all — but an attacker with more addresses than the table's capacity (4097 keys, a `/52` of IPv6, is enough to evict past the 4096-address default) could rotate through them so that no single address ever locked out, turning the per-address budget into a throughput limit only. Accepted trade-off: a flood from more distinct addresses than the table holds shares and exhausts the one overflow budget together, slowing pairing for every new address until that shared window or lockout passes (or the collector restarts) — deliberate, so a single generous per-address budget cannot be defeated by rotating addresses.
 - Decision 12: `join` re-pairs automatically only after `revoked`. After `bad_proof` it refuses and names the files to remove. An old outbox is never deleted: it is moved aside as `outbox.db.orphaned-<old host id>`, and so is any outbox a new identity would otherwise inherit (A4).
 - Decision 13: the socket task parks the sessions again when it ends if its host is revoked, so a frame applied while a revoke timed out still converges (A5).
 - Decision 1: the development token must be at least 16 characters; the binary refuses to start otherwise (A6).
@@ -129,9 +130,9 @@ Items marked **(amendment)** depart from explicit spec text and should be writte
    - The fifth locks the address out for 60 s, and every further wrong attempt doubles that, up to an hour.
    - While locked out, even a right code is answered 429 `rate_limited` with `Retry-After`, without being checked (and so without being spent).
    - The key is `IpAddr::to_canonical()` (an IPv4-mapped address counts as its IPv4 address), with IPv6 grouped per /64.
-   - At most 4096 addresses are tracked. Past that, forgotten entries go first, then the oldest that are not locked out, then the oldest.
-   - Counts and lockouts are in memory: a collector restart clears them. There is no global budget and no loopback exemption.
-   - Behind a reverse proxy every client shares the proxy's address. `X-Forwarded-For` is forgeable, so it is not trusted, and one flood of wrong codes slows pairing for everyone for a while.
+   - At most 4096 addresses are tracked. Past that, forgotten entries are pruned first; **a live entry is never evicted** (amended 2026-10-01, round 2): a new address past capacity instead shares one overflow entry with its own five-per-window budget and lockout, so an attacker with more addresses than the table holds cannot rotate through them to dodge a lockout. Memory stays bounded by capacity plus one.
+   - Counts and lockouts are in memory: a collector restart clears them, including the shared overflow entry. Each tracked address still has its own separate budget; only addresses past capacity share the overflow entry's. There is no loopback exemption.
+   - Behind a reverse proxy every client shares the proxy's address. `X-Forwarded-For` is forgeable, so it is not trusted, and one flood of wrong codes slows pairing for everyone for a while. The same is true, deliberately, of a flood spread across more addresses than the table can track: they share the one overflow budget and lock out together.
    - The limiter takes `now`, so its tests never sleep. It is the one 3b's login limit reuses.
 7. **Times in kernel tables are integer Unix seconds**, passed in by the caller; REST shows RFC 3339.
 8. **Endpoints.**
@@ -183,7 +184,7 @@ Items marked **(amendment)** depart from explicit spec text and should be writte
 - ACP core §3.5: the labelled, length-delimited proof message and the `hennery-hello-nonce` header;
 - kernel §4.1: re-join through a probe; automatic re-pair only after `revoked`; the old outbox moved aside, never deleted; any two loopback URLs one collector; `https://` refused until `wss://` works;
 - kernel §4.1: the pairing-code hash is unsalted and protects no live code from a reader of `hennery.db` (same-user threat model, §10);
-- kernel §4.1: the enrollment limiter counts attempts per canonical address and IPv6 /64, bounded, in memory;
+- kernel §4.1: the enrollment limiter counts attempts per canonical address and IPv6 /64, bounded, in memory, and (amended 2026-10-01, round 2) never evicts a live entry to make room — a new address past capacity shares one overflow budget instead;
 - kernel §4.2: `up` never re-pairs a key the collector does not know; a revoked all-in-one host leaves the collector serving;
 - distribution §7: `host run` names the remedy for `bad_proof`, and exits 78 when revoked;
 - kernel §8: the 201/400/401/409/429 shapes of the two pairing endpoints, `HostItem`;
@@ -7697,7 +7698,7 @@ git push
 - **The collector's single writer thread** (kernel §1), now that two stores share `hennery.db`.
 - **`host.lock`** (distribution §8), so a second `hennery host run` on one directory refuses to start. The probe cannot stand in for it.
 - **The supervisor's restart policy** (distribution §5.2). A crashed host child still ends `up`; only a revoked one (exit 78) does not.
-- **Enrollment lockouts live in memory:** a collector restart clears them (decision 6). A shared budget across addresses, if abuse ever shows, belongs with 3b's login limit.
+- **Enrollment lockouts live in memory:** a collector restart clears them (decision 6). Past capacity, addresses already share one overflow budget (decision 6, round 2); a *global* budget across every tracked address too, if abuse ever shows it's needed, belongs with 3b's login limit.
 - **Orphaned outboxes** (`outbox.db.orphaned-*`) are kept for inspection and never read. `doctor` should list them.
 - **Spec amendments** listed under the decisions.
 

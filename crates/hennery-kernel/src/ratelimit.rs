@@ -11,11 +11,26 @@
 //!   /64, the block one subscriber usually holds.
 //! - **The window runs from the end of the last lockout**, so waiting out a
 //!   lockout does not reset the count; the next wrong attempt doubles it.
-//! - **Bounded:** at most `capacity` addresses are tracked. Past it,
-//!   forgotten entries are dropped first, then the oldest that are not
-//!   locked out, then the oldest of all.
+//! - **Bounded, and a live entry is never evicted (amendment 2026-10-01).**
+//!   At most `capacity` addresses are tracked. Past it, forgotten entries are
+//!   pruned first; if the table is still full of live ones, the new
+//!   address's attempt is instead counted against one shared "overflow"
+//!   entry with its own budget and lockout, rather than evicting an
+//!   unrelated address's real count. An earlier version evicted the oldest
+//!   not-locked-out entry (then the oldest of all) to make room — but an
+//!   attacker holding more addresses than `capacity` (a `/52` of IPv6 is
+//!   4097 distinct `/64`s) could rotate through them so that no single
+//!   address ever accumulated enough failures to lock out, turning the
+//!   per-address budget into a throughput limit only. Sharing one overflow
+//!   budget instead means a flood from more addresses than the table holds
+//!   locks *itself* out together and slows pairing for everyone until that
+//!   shared window or lockout passes (or the collector restarts) — a
+//!   deliberate trade-off, not a bug: a single generous per-address budget
+//!   should not be defeatable by rotating addresses.
 //! - **In memory only:** a collector restart clears every count and
-//!   lockout. There is no global budget and no exemption for loopback.
+//!   lockout, including the shared overflow entry. Each *tracked* address
+//!   still has its own separate budget; only addresses past capacity share
+//!   the overflow entry's. There is no exemption for loopback.
 //!
 //! Callers pass `now`, so the policy is testable without sleeping.
 
@@ -84,10 +99,17 @@ pub fn key(addr: IpAddr) -> IpAddr {
     }
 }
 
+/// The per-address table plus the one shared budget new addresses fall back
+/// to once it is full of live entries (amendment 2026-10-01).
+struct State {
+    entries: HashMap<IpAddr, Entry>,
+    overflow: Option<Entry>,
+}
+
 pub struct Limiter {
     policy: Policy,
     capacity: usize,
-    entries: Mutex<HashMap<IpAddr, Entry>>,
+    state: Mutex<State>,
 }
 
 impl Limiter {
@@ -99,73 +121,85 @@ impl Limiter {
         Self {
             policy,
             capacity: capacity.max(1),
-            entries: Mutex::new(HashMap::new()),
+            state: Mutex::new(State {
+                entries: HashMap::new(),
+                overflow: None,
+            }),
         }
     }
 
-    /// Start an attempt from `addr`: `Err(retry_after)` while it is locked
-    /// out, else the attempt is counted as a failure until `succeeded`.
+    /// Start an attempt from `addr`: `Err(retry_after)` while it (or the
+    /// shared overflow budget it falls back to) is locked out, else the
+    /// attempt is counted as a failure until `succeeded`.
     pub fn attempt(&self, addr: IpAddr, now: Instant) -> Result<(), Duration> {
         let policy = self.policy;
         let addr = key(addr);
-        let mut entries = self.entries.lock().expect("limiter lock");
-        if let Some(until) = entries.get(&addr).and_then(|e| e.locked_until)
-            && now < until
-        {
-            return Err(until - now);
+        let mut state = self.state.lock().expect("limiter lock");
+        if let Some(entry) = state.entries.get_mut(&addr) {
+            return record_attempt(entry, &policy, now);
         }
-        if !entries.contains_key(&addr) && entries.len() >= self.capacity {
-            make_room(&mut entries, &policy, now, self.capacity);
+        // A new address: forgotten entries are pruned to make room, but a
+        // live one is never evicted for it (amendment 2026-10-01).
+        state.entries.retain(|_, e| !e.forgotten(&policy, now));
+        if state.entries.len() < self.capacity {
+            let entry = state.entries.entry(addr).or_insert(Entry {
+                failures: 0,
+                last_failure: now,
+                locked_until: None,
+            });
+            return record_attempt(entry, &policy, now);
         }
-        let entry = entries.entry(addr).or_insert(Entry {
+        // The table is still full of live entries: share the one overflow
+        // budget instead of evicting someone else's real count.
+        let overflow = state.overflow.get_or_insert(Entry {
             failures: 0,
             last_failure: now,
             locked_until: None,
         });
-        if entry.forgotten(&policy, now) {
-            entry.failures = 0;
-            entry.locked_until = None;
-        }
-        entry.failures += 1;
-        entry.last_failure = now;
-        if entry.failures >= policy.free_failures {
-            let doublings = (entry.failures - policy.free_failures).min(20);
-            let lockout = policy
-                .first_lockout
-                .saturating_mul(1 << doublings)
-                .min(policy.max_lockout);
-            entry.locked_until = Some(now + lockout);
-        }
-        Ok(())
+        record_attempt(overflow, &policy, now)
     }
 
-    /// The attempt succeeded: `addr`'s count and lockout are cleared.
+    /// The attempt succeeded: `addr`'s own count and lockout are cleared.
+    /// (An address that was counted against the shared overflow budget
+    /// instead never had its own entry to clear; the overflow budget itself
+    /// is shared and is not reset by any one address's success.)
     pub fn succeeded(&self, addr: IpAddr) {
-        self.entries.lock().expect("limiter lock").remove(&key(addr));
+        self.state.lock().expect("limiter lock").entries.remove(&key(addr));
     }
 
-    /// Addresses currently tracked.
+    /// Addresses currently tracked with their own entry (not counting the
+    /// shared overflow budget, which is not itself an address).
     pub fn tracked(&self) -> usize {
-        self.entries.lock().expect("limiter lock").len()
+        self.state.lock().expect("limiter lock").entries.len()
     }
 }
 
-/// Bring `entries` under `capacity`, leaving room for one more.
-fn make_room(entries: &mut HashMap<IpAddr, Entry>, policy: &Policy, now: Instant, capacity: usize) {
-    entries.retain(|_, e| !e.forgotten(policy, now));
-    let excess = (entries.len() + 1).saturating_sub(capacity);
-    if excess == 0 {
-        return;
+/// Check `entry`'s lockout first (an attempt while locked out is not
+/// counted again), else count this attempt as a failure — forgetting a
+/// stale count first — and set a fresh lockout if this failure reaches it.
+/// Shared between a per-address `Entry` and the overflow `Entry`: the same
+/// policy applies either way.
+fn record_attempt(entry: &mut Entry, policy: &Policy, now: Instant) -> Result<(), Duration> {
+    if let Some(until) = entry.locked_until
+        && now < until
+    {
+        return Err(until - now);
     }
-    // Not locked out first (oldest failure first), then the rest.
-    let mut order: Vec<(bool, Instant, IpAddr)> = entries
-        .iter()
-        .map(|(addr, e)| (e.locked(now), e.last_failure, *addr))
-        .collect();
-    order.sort();
-    for (_, _, addr) in order.into_iter().take(excess) {
-        entries.remove(&addr);
+    if entry.forgotten(policy, now) {
+        entry.failures = 0;
+        entry.locked_until = None;
     }
+    entry.failures += 1;
+    entry.last_failure = now;
+    if entry.failures >= policy.free_failures {
+        let doublings = (entry.failures - policy.free_failures).min(20);
+        let lockout = policy
+            .first_lockout
+            .saturating_mul(1 << doublings)
+            .min(policy.max_lockout);
+        entry.locked_until = Some(now + lockout);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -276,18 +310,98 @@ mod tests {
     }
 
     #[test]
-    fn past_its_capacity_it_evicts_the_oldest_addresses_that_are_not_locked_out() {
+    fn past_its_capacity_forgotten_entries_are_pruned_before_anything_else() {
         let limiter = Limiter::with_capacity(Policy::ENROLL, 3);
         let t0 = Instant::now();
-        for _ in 0..5 {
-            limiter.attempt(A, t0).unwrap();
-        }
         let addr = |n: u8| IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, n));
-        for n in 1..=10 {
-            limiter.attempt(addr(n), t0 + secs(u64::from(n))).unwrap();
-            assert!(limiter.tracked() <= 3);
+        for n in 1..=3 {
+            limiter.attempt(addr(n), t0).unwrap();
         }
-        // The locked-out address survived every eviction.
-        assert!(limiter.attempt(A, t0 + secs(11)).is_err());
+        assert_eq!(limiter.tracked(), 3);
+        // Every entry is forgotten by now: the table has room again without
+        // anything being shared through the overflow budget.
+        let later = t0 + secs(10 * 60);
+        assert_eq!(limiter.attempt(addr(4), later), Ok(()));
+        assert_eq!(limiter.tracked(), 1);
+    }
+
+    /// Amendment 2026-10-01 (round 2): a live (not-yet-forgotten) entry is
+    /// never evicted to make room. Past capacity, a new address's attempt is
+    /// instead counted against one address-agnostic overflow budget, so an
+    /// attacker cannot dodge the per-address limit by rotating through more
+    /// addresses than the table can hold.
+    #[test]
+    fn once_the_table_is_full_of_live_entries_new_addresses_share_one_overflow_budget() {
+        let limiter = Limiter::with_capacity(Policy::ENROLL, 3);
+        let t0 = Instant::now();
+        let live = |n: u8| IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, n));
+        for n in 1..=3 {
+            // One failure each: live and not locked, so none is forgotten
+            // and none is locked either.
+            assert_eq!(limiter.attempt(live(n), t0), Ok(()));
+        }
+        assert_eq!(limiter.tracked(), 3);
+
+        // Five different new addresses, each turned away from a full table:
+        // every one of them shares the same overflow entry.
+        let flood = |n: u8| IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, n));
+        for n in 1..=5 {
+            assert_eq!(limiter.attempt(flood(n), t0), Ok(()), "overflow attempt {n}");
+        }
+        // The table never grew: no live entry was evicted, and the overflow
+        // budget is not itself a tracked address.
+        assert_eq!(limiter.tracked(), 3);
+        // The sixth address to overflow finds the shared budget locked out
+        // for the policy's own first lockout, even though it never made an
+        // attempt before — the same doubling policy as any per-address entry.
+        assert_eq!(limiter.attempt(flood(6), t0), Err(secs(60)));
+
+        // The three original addresses were never touched by the flood: each
+        // still has exactly its first failure. Four more attempts each (five
+        // total) are still free, and only the sixth locks them out — proving
+        // the count survived, rather than merely returning `Ok` (which a
+        // reset-to-zero entry would also do for its next four attempts).
+        for n in 1..=3 {
+            for _ in 0..4 {
+                assert_eq!(
+                    limiter.attempt(live(n), t0),
+                    Ok(()),
+                    "address {n} was reset by the flood"
+                );
+            }
+            assert!(
+                limiter.attempt(live(n), t0).is_err(),
+                "address {n} was reset by the flood (should be locked after 5 total failures)"
+            );
+        }
+        assert_eq!(limiter.tracked(), 3);
+    }
+
+    /// The all-locked case: every tracked address is already locked out
+    /// (never forgotten, since `forgotten` exempts a locked entry), so
+    /// pruning frees nothing. A flood of new addresses must still never
+    /// evict any of them.
+    #[test]
+    fn locked_entries_are_never_evicted_even_by_a_large_flood() {
+        let limiter = Limiter::with_capacity(Policy::ENROLL, 2);
+        let t0 = Instant::now();
+        let locked = |n: u8| IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, n));
+        for n in 1..=2 {
+            for _ in 0..5 {
+                limiter.attempt(locked(n), t0).unwrap();
+            }
+            assert!(limiter.attempt(locked(n), t0).is_err());
+        }
+        assert_eq!(limiter.tracked(), 2);
+
+        let flood = |n: u16| IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, (n % 256) as u8));
+        for n in 1..=20 {
+            let _ = limiter.attempt(flood(n), t0);
+            assert_eq!(limiter.tracked(), 2, "a locked entry was evicted at flood attempt {n}");
+        }
+        // Both locked addresses are still locked, undisturbed by the flood.
+        for n in 1..=2 {
+            assert!(limiter.attempt(locked(n), t0).is_err(), "address {n} was reset");
+        }
     }
 }

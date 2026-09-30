@@ -110,11 +110,13 @@ async fn main() -> Result<()> {
 }
 
 async fn run_collector(args: CollectorArgs) -> Result<()> {
+    // Checked before anything touches the data dir, like `run_up` does.
+    let token = DevToken::new(args.dev_token)?;
     std::fs::create_dir_all(&args.data_dir)?;
     let db = args.data_dir.join("hennery.db");
     let store = Store::open(&db)?;
     let hosts = Hosts::open(&db)?;
-    let mut state = AppState::new(store, hosts, DevToken::new(args.dev_token)?);
+    let mut state = AppState::new(store, hosts, token);
     state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
     hennery_sessions::offline::after_startup(&state);
     let listener = tokio::net::TcpListener::bind(&args.listen)

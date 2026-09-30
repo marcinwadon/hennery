@@ -53,6 +53,24 @@ fn a_short_dev_token_is_refused_at_start() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// `collector` must reject a short dev token before it does anything to the
+/// data directory: `run_up` already validates first (checked above), and
+/// `run_collector` must too, the same way — not only after opening the
+/// store and the host registry there.
+#[test]
+fn a_short_dev_token_stops_the_collector_before_it_touches_the_data_dir() {
+    let dir = std::env::temp_dir().join(format!("hennery-cli-token-first-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["collector", "--listen", "127.0.0.1:0", "--dev-token", "short"])
+        .arg("--data-dir")
+        .arg(&dir)
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(!dir.exists(), "the data dir was created before the token was validated");
+}
+
 /// Kills this test's `up` process tree and removes its scratch dir
 /// unconditionally, including on an assertion panic mid-test — nothing below
 /// is allowed to leave a process running just because a `assert!` fired
