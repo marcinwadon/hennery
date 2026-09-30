@@ -82,7 +82,9 @@ struct SessionMap {
 
 type Sessions = Arc<Mutex<SessionMap>>;
 
-/// Run the host until the process exits. Reconnects with exponential backoff.
+/// Run the host forever, reconnecting with exponential backoff — except that
+/// this returns `Err` the moment the collector says this host is revoked,
+/// after stopping every adapter it runs.
 pub async fn run(cfg: HostConfig) -> Result<()> {
     run_until(cfg, std::future::pending()).await
 }
@@ -167,6 +169,13 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Ask the collector whether it still accepts this host's key: one `hello`
 /// with nothing attached, then the connection is closed.
+///
+/// A successful probe still passes the collector's proof check like any
+/// other `hello`, so for the moment the socket is open it briefly registers
+/// this host id as connected (ACP core §4.3) before the probe closes it —
+/// the real host reconnecting at the same moment sees `already_connected`
+/// rather than being displaced by a probe that never sends `resend_complete`
+/// and holds nothing open.
 pub async fn probe(collector_url: &str, host_id: &str, key: &HostKey) -> Result<Standing> {
     let (mut sink, _stream, answer) = handshake(
         collector_url,

@@ -127,19 +127,38 @@ fn parse_agent(s: &str) -> Result<(String, AgentCommand), String> {
 const PLACEHOLDER: &str = "<!doctype html><meta charset=utf-8><title>hennery</title><h1>hennery</h1><p>Walking skeleton. The UI is not built yet.</p>";
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
-    match Cli::parse().command {
-        Command::Collector(args) => run_collector(args).await,
+    // Every arm returns a `Result<ExitCode>` (not just `Result<()>`), and
+    // nothing on this path ever calls `std::process::exit`: that call tears
+    // down the whole process immediately, without unwinding this `async fn`
+    // or dropping the `#[tokio::main]` runtime — so any other task still
+    // running on it (a session actor mid-launch of a slow adapter, say)
+    // never gets to run its own `Drop` and never kills its adapter's process
+    // group. Returning an `ExitCode` here instead lets the runtime finish
+    // and drop normally first, exactly like a plain `Ok(())` return always
+    // did; only then does the process actually exit with that code.
+    let result = match Cli::parse().command {
+        Command::Collector(args) => run_collector(args).await.map(|()| std::process::ExitCode::SUCCESS),
         Command::Host {
             command: HostCommand::Join(args),
-        } => join_host(args).await,
+        } => join_host(args).await.map(|()| std::process::ExitCode::SUCCESS),
         Command::Host {
             command: HostCommand::Run(args),
         } => run_host(args).await,
-        Command::Up(args) => run_up(args).await,
+        Command::Up(args) => run_up(args).await.map(|()| std::process::ExitCode::SUCCESS),
+    };
+    match result {
+        Ok(code) => code,
+        // `{err:?}`, not `{err:#}`: this replaces the default `Result<(),
+        // E>` `Termination`, which prints via `Debug` — keep the same output
+        // other tests (and operators) already read the exit-1 path by.
+        Err(err) => {
+            eprintln!("Error: {err:?}");
+            std::process::ExitCode::FAILURE
+        }
     }
 }
 
@@ -189,7 +208,7 @@ async fn join_host(args: JoinArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_host(args: HostArgs) -> Result<()> {
+async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
     let paired = match Paired::load(&args.data_dir)? {
         Some(paired) => {
             // Paired already (kernel spec §4.2): the code is not needed.
@@ -215,22 +234,29 @@ async fn run_host(args: HostArgs) -> Result<()> {
     let mut cfg = HostConfig::new(collector_url, paired.host_id, paired.key, args.data_dir);
     cfg.agents = args.agents.into_iter().collect();
     cfg.idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
-    // On SIGINT/SIGTERM the host stops its connection and waits (bounded)
-    // for every session actor to SIGTERM its adapter's group and SIGKILL it
-    // after the grace; only then does returning drop the runtime.
+    // On SIGINT/SIGTERM, and on a revoke, the host stops its connection and
+    // waits (bounded) for every session actor to SIGTERM its adapter's group
+    // and SIGKILL it after the grace. `run_until` returning — however it
+    // returns — is what lets `main` return in turn, which is what lets the
+    // `#[tokio::main]` runtime drop normally: only that drop reaps any
+    // actor `run_until`'s own bound gave up waiting on (one still starting a
+    // slow adapter, say), by dropping its still-running task and, with it,
+    // the `Adapter` whose `Drop` kills the whole process group. A bare
+    // `std::process::exit` here would skip all of that.
     match hennery_host::run_until(cfg, terminated()).await {
         // Its own exit code, so `hennery up` can tell a revoke apart.
         Err(err) if hennery_host::connection::revoked(&err) => {
             eprintln!("Error: {err:#}");
-            std::process::exit(REVOKED_EXIT);
+            Ok(std::process::ExitCode::from(REVOKED_EXIT))
         }
-        other => other,
+        Err(err) => Err(err),
+        Ok(()) => Ok(std::process::ExitCode::SUCCESS),
     }
 }
 
 /// `hennery host run`'s exit code once the collector says the host was
 /// revoked (sysexits' `EX_CONFIG`).
-const REVOKED_EXIT: i32 = 78;
+const REVOKED_EXIT: u8 = 78;
 
 /// Resolves on SIGINT or SIGTERM.
 async fn terminated() {
@@ -262,8 +288,11 @@ fn loopback_url(listen: &str) -> String {
 }
 
 /// Two child processes of this binary, exchanging the same frames as a
-/// remote host (architecture spec §3.3). The supervisor exits when either
-/// child exits; restart policy comes with the distribution work.
+/// remote host (architecture spec §3.3). The supervisor exits when the
+/// collector exits, or when the host exits for any reason *other* than a
+/// revoke (exit 78): a revoked host alone does not take `up` down (decision
+/// 11, A1) — restart policy for a genuine crash comes with the distribution
+/// work.
 async fn run_up(args: UpArgs) -> Result<()> {
     // Checked here too, so a bad token stops `up` before any child starts.
     DevToken::new(args.dev_token.clone())?;
@@ -331,9 +360,11 @@ async fn run_up(args: UpArgs) -> Result<()> {
     // Both children hold their ends now; with the supervisor's copies
     // closed, the host sees end-of-file if the collector dies first.
     drop(pairing);
-    // Only a collector exit (or a signal) ends `up`. A revoked host exits
-    // for good, and the collector keeps serving the operator and every
-    // remote host.
+    // A collector exit, a non-revoked host exit, or a signal ends `up`, the
+    // same as before this host could be revoked. Only a *revoked* host
+    // (exit 78) does not: it exits for good, and the loop below goes back to
+    // waiting on the collector alone, so the collector keeps serving the
+    // operator and every remote host.
     let mut host_running = true;
     loop {
         tokio::select! {
@@ -343,7 +374,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
             }
             status = host.wait(), if host_running => {
                 host_running = false;
-                if status.as_ref().ok().and_then(|s| s.code()) == Some(REVOKED_EXIT) {
+                if status.as_ref().ok().and_then(|s| s.code()) == Some(REVOKED_EXIT as i32) {
                     tracing::warn!(
                         "the all-in-one host was revoked; the collector keeps serving. To pair it again, stop `hennery up`, remove {} and {}, and start it again",
                         host_dir.join(hennery_host::identity::KEY_FILE).display(),

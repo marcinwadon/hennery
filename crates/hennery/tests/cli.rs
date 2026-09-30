@@ -404,6 +404,29 @@ fn up_pairs_its_own_host_once() {
     assert_eq!(std::fs::read(host_dir.join("host.key")).unwrap(), key);
 }
 
+/// `POST path` with a JSON body, on the collector with the development
+/// bearer. The response is never read past a short timeout: a session start
+/// that never finishes (the point of the slow-starting-adapter test below)
+/// may hold the request open, and the pid files it writes are this test's
+/// real readiness signal, not the HTTP response.
+fn post_json(listen: &str, path: &str, token: &str, body: &str) {
+    let Ok(mut stream) = TcpStream::connect(listen) else {
+        return;
+    };
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let _ = write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: {listen}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut discard = [0u8; 1];
+    let _ = stream.read(&mut discard);
+}
+
+fn pid_from(path: &std::path::Path) -> Option<i32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 /// `DELETE path` on the collector with the development bearer: the status.
 fn delete(listen: &str, path: &str) -> Option<u16> {
     let mut stream = TcpStream::connect(listen).ok()?;
@@ -420,11 +443,17 @@ fn delete(listen: &str, path: &str) -> Option<u16> {
 
 /// Start `up` with its log in `log`.
 fn up_logging_to(listen: &str, dir: &std::path::Path, log: &std::path::Path) -> KillTree {
+    up_logging_to_with(listen, dir, log, &[])
+}
+
+/// Like `up_logging_to`, with extra CLI arguments appended (e.g. `--agent`).
+fn up_logging_to_with(listen: &str, dir: &std::path::Path, log: &std::path::Path, extra: &[&str]) -> KillTree {
     let up = Command::new(env!("CARGO_BIN_EXE_hennery"))
         .args(["up", "--listen", listen])
         .arg("--data-dir")
         .arg(dir)
         .args(["--dev-token", "dev-token-for-tests"])
+        .args(extra)
         .stdout(std::fs::File::create(log).unwrap())
         .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
         .spawn()
@@ -442,6 +471,20 @@ fn wait_until(what: &str, mut probe: impl FnMut() -> bool) {
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Whether `text` contains a run shaped like a pairing code
+/// (`[0-9A-Z]{4}-[0-9A-Z]{4}`, kernel spec §4.1) anywhere, not just next to a
+/// particular label: a log line could quote the code under a different key,
+/// or with no key at all, and either would still be a leak.
+fn contains_a_pairing_code_shape(text: &str) -> bool {
+    let is_code_char = |b: u8| b.is_ascii_uppercase() || b.is_ascii_digit();
+    let bytes = text.as_bytes();
+    (0..bytes.len().saturating_sub(8)).any(|i| {
+        bytes[i..i + 4].iter().all(|&b| is_code_char(b))
+            && bytes[i + 4] == b'-'
+            && bytes[i + 5..i + 9].iter().all(|&b| is_code_char(b))
+    })
 }
 
 /// Operator recovery: revoking the all-in-one host stops the host child
@@ -498,10 +541,20 @@ fn a_revoked_all_in_one_host_leaves_the_collector_serving() {
 /// Task 4 review (controller ruling): `up` must compute and validate its
 /// host's collector URL (`collector_ws_url`) *before* spawning the collector
 /// child, so a `--listen` address that `collector_ws_url` cannot make sense
-/// of fails at once, with nothing started — not after a collector is already
-/// bound and serving on it.
+/// of fails cleanly, with neither data directory ever touched.
+///
+/// This does *not* prove the ordering itself (that the validation runs
+/// strictly before `collector_cmd.spawn()`): that is a fact about the source,
+/// checked by reading `run_up`, not one a black-box process test can pin
+/// reliably. A revert-probe against the old (validate-after-spawn) code
+/// still passed this exact test, because the parent's own string-only
+/// validation is so much faster than the freshly forked child's own
+/// exec-and-parse that the parent's early return (and the `kill_on_drop`
+/// that comes with it) almost always wins the race regardless of which
+/// order the source uses. So this is real coverage of the *outcome* `up`
+/// must have either way, not a regression guard for the ordering fix.
 #[test]
-fn a_non_loopback_listen_fails_up_before_any_child_starts() {
+fn a_non_loopback_listen_is_refused_and_touches_neither_data_dir() {
     let dir = std::env::temp_dir().join(format!("hennery-cli-badlisten-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
@@ -592,13 +645,139 @@ fn a_failed_pairing_code_write_is_logged_without_the_code_and_does_not_kill_the_
     let stdout = std::fs::read_to_string(&log).unwrap();
     assert!(stdout.contains("could not hand the pairing code"), "stdout: {stdout}");
     // The code minted for the write that failed is a secret; it must never
-    // reach the log.
-    let code_line = stdout
-        .lines()
-        .find(|l| l.contains("could not hand the pairing code"))
-        .unwrap();
-    assert!(!code_line.contains("code="), "{code_line}");
+    // reach the log — checked against its actual shape (`XXXX-XXXX`, kernel
+    // spec §4.1), anywhere in the log, not just a `code=`-labelled field a
+    // future log line might not use.
+    assert!(!contains_a_pairing_code_shape(&stdout), "stdout: {stdout}");
 
     unsafe { libc::kill(guard.up.id() as i32, libc::SIGTERM) };
     assert!(wait_with_timeout(&mut guard.up, Duration::from_secs(15)).is_some());
+}
+
+/// Kills an adapter's whole process group on drop, from its pid file. Unlike
+/// `KillTree` (which reaches only `up`'s own two children and their groups),
+/// an adapter the host child spawns leads its *own* process group — this is
+/// the only thing standing between a bug here and a real leaked `sleep`.
+struct KillAdapter(std::path::PathBuf);
+
+impl Drop for KillAdapter {
+    fn drop(&mut self) {
+        if let Some(pid) = pid_from(&self.0) {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// Task 7 review, fix round 1: a revoked host must stop *every* adapter it
+/// runs (ACP core §3.5), including one whose session actor is still stuck
+/// "starting" — negotiating the adapter's own handshake (session.rs's
+/// `drive`, the `tokio::select!` around `negotiate`) has no arm that reads a
+/// shutdown or command-channel signal, so such an actor does not react to
+/// `run_until`'s shutdown on its own. Cleanup for it depends entirely on
+/// `shut_down`'s bound being exceeded (it logs "did not stop in time" and
+/// gives up on that actor) and, from there, on the actor's *task* being
+/// dropped when the `#[tokio::main]` runtime itself finally drops — which is
+/// exactly what a `std::process::exit` inside that runtime would skip,
+/// orphaning the adapter's process group for good. Driven through the real
+/// `hennery` binary via `up`, not `hennery_host::run` in-process, because the
+/// bug is specifically in `main`'s own exit path.
+#[test]
+fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
+    let listen = free_listen();
+    let dir = std::env::temp_dir().join(format!(
+        "hennery-cli-slowstart-{}-{}",
+        std::process::id(),
+        listen.replace(':', "-")
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveDir(dir.clone());
+
+    // A shell script, not `hennery-fake-acp` (a binary of another crate this
+    // one has no dependency on): it records its own pid and a grandchild's,
+    // then never answers `initialize` — the adapter that never finishes
+    // starting.
+    let adapter_pid_file = dir.join("adapter.pid");
+    let grandchild_pid_file = dir.join("grandchild.pid");
+    let script = dir.join("slow.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "echo $$ > {}\nsleep 7117 &\necho $! > {}\nwait\n",
+            adapter_pid_file.display(),
+            grandchild_pid_file.display()
+        ),
+    )
+    .unwrap();
+    // A drop guard for the adapter's own group: declared before any
+    // assertion below, so a panic mid-test still reaps it.
+    let _kill_adapter = KillAdapter(adapter_pid_file.clone());
+
+    let log = dir.join("up.log");
+    let mut up = up_logging_to_with(
+        &listen,
+        &dir.join("data"),
+        &log,
+        &["--agent", &format!("slow=/bin/sh {}", script.display())],
+    );
+
+    let mut host_id = String::new();
+    wait_until("the host connected", || {
+        let Some(serde_json::Value::Array(hosts)) = get_json(&listen, "/api/hosts", "dev-token-for-tests") else {
+            return false;
+        };
+        match hosts.first() {
+            Some(h) if h["connected"] == true => {
+                host_id = h["host_id"].as_str().unwrap().to_string();
+                true
+            }
+            _ => false,
+        }
+    });
+
+    post_json(
+        &listen,
+        "/api/sessions",
+        "dev-token-for-tests",
+        &serde_json::json!({ "host_id": host_id, "agent": "slow", "cwd": dir }).to_string(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let grandchild = loop {
+        if let Some(pid) = pid_from(&grandchild_pid_file) {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the slow adapter never started");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(pid_alive(grandchild), "the grandchild died before the revoke");
+
+    assert_eq!(delete(&listen, &format!("/api/hosts/{host_id}")), Some(200));
+    // Generous: a reconnect (up to ~1s of backoff) plus `shut_down`'s ~6s
+    // bound, with slack for four parallel copies of this binary.
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !std::fs::read_to_string(&log).is_ok_and(|text| text.contains("the all-in-one host was revoked")) {
+        assert!(Instant::now() < deadline, "timed out waiting for the revoke logged");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let text = std::fs::read_to_string(&log).unwrap();
+    // Proof this exercised the runtime-drop path, not the graceful one: the
+    // actor genuinely never reacted to the shutdown on its own.
+    assert!(
+        text.contains("session actors did not stop in time"),
+        "the bound was never exceeded, so this never reached the code path under test: {text}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while pid_alive(grandchild) {
+        assert!(
+            Instant::now() < deadline,
+            "the still-starting adapter's grandchild outlived the revoked host"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
+    assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
 }
