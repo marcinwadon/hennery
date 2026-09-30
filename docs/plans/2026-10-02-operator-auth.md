@@ -3,27 +3,29 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ] `) syntax for tracking.
 
 **Goal:** The development bearer token leaves the REST API; the operator signs in instead.
-- On first start the collector writes a one-time setup link to a private file (it prints it only to a terminal).
+- On first start the collector writes a one-time setup link to a private file (it prints it only to a terminal). The token is in the link's fragment, so it never reaches a request line.
 - Setup creates the one owner with an Argon2id password and a `public_url`, and signs them in.
 - Every operator route then needs a server-side session behind an `HttpOnly`, `SameSite=Strict` cookie, and the `Origin` and `Sec-Fetch-Site` rules of kernel §3.3.
 - Login is rate limited per address, with one password check per attempt.
-- Minting a pairing code, revoking a host and revoking a session need a password check within the last five minutes (step-up).
+- Minting a pairing code, revoking a host and revoking a session need a password check within the last five minutes (step-up). Ending a session ends the event streams it holds open.
 - `hennery host join` also takes its code on standard input.
 
 **Architecture:**
 - **Kernel** (`hennery-kernel`):
-  - `operator.rs`, the `Operator` store, on its own connection to `hennery.db`. It holds the owner, the password, the `public_url` setting, the in-memory setup token and the `setup-url` file, the `auth_sessions` rows, and the login limiter.
-  - `auth_api.rs`: the HTTP handlers for `/api/setup` and `/api/auth/*`.
+  - `operator.rs`, the `Operator` store, on its own connection to `hennery.db`. It holds the owner, the password, the `public_url` setting, the in-memory setup token and the `setup-url` file, the `auth_sessions` rows, the login and step-up limiters, and a `watch` channel bumped whenever a session ends.
+  - `auth_api.rs`: the HTTP handlers for `/api/setup` and `/api/auth/*`, with a 16 KiB body limit.
+  - `setup_page.rs`: the static `/setup` page and its `/setup.js`, which read the token from the fragment.
   - `origin.rs`: the browser rules.
   - `auth.rs`: `operator_only` (browser rules, then the session cookie) and `require_step_up`.
   - `schema.rs`: the kernel's migrations, moved out of `hosts.rs`, now with a second one.
-  - `db::configure` makes every transaction `IMMEDIATE`, because three connections now write the same file (decision 14).
+  - `auth.rs` also has `session_ended`, which the session stream waits on.
 - **Wire** (`hennery-proto`): `SetupRequest`, `SetupResponse`, `LoginRequest`, `StepUpRequest` and `AuthSessionItem`. The three request types redact their password in `Debug`.
 - **Collector** (`hennery-sessions`):
   - `AppState` gains `operator` and loses `token`.
   - The session API and the host routes sit behind `operator_only`. Minting and revoking a host also sit behind `require_step_up`.
+  - The session stream ends when the operator's session that opened it ends.
   - Enrollment and the host WebSocket stay outside both.
-- **Binary:** `--dev-token` is gone. `collector` announces the setup link once it listens, and serves a placeholder at `/setup/{token}`. The `code` argument of `host join` becomes optional.
+- **Binary:** `--dev-token` is gone. `collector` announces the setup link once it listens. The `code` argument of `host join` becomes optional.
 - **Testkit:** `hennery_testkit::operator_client(&Operator)` sets a test collector up and opens a session through the kernel API, so no test-only production path exists. The CLI tests sign in through `setup-url`, the way an operator would.
 
 **Tech Stack:** Rust (edition 2024, MSRV 1.88), tokio, axum 0.8, rusqlite 0.40, reqwest 0.12 (rustls). There are two new crates, pinned exactly in `[workspace.dependencies]`:
@@ -50,14 +52,14 @@ It also relies on the umbrella spec [`2026-09-25-hennery-architecture-design.md`
 - §7.4: every API call authenticated, and `owner_id` on every row;
 - §7.5: `public_url` and TLS except on loopback.
 
-It builds on the executed [host pairing plan](2026-10-01-host-pairing.md) (plan 3a). Read its "Execution status" and "After this plan" first. Its code wins over its task text, and every anchor below was taken from that code (`main` at `c29aa09`, which merged it).
+It builds on the executed [host pairing plan](2026-10-01-host-pairing.md) (plan 3a). Read its "Execution status" and "After this plan" first. Its code wins over its task text. It also builds on PR #9, which shipped decision 14 (`IMMEDIATE` transactions) ahead of this plan. Every anchor below was taken from that code (`main` at `a005dfa`, which merged #9).
 
-**Status:** not executed. Every code block below was built and tested in a scratch copy of `c29aa09`, and every block was generated from the scratch commits. The plan was then replayed from its own text, task by task, onto a fresh copy of `c29aa09`:
+**Status:** not executed. Amended after the security review of 2026-10-02: required amendments A1–A11, plus the optional hardening the coordinator took (see "Decisions"). Every code block below was built and tested in a scratch copy of `a005dfa`, and every block was generated from the scratch commits. The plan was then replayed from its own text, task by task, onto a fresh copy of `a005dfa`:
 - each block applied exactly as "Reading the steps" says;
 - after every task the tree matched the scratch commit byte for byte, `Cargo.lock` and the generated files included;
 - after every task the replay ran fmt, both clippy runs (the second on the shipped binary, with test hooks off), the workspace tests and both codegen checks.
 
-It ends with 423 tests, up from 392. The timing-sensitive tests passed with four copies of their test binary running at once.
+It ends with 431 tests, up from 393. The timing-sensitive tests passed with four copies of their test binary running at once.
 
 ## Scope
 
@@ -77,8 +79,9 @@ The `owner_id` backfill is a third, mechanical piece. It touches about 80 statem
   - `PublicUrl`;
   - the browser rules, `operator_only`, `require_step_up`;
   - the setup, login, logout, step-up and session handlers;
-  - `Policy::LOGIN`, and the limiter's loopback entry;
-  - `IMMEDIATE` transactions.
+  - `Policy::LOGIN`, the separate step-up limiter, and the limiter's loopback entry;
+  - the static setup page, the fragment-borne token and the 16 KiB body limit;
+  - `session_ended`, so a session's streams end with it;
 - Wire: the five REST types.
 - Collector: `AppState.operator`; every operator route behind the cookie; step-up on minting and host revoke.
 - Binary: the setup announcement and placeholder, no `--dev-token`, the join code on stdin.
@@ -111,7 +114,26 @@ The `owner_id` backfill is a third, mechanical piece. It touches about 80 statem
 
 ## Decisions this plan makes where the spec is silent
 
-These are for the stronger-model security review that confirms them on the maintainer's behalf. Each gives the choice, the alternatives, and the cost if it is wrong. Items marked **(amendment)** depart from explicit spec text and should be written back into it.
+These were confirmed by a stronger-model security review on the maintainer's behalf (2026-10-02, "ready after amendments"). Each gives the choice, the alternatives, and the cost if it is wrong. Decisions the review changed are marked "(amended after the security review of 2026-10-02)". Items marked **(amendment)** depart from explicit spec text and should be written back into it.
+
+**What the review changed:**
+- A1: step-up gets a limiter of its own (decisions 6 and 10).
+- A2: the proxy lock-out note in "After this plan".
+- A3: ending a session ends its streams (decision 7).
+- A4: the link's expiry, the proxy path and the setup headers (decisions 2 and 3).
+- A5: the operator's own queries join the 3b-ii `owner_id` list.
+- A6: recovery (decision 4).
+- A7: no `GET` changes state (decision 8).
+- A8: the static pages (decision 13).
+- A9: decision 14 shipped in PR #9.
+- A10: redacting `Debug` is tested (decision 5).
+- A11: rebuilt and replayed.
+- Optional hardening taken:
+  - the token in the link's fragment (decision 16);
+  - a 16 KiB body limit (decision 17);
+  - the refused origin logged at debug level (decision 8).
+
+  The skipped and recorded items are in "After this plan".
 
 1. **The split, and where `owner_id` goes (amendment).**
    - **Choice:** this plan's new tables carry `owner_id` from their first migration. The older tables are backfilled in 3b-ii: `hosts`, `pairing_codes`, and the sessions store's `sessions`, `turns`, `events`, `session_catalog`, `pending` and `answer_queue`. That is also when every query starts filtering by it.
@@ -119,17 +141,20 @@ These are for the stronger-model security review that confirms them on the maint
    - **Alternatives:** do it here (one very large Task 5), or leave it with no plan (the spec says every table).
    - **Cost if wrong:** until 3b-ii, a row written without an owner has to be backfilled. With a single owner that is one `UPDATE … SET owner_id = <the owner>` per table in that migration.
    - (The brief for this plan cites "decision 2 (`owner_id` everywhere)". In `docs/README.md`, decision 2 is about per-hat agent config. The `owner_id` rule is 3a's decision 2, kernel §1 and umbrella §7.4.)
-2. **The setup link.**
+2. **The setup link** (amended after the security review of 2026-10-02).
    - The token is 32 random bytes as hex, with only its SHA-256 kept, and **only in memory**: a restart issues a new one, and the old one is dead by construction (kernel §3.1). The alternative, a database row, needs explicit invalidation at start and outlives a crash.
-   - The link is `http://localhost:<bound port>/setup/<token>`. There is no `public_url` before setup; `config.toml` may provide one in 3b-ii.
+   - The link is `http://localhost:<bound port>/setup#<token>`, with the token in the fragment (decision 16). There is no `public_url` before setup; `config.toml` may provide one in 3b-ii.
+   - It is valid for an hour (`SETUP_TOKEN_TTL_SECS`). An expired link answers 401 `invalid_setup_token`, and the file stays until the next start replaces it with a fresh link.
    - It is written to `<data>/setup-url` **after the listener is bound**: the link names the port, and tests read the file's existence as "serving". It is written as a 0600 file created with `O_EXCL` under a random temporary name, then renamed into place. A symlink or hard link planted at `setup-url` is replaced, never written through. Alternative: `open(O_NOFOLLOW)` on the final name, which a hard link defeats.
    - It is printed only when stdout is a terminal. Otherwise only the file's path is logged, and a test pins that the token appears in neither output stream.
    - The file is removed when setup succeeds, and at start once there is an owner.
-   - `/setup/{token}` serves a static placeholder page until the frontend exists. It explains the `POST /api/setup` body and never echoes the token.
-   - **Cost if wrong:** without the placeholder, the printed link opens a 404. Setup still works with `curl`.
-3. **Setup's own `Origin` rule, and setup signs the owner in.**
+   - `/setup` serves a static page, and `/setup.js` its script (decision 16), until the frontend exists. The script reads the token from `location.hash`, removes it from the address bar, and POSTs it with the password and `public_url` (pre-filled with `location.origin`).
+   - Every `/setup`, `/setup.js` and `/api/setup` response carries `Referrer-Policy: no-referrer` and `Cache-Control: no-store`. The page carries kernel §7.2's `Content-Security-Policy` (`script-src 'self'`, with no inline script).
+   - **Cost if wrong:** without the page, the printed link opens a 404. Setup still works with `curl`.
+3. **Setup's own `Origin` rule, and setup signs the owner in** (amended after the security review of 2026-10-02).
    - Before setup there is no `public_url` to check against. So `POST /api/setup` requires an `Origin` equal to the origin of the `public_url` it submits; a missing one is refused, 403 `origin_mismatch`. The token is the authentication. The `Origin` check makes sure the stored origin is the one this browser uses: a mismatch would lock the operator out of every state-changing route afterwards.
    - It is **not** a CSRF defence. Without the 256-bit token a cross-site page can do nothing, whatever `Origin` it sends.
+   - Behind a reverse proxy, the token passes through the proxy, in the `POST /api/setup` body. With the token in the link's fragment (decision 16) it is never in a request line, so it does not land in the proxy's access log.
    - The checks run in this order:
      1. the URL's shape (400 `invalid`);
      2. `Origin` (403);
@@ -141,7 +166,7 @@ These are for the stronger-model security review that confirms them on the maint
    - A success answers 201 `{public_url}` with the session cookie. The operator who just typed the password is the owner, and the session counts as stepped up.
    - The default hat's name is **not** asked for yet. The hats plan adds it to `SetupRequest` as an additive change, together with the default hat it names.
    - **Cost if wrong:** the operator needs one extra login after setup, which is trivial.
-4. **`public_url` is kept as the browser's `Origin` serialisation.**
+4. **`public_url` is kept as the browser's `Origin` serialisation** (amended after the security review of 2026-10-02).
    - It is parsed with `url` and stored as `Url::origin().ascii_serialization()`: lowercase scheme and host, no default port, no trailing slash, IPv6 in brackets, IDNA punycode. So `https://Hennery.Example:443/` matches the `Origin: https://hennery.example` a browser sends, and the two compare as plain strings.
    - It must be `https://`, or `http://` to `localhost`, `127.0.0.0/8` or `[::1]` (umbrella §7.5). There may be no path, query, fragment or credentials.
    - The cookie's `Secure` flag comes from `public_url`'s scheme, **never from the peer address**. Behind a TLS proxy on loopback every peer is `127.0.0.1`, yet the browser is on `https://`.
@@ -151,22 +176,26 @@ These are for the stronger-model security review that confirms them on the maint
      - The effect: every state-changing request, login included, is refused 403 `origin_mismatch`. Only `GET`s still work.
      - Why nothing here fixes it: 3b-i has no `PATCH /api/settings`, no admin socket and no `config.toml`.
      - Today's recovery: stop the collector and edit the row by hand, with `UPDATE settings SET value = '<new origin>' WHERE key = 'public_url'` in `hennery.db`.
-     - 3b-ii owes a proper reset path (see "After this plan").
-5. **Passwords.**
+     - 3b-ii owes a proper reset path (see "After this plan"). Any reset path must also replace `Operator`'s cached `public_url`, not only the row.
+   - `load_public_url` re-parses the stored value when the collector opens its database, so a row edited by hand into something invalid stops the start with a clear error instead of serving with it.
+   - **A forgotten password, recovered by hand** (until 3b-ii's admin-socket reset): stop the collector, then run `DELETE FROM auth_sessions; DELETE FROM password_credentials; DELETE FROM settings; DELETE FROM owners;` against `hennery.db`, in that order (the foreign keys point at `owners`). Start it again: with no owner, it writes a fresh setup link.
+5. **Passwords** (amended after the security review of 2026-10-02).
    - Argon2id via `password-auth` 1.0.0 with its defaults (19 MiB, t=2, p=1, PHC string).
    - At least 12 characters; at most 1024 bytes, which bounds each hash.
    - At most **two** hashes or verifications run at once (a `tokio` semaphore); others wait their turn. Each costs about 19 MiB, and per-address limits do not bound a flood from many addresses.
    - Before setup, a check runs against a dummy hash computed once, so every check costs one Argon2 verify.
    - `argon2` and `blake2` are built at `opt-level = 3` in the dev profile. Unoptimised, every test that logs in would take seconds, worse with four copies at once. Release builds are optimised anyway.
+   - `SetupRequest`, `LoginRequest` and `StepUpRequest` implement `Debug` by hand and leave the password out. A `format!("{req:?}")` test pins each in the task that adds it (3, 4 and 6).
    - **Cost if wrong:** with two permits, a login flood queues the owner's own login behind it. More permits trade memory for latency.
-6. **Login.**
+6. **Login** (amended after the security review of 2026-10-02).
    - The body is `{password}` only: v1 has one owner (umbrella §7.3). A success answers 204 with the cookie. Setup and login both record a step-up.
-   - Rate limiting reuses 3a's `Limiter` with `Policy::LOGIN`: 5 wrong passwords per minute per address, then 60 s, doubling to at most an hour. Step-up shares the budget, because both guess the same password.
+   - Rate limiting reuses 3a's `Limiter` with `Policy::LOGIN`: 5 wrong passwords per minute per address, then 60 s, doubling to at most an hour.
+   - Step-up has its own `Limiter` with the same policy (decision 10), so its budget is separate. Login is the path an anonymous guesser reaches, and behind a proxy it is the one a flood locks out. A step-up needs a live session already, and must stay usable while login is locked.
    - Every attempt counts from the moment it starts; only a success clears the address.
    - **The constant-time failure path is structural:** an attempt that is not rate limited runs exactly one Argon2 verify, right password or wrong. A rate-limited one runs none, so even the right password gets 429 while its address is locked out. `password-auth` compares hashes in constant time. A test pins the count (`Operator::verifications`); wall-clock timing is not asserted, because it would flake under load.
    - Before setup, login is refused by the browser rules (403 `setup_required`) before any check.
    - **Accepted cost:** behind a reverse proxy every client is the proxy's address, often loopback. A flood of wrong passwords there locks the owner out too, for up to an hour; a collector restart clears it, because the limits live in memory. `X-Forwarded-For` is forgeable and is not trusted (as in 3a). 3a's handed-on "global budget" is not added.
-7. **Sessions.**
+7. **Sessions** (amended after the security review of 2026-10-02).
    - The token is 32 random bytes as hex. The row's id is its SHA-256 hex (kernel §3.2).
    - It expires 30 days after its last use. A use slides the expiry **at most once every 60 s**, so a busy client does not write on every request. When a request slides it, the response sends the cookie again: otherwise the browser's `Max-Age` would run out 30 days after login even while the session is in use.
    - The cookie is `hennery_session=<token>; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000`, plus `; Secure` unless `public_url` is loopback `http://`.
@@ -174,8 +203,13 @@ These are for the stronger-model security review that confirms them on the maint
    - `GET /api/auth/sessions` lists the live sessions, most recently used first, with `current` marked. The listed `id` is the stored hash: it names a session without revealing its cookie.
    - `DELETE /api/auth/sessions/{id}` (step-up) answers 204 or 404. Revoking the request's own session is allowed and clears its cookie.
    - `POST /api/auth/logout` sits behind the browser rules but needs no session. It answers 204 and clears the cookie, ending the session if there is one.
+   - **Ending a session ends its streams.**
+     - The mechanism: `Operator` keeps a `tokio::sync::watch` generation, bumped by every `revoke_session`, so by a revoke and by a logout (and by 3b-ii's password reset, which must end every session).
+     - The stream: `GET /api/stream/sessions/{id}` takes the request's `Authenticated` session and ends (`auth::session_ended`) when a bump finds that session gone. It also ends at its expiry, re-read at that moment, since the session's other requests may have slid it.
+     - The check at subscription: it runs once when it subscribes, so an ending between the cookie check and the subscription is not missed.
+     - Why: without it, a revoked device could keep reading a session's events for as long as its SSE connection lasted.
    - **Cost if wrong:** a 60 s slide is invisible to anyone; the list's `last_seen_at` is only as fine as that.
-8. **The browser rules** (kernel §3.3, `origin::browser_rules`).
+8. **The browser rules** (kernel §3.3, `origin::browser_rules`) (amended after the security review of 2026-10-02).
    - **Which methods count as state-changing:** every method except `GET` and `HEAD`, not only the four the spec names. `OPTIONS`, a CORS preflight, is refused like a `POST`: hennery serves no CORS.
    - **State-changing requests:**
      - `Origin` must equal `public_url`'s origin, and a missing or non-ASCII one is refused (403 `origin_mismatch`).
@@ -184,17 +218,23 @@ These are for the stronger-model security review that confirms them on the maint
    - **`GET` and `HEAD`:**
      - `Sec-Fetch-Site` may be `same-origin` or `none`. Any other value is refused, 403 `cross_site`.
      - **A missing `Sec-Fetch-Site` is accepted**: `curl` and older browsers send none, and the `SameSite=Strict` cookie already keeps cross-site `GET`s unauthenticated.
+     - **No `GET` or `HEAD` route changes state; one that must is a `POST`.** Accepting a missing `Sec-Fetch-Site` relies on this. `origin.rs`'s module doc says so too, for whoever adds the next route.
      - A present `Origin` must match.
    - **Order:** the browser rules wrap the session check, so a cross-origin request gets 403 before its missing cookie gets 401.
+   - An `origin_mismatch` logs the expected and the received origin at debug level (the received one `Debug`-escaped, since a client chose it), so an operator behind a misconfigured proxy can see why.
    - **Cost if wrong:** refusing a missing `Sec-Fetch-Site` would break `curl` and pre-16.4 Safari, and would add nothing that `SameSite=Strict` does not already give.
 9. **Loopback in the limiter** (3a's M3).
    - Every `127.0.0.0/8` address is keyed as `127.0.0.1`. `::1` stays itself: masking it to its /64 would give `::`, which is not loopback.
    - Loopback always gets its own entry, past capacity too, so a flood from elsewhere cannot push `hennery up`'s own enrollment, or a local proxy's logins, into the shared overflow budget. Loopback is not exempt: its budget is anyone's.
    - The alternative, per-address loopback entries, would give a local process 16 million separate budgets on Linux, where the whole /8 reaches `lo`.
    - **Cost:** at most two entries past capacity.
-10. **Step-up** (kernel §3.4).
+10. **Step-up** (kernel §3.4) (amended after the security review of 2026-10-02).
     - `last_step_up_at` is fresh for **strictly less than** 300 s.
-    - Setup and login stamp it. `POST /api/auth/step-up/password {password}` stamps it again (204). A wrong password answers 401 `invalid_password`, and the attempt counts against the login budget.
+    - Setup and login stamp it. `POST /api/auth/step-up/password {password}` stamps it again (204). A wrong password answers 401 `invalid_password`.
+    - Rate limiting uses **its own limiter**, `Operator::step_up_limiter` (`Policy::LOGIN`), with one Argon2 verify per attempt that gets in, as at login:
+      - five wrong step-ups from an address lock out step-up from it, and leave login alone;
+      - a login flood from the owner's address (a shared proxy, say) does not stop a signed-in owner stepping up.
+    - The alternative, one budget for both, let an anonymous flood at the login route deny step-up to the owner who is already signed in.
     - `require_step_up` (403 `step_up_required`) guards `POST /api/hosts/pairing-codes`, `DELETE /api/hosts/{id}` and `DELETE /api/auth/sessions/{id}`. The other actions in §3.4 get it when their endpoints exist.
     - It is a route layer inside `operator_only`, so it reads the session that the cookie check put in the request.
     - **Cost if wrong:** a stale session gets one extra password prompt.
@@ -214,17 +254,30 @@ These are for the stronger-model security review that confirms them on the maint
 12. **`host join` takes the code on stdin** (the host-side half of 3a's M5).
     - `code` becomes optional. Left out, one line is read from stdin, with a `Pairing code:` prompt on stderr when stdin is a terminal. An empty line is refused.
     - The positional code is kept for scripts. Kernel §2's rule ("never as CLI flags") is kept in spirit: it is single-use and dies in ten minutes, as 3a's decision 5 argued.
-13. **Exempt routes** (kernel §3.3):
+13. **Exempt routes** (kernel §3.3) (amended after the security review of 2026-10-02):
     - `POST /api/hosts/enroll` (the code) and `GET /api/hosts/ws` (the `hello` proof), merged outside `operator_only`;
-    - `POST /api/setup` (the token, with its own `Origin` rule, decision 3).
+    - `POST /api/setup` (the token, with its own `Origin` rule, decision 3);
+    - `GET /` (the placeholder) and `GET /setup`, `GET /setup.js` (decision 16): static pages with no data, outside the browser rules and the cookie.
 
     `/healthz` and `/readyz` do not exist yet (3b-ii). A route table test pins every operator route, and a test pins that enrollment and the WebSocket need neither a cookie nor an `Origin`.
-14. **Every transaction is `IMMEDIATE` (amendment to 3a's decision 2).**
+14. **Every transaction is `IMMEDIATE` (amendment to 3a's decision 2)** (amended after the security review of 2026-10-02): **shipped in PR #9** (`66ec866`, merged as `a005dfa`) ahead of this plan, so this plan no longer carries it.
     - Found while building this plan. With a third writer on `hennery.db` (the operator, for setup and for session slides), enrollment failed at once with `database is locked` in about one parallel CLI run in three. The all-in-one host then exited, and the tests timed out.
     - **The cause:** a deferred transaction that reads first (`Hosts::enroll`, and most of the store's) fails on its first write with `SQLITE_BUSY_SNAPSHOT` whenever another connection committed after its read. The busy timeout is **not** applied to that case, so 3a's "the busy timeout covers the overlap" was wrong.
-    - **The fix:** `db::configure` sets `TransactionBehavior::Immediate` on every connection, so `transaction()` takes the write lock when it begins and waits out the busy timeout. It serialises the writers until the single writer thread (kernel §1).
+    - **The fix, in PR #9:** `db::configure` sets `TransactionBehavior::Immediate` on every connection, so `transaction()` takes the write lock when it begins and waits out the busy timeout. It serialises the writers until the single writer thread (kernel §1). Its test is `a_transaction_holds_the_write_lock_from_its_start`.
     - **Cost:** transactions that only read also take the write lock. There are none in the tree today.
 15. **`Operator` on its own connection.** It opens `hennery.db` like `Hosts` does, and runs the same kernel migration list (`schema.rs`, which moves out of `hosts.rs`). This is three connections, serialised by decision 14. `public_url` is cached in memory, loaded at open and replaced by setup, because every browser request reads it.
+16. **The setup token travels in the link's fragment (amendment to kernel §3.1)** (added after the security review of 2026-10-02).
+    - The link is `…/setup#<token>`, not kernel §3.1's `…/setup/<token>`, and the `setup-url` file holds that form.
+    - A browser never sends a fragment, so the token never appears in a request line, and so in no server log, proxy access log or `Referer`. It leaves the browser only in the `POST /api/setup` body.
+    - The page's script is the file `/setup.js`, not inline, so the page's CSP needs no hash (kernel §7.2).
+    - **Alternatives:**
+      - the path form, which leaks into access logs and `Referer`;
+      - a query string, which leaks the same way.
+    - **Cost if wrong:** a client that cannot run the script, `curl` say, has to take the token out of the link by hand. The body format is the same either way.
+17. **A 16 KiB body limit on the auth routes** (added after the security review of 2026-10-02).
+    - `DefaultBodyLimit::max(MAX_BODY_BYTES)` (16 KiB) covers `/api/setup` and `/api/auth/*`, where axum's default is 2 MiB. A password is at most 1024 bytes.
+    - A larger body is refused 413 before it is parsed, and before any password check.
+    - **Cost if wrong:** none: no legitimate auth body comes near it.
 
 ## Global Constraints
 
@@ -237,7 +290,7 @@ These are for the stronger-model security review that confirms them on the maint
   - `cargo run -p hennery-proto --bin gen -- --check` and `cargo run --bin gen -- --check`.
 - A task that changes a `Cargo.toml` runs one `cargo build --workspace` **without** `--locked` first, and commits the updated `Cargo.lock`. New crates are pinned with `=x.y.z` in `[workspace.dependencies]` and taken from there with `.workspace = true`.
 - Generated files (`schema/hennery-protocol.schema.json`, `web/src/generated/protocol.ts`) are regenerated with `cargo run -p hennery-proto --bin gen` whenever a wire type changes. In `codegen.rs`, new root types go in both `add!` lists.
-- Setup (kernel §3.1): "generate a 256-bit setup token and write `<public_url or http://localhost:PORT>/setup/<token>` to `<data>/setup-url` (mode 0600). The full link is printed to the terminal **only when stdout is a TTY** … Valid for 1 hour, single use; a restart before setup issues a new one and invalidates the old."
+- Setup (kernel §3.1): "generate a 256-bit setup token and write `<public_url or http://localhost:PORT>/setup/<token>` to `<data>/setup-url` (mode 0600). The full link is printed to the terminal **only when stdout is a TTY** … Valid for 1 hour, single use; a restart before setup issues a new one and invalidates the old." Decision 16 amends the link's form to `/setup#<token>`.
 - `public_url` "must be `https://` or a loopback `http://` origin" (kernel §3.1).
 - Login (kernel §3.2): "Argon2id (PHC string, `password-auth`), verification on a blocking thread. Login attempts are rate limited per client address (5 per minute, then exponential backoff), with a constant-time failure path."
 - Sessions (kernel §3.2): "server-side (`auth_sessions`: random 256-bit id hashed at rest). Cookie `hennery_session`: `HttpOnly`, `Secure` (except loopback), `SameSite=Strict`, `Path=/`. 30-day sliding expiry."
@@ -260,19 +313,20 @@ These are the inputs most likely to bite a real user that the obvious tests woul
    - Tests: Task 1 `public_urls_are_normalised_to_their_browser_origin`; Task 3 `setup_creates_the_owner_signs_them_in_and_happens_once`.
 2. **Several connections writing `hennery.db` at once:** a setup, or a session slide, landing during an enrollment or an ingest.
    - Expected: each waits its turn. None fails with `database is locked`, and the all-in-one host still pairs.
-   - Tests: Task 1 `a_transaction_holds_the_write_lock_from_its_start`. Every CLI test that runs `up` then signs in while the host pairs, e.g. `up_pairs_its_own_host_once`, under four parallel copies.
+   - Tests: `a_transaction_holds_the_write_lock_from_its_start` (PR #9, decision 14). Every CLI test that runs `up` then signs in while the host pairs, e.g. `up_pairs_its_own_host_once`, under four parallel copies.
 3. **An operator route added after the auth layer, or a cross-site page aiming at one.**
    - Expected: every operator route answers 401 without a live cookie. State-changing routes answer 403 without the `public_url`'s `Origin`, and `GET`s answer 403 when the browser marks them cross-site. Enrollment and the host WebSocket need neither.
    - Tests: Task 5 `every_operator_route_needs_the_session_cookie`, `every_operator_route_applies_the_browser_rules`, `enrollment_and_the_host_socket_need_neither_a_session_nor_an_origin`; revert-probed by moving a route after the layer.
-4. **The setup link leaking, or being redirected:** a service's log collector, or a symlink planted at `setup-url`.
-   - Expected: the token appears in neither output stream, the file is 0600, a planted symlink's target is untouched, and the file is gone after setup.
-   - Tests: Task 3 `an_unset_collector_writes_its_setup_link_to_a_private_file_and_never_to_its_output`, `a_symlink_at_the_setup_link_is_replaced_and_its_target_left_alone`, `the_setup_link_is_written_privately_and_removed_by_setup`.
-5. **A password guesser, from one address or through step-up.**
-   - Expected: four wrong passwords are free and the fifth locks the address out. From then on even the right password gets 429 with a `Retry-After`, and no locked-out attempt runs a password check. Step-up spends the same budget.
-   - Tests: Task 4 `wrong_passwords_lock_the_address_out_and_each_attempt_checks_once`, `a_right_password_clears_the_count`, `loopback_keeps_one_entry_of_its_own_past_capacity`; Task 6 `wrong_step_ups_count_against_the_login_limit`.
-6. **A session in use for more than 30 days, and one idle for five minutes.**
-   - Expected: use keeps both the server row and the browser's cookie alive (the cookie is re-sent when the expiry slides). A session last checked five minutes ago must step up before minting, revoking a host or revoking a session.
-   - Tests: Task 2 `a_session_authenticates_until_it_expires_and_use_slides_its_expiry`; Task 5 `a_request_that_slides_the_session_sends_its_cookie_again`; Task 6 `minting_revoking_a_host_and_revoking_a_session_need_a_fresh_password_check`.
+4. **The setup link leaking, or being redirected:** a service's log collector, a proxy's access log, a `Referer`, or a symlink planted at `setup-url`.
+   - Expected: the token appears in neither output stream and never in a request line (it is the fragment). The file is 0600, a planted symlink's target is untouched, and the file is gone after setup. Setup responses are never cached and send no `Referer`.
+   - Tests: Task 3 `an_unset_collector_writes_its_setup_link_to_a_private_file_and_never_to_its_output`, `a_symlink_at_the_setup_link_is_replaced_and_its_target_left_alone`, `the_setup_link_is_written_privately_and_removed_by_setup`, `setup_responses_are_never_cached_nor_referred`, `the_setup_page_is_static_and_reads_the_token_from_the_fragment`.
+5. **A password guesser at login or at step-up, and the owner caught in the middle.**
+   - Expected at login: four wrong passwords are free and the fifth locks the address out. From then on even the right password gets 429 with a `Retry-After`, and no locked-out attempt runs a password check. An oversized body is refused 413 before anything is checked.
+   - Expected at step-up: the same, on a budget of its own. A step-up lockout leaves login alone, and a login lockout (a flood through a shared proxy, say) does not stop a signed-in owner stepping up.
+   - Tests: Task 4 `wrong_passwords_lock_the_address_out_and_each_attempt_checks_once`, `a_right_password_clears_the_count`, `loopback_keeps_one_entry_of_its_own_past_capacity`, `an_oversized_body_is_refused_before_it_is_parsed`; Task 6 `wrong_step_ups_lock_out_step_up_only`, `a_locked_out_login_does_not_block_step_up`.
+6. **A session in use for more than 30 days, one idle for five minutes, and one revoked while it streams.**
+   - Expected: use keeps both the server row and the browser's cookie alive (the cookie is re-sent when the expiry slides). A session last checked five minutes ago must step up before minting, revoking a host or revoking a session. A revoked or signed-out session's open event stream ends within a second; another session's stays open.
+   - Tests: Task 2 `a_session_authenticates_until_it_expires_and_use_slides_its_expiry`; Task 5 `a_request_that_slides_the_session_sends_its_cookie_again`; Task 6 `minting_revoking_a_host_and_revoking_a_session_need_a_fresh_password_check`, `ending_a_session_ends_its_open_streams`.
 
 ## File structure
 
@@ -280,15 +334,15 @@ These are the inputs most likely to bite a real user that the obvious tests woul
 |---|---|---|
 | `Cargo.toml`, `crates/hennery-kernel/Cargo.toml`, `crates/hennery-testkit/Cargo.toml`, `Cargo.lock` | `password-auth`, `url`; `tokio` and `time` for the kernel; the kernel and `reqwest` for the testkit's library; `opt-level = 3` for `argon2` and `blake2` | 1, 5, 6 |
 | `crates/hennery-kernel/src/schema.rs` | The kernel's migrations (moved from `hosts.rs`), with the operator tables | 1 |
-| `crates/hennery-kernel/src/db.rs` | `IMMEDIATE` transactions | 1 |
 | `crates/hennery-kernel/src/operator.rs` | `Operator`, `PublicUrl`, `SetupOutcome`, `SetupLink`, `Authenticated`, `AuthSession`, the cookie helpers | 1–4 |
-| `crates/hennery-kernel/src/auth_api.rs` | `/api/setup`, `/api/auth/login`, `logout`, `step-up/password`, `sessions` | 3, 4, 6 |
+| `crates/hennery-kernel/src/auth_api.rs` | `/api/setup`, `/api/auth/login`, `logout`, `step-up/password`, `sessions`; the body limit | 3, 4, 6 |
+| `crates/hennery-kernel/src/setup_page.rs` | `/setup` and `/setup.js`, and the no-referrer, no-store headers | 3 |
 | `crates/hennery-kernel/src/origin.rs` | `browser_rules` | 4 |
-| `crates/hennery-kernel/src/auth.rs` | `operator_only`, `require_operator`, `require_step_up` (replaces `DevToken`) | 5, 6 |
+| `crates/hennery-kernel/src/auth.rs` | `operator_only`, `require_operator`, `require_step_up`, `session_ended` (replaces `DevToken`) | 5, 6 |
 | `crates/hennery-kernel/src/ratelimit.rs` | `Policy::LOGIN`; loopback's key and entry | 4 |
 | `crates/hennery-proto/src/rest.rs`, `codegen.rs` | `SetupRequest`, `SetupResponse`, `LoginRequest`, `StepUpRequest`, `AuthSessionItem` | 3, 4, 6 |
-| `crates/hennery-sessions/src/lib.rs`, `api.rs`, `hosts.rs` | `AppState.operator`; the operator routes behind the cookie; step-up on minting and revoke | 3, 5, 6 |
-| `crates/hennery/src/main.rs` | The setup announcement and placeholder; no `--dev-token`; the join code on stdin | 3, 5, 7 |
+| `crates/hennery-sessions/src/lib.rs`, `api.rs`, `hosts.rs` | `AppState.operator`; the operator routes behind the cookie; step-up on minting and revoke; the stream ends with its session | 3, 5, 6 |
+| `crates/hennery/src/main.rs` | The setup announcement; no `--dev-token`; the join code on stdin | 3, 5, 7 |
 | `crates/hennery-testkit/src/lib.rs` | `operator_client`, `PUBLIC_URL`, `OWNER_PASSWORD` | 5 |
 | Tests: `crates/hennery-kernel/tests/{operator,auth_sessions}.rs`, `crates/hennery-testkit/tests/{setup,login,step_up,auth,e2e,reconcile,join,pairing,ws_ingest_error}.rs`, `crates/hennery/tests/cli.rs` | | all |
 
@@ -300,7 +354,7 @@ All commands run from the repository root inside the dev shell (`nix develop`, o
 - "Append to `path`:" adds a blank line, then the block, at the end of the file.
 - "In `path`, replace:" is followed by a block that occurs **exactly once** in the file at that point, as whole lines (earlier blocks of the same task already applied, in order), then "with:" and its replacement.
 
-Other "Run:" lines only check or regenerate; they change no source file. The plan was replayed exactly this way, from its own text, onto `c29aa09`.
+Other "Run:" lines only check or regenerate; they change no source file. The plan was replayed exactly this way, from its own text, onto `a005dfa`.
 
 ---
 
@@ -309,8 +363,8 @@ Other "Run:" lines only check or regenerate; they change no source file. The pla
 **Files:**
 - Modify: `Cargo.toml` (`password-auth`, `url`, the `argon2`/`blake2` profile), `crates/hennery-kernel/Cargo.toml`, `Cargo.lock`
 - Create: `crates/hennery-kernel/src/schema.rs`, `crates/hennery-kernel/src/operator.rs`
-- Modify: `crates/hennery-kernel/src/lib.rs`, `crates/hennery-kernel/src/hosts.rs` (its migrations move to `schema.rs`), `crates/hennery-kernel/src/db.rs` (decision 14)
-- Test: `crates/hennery-kernel/tests/operator.rs`; a unit test in `db.rs`
+- Modify: `crates/hennery-kernel/src/lib.rs`, `crates/hennery-kernel/src/hosts.rs` (its migrations move to `schema.rs`)
+- Test: `crates/hennery-kernel/tests/operator.rs`
 
 **Interfaces:**
 - Produces (`hennery_kernel::operator`):
@@ -326,7 +380,6 @@ Other "Run:" lines only check or regenerate; they change no source file. The pla
     - `async check_password(self: &Arc<Self>, String) -> Result<bool>`: a blocking thread, at most two at once;
     - `verifications() -> u64`.
 - Produces (`hennery_kernel::schema`, crate-private): `COMPONENT`, `MIGRATIONS`. The second migration creates `owners`, `password_credentials`, `auth_sessions` and `settings`.
-- Produces (`hennery_kernel::db`): every connection's `transaction()` is `IMMEDIATE`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -496,7 +549,7 @@ Expected: FAIL to compile. `error[E0432]: unresolved import hennery_kernel::oper
 
 - [ ] **Step 3: The crates, the schema module and the operator**
 
-`operator.rs` holds the whole store; its tests are the integration tests above. `db.rs` gains decision 14's line and a unit test that pins it.
+`operator.rs` holds the whole store; its tests are the integration tests above. `db.rs` is untouched: decision 14 shipped in PR #9.
 
 In `Cargo.toml`, replace:
 
@@ -688,82 +741,6 @@ with:
     fn init(mut conn: Connection) -> Result<Self> {
         db::migrate_component(&mut conn, schema::COMPONENT, schema::MIGRATIONS)?;
         Ok(Self { conn: Mutex::new(conn) })
-```
-
-In `crates/hennery-kernel/src/db.rs`, replace:
-
-```rust
-
-fn configure(conn: Connection) -> Result<Connection> {
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    Ok(conn)
-```
-
-with:
-
-```rust
-
-/// Every transaction is `IMMEDIATE`: it takes the write lock when it
-/// begins, waiting out the busy timeout if another connection holds it.
-/// Several connections write to `hennery.db` (the sessions store, the host
-/// registry, the operator), and a deferred transaction that reads first
-/// fails on its first write, at once and without the busy timeout
-/// (`SQLITE_BUSY_SNAPSHOT`), whenever another connection committed after
-/// its read. Until one writer thread owns the database (kernel spec §1),
-/// this is what serialises them (3b decision 14).
-fn configure(mut conn: Connection) -> Result<Connection> {
-    conn.pragma_update(None, "journal_mode", "WAL")?;
-    conn.pragma_update(None, "foreign_keys", "ON")?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
-    Ok(conn)
-```
-
-In `crates/hennery-kernel/src/db.rs`, replace:
-
-```rust
-    }
-
-    #[test]
-    fn migrations_apply_once_and_record_the_version() {
-```
-
-with:
-
-```rust
-    }
-
-    /// 3b decision 14: a transaction holds the write lock from its start, so
-    /// another connection's write waits for it (here, with no busy timeout,
-    /// is refused) instead of committing between the transaction's read and
-    /// its write and failing that write with `SQLITE_BUSY_SNAPSHOT`.
-    #[test]
-    fn a_transaction_holds_the_write_lock_from_its_start() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("hennery.db");
-        let mut first = open(&path).unwrap();
-        first.execute_batch("CREATE TABLE t (x INTEGER);").unwrap();
-        let second = open(&path).unwrap();
-        second.busy_timeout(std::time::Duration::ZERO).unwrap();
-
-        let tx = first.transaction().unwrap();
-        let count: i64 = tx.query_row("SELECT count(*) FROM t", [], |r| r.get(0)).unwrap();
-        assert_eq!(count, 0);
-        let err = second.execute("INSERT INTO t VALUES (1)", []).unwrap_err();
-        assert_eq!(
-            err.sqlite_error_code(),
-            Some(rusqlite::ErrorCode::DatabaseBusy),
-            "{err}"
-        );
-        tx.execute("INSERT INTO t VALUES (2)", []).unwrap();
-        tx.commit().unwrap();
-        second.execute("INSERT INTO t VALUES (3)", []).unwrap();
-    }
-
-    #[test]
-    fn migrations_apply_once_and_record_the_version() {
 ```
 
 Create `crates/hennery-kernel/src/operator.rs`:
@@ -1084,15 +1061,14 @@ pub mod secret;
 - [ ] **Step 4: Update the lock file and run the new tests**
 
 Run: `cargo build --workspace` (no `--locked`: it records `password-auth`, `password-hash`, `argon2` and `blake2` in `Cargo.lock`), then `cargo test -p hennery-kernel --locked`.
-Expected: all pass, among them `a_restart_before_setup_invalidates_the_old_token` and `a_transaction_holds_the_write_lock_from_its_start`.
+Expected: all pass, among them `a_restart_before_setup_invalidates_the_old_token`.
 
-- [ ] **Step 5: Revert-probe the token, the URL rule and the transaction behaviour**
+- [ ] **Step 5: Revert-probe the token and the URL rule**
 
 Each probe is a one-line change. Rerun the named tests, see them fail, then restore the code.
 1. Remove `t.expires_at > now && ` from `set_up`'s `live` check. Rerun `cargo test -p hennery-kernel --test operator --locked`. Expected: `a_setup_token_expires_after_an_hour` fails.
 2. Remove ` && t.hash == sha256_hex(token.as_bytes())` from the same check. Expected: `a_setup_token_is_single_use_and_creates_one_owner` fails.
 3. In `PublicUrl::parse`, change `"http" if is_loopback_host(&url) => false,` to `"http" => false,`. Expected: `public_urls_are_normalised_to_their_browser_origin` and `a_bad_password_or_public_url_is_refused_and_keeps_the_token` fail.
-4. Remove the line `conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);` from `db::configure`, and rerun `cargo test -p hennery-kernel --lib db --locked`. Expected: `a_transaction_holds_the_write_lock_from_its_start` fails (`called Result::unwrap_err() on an Ok value`): the second connection's write went in between.
 
 - [ ] **Step 6: Run the whole gate**
 
@@ -1477,7 +1453,7 @@ git push
 ### Task 3: The one-time setup link and `POST /api/setup`
 
 **Files:**
-- Create: `crates/hennery-kernel/src/auth_api.rs`
+- Create: `crates/hennery-kernel/src/auth_api.rs`, `crates/hennery-kernel/src/setup_page.rs`
 - Modify: `crates/hennery-kernel/src/operator.rs` (`announce_setup`, the `setup-url` file), `crates/hennery-kernel/src/lib.rs`, `crates/hennery-proto/src/rest.rs`, `crates/hennery-proto/src/codegen.rs`, `crates/hennery-sessions/src/lib.rs`, `crates/hennery/src/main.rs`
 - Modify (`AppState::new` gains the operator): `crates/hennery-testkit/tests/{auth,e2e,join,pairing,reconcile,ws_ingest_error}.rs`, `crates/hennery/tests/cli.rs`
 - Regenerate: `schema/hennery-protocol.schema.json`, `web/src/generated/protocol.ts`
@@ -1494,7 +1470,10 @@ git push
   - `pub(crate) fn error`, `internal`, `user_agent` and `with_cookie`.
 - Produces (`hennery_proto::rest`): `SetupRequest { token, password, public_url: String }`, with a redacting `Debug`; and `SetupResponse { public_url: String }`.
 - Produces (`hennery_sessions`): `AppState::new(store, hosts, operator: Operator, token: DevToken)` (the token goes in Task 5), and the field `operator: Arc<Operator>`. The router merges `auth_api::router`.
-- Produces (HTTP): `POST /api/setup`, answering 201 `SetupResponse` with `Set-Cookie`, or 400 `invalid`, 401 `invalid_setup_token`, 403 `origin_mismatch`, 409 `already_set_up` or 415. `GET /setup/{token}` serves the placeholder page.
+- Produces (HTTP):
+  - `POST /api/setup`, answering 201 `SetupResponse` with `Set-Cookie`, or 400 `invalid`, 401 `invalid_setup_token`, 403 `origin_mismatch`, 409 `already_set_up` or 415;
+  - `GET /setup` (the page, with the CSP) and `GET /setup.js` (its script). All three answer with `Referrer-Policy: no-referrer` and `Cache-Control: no-store`.
+- Produces (`setup-url`): one line, `http://localhost:<port>/setup#<token>`.
 - Produces (binary): once the collector listens, it writes `<data-dir>/setup-url`. It prints the link only to a terminal; otherwise it logs the file's path.
 
 - [ ] **Step 1: Write the failing tests**
@@ -1540,7 +1519,7 @@ fn the_setup_link_is_written_privately_and_removed_by_setup() {
     assert_eq!(link.file, dir.path().join(SETUP_URL_FILE));
     assert_eq!(mode(&link.file), 0o600);
     assert_eq!(std::fs::read_to_string(&link.file).unwrap(), format!("{}\n", link.url));
-    let token = link.url.strip_prefix("http://localhost:7117/setup/").unwrap();
+    let token = link.url.strip_prefix("http://localhost:7117/setup#").unwrap();
     assert!(
         token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()),
         "{token}"
@@ -1584,7 +1563,7 @@ fn a_new_setup_link_replaces_the_old_one() {
         std::fs::read_to_string(&second.file).unwrap(),
         format!("{}\n", second.url)
     );
-    let old = first.url.rsplit('/').next().unwrap();
+    let old = first.url.rsplit('#').next().unwrap();
     assert_eq!(
         op.set_up(old, PASSWORD, "https://hennery.example", NOW).unwrap(),
         SetupOutcome::InvalidToken
@@ -1764,6 +1743,73 @@ async fn a_wrong_token_bad_input_or_a_form_post_is_refused_and_keeps_the_token()
     // Loopback `http://`: the cookie cannot be `Secure`.
     let cookie = session_cookie(&resp);
     assert!(!cookie.contains("Secure"), "{cookie}");
+}
+
+fn assert_private(resp: &reqwest::Response) {
+    assert_eq!(resp.headers()["referrer-policy"], "no-referrer");
+    assert_eq!(resp.headers()["cache-control"], "no-store");
+}
+
+/// Every setup response is uncached and sends no `Referer` onwards, the
+/// refusals as well as the success.
+#[tokio::test]
+async fn setup_responses_are_never_cached_nor_referred() {
+    let c = Collector::start().await;
+    let url = "https://hennery.example";
+    let refused = c.setup(None, &c.token, PASSWORD, url).await;
+    assert_private(&refused);
+    let done = c.setup(Some(url), &c.token, PASSWORD, url).await;
+    assert_eq!(done.status(), 201);
+    assert_private(&done);
+}
+
+/// 3b decision 16: the link is `/setup#<token>`. The page and its script
+/// are static; the script reads the token from the fragment and sends it
+/// only in the `POST /api/setup` body. The page runs no inline script.
+#[tokio::test]
+async fn the_setup_page_is_static_and_reads_the_token_from_the_fragment() {
+    let c = Collector::start().await;
+    let page = reqwest::get(format!("http://{}/setup", c.addr)).await.unwrap();
+    assert_eq!(page.status(), 200);
+    assert_private(&page);
+    let csp = page.headers()["content-security-policy"].to_str().unwrap().to_string();
+    assert!(
+        csp.starts_with("script-src 'self';") && csp.contains("frame-ancestors 'none'"),
+        "{csp}"
+    );
+    let html = page.text().await.unwrap();
+    assert!(html.contains(r#"<script src="/setup.js" defer></script>"#), "{html}");
+    assert_eq!(html.matches("<script").count(), 1, "an inline script: {html}");
+
+    let script = reqwest::get(format!("http://{}/setup.js", c.addr)).await.unwrap();
+    assert_eq!(script.status(), 200);
+    assert_private(&script);
+    assert!(
+        script.headers()["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/javascript")
+    );
+    let js = script.text().await.unwrap();
+    assert!(
+        js.contains("location.hash") && js.contains(r#"fetch("/api/setup""#),
+        "{js}"
+    );
+}
+
+/// A logged request must never show the password.
+#[test]
+fn a_setup_request_does_not_show_its_password_in_debug() {
+    let req = SetupRequest {
+        token: "t".into(),
+        password: PASSWORD.into(),
+        public_url: "https://hennery.example".into(),
+    };
+    let shown = format!("{req:?}");
+    assert!(
+        !shown.contains(PASSWORD) && shown.contains("hennery.example"),
+        "{shown}"
+    );
 }
 ```
 
@@ -2029,7 +2075,7 @@ fn an_unset_collector_writes_its_setup_link_to_a_private_file_and_never_to_its_o
     let port = listen.rsplit(':').next().unwrap();
     let token = url
         .trim_end()
-        .strip_prefix(&format!("http://localhost:{port}/setup/"))
+        .strip_prefix(&format!("http://localhost:{port}/setup#"))
         .unwrap_or_else(|| panic!("{url}"));
     assert_eq!(token.len(), 64, "{url}");
     unsafe { libc::kill(collector.up.id() as i32, libc::SIGTERM) };
@@ -2107,7 +2153,7 @@ with:
 /// Where the setup link was written (`Operator::announce_setup`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetupLink {
-    /// `<base>/setup/<token>`.
+    /// `<base>/setup#<token>`: the token in the fragment (3b decision 16).
     pub url: String,
     /// The 0600 file holding `url`.
     pub file: PathBuf,
@@ -2164,7 +2210,7 @@ with:
     }
 
     /// Before setup: issue a fresh setup token and write its link,
-    /// `<base_url>/setup/<token>`, to `dir/setup-url` (kernel spec §3.1).
+    /// `<base_url>/setup#<token>`, to `dir/setup-url` (kernel spec §3.1).
     /// The file is created 0600 under a temporary name and renamed into
     /// place, so an existing `setup-url` (even a symlink) is replaced, never
     /// written through. Once set up: remove a stale `setup-url` and return
@@ -2175,7 +2221,7 @@ with:
             remove_setup_file(&file);
             return Ok(None);
         };
-        let url = format!("{}/setup/{token}", base_url.trim_end_matches('/'));
+        let url = format!("{}/setup#{token}", base_url.trim_end_matches('/'));
         let temp = dir.join(format!(".{SETUP_URL_FILE}.{}.tmp", hex::encode(random_bytes::<8>())));
         let written = (|| {
             let mut out = std::fs::OpenOptions::new()
@@ -2246,15 +2292,20 @@ use crate::secret::unix_now;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
-use axum::{Json, Router};
+use axum::routing::{get, post};
+use axum::{Json, Router, middleware};
 use hennery_proto::rest::{ApiError, SetupRequest, SetupResponse};
 use std::sync::Arc;
 
 /// The operator auth routes, each with its own `Origin` rule (kernel spec
 /// §3.3).
 pub fn router(operator: Arc<Operator>) -> Router {
-    Router::new().route("/api/setup", post(setup)).with_state(operator)
+    let private = || middleware::map_response(crate::setup_page::private_headers);
+    Router::new()
+        .route("/api/setup", post(setup).layer(private()))
+        .route("/setup", get(crate::setup_page::page).layer(private()))
+        .route("/setup.js", get(crate::setup_page::script).layer(private()))
+        .with_state(operator)
 }
 
 pub(crate) fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {
@@ -2302,6 +2353,7 @@ async fn setup(State(operator): State<Arc<Operator>>, headers: HeaderMap, Json(r
     };
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     if origin != Some(public_url.origin()) {
+        tracing::debug!(expected = %public_url.origin(), received = ?origin, "setup refused: origin_mismatch");
         return error(
             StatusCode::FORBIDDEN,
             "origin_mismatch",
@@ -2345,6 +2397,96 @@ async fn setup(State(operator): State<Arc<Operator>>, headers: HeaderMap, Json(r
 }
 ```
 
+Create `crates/hennery-kernel/src/setup_page.rs`:
+
+```rust
+//! The page a setup link opens (kernel spec §3.1), until the frontend
+//! replaces it. The link is `…/setup#<token>`: the token is in the
+//! fragment, which a browser never sends, so it reaches no server log,
+//! proxy log or `Referer` (3b decision 16). The page's script reads it
+//! from `location.hash` and sends it in the `POST /api/setup` body.
+//!
+//! The page and its script are static and hold no data, so they sit
+//! outside the browser rules and the session cookie (3b decision 13). The
+//! script is a file of its own, not inline, so the page's
+//! `Content-Security-Policy` can be kernel spec §7.2's without a hash.
+
+use axum::http::{HeaderValue, header};
+use axum::response::{IntoResponse, Response};
+
+const PAGE: &str = r#"<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Set up hennery</title>
+<h1>Set up hennery</h1>
+<form id="setup">
+  <p><label>Password (at least 12 characters)<br><input id="password" type="password" minlength="12" required autocomplete="new-password"></label></p>
+  <p><label>Public URL (where your browser reaches hennery)<br><input id="public_url" type="url" required></label></p>
+  <p><button type="submit">Set up</button></p>
+</form>
+<p id="result" role="status"></p>
+<script src="/setup.js" defer></script>
+</html>
+"#;
+
+const SCRIPT: &str = r#"// hennery setup: the token is in the fragment and leaves the browser only
+// in this request's body.
+const token = location.hash.slice(1);
+history.replaceState(null, "", location.pathname);
+const result = document.getElementById("result");
+document.getElementById("public_url").value = location.origin;
+if (!token) {
+  result.textContent = "This page needs the setup link the collector wrote to its setup-url file.";
+}
+document.getElementById("setup").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const response = await fetch("/api/setup", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      token,
+      password: document.getElementById("password").value,
+      public_url: document.getElementById("public_url").value,
+    }),
+  });
+  if (response.ok) {
+    result.textContent = "hennery is set up, and you are signed in.";
+  } else {
+    const body = await response.json().catch(() => ({}));
+    result.textContent = "Setup failed: " + (body.message || response.status);
+  }
+});
+"#;
+
+/// Kernel spec §7.2's policy, without the theme bootstrap this page has not.
+const CSP: &str =
+    "script-src 'self'; img-src 'self' data: blob:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'";
+
+/// `GET /setup`.
+pub(crate) async fn page() -> Response {
+    let mut response = ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], PAGE).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
+    response
+}
+
+/// `GET /setup.js`.
+pub(crate) async fn script() -> Response {
+    ([(header::CONTENT_TYPE, "text/javascript; charset=utf-8")], SCRIPT).into_response()
+}
+
+/// Every setup response, the page and the API alike: never cached, and
+/// never a `Referer` onwards.
+pub(crate) async fn private_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+```
+
 In `crates/hennery-kernel/src/lib.rs`, replace:
 
 ```rust
@@ -2358,6 +2500,19 @@ with:
 pub mod auth;
 pub mod auth_api;
 pub mod db;
+```
+
+In `crates/hennery-kernel/src/lib.rs`, replace:
+
+```rust
+pub mod secret;
+```
+
+with:
+
+```rust
+pub mod secret;
+mod setup_page;
 ```
 
 Append to `crates/hennery-proto/src/rest.rs`:
@@ -2528,24 +2683,6 @@ use hennery_sessions::{AppState, store::Store};
 In `crates/hennery/src/main.rs`, replace:
 
 ```rust
-
-const PLACEHOLDER: &str = "<!doctype html><meta charset=utf-8><title>hennery</title><h1>hennery</h1><p>Walking skeleton. The UI is not built yet.</p>";
-```
-
-with:
-
-```rust
-
-/// What a setup link opens until the frontend exists: how to finish setup
-/// by hand. The token stays in the address bar; the page never shows it.
-const SETUP_PLACEHOLDER: &str = "<!doctype html><meta charset=utf-8><title>hennery setup</title><h1>Set up hennery</h1><p>The UI is not built yet. Finish setup with <code>POST /api/setup</code>, a JSON body <code>{\"token\": \"&lt;the last part of this address&gt;\", \"password\": \"&hellip;\", \"public_url\": \"&hellip;\"}</code> and an <code>Origin</code> header equal to that <code>public_url</code>.</p>";
-
-const PLACEHOLDER: &str = "<!doctype html><meta charset=utf-8><title>hennery</title><h1>hennery</h1><p>Walking skeleton. The UI is not built yet.</p>";
-```
-
-In `crates/hennery/src/main.rs`, replace:
-
-```rust
     let hosts = Hosts::open(&db)?;
     let mut state = AppState::new(store, hosts, token);
     state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
@@ -2583,24 +2720,6 @@ with:
         announce_setup(&link);
     }
     if let Some(fd) = args.pairing_code_fd {
-```
-
-In `crates/hennery/src/main.rs`, replace:
-
-```rust
-    });
-    let app = hennery_sessions::router(state.clone()).route("/", get(|| async { Html(PLACEHOLDER) }));
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
-```
-
-with:
-
-```rust
-    });
-    let app = hennery_sessions::router(state.clone())
-        .route("/", get(|| async { Html(PLACEHOLDER) }))
-        .route("/setup/{token}", get(|| async { Html(SETUP_PLACEHOLDER) }));
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
 ```
 
 In `crates/hennery/src/main.rs`, replace:
@@ -2647,18 +2766,20 @@ Expected: `wrote schema/hennery-protocol.schema.json`, `wrote web/src/generated/
 Run: `cargo test -p hennery-kernel --test operator --locked && cargo test -p hennery-testkit --test setup --locked && cargo test -p hennery --test cli an_unset_collector --locked`
 Expected: all pass.
 
-- [ ] **Step 5: Revert-probe the terminal check, setup's `Origin` rule and the file**
+- [ ] **Step 5: Revert-probe the terminal check, setup's `Origin` rule, the file, the headers and `Debug`**
 
 1. In `announce_setup` (`main.rs`), change `if std::io::stdout().is_terminal() {` to `if std::io::stdout().is_terminal() || true {`, and rerun `cargo test -p hennery --test cli an_unset_collector --locked`. Expected: it fails with `the setup token was logged`. Restore the code.
 2. In `auth_api::setup`, change `if origin != Some(public_url.origin()) {` to `if false && origin != Some(public_url.origin()) {`, and rerun `cargo test -p hennery-testkit --test setup --locked`. Expected: `setup_needs_the_origin_of_the_public_url_it_stores` fails. Restore the code.
 3. In `announce_setup` (`operator.rs`), open `&file` itself with `.create(true).truncate(true)` in place of `&temp` with `.create_new(true)`, so a symlink there is followed. Rerun `cargo test -p hennery-kernel --test operator --locked`. Expected: `a_symlink_at_the_setup_link_is_replaced_and_its_target_left_alone` fails. Restore the code.
 4. Change the file's `.mode(0o600)` to `.mode(0o644)`. Expected: `the_setup_link_is_written_privately_and_removed_by_setup` fails. Restore the code.
 5. Remove the three lines in `set_up` that take `setup_file` and call `remove_setup_file`. Expected: the same test fails. Restore the code.
+6. In `auth_api::router`, change `.route("/api/setup", post(setup).layer(private()))` to `.route("/api/setup", post(setup))`. Rerun `cargo test -p hennery-testkit --test setup --locked`. Expected: `setup_responses_are_never_cached_nor_referred` fails. Restore the code.
+7. In `SetupRequest`'s `Debug`, add `.field("password", &self.password)`. Expected: `a_setup_request_does_not_show_its_password_in_debug` fails. Restore the code.
 
 - [ ] **Step 6: Run the whole gate**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo clippy -p hennery --locked -- -D warnings && cargo test --workspace --locked && cargo run -p hennery-proto --bin gen -- --check && cargo run --bin gen -- --check`
-Expected: all 414 tests pass.
+Expected: all 417 tests pass.
 
 - [ ] **Step 7: Commit and push**
 
@@ -2681,7 +2802,7 @@ git push
 - Produces (`hennery_kernel::ratelimit`): `Policy::LOGIN { free_failures: 5, window: 60 s, first_lockout: 60 s, max_lockout: 1 h }`. `key` maps `127.0.0.0/8` to `127.0.0.1` and leaves `::1` as it is. Loopback gets its own entry past capacity.
 - Produces (`hennery_kernel::operator`): the field `Operator::login_limiter: Limiter`.
 - Produces (`hennery_kernel::origin`): `async fn browser_rules(State<Arc<Operator>>, Request, Next) -> Response`, which answers 403 `setup_required`, `origin_mismatch` or `cross_site`, or 415 `unsupported_media_type`.
-- Produces (`hennery_kernel::auth_api`): `pub(crate) fn rate_limited(Duration, &str) -> Response` and `pub(crate) fn secure_cookies(&Operator) -> bool`.
+- Produces (`hennery_kernel::auth_api`): `pub const MAX_BODY_BYTES: usize = 16 * 1024`, applied to every route of `router`; `pub(crate) fn rate_limited(Duration, &str) -> Response` and `pub(crate) fn secure_cookies(&Operator) -> bool`.
 - Produces (`hennery_proto::rest`): `LoginRequest { password: String }`, with a redacting `Debug`.
 - Produces (HTTP), both behind the browser rules:
   - `POST /api/auth/login`: 204 with `Set-Cookie`, 401 `invalid_password`, or 429 `rate_limited` with `Retry-After`;
@@ -2886,12 +3007,45 @@ async fn login_needs_the_public_urls_origin_json_and_setup() {
         (403, "setup_required".into())
     );
 }
+
+/// A body far larger than any password is refused with 413 before it is
+/// parsed, on setup and on login alike.
+#[tokio::test]
+async fn an_oversized_body_is_refused_before_it_is_parsed() {
+    let unset = Collector::start(false).await;
+    let token = unset.state.operator.issue_setup_token(unix_now()).unwrap().unwrap();
+    let huge = "x".repeat(hennery_kernel::auth_api::MAX_BODY_BYTES + 1);
+    let setup = unset
+        .post("/api/setup")
+        .json(&serde_json::json!({ "token": token, "password": huge, "public_url": ORIGIN }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(setup.status(), 413);
+    assert!(!unset.state.operator.is_set_up().unwrap());
+
+    let c = Collector::start(true).await;
+    assert_eq!(c.login(&huge).await.status(), 413);
+    assert_eq!(c.state.operator.verifications(), 0);
+}
+
+/// A logged request must never show the password.
+#[test]
+fn a_login_request_does_not_show_its_password_in_debug() {
+    let shown = format!(
+        "{:?}",
+        LoginRequest {
+            password: PASSWORD.into()
+        }
+    );
+    assert!(!shown.contains(PASSWORD), "{shown}");
+}
 ```
 
 - [ ] **Step 2: Run them to see them fail**
 
 Run: `cargo test -p hennery-testkit --test login`
-Expected: FAIL to compile. `error[E0432]: unresolved import hennery_proto::rest::LoginRequest`.
+Expected: FAIL to compile. `error[E0432]: unresolved import hennery_proto::rest::LoginRequest`, and `error[E0425]: cannot find value MAX_BODY_BYTES in module hennery_kernel::auth_api`.
 
 - [ ] **Step 3: The rules, the limiter and the endpoints**
 
@@ -3112,6 +3266,9 @@ Create `crates/hennery-kernel/src/origin.rs`:
 //!   the `SameSite=Strict` cookie still keeps cross-site requests out). A
 //!   present `Origin` must match.
 //!
+//! No `GET` or `HEAD` route changes state; one that must is a `POST`.
+//! Accepting a missing `Sec-Fetch-Site` relies on this.
+//!
 //! Host enrollment, the host WebSocket and setup are not browser routes in
 //! this sense and sit outside this layer (setup has its own rule).
 
@@ -3134,6 +3291,7 @@ pub async fn browser_rules(State(operator): State<Arc<Operator>>, req: Request, 
             return error(StatusCode::FORBIDDEN, "setup_required", "hennery is not set up yet");
         }
         if origin != expected {
+            tracing::debug!(?expected, received = ?origin, "request refused: origin_mismatch");
             return error(
                 StatusCode::FORBIDDEN,
                 "origin_mismatch",
@@ -3153,6 +3311,7 @@ pub async fn browser_rules(State(operator): State<Arc<Operator>>, req: Request, 
             return error(StatusCode::FORBIDDEN, "cross_site", "cross-site requests are refused");
         }
         if origin.is_some() && origin != expected {
+            tracing::debug!(?expected, received = ?origin, "request refused: origin_mismatch");
             return error(
                 StatusCode::FORBIDDEN,
                 "origin_mismatch",
@@ -3194,17 +3353,6 @@ use crate::operator::{Operator, PublicUrl, SetupOutcome, session_cookie};
 use crate::secret::unix_now;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::response::{IntoResponse, Response};
-use axum::routing::post;
-use axum::{Json, Router};
-use hennery_proto::rest::{ApiError, SetupRequest, SetupResponse};
-use std::sync::Arc;
-
-/// The operator auth routes, each with its own `Origin` rule (kernel spec
-/// §3.3).
-pub fn router(operator: Arc<Operator>) -> Router {
-    Router::new().route("/api/setup", post(setup)).with_state(operator)
-}
 ```
 
 with:
@@ -3215,15 +3363,36 @@ with:
 
 use crate::operator::{Operator, PublicUrl, SetupOutcome, cleared_cookie, session_cookie, session_token};
 use crate::secret::unix_now;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
-use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+```
+
+In `crates/hennery-kernel/src/auth_api.rs`, replace:
+
+```rust
+use axum::{Json, Router, middleware};
+use hennery_proto::rest::{ApiError, SetupRequest, SetupResponse};
+use std::sync::Arc;
+
+/// The operator auth routes, each with its own `Origin` rule (kernel spec
+/// §3.3).
+pub fn router(operator: Arc<Operator>) -> Router {
+    let private = || middleware::map_response(crate::setup_page::private_headers);
+```
+
+with:
+
+```rust
 use axum::{Json, Router, middleware};
 use hennery_proto::rest::{ApiError, LoginRequest, SetupRequest, SetupResponse};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// The largest request body the auth routes read: a password is at most
+/// 1024 bytes (`MAX_PASSWORD_BYTES`), so anything much larger is refused
+/// with 413 before it is parsed.
+pub const MAX_BODY_BYTES: usize = 16 * 1024;
 
 /// The operator auth routes. Setup has its own `Origin` rule; the rest are
 /// browser routes (kernel spec §3.3). Serve with `ConnectInfo<SocketAddr>`:
@@ -3236,11 +3405,23 @@ pub fn router(operator: Arc<Operator>) -> Router {
             operator.clone(),
             crate::origin::browser_rules,
         ));
-    Router::new()
-        .route("/api/setup", post(setup))
-        .merge(browser)
+    let private = || middleware::map_response(crate::setup_page::private_headers);
+```
+
+In `crates/hennery-kernel/src/auth_api.rs`, replace:
+
+```rust
+        .route("/setup.js", get(crate::setup_page::script).layer(private()))
         .with_state(operator)
-}
+```
+
+with:
+
+```rust
+        .route("/setup.js", get(crate::setup_page::script).layer(private()))
+        .merge(browser)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .with_state(operator)
 ```
 
 In `crates/hennery-kernel/src/auth_api.rs`, replace:
@@ -3400,7 +3581,7 @@ with:
 Run: `cargo run -p hennery-proto --bin gen`, then `cargo test -p hennery-testkit --test login --locked && cargo test -p hennery-kernel --lib ratelimit --locked`
 Expected: all pass.
 
-- [ ] **Step 5: Revert-probe the limiter, loopback and the rules**
+- [ ] **Step 5: Revert-probe the limiter, loopback, the rules, the body limit and `Debug`**
 
 Each probe is a one-line change. Rerun the named test, see it fail, then restore the code.
 1. In `login`, change `if let Err(retry_after) = operator.login_limiter.attempt(peer.ip(), Instant::now())` to `if let (false, Err(retry_after)) = (true, operator.login_limiter.attempt(peer.ip(), Instant::now()))`. Expected: `wrong_passwords_lock_the_address_out_and_each_attempt_checks_once` fails.
@@ -3408,11 +3589,13 @@ Each probe is a one-line change. Rerun the named test, see it fail, then restore
 3. In `browser_rules`, change `if origin != expected {` to `if false && origin != expected {`. Expected: `login_needs_the_public_urls_origin_json_and_setup` fails.
 4. In `browser_rules`, change `if !is_json_or_empty(headers) {` to `if false && !is_json_or_empty(headers) {`. Expected: the same test fails.
 5. In `browser_rules`, change `if expected.is_none() {` to `if false && expected.is_none() {`. Expected: the same test fails.
+6. In `auth_api::router`, remove the line `.layer(DefaultBodyLimit::max(MAX_BODY_BYTES))`. Expected: `an_oversized_body_is_refused_before_it_is_parsed` fails.
+7. In `LoginRequest`'s `Debug`, change `f.debug_struct("LoginRequest").finish_non_exhaustive()` to `f.debug_struct("LoginRequest").field("password", &self.password).finish()`. Expected: `a_login_request_does_not_show_its_password_in_debug` fails.
 
 - [ ] **Step 6: Run the whole gate**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo clippy -p hennery --locked -- -D warnings && cargo test --workspace --locked && cargo run -p hennery-proto --bin gen -- --check && cargo run --bin gen -- --check`
-Expected: all 419 tests pass.
+Expected: all 424 tests pass.
 
 - [ ] **Step 7: Commit and push**
 
@@ -6027,7 +6210,8 @@ fn sign_in(listen: &str, collector_dir: &std::path::Path) -> String {
     let file = collector_dir.join("setup-url");
     wait_until("the setup link", || file.exists());
     let url = std::fs::read_to_string(&file).unwrap();
-    let token = url.trim_end().rsplit('/').next().unwrap();
+    // `…/setup#<token>`: the token is the fragment (3b decision 16).
+    let token = url.trim_end().rsplit_once('#').unwrap().1;
     let origin = format!("http://{listen}");
     let body = serde_json::json!({ "token": token, "password": PASSWORD, "public_url": origin }).to_string();
     let mut stream = TcpStream::connect(listen).unwrap();
@@ -7103,7 +7287,7 @@ Expected: every run passes.
 - [ ] **Step 7: Run the whole gate**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo clippy -p hennery --locked -- -D warnings && cargo test --workspace --locked && cargo run -p hennery-proto --bin gen -- --check && cargo run --bin gen -- --check`
-Expected: all 419 tests pass, as many as before: four added in `auth.rs` and one in `cli.rs`; the bearer test, the two `DevToken` unit tests and the two short-token CLI tests removed (decision 11).
+Expected: all 424 tests pass, as many as before: four added in `auth.rs` and one in `cli.rs`; the bearer test, the two `DevToken` unit tests and the two short-token CLI tests removed (decision 11).
 
 - [ ] **Step 8: Commit and push**
 
@@ -7113,16 +7297,22 @@ git commit -m "feat(sessions): the session cookie replaces the development beare
 git push
 ```
 
-### Task 6: Step-up for minting, host revoke and session revoke; the session list
+### Task 6: Step-up for minting, host revoke and session revoke; the session list; streams end with their session
 
 **Files:**
-- Modify: `crates/hennery-kernel/Cargo.toml` (`time`), `Cargo.lock`, `crates/hennery-kernel/src/auth.rs` (`require_step_up`), `crates/hennery-kernel/src/auth_api.rs`, `crates/hennery-proto/src/rest.rs`, `crates/hennery-proto/src/codegen.rs`, `crates/hennery-sessions/src/hosts.rs`
+- Modify: `crates/hennery-kernel/Cargo.toml` (`time`), `Cargo.lock`, `crates/hennery-kernel/src/auth.rs` (`require_step_up`, `session_ended`), `crates/hennery-kernel/src/auth_api.rs`, `crates/hennery-kernel/src/operator.rs` (`step_up_limiter`, the ending generation), `crates/hennery-proto/src/rest.rs`, `crates/hennery-proto/src/codegen.rs`, `crates/hennery-sessions/src/hosts.rs`, `crates/hennery-sessions/src/api.rs` (the stream)
 - Regenerate: `schema/hennery-protocol.schema.json`, `web/src/generated/protocol.ts`
 - Test: `crates/hennery-testkit/tests/step_up.rs`, `crates/hennery-testkit/tests/auth.rs` (three more routes in the table)
 
 **Interfaces:**
 - Consumes: Tasks 2, 4 and 5 (`step_up`, `sessions`, `revoke_session`, `login_limiter`, `operator_only`, `Authenticated` in the extensions).
-- Produces (`hennery_kernel::auth`): `async fn require_step_up(Request, Next) -> Response`, which answers 403 `step_up_required`. It is used as a `route_layer` inside `operator_only`.
+- Produces (`hennery_kernel::auth`):
+  - `async fn require_step_up(Request, Next) -> Response`, which answers 403 `step_up_required`. It is used as a `route_layer` inside `operator_only`.
+  - `async fn session_ended(Arc<Operator>, Authenticated)`, which resolves once that session is revoked, signed out or expired.
+- Produces (`hennery_kernel::operator`):
+  - the field `step_up_limiter: Limiter`, with `Policy::LOGIN`;
+  - `session_ends() -> tokio::sync::watch::Receiver<u64>`, bumped by every `revoke_session` that ends a session;
+  - `session_expires_at(session_id: &str, now) -> Result<Option<i64>>`, which does not slide.
 - Produces (`hennery_proto::rest`):
   - `StepUpRequest { password: String }`, with a redacting `Debug`;
   - `AuthSessionItem { id, user_agent, created_at, last_seen_at, expires_at: String, current: bool }`.
@@ -7130,7 +7320,8 @@ git push
   - `POST /api/auth/step-up/password`: 204, 401 `invalid_password`, or 429;
   - `GET /api/auth/sessions`: `Vec<AuthSessionItem>`;
   - `DELETE /api/auth/sessions/{id}` (step-up): 204 or 404;
-  - `POST /api/hosts/pairing-codes` and `DELETE /api/hosts/{id}` now need step-up too.
+  - `POST /api/hosts/pairing-codes` and `DELETE /api/hosts/{id}` now need step-up too;
+  - `GET /api/stream/sessions/{id}` ends when the session that opened it ends.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -7150,6 +7341,7 @@ use hennery_sessions::AppState;
 use hennery_sessions::store::Store;
 use hennery_testkit::{OWNER_PASSWORD, PUBLIC_URL};
 use std::net::SocketAddr;
+use std::time::Duration;
 
 struct Collector {
     addr: SocketAddr,
@@ -7265,24 +7457,118 @@ async fn minting_revoking_a_host_and_revoking_a_session_need_a_fresh_password_ch
     assert_eq!(resp.status(), 201);
 }
 
-/// Step-up guesses the same password as login, so it spends the same
-/// per-address budget.
+impl Collector {
+    async fn login(&self, password: &str) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("http://{}/api/auth/login", self.addr))
+            .header("origin", PUBLIC_URL)
+            .json(&serde_json::json!({ "password": password }))
+            .send()
+            .await
+            .unwrap()
+    }
+}
+
+/// 3b decision 10: step-up has a budget of its own. Five wrong step-ups
+/// lock out step-up from that address, even with the right password, and
+/// leave login alone.
 #[tokio::test]
-async fn wrong_step_ups_count_against_the_login_limit() {
+async fn wrong_step_ups_lock_out_step_up_only() {
     let c = Collector::start().await;
     let session = c.session(0);
     for _ in 0..5 {
         assert_eq!(c.step_up(&session, "wrong password").await.status(), 401);
     }
-    assert_eq!(c.step_up(&session, OWNER_PASSWORD).await.status(), 429);
-    let login = reqwest::Client::new()
-        .post(format!("http://{}/api/auth/login", c.addr))
-        .header("origin", PUBLIC_URL)
-        .json(&serde_json::json!({ "password": OWNER_PASSWORD }))
+    assert_eq!(
+        code_of(c.step_up(&session, OWNER_PASSWORD).await).await,
+        (429, "rate_limited".into())
+    );
+    assert_eq!(c.login(OWNER_PASSWORD).await.status(), 204);
+}
+
+/// The other way round: a login flood from the owner's address (a shared
+/// proxy, say) does not stop a signed-in owner stepping up.
+#[tokio::test]
+async fn a_locked_out_login_does_not_block_step_up() {
+    let c = Collector::start().await;
+    for _ in 0..5 {
+        assert_eq!(c.login("wrong password").await.status(), 401);
+    }
+    assert_eq!(
+        code_of(c.login(OWNER_PASSWORD).await).await,
+        (429, "rate_limited".into())
+    );
+    let session = c.session(0);
+    assert_eq!(c.step_up(&session, OWNER_PASSWORD).await.status(), 204);
+}
+
+/// Open `GET /api/stream/sessions/s-1` with `session`.
+async fn open_stream(c: &Collector, session: &str) -> reqwest::Response {
+    let resp = c
+        .request(session, "GET", "/api/stream/sessions/s-1")
         .send()
         .await
         .unwrap();
-    assert_eq!(code_of(login).await, (429, "rate_limited".into()));
+    assert_eq!(resp.status(), 200);
+    resp
+}
+
+/// Whether the SSE body of `stream` ends within `within`.
+async fn ends(stream: reqwest::Response, within: Duration) -> bool {
+    use futures::StreamExt;
+    let mut body = stream.bytes_stream();
+    tokio::time::timeout(within, async { while let Some(Ok(_)) = body.next().await {} })
+        .await
+        .is_ok()
+}
+
+/// 3b decision 7: a stream a session opened ends when that session does,
+/// by a revoke or a logout; another session's stream stays open.
+#[tokio::test]
+async fn ending_a_session_ends_its_open_streams() {
+    let c = Collector::start().await;
+    let owner = c.session(0);
+    let kept = open_stream(&c, &owner).await;
+
+    let revoked = c.session(0);
+    let stream = open_stream(&c, &revoked).await;
+    let resp = c
+        .request(&owner, "DELETE", &format!("/api/auth/sessions/{}", c.id_of(&revoked)))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 204);
+    assert!(
+        ends(stream, Duration::from_secs(1)).await,
+        "a revoked session's stream stayed open"
+    );
+
+    let signed_out = c.session(0);
+    let stream = open_stream(&c, &signed_out).await;
+    let resp = c.request(&signed_out, "POST", "/api/auth/logout").send().await.unwrap();
+    assert_eq!(resp.status(), 204);
+    assert!(
+        ends(stream, Duration::from_secs(1)).await,
+        "a signed-out session's stream stayed open"
+    );
+
+    // Control: the owner's own stream is still open.
+    assert!(
+        !ends(kept, Duration::from_millis(200)).await,
+        "an unrelated stream ended"
+    );
+}
+
+/// A logged request must never show the password.
+#[test]
+fn a_step_up_request_does_not_show_its_password_in_debug() {
+    let shown = format!(
+        "{:?}",
+        StepUpRequest {
+            password: OWNER_PASSWORD.into()
+        }
+    );
+    assert!(!shown.contains(OWNER_PASSWORD), "{shown}");
 }
 
 #[tokio::test]
@@ -7351,7 +7637,7 @@ Expected:
 - `step_up` fails to compile: `error[E0432]: unresolved imports hennery_proto::rest::AuthSessionItem, hennery_proto::rest::StepUpRequest`.
 - `auth` fails: `every_operator_route_needs_the_session_cookie` and `every_operator_route_applies_the_browser_rules` get 404 from the three routes that do not exist yet.
 
-- [ ] **Step 3: Step-up, the session list and the guarded routes**
+- [ ] **Step 3: Step-up, the session list, the guarded routes and the stream's end**
 
 In `crates/hennery-kernel/Cargo.toml`, replace:
 
@@ -7384,6 +7670,21 @@ use crate::operator::{Authenticated, Operator, session_cookie, session_token};
 use crate::secret::unix_now;
 ```
 
+In `crates/hennery-kernel/src/auth.rs`, replace:
+
+```rust
+use std::sync::Arc;
+
+```
+
+with:
+
+```rust
+use std::sync::Arc;
+use std::time::Duration;
+
+```
+
 Append to `crates/hennery-kernel/src/auth.rs`:
 
 ```rust
@@ -7404,6 +7705,34 @@ pub async fn require_step_up(req: Request, next: Next) -> Response {
     }
     next.run(req).await
 }
+
+/// Resolves once `session` has ended: revoked, signed out, or expired. A
+/// stream a session holds open must not outlive it (3b decision 7), so
+/// long-lived responses end with this. It re-checks the session whenever
+/// the operator announces an ending, and at its expiry (which may have
+/// slid since, through the session's other requests).
+pub async fn session_ended(operator: Arc<Operator>, session: Authenticated) {
+    let mut ends = operator.session_ends();
+    // Whatever ended before this subscription is checked here.
+    let Ok(Some(mut expires_at)) = operator.session_expires_at(&session.session_id, unix_now()) else {
+        return;
+    };
+    loop {
+        let left = Duration::from_secs(expires_at.saturating_sub(unix_now()).max(0) as u64);
+        tokio::select! {
+            changed = ends.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            () = tokio::time::sleep(left) => {}
+        }
+        match operator.session_expires_at(&session.session_id, unix_now()) {
+            Ok(Some(later)) => expires_at = later,
+            Ok(None) | Err(_) => return,
+        }
+    }
+}
 ```
 
 In `crates/hennery-kernel/src/auth_api.rs`, replace:
@@ -7414,10 +7743,10 @@ In `crates/hennery-kernel/src/auth_api.rs`, replace:
 
 use crate::operator::{Operator, PublicUrl, SetupOutcome, cleared_cookie, session_cookie, session_token};
 use crate::secret::unix_now;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router, middleware};
 use hennery_proto::rest::{ApiError, LoginRequest, SetupRequest, SetupResponse};
 use std::net::SocketAddr;
@@ -7433,7 +7762,7 @@ use crate::operator::{
     Authenticated, Operator, PublicUrl, SetupOutcome, cleared_cookie, session_cookie, session_token,
 };
 use crate::secret::unix_now;
-use axum::extract::{ConnectInfo, Extension, Path, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -7446,10 +7775,7 @@ In `crates/hennery-kernel/src/auth_api.rs`, replace:
 
 ```rust
         ));
-    Router::new()
-        .route("/api/setup", post(setup))
-        .merge(browser)
-        .with_state(operator)
+    let private = || middleware::map_response(crate::setup_page::private_headers);
 ```
 
 with:
@@ -7466,26 +7792,37 @@ with:
             ),
         operator.clone(),
     );
-    Router::new()
-        .route("/api/setup", post(setup))
+    let private = || middleware::map_response(crate::setup_page::private_headers);
+```
+
+In `crates/hennery-kernel/src/auth_api.rs`, replace:
+
+```rust
+        .merge(browser)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+```
+
+with:
+
+```rust
         .merge(browser)
         .merge(signed_in)
-        .with_state(operator)
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
 ```
 
 Append to `crates/hennery-kernel/src/auth_api.rs`:
 
 ```rust
 /// `POST /api/auth/step-up/password`: 204, the session stepped up for five
-/// minutes (kernel spec §3.4). Rate limited like login, on the same
-/// budget: both guess the same password.
+/// minutes (kernel spec §3.4). Rate limited like login, on a budget of its
+/// own (3b decision 10).
 async fn step_up(
     State(operator): State<Arc<Operator>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Extension(session): Extension<Authenticated>,
     Json(req): Json<StepUpRequest>,
 ) -> Response {
-    if let Err(retry_after) = operator.login_limiter.attempt(peer.ip(), Instant::now()) {
+    if let Err(retry_after) = operator.step_up_limiter.attempt(peer.ip(), Instant::now()) {
         return rate_limited(
             retry_after,
             "too many wrong passwords from this address; try again later",
@@ -7496,7 +7833,7 @@ async fn step_up(
         Ok(false) => return error(StatusCode::UNAUTHORIZED, "invalid_password", "wrong password"),
         Err(err) => return internal(err),
     }
-    operator.login_limiter.succeeded(peer.ip());
+    operator.step_up_limiter.succeeded(peer.ip());
     match operator.step_up(&session.session_id, unix_now()) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => error(StatusCode::UNAUTHORIZED, "unauthenticated", "sign in first"),
@@ -7555,6 +7892,85 @@ async fn revoke_session(
         Err(err) => internal(err),
     }
 }
+```
+
+In `crates/hennery-kernel/src/operator.rs`, replace:
+
+```rust
+    verifications: AtomicU64,
+    /// Wrong passwords per client address, at login and step-up (kernel
+    /// spec §3.2).
+    pub login_limiter: Limiter,
+}
+```
+
+with:
+
+```rust
+    verifications: AtomicU64,
+    /// Wrong passwords per client address at login (kernel spec §3.2).
+    pub login_limiter: Limiter,
+    /// Wrong passwords per client address at step-up, a budget of its own
+    /// (3b decision 10): a login flood from a shared address does not stop
+    /// a signed-in owner stepping up, nor step-up guesses lock out login.
+    pub step_up_limiter: Limiter,
+    /// Bumped whenever a session ends (revoked or signed out): streams
+    /// held open by a session re-check it on every bump (3b decision 7).
+    ended: tokio::sync::watch::Sender<u64>,
+}
+```
+
+In `crates/hennery-kernel/src/operator.rs`, replace:
+
+```rust
+            login_limiter: Limiter::new(Policy::LOGIN),
+        })
+```
+
+with:
+
+```rust
+            login_limiter: Limiter::new(Policy::LOGIN),
+            step_up_limiter: Limiter::new(Policy::LOGIN),
+            ended: tokio::sync::watch::Sender::new(0),
+        })
+```
+
+In `crates/hennery-kernel/src/operator.rs`, replace:
+
+```rust
+            .execute("DELETE FROM auth_sessions WHERE id_hash = ?1", [session_id])?;
+        Ok(changed > 0)
+    }
+```
+
+with:
+
+```rust
+            .execute("DELETE FROM auth_sessions WHERE id_hash = ?1", [session_id])?;
+        if changed > 0 {
+            self.ended.send_modify(|generation| *generation += 1);
+        }
+        Ok(changed > 0)
+    }
+
+    /// Changes whenever a session ends (`revoke_session`, and so logout).
+    pub fn session_ends(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.ended.subscribe()
+    }
+
+    /// When the live session `session_id` expires, without sliding it;
+    /// `None` once it is gone or expired.
+    pub fn session_expires_at(&self, session_id: &str, now: i64) -> Result<Option<i64>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT expires_at FROM auth_sessions WHERE id_hash = ?1 AND expires_at > ?2",
+                params![session_id, now],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
 ```
 
 Append to `crates/hennery-proto/src/rest.rs`:
@@ -7684,28 +8100,108 @@ with:
         state.operator.clone(),
 ```
 
+In `crates/hennery-sessions/src/api.rs`, replace:
+
+```rust
+use crate::store::{AnswerSubmission, ResumeRequest, Store};
+use axum::extract::{Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+```
+
+with:
+
+```rust
+use crate::store::{AnswerSubmission, ResumeRequest, Store};
+use axum::extract::{Extension, Path, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+```
+
+In `crates/hennery-sessions/src/api.rs`, replace:
+
+```rust
+use futures::stream::{self, Stream, StreamExt};
+use hennery_proto::frames::{Capability, CollectorFrame, Indexed, SessionBody};
+```
+
+with:
+
+```rust
+use futures::stream::{self, Stream, StreamExt};
+use hennery_kernel::operator::Authenticated;
+use hennery_proto::frames::{Capability, CollectorFrame, Indexed, SessionBody};
+```
+
+In `crates/hennery-sessions/src/api.rs`, replace:
+
+```rust
+/// Session stream: replays from `Last-Event-ID`, then follows live events.
+async fn stream_session(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+```
+
+with:
+
+```rust
+/// Session stream: replays from `Last-Event-ID`, then follows live events.
+/// The session's events as SSE, until the collector shuts down or the
+/// operator's session that opened it ends (3b decision 7).
+async fn stream_session(
+    State(state): State<AppState>,
+    Extension(operator_session): Extension<Authenticated>,
+    Path(id): Path<String>,
+```
+
+In `crates/hennery-sessions/src/api.rs`, replace:
+
+```rust
+        .chain(follow)
+        .take_until(state.shutdown.clone().cancelled_owned());
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+```
+
+with:
+
+```rust
+        .chain(follow)
+        .take_until(state.shutdown.clone().cancelled_owned())
+        .take_until(hennery_kernel::auth::session_ended(
+            state.operator.clone(),
+            operator_session,
+        ));
+    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+```
+
 - [ ] **Step 4: Update the lock file, regenerate and run the tests**
 
 Run: `cargo build --workspace` (no `--locked`: it records `time` for the kernel), `cargo run -p hennery-proto --bin gen`, then `cargo test -p hennery-testkit --test step_up --test auth --locked`
 Expected: all pass.
 
-- [ ] **Step 5: Revert-probe the step-up layers**
+- [ ] **Step 5: Revert-probe the step-up layers, the separate budget, the stream's end and `Debug`**
 
 1. In `hosts::router`, change `post(mint_pairing_code).route_layer(middleware::from_fn(hennery_kernel::auth::require_step_up))` to `post(mint_pairing_code)`. Rerun `cargo test -p hennery-testkit --test step_up --locked`. Expected: `minting_revoking_a_host_and_revoking_a_session_need_a_fresh_password_check` fails, `(201, "")` where 403 was expected. Restore the code.
 2. In `auth_api::router`, change `delete(revoke_session).route_layer(middleware::from_fn(crate::auth::require_step_up))` to `delete(revoke_session)`. Expected: the same test fails. Restore the code.
 3. In `hosts::router`, change `delete(revoke_host).route_layer(middleware::from_fn(hennery_kernel::auth::require_step_up))` to `delete(revoke_host)`. Expected: the same test fails. Restore the code.
-4. In `step_up`, change `if let Err(retry_after) = operator.login_limiter.attempt(peer.ip(), Instant::now())` to `if let (false, Err(retry_after)) = (true, operator.login_limiter.attempt(peer.ip(), Instant::now()))`. Expected: `wrong_step_ups_count_against_the_login_limit` fails. Restore the code.
+4. In `step_up`, use `operator.login_limiter` in place of `operator.step_up_limiter`, in both places. Expected: `wrong_step_ups_lock_out_step_up_only` and `a_locked_out_login_does_not_block_step_up` both fail. Restore the code.
+5. In `stream_session`, remove the `.take_until(hennery_kernel::auth::session_ended(…))` call. Expected: `ending_a_session_ends_its_open_streams` fails after its one-second wait. Restore the code.
+6. In `Operator::revoke_session`, remove `self.ended.send_modify(|generation| *generation += 1);`. Expected: the same test fails. Restore the code.
+7. In `StepUpRequest`'s `Debug`, add `.field("password", &self.password)`. Expected: `a_step_up_request_does_not_show_its_password_in_debug` fails. Restore the code.
 
-- [ ] **Step 6: Run the whole gate**
+- [ ] **Step 6: Check the timing-sensitive tests under load**
+
+Run: `cargo test -p hennery-testkit --test step_up --test auth --test login --test setup --no-run --locked`, then run each printed binary four times at once, three times over.
+Expected: every run passes. `ending_a_session_ends_its_open_streams` waits on the stream's end with a one-second bound; it never sleeps for the ending itself.
+
+- [ ] **Step 7: Run the whole gate**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo clippy -p hennery --locked -- -D warnings && cargo test --workspace --locked && cargo run -p hennery-proto --bin gen -- --check && cargo run --bin gen -- --check`
-Expected: all 422 tests pass. The CLI's revoke tests pass without an explicit step-up: the session the setup opened is stepped up (decision 3).
+Expected: all 430 tests pass. The CLI's revoke tests pass without an explicit step-up: the session the setup opened is stepped up (decision 3).
 
-- [ ] **Step 7: Commit and push**
+- [ ] **Step 8: Commit and push**
 
 ```bash
 git add Cargo.lock crates schema web/src/generated
-git commit -m "feat(kernel): step-up for minting, host revoke and session revoke; the session list"
+git commit -m "feat(kernel): step-up for minting, host revoke and session revoke; the session list; streams end with their session"
 git push
 ```
 
@@ -7875,7 +8371,7 @@ Expected: `host_help_lists_join_and_run`, `joining_over_http_ignores_a_configure
 - [ ] **Step 5: Run the whole gate**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo clippy -p hennery --locked -- -D warnings && cargo test --workspace --locked && cargo run -p hennery-proto --bin gen -- --check && cargo run --bin gen -- --check`
-Expected: all 423 tests pass.
+Expected: all 431 tests pass.
 
 - [ ] **Step 6: Commit and push**
 
@@ -7897,12 +8393,12 @@ git push
 - **`config.toml`**, and the precedence of flags, then environment, then file, then defaults. Also a `public_url` there, so the setup link can name it (kernel §3.1: `<public_url or http://localhost:PORT>`).
 - **The admin socket** (`admin.sock`, 0600):
   - print the setup URL: it needs `Operator::announce_setup`'s link, which lives in memory;
-  - reset the password: a new `set_password` on `Operator`, which also ends every session;
-  - **reset `public_url`** (decision 4's lock-out): an admin-socket command, or a `config.toml` value that overrides the stored one;
+  - reset the password: a new `set_password` on `Operator`, which also ends every session and bumps the ending generation (decision 7), so their streams end too;
+  - **reset `public_url`** (decision 4's lock-out): an admin-socket command, or a `config.toml` value that overrides the stored one. Either path must replace `Operator`'s cached `public_url`, not only the `settings` row;
   - list hosts; mint a pairing code.
 
   Destructive commands need a confirmation on a TTY.
-- **`owner_id` on the older tables** (decision 1): `hosts`, `pairing_codes` and every sessions-store table, backfilled with the one owner, with every query filtering by it.
+- **`owner_id` on the older tables** (decision 1): `hosts`, `pairing_codes` and every sessions-store table, backfilled with the one owner, with every query filtering by it. That includes the operator's own queries, which select across all owners today: `verify_password`, `authenticate`, `step_up`, `sessions`, `revoke_session` and `load_public_url` (and `session_expires_at`).
 - **`/healthz` and `/readyz`**, exempt (kernel §3.3). A test pins that they carry no data.
 
 **Plan 3c, passkeys** (unchanged): `webauthn-rs`, with the RP id and origin from `public_url` and ceremony state in memory. Several labelled passkeys, removable while another login method remains. Step-up by passkey. Tests with the `passkey` crate's software authenticator. `webauthn-rs` needs OpenSSL: add `openssl` and `pkg-config` to `flake.nix`'s dev shell (no global install), and vendor it statically for the musl build.
@@ -7917,20 +8413,30 @@ git push
 
   Each gets `.route_layer(require_step_up)` and a row in `step_up.rs`.
 - **The frontend:**
-  - the setup page behind `/setup/{token}`, which POSTs `SetupRequest` with the token from its own path;
+  - the setup page at `/setup`, replacing `setup_page.rs`: it reads the token from the fragment and POSTs `SetupRequest` (decision 16);
   - the login form;
   - the `step_up_required` prompt and retry (frontend spec §3);
   - Settings' session list, rendering `user_agent` escaped.
 - **The default hat's name** in `SetupRequest` (decision 3), with hats.
-- **The login limiter behind a proxy** (decision 6): a flood through a reverse proxy locks the owner out for up to an hour. If that is seen in practice: a global budget, or a signed forwarded identity (spec-deferred).
+- **The login limiter behind a proxy** (decision 6): a flood through a reverse proxy locks every client behind it out of password login for up to an hour, since they share one address. What still works:
+  - a collector restart clears the lockout (the limits live in memory);
+  - a signed-in owner can still step up (decision 10);
+  - passkey login (3c) must not be gated by the password limiter's lockout.
+
+  If lockouts are seen in practice, the options are OWASP-style device cookies (a browser that logged in before keeps its own budget), or a signed forwarded identity (deferred by the spec).
 - **The collector's single writer thread** (kernel §1). Decision 14 serialises today's three writers with `IMMEDIATE` transactions; one writer would also remove the busy waits.
-- **A race found while building this plan, not caused by it:**
+- **A race found while building this plan, not caused by it, to fix on its own, separately from auth:**
   - The race: `up` installs its signal handlers only after it has spawned both children. A SIGTERM before then kills `up` by the default action and leaves the collector child orphaned (reparented to launchd, still running).
   - How it shows: `up_warns_about_a_loose_existing_data_root` sends SIGTERM right after `up`'s data-root warning, so it can hit that window. It left one orphaned collector in about ten full runs.
   - The fix: register the `SIGINT` and `SIGTERM` streams at the top of `run_up`, before any spawn, and wait on those streams in the select loop.
 - **One parallel-load failure seen:** with 32 test binaries at once (eight of them, four copies each), `up_pairs_its_own_host_once` once timed out waiting for the setup link, most likely `free_listen`'s port being taken between release and bind. Four copies of the CLI binary alone passed 12 of 12.
-- **The redacting `Debug` of `SetupRequest`, `LoginRequest` and `StepUpRequest` has no test.** A one-line `format!("{req:?}")` check per type would pin it.
-- **Spec amendments:** decisions 1 and 14, and in kernel §3.3 the rule that every method but `GET` and `HEAD` is state-changing (decision 8).
+- **Hardening the review suggested and the coordinator skipped for now:**
+  - the `__Host-` cookie prefix, which renames the cookie kernel §3.2 fixes as `hennery_session`;
+  - revoking a live session that is presented to login, in place of opening a second one;
+  - a dummy hash precomputed at start, not on the first check before setup.
+- **`is_json_or_empty` and HTTP/2** (decision 8). The rule reads a body-less request from `Content-Length` (absent or 0) and a missing `Transfer-Encoding`. Over HTTP/2, which forbids `Transfer-Encoding`, a body can arrive with neither header, so a body with no `Content-Type` passes the rule. Two things hold it today: every handler that reads a body takes `Json`, which refuses a missing `Content-Type` on its own (415), and the body-less handlers never read one. If a handler ever reads a raw body, check it for itself.
+- **The setup page's script** is checked only statically: served, and naming `location.hash` and `/api/setup`. A browser test of it comes with the frontend's own test setup.
+- **Spec amendments:** decisions 1, 14 and 16, and in kernel §3.3 the rule that every method but `GET` and `HEAD` is state-changing (decision 8).
 
 **Carried from plan 3a, unchanged:**
 - `wss://` for remote hosts (3a decision 10), with the `hennery-hello-nonce` header live-checked through Caddy, nginx and `tailscale serve`, and a smaller first-frame limit;
