@@ -804,13 +804,15 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     let _cleanup = RemoveDir(dir.clone());
 
     // Written to temporary names and moved into place, so a reader never
-    // sees half a file.
+    // sees half a file. The probe runs in a subshell: a failed redirection
+    // on a special builtin (`:`) ends a POSIX shell such as dash (Debian's
+    // and Ubuntu's `/bin/sh`), which would then never write its report.
     let script = dir.join("envdump.sh");
     let report = |name: &str| dir.join(name);
     std::fs::write(
         &script,
         format!(
-            "if {{ : <&3; }} 2>/dev/null; then echo open > {fd}.tmp; else echo closed > {fd}.tmp; fi\n\
+            "if ( : <&3 ) 2>/dev/null; then echo open > {fd}.tmp; else echo closed > {fd}.tmp; fi\n\
              env > {env}.tmp\nmv {fd}.tmp {fd}\nmv {env}.tmp {env}\n",
             fd = report("fd3.txt").display(),
             env = report("env.txt").display(),
