@@ -27,6 +27,9 @@ pub(super) enum HoldAt {
     SwitchSent,
     /// Right after a switch's deadline orphaned it.
     Orphaned,
+    /// Right after a turn's reply errored, before `exited_within` checks
+    /// whether the adapter has already exited.
+    PromptErrored,
 }
 
 /// Shared between a test and the actor it passes these to (in
@@ -44,6 +47,9 @@ struct Inner {
     released: watch::Sender<bool>,
     /// Switch answers pushed onto the actor's inbound channel so far.
     answers_queued: watch::Sender<u64>,
+    /// Set once the actor is actually parked at its armed hold point,
+    /// waiting for `released`.
+    holding: watch::Sender<bool>,
 }
 
 impl TestHooks {
@@ -61,6 +67,14 @@ impl TestHooks {
         Self::holding_at(HoldAt::Orphaned)
     }
 
+    /// Hold the actor right after a turn's reply errors, before it checks
+    /// whether the adapter has already exited, until `release`. Lets a test
+    /// force the real exit only once the actor is provably waiting to check
+    /// for it, instead of racing a fixed sleep against `EXIT_SETTLE`.
+    pub fn hold_after_prompt_errors() -> Self {
+        Self::holding_at(HoldAt::PromptErrored)
+    }
+
     fn holding_at(hold_at: HoldAt) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -68,6 +82,7 @@ impl TestHooks {
                 hold_armed: AtomicBool::new(true),
                 released: watch::Sender::new(false),
                 answers_queued: watch::Sender::new(0),
+                holding: watch::Sender::new(false),
             }),
         }
     }
@@ -92,9 +107,18 @@ impl TestHooks {
         self.inner.answers_queued.send_modify(|count| *count += 1);
     }
 
+    /// Resolves once the actor has reached its armed hold point and is
+    /// actually waiting there for `release` — as opposed to a test assuming
+    /// so from timing alone.
+    pub async fn holding(&self) {
+        let mut holding = self.inner.holding.subscribe();
+        let _ = holding.wait_for(|holding| *holding).await;
+    }
+
     /// Called by the actor at each hold point.
     pub(super) async fn hold_if_armed(&self, at: HoldAt) {
         if self.inner.hold_at == at && self.inner.hold_armed.swap(false, Ordering::SeqCst) {
+            self.inner.holding.send_replace(true);
             let mut released = self.inner.released.subscribe();
             let _ = released.wait_for(|released| *released).await;
         }

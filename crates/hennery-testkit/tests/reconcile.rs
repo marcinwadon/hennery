@@ -928,7 +928,7 @@ async fn the_session_detail_shows_the_open_turn() {
         json!({
             "session_id": session, "host_id": HOST, "agent": "fake", "cwd": "/tmp",
             "lifecycle": "active", "activity": "running", "presumed_parked": false,
-            "open_turn": { "turn_id": turn, "state": "started" }
+            "open_turn": { "turn_id": turn, "state": "started" }, "pending": []
         })
     );
     let (status, _) = get(&client(), collector.url("/api/sessions/no-such-session")).await;
@@ -1512,4 +1512,297 @@ async fn every_catalogue_change_is_also_a_catalog_changed_message_on_the_session
         .find(|m| m.contains("config_option_update"))
         .unwrap();
     assert_eq!(id(changed[0]), id(update), "catalog_changed carries its event's id");
+}
+
+// Plan (2): answers through the API, the queue and the host (ACP core §4.6,
+// §5, §9).
+
+fn opened(pending_id: &str, turn_id: &str) -> SessionBody {
+    use hennery_proto::frames::{Indexed, PendingExtract, PendingKind};
+    SessionBody::PendingOpened {
+        pending_id: pending_id.into(),
+        indexed: Indexed {
+            turn_id: Some(turn_id.into()),
+            pending: Some(PendingExtract {
+                id: pending_id.into(),
+                kind: PendingKind::Permission,
+                option_ids: Some(vec!["allow".into(), "reject".into()]),
+            }),
+            ..Indexed::default()
+        },
+        payload: json!({"toolCall": {"toolCallId": "call-1"}}),
+    }
+}
+
+fn answer_url(collector: &Collector, session: &str, pending_id: &str) -> String {
+    collector.url(&format!("/api/sessions/{session}/pending/{pending_id}/answer"))
+}
+
+/// A session with turn `t` running and question `p1` open in it.
+async fn asking_session(collector: &Collector, host: &mut ScriptedHost) -> (String, String) {
+    let session = started_session(collector, host).await;
+    let turn = started_turn(collector, host, &session).await;
+    host.emit(&session, opened("p1", &turn)).await;
+    wait_for("the question", || async {
+        (!collector.state.store.open_pending(&session).unwrap().is_empty()).then_some(())
+    })
+    .await;
+    (session, turn)
+}
+
+/// The next frame must be `p1`'s answer; returns its request id.
+async fn expect_answer(host: &mut ScriptedHost, session: &str, option: &str) -> String {
+    match host.next().await {
+        CollectorFrame::AnswerPermission {
+            request_id,
+            session_id,
+            pending_id,
+            option_id,
+        } => {
+            assert_eq!(
+                (session_id.as_str(), pending_id.as_str(), option_id.as_str()),
+                (session, "p1", option)
+            );
+            request_id
+        }
+        other => panic!("expected an answer, got {other:?}"),
+    }
+}
+
+fn verdict_of(collector: &Collector) -> Option<bool> {
+    collector.state.store.pending_item("p1").unwrap().unwrap().delivered
+}
+
+#[tokio::test]
+async fn an_answer_is_queued_sent_to_the_host_and_its_verdict_recorded() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let (session, _) = asking_session(&collector, &mut host).await;
+    let detail_url = collector.url(&format!("/api/sessions/{session}"));
+    let (_, detail) = get(&client(), detail_url.clone()).await;
+    assert_eq!(detail["activity"], "blocked");
+    assert_eq!(detail["pending"][0]["pending_id"], "p1");
+    assert_eq!(detail["pending"][0]["option_ids"], json!(["allow", "reject"]));
+
+    let url = answer_url(&collector, &session, "p1");
+    let (status, body) = post(&client(), url.clone(), json!({"option_id": "allow"})).await;
+    assert_eq!(status, 202, "{body}");
+    let request_id = expect_answer(&mut host, &session, "allow").await;
+    assert_eq!(body, json!({"pending_id": "p1", "request_id": request_id}));
+    // One answer per question, even before its verdict.
+    let (status, body) = post(&client(), url.clone(), json!({"option_id": "reject"})).await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("already_answered")));
+
+    host.emit(
+        &session,
+        SessionBody::AnswerResult {
+            pending_id: "p1".into(),
+            request_id,
+            delivered: true,
+        },
+    )
+    .await;
+    host.emit(
+        &session,
+        SessionBody::PendingResolved {
+            pending_id: "p1".into(),
+            resolution: hennery_proto::frames::PendingResolution::Delivered,
+            reason: None,
+        },
+    )
+    .await;
+    wait_for("delivered", || async {
+        (verdict_of(&collector) == Some(true)).then_some(())
+    })
+    .await;
+    let (_, detail) = get(&client(), detail_url).await;
+    assert_eq!(
+        (detail["activity"].as_str(), &detail["pending"]),
+        (Some("running"), &json!([]))
+    );
+    let (status, body) = post(&client(), url, json!({"option_id": "allow"})).await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("not_open")));
+}
+
+#[tokio::test]
+async fn answers_are_checked_against_the_stored_request() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let (session, _) = asking_session(&collector, &mut host).await;
+    let url = answer_url(&collector, &session, "p1");
+    let (status, body) = post(&client(), url.clone(), json!({"option_id": "maybe"})).await;
+    assert_eq!((status, body["code"].as_str()), (400, Some("invalid")), "{body}");
+    let (status, _) = post(&client(), url.clone(), json!({"action": "accept"})).await;
+    assert_eq!(status, 400, "an elicitation's answer to a permission request");
+    let (status, _) = post(&client(), url, json!({"action": "whatever"})).await;
+    assert_eq!(status, 422);
+    let (status, body) = post(
+        &client(),
+        answer_url(&collector, &session, "no-such-question"),
+        json!({"option_id": "allow"}),
+    )
+    .await;
+    assert_eq!((status, body["code"].as_str()), (404, Some("not_found")));
+    assert!(verdict_of(&collector).is_none(), "nothing was queued");
+}
+
+/// Scenario 9: an answer given while the host is away is delivered after
+/// its next handshake, and again after the one after that for as long as
+/// no verdict came (the host dedupes by pending id).
+#[tokio::test]
+async fn an_answer_given_while_the_host_is_offline_is_sent_after_its_next_handshake() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let (session, turn) = asking_session(&collector, &mut host).await;
+    let seq = host.seq;
+    host.drop_connection(&collector).await;
+    let (status, body) = post(
+        &client(),
+        answer_url(&collector, &session, "p1"),
+        json!({"option_id": "allow"}),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+
+    let listed = || {
+        vec![AttachedSession {
+            session_id: session.clone(),
+            last_seq: seq,
+            open_turn_id: Some(turn.clone()),
+        }]
+    };
+    let mut host = ScriptedHost::hello(&collector, listed(), seq).await;
+    // Nothing before the reconciliation.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), host.next())
+            .await
+            .is_err(),
+        "sent before resend_complete"
+    );
+    host.send(&HostFrame::ResendComplete).await;
+    let first = expect_answer(&mut host, &session, "allow").await;
+    host.drop_connection(&collector).await;
+    let mut host = ScriptedHost::connect(&collector, listed(), seq).await;
+    assert_eq!(expect_answer(&mut host, &session, "allow").await, first, "resent as is");
+    assert!(verdict_of(&collector).is_none());
+}
+
+/// A host's refusal (no live actor for the session) is logged, not a
+/// verdict: the answer waits for its question's resolution.
+#[tokio::test]
+async fn a_refused_answer_gets_its_verdict_from_its_questions_resolution() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let (session, _) = asking_session(&collector, &mut host).await;
+    post(
+        &client(),
+        answer_url(&collector, &session, "p1"),
+        json!({"option_id": "allow"}),
+    )
+    .await;
+    let request_id = expect_answer(&mut host, &session, "allow").await;
+    host.send(&HostFrame::Error {
+        request_id,
+        code: "not_attached".into(),
+        message: "session is not attached on this host".into(),
+    })
+    .await;
+    // Frames are read in order: once this note is in, so is the refusal.
+    host.emit(
+        &session,
+        SessionBody::HostNote {
+            note: "marker".into(),
+            text: String::new(),
+        },
+    )
+    .await;
+    wait_for("the marker", || async {
+        collector
+            .event_kinds(&session)
+            .contains(&"host_note".to_string())
+            .then_some(())
+    })
+    .await;
+    assert_eq!(verdict_of(&collector), None, "a refusal is logged, not a verdict");
+    host.emit(
+        &session,
+        SessionBody::PendingResolved {
+            pending_id: "p1".into(),
+            resolution: hennery_proto::frames::PendingResolution::Cancelled,
+            reason: Some(hennery_proto::frames::PendingReason::AdapterLost),
+        },
+    )
+    .await;
+    wait_for("the verdict", || async {
+        (verdict_of(&collector) == Some(false)).then_some(())
+    })
+    .await;
+}
+
+/// Scenario 7's questions: a restarted host holds none, so they are
+/// cancelled after its resend, and an answer queued for one is never sent.
+#[tokio::test]
+async fn a_host_restart_cancels_the_open_questions_and_drops_their_queued_answers() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let (session, _) = asking_session(&collector, &mut host).await;
+    host.drop_connection(&collector).await;
+    post(
+        &client(),
+        answer_url(&collector, &session, "p1"),
+        json!({"option_id": "allow"}),
+    )
+    .await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    assert_eq!(collector.lifecycle(&session), "parked");
+    let item = collector.state.store.pending_item("p1").unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value((item.state, item.reason, item.delivered)).unwrap(),
+        json!(["cancelled", "host_restarted", false])
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), host.next())
+            .await
+            .is_err(),
+        "an answer to a cancelled question was sent"
+    );
+}
+
+#[tokio::test]
+async fn every_step_of_a_question_is_a_pending_changed_message_on_the_session_stream() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let (session, _) = asking_session(&collector, &mut host).await;
+    post(
+        &client(),
+        answer_url(&collector, &session, "p1"),
+        json!({"option_id": "allow"}),
+    )
+    .await;
+    let request_id = expect_answer(&mut host, &session, "allow").await;
+    host.emit(
+        &session,
+        SessionBody::AnswerResult {
+            pending_id: "p1".into(),
+            request_id,
+            delivered: true,
+        },
+    )
+    .await;
+    let stream = read_stream(&collector, &session, |s| {
+        s.matches("event: pending_changed").count() >= 3
+    })
+    .await;
+    let messages: Vec<&str> = stream.split("\n\n").collect();
+    let id = |m: &str| m.lines().find(|l| l.starts_with("id: ")).map(str::to_string);
+    for kind in ["pending_opened", "answer_submitted", "answer_result"] {
+        let at = messages
+            .iter()
+            .position(|m| m.contains("event: event") && m.contains(&format!(r#""kind":"{kind}""#)))
+            .unwrap_or_else(|| panic!("no {kind} in {stream}"));
+        let changed = messages[at + 1];
+        assert!(changed.contains("event: pending_changed"), "{changed}");
+        assert_eq!(id(changed), id(messages[at]), "pending_changed carries its event's id");
+        assert!(changed.contains(r#""pending_id":"p1""#), "{changed}");
+    }
 }

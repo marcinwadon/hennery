@@ -4,12 +4,16 @@
 
 use hennery_host::outbox::Outbox;
 use hennery_host::session::test_hooks::{self, TestHooks};
-use hennery_host::session::{self, AgentCommand, Attach, Launch, SessionCmd, SessionHandle, SessionOptions};
+use hennery_host::session::{self, AgentCommand, Answer, Attach, Launch, SessionCmd, SessionHandle, SessionOptions};
 use hennery_host::uplink::Uplink;
-use hennery_proto::frames::{ConfigValue, HostFrame, Indexed, SessionBody, SessionConfig, TurnOutcome};
-use hennery_testkit::{FakeScript, SCRIPT_ENV, pid_alive};
+use hennery_proto::frames::{
+    ConfigValue, ElicitationAction, HostFrame, Indexed, PendingExtract, PendingKind, SessionBody, SessionConfig,
+    TurnOutcome,
+};
+use hennery_testkit::{FakeAsk, FakeScript, SCRIPT_ENV, pid_alive};
 use serde_json::json;
 use std::path::Path;
+use std::process::Command;
 use std::time::Duration;
 
 fn kinds(frames: &[HostFrame]) -> Vec<String> {
@@ -37,10 +41,24 @@ fn kinds(frames: &[HostFrame]) -> Vec<String> {
                 SessionBody::AdapterExited { .. } => "adapter_exited".to_string(),
                 SessionBody::HostNote { note, .. } => format!("host_note:{note}"),
                 SessionBody::ConfigApplied { .. } => "config_applied".to_string(),
+                SessionBody::PendingOpened { indexed, .. } => match &indexed.pending {
+                    Some(pending) => format!("pending_opened:{}", tag(pending.kind)),
+                    None => "pending_opened:?".to_string(),
+                },
+                SessionBody::PendingResolved { resolution, reason, .. } => match reason {
+                    Some(reason) => format!("pending_resolved:{}:{}", tag(resolution), tag(reason)),
+                    None => format!("pending_resolved:{}", tag(resolution)),
+                },
+                SessionBody::AnswerResult { delivered, .. } => format!("answer_result:{delivered}"),
             },
             other => format!("{other:?}"),
         })
         .collect()
+}
+
+/// A wire enum's snake_case name.
+fn tag(value: impl serde::Serialize) -> String {
+    serde_json::to_value(value).unwrap().as_str().unwrap().to_string()
 }
 
 async fn wait_until(uplink: &Uplink, pred: impl Fn(&[HostFrame]) -> bool) -> Vec<HostFrame> {
@@ -531,9 +549,27 @@ async fn a_repeated_start_re_emits_session_started_with_the_new_request_id() {
     );
 }
 
-/// The adapter's stdout reaches EOF 300 ms before its process exits, so the
-/// prompt fails before the exit watcher sees the exit. The turn must still
-/// end `interrupted` (the adapter is gone), not `failed`.
+/// The adapter's stdout reaches EOF before its process actually exits, so
+/// the prompt fails before the exit watcher sees the exit. The turn must
+/// still end `interrupted` (the adapter is gone), not `failed`.
+///
+/// This used to be set up with a fixed `sleep 0.3` in the wrapper, racing
+/// `EXIT_SETTLE`'s fixed 500 ms budget: under load (several copies of this
+/// test binary at once) either timer can outrun the other for reasons that
+/// have nothing to do with the code under test, flaking the assertion.
+/// Instead the wrapper closes stdout and then blocks reading a FIFO, so it
+/// physically cannot exit until this test says so. The actor is held
+/// (`test_hooks::HoldAt::PromptErrored`) right where it is about to check
+/// whether the adapter has already exited; `hooks.holding()` proves it is
+/// actually parked there. Only then does the test release the hold — and
+/// give the now-runnable actor a scheduling turn (`yield_now`) to reach and
+/// subscribe to the adapter's exit watch — before letting the wrapper read
+/// the FIFO and exit. So the wrapper cannot exit before the actor is
+/// already subscribed and waiting for that exit; the residual, much
+/// smaller dependency is that the real exit must land within `EXIT_SETTLE`
+/// of the actor starting to wait, which a revert-probe (`EXIT_SETTLE` set
+/// to zero, ~20 runs, reliably `Failed`) confirmed is genuinely exercised,
+/// not skipped by an adapter that turns out to already be exited.
 #[tokio::test]
 async fn a_prompt_that_fails_because_the_adapter_is_dying_ends_interrupted() {
     let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
@@ -542,17 +578,54 @@ async fn a_prompt_that_fails_because_the_adapter_is_dying_ends_interrupted() {
         exit_after_chunks: Some(1),
         ..FakeScript::default()
     };
+    let dir = tempfile::tempdir().unwrap();
+    let fifo = dir.path().join("go");
+    assert!(
+        Command::new("mkfifo").arg(&fifo).status().unwrap().success(),
+        "mkfifo failed"
+    );
     let wrapper = AgentCommand {
         program: "sh".into(),
         args: vec![
             "-c".into(),
-            format!("{} ; exec >&- ; sleep 0.3", env!("CARGO_BIN_EXE_hennery-fake-acp")),
+            format!(
+                "{} ; exec >&- ; read _ < {}",
+                env!("CARGO_BIN_EXE_hennery-fake-acp"),
+                fifo.display()
+            ),
         ],
         env: vec![(SCRIPT_ENV.into(), serde_json::to_string(&script).unwrap())],
     };
-    let handle = session::start(uplink.clone(), "r0".into(), "s1".into(), wrapper, std::env::temp_dir());
+    let hooks = TestHooks::hold_after_prompt_errors();
+    let handle = session::spawn(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        wrapper,
+        std::env::temp_dir(),
+        SessionOptions {
+            test_hooks: Some(hooks.clone()),
+            ..SessionOptions::default()
+        },
+    );
     wait_until(&uplink, has("session_started")).await;
     assert!(handle.send(prompt("r1", "t1")));
+    // Provably waiting right before the exit check.
+    tokio::time::timeout(Duration::from_secs(30), hooks.holding())
+        .await
+        .expect("the actor never reached the prompt-errored hold");
+    hooks.release();
+    // Let the now-runnable actor actually reach and subscribe to the
+    // adapter's exit watch before the wrapper is allowed to exit for real:
+    // otherwise the exit could land before the actor started watching for
+    // it, which would silently turn this into a test of the "already
+    // exited" path instead of the "wait for it" path.
+    tokio::task::yield_now().await;
+    let go = fifo.clone();
+    tokio::task::spawn_blocking(move || std::fs::write(&go, b"go\n"))
+        .await
+        .unwrap()
+        .expect("writing to the fifo failed");
     let frames = wait_until(&uplink, has("session_parked:adapter_exited")).await;
     let outcomes: Vec<TurnOutcome> = frames
         .iter()
@@ -2604,24 +2677,51 @@ async fn a_switch_queued_behind_one_the_pre_turn_drain_answers_is_sent_without_w
 /// a synchronous drain-then-decide would have made worst, since draining
 /// ties up the actor for exactly as long as it takes to work through
 /// whatever has accumulated by the time the deadline fires.
+///
+/// "Read promptly" is measured directly rather than by waiting for the turn
+/// to fully end: the fake appends to `cancel_received_file` the instant
+/// `session/cancel` reaches it on the wire, which happens as soon as the
+/// actor's `commands` arm processes the `Cancel` — that arm sends the
+/// notification synchronously, in the same `select!` iteration, so this is
+/// a direct signal for "the actor read the command", not an inference from
+/// how long everything downstream then takes. The old assertion
+/// (`while handle.open_turn_id().is_some() { .. 20s .. }`) instead waited
+/// for the turn to fully end, which requires draining however much of the
+/// literally-never-ending flood is left — a quantity that scales with
+/// system load, not with whether the cancel was read promptly, and flaked
+/// under heavy concurrent stress for exactly that reason.
+///
+/// `config_timeout` (1s) is longer than it needs to be for the fix to pass
+/// quickly, deliberately: it gives the flood a real window to build a
+/// substantial backlog before `out_deadline` fires, so a reinstated
+/// synchronous drain there is slow enough to fail reliably, not just
+/// "sometimes measurably slower". Measured empirically (revert-probe:
+/// reinstating `self.drain_updates(..)` in `out_deadline`'s orphan branch,
+/// the round-1 bug this test exists to catch): with the fix, the fake sees
+/// `session/cancel` in 20-130ms even under 4-way concurrent stress; with
+/// the bug reinstated, it consistently takes 2.1-2.6s (four standalone
+/// runs). The budget below sits well clear of both.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cancel_is_read_promptly_even_though_a_switch_deadline_fires_mid_flood() {
     let dir = tempfile::tempdir().unwrap();
     let log = dir.path().join("config.log");
+    let cancel_received = dir.path().join("cancel_received");
     let (uplink, mut replies) = Uplink::new(Outbox::open(&dir.path().join("outbox.db")).unwrap());
     let script = FakeScript {
         chunks: vec!["flood".into()],
         flood: true,
         hang_config: true,
+        cancel_received_file: Some(cancel_received.to_string_lossy().into_owned()),
         ..config_script(&log)
     };
+    let config_timeout = Duration::from_secs(1);
     let handle = launching(
         &uplink,
         &script,
         Attach::New,
         SessionConfig::default(),
         SessionOptions {
-            config_timeout: Duration::from_millis(200),
+            config_timeout,
             ..SessionOptions::default()
         },
     );
@@ -2633,22 +2733,21 @@ async fn a_cancel_is_read_promptly_even_though_a_switch_deadline_fires_mid_flood
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
-    // Well past `config_timeout` (200ms): `out_deadline` has certainly
-    // fired by now, mid-flood, and (since `hang_config` never answers)
-    // certainly orphaned rc1 rather than disarmed it.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // Well past `config_timeout`: `out_deadline` has certainly fired by
+    // now, mid-flood (with a real backlog built up behind it), and (since
+    // `hang_config` never answers) certainly orphaned rc1 rather than
+    // disarmed it.
+    tokio::time::sleep(config_timeout + Duration::from_millis(200)).await;
     assert!(handle.send(cancel("rc2", "t1")));
-    // A synchronous drain in `out_deadline` would tie the actor up for as
-    // long as it takes to work through everything the flood produced by
-    // the time the deadline fired — unbounded, in practice (a bare few
-    // hundred ms of flood was already observed to take 10s+ to recover
-    // from under the drain-based round-1 fix). Without any drain there,
-    // the cancel gets its fair turn within one burst cycle. The budget also
-    // covers draining the flood's backlog before the cancelled turn ends,
-    // slow on a loaded macOS runner: 20s, like the sibling
-    // `a_flooding_adapter_cannot_hold_off_a_cancel` (final review M3).
-    let cancel_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    while handle.open_turn_id().is_some() {
+    // The property under test: reading the `Cancel` command (and so
+    // forwarding `session/cancel`) does not wait on the flood. See the doc
+    // comment above for the measured fixed-vs-buggy gap this budget sits
+    // between.
+    let cancel_deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+    loop {
+        if std::fs::metadata(&cancel_received).is_ok_and(|meta| meta.len() > 0) {
+            break;
+        }
         assert!(
             tokio::time::Instant::now() < cancel_deadline,
             "the cancel was held off by the switch's own deadline arm"
@@ -2705,4 +2804,511 @@ async fn a_start_switch_that_timed_out_blocks_set_config_until_its_grace_passes(
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+// Plan (2): permission and elicitation (ACP core §2.5, §4.6).
+
+fn asking(asks: Vec<FakeAsk>) -> FakeScript {
+    FakeScript {
+        asks,
+        ..FakeScript::default()
+    }
+}
+
+/// A new session `s1` of the fake with `script`, default options.
+fn starting(uplink: &Uplink, script: &FakeScript) -> SessionHandle {
+    session::start(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        fake_with(script),
+        std::env::temp_dir(),
+    )
+}
+
+/// Every `pending_opened`: its extract, turn and ACP payload.
+fn opened(frames: &[HostFrame]) -> Vec<(PendingExtract, Option<String>, serde_json::Value)> {
+    frames
+        .iter()
+        .filter_map(|f| match f {
+            HostFrame::Session {
+                body: SessionBody::PendingOpened { indexed, payload, .. },
+                ..
+            } => Some((
+                indexed.pending.clone().unwrap(),
+                indexed.turn_id.clone(),
+                payload.clone(),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The id of the `n`th pending request opened, once it is.
+async fn nth_pending(uplink: &Uplink, n: usize) -> String {
+    let frames = wait_until(uplink, |f| opened(f).len() > n).await;
+    opened(&frames)[n].0.id.clone()
+}
+
+fn choose(request_id: &str, pending_id: &str, option_id: &str) -> SessionCmd {
+    SessionCmd::Answer {
+        request_id: request_id.into(),
+        pending_id: pending_id.into(),
+        answer: Answer::Permission {
+            option_id: option_id.into(),
+        },
+    }
+}
+
+/// Every `answer_result`: (request id, pending id, delivered).
+fn verdicts(frames: &[HostFrame]) -> Vec<(String, String, bool)> {
+    frames
+        .iter()
+        .filter_map(|f| match f {
+            HostFrame::Session {
+                body:
+                    SessionBody::AnswerResult {
+                        pending_id,
+                        request_id,
+                        delivered,
+                    },
+                ..
+            } => Some((request_id.clone(), pending_id.clone(), *delivered)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_permission_request_waits_for_the_operator_and_the_answer_reaches_the_agent() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let handle = starting(&uplink, &asking(vec![FakeAsk::Permission]));
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let pending = nth_pending(&uplink, 0).await;
+    // Nothing moves until the operator answers: the turn stays open.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let frames = uplink.pending().unwrap();
+    assert_eq!(
+        kinds(&frames),
+        ["session_started", "turn_started", "pending_opened:permission"]
+    );
+    assert_eq!(handle.open_turn_id().as_deref(), Some("t1"));
+    let (extract, turn, payload) = opened(&frames).remove(0);
+    assert_eq!(
+        (extract.kind, extract.option_ids, turn.as_deref()),
+        (
+            PendingKind::Permission,
+            Some(vec!["allow".to_string(), "reject".to_string()]),
+            Some("t1")
+        )
+    );
+    // Verbatim, `_meta` and all.
+    assert_eq!(payload["toolCall"]["toolCallId"], "call-1");
+
+    assert!(handle.send(choose("ra", &pending, "allow")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    assert_eq!(
+        kinds(&frames)[3..],
+        [
+            "answer_result:true",
+            "pending_resolved:delivered",
+            "update:permission:selected:allow",
+            "update:Hello",
+            "update: world",
+            "turn_ended"
+        ]
+    );
+    assert_eq!(verdicts(&frames), [("ra".to_string(), pending, true)]);
+}
+
+#[tokio::test]
+async fn an_answer_is_delivered_once_and_one_for_a_question_not_open_is_not() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        chunks: vec![],
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let handle = starting(&uplink, &script);
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let pending = nth_pending(&uplink, 0).await;
+    assert!(handle.send(choose("ra", &pending, "reject")));
+    // A resent answer (a reconnect, a second client) and one for a question
+    // this actor never asked: neither has anyone waiting for it.
+    assert!(handle.send(choose("rb", &pending, "allow")));
+    assert!(handle.send(choose("rc", "no-such-question", "allow")));
+    let frames = wait_until(&uplink, |f| verdicts(f).len() == 3).await;
+    assert_eq!(
+        verdicts(&frames),
+        [
+            ("ra".to_string(), pending.clone(), true),
+            ("rb".to_string(), pending, false),
+            ("rc".to_string(), "no-such-question".to_string(), false),
+        ]
+    );
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    let resolved = kinds(&frames)
+        .iter()
+        .filter(|k| k.starts_with("pending_resolved"))
+        .count();
+    assert_eq!(resolved, 1, "{:?}", kinds(&frames));
+    assert!(kinds(&frames).contains(&"update:permission:selected:reject".to_string()));
+}
+
+#[tokio::test]
+async fn an_elicitation_reaches_the_operator_and_the_form_content_reaches_the_agent() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    // The fake asks only a client that advertised form elicitation (P-19).
+    let handle = starting(&uplink, &asking(vec![FakeAsk::Elicitation]));
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let pending = nth_pending(&uplink, 0).await;
+    let frames = uplink.pending().unwrap();
+    let (extract, _, payload) = opened(&frames).remove(0);
+    assert_eq!((extract.kind, extract.option_ids), (PendingKind::Elicitation, None));
+    assert_eq!(payload["mode"], "form");
+    assert!(handle.send(SessionCmd::Answer {
+        request_id: "ra".into(),
+        pending_id: pending,
+        answer: Answer::Elicitation {
+            action: ElicitationAction::Accept,
+            content: Some(json!({"name": "notes.txt"})),
+        },
+    }));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    assert!(
+        kinds(&frames).contains(&r#"update:elicitation:accept:{"name":"notes.txt"}"#.to_string()),
+        "{:?}",
+        kinds(&frames)
+    );
+}
+
+#[tokio::test]
+async fn several_open_questions_each_take_their_own_answer() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        asks_at_once: true,
+        chunks: vec![],
+        ..asking(vec![FakeAsk::Permission, FakeAsk::Elicitation])
+    };
+    let handle = starting(&uplink, &script);
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let first = nth_pending(&uplink, 0).await;
+    let second = nth_pending(&uplink, 1).await;
+    assert!(handle.send(SessionCmd::Answer {
+        request_id: "rb".into(),
+        pending_id: second,
+        answer: Answer::Elicitation {
+            action: ElicitationAction::Decline,
+            content: None,
+        },
+    }));
+    assert!(handle.send(choose("ra", &first, "allow")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    let echoes: Vec<String> = kinds(&frames)
+        .into_iter()
+        .filter(|k| k.starts_with("update:"))
+        .collect();
+    assert_eq!(
+        echoes,
+        ["update:permission:selected:allow", "update:elicitation:decline"]
+    );
+    assert_eq!(verdicts(&frames).iter().filter(|v| v.2).count(), 2);
+}
+
+#[tokio::test]
+async fn a_request_the_host_does_not_serve_is_refused_method_not_found() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        chunks: vec![],
+        ..asking(vec![FakeAsk::Unknown])
+    };
+    let handle = starting(&uplink, &script);
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    assert_eq!(
+        kinds(&frames),
+        [
+            "session_started",
+            "turn_started",
+            "update:unknown:error:-32601",
+            "turn_ended"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_question_asked_while_the_session_loads_opens_after_session_started() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        ask_on_load: true,
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let handle = resuming(&uplink, &script);
+    let pending = nth_pending(&uplink, 0).await;
+    let frames = uplink.pending().unwrap();
+    assert_eq!(kinds(&frames), ["session_started", "pending_opened:permission"]);
+    assert_eq!(opened(&frames)[0].1, None, "asked outside any turn");
+    assert!(handle.send(choose("ra", &pending, "allow")));
+    wait_until(&uplink, has("update:permission:selected:allow")).await;
+}
+
+/// A newer adapter may offer an option of a kind this build's schema does
+/// not know: the question keeps every option id, and each can be chosen.
+#[tokio::test]
+async fn a_permission_with_an_option_kind_this_build_does_not_know_keeps_its_option_ids() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        chunks: vec![],
+        ..asking(vec![FakeAsk::FuturePermission])
+    };
+    let handle = starting(&uplink, &script);
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let pending = nth_pending(&uplink, 0).await;
+    let frames = uplink.pending().unwrap();
+    assert_eq!(
+        opened(&frames)[0].0.option_ids,
+        Some(vec!["allow".to_string(), "allow_session".to_string()])
+    );
+    assert!(handle.send(choose("ra", &pending, "allow_session")));
+    wait_until(&uplink, has("update:permission:selected:allow_session")).await;
+}
+
+/// A question held back during the load, which the load then waits for:
+/// the start runs out of time, and its failure says why.
+#[tokio::test]
+async fn a_start_that_runs_out_of_time_says_which_questions_it_held_back() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        ask_on_load: true,
+        ask_on_load_waits: true,
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let _handle = session::resume(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        "agent-7".into(),
+        fake_with(&script),
+        std::env::temp_dir(),
+        SessionOptions {
+            start_timeout: Duration::from_secs(3),
+            ..SessionOptions::default()
+        },
+    );
+    let frames = wait_until(&uplink, has("start_failed")).await;
+    let HostFrame::Session {
+        body: SessionBody::StartFailed { message, .. },
+        ..
+    } = &frames[0]
+    else {
+        panic!("{:?}", kinds(&frames));
+    };
+    assert!(
+        message.contains(
+            "the agent asked 1 question(s) during start-up (permission) that hennery cannot show before the session exists"
+        ),
+        "{message}"
+    );
+}
+
+// Plan (2): the host cancels open questions (ACP core §2.3, §4.6, §4.8).
+
+/// The kinds from the first `pending_opened` on.
+fn from_the_question(frames: &[HostFrame]) -> Vec<String> {
+    let kinds = kinds(frames);
+    let at = kinds
+        .iter()
+        .position(|k| k.starts_with("pending_opened"))
+        .expect("a question");
+    kinds[at..].to_vec()
+}
+
+#[tokio::test]
+async fn a_cancel_answers_the_open_questions_cancelled_and_the_turn_ends_cancelled() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let handle = starting(&uplink, &asking(vec![FakeAsk::Permission]));
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let pending = nth_pending(&uplink, 0).await;
+    assert!(handle.send(cancel("rc", "t1")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    assert_eq!(
+        from_the_question(&frames),
+        [
+            "pending_opened:permission",
+            "pending_resolved:cancelled:turn_cancelled",
+            "update:permission:cancelled",
+            "turn_ended"
+        ]
+    );
+    assert_eq!(turn_ends(&frames)[0].1, TurnOutcome::Cancelled);
+    // The question is gone: a late answer reaches nobody.
+    assert!(handle.send(choose("ra", &pending, "allow")));
+    let frames = wait_until(&uplink, |f| !verdicts(f).is_empty()).await;
+    assert_eq!(verdicts(&frames), [("ra".to_string(), pending, false)]);
+}
+
+#[tokio::test]
+async fn a_question_asked_after_the_cancel_is_cancelled_at_once() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    // An adapter that keeps going after `session/cancel`: its second
+    // question comes in after the cancel was sent.
+    let script = FakeScript {
+        ignore_cancel: true,
+        chunks: vec![],
+        ..asking(vec![FakeAsk::Permission, FakeAsk::Permission])
+    };
+    let handle = starting(&uplink, &script);
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    nth_pending(&uplink, 0).await;
+    assert!(handle.send(cancel("rc", "t1")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    assert_eq!(
+        from_the_question(&frames),
+        [
+            "pending_opened:permission",
+            "pending_resolved:cancelled:turn_cancelled",
+            "pending_opened:permission",
+            "pending_resolved:cancelled:turn_cancelled",
+            "update:permission:cancelled",
+            "update:permission:cancelled",
+            "turn_ended"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn park_and_close_cancel_the_open_questions_before_the_session_detaches() {
+    for (cmd, last) in [
+        (
+            SessionCmd::Park {
+                request_id: "rp".into(),
+            },
+            "session_parked:operator",
+        ),
+        (
+            SessionCmd::Close {
+                request_id: "rp".into(),
+            },
+            "session_closed",
+        ),
+    ] {
+        let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+        let handle = starting(&uplink, &asking(vec![FakeAsk::Permission]));
+        wait_until(&uplink, has("session_started")).await;
+        assert!(handle.send(prompt("r1", "t1")));
+        nth_pending(&uplink, 0).await;
+        let reason = if last == "session_closed" {
+            "session_closed"
+        } else {
+            "session_parked"
+        };
+        assert!(handle.send(cmd));
+        let frames = wait_until(&uplink, has(last)).await;
+        assert_eq!(
+            from_the_question(&frames),
+            [
+                "pending_opened:permission".to_string(),
+                "turn_ended".to_string(),
+                format!("pending_resolved:cancelled:{reason}"),
+                last.to_string()
+            ]
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_adapter_lost_with_a_question_open_cancels_it_adapter_lost() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        crash_while_asking: true,
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let handle = starting(&uplink, &script);
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let frames = wait_until(&uplink, has("session_parked:adapter_exited")).await;
+    // The exit watcher's order (ACP core §2.3).
+    assert_eq!(
+        from_the_question(&frames),
+        [
+            "pending_opened:permission",
+            "turn_ended",
+            "pending_resolved:cancelled:adapter_lost",
+            "adapter_exited",
+            "session_parked:adapter_exited"
+        ]
+    );
+    wait_ended(&handle).await;
+}
+
+/// No timeout on a question (ACP core §4.6, scenario 10): one asked
+/// outside any turn keeps the session through many idle windows, and is
+/// still answered.
+#[tokio::test]
+async fn the_reaper_never_parks_a_session_with_a_question_open() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        ask_on_load: true,
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let handle = session::resume(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        "agent-7".into(),
+        fake_with(&script),
+        std::env::temp_dir(),
+        SessionOptions {
+            idle_timeout: Some(Duration::from_millis(100)),
+            ..SessionOptions::default()
+        },
+    );
+    let pending = nth_pending(&uplink, 0).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        kinds(&uplink.pending().unwrap()),
+        ["session_started", "pending_opened:permission"],
+        "ten idle windows passed with the question open"
+    );
+    assert!(handle.send(choose("ra", &pending, "allow")));
+    wait_until(&uplink, has("update:permission:selected:allow")).await;
+    // Answered, the session is idle again: now the reaper parks it.
+    wait_until(&uplink, has("session_parked:idle")).await;
+}
+
+/// The adapter may withdraw its own question (`$/cancel_request`): the
+/// question closes, the adapter hears the cancellation error, and an answer
+/// given afterwards reaches nobody.
+#[tokio::test]
+async fn a_question_the_agent_withdraws_closes_and_an_answer_reaches_nobody() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        withdraw_asks: true,
+        chunks: vec![],
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let handle = starting(&uplink, &script);
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    assert_eq!(
+        from_the_question(&frames),
+        [
+            "pending_opened:permission",
+            "pending_resolved:cancelled:agent_withdrew",
+            "update:permission:error:-32800",
+            "turn_ended"
+        ]
+    );
+    let pending = opened(&frames)[0].0.id.clone();
+    assert!(handle.send(choose("ra", &pending, "allow")));
+    let frames = wait_until(&uplink, |f| !verdicts(f).is_empty()).await;
+    assert_eq!(verdicts(&frames), [("ra".to_string(), pending, false)]);
 }

@@ -259,6 +259,11 @@ async fn serve(socket: WebSocket, state: AppState) {
                                 break;
                             }
                         }
+                    } else {
+                        // No waiter: an answer (its verdict comes from
+                        // `answer_result` or its question's resolution),
+                        // or a request whose caller already gave up.
+                        tracing::warn!(%host_id, %request_id, %code, %message, "host refused a request nobody waits for");
                     }
                 }
             }
@@ -278,6 +283,22 @@ async fn serve(socket: WebSocket, state: AppState) {
                         }
                         reconciled = true;
                         state.hub.mark_ready(&host_id, conn_id);
+                        // The answer queue (ACP core §5.1 step 4), after the
+                        // reconciliation cancelled what a restart lost, and
+                        // after `mark_ready`: an answer submitted meanwhile
+                        // is either read here or sent by its own handler
+                        // (or both; the host dedupes by pending id).
+                        match state.store.answers_to_send(&host_id) {
+                            Ok(answers) => {
+                                for frame in answers {
+                                    let _ = tx.send(frame);
+                                }
+                            }
+                            Err(err) => {
+                                tracing::error!(%host_id, error = %err, "reading the answer queue failed; dropping connection");
+                                break;
+                            }
+                        }
                         tracing::info!(%host_id, "host reconciled");
                     }
                     Err(err) => {

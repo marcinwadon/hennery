@@ -141,15 +141,24 @@ fn sigint_to_ups_process_group_still_shuts_down_cleanly() {
         assert!(Instant::now() < deadline, "collector never started listening");
         std::thread::sleep(Duration::from_millis(50));
     }
-    // Give the host child a moment to spawn too (it's launched right after
-    // the collector, independent of the collector's readiness).
-    std::thread::sleep(Duration::from_millis(300));
-    let children = children_of(guard.up.id() as i32);
+    // Wait for the host child to spawn too (it's launched right after the
+    // collector, independent of the collector's readiness). Poll instead of
+    // a fixed sleep: fork/exec/setpgid latency under load (this test must
+    // stay green with several copies of the binary running concurrently)
+    // can exceed any fixed budget short enough to keep the common case fast.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let children = loop {
+        let children = children_of(guard.up.id() as i32);
+        if children.len() >= 2 {
+            break children;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "expected up to have spawned a collector and a host child within 10s, found {children:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
     guard.children = children.clone();
-    assert!(
-        children.len() >= 2,
-        "expected up to have spawned a collector and a host child, found {children:?}"
-    );
 
     // Simulate a terminal delivering SIGINT to the whole foreground group.
     let rc = unsafe { libc::kill(-up_pgid, libc::SIGINT) };

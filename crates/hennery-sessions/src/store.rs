@@ -2,8 +2,11 @@
 //! the connection mutex (kernel §1's writer thread replaces it later).
 
 use anyhow::Result;
-use hennery_proto::frames::{AttachedSession, ConfigValue, Indexed, SessionBody, SessionConfig, TurnOutcome};
-use hennery_proto::rest::{EventDto, SessionCatalog};
+use hennery_proto::frames::{
+    AttachedSession, CollectorFrame, ConfigValue, ElicitationAction, Indexed, ParkReason, PendingKind, PendingReason,
+    PendingResolution, SessionBody, SessionConfig, TurnOutcome,
+};
+use hennery_proto::rest::{AnswerRequest, EventDto, PendingItem, PendingState, SessionCatalog};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -75,6 +78,34 @@ const MIGRATIONS: &[&str] = &[
         config_options TEXT NOT NULL,
         updated_at TEXT NOT NULL);
 ",
+    // Permission and elicitation (ACP core §4.6, §8): the pending set, which
+    // is canonical here, and the durable answer queue, keyed by pending_id.
+    // `delivered` stays NULL until a verdict: `answer_result`, or the
+    // question's cancellation (which gives `false`, decision 10). A host's
+    // refusal of the answer's request is logged and is no verdict (amended
+    // decision 10): `delivered` stays NULL, and the answer goes again after
+    // the next handshake while the question is open.
+    "
+    CREATE TABLE pending (
+        pending_id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES sessions(id),
+        kind TEXT NOT NULL,
+        turn_id TEXT,
+        option_ids TEXT,
+        payload TEXT NOT NULL,
+        state TEXT NOT NULL,
+        reason TEXT,
+        opened_at TEXT NOT NULL,
+        resolved_at TEXT);
+    CREATE INDEX pending_by_session ON pending(session_id, state);
+    CREATE TABLE answer_queue (
+        pending_id TEXT PRIMARY KEY REFERENCES pending(pending_id),
+        session_id TEXT NOT NULL REFERENCES sessions(id),
+        request_id TEXT NOT NULL UNIQUE,
+        answer TEXT NOT NULL,
+        submitted_at TEXT NOT NULL,
+        delivered INTEGER);
+",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -115,6 +146,32 @@ pub enum ResumeRequest {
     /// The agent never created a session for it: there is nothing to load.
     NoRecord,
     NotFound,
+}
+
+/// The outcome of `Store::submit_answer` (ACP core §4.6).
+#[derive(Debug, PartialEq)]
+pub enum AnswerSubmission {
+    Queued(Box<QueuedAnswer>),
+    /// No such pending request in that session.
+    NotFound,
+    /// Answered or cancelled already.
+    NotOpen,
+    /// An answer is queued for it already.
+    AlreadyAnswered,
+    /// The answer does not fit the question (why).
+    Invalid(String),
+}
+
+/// An answer the collector has queued durably.
+#[derive(Debug, PartialEq)]
+pub struct QueuedAnswer {
+    /// Its `answer_submitted` event.
+    pub event: EventDto,
+    /// Where `frame` goes: now if that host is connected and reconciled,
+    /// else after its next handshake.
+    pub host_id: String,
+    pub request_id: String,
+    pub frame: CollectorFrame,
 }
 
 /// What the collector did after a host's `resend_complete` (ACP core §5.1).
@@ -255,6 +312,7 @@ fn close_in(tx: &Transaction<'_>, session_id: &str) -> Result<Vec<EventDto>> {
         if let Some(turn) = open_turn.as_deref() {
             events.push(resolve_open_turn(tx, session_id, turn, &ts)?);
         }
+        events.extend(cancel_open_pending(tx, session_id, PendingReason::SessionClosed, &ts)?);
         if !close_requested {
             events.push(collector_event(tx, session_id, "operator_closed", json!({}), &ts)?);
         }
@@ -305,6 +363,171 @@ fn stored_config((model, mode, axes): ConfigColumns) -> Result<SessionConfig> {
         None => BTreeMap::new(),
     };
     Ok(SessionConfig { model, mode, axes })
+}
+
+/// A wire enum's snake_case name, as stored.
+fn tag(value: impl serde::Serialize) -> Result<String> {
+    Ok(serde_json::to_value(value)?.as_str().unwrap_or_default().to_string())
+}
+
+/// A stored snake_case name back as its wire enum.
+fn untag<T: serde::de::DeserializeOwned>(name: String) -> Result<T> {
+    Ok(serde_json::from_value(Value::String(name))?)
+}
+
+/// Move an open pending request of `session_id` to `state` (with `reason`
+/// if cancelled). An answer queued for a cancelled one can never be
+/// delivered any more, so it gets its verdict. A session blocked on
+/// nothing else runs again. `false` if the request was not open.
+fn resolve_pending(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    pending_id: &str,
+    state: PendingState,
+    reason: Option<PendingReason>,
+    ts: &str,
+) -> Result<bool> {
+    let changed = tx.execute(
+        "UPDATE pending SET state = ?3, reason = ?4, resolved_at = ?5
+         WHERE pending_id = ?1 AND session_id = ?2 AND state = 'open'",
+        params![pending_id, session_id, tag(state)?, reason.map(tag).transpose()?, ts],
+    )?;
+    if changed == 0 {
+        return Ok(false);
+    }
+    if state == PendingState::Cancelled {
+        tx.execute(
+            "UPDATE answer_queue SET delivered = 0 WHERE pending_id = ?1 AND delivered IS NULL",
+            [pending_id],
+        )?;
+    }
+    tx.execute(
+        "UPDATE sessions SET activity = 'running'
+         WHERE id = ?1 AND activity = 'blocked'
+             AND NOT EXISTS (SELECT 1 FROM pending WHERE session_id = ?1 AND state = 'open')",
+        [session_id],
+    )?;
+    Ok(true)
+}
+
+/// Cancel, collector-side, every pending request of `session_id` that is
+/// still open, with one `pending_cancelled` event each (ACP core §4.6,
+/// §5.2): the host will never resolve them (it restarted, or the session
+/// is gone), and a question must not stay answerable.
+fn cancel_open_pending(
+    tx: &Transaction<'_>,
+    session_id: &str,
+    reason: PendingReason,
+    ts: &str,
+) -> Result<Vec<EventDto>> {
+    let ids: Vec<String> = {
+        let mut stmt =
+            tx.prepare("SELECT pending_id FROM pending WHERE session_id = ?1 AND state = 'open' ORDER BY rowid")?;
+        let rows = stmt.query_map([session_id], |r| r.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    let mut events = Vec::new();
+    for id in ids {
+        resolve_pending(tx, session_id, &id, PendingState::Cancelled, Some(reason), ts)?;
+        let body = json!({ "pending_id": id, "reason": reason });
+        events.push(collector_event(tx, session_id, "pending_cancelled", body, ts)?);
+    }
+    Ok(events)
+}
+
+/// Whether `answer` fits a pending request of `kind` (ACP core §4.6): one
+/// of the stored options for a permission request, an action for an
+/// elicitation, with content (an object) only to accept.
+fn check_answer(kind: PendingKind, option_ids: Option<&[String]>, answer: &AnswerRequest) -> Result<(), String> {
+    match (kind, answer) {
+        (PendingKind::Permission, AnswerRequest::Permission { option_id }) => match option_ids {
+            Some(ids) if ids.contains(option_id) => Ok(()),
+            Some(ids) if !ids.is_empty() => Err(format!("the request offers no option {option_id}")),
+            // `None`, or `Some(&[])` (every option lacked a string optionId,
+            // decision 4): either way there is nothing to validate against,
+            // so this is the same "stop, park or close" case, not "no option
+            // X".
+            _ => Err("the request's options could not be read; stop, park or close the session".into()),
+        },
+        (PendingKind::Elicitation, AnswerRequest::Elicitation { action, content }) => match (action, content) {
+            (_, None) => Ok(()),
+            (ElicitationAction::Accept, Some(content)) if content.is_object() => Ok(()),
+            (ElicitationAction::Accept, Some(_)) => Err("the form's content must be an object".into()),
+            (_, Some(_)) => Err("only an accepted form has content".into()),
+        },
+        (PendingKind::Permission, _) => Err("a permission request is answered with an option_id".into()),
+        (PendingKind::Elicitation, _) => Err("an elicitation is answered with an action".into()),
+    }
+}
+
+/// The frame that carries a queued answer to its host.
+fn answer_frame(request_id: String, session_id: &str, pending_id: &str, answer: AnswerRequest) -> CollectorFrame {
+    let (session_id, pending_id) = (session_id.to_string(), pending_id.to_string());
+    match answer {
+        AnswerRequest::Permission { option_id } => CollectorFrame::AnswerPermission {
+            request_id,
+            session_id,
+            pending_id,
+            option_id,
+        },
+        AnswerRequest::Elicitation { action, content } => CollectorFrame::AnswerElicitation {
+            request_id,
+            session_id,
+            pending_id,
+            action,
+            content,
+        },
+    }
+}
+
+/// One `pending` row joined with its answer, as read.
+struct PendingRow {
+    pending_id: String,
+    session_id: String,
+    kind: String,
+    state: String,
+    reason: Option<String>,
+    turn_id: Option<String>,
+    option_ids: Option<String>,
+    payload: String,
+    answered: bool,
+    delivered: Option<bool>,
+}
+
+const PENDING_COLUMNS: &str = "p.pending_id, p.session_id, p.kind, p.state, p.reason, p.turn_id, p.option_ids,
+     p.payload, q.pending_id IS NOT NULL, q.delivered
+     FROM pending p LEFT JOIN answer_queue q ON q.pending_id = p.pending_id";
+
+impl PendingRow {
+    fn read(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            pending_id: r.get(0)?,
+            session_id: r.get(1)?,
+            kind: r.get(2)?,
+            state: r.get(3)?,
+            reason: r.get(4)?,
+            turn_id: r.get(5)?,
+            option_ids: r.get(6)?,
+            payload: r.get(7)?,
+            answered: r.get(8)?,
+            delivered: r.get(9)?,
+        })
+    }
+
+    fn item(self) -> Result<PendingItem> {
+        Ok(PendingItem {
+            pending_id: self.pending_id,
+            session_id: self.session_id,
+            kind: untag(self.kind)?,
+            state: untag(self.state)?,
+            reason: self.reason.map(untag).transpose()?,
+            turn_id: self.turn_id,
+            option_ids: self.option_ids.map(|ids| serde_json::from_str(&ids)).transpose()?,
+            payload: serde_json::from_str(&self.payload)?,
+            answered: self.answered,
+            delivered: self.delivered,
+        })
+    }
 }
 
 /// Keep a stored host fact that did not apply as the idempotency key only:
@@ -438,6 +661,123 @@ impl Store {
             },
             current: stored_config(config)?,
         }))
+    }
+
+    /// A session's open pending requests, oldest first (ACP core §9: the
+    /// session detail).
+    pub fn open_pending(&self, session_id: &str) -> Result<Vec<PendingItem>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {PENDING_COLUMNS} WHERE p.session_id = ?1 AND p.state = 'open' ORDER BY p.rowid"
+        ))?;
+        let rows = stmt.query_map([session_id], PendingRow::read)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?.item()?);
+        }
+        Ok(out)
+    }
+
+    /// One pending request, whatever its state (SSE `pending_changed`).
+    pub fn pending_item(&self, pending_id: &str) -> Result<Option<PendingItem>> {
+        let row = self
+            .conn()
+            .query_row(
+                &format!("SELECT {PENDING_COLUMNS} WHERE p.pending_id = ?1"),
+                [pending_id],
+                PendingRow::read,
+            )
+            .optional()?;
+        row.map(PendingRow::item).transpose()
+    }
+
+    /// Accept an operator's answer to an open pending request of
+    /// `session_id` (ACP core §4.6): validated against the stored kind and
+    /// option ids, written as `answer_submitted` and queued durably. At most
+    /// one answer per request: the check and the insert are one
+    /// transaction, and the queue's key is the pending id.
+    pub fn submit_answer(
+        &self,
+        session_id: &str,
+        pending_id: &str,
+        answer: &AnswerRequest,
+    ) -> Result<AnswerSubmission> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let row: Option<(String, String, Option<String>, String, bool)> = tx
+            .query_row(
+                "SELECT p.kind, p.state, p.option_ids, s.host_id,
+                        EXISTS(SELECT 1 FROM answer_queue q WHERE q.pending_id = p.pending_id)
+                 FROM pending p JOIN sessions s ON s.id = p.session_id
+                 WHERE p.pending_id = ?1 AND p.session_id = ?2",
+                params![pending_id, session_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let Some((kind, state, option_ids, host_id, queued)) = row else {
+            return Ok(AnswerSubmission::NotFound);
+        };
+        if state != "open" {
+            return Ok(AnswerSubmission::NotOpen);
+        }
+        if queued {
+            return Ok(AnswerSubmission::AlreadyAnswered);
+        }
+        let option_ids: Option<Vec<String>> = option_ids.map(|ids| serde_json::from_str(&ids)).transpose()?;
+        if let Err(why) = check_answer(untag(kind)?, option_ids.as_deref(), answer) {
+            return Ok(AnswerSubmission::Invalid(why));
+        }
+        let request_id = uuid::Uuid::now_v7().to_string();
+        let ts = now();
+        tx.execute(
+            "INSERT INTO answer_queue(pending_id, session_id, request_id, answer, submitted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![pending_id, session_id, request_id, serde_json::to_string(answer)?, ts],
+        )?;
+        let body = json!({ "pending_id": pending_id, "request_id": request_id, "answer": answer });
+        let event = collector_event(&tx, session_id, "answer_submitted", body, &ts)?;
+        tx.commit()?;
+        Ok(AnswerSubmission::Queued(Box::new(QueuedAnswer {
+            event,
+            host_id,
+            frame: answer_frame(request_id.clone(), session_id, pending_id, answer.clone()),
+            request_id,
+        })))
+    }
+
+    /// The answers still owed to `host_id` (ACP core §4.6, §5.1): queued,
+    /// with no verdict, for a question still open; oldest first. Sent after
+    /// every handshake's reconciliation, so one lost with a connection goes
+    /// again; the host dedupes by pending id.
+    pub fn answers_to_send(&self, host_id: &str) -> Result<Vec<CollectorFrame>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT q.request_id, q.session_id, q.pending_id, q.answer
+             FROM answer_queue q
+                 JOIN pending p ON p.pending_id = q.pending_id
+                 JOIN sessions s ON s.id = q.session_id
+             WHERE s.host_id = ?1 AND q.delivered IS NULL AND p.state = 'open'
+             ORDER BY q.rowid",
+        )?;
+        let rows = stmt.query_map([host_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (request_id, session_id, pending_id, answer) = row?;
+            out.push(answer_frame(
+                request_id,
+                &session_id,
+                &pending_id,
+                serde_json::from_str(&answer)?,
+            ));
+        }
+        Ok(out)
     }
 
     /// A turn's state: `sent`, `started`, `ended` or `not_delivered`.
@@ -842,7 +1182,7 @@ impl Store {
                     mark_unapplied(&tx, fact_id)?;
                 }
             }
-            SessionBody::SessionParked { .. } => {
+            SessionBody::SessionParked { reason } => {
                 created.extend(release_turn_on_detach(&tx, session_id, &ts)?);
                 // A park that overtakes an operator close ends the session
                 // as the operator asked: closed.
@@ -856,6 +1196,14 @@ impl Store {
                 if changed == 0 {
                     created.clear();
                     mark_unapplied(&tx, fact_id)?;
+                } else {
+                    // The host cancels its questions before it detaches;
+                    // one it left open goes with the session.
+                    let reason = match reason {
+                        ParkReason::AdapterExited => PendingReason::AdapterLost,
+                        ParkReason::Idle | ParkReason::Operator => PendingReason::SessionParked,
+                    };
+                    created.extend(cancel_open_pending(&tx, session_id, reason, &ts)?);
                 }
             }
             SessionBody::SessionClosed => {
@@ -870,6 +1218,8 @@ impl Store {
                 if changed == 0 {
                     created.clear();
                     mark_unapplied(&tx, fact_id)?;
+                } else {
+                    created.extend(cancel_open_pending(&tx, session_id, PendingReason::SessionClosed, &ts)?);
                 }
             }
             SessionBody::AcpUpdate { indexed, .. } => {
@@ -894,6 +1244,84 @@ impl Store {
                 if lifecycle == "active" || presumed {
                     store_catalogue(&tx, session_id, indexed, &ts)?;
                 } else {
+                    created.clear();
+                    mark_unapplied(&tx, fact_id)?;
+                }
+            }
+            SessionBody::PendingOpened {
+                pending_id,
+                indexed,
+                payload,
+            } => {
+                // A question of the attached session, asked in a turn that
+                // is still open if it names one. Everything the collector
+                // keeps comes from the extract (ACP core §3.2).
+                let (lifecycle, presumed): (String, bool) = tx.query_row(
+                    "SELECT lifecycle, presumed_parked FROM sessions WHERE id = ?1",
+                    [session_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                let extract = indexed.pending.as_ref().filter(|p| p.id == *pending_id);
+                let applies =
+                    (lifecycle == "active" || presumed) && fact_applies(&tx, session_id, indexed.turn_id.as_deref())?;
+                let inserted = match extract.filter(|_| applies) {
+                    Some(extract) => tx.execute(
+                        "INSERT INTO pending(pending_id, session_id, kind, turn_id, option_ids, payload, state, opened_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7)
+                         ON CONFLICT(pending_id) DO NOTHING",
+                        params![
+                            pending_id,
+                            session_id,
+                            tag(extract.kind)?,
+                            indexed.turn_id,
+                            extract.option_ids.as_ref().map(serde_json::to_string).transpose()?,
+                            payload.to_string(),
+                            ts
+                        ],
+                    )?,
+                    None => 0,
+                };
+                if inserted == 0 {
+                    created.clear();
+                    mark_unapplied(&tx, fact_id)?;
+                } else {
+                    tx.execute(
+                        "UPDATE sessions SET activity = 'blocked' WHERE id = ?1 AND activity = 'running'",
+                        [session_id],
+                    )?;
+                }
+            }
+            SessionBody::PendingResolved {
+                pending_id,
+                resolution,
+                reason,
+            } => {
+                let state = match resolution {
+                    PendingResolution::Delivered => PendingState::Delivered,
+                    PendingResolution::Cancelled => PendingState::Cancelled,
+                };
+                if !resolve_pending(&tx, session_id, pending_id, state, *reason, &ts)? {
+                    created.clear();
+                    mark_unapplied(&tx, fact_id)?;
+                }
+            }
+            SessionBody::AnswerResult {
+                pending_id, delivered, ..
+            } => {
+                // Folded monotonically: `delivered` sticks, a later `false`
+                // never overwrites it (umbrella §6.8). The guard makes that
+                // a real no-op check, not just a match on the row: SQLite's
+                // changed-row count is rows matched, not rows whose value
+                // moved, so a WHERE on the id alone would call a same-value
+                // resend "applied" (decision 14 says a verdict that changes
+                // nothing is stored but not applied).
+                let changed = tx.execute(
+                    "UPDATE answer_queue SET delivered = CASE WHEN delivered = 1 THEN 1 ELSE ?3 END
+                     WHERE pending_id = ?1 AND session_id = ?2
+                         AND (delivered IS NULL OR (delivered = 0 AND ?3 = 1))",
+                    params![pending_id, session_id, delivered],
+                )?;
+                if changed == 0 {
                     created.clear();
                     mark_unapplied(&tx, fact_id)?;
                 }
@@ -978,6 +1406,9 @@ impl Store {
                         out.events.push(resolve_open_turn(&tx, &id, turn, &ts)?);
                     }
                     if host.is_none() {
+                        // The restarted host holds none of its questions.
+                        out.events
+                            .extend(cancel_open_pending(&tx, &id, PendingReason::HostRestarted, &ts)?);
                         tx.execute(
                             "UPDATE sessions SET
                                  lifecycle = CASE WHEN close_requested = 1 THEN 'closed' ELSE 'parked' END,
@@ -1042,6 +1473,9 @@ fn body_kind(body: &SessionBody) -> &'static str {
         SessionBody::AdapterExited { .. } => "adapter_exited",
         SessionBody::HostNote { .. } => "host_note",
         SessionBody::ConfigApplied { .. } => "config_applied",
+        SessionBody::PendingOpened { .. } => "pending_opened",
+        SessionBody::PendingResolved { .. } => "pending_resolved",
+        SessionBody::AnswerResult { .. } => "answer_result",
     }
 }
 

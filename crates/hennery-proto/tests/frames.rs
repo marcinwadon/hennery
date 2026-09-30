@@ -116,6 +116,19 @@ fn every_collector_frame_round_trips() {
             config_id: "model".into(),
             value: ConfigValue::Id("large".into()),
         },
+        CollectorFrame::AnswerPermission {
+            request_id: "r".into(),
+            session_id: "s".into(),
+            pending_id: "p".into(),
+            option_id: "allow".into(),
+        },
+        CollectorFrame::AnswerElicitation {
+            request_id: "r".into(),
+            session_id: "s".into(),
+            pending_id: "p".into(),
+            action: hennery_proto::frames::ElicitationAction::Cancel,
+            content: None,
+        },
     ];
     for f in frames {
         let back: CollectorFrame = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
@@ -195,13 +208,14 @@ fn session_detail_leaves_out_absent_optionals() {
             turn_id: "t".into(),
             state: "started".into(),
         }),
+        pending: vec![],
     };
     assert_eq!(
         serde_json::to_value(&detail).unwrap(),
         json!({
             "session_id": "s", "host_id": "h", "agent": "claude", "cwd": "/tmp",
             "lifecycle": "active", "activity": "running", "presumed_parked": false,
-            "open_turn": {"turn_id": "t", "state": "started"}
+            "open_turn": {"turn_id": "t", "state": "started"}, "pending": []
         })
     );
 }
@@ -389,4 +403,111 @@ fn rest_config_requests_take_a_value_id_or_a_boolean() {
     let toggle: ConfigRequest = serde_json::from_value(json!({"config_id": "fast", "value": true})).unwrap();
     assert_eq!(toggle.value, ConfigValue::Bool(true));
     assert!(serde_json::from_value::<ConfigRequest>(json!({"config_id": "fast", "value": 3})).is_err());
+}
+
+// Plan (2): permission and elicitation (ACP core §3.2, §3.3, §4.6).
+
+#[test]
+fn pending_bodies_use_the_spec_field_names() {
+    use hennery_proto::frames::{PendingExtract, PendingKind, PendingReason, PendingResolution};
+    let opened = SessionBody::PendingOpened {
+        pending_id: "p1".into(),
+        indexed: Indexed {
+            turn_id: Some("t1".into()),
+            pending: Some(PendingExtract {
+                id: "p1".into(),
+                kind: PendingKind::Permission,
+                option_ids: Some(vec!["allow".into(), "reject".into()]),
+            }),
+            ..Indexed::default()
+        },
+        payload: json!({"sessionId": "a1", "options": [], "_meta": {"x": 1}}),
+    };
+    // `kind` is the body's tag, so the request's own kind rides in the
+    // `pending` extract.
+    let expected = json!({
+        "kind": "pending_opened", "pending_id": "p1",
+        "indexed": {"turn_id": "t1", "pending": {"id": "p1", "kind": "permission", "option_ids": ["allow", "reject"]}},
+        "payload": {"sessionId": "a1", "options": [], "_meta": {"x": 1}}
+    });
+    assert_eq!(serde_json::to_value(&opened).unwrap(), expected);
+    assert_eq!(serde_json::from_value::<SessionBody>(expected).unwrap(), opened);
+    let cancelled = SessionBody::PendingResolved {
+        pending_id: "p1".into(),
+        resolution: PendingResolution::Cancelled,
+        reason: Some(PendingReason::TurnCancelled),
+    };
+    let expected =
+        json!({"kind": "pending_resolved", "pending_id": "p1", "resolution": "cancelled", "reason": "turn_cancelled"});
+    assert_eq!(serde_json::to_value(&cancelled).unwrap(), expected);
+    assert_eq!(serde_json::from_value::<SessionBody>(expected).unwrap(), cancelled);
+    let result = SessionBody::AnswerResult {
+        pending_id: "p1".into(),
+        request_id: "r9".into(),
+        delivered: true,
+    };
+    let expected = json!({"kind": "answer_result", "pending_id": "p1", "request_id": "r9", "delivered": true});
+    assert_eq!(serde_json::to_value(&result).unwrap(), expected);
+    assert_eq!(serde_json::from_value::<SessionBody>(expected).unwrap(), result);
+}
+
+#[test]
+fn answer_frames_use_the_spec_field_names() {
+    use hennery_proto::frames::ElicitationAction;
+    let permission = CollectorFrame::AnswerPermission {
+        request_id: "r".into(),
+        session_id: "s".into(),
+        pending_id: "p".into(),
+        option_id: "allow".into(),
+    };
+    let expected = json!({"type": "answer_permission", "request_id": "r", "session_id": "s", "pending_id": "p", "option_id": "allow"});
+    assert_eq!(serde_json::to_value(&permission).unwrap(), expected);
+    assert_eq!(serde_json::from_value::<CollectorFrame>(expected).unwrap(), permission);
+    let elicitation = CollectorFrame::AnswerElicitation {
+        request_id: "r".into(),
+        session_id: "s".into(),
+        pending_id: "p".into(),
+        action: ElicitationAction::Accept,
+        content: Some(json!({"name": "hennery"})),
+    };
+    let expected = json!({
+        "type": "answer_elicitation", "request_id": "r", "session_id": "s", "pending_id": "p",
+        "action": "accept", "content": {"name": "hennery"}
+    });
+    assert_eq!(serde_json::to_value(&elicitation).unwrap(), expected);
+    assert_eq!(serde_json::from_value::<CollectorFrame>(expected).unwrap(), elicitation);
+    let declined: CollectorFrame = serde_json::from_value(json!({
+        "type": "answer_elicitation", "request_id": "r", "session_id": "s", "pending_id": "p", "action": "decline"
+    }))
+    .unwrap();
+    assert!(matches!(
+        declined,
+        CollectorFrame::AnswerElicitation { content: None, .. }
+    ));
+}
+
+#[test]
+fn a_rest_answer_is_an_option_or_an_elicitation_action() {
+    use hennery_proto::frames::ElicitationAction;
+    use hennery_proto::rest::AnswerRequest;
+    let option: AnswerRequest = serde_json::from_value(json!({"option_id": "allow"})).unwrap();
+    assert_eq!(
+        option,
+        AnswerRequest::Permission {
+            option_id: "allow".into()
+        }
+    );
+    let accept: AnswerRequest = serde_json::from_value(json!({"action": "accept", "content": {"n": 1}})).unwrap();
+    assert_eq!(
+        accept,
+        AnswerRequest::Elicitation {
+            action: ElicitationAction::Accept,
+            content: Some(json!({"n": 1}))
+        }
+    );
+    let decline: AnswerRequest = serde_json::from_value(json!({"action": "decline"})).unwrap();
+    assert!(matches!(decline, AnswerRequest::Elicitation { content: None, .. }));
+    for bad in [json!({}), json!({"action": "maybe"}), json!({"option_id": 3})] {
+        assert!(serde_json::from_value::<AnswerRequest>(bad.clone()).is_err(), "{bad}");
+    }
 }

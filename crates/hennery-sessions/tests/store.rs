@@ -378,6 +378,8 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
              ALTER TABLE sessions DROP COLUMN mode;
              ALTER TABLE sessions DROP COLUMN config_axes;
              DROP TABLE session_catalog;
+             DROP TABLE answer_queue;
+             DROP TABLE pending;
              PRAGMA user_version = 1;",
         )
         .unwrap();
@@ -1283,4 +1285,357 @@ fn a_resume_hands_back_the_config_to_re_apply() {
         panic!("not resumable");
     };
     assert_eq!(wanted, config("large", "plan"));
+}
+
+// Plan (2): the pending set and the answer queue (ACP core §4.6, §5, §8).
+
+use hennery_proto::frames::{
+    CollectorFrame, ElicitationAction, PendingExtract, PendingKind, PendingReason, PendingResolution,
+};
+use hennery_proto::rest::{AnswerRequest, PendingState};
+use hennery_sessions::store::AnswerSubmission;
+
+/// `s1` active with turn `t1` running (seqs 1 and 2).
+fn running(store: &Store) {
+    started(store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.ingest("s1", 2, &turn_started("t1")).unwrap();
+}
+
+fn permission(pending_id: &str) -> SessionBody {
+    SessionBody::PendingOpened {
+        pending_id: pending_id.into(),
+        indexed: Indexed {
+            turn_id: Some("t1".into()),
+            pending: Some(PendingExtract {
+                id: pending_id.into(),
+                kind: PendingKind::Permission,
+                option_ids: Some(vec!["allow".into(), "reject".into()]),
+            }),
+            ..Indexed::default()
+        },
+        payload: json!({"toolCall": {"toolCallId": "call-1"}}),
+    }
+}
+
+fn elicitation(pending_id: &str) -> SessionBody {
+    SessionBody::PendingOpened {
+        pending_id: pending_id.into(),
+        indexed: Indexed {
+            turn_id: Some("t1".into()),
+            pending: Some(PendingExtract {
+                id: pending_id.into(),
+                kind: PendingKind::Elicitation,
+                option_ids: None,
+            }),
+            ..Indexed::default()
+        },
+        payload: json!({"mode": "form"}),
+    }
+}
+
+fn resolved(pending_id: &str, reason: Option<PendingReason>) -> SessionBody {
+    SessionBody::PendingResolved {
+        pending_id: pending_id.into(),
+        resolution: if reason.is_some() {
+            PendingResolution::Cancelled
+        } else {
+            PendingResolution::Delivered
+        },
+        reason,
+    }
+}
+
+fn verdict(pending_id: &str, delivered: bool) -> SessionBody {
+    SessionBody::AnswerResult {
+        pending_id: pending_id.into(),
+        request_id: "whatever".into(),
+        delivered,
+    }
+}
+
+fn choose(option_id: &str) -> AnswerRequest {
+    AnswerRequest::Permission {
+        option_id: option_id.into(),
+    }
+}
+
+fn activity(store: &Store) -> Option<String> {
+    store.session("s1").unwrap().unwrap().activity
+}
+
+fn state_of(store: &Store, pending_id: &str) -> (PendingState, Option<PendingReason>) {
+    let item = store.pending_item(pending_id).unwrap().unwrap();
+    (item.state, item.reason)
+}
+
+#[test]
+fn a_running_turn_is_blocked_until_its_last_open_question_is_resolved() {
+    let store = Store::open_in_memory().unwrap();
+    running(&store);
+    store.ingest("s1", 3, &permission("p1")).unwrap();
+    store.ingest("s1", 4, &elicitation("p2")).unwrap();
+    assert_eq!(activity(&store).as_deref(), Some("blocked"));
+    let open: Vec<String> = store
+        .open_pending("s1")
+        .unwrap()
+        .into_iter()
+        .map(|p| p.pending_id)
+        .collect();
+    assert_eq!(open, ["p1", "p2"], "oldest first");
+    store.ingest("s1", 5, &resolved("p1", None)).unwrap();
+    assert_eq!(activity(&store).as_deref(), Some("blocked"), "p2 is still open");
+    store
+        .ingest("s1", 6, &resolved("p2", Some(PendingReason::TurnCancelled)))
+        .unwrap();
+    assert_eq!(activity(&store).as_deref(), Some("running"));
+    assert_eq!(
+        state_of(&store, "p2"),
+        (PendingState::Cancelled, Some(PendingReason::TurnCancelled))
+    );
+    assert!(store.open_pending("s1").unwrap().is_empty());
+    // A second resolution of the same request is stored, not applied.
+    assert!(store.ingest("s1", 7, &resolved("p2", None)).unwrap().is_empty());
+    assert_eq!(state_of(&store, "p2").0, PendingState::Cancelled);
+}
+
+#[test]
+fn a_question_for_a_detached_session_or_an_ended_turn_is_not_applied() {
+    let store = Store::open_in_memory().unwrap();
+    running(&store);
+    store.ingest("s1", 3, &ended("t1")).unwrap();
+    assert!(store.ingest("s1", 4, &permission("p1")).unwrap().is_empty());
+    assert!(store.pending_item("p1").unwrap().is_none());
+    parked(&store, 5);
+    assert!(store.ingest("s1", 6, &permission("p2")).unwrap().is_empty());
+}
+
+#[test]
+fn an_answer_is_queued_once_and_only_if_it_fits_the_question() {
+    let store = Store::open_in_memory().unwrap();
+    running(&store);
+    store.ingest("s1", 3, &permission("p1")).unwrap();
+    store.ingest("s1", 4, &elicitation("p2")).unwrap();
+    let invalid = |answer: AnswerRequest, pending: &str| {
+        matches!(
+            store.submit_answer("s1", pending, &answer).unwrap(),
+            AnswerSubmission::Invalid(_)
+        )
+    };
+    assert!(invalid(choose("maybe"), "p1"), "an option it does not offer");
+    let decline_with_content = AnswerRequest::Elicitation {
+        action: ElicitationAction::Decline,
+        content: Some(json!({"name": "x"})),
+    };
+    assert!(invalid(decline_with_content, "p2"));
+    assert!(invalid(choose("allow"), "p2"), "an option for an elicitation");
+    let AnswerSubmission::Queued(queued) = store.submit_answer("s1", "p1", &choose("allow")).unwrap() else {
+        panic!("not queued");
+    };
+    assert_eq!(
+        (queued.event.kind.as_str(), queued.host_id.as_str()),
+        ("answer_submitted", "h1")
+    );
+    assert_eq!(queued.event.body["pending_id"], "p1");
+    assert_eq!(
+        queued.frame,
+        CollectorFrame::AnswerPermission {
+            request_id: queued.request_id.clone(),
+            session_id: "s1".into(),
+            pending_id: "p1".into(),
+            option_id: "allow".into(),
+        }
+    );
+    assert_eq!(
+        store.submit_answer("s1", "p1", &choose("reject")).unwrap(),
+        AnswerSubmission::AlreadyAnswered
+    );
+    assert_eq!(
+        store.submit_answer("s1", "nope", &choose("allow")).unwrap(),
+        AnswerSubmission::NotFound
+    );
+    assert_eq!(
+        store.submit_answer("other", "p1", &choose("allow")).unwrap(),
+        AnswerSubmission::NotFound,
+        "a pending id is looked up within its own session"
+    );
+    store
+        .ingest("s1", 5, &resolved("p2", Some(PendingReason::TurnCancelled)))
+        .unwrap();
+    let accept = AnswerRequest::Elicitation {
+        action: ElicitationAction::Accept,
+        content: Some(json!({"name": "x"})),
+    };
+    assert_eq!(
+        store.submit_answer("s1", "p2", &accept).unwrap(),
+        AnswerSubmission::NotOpen
+    );
+    let item = store.pending_item("p1").unwrap().unwrap();
+    assert_eq!((item.answered, item.delivered), (true, None));
+}
+
+#[test]
+fn an_empty_option_ids_is_treated_like_no_option_ids() {
+    // Decision 4: every option lacked a string optionId, so the extract's
+    // `option_ids` is `Some(&[])` rather than `None`. That must still steer
+    // the operator to "stop, park or close the session" -- not report that
+    // the request offers no option "allow", which would suggest a retry
+    // with a different option id would help.
+    let store = Store::open_in_memory().unwrap();
+    running(&store);
+    let empty_options = SessionBody::PendingOpened {
+        pending_id: "p1".into(),
+        indexed: Indexed {
+            turn_id: Some("t1".into()),
+            pending: Some(PendingExtract {
+                id: "p1".into(),
+                kind: PendingKind::Permission,
+                option_ids: Some(vec![]),
+            }),
+            ..Indexed::default()
+        },
+        payload: json!({"toolCall": {"toolCallId": "call-1"}}),
+    };
+    store.ingest("s1", 3, &empty_options).unwrap();
+    let AnswerSubmission::Invalid(why) = store.submit_answer("s1", "p1", &choose("allow")).unwrap() else {
+        panic!("expected Invalid");
+    };
+    assert!(
+        why.contains("stop, park or close the session"),
+        "expected the stop/park/close guidance, got: {why}"
+    );
+    assert!(
+        !why.contains("offers no option"),
+        "should not blame the option id: {why}"
+    );
+}
+
+#[test]
+fn a_delivered_verdict_sticks_and_a_later_false_does_not_overwrite_it() {
+    let store = Store::open_in_memory().unwrap();
+    running(&store);
+    store.ingest("s1", 3, &permission("p1")).unwrap();
+    store.submit_answer("s1", "p1", &choose("allow")).unwrap();
+    store.ingest("s1", 4, &verdict("p1", true)).unwrap();
+    store.ingest("s1", 5, &resolved("p1", None)).unwrap();
+    // A resent answer the host no longer had a waiter for: a verdict that
+    // changes nothing is stored but not applied (decision 14).
+    assert!(store.ingest("s1", 6, &verdict("p1", false)).unwrap().is_empty());
+    let item = store.pending_item("p1").unwrap().unwrap();
+    assert_eq!((item.state, item.delivered), (PendingState::Delivered, Some(true)));
+}
+
+#[test]
+fn a_later_true_verdict_upgrades_an_earlier_false_one() {
+    let store = Store::open_in_memory().unwrap();
+    running(&store);
+    store.ingest("s1", 3, &permission("p1")).unwrap();
+    store.submit_answer("s1", "p1", &choose("allow")).unwrap();
+    // The first verdict finds no live waiter (an earlier adapter, say).
+    let created = store.ingest("s1", 4, &verdict("p1", false)).unwrap();
+    assert_eq!(kinds(&created), ["answer_result"]);
+    assert_eq!(store.pending_item("p1").unwrap().unwrap().delivered, Some(false));
+    // A later one does reach a waiter: `false` is not a verdict that sticks.
+    let created = store.ingest("s1", 5, &verdict("p1", true)).unwrap();
+    assert_eq!(kinds(&created), ["answer_result"]);
+    assert_eq!(store.pending_item("p1").unwrap().unwrap().delivered, Some(true));
+}
+
+#[test]
+fn only_answers_still_waiting_for_a_verdict_on_an_open_question_are_sent() {
+    let store = Store::open_in_memory().unwrap();
+    running(&store);
+    store.ingest("s1", 3, &permission("p1")).unwrap();
+    store.ingest("s1", 4, &permission("p2")).unwrap();
+    store.ingest("s1", 5, &permission("p3")).unwrap();
+    for p in ["p1", "p2", "p3"] {
+        let queued = store.submit_answer("s1", p, &choose("allow")).unwrap();
+        assert!(matches!(queued, AnswerSubmission::Queued(_)), "{p} not queued");
+    }
+    let pending_ids = |frames: Vec<CollectorFrame>| -> Vec<String> {
+        frames
+            .into_iter()
+            .map(|f| match f {
+                CollectorFrame::AnswerPermission { pending_id, .. } => pending_id,
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    };
+    assert_eq!(pending_ids(store.answers_to_send("h1").unwrap()), ["p1", "p2", "p3"]);
+    assert!(store.answers_to_send("another-host").unwrap().is_empty());
+    // p1 got its verdict; p2's question was cancelled before its answer
+    // could be sent, so the answer can never be delivered.
+    store.ingest("s1", 6, &verdict("p1", true)).unwrap();
+    store
+        .ingest("s1", 7, &resolved("p2", Some(PendingReason::TurnCancelled)))
+        .unwrap();
+    assert_eq!(pending_ids(store.answers_to_send("h1").unwrap()), ["p3"]);
+    assert_eq!(store.pending_item("p2").unwrap().unwrap().delivered, Some(false));
+    // p3's goes again after every handshake until its verdict comes.
+    assert_eq!(pending_ids(store.answers_to_send("h1").unwrap()), ["p3"]);
+}
+
+#[test]
+fn a_host_restart_cancels_open_questions_and_a_presumed_park_keeps_them() {
+    let store = Store::open_in_memory().unwrap();
+    running(&store);
+    store.ingest("s1", 3, &permission("p1")).unwrap();
+    store.presume_parked("h1").unwrap();
+    assert_eq!(
+        state_of(&store, "p1").0,
+        PendingState::Open,
+        "the host may still hold it"
+    );
+    store.reconcile_host("h1", &[attached("s1", Some("t1"))]).unwrap();
+    assert_eq!(state_of(&store, "p1").0, PendingState::Open, "reattached, intact");
+    // Away again, and this time back without the session: a restart found
+    // through a presumed park.
+    store.presume_parked("h1").unwrap();
+    let r = store.reconcile_host("h1", &[]).unwrap();
+    assert_eq!(
+        kinds(&r.events),
+        ["host_restarted", "turn_ended_synthesized", "pending_cancelled"]
+    );
+    assert_eq!(
+        r.events[2].body,
+        json!({"pending_id": "p1", "reason": "host_restarted"})
+    );
+    assert_eq!(
+        state_of(&store, "p1"),
+        (PendingState::Cancelled, Some(PendingReason::HostRestarted))
+    );
+}
+
+#[test]
+fn a_detach_or_an_unattached_close_cancels_whatever_is_still_open() {
+    // The host resolves its questions before it detaches; a question it
+    // left open is cancelled with the detach.
+    let store = Store::open_in_memory().unwrap();
+    running(&store);
+    store.ingest("s1", 3, &permission("p1")).unwrap();
+    let created = store
+        .ingest(
+            "s1",
+            4,
+            &SessionBody::SessionParked {
+                reason: ParkReason::AdapterExited,
+            },
+        )
+        .unwrap();
+    assert_eq!(kinds(&created).last(), Some(&"pending_cancelled"));
+    assert_eq!(
+        state_of(&store, "p1"),
+        (PendingState::Cancelled, Some(PendingReason::AdapterLost))
+    );
+    // Closing a session whose host is away closes its questions too.
+    let store = Store::open_in_memory().unwrap();
+    running(&store);
+    store.ingest("s1", 3, &permission("p1")).unwrap();
+    store.presume_parked("h1").unwrap();
+    let events = store.close_now("s1").unwrap();
+    assert!(kinds(&events).contains(&"pending_cancelled"), "{:?}", kinds(&events));
+    assert_eq!(
+        state_of(&store, "p1"),
+        (PendingState::Cancelled, Some(PendingReason::SessionClosed))
+    );
 }

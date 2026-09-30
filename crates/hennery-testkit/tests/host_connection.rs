@@ -1044,3 +1044,64 @@ async fn a_resume_during_an_idle_reaps_kill_grace_waits_for_the_old_actor_to_fin
          actor's teardown would show a third"
     );
 }
+
+// Plan (2): answers over the connection.
+
+fn asking_fake() -> hennery_host::AgentCommand {
+    let mut fake = hennery_host::AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    let script = hennery_testkit::FakeScript {
+        asks: vec![hennery_testkit::FakeAsk::Permission],
+        ..Default::default()
+    };
+    fake.env.push((
+        hennery_testkit::SCRIPT_ENV.into(),
+        serde_json::to_string(&script).unwrap(),
+    ));
+    fake
+}
+
+/// A session frame's body as JSON.
+fn body_of(frame: &HostFrame) -> serde_json::Value {
+    match frame {
+        HostFrame::Session { body, .. } => serde_json::to_value(body).unwrap(),
+        other => panic!("expected a session frame, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn answers_reach_the_actor_and_one_for_a_detached_session_is_not_attached() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(run(host_with_fake(addr, "answers", asking_fake())));
+
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    send_frame(&mut sink, &start("r1", "s1")).await;
+    read_until(&mut stream, body_is("s1", "session_started")).await;
+    let prompt = CollectorFrame::Prompt {
+        request_id: "r2".into(),
+        session_id: "s1".into(),
+        turn_id: "t1".into(),
+        content: vec![serde_json::json!({"type": "text", "text": "hi"})],
+    };
+    send_frame(&mut sink, &prompt).await;
+    let opened = body_of(&read_until(&mut stream, body_is("s1", "pending_opened")).await);
+    let pending_id = opened["pending_id"].as_str().unwrap().to_string();
+    let answer = |request_id: &str, session_id: &str| CollectorFrame::AnswerPermission {
+        request_id: request_id.into(),
+        session_id: session_id.into(),
+        pending_id: pending_id.clone(),
+        option_id: "allow".into(),
+    };
+    send_frame(&mut sink, &answer("r3", "s1")).await;
+    let result = body_of(&read_until(&mut stream, body_is("s1", "answer_result")).await);
+    assert_eq!(
+        (&result["request_id"], &result["delivered"]),
+        (&serde_json::json!("r3"), &serde_json::json!(true))
+    );
+    send_frame(&mut sink, &answer("r4", "no-such-session")).await;
+    let refused = read_until(&mut stream, error_for("r4")).await;
+    assert!(
+        matches!(&refused, HostFrame::Error { code, .. } if code == "not_attached"),
+        "{refused:?}"
+    );
+}

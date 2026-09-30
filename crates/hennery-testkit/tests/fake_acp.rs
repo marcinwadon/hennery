@@ -1,8 +1,10 @@
 //! The fake adapter speaks ACP over stdio like a real one.
 
+use hennery_testkit::{FakeAsk, FakeScript};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 fn exchange(script: Option<&str>, requests: &[Value]) -> Vec<Value> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery-fake-acp"));
@@ -549,4 +551,372 @@ fn a_model_switch_can_send_a_known_backlog_of_chunks_before_answering() {
         json!("large"),
         "{out:?}"
     );
+}
+
+// Plan (2): the fake asks the client questions (ACP core §2.5, §4.6).
+
+/// What the fake sent during one `converse`, and how it exited if it did.
+struct Conversation {
+    messages: Vec<Value>,
+    exit: Option<i32>,
+}
+
+/// Drive the fake through `initialize` (advertising `capabilities`),
+/// `session/new` and one prompt, playing the client: every request the fake
+/// sends is handed to `on_request`, and whatever it returns is written back.
+/// Ends when the prompt is answered or the fake exits; a watchdog kills a
+/// fake still running after 20 s, so a question nobody answers fails the
+/// test instead of hanging it.
+fn converse(script: &FakeScript, capabilities: Value, on_request: impl FnMut(&Value) -> Vec<Value>) -> Conversation {
+    let mut requests = session_requests();
+    requests[0]["params"]["clientCapabilities"] = capabilities;
+    converse_with(script, requests, on_request)
+}
+
+/// `converse` over any list of requests; it ends when the last one is
+/// answered.
+fn converse_with(
+    script: &FakeScript,
+    requests: Vec<Value>,
+    mut on_request: impl FnMut(&Value) -> Vec<Value>,
+) -> Conversation {
+    let last = requests.last().unwrap()["id"].clone();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hennery-fake-acp"))
+        .env(hennery_testkit::SCRIPT_ENV, serde_json::to_string(script).unwrap())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (done, finished) = std::sync::mpsc::channel::<()>();
+    let pid = child.id() as i32;
+    let watchdog = std::thread::spawn(move || {
+        if finished.recv_timeout(Duration::from_secs(20)).is_err() {
+            // SAFETY: the child is not reaped before `done` is sent, so its
+            // pid cannot have been recycled yet.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    });
+    let mut stdin = child.stdin.take().unwrap();
+    for r in &requests {
+        writeln!(stdin, "{r}").unwrap();
+    }
+    let mut messages = Vec::new();
+    let mut answered = false;
+    for line in BufReader::new(child.stdout.take().unwrap()).lines() {
+        let msg: Value = serde_json::from_str(&line.unwrap()).unwrap();
+        if msg.get("method").is_some() && msg.get("id").is_some() {
+            for reply in on_request(&msg) {
+                writeln!(stdin, "{reply}").unwrap();
+            }
+        }
+        answered = msg["id"] == last && msg.get("method").is_none();
+        messages.push(msg);
+        if answered {
+            break;
+        }
+    }
+    if answered {
+        child.kill().ok();
+    }
+    let _ = done.send(());
+    watchdog.join().unwrap();
+    let status = child.wait().unwrap();
+    Conversation {
+        messages,
+        exit: if answered { None } else { status.code() },
+    }
+}
+
+/// The client's answer to one of the fake's requests.
+fn result(request: &Value, result: Value) -> Value {
+    json!({"jsonrpc": "2.0", "id": request["id"], "result": result})
+}
+
+/// The text of every `agent_message_chunk`, in order.
+fn texts(messages: &[Value]) -> Vec<String> {
+    messages
+        .iter()
+        .filter(|m| m["method"] == "session/update")
+        .filter_map(|m| m["params"]["update"]["content"]["text"].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+fn asking(asks: Vec<FakeAsk>) -> FakeScript {
+    FakeScript {
+        asks,
+        ..FakeScript::default()
+    }
+}
+
+#[test]
+fn a_permission_ask_waits_for_the_clients_choice_and_the_agent_sees_it() {
+    let mut asked = Vec::new();
+    let talk = converse(&asking(vec![FakeAsk::Permission]), json!({}), |req| {
+        asked.push(req.clone());
+        vec![result(
+            req,
+            json!({"outcome": {"outcome": "selected", "optionId": "allow"}}),
+        )]
+    });
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0]["method"], "session/request_permission");
+    assert_eq!(asked[0]["params"]["sessionId"], "fake-session-1");
+    let options: Vec<&str> = asked[0]["params"]["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["optionId"].as_str().unwrap())
+        .collect();
+    assert_eq!(options, ["allow", "reject"]);
+    assert_eq!(texts(&talk.messages), ["permission:selected:allow", "Hello", " world"]);
+    assert_eq!(talk.messages.last().unwrap()["result"]["stopReason"], "end_turn");
+}
+
+#[test]
+fn an_elicitation_is_asked_only_of_a_client_that_advertises_form_elicitation() {
+    let script = asking(vec![FakeAsk::Elicitation]);
+    let talk = converse(&script, json!({"elicitation": {"form": {}}}), |req| {
+        assert_eq!(
+            (req["method"].as_str(), req["params"]["mode"].as_str()),
+            (Some("elicitation/create"), Some("form"))
+        );
+        vec![result(
+            req,
+            json!({"action": "accept", "content": {"name": "notes.txt"}}),
+        )]
+    });
+    assert_eq!(texts(&talk.messages)[0], r#"elicitation:accept:{"name":"notes.txt"}"#);
+    // A boolean is not the capability (P-19): the agent asks nothing, as
+    // if none were advertised.
+    for caps in [json!({"elicitation": true}), json!({})] {
+        let talk = converse(&script, caps.clone(), |req| {
+            panic!("asked {req} of a client with {caps}")
+        });
+        assert_eq!(texts(&talk.messages)[0], "elicitation:unsupported", "{caps}");
+    }
+}
+
+#[test]
+fn a_prompt_cancelled_while_it_asks_stops_asking_and_ends_cancelled() {
+    let mut asked = 0;
+    let talk = converse(
+        &asking(vec![FakeAsk::Permission, FakeAsk::Elicitation]),
+        json!({"elicitation": {"form": {}}}),
+        |req| {
+            asked += 1;
+            // A client cancels the turn, then answers what is pending as
+            // cancelled, as ACP asks of it.
+            vec![
+                json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": "fake-session-1"}}),
+                result(req, json!({"outcome": {"outcome": "cancelled"}})),
+            ]
+        },
+    );
+    assert_eq!(asked, 1, "the agent kept asking after the cancel");
+    assert_eq!(texts(&talk.messages), ["permission:cancelled"]);
+    assert_eq!(talk.messages.last().unwrap()["result"]["stopReason"], "cancelled");
+}
+
+#[test]
+fn asks_at_once_are_all_open_before_the_first_answer() {
+    let script = FakeScript {
+        asks_at_once: true,
+        ..asking(vec![FakeAsk::Permission, FakeAsk::Elicitation])
+    };
+    let mut open = Vec::new();
+    let talk = converse(&script, json!({"elicitation": {"form": {}}}), |req| {
+        open.push(req.clone());
+        if open.len() < 2 {
+            return vec![];
+        }
+        // Answered newest first: the echoes still follow the asks' order.
+        vec![
+            result(&open[1], json!({"action": "decline"})),
+            result(
+                &open[0],
+                json!({"outcome": {"outcome": "selected", "optionId": "reject"}}),
+            ),
+        ]
+    });
+    assert_eq!(open.len(), 2);
+    assert_eq!(
+        texts(&talk.messages)[..2],
+        ["permission:selected:reject", "elicitation:decline"]
+    );
+}
+
+#[test]
+fn a_request_no_client_serves_comes_back_with_the_clients_error() {
+    let talk = converse(&asking(vec![FakeAsk::Unknown]), json!({}), |req| {
+        assert_eq!(req["method"], "_fake/unknown");
+        vec![json!({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32601, "message": "Method not found"}})]
+    });
+    assert_eq!(texts(&talk.messages)[0], "unknown:error:-32601");
+}
+
+#[test]
+fn ask_on_load_asks_before_the_load_is_answered() {
+    let script = FakeScript {
+        ask_on_load: true,
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let requests = vec![
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"fake-session-1","cwd":"/tmp","mcpServers":[]}}),
+    ];
+    let talk = converse_with(&script, requests, |_| vec![]);
+    let asked = talk
+        .messages
+        .iter()
+        .position(|m| m["method"] == "session/request_permission")
+        .expect("asked");
+    let loaded = talk.messages.iter().position(|m| m["id"] == json!(2)).unwrap();
+    assert!(asked < loaded, "{:?}", talk.messages);
+}
+
+#[test]
+fn a_withdrawn_ask_is_cancelled_on_the_wire() {
+    let script = FakeScript {
+        withdraw_asks: true,
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let mut asked = Vec::new();
+    let talk = converse(&script, json!({}), |req| {
+        asked.push(req.clone());
+        vec![json!({"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32800, "message": "Request cancelled"}})]
+    });
+    let withdrawn = talk
+        .messages
+        .iter()
+        .find(|m| m["method"] == "$/cancel_request")
+        .expect("the ask was withdrawn");
+    assert_eq!(withdrawn["params"]["requestId"], asked[0]["id"]);
+    assert_eq!(texts(&talk.messages)[0], "permission:error:-32800");
+}
+
+#[test]
+fn crash_while_asking_exits_with_the_question_unanswered() {
+    let script = FakeScript {
+        crash_while_asking: true,
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let mut asked = 0;
+    let talk = converse(&script, json!({}), |_| {
+        asked += 1;
+        vec![]
+    });
+    assert_eq!(asked, 1);
+    assert_eq!(talk.exit, Some(hennery_testkit::CRASH_EXIT_CODE));
+    assert!(texts(&talk.messages).is_empty(), "{:?}", talk.messages);
+}
+
+// Fix round 1 (review): compose `ask_on_load_waits` with the load's own
+// answer, and cover `FuturePermission` at the fake level.
+
+/// Drive `initialize` + `session/load` for a script with `ask_on_load` and
+/// `ask_on_load_waits` set: read the load-time ask, confirm the load has not
+/// answered yet, answer the ask, then return the load's own answer.
+fn ask_on_load_waits_drive(script: &FakeScript) -> Value {
+    use std::os::unix::process::CommandExt;
+    let mut child = KillGroupOnDrop(
+        Command::new(env!("CARGO_BIN_EXE_hennery-fake-acp"))
+            .env(hennery_testkit::SCRIPT_ENV, serde_json::to_string(script).unwrap())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdin = child.0.stdin.take().unwrap();
+    for r in &load_requests("agent-7") {
+        writeln!(stdin, "{r}").unwrap();
+    }
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+                break;
+            };
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+    let init = rx.recv_timeout(Duration::from_secs(5)).expect("initialize answered");
+    assert_eq!(init["id"], json!(1), "{init}");
+    let ask = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("asked before the load answered");
+    assert_eq!(ask["method"], "session/request_permission", "{ask}");
+    // Nothing else follows until we answer: in particular not the load.
+    if let Ok(msg) = rx.recv_timeout(Duration::from_millis(300)) {
+        panic!("the load answered before its question was: {msg}");
+    }
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "id": ask["id"], "result": {"outcome": {"outcome": "selected", "optionId": "allow"}}})
+    )
+    .unwrap();
+    let loaded = rx.recv_timeout(Duration::from_secs(5)).expect("the load answered");
+    assert_eq!(loaded["id"], json!(2), "{loaded:?}");
+    loaded
+    // `child` drops here: SIGKILLs the group and reaps it, on this path and
+    // on any assertion failure above.
+}
+
+#[test]
+fn ask_on_load_waits_defers_the_loads_answer_until_the_question_is() {
+    let script = FakeScript {
+        ask_on_load: true,
+        ask_on_load_waits: true,
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let loaded = ask_on_load_waits_drive(&script);
+    assert!(loaded.get("error").is_none(), "{loaded}");
+}
+
+/// Fix round 1, finding 1: the waited path must apply `load_error` exactly
+/// as the non-waiting path does, not bypass it with a bare success.
+#[test]
+fn ask_on_load_waits_still_answers_a_scripted_load_error_after_the_question() {
+    let script = FakeScript {
+        ask_on_load: true,
+        ask_on_load_waits: true,
+        load_error: Some(-32002),
+        ..asking(vec![FakeAsk::Permission])
+    };
+    let loaded = ask_on_load_waits_drive(&script);
+    assert_eq!(loaded["error"]["code"], -32002, "{loaded}");
+}
+
+/// Fix round 1, finding 2: `FuturePermission` at the fake level — the
+/// request on the wire carries an option of a kind outside the schema
+/// (`allow_for_session`), and its `optionId`s are still there raw for a
+/// client (or, at the host, the collector) that reads them without typed
+/// validation.
+#[test]
+fn a_future_permission_option_kind_reaches_the_wire_raw_and_is_still_answerable() {
+    let mut asked = Vec::new();
+    let talk = converse(&asking(vec![FakeAsk::FuturePermission]), json!({}), |req| {
+        asked.push(req.clone());
+        vec![result(
+            req,
+            json!({"outcome": {"outcome": "selected", "optionId": "allow_session"}}),
+        )]
+    });
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0]["method"], "session/request_permission");
+    let options = asked[0]["params"]["options"].as_array().unwrap();
+    let option_ids: Vec<&str> = options.iter().map(|o| o["optionId"].as_str().unwrap()).collect();
+    assert_eq!(option_ids, ["allow", "allow_session"]);
+    let future = options.iter().find(|o| o["optionId"] == "allow_session").unwrap();
+    assert_eq!(
+        future["kind"], "allow_for_session",
+        "a kind outside the schema: {future}"
+    );
+    assert_eq!(texts(&talk.messages)[0], "permission:selected:allow_session");
 }

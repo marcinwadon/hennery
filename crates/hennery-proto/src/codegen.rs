@@ -45,6 +45,9 @@ pub fn render_schema() -> String {
         rest::CancelResponse,
         rest::ConfigRequest,
         rest::SessionCatalog,
+        rest::PendingItem,
+        rest::AnswerRequest,
+        rest::AnswerResponse,
     );
     // `serde_json::Map` is a `BTreeMap` (always iterates sorted) by default,
     // or an `IndexMap` (iterates in insertion order) when serde_json's
@@ -108,6 +111,11 @@ pub fn render_ts() -> String {
         frames::AttachedSession,
         frames::TurnOutcome,
         frames::ParkReason,
+        frames::PendingKind,
+        frames::PendingResolution,
+        frames::PendingReason,
+        frames::ElicitationAction,
+        frames::PendingExtract,
         frames::Indexed,
         frames::SessionBody,
         frames::HostFrame,
@@ -124,6 +132,10 @@ pub fn render_ts() -> String {
         rest::CancelResponse,
         rest::ConfigRequest,
         rest::SessionCatalog,
+        rest::PendingState,
+        rest::PendingItem,
+        rest::AnswerRequest,
+        rest::AnswerResponse,
     );
     out
 }

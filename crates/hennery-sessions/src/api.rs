@@ -2,7 +2,7 @@
 
 use crate::AppState;
 use crate::hub::{RequestError, Undo};
-use crate::store::ResumeRequest;
+use crate::store::{AnswerSubmission, ResumeRequest, Store};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -12,8 +12,9 @@ use axum::{Json, Router, middleware};
 use futures::stream::{self, Stream, StreamExt};
 use hennery_proto::frames::{Capability, CollectorFrame, Indexed, SessionBody};
 use hennery_proto::rest::{
-    ApiError, CancelResponse, ConfigRequest, EventDto, LifecycleResponse, OpenTurn, PromptRequest, PromptResponse,
-    SessionCatalog, SessionDetail, StartSessionRequest, StartSessionResponse,
+    AnswerRequest, AnswerResponse, ApiError, CancelResponse, ConfigRequest, EventDto, LifecycleResponse, OpenTurn,
+    PendingItem, PromptRequest, PromptResponse, SessionCatalog, SessionDetail, StartSessionRequest,
+    StartSessionResponse,
 };
 use serde::Deserialize;
 use std::convert::Infallible;
@@ -58,6 +59,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/{id}/close", post(close))
         .route("/api/sessions/{id}/catalog", get(catalog))
         .route("/api/sessions/{id}/config", post(set_config))
+        .route("/api/sessions/{id}/pending/{pending_id}/answer", post(answer))
         .route("/api/sessions/{id}/events", get(events))
         .route("/api/stream/sessions/{id}", get(stream_session))
         .layer(middleware::from_fn_with_state(
@@ -200,6 +202,10 @@ async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -
         },
         None => None,
     };
+    let pending = match state.store.open_pending(&id) {
+        Ok(pending) => pending,
+        Err(err) => return internal(err),
+    };
     Json(SessionDetail {
         session_id: session.id,
         host_id: session.host_id,
@@ -210,6 +216,7 @@ async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -
         failure_reason: session.failure_reason,
         presumed_parked: session.presumed_parked,
         open_turn,
+        pending,
     })
     .into_response()
 }
@@ -440,6 +447,41 @@ async fn set_config(State(state): State<AppState>, Path(id): Path<String>, Json(
     }
 }
 
+/// Answer a pending request (ACP core §4.6, §9): 202 once the answer is
+/// queued durably, whatever the host's state. It goes out now if the host
+/// is connected and reconciled, else after its next handshake; the verdict
+/// follows as SSE `pending_changed`.
+async fn answer(
+    State(state): State<AppState>,
+    Path((id, pending_id)): Path<(String, String)>,
+    Json(req): Json<AnswerRequest>,
+) -> Response {
+    match state.store.submit_answer(&id, &pending_id, &req) {
+        Ok(AnswerSubmission::Queued(queued)) => {
+            state.hub.publish(queued.event);
+            state.hub.notify(&queued.host_id, queued.frame);
+            let body = AnswerResponse {
+                pending_id,
+                request_id: queued.request_id,
+            };
+            (StatusCode::ACCEPTED, Json(body)).into_response()
+        }
+        Ok(AnswerSubmission::NotFound) => error(StatusCode::NOT_FOUND, "not_found", "no such pending request"),
+        Ok(AnswerSubmission::NotOpen) => error(
+            StatusCode::CONFLICT,
+            "not_open",
+            "the request was answered or cancelled already",
+        ),
+        Ok(AnswerSubmission::AlreadyAnswered) => error(
+            StatusCode::CONFLICT,
+            "already_answered",
+            "an answer is already on its way",
+        ),
+        Ok(AnswerSubmission::Invalid(why)) => error(StatusCode::BAD_REQUEST, "invalid", why),
+        Err(err) => internal(err),
+    }
+}
+
 fn lifecycle_response(state: &AppState, id: &str) -> Response {
     match state.store.session(id) {
         Ok(Some(s)) => (
@@ -580,11 +622,13 @@ fn sse_event(e: &EventDto) -> Event {
 }
 
 /// The SSE messages for one stored event: the event, then `catalog_changed`
-/// with the same id if it carries a catalogue snapshot (ACP core §9). A
-/// listed event with a snapshot is one that changed the stored catalogue,
-/// and both come from the stored row, so a replay from `Last-Event-ID`
-/// sends them too.
-fn sse_messages(e: &EventDto) -> Vec<Result<Event, Infallible>> {
+/// with the same id if it carries a catalogue snapshot, and
+/// `pending_changed` with the same id if it concerns a pending request
+/// (ACP core §9). A listed event with a snapshot is one that changed the
+/// stored catalogue, and both come from the stored row, so a replay from
+/// `Last-Event-ID` sends them too. `pending_changed` carries the request as
+/// it stands when the message is sent.
+fn sse_messages(store: &Store, e: &EventDto) -> Vec<Result<Event, Infallible>> {
     let mut out = vec![Ok(sse_event(e))];
     if let Some(catalog) = catalog_in(e) {
         out.push(Ok(Event::default()
@@ -592,7 +636,25 @@ fn sse_messages(e: &EventDto) -> Vec<Result<Event, Infallible>> {
             .event("catalog_changed")
             .data(serde_json::to_string(&catalog).expect("catalog serializes"))));
     }
+    if let Some(pending) = pending_in(store, e) {
+        out.push(Ok(Event::default()
+            .id(e.event_id.to_string())
+            .event("pending_changed")
+            .data(serde_json::to_string(&pending).expect("pending request serializes"))));
+    }
     out
+}
+
+/// The pending request a stored event concerns, as it stands now.
+fn pending_in(store: &Store, e: &EventDto) -> Option<PendingItem> {
+    if !matches!(
+        e.kind.as_str(),
+        "pending_opened" | "pending_resolved" | "pending_cancelled" | "answer_submitted" | "answer_result"
+    ) {
+        return None;
+    }
+    let pending_id = e.body.get("pending_id")?.as_str()?;
+    store.pending_item(pending_id).ok().flatten()
 }
 
 /// The catalogue snapshot a stored host fact carries in its extracts.
@@ -619,14 +681,21 @@ async fn stream_session(
     let live = BroadcastStream::new(state.hub.subscribe());
     let backlog = state.store.events(&id, after, u32::MAX).unwrap_or_default();
     let last = backlog.last().map(|e| e.event_id).unwrap_or(after);
-    let replay = stream::iter(backlog.iter().flat_map(sse_messages).collect::<Vec<_>>());
+    let replay = stream::iter(
+        backlog
+            .iter()
+            .flat_map(|e| sse_messages(&state.store, e))
+            .collect::<Vec<_>>(),
+    );
     let session = id.clone();
+    let store = state.store.clone();
     let follow = live
         .filter_map(move |item| {
             let session = session.clone();
+            let store = store.clone();
             async move {
                 match item {
-                    Ok(e) if e.session_id == session && e.event_id > last => Some(sse_messages(&e)),
+                    Ok(e) if e.session_id == session && e.event_id > last => Some(sse_messages(&store, &e)),
                     Ok(_) => None,
                     // Lagged: tell the client to refetch instead of skipping silently.
                     Err(_) => Some(vec![Ok(Event::default().event("resync_required").data("{}"))]),

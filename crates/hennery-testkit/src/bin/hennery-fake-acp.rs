@@ -6,13 +6,14 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ConfigOptionUpdate, ContentBlock, ContentChunk, InitializeRequest,
     InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
     PromptResponse, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigSelect, SessionConfigSelectOption, SessionConfigSelectOptions, SessionConfigValueId,
+    SessionConfigSelect, SessionConfigSelectOption, SessionConfigSelectOptions, SessionConfigValueId, SessionId,
     SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
     TextContent,
 };
-use agent_client_protocol::{Agent, Stdio, UntypedMessage};
-use hennery_testkit::{CRASH_EXIT_CODE, FakeScript, SCRIPT_ENV};
+use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, SentRequest, Stdio, UntypedMessage};
+use hennery_testkit::{CRASH_EXIT_CODE, FakeAsk, FakeScript, SCRIPT_ENV};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
@@ -64,13 +65,25 @@ async fn main() -> agent_client_protocol::Result<()> {
     // cleared when a prompt starts. Handlers run in arrival order, so a
     // cancel sent right after its prompt is never cleared by that prompt.
     let cancel = Arc::new(watch::channel(false).0);
+    // The client advertised form elicitation in `initialize`.
+    let forms = Arc::new(AtomicBool::new(false));
     Agent
         .builder()
         .name("hennery-fake-acp")
         .on_receive_request(
             {
                 let catalogue = catalogue.clone();
+                let forms = forms.clone();
                 async move |req: InitializeRequest, responder, _cx| {
+                    // Typed, like the real adapters' schema validation: a
+                    // boolean `elicitation` does not parse, so it counts as
+                    // not advertised (P-19).
+                    let advertised = req
+                        .client_capabilities
+                        .elicitation
+                        .as_ref()
+                        .is_some_and(|elicitation| elicitation.form.is_some());
+                    forms.store(advertised, Ordering::SeqCst);
                     // A boolean option is announced as one only to a client
                     // that says it can show one; any other gets an on/off
                     // select, as the real adapters do.
@@ -115,7 +128,16 @@ async fn main() -> agent_client_protocol::Result<()> {
             {
                 let script = script.clone();
                 let announced = announced.clone();
+                let forms = forms.clone();
                 async move |req: LoadSessionRequest, responder, cx| {
+                    // Owned locals: the captured fields sit behind `&mut
+                    // self` (this handler is called via a shared/mut
+                    // reference, reused for every `session/load`), so
+                    // anything moved later (into a nested `cx.spawn`, or
+                    // into `answer_load`) must be its own clone first.
+                    let script = script.clone();
+                    let announced = announced.clone();
+                    let forms = forms.load(Ordering::SeqCst);
                     // History first, then the answer: an ACP agent replays a
                     // loaded session as `session/update`s before it responds.
                     for update in &script.replay {
@@ -124,19 +146,32 @@ async fn main() -> agent_client_protocol::Result<()> {
                             serde_json::json!({ "sessionId": req.session_id, "update": update }),
                         )?)?;
                     }
-                    match script.load_error {
-                        Some(code) => responder.respond_with_error(agent_client_protocol::Error::new(code, "scripted")),
-                        None if script.config_in_update_only => {
-                            if let Some(options) = announced() {
-                                cx.send_notification(SessionNotification::new(
-                                    req.session_id.clone(),
-                                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
-                                ))?;
-                            }
-                            responder.respond(LoadSessionResponse::new())
+                    if script.ask_on_load
+                        && let Some(ask) = script.asks.first().copied()
+                        && let Some(request) = ask_request(ask, &req.session_id, forms)?
+                    {
+                        // On the wire before the load's answer; awaited
+                        // from a task of its own.
+                        let sent = cx.send_request(request);
+                        if script.ask_on_load_waits {
+                            // The load is answered only once the question is,
+                            // then exactly as the non-waiting path below:
+                            // `load_error` / `config_in_update_only` still
+                            // apply, just deferred until the answer is in.
+                            let (cx2, session, script2, announced2) =
+                                (cx.clone(), req.session_id.clone(), script.clone(), announced.clone());
+                            return cx.spawn(async move {
+                                let _ = sent.block_task().await;
+                                answer_load(&script2, announced2, &session, &cx2, responder)
+                            });
                         }
-                        None => responder.respond(LoadSessionResponse::new().config_options(announced())),
+                        let (cx2, session) = (cx.clone(), req.session_id.clone());
+                        cx.spawn(async move {
+                            let echo = echo(ask, sent.block_task().await);
+                            cx2.send_notification(chunk(&session, echo))
+                        })?;
                     }
+                    answer_load(&script, announced, &req.session_id, &cx, responder)
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -292,7 +327,19 @@ async fn main() -> agent_client_protocol::Result<()> {
             {
                 let cancel = cancel.clone();
                 let ignore = script.ignore_cancel;
+                let cancel_received_file = script.cancel_received_file.clone();
                 async move |_n: CancelNotification, _cx| {
+                    if let Some(path) = &cancel_received_file {
+                        // Marks arrival regardless of `ignore`: this is a
+                        // signal for "the host forwarded it", not "the
+                        // adapter obeyed it".
+                        let mut log = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                            .expect("open cancel_received_file");
+                        writeln!(log, "cancel").expect("write cancel_received_file");
+                    }
                     if !ignore {
                         cancel.send_replace(true);
                     }
@@ -304,6 +351,7 @@ async fn main() -> agent_client_protocol::Result<()> {
         .on_receive_request(
             {
                 let script = script.clone();
+                let forms = forms.clone();
                 async move |req: PromptRequest, responder, cx| {
                     let script = script.clone();
                     let cx2 = cx.clone();
@@ -320,7 +368,26 @@ async fn main() -> agent_client_protocol::Result<()> {
                             SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
                         ))?;
                     }
+                    let forms = forms.load(Ordering::SeqCst);
                     cx.spawn(async move {
+                        if script.crash_while_asking {
+                            // Sent, never awaited: kept alive until the crash.
+                            let mut sent: Vec<SentRequest<serde_json::Value>> = Vec::new();
+                            for ask in &script.asks {
+                                if let Some(request) = ask_request(*ask, &req.session_id, forms)? {
+                                    sent.push(cx2.send_request(request));
+                                }
+                            }
+                            crash().await;
+                        }
+                        if !script.asks.is_empty() {
+                            for echo in ask_all(&cx2, &script, &req.session_id, forms, &cancelled).await? {
+                                cx2.send_notification(chunk(&req.session_id, echo))?;
+                            }
+                            if *cancelled.borrow() {
+                                return responder.respond(PromptResponse::new(StopReason::Cancelled));
+                            }
+                        }
                         if script.flood {
                             // Back to back until cancelled, yielding (never
                             // sleeping) so the cancel can land.
@@ -371,6 +438,166 @@ async fn main() -> agent_client_protocol::Result<()> {
         )
         .connect_to(Stdio::new())
         .await
+}
+
+/// Answer `session/load` as the script asks: the scripted error, options
+/// announced only in a preceding update, or a normal read-back. Shared by
+/// the immediate path and the `ask_on_load_waits` path, which only defers
+/// reaching this until the load-time question is answered — the same rules
+/// apply either way.
+fn answer_load(
+    script: &FakeScript,
+    announced: impl FnOnce() -> Option<Vec<SessionConfigOption>>,
+    session: &SessionId,
+    cx: &ConnectionTo<Client>,
+    responder: Responder<LoadSessionResponse>,
+) -> agent_client_protocol::Result<()> {
+    match script.load_error {
+        Some(code) => responder.respond_with_error(agent_client_protocol::Error::new(code, "scripted")),
+        None if script.config_in_update_only => {
+            if let Some(options) = announced() {
+                cx.send_notification(SessionNotification::new(
+                    session.clone(),
+                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
+                ))?;
+            }
+            responder.respond(LoadSessionResponse::new())
+        }
+        None => responder.respond(LoadSessionResponse::new().config_options(announced())),
+    }
+}
+
+/// One text chunk of the agent's reply.
+fn chunk(session: &SessionId, text: String) -> SessionNotification {
+    SessionNotification::new(
+        session.clone(),
+        SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(TextContent::new(text)))),
+    )
+}
+
+/// The ACP request for one ask, sent untyped so the test sees the answer
+/// exactly as the client wrote it. `None` for an elicitation to a client
+/// that did not advertise form elicitation.
+fn ask_request(
+    ask: FakeAsk,
+    session: &SessionId,
+    forms: bool,
+) -> agent_client_protocol::Result<Option<UntypedMessage>> {
+    match ask {
+        FakeAsk::Permission => UntypedMessage::new(
+            "session/request_permission",
+            serde_json::json!({
+                "sessionId": session,
+                "toolCall": {"toolCallId": "call-1", "title": "Write notes.txt", "kind": "edit"},
+                "options": [
+                    {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "reject", "name": "Reject", "kind": "reject_once"}
+                ]
+            }),
+        )
+        .map(Some),
+        FakeAsk::FuturePermission => UntypedMessage::new(
+            "session/request_permission",
+            serde_json::json!({
+                "sessionId": session,
+                "toolCall": {"toolCallId": "call-1", "title": "Write notes.txt", "kind": "edit"},
+                "options": [
+                    {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                    {"optionId": "allow_session", "name": "Allow for this session", "kind": "allow_for_session"}
+                ]
+            }),
+        )
+        .map(Some),
+        FakeAsk::Elicitation if forms => UntypedMessage::new(
+            "elicitation/create",
+            serde_json::json!({
+                "mode": "form",
+                "sessionId": session,
+                "message": "What should the file be called?",
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {"name": {"type": "string"}},
+                    "required": ["name"]
+                }
+            }),
+        )
+        .map(Some),
+        FakeAsk::Elicitation => Ok(None),
+        FakeAsk::Unknown => UntypedMessage::new("_fake/unknown", serde_json::json!({ "sessionId": session })).map(Some),
+    }
+}
+
+/// An ask whose echo is known (not asked), or still out.
+enum Asked {
+    Echo(String),
+    Out(FakeAsk, SentRequest<serde_json::Value>),
+}
+
+/// Ask the script's questions and return one echo per ask, in order. One
+/// at a time, unless `asks_at_once`; a cancelled prompt asks nothing more.
+async fn ask_all(
+    cx: &ConnectionTo<Client>,
+    script: &FakeScript,
+    session: &SessionId,
+    forms: bool,
+    cancelled: &watch::Receiver<bool>,
+) -> agent_client_protocol::Result<Vec<String>> {
+    let mut asked = Vec::new();
+    for ask in &script.asks {
+        if *cancelled.borrow() {
+            break;
+        }
+        let Some(request) = ask_request(*ask, session, forms)? else {
+            asked.push(Asked::Echo("elicitation:unsupported".into()));
+            continue;
+        };
+        let sent = cx.send_request(request);
+        if script.withdraw_asks {
+            sent.cancel()?;
+        }
+        asked.push(if script.asks_at_once {
+            Asked::Out(*ask, sent)
+        } else {
+            Asked::Echo(echo(*ask, sent.block_task().await))
+        });
+    }
+    let mut echoes = Vec::new();
+    for asked in asked {
+        echoes.push(match asked {
+            Asked::Echo(echo) => echo,
+            Asked::Out(ask, sent) => echo(ask, sent.block_task().await),
+        });
+    }
+    Ok(echoes)
+}
+
+/// The answer to one ask, as the agent understood it.
+fn echo(ask: FakeAsk, answer: agent_client_protocol::Result<serde_json::Value>) -> String {
+    let name = match ask {
+        FakeAsk::Permission | FakeAsk::FuturePermission => "permission",
+        FakeAsk::Elicitation => "elicitation",
+        FakeAsk::Unknown => "unknown",
+    };
+    let answer = match answer {
+        Ok(answer) => answer,
+        Err(err) => return format!("{name}:error:{}", i32::from(err.code)),
+    };
+    match ask {
+        FakeAsk::Permission | FakeAsk::FuturePermission => match answer["outcome"]["outcome"].as_str() {
+            Some("selected") => format!(
+                "permission:selected:{}",
+                answer["outcome"]["optionId"].as_str().unwrap_or("?")
+            ),
+            Some(other) => format!("permission:{other}"),
+            None => format!("permission:unreadable:{answer}"),
+        },
+        FakeAsk::Elicitation => match (answer["action"].as_str(), answer.get("content")) {
+            (Some(action), Some(content)) => format!("elicitation:{action}:{content}"),
+            (Some(action), None) => format!("elicitation:{action}"),
+            (None, _) => format!("elicitation:unreadable:{answer}"),
+        },
+        FakeAsk::Unknown => format!("unknown:answered:{answer}"),
+    }
 }
 
 /// Record a switch in the script's `config_log`, if it has one.

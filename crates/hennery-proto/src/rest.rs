@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-use crate::frames::{ConfigValue, Indexed, SessionConfig};
+use crate::frames::{ConfigValue, ElicitationAction, Indexed, PendingKind, PendingReason, SessionConfig};
 
 /// `POST /api/sessions` (ACP core §9): `{host_id, agent, cwd, model?, mode?, axes?}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -74,8 +74,8 @@ pub struct OpenTurn {
     pub state: String,
 }
 
-/// `GET /api/sessions/{id}` (ACP core §9): the list item plus the open turn.
-/// Pending requests join it with permission handling.
+/// `GET /api/sessions/{id}` (ACP core §9): the list item, the open turn and
+/// the pending requests still open.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct SessionDetail {
     pub session_id: String,
@@ -95,6 +95,78 @@ pub struct SessionDetail {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "OpenTurn | undefined", optional)]
     pub open_turn: Option<OpenTurn>,
+    /// Open pending requests, oldest first: what the operator can answer.
+    #[serde(default)]
+    pub pending: Vec<PendingItem>,
+}
+
+/// Where a pending request stands (ACP core §4.6): `open`, then
+/// `delivered` or `cancelled`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingState {
+    Open,
+    Delivered,
+    Cancelled,
+}
+
+/// One pending request, as the collector holds it: an entry of
+/// `SessionDetail.pending`, and the data of SSE `pending_changed`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PendingItem {
+    pub pending_id: String,
+    pub session_id: String,
+    pub kind: PendingKind,
+    pub state: PendingState,
+    /// Why it was cancelled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "PendingReason | undefined", optional)]
+    pub reason: Option<PendingReason>,
+    /// The turn it was asked in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub turn_id: Option<String>,
+    /// A permission's option ids: the only valid answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string[] | undefined", optional)]
+    pub option_ids: Option<Vec<String>>,
+    /// The adapter's ACP request, verbatim.
+    #[ts(type = "unknown")]
+    pub payload: Value,
+    /// An answer has been accepted for it (at most one is).
+    pub answered: bool,
+    /// The host's verdict on that answer, once one arrived. `true` sticks
+    /// (umbrella §6.8): a card shows "answered" only then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "boolean | undefined", optional)]
+    pub delivered: Option<bool>,
+}
+
+/// `POST /api/sessions/{id}/pending/{pending_id}/answer` (ACP core §9): an
+/// option for a permission request, or an action for an elicitation, with
+/// the form's content when it accepts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(untagged)]
+pub enum AnswerRequest {
+    Permission {
+        option_id: String,
+    },
+    Elicitation {
+        action: ElicitationAction,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "unknown", optional)]
+        content: Option<Value>,
+    },
+}
+
+/// 202 to an answer: it is queued for the session's host, and delivered now
+/// or on the host's next connection (ACP core §4.6). The verdict follows on
+/// the session stream as `pending_changed`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct AnswerResponse {
+    pub pending_id: String,
+    /// Carried by the host's `answer_result` for this answer.
+    pub request_id: String,
 }
 
 /// `POST /api/sessions/{id}/cancel`: how the open turn ended. Usually

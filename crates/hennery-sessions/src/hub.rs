@@ -229,6 +229,18 @@ impl Hub {
             .is_some_and(|h| h.capabilities.has(capability))
     }
 
+    /// Send a frame nobody waits for (an answer: its verdict arrives as a
+    /// fact, ACP core §4.6) to a host that is connected and reconciled.
+    /// `false` if it is not: the frame then goes after its next handshake.
+    pub fn notify(&self, host_id: &str, frame: CollectorFrame) -> bool {
+        self.hosts
+            .lock()
+            .expect("hosts lock")
+            .get(host_id)
+            .filter(|h| h.ready)
+            .is_some_and(|h| h.tx.send(frame).is_ok())
+    }
+
     /// Send a request and wait until the outboxed fact carrying `request_id`
     /// is ingested (`resolve`), the host rejects it (`reject`), the
     /// connection drops, or `timeout` passes.
