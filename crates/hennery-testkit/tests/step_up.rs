@@ -232,6 +232,39 @@ async fn ending_a_session_ends_its_open_streams() {
     );
 }
 
+/// The admin socket's resets (kernel spec §4.2) end every session, and so
+/// every stream a session holds open: a password reset, then a
+/// `public_url` reset.
+#[tokio::test]
+async fn a_reset_ends_every_session_and_its_streams() {
+    let c = Collector::start().await;
+    let streams = [
+        open_stream(&c, &c.session(0)).await,
+        open_stream(&c, &c.session(0)).await,
+    ];
+    let reset = c
+        .state
+        .operator
+        .reset_password("a new long password".into(), unix_now())
+        .await
+        .unwrap();
+    assert_eq!(reset, hennery_kernel::operator::Reset::Done { sessions_ended: 3 });
+    for stream in streams {
+        assert!(
+            ends(stream, Duration::from_secs(1)).await,
+            "a stream outlived the password reset"
+        );
+    }
+
+    let stream = open_stream(&c, &c.session(0)).await;
+    let reset = c.state.operator.reset_public_url(PUBLIC_URL).unwrap();
+    assert_eq!(reset, hennery_kernel::operator::Reset::Done { sessions_ended: 1 });
+    assert!(
+        ends(stream, Duration::from_secs(1)).await,
+        "a stream outlived the public_url reset"
+    );
+}
+
 /// A logged request must never show the password.
 #[test]
 fn a_step_up_request_does_not_show_its_password_in_debug() {
