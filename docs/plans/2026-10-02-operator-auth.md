@@ -54,12 +54,33 @@ It also relies on the umbrella spec [`2026-09-25-hennery-architecture-design.md`
 
 It builds on the executed [host pairing plan](2026-10-01-host-pairing.md) (plan 3a). Read its "Execution status" and "After this plan" first. Its code wins over its task text. It also builds on PR #9, which shipped decision 14 (`IMMEDIATE` transactions) ahead of this plan. Every anchor below was taken from that code (`main` at `a005dfa`, which merged #9).
 
-**Status:** not executed. Amended after the security review of 2026-10-02: required amendments A1–A11, plus the optional hardening the coordinator took (see "Decisions"). Every code block below was built and tested in a scratch copy of `a005dfa`, and every block was generated from the scratch commits. The plan was then replayed from its own text, task by task, onto a fresh copy of `a005dfa`:
+**Status:** executed 2026-10-02 (see "Execution status"). Amended after the security review of 2026-10-02: required amendments A1–A11, plus the optional hardening the coordinator took (see "Decisions"). Every code block below was built and tested in a scratch copy of `a005dfa`, and every block was generated from the scratch commits. The plan was then replayed from its own text, task by task, onto a fresh copy of `a005dfa`:
 - each block applied exactly as "Reading the steps" says;
 - after every task the tree matched the scratch commit byte for byte, `Cargo.lock` and the generated files included;
 - after every task the replay ran fmt, both clippy runs (the second on the shipped binary, with test hooks off), the workspace tests and both codegen checks.
 
 It ends with 431 tests, up from 393. The timing-sensitive tests passed with four copies of their test binary running at once.
+
+## Execution status (2026-10-02)
+
+**Executed** on branch `feat/operator-auth`: one subagent per task, each followed by a review (Task 7's review was folded into the whole-branch review, as a small task); then a whole-branch security review of `a005dfa..55e00c3` ("with fixes") and a fix wave. The plan's decisions were confirmed by a stronger-model security review on the maintainer's behalf, which added amendments A1–A11; decision 14 shipped ahead of the plan as PR #9. Deviations found in review:
+
+| Area | As built | Why |
+|---|---|---|
+| Hashing permit (T1) | `Operator.hashing` is an `Arc<Semaphore>`; `check_password` moves an owned permit into the blocking closure. Two unit tests pin the bound, one of them for an abandoned check. | A borrowed permit was freed when the caller's future was dropped, while its verify ran on: 15 verifies at once were reproduced |
+| `SetupLink` (T3) | `Debug` is written by hand and prints the link as `…/setup#<redacted>` | The derived `Debug` printed the live token |
+| Layer order (T5) | `the_browser_rules_run_before_the_session_check` pins that a cross-origin request without a cookie gets 403, not 401 | Swapping the two layers passed every other test |
+| Self-revoke (T6) | Revoking the request's own session sends a single `Set-Cookie`, the clearing one: `require_operator` re-sends a slid cookie only if the handler set none and the session still exists. `revoke_session` matches only live rows, so an expired session answers 404. | Two `Set-Cookie`s left the browser holding the dead token; a revoke of a dead row answered 204 and bumped the ending generation |
+| Locked-out step-up (T6) | `wrong_step_ups_lock_out_step_up_only` asserts that the refused step-up runs no password check (`verifications()` unchanged) | Only login's test pinned the no-verify path |
+| Session cookies (final) | Every `hennery_session` cookie of a request is tried in order, at most `MAX_SESSION_COOKIES` (4), by `require_operator` and by logout; the first that authenticates is used, and is the one re-sent when it slides | A same-named cookie tossed in from a sibling subdomain, sent first, signed the owner out (confirmed live) |
+| Development token (final) | `collector`, `up` and `host run` log one warning at start when `HENNERY_DEV_TOKEN` is set, without its value. `up` no longer hands it to its collector child. | A service definition still setting it would look as if it protected something |
+| Stream expiry (final) | `session_ended` sleeps at most `SESSION_RECHECK` (an hour) before re-checking against the wall clock. No test: it needs a clock seam that does not exist yet. | Tokio's monotonic clock does not count a suspend, so a stream could outlive its session after a laptop sleep |
+
+Task 3's revert-probe 3 as written fails for the wrong reason: with the rename left in, `rename` of a temp file that was never created errors, so the tests fail at `announce_setup(..).unwrap()` before the symlink assertion. The variant used replaces the rename with `Ok(())`, and then only `a_symlink_at_the_setup_link_is_replaced_and_its_target_left_alone` fails.
+
+Tests: 439 in the workspace, up from 393 before this plan (the plan's 431, plus the tests added in review fix rounds and the final wave).
+
+Still open: the spec amendments listed in this plan, and the hand-offs in "After this plan".
 
 ## Scope
 
@@ -315,8 +336,8 @@ These are the inputs most likely to bite a real user that the obvious tests woul
    - Expected: each waits its turn. None fails with `database is locked`, and the all-in-one host still pairs.
    - Tests: `a_transaction_holds_the_write_lock_from_its_start` (PR #9, decision 14). Every CLI test that runs `up` then signs in while the host pairs, e.g. `up_pairs_its_own_host_once`, under four parallel copies.
 3. **An operator route added after the auth layer, or a cross-site page aiming at one.**
-   - Expected: every operator route answers 401 without a live cookie. State-changing routes answer 403 without the `public_url`'s `Origin`, and `GET`s answer 403 when the browser marks them cross-site. Enrollment and the host WebSocket need neither.
-   - Tests: Task 5 `every_operator_route_needs_the_session_cookie`, `every_operator_route_applies_the_browser_rules`, `enrollment_and_the_host_socket_need_neither_a_session_nor_an_origin`; revert-probed by moving a route after the layer.
+   - Expected: every operator route in the route table answers 401 without a live cookie. State-changing routes answer 403 without the `public_url`'s `Origin`, and `GET`s answer 403 when the browser marks them cross-site. Enrollment and the host WebSocket need neither.
+   - Tests: Task 5 `every_operator_route_needs_the_session_cookie`, `every_operator_route_applies_the_browser_rules`, `enrollment_and_the_host_socket_need_neither_a_session_nor_an_origin`; revert-probed by moving a route after the layer. They cover the routes the table lists: a new route that is not added to the table is not caught (see "After this plan").
 4. **The setup link leaking, or being redirected:** a service's log collector, a proxy's access log, a `Referer`, or a symlink planted at `setup-url`.
    - Expected: the token appears in neither output stream and never in a request line (it is the fragment). The file is 0600, a planted symlink's target is untouched, and the file is gone after setup. Setup responses are never cached and send no `Referer`.
    - Tests: Task 3 `an_unset_collector_writes_its_setup_link_to_a_private_file_and_never_to_its_output`, `a_symlink_at_the_setup_link_is_replaced_and_its_target_left_alone`, `the_setup_link_is_written_privately_and_removed_by_setup`, `setup_responses_are_never_cached_nor_referred`, `the_setup_page_is_static_and_reads_the_token_from_the_fragment`.
@@ -8429,12 +8450,27 @@ git push
   - The race: `up` installs its signal handlers only after it has spawned both children. A SIGTERM before then kills `up` by the default action and leaves the collector child orphaned (reparented to launchd, still running).
   - How it shows: `up_warns_about_a_loose_existing_data_root` sends SIGTERM right after `up`'s data-root warning, so it can hit that window. It left one orphaned collector in about ten full runs.
   - The fix: register the `SIGINT` and `SIGTERM` streams at the top of `run_up`, before any spawn, and wait on those streams in the select loop.
-- **One parallel-load failure seen:** with 32 test binaries at once (eight of them, four copies each), `up_pairs_its_own_host_once` once timed out waiting for the setup link, most likely `free_listen`'s port being taken between release and bind. Four copies of the CLI binary alone passed 12 of 12.
+- **The CLI tests' port race, PROVEN:** under parallel load, CLI tests time out waiting for the setup link or for the collector to serve, because `free_listen`'s port is taken between its release and the collector's bind (`collector.err`: `Address already in use`). A harness PR, separate from auth, should fix it (for example, the collector binds port 0 and the test reads the port from `setup-url`), and also cover:
+  - the macOS pipe `CLOEXEC` race suspected in `a_failed_pairing_code_write_is_logged_without_the_code_and_does_not_kill_the_collector` (`pipe` then `fcntl` is not atomic there);
+  - `wait_until` calling `try_wait` on the child and printing its `.err`, so a dead collector fails the test at once and says why.
 - **Hardening the review suggested and the coordinator skipped for now:**
   - the `__Host-` cookie prefix, which renames the cookie kernel §3.2 fixes as `hennery_session`;
   - revoking a live session that is presented to login, in place of opening a second one;
   - a dummy hash precomputed at start, not on the first check before setup.
 - **`is_json_or_empty` and HTTP/2** (decision 8). The rule reads a body-less request from `Content-Length` (absent or 0) and a missing `Transfer-Encoding`. Over HTTP/2, which forbids `Transfer-Encoding`, a body can arrive with neither header, so a body with no `Content-Type` passes the rule. Two things hold it today: every handler that reads a body takes `Json`, which refuses a missing `Content-Type` on its own (415), and the body-less handlers never read one. If a handler ever reads a raw body, check it for itself.
+- **Found in execution and the final review, not fixed here:**
+  - `verify_password` is public and takes no hashing permit. Any later hash outside setup and login (3b-ii's password reset or change) MUST go through the permit (`check_password`).
+  - `migrate_component` reads the migration version outside its transaction. Open the stores one after the other, never concurrently; this matters for 3b-ii's listeners.
+  - The stored `User-Agent` keeps bidi and zero-width characters. The frontend's session list must render it escaped and isolated.
+  - Sessions have no absolute cap, only the 30-day sliding expiry. An option for 3b-ii, for example 90 days from login.
+  - `setup-url` has a symlink test but no hard-link test.
+  - axum's own 400, 415 and 422 rejections are plain text, not the `ApiError` shape.
+  - The setup page lacks `X-Content-Type-Options: nosniff`, and a CSP `default-src`, `connect-src` and `form-action`; add them with the frontend's headers.
+  - `rfc3339` is duplicated; the kernel should own it.
+  - The route table is an allowlist that a new route can miss. A deny-by-default operator router with an explicit exempt allowlist, or a test that fails on any route outside the two lists, would close it.
+  - The step-up limiter is keyed by address; it could also be keyed by session.
+  - No test pins a stream ending at its session's expiry (only at a revoke or a logout).
+  - `host join`'s stdin `read_line` has no length bound.
 - **The setup page's script** is checked only statically: served, and naming `location.hash` and `/api/setup`. A browser test of it comes with the frontend's own test setup.
 - **Spec amendments:** decisions 1, 14 and 16, and in kernel §3.3 the rule that every method but `GET` and `HEAD` is state-changing (decision 8).
 
