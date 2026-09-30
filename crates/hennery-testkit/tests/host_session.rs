@@ -558,15 +558,18 @@ async fn a_repeated_start_re_emits_session_started_with_the_new_request_id() {
 /// test binary at once) either timer can outrun the other for reasons that
 /// have nothing to do with the code under test, flaking the assertion.
 /// Instead the wrapper closes stdout and then blocks reading a FIFO, so it
-/// physically cannot exit until this test says so, and the actor is held
+/// physically cannot exit until this test says so. The actor is held
 /// (`test_hooks::HoldAt::PromptErrored`) right where it is about to check
-/// whether the adapter has already exited. Only once `hooks.holding()`
-/// proves the actor is parked there does the test let the wrapper read the
-/// FIFO and exit; the actor is released only after that. So the real exit
-/// can never happen before the actor starts waiting for it (which would
-/// silently turn this into a test of the "already exited" path instead),
-/// and by the time `exited_within` is released to look, the wrapper is
-/// already exiting — no fixed sleep has to out-race anything.
+/// whether the adapter has already exited; `hooks.holding()` proves it is
+/// actually parked there. Only then does the test release the hold — and
+/// give the now-runnable actor a scheduling turn (`yield_now`) to reach and
+/// subscribe to the adapter's exit watch — before letting the wrapper read
+/// the FIFO and exit. So the wrapper cannot exit before the actor is
+/// already subscribed and waiting for that exit; the residual, much
+/// smaller dependency is that the real exit must land within `EXIT_SETTLE`
+/// of the actor starting to wait, which a revert-probe (`EXIT_SETTLE` set
+/// to zero, ~20 runs, reliably `Failed`) confirmed is genuinely exercised,
+/// not skipped by an adapter that turns out to already be exited.
 #[tokio::test]
 async fn a_prompt_that_fails_because_the_adapter_is_dying_ends_interrupted() {
     let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
@@ -607,17 +610,22 @@ async fn a_prompt_that_fails_because_the_adapter_is_dying_ends_interrupted() {
     );
     wait_until(&uplink, has("session_started")).await;
     assert!(handle.send(prompt("r1", "t1")));
-    // Provably waiting right before the exit check: only now can the
-    // wrapper's real exit be released without racing anything.
+    // Provably waiting right before the exit check.
     tokio::time::timeout(Duration::from_secs(30), hooks.holding())
         .await
         .expect("the actor never reached the prompt-errored hold");
+    hooks.release();
+    // Let the now-runnable actor actually reach and subscribe to the
+    // adapter's exit watch before the wrapper is allowed to exit for real:
+    // otherwise the exit could land before the actor started watching for
+    // it, which would silently turn this into a test of the "already
+    // exited" path instead of the "wait for it" path.
+    tokio::task::yield_now().await;
     let go = fifo.clone();
     tokio::task::spawn_blocking(move || std::fs::write(&go, b"go\n"))
         .await
         .unwrap()
         .expect("writing to the fifo failed");
-    hooks.release();
     let frames = wait_until(&uplink, has("session_parked:adapter_exited")).await;
     let outcomes: Vec<TurnOutcome> = frames
         .iter()
