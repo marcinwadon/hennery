@@ -1064,6 +1064,7 @@ dependencies = [
  "libc",
  "password-auth",
  "rusqlite",
+ "serde",
  "serde_json",
  "sha2",
  "tempfile",
