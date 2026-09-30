@@ -40,6 +40,24 @@ It builds on the executed [session config plan](2026-09-30-session-config.md) (p
 
 **Status:** not executed. Every code block below was built and tested in a scratch copy of `4659c27`. The plan was then replayed from its own text, task by task, onto a fresh copy of `4659c27`. After every task the replay ran fmt, clippy (also on the shipped binary with test hooks off), the workspace tests and the codegen check. It ends with 304 tests, up from 258. The review amendments of 2026-10-01 were replayed the same way. Every new timing-sensitive test passed with four copies of its test binary running at once.
 
+## Execution status (2026-10-01)
+
+**Executed** on branch `feat/permissions` (task-by-task with reviews, a whole-branch review — "ready to merge" —
+and one small fix wave). The plan's decisions were confirmed by a stronger-model review on the maintainer's behalf
+(D2, D4, D7, D10 amended; D15 `agent_withdrew` added). Deviations found in review:
+
+| Area | As built | Why |
+|---|---|---|
+| Fake load-time ask (T2) | `ask_on_load_waits` composes with `load_error` / `config_in_update_only` (shared `answer_load`) | The early return silently answered a bare successful load |
+| Answer verdict (T5) | `answer_result` applies only when it changes something: `delivered IS NULL OR (delivered = 0 AND verdict = 1)` | A no-op late `false` was listed and would have fired `pending_changed` |
+| Empty option ids (final) | A permission whose options all lack an id is treated like one without options | The operator got "offers no option X" instead of "stop, park or close the session" |
+| Flaky tests (final) | Three wall-clock tests made deterministic (test-hooks hold, fake receipt file, polling) | They failed under 2–4 vCPU load |
+
+Still open: the spec amendments this plan lists are not yet applied to `docs/specs/2026-09-26-acp-core-design.md`
+(recommend one docs PR covering this plan and B2a/B2b's drift items); `cancel_questions` on a turn cancel also cancels
+questions asked outside the turn (ACP-conformant; note it in the spec amendment); the frontend must render
+`PendingItem{state: cancelled, delivered: true}`.
+
 ## Scope
 
 This is **plan (2)**, permission and elicitation, as plans A, B1, B2a and B2b scoped it in their "After this plan". It fits in seven right-sized tasks, so it is not split.
