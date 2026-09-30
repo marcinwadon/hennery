@@ -281,6 +281,9 @@ pub enum CollectorFrame {
         code: String,
         message: String,
     },
+    /// Start a new session: spawn the adapter, `session/new`, then apply the
+    /// requested config (ACP core §3.3, §4.3). Completed by
+    /// `session_started` | `start_failed`.
     StartSession {
         request_id: String,
         session_id: String,

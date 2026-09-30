@@ -143,7 +143,7 @@
           "type": "object"
         },
         {
-          "description": "Model, mode and the other config axes of a session (ACP core §3.3,\n§4.3): what a start asks for, and what a resume re-applies. `model` and\n`mode` are the values of the adapter's model and mode options; `axes`\nholds every other option, by config id. Flattened into the frames and\nthe start request, so the wire stays `model?, mode?, axes{}`.",
+          "description": "Start a new session: spawn the adapter, `session/new`, then apply the\nrequested config (ACP core §3.3, §4.3). Completed by\n`session_started` | `start_failed`.",
           "properties": {
             "agent": {
               "type": "string"
