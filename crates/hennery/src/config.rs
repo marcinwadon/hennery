@@ -63,12 +63,20 @@ impl FileConfig {
     }
 
     /// The listen addresses: `given` (a flag or `HENNERY_LISTEN`) if any,
-    /// else the file's. Empty means the default.
-    pub fn listen(&self, given: &[String]) -> Vec<String> {
-        if given.is_empty() {
-            self.listen.clone().unwrap_or_default()
-        } else {
-            given.to_vec()
+    /// else the file's. No key at all means the default; an explicit empty
+    /// list in the file is refused, symmetric with an empty `HENNERY_LISTEN`
+    /// (`main::listen_addresses`) — an operator who wrote `listen = []` most
+    /// likely meant something else, not "use the default".
+    pub fn listen(&self, given: &[String]) -> Result<Vec<String>> {
+        if !given.is_empty() {
+            return Ok(given.to_vec());
+        }
+        match &self.listen {
+            None => Ok(Vec::new()),
+            Some(addresses) if addresses.is_empty() => {
+                bail!("listen in config.toml is empty: give at least one address, or remove the key")
+            }
+            Some(addresses) => Ok(addresses.clone()),
         }
     }
 
@@ -111,18 +119,18 @@ mod tests {
 
     #[test]
     fn a_file_others_can_write_is_refused() {
-        let dir = std::env::temp_dir().join(format!("hennery-config-mode-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(CONFIG_FILE);
+        // `tempfile`, not a hand-rolled `temp_dir()/…-<pid>`: it removes the
+        // directory on drop, a failing assertion below included.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONFIG_FILE);
         std::fs::write(&path, "listen = [\"127.0.0.1:7117\"]\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(FileConfig::load(&dir).unwrap().listen.is_some());
+        assert!(FileConfig::load(dir.path()).unwrap().listen.is_some());
         for mode in [0o664, 0o646] {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
-            let err = FileConfig::load(&dir).unwrap_err();
+            let err = FileConfig::load(dir.path()).unwrap_err();
             assert!(format!("{err:#}").contains("chmod go-w"), "{mode:o}: {err:#}");
         }
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -131,15 +139,29 @@ mod tests {
             listen: Some(vec!["127.0.0.1:1".into()]),
             public_url: Some("https://file.example".into()),
         };
-        assert_eq!(file.listen(&[]), ["127.0.0.1:1"]);
-        assert_eq!(file.listen(&["127.0.0.1:2".into()]), ["127.0.0.1:2"]);
+        assert_eq!(file.listen(&[]).unwrap(), ["127.0.0.1:1"]);
+        assert_eq!(file.listen(&["127.0.0.1:2".into()]).unwrap(), ["127.0.0.1:2"]);
         assert_eq!(file.public_url(None).as_deref(), Some("https://file.example"));
         assert_eq!(
             file.public_url(Some("https://flag.example")).as_deref(),
             Some("https://flag.example")
         );
         let empty = FileConfig::default();
-        assert!(empty.listen(&[]).is_empty());
+        assert!(empty.listen(&[]).unwrap().is_empty());
         assert_eq!(empty.public_url(None), None);
+    }
+
+    #[test]
+    fn an_explicit_empty_listen_in_the_file_is_refused() {
+        let empty_list = FileConfig {
+            listen: Some(vec![]),
+            public_url: None,
+        };
+        let err = empty_list.listen(&[]).unwrap_err();
+        assert!(format!("{err:#}").contains("listen in config.toml is empty"), "{err:#}");
+        // A flag or `HENNERY_LISTEN` still wins, same as any other file value.
+        assert_eq!(empty_list.listen(&["127.0.0.1:1".into()]).unwrap(), ["127.0.0.1:1"]);
+        // No key at all is still the default (empty means "nothing given").
+        assert!(FileConfig::default().listen(&[]).unwrap().is_empty());
     }
 }

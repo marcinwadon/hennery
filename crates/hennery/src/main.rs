@@ -220,14 +220,25 @@ async fn main() -> std::process::ExitCode {
 async fn run_collector(args: CollectorArgs) -> Result<()> {
     warn_if_dev_token();
     let file = config::FileConfig::load(&args.data_dir)?;
+    // Named by its source: an operator cannot otherwise tell whether a flag,
+    // `HENNERY_PUBLIC_URL` or the file gave the bad value.
+    let public_url_source = if args.public_url.is_some() {
+        "--public-url or HENNERY_PUBLIC_URL".to_string()
+    } else {
+        args.data_dir.join(config::CONFIG_FILE).display().to_string()
+    };
     let public_url = file
         .public_url(args.public_url.as_deref())
-        .map(|url| PublicUrl::parse(&url).map_err(|why| anyhow::anyhow!("{why}")))
+        .map(|url| {
+            PublicUrl::parse(&url)
+                .map_err(|why| anyhow::anyhow!("{why}"))
+                .with_context(|| public_url_source.clone())
+        })
         .transpose()?;
     // Before anything is created: a descriptor that is not a listening TCP
     // socket, or an address that is taken, must fail here, and clearly.
     let listeners = if args.listen_fd.is_empty() {
-        bind_all(&listen_addresses(&file.listen(&args.listen))?)?
+        bind_all(&listen_addresses(&file.listen(&args.listen)?)?)?
     } else {
         if args.listen_fd.len() > MAX_LISTENERS {
             bail!("more than {MAX_LISTENERS} --listen-fd");
@@ -424,7 +435,7 @@ fn warn_if_public_url_differs(stored: Option<&PublicUrl>, configured: Option<&Pu
             stored = stored.origin(),
             configured = configured.origin(),
             "the configured public_url is not the one setup stored, which stays in effect; \
-             to move hennery, reset it with `hennery admin reset-public-url`"
+             `hennery admin reset-public-url`, coming with `hennery admin`, will move it"
         );
     }
 }
@@ -653,7 +664,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     let exe = std::env::current_exe()?;
     let host_dir = args.data_dir.join("host");
     let file = config::FileConfig::load(&args.data_dir.join("collector"))?;
-    let addresses = listen_addresses(&file.listen(&args.listen))?;
+    let addresses = listen_addresses(&file.listen(&args.listen)?)?;
     // Validated before any child starts: with no address that loopback
     // reaches (or only schemes it cannot make sense of) `up` fails here,
     // not after the collector is already up and serving.
@@ -710,7 +721,12 @@ async fn run_up(args: UpArgs) -> Result<()> {
             .arg(inherit::CHILD_FD.to_string());
     }
     inherit::pass_to_child(&mut collector_cmd, &fds);
-    let mut collector = collector_cmd.spawn()?;
+    // A low `ulimit -n` can make `pass_to_child`'s `F_DUPFD_CLOEXEC` at
+    // `MOVE_FLOOR` fail with a bare "Invalid argument (os error 22)": named
+    // here so that is not left a mystery.
+    let mut collector = collector_cmd
+        .spawn()
+        .context("pass the listening sockets to the collector")?;
     // The collector holds the sockets now. Kept open here, they would hold
     // the ports after the collector exits.
     drop(listeners);

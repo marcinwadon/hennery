@@ -1419,11 +1419,19 @@ fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
     for args in [
         &["--listen-fd", "2"][..],
         &["--listen-fd", "50", "--listen", "127.0.0.1:0"],
-        &["--listen-fd", "50", "--listen-fd", "50"],
     ] {
         let (status, stderr) = collector(Some(&listening), args);
         assert!(!status.unwrap().success(), "{args:?} was taken: {stderr}");
     }
+    // A descriptor given twice would be adopted as two listeners sharing one
+    // socket: refused before anything is created (decision 14, A6). Without
+    // the guard this stays green on Linux (the second `TcpListener::from_std`
+    // still fails, but only after `private_data_dir` ran), so both the
+    // message and "nothing was made" are pinned here, not just `!success()`.
+    let (status, stderr) = collector(Some(&listening), &["--listen-fd", "50", "--listen-fd", "50"]);
+    assert!(!status.unwrap().success(), "was taken: {stderr}");
+    assert!(stderr.contains("--listen-fd 50 is given twice"), "{stderr}");
+    assert!(!data.exists(), "the data directory was made");
 }
 
 /// Kernel spec §3.1: a collector that is not set up writes its one-time
@@ -1740,6 +1748,7 @@ fn a_bad_config_toml_stops_the_start() {
         child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
         assert!(status.is_some_and(|s| !s.success()), "{name}: started: {stderr}");
         assert!(stderr.contains(expected), "{name}: {stderr}");
+        assert!(stderr.contains("config.toml"), "{name}: {stderr}");
         assert!(!data.join("hennery.db").exists(), "{name}: the database was made");
     }
 }
