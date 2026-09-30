@@ -27,6 +27,77 @@ fn host_help_lists_join_and_run() {
     }
 }
 
+/// The pairing code and the host's new public key are the only secrets
+/// `host join` still has to spend. `parse_public_url` limits plain `http://`
+/// to a loopback address, but a generic HTTP client still honours
+/// `HTTP_PROXY`/`ALL_PROXY` by default — handing both to whatever address
+/// the environment names, which would defeat that check for anyone able to
+/// set it (a captured shell, a CI runner, a compromised dependency's
+/// `postinstall`). `pairing::enroll` must call `.no_proxy()` unconditionally.
+///
+/// Proven end to end: the collector runs in-process (this crate already
+/// depends on `hennery-sessions`/`hennery-kernel`), and `host join` runs as a
+/// real *subprocess* with the proxy variables set on that child alone — the
+/// env vars are per-process, so a subprocess is what lets this test run
+/// alongside every other test in the binary without racing their env
+/// (`std::env::set_var` on the test process itself would not be safe here).
+/// The configured proxy is a port nothing listens on: if the client ever
+/// tried to use it, the connection would be refused and the join would fail
+/// instead of pairing.
+#[test]
+fn joining_over_http_ignores_a_configured_proxy() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (addr, code, collector_dir) = rt.block_on(async {
+        let dir = std::env::temp_dir().join(format!("hennery-cli-noproxy-collector-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("hennery.db");
+        let store = hennery_sessions::store::Store::open(&db).unwrap();
+        let hosts = hennery_kernel::hosts::Hosts::open(&db).unwrap();
+        let token = hennery_kernel::auth::DevToken::new("dev-token-for-tests").unwrap();
+        let state = hennery_sessions::AppState::new(store, hosts, token);
+        let code = state
+            .hosts
+            .mint_pairing_code(hennery_kernel::secret::unix_now())
+            .unwrap()
+            .code;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(hennery_sessions::serve(listener, state));
+        (addr, code, dir)
+    });
+
+    let host_dir = std::env::temp_dir().join(format!("hennery-cli-noproxy-host-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&host_dir);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["host", "join", &format!("http://{addr}"), &code, "--name", "laptop"])
+        .arg("--data-dir")
+        .arg(&host_dir)
+        // A bogus proxy nobody listens on.
+        .env("HTTP_PROXY", "http://127.0.0.1:1")
+        .env("http_proxy", "http://127.0.0.1:1")
+        .env("ALL_PROXY", "http://127.0.0.1:1")
+        .env("all_proxy", "http://127.0.0.1:1")
+        .output()
+        .unwrap();
+
+    let _ = std::fs::remove_dir_all(&collector_dir);
+    let _ = std::fs::remove_dir_all(&host_dir);
+
+    assert!(
+        out.status.success(),
+        "join failed with a proxy configured:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("paired as"),
+        "stdout: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 #[test]
 fn a_malformed_agent_flag_is_rejected() {
     let out = Command::new(env!("CARGO_BIN_EXE_hennery"))

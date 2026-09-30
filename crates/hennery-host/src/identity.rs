@@ -122,12 +122,19 @@ impl Paired {
     pub fn save(&self, data_dir: &Path) -> Result<()> {
         create_private_dir(data_dir)?;
         self.key.save(&data_dir.join(KEY_FILE))?;
-        let config = toml::to_string(&HostToml {
-            collector: self.collector_url.clone(),
-            host_id: self.host_id.clone(),
-        })?;
-        write_private(&data_dir.join(CONFIG_FILE), config.as_bytes())
+        write_config(data_dir, &self.collector_url, &self.host_id)
     }
+}
+
+/// Write `host.toml` alone. Used by `Paired::save` (which writes the key
+/// first) and by `pairing::join`, which puts the key in place itself by
+/// renaming its pending file rather than writing the seed a second time.
+pub(crate) fn write_config(data_dir: &Path, collector_url: &str, host_id: &str) -> Result<()> {
+    let config = toml::to_string(&HostToml {
+        collector: collector_url.to_string(),
+        host_id: host_id.to_string(),
+    })?;
+    write_private(&data_dir.join(CONFIG_FILE), config.as_bytes())
 }
 
 /// Create `dir` (and its parents) with mode 0700: it holds the host key
@@ -165,7 +172,17 @@ fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
     file.write_all(contents)?;
     file.sync_all()?;
     std::fs::rename(&tmp, path).with_context(|| format!("rename {} to {}", tmp.display(), path.display()))?;
-    Ok(())
+    fsync_parent(path)
+}
+
+/// Fsync `path`'s parent directory: on its own, a rename is only guaranteed
+/// durable once the directory entry that names it has been synced too — on
+/// a crash right after a bare rename, some filesystems can still lose the
+/// rename (or leave both names) even though the file's own `sync_all` ran.
+pub(crate) fn fsync_parent(path: &Path) -> Result<()> {
+    let dir = path.parent().context("a file path has a parent")?;
+    let dir_file = std::fs::File::open(dir).with_context(|| format!("open {}", dir.display()))?;
+    dir_file.sync_all().with_context(|| format!("fsync {}", dir.display()))
 }
 
 #[cfg(test)]
