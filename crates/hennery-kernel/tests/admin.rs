@@ -261,6 +261,14 @@ fn a_setup_link_or_pairing_code_answer_does_not_show_it_in_debug() {
 /// the start, named, and is left where it is.
 #[tokio::test]
 async fn a_socket_that_cannot_be_checked_stops_the_start() {
+    // Root ignores a socket's mode 000: the `connect` below would then
+    // answer `ECONNREFUSED`, the socket would be replaced, and this test
+    // would fail for a reason unrelated to what it checks.
+    // SAFETY: geteuid(2) cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping: root ignores a socket's mode");
+        return;
+    }
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join(ADMIN_SOCKET);
     drop(std::os::unix::net::UnixListener::bind(&socket).unwrap());

@@ -1948,8 +1948,11 @@ fn open_pty() -> (std::fs::File, std::os::fd::OwnedFd) {
     use std::os::fd::{FromRawFd, OwnedFd};
     let (mut master, mut slave) = (-1, -1);
     // SAFETY: openpty(3) into two local ints, with no name and the default
-    // settings; both ends are made close-on-exec at once, so no other
-    // test's child inherits them, and owned.
+    // settings. The `fcntl(F_SETFD)` calls below are separate syscalls, not
+    // atomic with the open: a child spawned by another test thread in
+    // between inherits both ends, and holds them open until it exits (the
+    // unbounded `shown_thread.join()` above then waits that long too). The
+    // fds are otherwise unused until returned, and owned.
     unsafe {
         let rc = libc::openpty(
             &mut master,
@@ -2094,6 +2097,10 @@ fn a_password_reset_over_the_admin_socket_signs_everyone_out() {
             ("Type yes", "yes\n"),
         ],
     );
+    // Echo is back on at the confirmation, so the reader having seen
+    // nothing at all here would let the assertion below pass vacuously:
+    // prove it actually captured the terminal first.
+    assert!(shown.contains("yes"), "{shown:?}");
     assert!(!shown.contains(NEW), "the terminal echoed the password: {shown:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
