@@ -299,3 +299,33 @@ impl std::fmt::Debug for LoginRequest {
         f.debug_struct("LoginRequest").finish_non_exhaustive()
     }
 }
+
+/// `POST /api/auth/step-up/password` (kernel spec §3.4): the owner's
+/// password again, within a session. 204 on success. `Debug` leaves the
+/// password out.
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct StepUpRequest {
+    pub password: String,
+}
+
+impl std::fmt::Debug for StepUpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StepUpRequest").finish_non_exhaustive()
+    }
+}
+
+/// One entry of `GET /api/auth/sessions` (kernel spec §3.2): a signed-in
+/// device, most recently used first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct AuthSessionItem {
+    /// What `DELETE /api/auth/sessions/{id}` takes: the SHA-256 of the
+    /// session's token, never the token.
+    pub id: String,
+    pub user_agent: String,
+    /// RFC 3339.
+    pub created_at: String,
+    pub last_seen_at: String,
+    pub expires_at: String,
+    /// The session this request came with.
+    pub current: bool,
+}

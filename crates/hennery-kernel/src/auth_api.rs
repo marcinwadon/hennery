@@ -1,14 +1,16 @@
-//! Operator auth over HTTP (kernel spec §3, §8): the one-time setup, and
-//! login and logout.
+//! Operator auth over HTTP (kernel spec §3, §8): the one-time setup, login
+//! and logout, step-up, and the signed-in sessions.
 
-use crate::operator::{Operator, PublicUrl, SetupOutcome, cleared_cookie, session_cookie, session_token};
+use crate::operator::{
+    Authenticated, Operator, PublicUrl, SetupOutcome, cleared_cookie, session_cookie, session_token,
+};
 use crate::secret::unix_now;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router, middleware};
-use hennery_proto::rest::{ApiError, LoginRequest, SetupRequest, SetupResponse};
+use hennery_proto::rest::{ApiError, AuthSessionItem, LoginRequest, SetupRequest, SetupResponse, StepUpRequest};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,12 +31,23 @@ pub fn router(operator: Arc<Operator>) -> Router {
             operator.clone(),
             crate::origin::browser_rules,
         ));
+    let signed_in = crate::auth::operator_only(
+        Router::new()
+            .route("/api/auth/step-up/password", post(step_up))
+            .route("/api/auth/sessions", get(list_sessions))
+            .route(
+                "/api/auth/sessions/{id}",
+                delete(revoke_session).route_layer(middleware::from_fn(crate::auth::require_step_up)),
+            ),
+        operator.clone(),
+    );
     let private = || middleware::map_response(crate::setup_page::private_headers);
     Router::new()
         .route("/api/setup", post(setup).layer(private()))
         .route("/setup", get(crate::setup_page::page).layer(private()))
         .route("/setup.js", get(crate::setup_page::script).layer(private()))
         .merge(browser)
+        .merge(signed_in)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(operator)
 }
@@ -181,7 +194,7 @@ async fn logout(State(operator): State<Arc<Operator>>, headers: HeaderMap) -> Re
     if let Some(token) = session_token(&headers) {
         match operator.authenticate(token, unix_now()) {
             Ok(Some(session)) => {
-                if let Err(err) = operator.revoke_session(&session.session_id) {
+                if let Err(err) = operator.revoke_session(&session.session_id, unix_now()) {
                     return internal(err);
                 }
             }
@@ -193,4 +206,84 @@ async fn logout(State(operator): State<Arc<Operator>>, headers: HeaderMap) -> Re
         StatusCode::NO_CONTENT.into_response(),
         &cleared_cookie(secure_cookies(&operator)),
     )
+}
+
+/// `POST /api/auth/step-up/password`: 204, the session stepped up for five
+/// minutes (kernel spec §3.4). Rate limited like login, on a budget of its
+/// own (3b decision 10).
+async fn step_up(
+    State(operator): State<Arc<Operator>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(session): Extension<Authenticated>,
+    Json(req): Json<StepUpRequest>,
+) -> Response {
+    if let Err(retry_after) = operator.step_up_limiter.attempt(peer.ip(), Instant::now()) {
+        return rate_limited(
+            retry_after,
+            "too many wrong passwords from this address; try again later",
+        );
+    }
+    match operator.check_password(req.password).await {
+        Ok(true) => {}
+        Ok(false) => return error(StatusCode::UNAUTHORIZED, "invalid_password", "wrong password"),
+        Err(err) => return internal(err),
+    }
+    operator.step_up_limiter.succeeded(peer.ip());
+    match operator.step_up(&session.session_id, unix_now()) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => error(StatusCode::UNAUTHORIZED, "unauthenticated", "sign in first"),
+        Err(err) => internal(err),
+    }
+}
+
+/// RFC 3339 for a kernel timestamp (seconds since the epoch).
+fn rfc3339(unix: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(unix)
+        .ok()
+        .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
+        .unwrap_or_default()
+}
+
+/// `GET /api/auth/sessions`: every signed-in session, most recently used
+/// first, the request's own marked `current`.
+async fn list_sessions(
+    State(operator): State<Arc<Operator>>,
+    Extension(session): Extension<Authenticated>,
+) -> Response {
+    match operator.sessions(unix_now()) {
+        Ok(sessions) => {
+            let items: Vec<AuthSessionItem> = sessions
+                .into_iter()
+                .map(|s| AuthSessionItem {
+                    current: s.id == session.session_id,
+                    id: s.id,
+                    user_agent: s.user_agent,
+                    created_at: rfc3339(s.created_at),
+                    last_seen_at: rfc3339(s.last_seen_at),
+                    expires_at: rfc3339(s.expires_at),
+                })
+                .collect();
+            Json(items).into_response()
+        }
+        Err(err) => internal(err),
+    }
+}
+
+/// `DELETE /api/auth/sessions/{id}` (step-up): 204, that session signed
+/// out; 404 if there is none. Ending the request's own session also clears
+/// its cookie.
+async fn revoke_session(
+    State(operator): State<Arc<Operator>>,
+    Extension(session): Extension<Authenticated>,
+    Path(id): Path<String>,
+) -> Response {
+    match operator.revoke_session(&id, unix_now()) {
+        Ok(true) if id == session.session_id => with_cookie(
+            StatusCode::NO_CONTENT.into_response(),
+            &cleared_cookie(secure_cookies(&operator)),
+        ),
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) => internal(err),
+    }
 }

@@ -88,13 +88,15 @@ fn sessions_are_listed_most_recent_first_and_a_revoked_one_is_gone() {
     assert_eq!(listed[1].user_agent, "phone");
 
     let phone_id = op.authenticate(&phone, NOW + 10).unwrap().unwrap().session_id;
-    assert!(op.revoke_session(&phone_id).unwrap());
-    assert!(!op.revoke_session(&phone_id).unwrap());
+    assert!(op.revoke_session(&phone_id, NOW + 10).unwrap());
+    assert!(!op.revoke_session(&phone_id, NOW + 10).unwrap());
     assert_eq!(op.authenticate(&phone, NOW + 10).unwrap(), None);
     assert!(op.authenticate(&laptop, NOW + 10).unwrap().is_some());
     assert_eq!(op.sessions(NOW + 10).unwrap().len(), 1);
-    // An expired session is not listed.
+    // An expired session is not listed, nor there to revoke.
     assert!(op.sessions(NOW + 10 + SESSION_TTL_SECS).unwrap().is_empty());
+    let laptop_id = op.authenticate(&laptop, NOW + 10).unwrap().unwrap().session_id;
+    assert!(!op.revoke_session(&laptop_id, NOW + 10 + SESSION_TTL_SECS).unwrap());
 }
 
 #[test]

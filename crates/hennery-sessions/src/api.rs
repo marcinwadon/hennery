@@ -3,13 +3,14 @@
 use crate::AppState;
 use crate::hub::{RequestError, Undo};
 use crate::store::{AnswerSubmission, ResumeRequest, Store};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::{self, Stream, StreamExt};
+use hennery_kernel::operator::Authenticated;
 use hennery_proto::frames::{Capability, CollectorFrame, Indexed, SessionBody};
 use hennery_proto::rest::{
     AnswerRequest, AnswerResponse, ApiError, CancelResponse, ConfigRequest, EventDto, LifecycleResponse, OpenTurn,
@@ -659,8 +660,11 @@ fn catalog_in(e: &EventDto) -> Option<SessionCatalog> {
 }
 
 /// Session stream: replays from `Last-Event-ID`, then follows live events.
+/// The session's events as SSE, until the collector shuts down or the
+/// operator's session that opened it ends (3b decision 7).
 async fn stream_session(
     State(state): State<AppState>,
+    Extension(operator_session): Extension<Authenticated>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -697,6 +701,10 @@ async fn stream_session(
         .flat_map(stream::iter);
     let stream = replay
         .chain(follow)
-        .take_until(state.shutdown.clone().cancelled_owned());
+        .take_until(state.shutdown.clone().cancelled_owned())
+        .take_until(hennery_kernel::auth::session_ended(
+            state.operator.clone(),
+            operator_session,
+        ));
     Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
 }

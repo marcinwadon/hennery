@@ -142,9 +142,15 @@ pub struct Operator {
     /// `check_password`'s slots, each held until its verify ends.
     hashing: Arc<tokio::sync::Semaphore>,
     verifications: AtomicU64,
-    /// Wrong passwords per client address, at login and step-up (kernel
-    /// spec §3.2).
+    /// Wrong passwords per client address at login (kernel spec §3.2).
     pub login_limiter: Limiter,
+    /// Wrong passwords per client address at step-up, a budget of its own
+    /// (3b decision 10): a login flood from a shared address does not stop
+    /// a signed-in owner stepping up, nor step-up guesses lock out login.
+    pub step_up_limiter: Limiter,
+    /// Bumped whenever a session ends (revoked or signed out): streams
+    /// held open by a session re-check it on every bump (3b decision 7).
+    ended: tokio::sync::watch::Sender<u64>,
     /// Verifies running now, and the most ever at once (`check_password`'s
     /// bound, pinned by the unit tests below).
     #[cfg(test)]
@@ -175,6 +181,8 @@ impl Operator {
             hashing: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HASHES)),
             verifications: AtomicU64::new(0),
             login_limiter: Limiter::new(Policy::LOGIN),
+            step_up_limiter: Limiter::new(Policy::LOGIN),
+            ended: tokio::sync::watch::Sender::new(0),
             #[cfg(test)]
             in_flight: Default::default(),
             #[cfg(test)]
@@ -535,12 +543,35 @@ impl Operator {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// End a session. Whether there was one.
-    pub fn revoke_session(&self, session_id: &str) -> Result<bool> {
-        let changed = self
-            .conn()
-            .execute("DELETE FROM auth_sessions WHERE id_hash = ?1", [session_id])?;
+    /// End a live session. Whether there was one: an expired session is
+    /// not listed by `sessions`, so it is not there to revoke either.
+    pub fn revoke_session(&self, session_id: &str, now: i64) -> Result<bool> {
+        let changed = self.conn().execute(
+            "DELETE FROM auth_sessions WHERE id_hash = ?1 AND expires_at > ?2",
+            params![session_id, now],
+        )?;
+        if changed > 0 {
+            self.ended.send_modify(|generation| *generation += 1);
+        }
         Ok(changed > 0)
+    }
+
+    /// Changes whenever a session ends (`revoke_session`, and so logout).
+    pub fn session_ends(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.ended.subscribe()
+    }
+
+    /// When the live session `session_id` expires, without sliding it;
+    /// `None` once it is gone or expired.
+    pub fn session_expires_at(&self, session_id: &str, now: i64) -> Result<Option<i64>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT expires_at FROM auth_sessions WHERE id_hash = ?1 AND expires_at > ?2",
+                params![session_id, now],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 }
 
