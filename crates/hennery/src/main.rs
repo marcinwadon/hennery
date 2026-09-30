@@ -50,8 +50,10 @@ enum HostCommand {
 struct JoinArgs {
     /// The collector's public URL, e.g. https://hennery.example.
     url: String,
-    /// The pairing code shown by the collector (`XXXX-XXXX`).
-    code: String,
+    /// The pairing code shown by the collector (`XXXX-XXXX`). Leave it out
+    /// to type it, or pipe it, on standard input instead: that keeps it out
+    /// of the process list and the shell history.
+    code: Option<String>,
     /// How the collector lists this host; defaults to the host name.
     #[arg(long)]
     name: Option<String>,
@@ -234,11 +236,34 @@ fn private_data_dir(dir: &std::path::Path) -> Result<()> {
 
 async fn join_host(args: JoinArgs) -> Result<()> {
     let name = args.name.unwrap_or_else(hennery_host::pairing::default_name);
-    match hennery_host::pairing::join(&args.url, &args.code, &args.data_dir, &name).await? {
+    let code = match args.code {
+        Some(code) => code,
+        None => read_code_from_stdin()?,
+    };
+    match hennery_host::pairing::join(&args.url, &code, &args.data_dir, &name).await? {
         Joined::Paired { host_id } => println!("paired as {host_id}"),
         Joined::AlreadyPaired { host_id } => println!("already paired as {host_id}; nothing to do"),
     }
     Ok(())
+}
+
+/// One line of standard input, prompted for on a terminal.
+fn read_code_from_stdin() -> Result<String> {
+    use std::io::{BufRead, IsTerminal, Write};
+    if std::io::stdin().is_terminal() {
+        eprint!("Pairing code: ");
+        std::io::stderr().flush()?;
+    }
+    let mut line = String::new();
+    std::io::stdin()
+        .lock()
+        .read_line(&mut line)
+        .context("read the pairing code from standard input")?;
+    let code = line.trim().to_string();
+    if code.is_empty() {
+        bail!("no pairing code: give it after the URL, or on standard input");
+    }
+    Ok(code)
 }
 
 async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {

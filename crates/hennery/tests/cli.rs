@@ -1139,3 +1139,58 @@ fn an_unset_collector_writes_its_setup_link_to_a_private_file_and_never_to_its_o
     );
     assert!(stdout.contains(&file.display().to_string()), "{stdout}");
 }
+
+/// 3a's deferred M5: a pairing code on the command line is in the process
+/// list and the shell history, so `host join` also takes it on standard
+/// input when it is left out, and refuses an empty one.
+#[test]
+fn join_reads_the_code_from_standard_input_when_it_is_left_out() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = std::env::temp_dir().join(format!("hennery-cli-stdin-code-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveDir(dir.clone());
+    let (addr, code) = rt.block_on(async {
+        let db = dir.join("hennery.db");
+        let state = hennery_sessions::AppState::new(
+            hennery_sessions::store::Store::open(&db).unwrap(),
+            hennery_kernel::hosts::Hosts::open(&db).unwrap(),
+            hennery_kernel::operator::Operator::open(&db).unwrap(),
+        );
+        let code = state
+            .hosts
+            .mint_pairing_code(hennery_kernel::secret::unix_now())
+            .unwrap()
+            .code;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(hennery_sessions::serve(listener, state));
+        (addr, code)
+    });
+    let join = |stdin: &str| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_hennery"))
+            .args(["host", "join", &format!("http://{addr}"), "--name", "laptop"])
+            .arg("--data-dir")
+            .arg(dir.join("host"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    let empty = join("\n");
+    assert!(!empty.status.success());
+    assert!(String::from_utf8_lossy(&empty.stderr).contains("no pairing code"));
+
+    let out = join(&format!("{code}\n"));
+    assert!(
+        out.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(String::from_utf8_lossy(&out.stdout).contains("paired as"));
+}
