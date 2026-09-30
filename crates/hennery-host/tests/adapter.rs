@@ -1,10 +1,13 @@
 //! The adapter supervisor against plain shell processes: group kill reaches
 //! grandchildren, SIGTERM escalates to SIGKILL, dropping an adapter kills its
-//! group, stderr is bounded and scrubbed, nesting variables are stripped.
+//! group, stderr is bounded and scrubbed, nesting variables are stripped,
+//! and no descriptor but its stdio reaches the agent.
 
 use hennery_host::adapter::{Adapter, AgentCommand, STDERR_TAIL_BYTES, scrub};
+use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncReadExt;
 
 fn sh(script: &str) -> AgentCommand {
     AgentCommand {
@@ -201,4 +204,131 @@ fn scrub_redacts_token_like_strings_and_leaves_words_alone() {
     for (input, expected) in cases {
         assert_eq!(scrub(input), expected, "input {input:?}");
     }
+}
+
+/// Closes a raw descriptor on drop, however the test ends.
+struct CloseOnDrop(i32);
+
+impl Drop for CloseOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: close(2) on a descriptor this test opened.
+        unsafe { libc::close(self.0) };
+    }
+}
+
+/// The descriptor numbers `ls /dev/fd` printed.
+fn listed(out: &[u8]) -> Vec<i32> {
+    String::from_utf8_lossy(out)
+        .split_whitespace()
+        .filter_map(|s| s.parse().ok())
+        .collect()
+}
+
+/// A descriptor the host holds open across `exec` (inherited from `hennery
+/// up`, a service manager or a shell, or opened by another thread without
+/// close-on-exec) never reaches an agent: it gets its stdio and nothing
+/// else of the host's.
+#[tokio::test]
+async fn an_adapter_inherits_no_descriptor_but_its_stdio() {
+    let file = std::fs::File::open("/dev/null").unwrap();
+    // SAFETY: fcntl(2) on an open descriptor: a copy at 64 or above,
+    // without close-on-exec, as a leaked one would be.
+    let leaked = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD, 64) };
+    assert!(leaked >= 64, "{}", std::io::Error::last_os_error());
+    let _close = CloseOnDrop(leaked);
+    // Control: a plain spawn passes it on.
+    let control = std::process::Command::new("ls").arg("/dev/fd").output().unwrap();
+    assert!(listed(&control.stdout).contains(&leaked), "{control:?}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let ls = AgentCommand {
+        program: "ls".into(),
+        args: vec!["/dev/fd".into()],
+        env: Vec::new(),
+    };
+    let (mut adapter, mut io) = Adapter::spawn(&ls, dir.path()).unwrap();
+    let mut out = Vec::new();
+    io.stdout.read_to_end(&mut out).await.unwrap();
+    adapter.exited().await;
+    let fds = listed(&out);
+    assert!(fds.contains(&0) && fds.contains(&1), "{fds:?}");
+    assert!(
+        !fds.contains(&leaked),
+        "the agent inherited descriptor {leaked}: {fds:?}"
+    );
+}
+
+/// Set in the copy of this binary that
+/// `a_descriptor_above_a_lowered_soft_limit_is_closed_too` runs.
+const LOWERED_SOFT_LIMIT: &str = "HENNERY_TEST_LOWERED_SOFT_LIMIT";
+
+/// Held open across `exec` above the lowered soft limit.
+const ABOVE_THE_LIMIT: i32 = 60;
+
+/// A descriptor opened while the soft `RLIMIT_NOFILE` was higher stays open
+/// once it is lowered, so the spawn closes up to the hard limit. The test
+/// runs itself again in a copy of this binary, holding descriptor 60 open
+/// with the soft limit lowered to 50: the limit is process-wide, and would
+/// starve the other tests here.
+#[tokio::test]
+async fn a_descriptor_above_a_lowered_soft_limit_is_closed_too() {
+    if std::env::var_os(LOWERED_SOFT_LIMIT).is_some() {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit(2) and fcntl(2) into and on local values.
+        unsafe {
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            assert!(libc::fcntl(ABOVE_THE_LIMIT, libc::F_GETFD) >= 0, "not inherited");
+        }
+        assert!(limit.rlim_cur < ABOVE_THE_LIMIT as libc::rlim_t, "{}", limit.rlim_cur);
+        let dir = tempfile::tempdir().unwrap();
+        let ls = AgentCommand {
+            program: "ls".into(),
+            args: vec!["/dev/fd".into()],
+            env: Vec::new(),
+        };
+        let (mut adapter, mut io) = Adapter::spawn(&ls, dir.path()).unwrap();
+        let mut out = Vec::new();
+        io.stdout.read_to_end(&mut out).await.unwrap();
+        adapter.exited().await;
+        let fds = listed(&out);
+        assert!(fds.contains(&1), "{fds:?}");
+        assert!(!fds.contains(&ABOVE_THE_LIMIT), "the agent inherited it: {fds:?}");
+        return;
+    }
+    let file = std::fs::File::open("/dev/null").unwrap();
+    let fd = file.as_raw_fd();
+    let mut hard = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit(2) into a local struct.
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut hard) }, 0);
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args(["--exact", "a_descriptor_above_a_lowered_soft_limit_is_closed_too"])
+        .env(LOWERED_SOFT_LIMIT, "1");
+    // SAFETY: dup2(2) and setrlimit(2) in the forked child, before exec;
+    // nothing is allocated.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut child, move || {
+            if libc::dup2(fd, ABOVE_THE_LIMIT) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let lowered = libc::rlimit {
+                rlim_cur: 50,
+                rlim_max: hard.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = child.output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("1 passed"), "{text}");
 }

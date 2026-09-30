@@ -1,6 +1,7 @@
 //! Adapter process supervision (ACP core §2.3): spawn in its own process
-//! group with a scrubbed environment, capture a bounded stderr tail, watch
-//! for exit, and kill the whole group — never just the direct child.
+//! group with a scrubbed environment and no inherited descriptor but its
+//! stdio, capture a bounded stderr tail, watch for exit, and kill the whole
+//! group — never just the direct child.
 
 use std::collections::VecDeque;
 use std::os::unix::process::ExitStatusExt;
@@ -104,6 +105,17 @@ impl Adapter {
         // configuration names it.
         for var in NESTING_VARS.iter().chain(HOST_SECRET_VARS) {
             command.env_remove(var);
+        }
+        // Read before the fork: getrlimit is not async-signal-safe.
+        let limit = fd_limit();
+        // SAFETY: the closure runs in the forked child before `exec` and
+        // calls only `fcntl` and `close`, which are async-signal-safe; it
+        // allocates nothing.
+        unsafe {
+            command.pre_exec(move || {
+                close_inherited(limit);
+                Ok(())
+            });
         }
         let mut child = command.spawn()?;
         let pgid = child.id().expect("a just-spawned child has a pid") as i32;
@@ -253,6 +265,45 @@ impl Drop for Adapter {
     /// subtree running: `kill_on_drop` alone reaches only the direct child.
     fn drop(&mut self) {
         self.kill_group();
+    }
+}
+
+/// `close_inherited` checks no descriptor at or above this, whatever the
+/// soft limit: a soft `RLIMIT_NOFILE` of a million (a container's default)
+/// would cost every adapter spawn a million `fcntl` calls.
+pub const MAX_CLOSED_FD: libc::c_int = 65_536;
+
+/// The first descriptor number `close_inherited` does not check: the hard
+/// `RLIMIT_NOFILE`, at most `MAX_CLOSED_FD`. Not the soft limit: a
+/// descriptor opened while it was higher stays open once it is lowered.
+fn fd_limit() -> libc::c_int {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit(2) into a local struct of the right type.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return MAX_CLOSED_FD;
+    }
+    limit.rlim_max.min(MAX_CLOSED_FD as libc::rlim_t) as libc::c_int
+}
+
+/// In the forked child, before `exec`: close every descriptor from 3 up to
+/// `limit` that would stay open in the agent. Whatever the host inherited
+/// without close-on-exec (from `hennery up`, a service manager or a shell)
+/// and whatever another thread opened without it would otherwise reach
+/// every agent. Descriptors that are close-on-exec already are left alone:
+/// std reports a failed `exec` over one of them.
+fn close_inherited(limit: libc::c_int) {
+    for fd in 3..limit {
+        // SAFETY: fcntl(2) and close(2) on a descriptor number of this
+        // (forked) process; both are async-signal-safe.
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+                libc::close(fd);
+            }
+        }
     }
 }
 
