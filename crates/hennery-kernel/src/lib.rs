@@ -1,6 +1,8 @@
 //! Shared collector foundations (kernel spec): storage, request auth, and
-//! the operator and their setup, and host identity and pairing.
+//! the operator and their setup, host identity and pairing, and the admin
+//! socket.
 
+pub mod admin;
 pub mod auth;
 pub mod auth_api;
 pub mod db;

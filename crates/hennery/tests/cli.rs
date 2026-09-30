@@ -1120,11 +1120,15 @@ fn the_collectors_data_is_private_to_its_user() {
     // removes the `-wal` and `-shm`.
     assert_eq!(mode_of(&dir.join("root")), 0o700);
     assert_eq!(mode_of(&data), 0o700);
-    for file in ["hennery.db", "hennery.db-wal", "hennery.db-shm"] {
+    for file in ["hennery.db", "hennery.db-wal", "hennery.db-shm", "admin.sock"] {
         assert_eq!(mode_of(&data.join(file)), 0o600, "{file}");
     }
     unsafe { libc::kill(collector.up.id() as i32, libc::SIGTERM) };
     assert!(wait_with_timeout(&mut collector.up, Duration::from_secs(15)).is_some());
+    assert!(
+        !data.join("admin.sock").exists(),
+        "the admin socket outlived the collector"
+    );
 }
 
 /// Final review I2, an install from before the fix: a database others can

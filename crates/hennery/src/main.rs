@@ -218,6 +218,10 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn run_collector(args: CollectorArgs) -> Result<()> {
+    // First: a SIGINT or SIGTERM from here on shuts down cleanly, removing
+    // the admin socket, instead of killing the collector by the default
+    // action while it starts.
+    let mut signals = Signals::new()?;
     warn_if_dev_token();
     let file = config::FileConfig::load(&args.data_dir)?;
     let public_url = file
@@ -244,6 +248,9 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
             .collect::<Result<_>>()?
     };
     private_data_dir(&args.data_dir)?;
+    // Before the database and the setup link: a second collector on this
+    // data directory stops here, while the first still answers on it.
+    let admin_socket = hennery_kernel::admin::bind(&args.data_dir)?;
     let db = args.data_dir.join("hennery.db");
     let store = Store::open(&db)?;
     let hosts = Hosts::open(&db)?;
@@ -289,11 +296,31 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     }
     let shutdown = state.shutdown.clone();
     tokio::spawn(async move {
-        terminated().await;
+        signals.recv().await;
         shutdown.cancel();
     });
+    // Served on the router's own operator and registry (kernel spec §4.2).
+    let admin = admin_socket.map(|socket| {
+        let admin = hennery_kernel::admin::Admin {
+            operator: state.operator.clone(),
+            hosts: state.hosts.clone(),
+            dir: args.data_dir.clone(),
+            base_url,
+        };
+        tokio::spawn(hennery_kernel::admin::serve(
+            socket,
+            admin,
+            state.shutdown.clone().cancelled_owned(),
+        ))
+    });
     let app = hennery_sessions::router(state.clone()).route("/", get(|| async { Html(PLACEHOLDER) }));
-    hennery_sessions::serve_all(listeners, app, state.shutdown.clone()).await?;
+    let served = hennery_sessions::serve_all(listeners, app, state.shutdown.clone()).await;
+    // Also when serving failed: the admin socket is removed once it stops.
+    state.shutdown.cancel();
+    if let Some(admin) = admin {
+        let _ = admin.await;
+    }
+    served?;
     Ok(())
 }
 
@@ -554,8 +581,9 @@ async fn terminated() {
     }
 }
 
-/// `up`'s SIGINT and SIGTERM, caught from the moment it is made: unlike
-/// `terminated`, whose handlers exist only once it is first polled.
+/// SIGINT and SIGTERM for `up` and the collector, caught from the moment it
+/// is made: unlike `terminated`, whose handlers exist only once it is first
+/// polled.
 struct Signals {
     interrupt: tokio::signal::unix::Signal,
     terminate: tokio::signal::unix::Signal,
