@@ -16,6 +16,7 @@ use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::{Operator, SetupLink};
 use hennery_sessions::{AppState, store::Store};
 use std::net::SocketAddr;
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -74,6 +75,10 @@ struct CollectorArgs {
     /// inherited descriptor (kernel spec §4.2).
     #[arg(long, hide = true)]
     pairing_code_fd: Option<i32>,
+    /// `hennery up` only: serve on this inherited listening socket, which
+    /// `up` bound, in place of binding `--listen`.
+    #[arg(long, hide = true)]
+    listen_fd: Option<i32>,
 }
 
 #[derive(Args, Clone)]
@@ -166,9 +171,17 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     let mut state = AppState::new(store, hosts, operator);
     state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
     hennery_sessions::offline::after_startup(&state);
-    let listener = tokio::net::TcpListener::bind(&args.listen)
-        .await
-        .with_context(|| format!("bind {}", args.listen))?;
+    let listener = match args.listen_fd {
+        Some(fd) => {
+            // SAFETY: `fd` was inherited for exactly this and nothing else owns it.
+            let listener = unsafe { <std::net::TcpListener as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+            listener.set_nonblocking(true)?;
+            tokio::net::TcpListener::from_std(listener).context("the listening socket `up` handed over")?
+        }
+        None => tokio::net::TcpListener::bind(&args.listen)
+            .await
+            .with_context(|| format!("bind {}", args.listen))?,
+    };
     let address = listener.local_addr()?;
     tracing::info!(%address, "collector listening");
     // Only once listening: the link names the port (kernel spec §3.1).
@@ -363,6 +376,15 @@ fn loopback_url(listen: &str) -> String {
     }
 }
 
+/// `listen` (`host:port`) with its port replaced by `port`, the one it was
+/// bound on: `listen` may name port 0.
+fn with_port(listen: &str, port: u16) -> String {
+    match listen.rsplit_once(':') {
+        Some((host, _)) => format!("{host}:{port}"),
+        None => listen.to_string(),
+    }
+}
+
 /// `up`'s host child, but for the pairing descriptor (`run_up` adds it).
 fn host_command(
     exe: &std::path::Path,
@@ -409,11 +431,10 @@ async fn run_up(args: UpArgs) -> Result<()> {
     warn_if_dev_token();
     let exe = std::env::current_exe()?;
     let host_dir = args.data_dir.join("host");
-    // Computed and validated before any child starts: a non-loopback
-    // `--listen` (or another scheme it cannot make sense of) must fail here,
-    // not after the collector is already up and serving.
-    let collector_url = loopback_url(&args.listen);
-    let collector_ws_url = hennery_host::pairing::collector_ws_url(&collector_url)?;
+    // Validated before any child starts: a non-loopback `--listen` (or
+    // another scheme it cannot make sense of) must fail here, not after the
+    // collector is already up and serving.
+    hennery_host::pairing::collector_ws_url(&loopback_url(&args.listen))?;
     // Before either child creates its own directory in it.
     private_data_dir(&args.data_dir)?;
     // The host pairs itself on first start only; a pairing that was revoked
@@ -422,6 +443,11 @@ async fn run_up(args: UpArgs) -> Result<()> {
         Some(_) => None,
         None => Some(std::io::pipe()?),
     };
+    // Bound here and handed to the collector child, so the host's URL names
+    // the port the collector serves on, also for `--listen` port 0.
+    let listener = std::net::TcpListener::bind(&args.listen).with_context(|| format!("bind {}", args.listen))?;
+    let collector_url = loopback_url(&with_port(&args.listen, listener.local_addr()?.port()));
+    let collector_ws_url = hennery_host::pairing::collector_ws_url(&collector_url)?;
     // Keep both children out of the terminal's foreground process group: a
     // Ctrl-C there delivers SIGINT to every process in that group at once,
     // which would race each child's own signal handler against the ordered
@@ -429,23 +455,28 @@ async fn run_up(args: UpArgs) -> Result<()> {
     // and it alone decides the order (host, then collector).
     let mut collector_cmd = tokio::process::Command::new(&exe);
     collector_cmd
-        .args(["collector", "--listen", &args.listen])
+        .args(["collector", "--listen-fd", &inherit::LISTENER_FD.to_string()])
         .arg("--data-dir")
         .arg(args.data_dir.join("collector"))
         // `up` has warned about it already; the collector has no use for it.
         .env_remove(DEV_TOKEN_VAR)
         .kill_on_drop(true)
         .process_group(0);
+    let mut fds = vec![(listener.as_raw_fd(), inherit::LISTENER_FD)];
     if let Some((_, writer)) = &pairing {
-        inherit::pass_to_child(&mut collector_cmd, writer);
+        fds.push((writer.as_raw_fd(), inherit::CHILD_FD));
         collector_cmd
             .arg("--pairing-code-fd")
             .arg(inherit::CHILD_FD.to_string());
     }
+    inherit::pass_to_child(&mut collector_cmd, &fds);
     let mut collector = collector_cmd.spawn()?;
+    // The collector holds the socket now. Kept open here, it would hold the
+    // port after the collector exits.
+    drop(listener);
     let mut host_cmd = host_command(&exe, &host_dir, &collector_ws_url, &args);
     if let Some((reader, _)) = &pairing {
-        inherit::pass_to_child(&mut host_cmd, reader);
+        inherit::pass_to_child(&mut host_cmd, &[(reader.as_raw_fd(), inherit::CHILD_FD)]);
         host_cmd
             .arg("--join-url")
             .arg(&collector_url)
