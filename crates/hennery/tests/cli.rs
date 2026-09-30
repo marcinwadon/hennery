@@ -1044,3 +1044,35 @@ fn ups_data_root_is_private_to_its_user() {
     unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
     assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
 }
+
+/// Review of the fix wave: `up` names an existing data root that other
+/// users can reach into, and leaves it as it is, like the collector does
+/// for its own directory.
+#[test]
+fn up_warns_about_a_loose_existing_data_root() {
+    use std::os::unix::fs::PermissionsExt;
+    let listen = free_listen();
+    let dir = std::env::temp_dir().join(format!(
+        "hennery-cli-looseroot-{}-{}",
+        std::process::id(),
+        listen.replace(':', "-")
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveDir(dir.clone());
+    let root = dir.join("data");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let log = dir.join("up.log");
+    let mut up = up_logging_to(&listen, &root, &log);
+    wait_until("the warning about the data root", || {
+        std::fs::read_to_string(&log).is_ok_and(|text| {
+            text.lines()
+                .any(|line| line.contains("readable by other users") && line.contains(&root.display().to_string()))
+        })
+    });
+    assert_eq!(mode_of(&root), 0o755, "the operator's directory was changed");
+    unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
+    assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
+}
