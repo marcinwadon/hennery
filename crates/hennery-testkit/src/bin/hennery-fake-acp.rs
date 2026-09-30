@@ -163,6 +163,36 @@ async fn main() -> agent_client_protocol::Result<()> {
                         .unwrap()
                         .iter()
                         .any(|o| o.id == req.config_id && o.category == Some(SessionConfigOptionCategory::Model));
+                    if let (Some(file), true) = (script.model_switch_answer_on_file.clone(), is_model) {
+                        // Answered only once the test creates `file`, from a
+                        // task of its own, backlog first (see the script).
+                        let script = script.clone();
+                        let catalogue = catalogue.clone();
+                        let cx2 = cx.clone();
+                        return cx.spawn(async move {
+                            while !std::path::Path::new(&file).exists() {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                            for i in 0..script.model_switch_chunks_first.unwrap_or(0) {
+                                cx2.send_notification(SessionNotification::new(
+                                    req.session_id.clone(),
+                                    SessionUpdate::AgentMessageChunk(ContentChunk::new(ContentBlock::Text(
+                                        TextContent::new(format!("backlog{i}")),
+                                    ))),
+                                ))?;
+                            }
+                            let switched = {
+                                let mut options = catalogue.lock().unwrap();
+                                switch(&mut options, &req, None, None, &script.sticky_options).map(|()| options.clone())
+                            };
+                            match switched {
+                                Ok(options) => responder.respond(SetSessionConfigOptionResponse::new(options)),
+                                Err(message) => {
+                                    responder.respond_with_error(agent_client_protocol::Error::new(-32602, message))
+                                }
+                            }
+                        });
+                    }
                     if is_model && let Some(n) = script.model_switch_chunks_first {
                         // Sent inline, with no sleep, so they land on the
                         // wire strictly before this switch's own answer

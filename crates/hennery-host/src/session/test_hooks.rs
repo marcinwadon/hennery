@@ -17,6 +17,18 @@ use tokio::sync::watch;
 /// (and polls its deadlines) before reaching whatever waits behind it.
 pub const UPDATE_BURST: usize = super::UPDATE_BURST;
 
+/// How many `config_timeout`s an orphaned switch is still tracked for.
+pub const ORPHAN_GRACE: u32 = super::ORPHAN_GRACE;
+
+/// Where a held actor stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum HoldAt {
+    /// Right after a `set_config` sent a switch.
+    SwitchSent,
+    /// Right after a switch's deadline orphaned it.
+    Orphaned,
+}
+
 /// Shared between a test and the actor it passes these to (in
 /// `SessionOptions::test_hooks`).
 #[derive(Clone, Debug)]
@@ -26,7 +38,8 @@ pub struct TestHooks {
 
 #[derive(Debug)]
 struct Inner {
-    /// One-shot: the next `set_config` that sends a switch holds the actor.
+    hold_at: HoldAt,
+    /// One-shot: the actor holds the first time it reaches `hold_at`.
     hold_armed: AtomicBool,
     released: watch::Sender<bool>,
     /// Switch answers pushed onto the actor's inbound channel so far.
@@ -39,8 +52,19 @@ impl TestHooks {
     /// consumed meanwhile, while the connection task keeps queueing what the
     /// adapter sends.
     pub fn hold_after_first_switch() -> Self {
+        Self::holding_at(HoldAt::SwitchSent)
+    }
+
+    /// Hold the actor right after the first switch its deadline orphans
+    /// (its requester already answered `config_failed`), until `release`.
+    pub fn hold_after_first_orphan() -> Self {
+        Self::holding_at(HoldAt::Orphaned)
+    }
+
+    fn holding_at(hold_at: HoldAt) -> Self {
         Self {
             inner: Arc::new(Inner {
+                hold_at,
                 hold_armed: AtomicBool::new(true),
                 released: watch::Sender::new(false),
                 answers_queued: watch::Sender::new(0),
@@ -68,9 +92,9 @@ impl TestHooks {
         self.inner.answers_queued.send_modify(|count| *count += 1);
     }
 
-    /// Called by the actor right after a `set_config` sent a switch.
-    pub(super) async fn hold_if_armed(&self) {
-        if self.inner.hold_armed.swap(false, Ordering::SeqCst) {
+    /// Called by the actor at each hold point.
+    pub(super) async fn hold_if_armed(&self, at: HoldAt) {
+        if self.inner.hold_at == at && self.inner.hold_armed.swap(false, Ordering::SeqCst) {
             let mut released = self.inner.released.subscribe();
             let _ = released.wait_for(|released| *released).await;
         }

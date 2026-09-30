@@ -122,6 +122,13 @@ pub struct FakeScript {
     /// depends on racing another task's timing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_switch_chunks_first: Option<usize>,
+    /// Answer a switch of the model option only once this file exists,
+    /// from a task of its own (other requests are handled meanwhile), with
+    /// `model_switch_chunks_first`'s backlog sent right before the answer
+    /// rather than on receipt: a switch answered exactly when the test says
+    /// so, instead of after a delay that races the host's own deadlines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_switch_answer_on_file: Option<String>,
 }
 
 impl Default for FakeScript {
@@ -152,6 +159,7 @@ impl Default for FakeScript {
             announce_before_switch: false,
             flood: false,
             model_switch_chunks_first: None,
+            model_switch_answer_on_file: None,
         }
     }
 }

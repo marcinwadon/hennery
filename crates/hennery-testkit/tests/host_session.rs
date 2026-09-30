@@ -2447,6 +2447,67 @@ async fn a_switch_answered_just_in_time_is_applied_not_orphaned_under_a_backlog(
     }
 }
 
+/// An orphan's grace can expire while its answer is already queued behind
+/// the adapter's own output — the same race F1 closed for `out_deadline`.
+/// Dropping it then would discard a read-back the agent really runs with;
+/// instead the grace is disarmed (never drained) and the queued answer is
+/// handled in wire order and announced as a late `config_applied` for the
+/// orphan's request id (final review I2).
+///
+/// Set up without racing the clock: the fake answers `rc1` only once the
+/// test says so, so `out_deadline` certainly finds it unanswered and
+/// orphans it (`config_failed`); the actor is held right there, the test
+/// lets the fake answer (backlog first), waits for that answer to be
+/// queued, waits out the grace and releases the actor. Its first burst
+/// boundary comes long before the answer, so the grace is certain to fire
+/// with the answer queued but not yet handled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_orphan_whose_answer_is_queued_when_its_grace_ends_is_still_announced() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("config.log");
+    let answer_now = dir.path().join("answer-now");
+    let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        model_switch_chunks_first: Some(BACKLOG),
+        model_switch_answer_on_file: Some(answer_now.to_str().unwrap().into()),
+        ..config_script(&log)
+    };
+    let hooks = TestHooks::hold_after_first_orphan();
+    let config_timeout = Duration::from_millis(200);
+    let handle = launching(
+        &uplink,
+        &script,
+        Attach::New,
+        SessionConfig::default(),
+        SessionOptions {
+            config_timeout,
+            test_hooks: Some(hooks.clone()),
+            ..SessionOptions::default()
+        },
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(set_config("rc1", "model", ConfigValue::Id("large".into()))));
+    // Orphaned (and the actor held right after): the fake has not answered.
+    let (id, code) = refusal(&mut replies).await;
+    assert_eq!((id.as_str(), code.as_str()), ("rc1", "config_failed"));
+    std::fs::write(&answer_now, "").unwrap();
+    tokio::time::timeout(Duration::from_secs(30), hooks.answers_queued(1))
+        .await
+        .expect("rc1's answer never reached the host");
+    // The grace (from rc1's sending, before any of this) has passed once
+    // this is over; the actor, held, has seen none of it.
+    tokio::time::sleep(config_timeout * test_hooks::ORPHAN_GRACE).await;
+    hooks.release();
+    let frames = wait_until(&uplink, has("config_applied")).await;
+    let (request, indexed) = applied(&frames).remove(0);
+    assert_eq!(request.as_str(), "rc1");
+    assert_eq!(
+        indexed.current_config().unwrap().model.as_deref(),
+        Some("large"),
+        "the orphan's queued read-back was not applied"
+    );
+}
+
 /// F2 (review round 1): the pre-turn drain (run right before a new turn
 /// starts, so updates from before it are never tagged with the new turn)
 /// can answer a switch that was out without a follow-up `send_next_switch`

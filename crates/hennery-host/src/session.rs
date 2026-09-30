@@ -374,13 +374,19 @@ struct OutSwitch {
 /// never a second answer. Given up on, unanswered, `config_timeout *
 /// ORPHAN_GRACE` after it was sent, in case the adapter never answers at
 /// all — the catalogue then simply stays not current, as it already was
-/// made at the timeout. A start switch that got no answer in time is an
+/// made at the timeout — unless its answer is already flagged
+/// (`PendingConfigs::answered_token`), in which case the grace is disarmed
+/// instead, exactly like `OutSwitch::deadline`: the answer is already on
+/// the wire-ordered channel and is handled (and announced) in order. A
+/// start switch that got no answer in time is an
 /// orphan too (final review I1), with no `request_id` and `NO_TOKEN`: its
 /// answer was dropped with the start, so only its grace clears it.
 struct Orphan {
     token: u64,
     request_id: Option<String>,
-    drop_after: Instant,
+    /// `None` once disarmed (its answer is already queued): a cleared grace
+    /// can never re-fire in a busy loop.
+    drop_after: Option<Instant>,
 }
 
 /// How many `config_timeout`s an orphaned switch is still tracked for.
@@ -774,7 +780,7 @@ impl Actor {
             orphan: applied_hung.map(|sent_at| Orphan {
                 token: NO_TOKEN,
                 request_id: None,
-                drop_after: sent_at + self.options.config_timeout * ORPHAN_GRACE,
+                drop_after: Some(sent_at + self.options.config_timeout * ORPHAN_GRACE),
             }),
             next_token: NO_TOKEN + 1,
             answered_token: Arc::new(AtomicU64::new(NO_TOKEN)),
@@ -785,7 +791,7 @@ impl Actor {
         loop {
             let cancel_at = turn.as_ref().and_then(|t| t.cancel_deadline);
             let out_at = configs.out.as_ref().and_then(|out| out.deadline);
-            let orphan_at = configs.orphan.as_ref().map(|orphan| orphan.drop_after);
+            let orphan_at = configs.orphan.as_ref().and_then(|orphan| orphan.drop_after);
             tokio::select! {
                 // Biased: adapter output already received is emitted before
                 // the prompt reply it preceded on the wire (every arm that
@@ -881,7 +887,7 @@ impl Actor {
                             if configs.out.is_some()
                                 && let Some(hooks) = &self.options.test_hooks
                             {
-                                hooks.hold_if_armed().await;
+                                hooks.hold_if_armed(test_hooks::HoldAt::SwitchSent).await;
                             }
                         }
                     }
@@ -951,11 +957,25 @@ impl Actor {
                     } else {
                         let out = configs.out.take().expect("just matched");
                         self.orphan_switch(out, &mut configs);
+                        #[cfg(feature = "test-hooks")]
+                        if let Some(hooks) = &self.options.test_hooks {
+                            hooks.hold_if_armed(test_hooks::HoldAt::Orphaned).await;
+                        }
                     }
                 }
                 _ = orphan_deadline(orphan_at) => {
-                    configs.orphan = None;
-                    idle_since = Instant::now();
+                    // Never drains, like `out_deadline`: an orphan whose
+                    // answer is already flagged (so on the channel, or about
+                    // to be) keeps waiting for it, grace disarmed, and the
+                    // ordinary arm handles it in wire order. A start's
+                    // orphan (`NO_TOKEN`) has no answer to wait for.
+                    let orphan = configs.orphan.as_mut().expect("a grace implies an orphan");
+                    if orphan.token != NO_TOKEN && configs.answered_token.load(Ordering::SeqCst) == orphan.token {
+                        orphan.drop_after = None;
+                    } else {
+                        configs.orphan = None;
+                        idle_since = Instant::now();
+                    }
                 }
                 _ = cancel_deadline(cancel_at) => {
                     let unanswered = turn.take().expect("a deadline implies a turn");
@@ -1145,7 +1165,7 @@ impl Actor {
         configs.orphan = Some(Orphan {
             token: out.token,
             request_id: Some(out.request_id),
-            drop_after: out.sent_at + self.options.config_timeout * ORPHAN_GRACE,
+            drop_after: Some(out.sent_at + self.options.config_timeout * ORPHAN_GRACE),
         });
     }
 
