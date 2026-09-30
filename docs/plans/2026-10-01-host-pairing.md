@@ -21,7 +21,7 @@
 - **Binary:**
   - `hennery host join`;
   - `host run` reads the stored pairing;
-  - `hennery up` hands the collector child and the host child the two ends of one pipe, so the code never touches a command line or the environment.
+  - `hennery up` hands the collector child and the host child the two ends of one pipe, so the code never touches a command line or the environment. It gives its host the collector's current loopback URL, and keeps the collector serving if that host is revoked.
 
 **Tech Stack:** Rust (edition 2024, MSRV 1.88), tokio, axum 0.8 (`ConnectInfo`), tokio-tungstenite 0.29 (`accept_hdr_async` in tests), rusqlite 0.40, reqwest 0.12 (rustls). New crates, pinned exactly in `[workspace.dependencies]`: `ed25519-dalek = "=2.2.0"`, `sha2 = "=0.10.9"`, `getrandom = "=0.3.4"`, `hex = "=0.4.3"`, `toml = "=1.1.6"`. All are pure Rust: the nix dev shell needs nothing new. `std::io::pipe` needs Rust 1.87, under the MSRV. Nix flake dev shell.
 
@@ -44,9 +44,9 @@ It also relies on:
 - The umbrella spec [`2026-09-25-hennery-architecture-design.md`](../specs/2026-09-25-hennery-architecture-design.md): §5.9 (host identity on the wire), §7.5 (TLS except on loopback), §7.6 (pairing), §8.4 (the host key is readable by every agent of that OS user).
 - [`2026-09-26-distribution-design.md`](../specs/2026-09-26-distribution-design.md): §1 (`hennery host join <url> <code>`, `hennery host run`), §5.1 (the supervisor's pipe), §8 (`host.key`, `host.toml`).
 
-It builds on the executed [permission and elicitation plan](2026-10-01-permissions.md) (plan 2). Read its "Execution status" and "After this plan" first. Its code wins over its task text, and every anchor below was taken from that code (`feat/permissions` at `c6315b2`, which is about to merge to `main`).
+It builds on the executed [permission and elicitation plan](2026-10-01-permissions.md) (plan 2). Read its "Execution status" and "After this plan" first. Its code wins over its task text, and every anchor below was taken from that code (`main` at `9bcbbcb`, which merged it; its code is identical to `c6315b2`).
 
-**Status:** not executed. Every code block below was built and tested in a scratch copy of `c6315b2`. Every block was generated from the scratch commits. The plan was then replayed from its own text, task by task, onto a fresh copy of `c6315b2`: each block applied exactly as "Reading the steps" says, and after every task the tree matched the scratch commit byte for byte. After every task the replay ran fmt, clippy (also on the shipped binary with test hooks off), the workspace tests and the codegen check. It ends with 356 tests, up from 309. Every new timing-sensitive test passed with four copies of its test binary running at once.
+**Status:** not executed. Amended after the security review of 2026-10-01 (see "Decisions"). Every code block below was built and tested in a scratch copy of `9bcbbcb`. Every block was generated from the scratch commits. The plan was then replayed from its own text, task by task, onto a fresh copy of `9bcbbcb`: each block applied exactly as "Reading the steps" says, and after every task the tree matched the scratch commit byte for byte. After every task the replay ran fmt, clippy (also on the shipped binary with test hooks off), the workspace tests and the codegen check. It ends with 368 tests, up from 309. Every new timing-sensitive test passed with four copies of its test binary running at once.
 
 ## Scope
 
@@ -84,9 +84,27 @@ This is **plan (3), real auth and pairing**, as every earlier plan handed it on.
 
 ## Decisions this plan makes where the spec is silent
 
+**Amendments (2026-10-01 security review):**
+- Decision 11: revoking the all-in-one host no longer takes `up` down. `host run` exits 78 when it is revoked; `up` logs how to pair it again and keeps the collector serving. Only a collector exit ends `up` (A1).
+- Decision 11: `up` hands its host the collector's current loopback URL (`--collector-url`), and `join` treats any two loopback URLs as the same collector, so a new port or `localhost` for `127.0.0.1` is not "another collector" (A2).
+- Decision 6: the limiter counts every attempt as a failure the moment it starts (`attempt`), so a parallel burst cannot exceed five guesses. It keys on the canonical address with IPv6 grouped per /64, keeps at most 4096 addresses, and lives in memory (A3).
+- Decision 12: `join` re-pairs automatically only after `revoked`. After `bad_proof` it refuses and names the files to remove. An old outbox is never deleted: it is moved aside as `outbox.db.orphaned-<old host id>`, and so is any outbox a new identity would otherwise inherit (A4).
+- Decision 13: the socket task parks the sessions again when it ends if its host is revoked, so a frame applied while a revoke timed out still converges (A5).
+- Decision 1: the development token must be at least 16 characters; the binary refuses to start otherwise (A6).
+- Smaller amendments:
+  - the host data directory is created 0700, and a group- or world-readable `host.key` is warned about;
+  - the half-pairing error names the file to remove;
+  - `join https://…` is refused until `wss://` works;
+  - host names may not hold Unicode format characters;
+  - an unauthenticated host id is logged escaped (`?host_id`);
+  - `host run`'s `bad_proof` warning names the remedy.
+
+Reviewed and confirmed (with the amendments above) on 2026-10-01 by a stronger-model security review on the maintainer's behalf.
+
 Items marked **(amendment)** depart from explicit spec text and should be written back into it.
 
 1. **The split, and what stays on the bearer.** REST keeps `DevToken`/`require_bearer` until 3b. Minting a code and revoking are therefore "operator" routes, with no step-up yet (kernel §3.4 names both). Enrollment is merged **outside** the bearer layer, so no route added later can inherit it by accident; a test pins that.
+   - `DevToken::new` refuses a token shorter than 16 characters, and `collector` and `up` fail at start with one. An empty token would otherwise let anyone in: `Bearer ` with nothing after it matches an empty token. Tests use a fixed long token.
 2. **The kernel's tables share `hennery.db` as their own component.** `db::migrate_component` versions them in a `schema_versions` row, beside the sessions store's `user_version`. It refuses a newer component the way `migrate` refuses a newer database.
    - That makes two write connections to the file. The spec's single writer thread (§1) is still to come, and the busy timeout covers the overlap until then **(amendment: one writer per database comes later)**.
    - There is no `owner_id` yet, on the kernel tables or the session tables. 3b adds the `owners` table and backfills `owner_id` everywhere at once.
@@ -95,20 +113,24 @@ Items marked **(amendment)** depart from explicit spec text and should be writte
    - The nonce is 32 random bytes per upgrade, sent as lowercase hex in the `hennery-hello-nonce` response header **(amendment: name the header)**.
    - Public keys and signatures travel as lowercase hex. A key is stored lowercase, so the same key in another case is recognised as the same key.
    - A fixed vector (seed `[1; 32]`, nonce `[2; 32]`, `host-1`, `1.0`) is checked by both the host's signer and the kernel's verifier.
-4. **What a `hello` is told.** An unknown host id gets `bad_proof`, exactly like a wrong signature. The signature is verified before revocation is looked at, so `revoked` is only ever told to the holder of the key. A host whose collector sent no nonce sends no `hello` at all.
+4. **What a `hello` is told.** An unknown host id gets `bad_proof`, exactly like a wrong signature. The signature is verified before revocation is looked at, so `revoked` is only ever told to the holder of the key. A host whose collector sent no nonce sends no `hello` at all. Until the proof checks out, the host id is logged `Debug`-escaped (`?host_id`): an unauthenticated peer chose it.
 5. **Pairing codes.**
    - Eight characters of Crockford base32 (40 random bits), shown `XXXX-XXXX`.
    - Case, dashes and spaces are ignored; `O` is read as `0`, and `I` and `L` as `1`.
-   - Stored as SHA-256 hex. Valid while `expires_at > now`, so a code is dead exactly 600 s after minting.
+   - Stored as SHA-256 hex, unsalted: 40 bits hash quickly, so this keeps a code out of a casual look at the database, not away from a reader of `hennery.db` while the code is live. That reader runs as the collector's user and has every other secret too (kernel §10).
+   - Valid while `expires_at > now`, so a code is dead exactly 600 s after minting.
    - Spent in the same transaction that creates the host.
-   - An enrollment whose key is paired already is 409 `already_paired`; a malformed one (key, or a name, version or platform outside 1–64 printable characters) is 400 `invalid`. Neither spends the code.
+   - An enrollment whose key is paired already is 409 `already_paired`; a malformed one (key, or a name, version or platform outside 1–64 printable characters, with no control or Unicode format characters such as bidi overrides) is 400 `invalid`. Neither spends the code.
    - Host ids are collector-minted, `host-` plus 16 hex characters.
    - Per kernel §4.1 and distribution §1, the code is a positional argument of `host join`. It is single-use and dies in ten minutes, so §2's rule against secrets as CLI flags is not broken in spirit; `up` never puts it on a command line (decision 11).
-6. **Rate limiting counts failures only, per peer address.**
-   - Five wrong codes are free within a window that resets ten minutes after the last one.
-   - The fifth locks the address out for 60 s, and every further wrong code doubles that, up to an hour.
+6. **Rate limiting counts attempts, per client network.**
+   - `Limiter::attempt` checks the lockout and counts the attempt as a failure under one lock, so a burst of parallel requests gets at most five guesses in. Only a successful enrollment takes the count back (`succeeded` clears the address).
+   - Five attempts are free within a window that ends ten minutes after the last failure or, if later, the end of the last lockout. So waiting out a lockout does not reset the count.
+   - The fifth locks the address out for 60 s, and every further wrong attempt doubles that, up to an hour.
    - While locked out, even a right code is answered 429 `rate_limited` with `Retry-After`, without being checked (and so without being spent).
-   - A success clears the address.
+   - The key is `IpAddr::to_canonical()` (an IPv4-mapped address counts as its IPv4 address), with IPv6 grouped per /64.
+   - At most 4096 addresses are tracked. Past that, forgotten entries go first, then the oldest that are not locked out, then the oldest.
+   - Counts and lockouts are in memory: a collector restart clears them. There is no global budget and no loopback exemption.
    - Behind a reverse proxy every client shares the proxy's address. `X-Forwarded-For` is forgeable, so it is not trusted, and one flood of wrong codes slows pairing for everyone for a while.
    - The limiter takes `now`, so its tests never sleep. It is the one 3b's login limit reuses.
 7. **Times in kernel tables are integer Unix seconds**, passed in by the caller; REST shows RFC 3339.
@@ -121,19 +143,24 @@ Items marked **(amendment)** depart from explicit spec text and should be writte
 9. **The host's files.**
    - `host.key` holds the 32-byte seed as hex. `host.toml` holds `collector` (the WebSocket URL) and `host_id`. Both are written 0600 through a temporary file and a rename, the key first.
    - `join` writes the new key to `host.key.pending` *before* enrolling, so a directory that cannot hold it never costs a code.
-   - Half a pairing is an error, never a silent re-pair.
+   - Half a pairing is an error, never a silent re-pair; the error names the file to remove.
+   - The data directory is created 0700. A `host.key` that others can read is still used, with a warning to `chmod 600` it or pair again.
 10. **URLs.**
-    - `join` accepts `https://`, or `http://` to a loopback address only (umbrella §7.5), with no path. The WebSocket URL is derived from it (`wss`/`ws`, `/api/hosts/ws`).
-    - The workspace's `tokio-tungstenite` has no TLS feature, so a `wss://` host cannot connect yet. Enabling and live-testing it behind a TLS terminator is handed on.
+    - The public URL must be `https://`, or `http://` to a loopback address only (umbrella §7.5), with no path. The WebSocket URL is derived from it (`wss`/`ws`, `/api/hosts/ws`).
+    - The workspace's `tokio-tungstenite` has no TLS feature, so a `wss://` host cannot connect yet. `join` therefore refuses `https://` before it spends the code, naming the `wss://` follow-up. Enabling and live-testing it behind a TLS terminator is handed on.
+    - Two host WebSocket URLs name the same collector if they are equal, or if both are on loopback (`same_collector`): the all-in-one collector may listen on another port, or be reached as `localhost`.
     - `up` joins over loopback even when it listens on every interface.
 11. **`up` pairs its own host through one pipe (amendment).** The spec has the supervisor receive the code and pass it on. Here the supervisor creates one pipe and gives its write end to the collector child and its read end to the host child, both as descriptor 3. The code passes between the two children only, and the supervisor never reads it.
     - The collector mints the code only after it has migrated and bound its listener.
-    - No pipe exists when `host/host.key` is already there.
-    - A revoked all-in-one host exits, and `up` exits with it (restart policy is the distribution plan's). It is not re-paired.
+    - No pipe exists when `host/host.key` is already there. `up` never re-pairs a key the collector does not know, either.
+    - `up` hands its host child the collector's current loopback WebSocket URL (hidden `--collector-url`), which wins over the one stored at pairing. So an all-in-one install moved to another port keeps working.
+    - **A revoked all-in-one host does not take `up` down.** `host run` exits with code 78 (`EX_CONFIG`) once it is revoked. `up` then logs how to pair it again ("stop `hennery up`, remove `…/host/host.key` and `…/host/host.toml`, and start it again") and keeps the collector serving the operator and every remote host. Only a collector exit, or a signal, ends `up`. A later `up` repeats this until the files are removed; it never re-pairs by itself.
 12. **`host join` is idempotent through a probe `hello`.** The probe carries nothing attached, never sends `resend_complete`, and closes.
     - `hello_ack` or `already_connected` mean the collector accepts the key: nothing changes and no code is spent. (`already_connected` is only said after the proof was checked.)
-    - `revoked` or `bad_proof` mean the pairing is dead. A new key and a new host id replace it, and **the old outbox is deleted (amendment)**: its frames belong to a host id the collector will never hear from again, and would otherwise be resent unacked after every handshake.
-    - A pairing with *another* collector URL is refused. Remove the files to move a host.
+    - `revoked` is certain: the collector checked the key and refused it for good. A new key and a new host id replace the pairing, and **the old outbox is moved aside (amendment)** as `outbox.db.orphaned-<old host id>` (with its `-wal` and `-shm`). Its frames belong to a host id the collector will never hear from again. Left in place, they would be resent unacked after every handshake.
+    - `bad_proof` is ambiguous: the collector's database may have been reset or restored. `join` refuses, and names `host.key` and `host.toml` as the files to remove if the host should be paired anew. Nothing is touched.
+    - A pairing with *another* collector URL (not `same_collector`) is refused the same way.
+    - Whenever `join` writes a new identity next to an existing outbox, that outbox is moved aside first (`outbox.db.orphaned-unpaired` when there was no pairing). An outbox is never deleted.
 13. **Revoke, in this order.**
     1. Mark the host revoked. From then on its `hello`s get `revoked`.
     2. Kick its connection and wait, at most 10 s, until the socket task has unregistered it (`Hub::disconnect_and_wait`).
@@ -145,15 +172,20 @@ Items marked **(amendment)** depart from explicit spec text and should be writte
     It is idempotent: a session already presumed parked for the revoke is skipped. A repeated `DELETE` re-runs every step, which heals a revoke cut short.
     - The socket task re-checks revocation right after it registers. Its reader's `select!` is `biased` towards shutdown and the kick, so a kicked connection reads no further frame.
     - Those two guard interleavings that no test reproduces deterministically: a revoke landing between the proof check and the registration, and frames already buffered when the kick lands. They are argued in the code. The tests pin the end state (a host that keeps talking after its revoke cannot reattach) and the waiting primitive.
+    - When a socket task ends and its host is revoked, it calls `on_host_revoked` again. A revoke whose wait timed out parked the sessions while that connection could still apply a frame; this second pass converges them.
     - `LifecycleHooks` has only `on_host_revoked` for now; `on_hat_purged` comes with hats.
-14. **A revoked host stops.** `run_until` returns an error the moment a `hello` is refused `revoked`, after stopping every adapter the way a shutdown does. Other refusals (`bad_proof`, `incompatible`, `already_connected`) keep the reconnect backoff, as today. `HelloRejected` is a typed error, so callers can tell.
+14. **A revoked host stops.** `run_until` returns an error the moment a `hello` is refused `revoked`, after stopping every adapter the way a shutdown does. Other refusals (`bad_proof`, `incompatible`, `already_connected`) keep the reconnect backoff, as today. A `bad_proof` warning names the remedy: remove `host.key` and `host.toml`, then `hennery host join`. `HelloRejected` is a typed error, so callers can tell.
 15. **An accepted `hello` updates the registry** (kernel §4.3): `host_version`, `capabilities` and `last_seen_at`. The probe announces the same capabilities as the host, so a probe never blanks them.
 
 **Spec drift to reconcile after review:**
 - kernel §1: two write connections until the writer thread;
 - kernel §4.2 and distribution §5.1: the pipe between the children;
 - ACP core §3.5: the labelled, length-delimited proof message and the `hennery-hello-nonce` header;
-- kernel §4.1: re-join through a probe, the outbox dropped on re-pair, and a different collector refused;
+- kernel §4.1: re-join through a probe; automatic re-pair only after `revoked`; the old outbox moved aside, never deleted; any two loopback URLs one collector; `https://` refused until `wss://` works;
+- kernel §4.1: the pairing-code hash is unsalted and protects no live code from a reader of `hennery.db` (same-user threat model, §10);
+- kernel §4.1: the enrollment limiter counts attempts per canonical address and IPv6 /64, bounded, in memory;
+- kernel §4.2: `up` never re-pairs a key the collector does not know; a revoked all-in-one host leaves the collector serving;
+- distribution §7: `host run` names the remedy for `bad_proof`, and exits 78 when revoked;
 - kernel §8: the 201/400/401/409/429 shapes of the two pairing endpoints, `HostItem`;
 - ACP core §4.6's reason list: `host_revoked`;
 - kernel §3.4: step-up on minting and revoking, still to come in 3b.
@@ -180,23 +212,26 @@ Items marked **(amendment)** depart from explicit spec text and should be writte
 
 ## Review Focus
 
-These are the five inputs most likely to bite a real user that the obvious tests would not exercise, most likely first. Each is pinned by the named tests.
+These are the six inputs most likely to bite a real user that the obvious tests would not exercise, most likely first. Each is pinned by the named tests.
 
 1. **A host revoked while it is connected, mid-handshake, or with a question open and its answer already delivered.**
    - Expected: its socket is closed, and its `hello` is refused `revoked` from then on. Its sessions are presumed parked `host_revoked` and never come back `reattached`, even if the host keeps talking after the revoke. The open turn ends, the question is cancelled `host_revoked`, and the answer's verdict is `delivered: false`.
    - The host stops its adapters and exits with an error. A repeated revoke changes nothing more.
    - (Task 6: `a_revoke_closes_the_hosts_connection_and_parks_its_sessions_for_good`, `a_revoke_during_a_handshake_is_not_undone_by_its_reconciliation`, `a_revoked_hosts_sessions_are_parked_for_good_and_what_they_held_is_cancelled`, `disconnect_and_wait_returns_once_the_socket_task_has_let_go`; Task 7: `a_revoked_host_stops_its_adapters_and_exits`.)
-   - The two interleavings decision 13 names are argued in code, not reproduced.
-2. **`hennery host join` run again: while the host runs, after a revoke, or against another collector.**
-   - Expected: while the collector accepts the key, nothing changes and the code is not spent. After a revoke, a new key and a new id replace the pairing and the old outbox is gone. Another collector is refused, with the way out named.
-   - (Task 3: `joining_again_leaves_the_pairing_as_it_is_and_spends_no_code`; Task 7: `joining_again_while_the_host_runs_leaves_it_running`, `joining_again_after_a_revoke_pairs_anew_and_drops_the_old_outbox`, `joining_another_collector_while_paired_is_refused`.)
-3. **A code typed the way people type codes:** lower case, without the dash, with spaces, `O` for `0`, `I` or `L` for `1`, or one second too late.
+   - A revoke whose wait timed out still converges once the connection ends (Task 6: `a_connection_that_ends_after_its_host_was_revoked_parks_its_sessions`). The two interleavings decision 13 names are argued in code, not reproduced.
+2. **Operator recovery: the all-in-one host revoked, or `up` restarted on another port.**
+   - Expected: revoking the local host stops the host child only. `up` keeps the collector serving, and says which files to remove to pair it again; every later start does the same. After a restart on another port, the paired host connects under its old id.
+   - (Task 4: `up_pairs_its_own_host_once`; Task 7: `a_revoked_all_in_one_host_leaves_the_collector_serving`.)
+3. **`hennery host join` run again: while the host runs, after a revoke, against a collector that does not know the key, over `https://`, or next to an old outbox.**
+   - Expected: while the collector accepts the key, nothing changes and the code is not spent. After a revoke, a new key and a new id replace the pairing, and the old outbox is kept as `outbox.db.orphaned-<old id>`. A collector that does not know the key is refused, with the files to remove named, and nothing touched. `https://` is refused before any code is spent.
+   - (Task 3: `joining_again_leaves_the_pairing_as_it_is_and_spends_no_code`, `joining_over_https_is_refused_before_a_code_is_spent`, `joining_next_to_an_old_outbox_moves_it_aside`; Task 7: `joining_again_while_the_host_runs_leaves_it_running`, `joining_again_after_a_revoke_pairs_anew_and_moves_the_old_outbox_aside`, `joining_a_collector_that_does_not_know_the_key_is_refused`.)
+4. **A code typed the way people type codes:** lower case, without the dash, with spaces, `O` for `0`, `I` or `L` for `1`, or one second too late.
    - Expected: every spelling of a live code works, and a code is dead at exactly 600 s.
    - (Task 1: `a_code_is_read_however_it_is_typed`, `a_minted_code_enrolls_one_host_once`, `a_code_expires_after_ten_minutes`.)
-4. **Wrong codes from one address.**
-   - Expected: four are free. The fifth locks the address out, and then even the right code gets 429 with a `Retry-After` it can wait for, without being spent. Other outstanding codes stay valid, and other addresses are not affected.
-   - (Task 1: `wrong_codes_leave_other_outstanding_codes_valid`; Task 2: `the_fifth_failure_locks_out_and_each_further_one_doubles_the_lockout`, `failures_older_than_the_window_are_forgotten`, `wrong_codes_lock_the_address_out_but_leave_valid_codes_unspent`.)
-5. **A forged, replayed or unsolicited `hello`:** another key, a proof lifted from another connection, an unknown host id, or a collector that sends no nonce.
+5. **Wrong codes from one address, in a parallel burst, or from one IPv6 /64.**
+   - Expected: four are free. The fifth locks the address out, and then even the right code gets 429 with a `Retry-After` it can wait for, without being spent. A burst of parallel attempts gets no more than five in. Other outstanding codes stay valid, and other addresses are not affected.
+   - (Task 1: `wrong_codes_leave_other_outstanding_codes_valid`; Task 2: `the_fifth_attempt_locks_out_and_each_further_one_doubles_the_lockout`, `a_parallel_burst_gets_no_more_than_the_free_attempts`, `an_ipv6_64_is_one_address_and_a_mapped_ipv4_is_its_ipv4`, `failures_older_than_the_window_are_forgotten`, `wrong_codes_lock_the_address_out_but_leave_valid_codes_unspent`.)
+6. **A forged, replayed or unsolicited `hello`:** another key, a proof lifted from another connection, an unknown host id, or a collector that sends no nonce.
    - Expected: `bad_proof`, the host never registered and never listed as connected. A revoked host hears `revoked` only with a valid proof. A host never signs without a nonce.
    - (Task 1: `a_hello_is_accepted_only_with_a_proof_over_its_own_nonce`, `a_revoked_host_is_told_so_only_with_a_valid_proof`; Task 5: `a_hello_signed_by_another_key_is_rejected_without_registering`, `a_proof_is_good_on_its_own_connection_only`, `an_unknown_host_is_refused_like_a_bad_proof`, `a_collector_that_sends_no_nonce_gets_no_hello`.)
 
@@ -210,16 +245,18 @@ These are the five inputs most likely to bite a real user that the obvious tests
 | `crates/hennery-kernel/src/db.rs` | `migrate_component` | 1 |
 | `crates/hennery-kernel/src/secret.rs` | `random_bytes`, `sha256_hex`, `unix_now` | 1 |
 | `crates/hennery-kernel/src/hosts.rs` | The registry: codes, enrollment, the proof check, revoke, listing | 1 |
-| `crates/hennery-kernel/src/ratelimit.rs` | `Policy`, `Limiter` | 2 |
+| `crates/hennery-kernel/src/ratelimit.rs` | `Policy`, `Limiter`, `key` | 2 |
+| `crates/hennery-kernel/src/auth.rs` | `DevToken::new` refuses a token under 16 characters | 2 |
 | `crates/hennery-kernel/src/lifecycle.rs` | `LifecycleHooks` | 6 |
 | `crates/hennery-sessions/src/lib.rs` | `AppState.hosts`, `.enroll_limiter`; serving with `ConnectInfo`; `LifecycleHooks for AppState` | 2, 6 |
 | `crates/hennery-sessions/src/hosts.rs` | The four host endpoints | 2, 5, 6 |
 | `crates/hennery-sessions/src/ws.rs` | Nonce, proof check, `record_hello`, the revoke re-check, `biased` | 5, 6 |
 | `crates/hennery-sessions/src/hub.rs`, `store.rs` | `disconnect_and_wait`; `revoke_host` | 6 |
-| `crates/hennery-host/src/identity.rs` | `HostKey`, `Paired` | 3 |
-| `crates/hennery-host/src/pairing.rs` | URLs, `join` | 3, 7 |
-| `crates/hennery-host/src/connection.rs`, `outbox.rs` | Signing `hello`; `HelloRejected`, `probe`, stopping on `revoked`; `outbox::FILE` | 5, 7 |
-| `crates/hennery/src/main.rs`, `inherit.rs` | `host join`; `host run` from the pairing; `up`'s pipe | 2–5 |
+| `crates/hennery-host/src/identity.rs` | `HostKey`, `Paired`, `create_private_dir`, `is_private` | 3 |
+| `crates/hennery-host/src/outbox.rs` | `outbox::FILE` | 3 |
+| `crates/hennery-host/src/pairing.rs` | URLs, `orphan_outbox`, `join`; `same_collector` | 3, 7 |
+| `crates/hennery-host/src/connection.rs` | Signing `hello`; `HelloRejected`, `probe`, stopping on `revoked` | 5, 7 |
+| `crates/hennery/src/main.rs`, `inherit.rs` | `host join`; `host run` from the pairing; `up`'s pipe and `--collector-url`; exit 78 and `up` surviving it | 2–5, 7 |
 | Tests: `crates/hennery-kernel/tests/hosts.rs`, `crates/hennery-proto/tests/{proof,frames}.rs`, `crates/hennery-sessions/tests/{store,hub}.rs`, `crates/hennery-testkit/tests/{pairing,join,auth,e2e,reconcile,host_connection,ws_ingest_error}.rs`, `crates/hennery/tests/cli.rs` | | all |
 
 All commands run from the repository root inside the dev shell (`nix develop`, or direnv). Work on a feature branch off `main` (e.g. `feat/host-pairing`), once `feat/permissions` has merged. Each task leaves the workspace compiling, clippy-clean and green, and the binary working: `up` keeps connecting its host through every task.
@@ -230,7 +267,7 @@ All commands run from the repository root inside the dev shell (`nix develop`, o
 - "Append to `path`:" adds a blank line, then the block, at the end of the file.
 - "In `path`, replace:" is followed by a block that occurs **exactly once** in the file at that point (earlier blocks of the same task already applied, in order), then "with:" and its replacement.
 
-Other "Run:" lines only check or regenerate; they change no source file. The plan was replayed exactly this way, from its own text, onto `c6315b2`.
+Other "Run:" lines only check or regenerate; they change no source file. The plan was replayed exactly this way, from its own text, onto `9bcbbcb`.
 
 ---
 
@@ -243,7 +280,7 @@ Other "Run:" lines only check or regenerate; they change no source file. The pla
 - Test: `crates/hennery-proto/tests/proof.rs`, `crates/hennery-kernel/tests/hosts.rs`, `crates/hennery-sessions/tests/store.rs`; unit tests in `db.rs` and `secret.rs`
 
 **Interfaces:**
-- Consumes: `hennery_kernel::db::{open, open_in_memory, migrate}`, `hennery_proto::frames::Capabilities` as `c6315b2` has them.
+- Consumes: `hennery_kernel::db::{open, open_in_memory, migrate}`, `hennery_proto::frames::Capabilities` as `9bcbbcb` has them.
 - Produces (`hennery_proto`):
   - `const HELLO_NONCE_HEADER: &str = "hennery-hello-nonce"`;
   - `fn hello_proof_message(nonce: &[u8], host_id: &str, protocol_version: &str) -> Vec<u8>`.
@@ -456,6 +493,18 @@ fn a_key_that_is_paired_already_or_a_malformed_enrollment_does_not_use_the_code(
         hosts.enroll(&code.code, &no_name, NOW).unwrap(),
         EnrollOutcome::Invalid(why) if why.contains("name")
     ));
+    // A name that would display reversed, or hide characters, is refused.
+    for disguised in ["lap\u{202E}pot", "lap\u{200B}top", "\u{2066}laptop"] {
+        let mut named = enrollment(&key(2));
+        named.name = disguised.into();
+        assert!(
+            matches!(
+                hosts.enroll(&code.code, &named, NOW).unwrap(),
+                EnrollOutcome::Invalid(_)
+            ),
+            "{disguised:?}"
+        );
+    }
     // The code is still good.
     enrolled(hosts.enroll(&code.code, &enrollment(&key(2)), NOW).unwrap());
 }
@@ -960,7 +1009,10 @@ impl Enrollment {
             ("platform", &self.platform),
         ] {
             let value = value.trim();
-            if value.is_empty() || value.chars().count() > MAX_FIELD || value.chars().any(char::is_control) {
+            if value.is_empty()
+                || value.chars().count() > MAX_FIELD
+                || value.chars().any(|c| c.is_control() || is_format_char(c))
+            {
                 return Some(format!("{field} must be 1 to {MAX_FIELD} printable characters"));
             }
         }
@@ -1021,6 +1073,15 @@ pub struct HostRecord {
     pub created_at: i64,
     pub last_seen_at: Option<i64>,
     pub revoked_at: Option<i64>,
+}
+
+/// Invisible Unicode format characters (bidi overrides and isolates,
+/// zero-width characters, the byte-order mark): a host name holding one can
+/// display as another host's name.
+fn is_format_char(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
 }
 
 /// A pairing code as typed, reduced to its eight canonical characters:
@@ -1321,16 +1382,21 @@ git push
 
 **Files:**
 - Create: `crates/hennery-kernel/src/ratelimit.rs`, `crates/hennery-sessions/src/hosts.rs`
-- Modify: `crates/hennery-kernel/src/lib.rs`, `crates/hennery-proto/src/rest.rs`, `crates/hennery-proto/src/codegen.rs`, `crates/hennery-sessions/src/lib.rs`, `crates/hennery-sessions/src/api.rs`, `crates/hennery/src/main.rs`
-- Modify (`AppState::new` gains the registry): `crates/hennery-testkit/tests/{auth,e2e,reconcile,ws_ingest_error}.rs`
+- Modify: `crates/hennery-kernel/src/lib.rs`, `crates/hennery-kernel/src/auth.rs` (`DevToken::new` refuses short tokens), `crates/hennery-proto/src/rest.rs`, `crates/hennery-proto/src/codegen.rs`, `crates/hennery-sessions/src/lib.rs`, `crates/hennery-sessions/src/api.rs`, `crates/hennery/src/main.rs`
+- Modify (`AppState::new` gains the registry, and the harnesses a 19-character token): `crates/hennery-testkit/tests/{auth,e2e,reconcile,ws_ingest_error}.rs`
 - Regenerate: `schema/hennery-protocol.schema.json`, `web/src/generated/protocol.ts`
-- Test: `crates/hennery-testkit/tests/pairing.rs`; unit tests in `ratelimit.rs`
+- Test: `crates/hennery-testkit/tests/pairing.rs`, `crates/hennery/tests/cli.rs`; unit tests in `ratelimit.rs` and `auth.rs`
 
 **Interfaces:**
 - Consumes: Task 1's `Hosts`, `Enrollment`, `EnrollOutcome`, `secret::unix_now`.
 - Produces (`hennery_kernel::ratelimit`):
   - `struct Policy { free_failures: u32, window, first_lockout, max_lockout: Duration }`, with `Policy::ENROLL`;
-  - `struct Limiter`, with `new(Policy)`, `check(IpAddr, Instant) -> Result<(), Duration>` (the `Err` is the retry-after), `failed(IpAddr, Instant)` and `succeeded(IpAddr)`.
+  - `struct Limiter`, with:
+    - `new(Policy)` and `with_capacity(Policy, usize)` (`DEFAULT_CAPACITY = 4096`);
+    - `attempt(IpAddr, Instant) -> Result<(), Duration>`: the `Err` is the retry-after, and an `Ok` attempt counts as a failure until `succeeded`;
+    - `succeeded(IpAddr)` and `tracked() -> usize`;
+  - `fn key(IpAddr) -> IpAddr`: the canonical address, with IPv6 masked to /64.
+- Produces (`hennery_kernel::auth`): `MIN_DEV_TOKEN_LEN = 16`; `DevToken::new(impl Into<String>) -> anyhow::Result<DevToken>`, which refuses shorter tokens. `collector` and `up` fail at start with a short token.
 - Produces (`hennery_proto::rest`): `PairingCodeResponse { code, expires_at: String }`, `EnrollRequest { code, public_key, name, host_version, platform: String }`, `EnrollResponse { host_id: String }`.
 - Produces (`hennery_sessions`):
   - `AppState::new(store: Store, hosts: Hosts, token: DevToken)`, with the new fields `hosts: Arc<Hosts>` and `enroll_limiter: Arc<Limiter>`;
@@ -1359,7 +1425,7 @@ use hennery_sessions::AppState;
 use hennery_sessions::store::Store;
 use std::net::SocketAddr;
 
-const TOKEN: &str = "dev-token";
+const TOKEN: &str = "dev-token-for-tests";
 /// Valid Ed25519 public keys (RFC 8032 §7.1, tests 1 to 3).
 const KEYS: [&str; 3] = [
     "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a",
@@ -1382,7 +1448,7 @@ impl Collector {
         let state = AppState::new(
             Store::open(&db).unwrap(),
             Hosts::open(&db).unwrap(),
-            DevToken::new(TOKEN),
+            DevToken::new(TOKEN).unwrap(),
         );
         tokio::spawn(hennery_sessions::serve(listener, state.clone()));
         Self { addr, state, _dir: dir }
@@ -1520,35 +1586,188 @@ async fn a_malformed_or_already_paired_enrollment_is_refused_and_keeps_the_code(
 }
 ```
 
+In `crates/hennery/tests/cli.rs`, replace:
+
+```rust
+    assert!(String::from_utf8_lossy(&out.stderr).contains("name=command"));
+```
+
+with:
+
+```rust
+    assert!(String::from_utf8_lossy(&out.stderr).contains("name=command"));
+}
+
+#[test]
+fn a_short_dev_token_is_refused_at_start() {
+    let dir = std::env::temp_dir().join(format!("hennery-cli-short-token-{}", std::process::id()));
+    for command in ["collector", "up"] {
+        let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+            .args([command, "--listen", "127.0.0.1:0", "--dev-token", "short"])
+            .arg("--data-dir")
+            .arg(&dir)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{command} started with a short token");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("at least 16 characters"), "{command}: {stderr}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+```
+
+In `crates/hennery/tests/cli.rs`, replace:
+
+```rust
+        .args(["--dev-token", "t"]);
+```
+
+with:
+
+```rust
+        .args(["--dev-token", "dev-token-for-tests"]);
+```
+
 - [ ] **Step 2: Run them to see them fail**
 
 Run: `cargo test -p hennery-testkit --test pairing`
-Expected: FAIL to compile. `error[E0432]: unresolved imports hennery_proto::rest::EnrollRequest, hennery_proto::rest::EnrollResponse, hennery_proto::rest::PairingCodeResponse`, `error[E0061]: this function takes 2 arguments but 3 arguments were supplied` (`AppState::new`) and `error[E0609]: no field hosts on type AppState`.
+Expected: FAIL to compile. `error[E0432]: unresolved imports hennery_proto::rest::EnrollRequest, hennery_proto::rest::EnrollResponse, hennery_proto::rest::PairingCodeResponse`, `error[E0061]: this function takes 2 arguments but 3 arguments were supplied` (`AppState::new`), `error[E0599]: no method named unwrap found for struct DevToken` and `error[E0609]: no field hosts on type AppState`.
 
 - [ ] **Step 3: The limiter, the REST types and the endpoints**
 
-The limiter's own tests are in the module. `AppState::new` now takes the registry, so each existing harness opens one on its database file. `ws_ingest_error` uses one in memory: those tests lock the session database on purpose.
+The limiter's own tests are in the module, among them a parallel burst of 32 threads. `AppState::new` now takes the registry, so each existing harness opens one on its database file. `ws_ingest_error` uses one in memory: those tests lock the session database on purpose. `DevToken::new` now returns a `Result`, and every harness's token is 19 characters.
+
+In `crates/hennery-kernel/src/auth.rs`, replace:
+
+```rust
+//! Replaced by operator sessions and passkeys (kernel spec §3).
+```
+
+with:
+
+```rust
+//! Replaced by operator sessions and passkeys (kernel spec §3).
+
+use anyhow::{Result, ensure};
+```
+
+In `crates/hennery-kernel/src/auth.rs`, replace:
+
+```rust
+pub struct DevToken(pub Arc<str>);
+
+impl DevToken {
+```
+
+with:
+
+```rust
+pub struct DevToken(pub Arc<str>);
+
+/// The shortest development token accepted: an empty or short one would
+/// let anyone (or any guess) through.
+pub const MIN_DEV_TOKEN_LEN: usize = 16;
+
+impl DevToken {
+```
+
+In `crates/hennery-kernel/src/auth.rs`, replace:
+
+```rust
+    pub fn new(token: impl Into<String>) -> Self {
+        Self(Arc::from(token.into()))
+```
+
+with:
+
+```rust
+    /// Refuses a token shorter than `MIN_DEV_TOKEN_LEN` characters.
+    pub fn new(token: impl Into<String>) -> Result<Self> {
+        let token = token.into();
+        ensure!(
+            token.chars().count() >= MIN_DEV_TOKEN_LEN,
+            "the development token must be at least {MIN_DEV_TOKEN_LEN} characters"
+        );
+        Ok(Self(Arc::from(token)))
+```
+
+In `crates/hennery-kernel/src/auth.rs`, replace:
+
+```rust
+        let t = DevToken::new("secret");
+        assert!(t.matches("secret"));
+        assert!(!t.matches("secre"));
+        assert!(!t.matches("secret2"));
+```
+
+with:
+
+```rust
+        let t = DevToken::new("secret-secret-secret").unwrap();
+        assert!(t.matches("secret-secret-secret"));
+        assert!(!t.matches("secret-secret-secre"));
+        assert!(!t.matches("secret-secret-secret2"));
+```
+
+In `crates/hennery-kernel/src/auth.rs`, replace:
+
+```rust
+        assert!(!t.matches(""));
+    }
+}
+```
+
+with:
+
+```rust
+        assert!(!t.matches(""));
+    }
+
+    #[test]
+    fn an_empty_or_short_token_is_refused() {
+        for short in ["", "t", "fifteen-chars-x"] {
+            assert!(DevToken::new(short).is_err(), "{short:?}");
+        }
+        assert!(DevToken::new("sixteen-chars-xx").is_ok());
+    }
+}
+```
 
 Create `crates/hennery-kernel/src/ratelimit.rs`:
 
 ```rust
 //! Failure-based rate limiting per client address (kernel spec §3.2, §4.1):
 //! a few free failures within a window, then an exponentially growing
-//! lockout. Only failures count; while an address is locked out its
-//! attempts are refused without being checked.
+//! lockout.
+//!
+//! - **Every attempt counts as a failure the moment it is made**
+//!   (`attempt`), under the same lock as the lockout check, so a burst of
+//!   parallel requests cannot get more guesses in than the policy allows.
+//!   Only a success (`succeeded`) takes it back, and clears the address.
+//! - **The key is the network, not the socket address:** an IPv4-mapped
+//!   IPv6 address counts as its IPv4 address, and IPv6 addresses count per
+//!   /64, the block one subscriber usually holds.
+//! - **The window runs from the end of the last lockout**, so waiting out a
+//!   lockout does not reset the count; the next wrong attempt doubles it.
+//! - **Bounded:** at most `capacity` addresses are tracked. Past it,
+//!   forgotten entries are dropped first, then the oldest that are not
+//!   locked out, then the oldest of all.
+//! - **In memory only:** a collector restart clears every count and
+//!   lockout. There is no global budget and no exemption for loopback.
 //!
 //! Callers pass `now`, so the policy is testable without sleeping.
 
 use std::collections::HashMap;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Policy {
-    /// Failures allowed within `window` before the first lockout.
+    /// Failures allowed within `window`; the last of them starts the first
+    /// lockout.
     pub free_failures: u32,
-    /// Failures older than this (and no lockout pending) are forgotten.
+    /// Failures are forgotten this long after the last one, or after the
+    /// end of its lockout.
     pub window: Duration,
     /// The first lockout; each further failure doubles it.
     pub first_lockout: Duration,
@@ -1565,6 +1784,9 @@ impl Policy {
     };
 }
 
+/// Addresses tracked by default.
+pub const DEFAULT_CAPACITY: usize = 4096;
+
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     failures: u32,
@@ -1573,43 +1795,64 @@ struct Entry {
 }
 
 impl Entry {
+    fn locked(&self, now: Instant) -> bool {
+        self.locked_until.is_some_and(|until| now < until)
+    }
+
+    /// Nothing within `window` of the last failure or, if later, of the end
+    /// of the lockout: waiting out a long lockout does not reset the count.
     fn forgotten(&self, policy: &Policy, now: Instant) -> bool {
-        let locked = self.locked_until.is_some_and(|until| now < until);
-        !locked && now.saturating_duration_since(self.last_failure) >= policy.window
+        let since = self
+            .locked_until
+            .map_or(self.last_failure, |u| u.max(self.last_failure));
+        !self.locked(now) && now.saturating_duration_since(since) >= policy.window
     }
 }
 
-/// Entries kept before stale ones are pruned.
-const PRUNE_ABOVE: usize = 4096;
+/// What a client address is counted as: its IPv4 address (also when it
+/// arrives IPv4-mapped), or its IPv6 /64.
+pub fn key(addr: IpAddr) -> IpAddr {
+    match addr.to_canonical() {
+        IpAddr::V4(v4) => IpAddr::V4(v4),
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+    }
+}
 
 pub struct Limiter {
     policy: Policy,
+    capacity: usize,
     entries: Mutex<HashMap<IpAddr, Entry>>,
 }
 
 impl Limiter {
     pub fn new(policy: Policy) -> Self {
+        Self::with_capacity(policy, DEFAULT_CAPACITY)
+    }
+
+    pub fn with_capacity(policy: Policy, capacity: usize) -> Self {
         Self {
             policy,
+            capacity: capacity.max(1),
             entries: Mutex::new(HashMap::new()),
         }
     }
 
-    /// `Err(retry_after)` while `addr` is locked out.
-    pub fn check(&self, addr: IpAddr, now: Instant) -> Result<(), Duration> {
-        let entries = self.entries.lock().expect("limiter lock");
-        match entries.get(&addr).and_then(|e| e.locked_until) {
-            Some(until) if now < until => Err(until - now),
-            _ => Ok(()),
-        }
-    }
-
-    /// Record a failed attempt from `addr`.
-    pub fn failed(&self, addr: IpAddr, now: Instant) {
+    /// Start an attempt from `addr`: `Err(retry_after)` while it is locked
+    /// out, else the attempt is counted as a failure until `succeeded`.
+    pub fn attempt(&self, addr: IpAddr, now: Instant) -> Result<(), Duration> {
         let policy = self.policy;
+        let addr = key(addr);
         let mut entries = self.entries.lock().expect("limiter lock");
-        if entries.len() > PRUNE_ABOVE {
-            entries.retain(|_, e| !e.forgotten(&policy, now));
+        if let Some(until) = entries.get(&addr).and_then(|e| e.locked_until)
+            && now < until
+        {
+            return Err(until - now);
+        }
+        if !entries.contains_key(&addr) && entries.len() >= self.capacity {
+            make_room(&mut entries, &policy, now, self.capacity);
         }
         let entry = entries.entry(addr).or_insert(Entry {
             failures: 0,
@@ -1630,17 +1873,42 @@ impl Limiter {
                 .min(policy.max_lockout);
             entry.locked_until = Some(now + lockout);
         }
+        Ok(())
     }
 
-    /// A successful attempt forgets `addr`'s failures.
+    /// The attempt succeeded: `addr`'s count and lockout are cleared.
     pub fn succeeded(&self, addr: IpAddr) {
-        self.entries.lock().expect("limiter lock").remove(&addr);
+        self.entries.lock().expect("limiter lock").remove(&key(addr));
+    }
+
+    /// Addresses currently tracked.
+    pub fn tracked(&self) -> usize {
+        self.entries.lock().expect("limiter lock").len()
+    }
+}
+
+/// Bring `entries` under `capacity`, leaving room for one more.
+fn make_room(entries: &mut HashMap<IpAddr, Entry>, policy: &Policy, now: Instant, capacity: usize) {
+    entries.retain(|_, e| !e.forgotten(policy, now));
+    let excess = (entries.len() + 1).saturating_sub(capacity);
+    if excess == 0 {
+        return;
+    }
+    // Not locked out first (oldest failure first), then the rest.
+    let mut order: Vec<(bool, Instant, IpAddr)> = entries
+        .iter()
+        .map(|(addr, e)| (e.locked(now), e.last_failure, *addr))
+        .collect();
+    order.sort();
+    for (_, _, addr) in order.into_iter().take(excess) {
+        entries.remove(&addr);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     const A: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
     const B: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2));
@@ -1650,23 +1918,39 @@ mod tests {
     }
 
     #[test]
-    fn the_fifth_failure_locks_out_and_each_further_one_doubles_the_lockout() {
+    fn the_fifth_attempt_locks_out_and_each_further_one_doubles_the_lockout() {
         let limiter = Limiter::new(Policy::ENROLL);
         let t0 = Instant::now();
-        for _ in 0..4 {
-            limiter.failed(A, t0);
-            assert_eq!(limiter.check(A, t0), Ok(()));
+        for _ in 0..5 {
+            assert_eq!(limiter.attempt(A, t0), Ok(()));
         }
-        limiter.failed(A, t0);
-        assert_eq!(limiter.check(A, t0), Err(secs(60)));
-        assert_eq!(limiter.check(A, t0 + secs(59)), Err(secs(1)));
-        assert_eq!(limiter.check(A, t0 + secs(60)), Ok(()));
-        limiter.failed(A, t0 + secs(60));
-        assert_eq!(limiter.check(A, t0 + secs(60)), Err(secs(120)));
-        limiter.failed(A, t0 + secs(180));
-        assert_eq!(limiter.check(A, t0 + secs(180)), Err(secs(240)));
+        assert_eq!(limiter.attempt(A, t0), Err(secs(60)));
+        assert_eq!(limiter.attempt(A, t0 + secs(59)), Err(secs(1)));
+        assert_eq!(limiter.attempt(A, t0 + secs(60)), Ok(()));
+        assert_eq!(limiter.attempt(A, t0 + secs(60)), Err(secs(120)));
+        assert_eq!(limiter.attempt(A, t0 + secs(180)), Ok(()));
+        assert_eq!(limiter.attempt(A, t0 + secs(180)), Err(secs(240)));
         // Other addresses are not affected.
-        assert_eq!(limiter.check(B, t0), Ok(()));
+        assert_eq!(limiter.attempt(B, t0), Ok(()));
+    }
+
+    #[test]
+    fn a_parallel_burst_gets_no_more_than_the_free_attempts() {
+        let limiter = Arc::new(Limiter::new(Policy::ENROLL));
+        let now = Instant::now();
+        let barrier = Arc::new(std::sync::Barrier::new(32));
+        let threads: Vec<_> = (0..32)
+            .map(|_| {
+                let limiter = limiter.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    limiter.attempt(A, now).is_ok()
+                })
+            })
+            .collect();
+        let allowed = threads.into_iter().map(|t| t.join().unwrap()).filter(|ok| *ok).count();
+        assert_eq!(allowed, 5);
     }
 
     #[test]
@@ -1674,13 +1958,14 @@ mod tests {
         let limiter = Limiter::new(Policy::ENROLL);
         let t0 = Instant::now();
         for _ in 0..4 {
-            limiter.failed(A, t0);
+            limiter.attempt(A, t0).unwrap();
         }
         let later = t0 + secs(10 * 60);
         for _ in 0..4 {
-            limiter.failed(A, later);
-            assert_eq!(limiter.check(A, later), Ok(()));
+            assert_eq!(limiter.attempt(A, later), Ok(()));
         }
+        assert_eq!(limiter.attempt(A, later), Ok(()));
+        assert!(limiter.attempt(A, later).is_err());
     }
 
     #[test]
@@ -1688,17 +1973,59 @@ mod tests {
         let limiter = Limiter::new(Policy::ENROLL);
         let t0 = Instant::now();
         for _ in 0..4 {
-            limiter.failed(A, t0);
+            limiter.attempt(A, t0).unwrap();
         }
         limiter.succeeded(A);
         for _ in 0..4 {
-            limiter.failed(A, t0);
+            assert_eq!(limiter.attempt(A, t0), Ok(()));
         }
-        assert_eq!(limiter.check(A, t0), Ok(()));
-        for _ in 0..30 {
-            limiter.failed(A, t0);
+        // Waiting out every lockout, each wrong attempt doubles the next
+        // one, up to the cap.
+        let mut t = t0;
+        let mut longest = Duration::ZERO;
+        for _ in 0..40 {
+            if let Err(wait) = limiter.attempt(A, t) {
+                longest = longest.max(wait);
+                t += wait;
+            }
         }
-        assert_eq!(limiter.check(A, t0), Err(secs(60 * 60)));
+        assert_eq!(longest, secs(60 * 60));
+    }
+
+    #[test]
+    fn an_ipv6_64_is_one_address_and_a_mapped_ipv4_is_its_ipv4() {
+        let limiter = Limiter::new(Policy::ENROLL);
+        let t0 = Instant::now();
+        let v6 = |last: u16| IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, last));
+        for last in 1..=5 {
+            limiter.attempt(v6(last), t0).unwrap();
+        }
+        assert!(limiter.attempt(v6(99), t0).is_err(), "same /64");
+        let other_64 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 3, 0, 0, 0, 1));
+        assert_eq!(limiter.attempt(other_64, t0), Ok(()));
+
+        for _ in 0..5 {
+            limiter.attempt(A, t0).unwrap();
+        }
+        let mapped = IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0xc000, 0x0201));
+        assert_eq!(key(mapped), A);
+        assert!(limiter.attempt(mapped, t0).is_err());
+    }
+
+    #[test]
+    fn past_its_capacity_it_evicts_the_oldest_addresses_that_are_not_locked_out() {
+        let limiter = Limiter::with_capacity(Policy::ENROLL, 3);
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            limiter.attempt(A, t0).unwrap();
+        }
+        let addr = |n: u8| IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 100, n));
+        for n in 1..=10 {
+            limiter.attempt(addr(n), t0 + secs(u64::from(n))).unwrap();
+            assert!(limiter.tracked() <= 3);
+        }
+        // The locked-out address survived every eviction.
+        assert!(limiter.attempt(A, t0 + secs(11)).is_err());
     }
 }
 ```
@@ -1868,16 +2195,17 @@ async fn mint_pairing_code(State(state): State<AppState>) -> Response {
     }
 }
 
-/// `POST /api/hosts/enroll`: 201 `{host_id}`. A wrong code counts against
-/// the client's address (kernel spec §4.1); once that address is locked
-/// out, attempts are answered 429 without the code being looked at.
+/// `POST /api/hosts/enroll`: 201 `{host_id}`. Every attempt counts against
+/// the client's address until it pairs a host (kernel spec §4.1); once that
+/// address is locked out, attempts are answered 429 without the code being
+/// looked at.
 async fn enroll(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(req): Json<EnrollRequest>,
 ) -> Response {
     let now = Instant::now();
-    if let Err(retry_after) = state.enroll_limiter.check(peer.ip(), now) {
+    if let Err(retry_after) = state.enroll_limiter.attempt(peer.ip(), now) {
         let mut response = error(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limited",
@@ -1901,14 +2229,11 @@ async fn enroll(
             tracing::info!(%host_id, name = %enrollment.name, "host paired");
             (StatusCode::CREATED, Json(EnrollResponse { host_id })).into_response()
         }
-        Ok(EnrollOutcome::InvalidCode) => {
-            state.enroll_limiter.failed(peer.ip(), now);
-            error(
-                StatusCode::UNAUTHORIZED,
-                "invalid_code",
-                "the pairing code is unknown, used or expired",
-            )
-        }
+        Ok(EnrollOutcome::InvalidCode) => error(
+            StatusCode::UNAUTHORIZED,
+            "invalid_code",
+            "the pairing code is unknown, used or expired",
+        ),
         Ok(EnrollOutcome::AlreadyPaired { .. }) => error(
             StatusCode::CONFLICT,
             "already_paired",
@@ -2077,7 +2402,7 @@ with:
     let db = args.data_dir.join("hennery.db");
     let store = Store::open(&db)?;
     let hosts = Hosts::open(&db)?;
-    let mut state = AppState::new(store, hosts, DevToken::new(args.dev_token));
+    let mut state = AppState::new(store, hosts, DevToken::new(args.dev_token)?);
 ```
 
 In `crates/hennery/src/main.rs`, replace:
@@ -2092,6 +2417,20 @@ with:
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
 ```
 
+In `crates/hennery/src/main.rs`, replace:
+
+```rust
+async fn run_up(args: UpArgs) -> Result<()> {
+```
+
+with:
+
+```rust
+async fn run_up(args: UpArgs) -> Result<()> {
+    // Checked here too, so a bad token stops `up` before any child starts.
+    DevToken::new(args.dev_token.clone())?;
+```
+
 In `crates/hennery-testkit/tests/auth.rs`, replace:
 
 ```rust
@@ -2108,14 +2447,26 @@ use hennery_kernel::hosts::Hosts;
 In `crates/hennery-testkit/tests/auth.rs`, replace:
 
 ```rust
-            Store::open(&dir.path().join("hennery.db")).unwrap(),
+const TOKEN: &str = "dev-token";
 ```
 
 with:
 
 ```rust
-            Store::open(&dir.path().join("hennery.db")).unwrap(),
+const TOKEN: &str = "dev-token-for-tests";
+```
+
+In `crates/hennery-testkit/tests/auth.rs`, replace:
+
+```rust
+            DevToken::new(TOKEN),
+```
+
+with:
+
+```rust
             Hosts::open(&dir.path().join("hennery.db")).unwrap(),
+            DevToken::new(TOKEN).unwrap(),
 ```
 
 In `crates/hennery-testkit/tests/e2e.rs`, replace:
@@ -2129,6 +2480,18 @@ with:
 ```rust
 use hennery_kernel::auth::DevToken;
 use hennery_kernel::hosts::Hosts;
+```
+
+In `crates/hennery-testkit/tests/e2e.rs`, replace:
+
+```rust
+const TOKEN: &str = "dev-token";
+```
+
+with:
+
+```rust
+const TOKEN: &str = "dev-token-for-tests";
 ```
 
 In `crates/hennery-testkit/tests/e2e.rs`, replace:
@@ -2140,7 +2503,11 @@ In `crates/hennery-testkit/tests/e2e.rs`, replace:
 with:
 
 ```rust
-        let mut state = AppState::new(Store::open(db).unwrap(), Hosts::open(db).unwrap(), DevToken::new(TOKEN));
+        let mut state = AppState::new(
+            Store::open(db).unwrap(),
+            Hosts::open(db).unwrap(),
+            DevToken::new(TOKEN).unwrap(),
+        );
 ```
 
 In `crates/hennery-testkit/tests/reconcile.rs`, replace:
@@ -2159,14 +2526,26 @@ use hennery_kernel::hosts::Hosts;
 In `crates/hennery-testkit/tests/reconcile.rs`, replace:
 
 ```rust
-            Store::open(&dir.path().join("hennery.db")).unwrap(),
+const TOKEN: &str = "dev-token";
 ```
 
 with:
 
 ```rust
-            Store::open(&dir.path().join("hennery.db")).unwrap(),
+const TOKEN: &str = "dev-token-for-tests";
+```
+
+In `crates/hennery-testkit/tests/reconcile.rs`, replace:
+
+```rust
+            DevToken::new(TOKEN),
+```
+
+with:
+
+```rust
             Hosts::open(&dir.path().join("hennery.db")).unwrap(),
+            DevToken::new(TOKEN).unwrap(),
 ```
 
 In `crates/hennery-testkit/tests/ws_ingest_error.rs`, replace:
@@ -2185,6 +2564,18 @@ use hennery_kernel::hosts::Hosts;
 In `crates/hennery-testkit/tests/ws_ingest_error.rs`, replace:
 
 ```rust
+const TOKEN: &str = "dev-token";
+```
+
+with:
+
+```rust
+const TOKEN: &str = "dev-token-for-tests";
+```
+
+In `crates/hennery-testkit/tests/ws_ingest_error.rs`, replace:
+
+```rust
     store.create_session("s1", "host-1", "fake", "/tmp").unwrap();
 
     let state = AppState::new(store, DevToken::new(TOKEN));
@@ -2196,7 +2587,7 @@ with:
 ```rust
     store.create_session("s1", "host-1", "fake", "/tmp").unwrap();
 
-    let state = AppState::new(store, Hosts::open_in_memory().unwrap(), DevToken::new(TOKEN));
+    let state = AppState::new(store, Hosts::open_in_memory().unwrap(), DevToken::new(TOKEN).unwrap());
     let shutdown = state.shutdown.clone();
 ```
 
@@ -2209,7 +2600,7 @@ In `crates/hennery-testkit/tests/ws_ingest_error.rs`, replace:
 with:
 
 ```rust
-    let state = AppState::new(store, Hosts::open_in_memory().unwrap(), DevToken::new(TOKEN));
+    let state = AppState::new(store, Hosts::open_in_memory().unwrap(), DevToken::new(TOKEN).unwrap());
 ```
 
 - [ ] **Step 4: Regenerate and run the new tests**
@@ -2217,7 +2608,7 @@ with:
 Run: `cargo run -p hennery-proto --bin gen`
 Expected: `wrote schema/hennery-protocol.schema.json`, `wrote web/src/generated/protocol.ts`.
 
-Run: `cargo test -p hennery-testkit --test pairing --locked && cargo test -p hennery-kernel --lib --locked`
+Run: `cargo test -p hennery-testkit --test pairing --locked && cargo test -p hennery-kernel --lib --locked && cargo test -p hennery --test cli a_short_dev_token --locked`
 Expected: all pass.
 
 - [ ] **Step 5: Revert-probe the layering**
@@ -2227,7 +2618,7 @@ Move `.route("/api/hosts/enroll", post(enroll))` into the `operator` router, abo
 - [ ] **Step 6: Run the whole gate**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo clippy -p hennery --locked -- -D warnings && cargo test --workspace --locked && cargo run -p hennery-proto --bin gen -- --check`
-Expected: all 332 tests pass.
+Expected: all 337 tests pass.
 
 - [ ] **Step 7: Commit and push**
 
@@ -2242,7 +2633,7 @@ git push
 **Files:**
 - Modify: `Cargo.toml` (`toml`), `crates/hennery-host/Cargo.toml`, `Cargo.lock`
 - Create: `crates/hennery-host/src/identity.rs`, `crates/hennery-host/src/pairing.rs`
-- Modify: `crates/hennery-host/src/lib.rs`, `crates/hennery/src/main.rs`
+- Modify: `crates/hennery-host/src/lib.rs`, `crates/hennery-host/src/outbox.rs` (`FILE`), `crates/hennery/src/main.rs`
 - Test: `crates/hennery-testkit/tests/join.rs`, `crates/hennery/tests/cli.rs`; unit tests in `identity.rs` and `pairing.rs`
 
 **Interfaces:**
@@ -2250,12 +2641,15 @@ git push
 - Produces (`hennery_host::identity`):
   - `KEY_FILE = "host.key"`, `CONFIG_FILE = "host.toml"`;
   - `#[derive(Clone)] struct HostKey`, with `generate()`, `from_seed([u8; 32])`, `public_key_hex() -> String`, `sign_hello(nonce: &[u8], host_id, protocol_version) -> String`, `load(&Path) -> Result<Self>` and `save(&Path) -> Result<()>`. Its `Debug` shows only the public key;
-  - `struct Paired { collector_url: String, host_id: String, key: HostKey }`, with `load(data_dir) -> Result<Option<Paired>>` and `save(data_dir) -> Result<()>`.
+  - `struct Paired { collector_url: String, host_id: String, key: HostKey }`, with `load(data_dir) -> Result<Option<Paired>>` and `save(data_dir) -> Result<()>`;
+  - `create_private_dir(&Path) -> Result<()>` (mode 0700) and `is_private(&Path) -> Result<bool>`. `HostKey::load` warns about a key others can read.
+- Produces: `hennery_host::outbox::FILE = "outbox.db"`.
 - Produces (`hennery_host::pairing`):
   - `enum Joined { Paired { host_id }, AlreadyPaired { host_id } }`;
   - `parse_public_url(&str) -> Result<reqwest::Url>` and `collector_ws_url(&str) -> Result<String>`;
   - `platform() -> String` and `default_name() -> String`;
-  - `async join(public_url, code, data_dir: &Path, name) -> Result<Joined>`.
+  - `orphan_outbox(data_dir: &Path, label: &str) -> Result<Option<PathBuf>>`, which moves `outbox.db` (with `-wal`, `-shm`) to `outbox.db.orphaned-<label>` (numbered if taken);
+  - `async join(public_url, code, data_dir: &Path, name) -> Result<Joined>`, which refuses `https://` before spending the code.
 - Produces (CLI): `hennery host join <URL> <CODE> [--name NAME] --data-dir DIR` (or `HENNERY_HOST_DATA_DIR`).
 - Interim, until Task 7: `join` treats a directory holding a pairing as paired without asking the collector; Task 7 asks it.
 
@@ -2278,7 +2672,7 @@ use hennery_sessions::AppState;
 use hennery_sessions::store::Store;
 use std::net::SocketAddr;
 
-const TOKEN: &str = "dev-token";
+const TOKEN: &str = "dev-token-for-tests";
 
 struct Collector {
     addr: SocketAddr,
@@ -2295,7 +2689,7 @@ impl Collector {
         let state = AppState::new(
             Store::open(&db).unwrap(),
             Hosts::open(&db).unwrap(),
-            DevToken::new(TOKEN),
+            DevToken::new(TOKEN).unwrap(),
         );
         tokio::spawn(hennery_sessions::serve(listener, state.clone()));
         Self { addr, state, _dir: dir }
@@ -2398,6 +2792,32 @@ async fn a_wrong_code_fails_and_leaves_nothing_behind() {
     let left: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
     assert!(left.is_empty(), "{left:?}");
     assert!(collector.state.hosts.list().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn joining_over_https_is_refused_before_a_code_is_spent() {
+    let dir = tempfile::tempdir().unwrap();
+    let err = join("https://c.example", "0000-0000", dir.path(), "laptop")
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("wss://"), "{err}");
+    assert!(!dir.path().join(KEY_FILE).exists());
+}
+
+#[tokio::test]
+async fn joining_next_to_an_old_outbox_moves_it_aside() {
+    let collector = Collector::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("outbox.db"), b"frames of an unpaired host").unwrap();
+    let code = collector.mint().await;
+    join(&collector.public_url(), &code, dir.path(), "laptop")
+        .await
+        .unwrap();
+    assert!(!dir.path().join("outbox.db").exists());
+    assert_eq!(
+        std::fs::read(dir.path().join("outbox.db.orphaned-unpaired")).unwrap(),
+        b"frames of an unpaired host"
+    );
 }
 ```
 
@@ -2515,7 +2935,7 @@ use anyhow::{Context, Result, bail};
 use ed25519_dalek::{Signer, SigningKey};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub const KEY_FILE: &str = "host.key";
@@ -2556,8 +2976,15 @@ impl HostKey {
         hex::encode(self.0.sign(&message).to_bytes())
     }
 
-    /// Read a key file written by `save`.
+    /// Read a key file written by `save`. A key other users can read is
+    /// still used, with a warning: it may have leaked already.
     pub fn load(path: &Path) -> Result<Self> {
+        if !is_private(path)? {
+            tracing::warn!(
+                path = %path.display(),
+                "the host key is readable by other users; restrict it with `chmod 600`, or pair again if it may have leaked"
+            );
+        }
         let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         let seed: [u8; 32] = hex::decode(text.trim())
             .ok()
@@ -2598,9 +3025,15 @@ impl Paired {
         match (key_path.exists(), config_path.exists()) {
             (false, false) => return Ok(None),
             (true, true) => {}
-            _ => bail!(
-                "{} holds only half a pairing ({KEY_FILE} and {CONFIG_FILE} go together); pair again with `hennery host join`",
-                data_dir.display()
+            (true, false) => bail!(
+                "{} holds a host key but no {CONFIG_FILE}: remove {} to pair this host again",
+                data_dir.display(),
+                key_path.display()
+            ),
+            (false, true) => bail!(
+                "{} holds a {CONFIG_FILE} but no host key: remove {} to pair this host again",
+                data_dir.display(),
+                config_path.display()
             ),
         }
         let text = std::fs::read_to_string(&config_path).with_context(|| format!("read {}", config_path.display()))?;
@@ -2615,7 +3048,7 @@ impl Paired {
     /// Store the pairing in `data_dir`: the key first, then `host.toml`, so
     /// a `host.toml` is never there without its key.
     pub fn save(&self, data_dir: &Path) -> Result<()> {
-        std::fs::create_dir_all(data_dir)?;
+        create_private_dir(data_dir)?;
         self.key.save(&data_dir.join(KEY_FILE))?;
         let config = toml::to_string(&HostToml {
             collector: self.collector_url.clone(),
@@ -2623,6 +3056,25 @@ impl Paired {
         })?;
         write_private(&data_dir.join(CONFIG_FILE), config.as_bytes())
     }
+}
+
+/// Create `dir` (and its parents) with mode 0700: it holds the host key
+/// and the outbox. An existing directory is left as it is.
+pub fn create_private_dir(dir: &Path) -> Result<()> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .with_context(|| format!("create {}", dir.display()))
+}
+
+/// Whether nobody but its owner can read or write `path`.
+pub fn is_private(path: &Path) -> Result<bool> {
+    let mode = std::fs::metadata(path)
+        .with_context(|| format!("read {}", path.display()))?
+        .permissions()
+        .mode();
+    Ok(mode & 0o077 == 0)
 }
 
 fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
@@ -2647,7 +3099,6 @@ fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     /// Checked by the collector too (`hennery-kernel`'s `hosts` tests).
     const VECTOR_SIGNATURE: &str = "bd2b7388413c333e9ed69c330b4a8be8ffb6228609979b30607236fcdefab259\
@@ -2682,16 +3133,47 @@ cdf6b48fb39bfaa9b5a3cd01538280ec9e6d50c8831e9aae4d791f68112a6c04";
     }
 
     #[test]
+    fn a_new_data_directory_is_private_and_a_readable_key_is_noticed() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("a").join("host");
+        create_private_dir(&data).unwrap();
+        let mode = std::fs::metadata(&data).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+        let key = data.join(KEY_FILE);
+        HostKey::generate().save(&key).unwrap();
+        assert!(is_private(&key).unwrap());
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_private(&key).unwrap());
+        HostKey::load(&key).expect("still usable, with a warning");
+    }
+
+    #[test]
     fn half_a_pairing_is_an_error_and_the_key_never_shows_in_debug() {
         let dir = tempfile::tempdir().unwrap();
         let key = HostKey::from_seed([1; 32]);
         key.save(&dir.path().join(KEY_FILE)).unwrap();
-        let err = Paired::load(dir.path()).unwrap_err();
-        assert!(err.to_string().contains("half a pairing"), "{err}");
+        let err = Paired::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("no host.toml") && err.contains("remove"), "{err}");
+        assert!(err.contains(&dir.path().join(KEY_FILE).display().to_string()), "{err}");
         let seed_hex = hex::encode([1u8; 32]);
         assert!(!format!("{key:?}").contains(&seed_hex));
     }
 }
+```
+
+In `crates/hennery-host/src/outbox.rs`, replace:
+
+```rust
+use std::path::Path;
+```
+
+with:
+
+```rust
+use std::path::Path;
+
+/// The outbox's file in the host's data directory.
+pub const FILE: &str = "outbox.db";
 ```
 
 Create `crates/hennery-host/src/pairing.rs`:
@@ -2700,11 +3182,12 @@ Create `crates/hennery-host/src/pairing.rs`:
 //! `hennery host join <url> <code>` (kernel spec §4.1): generate the host's
 //! key, enroll it with a pairing code, and store the pairing.
 
-use crate::identity::{HostKey, KEY_FILE, Paired};
+use crate::identity::{HostKey, KEY_FILE, Paired, create_private_dir};
+use crate::outbox::FILE as OUTBOX_FILE;
 use anyhow::{Context, Result, bail};
 use hennery_proto::rest::{ApiError, EnrollRequest, EnrollResponse};
 use reqwest::Url;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// How long one enrollment request may take.
@@ -2770,6 +3253,39 @@ pub fn default_name() -> String {
     }
 }
 
+/// Move an outbox that belongs to another identity out of the way, so the
+/// new one starts empty and the old frames are kept for inspection:
+/// `outbox.db` (and its `-wal`, `-shm`) becomes `outbox.db.orphaned-<label>`
+/// (with a numeric suffix if that name is taken). `None` if there was none.
+pub fn orphan_outbox(data_dir: &Path, label: &str) -> Result<Option<PathBuf>> {
+    let db = data_dir.join(OUTBOX_FILE);
+    if !db.exists() {
+        return Ok(None);
+    }
+    let target = |n: u32| {
+        let name = match n {
+            0 => format!("{OUTBOX_FILE}.orphaned-{label}"),
+            n => format!("{OUTBOX_FILE}.orphaned-{label}.{n}"),
+        };
+        data_dir.join(name)
+    };
+    let mut n = 0;
+    while target(n).exists() {
+        n += 1;
+    }
+    let base = target(n);
+    for suffix in ["", "-wal", "-shm"] {
+        let from = data_dir.join(format!("{OUTBOX_FILE}{suffix}"));
+        if from.exists() {
+            let mut to = base.clone().into_os_string();
+            to.push(suffix);
+            std::fs::rename(&from, &to).with_context(|| format!("move {} aside", from.display()))?;
+        }
+    }
+    tracing::warn!(kept = %base.display(), "moved an outbox of an earlier identity aside");
+    Ok(Some(base))
+}
+
 /// Pair the host whose data directory is `data_dir` with the collector at
 /// `public_url`. Idempotent: a directory that is paired already is left as
 /// it is, and the code is not spent.
@@ -2780,8 +3296,14 @@ pub async fn join(public_url: &str, code: &str, data_dir: &Path, name: &str) -> 
         });
     }
     let base = parse_public_url(public_url)?;
+    if base.scheme() == "https" {
+        // Enrolling would spend the code on a host that cannot connect.
+        bail!(
+            "{public_url}: hosts cannot connect over wss:// in this version yet; pair over a loopback http:// address, or wait for the wss:// support"
+        );
+    }
     let collector_url = collector_ws_url(public_url)?;
-    std::fs::create_dir_all(data_dir)?;
+    create_private_dir(data_dir)?;
     let key = HostKey::generate();
     // Written before enrolling, so a directory that cannot hold the key
     // never costs a code; renamed into place only once enrolled.
@@ -2800,6 +3322,8 @@ pub async fn join(public_url: &str, code: &str, data_dir: &Path, name: &str) -> 
         host_id: host_id.clone(),
         key,
     };
+    // Frames an earlier, unpaired host left behind are not this identity's.
+    orphan_outbox(data_dir, "unpaired")?;
     paired.save(data_dir)?;
     let _ = std::fs::remove_file(&pending);
     Ok(Joined::Paired { host_id })
@@ -2867,6 +3391,32 @@ mod tests {
             collector_ws_url("http://[::1]:7117").unwrap(),
             "ws://[::1]:7117/api/hosts/ws"
         );
+    }
+
+    #[test]
+    fn an_outbox_moved_aside_keeps_its_files_together_under_a_free_name() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(orphan_outbox(dir.path(), "host-1").unwrap(), None);
+        for round in ["first", "second"] {
+            for suffix in ["", "-wal", "-shm"] {
+                std::fs::write(dir.path().join(format!("outbox.db{suffix}")), round).unwrap();
+            }
+            orphan_outbox(dir.path(), "host-1").unwrap().unwrap();
+        }
+        for name in [
+            "outbox.db.orphaned-host-1",
+            "outbox.db.orphaned-host-1-wal",
+            "outbox.db.orphaned-host-1-shm",
+            "outbox.db.orphaned-host-1.1",
+            "outbox.db.orphaned-host-1.1-wal",
+        ] {
+            assert!(dir.path().join(name).exists(), "{name}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("outbox.db.orphaned-host-1")).unwrap(),
+            "first"
+        );
+        assert!(!dir.path().join("outbox.db").exists());
     }
 
     #[test]
@@ -2981,7 +3531,7 @@ Expected: all pass, among them `the_host_signs_the_fixed_proof_vector` (the same
 - [ ] **Step 5: Run the whole gate**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo clippy -p hennery --locked -- -D warnings && cargo test --workspace --locked && cargo run -p hennery-proto --bin gen -- --check`
-Expected: all 341 tests pass.
+Expected: all 350 tests pass.
 
 - [ ] **Step 6: Commit and push**
 
@@ -3006,7 +3556,7 @@ git push
   - `write_code(RawFd, &str) -> Result<()>`, `async read_code(RawFd) -> Result<String>` and `close(RawFd)`.
 - Produces (CLI):
   - `hennery host run --data-dir DIR [--agent …] [--idle-timeout-secs N]`, which reads `host.toml` and `host.key` and no longer takes `--collector` or `--host-id`;
-  - hidden `--join-url URL --join-code-fd FD` on `host run`, and a hidden `--pairing-code-fd FD` on `collector`, for `up` only.
+  - hidden `--join-url URL --join-code-fd FD` and `--collector-url WS_URL` on `host run`, and a hidden `--pairing-code-fd FD` on `collector`, for `up` only. `up` always passes `--collector-url` (its current loopback address), which wins over the stored URL.
 - Interim, until Task 5: `host run` still takes `--dev-token` for its `hello`, and `up` still passes it to the host child.
 
 - [ ] **Step 1: Write the failing test**
@@ -3094,7 +3644,7 @@ fn up_until_connected(listen: &str, dir: &std::path::Path) -> (KillTree, Vec<Str
         .args(["up", "--listen", listen])
         .arg("--data-dir")
         .arg(dir)
-        .args(["--dev-token", "t"])
+        .args(["--dev-token", "dev-token-for-tests"])
         .spawn()
         .unwrap();
     let guard = KillTree {
@@ -3104,7 +3654,7 @@ fn up_until_connected(listen: &str, dir: &std::path::Path) -> (KillTree, Vec<Str
     };
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        if let Some(serde_json::Value::Array(hosts)) = get_json(listen, "/api/hosts", "t")
+        if let Some(serde_json::Value::Array(hosts)) = get_json(listen, "/api/hosts", "dev-token-for-tests")
             && !hosts.is_empty()
         {
             let ids = hosts.iter().filter_map(|h| h.as_str().map(str::to_string)).collect();
@@ -3117,7 +3667,7 @@ fn up_until_connected(listen: &str, dir: &std::path::Path) -> (KillTree, Vec<Str
 
 /// `hennery up` pairs its own host on first start, through the pipe the
 /// supervisor hands both children (kernel spec §4.2), and a restart reuses
-/// that pairing instead of minting another.
+/// that pairing instead of minting another, also on another port.
 #[test]
 fn up_pairs_its_own_host_once() {
     let listen = free_listen();
@@ -3138,7 +3688,7 @@ fn up_pairs_its_own_host_once() {
     unsafe { libc::kill(first.up.id() as i32, libc::SIGTERM) };
     assert!(wait_with_timeout(&mut first.up, Duration::from_secs(15)).is_some());
 
-    let (_second, again) = up_until_connected(&listen, &dir);
+    let (_second, again) = up_until_connected(&free_listen(), &dir);
     assert_eq!(again, ids, "the restart paired a second host");
     assert_eq!(std::fs::read(host_dir.join("host.key")).unwrap(), key);
 }
@@ -3311,6 +3861,10 @@ with:
     join_url: Option<String>,
     #[arg(long, hide = true, requires = "join_url")]
     join_code_fd: Option<i32>,
+    /// `hennery up` only: the collector's host WebSocket as it listens now,
+    /// in place of the stored one (its port may have changed).
+    #[arg(long, hide = true)]
+    collector_url: Option<String>,
 }
 
 #[derive(Args)]
@@ -3363,7 +3917,8 @@ with:
             Paired::load(&args.data_dir)?.context("the pairing just stored")?
         }
     };
-    let mut cfg = HostConfig::new(paired.collector_url, paired.host_id, args.dev_token, args.data_dir);
+    let collector_url = args.collector_url.unwrap_or(paired.collector_url);
+    let mut cfg = HostConfig::new(collector_url, paired.host_id, args.dev_token, args.data_dir);
 ```
 
 In `crates/hennery/src/main.rs`, replace:
@@ -3442,6 +3997,7 @@ with:
             .arg(inherit::CHILD_FD.to_string());
     }
     let mut collector = collector_cmd.spawn()?;
+    let collector_url = loopback_url(&args.listen);
 ```
 
 In `crates/hennery/src/main.rs`, replace:
@@ -3471,6 +4027,8 @@ with:
 
 ```rust
         .arg(&host_dir)
+        .arg("--collector-url")
+        .arg(hennery_host::pairing::collector_ws_url(&collector_url)?)
 ```
 
 In `crates/hennery/src/main.rs`, replace:
@@ -3488,7 +4046,7 @@ with:
         inherit::pass_to_child(&mut host_cmd, reader);
         host_cmd
             .arg("--join-url")
-            .arg(loopback_url(&args.listen))
+            .arg(&collector_url)
             .arg("--join-code-fd")
             .arg(inherit::CHILD_FD.to_string());
     }
@@ -3513,12 +4071,12 @@ with:
 - [ ] **Step 4: Update the lock file and run the tests**
 
 Run: `cargo build --workspace`, then `cargo test -p hennery --test cli --locked`.
-Expected: 6 pass, `up_pairs_its_own_host_once` in about two seconds.
+Expected: 6 pass, `up_pairs_its_own_host_once` (which restarts `up` on a second port) in about two seconds.
 
 - [ ] **Step 5: Run the whole gate**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo clippy -p hennery --locked -- -D warnings && cargo test --workspace --locked && cargo run -p hennery-proto --bin gen -- --check`
-Expected: all 342 tests pass.
+Expected: all 351 tests pass.
 
 - [ ] **Step 6: Commit and push**
 
@@ -3570,7 +4128,7 @@ use hennery_sessions::store::Store;
 use std::net::SocketAddr;
 use tokio_tungstenite::tungstenite::Message;
 
-const TOKEN: &str = "dev-token";
+const TOKEN: &str = "dev-token-for-tests";
 const HOST: &str = "host-1";
 
 fn host_key() -> HostKey {
@@ -3592,7 +4150,7 @@ impl Collector {
         let state = AppState::new(
             Store::open(&dir.path().join("hennery.db")).unwrap(),
             Hosts::open(&dir.path().join("hennery.db")).unwrap(),
-            DevToken::new(TOKEN),
+            DevToken::new(TOKEN).unwrap(),
         );
         let enrollment = Enrollment {
             public_key: host_key().public_key_hex(),
@@ -4172,7 +4730,9 @@ In `crates/hennery-sessions/src/ws.rs`, replace:
 with:
 
 ```rust
-    // The host id is never taken on its word (ACP core §3.5).
+    // The host id is never taken on its word (ACP core §3.5). Until the
+    // proof checks out it is logged `Debug`-escaped (`?host_id`): an
+    // unauthenticated peer chose it.
     match state.hosts.check_hello(&host_id, &nonce, &protocol_version, &proof) {
         Ok(HelloCheck::Accepted) => {}
         Ok(HelloCheck::Revoked) => {
@@ -4186,14 +4746,14 @@ with:
             return;
         }
         Ok(HelloCheck::BadProof) => {
-            tracing::warn!(%host_id, "hello with an unknown host id or an invalid proof");
+            tracing::warn!(?host_id, "hello with an unknown host id or an invalid proof");
             let _ = sink
                 .send(text(&reject("bad_proof", "unknown host or invalid proof")))
                 .await;
             return;
         }
         Err(err) => {
-            tracing::error!(%host_id, error = %err, "checking a hello failed");
+            tracing::error!(?host_id, error = %err, "checking a hello failed");
             return;
         }
 ```
@@ -4411,13 +4971,13 @@ with:
 In `crates/hennery/src/main.rs`, replace:
 
 ```rust
-    let mut cfg = HostConfig::new(paired.collector_url, paired.host_id, args.dev_token, args.data_dir);
+    let mut cfg = HostConfig::new(collector_url, paired.host_id, args.dev_token, args.data_dir);
 ```
 
 with:
 
 ```rust
-    let mut cfg = HostConfig::new(paired.collector_url, paired.host_id, paired.key, args.data_dir);
+    let mut cfg = HostConfig::new(collector_url, paired.host_id, paired.key, args.data_dir);
 ```
 
 In `crates/hennery/src/main.rs`, replace:
@@ -4517,13 +5077,13 @@ use hennery_proto::rest::{EventDto, HostItem, PromptResponse, StartSessionRespon
 In `crates/hennery-testkit/tests/e2e.rs`, replace:
 
 ```rust
-const TOKEN: &str = "dev-token";
+const TOKEN: &str = "dev-token-for-tests";
 ```
 
 with:
 
 ```rust
-const TOKEN: &str = "dev-token";
+const TOKEN: &str = "dev-token-for-tests";
 
 /// The key `host-1` is paired with in every collector here.
 fn host_key() -> HostKey {
@@ -4545,7 +5105,11 @@ fn pair_host(hosts: &Hosts) {
 In `crates/hennery-testkit/tests/e2e.rs`, replace:
 
 ```rust
-        let mut state = AppState::new(Store::open(db).unwrap(), Hosts::open(db).unwrap(), DevToken::new(TOKEN));
+        let mut state = AppState::new(
+            Store::open(db).unwrap(),
+            Hosts::open(db).unwrap(),
+            DevToken::new(TOKEN).unwrap(),
+        );
 ```
 
 with:
@@ -4553,7 +5117,7 @@ with:
 ```rust
         let hosts = Hosts::open(db).unwrap();
         pair_host(&hosts);
-        let mut state = AppState::new(Store::open(db).unwrap(), hosts, DevToken::new(TOKEN));
+        let mut state = AppState::new(Store::open(db).unwrap(), hosts, DevToken::new(TOKEN).unwrap());
 ```
 
 In `crates/hennery-testkit/tests/e2e.rs`, replace:
@@ -4829,7 +5393,7 @@ In `crates/hennery-testkit/tests/ws_ingest_error.rs`, replace:
 ```rust
     store.create_session("s1", "host-1", "fake", "/tmp").unwrap();
 
-    let state = AppState::new(store, Hosts::open_in_memory().unwrap(), DevToken::new(TOKEN));
+    let state = AppState::new(store, Hosts::open_in_memory().unwrap(), DevToken::new(TOKEN).unwrap());
     let shutdown = state.shutdown.clone();
 ```
 
@@ -4838,7 +5402,7 @@ with:
 ```rust
     store.create_session("s1", "host-1", "fake", "/tmp").unwrap();
 
-    let state = AppState::new(store, paired_hosts(), DevToken::new(TOKEN));
+    let state = AppState::new(store, paired_hosts(), DevToken::new(TOKEN).unwrap());
     let shutdown = state.shutdown.clone();
 ```
 
@@ -4900,13 +5464,13 @@ with:
 In `crates/hennery-testkit/tests/ws_ingest_error.rs`, replace:
 
 ```rust
-    let state = AppState::new(store, Hosts::open_in_memory().unwrap(), DevToken::new(TOKEN));
+    let state = AppState::new(store, Hosts::open_in_memory().unwrap(), DevToken::new(TOKEN).unwrap());
 ```
 
 with:
 
 ```rust
-    let state = AppState::new(store, paired_hosts(), DevToken::new(TOKEN));
+    let state = AppState::new(store, paired_hosts(), DevToken::new(TOKEN).unwrap());
 ```
 
 In `crates/hennery-testkit/tests/ws_ingest_error.rs`, replace:
@@ -5370,7 +5934,7 @@ In `ws.rs`'s `upgrade`, replace `random_bytes::<32>()` with `[0u8; 32]`, and rer
 - [ ] **Step 7: Run the whole gate**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo clippy -p hennery --locked -- -D warnings && cargo test --workspace --locked && cargo run -p hennery-proto --bin gen -- --check`
-Expected: all 347 tests pass. `grep -rn 'dev_token\|DevToken' crates/hennery-host crates/hennery-sessions/src/ws.rs` finds nothing.
+Expected: all 356 tests pass. `grep -rn 'dev_token\|DevToken' crates/hennery-host crates/hennery-sessions/src/ws.rs` finds nothing.
 
 - [ ] **Step 8: Commit and push**
 
@@ -5389,13 +5953,14 @@ git push
 - Test: `crates/hennery-sessions/tests/store.rs`, `crates/hennery-sessions/tests/hub.rs`, `crates/hennery-testkit/tests/reconcile.rs`
 
 **Interfaces:**
-- Consumes: Task 1's `Hosts::{revoke, is_revoked, host}`; Task 5's `host_item`; the store's `collector_event`, `resolve_open_turn`, `cancel_open_pending` as `c6315b2` has them.
+- Consumes: Task 1's `Hosts::{revoke, is_revoked, host}`; Task 5's `host_item`; the store's `collector_event`, `resolve_open_turn`, `cancel_open_pending` as `9bcbbcb` has them.
 - Produces:
   - `PendingReason::HostRevoked` (`host_revoked` on the wire);
   - `hennery_kernel::lifecycle::LifecycleHooks: Send + Sync`, with `fn on_host_revoked(&self, host_id: &str) -> anyhow::Result<()>`, implemented for `AppState`;
   - `Hub::disconnect_and_wait(&self, host_id: &str, bound: Duration) -> bool`, `true` once no connection is left;
   - `Store::revoke_host(&self, host_id: &str) -> Result<Vec<EventDto>>`;
-  - `DELETE /api/hosts/{id}` (bearer): 200 `HostItem`, or 404 `not_found`.
+  - `DELETE /api/hosts/{id}` (bearer): 200 `HostItem`, or 404 `not_found`;
+  - the socket task calls `on_host_revoked` again when it ends and its host is revoked.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5675,6 +6240,26 @@ async fn a_revoke_during_a_handshake_is_not_undone_by_its_reconciliation() {
     assert!(!collector.event_kinds(&session).contains(&"reattached".to_string()));
     assert!(collector.state.hub.connected_hosts().is_empty());
 }
+
+/// A revoke whose wait for the connection ran out has already parked the
+/// sessions while the connection could still apply a frame. The socket
+/// task parks them again once it is gone: here the registry is marked
+/// revoked and the connection kicked, with no hook run by anyone else.
+#[tokio::test]
+async fn a_connection_that_ends_after_its_host_was_revoked_parks_its_sessions() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    collector.state.hosts.revoke(HOST, 1).unwrap();
+    collector.state.hub.disconnect(HOST);
+    host.closed().await;
+    wait_for("the session parked", || async {
+        let row = collector.state.store.session(&session).unwrap().unwrap();
+        (row.lifecycle == "parked" && row.presumed_parked).then_some(())
+    })
+    .await;
+    assert!(collector.event_kinds(&session).contains(&"presumed_parked".to_string()));
+}
 ```
 
 - [ ] **Step 2: Run them to see them fail**
@@ -5952,6 +6537,19 @@ impl hennery_kernel::lifecycle::LifecycleHooks for AppState {
 In `crates/hennery-sessions/src/ws.rs`, replace:
 
 ```rust
+use hennery_kernel::hosts::HelloCheck;
+```
+
+with:
+
+```rust
+use hennery_kernel::hosts::HelloCheck;
+use hennery_kernel::lifecycle::LifecycleHooks;
+```
+
+In `crates/hennery-sessions/src/ws.rs`, replace:
+
+```rust
         return;
     };
 
@@ -6007,6 +6605,26 @@ with:
 ```rust
         let next = tokio::select! {
             biased;
+```
+
+In `crates/hennery-sessions/src/ws.rs`, replace:
+
+```rust
+    tracing::info!(%host_id, "host disconnected");
+```
+
+with:
+
+```rust
+    tracing::info!(%host_id, "host disconnected");
+    // A revoke that gave up waiting for this connection parked the sessions
+    // while it could still apply frames. Parking again now that it is gone
+    // converges them (the hook is idempotent).
+    if matches!(state.hosts.is_revoked(&host_id), Ok(true))
+        && let Err(err) = state.on_host_revoked(&host_id)
+    {
+        tracing::error!(%host_id, error = %err, "parking a revoked host's sessions failed");
+    }
 ```
 
 In `crates/hennery-sessions/src/hosts.rs`, replace:
@@ -6141,12 +6759,12 @@ Expected: all pass.
 
 - [ ] **Step 5: Revert-probe the hook**
 
-In `revoke_host` (`hosts.rs`), comment out the `on_host_revoked` call, and rerun the reconcile tests above. Expected: `a_revoke_closes_the_hosts_connection_and_parks_its_sessions_for_good` fails on the lifecycle (`active`, not `parked`). Restore the code.
+In `revoke_host` (`hosts.rs`), comment out the `on_host_revoked` call, and rerun the reconcile tests above. Expected: `a_revoke_closes_the_hosts_connection_and_parks_its_sessions_for_good` fails on the lifecycle (`active`, not `parked`). Restore the code. Then, in `ws.rs`'s exit path, change `if matches!(state.hosts.is_revoked(&host_id), Ok(true))` to `if false && matches!(…)`. `a_connection_that_ends_after_its_host_was_revoked_parks_its_sessions` then fails waiting for "the session parked". Restore the code.
 
 - [ ] **Step 6: Run the whole gate**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo clippy -p hennery --locked -- -D warnings && cargo test --workspace --locked && cargo run -p hennery-proto --bin gen -- --check`
-Expected: all 352 tests pass.
+Expected: all 362 tests pass.
 
 - [ ] **Step 7: Commit and push**
 
@@ -6159,8 +6777,8 @@ git push
 ### Task 7: A revoked host stops, and `join` asks the collector
 
 **Files:**
-- Modify: `crates/hennery-host/src/connection.rs` (`HelloRejected`, `revoked`, `Standing`, `probe`, `handshake`, `run_until`), `crates/hennery-host/src/outbox.rs` (`FILE`), `crates/hennery-host/src/pairing.rs` (`join`)
-- Test: `crates/hennery-testkit/tests/e2e.rs`, `crates/hennery-testkit/tests/join.rs`
+- Modify: `crates/hennery-host/src/connection.rs` (`HelloRejected`, `revoked`, `Standing`, `probe`, `handshake`, `run_until`), `crates/hennery-host/src/pairing.rs` (`same_collector`, `join`), `crates/hennery/src/main.rs` (exit 78; `up` outlives a revoked host)
+- Test: `crates/hennery-testkit/tests/e2e.rs`, `crates/hennery-testkit/tests/join.rs`, `crates/hennery/tests/cli.rs`; a unit test in `pairing.rs`
 
 **Interfaces:**
 - Consumes: Task 5's signed handshake; Task 6's revoke endpoint.
@@ -6170,8 +6788,9 @@ git push
   - `enum Standing { Accepted, Revoked, Unknown }`;
   - `async fn probe(collector_url: &str, host_id: &str, key: &HostKey) -> Result<Standing>`.
 - Produces: `run_until` now returns `Err` (context "this host was revoked; …") once a `hello` is refused `revoked`, after stopping every adapter. `run`, which never returned before, returns that error.
-- Produces: `hennery_host::outbox::FILE = "outbox.db"`.
-- Changes: `pairing::join` probes an existing pairing, re-pairs a revoked or unknown one (dropping the outbox), and refuses one for another collector.
+- Produces: `hennery_host::pairing::same_collector(a: &str, b: &str) -> bool`, which is equal, or both on loopback.
+- Changes: `pairing::join` probes an existing pairing. It re-pairs a revoked one (moving the outbox aside as `outbox.db.orphaned-<old id>`), and refuses an unknown one or one for another collector, naming the files to remove.
+- Produces (binary): `host run` exits with code 78 once revoked. `up` then logs how to pair the host again and keeps running while the collector does.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -6249,14 +6868,16 @@ use hennery_host::identity::{KEY_FILE, Paired};
 In `crates/hennery-testkit/tests/join.rs`, replace:
 
 ```rust
-    assert!(collector.state.hosts.list().unwrap().is_empty());
+        b"frames of an unpaired host"
+    );
 }
 ```
 
 with:
 
 ```rust
-    assert!(collector.state.hosts.list().unwrap().is_empty());
+        b"frames of an unpaired host"
+    );
 }
 
 async fn joined(collector: &Collector, dir: &std::path::Path) -> String {
@@ -6300,7 +6921,7 @@ async fn joining_again_while_the_host_runs_leaves_it_running() {
 }
 
 #[tokio::test]
-async fn joining_again_after_a_revoke_pairs_anew_and_drops_the_old_outbox() {
+async fn joining_again_after_a_revoke_pairs_anew_and_moves_the_old_outbox_aside() {
     let collector = Collector::start().await;
     let dir = tempfile::tempdir().unwrap();
     let old_id = joined(&collector, dir.path()).await;
@@ -6316,48 +6937,145 @@ async fn joining_again_after_a_revoke_pairs_anew_and_drops_the_old_outbox() {
     assert_ne!(new_id, old_id);
     assert_ne!(std::fs::read(dir.path().join(KEY_FILE)).unwrap(), old_key);
     assert!(!dir.path().join("outbox.db").exists());
+    assert_eq!(
+        std::fs::read(dir.path().join(format!("outbox.db.orphaned-{old_id}"))).unwrap(),
+        b"frames of the old identity"
+    );
     assert_eq!(Paired::load(dir.path()).unwrap().unwrap().host_id, new_id);
     let hosts = collector.state.hosts.list().unwrap();
     assert_eq!(hosts.len(), 2);
     assert!(hosts.iter().any(|h| h.id == old_id && h.revoked_at.is_some()));
 }
 
+/// Two collectors on loopback count as one (the all-in-one collector may
+/// come back on another port), so the second is asked about the key: it
+/// does not know it, and that is refused rather than guessed at.
 #[tokio::test]
-async fn joining_another_collector_while_paired_is_refused() {
+async fn joining_a_collector_that_does_not_know_the_key_is_refused() {
     let first = Collector::start().await;
     let second = Collector::start().await;
     let dir = tempfile::tempdir().unwrap();
     joined(&first, dir.path()).await;
+    std::fs::write(dir.path().join("outbox.db"), b"frames of the first pairing").unwrap();
     let code = second.mint().await;
     let err = join(&second.public_url(), &code, dir.path(), "laptop")
         .await
-        .unwrap_err();
-    assert!(err.to_string().contains("is paired with"), "{err}");
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("does not know host"), "{err}");
+    assert!(err.contains(&dir.path().join(KEY_FILE).display().to_string()), "{err}");
     assert!(second.state.hosts.list().unwrap().is_empty());
+    // Nothing was touched.
+    assert!(dir.path().join("outbox.db").exists());
+    assert!(Paired::load(dir.path()).unwrap().is_some());
+}
+```
+
+Append to `crates/hennery/tests/cli.rs`:
+
+```rust
+/// `DELETE path` on the collector with the development bearer: the status.
+fn delete(listen: &str, path: &str) -> Option<u16> {
+    let mut stream = TcpStream::connect(listen).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(15))).ok()?;
+    write!(
+        stream,
+        "DELETE {path} HTTP/1.1\r\nHost: {listen}\r\nAuthorization: Bearer dev-token-for-tests\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    response.split(' ').nth(1)?.parse().ok()
+}
+
+/// Start `up` with its log in `log`.
+fn up_logging_to(listen: &str, dir: &std::path::Path, log: &std::path::Path) -> KillTree {
+    let up = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["up", "--listen", listen])
+        .arg("--data-dir")
+        .arg(dir)
+        .args(["--dev-token", "dev-token-for-tests"])
+        .stdout(std::fs::File::create(log).unwrap())
+        .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
+        .spawn()
+        .unwrap();
+    KillTree {
+        up,
+        dir: std::path::PathBuf::new(),
+        children: Vec::new(),
+    }
+}
+
+fn wait_until(what: &str, mut probe: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !probe() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Operator recovery: revoking the all-in-one host stops the host child
+/// only. `up` keeps the collector serving, says how to pair the host
+/// again, and does the same on every later start until that is done.
+#[test]
+fn a_revoked_all_in_one_host_leaves_the_collector_serving() {
+    let listen = free_listen();
+    let dir = std::env::temp_dir().join(format!(
+        "hennery-cli-revoke-{}-{}",
+        std::process::id(),
+        listen.replace(':', "-")
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _cleanup = RemoveDir(dir.clone());
+    let revoked_logged = |log: &std::path::Path| {
+        std::fs::read_to_string(log).is_ok_and(|text| text.contains("the all-in-one host was revoked"))
+    };
+
+    let log = dir.join("first.log");
+    let mut first = up_logging_to(&listen, &dir.join("data"), &log);
+    let mut host_id = String::new();
+    wait_until("the host connected", || {
+        let Some(serde_json::Value::Array(hosts)) = get_json(&listen, "/api/hosts", "dev-token-for-tests") else {
+            return false;
+        };
+        match hosts.first() {
+            Some(h) if h["connected"] == true => {
+                host_id = h["host_id"].as_str().unwrap().to_string();
+                true
+            }
+            _ => false,
+        }
+    });
+    assert_eq!(delete(&listen, &format!("/api/hosts/{host_id}")), Some(200));
+    wait_until("the revoke logged", || revoked_logged(&log));
+    assert!(first.up.try_wait().unwrap().is_none(), "up exited with its host");
+    let hosts = get_json(&listen, "/api/hosts", "dev-token-for-tests").expect("the collector still serves");
+    assert!(hosts[0]["revoked_at"].is_string(), "{hosts}");
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert!(text.contains("host.key") && text.contains("host.toml"), "{text}");
+    unsafe { libc::kill(first.up.id() as i32, libc::SIGTERM) };
+    assert!(wait_with_timeout(&mut first.up, Duration::from_secs(15)).is_some());
+
+    // Started again: the host is refused again, and the collector serves.
+    let log = dir.join("second.log");
+    let mut second = up_logging_to(&listen, &dir.join("data"), &log);
+    wait_until("the revoke logged again", || revoked_logged(&log));
+    assert!(get_json(&listen, "/api/hosts", "dev-token-for-tests").is_some());
+    assert!(second.up.try_wait().unwrap().is_none());
 }
 ```
 
 - [ ] **Step 2: Run them to see them fail**
 
-Run: `cargo test --no-fail-fast -p hennery-testkit --test join --test e2e -- joining a_revoked_host`
-Expected: FAIL. `a_revoked_host_stops_its_adapters_and_exits` fails after 30 s at "the revoked host stops" (the host keeps reconnecting). `joining_again_after_a_revoke_pairs_anew_and_drops_the_old_outbox` panics "expected a new pairing, got AlreadyPaired", and `joining_another_collector_while_paired_is_refused` at its `unwrap_err`: `join` still trusts the files. `joining_again_while_the_host_runs_leaves_it_running` already passes, for the same reason.
+Run: `cargo test --no-fail-fast -p hennery-testkit --test join --test e2e -p hennery --test cli -- joining a_revoked`
+Expected: FAIL.
+- `a_revoked_host_stops_its_adapters_and_exits` fails after 30 s at "the revoked host stops": the host keeps reconnecting.
+- `a_revoked_all_in_one_host_leaves_the_collector_serving` times out "waiting for the revoke logged".
+- `joining_again_after_a_revoke_pairs_anew_and_moves_the_old_outbox_aside` panics "expected a new pairing, got AlreadyPaired", and `joining_a_collector_that_does_not_know_the_key_is_refused` panics at its `unwrap_err`: `join` still trusts the files.
+- `joining_again_while_the_host_runs_leaves_it_running` already passes, for the same reason.
 
 - [ ] **Step 3: Stop on `revoked`, and probe before re-joining**
-
-In `crates/hennery-host/src/outbox.rs`, replace:
-
-```rust
-use std::path::Path;
-```
-
-with:
-
-```rust
-use std::path::Path;
-
-/// The outbox's file in the host's data directory.
-pub const FILE: &str = "outbox.db";
-```
 
 In `crates/hennery-host/src/connection.rs`, replace:
 
@@ -6387,15 +7105,26 @@ with:
 In `crates/hennery-host/src/connection.rs`, replace:
 
 ```rust
-            if let Err(err) = connect_once(&cfg, &uplink, &sessions, &mut replies, &mut backoff).await {
+                tracing::warn!(error = %err, "collector connection ended");
 ```
 
 with:
 
 ```rust
-            if let Err(err) = connect_once(&cfg, &uplink, &sessions, &mut replies, &mut backoff).await {
                 if revoked(&err) {
                     return err;
+                }
+                if err
+                    .downcast_ref::<HelloRejected>()
+                    .is_some_and(|r| r.code == "bad_proof")
+                {
+                    tracing::warn!(
+                        error = %err,
+                        data_dir = %cfg.data_dir.display(),
+                        "the collector does not know this host's key; if it should be paired anew, remove host.key and host.toml from the data directory and run `hennery host join`"
+                    );
+                } else {
+                    tracing::warn!(error = %err, "collector connection ended");
                 }
 ```
 
@@ -6647,31 +7376,14 @@ with:
 In `crates/hennery-host/src/pairing.rs`, replace:
 
 ```rust
-//! key, enroll it with a pairing code, and store the pairing.
-
-use crate::identity::{HostKey, KEY_FILE, Paired};
+use crate::identity::{HostKey, KEY_FILE, Paired, create_private_dir};
 ```
 
 with:
 
 ```rust
-//! key, enroll it with a pairing code, and store the pairing.
-
 use crate::connection::{Standing, probe};
-use crate::identity::{HostKey, KEY_FILE, Paired};
-```
-
-In `crates/hennery-host/src/pairing.rs`, replace:
-
-```rust
-use crate::identity::{HostKey, KEY_FILE, Paired};
-```
-
-with:
-
-```rust
-use crate::identity::{HostKey, KEY_FILE, Paired};
-use crate::outbox::FILE as OUTBOX_FILE;
+use crate::identity::{CONFIG_FILE, HostKey, KEY_FILE, Paired, create_private_dir};
 ```
 
 In `crates/hennery-host/src/pairing.rs`, replace:
@@ -6690,6 +7402,41 @@ with:
 In `crates/hennery-host/src/pairing.rs`, replace:
 
 ```rust
+}
+
+/// Pair the host whose data directory is `data_dir` with the collector at
+```
+
+with:
+
+```rust
+}
+
+/// Whether two host WebSocket URLs name the same collector: equal, or both
+/// on loopback (the all-in-one host's collector may listen on another port,
+/// or be reached as `localhost` instead of `127.0.0.1`).
+pub fn same_collector(a: &str, b: &str) -> bool {
+    let loopback = |u: &str| {
+        Url::parse(u)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .is_some_and(|h| {
+                h.eq_ignore_ascii_case("localhost")
+                    || h.trim_start_matches('[')
+                        .trim_end_matches(']')
+                        .parse::<std::net::IpAddr>()
+                        .is_ok_and(|ip| ip.is_loopback())
+            })
+    };
+    a == b || (loopback(a) && loopback(b))
+}
+
+/// Pair the host whose data directory is `data_dir` with the collector at
+```
+
+In `crates/hennery-host/src/pairing.rs`, replace:
+
+```rust
 /// `public_url`. Idempotent: a directory that is paired already is left as
 /// it is, and the code is not spent.
 ```
@@ -6699,9 +7446,9 @@ with:
 ```rust
 /// `public_url` (kernel spec §4.1). Idempotent: if the collector still
 /// accepts the stored key, nothing changes and the code is not spent. A
-/// pairing it revoked or no longer knows is replaced by a new key and a new
-/// host id, and the outbox of the old identity is dropped: its sessions
-/// belong to a host id the collector will never hear from again.
+/// pairing it revoked is replaced by a new key and a new host id, and the
+/// outbox of the old identity is moved aside (`orphan_outbox`). A pairing
+/// it does not know is refused: that needs the operator's decision.
 ```
 
 In `crates/hennery-host/src/pairing.rs`, replace:
@@ -6732,11 +7479,13 @@ with:
 ```rust
     let collector_url = collector_ws_url(public_url)?;
     if let Some(paired) = Paired::load(data_dir)? {
-        if paired.collector_url != collector_url {
+        if !same_collector(&paired.collector_url, &collector_url) {
             bail!(
-                "{} is paired with {} already; remove its {KEY_FILE} and host.toml to pair it with {public_url} instead",
+                "{} is paired with {} already; remove {} and {} to pair it with {public_url} instead",
                 data_dir.display(),
-                paired.collector_url
+                paired.collector_url,
+                data_dir.join(KEY_FILE).display(),
+                data_dir.join(CONFIG_FILE).display()
             );
         }
         match probe(&collector_url, &paired.host_id, &paired.key).await? {
@@ -6745,42 +7494,170 @@ with:
                     host_id: paired.host_id,
                 });
             }
-            Standing::Revoked | Standing::Unknown => {
-                for file in [
-                    OUTBOX_FILE.to_string(),
-                    format!("{OUTBOX_FILE}-wal"),
-                    format!("{OUTBOX_FILE}-shm"),
-                ] {
-                    let _ = std::fs::remove_file(data_dir.join(file));
-                }
+            // Only a revoke is certain: the collector checked the key and
+            // refused it for good.
+            Standing::Revoked => {
+                orphan_outbox(data_dir, &paired.host_id)?;
             }
+            // A collector that no longer knows the key may be one whose
+            // database was reset or restored; re-pairing on a guess could
+            // strand sessions that are only waiting for it to come back.
+            Standing::Unknown => bail!(
+                "the collector at {public_url} does not know host {} (its database may have been reset or restored). \
+                 If this host should be paired anew, remove {} and {} and run `hennery host join` again",
+                paired.host_id,
+                data_dir.join(KEY_FILE).display(),
+                data_dir.join(CONFIG_FILE).display()
+            ),
         }
     }
 ```
 
+In `crates/hennery-host/src/pairing.rs`, replace:
+
+```rust
+    #[test]
+    fn plain_http_off_loopback_paths_and_other_schemes_are_refused() {
+```
+
+with:
+
+```rust
+    #[test]
+    fn any_two_loopback_urls_name_the_same_collector() {
+        assert!(same_collector(
+            "ws://127.0.0.1:7117/api/hosts/ws",
+            "ws://localhost:7200/api/hosts/ws"
+        ));
+        assert!(same_collector(
+            "ws://[::1]:7117/api/hosts/ws",
+            "ws://127.0.0.2:7117/api/hosts/ws"
+        ));
+        assert!(same_collector(
+            "wss://c.example/api/hosts/ws",
+            "wss://c.example/api/hosts/ws"
+        ));
+        assert!(!same_collector(
+            "wss://c.example/api/hosts/ws",
+            "wss://d.example/api/hosts/ws"
+        ));
+        assert!(!same_collector(
+            "ws://127.0.0.1:7117/api/hosts/ws",
+            "wss://c.example/api/hosts/ws"
+        ));
+    }
+
+    #[test]
+    fn plain_http_off_loopback_paths_and_other_schemes_are_refused() {
+```
+
+In `crates/hennery/src/main.rs`, replace:
+
+```rust
+    hennery_host::run_until(cfg, terminated()).await
+```
+
+with:
+
+```rust
+    match hennery_host::run_until(cfg, terminated()).await {
+        // Its own exit code, so `hennery up` can tell a revoke apart.
+        Err(err) if hennery_host::connection::revoked(&err) => {
+            eprintln!("Error: {err:#}");
+            std::process::exit(REVOKED_EXIT);
+        }
+        other => other,
+    }
+```
+
+In `crates/hennery/src/main.rs`, replace:
+
+```rust
+    }
+}
+
+/// Resolves on SIGINT or SIGTERM.
+```
+
+with:
+
+```rust
+    }
+}
+
+/// `hennery host run`'s exit code once the collector says the host was
+/// revoked (sysexits' `EX_CONFIG`).
+const REVOKED_EXIT: i32 = 78;
+
+/// Resolves on SIGINT or SIGTERM.
+```
+
+In `crates/hennery/src/main.rs`, replace:
+
+```rust
+    tokio::select! {
+        status = collector.wait() => tracing::warn!(?status, "collector exited"),
+        status = host.wait() => tracing::warn!(?status, "host exited"),
+        _ = terminated() => {}
+```
+
+with:
+
+```rust
+    // Only a collector exit (or a signal) ends `up`. A revoked host exits
+    // for good, and the collector keeps serving the operator and every
+    // remote host.
+    let mut host_running = true;
+    loop {
+        tokio::select! {
+            status = collector.wait() => {
+                tracing::warn!(?status, "collector exited");
+                break;
+            }
+            status = host.wait(), if host_running => {
+                host_running = false;
+                if status.as_ref().ok().and_then(|s| s.code()) == Some(REVOKED_EXIT) {
+                    tracing::warn!(
+                        "the all-in-one host was revoked; the collector keeps serving. To pair it again, stop `hennery up`, remove {} and {}, and start it again",
+                        host_dir.join(hennery_host::identity::KEY_FILE).display(),
+                        host_dir.join(hennery_host::identity::CONFIG_FILE).display()
+                    );
+                    continue;
+                }
+                tracing::warn!(?status, "host exited");
+                break;
+            }
+            _ = terminated() => break,
+        }
+```
+
 - [ ] **Step 4: Run the tests**
 
-Run: `cargo test -p hennery-testkit --test join --test e2e --test host_connection --locked`
+Run: `cargo test -p hennery-testkit --test join --test e2e --test host_connection --locked && cargo test -p hennery --test cli --locked && cargo test -p hennery-host --lib --locked`
 Expected: all pass; `a_revoked_host_stops_its_adapters_and_exits` in about a second.
 
 - [ ] **Step 5: Revert-probe the stop**
 
 In `run_until`, change `if revoked(&err) {` to `if false && revoked(&err) {`, and rerun `cargo test -p hennery-testkit --test e2e a_revoked_host --locked`. Expected: it fails after 30 s at "the revoked host stops". Restore the code.
 
-- [ ] **Step 6: Check the timing-sensitive tests under load**
+- [ ] **Step 6: Revert-probe `up`'s survival**
+
+In `run_up`, change the `continue;` after the "was revoked" warning to `break;`, and rerun `cargo test -p hennery --test cli a_revoked_all --locked`. Expected: it fails at "up exited with its host". Restore the code.
+
+- [ ] **Step 7: Check the timing-sensitive tests under load**
 
 Run four copies of each binary at once: `for b in e2e reconcile join host_connection; do for i in 1 2 3 4; do cargo test -p hennery-testkit --test $b --locked -q & done; wait; done`, then the same for `-p hennery-sessions --test hub` and `-p hennery --test cli`.
 Expected: every copy passes.
 
-- [ ] **Step 7: Run the whole gate**
+- [ ] **Step 8: Run the whole gate**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo clippy -p hennery --locked -- -D warnings && cargo test --workspace --locked && cargo run -p hennery-proto --bin gen -- --check`
-Expected: all 356 tests pass.
+Expected: all 368 tests pass.
 
-- [ ] **Step 8: Commit and push**
+- [ ] **Step 9: Commit and push**
 
 ```bash
-git add crates/hennery-host crates/hennery-testkit
+git add crates/hennery-host crates/hennery-testkit crates/hennery
 git commit -m "feat(host): a revoked host stops its adapters; join re-pairs a revoked host"
 git push
 ```
@@ -6809,7 +7686,8 @@ git push
 - **`webauthn-rs` needs OpenSSL.** Add `openssl` and `pkg-config` to `flake.nix`'s dev shell (no global install). The musl release build needs it vendored and static (distribution §1.1).
 
 **Obligations plan 3a hands on:**
-- **`wss://` for remote hosts** (decision 10): enable `tokio-tungstenite`'s rustls feature (with the ring provider reqwest already pulls in), and test it live behind a TLS terminator. `host join https://…` works today, but the host then cannot connect.
+- **`wss://` for remote hosts** (decision 10). Enable `tokio-tungstenite`'s rustls feature (with the ring provider reqwest already pulls in), and lift `join`'s refusal of `https://`. Test it live behind a TLS terminator.
+  - Live-check that the `hennery-hello-nonce` header survives the `101 Switching Protocols` through Caddy, nginx and `tailscale serve`. Without it, a host sends no `hello`.
 - **`PATCH /api/hosts/{id}`** (rename, default hat), with hats.
 - **`hello.agents`, `workspace_roots` and `probe_agents`**, and storing them from `hello` (kernel §4.3).
 - **A revoked host's sessions.** They stay presumed parked under the dead host id for good, and a resume answers 409 `host_offline`. The frontend should say "host revoked" (the `presumed_parked` event's reason) and offer delete (§4.10) once it exists.
@@ -6818,7 +7696,9 @@ git push
 - **Hats:** `LifecycleHooks::on_hat_purged`.
 - **The collector's single writer thread** (kernel §1), now that two stores share `hennery.db`.
 - **`host.lock`** (distribution §8), so a second `hennery host run` on one directory refuses to start. The probe cannot stand in for it.
-- **The supervisor's restart policy** (distribution §5.2): a revoked all-in-one host makes `up` exit today.
+- **The supervisor's restart policy** (distribution §5.2). A crashed host child still ends `up`; only a revoked one (exit 78) does not.
+- **Enrollment lockouts live in memory:** a collector restart clears them (decision 6). A shared budget across addresses, if abuse ever shows, belongs with 3b's login limit.
+- **Orphaned outboxes** (`outbox.db.orphaned-*`) are kept for inspection and never read. `doctor` should list them.
 - **Spec amendments** listed under the decisions.
 
 **Carried from plan (2), unchanged:**
@@ -6832,7 +7712,7 @@ git push
 - (2)'s spec amendments, still to be applied, with B2a/B2b's drift items, in one docs PR;
 - `cancel_questions` on a turn cancel also cancelling questions asked outside the turn;
 - the frontend rendering `PendingItem{state: cancelled, delivered: true}`;
-- the wall-clock budgets in older tests.
+- the wall-clock budgets in older tests. Add `an_orphaned_switchs_late_answer_updates_the_catalogue_and_a_later_switch_is_sent_normally` (`host_session`) to that list: it failed once in a full-workspace run during this plan's replay, and passed on every rerun.
 
 **Carried from B2b, unchanged:**
 - legacy model and mode switching;
