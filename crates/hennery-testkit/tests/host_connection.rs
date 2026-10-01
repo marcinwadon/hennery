@@ -792,6 +792,25 @@ async fn a_host_announces_that_it_can_park_and_take_images() {
     assert_eq!(capabilities, Capabilities(vec![Capability::Park, Capability::Images]));
 }
 
+/// ACP core §3.3, §7: `hello` reports the workspace roots as configured.
+#[tokio::test]
+async fn a_host_reports_its_workspace_roots_in_hello() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut cfg = host_with_fake(addr, "roots", slow_fake());
+    cfg.workspace_roots = vec!["/srv/projects".into(), "/nonexistent/root".into()];
+    tokio::spawn(run(cfg));
+    let (tcp, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("host connects")
+        .unwrap();
+    let (_sink, mut stream) = accept(tcp).await.unwrap().split();
+    let HostFrame::Hello { workspace_roots, .. } = read_host_frame(&mut stream).await else {
+        panic!("expected hello");
+    };
+    assert_eq!(workspace_roots, ["/srv/projects", "/nonexistent/root"]);
+}
+
 #[tokio::test]
 async fn cancel_turn_reaches_the_actor_and_a_cancel_for_a_detached_session_is_not_attached() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

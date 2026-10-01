@@ -1,7 +1,8 @@
 //! The host's identity (kernel spec §4.1, ACP core §3.5): the Ed25519 key it
 //! generated when it paired, and the collector and host id it paired with.
 //! Both live in the host's data directory (distribution spec §8):
-//! `host.key` (the key's 32-byte seed in hex, mode 0600) and `host.toml`.
+//! `host.key` (the key's 32-byte seed in hex, mode 0600) and `host.toml`,
+//! which also holds the operator's workspace roots (ACP core §7).
 
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::{Signer, SigningKey};
@@ -83,6 +84,10 @@ struct HostToml {
     /// from pairings stored before it, and then not checked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     public_key: Option<String>,
+    /// Where projects are (ACP core §7): absolute paths, or `~/…`, as the
+    /// operator wrote them (`projects::workspace_roots` expands them).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    workspace_roots: Vec<String>,
 }
 
 /// A paired host: what `hennery host run` needs to connect.
@@ -91,6 +96,8 @@ pub struct Paired {
     pub collector_url: String,
     pub host_id: String,
     pub key: HostKey,
+    /// `host.toml`'s `workspace_roots`, as written there.
+    pub workspace_roots: Vec<String>,
 }
 
 impl Paired {
@@ -127,6 +134,7 @@ impl Paired {
             collector_url: config.collector,
             host_id: config.host_id,
             key,
+            workspace_roots: config.workspace_roots,
         }))
     }
 
@@ -135,12 +143,15 @@ impl Paired {
     pub fn save(&self, data_dir: &Path) -> Result<()> {
         create_private_dir(data_dir)?;
         self.key.save(&data_dir.join(KEY_FILE))?;
-        write_config_to(
-            &data_dir.join(CONFIG_FILE),
-            &self.collector_url,
-            &self.host_id,
-            &self.key,
-        )
+        write_config_with(&data_dir.join(CONFIG_FILE), |table| {
+            set_pairing(table, &self.collector_url, &self.host_id, &self.key);
+            if self.workspace_roots.is_empty() {
+                table.remove("workspace_roots");
+            } else {
+                let roots = self.workspace_roots.iter().cloned().map(toml::Value::String).collect();
+                table.insert("workspace_roots".into(), toml::Value::Array(roots));
+            }
+        })
     }
 }
 
@@ -151,14 +162,31 @@ fn read_config(path: &Path) -> Result<HostToml> {
 
 /// Write a `host.toml` at `path`, naming `key`'s public half:
 /// `pairing::join` writes it as `pending_path(CONFIG_FILE)` first (see
-/// `finish_interrupted_pairing`).
+/// `finish_interrupted_pairing`). Every other key of the `host.toml` in
+/// place beside `path` is kept: the operator's `workspace_roots` survive a
+/// re-pair after a revoke (plan 6c decision 6).
 pub(crate) fn write_config_to(path: &Path, collector_url: &str, host_id: &str, key: &HostKey) -> Result<()> {
-    let config = toml::to_string(&HostToml {
-        collector: collector_url.to_string(),
-        host_id: host_id.to_string(),
-        public_key: Some(key.public_key_hex()),
-    })?;
-    write_private(path, config.as_bytes())
+    write_config_with(path, |table| set_pairing(table, collector_url, host_id, key))
+}
+
+fn set_pairing(table: &mut toml::Table, collector_url: &str, host_id: &str, key: &HostKey) {
+    table.insert("collector".into(), toml::Value::String(collector_url.to_string()));
+    table.insert("host_id".into(), toml::Value::String(host_id.to_string()));
+    table.insert("public_key".into(), toml::Value::String(key.public_key_hex()));
+}
+
+/// Write the table of the `host.toml` beside `path` (an empty one if there
+/// is none yet), with `change` applied, to `path`: mode 0600, atomically. A
+/// `host.toml` that does not parse is an error, never replaced.
+fn write_config_with(path: &Path, change: impl FnOnce(&mut toml::Table)) -> Result<()> {
+    let current = path.with_file_name(CONFIG_FILE);
+    let mut table = match std::fs::read_to_string(&current) {
+        Ok(text) => toml::from_str::<toml::Table>(&text).with_context(|| format!("parse {}", current.display()))?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(err) => return Err(err).with_context(|| format!("read {}", current.display())),
+    };
+    change(&mut table);
+    write_private(path, toml::to_string(&table)?.as_bytes())
 }
 
 /// Where `join` stages `file` (`host.key` or `host.toml`) before renaming it
@@ -277,6 +305,7 @@ cdf6b48fb39bfaa9b5a3cd01538280ec9e6d50c8831e9aae4d791f68112a6c04";
             collector_url: "ws://127.0.0.1:7117/api/hosts/ws".into(),
             host_id: "host-1".into(),
             key: HostKey::generate(),
+            workspace_roots: vec!["/srv/projects".into(), "~/src".into()],
         };
         paired.save(dir.path()).unwrap();
         let loaded = Paired::load(dir.path()).unwrap().unwrap();
@@ -285,6 +314,7 @@ cdf6b48fb39bfaa9b5a3cd01538280ec9e6d50c8831e9aae4d791f68112a6c04";
             ("ws://127.0.0.1:7117/api/hosts/ws", "host-1")
         );
         assert_eq!(loaded.key.public_key_hex(), paired.key.public_key_hex());
+        assert_eq!(loaded.workspace_roots, ["/srv/projects", "~/src"]);
         for file in [KEY_FILE, CONFIG_FILE] {
             let mode = std::fs::metadata(dir.path().join(file)).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "{file}");
@@ -318,6 +348,7 @@ cdf6b48fb39bfaa9b5a3cd01538280ec9e6d50c8831e9aae4d791f68112a6c04";
                 collector_url: "ws://127.0.0.1:7117/api/hosts/ws".into(),
                 host_id: "host-old".into(),
                 key: HostKey::from_seed([1; 32]),
+                workspace_roots: Vec::new(),
             }
             .save(dir.path())
             .unwrap();
@@ -363,6 +394,7 @@ cdf6b48fb39bfaa9b5a3cd01538280ec9e6d50c8831e9aae4d791f68112a6c04";
             collector_url: url.into(),
             host_id: "host-old".into(),
             key: HostKey::from_seed([1; 32]),
+            workspace_roots: Vec::new(),
         };
         old.save(dir.path()).unwrap();
         let staged = pending_path(dir.path(), CONFIG_FILE);
@@ -406,5 +438,52 @@ cdf6b48fb39bfaa9b5a3cd01538280ec9e6d50c8831e9aae4d791f68112a6c04";
         assert!(err.contains(&dir.path().join(KEY_FILE).display().to_string()), "{err}");
         let seed_hex = hex::encode([1u8; 32]);
         assert!(!format!("{key:?}").contains(&seed_hex));
+    }
+
+    /// Plan 6c decision 6: a re-pair rewrites the pairing and keeps every
+    /// other key, the operator's workspace roots among them.
+    #[test]
+    fn rewriting_the_pairing_keeps_the_operators_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = HostKey::generate();
+        key.save(&dir.path().join(KEY_FILE)).unwrap();
+        let config = dir.path().join(CONFIG_FILE);
+        std::fs::write(
+            &config,
+            "collector = \"ws://127.0.0.1:1/api/hosts/ws\"\nhost_id = \"host-old\"\n\
+             workspace_roots = [\"/srv/projects\"]\nfuture_key = 7\n",
+        )
+        .unwrap();
+        write_config_to(&config, "ws://127.0.0.1:2/api/hosts/ws", "host-new", &key).unwrap();
+        let loaded = Paired::load(dir.path()).unwrap().unwrap();
+        assert_eq!(
+            (loaded.collector_url.as_str(), loaded.host_id.as_str()),
+            ("ws://127.0.0.1:2/api/hosts/ws", "host-new")
+        );
+        assert_eq!(loaded.workspace_roots, ["/srv/projects"]);
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(text.contains("future_key = 7"), "{text}");
+        assert_eq!(std::fs::metadata(&config).unwrap().permissions().mode() & 0o777, 0o600);
+        // Staged beside it, as `join` does, it starts from the same file.
+        write_config_to(
+            &pending_path(dir.path(), CONFIG_FILE),
+            "ws://127.0.0.1:3/api/hosts/ws",
+            "host-3",
+            &key,
+        )
+        .unwrap();
+        let staged = std::fs::read_to_string(pending_path(dir.path(), CONFIG_FILE)).unwrap();
+        assert!(
+            staged.contains("/srv/projects") && staged.contains("host-3"),
+            "{staged}"
+        );
+        std::fs::remove_file(pending_path(dir.path(), CONFIG_FILE)).unwrap();
+        std::fs::write(&config, "not = [toml").unwrap();
+        assert!(write_config_to(&config, "ws://127.0.0.1:2/api/hosts/ws", "host-new", &key).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "not = [toml",
+            "a host.toml that does not parse was replaced"
+        );
     }
 }

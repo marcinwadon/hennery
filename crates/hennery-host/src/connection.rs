@@ -46,6 +46,13 @@ pub struct HostConfig {
     /// A connection that stays up this long resets the reconnect backoff,
     /// even if nothing was acked (an idle host sends nothing to ack).
     pub healthy_after: Duration,
+    /// Where projects are enumerated, and browsing is allowed (ACP core §7):
+    /// absolute, as configured (`projects::workspace_roots`). Reported in
+    /// `hello`.
+    pub workspace_roots: Vec<PathBuf>,
+    /// The host user's home directory (`projects::home_dir`): browsing is
+    /// allowed under it too.
+    pub home: Option<PathBuf>,
 }
 
 impl HostConfig {
@@ -63,7 +70,17 @@ impl HostConfig {
             idle_timeout: session::IDLE_TIMEOUT,
             connect_timeout: Duration::from_secs(10),
             healthy_after: Duration::from_secs(60),
+            workspace_roots: Vec::new(),
+            home: crate::projects::home_dir(),
         }
+    }
+
+    /// `hello.workspace_roots`: the roots as configured.
+    pub fn reported_roots(&self) -> Vec<String> {
+        self.workspace_roots
+            .iter()
+            .filter_map(|root| root.to_str().map(str::to_string))
+            .collect()
     }
 
     /// Options for every session actor this host spawns.
@@ -183,10 +200,13 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// rather than being displaced by a probe that never sends `resend_complete`
 /// and holds nothing open.
 pub async fn probe(collector_url: &str, host_id: &str, key: &HostKey) -> Result<Standing> {
+    // No roots: the collector stores them only from a reconciled
+    // connection, which a probe never becomes (decision 7).
     let (mut sink, _stream, answer) = handshake(
         collector_url,
         host_id,
         key,
+        Vec::new(),
         || Ok(Vec::new()),
         PROBE_TIMEOUT,
         PROBE_TIMEOUT,
@@ -219,6 +239,7 @@ async fn handshake(
     collector_url: &str,
     host_id: &str,
     key: &HostKey,
+    workspace_roots: Vec<String>,
     attached: impl FnOnce() -> Result<Vec<AttachedSession>>,
     connect_timeout: Duration,
     read_timeout: Duration,
@@ -252,7 +273,7 @@ async fn handshake(
             // agent offers none refuses them (plan 6a, decision 2).
             // `projects` comes with the probes.
             capabilities: Capabilities(vec![Capability::Park, Capability::Images]),
-            workspace_roots: Vec::new(),
+            workspace_roots,
             attached_sessions: attached()?,
         },
     )
@@ -296,6 +317,7 @@ async fn connect_once(
         &cfg.collector_url,
         &cfg.host_id,
         &cfg.key,
+        cfg.reported_roots(),
         || attached_sessions(uplink, sessions),
         cfg.connect_timeout,
         cfg.read_timeout,
