@@ -326,8 +326,9 @@ pub enum HostFrame {
         /// protocol_version)`, where the nonce is the one the collector sent
         /// in the upgrade response's `hennery-hello-nonce` header.
         proof: String,
-        /// What this host implements (a closed list, ACP core §3.3). Absent
-        /// means none.
+        /// What this host implements (ACP core §3.3). `Capability` lists
+        /// the values this version knows; an unknown one is ignored, not
+        /// rejected (see `Capabilities`). Absent means none.
         #[serde(default)]
         capabilities: Capabilities,
         attached_sessions: Vec<AttachedSession>,

@@ -670,7 +670,7 @@
             "capabilities": {
               "$ref": "#/$defs/Capabilities",
               "default": [],
-              "description": "What this host implements (a closed list, ACP core §3.3). Absent\nmeans none."
+              "description": "What this host implements (ACP core §3.3). `Capability` lists\nthe values this version knows; an unknown one is ignored, not\nrejected (see `Capabilities`). Absent means none."
             },
             "host_id": {
               "type": "string"
