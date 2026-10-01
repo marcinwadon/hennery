@@ -36,6 +36,8 @@ pub fn router(state: AppState) -> Router {
             )
             .route(
                 "/api/hosts/{id}",
+                // `.route_layer` covers only the methods chained before it:
+                // a method added after it would run without step-up.
                 delete(revoke_host)
                     .patch(update_host)
                     .route_layer(middleware::from_fn(hennery_kernel::auth::require_step_up)),

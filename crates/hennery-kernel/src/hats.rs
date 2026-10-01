@@ -324,10 +324,13 @@ impl Hosts {
             )?;
         }
         if default_for_new_hosts == Some(true) {
-            tx.execute(
+            // Otherwise the transaction rolls back: the name and colour
+            // changes above don't apply either.
+            let moved = tx.execute(
                 "UPDATE settings SET value = ?1 WHERE owner_id = ?2 AND key = ?3",
                 params![hat_id, self.owner_id(), DEFAULT_HAT_KEY],
             )?;
+            anyhow::ensure!(moved == 1, "the owner has no default hat setting to move");
         }
         let updated = hats_of(&tx, self.owner_id())?.into_iter().find(|hat| hat.id == hat_id);
         tx.commit()?;

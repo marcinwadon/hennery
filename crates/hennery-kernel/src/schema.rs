@@ -121,6 +121,15 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     // rule's host and hat are the same owner's, by composite foreign keys
     // (the review's A3). Rules are made last: they reference the rebuilt
     // `hosts`.
+    //
+    // From now on, `hats` and `hosts` have children (`hosts` references
+    // `hats`; `hat_path_rules` references both), so neither can be rebuilt
+    // by the usual create/copy/drop/rename once child rows exist:
+    // `migrate_component` runs each step in an IMMEDIATE transaction with
+    // `foreign_keys=ON` (`db::configure`), and `PRAGMA foreign_keys` cannot
+    // change inside a transaction. New columns go in with `ADD COLUMN`; a
+    // rebuild needs a runner mode that turns foreign keys off before BEGIN
+    // and runs `PRAGMA foreign_key_check` before COMMIT.
     "
     CREATE TABLE hats (
         id TEXT PRIMARY KEY,

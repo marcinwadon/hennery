@@ -29,6 +29,9 @@ pub fn router(state: AppState) -> Router {
         )
         .route(
             "/api/hosts/{id}/path-rules",
+            // Step-up is layered on `put` alone (`Handler::layer`), so GET
+            // stays free; a method added to this route later gets no
+            // step-up unless it is layered too.
             get(path_rules).put(replace_path_rules.layer(middleware::from_fn(hennery_kernel::auth::require_step_up))),
         );
     hennery_kernel::auth::operator_only(routes, state.operator.clone()).with_state(state)

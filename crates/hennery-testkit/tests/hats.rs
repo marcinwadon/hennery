@@ -269,6 +269,7 @@ async fn path_rules_are_replaced_as_a_set_normalised_and_unverified() {
         vec![("/p/acme", "hat-nope")],
         vec![("/p/a", acme.id.as_str()), ("/p/a/", acme.id.as_str())],
         vec![("/p/a\u{0}b", acme.id.as_str())],
+        vec![("/p/a\u{202E}b", acme.id.as_str())],
         vec![("/p/x/../a", acme.id.as_str())],
         vec![("/", acme.id.as_str())],
     ] {
