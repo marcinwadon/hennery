@@ -1,7 +1,9 @@
 # hennery — distribution (subsystem spec)
 
 - **Date:** 2026-09-26
-- **Status:** Draft, awaiting review
+- **Status:** Draft. Amended 2026-10-01 to the parts of `hennery up`, `host
+  join`, `host run` and `hennery admin` that plans 3a and 3b-ii built; the
+  rest (runtime, services, doctor, releases) is still design.
 - **Refines:** [architecture spec](2026-09-25-hennery-architecture-design.md) §3.3
   (all-in-one supervisor) and §12 (distribution).
 - **Evidence:** measured on macOS arm64 on 2026-09-26: a lockfile-driven
@@ -20,13 +22,14 @@ One binary, `hennery`:
 | `hennery up` | All-in-one: supervisor running a collector and a host (§5) |
 | `hennery collector` | Collector only (full mode) |
 | `hennery gateway` | Collector in gateway-only mode |
-| `hennery host join <url> <code>` | Pair this machine and install its runtime (§3) |
-| `hennery host run` | Run a paired host |
+| `hennery host join <url> [<code>]` | Pair this machine (the code from stdin when left out) and install its runtime (§3) |
+| `hennery host run` | Run a paired host; exits 78 (`EX_CONFIG`) once it is revoked |
 | `hennery host adapters update` / `rollback` | Switch to the adapter set pinned by this binary / back to the previous one |
 | `hennery mcp apply --client claude\|codex` | Render a standalone client's gateway manifest into agent config; token from `--token-file`, `HENNERY_MCP_TOKEN` or stdin, never a flag (gateway spec §3.3) |
 | `hennery service install\|uninstall\|status [--role up\|host\|collector]` | launchd / systemd user service, one per role (§6) |
 | `hennery doctor` | Diagnose (§7) |
-| `hennery backup`, `hennery restore`, `hennery admin …` | Via the collector's admin socket (kernel spec) |
+| `hennery admin setup-url\|reset-password\|reset-public-url <url>\|hosts\|pairing-code` | Recovery over the collector's admin socket (kernel spec §4.2); `--data-dir` is the collector's or `hennery up`'s |
+| `hennery backup`, `hennery restore` | Via the collector's admin socket (kernel spec §9) |
 | `hennery collector healthcheck` | Exit 0/1 against `/healthz` (containers) |
 
 Platforms v1: Linux x86_64 and aarch64, macOS aarch64. Windows through WSL2
@@ -185,8 +188,8 @@ CMD ["collector"]
   non-root user; no shell.
 - The volume must be local storage (SQLite locking is unreliable on network
   filesystems). Documented.
-- `/healthz` (process up) and `/readyz` (database open, migrations done) for
-  orchestrators.
+- `/healthz` (process up) and `/readyz` (the database answers within 2 s;
+  migrations run before any listener) for orchestrators.
 - The image contains no Node and no adapters.
 
 ### 4.2 curl installer and Homebrew
@@ -226,11 +229,20 @@ runtime (§3.2), so the installer never touches the npm registry.
 
 `hennery up` runs as a small supervisor with two children: `hennery collector` and
 `hennery host run`. They communicate only over the collector's normal WebSocket
-(umbrella §3.3). On first start the collector child hands the supervisor a
-pairing code over an inherited file descriptor, and the supervisor passes it to
-the host child through another inherited file descriptor — never on a command
-line (kernel spec §4.2). Pairing is idempotent: if the host's `host.key`
-exists and the collector accepts it, no code is minted.
+(umbrella §3.3). On first start (no pairing in the host's directory) the
+supervisor creates one pipe and gives its write end to the collector child and
+its read end to the host child, as inherited descriptors: the code passes
+between the two children only, never on a command line or in the environment,
+and the supervisor never reads it (kernel spec §4.2). Pairing is idempotent:
+an existing pairing gets no pipe, and no code is minted.
+
+`hennery up` binds every listen address itself (flags, `HENNERY_LISTEN`, else
+the collector's `config.toml`) before touching its data directory, so a taken
+port starts no child, and hands each socket to the collector child as an
+inherited descriptor; the collector accepts there only a listening TCP socket,
+each once. The host child is given the collector's current loopback URL (the
+first address loopback reaches). `up --public-url` is handed on to the
+collector.
 
 At start `hennery up` checks whether gateway credentials exist for more than one
 hat while the collector shares its OS user with the host child, and warns if so
@@ -241,8 +253,16 @@ hat while the collector shares its OS user with the host child, and warns if so
 - A crashed child is restarted with exponential backoff (1 s → 60 s); ten
   crashes in five minutes stop restarts for that child and are reported by
   `hennery service status` and `doctor`.
-- The supervisor forwards SIGTERM: host first (it flushes its outbox, closes
-  adapters; sessions will be parked), then the collector.
+- A host child that exits 78 (revoked) is not restarted: `up` logs which files
+  to remove to pair it again, and keeps the collector serving the operator and
+  remote hosts.
+- Both children run in their own process groups, so a terminal's Ctrl-C
+  reaches only the supervisor. The supervisor handles SIGINT like SIGTERM and
+  forwards it: host first (it flushes its outbox, closes adapters; sessions
+  will be parked), then the collector.
+
+*Built so far:* no restarts. A collector exit, any other host exit or a signal
+ends `up`.
 
 ### 5.3 Upgrades
 
@@ -363,9 +383,9 @@ are never printed (only "logged in" and the method).
 | 4 | Logged in: the adapter's `_auth/status_update`, else the bundled CLI's `claude auth status` / `codex login status` (exit 0/1) — **under the service's environment** |
 | 5 | Service PATH: `sh` and `git` present, `rg` optional; volatile entries; drift from the login shell |
 | 6 | Nesting variables set in the current environment (warn) |
-| 7 | Collector: DNS, TCP, TLS, certificate matches `public_url`; `http://` only on loopback; WebSocket `hello` accepted (revoked → "re-pair with `hennery host join`") |
+| 7 | Collector: DNS, TCP, TLS, certificate matches `public_url`; `http://` only on loopback; WebSocket `hello` accepted (revoked → "re-pair with `hennery host join`"; `bad_proof`, an unknown host → "remove `host.key` and `host.toml`, then `hennery host join`") |
 | 8 | Clock skew against the collector's `Date` header (warn > 30 s, fail > 5 min) |
-| 9 | Disk: free space for two adapter sets and the outbox; current outbox size; recent transcript gaps |
+| 9 | Disk: free space for two adapter sets and the outbox; current outbox size; recent transcript gaps; `outbox.db.orphaned-*` kept from earlier identities |
 | 10 | Service: installed, active, pointing at this binary; linger on Linux; only one role installed per machine; restart needed after an upgrade (running version ≠ binary on disk) |
 | 11 | Another `hennery` earlier on PATH (name collision, §11) |
 | 12 | Adapter set: installed set differs from the one pinned by this binary (warn, with `hennery host adapters update`) |
@@ -390,21 +410,25 @@ them to the collector, so the Hosts view shows them without a terminal.
 
 `HENNERY_DATA_DIR` overrides the data directory (containers, tests). Logs rotate
 at 10 MiB × 5 files. A collector and a host on the same machine (`hennery up`)
-share the data directory; their files do not overlap.
+share the data directory, in two subdirectories: `<data>/collector` and
+`<data>/host`.
 
 **Host data directory:**
 
 | Entry | Purpose |
 |---|---|
-| `host.key` | Ed25519 private key from pairing (0600) |
-| `host.toml` | Collector URL, host id, workspace roots, agent overrides |
+| `host.key` | Ed25519 key seed from pairing, hex (0600, written through a temporary file and a rename; a readable one is used with a warning) |
+| `host.key.pending` | A key being enrolled; renamed to `host.key` once paired |
+| `host.toml` | Collector WebSocket URL, host id, workspace roots, agent overrides (so far the first two) |
 | `outbox.db` | Outbox (ACP core §5.5) |
+| `outbox.db.orphaned-<id>` | Outbox of an earlier identity, moved aside at a re-pair, kept for inspection, never read |
 | `runtimes/` | Managed Node (§3.2) |
 | `adapters/` | Adapter sets (§3.2) |
 | `codex-home/` | Composed `CODEX_HOME` per hat (ACP core §6) |
 | `host.lock` | Exclusive lock; a second `hennery host run` refuses to start |
 
-The collector's data directory is described in the kernel spec §1.
+The host data directory is created 0700. The collector's data directory is
+described in the kernel spec §1.
 
 ---
 
@@ -420,7 +444,9 @@ The collector's data directory is described in the kernel spec §1.
   job.
 - Supervisor: child crash backoff and give-up; pairing code passed only
   through inherited descriptors; no re-pairing when the existing key is
-  accepted.
+  accepted; a revoked all-in-one host leaves the collector serving; after a
+  restart on another port the host reconnects under its old id; agents
+  inherit neither the pairing pipe nor an operator secret.
 - Upgrade: a replaced binary triggers the "restart needed" warning and nothing
   else; a host keeps its adapter set until its next start or
   `adapters update`.
