@@ -50,7 +50,7 @@ enum ServiceCommand {
     },
     /// Show the installed service: what it runs, whether it runs, and, for
     /// `up`, its children. Exits 1 unless it is installed and running, with
-    /// no child given up on.
+    /// no child given up on or revoked.
     Status {
         /// By default, whichever role is installed.
         #[arg(long, value_enum)]
@@ -458,7 +458,8 @@ fn install_launchd(cx: &Context, role: Role, argv: &[String], path: &str, file: 
     if !ran.ok {
         bail!(
             "launchctl bootstrap {} {plist} failed: {}. A launchd user agent loads only in a GUI login session \
-             (log in on the Mac's screen, not only over SSH); then run `hennery service install` again",
+             (log in on the Mac's screen, not only over SSH); then run `hennery service install` again. \
+             The agent that ran before, if any, has been stopped",
             cx.launchd_domain(),
             ran.stderr.trim()
         );
@@ -540,7 +541,9 @@ pub fn uninstall(cx: &Context, role: Option<Role>, out: &mut dyn Write) -> Resul
                 }
                 std::fs::remove_file(&file).with_context(|| format!("remove {}", file.display()))?;
                 let _ = std::fs::remove_file(cx.env_file());
-                systemctl(cx, &["daemon-reload"])?;
+                if let Err(err) = systemctl(cx, &["daemon-reload"]) {
+                    writeln!(out, "  warning: {err:#}")?;
+                }
             }
         }
         writeln!(out, "removed the {role} service: {}", file.display())?;
@@ -568,8 +571,8 @@ fn data_dir_of(argv: &[String]) -> Option<PathBuf> {
 }
 
 /// `hennery service status`: exit 0 when the service is installed and
-/// running, its binary is this one, and no child of `up` was given up on or
-/// revoked; 1 otherwise.
+/// running, its binary exists, and no child of `up` was given up on or
+/// revoked; 1 otherwise. A binary other than this one is only named.
 pub fn status(cx: &Context, role: Option<Role>, out: &mut dyn Write) -> Result<ExitCode> {
     let roles = match role {
         Some(role) => vec![role],

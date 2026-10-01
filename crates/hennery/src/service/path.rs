@@ -128,13 +128,20 @@ fn run_shell(shell: &Path, env: &[(String, String)], out: &Path, timeout: Durati
     // cannot be another process's, so the kill below reaches only what the
     // shell left behind.
     let finished = loop {
-        if exited(group)? {
-            break true;
+        match exited(group) {
+            Ok(true) => break true,
+            Ok(false) if Instant::now() >= deadline => break false,
+            Ok(false) => std::thread::sleep(Duration::from_millis(20)),
+            // Not left running: killed, with its group, and reaped.
+            Err(err) => {
+                // SAFETY: kill(2) on the process group the shell leads.
+                unsafe {
+                    libc::kill(-group, libc::SIGKILL);
+                }
+                let _ = child.wait();
+                return Err(err).context("watch the login shell");
+            }
         }
-        if Instant::now() >= deadline {
-            break false;
-        }
-        std::thread::sleep(Duration::from_millis(20));
     };
     // Whatever its startup files left running in its session goes too.
     // SAFETY: kill(2) on the process group the shell leads.

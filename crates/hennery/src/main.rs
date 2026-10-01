@@ -572,7 +572,8 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
     }
     warn_if_dev_token();
     // Held until this returns (distribution spec §8): a second host on this
-    // data directory stops here, before it reads or makes a pairing.
+    // data directory stops here, once it has looked for its pairing and
+    // before it reads a pairing code or connects.
     let (paired, _lock) = match Paired::load(&args.data_dir)? {
         Some(paired) => {
             // Paired already (kernel spec §4.2): the code is not needed.
