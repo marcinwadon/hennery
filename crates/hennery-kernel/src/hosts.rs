@@ -20,6 +20,25 @@ use std::sync::Mutex;
 /// A pairing code is valid this long (kernel spec §4.1).
 pub const PAIRING_CODE_TTL_SECS: i64 = 10 * 60;
 
+/// At most this many pairing codes are live (unspent and unexpired) at
+/// once; a mint past it is refused with `TooManyPairingCodes`.
+pub const MAX_LIVE_PAIRING_CODES: usize = 16;
+
+/// A mint refused because `MAX_LIVE_PAIRING_CODES` codes are live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooManyPairingCodes;
+
+impl std::fmt::Display for TooManyPairingCodes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{MAX_LIVE_PAIRING_CODES} pairing codes are live already; use one or wait for one to expire"
+        )
+    }
+}
+
+impl std::error::Error for TooManyPairingCodes {}
+
 /// Crockford's base32 alphabet: no `I`, `L`, `O` or `U`.
 const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 
@@ -239,15 +258,45 @@ impl Hosts {
     }
 
     /// Mint a single-use pairing code valid for `PAIRING_CODE_TTL_SECS`.
-    /// Only its hash is stored.
+    /// Only its hash is stored. Spent and expired codes are deleted first,
+    /// even when the mint is then refused (`TooManyPairingCodes`) because
+    /// `MAX_LIVE_PAIRING_CODES` are live, so the table stays bounded.
     pub fn mint_pairing_code(&self, now: i64) -> Result<PairingCode> {
+        self.mint(now, true)
+    }
+
+    /// `mint_pairing_code` for `hennery up`'s own host, once at start: not
+    /// capped, so live codes minted by the operator can never stop the
+    /// all-in-one from pairing its host (a host that cannot pair ends
+    /// `up`). Spent and expired codes are still deleted.
+    pub fn mint_local_pairing_code(&self, now: i64) -> Result<PairingCode> {
+        self.mint(now, false)
+    }
+
+    fn mint(&self, now: i64, capped: bool) -> Result<PairingCode> {
         let code = new_code();
         let expires_at = now + PAIRING_CODE_TTL_SECS;
         let normalized = normalize_code(&code).expect("a minted code is canonical");
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM pairing_codes WHERE (used_at IS NOT NULL OR expires_at <= ?1) AND owner_id = ?2",
+            params![now, self.owner],
+        )?;
+        let live: i64 = tx.query_row(
+            "SELECT count(*) FROM pairing_codes WHERE owner_id = ?1",
+            [&self.owner],
+            |r| r.get(0),
+        )?;
+        if capped && live >= MAX_LIVE_PAIRING_CODES as i64 {
+            tx.commit()?;
+            return Err(TooManyPairingCodes.into());
+        }
+        tx.execute(
             "INSERT INTO pairing_codes(code_hash, owner_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
             params![code_hash(&normalized), self.owner, now, expires_at],
         )?;
+        tx.commit()?;
         Ok(PairingCode { code, expires_at })
     }
 

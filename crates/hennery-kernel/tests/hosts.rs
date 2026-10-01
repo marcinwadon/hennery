@@ -3,8 +3,8 @@
 
 use ed25519_dalek::{Signer, SigningKey};
 use hennery_kernel::hosts::{
-    EnrollOutcome, Enrollment, HelloCheck, Hosts, PAIRING_CODE_TTL_SECS, Registered, Revoke, normalize_code,
-    verify_proof,
+    EnrollOutcome, Enrollment, HelloCheck, Hosts, MAX_LIVE_PAIRING_CODES, PAIRING_CODE_TTL_SECS, Registered, Revoke,
+    TooManyPairingCodes, normalize_code, verify_proof,
 };
 use hennery_proto::frames::{Capabilities, Capability};
 use hennery_proto::hello_proof_message;
@@ -282,4 +282,52 @@ fn the_fixed_proof_vector_verifies() {
         "1.0",
         VECTOR_SIGNATURE
     ));
+}
+
+/// `pairing_codes` stays bounded: every mint first deletes the spent and
+/// expired codes, and refuses once `MAX_LIVE_PAIRING_CODES` are live, so a
+/// flood of mints cannot grow the table.
+#[test]
+fn minting_prunes_spent_and_expired_codes_and_caps_the_live_ones() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    let hosts = Hosts::open(&db).unwrap();
+    let rows = || {
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row("SELECT count(*) FROM pairing_codes", [], |r| r.get::<_, i64>(0))
+            .unwrap()
+    };
+    let first = hosts.mint_pairing_code(NOW).unwrap();
+    let second = hosts.mint_pairing_code(NOW).unwrap();
+    for _ in 2..MAX_LIVE_PAIRING_CODES {
+        hosts.mint_pairing_code(NOW).unwrap();
+    }
+    let refused = hosts.mint_pairing_code(NOW).unwrap_err();
+    assert!(refused.downcast_ref::<TooManyPairingCodes>().is_some(), "{refused:#}");
+    assert_eq!(rows(), MAX_LIVE_PAIRING_CODES as i64);
+
+    // `up`'s own mint at start is not capped.
+    hosts.mint_local_pairing_code(NOW).unwrap();
+    assert_eq!(rows(), MAX_LIVE_PAIRING_CODES as i64 + 1);
+    let refused = hosts.mint_pairing_code(NOW).unwrap_err();
+    assert!(refused.downcast_ref::<TooManyPairingCodes>().is_some(), "{refused:#}");
+
+    // A spent code is no longer live, and goes at the next mint.
+    enrolled(hosts.enroll(&first.code, &enrollment(&key(1)), NOW + 1).unwrap());
+    hosts.mint_pairing_code(NOW + 1).unwrap_err();
+    assert_eq!(rows(), MAX_LIVE_PAIRING_CODES as i64, "pruned even though refused");
+    hosts.mint_pairing_code(NOW + 1).unwrap_err();
+    enrolled(hosts.enroll(&second.code, &enrollment(&key(3)), NOW + 1).unwrap());
+    hosts.mint_pairing_code(NOW + 1).unwrap();
+    assert_eq!(rows(), MAX_LIVE_PAIRING_CODES as i64);
+
+    // Once they have expired, every older code goes.
+    let later = hosts.mint_pairing_code(NOW + PAIRING_CODE_TTL_SECS + 1).unwrap();
+    assert_eq!(rows(), 1);
+    enrolled(
+        hosts
+            .enroll(&later.code, &enrollment(&key(2)), NOW + PAIRING_CODE_TTL_SECS + 2)
+            .unwrap(),
+    );
 }

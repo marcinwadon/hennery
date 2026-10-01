@@ -210,3 +210,22 @@ async fn a_spoofed_x_forwarded_for_does_not_evade_the_rate_limit() {
     assert_eq!(locked.status(), 429);
     assert!(locked.headers().contains_key("retry-after"));
 }
+
+/// Past `MAX_LIVE_PAIRING_CODES` live codes a mint is refused 409, and the
+/// codes already minted still pair.
+#[tokio::test]
+async fn a_mint_past_the_live_codes_cap_is_refused() {
+    let collector = Collector::start().await;
+    let first = collector.mint().await;
+    for _ in 1..hennery_kernel::hosts::MAX_LIVE_PAIRING_CODES {
+        collector.mint().await;
+    }
+    let resp = hennery_testkit::operator_client(&collector.state.operator)
+        .post(collector.url("/api/hosts/pairing-codes"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(code_of(resp).await, (409, "too_many_codes".into()));
+    assert_eq!(collector.enroll(&first, KEYS[0]).await.status(), 201);
+    collector.mint().await;
+}

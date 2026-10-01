@@ -300,7 +300,9 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     }
     if let Some(fd) = args.pairing_code_fd {
         // Only once migrated and listening: the host enrolls right away.
-        let code = state.hosts.mint_pairing_code(hennery_kernel::secret::unix_now())?;
+        let code = state
+            .hosts
+            .mint_local_pairing_code(hennery_kernel::secret::unix_now())?;
         // The host child may have died already (e.g. it could not bind, or
         // was killed) — closing its end of the pipe before this write. That
         // is the host's problem, not the collector's: it must keep serving
