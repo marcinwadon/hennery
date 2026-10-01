@@ -37,6 +37,8 @@ Obligations this skeleton hands to later plans:
 - **distribution:** the systemd unit needs `KillMode=mixed`.
 - **frontend:** settle generated TS optionals (`host_seq`, `indexed`).
 
+**Spec write-back (2026-10-01):** this plan's spec amendments and spec-level deviations are applied: in PR #7 (ACP core, umbrella), and the few it missed in #21 (umbrella) and #22 (ACP core, frontend, distribution). Notes above that call them still to be applied are history.
+
 ## Scope
 
 In: workspace and tooling; wire types and codegen with a CI drift gate; the fake ACP adapter; the host outbox, session actor and connection loop; the collector store, host WebSocket, REST (`/api/hosts`, `/api/sessions`, `/api/sessions/{id}/prompt`, `/api/sessions/{id}/events`) and the session SSE stream; the `hennery` binary with `collector`, `host run` and `up`; end-to-end tests including a collector restart mid-turn.

@@ -46,6 +46,8 @@ written. Deviations:
 **Decision 6 amended in execution:** the orphan's late non-empty read-back is announced as `config_applied` (a
 sequenced fact, not a second HTTP answer), and a timed-out start switch blocks live switches until its grace passes.
 
+**Spec write-back (2026-10-01):** this plan's spec amendments and spec-level deviations are applied: in PR #7 (ACP core, umbrella), and the few it missed in #21 (umbrella) and #22 (ACP core, frontend, distribution). Notes above that call them still to be applied are history.
+
 ## Scope
 
 This is **plan B2b**, the config half of B2 as B2a's "After this plan" scoped it. It fits in ten right-sized tasks, including both B2a carry-overs, so it is not split further.

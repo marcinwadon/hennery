@@ -29,6 +29,8 @@ bodies below are kept as written. Deviations:
 | Host shutdown (final) | Waits for actors (bounded by kill grace + 1 s), so adapters get SIGTERM first | Shutdown SIGKILLed adapters with no grace |
 | Wire order (final) | Outboxed facts are sent before each reply | A rejection could overtake the fact before it |
 
+**Spec write-back (2026-10-01):** this plan's spec amendments and spec-level deviations are applied: in PR #7 (ACP core, umbrella), and the few it missed in #21 (umbrella) and #22 (ACP core, frontend, distribution). Notes above that call them still to be applied are history.
+
 ## Scope
 
 This is **plan A** of the skeleton's "After this plan" item (1). That item was too big for one plan of right-sized tasks, so it is split. Plan A is the reconciliation and teardown core: it removes every known wedge. Plan B (resume) is scoped under "After this plan" below.
