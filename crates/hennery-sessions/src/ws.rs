@@ -19,7 +19,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-const MAX_FRAME: usize = 32 << 20;
+/// The largest frame or message either end reads (ACP core §11).
+pub(crate) const MAX_FRAME: usize = 32 << 20;
 const PING_INTERVAL: Duration = Duration::from_secs(15);
 pub(crate) const READ_TIMEOUT: Duration = Duration::from_secs(45);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(10);

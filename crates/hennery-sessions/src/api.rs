@@ -1,10 +1,11 @@
 //! Session REST and SSE endpoints (ACP core §9), walking-skeleton subset.
 
 use crate::AppState;
+use crate::content::{self, Refusal};
 use crate::hub::{RequestError, Undo};
 use crate::store::{AnswerSubmission, ResumeRequest, Store};
-use axum::extract::{Extension, Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -49,13 +50,24 @@ const _: () = assert!(
     "every request timeout must exceed the host connection's read deadline"
 );
 
+// Plan 6a: a prompt the route accepts fits in one frame to its host, with
+// room for the frame's own fields.
+const _: () = assert!(
+    content::PROMPT_BODY_LIMIT + (1 << 20) <= crate::ws::MAX_FRAME,
+    "a prompt request's body must fit in a host frame"
+);
+
 /// Every route here is an operator's (kernel spec §3.3).
 pub fn router(state: AppState) -> Router {
     let routes = Router::new()
         .route("/api/sessions", post(start_session))
         .route("/api/sessions/{id}", get(session_detail))
         .route("/api/sessions/{id}/resume", post(resume))
-        .route("/api/sessions/{id}/prompt", post(prompt))
+        // The one route that reads more than axum's default 2 MB (plan 6a).
+        .route(
+            "/api/sessions/{id}/prompt",
+            post(prompt).layer(DefaultBodyLimit::max(content::PROMPT_BODY_LIMIT)),
+        )
         .route("/api/sessions/{id}/cancel", post(cancel))
         .route("/api/sessions/{id}/park", post(park))
         .route("/api/sessions/{id}/close", post(close))
@@ -63,7 +75,9 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/{id}/config", post(set_config))
         .route("/api/sessions/{id}/pending/{pending_id}/answer", post(answer))
         .route("/api/sessions/{id}/events", get(events))
-        .route("/api/stream/sessions/{id}", get(stream_session));
+        .route("/api/stream/sessions/{id}", get(stream_session))
+        .route("/api/attachments/{sha256}", get(attachment))
+        .route("/api/settings/attachments", get(attachment_usage));
     hennery_kernel::auth::operator_only(routes, state.operator.clone()).with_state(state)
 }
 
@@ -104,7 +118,9 @@ fn request_failed(err: RequestError) -> Response {
         RequestError::NotConnected => error(StatusCode::CONFLICT, "host_offline", "the host is not connected"),
         RequestError::Rejected { code, message } => {
             let status = match code.as_str() {
-                "not_attached" | "turn_in_progress" | "not_running" | "unknown_option" => StatusCode::CONFLICT,
+                "not_attached" | "turn_in_progress" | "not_running" | "unknown_option" | "images_unsupported" => {
+                    StatusCode::CONFLICT
+                }
                 "unknown_agent" | "start_failed" => StatusCode::BAD_GATEWAY,
                 "invalid" => StatusCode::BAD_REQUEST,
                 _ => StatusCode::BAD_GATEWAY,
@@ -295,18 +311,29 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
     }
 }
 
+/// Send a prompt (ACP core §4.4, §9). Everything that can refuse it is
+/// checked before anything is written (plan 6a): the content, the session,
+/// and for images the host's `images` capability. Its images are then
+/// saved, and the turn opened with references to them; only the frame to
+/// the host carries their bytes, in the blocks as checked (the review's
+/// A1).
 async fn prompt(
     State(state): State<AppState>,
     Path(id): Path<String>,
     ApiJson(req): ApiJson<PromptRequest>,
 ) -> Response {
-    if req.content.is_empty() {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "empty_prompt",
-            "a prompt needs text or an image",
-        );
-    }
+    let mut checked = match content::check(req.content) {
+        Ok(checked) => checked,
+        Err(Refusal::Empty) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "empty_prompt",
+                "a prompt needs text or an image",
+            );
+        }
+        Err(Refusal::Invalid(why)) => return error(StatusCode::BAD_REQUEST, "invalid_content", why),
+        Err(Refusal::TooLarge(why)) => return error(StatusCode::PAYLOAD_TOO_LARGE, "content_too_large", why),
+    };
     let session = match state.store.session(&id) {
         Ok(Some(s)) => s,
         Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
@@ -315,8 +342,35 @@ async fn prompt(
     if session.lifecycle != "active" {
         return error(StatusCode::CONFLICT, "not_attached", "resume the session first");
     }
+    if !checked.images.is_empty() {
+        // A host that is gone has no capabilities: it is offline, not one
+        // without images.
+        if !state.hub.is_ready(&session.host_id) {
+            return request_failed(RequestError::NotConnected);
+        }
+        // Never an image to a host that did not announce it (ACP core §3.3).
+        if !state.hub.has_capability(&session.host_id, Capability::Images) {
+            return error(
+                StatusCode::CONFLICT,
+                "images_unsupported",
+                "this host cannot take images; send text only",
+            );
+        }
+        // Not to write files for a prompt `open_prompt` would refuse anyway;
+        // it still decides.
+        if session.open_turn_id.is_some() {
+            return error(
+                StatusCode::CONFLICT,
+                "turn_in_progress",
+                "wait for the current turn to end",
+            );
+        }
+        if let Err(err) = state.store.save_images(&checked.images) {
+            return internal(err);
+        }
+    }
     let turn_id = uuid::Uuid::now_v7().to_string();
-    match state.store.open_turn(&id, &turn_id, &req.content) {
+    match state.store.open_prompt(&id, &turn_id, &checked) {
         Ok(true) => {}
         Ok(false) => {
             return error(
@@ -332,7 +386,7 @@ async fn prompt(
         request_id: request_id.clone(),
         session_id: id.clone(),
         turn_id: turn_id.clone(),
-        content: req.content,
+        content: std::mem::take(&mut checked.sent),
     };
     let undo = Undo::Prompt {
         session_id: id.clone(),
@@ -355,6 +409,47 @@ async fn prompt(
         }
         // The socket task has already removed the turn (`Undo::Prompt`).
         Err(err) => request_failed(err),
+    }
+}
+
+/// One of the owner's images (plan 6a), by its hash. Served as the type it
+/// was stored as, never sniffed, and never as a document: no script, no
+/// style, no frame. Its name is its hash, so it never changes: cached for a
+/// year, privately, since it needs the cookie.
+async fn attachment(State(state): State<AppState>, Path(sha256): Path<String>) -> Response {
+    let found = match state.store.attachment(&sha256) {
+        Ok(Some(found)) => found,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such attachment"),
+        Err(err) => return internal(err),
+    };
+    let Ok(mime) = HeaderValue::from_str(&found.mime) else {
+        return internal(anyhow::anyhow!("attachment {sha256} has a type no header can carry"));
+    };
+    let headers = [
+        (header::CONTENT_TYPE, mime),
+        (header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")),
+        (
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("default-src 'none'"),
+        ),
+        (
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("private, max-age=31536000, immutable"),
+        ),
+        // The review's O8: no other site may embed it.
+        (
+            HeaderName::from_static("cross-origin-resource-policy"),
+            HeaderValue::from_static("same-origin"),
+        ),
+    ];
+    (headers, found.bytes).into_response()
+}
+
+/// The owner's attachment store, for Settings (ACP core §15, plan 6a).
+async fn attachment_usage(State(state): State<AppState>) -> Response {
+    match state.store.attachment_usage() {
+        Ok(usage) => Json(usage).into_response(),
+        Err(err) => internal(err),
     }
 }
 
