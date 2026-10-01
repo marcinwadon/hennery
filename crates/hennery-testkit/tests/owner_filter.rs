@@ -5,17 +5,32 @@
 //! - a table it reads, changes or deletes from must have its owner column
 //!   read too (`owner_id`; `id` for `owners`), whether in a `WHERE`, a
 //!   join or a subquery;
+//! - one owner column at least must be compared with a parameter, not only
+//!   with another owner column (all but a plain `INSERT … VALUES`);
 //! - an `INSERT` must name `owner_id` among its columns.
+//!
+//! Reads SQLite makes on its own are not the statement's: a foreign key's
+//! check of its parent (a table the statement does not name), and an
+//! upsert's look-up of its conflict target (the table it inserts into, when
+//! it changes nothing there and does not select from it).
+//!
+//! A statement is any string literal that begins with `SELECT`, `INSERT`,
+//! `REPLACE`, `UPDATE`, `DELETE` or `WITH`, in any case (ED4), and the
+//! rules read its text case-insensitively too, where a miss would let it
+//! pass.
 //!
 //! A statement that does not prepare, a `{CONST}` that does not resolve,
 //! or a source with fewer statements than it has fails the test too, so a
-//! broken extractor cannot pass by finding nothing.
+//! broken extractor cannot pass by finding nothing. And every file of the
+//! workspace's `src` that holds SQL is in `SOURCES` or, with its reason, in
+//! `EXEMPT`.
 
 use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::Operator;
 use hennery_sessions::store::Store;
 use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 /// The audited sources, and the fewest statements each holds.
@@ -29,6 +44,25 @@ const SOURCES: &[(&str, &str, usize)] = &[
         "hennery-kernel/src/hosts.rs",
         include_str!("../../hennery-kernel/src/hosts.rs"),
         13,
+    ),
+    (
+        "hennery-sessions/src/store.rs",
+        include_str!("../../hennery-sessions/src/store.rs"),
+        77,
+    ),
+];
+
+/// Files under `crates/*/src` with SQL that the audit does not read, and
+/// why (3b-iii review, A3). Any other such file fails
+/// `every_file_with_sql_is_audited_or_exempt`.
+const EXEMPT: &[(&str, &str)] = &[
+    (
+        "hennery-kernel/src/db.rs",
+        "`kernel_owner`'s query finds the owner; the rest is the migrations' bookkeeping and their unit tests",
+    ),
+    (
+        "hennery-host/src/outbox.rs",
+        "the host's own database, on the host's machine, not `hennery.db`",
     ),
 ];
 
@@ -132,13 +166,38 @@ fn str_consts(source: &str) -> BTreeMap<String, String> {
     out
 }
 
-/// The SQL statements in `source`, `{CONST}`s resolved.
+/// Whether a string literal is SQL: it begins with a statement's verb, in
+/// any case, `REPLACE` among them (ED4), and goes on past it. A literal
+/// that is only the word (`"update"`, `"select"`: JSON keys and values) is
+/// not a statement.
+fn is_sql(lit: &str) -> bool {
+    let mut words = lit.split_whitespace();
+    let first = words.next().unwrap_or_default();
+    ["SELECT", "INSERT", "UPDATE", "DELETE", "WITH", "REPLACE"]
+        .iter()
+        .any(|verb| first.eq_ignore_ascii_case(verb))
+        && words.next().is_some()
+}
+
+/// `source` without its unit tests (`#[cfg(test)] mod tests`, at the end
+/// of the file): their fixtures write raw rows on purpose, and are no
+/// store's queries. Everything from the exact text `\n#[cfg(test)]\nmod
+/// tests {` on is left out. Clippy's default `items_after_test_module`
+/// lint, which CI runs with `-D warnings`, is what keeps production code
+/// out of that region: an item after the test module fails the build (ED2;
+/// do not allow the lint in an audited file).
+fn without_tests(source: &str) -> &str {
+    source.split("\n#[cfg(test)]\nmod tests {").next().unwrap_or(source)
+}
+
+/// The SQL statements in `source`, `{CONST}`s resolved; its unit tests
+/// left out.
 fn statements(source: &str) -> Vec<String> {
+    let source = without_tests(source);
     let consts = str_consts(source);
     let mut out = Vec::new();
     for lit in string_literals(source) {
-        let first = lit.split_whitespace().next().unwrap_or_default();
-        if !matches!(first, "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "WITH") {
+        if !is_sql(&lit) {
             continue;
         }
         let mut sql = lit.clone();
@@ -202,9 +261,40 @@ fn owner_column(table: &str) -> &'static str {
     if table == "owners" { "id" } else { "owner_id" }
 }
 
-/// Whether an `INSERT INTO table(…)` in `sql` names `owner_id`.
+/// Whether `sql` reads `table` itself: `FROM table` or `JOIN table`. An
+/// `INSERT … SELECT` from its own target is then the statement's read, not
+/// an upsert's look-up of its conflict target (3b-iii review, A2). In any
+/// case (ED4): the authorizer names `table` as the schema does.
+fn selects_from(sql: &str, table: &str) -> bool {
+    let tokens: Vec<&str> = sql.split_whitespace().collect();
+    tokens.windows(2).any(|w| {
+        (w[0].eq_ignore_ascii_case("FROM") || w[0].eq_ignore_ascii_case("JOIN"))
+            && w[1].trim_end_matches([')', ',']).eq_ignore_ascii_case(table)
+    })
+}
+
+/// Whether `sql` names `table`, as a whole word, in any case (ED4): the
+/// authorizer names it as the schema does, so `FROM EVENTS` names `events`.
+fn names(sql: &str, table: &str) -> bool {
+    let sql = sql.to_ascii_lowercase();
+    let table = table.to_ascii_lowercase();
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    sql.match_indices(&table)
+        .any(|(at, _)| !word(sql[..at].chars().next_back()) && !word(sql[at + table.len()..].chars().next()))
+}
+
+/// Whether `sql` is an `INSERT`: it begins with `INSERT` or `REPLACE`, in
+/// any case (ED4).
+fn is_insert(sql: &str) -> bool {
+    let first = sql.split_whitespace().next().unwrap_or_default();
+    first.eq_ignore_ascii_case("INSERT") || first.eq_ignore_ascii_case("REPLACE")
+}
+
+/// Whether an `INSERT INTO table(…)` in `sql` names `owner_id`, in any
+/// case; `REPLACE INTO` and `INSERT OR REPLACE INTO` too (ED4).
 fn inserts_owner(sql: &str, table: &str) -> bool {
-    let Some((_, after)) = sql.split_once(&format!("INSERT INTO {table}(")) else {
+    let sql = sql.to_ascii_lowercase();
+    let Some((_, after)) = sql.split_once(&format!(" into {}(", table.to_ascii_lowercase())) else {
         return false;
     };
     let columns = after.split(')').next().unwrap_or_default();
@@ -338,7 +428,13 @@ fn compares_owner_with_a_parameter(sql: &str) -> bool {
 fn problems(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
     let t = touched(conn, sql);
     let mut out = Vec::new();
-    let tables: BTreeSet<&String> = t.read.keys().chain(&t.changed).collect();
+    let tables: BTreeSet<&String> = t
+        .read
+        .keys()
+        .chain(&t.changed)
+        .filter(|table| names(sql, table))
+        .filter(|table| !t.inserted.contains(*table) || t.changed.contains(*table) || selects_from(sql, table))
+        .collect();
     for table in &tables {
         let read = t.read.get(*table).cloned().unwrap_or_default();
         if !read.contains(owner_column(table)) {
@@ -353,13 +449,14 @@ fn problems(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
     if t.returned.iter().any(|c| c == "owner_id") {
         out.push("it returns owner_id: compare the column, do not read it back".into());
     }
-    if sql.trim_start().starts_with("INSERT")
-        && let Some((_, select)) = sql.split_once("SELECT")
-        && select.split("FROM").next().unwrap_or_default().contains("owner_id")
+    let lower = sql.to_ascii_lowercase();
+    if is_insert(sql)
+        && let Some((_, select)) = lower.split_once("select")
+        && select.split("from").next().unwrap_or_default().contains("owner_id")
     {
         out.push("its INSERT … SELECT copies owner_id: take it from a parameter".into());
     }
-    let values_only = sql.trim_start().starts_with("INSERT") && !sql.contains("SELECT");
+    let values_only = is_insert(sql) && !lower.contains("select");
     if !tables.is_empty() && !values_only && !compares_owner_with_a_parameter(sql) {
         out.push("no owner column is compared with a parameter".into());
     }
@@ -377,15 +474,72 @@ fn every_query_of_the_stores_filters_by_the_owner() {
     let mut found = Vec::new();
     for (path, source, at_least) in SOURCES {
         let sql = statements(source);
-        assert!(
-            sql.len() >= *at_least,
-            "{path}: {} statements, not {at_least}",
-            sql.len()
-        );
+        if sql.len() < *at_least {
+            found.push(format!("{path}: {} statements, not {at_least}", sql.len()));
+        }
         for statement in sql {
             for problem in problems(&conn, &statement) {
                 found.push(format!("{path}: {problem}:\n    {statement}"));
             }
+        }
+    }
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+/// Every `*.rs` under `dir`, as paths relative to `root` with `/` between
+/// their parts.
+fn rust_files(root: &Path, dir: &Path, out: &mut Vec<String>) {
+    let mut entries: Vec<_> = std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+    entries.sort();
+    for path in entries {
+        if path.is_dir() {
+            rust_files(root, &path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            let parts: Vec<String> = path
+                .strip_prefix(root)
+                .unwrap()
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect();
+            out.push(parts.join("/"));
+        }
+    }
+}
+
+/// 3b-iii review, A3: a file with SQL cannot escape the audit by not being
+/// listed. Every `*.rs` under `crates/*/src` that holds a statement is in
+/// `SOURCES` or `EXEMPT`, and every `EXEMPT` file still exists.
+#[test]
+fn every_file_with_sql_is_audited_or_exempt() {
+    let crates = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let listed: BTreeSet<&str> = SOURCES
+        .iter()
+        .map(|(path, ..)| *path)
+        .chain(EXEMPT.iter().map(|(path, _)| *path))
+        .collect();
+    let mut files = Vec::new();
+    let mut members: Vec<_> = std::fs::read_dir(crates).unwrap().map(|e| e.unwrap().path()).collect();
+    members.sort();
+    for member in members {
+        let src = member.join("src");
+        if src.is_dir() {
+            rust_files(crates, &src, &mut files);
+        }
+    }
+    assert!(files.len() > 20, "found only {files:?}");
+    let mut found = Vec::new();
+    for path in &files {
+        let source = std::fs::read_to_string(crates.join(path)).unwrap();
+        let holds_sql = string_literals(without_tests(&source)).iter().any(|lit| is_sql(lit));
+        if holds_sql && !listed.contains(path.as_str()) {
+            found.push(format!(
+                "{path} holds SQL: add it to SOURCES, or to EXEMPT with a reason"
+            ));
+        }
+    }
+    for (path, _) in EXEMPT {
+        if !crates.join(path).is_file() {
+            found.push(format!("{path} is in EXEMPT but no longer exists"));
         }
     }
     assert!(found.is_empty(), "{}", found.join("\n"));
@@ -397,7 +551,7 @@ fn every_query_of_the_stores_filters_by_the_owner() {
 fn the_audit_catches_a_query_without_the_owner() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("hennery.db");
-    Operator::open(&db).unwrap();
+    Store::open(&db).unwrap();
     let conn = rusqlite::Connection::open(&db).unwrap();
     for bad in [
         "SELECT phc FROM password_credentials LIMIT 1",
@@ -408,6 +562,14 @@ fn the_audit_catches_a_query_without_the_owner() {
         "INSERT INTO settings(key, value) VALUES (?1, ?2)",
         "SELECT set_up_at FROM owners LIMIT 1",
         "SELECT owner_id FROM auth_sessions WHERE id_hash = ?1",
+        "INSERT INTO session_catalog(session_id, config_options, updated_at, owner_id) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(session_id) DO UPDATE SET config_options = excluded.config_options",
+        "INSERT INTO events(session_id, kind, body, ts, owner_id)
+         SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?1)",
+        "SELECT q.answer FROM answer_queue q JOIN sessions s ON s.id = q.session_id AND s.owner_id = q.owner_id
+         WHERE s.host_id = ?1",
+        "INSERT INTO events(session_id, kind, body, ts, owner_id)
+         SELECT session_id, kind, body, ts, ?1 FROM events WHERE event_id = ?2",
         "INSERT INTO auth_sessions(id_hash, owner_id, user_agent, created_at, last_seen_at, expires_at)
          SELECT ?1, owner_id, 'x', 0, 0, 0 FROM password_credentials WHERE phc = ?2",
         "SELECT s.user_agent FROM auth_sessions s JOIN password_credentials c ON c.owner_id = s.owner_id
@@ -435,6 +597,20 @@ fn the_audit_catches_a_query_without_the_owner() {
         // columns compared to each other, not to a parameter, A1) is
         // right next to it.
         "SELECT name FROM owners, hosts WHERE hosts.owner_id = owners.id AND hosts.id = ?1",
+        // ED4 (3b-iii Task 3 review M3): SQL is case-insensitive, and so is
+        // every rule that reads the statement's text. The authorizer names
+        // tables as the schema does (`events`), whatever case the statement
+        // wrote them in.
+        "SELECT body FROM EVENTS WHERE event_id = ?1",
+        "insert into events(session_id, kind, body, ts, owner_id)
+         select session_id, kind, body, ts, ?1 from events where event_id = ?2",
+        "insert into events(session_id, kind, body, ts, owner_id)
+         select session_id, kind, body, ts, owner_id from events where event_id = ?1 and owner_id = ?2",
+        "INSERT INTO events(session_id, kind, body, ts, owner_id)
+         select ?1, ?2, ?3, ?4, ?5 where exists (select 1 from sessions where id = ?1 and owner_id = owner_id)",
+        // ED4: `REPLACE` inserts.
+        "REPLACE INTO session_catalog(session_id, config_options, updated_at) VALUES (?1, ?2, ?3)",
+        "INSERT OR REPLACE INTO session_catalog(session_id, config_options, updated_at) VALUES (?1, ?2, ?3)",
     ] {
         assert!(!problems(&conn, bad).is_empty(), "passed: {bad}");
     }
@@ -448,11 +624,38 @@ fn the_audit_catches_a_query_without_the_owner() {
         "SELECT phc FROM password_credentials WHERE ?1 = owner_id",
         "SELECT s.user_agent FROM auth_sessions s JOIN password_credentials c ON c.owner_id = s.owner_id
          WHERE s.id_hash = ?1 AND s.owner_id = ?2",
+        "INSERT INTO turns(turn_id, session_id, content, created_at, owner_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO events(session_id, host_seq, kind, body, ts, owner_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(session_id, host_seq) DO NOTHING",
+        "INSERT INTO session_catalog(session_id, config_options, updated_at, owner_id) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(session_id) DO UPDATE SET config_options = excluded.config_options
+             WHERE session_catalog.owner_id = excluded.owner_id",
         "INSERT INTO auth_sessions(id_hash, owner_id, user_agent, created_at, last_seen_at, expires_at)
          SELECT ?1, ?2, 'x', 0, 0, 0 FROM password_credentials WHERE owner_id = ?2 AND phc = ?3",
         "SELECT 1",
+        "select body from events where event_id = ?1 and owner_id = ?2",
+        "REPLACE INTO session_catalog(session_id, config_options, updated_at, owner_id) VALUES (?1, ?2, ?3, ?4)",
+        "INSERT OR REPLACE INTO session_catalog(session_id, config_options, updated_at, owner_id)
+         VALUES (?1, ?2, ?3, ?4)",
     ] {
         assert_eq!(problems(&conn, good), Vec::<String>::new(), "{good}");
+    }
+    // ED4: a statement is found whatever the case of its verb, `REPLACE`
+    // among them; a literal that is only the word is not one (`"update"`,
+    // `"select"`: JSON keys and values in the host's and testkit's code).
+    for sql in [
+        "select 1",
+        "Insert INTO t(a) VALUES (1)",
+        "update t SET a = 1",
+        "delete FROM t",
+        "with x AS (SELECT 1) SELECT * FROM x",
+        "REPLACE INTO t(a) VALUES (1)",
+        "replace into t(a) values (1)",
+    ] {
+        assert!(is_sql(sql), "not SQL: {sql}");
+    }
+    for not_sql in ["update", "select", "selected rows", "Without it", "replaced by"] {
+        assert!(!is_sql(not_sql), "SQL: {not_sql}");
     }
     let literals = string_literals("// \"no\"\nlet a = 'x'; let b = '\"'; f::<'a>(\"one\", r#\"two \"q\"\"#);");
     assert_eq!(literals, ["one", "two \"q\""]);

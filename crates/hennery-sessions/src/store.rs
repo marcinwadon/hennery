@@ -1,5 +1,11 @@
 //! Collector session storage (ACP core §8). SQLite; writes are serialised by
 //! the connection mutex (kernel §1's writer thread replaces it later).
+//!
+//! Every row carries `owner_id` and every query names it (kernel spec §1):
+//! the database's owner, bound when the store opens (`Store::init`).
+//! Another owner's sessions, turns, events and questions are not there for
+//! this store: it reads none of them, changes none, and writes nothing
+//! for them.
 
 use anyhow::Result;
 use hennery_proto::frames::{
@@ -106,6 +112,27 @@ const MIGRATIONS: &[&str] = &[
         submitted_at TEXT NOT NULL,
         delivered INTEGER);
 ",
+    // `owner_id` everywhere (plan 3b-iii decision 4), filled with the
+    // database's owner, which the kernel's migrations made (`Store::init`
+    // runs them first). No foreign key: SQLite adds a REFERENCES column only
+    // with a NULL default, and rebuilding six tables that reference each
+    // other needs foreign keys off, which a migration's transaction cannot
+    // turn off. The default names no owner, so a row written without one is
+    // invisible.
+    "
+    ALTER TABLE sessions ADD COLUMN owner_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE turns ADD COLUMN owner_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE events ADD COLUMN owner_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE session_catalog ADD COLUMN owner_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE pending ADD COLUMN owner_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE answer_queue ADD COLUMN owner_id TEXT NOT NULL DEFAULT '';
+    UPDATE sessions SET owner_id = (SELECT id FROM owners ORDER BY created_at, id LIMIT 1);
+    UPDATE turns SET owner_id = (SELECT id FROM owners ORDER BY created_at, id LIMIT 1);
+    UPDATE events SET owner_id = (SELECT id FROM owners ORDER BY created_at, id LIMIT 1);
+    UPDATE session_catalog SET owner_id = (SELECT id FROM owners ORDER BY created_at, id LIMIT 1);
+    UPDATE pending SET owner_id = (SELECT id FROM owners ORDER BY created_at, id LIMIT 1);
+    UPDATE answer_queue SET owner_id = (SELECT id FROM owners ORDER BY created_at, id LIMIT 1);
+",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -185,6 +212,9 @@ pub struct Reconciliation {
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// The database's owner (`hennery_kernel::db::kernel_owner`), whom
+    /// every query names.
+    owner: String,
 }
 
 fn now() -> String {
@@ -193,15 +223,25 @@ fn now() -> String {
         .expect("RFC 3339 formatting of the current time")
 }
 
-/// Write a collector-originated event (`host_seq` NULL, ACP core §8).
-fn collector_event(tx: &Transaction<'_>, session_id: &str, kind: &str, body: Value, ts: &str) -> Result<EventDto> {
-    tx.execute(
-        "INSERT INTO events(session_id, host_seq, kind, body, ts) VALUES (?1, NULL, ?2, ?3, ?4)",
-        params![session_id, kind, body.to_string(), ts],
+/// Write a collector-originated event (`host_seq` NULL, ACP core §8), for
+/// a session of `owner`'s only: for any other it fails and writes nothing.
+fn collector_event(
+    tx: &Transaction<'_>,
+    owner: &str,
+    session_id: &str,
+    kind: &str,
+    body: Value,
+    ts: &str,
+) -> Result<EventDto> {
+    let written = tx.execute(
+        "INSERT INTO events(session_id, host_seq, kind, body, ts, owner_id)
+         SELECT ?1, NULL, ?2, ?3, ?4, ?5 WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?1 AND owner_id = ?5)",
+        params![session_id, kind, body.to_string(), ts, owner],
     )?;
+    anyhow::ensure!(written == 1, "no session {session_id}");
     tx.execute(
-        "UPDATE sessions SET last_event_at = ?2 WHERE id = ?1",
-        params![session_id, ts],
+        "UPDATE sessions SET last_event_at = ?2 WHERE id = ?1 AND owner_id = ?3",
+        params![session_id, ts, owner],
     )?;
     Ok(EventDto {
         event_id: tx.last_insert_rowid(),
@@ -214,17 +254,25 @@ fn collector_event(tx: &Transaction<'_>, session_id: &str, kind: &str, body: Val
 }
 
 /// Close an open turn that the host will never end, as `interrupted`.
-fn synthesize_turn_end(tx: &Transaction<'_>, session_id: &str, turn_id: &str, ts: &str) -> Result<EventDto> {
+fn synthesize_turn_end(
+    tx: &Transaction<'_>,
+    owner: &str,
+    session_id: &str,
+    turn_id: &str,
+    ts: &str,
+) -> Result<EventDto> {
     tx.execute(
-        "UPDATE turns SET state = 'ended', outcome = 'interrupted' WHERE turn_id = ?1",
-        [turn_id],
+        "UPDATE turns SET state = 'ended', outcome = 'interrupted' WHERE turn_id = ?1 AND owner_id = ?2",
+        [turn_id, owner],
     )?;
     tx.execute(
-        "UPDATE sessions SET open_turn_id = NULL, activity = 'idle' WHERE id = ?1 AND open_turn_id = ?2",
-        params![session_id, turn_id],
+        "UPDATE sessions SET open_turn_id = NULL, activity = 'idle'
+         WHERE id = ?1 AND open_turn_id = ?2 AND owner_id = ?3",
+        params![session_id, turn_id, owner],
     )?;
     collector_event(
         tx,
+        owner,
         session_id,
         "turn_ended_synthesized",
         json!({ "turn_id": turn_id, "outcome": "interrupted" }),
@@ -233,24 +281,45 @@ fn synthesize_turn_end(tx: &Transaction<'_>, session_id: &str, turn_id: &str, ts
 }
 
 /// Release an open turn whose prompt never reached the adapter.
-fn turn_not_delivered(tx: &Transaction<'_>, session_id: &str, turn_id: &str, ts: &str) -> Result<EventDto> {
-    tx.execute("UPDATE turns SET state = 'not_delivered' WHERE turn_id = ?1", [turn_id])?;
+fn turn_not_delivered(
+    tx: &Transaction<'_>,
+    owner: &str,
+    session_id: &str,
+    turn_id: &str,
+    ts: &str,
+) -> Result<EventDto> {
     tx.execute(
-        "UPDATE sessions SET open_turn_id = NULL, activity = 'idle' WHERE id = ?1 AND open_turn_id = ?2",
-        params![session_id, turn_id],
+        "UPDATE turns SET state = 'not_delivered' WHERE turn_id = ?1 AND owner_id = ?2",
+        [turn_id, owner],
     )?;
-    collector_event(tx, session_id, "turn_not_delivered", json!({ "turn_id": turn_id }), ts)
+    tx.execute(
+        "UPDATE sessions SET open_turn_id = NULL, activity = 'idle'
+         WHERE id = ?1 AND open_turn_id = ?2 AND owner_id = ?3",
+        params![session_id, turn_id, owner],
+    )?;
+    collector_event(
+        tx,
+        owner,
+        session_id,
+        "turn_not_delivered",
+        json!({ "turn_id": turn_id }),
+        ts,
+    )
 }
 
 /// Resolve an open turn the host will never end: `interrupted` if the
 /// adapter had it (`started`), otherwise `turn_not_delivered`.
-fn resolve_open_turn(tx: &Transaction<'_>, session_id: &str, turn_id: &str, ts: &str) -> Result<EventDto> {
+fn resolve_open_turn(tx: &Transaction<'_>, owner: &str, session_id: &str, turn_id: &str, ts: &str) -> Result<EventDto> {
     let state: Option<String> = tx
-        .query_row("SELECT state FROM turns WHERE turn_id = ?1", [turn_id], |r| r.get(0))
+        .query_row(
+            "SELECT state FROM turns WHERE turn_id = ?1 AND owner_id = ?2",
+            [turn_id, owner],
+            |r| r.get(0),
+        )
         .optional()?;
     match state.as_deref() {
-        Some("started") => synthesize_turn_end(tx, session_id, turn_id, ts),
-        _ => turn_not_delivered(tx, session_id, turn_id, ts),
+        Some("started") => synthesize_turn_end(tx, owner, session_id, turn_id, ts),
+        _ => turn_not_delivered(tx, owner, session_id, turn_id, ts),
     }
 }
 
@@ -258,17 +327,17 @@ fn resolve_open_turn(tx: &Transaction<'_>, session_id: &str, turn_id: &str, ts: 
 /// A turn still open is one the host never acknowledged: its `not_attached`
 /// answer is not outboxed and can be lost. Release it, or the next resume
 /// inherits a permanent 409 (plan A, "After this plan").
-fn release_turn_on_detach(tx: &Transaction<'_>, session_id: &str, ts: &str) -> Result<Option<EventDto>> {
+fn release_turn_on_detach(tx: &Transaction<'_>, owner: &str, session_id: &str, ts: &str) -> Result<Option<EventDto>> {
     let row: Option<(String, Option<String>, bool)> = tx
         .query_row(
-            "SELECT lifecycle, open_turn_id, presumed_parked FROM sessions WHERE id = ?1",
-            [session_id],
+            "SELECT lifecycle, open_turn_id, presumed_parked FROM sessions WHERE id = ?1 AND owner_id = ?2",
+            [session_id, owner],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
     match row {
         Some((lifecycle, Some(turn), presumed)) if lifecycle == "active" || presumed => {
-            Ok(Some(resolve_open_turn(tx, session_id, &turn, ts)?))
+            Ok(Some(resolve_open_turn(tx, owner, session_id, &turn, ts)?))
         }
         _ => Ok(None),
     }
@@ -279,10 +348,12 @@ fn release_turn_on_detach(tx: &Transaction<'_>, session_id: &str, ts: &str) -> R
 /// closed the session, and an update of a turn only while that turn is
 /// open. An update for a turn the collector already ended (a synthesized
 /// end) would otherwise be listed after that end.
-fn fact_applies(tx: &Transaction<'_>, session_id: &str, turn_id: Option<&str>) -> Result<bool> {
-    let lifecycle: String = tx.query_row("SELECT lifecycle FROM sessions WHERE id = ?1", [session_id], |r| {
-        r.get(0)
-    })?;
+fn fact_applies(tx: &Transaction<'_>, owner: &str, session_id: &str, turn_id: Option<&str>) -> Result<bool> {
+    let lifecycle: String = tx.query_row(
+        "SELECT lifecycle FROM sessions WHERE id = ?1 AND owner_id = ?2",
+        [session_id, owner],
+        |r| r.get(0),
+    )?;
     if lifecycle == "closed" {
         return Ok(false);
     }
@@ -290,17 +361,21 @@ fn fact_applies(tx: &Transaction<'_>, session_id: &str, turn_id: Option<&str>) -
         return Ok(true);
     };
     let state: Option<String> = tx
-        .query_row("SELECT state FROM turns WHERE turn_id = ?1", [turn_id], |r| r.get(0))
+        .query_row(
+            "SELECT state FROM turns WHERE turn_id = ?1 AND owner_id = ?2",
+            [turn_id, owner],
+            |r| r.get(0),
+        )
         .optional()?;
     Ok(state.as_deref() == Some("started"))
 }
 
 /// `Store::close_now`'s body, inside the caller's transaction.
-fn close_in(tx: &Transaction<'_>, session_id: &str) -> Result<Vec<EventDto>> {
+fn close_in(tx: &Transaction<'_>, owner: &str, session_id: &str) -> Result<Vec<EventDto>> {
     let row: Option<(String, bool, Option<String>)> = tx
         .query_row(
-            "SELECT lifecycle, close_requested, open_turn_id FROM sessions WHERE id = ?1",
-            [session_id],
+            "SELECT lifecycle, close_requested, open_turn_id FROM sessions WHERE id = ?1 AND owner_id = ?2",
+            [session_id, owner],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
@@ -310,17 +385,30 @@ fn close_in(tx: &Transaction<'_>, session_id: &str) -> Result<Vec<EventDto>> {
     {
         let ts = now();
         if let Some(turn) = open_turn.as_deref() {
-            events.push(resolve_open_turn(tx, session_id, turn, &ts)?);
+            events.push(resolve_open_turn(tx, owner, session_id, turn, &ts)?);
         }
-        events.extend(cancel_open_pending(tx, session_id, PendingReason::SessionClosed, &ts)?);
+        events.extend(cancel_open_pending(
+            tx,
+            owner,
+            session_id,
+            PendingReason::SessionClosed,
+            &ts,
+        )?);
         if !close_requested {
-            events.push(collector_event(tx, session_id, "operator_closed", json!({}), &ts)?);
+            events.push(collector_event(
+                tx,
+                owner,
+                session_id,
+                "operator_closed",
+                json!({}),
+                &ts,
+            )?);
         }
         tx.execute(
             "UPDATE sessions SET lifecycle = 'closed', activity = NULL, open_turn_id = NULL, close_requested = 0,
                  presumed_parked = 0
-             WHERE id = ?1",
-            [session_id],
+             WHERE id = ?1 AND owner_id = ?2",
+            [session_id, owner],
         )?;
     }
     Ok(events)
@@ -331,24 +419,26 @@ fn close_in(tx: &Transaction<'_>, session_id: &str) -> Result<Vec<EventDto>> {
 /// session's `model`, `mode` and `config_axes`, which a resume re-applies.
 /// Extracts without a snapshot (none, or an empty read-back) change
 /// nothing: the stored values are never replaced by a guess (P-13).
-fn store_catalogue(tx: &Transaction<'_>, session_id: &str, indexed: &Indexed, ts: &str) -> Result<()> {
+fn store_catalogue(tx: &Transaction<'_>, owner: &str, session_id: &str, indexed: &Indexed, ts: &str) -> Result<()> {
     let Some(current) = indexed.current_config() else {
         return Ok(());
     };
     let options = indexed.config_options.clone().unwrap_or_default();
     tx.execute(
-        "UPDATE sessions SET model = ?2, mode = ?3, config_axes = ?4 WHERE id = ?1",
+        "UPDATE sessions SET model = ?2, mode = ?3, config_axes = ?4 WHERE id = ?1 AND owner_id = ?5",
         params![
             session_id,
             current.model,
             current.mode,
-            serde_json::to_string(&current.axes)?
+            serde_json::to_string(&current.axes)?,
+            owner
         ],
     )?;
     tx.execute(
-        "INSERT INTO session_catalog(session_id, config_options, updated_at) VALUES (?1, ?2, ?3)
-         ON CONFLICT(session_id) DO UPDATE SET config_options = excluded.config_options, updated_at = excluded.updated_at",
-        params![session_id, serde_json::to_string(&options)?, ts],
+        "INSERT INTO session_catalog(session_id, config_options, updated_at, owner_id) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(session_id) DO UPDATE SET config_options = excluded.config_options, updated_at = excluded.updated_at
+             WHERE session_catalog.owner_id = excluded.owner_id",
+        params![session_id, serde_json::to_string(&options)?, ts, owner],
     )?;
     Ok(())
 }
@@ -381,6 +471,7 @@ fn untag<T: serde::de::DeserializeOwned>(name: String) -> Result<T> {
 /// nothing else runs again. `false` if the request was not open.
 fn resolve_pending(
     tx: &Transaction<'_>,
+    owner: &str,
     session_id: &str,
     pending_id: &str,
     state: PendingState,
@@ -389,23 +480,30 @@ fn resolve_pending(
 ) -> Result<bool> {
     let changed = tx.execute(
         "UPDATE pending SET state = ?3, reason = ?4, resolved_at = ?5
-         WHERE pending_id = ?1 AND session_id = ?2 AND state = 'open'",
-        params![pending_id, session_id, tag(state)?, reason.map(tag).transpose()?, ts],
+         WHERE pending_id = ?1 AND session_id = ?2 AND state = 'open' AND owner_id = ?6",
+        params![
+            pending_id,
+            session_id,
+            tag(state)?,
+            reason.map(tag).transpose()?,
+            ts,
+            owner
+        ],
     )?;
     if changed == 0 {
         return Ok(false);
     }
     if state == PendingState::Cancelled {
         tx.execute(
-            "UPDATE answer_queue SET delivered = 0 WHERE pending_id = ?1 AND delivered IS NULL",
-            [pending_id],
+            "UPDATE answer_queue SET delivered = 0 WHERE pending_id = ?1 AND delivered IS NULL AND owner_id = ?2",
+            [pending_id, owner],
         )?;
     }
     tx.execute(
         "UPDATE sessions SET activity = 'running'
-         WHERE id = ?1 AND activity = 'blocked'
-             AND NOT EXISTS (SELECT 1 FROM pending WHERE session_id = ?1 AND state = 'open')",
-        [session_id],
+         WHERE id = ?1 AND activity = 'blocked' AND owner_id = ?2
+             AND NOT EXISTS (SELECT 1 FROM pending WHERE session_id = ?1 AND state = 'open' AND owner_id = ?2)",
+        [session_id, owner],
     )?;
     Ok(true)
 }
@@ -416,21 +514,23 @@ fn resolve_pending(
 /// is gone), and a question must not stay answerable.
 fn cancel_open_pending(
     tx: &Transaction<'_>,
+    owner: &str,
     session_id: &str,
     reason: PendingReason,
     ts: &str,
 ) -> Result<Vec<EventDto>> {
     let ids: Vec<String> = {
-        let mut stmt =
-            tx.prepare("SELECT pending_id FROM pending WHERE session_id = ?1 AND state = 'open' ORDER BY rowid")?;
-        let rows = stmt.query_map([session_id], |r| r.get(0))?;
+        let mut stmt = tx.prepare(
+            "SELECT pending_id FROM pending WHERE session_id = ?1 AND state = 'open' AND owner_id = ?2 ORDER BY rowid",
+        )?;
+        let rows = stmt.query_map([session_id, owner], |r| r.get(0))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
     let mut events = Vec::new();
     for id in ids {
-        resolve_pending(tx, session_id, &id, PendingState::Cancelled, Some(reason), ts)?;
+        resolve_pending(tx, owner, session_id, &id, PendingState::Cancelled, Some(reason), ts)?;
         let body = json!({ "pending_id": id, "reason": reason });
-        events.push(collector_event(tx, session_id, "pending_cancelled", body, ts)?);
+        events.push(collector_event(tx, owner, session_id, "pending_cancelled", body, ts)?);
     }
     Ok(events)
 }
@@ -496,7 +596,7 @@ struct PendingRow {
 
 const PENDING_COLUMNS: &str = "p.pending_id, p.session_id, p.kind, p.state, p.reason, p.turn_id, p.option_ids,
      p.payload, q.pending_id IS NOT NULL, q.delivered
-     FROM pending p LEFT JOIN answer_queue q ON q.pending_id = p.pending_id";
+     FROM pending p LEFT JOIN answer_queue q ON q.pending_id = p.pending_id AND q.owner_id = p.owner_id";
 
 impl PendingRow {
     fn read(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -532,19 +632,29 @@ impl PendingRow {
 
 /// Keep a stored host fact that did not apply as the idempotency key only:
 /// it is hidden from `Store::events` (and so from SSE replay).
-fn mark_unapplied(tx: &Transaction<'_>, event_id: i64) -> Result<()> {
-    tx.execute("UPDATE events SET applied = 0 WHERE event_id = ?1", [event_id])?;
+fn mark_unapplied(tx: &Transaction<'_>, owner: &str, event_id: i64) -> Result<()> {
+    tx.execute(
+        "UPDATE events SET applied = 0 WHERE event_id = ?1 AND owner_id = ?2",
+        params![event_id, owner],
+    )?;
     Ok(())
 }
 
 /// Whether a `conflict` event with this exact `received` body is already
 /// recorded for `(session_id, seq)` (fix round 1, ruling D): a re-sent
 /// conflicting frame must not pile up a second `conflict` event.
-fn conflict_already_recorded(tx: &Transaction<'_>, session_id: &str, seq: u64, received: &Value) -> Result<bool> {
+fn conflict_already_recorded(
+    tx: &Transaction<'_>,
+    owner: &str,
+    session_id: &str,
+    seq: u64,
+    received: &Value,
+) -> Result<bool> {
     let mut stmt = tx.prepare(
-        "SELECT body FROM events WHERE session_id = ?1 AND kind = 'conflict' AND json_extract(body, '$.seq') = ?2",
+        "SELECT body FROM events
+         WHERE session_id = ?1 AND kind = 'conflict' AND json_extract(body, '$.seq') = ?2 AND owner_id = ?3",
     )?;
-    let mut rows = stmt.query(params![session_id, seq as i64])?;
+    let mut rows = stmt.query(params![session_id, seq as i64, owner])?;
     while let Some(row) = rows.next()? {
         let body: String = row.get(0)?;
         let value: Value = serde_json::from_str(&body)?;
@@ -564,29 +674,41 @@ impl Store {
         Self::init(hennery_kernel::db::open_in_memory()?)
     }
 
+    /// The kernel's tables first: they hold the owner, which this store's
+    /// rows name and its last migration fills in. So the store and the
+    /// kernel agree on the owner whichever opens the database first.
     fn init(mut conn: Connection) -> Result<Self> {
+        let owner = hennery_kernel::db::kernel_owner(&mut conn)?;
         hennery_kernel::db::migrate(&mut conn, MIGRATIONS)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+            owner,
+        })
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("store lock")
     }
 
+    /// The owner whose sessions these are.
+    pub fn owner_id(&self) -> &str {
+        &self.owner
+    }
+
     pub fn create_session(&self, id: &str, host_id: &str, agent: &str, cwd: &str) -> Result<()> {
         let ts = now();
         self.conn().execute(
-            "INSERT INTO sessions(id, host_id, agent, cwd, lifecycle, created_at, last_event_at)
-             VALUES (?1, ?2, ?3, ?4, 'starting', ?5, ?5)",
-            params![id, host_id, agent, cwd, ts],
+            "INSERT INTO sessions(id, host_id, agent, cwd, lifecycle, created_at, last_event_at, owner_id)
+             VALUES (?1, ?2, ?3, ?4, 'starting', ?5, ?5, ?6)",
+            params![id, host_id, agent, cwd, ts, self.owner],
         )?;
         Ok(())
     }
 
     pub fn mark_failed(&self, id: &str, reason: &str) -> Result<()> {
         self.conn().execute(
-            "UPDATE sessions SET lifecycle = 'failed', failure_reason = ?2 WHERE id = ?1",
-            params![id, reason],
+            "UPDATE sessions SET lifecycle = 'failed', failure_reason = ?2 WHERE id = ?1 AND owner_id = ?3",
+            params![id, reason, self.owner],
         )?;
         Ok(())
     }
@@ -597,8 +719,9 @@ impl Store {
     /// outcome) is left as it is.
     pub fn mark_failed_if_starting(&self, id: &str, reason: &str) -> Result<()> {
         self.conn().execute(
-            "UPDATE sessions SET lifecycle = 'failed', failure_reason = ?2 WHERE id = ?1 AND lifecycle = 'starting'",
-            params![id, reason],
+            "UPDATE sessions SET lifecycle = 'failed', failure_reason = ?2
+             WHERE id = ?1 AND lifecycle = 'starting' AND owner_id = ?3",
+            params![id, reason, self.owner],
         )?;
         Ok(())
     }
@@ -609,8 +732,8 @@ impl Store {
             .query_row(
                 "SELECT id, host_id, agent, cwd, lifecycle, activity, open_turn_id, failure_reason, close_requested,
                         presumed_parked, model, mode, config_axes
-                 FROM sessions WHERE id = ?1",
-                [id],
+                 FROM sessions WHERE id = ?1 AND owner_id = ?2",
+                [id, &self.owner],
                 |r| {
                     let config: ConfigColumns = (r.get(10)?, r.get(11)?, r.get(12)?);
                     let row = SessionRow {
@@ -645,8 +768,9 @@ impl Store {
             .conn()
             .query_row(
                 "SELECT s.model, s.mode, s.config_axes, c.config_options
-                 FROM sessions s LEFT JOIN session_catalog c ON c.session_id = s.id WHERE s.id = ?1",
-                [session_id],
+                 FROM sessions s LEFT JOIN session_catalog c ON c.session_id = s.id AND c.owner_id = s.owner_id
+                 WHERE s.id = ?1 AND s.owner_id = ?2",
+                [session_id, &self.owner],
                 |r| Ok(((r.get(0)?, r.get(1)?, r.get(2)?), r.get(3)?)),
             )
             .optional()?;
@@ -668,9 +792,9 @@ impl Store {
     pub fn open_pending(&self, session_id: &str) -> Result<Vec<PendingItem>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
-            "SELECT {PENDING_COLUMNS} WHERE p.session_id = ?1 AND p.state = 'open' ORDER BY p.rowid"
+            "SELECT {PENDING_COLUMNS} WHERE p.session_id = ?1 AND p.state = 'open' AND p.owner_id = ?2 ORDER BY p.rowid"
         ))?;
-        let rows = stmt.query_map([session_id], PendingRow::read)?;
+        let rows = stmt.query_map([session_id, &self.owner], PendingRow::read)?;
         let mut out = Vec::new();
         for row in rows {
             out.push(row?.item()?);
@@ -683,8 +807,8 @@ impl Store {
         let row = self
             .conn()
             .query_row(
-                &format!("SELECT {PENDING_COLUMNS} WHERE p.pending_id = ?1"),
-                [pending_id],
+                &format!("SELECT {PENDING_COLUMNS} WHERE p.pending_id = ?1 AND p.owner_id = ?2"),
+                [pending_id, &self.owner],
                 PendingRow::read,
             )
             .optional()?;
@@ -707,10 +831,10 @@ impl Store {
         let row: Option<(String, String, Option<String>, String, bool)> = tx
             .query_row(
                 "SELECT p.kind, p.state, p.option_ids, s.host_id,
-                        EXISTS(SELECT 1 FROM answer_queue q WHERE q.pending_id = p.pending_id)
-                 FROM pending p JOIN sessions s ON s.id = p.session_id
-                 WHERE p.pending_id = ?1 AND p.session_id = ?2",
-                params![pending_id, session_id],
+                        EXISTS(SELECT 1 FROM answer_queue q WHERE q.pending_id = p.pending_id AND q.owner_id = p.owner_id)
+                 FROM pending p JOIN sessions s ON s.id = p.session_id AND s.owner_id = p.owner_id
+                 WHERE p.pending_id = ?1 AND p.session_id = ?2 AND p.owner_id = ?3",
+                params![pending_id, session_id, self.owner],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
@@ -730,12 +854,19 @@ impl Store {
         let request_id = uuid::Uuid::now_v7().to_string();
         let ts = now();
         tx.execute(
-            "INSERT INTO answer_queue(pending_id, session_id, request_id, answer, submitted_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![pending_id, session_id, request_id, serde_json::to_string(answer)?, ts],
+            "INSERT INTO answer_queue(pending_id, session_id, request_id, answer, submitted_at, owner_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                pending_id,
+                session_id,
+                request_id,
+                serde_json::to_string(answer)?,
+                ts,
+                self.owner
+            ],
         )?;
         let body = json!({ "pending_id": pending_id, "request_id": request_id, "answer": answer });
-        let event = collector_event(&tx, session_id, "answer_submitted", body, &ts)?;
+        let event = collector_event(&tx, &self.owner, session_id, "answer_submitted", body, &ts)?;
         tx.commit()?;
         Ok(AnswerSubmission::Queued(Box::new(QueuedAnswer {
             event,
@@ -754,12 +885,12 @@ impl Store {
         let mut stmt = conn.prepare(
             "SELECT q.request_id, q.session_id, q.pending_id, q.answer
              FROM answer_queue q
-                 JOIN pending p ON p.pending_id = q.pending_id
-                 JOIN sessions s ON s.id = q.session_id
-             WHERE s.host_id = ?1 AND q.delivered IS NULL AND p.state = 'open'
+                 JOIN pending p ON p.pending_id = q.pending_id AND p.owner_id = q.owner_id
+                 JOIN sessions s ON s.id = q.session_id AND s.owner_id = q.owner_id
+             WHERE s.host_id = ?1 AND q.delivered IS NULL AND p.state = 'open' AND q.owner_id = ?2
              ORDER BY q.rowid",
         )?;
-        let rows = stmt.query_map([host_id], |r| {
+        let rows = stmt.query_map([host_id, &self.owner], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -784,7 +915,11 @@ impl Store {
     pub fn turn_state(&self, turn_id: &str) -> Result<Option<String>> {
         Ok(self
             .conn()
-            .query_row("SELECT state FROM turns WHERE turn_id = ?1", [turn_id], |r| r.get(0))
+            .query_row(
+                "SELECT state FROM turns WHERE turn_id = ?1 AND owner_id = ?2",
+                [turn_id, &self.owner],
+                |r| r.get(0),
+            )
             .optional()?)
     }
 
@@ -794,8 +929,8 @@ impl Store {
         let outcome: Option<String> = self
             .conn()
             .query_row(
-                "SELECT outcome FROM turns WHERE turn_id = ?1 AND state = 'ended'",
-                [turn_id],
+                "SELECT outcome FROM turns WHERE turn_id = ?1 AND state = 'ended' AND owner_id = ?2",
+                [turn_id, &self.owner],
                 |r| r.get(0),
             )
             .optional()?
@@ -813,13 +948,13 @@ impl Store {
         let tx = conn.transaction()?;
         let changed = tx.execute(
             "UPDATE sessions SET open_turn_id = ?2
-             WHERE id = ?1 AND lifecycle = 'active' AND open_turn_id IS NULL",
-            params![session_id, turn_id],
+             WHERE id = ?1 AND lifecycle = 'active' AND open_turn_id IS NULL AND owner_id = ?3",
+            params![session_id, turn_id, self.owner],
         )?;
         if changed == 1 {
             tx.execute(
-                "INSERT INTO turns(turn_id, session_id, content, created_at) VALUES (?1, ?2, ?3, ?4)",
-                params![turn_id, session_id, serde_json::to_string(content)?, now()],
+                "INSERT INTO turns(turn_id, session_id, content, created_at, owner_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![turn_id, session_id, serde_json::to_string(content)?, now(), self.owner],
             )?;
         }
         tx.commit()?;
@@ -831,10 +966,13 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute(
-            "UPDATE sessions SET open_turn_id = NULL WHERE id = ?1 AND open_turn_id = ?2",
-            params![session_id, turn_id],
+            "UPDATE sessions SET open_turn_id = NULL WHERE id = ?1 AND open_turn_id = ?2 AND owner_id = ?3",
+            params![session_id, turn_id, self.owner],
         )?;
-        tx.execute("DELETE FROM turns WHERE turn_id = ?1", [turn_id])?;
+        tx.execute(
+            "DELETE FROM turns WHERE turn_id = ?1 AND owner_id = ?2",
+            [turn_id, &self.owner],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -843,7 +981,7 @@ impl Store {
     pub fn record_park_request(&self, session_id: &str) -> Result<EventDto> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let event = collector_event(&tx, session_id, "operator_parked", json!({}), &now())?;
+        let event = collector_event(&tx, &self.owner, session_id, "operator_parked", json!({}), &now())?;
         tx.commit()?;
         Ok(event)
     }
@@ -854,8 +992,11 @@ impl Store {
     pub fn record_close_request(&self, session_id: &str) -> Result<EventDto> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        tx.execute("UPDATE sessions SET close_requested = 1 WHERE id = ?1", [session_id])?;
-        let event = collector_event(&tx, session_id, "operator_closed", json!({}), &now())?;
+        tx.execute(
+            "UPDATE sessions SET close_requested = 1 WHERE id = ?1 AND owner_id = ?2",
+            [session_id, &self.owner],
+        )?;
+        let event = collector_event(&tx, &self.owner, session_id, "operator_closed", json!({}), &now())?;
         tx.commit()?;
         Ok(event)
     }
@@ -871,7 +1012,7 @@ impl Store {
     pub fn close_now(&self, session_id: &str) -> Result<Vec<EventDto>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let events = close_in(&tx, session_id)?;
+        let events = close_in(&tx, &self.owner, session_id)?;
         tx.commit()?;
         Ok(events)
     }
@@ -889,14 +1030,14 @@ impl Store {
         let still_requested: bool = tx
             .query_row(
                 "SELECT close_requested = 1 AND (lifecycle = 'active' OR presumed_parked = 1)
-                 FROM sessions WHERE id = ?1",
-                [session_id],
+                 FROM sessions WHERE id = ?1 AND owner_id = ?2",
+                [session_id, &self.owner],
                 |r| r.get(0),
             )
             .optional()?
             .unwrap_or(false);
         let events = if still_requested {
-            close_in(&tx, session_id)?
+            close_in(&tx, &self.owner, session_id)?
         } else {
             Vec::new()
         };
@@ -913,8 +1054,9 @@ impl Store {
         let tx = conn.transaction()?;
         let row: Option<(String, Option<String>, Option<String>, ConfigColumns)> = tx
             .query_row(
-                "SELECT lifecycle, agent_session_id, open_turn_id, model, mode, config_axes FROM sessions WHERE id = ?1",
-                [session_id],
+                "SELECT lifecycle, agent_session_id, open_turn_id, model, mode, config_axes FROM sessions
+                 WHERE id = ?1 AND owner_id = ?2",
+                [session_id, &self.owner],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, (r.get(3)?, r.get(4)?, r.get(5)?))),
             )
             .optional()?;
@@ -930,18 +1072,25 @@ impl Store {
         let ts = now();
         let mut events = Vec::new();
         if let Some(turn) = open_turn.as_deref() {
-            events.push(resolve_open_turn(&tx, session_id, turn, &ts)?);
+            events.push(resolve_open_turn(&tx, &self.owner, session_id, turn, &ts)?);
         }
-        events.push(collector_event(&tx, session_id, "operator_resumed", json!({}), &ts)?);
+        events.push(collector_event(
+            &tx,
+            &self.owner,
+            session_id,
+            "operator_resumed",
+            json!({}),
+            &ts,
+        )?);
         tx.execute(
             "UPDATE sessions SET lifecycle = 'starting', activity = NULL, failure_reason = NULL,
                  close_requested = 0, open_turn_id = NULL, presumed_parked = 0
-             WHERE id = ?1",
-            [session_id],
+             WHERE id = ?1 AND owner_id = ?2",
+            [session_id, &self.owner],
         )?;
         let committed: Option<i64> = tx.query_row(
-            "SELECT MAX(host_seq) FROM events WHERE session_id = ?1",
-            [session_id],
+            "SELECT MAX(host_seq) FROM events WHERE session_id = ?1 AND owner_id = ?2",
+            [session_id, &self.owner],
             |r| r.get(0),
         )?;
         tx.commit()?;
@@ -961,23 +1110,25 @@ impl Store {
         let tx = conn.transaction()?;
         let ts = now();
         let ids: Vec<String> = {
-            let mut stmt =
-                tx.prepare("SELECT id FROM sessions WHERE host_id = ?1 AND lifecycle = 'active' ORDER BY id")?;
-            let rows = stmt.query_map([host_id], |r| r.get(0))?;
+            let mut stmt = tx.prepare(
+                "SELECT id FROM sessions WHERE host_id = ?1 AND lifecycle = 'active' AND owner_id = ?2 ORDER BY id",
+            )?;
+            let rows = stmt.query_map([host_id, &self.owner], |r| r.get(0))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
         let mut events = Vec::new();
         for id in &ids {
             events.push(collector_event(
                 &tx,
+                &self.owner,
                 id,
                 "presumed_parked",
                 json!({ "reason": "host_offline" }),
                 &ts,
             )?);
             tx.execute(
-                "UPDATE sessions SET lifecycle = 'parked', presumed_parked = 1 WHERE id = ?1",
-                [id],
+                "UPDATE sessions SET lifecycle = 'parked', presumed_parked = 1 WHERE id = ?1 AND owner_id = ?2",
+                [id, &self.owner],
             )?;
         }
         tx.commit()?;
@@ -1010,8 +1161,9 @@ impl Store {
         let tx = conn.transaction()?;
         let ts = now();
         let starting: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT id FROM sessions WHERE host_id = ?1 AND lifecycle = 'starting'")?;
-            let rows = stmt.query_map([host_id], |r| r.get(0))?;
+            let mut stmt =
+                tx.prepare("SELECT id FROM sessions WHERE host_id = ?1 AND lifecycle = 'starting' AND owner_id = ?2")?;
+            let rows = stmt.query_map([host_id, &self.owner], |r| r.get(0))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
         let mut events = Vec::new();
@@ -1019,32 +1171,42 @@ impl Store {
             // Consistent with how reconciliation reports its own analogous
             // `starting` failure (`start_not_delivered`): the timeline gets
             // an event, not just a silent column change.
-            events.push(collector_event(&tx, id, "start_not_delivered", json!({}), &ts)?);
+            events.push(collector_event(
+                &tx,
+                &self.owner,
+                id,
+                "start_not_delivered",
+                json!({}),
+                &ts,
+            )?);
             tx.execute(
-                "UPDATE sessions SET lifecycle = 'failed', failure_reason = 'host_revoked' WHERE id = ?1",
-                [id],
+                "UPDATE sessions SET lifecycle = 'failed', failure_reason = 'host_revoked' WHERE id = ?1 AND owner_id = ?2",
+                [id, &self.owner],
             )?;
         }
         let rows: Vec<(String, Option<String>, String, bool)> = {
             let mut stmt = tx.prepare(
                 "SELECT id, open_turn_id, lifecycle, presumed_parked FROM sessions
-                 WHERE host_id = ?1 AND (lifecycle = 'active' OR presumed_parked = 1) ORDER BY id",
+                 WHERE host_id = ?1 AND (lifecycle = 'active' OR presumed_parked = 1) AND owner_id = ?2 ORDER BY id",
             )?;
-            let rows = stmt.query_map([host_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            let rows = stmt.query_map([host_id, &self.owner], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })?;
             rows.collect::<rusqlite::Result<_>>()?
         };
         for (id, open_turn, lifecycle, presumed_parked) in rows {
             let presumed_for: Option<Option<String>> = tx
                 .query_row(
                     "SELECT json_extract(body, '$.reason') FROM events
-                     WHERE session_id = ?1 AND kind = 'presumed_parked' ORDER BY event_id DESC LIMIT 1",
-                    [&id],
+                     WHERE session_id = ?1 AND kind = 'presumed_parked' AND owner_id = ?2
+                     ORDER BY event_id DESC LIMIT 1",
+                    [&id, &self.owner],
                     |r| r.get(0),
                 )
                 .optional()?;
             let has_open_pending: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pending WHERE session_id = ?1 AND state = 'open')",
-                [&id],
+                "SELECT EXISTS(SELECT 1 FROM pending WHERE session_id = ?1 AND state = 'open' AND owner_id = ?2)",
+                [&id, &self.owner],
                 |r| r.get(0),
             )?;
             let already_converged = lifecycle == "parked"
@@ -1056,22 +1218,29 @@ impl Store {
             }
             events.push(collector_event(
                 &tx,
+                &self.owner,
                 &id,
                 "presumed_parked",
                 json!({ "reason": "host_revoked" }),
                 &ts,
             )?);
             if let Some(turn) = open_turn {
-                events.push(resolve_open_turn(&tx, &id, &turn, &ts)?);
+                events.push(resolve_open_turn(&tx, &self.owner, &id, &turn, &ts)?);
             }
-            events.extend(cancel_open_pending(&tx, &id, PendingReason::HostRevoked, &ts)?);
+            events.extend(cancel_open_pending(
+                &tx,
+                &self.owner,
+                &id,
+                PendingReason::HostRevoked,
+                &ts,
+            )?);
             tx.execute(
                 "UPDATE sessions SET
                      lifecycle = CASE WHEN close_requested = 1 THEN 'closed' ELSE 'parked' END,
                      presumed_parked = CASE WHEN close_requested = 1 THEN 0 ELSE 1 END,
                      activity = NULL, open_turn_id = NULL, close_requested = 0
-                 WHERE id = ?1",
-                [&id],
+                 WHERE id = ?1 AND owner_id = ?2",
+                [&id, &self.owner],
             )?;
         }
         tx.commit()?;
@@ -1081,17 +1250,18 @@ impl Store {
     /// Hosts the collector believes are running at least one session.
     pub fn hosts_with_active_sessions(&self) -> Result<Vec<String>> {
         let conn = self.conn();
-        let mut stmt =
-            conn.prepare("SELECT DISTINCT host_id FROM sessions WHERE lifecycle = 'active' ORDER BY host_id")?;
-        let rows = stmt.query_map([], |r| r.get(0))?;
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT host_id FROM sessions WHERE lifecycle = 'active' AND owner_id = ?1 ORDER BY host_id",
+        )?;
+        let rows = stmt.query_map([&self.owner], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// Highest committed host seq for a session (0 if none).
     pub fn committed_seq(&self, session_id: &str) -> Result<u64> {
         let v: Option<i64> = self.conn().query_row(
-            "SELECT MAX(host_seq) FROM events WHERE session_id = ?1",
-            [session_id],
+            "SELECT MAX(host_seq) FROM events WHERE session_id = ?1 AND owner_id = ?2",
+            [session_id, &self.owner],
             |r| r.get(0),
         )?;
         Ok(v.unwrap_or(0) as u64)
@@ -1100,34 +1270,42 @@ impl Store {
     /// Ingest one sequenced host frame. Idempotent on (session_id, seq): a
     /// duplicate with the same body is discarded; one with a different body
     /// is kept as a `conflict` event (ACP core §3.6). Returns the events it
-    /// created, in order.
+    /// created, in order. A frame for a session that is not the owner's
+    /// fails, and nothing is written.
     pub fn ingest(&self, session_id: &str, seq: u64, body: &SessionBody) -> Result<Vec<EventDto>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        let owned: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1 AND owner_id = ?2)",
+            [session_id, &self.owner],
+            |r| r.get(0),
+        )?;
+        anyhow::ensure!(owned, "no session {session_id}");
         let ts = now();
         let kind = body_kind(body);
         let received = serde_json::to_value(body)?;
         let inserted = tx.execute(
-            "INSERT INTO events(session_id, host_seq, kind, body, ts) VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO events(session_id, host_seq, kind, body, ts, owner_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(session_id, host_seq) DO NOTHING",
-            params![session_id, seq as i64, kind, received.to_string(), ts],
+            params![session_id, seq as i64, kind, received.to_string(), ts, self.owner],
         )?;
         if inserted == 0 {
             let stored: String = tx.query_row(
-                "SELECT body FROM events WHERE session_id = ?1 AND host_seq = ?2",
-                params![session_id, seq as i64],
+                "SELECT body FROM events WHERE session_id = ?1 AND host_seq = ?2 AND owner_id = ?3",
+                params![session_id, seq as i64, self.owner],
                 |r| r.get(0),
             )?;
             // Structural comparison: key order is not stable across builds
             // (serde_json's `preserve_order` is feature-unified).
             let created = if serde_json::from_str::<Value>(&stored)? == received {
                 Vec::new()
-            } else if conflict_already_recorded(&tx, session_id, seq, &received)? {
+            } else if conflict_already_recorded(&tx, &self.owner, session_id, seq, &received)? {
                 // A re-sent conflicting frame: already on record, ruling D.
                 Vec::new()
             } else {
                 vec![collector_event(
                     &tx,
+                    &self.owner,
                     session_id,
                     "conflict",
                     json!({ "seq": seq, "received": received }),
@@ -1160,15 +1338,15 @@ impl Store {
                 let changed = tx.execute(
                     "UPDATE sessions SET lifecycle = 'active', activity = 'idle', agent_session_id = ?2,
                          failure_reason = NULL
-                     WHERE id = ?1 AND lifecycle IN ('starting', 'failed')",
-                    params![session_id, agent_session_id],
+                     WHERE id = ?1 AND lifecycle IN ('starting', 'failed') AND owner_id = ?3",
+                    params![session_id, agent_session_id, self.owner],
                 )?;
                 if changed == 0 {
                     created.clear();
-                    mark_unapplied(&tx, fact_id)?;
+                    mark_unapplied(&tx, &self.owner, fact_id)?;
                 } else {
                     // The catalogue after the start's switches (P-13).
-                    store_catalogue(&tx, session_id, indexed, &ts)?;
+                    store_catalogue(&tx, &self.owner, session_id, indexed, &ts)?;
                 }
             }
             SessionBody::StartFailed { code, .. } => {
@@ -1181,13 +1359,13 @@ impl Store {
                 // decision 3 sets `failed` with that code).
                 let changed = tx.execute(
                     "UPDATE sessions SET lifecycle = 'failed', failure_reason = ?2
-                     WHERE id = ?1 AND (lifecycle = 'starting'
+                     WHERE id = ?1 AND owner_id = ?3 AND (lifecycle = 'starting'
                          OR (lifecycle = 'failed' AND failure_reason = 'start_not_delivered'))",
-                    params![session_id, code],
+                    params![session_id, code, self.owner],
                 )?;
                 if changed == 0 {
                     created.clear();
-                    mark_unapplied(&tx, fact_id)?;
+                    mark_unapplied(&tx, &self.owner, fact_id)?;
                 }
             }
             SessionBody::TurnStarted { turn_id, .. } => {
@@ -1198,11 +1376,15 @@ impl Store {
                 // still `sent` or `not_delivered` — it never reopens a turn
                 // that has already `ended`.
                 let turn_state: Option<String> = tx
-                    .query_row("SELECT state FROM turns WHERE turn_id = ?1", [turn_id], |r| r.get(0))
+                    .query_row(
+                        "SELECT state FROM turns WHERE turn_id = ?1 AND owner_id = ?2",
+                        [turn_id, &self.owner],
+                        |r| r.get(0),
+                    )
                     .optional()?;
                 let (lifecycle, slot, presumed): (String, Option<String>, bool) = tx.query_row(
-                    "SELECT lifecycle, open_turn_id, presumed_parked FROM sessions WHERE id = ?1",
-                    [session_id],
+                    "SELECT lifecycle, open_turn_id, presumed_parked FROM sessions WHERE id = ?1 AND owner_id = ?2",
+                    [session_id, &self.owner],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )?;
                 // A presumed-parked session is still attached as far as its
@@ -1221,10 +1403,14 @@ impl Store {
                             // as `turn_not_delivered` — before `turn_id`'s
                             // own `user_turn` (timeline order).
                             let other_state: Option<String> = tx
-                                .query_row("SELECT state FROM turns WHERE turn_id = ?1", [other], |r| r.get(0))
+                                .query_row(
+                                    "SELECT state FROM turns WHERE turn_id = ?1 AND owner_id = ?2",
+                                    [other, &self.owner],
+                                    |r| r.get(0),
+                                )
                                 .optional()?;
                             if other_state.as_deref() == Some("sent") {
-                                created.push(turn_not_delivered(&tx, session_id, other, &ts)?);
+                                created.push(turn_not_delivered(&tx, &self.owner, session_id, other, &ts)?);
                                 true
                             } else {
                                 // The slot holds a turn already `started`:
@@ -1236,23 +1422,30 @@ impl Store {
                 }
                 if takes_slot {
                     tx.execute(
-                        "UPDATE sessions SET activity = 'running', open_turn_id = ?2 WHERE id = ?1",
-                        params![session_id, turn_id],
+                        "UPDATE sessions SET activity = 'running', open_turn_id = ?2 WHERE id = ?1 AND owner_id = ?3",
+                        params![session_id, turn_id, self.owner],
                     )?;
-                    tx.execute("UPDATE turns SET state = 'started' WHERE turn_id = ?1", [turn_id])?;
+                    tx.execute(
+                        "UPDATE turns SET state = 'started' WHERE turn_id = ?1 AND owner_id = ?2",
+                        [turn_id, &self.owner],
+                    )?;
                     // The user's turn is recorded only once the adapter has
                     // it (ACP core §4.4), in seq order before the turn's
                     // updates.
                     let content: Option<String> = tx
-                        .query_row("SELECT content FROM turns WHERE turn_id = ?1", [turn_id], |r| r.get(0))
+                        .query_row(
+                            "SELECT content FROM turns WHERE turn_id = ?1 AND owner_id = ?2",
+                            [turn_id, &self.owner],
+                            |r| r.get(0),
+                        )
                         .optional()?;
                     if let Some(content) = content {
                         let body = json!({ "turn_id": turn_id, "content": serde_json::from_str::<Value>(&content)? });
-                        created.push(collector_event(&tx, session_id, "user_turn", body, &ts)?);
+                        created.push(collector_event(&tx, &self.owner, session_id, "user_turn", body, &ts)?);
                     }
                 } else {
                     created.clear();
-                    mark_unapplied(&tx, fact_id)?;
+                    mark_unapplied(&tx, &self.owner, fact_id)?;
                 }
             }
             SessionBody::TurnEnded { turn_id, outcome, .. } => {
@@ -1261,35 +1454,40 @@ impl Store {
                 // §4.4) must never be pushed to a caller — only the store
                 // knows whether the transition actually applied.
                 let applied = tx.execute(
-                    "UPDATE sessions SET open_turn_id = NULL, activity = 'idle' WHERE id = ?1 AND open_turn_id = ?2",
-                    params![session_id, turn_id],
+                    "UPDATE sessions SET open_turn_id = NULL, activity = 'idle'
+                     WHERE id = ?1 AND open_turn_id = ?2 AND owner_id = ?3",
+                    params![session_id, turn_id, self.owner],
                 )?;
                 // Only a `started` turn can be ended by a real `turn_ended`
                 // (fix round 1, ruling B): a stray end must not jump a
                 // `sent`/`not_delivered` turn straight to `ended`.
                 tx.execute(
-                    "UPDATE turns SET state = 'ended', outcome = ?2 WHERE turn_id = ?1 AND state = 'started'",
-                    params![turn_id, serde_json::to_value(outcome)?.as_str().unwrap_or_default()],
+                    "UPDATE turns SET state = 'ended', outcome = ?2 WHERE turn_id = ?1 AND state = 'started' AND owner_id = ?3",
+                    params![
+                        turn_id,
+                        serde_json::to_value(outcome)?.as_str().unwrap_or_default(),
+                        self.owner
+                    ],
                 )?;
                 if applied == 0 {
                     created.clear();
-                    mark_unapplied(&tx, fact_id)?;
+                    mark_unapplied(&tx, &self.owner, fact_id)?;
                 }
             }
             SessionBody::SessionParked { reason } => {
-                created.extend(release_turn_on_detach(&tx, session_id, &ts)?);
+                created.extend(release_turn_on_detach(&tx, &self.owner, session_id, &ts)?);
                 // A park that overtakes an operator close ends the session
                 // as the operator asked: closed.
                 let changed = tx.execute(
                     "UPDATE sessions SET
                          lifecycle = CASE WHEN close_requested = 1 THEN 'closed' ELSE 'parked' END,
                          activity = NULL, close_requested = 0, presumed_parked = 0
-                     WHERE id = ?1 AND (lifecycle = 'active' OR presumed_parked = 1)",
-                    [session_id],
+                     WHERE id = ?1 AND owner_id = ?2 AND (lifecycle = 'active' OR presumed_parked = 1)",
+                    [session_id, &self.owner],
                 )?;
                 if changed == 0 {
                     created.clear();
-                    mark_unapplied(&tx, fact_id)?;
+                    mark_unapplied(&tx, &self.owner, fact_id)?;
                 } else {
                     // The host cancels its questions before it detaches;
                     // one it left open goes with the session.
@@ -1297,49 +1495,55 @@ impl Store {
                         ParkReason::AdapterExited => PendingReason::AdapterLost,
                         ParkReason::Idle | ParkReason::Operator => PendingReason::SessionParked,
                     };
-                    created.extend(cancel_open_pending(&tx, session_id, reason, &ts)?);
+                    created.extend(cancel_open_pending(&tx, &self.owner, session_id, reason, &ts)?);
                 }
             }
             SessionBody::SessionClosed => {
-                created.extend(release_turn_on_detach(&tx, session_id, &ts)?);
+                created.extend(release_turn_on_detach(&tx, &self.owner, session_id, &ts)?);
                 // Also the host's confirmation of a close the collector
                 // already made (an offline close): nothing left to change.
                 let changed = tx.execute(
                     "UPDATE sessions SET lifecycle = 'closed', activity = NULL, close_requested = 0, presumed_parked = 0
-                     WHERE id = ?1 AND (lifecycle = 'active' OR presumed_parked = 1)",
-                    [session_id],
+                     WHERE id = ?1 AND owner_id = ?2 AND (lifecycle = 'active' OR presumed_parked = 1)",
+                    [session_id, &self.owner],
                 )?;
                 if changed == 0 {
                     created.clear();
-                    mark_unapplied(&tx, fact_id)?;
+                    mark_unapplied(&tx, &self.owner, fact_id)?;
                 } else {
-                    created.extend(cancel_open_pending(&tx, session_id, PendingReason::SessionClosed, &ts)?);
+                    created.extend(cancel_open_pending(
+                        &tx,
+                        &self.owner,
+                        session_id,
+                        PendingReason::SessionClosed,
+                        &ts,
+                    )?);
                 }
             }
             SessionBody::AcpUpdate { indexed, .. } => {
-                if !fact_applies(&tx, session_id, indexed.turn_id.as_deref())? {
+                if !fact_applies(&tx, &self.owner, session_id, indexed.turn_id.as_deref())? {
                     created.clear();
-                    mark_unapplied(&tx, fact_id)?;
+                    mark_unapplied(&tx, &self.owner, fact_id)?;
                 } else {
                     // A live `config_option_update` (the agent changed its
                     // own config); the host never sends a replayed one
                     // with extracts.
-                    store_catalogue(&tx, session_id, indexed, &ts)?;
+                    store_catalogue(&tx, &self.owner, session_id, indexed, &ts)?;
                 }
             }
             SessionBody::ConfigApplied { indexed, .. } => {
                 // The read-back of a switch on an attached session. A late
                 // one for a session that has detached since changes nothing.
                 let (lifecycle, presumed): (String, bool) = tx.query_row(
-                    "SELECT lifecycle, presumed_parked FROM sessions WHERE id = ?1",
-                    [session_id],
+                    "SELECT lifecycle, presumed_parked FROM sessions WHERE id = ?1 AND owner_id = ?2",
+                    [session_id, &self.owner],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
                 if lifecycle == "active" || presumed {
-                    store_catalogue(&tx, session_id, indexed, &ts)?;
+                    store_catalogue(&tx, &self.owner, session_id, indexed, &ts)?;
                 } else {
                     created.clear();
-                    mark_unapplied(&tx, fact_id)?;
+                    mark_unapplied(&tx, &self.owner, fact_id)?;
                 }
             }
             SessionBody::PendingOpened {
@@ -1351,17 +1555,18 @@ impl Store {
                 // is still open if it names one. Everything the collector
                 // keeps comes from the extract (ACP core §3.2).
                 let (lifecycle, presumed): (String, bool) = tx.query_row(
-                    "SELECT lifecycle, presumed_parked FROM sessions WHERE id = ?1",
-                    [session_id],
+                    "SELECT lifecycle, presumed_parked FROM sessions WHERE id = ?1 AND owner_id = ?2",
+                    [session_id, &self.owner],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )?;
                 let extract = indexed.pending.as_ref().filter(|p| p.id == *pending_id);
-                let applies =
-                    (lifecycle == "active" || presumed) && fact_applies(&tx, session_id, indexed.turn_id.as_deref())?;
+                let applies = (lifecycle == "active" || presumed)
+                    && fact_applies(&tx, &self.owner, session_id, indexed.turn_id.as_deref())?;
                 let inserted = match extract.filter(|_| applies) {
                     Some(extract) => tx.execute(
-                        "INSERT INTO pending(pending_id, session_id, kind, turn_id, option_ids, payload, state, opened_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7)
+                        "INSERT INTO pending(pending_id, session_id, kind, turn_id, option_ids, payload, state, opened_at,
+                                             owner_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8)
                          ON CONFLICT(pending_id) DO NOTHING",
                         params![
                             pending_id,
@@ -1370,18 +1575,19 @@ impl Store {
                             indexed.turn_id,
                             extract.option_ids.as_ref().map(serde_json::to_string).transpose()?,
                             payload.to_string(),
-                            ts
+                            ts,
+                            self.owner
                         ],
                     )?,
                     None => 0,
                 };
                 if inserted == 0 {
                     created.clear();
-                    mark_unapplied(&tx, fact_id)?;
+                    mark_unapplied(&tx, &self.owner, fact_id)?;
                 } else {
                     tx.execute(
-                        "UPDATE sessions SET activity = 'blocked' WHERE id = ?1 AND activity = 'running'",
-                        [session_id],
+                        "UPDATE sessions SET activity = 'blocked' WHERE id = ?1 AND activity = 'running' AND owner_id = ?2",
+                        [session_id, &self.owner],
                     )?;
                 }
             }
@@ -1394,9 +1600,9 @@ impl Store {
                     PendingResolution::Delivered => PendingState::Delivered,
                     PendingResolution::Cancelled => PendingState::Cancelled,
                 };
-                if !resolve_pending(&tx, session_id, pending_id, state, *reason, &ts)? {
+                if !resolve_pending(&tx, &self.owner, session_id, pending_id, state, *reason, &ts)? {
                     created.clear();
-                    mark_unapplied(&tx, fact_id)?;
+                    mark_unapplied(&tx, &self.owner, fact_id)?;
                 }
             }
             SessionBody::AnswerResult {
@@ -1411,13 +1617,13 @@ impl Store {
                 // nothing is stored but not applied).
                 let changed = tx.execute(
                     "UPDATE answer_queue SET delivered = CASE WHEN delivered = 1 THEN 1 ELSE ?3 END
-                     WHERE pending_id = ?1 AND session_id = ?2
+                     WHERE pending_id = ?1 AND session_id = ?2 AND owner_id = ?4
                          AND (delivered IS NULL OR (delivered = 0 AND ?3 = 1))",
-                    params![pending_id, session_id, delivered],
+                    params![pending_id, session_id, delivered, self.owner],
                 )?;
                 if changed == 0 {
                     created.clear();
-                    mark_unapplied(&tx, fact_id)?;
+                    mark_unapplied(&tx, &self.owner, fact_id)?;
                 }
             }
             // Diagnostics only, with no transition of their own: an
@@ -1425,15 +1631,15 @@ impl Store {
             // detaches; a `host_note` (e.g. `replay_unknown_dropped` after a
             // load) changes nothing.
             SessionBody::AdapterExited { .. } | SessionBody::HostNote { .. } => {
-                if !fact_applies(&tx, session_id, None)? {
+                if !fact_applies(&tx, &self.owner, session_id, None)? {
                     created.clear();
-                    mark_unapplied(&tx, fact_id)?;
+                    mark_unapplied(&tx, &self.owner, fact_id)?;
                 }
             }
         }
         tx.execute(
-            "UPDATE sessions SET last_event_at = ?2 WHERE id = ?1",
-            params![session_id, ts],
+            "UPDATE sessions SET last_event_at = ?2 WHERE id = ?1 AND owner_id = ?3",
+            params![session_id, ts, self.owner],
         )?;
         tx.commit()?;
         Ok(created)
@@ -1458,9 +1664,10 @@ impl Store {
             let mut stmt = tx.prepare(
                 "SELECT id, lifecycle, open_turn_id, close_requested, presumed_parked FROM sessions
                  WHERE host_id = ?1 AND (lifecycle IN ('starting', 'active', 'closed') OR presumed_parked = 1)
+                     AND owner_id = ?2
                  ORDER BY id",
             )?;
-            let rows = stmt.query_map([host_id], |r| {
+            let rows = stmt.query_map([host_id, &self.owner], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
             })?;
             rows.collect::<rusqlite::Result<_>>()?
@@ -1474,41 +1681,59 @@ impl Store {
             let lifecycle = if presumed { "active" } else { lifecycle.as_str() };
             match (lifecycle, host) {
                 ("starting", None) => {
-                    out.events
-                        .push(collector_event(&tx, &id, "start_not_delivered", json!({}), &ts)?);
+                    out.events.push(collector_event(
+                        &tx,
+                        &self.owner,
+                        &id,
+                        "start_not_delivered",
+                        json!({}),
+                        &ts,
+                    )?);
                     tx.execute(
-                        "UPDATE sessions SET lifecycle = 'failed', failure_reason = 'start_not_delivered' WHERE id = ?1",
-                        [&id],
+                        "UPDATE sessions SET lifecycle = 'failed', failure_reason = 'start_not_delivered'
+                         WHERE id = ?1 AND owner_id = ?2",
+                        [&id, &self.owner],
                     )?;
                 }
                 ("active", _) => {
                     if host.is_none() {
-                        out.events
-                            .push(collector_event(&tx, &id, "host_restarted", json!({}), &ts)?);
+                        out.events.push(collector_event(
+                            &tx,
+                            &self.owner,
+                            &id,
+                            "host_restarted",
+                            json!({}),
+                            &ts,
+                        )?);
                     } else if presumed {
                         out.events
-                            .push(collector_event(&tx, &id, "reattached", json!({}), &ts)?);
+                            .push(collector_event(&tx, &self.owner, &id, "reattached", json!({}), &ts)?);
                         tx.execute(
-                            "UPDATE sessions SET lifecycle = 'active', presumed_parked = 0 WHERE id = ?1",
-                            [&id],
+                            "UPDATE sessions SET lifecycle = 'active', presumed_parked = 0 WHERE id = ?1 AND owner_id = ?2",
+                            [&id, &self.owner],
                         )?;
                     }
                     let host_turn = host.and_then(|a| a.open_turn_id.as_deref());
                     if let Some(turn) = open_turn.as_deref()
                         && host_turn != Some(turn)
                     {
-                        out.events.push(resolve_open_turn(&tx, &id, turn, &ts)?);
+                        out.events.push(resolve_open_turn(&tx, &self.owner, &id, turn, &ts)?);
                     }
                     if host.is_none() {
                         // The restarted host holds none of its questions.
-                        out.events
-                            .extend(cancel_open_pending(&tx, &id, PendingReason::HostRestarted, &ts)?);
+                        out.events.extend(cancel_open_pending(
+                            &tx,
+                            &self.owner,
+                            &id,
+                            PendingReason::HostRestarted,
+                            &ts,
+                        )?);
                         tx.execute(
                             "UPDATE sessions SET
                                  lifecycle = CASE WHEN close_requested = 1 THEN 'closed' ELSE 'parked' END,
                                  activity = NULL, open_turn_id = NULL, close_requested = 0, presumed_parked = 0
-                             WHERE id = ?1",
-                            [&id],
+                             WHERE id = ?1 AND owner_id = ?2",
+                            [&id, &self.owner],
                         )?;
                     } else if close_requested {
                         out.close.push(id);
@@ -1528,9 +1753,9 @@ impl Store {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT event_id, host_seq, kind, body, ts FROM events
-             WHERE session_id = ?1 AND event_id > ?2 AND applied = 1 ORDER BY event_id LIMIT ?3",
+             WHERE session_id = ?1 AND event_id > ?2 AND applied = 1 AND owner_id = ?4 ORDER BY event_id LIMIT ?3",
         )?;
-        let rows = stmt.query_map(params![session_id, after, limit], |r| {
+        let rows = stmt.query_map(params![session_id, after, limit, self.owner], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, Option<i64>>(1)?,
@@ -1575,9 +1800,197 @@ fn body_kind(body: &SessionBody) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use hennery_kernel::hosts::{EnrollOutcome, Enrollment, Hosts};
+    use hennery_kernel::operator::{Operator, SetupOutcome};
+
     #[test]
     fn timestamps_are_rfc3339_utc() {
         let ts = super::now();
         assert!(ts.ends_with('Z') && ts.as_bytes()[10] == b'T', "{ts}");
+    }
+
+    /// The kernel's first two migrations, as 3b-ii shipped them.
+    const KERNEL_3B_II: &[&str] = &[
+        "
+        CREATE TABLE hosts (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            public_key TEXT NOT NULL UNIQUE,
+            platform TEXT NOT NULL,
+            host_version TEXT NOT NULL,
+            capabilities TEXT NOT NULL DEFAULT '[]',
+            created_at INTEGER NOT NULL,
+            last_seen_at INTEGER,
+            revoked_at INTEGER);
+        CREATE TABLE pairing_codes (
+            code_hash TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            used_at INTEGER);
+        ",
+        "
+        CREATE TABLE owners (
+            id TEXT PRIMARY KEY,
+            contact TEXT,
+            created_at INTEGER NOT NULL);
+        CREATE TABLE password_credentials (
+            owner_id TEXT PRIMARY KEY REFERENCES owners(id),
+            phc TEXT NOT NULL,
+            updated_at INTEGER NOT NULL);
+        CREATE TABLE auth_sessions (
+            id_hash TEXT PRIMARY KEY,
+            owner_id TEXT NOT NULL REFERENCES owners(id),
+            user_agent TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_seen_at INTEGER NOT NULL,
+            last_step_up_at INTEGER,
+            expires_at INTEGER NOT NULL);
+        CREATE TABLE settings (
+            owner_id TEXT NOT NULL REFERENCES owners(id),
+            key TEXT NOT NULL,
+            value TEXT NOT NULL,
+            PRIMARY KEY (owner_id, key));
+        ",
+    ];
+
+    const PASSWORD: &str = "correct horse battery";
+    /// RFC 8032's first two test keys: valid Ed25519 public keys.
+    const OLD_KEY: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+    const NEW_KEY: &str = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c";
+
+    /// A PHC string of `PASSWORD`, as 3b-ii's setup stored it.
+    fn phc() -> String {
+        let op = Operator::open_in_memory().unwrap();
+        let token = op.issue_setup_token(0).unwrap().unwrap();
+        let SetupOutcome::Done { phc, .. } = op.set_up(&token, PASSWORD, "https://hennery.example", 0).unwrap() else {
+            panic!("setup failed");
+        };
+        phc
+    }
+
+    /// `hennery.db` as 3b-ii made it: the kernel's first two migrations
+    /// and this store's first six, verbatim, with a row in each of the
+    /// eight tables from before `owner_id` (a host and a live pairing code;
+    /// a session with a turn, a fact, its catalogue, an open question and
+    /// an answer queued for it), and the owner set up if `set_up`.
+    fn a_3b_ii_database(path: &Path, set_up: bool) {
+        let mut conn = Connection::open(path).unwrap();
+        hennery_kernel::db::migrate_component(&mut conn, "kernel", KERNEL_3B_II).unwrap();
+        hennery_kernel::db::migrate(&mut conn, &MIGRATIONS[..6]).unwrap();
+        let code = hennery_kernel::secret::sha256_hex(b"AAAAAAAA");
+        conn.execute_batch(&format!(
+            "
+            INSERT INTO hosts(id, name, public_key, platform, host_version, created_at)
+                VALUES ('host-old', 'laptop', '{OLD_KEY}', 'macos-aarch64', '0.0.0', 1700000000);
+            INSERT INTO pairing_codes VALUES ('{code}', 1700000000, 9000000000000000000, NULL);
+            INSERT INTO sessions(id, host_id, agent, cwd, agent_session_id, lifecycle, activity, open_turn_id,
+                                 created_at, last_event_at)
+                VALUES ('session-old', 'host-old', 'fake', '/tmp', 'agent-old', 'active', 'blocked', 'turn-old',
+                        't', 't');
+            INSERT INTO turns(turn_id, session_id, content, created_at, state)
+                VALUES ('turn-old', 'session-old', '[]', 't', 'started');
+            INSERT INTO events(session_id, host_seq, kind, body, ts)
+                VALUES ('session-old', 1, 'session_started', '{{}}', 't');
+            INSERT INTO session_catalog(session_id, config_options, updated_at) VALUES ('session-old', '[]', 't');
+            INSERT INTO pending(pending_id, session_id, kind, turn_id, option_ids, payload, state, opened_at)
+                VALUES ('pending-old', 'session-old', 'permission', 'turn-old', '[\"allow\"]', '{{}}', 'open', 't');
+            INSERT INTO answer_queue(pending_id, session_id, request_id, answer, submitted_at)
+                VALUES ('pending-old', 'session-old', 'request-old',
+                        '{{\"kind\":\"permission\",\"option_id\":\"allow\"}}', 't');
+            "
+        ))
+        .unwrap();
+        if set_up {
+            conn.execute_batch("INSERT INTO owners(id, created_at) VALUES ('owner-00000000000000a1', 1700000000);")
+                .unwrap();
+            conn.execute(
+                "INSERT INTO password_credentials VALUES ('owner-00000000000000a1', ?1, 1700000000)",
+                [phc()],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "INSERT INTO settings VALUES ('owner-00000000000000a1', 'public_url', 'https://hennery.example');",
+            )
+            .unwrap();
+        }
+    }
+
+    /// 3b-iii review, O2: a 3b-ii database, set up or not, opened as
+    /// `run_collector` opens it (the store, then the registry, then the
+    /// operator): kernel 2 to 4 and store 6 to 7 in one start, store first.
+    /// One owner, the same for all three; every row of the eight older
+    /// tables carries it and is found; the password from before still
+    /// works, or setup does.
+    #[test]
+    fn a_3b_ii_database_opened_in_the_collectors_order_has_one_owner_for_every_row() {
+        for set_up in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = dir.path().join("hennery.db");
+            a_3b_ii_database(&db, set_up);
+            let store = Store::open(&db).unwrap();
+            let hosts = Hosts::open(&db).unwrap();
+            let operator = Operator::open(&db).unwrap();
+            let owner = store.owner_id().to_string();
+            assert_eq!(
+                (hosts.owner_id(), operator.owner_id()),
+                (owner.as_str(), owner.as_str())
+            );
+            assert_eq!(set_up, owner == "owner-00000000000000a1", "{owner}");
+
+            let conn = Connection::open(&db).unwrap();
+            let owners: i64 = conn.query_row("SELECT count(*) FROM owners", [], |r| r.get(0)).unwrap();
+            assert_eq!(owners, 1);
+            for table in [
+                "hosts",
+                "pairing_codes",
+                "sessions",
+                "turns",
+                "events",
+                "session_catalog",
+                "pending",
+                "answer_queue",
+            ] {
+                let mut stmt = conn.prepare(&format!("SELECT owner_id FROM {table}")).unwrap();
+                let found: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+                assert_eq!(found, vec![owner.clone()], "{table}");
+            }
+
+            let listed: Vec<String> = hosts.list().unwrap().into_iter().map(|h| h.id).collect();
+            assert_eq!(listed, ["host-old"]);
+            assert!(store.session("session-old").unwrap().is_some());
+            assert!(store.catalog("session-old").unwrap().is_some());
+            assert_eq!(store.turn_state("turn-old").unwrap().as_deref(), Some("started"));
+            assert_eq!(store.events("session-old", 0, 10).unwrap().len(), 1);
+            assert_eq!(store.open_pending("session-old").unwrap().len(), 1);
+            assert_eq!(store.answers_to_send("host-old").unwrap().len(), 1);
+            let enrollment = Enrollment {
+                public_key: NEW_KEY.into(),
+                name: "desktop".into(),
+                host_version: "0.0.0".into(),
+                platform: "macos-aarch64".into(),
+            };
+            assert!(matches!(
+                hosts.enroll("AAAA-AAAA", &enrollment, 1_800_000_000).unwrap(),
+                EnrollOutcome::Enrolled { .. }
+            ));
+
+            if set_up {
+                assert!(operator.is_set_up().unwrap());
+                assert!(operator.verify_password(PASSWORD).unwrap().is_some());
+                assert_eq!(operator.public_url().unwrap().origin(), "https://hennery.example");
+            } else {
+                assert!(!operator.is_set_up().unwrap());
+                let token = operator.issue_setup_token(1_800_000_000).unwrap().unwrap();
+                let SetupOutcome::Done { owner_id, .. } = operator
+                    .set_up(&token, PASSWORD, "https://hennery.example", 1_800_000_000)
+                    .unwrap()
+                else {
+                    panic!("setup failed");
+                };
+                assert_eq!(owner_id, owner);
+                assert_eq!(hosts.list().unwrap().len(), 2);
+            }
+        }
     }
 }
