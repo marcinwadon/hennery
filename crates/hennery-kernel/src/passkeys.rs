@@ -304,10 +304,12 @@ fn verify_assertion(
                     |r| r.get(0),
                 )
                 .optional()?;
-            tracing::warn!(
-                passkey = ?id,
-                "a passkey's counter did not move on, so it may have been cloned: refused"
-            );
+            const WHY: &str = "a passkey's counter did not move on, so it may have been cloned: refused";
+            match id {
+                Some(id) => tracing::warn!(passkey = %id, "{WHY}"),
+                // Removed since: the warning still stands.
+                None => tracing::warn!("{WHY}"),
+            }
             Ok(Err(Refused::CounterWentBack))
         }
         Err(err) => Ok(Err(Refused::Credential(err.to_string()))),

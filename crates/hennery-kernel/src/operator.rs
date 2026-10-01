@@ -469,7 +469,8 @@ impl Operator {
     /// It fails, changing nothing, unless it replaced exactly one password
     /// (3b-ii's O9): an owner with none (a passkey-only owner, in 3c) has
     /// nothing to reset. Every passkey is removed and every passkey
-    /// ceremony ends (plan 3c decision 2, amended by its review's A1): a
+    /// ceremony begun before it ends, a finish re-checking under the lock
+    /// in any case (plan 3c decision 2, amended by its review's A1): a
     /// passkey added with a stolen session must not survive the recovery.
     /// With no change-password route, every password change costs the
     /// passkeys.
@@ -529,7 +530,8 @@ impl Operator {
     /// signs in afresh. Passkeys are bound to the host name, the RP id
     /// (kernel spec §3.2): when it changes they stop working, and are
     /// removed; a move to another port or scheme keeps them (plan 3c
-    /// decision 9). Every passkey ceremony under way ends too.
+    /// decision 9). Every passkey ceremony begun before it ends too, a
+    /// finish re-checking under the lock in any case.
     pub fn reset_public_url(&self, input: &str) -> Result<Reset> {
         let public_url = match PublicUrl::parse(input) {
             Ok(url) => url,
