@@ -87,7 +87,7 @@ impl Enrollment {
 /// (kernel spec §4.1), and re-checked on every `hello` (kernel spec §4.3) so
 /// an authenticated host cannot later overwrite a good value with a
 /// disguised or oversized one.
-fn is_valid_display_field(value: &str) -> bool {
+pub(crate) fn is_valid_display_field(value: &str) -> bool {
     let value = value.trim();
     !value.is_empty()
         && value.chars().count() <= MAX_FIELD
@@ -144,6 +144,8 @@ pub struct HostRecord {
     pub host_version: String,
     /// From its latest accepted `hello`.
     pub capabilities: Capabilities,
+    /// The hat of its sessions that no path rule claims (kernel spec §5.1).
+    pub default_hat_id: String,
     pub created_at: i64,
     pub last_seen_at: Option<i64>,
     pub revoked_at: Option<i64>,
@@ -152,7 +154,7 @@ pub struct HostRecord {
 /// Invisible Unicode format characters (bidi overrides and isolates,
 /// zero-width characters, the byte-order mark): a host name holding one can
 /// display as another host's name.
-fn is_format_char(c: char) -> bool {
+pub(crate) fn is_format_char(c: char) -> bool {
     matches!(c,
         '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
         | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
@@ -248,7 +250,7 @@ impl Hosts {
         })
     }
 
-    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("hosts lock")
     }
 
@@ -494,7 +496,8 @@ impl Hosts {
     }
 }
 
-const HOST_COLUMNS: &str = "id, name, platform, host_version, capabilities, created_at, last_seen_at, revoked_at";
+const HOST_COLUMNS: &str =
+    "id, name, platform, host_version, capabilities, default_hat_id, created_at, last_seen_at, revoked_at";
 
 fn read_host(r: &rusqlite::Row<'_>) -> rusqlite::Result<HostRecord> {
     let capabilities: String = r.get(4)?;
@@ -504,9 +507,10 @@ fn read_host(r: &rusqlite::Row<'_>) -> rusqlite::Result<HostRecord> {
         platform: r.get(2)?,
         host_version: r.get(3)?,
         capabilities: serde_json::from_str(&capabilities).unwrap_or_default(),
-        created_at: r.get(5)?,
-        last_seen_at: r.get(6)?,
-        revoked_at: r.get(7)?,
+        default_hat_id: r.get(5)?,
+        created_at: r.get(6)?,
+        last_seen_at: r.get(7)?,
+        revoked_at: r.get(8)?,
     })
 }
 
@@ -514,9 +518,10 @@ fn new_host_id() -> String {
     format!("host-{}", hex::encode(random_bytes::<8>()))
 }
 
-/// Store a host of `owner`'s. A key paired already under another owner
-/// is not found here, and the insert fails on the key's uniqueness (3b-iii
-/// decision 7): an error, which nothing in v1 can reach.
+/// Store a host of `owner`'s, with the hat new hosts get as its default
+/// hat (kernel spec §4.1, plan 5a decision 2). A key paired already under
+/// another owner is not found here, and the insert fails on the key's
+/// uniqueness (3b-iii decision 7): an error, which nothing in v1 can reach.
 fn insert_host(
     tx: &rusqlite::Transaction<'_>,
     owner: &str,
@@ -536,9 +541,11 @@ fn insert_host(
     if let Some(host_id) = existing {
         return Ok(Registered::AlreadyPaired { host_id });
     }
-    tx.execute(
-        "INSERT INTO hosts(id, owner_id, name, public_key, platform, host_version, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+    let inserted = tx.execute(
+        "INSERT INTO hosts(id, owner_id, name, public_key, platform, host_version, default_hat_id, created_at)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, h.id, ?7
+         FROM settings s JOIN hats h ON h.id = s.value AND h.owner_id = s.owner_id
+         WHERE s.owner_id = ?2 AND s.key = ?8",
         params![
             host_id,
             owner,
@@ -546,9 +553,13 @@ fn insert_host(
             public_key,
             e.platform.trim(),
             e.host_version.trim(),
-            now
+            now,
+            crate::hats::DEFAULT_HAT_KEY
         ],
     )?;
+    // The migration gives every owner a default hat; an owner without one
+    // pairs nothing rather than a hat-less host.
+    anyhow::ensure!(inserted == 1, "the owner has no default hat for new hosts");
     Ok(Registered::Created)
 }
 

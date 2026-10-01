@@ -249,11 +249,16 @@ fn write_session(conn: &rusqlite::Connection, owner: &str, token: &str, expires_
     .unwrap();
 }
 
-/// `OTHER`, set up, with a password, a `public_url`, a live session and an
-/// expired one.
+/// `OTHER`, set up, with a hat, a password, a `public_url`, a live session
+/// and an expired one.
 fn write_other_owner(conn: &rusqlite::Connection) {
     conn.execute(
         "INSERT INTO owners(id, created_at, set_up_at) VALUES (?1, ?2, ?2)",
+        rusqlite::params![OTHER, OTHER_CREATED_AT],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO hats(id, owner_id, name, colour, created_at) VALUES ('hat-00000000000000b2', ?1, 'Theirs', '#000000', ?2)",
         rusqlite::params![OTHER, OTHER_CREATED_AT],
     )
     .unwrap();
@@ -389,11 +394,13 @@ fn enrollment(seed: u8) -> Enrollment {
     }
 }
 
-/// A paired host of `owner`'s, as `enroll` writes one, keyed by `seed`.
+/// A paired host of `owner`'s, as `enroll` writes one, keyed by `seed`,
+/// with the owner's oldest hat as its default.
 fn write_host(conn: &rusqlite::Connection, owner: &str, host_id: &str, seed: u8) {
     conn.execute(
-        "INSERT INTO hosts(id, owner_id, name, public_key, platform, host_version, created_at)
-         VALUES (?1, ?2, 'laptop', ?3, 'macos-aarch64', '0.0.0', ?4)",
+        "INSERT INTO hosts(id, owner_id, name, public_key, platform, host_version, default_hat_id, created_at)
+         VALUES (?1, ?2, 'laptop', ?3, 'macos-aarch64', '0.0.0',
+                 (SELECT id FROM hats WHERE owner_id = ?2 ORDER BY created_at, id LIMIT 1), ?4)",
         rusqlite::params![host_id, owner, enrollment(seed).public_key, NOW],
     )
     .unwrap();
