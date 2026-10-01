@@ -11,6 +11,7 @@ pub mod hosts;
 pub mod lifecycle;
 pub mod operator;
 pub mod origin;
+pub mod passkeys;
 pub mod ratelimit;
 mod schema;
 pub mod secret;

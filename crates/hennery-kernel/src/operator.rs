@@ -55,6 +55,8 @@ const PUBLIC_URL_KEY: &str = "public_url";
 pub struct PublicUrl {
     origin: String,
     https: bool,
+    /// The host, when it is a domain rather than an IP address.
+    rp_id: Option<String>,
 }
 
 impl PublicUrl {
@@ -73,7 +75,8 @@ impl PublicUrl {
             _ => return Err("public_url must be https:// or http://".into()),
         };
         let origin = url.origin().ascii_serialization();
-        Ok(Self { origin, https })
+        let rp_id = url.domain().map(str::to_string);
+        Ok(Self { origin, https, rp_id })
     }
 
     /// `scheme://host[:port]`, as a browser's `Origin` header has it.
@@ -85,6 +88,13 @@ impl PublicUrl {
     /// `http://` (kernel spec §3.2).
     pub fn is_https(&self) -> bool {
         self.https
+    }
+
+    /// The passkeys' relying party id (kernel spec §3.2): the host, in
+    /// lowercase. `None` when the host is an IP address, which WebAuthn
+    /// cannot bind a credential to.
+    pub fn rp_id(&self) -> Option<&str> {
+        self.rp_id.as_deref()
     }
 }
 
