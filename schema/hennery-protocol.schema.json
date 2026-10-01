@@ -1611,6 +1611,13 @@
     "SetupRequest": {
       "description": "`POST /api/setup` (kernel spec §3.1): the one-time owner setup, with the\ntoken from the setup link. `Debug` leaves the password out.",
       "properties": {
+        "default_hat_name": {
+          "description": "The default hat's name (kernel spec §3.1), 1 to 64 printable\ncharacters. Absent: it stays \"Personal\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "password": {
           "type": "string"
         },

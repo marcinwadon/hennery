@@ -214,7 +214,12 @@ export type SetupRequest = { token: string, password: string,
 /**
  * `https://…`, or `http://` to a loopback address; an origin only.
  */
-public_url: string, };
+public_url: string, 
+/**
+ * The default hat's name (kernel spec §3.1), 1 to 64 printable
+ * characters. Absent: it stays "Personal".
+ */
+default_hat_name?: string | undefined, };
 
 export type SetupResponse = { public_url: string, };
 

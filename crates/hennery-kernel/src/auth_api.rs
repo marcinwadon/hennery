@@ -147,8 +147,16 @@ async fn setup(
         );
     }
     let op = operator.clone();
-    let outcome =
-        tokio::task::spawn_blocking(move || op.set_up(&req.token, &req.password, &req.public_url, unix_now())).await;
+    let outcome = tokio::task::spawn_blocking(move || {
+        op.set_up_naming_hat(
+            &req.token,
+            &req.password,
+            &req.public_url,
+            req.default_hat_name.as_deref(),
+            unix_now(),
+        )
+    })
+    .await;
     let phc = match outcome {
         Ok(Ok(SetupOutcome::Done { owner_id, phc })) => {
             tracing::info!(%owner_id, public_url = %public_url.origin(), "hennery set up");

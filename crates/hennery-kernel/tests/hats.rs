@@ -6,10 +6,12 @@
 use ed25519_dalek::SigningKey;
 use hennery_kernel::hats::{DEFAULT_COLOUR, HatChange, HostChange, MAX_RULES, NewRule, Resolution, RulesChange};
 use hennery_kernel::hosts::{EnrollOutcome, Enrollment, Hosts, Registered};
+use hennery_kernel::operator::{Operator, SetupOutcome};
 
 /// Later than any real clock reaches (2096): the migration stamps the
 /// default hat with `unixepoch()`, and it must stay the oldest hat.
 const NOW: i64 = 4_000_000_000;
+const PASSWORD: &str = "correct horse battery";
 
 fn enrollment(seed: u8) -> Enrollment {
     Enrollment {
@@ -79,6 +81,51 @@ fn the_default_hat_exists_from_the_first_start_and_new_hosts_get_it() {
         panic!("not enrolled");
     };
     assert_eq!(hosts.host(&host_id).unwrap().unwrap().default_hat_id, default.id);
+}
+
+/// Kernel spec §3.1: the setup form names the default hat. The host paired
+/// before setup keeps the hat, now under that name.
+#[test]
+fn setup_names_the_default_hat_the_host_paired_before_it_already_has() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    let hosts = Hosts::open(&db).unwrap();
+    host(&hosts, "host-up", 1);
+    let before = hosts.host("host-up").unwrap().unwrap().default_hat_id;
+
+    let op = Operator::open(&db).unwrap();
+    let token = op.issue_setup_token(NOW).unwrap().unwrap();
+    assert!(matches!(
+        op.set_up_naming_hat(&token, PASSWORD, "https://hennery.example", Some("  Acme  "), NOW)
+            .unwrap(),
+        SetupOutcome::Done { .. }
+    ));
+    let hats = hosts.hats().unwrap();
+    assert_eq!(hats.len(), 1, "{hats:?}");
+    assert_eq!((hats[0].id.as_str(), hats[0].name.as_str()), (before.as_str(), "Acme"));
+    assert_eq!(hosts.host("host-up").unwrap().unwrap().default_hat_id, before);
+}
+
+#[test]
+fn a_bad_hat_name_fails_setup_and_leaves_the_token_live() {
+    let op = Operator::open_in_memory().unwrap();
+    let token = op.issue_setup_token(NOW).unwrap().unwrap();
+    for bad in ["", "   ", "a\u{202E}b", &"x".repeat(65)] {
+        assert!(
+            matches!(
+                op.set_up_naming_hat(&token, PASSWORD, "https://hennery.example", Some(bad), NOW)
+                    .unwrap(),
+                SetupOutcome::Invalid(_)
+            ),
+            "{bad:?}"
+        );
+    }
+    assert!(!op.is_set_up().unwrap());
+    assert!(matches!(
+        op.set_up_naming_hat(&token, PASSWORD, "https://hennery.example", None, NOW)
+            .unwrap(),
+        SetupOutcome::Done { .. }
+    ));
 }
 
 #[test]

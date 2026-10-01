@@ -21,6 +21,7 @@ const PAGE: &str = r#"<!doctype html>
 <form id="setup">
   <p><label>Password (at least 12 characters)<br><input id="password" type="password" minlength="12" required autocomplete="new-password"></label></p>
   <p><label>Public URL (where your browser reaches hennery)<br><input id="public_url" type="url" required></label></p>
+  <p><label>Name of your default hat (sessions belong to it unless a path rule says otherwise)<br><input id="hat_name" maxlength="64" required value="Personal"></label></p>
   <p><button type="submit">Set up</button></p>
 </form>
 <p id="result" role="status"></p>
@@ -46,6 +47,7 @@ document.getElementById("setup").addEventListener("submit", async (event) => {
       token,
       password: document.getElementById("password").value,
       public_url: document.getElementById("public_url").value,
+      default_hat_name: document.getElementById("hat_name").value,
     }),
   });
   if (response.ok) {

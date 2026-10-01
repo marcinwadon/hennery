@@ -42,6 +42,7 @@ impl Collector {
                 token: token.into(),
                 password: password.into(),
                 public_url: public_url.into(),
+                default_hat_name: None,
             });
         if let Some(origin) = origin {
             req = req.header("origin", origin);
@@ -196,7 +197,7 @@ async fn the_setup_page_is_static_and_reads_the_token_from_the_fragment() {
     );
     let js = script.text().await.unwrap();
     assert!(
-        js.contains("location.hash") && js.contains(r#"fetch("/api/setup""#),
+        js.contains("location.hash") && js.contains(r#"fetch("/api/setup""#) && js.contains("default_hat_name"),
         "{js}"
     );
 }
@@ -208,6 +209,7 @@ fn a_setup_request_does_not_show_its_password_in_debug() {
         token: "t".into(),
         password: PASSWORD.into(),
         public_url: "https://hennery.example".into(),
+        default_hat_name: Some("Acme".into()),
     };
     let shown = format!("{req:?}");
     assert!(

@@ -270,12 +270,18 @@ pub struct SetupRequest {
     pub password: String,
     /// `https://…`, or `http://` to a loopback address; an origin only.
     pub public_url: String,
+    /// The default hat's name (kernel spec §3.1), 1 to 64 printable
+    /// characters. Absent: it stays "Personal".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub default_hat_name: Option<String>,
 }
 
 impl std::fmt::Debug for SetupRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SetupRequest")
             .field("public_url", &self.public_url)
+            .field("default_hat_name", &self.default_hat_name)
             .finish_non_exhaustive()
     }
 }
