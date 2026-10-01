@@ -19,6 +19,12 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+/// The largest frame or message the host reads (ACP core §11), as the
+/// collector does: a prompt with 16 MiB of images is about 21.4 MiB of
+/// JSON, past tungstenite's default 16 MiB frame.
+const MAX_FRAME: usize = 32 << 20;
 
 #[derive(Debug, Clone)]
 pub struct HostConfig {
@@ -217,7 +223,11 @@ async fn handshake(
     connect_timeout: Duration,
     read_timeout: Duration,
 ) -> Result<(WsSink, WsStream, CollectorFrame)> {
-    let (ws, response) = tokio::time::timeout(connect_timeout, tokio_tungstenite::connect_async(collector_url))
+    let config = WebSocketConfig::default()
+        .max_message_size(Some(MAX_FRAME))
+        .max_frame_size(Some(MAX_FRAME));
+    let connect = tokio_tungstenite::connect_async_with_config(collector_url, Some(config), false);
+    let (ws, response) = tokio::time::timeout(connect_timeout, connect)
         .await
         .map_err(|_| anyhow::anyhow!("no WebSocket handshake within {connect_timeout:?}"))?
         .context("connect to collector")?;
@@ -238,9 +248,10 @@ async fn handshake(
             host_version: env!("CARGO_PKG_VERSION").into(),
             host_id: host_id.to_string(),
             proof: key.sign_hello(&nonce, host_id, PROTOCOL_VERSION),
-            // Every hennery host can park. `projects` and `images` come
-            // with the probes and with image prompts.
-            capabilities: Capabilities(vec![Capability::Park]),
+            // Every hennery host can park, and take images: a session whose
+            // agent offers none refuses them (plan 6a, decision 2).
+            // `projects` comes with the probes.
+            capabilities: Capabilities(vec![Capability::Park, Capability::Images]),
             attached_sessions: attached()?,
         },
     )

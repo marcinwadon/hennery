@@ -1328,3 +1328,100 @@ async fn a_revoked_host_stops_its_adapters_and_exits() {
     let row = collector.state.store.session(&session).unwrap().unwrap();
     assert_eq!((row.lifecycle.as_str(), row.presumed_parked), ("parked", true));
 }
+
+// Plan 6a: images in prompts, through a real host to the agent.
+
+/// `len` bytes of a PNG, different for each `seed`.
+fn png(seed: u8, len: usize) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.extend((0..len - 8).map(|i| seed.wrapping_mul(31).wrapping_add((i % 251) as u8)));
+    bytes
+}
+
+fn image(bytes: &[u8]) -> Value {
+    use base64::Engine;
+    json!({ "type": "image", "mimeType": "image/png", "data": base64::engine::general_purpose::STANDARD.encode(bytes) })
+}
+
+fn sha(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// The most a prompt may carry (ACP core §11): 16 MiB of images, one frame
+/// of about 21.4 MiB to the host, past tungstenite's default 16 MiB, which
+/// the host must read whole. The fake agent echoes each image's type and
+/// hash, so the bytes it decoded are the bytes sent.
+#[tokio::test]
+async fn a_prompt_at_the_limit_reaches_the_agent_whole() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let quiet = FakeScript {
+        chunks: vec![],
+        ..FakeScript::default()
+    };
+    start_host(collector.addr, &dir.path().join("host"), &quiet);
+    let c = client(&collector);
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+
+    let images: Vec<Vec<u8>> = [5 << 20, 5 << 20, 5 << 20, 1 << 20]
+        .iter()
+        .enumerate()
+        .map(|(n, len)| png(n as u8 + 1, *len))
+        .collect();
+    let mut content = vec![json!({ "type": "text", "text": "compare these" })];
+    content.extend(images.iter().map(|bytes| image(bytes)));
+    let (status, body) = post_json(
+        &c,
+        collector.url(&format!("/api/sessions/{session}/prompt")),
+        json!({ "content": content }),
+    )
+    .await;
+    assert_eq!(status, 202, "{body}");
+    let evs = wait_for("turn end", || async {
+        let evs = events(&c, &collector, &session).await;
+        (!turn_ends(&evs).is_empty()).then_some(evs)
+    })
+    .await;
+    let echoed: String = images
+        .iter()
+        .map(|bytes| format!("image:image/png:{}\n", sha(bytes)))
+        .collect();
+    assert_eq!(agent_text(&evs), echoed);
+    assert_eq!(turn_ends(&evs)[0].body["outcome"], "completed");
+}
+
+/// An agent whose `initialize` offers no images is never sent one (plan
+/// 6a, decision 2): its host refuses the prompt, 409
+/// `images_unsupported`, the turn is freed, and text still goes.
+#[tokio::test]
+async fn an_agent_that_takes_no_images_is_never_sent_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let script = FakeScript {
+        no_images: true,
+        ..FakeScript::default()
+    };
+    start_host(collector.addr, &dir.path().join("host"), &script);
+    let c = client(&collector);
+    wait_host_connected(&c, &collector).await;
+    let session = start_session(&c, &collector).await;
+    let url = collector.url(&format!("/api/sessions/{session}/prompt"));
+    let (status, body) = post_json(&c, url.clone(), json!({ "content": [image(&png(1, 64))] })).await;
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("images_unsupported")),
+        "{body}"
+    );
+
+    let (status, body) = post_json(&c, url, json!({ "content": text("hi") })).await;
+    assert_eq!(status, 202, "{body}");
+    let evs = wait_for("turn end", || async {
+        let evs = events(&c, &collector, &session).await;
+        (!turn_ends(&evs).is_empty()).then_some(evs)
+    })
+    .await;
+    assert_eq!(agent_text(&evs), "Hello world");
+    assert_eq!(of_kind(&evs, "user_turn").len(), 1);
+}

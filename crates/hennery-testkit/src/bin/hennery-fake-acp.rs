@@ -4,11 +4,11 @@
 
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ConfigOptionUpdate, ContentBlock, ContentChunk, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue,
-    SessionConfigSelect, SessionConfigSelectOption, SessionConfigSelectOptions, SessionConfigValueId, SessionId,
-    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
-    TextContent,
+    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
+    PromptCapabilities, PromptRequest, PromptResponse, SessionConfigKind, SessionConfigOption,
+    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelect, SessionConfigSelectOption,
+    SessionConfigSelectOptions, SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
+    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, SentRequest, Stdio, UntypedMessage};
 use hennery_testkit::{CRASH_EXIT_CODE, FakeAsk, FakeScript, SCRIPT_ENV};
@@ -48,6 +48,7 @@ async fn main() -> agent_client_protocol::Result<()> {
     }
 
     let load_session = !script.no_load_session;
+    let images = !script.no_images;
     let catalogue: Catalogue = Arc::new(Mutex::new(
         serde_json::from_value(serde_json::Value::Array(script.config_options.clone()))
             .expect("valid config options in the fake script"),
@@ -97,8 +98,11 @@ async fn main() -> agent_client_protocol::Result<()> {
                         booleans_as_selects(&mut catalogue.lock().unwrap());
                     }
                     responder.respond(
-                        InitializeResponse::new(req.protocol_version)
-                            .agent_capabilities(AgentCapabilities::new().load_session(load_session)),
+                        InitializeResponse::new(req.protocol_version).agent_capabilities(
+                            AgentCapabilities::new()
+                                .load_session(load_session)
+                                .prompt_capabilities(PromptCapabilities::new().image(images)),
+                        ),
                     )
                 }
             },
@@ -369,7 +373,11 @@ async fn main() -> agent_client_protocol::Result<()> {
                         ))?;
                     }
                     let forms = forms.load(Ordering::SeqCst);
+                    let echoes: Vec<String> = req.prompt.iter().filter_map(image_echo).collect();
                     cx.spawn(async move {
+                        for echo in echoes {
+                            cx2.send_notification(chunk(&req.session_id, echo))?;
+                        }
                         if script.crash_while_asking {
                             // Sent, never awaited: kept alive until the crash.
                             let mut sent: Vec<SentRequest<serde_json::Value>> = Vec::new();
@@ -465,6 +473,21 @@ fn answer_load(
         }
         None => responder.respond(LoadSessionResponse::new().config_options(announced())),
     }
+}
+
+/// What the fake says back for an image block: its type and the SHA-256
+/// of the bytes it decoded (`FakeScript::no_images`).
+fn image_echo(block: &ContentBlock) -> Option<String> {
+    use base64::Engine;
+    use sha2::Digest;
+    let ContentBlock::Image(image) = block else {
+        return None;
+    };
+    let digest = match base64::engine::general_purpose::STANDARD.decode(&image.data) {
+        Ok(bytes) => format!("{:x}", sha2::Sha256::digest(bytes)),
+        Err(_) => "undecodable".into(),
+    };
+    Some(format!("image:{}:{digest}\n", image.mime_type))
 }
 
 /// One text chunk of the agent's reply.

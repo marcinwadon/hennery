@@ -12,23 +12,24 @@ path = "src/bin/hennery-fake-acp.rs"
 
 [dependencies]
 agent-client-protocol.workspace = true
+# The fake adapter echoes each image it is sent by its hash (plan 6a).
+base64.workspace = true
 hennery-kernel.workspace = true
 libc = "0.2"
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
-base64.workspace = true
 futures.workspace = true
 hennery-host = { workspace = true, features = ["test-hooks"] }
 hennery-proto.workspace = true
 hennery-sessions.workspace = true
 hex.workspace = true
 rusqlite = { workspace = true, features = ["hooks"] }
-sha2.workspace = true
 tempfile = "3"
 tokio-tungstenite.workspace = true
 webauthn-authenticator-rs.workspace = true

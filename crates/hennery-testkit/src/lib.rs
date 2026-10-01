@@ -166,6 +166,12 @@ pub struct FakeScript {
     /// client answers then, usually `<name>:error:-32800`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub withdraw_asks: bool,
+    /// Offer no images in `initialize` (`promptCapabilities.image: false`),
+    /// like an agent that takes text only. By default the fake offers them,
+    /// and echoes each image of a prompt, before its chunks, as a chunk
+    /// `image:<mimeType>:<SHA-256 of the decoded bytes>\n`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_images: bool,
 }
 
 /// One question the fake asks its client during a prompt, and the chunk it
@@ -228,6 +234,7 @@ impl Default for FakeScript {
             ask_on_load: false,
             ask_on_load_waits: false,
             withdraw_asks: false,
+            no_images: false,
         }
     }
 }
