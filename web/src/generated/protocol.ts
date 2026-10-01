@@ -63,8 +63,9 @@ export type HostFrame = { "type": "hello", protocol_version: string, host_versio
  */
 proof: string, 
 /**
- * What this host implements (a closed list, ACP core §3.3). Absent
- * means none.
+ * What this host implements (ACP core §3.3). `Capability` lists
+ * the values this version knows; an unknown one is ignored, not
+ * rejected (see `Capabilities`). Absent means none.
  */
 capabilities: Capabilities, attached_sessions: Array<AttachedSession>, } | { "type": "session", session_id: string, seq: number, body: SessionBody, } | { "type": "error", request_id: string, code: string, message: string, } | { "type": "resend_complete" };
 
