@@ -130,7 +130,11 @@ fn installing_on_macos_writes_and_bootstraps_the_agent() {
     let argv = unit::command_line(Role::Up, &cx.exe, &data).unwrap();
     let args: String = argv.iter().map(|a| format!("\t\t<string>{a}</string>\n")).collect();
     assert!(text.contains(&format!("<array>\n{args}\t</array>")), "{text}");
-    assert!(text.contains("/usr/bin:/bin:/usr/sbin:/sbin</string>"), "{text}");
+    let (_, path) = text.split_once("<key>PATH</key>\n\t\t<string>").unwrap();
+    let (path, _) = path.split_once("</string>").unwrap();
+    for dir in ["/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
+        assert!(path.split(':').any(|e| e == dir), "{dir} not in {path}");
+    }
     assert!(text.contains("<string>Aqua</string>"), "{text}");
     let logs = cx.home.join("Library/Logs/hennery");
     assert_eq!(mode(&logs), 0o700);
