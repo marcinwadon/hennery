@@ -301,7 +301,8 @@ their endpoints.
    from a base32 alphabet without ambiguous characters, displayed as
    `XXXX-XXXX`; TTL 10 minutes; single use; stored hashed.
 2. `hennery host join <public_url> [<code>]` on the machine (without the code,
-   one line is read from stdin, which keeps it out of argv and history): the
+   one line of at most 256 bytes is read from stdin, which keeps it out of
+   argv and history; a longer one is refused and never echoed): the
    host generates an Ed25519 keypair (`host.key` in its data dir, 0600;
    distribution §8) and calls `POST /api/hosts/enroll {code, public_key, name,
    host_version, platform}`.
@@ -313,6 +314,11 @@ their endpoints.
 - **Codes** are Crockford base32 (40 bits): case, dashes and spaces are
   ignored, `O` reads as `0` and `I`/`L` as `1`. A code is dead exactly 600 s
   after minting, and is spent in the transaction that creates the host.
+- **The table stays bounded:** every mint first deletes the spent and expired
+  codes, and at most 16 codes are live at once; a mint past that is 409
+  `too_many_codes` (the admin socket's mint fails with the same message).
+  `hennery up`'s own mint at start (§4.2) is not capped, so live operator
+  codes can never stop the all-in-one from pairing its host.
 - **Enroll refusals:** a key paired already gets 409 `already_paired`; a
   malformed key, or a name, version or platform outside 1–64 printable
   characters (no control or Unicode format characters), gets 400 `invalid`;
@@ -336,7 +342,13 @@ Whenever a new identity is written beside an outbox, that outbox is moved
 aside as `outbox.db.orphaned-<old host id>` (or `-unpaired`), never deleted.
 The new key is written to `host.key.pending` before enrolling, so a directory
 that cannot hold it costs no code; half a pairing is an error naming the file
-to remove.
+to remove. Once enrollment answers, `host.toml.pending` is written before
+anything is renamed, then the key and `host.toml` are renamed into place, and
+nothing after the enrollment deletes the key it enrolled. `host.toml` names the
+enrolled public key: loading a pairing rolls a staged `host.toml.pending`
+forward only onto the key it names (a crash between the renames), and refuses
+a staged or stored `host.toml` whose key is another. A `host.toml` from before
+it named its key still loads.
 
 Enrollment is rate limited **per client address** (5 wrong codes per 10
 minutes, then a 60 s lockout doubling up to 1 h; §3.2 for how addresses are
@@ -353,7 +365,9 @@ end to the collector child and its read end to the host child, each as an
 **inherited file descriptor**; the supervisor never reads the code. The
 collector mints one code once it has migrated and is listening, and writes it
 there; the host joins over loopback, and sees end-of-file if the collector dies
-first. The code is never on a command line or in the environment. An existing
+first. The code is never on a command line or in the environment. Each child
+checks its descriptor at start, before anything else: it must be 3 or above,
+open, and a pipe; the host reads at most 256 bytes from it. An existing
 pairing gets no pipe: `up` never re-pairs a key the collector does not know.
 The host child is handed the collector's current loopback URL, which wins over
 the stored one, so a new port keeps working. The code and the host carry the
@@ -391,6 +405,13 @@ that speaks the socket protocol directly (§10).
   can still race (an `flock` would close that; not taken). When the path does
   not fit `sockaddr_un.sun_path` (104 bytes on macOS, 108 on Linux), the
   collector warns and runs without the socket.
+- **The CLI side:** before any prompt, `hennery admin` checks the socket: that
+  its path fits `sun_path` (a path too long is named, with the limit, rather
+  than reported as a failed connection), that it connects, and that it is the
+  same uid's. A connection closed without a request, which that check makes,
+  is not answered and not warned about. Each command gets 30 s for connect,
+  request and answer; past that the CLI says the outcome is unknown. For
+  `hennery up`'s data directory the socket is `<data>/collector/admin.sock`.
 - **`setup-url`** returns the live link, or issues a fresh one once its hour is
   up (the old token dies); once set up it fails.
 - **`reset-password` is the recovery.** It refuses before setup, takes a
@@ -418,6 +439,8 @@ that speaks the socket protocol directly (§10).
   `HostItem`. The socket task re-checks revocation right after registering and
   never reconciles or marks a revoked host ready; when a revoked host's socket
   ends, the hooks run again, so a revoke whose wait timed out converges. A
+  failed registry check there is retried (after 200 ms, 1 s and 5 s), then
+  logged with the remedy: revoke the host again. A
   repeated revoke re-runs every step. A connected host is kicked, so it learns
   of the revoke when it reconnects, at once.
 - `last_seen`, versions, platform, capabilities, workspace roots, agent
@@ -578,7 +601,8 @@ Content-Security-Policy: script-src 'self' 'sha256-<theme bootstrap>';
 
 The only inline script is the theme bootstrap (frontend spec §8), whose hash is
 computed at build time; a page with no inline script (the static setup page,
-§3.1) leaves the hash out. Together with the markdown pipeline (no raw HTML,
+§3.1) leaves the hash out. One layer over the whole router sets the header on
+every `text/html` response, so no page can be added without it. Together with the markdown pipeline (no raw HTML,
 frontend spec §6.4) this makes agent output unable to run script in the UI.
 
 ## 8. API
@@ -594,7 +618,7 @@ frontend spec §6.4) this makes agent output unable to run script in the UI.
 | `POST /api/auth/step-up/password`, `…/step-up/passkey/{start,finish}` | Step-up (§3.4) |
 | `GET/DELETE /api/auth/sessions[/{id}]` | Signed-in devices (revoke: step-up) |
 | `GET/PATCH /api/settings` | `public_url` (step-up), contact, push defaults |
-| `POST /api/hosts/pairing-codes` | Mint a pairing code (step-up) → 201 `{code, expires_at}` |
+| `POST /api/hosts/pairing-codes` | Mint a pairing code (step-up) → 201 `{code, expires_at}`, or 409 `too_many_codes` (§4.1) |
 | `POST /api/hosts/enroll` | Host enrollment (code-authenticated, §4.1) → 201 `{host_id}` |
 | `GET /api/hosts`, `PATCH/DELETE /api/hosts/{id}` | List, rename/default hat, revoke (step-up) |
 | `GET /api/hosts/ws` | Host WebSocket (ACP core) |

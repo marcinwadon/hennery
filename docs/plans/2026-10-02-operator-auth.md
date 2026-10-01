@@ -84,6 +84,14 @@ Still open: the spec amendments listed in this plan, and the hand-offs in "After
 
 **Spec write-back (2026-10-01):** this plan's spec amendments and spec-level deviations are applied: in #21 (kernel, umbrella) and #22 (ACP core, frontend, distribution). Notes above that call them still to be applied are history.
 
+**Debt sweep (2026-10-02):** closed from "Found in execution and the final review":
+- axum's plain-text 400/415/422 rejections are now fixed `ApiError`s, on the auth routes and enrollment (#19) and on the session API (#25);
+- `host join`'s stdin read is bounded (#32);
+- `rfc3339` has one copy, in the kernel (#32);
+- `setup-url`'s hard-link test (#35).
+
+Also: every HTML response, the placeholder `GET /` included, carries kernel §7.2's CSP from one layer over the router (#30).
+
 ## Scope
 
 Plan 3b, as 3a's "After this plan" lists it, does not fit in one plan of right-sized tasks. It has two halves that a reviewer can accept or reject separately:

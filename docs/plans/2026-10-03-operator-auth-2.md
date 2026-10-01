@@ -76,6 +76,14 @@ Tests: 475 in the workspace, up from 441 before this plan: the plan's 472, plus 
 
 **Spec write-back (2026-10-01):** this plan's spec amendments and spec-level deviations are applied: in #21 (kernel, umbrella) and #22 (ACP core, frontend, distribution). Notes above that call them still to be applied are history.
 
+**Debt sweep (2026-10-02):** closed:
+- `hennery admin` has a client-side timeout, and checks the socket before it prompts (#34);
+- O7, a socket path too long is named (#34);
+- 3a's hidden `--pairing-code-fd` / `--join-code-fd` are checked like `--listen-fd` (#32);
+- a load flake in `a_descriptor_above_a_lowered_soft_limit_is_closed_too`, and its class, closed by `hennery_testkit::place_fd` (#33).
+
+Linux `close_range` goes to plan 7 (distribution).
+
 ## Scope
 
 3b-i's "After this plan" gives 3b-ii five pieces: several listeners, `config.toml`, the admin socket, `owner_id` on the older tables with every query filtering by it, and the health checks. With the three fold-ins the brief asks for, that is more than 7 to 9 right-sized tasks. The plan is **split** (decision 1):
