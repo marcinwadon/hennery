@@ -1714,7 +1714,16 @@ fn the_pairing_code_never_reaches_ups_childrens_argv_or_environment() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let seen = argv_and_environment(control.id() as i32);
+    // Right after `spawn` the child may not have finished `exec` yet, and
+    // Linux shows it with an empty command line: read until it has.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let seen = loop {
+        let seen = argv_and_environment(control.id() as i32);
+        if seen.contains("ABCD-EFGH") || Instant::now() > deadline {
+            break seen;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
     drop(control.stdin.take());
     assert!(wait_with_timeout(&mut control, Duration::from_secs(15)).is_some());
     let _ = control.kill();
