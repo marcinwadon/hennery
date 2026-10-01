@@ -82,6 +82,8 @@ Tests: 439 in the workspace, up from 393 before this plan (the plan's 431, plus 
 
 Still open: the spec amendments listed in this plan, and the hand-offs in "After this plan".
 
+**Spec write-back (2026-10-01):** this plan's spec amendments and spec-level deviations are applied: in #21 (kernel, umbrella) and #22 (ACP core, frontend, distribution). Notes above that call them still to be applied are history.
+
 ## Scope
 
 Plan 3b, as 3a's "After this plan" lists it, does not fit in one plan of right-sized tasks. It has two halves that a reviewer can accept or reject separately:

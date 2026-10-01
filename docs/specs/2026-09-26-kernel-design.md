@@ -256,8 +256,13 @@ per route class:
   value but `same-origin`/`none` answers 403 `cross_site`.
 - These rules run before the cookie check, so a cross-origin request gets 403
   before 401 `unauthenticated`.
-- `/api/setup` and `/api/auth/*` read at most 16 KiB of body; more is 413,
-  before any parse or password check.
+- `/api/setup` and `/api/auth/*` read at most 16 KiB of body; more is 413
+  `body_too_large`, before any parse or password check.
+- A JSON body these routes or enrollment refuse keeps its status (400, 413,
+  415, 422) with a fixed `ApiError` (`invalid_body`, `body_too_large`,
+  `unsupported_media_type`), never the parser's message, which would quote the
+  request back. *Built so far:* the session API still answers with the
+  parser's text.
 
 ### 3.4 Step-up authentication
 

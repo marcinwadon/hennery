@@ -68,6 +68,8 @@ Tests: 392 in the workspace, up from 309 before this plan.
 
 Still open: the spec amendments listed in this plan, and the hand-offs in "After this plan".
 
+**Spec write-back (2026-10-01):** this plan's spec amendments and spec-level deviations are applied: in #21 (kernel, umbrella) and #22 (ACP core, frontend, distribution). Notes above that call them still to be applied are history.
+
 ## Scope
 
 This is **plan (3), real auth and pairing**, as every earlier plan handed it on. It does not fit in one plan of right-sized tasks: operator setup, password login, sessions and cookies, the `Origin` rules, step-up, several listeners, the admin socket and passkeys are a second system of about the same size. It is **split**:

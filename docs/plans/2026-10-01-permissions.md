@@ -58,6 +58,8 @@ Still open: the spec amendments this plan lists are not yet applied to `docs/spe
 questions asked outside the turn (ACP-conformant; note it in the spec amendment); the frontend must render
 `PendingItem{state: cancelled, delivered: true}`.
 
+**Spec write-back (2026-10-01):** this plan's spec amendments and spec-level deviations are applied: in PR #7 (ACP core, umbrella), and the few it missed in #21 (umbrella) and #22 (ACP core, frontend, distribution). Notes above that call them still to be applied are history.
+
 ## Scope
 
 This is **plan (2)**, permission and elicitation, as plans A, B1, B2a and B2b scoped it in their "After this plan". It fits in seven right-sized tasks, so it is not split.

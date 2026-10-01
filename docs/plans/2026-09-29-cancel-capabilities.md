@@ -40,6 +40,8 @@ refinements of ACP core §3.3; the spec text should be amended to match.
 Still open: an adapter streaming updates faster than the outbox writes can delay the Cancel command and its grace
 (needs a per-iteration cap in the actor's biased select); the `hello.capabilities` field doc still says "a closed list".
 
+**Spec write-back (2026-10-01):** this plan's spec amendments and spec-level deviations are applied: in PR #7 (ACP core, umbrella), and the few it missed in #21 (umbrella) and #22 (ACP core, frontend, distribution). Notes above that call them still to be applied are history.
+
 ## Scope
 
 This is **plan B2a**. B1's "After this plan" scoped plan B2 as cancel, capabilities and all of model, axes and mode. With B1's two carry-overs added, that does not fit one plan of right-sized tasks. The config half alone needs:

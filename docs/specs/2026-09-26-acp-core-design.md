@@ -3,8 +3,10 @@
 - **Date:** 2026-09-26
 - **Status:** Draft. Amended 2026-10-01 to match what plans A (teardown), B1
   (resume), B2a (cancel, capabilities), B2b (config) and 2 (permission and
-  elicitation) built, and the decisions confirmed with them. Where a section
-  still describes something not built yet, it says so.
+  elicitation) built, and the decisions confirmed with them; amended again
+  2026-10-01 to 3a (host pairing, revoke), 3b-ii (adapter descriptors) and
+  3b-iii (`owner_id`). Where a section still describes something not built
+  yet, it says so.
 - **Refines:** [architecture spec](2026-09-25-hennery-architecture-design.md)
   §5 (protocol), §6 (sessions), §11 (browser API) and §13 (frontend data
   flow). This document is the authoritative home of the frame catalogue
@@ -37,6 +39,10 @@ The Cargo workspace (Rust, umbrella §9.1):
 | `hennery-kernel` | lib | Operator auth, hosts and pairing, hats and path rules, SQLite pool and migrations, config, HTTP server scaffolding, outbound HTTP policy, push delivery, the hat purge hook. |
 | `hennery-gateway` | lib | MCP gateway (own spec), including the config renderers. Depends on `hennery-kernel`, never on `hennery-sessions`. |
 | `hennery` | bin | CLI (including `hennery mcp apply`, which wires the gateway's renderers), supervisor, wiring. |
+| `hennery-testkit` | lib + bin (dev only) | The fake ACP adapter (§12) and shared test helpers. Never a dependency of a shipped crate. |
+
+*Built so far:* no `hennery-gateway` crate and no `SessionMcp` trait; they come
+with the gateway.
 
 **Sessions → gateway interface.** `hennery-sessions` obtains a session's MCP
 servers through a trait that `hennery-gateway` defines and implements:
@@ -143,7 +149,13 @@ is serialised through it. Consequences:
 - **Environment:** the host's environment minus variables that make an agent
   refuse to start or double-report: `CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
   `CLAUDE_CODE_SSE_PORT` *(P-3: "cannot be launched inside another Claude Code
-  session")*, plus profile-specific additions (§6).
+  session")*, plus profile-specific additions (§6), and minus the host's own
+  secrets (named one by one, not by prefix).
+- **Descriptors:** before `exec`, every descriptor from 3 up that is not
+  close-on-exec is closed, up to the hard `RLIMIT_NOFILE` (at most 65 536), so
+  an agent gets only its stdio: never the pairing pipe (kernel spec §4.2) or
+  whatever the host inherited from `hennery up`, a service manager or a shell.
+  One numbered above that cap survives; Linux `close_range` is the follow-up.
 - **Exit watcher:** the supervisor awaits the child. On exit (any cause other
   than a requested close or park) it:
   1. fails every outstanding JSON-RPC call to that adapter;
@@ -407,10 +419,9 @@ host.)*
   never left to the collector's timeout (§2.2).
 
 **Not on the wire yet** (they arrive with their subsystems): `first_prompt`,
-`mcp_servers[]` and `hat` on start/resume (gateway, hats); `hello.proof`
-(the skeleton sends a shared development `token`), `hello.agents[]` and
-`workspace_roots[]`; the probes and their responses; `forget_hat`;
-`hello_error{revoked}`.
+`mcp_servers[]` and `hat` on start/resume (gateway, hats); `hello_ack.server_time`;
+`hello.agents[]` and `workspace_roots[]`; the probes and their responses;
+`forget_hat`.
 
 `hello` fields:
 
@@ -422,9 +433,11 @@ host.)*
   never a reason to refuse the `hello`; an absent field means none. The
   generated JSON Schema still lists the known values as a closed set, but that
   describes them, it does not constrain: a schema-validating client or proxy
-  must not reject a `hello` on an unknown capability either. The collector
-  keeps capabilities per connection (in the hub, not the store), so a host
-  that reconnects on an older build loses them at once. The hennery host
+  must not reject a `hello` on an unknown capability either. Gating uses the
+  capabilities of the live connection (in the hub), so a host that reconnects
+  on an older build loses them at once; the host registry also records the
+  latest accepted `hello`'s list for display (`HostItem.capabilities`, kernel
+  spec §8). The hennery host
   announces only `park` so far.
 - `agents[]`: per agent `{id, version, available, auth, catalog}` where
   `catalog` is the profile's **static default catalogue** (§6), so the
@@ -497,14 +510,33 @@ Answers have no waiter: they are queued durably (§4.6).
 
 ### 3.5 Host authentication
 
-`hello.proof` is an Ed25519 signature over `collector_nonce || host_id ||
-protocol_version` with the key generated at pairing; the collector sends the
-nonce in the WebSocket upgrade response header before the first frame. The
-connection is unauthenticated until a valid `hello` arrives. The host id is
-never self-asserted without the proof. A revoked host gets
-`hello_error{revoked}` and then stops all its adapters; until it connects, its
-adapters keep running (it cannot be reached). Pairing itself is in the kernel
-spec §4.
+`hello.proof` is the host's Ed25519 signature (lowercase hex), with the key
+generated at pairing, over `hennery hello proof v1` followed by the collector's
+nonce, the host id and the protocol version, each prefixed by its length (u32,
+big endian), so no two triples share bytes. The nonce is 32 random bytes per
+upgrade; the collector sends it, lowercase hex, in the `hennery-hello-nonce`
+upgrade response header before the first frame, and a host that gets none
+sends no `hello`. Keys are 32-byte Ed25519 in lowercase hex; small-order keys
+are refused and verification is strict. The connection is unauthenticated
+until a valid `hello` arrives. The host id is never self-asserted without the
+proof. A revoked host gets `hello_error{revoked}` and then stops all its
+adapters; until it connects, its adapters keep running (it cannot be reached).
+Pairing itself is in the kernel spec §4.
+
+- **Order of refusals:** the `hello` must arrive within 10 s. A different
+  protocol major is answered `incompatible` before the proof is looked at. An
+  unknown host id gets `bad_proof`, exactly like a wrong signature. The
+  signature is verified before revocation, so only the key's holder is told
+  `revoked`; `already_connected` is said only after a valid proof, and
+  revocation is re-checked once the connection is registered.
+- **On the host,** `revoked` stops every adapter, as a shutdown does, and ends
+  `host run` (exit 78); every other refusal keeps the reconnect backoff. A
+  `bad_proof` warning names the remedy: remove `host.key` and `host.toml`, then
+  `hennery host join`.
+- *Limit:* the proof does not name the collector. A relay on the host's path
+  that forwards the upgrade and its nonce to the real collector gets a valid
+  `hello` through. TLS with the collector's certificate checked (`wss://`)
+  closes this; the proof alone does not.
 
 **One live connection per host.** A second connection for a `host_id` that is
 already connected is rejected with `hello_error{already_connected}`; the
@@ -564,6 +596,7 @@ ingest in `seq` order (host facts) or when the collector writes its own event
 | `starting` | host rejects the start/resume | `failed` (the host's code) |
 | `starting` | start with the host offline | `failed` (`host_offline`) |
 | `starting` | reconciliation finds no trace of the start | `failed` (`start_not_delivered`) |
+| `starting` | host revoked (kernel spec §4.3) | `failed` (`host_revoked`), with a `start_not_delivered` event |
 | `failed` | a late `session_started` | `active` (the real fact wins, e.g. over a `start_not_delivered` guess) |
 | `failed{start_not_delivered}` | a late `start_failed` | `failed` (the host's code replaces the guess) |
 | `parked`, `closed`, `failed` | resume requested (atomic) | `starting` |
@@ -573,7 +606,7 @@ ingest in `seq` order (host facts) or when the collector writes its own event
 | `active/running`, `active/blocked` | `turn_ended` | `active/idle` |
 | `active/*` | `session_parked` | `parked` (`closed` if a close was requested) |
 | `active/*` | host offline > threshold | `parked` (presumed; §5.3) |
-| `active/*` | host revoked (kernel spec §4.3) | `parked` (presumed) |
+| `active/*` | host revoked (kernel spec §4.3) | `parked` (presumed; `closed` if a close was requested; §5.3) |
 | `active/*` | host restarted (§5.2) | `parked` (`closed` if a close was requested) |
 | `active/*` (attached) | `session_closed` after operator close | `closed` |
 | `active/*` (attached) | the host answers a close `not_attached` | `closed` (collector-side) |
@@ -684,7 +717,9 @@ each value a select's value id or a boolean.
   switch gets no answer in time, or the bound has passed, **no further switch
   is sent**: the adapter handles requests concurrently, so a late model switch
   could clamp a mode sent after it. The rest are listed as `not sent: an
-  earlier switch did not answer` (or `not sent: the start deadline passed`).
+  earlier switch did not answer` (or `not sent: the start deadline passed`). A
+  switch the deadline cut off reads `no answer before the start deadline`; an
+  option the adapter does not offer, `the adapter offers no … option`.
 - After the switches, each requested value is compared with the final
   read-back; a mismatch is a failure too (`effort: asked high, agent reports
   low`).
@@ -716,8 +751,10 @@ each value a select's value id or a boolean.
 - An orphan's late non-empty read-back is emitted as a sequenced
   `config_applied` under its request's id: the agent now runs with it, and
   without the fact a later resume would revert it. It answers no one.
-- A switch still out when the actor ends is answered `not_attached`, after the
-  actor's last fact.
+- A switch still out when the actor ends is answered at once, after the
+  actor's last fact: `config_failed` if the adapter's exit failed the request
+  first, else `not_attached`. Either way the collector never waits out its
+  timeout.
 - The actor also tracks the catalogue from the agent's own
   `config_option_update`s (e.g. leaving plan mode); those carry the extracts
   (§3.2).
@@ -884,11 +921,12 @@ post-switch-catalogue rule of §4.3.)*
 - **Cancellation, collector side** (`pending_cancelled{pending_id, reason}`,
   one event per question), for questions the host will never resolve: a host
   restart, including one found through a presumed-parked session
-  (`host_restarted`); a close of an unattached session (`session_closed`); and,
+  (`host_restarted`); a host revoke (`host_revoked`, kernel spec §4.3); a close
+  of an unattached session (`session_closed`); and,
   as a backstop, a host `session_parked`/`session_closed` that applies while a
   question is still open (`adapter_exited` gives `adapter_lost`, idle or
-  operator `session_parked`, a close `session_closed`). A presumed park leaves
-  questions `open` (§5.3).
+  operator `session_parked`, a close `session_closed`). A presumed park for a
+  host offline leaves questions `open` (§5.3).
 - **The elicitation client capability is advertised as `{"form": {}}`**, never
   a boolean. *(P-19: a boolean is silently discarded by the adapter's schema
   validator and looks exactly like not advertising the capability; the agent
@@ -928,7 +966,7 @@ post-switch-catalogue rule of §4.3.)*
   frontend drives actionability from it, not from timeline position. States:
   `open → delivered | cancelled(reason)`, reasons `turn_cancelled`,
   `session_closed`, `session_parked`, `adapter_lost`, `host_restarted`,
-  `agent_withdrew`.
+  `agent_withdrew`, `host_revoked`.
 - **The verdict** (`answer_queue.delivered`) is NULL until one comes, and
   comes only from `answer_result`, folded monotonically (`delivered` sticks
   and a later `delivered: false` never overwrites it, umbrella §6.8), or from
@@ -1056,8 +1094,10 @@ spec §5.5) deletes every session of the hat the same way.
    between a reconnect's `hello` and its `resend_complete` is refused (409
    `host_offline` for a start, resume or prompt; `not_attached` for a cancel,
    config or park), never sent, or reconciliation would mistake it for one lost
-   on the previous connection. `GET /api/hosts` lists only reconciled hosts. A
-   repeated `resend_complete` or `hello` on one connection is logged and
+   on the previous connection. `GET /api/hosts` shows a host `connected` only
+   once it is reconciled (kernel spec §8). A host revoked meanwhile is closed
+   at `resend_complete`, never reconciled or marked ready (kernel spec §4.3).
+   A repeated `resend_complete` or `hello` on one connection is logged and
    ignored.
 
    `hello.attached_sessions` carries each attached session's `open_turn_id`;
@@ -1093,6 +1133,13 @@ sessions: lifecycle `parked`, `presumed: true`, and a visible "host offline"
 note. Pending requests stay `open` — the host may still hold them. After the
 next handshake, listed sessions return to `active` (`reattached` event) with
 their pending requests intact.
+
+A **revoke** presumes the host's `active` sessions parked the same way, with
+reason `host_revoked`. The host never comes back, so the revoke also ends the
+open turn (`interrupted`, or `turn_not_delivered` if it never started) and
+cancels open questions `host_revoked`; a queued answer's verdict becomes
+`delivered: false`. Sessions already converged are skipped; none returns
+`reattached`, and a resume answers 409 `host_offline`.
 
 - The timer is armed per dropped connection and fires only if the host has
   registered no connection since; it checks and writes under the hub's lock,
@@ -1243,7 +1290,8 @@ therefore decides the CLI version.
 
 ## 8. Collector storage
 
-SQLite, WAL, one writer task. Every table carries `owner_id`.
+SQLite, WAL, one writer task (*built so far:* `IMMEDIATE` transactions on the
+store's own connection, kernel spec §1). Every table carries `owner_id`.
 
 ```sql
 sessions(
@@ -1252,22 +1300,22 @@ sessions(
   failure_reason, model, mode, config_axes JSON,
   git_branch, git_dirty, git_worktree, base_commit,
   open_turn_id, created_at, last_event_at, last_event_id)
-session_catalog(session_id PK, config_options JSON, commands JSON, usage JSON, updated_at)
+session_catalog(session_id PK, owner_id, config_options JSON, commands JSON, usage JSON, updated_at)
 host_agent_catalog(host_id, agent, config_options JSON, updated_at, PK(host_id, agent))
 events(
   event_id INTEGER PK AUTOINCREMENT,   -- global SSE cursor
-  session_id, host_seq NULL, kind, body JSON, ts,
+  session_id, owner_id, host_seq NULL, kind, body JSON, ts,
   applied BOOL,                        -- 0: stored host fact that did not apply
   UNIQUE(session_id, host_seq))
 attachments(sha256 PK, owner_id, mime, size, created_at)   -- file: <data>/attachments/<sha256>
 event_attachments(event_id, sha256, position)
-pending(pending_id PK, session_id, kind, turn_id NULL, option_ids JSON, payload JSON, state, reason, opened_at, resolved_at)
-answer_queue(pending_id PK, session_id, request_id UNIQUE, answer JSON, submitted_at, delivered BOOL NULL)
-turns(turn_id PK, session_id, request_id, state, content JSON, sent_at, started_at, ended_at, outcome, stop_reason, error)
+pending(pending_id PK, session_id, owner_id, kind, turn_id NULL, option_ids JSON, payload JSON, state, reason, opened_at, resolved_at)
+answer_queue(pending_id PK, session_id, owner_id, request_id UNIQUE, answer JSON, submitted_at, delivered BOOL NULL)
+turns(turn_id PK, session_id, owner_id, request_id, state, content JSON, sent_at, started_at, ended_at, outcome, stop_reason, error)
 plans(session_id PK, entries JSON, updated_at)
 ```
 
-**Built so far** (migrations 1–6, applied in order, never edited once
+**Built so far** (migrations 1–7, applied in order, never edited once
 shipped):
 
 1. `sessions`, `turns`, `events` — the walking skeleton;
@@ -1277,12 +1325,23 @@ shipped):
 4. `sessions.presumed_parked` — resume;
 5. `sessions.model`, `mode`, `config_axes` and `session_catalog` with
    `config_options` only — config;
-6. `pending` (with `turn_id`) and `answer_queue` — permission and elicitation.
+6. `pending` (with `turn_id`) and `answer_queue` — permission and elicitation;
+7. `owner_id` on `sessions`, `turns`, `events`, `session_catalog`, `pending`
+   and `answer_queue`, filled with the database's owner (kernel spec §1) —
+   `owner_id` everywhere. The store runs the kernel's migrations first.
 
-`sessions` has no `owner_id`, `hat_id`, `source_kind`, `title`, git columns or
+`sessions` has no `hat_id`, `source_kind`, `title`, git columns or
 `last_event_id` yet, `turns` keeps only `content`, `state`, `outcome` and its
-creation time, and `session_catalog` has no `commands` / `usage`; they, the
-other tables and `owner_id` everywhere arrive with the plans that need them.
+creation time, and `session_catalog` has no `commands` / `usage`; they and the
+other tables arrive with the plans that need them.
+
+- **`owner_id`** is `NOT NULL DEFAULT ''`, with no foreign key: SQLite adds a
+  `REFERENCES` column only nullable, and rebuilding six tables that reference
+  each other needs foreign keys off, which a migration cannot do. A row written
+  without an owner is found by no query. Every statement names the owner,
+  child rows and joins included; a write for a session that is not the owner's
+  writes nothing and fails, and the catalogue upsert updates only the owner's
+  row. The owner is always a parameter, never copied from a row.
 
 - **Idempotent ingest:** `INSERT … ON CONFLICT(session_id, host_seq) DO
   NOTHING`; a conflicting row whose body differs (compared structurally,
@@ -1317,8 +1376,7 @@ other tables and `owner_id` everywhere arrive with the plans that need them.
   | `session_deleted` | Tombstone after delete (§4.10). |
 
   Not written yet: `operator_started` (a start writes no collector event so
-  far), `operator_renamed`, `hat_reassigned`, `presumed_parked{host_revoked}`
-  and `session_deleted`. A cancel writes none by design (§4.4).
+  far), `operator_renamed`, `hat_reassigned` and `session_deleted`. A cancel writes none by design (§4.4).
 
 - **`sessions`, `session_catalog`, `plans` and the model/mode columns are
   filled from extracts** and from the fields of typed bodies, never by parsing
@@ -1346,7 +1404,7 @@ All endpoints require an operator session (kernel spec §3). Types come from
 |---|---|
 | `GET /api/sessions?cursor&limit&q&hat&lifecycle` | Paginated list, newest `last_event_at` first. `q` searches title, cwd, branch, id across all sessions regardless of filters except hat. |
 | `POST /api/sessions` | Start: `{host_id, agent, cwd, model?, mode?, axes?, first_prompt?{content[]}}` → 202 `{session_id, turn_id?}` once `session_started` is ingested; 409 `host_offline` (the session is created and marked `failed{host_offline}`); 502 with the host's code (`start_failed`, `unknown_agent`, …); 503 `delivery_unknown` **with `session_id`** (the session exists and may still start; the caller has no other way to learn its id). |
-| `GET /api/sessions/{id}` | Session detail `SessionDetail`: the list item (lifecycle, activity, failure reason, `presumed_parked`), the open turn `{turn_id, state: sent \| started}`, and `pending[]`: the open questions as `PendingItem`, oldest first. |
+| `GET /api/sessions/{id}` | Session detail `SessionDetail`: the list item (lifecycle, activity, failure reason, `presumed_parked`), the open turn `{turn_id, state: sent \| started}`, and `pending[]`: the open questions as `PendingItem {pending_id, session_id, kind, state, reason?, turn_id?, option_ids?, payload, answered, delivered?}`, oldest first (`answered`: an answer is queued; `delivered`: its verdict, absent until one comes). |
 | `GET /api/sessions/{id}/events?before=<event_id>&limit` | Timeline page ending before an event; without `before`, the tail. The frontend opens at the tail. |
 | `GET /api/sessions/{id}/events?after=<event_id>&limit` | Timeline page after an event (applied rows only, §8). |
 | `GET /api/sessions/{id}/catalog` | `SessionCatalog {session_id, config_options[], model?, mode?, axes{}}`; commands, plan and usage join it with the plans that produce them. |
@@ -1356,7 +1414,7 @@ All endpoints require an operator session (kernel spec §3). Types come from
 | `POST /api/sessions/{id}/park` | Explicit park → 202 `LifecycleResponse` once `session_parked` is ingested; 409 `not_attached` (not `active`, or host not ready); 409 `park_unsupported` (host lacks the `park` capability, nothing sent). |
 | `POST /api/sessions/{id}/close` | Close → 202 `LifecycleResponse` once closed (at once when unattached, parked, presumed parked, failed or the host is offline; on `session_closed` when attached); 409 `starting` while a start is in flight on a reachable host (§4.8). |
 | `DELETE /api/sessions/{id}` | Delete (§4.10); step-up required. |
-| `POST /api/sessions/{id}/config` | `{config_id, value}` (a select's value id or a boolean) → 202 with the session's `SessionCatalog` once `config_applied` is ingested; 409 `not_attached` (not `active`, or host not ready) / `unknown_option`; 400 `invalid`; 502 `config_failed`; 422 for a value that is neither a string nor a boolean. Every viewer also gets SSE `catalog_changed`. |
+| `POST /api/sessions/{id}/config` | `{config_id, value}` (a select's value id or a boolean) → 202 with the session's stored `SessionCatalog` once `config_applied` is ingested (after a read-back without options it still shows the old values, §3.2); 409 `not_attached` (not `active`, or host not ready) / `unknown_option`; 400 `invalid`; 502 `config_failed`; 422 for a value that is neither a string nor a boolean. Every viewer also gets SSE `catalog_changed`. |
 | `POST /api/sessions/{id}/pending/{pending_id}/answer` | `{option_id}` (permission) or `{action, content?}` (elicitation) → 202 `{pending_id, request_id}` once queued, whatever the lifecycle or host state; 404; 409 `not_open` / `already_answered`; 400 `invalid`; 422 for a body that is neither kind. The verdict follows as SSE `pending_changed`. |
 | `PATCH /api/sessions/{id}` | Rename; hat re-assignment (no running adapter, §4.9). |
 | `GET /api/attachments/{sha256}` | Image bytes, cache-immutable. |
@@ -1372,14 +1430,15 @@ reconciled; cancel, config and park answer `not_attached` then. Error bodies are
 `ApiError {code, message, session_id?}`.
 
 **Built so far:** the rows above except the session list, `events?before=`,
-`DELETE`, `PATCH`, attachments and the host routes; a start takes no
-`first_prompt` yet (202 `{session_id}`), and `hat_mismatch` comes with hats. The
-list stream `GET /api/stream/sessions` is not built yet either. `GET /api/hosts`
-lists the connected, reconciled host ids.
+`DELETE`, `PATCH`, attachments, and `GET /api/hosts/{id}/projects`, `…/browse`
+and `…/agents`; a start takes no `first_prompt` yet (202 `{session_id}`), and
+`hat_mismatch` comes with hats. The list stream `GET /api/stream/sessions` is
+not built yet either. The host registry routes are kernel spec §8.
 
 **SSE** (umbrella §11.2). **Every state change first writes an events row, and
 every SSE message carries the `event_id` that caused it** as its `id:`; both
-streams send a comment keepalive every 15 s.
+streams send a comment keepalive every 15 s. Both end when the operator
+session that opened them ends (kernel spec §3.2).
 
 - `GET /api/stream/sessions/{id}` — every timeline event for one session plus
   `catalog_changed`, `pending_changed`, `turn_changed`. It resumes from
@@ -1449,7 +1508,11 @@ Evaluated on ingest, edge-triggered only:
 | Cancel grace (`CANCEL_GRACE`) | 20 s, then the 5 s kill grace |
 | Updates handled in a row (`UPDATE_BURST`) | 64 |
 
-All configurable; none silent when hit.
+Configurable so far: the idle reap (`hennery host run --idle-timeout-secs`,
+`0` turns it off) and the host offline threshold (`hennery collector
+--host-offline-secs`). The others are constants in this build; the host's
+bounds must stay below the collector's timeouts (§3.4). None is silent when
+hit.
 
 ---
 
@@ -1457,8 +1520,8 @@ All configurable; none silent when hit.
 
 Beyond the umbrella §14:
 
-**Fake adapter** (`hennery-host` test support): a scripted ACP agent binary
-driven by a scenario file. Scenarios that must exist, each run over the
+**Fake adapter** (`hennery-testkit`, binary `hennery-fake-acp`): a scripted ACP
+agent driven by a JSON script in `HENNERY_FAKE_ACP_SCRIPT`. Scenarios that must exist, each run over the
 in-memory pipe and a real WebSocket:
 
 1. start with model+mode+axes; announced catalogue is post-switch; mode applied last.
@@ -1510,6 +1573,12 @@ in-memory pipe and a real WebSocket:
 - gateway token exposure: while a Claude session runs, the process list is
   searched for the session's token (gateway spec §3.2); the result is recorded
   per pin. Codex is measured the same way.
+
+**Timing.** A test that depends on ordering holds the session actor through
+`hennery-host`'s `test-hooks` feature (enabled only by `hennery-testkit`, never
+in a shipped build), or polls with a deadline, never a fixed sleep. Each such
+test must pass with four copies of its test binary running at once (CI runners
+have 2–4 vCPUs).
 
 ---
 

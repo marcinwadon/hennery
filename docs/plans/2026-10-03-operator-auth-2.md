@@ -74,6 +74,8 @@ Deferred with rulings (see "After this plan"):
 
 Tests: 475 in the workspace, up from 441 before this plan: the plan's 472, plus 3 added in review.
 
+**Spec write-back (2026-10-01):** this plan's spec amendments and spec-level deviations are applied: in #21 (kernel, umbrella) and #22 (ACP core, frontend, distribution). Notes above that call them still to be applied are history.
+
 ## Scope
 
 3b-i's "After this plan" gives 3b-ii five pieces: several listeners, `config.toml`, the admin socket, `owner_id` on the older tables with every query filtering by it, and the health checks. With the three fold-ins the brief asks for, that is more than 7 to 9 right-sized tasks. The plan is **split** (decision 1):

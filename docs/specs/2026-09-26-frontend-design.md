@@ -1,7 +1,8 @@
 # hennery — frontend (subsystem spec)
 
 - **Date:** 2026-09-26
-- **Status:** Draft, awaiting review
+- **Status:** Draft. Amended 2026-10-01 where the APIs it consumes changed as
+  built (plans A to 3c); rendering is still the design, untouched by any plan.
 - **Refines:** [architecture spec](2026-09-25-hennery-architecture-design.md) §13;
   consumes the APIs of the [ACP core](2026-09-26-acp-core-design.md) and
   [MCP gateway](2026-09-26-mcp-gateway-design.md) specs.
@@ -38,7 +39,7 @@ test saw.
 
 | Route | View | Shown in `gateway` mode |
 |---|---|---|
-| `/setup/:token` | Owner account creation (one-time link) | yes |
+| `/setup` (token in the URL fragment, kernel spec §3.1) | Owner account creation (one-time link) | yes |
 | `/login` | Password or passkey | yes |
 | `/sessions` | Session list | no |
 | `/sessions/:id` | Session | no |
@@ -63,9 +64,15 @@ test saw.
 
 ## 3. Auth screens
 
-- **Setup:** the one-time link opens a form for the owner's password and offers
-  to register a passkey immediately.
+- **Setup:** the one-time link opens a form for the owner's password and
+  `public_url` (pre-filled with `location.origin`); the token is read from
+  `location.hash`, removed from the address bar and sent in the
+  `POST /api/setup` body. It then offers to register a passkey: setup's
+  session counts as stepped up, so registration needs no second password
+  within 5 minutes.
 - **Login:** passkey first (conditional UI where supported), password second.
+  The passkey button is hidden on 409 `no_passkeys` or `passkeys_unavailable`
+  (a `public_url` at an IP address); a 429 honours `Retry-After`.
 - A 401 from any API call routes to `/login` with the current URL as the return
   target.
 - **Step-up:** a 403 `step_up_required` (kernel spec §3.4) opens a small
@@ -170,9 +177,14 @@ such:
 - `plan` updates replace the step list (latest snapshot).
 - Non-ACP session bodies and collector events render as dividers:
   `adapter_exited` (stderr excerpt behind a disclosure), `transcript_gap`,
-  `turn_ended{interrupted}` ("the turn was interrupted"), `session_parked`
-  with its reason, `host_note`, `conflict`, and operator actions (rename, hat
-  re-assignment).
+  `turn_ended{interrupted}` and `turn_ended_synthesized` ("the turn was
+  interrupted"), `turn_not_delivered` ("not delivered", with "send again"),
+  `start_not_delivered`, `host_restarted`, `presumed_parked` / `reattached`
+  ("host offline" / "host back"), `session_parked` with its reason,
+  `host_note` (including `config_failed` / `reapply_failed`: a switch on start
+  or resume that did not take), `conflict`, and operator actions (rename, hat
+  re-assignment). Question events (`pending_*`, `answer_*`) drive the cards
+  (§6.3), not dividers.
 - **Fabrication warning:** tool output that contains tool-invocation syntax
   (closed tags only: `<tool_use>`, not `<tool_use`, so a legitimate
   `<tool_use_error>` does not trip it) gets a visible warning. *(F-13: a
@@ -224,10 +236,14 @@ Both cards, delivery states:
 | `delivered` | "Answered" |
 | verdict `delivered: false` | "Sent, but the agent was no longer waiting" |
 | `cancelled(reason)` | "The agent stopped waiting (<reason>)" plus "Answer as a new message" |
+| `cancelled(reason)` with `delivered: true` | "Answered" (the agent took the answer before it stopped waiting) |
+| a permission with no option ids | no option buttons; "This question cannot be answered here: stop, park or close the session" |
 | 409 `already_answered` | "Already answered from another device" (the card then follows the other answer's verdict) |
 
 The verdict fold is monotonic: `delivered` sticks even if a later
-`delivered: false` arrives. "Answer as a new message" resumes the session if
+`delivered: false` arrives, or the question is cancelled after it (ACP core
+§4.6). Reasons are shown in words, including `agent_withdrew` ("the agent
+withdrew the question") and `host_revoked`. "Answer as a new message" resumes the session if
 needed and sends "You asked: …. My answer: …" as a new turn, labelled as such.
 
 ### 6.4 Rendering
@@ -259,11 +275,16 @@ needed and sends "You asked: …. My answer: …" as a new turn, labelled as suc
 - **Slash commands** from the catalogue: menu while the text starts with `/`
   and has no space; arrow keys, Enter to pick, Escape to dismiss.
 - **Config bar:** one switcher per catalogue axis (model, mode, then others in
-  a stable order); optimistic with rollback on error.
+  a stable order); optimistic, then replaced by the `SessionCatalog` the 202
+  returns (what the agent reports, which may differ from the pick, e.g. a mode
+  clamped by a model switch); rolled back on 409, 400 or 502 `config_failed`.
 - Send is disabled while a turn is in flight (`running`/`blocked`); a Cancel
-  control replaces it.
-- A 409 `not_attached` (the session is parked or its host offline) keeps the
-  draft and offers "Resume and send". A 503 "delivery unknown" keeps the draft
+  control replaces it. Cancel answers with the turn's real outcome
+  (`CancelResponse`): a turn that finished first shows as completed, not
+  cancelled; `no_open_turn` / `not_running` mean nothing was left to stop.
+- A 409 `not_attached` (parked, closed or failed) keeps the draft and offers
+  "Resume and send"; a 409 `host_offline` (active, but its host is not
+  reachable yet) keeps the draft and waits for the host. A 503 "delivery unknown" keeps the draft
   and shows that the outcome will be known when the host reconnects; a turn
   later reported `not_delivered` offers to send its content again.
 - **Per-session state is keyed by session id**: draft text, attachments,
@@ -277,6 +298,8 @@ needed and sends "You asked: …. My answer: …" as a new turn, labelled as suc
   and "Park" in the header menu for active sessions on hosts with the `park`
   capability. A resume refused with `hat_mismatch` names both hats and links to
   hat re-assignment (sessions with no running adapter, with a warning).
+- Starting: a spinner. With the host offline, "Close" closes at once; on a
+  reachable host Close waits for the start to settle (409 `starting`).
 - Failed: the reason and, for `agent_has_no_record`, "Start a new session in
   this project"; for `agent_not_logged_in`, the host's login instructions.
 - "Delete session" in the header menu (confirmation plus step-up).
@@ -312,7 +335,8 @@ One form, one request (`POST /api/sessions`):
 ## 8. Hosts, MCP, Hats, Settings
 
 - **Hosts:** "Add host" (step-up) shows a one-time code and the exact command
-  (`hennery host join <public_url> <code>`), with a countdown. The list shows
+  (`hennery host join <public_url> <code>`), with a countdown. Revoked hosts
+  stay listed, as revoked. Host names are rendered as escaped text. The list shows
   online state, versions (host, adapters), agent availability, last doctor
   result, rename and revoke (confirmation plus step-up; the dialog says the
   host's running agents stop only when it next connects). Notices: "restart
@@ -335,9 +359,12 @@ One form, one request (`POST /api/sessions`):
   sanitised by the server and always rendered as `<img>`), default hat per
   host, path rules per host with a live "this path resolves to" tester, and
   "Purge hat" (lists what will be deleted; confirmation plus step-up).
-- **Settings:** account and passkeys, push devices (subscribe/unsubscribe per
-  device), `public_url` (with a warning that passkeys and OAuth registrations
-  must be redone after a change), optional owner contact for push (kernel spec
+- **Settings:** account and passkeys (label, created, last used; registering
+  and removing need step-up), signed-in devices (`GET /api/auth/sessions`;
+  revoke with step-up; `user_agent` rendered as escaped, bidi-isolated text),
+  push devices (subscribe/unsubscribe per device), `public_url` (with a warning
+  that OAuth registrations must be redone, and passkeys too if the host name
+  changes), optional owner contact for push (kernel spec
   §6), attachment store disk usage (ACP core §15), per-hat push policy (mute,
   include details, generic title), and the deployment warning when the collector shares its OS
   user with agents while holding credentials for several hats (kernel spec
