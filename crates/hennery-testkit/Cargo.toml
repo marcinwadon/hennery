@@ -26,6 +26,6 @@ hennery-host = { workspace = true, features = ["test-hooks"] }
 hennery-proto.workspace = true
 hennery-sessions.workspace = true
 hex.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = "3"
 tokio-tungstenite.workspace = true

@@ -3,7 +3,8 @@
 //!
 //! - **One owner.** It exists from the first start (the kernel's
 //!   migrations create it, plan 3b-iii decision 1); setup sets it up, once,
-//!   and a second setup is refused.
+//!   and a second setup is refused. Every query names that owner (kernel
+//!   spec §1), bound when the operator opens (`db::kernel_owner`).
 //! - **The setup token lives in memory only.** A restart before setup
 //!   issues a new one, and the old one is dead by construction (kernel
 //!   spec §3.1). Only its SHA-256 is kept.
@@ -201,7 +202,7 @@ impl Operator {
 
     fn init(mut conn: Connection) -> Result<Self> {
         let owner = db::kernel_owner(&mut conn)?;
-        let public_url = load_public_url(&conn)?;
+        let public_url = load_public_url(&conn, &owner)?;
         Ok(Self {
             conn: Mutex::new(conn),
             owner,
@@ -390,7 +391,11 @@ impl Operator {
         self.verifications.fetch_add(1, Ordering::Relaxed);
         let phc: Option<String> = self
             .conn()
-            .query_row("SELECT phc FROM password_credentials LIMIT 1", [], |r| r.get(0))
+            .query_row(
+                "SELECT phc FROM password_credentials WHERE owner_id = ?1",
+                [&self.owner],
+                |r| r.get(0),
+            )
             .optional()?;
         let Some(phc) = phc else {
             let _ = password_auth::verify_password(password, dummy_hash());
@@ -527,11 +532,11 @@ fn remove_setup_file(file: &Path) {
     }
 }
 
-fn load_public_url(conn: &Connection) -> Result<Option<PublicUrl>> {
+fn load_public_url(conn: &Connection, owner: &str) -> Result<Option<PublicUrl>> {
     let stored: Option<String> = conn
         .query_row(
-            "SELECT value FROM settings WHERE key = ?1 LIMIT 1",
-            [PUBLIC_URL_KEY],
+            "SELECT value FROM settings WHERE owner_id = ?1 AND key = ?2",
+            [owner, PUBLIC_URL_KEY],
             |r| r.get(0),
         )
         .optional()?;
@@ -621,7 +626,10 @@ impl Operator {
             .take(MAX_USER_AGENT)
             .collect();
         let conn = self.conn();
-        conn.execute("DELETE FROM auth_sessions WHERE expires_at <= ?1", [now])?;
+        conn.execute(
+            "DELETE FROM auth_sessions WHERE expires_at <= ?1 AND owner_id = ?2",
+            params![now, self.owner],
+        )?;
         let opened = conn.execute(
             "INSERT INTO auth_sessions(id_hash, owner_id, user_agent, created_at, last_seen_at, last_step_up_at, expires_at)
              SELECT ?1, ?2, ?3, ?4, ?4, ?4, ?5
@@ -646,28 +654,28 @@ impl Operator {
         }
         let id = sha256_hex(token.as_bytes());
         let conn = self.conn();
-        let row: Option<(String, i64, Option<i64>, i64)> = conn
+        let row: Option<(i64, Option<i64>, i64)> = conn
             .query_row(
-                "SELECT owner_id, last_seen_at, last_step_up_at, expires_at FROM auth_sessions
-                 WHERE id_hash = ?1 AND expires_at > ?2",
-                params![id, now],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                "SELECT last_seen_at, last_step_up_at, expires_at FROM auth_sessions
+                 WHERE id_hash = ?1 AND expires_at > ?2 AND owner_id = ?3",
+                params![id, now, self.owner],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let Some((owner_id, last_seen_at, last_step_up_at, mut expires_at)) = row else {
+        let Some((last_seen_at, last_step_up_at, mut expires_at)) = row else {
             return Ok(None);
         };
         let slid = now - last_seen_at >= SESSION_SLIDE_SECS;
         if slid {
             expires_at = now + SESSION_TTL_SECS;
             conn.execute(
-                "UPDATE auth_sessions SET last_seen_at = ?2, expires_at = ?3 WHERE id_hash = ?1",
-                params![id, now, expires_at],
+                "UPDATE auth_sessions SET last_seen_at = ?2, expires_at = ?3 WHERE id_hash = ?1 AND owner_id = ?4",
+                params![id, now, expires_at, self.owner],
             )?;
         }
         Ok(Some(Authenticated {
             session_id: id,
-            owner_id,
+            owner_id: self.owner.clone(),
             last_step_up_at,
             expires_at,
             slid,
@@ -678,8 +686,8 @@ impl Operator {
     /// Whether the session still exists.
     pub fn step_up(&self, session_id: &str, now: i64) -> Result<bool> {
         let changed = self.conn().execute(
-            "UPDATE auth_sessions SET last_step_up_at = ?2 WHERE id_hash = ?1",
-            params![session_id, now],
+            "UPDATE auth_sessions SET last_step_up_at = ?2 WHERE id_hash = ?1 AND owner_id = ?3",
+            params![session_id, now, self.owner],
         )?;
         Ok(changed > 0)
     }
@@ -689,9 +697,9 @@ impl Operator {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id_hash, user_agent, created_at, last_seen_at, last_step_up_at, expires_at
-             FROM auth_sessions WHERE expires_at > ?1 ORDER BY last_seen_at DESC, id_hash",
+             FROM auth_sessions WHERE expires_at > ?1 AND owner_id = ?2 ORDER BY last_seen_at DESC, id_hash",
         )?;
-        let rows = stmt.query_map([now], |r| {
+        let rows = stmt.query_map(params![now, self.owner], |r| {
             Ok(AuthSession {
                 id: r.get(0)?,
                 user_agent: r.get(1)?,
@@ -708,8 +716,8 @@ impl Operator {
     /// not listed by `sessions`, so it is not there to revoke either.
     pub fn revoke_session(&self, session_id: &str, now: i64) -> Result<bool> {
         let changed = self.conn().execute(
-            "DELETE FROM auth_sessions WHERE id_hash = ?1 AND expires_at > ?2",
-            params![session_id, now],
+            "DELETE FROM auth_sessions WHERE id_hash = ?1 AND expires_at > ?2 AND owner_id = ?3",
+            params![session_id, now, self.owner],
         )?;
         if changed > 0 {
             self.sessions_ended();
@@ -729,8 +737,8 @@ impl Operator {
         Ok(self
             .conn()
             .query_row(
-                "SELECT expires_at FROM auth_sessions WHERE id_hash = ?1 AND expires_at > ?2",
-                params![session_id, now],
+                "SELECT expires_at FROM auth_sessions WHERE id_hash = ?1 AND expires_at > ?2 AND owner_id = ?3",
+                params![session_id, now, self.owner],
                 |r| r.get(0),
             )
             .optional()?)
