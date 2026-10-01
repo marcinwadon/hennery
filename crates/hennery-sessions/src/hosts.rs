@@ -10,7 +10,7 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router, middleware};
-use hennery_kernel::hosts::{EnrollOutcome, Enrollment, HostRecord, Revoke};
+use hennery_kernel::hosts::{EnrollOutcome, Enrollment, HostRecord, Revoke, TooManyPairingCodes};
 use hennery_kernel::json::ApiJson;
 use hennery_kernel::lifecycle::LifecycleHooks;
 use hennery_kernel::secret::unix_now;
@@ -62,6 +62,7 @@ async fn mint_pairing_code(State(state): State<AppState>) -> Response {
             }),
         )
             .into_response(),
+        Err(err) if err.is::<TooManyPairingCodes>() => error(StatusCode::CONFLICT, "too_many_codes", err.to_string()),
         Err(err) => internal(err),
     }
 }
