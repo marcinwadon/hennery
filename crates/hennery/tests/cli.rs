@@ -1416,6 +1416,19 @@ fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
     let collector = |fd: Option<&OwnedFd>, args: &[&str]| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
         cmd.arg("collector").args(args).arg("--data-dir").arg(&data);
+        if fd.is_none() {
+            // Another test's spawn can leak a descriptor into this child for
+            // a moment (macOS makes a pipe or socket close-on-exec only after
+            // it exists), and it may sit at 50: closed here, so what is
+            // tested is a closed descriptor.
+            // SAFETY: close(2) in the forked child, before exec; async-signal-safe.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::close(50);
+                    Ok(())
+                });
+            }
+        }
         if let Some(fd) = fd {
             let fd = fd.as_raw_fd();
             // SAFETY: dup2 in the forked child, before exec; async-signal-safe.
