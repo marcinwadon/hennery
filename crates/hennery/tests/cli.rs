@@ -1970,16 +1970,20 @@ fn open_pty() -> (std::fs::File, std::os::fd::OwnedFd) {
 }
 
 /// `POST /api/auth/login` with `password`, from `origin`: the status.
+///
+/// The request goes out in one write. A refused origin is answered before
+/// the body is read, and the collector then closes: a body still unread, or
+/// still on its way (`write!` sends each piece apart), resets the
+/// connection, and the 403 already received is lost to the reset.
 fn login(listen: &str, origin: &str, password: &str) -> Option<u16> {
     let body = serde_json::json!({ "password": password }).to_string();
     let mut stream = TcpStream::connect(listen).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(15))).ok()?;
-    write!(
-        stream,
+    let request = format!(
         "POST /api/auth/login HTTP/1.1\r\nHost: {listen}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
-    )
-    .ok()?;
+    );
+    stream.write_all(request.as_bytes()).ok()?;
     let mut response = String::new();
     stream.read_to_string(&mut response).ok()?;
     response.split(' ').nth(1)?.parse().ok()
