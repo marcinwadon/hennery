@@ -308,11 +308,40 @@ fn names(sql: &str, table: &str) -> bool {
         .any(|(at, _)| !word(sql[..at].chars().next_back()) && !word(sql[at + table.len()..].chars().next()))
 }
 
-/// The select list of `sql`'s first `SELECT`: what follows that word, up
-/// to the next whole word `FROM` (or the end).
-fn select_list(sql: &str) -> Option<&str> {
-    let list = after_word(sql, "select")?;
-    Some(after_word(list, "from").map_or(list, |rest| &list[..list.len() - rest.len()]))
+/// The select list of every `SELECT` in `sql`, in order: what follows
+/// that word, up to the next whole word `FROM` (or the end). A subquery's
+/// list is its own: an outer list ends at the subquery's `FROM` at the
+/// latest, before any `WHERE` of it (3b-iii final review, I2).
+fn select_lists(sql: &str) -> Vec<&str> {
+    let mut lists = Vec::new();
+    let mut rest = sql;
+    while let Some(list) = after_word(rest, "select") {
+        lists.push(after_word(list, "from").map_or(list, |tail| &list[..list.len() - tail.len()]));
+        rest = list;
+    }
+    lists
+}
+
+/// Whether `sql` orders, groups or partitions by `owner_id`: the column, as
+/// a whole word, in the list after `ORDER BY`, `GROUP BY` or `PARTITION BY`,
+/// up to the next word that ends that list. Read there, the column filters
+/// nothing (3b-iii final review, I2).
+fn orders_by_owner(sql: &str) -> bool {
+    const ENDS_THE_LIST: &str =
+        "limit offset having window order union except intersect where from select and or on join returning values set";
+    let words: Vec<String> = sql
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|w| !w.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+    words.windows(2).enumerate().any(|(at, w)| {
+        matches!(w[0].as_str(), "order" | "group" | "partition")
+            && w[1] == "by"
+            && words[at + 2..]
+                .iter()
+                .take_while(|word| !ENDS_THE_LIST.split(' ').any(|end| end == *word))
+                .any(|word| word == "owner_id")
+    })
 }
 
 /// Whether `sql` is an `INSERT`: it begins with `INSERT` or `REPLACE`, in
@@ -333,15 +362,38 @@ fn inserts_owner(sql: &str, table: &str) -> bool {
     columns.split(',').any(|c| c.trim() == "owner_id")
 }
 
-/// `sql` with its own comments removed (`-- … ` to end of line, `/* … */`):
-/// neither can satisfy `compares_owner_with_a_parameter` (3b-iii review,
-/// M2) — a commented-out comparison is not a real one.
+/// `sql` as the textual rules read it: its own comments removed (`-- … `
+/// to end of line, `/* … */`), since a commented-out comparison is not a
+/// real one (3b-iii review, M2); and each string literal (`'…'`, `''` its
+/// escape) emptied to `''`, since its text is a value, not the statement's
+/// own words. A comment's opening inside a literal opens nothing, and a
+/// literal's `from owners h` declares no table and no alias (3b-iii final
+/// review, I1). A quoted name (`"…"`, `` `…` ``, `[…]`) is a name: it is
+/// kept as it is, and a comment's opening inside it opens nothing either.
 fn without_sql_comments(sql: &str) -> String {
     let s: Vec<char> = sql.chars().collect();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < s.len() {
-        if s[i] == '-' && s.get(i + 1) == Some(&'-') {
+        if matches!(s[i], '\'' | '"' | '`' | '[') {
+            let quote = s[i];
+            let close = if quote == '[' { ']' } else { quote };
+            let start = i;
+            i += 1;
+            // To the closing quote; a doubled one (`''`, `""`) is its escape.
+            while i < s.len() {
+                if s[i] == close && !(close != ']' && s.get(i + 1) == Some(&close)) {
+                    break;
+                }
+                i += if s[i] == close { 2 } else { 1 };
+            }
+            i += 1;
+            if quote == '\'' {
+                out.push_str("''");
+            } else {
+                out.extend(&s[start..i.min(s.len())]);
+            }
+        } else if s[i] == '-' && s.get(i + 1) == Some(&'-') {
             while i < s.len() && s[i] != '\n' {
                 i += 1;
             }
@@ -451,14 +503,19 @@ fn compares_owner_with_a_parameter(sql: &str) -> bool {
 }
 
 /// Why `sql` does not filter by the owner, if it does not. A read of the
-/// owner column counts as filtering by it, so the column is never read for
-/// its value: not returned, and not copied by an `INSERT … SELECT` (the
-/// owner comes from a parameter there); and one owner column at least is
-/// compared with a parameter. What this cannot see (3b-iii review, A4): a
-/// filter that is wrong (`OR`, `owner_id = owner_id`); the owner column read
-/// for its value under an alias (`owner_id AS o`) or as an expression in
-/// the select list (`owner_id = ?1` there) beside another comparison. The
-/// second-owner tests are the other half.
+/// owner column counts as filtering by it, so `owner_id` is never read for
+/// its value or its order: not returned, not in any select list, the
+/// outer one or a subquery's (so not copied by an `INSERT … SELECT`
+/// either: the owner comes from a parameter there), and not ordered,
+/// grouped or partitioned by; and one owner column at least is compared
+/// with a parameter. Rule 1 is per table and A1 per statement, so without
+/// those, a second table whose owner column is only read to order it, or
+/// returned by a subquery, passed beside another table's comparison
+/// (3b-iii final review, I2). What this cannot see (3b-iii review, A4): a
+/// filter that is wrong rather than missing (`OR`, `owner_id = owner_id`,
+/// `owner_id <> ''`); `owners`' own `id` read for its value or its order
+/// (`EXISTS (SELECT id FROM owners)`), since only `owner_id` is matched
+/// there. The second-owner tests are the other half.
 fn problems(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
     let t = touched(conn, sql);
     let mut out = Vec::new();
@@ -483,15 +540,26 @@ fn problems(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
     if t.returned.iter().any(|c| c == "owner_id") {
         out.push("it returns owner_id: compare the column, do not read it back".into());
     }
+    // The textual rules read the statement without its comments and the
+    // text of its string literals (I1).
+    let code = without_sql_comments(sql);
     // `SELECT` and `FROM` as whole words, in any case: a column such as
-    // `from_seq` must not cut the select list short.
-    if is_insert(sql)
-        && let Some(list) = select_list(sql)
-        && has_word(list, "owner_id")
-    {
-        out.push("its INSERT … SELECT copies owner_id: take it from a parameter".into());
+    // `from_seq` must not cut a select list short. An `INSERT`'s first list
+    // is what it inserts.
+    for (at, list) in select_lists(&code).into_iter().enumerate() {
+        if !has_word(list, "owner_id") {
+            continue;
+        }
+        if at == 0 && is_insert(&code) {
+            out.push("its INSERT … SELECT copies owner_id: take it from a parameter".into());
+        } else {
+            out.push("a select list reads owner_id: compare the column, do not read it back".into());
+        }
     }
-    let values_only = is_insert(sql) && !has_word(sql, "select");
+    if orders_by_owner(&code) {
+        out.push("it orders or groups by owner_id: compare the column instead".into());
+    }
+    let values_only = is_insert(&code) && !has_word(&code, "select");
     if !tables.is_empty() && !values_only && !compares_owner_with_a_parameter(sql) {
         out.push("no owner column is compared with a parameter".into());
     }
@@ -632,6 +700,35 @@ fn the_audit_catches_a_query_without_the_owner() {
         // columns compared to each other, not to a parameter, A1) is
         // right next to it.
         "SELECT name FROM owners, hosts WHERE hosts.owner_id = owners.id AND hosts.id = ?1",
+        // 3b-iii final review I1: ED3's hosts case again, with a comment's
+        // opening inside a string literal. Stripped as a comment, `--`
+        // took `FROM hosts` with it, and `/*` everything up to a real
+        // `*/`: `owners`, from the subquery, was then the only table left.
+        "SELECT name, '--' FROM hosts
+         WHERE id = ?1 AND owner_id IN (SELECT id FROM owners)",
+        "SELECT name, '/*' FROM hosts /**/ WHERE id = ?1 AND owner_id IN (SELECT id FROM owners)",
+        // The same class: a literal's text read as the statement's own.
+        // Here it declared `h` an alias of `owners`, so `hosts`' own
+        // `h.id = ?1` counted as the owner comparison.
+        "SELECT name, ' from owners h ' FROM hosts h WHERE h.id = ?1 AND owner_id IN (SELECT id FROM owners)",
+        // 3b-iii final review I2: a second table's owner column read only
+        // to order or group it, or returned by a subquery's select list,
+        // while another table carries the comparison with a parameter.
+        // `auth_sessions`, `sessions` and `turns` are filtered by nothing.
+        "SELECT phc FROM password_credentials
+         WHERE owner_id = ?1 AND EXISTS (SELECT 1 FROM auth_sessions WHERE id_hash = ?2 ORDER BY owner_id)",
+        "SELECT phc FROM password_credentials
+         WHERE owner_id = ?1 AND EXISTS (SELECT 1 FROM auth_sessions WHERE id_hash = ?2 GROUP BY owner_id)",
+        "SELECT q.answer FROM answer_queue q JOIN sessions s ON s.id = q.session_id
+         WHERE q.owner_id = ?1 ORDER BY s.owner_id",
+        "SELECT body FROM events WHERE owner_id = ?1
+         AND session_id IN (SELECT id FROM sessions WHERE owner_id IN (SELECT owner_id FROM turns WHERE turn_id = ?2))",
+        // Every select list is read now, the outer one too: the owner
+        // column under an alias, or as an expression, beside another
+        // comparison (A4's two select-list cases until then).
+        "SELECT phc, owner_id AS o FROM password_credentials WHERE owner_id = ?1",
+        "SELECT q.answer, s.owner_id = ?2 FROM answer_queue q JOIN sessions s ON s.id = q.session_id
+         WHERE q.owner_id = ?1",
         // ED4 (3b-iii Task 3 review M3): SQL is case-insensitive, and so is
         // every rule that reads the statement's text. The authorizer names
         // tables as the schema does (`events`), whatever case the statement
@@ -706,4 +803,10 @@ fn the_audit_catches_a_query_without_the_owner() {
     }
     let literals = string_literals("// \"no\"\nlet a = 'x'; let b = '\"'; f::<'a>(\"one\", r#\"two \"q\"\"#);");
     assert_eq!(literals, ["one", "two \"q\""]);
+    // I1: a string literal's text is emptied, `''` and all; a quoted name
+    // is kept; a comment's opening opens nothing inside either.
+    assert_eq!(
+        without_sql_comments("SELECT 'it''s -- x', \"a--b\", [c/*d] -- e\nFROM t /* f */"),
+        "SELECT '', \"a--b\", [c/*d] \nFROM t "
+    );
 }
