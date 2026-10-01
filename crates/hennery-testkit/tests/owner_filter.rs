@@ -245,6 +245,20 @@ struct Touched {
     returned: Vec<String>,
 }
 
+/// The audit's connection to the migrated `db`, with SQLite's legacy
+/// double-quoted string literals turned off (3b-iii final re-review, N1).
+/// With them on, a `"…"` that names nothing falls back to a string, and
+/// its text, which the textual rules keep as a quoted name, could declare
+/// an alias of `owners` (`" from owners h "`). Off, `"…"` is always a
+/// name, and anything else fails to prepare, so it fails the audit.
+fn audit_connection(db: &Path) -> rusqlite::Connection {
+    use rusqlite::config::DbConfig;
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DML, false).unwrap();
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DQS_DDL, false).unwrap();
+    conn
+}
+
 fn touched(conn: &rusqlite::Connection, sql: &str) -> Touched {
     let log: Arc<Mutex<Touched>> = Arc::default();
     let sink = log.clone();
@@ -515,7 +529,9 @@ fn compares_owner_with_a_parameter(sql: &str) -> bool {
 /// filter that is wrong rather than missing (`OR`, `owner_id = owner_id`,
 /// `owner_id <> ''`); `owners`' own `id` read for its value or its order
 /// (`EXISTS (SELECT id FROM owners)`), since only `owner_id` is matched
-/// there. The second-owner tests are the other half.
+/// there; `owner_id` later in an ordering expression than its first
+/// keyword (`ORDER BY 1 AND owner_id`), since the ordering list ends at
+/// `AND`, `OR` and the like. The second-owner tests are the other half.
 fn problems(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
     let t = touched(conn, sql);
     let mut out = Vec::new();
@@ -573,7 +589,7 @@ fn every_query_of_the_stores_filters_by_the_owner() {
     Operator::open(&db).unwrap();
     Hosts::open(&db).unwrap();
     Store::open(&db).unwrap();
-    let conn = rusqlite::Connection::open(&db).unwrap();
+    let conn = audit_connection(&db);
     let mut found = Vec::new();
     for (path, source, at_least) in SOURCES {
         let sql = statements(source);
@@ -655,7 +671,7 @@ fn the_audit_catches_a_query_without_the_owner() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("hennery.db");
     Store::open(&db).unwrap();
-    let conn = rusqlite::Connection::open(&db).unwrap();
+    let conn = audit_connection(&db);
     for bad in [
         "SELECT phc FROM password_credentials LIMIT 1",
         "SELECT count(*) FROM auth_sessions",
@@ -809,4 +825,12 @@ fn the_audit_catches_a_query_without_the_owner() {
         without_sql_comments("SELECT 'it''s -- x', \"a--b\", [c/*d] -- e\nFROM t /* f */"),
         "SELECT '', \"a--b\", [c/*d] \nFROM t "
     );
+    // N1 (final re-review): the double-quoted twin of the literal-alias case
+    // does not prepare on the audit's connection, so it fails the audit
+    // (`touched` panics); with SQLite's default it was a string, and passed.
+    // A double-quoted name still prepares.
+    let double_quoted = "SELECT name, \" from owners h \" FROM hosts h
+         WHERE h.id = ?1 AND owner_id IN (SELECT id FROM owners)";
+    assert!(conn.prepare(double_quoted).is_err(), "prepared: {double_quoted}");
+    assert!(conn.prepare("SELECT \"name\" FROM \"hosts\"").is_ok());
 }

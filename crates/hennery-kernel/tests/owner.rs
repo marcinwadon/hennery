@@ -361,8 +361,9 @@ const HOST_TABLES: &[&str] = &["hosts", "pairing_codes"];
 /// owner. Another owner's host and pairing code, in the same database,
 /// are neither seen nor changed: its host's valid proof is refused like an
 /// unknown host's, it is not listed, cannot be revoked and, revoked
-/// already, is not seen as revoked either, and its code pairs nothing. The real owner's, written the same way, work (the
-/// control). The other owner's key cannot be paired again under this
+/// already, is not seen as revoked either, and its code pairs nothing.
+/// The real owner's, written the same way, work (the control). The other
+/// owner's key cannot be paired again under this
 /// owner either: keys are unique across owners (3b-iii decision 7).
 #[test]
 fn another_owners_hosts_and_codes_are_invisible_to_the_registry() {
