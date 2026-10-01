@@ -481,3 +481,77 @@ async fn passkey_register_finish(
         Err(err) => internal(err),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::sync::Mutex;
+
+    const NOW: i64 = 1_800_000_000;
+
+    /// A `tracing` writer into a shared buffer.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The reason a registration's finish is refused with, for an answer
+    /// whose `credProtect` names no policy: serde quotes an unknown variant
+    /// as it was sent, so the client's control characters reach `why` raw.
+    fn a_refusal_quoting(variant: &str) -> Refused {
+        let op = Operator::open_in_memory().unwrap();
+        let token = op.issue_setup_token(NOW).unwrap().unwrap();
+        let SetupOutcome::Done { phc, .. } = op
+            .set_up(&token, "correct horse battery", "https://hennery.example", NOW)
+            .unwrap()
+        else {
+            panic!("setup failed");
+        };
+        let token = op.open_session("test", &phc, NOW).unwrap().unwrap();
+        let session_id = op.authenticate(&token, NOW).unwrap().unwrap().session_id;
+        let Start::Begun { ceremony_id, .. } = op.start_passkey_registration(&session_id, "laptop", NOW).unwrap()
+        else {
+            panic!("the registration did not begin");
+        };
+        let answer = serde_json::json!({ "extensions": { "credProtect": variant } });
+        op.finish_passkey_registration(&session_id, &ceremony_id, &answer, NOW)
+            .unwrap()
+            .expect_err("refused")
+    }
+
+    /// 3c review, O4: a refused answer's reason is logged `Debug`-escaped,
+    /// so a client cannot forge a log line with a newline in its answer.
+    #[test]
+    fn a_refused_passkeys_reason_is_logged_escaped() {
+        let why = a_refusal_quoting("x\nforged log line");
+        let Refused::Credential(reason) = &why else {
+            panic!("not refused as a credential: {why:?}");
+        };
+        assert!(reason.contains("x\nforged log line"), "{reason}");
+
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let response = tracing::subscriber::with_default(subscriber, || refused(why));
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(log.contains("passkey refused: the answer did not verify"), "{log}");
+        assert_eq!(log.lines().count(), 1, "{log}");
+        assert!(log.contains(r"x\nforged log line"), "{log}");
+    }
+}
