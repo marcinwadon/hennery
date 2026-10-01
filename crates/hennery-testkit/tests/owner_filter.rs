@@ -165,17 +165,43 @@ fn str_consts(source: &str) -> BTreeMap<String, String> {
     out
 }
 
-/// Whether a string literal is SQL: it begins with a statement's verb, in
-/// any case, `REPLACE` among them (ED4), and goes on past it. A literal
-/// that is only the word (`"update"`, `"select"`: JSON keys and values) is
-/// not a statement.
+/// Whether a string literal is SQL: it begins with a statement's verb,
+/// `REPLACE` among them (ED4). In uppercase the verb alone is enough, so a
+/// fragment such as `"SELECT "`, the start of a query put together piece by
+/// piece, is found (and fails to prepare, or makes A3 flag its file). In
+/// any other case, another word must follow: a lone lowercase `"update"` or
+/// `"select"` is a JSON key or value, not a statement.
 fn is_sql(lit: &str) -> bool {
+    const VERBS: &[&str] = &["SELECT", "INSERT", "UPDATE", "DELETE", "WITH", "REPLACE"];
     let mut words = lit.split_whitespace();
     let first = words.next().unwrap_or_default();
-    ["SELECT", "INSERT", "UPDATE", "DELETE", "WITH", "REPLACE"]
-        .iter()
-        .any(|verb| first.eq_ignore_ascii_case(verb))
-        && words.next().is_some()
+    VERBS.contains(&first) || (VERBS.iter().any(|verb| first.eq_ignore_ascii_case(verb)) && words.next().is_some())
+}
+
+/// Whether `word` is one of `sql`'s words (runs of letters, digits and
+/// `_`), in any case: `from_seq` holds no `from`.
+fn has_word(sql: &str, word: &str) -> bool {
+    sql.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .any(|w| w.eq_ignore_ascii_case(word))
+}
+
+/// What follows the first whole word `word` of `sql`, if it has one.
+fn after_word<'a>(sql: &'a str, word: &str) -> Option<&'a str> {
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut start = None;
+    for (at, c) in sql.char_indices().chain([(sql.len(), ' ')]) {
+        match (ident(c), start) {
+            (true, None) => start = Some(at),
+            (false, Some(from)) => {
+                if sql[from..at].eq_ignore_ascii_case(word) {
+                    return Some(&sql[at..]);
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `source` without its unit tests (`#[cfg(test)] mod tests`, at the end
@@ -282,6 +308,13 @@ fn names(sql: &str, table: &str) -> bool {
         .any(|(at, _)| !word(sql[..at].chars().next_back()) && !word(sql[at + table.len()..].chars().next()))
 }
 
+/// The select list of `sql`'s first `SELECT`: what follows that word, up
+/// to the next whole word `FROM` (or the end).
+fn select_list(sql: &str) -> Option<&str> {
+    let list = after_word(sql, "select")?;
+    Some(after_word(list, "from").map_or(list, |rest| &list[..list.len() - rest.len()]))
+}
+
 /// Whether `sql` is an `INSERT`: it begins with `INSERT` or `REPLACE`, in
 /// any case (ED4).
 fn is_insert(sql: &str) -> bool {
@@ -361,10 +394,11 @@ fn compares_owner_with_a_parameter(sql: &str) -> bool {
             parts
         })
         .collect();
-    // The tables this statement names (`FROM`/`JOIN`/`UPDATE`/`INTO`, the
-    // last of `INSERT`, `REPLACE` and `INSERT OR REPLACE`), and any alias declared right after `owners` there. Textual,
-    // like the rest of this check: it does not track a subquery's own
-    // scope, only the word that follows a source keyword.
+    // The tables this statement names, after `FROM`, `JOIN`, `UPDATE` or
+    // `INTO` (which ends `INSERT INTO`, `REPLACE INTO` and `INSERT OR
+    // REPLACE INTO` alike), and any alias declared right after `owners`
+    // there. Textual, like the rest of this check: it does not track a
+    // subquery's own scope, only the word that follows a source keyword.
     let mut tables: BTreeSet<&str> = BTreeSet::new();
     let mut owners_aliases: BTreeSet<&str> = BTreeSet::new();
     const NOT_AN_ALIAS: &[&str] = &[
@@ -449,14 +483,15 @@ fn problems(conn: &rusqlite::Connection, sql: &str) -> Vec<String> {
     if t.returned.iter().any(|c| c == "owner_id") {
         out.push("it returns owner_id: compare the column, do not read it back".into());
     }
-    let lower = sql.to_ascii_lowercase();
+    // `SELECT` and `FROM` as whole words, in any case: a column such as
+    // `from_seq` must not cut the select list short.
     if is_insert(sql)
-        && let Some((_, select)) = lower.split_once("select")
-        && select.split("from").next().unwrap_or_default().contains("owner_id")
+        && let Some(list) = select_list(sql)
+        && has_word(list, "owner_id")
     {
         out.push("its INSERT … SELECT copies owner_id: take it from a parameter".into());
     }
-    let values_only = is_insert(sql) && !lower.contains("select");
+    let values_only = is_insert(sql) && !has_word(sql, "select");
     if !tables.is_empty() && !values_only && !compares_owner_with_a_parameter(sql) {
         out.push("no owner column is compared with a parameter".into());
     }
@@ -613,6 +648,10 @@ fn the_audit_catches_a_query_without_the_owner() {
          select session_id, kind, body, ts, owner_id from events where event_id = ?1 and owner_id = ?2",
         "INSERT INTO events(session_id, kind, body, ts, owner_id)
          select ?1, ?2, ?3, ?4, ?5 where exists (select 1 from sessions where id = ?1 and owner_id = owner_id)",
+        // M1 (Task 5 review): `SELECT` and `FROM` are whole words. A select
+        // list with `from_seq` in it still copies `owner_id`.
+        "INSERT INTO events(session_id, kind, body, ts, owner_id)
+         SELECT session_id AS from_seq, kind, body, ts, owner_id FROM events WHERE event_id = ?1 AND owner_id = ?2",
         // ED4: `REPLACE` inserts.
         "REPLACE INTO session_catalog(session_id, config_options, updated_at) VALUES (?1, ?2, ?3)",
         "INSERT OR REPLACE INTO session_catalog(session_id, config_options, updated_at) VALUES (?1, ?2, ?3)",
@@ -657,6 +696,8 @@ fn the_audit_catches_a_query_without_the_owner() {
         "with x AS (SELECT 1) SELECT * FROM x",
         "REPLACE INTO t(a) VALUES (1)",
         "replace into t(a) values (1)",
+        "SELECT ",
+        "DELETE",
     ] {
         assert!(is_sql(sql), "not SQL: {sql}");
     }
