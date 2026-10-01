@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::{self, Stream, StreamExt};
+use hennery_kernel::json::ApiJson;
 use hennery_kernel::operator::Authenticated;
 use hennery_proto::frames::{Capability, CollectorFrame, Indexed, SessionBody};
 use hennery_proto::rest::{
@@ -129,7 +130,7 @@ fn resume_failed(err: RequestError) -> Response {
     }
 }
 
-async fn start_session(State(state): State<AppState>, Json(req): Json<StartSessionRequest>) -> Response {
+async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<StartSessionRequest>) -> Response {
     let session_id = uuid::Uuid::now_v7().to_string();
     if let Err(err) = state
         .store
@@ -294,7 +295,11 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
     }
 }
 
-async fn prompt(State(state): State<AppState>, Path(id): Path<String>, Json(req): Json<PromptRequest>) -> Response {
+async fn prompt(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(req): ApiJson<PromptRequest>,
+) -> Response {
     if req.content.is_empty() {
         return error(
             StatusCode::BAD_REQUEST,
@@ -414,7 +419,11 @@ fn catalog_response(state: &AppState, id: &str, status: StatusCode) -> Response 
 /// Switch one config option of an attached session (ACP core §9): 202
 /// with the session's catalogue once the host's `config_applied` is
 /// ingested. Every viewer sees the change as SSE `catalog_changed`.
-async fn set_config(State(state): State<AppState>, Path(id): Path<String>, Json(req): Json<ConfigRequest>) -> Response {
+async fn set_config(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(req): ApiJson<ConfigRequest>,
+) -> Response {
     let session = match state.store.session(&id) {
         Ok(Some(s)) => s,
         Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
@@ -447,7 +456,7 @@ async fn set_config(State(state): State<AppState>, Path(id): Path<String>, Json(
 async fn answer(
     State(state): State<AppState>,
     Path((id, pending_id)): Path<(String, String)>,
-    Json(req): Json<AnswerRequest>,
+    ApiJson(req): ApiJson<AnswerRequest>,
 ) -> Response {
     match state.store.submit_answer(&id, &pending_id, &req) {
         Ok(AnswerSubmission::Queued(queued)) => {
