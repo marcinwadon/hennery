@@ -1231,6 +1231,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "futures",
  "hennery-kernel",
  "hennery-proto",
@@ -1238,6 +1239,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "time",
  "tokio",
