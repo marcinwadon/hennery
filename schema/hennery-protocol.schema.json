@@ -966,7 +966,7 @@
       "type": "object"
     },
     "PasskeyFinishRequest": {
-      "description": "The finish of every passkey ceremony: the credential the browser\nreturned, as `PublicKeyCredential.toJSON()` gives it.",
+      "description": "The finish of every passkey ceremony: the credential the browser\nreturned, as `PublicKeyCredential.toJSON()` gives it. `Debug` leaves\nthe credential out.",
       "properties": {
         "ceremony_id": {
           "type": "string"

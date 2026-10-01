@@ -660,6 +660,41 @@ impl Authenticated {
     }
 }
 
+/// Store a session for `owner` that `token` opens, stepped up at `now`,
+/// after dropping the owner's expired sessions: what every login does, by
+/// password (`open_session`) or by passkey. With `verified`, the session is
+/// stored only while that PHC string is still the owner's password, and
+/// `false` says it was not. `None` skips that binding, so it is only for a
+/// caller that proved the login some other way in the same transaction (a
+/// passkey login's `record_use`).
+pub(crate) fn insert_auth_session(
+    conn: &Connection,
+    owner: &str,
+    token: &str,
+    user_agent: &str,
+    verified: Option<&str>,
+    now: i64,
+) -> Result<bool> {
+    conn.execute(
+        "DELETE FROM auth_sessions WHERE expires_at <= ?1 AND owner_id = ?2",
+        params![now, owner],
+    )?;
+    let opened = conn.execute(
+        "INSERT INTO auth_sessions(id_hash, owner_id, user_agent, created_at, last_seen_at, last_step_up_at, expires_at)
+         SELECT ?1, ?2, ?3, ?4, ?4, ?4, ?5
+         WHERE ?6 IS NULL OR EXISTS (SELECT 1 FROM password_credentials WHERE owner_id = ?2 AND phc = ?6)",
+        params![
+            sha256_hex(token.as_bytes()),
+            owner,
+            kept_user_agent(user_agent),
+            now,
+            now + SESSION_TTL_SECS,
+            verified
+        ],
+    )?;
+    Ok(opened > 0)
+}
+
 /// One signed-in session, as Settings lists them (kernel spec §3.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthSession {
@@ -681,26 +716,8 @@ impl Operator {
     /// setup, when the owner has no password.
     pub fn open_session(&self, user_agent: &str, verified: &str, now: i64) -> Result<Option<String>> {
         let token = hex::encode(random_bytes::<32>());
-        let user_agent = kept_user_agent(user_agent);
-        let conn = self.conn();
-        conn.execute(
-            "DELETE FROM auth_sessions WHERE expires_at <= ?1 AND owner_id = ?2",
-            params![now, self.owner],
-        )?;
-        let opened = conn.execute(
-            "INSERT INTO auth_sessions(id_hash, owner_id, user_agent, created_at, last_seen_at, last_step_up_at, expires_at)
-             SELECT ?1, ?2, ?3, ?4, ?4, ?4, ?5
-             WHERE EXISTS (SELECT 1 FROM password_credentials WHERE owner_id = ?2 AND phc = ?6)",
-            params![
-                sha256_hex(token.as_bytes()),
-                self.owner,
-                user_agent,
-                now,
-                now + SESSION_TTL_SECS,
-                verified
-            ],
-        )?;
-        Ok((opened > 0).then_some(token))
+        let opened = insert_auth_session(&self.conn(), &self.owner, &token, user_agent, Some(verified), now)?;
+        Ok(opened.then_some(token))
     }
 
     /// The live session `token` names, if any. Its expiry slides to
