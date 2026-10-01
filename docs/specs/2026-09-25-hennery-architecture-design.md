@@ -1,7 +1,9 @@
 # hennery — product architecture (umbrella spec)
 
 - **Date:** 2026-09-25
-- **Status:** Draft, awaiting review
+- **Status:** Draft. Amended 2026-10-01 so that it agrees with what plans A
+  to 2 (sessions) and 3a to 3c (pairing, operator auth, `owner_id`, passkeys)
+  built; the subsystem specs carry the details.
 - **Scope:** the whole product at the level of processes, protocols, state
   ownership, trust boundaries and module seams. Each subsystem gets its own
   spec that refines this one; where they disagree, this document wins until it
@@ -166,7 +168,8 @@ the operator never sees an enrollment code for it.
 ## 4. Data model sketch
 
 Indicative, not a schema: which tables exist and who owns them. Columns are
-defined in the owning subsystem spec. Every table has `owner_id`.
+defined in the owning subsystem spec. Every table has `owner_id` (`owners`
+names it in `id`; migration bookkeeping has none).
 
 | Table | Owner | Notes |
 |---|---|---|
@@ -318,8 +321,11 @@ timeout that, for state-changing requests, is at least the WebSocket read
 deadline. When the host connection drops, every in-flight HTTP waiter for that
 host fails at once with "host disconnected; delivery unknown", and the
 affected start or turn is marked **awaiting reconciliation** — never failed —
-until the host's resend and `hello` settle it (ACP core §3.4). A response for
-an unknown or expired `request_id` is logged and dropped.
+until the host's resend and `hello` settle it (ACP core §3.4). A timeout on a
+live connection is answered the same way and drops that connection, so the
+timed-out request reconciles at the next handshake; the collector owns every
+request's deadline. A response for an unknown or expired `request_id` is
+logged and dropped.
 
 ### 5.8 Liveness
 
@@ -426,7 +432,7 @@ the kind name.
 |---|---|
 | WebSocket drops, host process survives | In-flight HTTP calls fail with "delivery unknown". Host reconnects; `hello` lists attached sessions; the outbox is resent; after `resend_complete` the collector reconciles. Sessions stay `active`, pending requests stay open. |
 | Collector restarts | Same as above from the host's side. Nothing is parked; `starting` sessions are reconciled on the host's next handshake. |
-| Host restarts (crash, upgrade, reboot) | Adapters die with it. After `resend_complete`, sessions that had a turn in flight get a `turn_ended{interrupted}` synthesised by the collector (the restarted host cannot emit it); all previously attached sessions become `parked`. Pending requests become `cancelled` with a visible reason. Resume = `session/load`. |
+| Host restarts (crash, upgrade, reboot) | Adapters die with it. After `resend_complete`, sessions that had a turn in flight get a `turn_ended{interrupted}` synthesised by the collector (the restarted host cannot emit it; a turn that never started becomes `turn_not_delivered`); all previously attached sessions become `parked`. Pending requests become `cancelled` with a visible reason. Resume = `session/load`. |
 | Host offline longer than the offline threshold (default 10 min, configurable) | Collector marks its sessions `parked` with a visible "host offline" note (presumed, not reported). On reconnect, `hello.attached_sessions` is authoritative: sessions whose adapter is still attached go `parked → active` without a resume, pending requests intact; the rest stay `parked`. |
 | Idle (default 30 min, configurable, never mid-turn, never with a pending request open) | Host's reaper releases the adapter; session becomes `parked`. |
 | `session/load` fails | Session becomes `failed` with a readable reason (e.g. the agent CLI has no record of that session). |
@@ -434,7 +440,11 @@ the kind name.
 
 `turn_ended{interrupted}` is the only representation of an interrupted turn.
 The host emits it whenever it can observe the interruption (adapter exit,
-close or park mid-turn); the collector synthesises it only for host restarts.
+close or park mid-turn); the collector synthesises it only for a started turn
+the host can no longer end: a host restart, a started turn the host no longer
+reports after a full resend, an open turn released when the session detaches,
+is resumed or its host is revoked (ACP core §4.2, §4.4, §5.3). A turn the agent never
+saw becomes `turn_not_delivered` instead.
 
 ### 6.7 Resume and park
 
@@ -451,7 +461,9 @@ close or park mid-turn); the collector synthesises it only for host restarts.
 - **Park** is available explicitly (a button and an API call); it is also what
   the reaper does.
 - **Prompt or config** on a session that is not attached (parked, or its host
-  offline) is refused with `not_attached`; the UI offers resume.
+  offline) is refused with `not_attached`; the UI offers resume. A prompt to an
+  `active` session whose host has just gone, or is not yet reconciled, gets
+  `host_offline` instead (ACP core §9).
 
 ### 6.8 Delivery acknowledgement for answers
 
@@ -491,8 +503,8 @@ process.
 Closing keeps everything. Deleting is separate and explicit, and requires
 step-up authentication (§7.3):
 
-- **Delete a session** removes its events, attachments, turns and pending
-  requests (ACP core §4.10).
+- **Delete a session** removes its events, attachments, turns, pending
+  requests and queued answers (ACP core §4.10).
 - **Purge a hat** removes all of its sessions, its gateway connections with
   their grants, and its path rules; hosts delete their composed agent homes for
   that hat on their next connection (kernel §5.5).
@@ -517,22 +529,24 @@ version may accept **signed** assertions only (e.g. a Cloudflare Access JWT).
 
 ### 7.2 Bootstrap
 
-On first start with an empty database the collector creates a **one-time setup
-link** (random token, expires, single use) to create the owner account. It
-prints the full link only when stdout is a terminal; otherwise it logs only the
-path of the file that holds it (kernel §3.1). There is no default password and
-no "first visitor becomes admin" window.
+On first start with an empty database the collector creates the owner, with no
+login method, and a **one-time setup link** (random token, expires, single use)
+to complete the owner account. It prints the full link only when stdout is a
+terminal; otherwise it logs only the path of the file that holds it (kernel
+§3.1). There is no default password and no "first visitor becomes admin"
+window. A lost password is reset on the collector's machine with `hennery admin
+reset-password`, which also removes every passkey (kernel §4.2).
 
 ### 7.3 Operator login
 
 - Password (argon2id) and **passkeys** (WebAuthn), passkeys as the primary path.
-- Session cookie: `HttpOnly`, `Secure` (except on `localhost`),
-  `SameSite=Strict`.
+- Session cookie: `HttpOnly`, `Secure` (unless `public_url` is a loopback
+  `http://` origin), `SameSite=Strict`.
 - **Step-up authentication** (a fresh passkey or password check within the
   last 5 minutes) for: minting pairing codes, creating or editing gateway
-  connection URLs and credentials, local stdio server configuration, revoking
-  hosts, sessions or passkeys, deleting sessions, purging hats, and changing
-  `public_url` (kernel §3.4).
+  connection URLs and credentials, local stdio server configuration,
+  registering or revoking passkeys, revoking hosts or sessions, deleting
+  sessions, purging hats, and changing `public_url` (kernel §3.4).
 - OIDC is deferred.
 
 ### 7.4 Request authentication
@@ -554,8 +568,11 @@ product others install.
 
 - `public_url` is a **required** setting: MCP OAuth callbacks, passkeys (RP id
   and origin) and push notification links are built from it. Changing it
-  invalidates passkeys and OAuth client registrations; Settings warns that both
-  must be redone.
+  invalidates OAuth client registrations, and removes the passkeys when the
+  host name changes (a port or scheme move keeps them; kernel §3.2); Settings
+  warns before saving. A collector moved after setup is re-pointed without a
+  browser by `hennery admin reset-public-url` (kernel §4.2), which ends every
+  session.
 - Web Push on iOS works only from an installed PWA over HTTPS, and push is core,
   so **v1 requires TLS** for anything but `localhost`.
 - Supported topologies, all documented:
@@ -577,7 +594,10 @@ product others install.
 
 Wrong codes are rate-limited per client address. Pairing is idempotent: a host
 whose existing key the collector still accepts is not paired again. The
-all-in-one host is paired automatically over the local channel.
+all-in-one host is paired automatically over the local channel. A revoked host
+pairs again with `host join`, under a new key and id; its old outbox is kept
+aside (kernel §4.1). *Built so far:* `join` takes `http://` to loopback only,
+until the host WebSocket supports `wss://`.
 
 *Rejected:* one shared fleet token. In the predecessor a single token
 authenticated every machine: impossible to revoke one laptop, and anyone holding
@@ -877,9 +897,13 @@ gated by collector capabilities.
 ### 11.1 REST
 
 Resource-oriented JSON over HTTPS, types generated from the Rust message types (§5.4).
-Mutations that reach a host return `202`; their outcome arrives over SSE. A
-prompt returns once the host has reported that the turn started; answers
-return once durably queued. Endpoints are listed in the subsystem specs.
+Mutations that reach a host answer `202` once the collector has ingested the
+fact that completes them, with its outcome in the body: the session started,
+the turn started, the cancelled turn's real outcome, parked or closed, the
+catalogue after a switch. If the connection dropped or the request timed out
+after sending, the answer is 503 `delivery_unknown`; the fact, if it happened,
+still arrives and applies. Every viewer also gets the change over SSE. Answers
+return once durably queued; their verdict follows over SSE. Endpoints are listed in the subsystem specs.
 Timelines page from the tail (`before=`) or forward (`after=`); the session view
 opens at the tail.
 
@@ -911,7 +935,7 @@ Refined in its own spec.
 |---|---|
 | `hennery up` | All-in-one: supervisor + collector + host. |
 | `hennery collector` | Collector only. |
-| `hennery host join <url> <code>` | Pair this machine. |
+| `hennery host join <url> [<code>]` | Pair this machine (the code from stdin when left out). |
 | `hennery host run` | Run a paired host. |
 | `hennery host adapters update` | Move to the adapter set pinned by the installed release. |
 | `hennery gateway` | Standalone MCP gateway. |
@@ -1008,7 +1032,7 @@ re-created. Both facts are documented next to the backup instructions.
 
 | Layer | What | Why |
 |---|---|---|
-| Protocol | Contract tests generated from the schema: every frame round-trips. Exhaustive dispatch is a compile-time property; CI fails on a diff in regenerated schema/TS types. | Hand-mirrored shapes drift silently (§5.4). |
+| Protocol | Contract tests generated from the schema: every frame round-trips. Exhaustive dispatch is a compile-time property; CI fails on a diff in regenerated schema/TS types, and every cargo step runs `--locked`. | Hand-mirrored shapes drift silently (§5.4). |
 | Transport parity | The same scenarios run over the in-memory pipe and a real WebSocket. | One code path must stay tested in both deployments (§3.3). |
 | Session behaviour | Deterministic **fake ACP adapter**: scripted replies, permissions, elicitation, replay on `session/load`. Scenarios: WS drop, collector restart, host restart, reconciliation only after `resend_complete`, seq fast-forward, seq conflict, outbox resend, outbox overflow → gap without losing state frames, reaper vs. blocked, answer queued while offline, answer delivered vs. dropped. Full list in ACP core §12. | Every failure row in §6.6 gets a test. |
 | Live e2e gate | Real `claude-agent-acp` and `codex-acp` on every adapter pin bump: start, prompt, tool call, permission, elicitation, resume, per-session MCP isolation, and whether the gateway token is visible in the process list (recorded, gateway §3.2). | In the predecessor only a live call caught a wrongly shaped capability that the SDK silently discarded; unit tests asserted our JSON against our own assumption. |
@@ -1037,7 +1061,7 @@ hermetic package builds stay green.
 | OIDC login | Later | Auth module seam next to passkeys. |
 | Identity from a fronting proxy | Later | Signed assertions only (e.g. a Cloudflare Access JWT); never a bare header (§7.1). |
 | Host-side rendering of MCP entries into agent config | Not v1 | `hennery mcp apply` with a standalone client covers terminal use. |
-| Teams / multiple operators | Later | `owner_id` on every row. |
+| Teams / multiple operators | Later | `owner_id` on every row, named by every query; v1 binds the owner per component when it opens, teams take it from the request (kernel §1). |
 | Built-in ACME | Not v1 | Reverse proxy / Tailscale documented instead. |
 | Windows native | Not v1 | WSL. |
 | MCP `tools/list_changed`, sampling, elicitation forwarding | Not v1 | — |
