@@ -1,12 +1,15 @@
 //! Host identity and pairing (kernel spec §4): the `hosts` registry, one-time
 //! pairing codes, and the check of a host's `hello` proof (ACP core §3.5).
+//! Every query names the database's owner (kernel spec §1), bound when the
+//! registry opens (`db::kernel_owner`): another owner's host is unknown
+//! here, and another owner's code pairs nothing.
 //!
 //! Every time is seconds since the Unix epoch and is passed in by the
 //! caller (`secret::unix_now()` in production), so expiry is testable
 //! without sleeping.
 
+use crate::db;
 use crate::secret::{random_bytes, sha256_hex};
-use crate::{db, schema};
 use anyhow::Result;
 use ed25519_dalek::{Signature, VerifyingKey};
 use hennery_proto::frames::Capabilities;
@@ -203,6 +206,8 @@ pub fn verify_proof(public_key: &str, nonce: &[u8], host_id: &str, protocol_vers
 
 pub struct Hosts {
     conn: Mutex<Connection>,
+    /// The database's owner (`db::kernel_owner`), whom every query names.
+    owner: String,
 }
 
 impl Hosts {
@@ -217,12 +222,20 @@ impl Hosts {
     }
 
     fn init(mut conn: Connection) -> Result<Self> {
-        db::migrate_component(&mut conn, schema::COMPONENT, schema::MIGRATIONS)?;
-        Ok(Self { conn: Mutex::new(conn) })
+        let owner = db::kernel_owner(&mut conn)?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+            owner,
+        })
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("hosts lock")
+    }
+
+    /// The owner whose hosts and codes these are.
+    pub fn owner_id(&self) -> &str {
+        &self.owner
     }
 
     /// Mint a single-use pairing code valid for `PAIRING_CODE_TTL_SECS`.
@@ -232,8 +245,8 @@ impl Hosts {
         let expires_at = now + PAIRING_CODE_TTL_SECS;
         let normalized = normalize_code(&code).expect("a minted code is canonical");
         self.conn().execute(
-            "INSERT INTO pairing_codes(code_hash, created_at, expires_at) VALUES (?1, ?2, ?3)",
-            params![code_hash(&normalized), now, expires_at],
+            "INSERT INTO pairing_codes(code_hash, owner_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+            params![code_hash(&normalized), self.owner, now, expires_at],
         )?;
         Ok(PairingCode { code, expires_at })
     }
@@ -264,8 +277,9 @@ impl Hosts {
         let tx = conn.transaction()?;
         let usable = tx
             .query_row(
-                "SELECT 1 FROM pairing_codes WHERE code_hash = ?1 AND used_at IS NULL AND expires_at > ?2",
-                params![hash, now],
+                "SELECT 1 FROM pairing_codes
+                 WHERE code_hash = ?1 AND used_at IS NULL AND expires_at > ?2 AND owner_id = ?3",
+                params![hash, now, self.owner],
                 |_| Ok(()),
             )
             .optional()?
@@ -274,13 +288,14 @@ impl Hosts {
             return Ok(EnrollOutcome::InvalidCode);
         }
         let host_id = new_host_id();
-        match insert_host(&tx, &host_id, enrollment, now)? {
+        match insert_host(&tx, &self.owner, &host_id, enrollment, now)? {
             Registered::Created => {}
             Registered::AlreadyPaired { host_id } => return Ok(EnrollOutcome::AlreadyPaired { host_id }),
         }
         let spent = tx.execute(
-            "UPDATE pairing_codes SET used_at = ?2 WHERE code_hash = ?1 AND used_at IS NULL AND expires_at > ?2",
-            params![hash, now],
+            "UPDATE pairing_codes SET used_at = ?2
+             WHERE code_hash = ?1 AND used_at IS NULL AND expires_at > ?2 AND owner_id = ?3",
+            params![hash, now, self.owner],
         )?;
         if spent == 0 {
             // Someone else spent it between our read and our write: drop
@@ -302,7 +317,7 @@ impl Hosts {
         );
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let registered = insert_host(&tx, host_id, enrollment, now)?;
+        let registered = insert_host(&tx, &self.owner, host_id, enrollment, now)?;
         tx.commit()?;
         Ok(registered)
     }
@@ -314,8 +329,8 @@ impl Hosts {
         let row: Option<(String, Option<i64>)> = self
             .conn()
             .query_row(
-                "SELECT public_key, revoked_at FROM hosts WHERE id = ?1",
-                [host_id],
+                "SELECT public_key, revoked_at FROM hosts WHERE id = ?1 AND owner_id = ?2",
+                [host_id, &self.owner],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
@@ -348,8 +363,9 @@ impl Hosts {
         let capabilities = serde_json::to_string(capabilities)?;
         if is_valid_display_field(host_version) {
             self.conn().execute(
-                "UPDATE hosts SET host_version = ?2, capabilities = ?3, last_seen_at = ?4 WHERE id = ?1",
-                params![host_id, host_version.trim(), capabilities, now],
+                "UPDATE hosts SET host_version = ?2, capabilities = ?3, last_seen_at = ?4
+                 WHERE id = ?1 AND owner_id = ?5",
+                params![host_id, host_version.trim(), capabilities, now, self.owner],
             )?;
         } else {
             tracing::warn!(
@@ -358,8 +374,8 @@ impl Hosts {
                 "hello reported a malformed host_version; keeping the one already stored"
             );
             self.conn().execute(
-                "UPDATE hosts SET capabilities = ?2, last_seen_at = ?3 WHERE id = ?1",
-                params![host_id, capabilities, now],
+                "UPDATE hosts SET capabilities = ?2, last_seen_at = ?3 WHERE id = ?1 AND owner_id = ?4",
+                params![host_id, capabilities, now, self.owner],
             )?;
         }
         Ok(())
@@ -368,7 +384,11 @@ impl Hosts {
     pub fn is_revoked(&self, host_id: &str) -> Result<bool> {
         let revoked: Option<Option<i64>> = self
             .conn()
-            .query_row("SELECT revoked_at FROM hosts WHERE id = ?1", [host_id], |r| r.get(0))
+            .query_row(
+                "SELECT revoked_at FROM hosts WHERE id = ?1 AND owner_id = ?2",
+                [host_id, &self.owner],
+                |r| r.get(0),
+            )
             .optional()?;
         Ok(matches!(revoked, Some(Some(_))))
     }
@@ -387,13 +407,17 @@ impl Hosts {
     pub fn revoke(&self, host_id: &str, now: i64) -> Result<Revoke> {
         let conn = self.conn();
         let revoked: Option<Option<i64>> = conn
-            .query_row("SELECT revoked_at FROM hosts WHERE id = ?1", [host_id], |r| r.get(0))
+            .query_row(
+                "SELECT revoked_at FROM hosts WHERE id = ?1 AND owner_id = ?2",
+                [host_id, &self.owner],
+                |r| r.get(0),
+            )
             .optional()?;
         Ok(match revoked {
             None => Revoke::NotFound,
             Some(Some(_)) => Revoke::AlreadyRevoked,
             Some(None) => {
-                if try_revoke(&conn, host_id, now)? {
+                if try_revoke(&conn, &self.owner, host_id, now)? {
                     Revoke::Revoked
                 } else {
                     Revoke::AlreadyRevoked
@@ -404,15 +428,19 @@ impl Hosts {
 
     pub fn host(&self, host_id: &str) -> Result<Option<HostRecord>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(&format!("SELECT {HOST_COLUMNS} FROM hosts WHERE id = ?1"))?;
-        Ok(stmt.query_row([host_id], read_host).optional()?)
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {HOST_COLUMNS} FROM hosts WHERE id = ?1 AND owner_id = ?2"
+        ))?;
+        Ok(stmt.query_row([host_id, &self.owner], read_host).optional()?)
     }
 
     /// Every paired host, revoked ones included, oldest first.
     pub fn list(&self) -> Result<Vec<HostRecord>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(&format!("SELECT {HOST_COLUMNS} FROM hosts ORDER BY created_at, id"))?;
-        let rows = stmt.query_map([], read_host)?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {HOST_COLUMNS} FROM hosts WHERE owner_id = ?1 ORDER BY created_at, id"
+        ))?;
+        let rows = stmt.query_map([&self.owner], read_host)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 }
@@ -437,22 +465,34 @@ fn new_host_id() -> String {
     format!("host-{}", hex::encode(random_bytes::<8>()))
 }
 
-fn insert_host(tx: &rusqlite::Transaction<'_>, host_id: &str, e: &Enrollment, now: i64) -> Result<Registered> {
+/// Store a host of `owner`'s. A key paired already under another owner
+/// is not found here, and the insert fails on the key's uniqueness (3b-iii
+/// decision 7): an error, which nothing in v1 can reach.
+fn insert_host(
+    tx: &rusqlite::Transaction<'_>,
+    owner: &str,
+    host_id: &str,
+    e: &Enrollment,
+    now: i64,
+) -> Result<Registered> {
     // Stored lowercase, so the same key in another case is the same key.
     let public_key = e.public_key.to_ascii_lowercase();
     let existing: Option<String> = tx
-        .query_row("SELECT id FROM hosts WHERE public_key = ?1", [&public_key], |r| {
-            r.get(0)
-        })
+        .query_row(
+            "SELECT id FROM hosts WHERE public_key = ?1 AND owner_id = ?2",
+            [&public_key, owner],
+            |r| r.get(0),
+        )
         .optional()?;
     if let Some(host_id) = existing {
         return Ok(Registered::AlreadyPaired { host_id });
     }
     tx.execute(
-        "INSERT INTO hosts(id, name, public_key, platform, host_version, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO hosts(id, owner_id, name, public_key, platform, host_version, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             host_id,
+            owner,
             e.name.trim(),
             public_key,
             e.platform.trim(),
@@ -470,10 +510,10 @@ fn insert_host(tx: &rusqlite::Transaction<'_>, host_id: &str, e: &Enrollment, no
 /// without going through `revoke`'s own read first, which is the only way
 /// to exercise this guard: a second, freshly-called `revoke` would simply
 /// see the row already revoked and never reach this write at all.
-fn try_revoke(conn: &Connection, host_id: &str, now: i64) -> Result<bool> {
+fn try_revoke(conn: &Connection, owner: &str, host_id: &str, now: i64) -> Result<bool> {
     let changed = conn.execute(
-        "UPDATE hosts SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL",
-        params![host_id, now],
+        "UPDATE hosts SET revoked_at = ?2 WHERE id = ?1 AND revoked_at IS NULL AND owner_id = ?3",
+        params![host_id, now, owner],
     )?;
     Ok(changed > 0)
 }
@@ -514,7 +554,7 @@ mod tests {
 
         // The second writer's own attempt, after the fact, must match
         // nothing rather than stamp over the timestamp already committed.
-        assert!(!try_revoke(&second, "host-1", 200).unwrap());
+        assert!(!try_revoke(&second, hosts.owner_id(), "host-1", 200).unwrap());
         assert_eq!(hosts.host("host-1").unwrap().unwrap().revoked_at, Some(100));
     }
 }

@@ -1,7 +1,7 @@
 //! SQLite helpers (kernel spec §1).
 
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
@@ -77,57 +77,87 @@ fn configure(mut conn: Connection) -> Result<Connection> {
 
 /// Apply `migrations[user_version..]` in order, each in its own transaction.
 /// Refuses to run against a database newer than this binary.
+///
+/// Each step reads the version inside its transaction, which holds the
+/// write lock from its start: `IMMEDIATE`, asked for here rather than left
+/// to the connection's default (`configure` sets it; a plain connection
+/// does not). Another connection migrating the same file meanwhile has
+/// either committed the step, and it is skipped, or not begun it. A
+/// version read before the lock could be stale by then, and the step
+/// would run twice.
 pub fn migrate(conn: &mut Connection, migrations: &[&str]) -> Result<()> {
-    let current: usize = conn.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? as usize;
-    if current > migrations.len() {
-        bail!(
-            "database schema version {current} is newer than this binary supports ({})",
-            migrations.len()
-        );
-    }
-    for (index, sql) in migrations.iter().enumerate().skip(current) {
-        let tx = conn.transaction()?;
+    loop {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let current: usize = tx.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))? as usize;
+        if current > migrations.len() {
+            bail!(
+                "database schema version {current} is newer than this binary supports ({})",
+                migrations.len()
+            );
+        }
+        let Some(sql) = migrations.get(current) else {
+            return Ok(());
+        };
         tx.execute_batch(sql)?;
-        tx.pragma_update(None, "user_version", (index + 1) as i64)?;
+        tx.pragma_update(None, "user_version", (current + 1) as i64)?;
         tx.commit()?;
     }
-    Ok(())
 }
 
 /// Like `migrate`, for one component of a database that several own
 /// (kernel spec §1): the kernel's tables share `hennery.db` with the
 /// sessions module, which keeps `user_version` for itself. Each component's
 /// version is a row of `schema_versions`, and a component newer than this
-/// binary is refused the same way.
+/// binary is refused the same way. Each step reads the version inside its
+/// transaction, as `migrate` does.
 pub fn migrate_component(conn: &mut Connection, component: &str, migrations: &[&str]) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS schema_versions (component TEXT PRIMARY KEY, version INTEGER NOT NULL);",
-    )?;
-    let current: usize = conn
-        .query_row(
-            "SELECT version FROM schema_versions WHERE component = ?1",
-            [component],
-            |r| r.get::<_, i64>(0),
-        )
-        .optional()?
-        .unwrap_or(0) as usize;
-    if current > migrations.len() {
-        bail!(
-            "{component} schema version {current} is newer than this binary supports ({})",
-            migrations.len()
-        );
-    }
-    for (index, sql) in migrations.iter().enumerate().skip(current) {
-        let tx = conn.transaction()?;
+    loop {
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_versions (component TEXT PRIMARY KEY, version INTEGER NOT NULL);",
+        )?;
+        let current: usize = tx
+            .query_row(
+                "SELECT version FROM schema_versions WHERE component = ?1",
+                [component],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0) as usize;
+        if current > migrations.len() {
+            bail!(
+                "{component} schema version {current} is newer than this binary supports ({})",
+                migrations.len()
+            );
+        }
+        let Some(sql) = migrations.get(current) else {
+            // Commits the `schema_versions` table, if this made it.
+            tx.commit()?;
+            return Ok(());
+        };
         tx.execute_batch(sql)?;
         tx.execute(
             "INSERT INTO schema_versions(component, version) VALUES (?1, ?2)
              ON CONFLICT(component) DO UPDATE SET version = excluded.version",
-            rusqlite::params![component, (index + 1) as i64],
+            rusqlite::params![component, (current + 1) as i64],
         )?;
         tx.commit()?;
     }
-    Ok(())
+}
+
+/// Migrate the kernel's tables (`schema`), then return the database's
+/// owner (plan 3b-iii decisions 1 and 2): the oldest row of `owners`,
+/// which the kernel's migrations create at the first start. Every store on
+/// `hennery.db` binds to it when it opens, so they agree whichever opens
+/// first. This is the one query that does not filter by the owner: it
+/// finds the owner.
+pub fn kernel_owner(conn: &mut Connection) -> Result<String> {
+    migrate_component(conn, crate::schema::COMPONENT, crate::schema::MIGRATIONS)?;
+    conn.query_row("SELECT id FROM owners ORDER BY created_at, id LIMIT 1", [], |r| {
+        r.get(0)
+    })
+    .optional()?
+    .context("the database has no owner")
 }
 
 #[cfg(test)]
@@ -258,6 +288,76 @@ mod tests {
         assert_eq!((user_version, kernel), (1, 2));
         // `migrate` still sees its own version, untouched by the components.
         migrate(&mut conn, &["CREATE TABLE a (x INTEGER);"]).unwrap();
+    }
+
+    /// A connection `configure` never touched: a busy timeout, but no
+    /// `IMMEDIATE` default. The migration functions must take the write
+    /// lock themselves (3b-iii review, O1).
+    fn unconfigured(path: &Path) -> Connection {
+        let conn = Connection::open(path).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        conn
+    }
+
+    /// Two connections migrating one file at once, as two components of
+    /// one collector, or two collectors, can. `first` holds the write lock
+    /// and applies the step meanwhile, as the other migrator would.
+    /// `migrate`, on a connection of its own (`unconfigured`), must read
+    /// the version once it holds the lock, then see the step done and skip
+    /// it. A version read before it waits for the lock is stale, and the
+    /// step would run twice. If `migrate` reaches its read only after
+    /// `first` commits (under load, say), the test passes falsely; it never
+    /// fails falsely.
+    #[test]
+    fn a_migration_racing_another_connection_is_applied_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hennery.db");
+        let steps = ["CREATE TABLE a (x INTEGER);"];
+        let mut first = open(&path).unwrap();
+        let tx = first.transaction().unwrap();
+        let racing = {
+            let path = path.clone();
+            std::thread::spawn(move || migrate(&mut unconfigured(&path), &steps))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        tx.execute_batch(steps[0]).unwrap();
+        tx.pragma_update(None, "user_version", 1).unwrap();
+        tx.commit().unwrap();
+        racing.join().unwrap().expect("the racing migration failed");
+        let v: i64 = first.pragma_query_value(None, "user_version", |r| r.get(0)).unwrap();
+        assert_eq!(v, 1);
+    }
+
+    /// The same race for a component's version (`schema_versions`).
+    #[test]
+    fn a_component_migration_racing_another_connection_is_applied_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hennery.db");
+        let steps = ["CREATE TABLE k1 (x INTEGER);"];
+        let mut first = open(&path).unwrap();
+        migrate_component(&mut first, "kernel", &[]).unwrap();
+        let tx = first.transaction().unwrap();
+        let racing = {
+            let path = path.clone();
+            std::thread::spawn(move || migrate_component(&mut unconfigured(&path), "kernel", &steps))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        tx.execute_batch(steps[0]).unwrap();
+        tx.execute(
+            "INSERT INTO schema_versions(component, version) VALUES ('kernel', 1)",
+            [],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        racing.join().unwrap().expect("the racing migration failed");
+        let v: i64 = first
+            .query_row(
+                "SELECT version FROM schema_versions WHERE component = 'kernel'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(v, 1);
     }
 
     #[test]
