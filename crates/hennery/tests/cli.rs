@@ -1535,23 +1535,27 @@ fn the_code_descriptors_must_be_open_pipes() {
         ] {
             cmd.env_remove(var);
         }
-        if let Some(fd) = fd {
-            let fd = fd.as_raw_fd();
-            // SAFETY: dup2 in the forked child, before exec; async-signal-safe.
-            unsafe {
-                cmd.pre_exec(move || {
+        let fd = fd.map(|fd| fd.as_raw_fd());
+        // SAFETY: dup2 and close in the forked child, before exec;
+        // async-signal-safe.
+        unsafe {
+            cmd.pre_exec(move || {
+                let rc = match fd {
                     // Already 50: `dup2` onto itself would keep close-on-exec.
-                    let rc = if fd == 50 {
-                        libc::fcntl(fd, libc::F_SETFD, 0)
-                    } else {
-                        libc::dup2(fd, 50)
-                    };
-                    if rc < 0 {
-                        return Err(std::io::Error::last_os_error());
+                    Some(50) => libc::fcntl(50, libc::F_SETFD, 0),
+                    Some(fd) => libc::dup2(fd, 50),
+                    // Closed for certain: something another thread opened
+                    // without close-on-exec may sit at 50.
+                    None => {
+                        libc::close(50);
+                        0
                     }
-                    Ok(())
-                });
-            }
+                };
+                if rc < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
         }
         let mut child = cmd
             .stdout(std::process::Stdio::null())

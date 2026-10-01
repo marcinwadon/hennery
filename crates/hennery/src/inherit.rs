@@ -91,17 +91,26 @@ pub fn write_code(fd: RawFd, code: &str) -> Result<()> {
     Ok(())
 }
 
+/// The most `read_code` reads: a code and its newline need far less.
+const MAX_CODE_BYTES: usize = 256;
+
 /// The host's side: read the code the collector wrote. Blocks until the
-/// collector has written it, or has exited without doing so.
+/// collector has written it, or has exited without doing so. More than
+/// `MAX_CODE_BYTES` is refused, not buffered.
 pub async fn read_code(fd: RawFd) -> Result<String> {
     // SAFETY: `fd` was inherited for exactly this and nothing else owns it.
-    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
     let text = tokio::task::spawn_blocking(move || {
         let mut text = String::new();
-        file.read_to_string(&mut text).map(|_| text)
+        file.take(MAX_CODE_BYTES as u64 + 1)
+            .read_to_string(&mut text)
+            .map(|_| text)
     })
     .await?
     .context("read the pairing code from the supervisor's pipe")?;
+    if text.len() > MAX_CODE_BYTES {
+        bail!("the pairing code on the supervisor's pipe is longer than {MAX_CODE_BYTES} bytes");
+    }
     let code = text.trim().to_string();
     if code.is_empty() {
         bail!("the collector exited without handing over a pairing code");
@@ -113,4 +122,29 @@ pub async fn read_code(fd: RawFd) -> Result<String> {
 pub fn close(fd: RawFd) {
     // SAFETY: as above; dropping the `File` closes it.
     drop(unsafe { std::fs::File::from_raw_fd(fd) });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::fd::IntoRawFd;
+
+    /// The host reads at most `MAX_CODE_BYTES` from the pipe: a writer
+    /// that sends more is refused, not buffered without end.
+    #[tokio::test]
+    async fn a_code_longer_than_the_bound_is_refused() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        let feed = std::thread::spawn(move || {
+            // Stops at EPIPE once the reader is done.
+            let _ = writer.write_all(&vec![b'A'; 1 << 20]);
+        });
+        let err = read_code(reader.into_raw_fd()).await.unwrap_err().to_string();
+        assert!(err.contains("longer than"), "{err}");
+        feed.join().unwrap();
+
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        writer.write_all(b"ABCD-EFGH\n").unwrap();
+        drop(writer);
+        assert_eq!(read_code(reader.into_raw_fd()).await.unwrap(), "ABCD-EFGH");
+    }
 }
