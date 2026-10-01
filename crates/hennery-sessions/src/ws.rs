@@ -384,12 +384,50 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
     // A revoke that gave up waiting for this connection parked the sessions
     // while it could still apply frames. Parking again now that it is gone
     // converges them (the hook is idempotent).
-    if matches!(state.hosts.is_revoked(&host_id), Ok(true))
-        && let Err(err) = state.on_host_revoked(&host_id)
-    {
-        tracing::error!(%host_id, error = %err, "parking a revoked host's sessions failed");
+    if repark_if_revoked(&state, &host_id).is_err() {
+        // Retried apart, so the offline bookkeeping below is not held up.
+        tokio::spawn(retry_repark(state.clone(), host_id.clone()));
     }
     crate::offline::after_disconnect(&state, host_id, conn_id);
+}
+
+/// The pauses before each retry of a re-park whose check or park failed.
+const REPARK_RETRIES: [Duration; 3] = [
+    Duration::from_millis(200),
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+];
+
+/// Park a revoked host's sessions again. An error is not taken to mean "not
+/// revoked": the caller retries it.
+fn repark_if_revoked(state: &AppState, host_id: &str) -> anyhow::Result<()> {
+    if state.hosts.is_revoked(host_id)? {
+        state.on_host_revoked(host_id)?;
+    }
+    Ok(())
+}
+
+/// Retry `repark_if_revoked`, bounded by `REPARK_RETRIES`. Once they are
+/// spent, say what converges the sessions instead: a repeated revoke parks
+/// them again.
+async fn retry_repark(state: AppState, host_id: String) {
+    for pause in REPARK_RETRIES {
+        tokio::select! {
+            () = tokio::time::sleep(pause) => {}
+            () = state.shutdown.cancelled() => return,
+        }
+        match repark_if_revoked(&state, &host_id) {
+            Ok(()) => return,
+            Err(err) => {
+                tracing::warn!(%host_id, error = %err, "re-parking a disconnected host's sessions failed; retrying")
+            }
+        }
+    }
+    tracing::error!(
+        %host_id,
+        "could not check whether a disconnected host was revoked, or park its sessions; \
+         if it was revoked, revoke it again (DELETE /api/hosts/{host_id}) to park them"
+    );
 }
 
 /// Revert what a request the host rejected changed in the store: a start or
