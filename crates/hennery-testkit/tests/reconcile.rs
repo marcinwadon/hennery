@@ -1991,6 +1991,41 @@ async fn a_connection_that_ends_after_its_host_was_revoked_parks_its_sessions() 
     assert!(collector.event_kinds(&session).contains(&"presumed_parked".to_string()));
 }
 
+/// 3a's M2: the registry check behind that second park fails while the
+/// connection ends (here: its table is briefly away). The socket task does
+/// not give up on the first error: it retries, bounded, and the session is
+/// parked once the registry answers again.
+#[tokio::test]
+async fn a_registry_error_when_a_revoked_hosts_connection_ends_is_retried() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    collector.state.hosts.revoke(HOST, 1).unwrap();
+    let db = rusqlite::Connection::open(collector._dir.path().join("hennery.db")).unwrap();
+    db.execute_batch("ALTER TABLE hosts RENAME TO hosts_away").unwrap();
+    collector.state.hub.disconnect(HOST);
+    host.closed().await;
+    // Long past the socket task's first check, which runs right after the
+    // close; without the retry the session would stay active for good.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    db.execute_batch("ALTER TABLE hosts_away RENAME TO hosts").unwrap();
+    wait_for("the session parked", || async {
+        let row = collector.state.store.session(&session).unwrap().unwrap();
+        (row.lifecycle == "parked" && row.presumed_parked).then_some(())
+    })
+    .await;
+    // Parked for the revoke, not presumed offline.
+    let reason: String = db
+        .query_row(
+            "SELECT json_extract(body, '$.reason') FROM events
+             WHERE session_id = ?1 AND kind = 'presumed_parked' ORDER BY rowid DESC LIMIT 1",
+            [&session],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(reason, "host_revoked");
+}
+
 // Fix round 1: F1 (defence in depth) and F2.
 
 /// F1, defence in depth: a revoke whose wait for the connection timed out
