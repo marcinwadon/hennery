@@ -588,9 +588,9 @@ fn an_authentication_ceremony_is_single_use_and_of_its_kind() {
         Err(Refused::Ceremony)
     );
     let (ceremony_id, assertion) = begin_step_up(&op, &session_id, &mut passkey, NOW);
-    // ED1: a made-up session id would not exercise the session-mismatch
-    // check (A2-style checks could refuse it anyway); use a real second
-    // session, as the registration test does.
+    // A real second session, as the registration test opens: a made-up
+    // session id could be refused by some other check, and would not show
+    // that the ceremony is bound to the session that began it.
     let phc = op.verify_password(PASSWORD).unwrap().unwrap();
     let other_token = op.open_session("other", &phc, NOW).unwrap().unwrap();
     let other_session = op.authenticate(&other_token, NOW).unwrap().unwrap().session_id;
@@ -639,7 +639,7 @@ fn an_assertion_from_another_origin_signs_nobody_in() {
 /// to `discouraged`, so it answers without the UV flag; the operator's
 /// finishes refuse that answer, and nothing is stored or opened.
 ///
-/// ED2: the refusal's reason must name user verification, not just be any
+/// The refusal's reason must name user verification, not just be any
 /// `Credential` refusal: `webauthn-rs` (pinned `=0.5.5`) refuses a missing
 /// UV flag with `WebauthnError::UserNotVerified`, whose message is "The
 /// user verified bit is not set, and required by policy" (checked against
