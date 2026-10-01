@@ -22,7 +22,10 @@ const OLD_OWNER: &str = "owner-00000000000000a1";
 
 /// `hennery.db` as 3b-ii left it: the kernel's first two migrations,
 /// verbatim, with a host paired and a pairing code minted (as `up` does
-/// before setup), and the owner set up if `set_up`.
+/// before setup), and the owner set up if `set_up`. The host and the code
+/// are the rows the backfill rebuilds, so every column of theirs holds a
+/// value of its own, none `NULL` or the default: one the rebuild dropped,
+/// nulled or swapped would show (`HOST_OLD`, `CODE_OLD`).
 fn a_3b_ii_database(path: &Path, set_up: bool) {
     let conn = rusqlite::Connection::open(path).unwrap();
     conn.execute_batch(
@@ -65,9 +68,11 @@ fn a_3b_ii_database(path: &Path, set_up: bool) {
             value TEXT NOT NULL,
             PRIMARY KEY (owner_id, key));
         INSERT INTO schema_versions VALUES ('kernel', 2);
-        INSERT INTO hosts(id, name, public_key, platform, host_version, created_at)
-            VALUES ('host-old', 'laptop', '00', 'macos-aarch64', '0.0.0', 1700000000);
-        INSERT INTO pairing_codes VALUES ('code-old', 1700000000, 1700000600, NULL);
+        INSERT INTO hosts(id, name, public_key, platform, host_version, capabilities, created_at,
+                          last_seen_at, revoked_at)
+            VALUES ('host-old', 'laptop', '00', 'macos-aarch64', '0.0.0', '[\"fixture\"]', 1700000000,
+                    1700000100, 1700000200);
+        INSERT INTO pairing_codes VALUES ('code-old', 1700000300, 1700000600, 1700000400);
         ",
     )
     .unwrap();
@@ -121,6 +126,47 @@ fn the_owner_exists_from_the_first_start_and_setup_keeps_it() {
     assert_eq!(owners, 1);
 }
 
+/// `a_3b_ii_database`'s host, column by column, as inserted.
+fn host_old() -> Vec<(&'static str, Value)> {
+    vec![
+        ("id", Value::Text("host-old".into())),
+        ("name", Value::Text("laptop".into())),
+        ("public_key", Value::Text("00".into())),
+        ("platform", Value::Text("macos-aarch64".into())),
+        ("host_version", Value::Text("0.0.0".into())),
+        ("capabilities", Value::Text("[\"fixture\"]".into())),
+        ("created_at", Value::Integer(1_700_000_000)),
+        ("last_seen_at", Value::Integer(1_700_000_100)),
+        ("revoked_at", Value::Integer(1_700_000_200)),
+    ]
+}
+
+/// `a_3b_ii_database`'s pairing code, column by column, as inserted.
+fn code_old() -> Vec<(&'static str, Value)> {
+    vec![
+        ("code_hash", Value::Text("code-old".into())),
+        ("created_at", Value::Integer(1_700_000_300)),
+        ("expires_at", Value::Integer(1_700_000_600)),
+        ("used_at", Value::Integer(1_700_000_400)),
+    ]
+}
+
+/// Every row of `table`, in order, each as its columns by name.
+fn named_rows(conn: &rusqlite::Connection, table: &str) -> Vec<std::collections::BTreeMap<String, Value>> {
+    let mut stmt = conn.prepare(&format!("SELECT * FROM {table} ORDER BY rowid")).unwrap();
+    let names: Vec<String> = stmt.column_names().into_iter().map(str::to_string).collect();
+    stmt.query_map([], |r| {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| Ok((name.clone(), r.get::<_, Value>(i)?)))
+            .collect()
+    })
+    .unwrap()
+    .map(Result::unwrap)
+    .collect()
+}
+
 /// The `owner_id` of every row of `table`, in order.
 fn owners_of(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
     let mut stmt = conn
@@ -132,7 +178,8 @@ fn owners_of(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
 /// The backfill (3b-iii decision 1): a database 3b-ii set up keeps its
 /// owner, set up, its password and its `public_url`. One 3b-ii left before
 /// setup gets an owner, not set up, which setup then keeps. Either way,
-/// the host and the pairing code written before carry that owner.
+/// the host and the pairing code written before carry that owner, and the
+/// rebuild keeps every other column of theirs as it was.
 #[test]
 fn a_3b_ii_database_keeps_its_owner_or_gets_one() {
     for set_up in [true, false] {
@@ -146,6 +193,16 @@ fn a_3b_ii_database_keeps_its_owner_or_gets_one() {
         let conn = rusqlite::Connection::open(&db).unwrap();
         for table in ["hosts", "pairing_codes"] {
             assert_eq!(owners_of(&conn, table), vec![owner.clone()], "{table}");
+        }
+        // Every column of the rebuilt rows, by name: what was inserted,
+        // and the owner.
+        for (table, inserted) in [("hosts", host_old()), ("pairing_codes", code_old())] {
+            let mut expected: std::collections::BTreeMap<String, Value> = inserted
+                .into_iter()
+                .map(|(name, value)| (name.to_string(), value))
+                .collect();
+            expected.insert("owner_id".into(), Value::Text(owner.clone()));
+            assert_eq!(named_rows(&conn, table), vec![expected], "{table}");
         }
         let hosts = Hosts::open(&db).unwrap();
         assert_eq!(hosts.owner_id(), owner);
@@ -264,6 +321,19 @@ async fn another_owners_password_and_sessions_are_invisible_to_the_operator() {
 
     assert_eq!(op.authenticate(mine, NOW).unwrap().unwrap().owner_id, op.owner_id());
     assert_eq!(op.verify_password(PASSWORD).unwrap(), Some(phc.clone()));
+    // The controls for the refusals below (3b-iii deferred minor): on the
+    // owner's own session, `step_up` and `session_expires_at` take effect.
+    // `NOW + 7`, not `NOW`: `write_session` stores `NOW` already.
+    let my_session = sha256_hex(mine.as_bytes());
+    assert!(op.step_up(&my_session, NOW + 7).unwrap());
+    assert_eq!(
+        op.authenticate(mine, NOW).unwrap().unwrap().last_step_up_at,
+        Some(NOW + 7)
+    );
+    assert_eq!(
+        op.session_expires_at(&my_session, NOW).unwrap(),
+        Some(NOW + SESSION_TTL_SECS)
+    );
 
     assert_eq!(op.verify_password(OTHER_PASSWORD).unwrap(), None);
     assert_eq!(op.authenticate(OTHER_TOKEN, NOW).unwrap(), None);
@@ -271,6 +341,14 @@ async fn another_owners_password_and_sessions_are_invisible_to_the_operator() {
     assert_eq!(op.session_expires_at(&other_session, NOW).unwrap(), None);
     let listed: Vec<String> = op.sessions(NOW).unwrap().into_iter().map(|s| s.id).collect();
     assert_eq!(listed, [sha256_hex(mine.as_bytes())]);
+    // The control for the refusal below: a spare session of the owner's,
+    // written only now so the listing above stays the owner's one, is
+    // revoked, and no longer authenticates.
+    let spare = "d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4";
+    write_session(&conn, op.owner_id(), spare, NOW + SESSION_TTL_SECS);
+    assert!(op.authenticate(spare, NOW).unwrap().is_some());
+    assert!(op.revoke_session(&sha256_hex(spare.as_bytes()), NOW).unwrap());
+    assert_eq!(op.authenticate(spare, NOW).unwrap(), None);
     assert!(!op.revoke_session(&other_session, NOW).unwrap());
     assert_eq!(op.open_session("theirs", &other_phc, NOW).unwrap(), None);
     // Opening one sweeps the owner's expired sessions, not theirs.
