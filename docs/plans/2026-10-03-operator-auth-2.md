@@ -38,7 +38,7 @@
 
 It builds on the executed [operator auth plan 3b-i](2026-10-02-operator-auth.md). Read its "Execution status" and "After this plan" first: the 3b-ii bullets there are this plan's scope. Every anchor below was taken from `main` at `c622c1e`, which merged PR #11 (the CLI tests' port-0 harness, and `up` binding its collector's socket and handing it over as `--listen-fd`). Where the code and a spec disagree, the code wins.
 
-**Status:** not executed. Amended after the security review of 2026-10-03: required amendments A1–A11, and the optional hardening the coordinator took (see "Decisions"). **Execution ships as two PRs:** Tasks 1–4 (descriptors, listeners, health, `config.toml`), then Tasks 5–7 (the resets, the admin socket, `hennery admin`). The tasks and their replay are unchanged by the split.
+**Status:** executed 2026-10-01 (see "Execution status"). Amended after the security review of 2026-10-03: required amendments A1–A11, and the optional hardening the coordinator took (see "Decisions"). **Execution ships as two PRs:** Tasks 1–4 (descriptors, listeners, health, `config.toml`), then Tasks 5–7 (the resets, the admin socket, `hennery admin`). The tasks and their replay are unchanged by the split.
 
 Every code block below was built and tested in a scratch copy of `c622c1e`, one commit per task, and every block was generated from those commits. The plan was then replayed from its own text, task by task, onto a fresh copy of `c622c1e`:
 - each block applied exactly as "Reading the steps" says;
@@ -46,6 +46,33 @@ Every code block below was built and tested in a scratch copy of `c622c1e`, one 
 - after every task the replay ran fmt, both clippy runs (the second on the shipped binary, test hooks off), the workspace tests and the codegen check.
 
 The replay ended with 472 tests, up from 441 (per task: 443, 443, 447, 454, 460, 468, 472). The timing-sensitive test binaries passed with four copies running at once, the CLI tests five rounds of four with macOS's default `TMPDIR` (`/var/folders/…`, 49 characters, as on CI) rather than the dev shell's short one. The security tests were revert-probed (each task's "Revert-probes" step). Every "Run:" of the failing-test and passing-test steps was run as written: before, on the parent commit with only the task's test files, and after, on the task's commit. Each "Expected:" is what it printed.
+
+## Execution status (2026-10-01)
+
+**Executed** in two PRs: Tasks 1–4 on `feat/operator-auth-2a` (#14), then Tasks 5–7 on `feat/operator-auth-2b` (#15). One subagent per task, each followed by a review. Task 6's review needed one fix round. Each PR then had a whole-branch review, one fix wave and a scoped re-review. Neither whole-branch review found a Critical or Important issue. The deviations found in review:
+
+| Area | As built | Why |
+|---|---|---|
+| Duplicate `--listen-fd` (T3) | The row for `--listen-fd 50 --listen-fd 50` asserts the guard's message ("is given twice") and that no data directory was made | On Linux, epoll refuses the second registration later, so a bare `!success` stayed green with the guard removed |
+| A bad `public_url` (T4) | The error names its source: `--public-url` or `HENNERY_PUBLIC_URL`, or the `config.toml` path | The operator could not tell which of the three gave the value |
+| `listen = []` (T4) | Refused, as an empty `HENNERY_LISTEN` is | An explicit empty list silently meant the default |
+| The second listener (T3) | Enrollment and the host WebSocket are also tested on it | Only the operator routes and health ran there |
+| `up`'s collector spawn (T3) | The error says it was passing the listening sockets | A tiny `ulimit -n` made `F_DUPFD_CLOEXEC` fail with a bare `EINVAL` |
+| Signals first (T6) | `a_sigterm_during_the_start_leaves_no_admin_socket` sends SIGTERM as soon as `admin.sock` exists. It fails every time without `Signals` up front, and passes every time with it. | The "1 in 12" of decision 6 and Task 6's revert-probe 6 did not reproduce (0 in 64 runs): `the_collectors_data_is_private_to_its_user` signals too late to reach the window |
+| A closed admin connection (T6) | `read_answer` reports "the collector closed the connection without answering (it may have stopped); the command's outcome is unknown" | A reset cut off by shutdown surfaced as serde's EOF message |
+| `admin.sock` after a failed `bind` (T6) | The cleanup guard is built right after `UnixListener::bind` | A later failure in `bind` left the socket file behind |
+| `set_up`'s cached origin (T5) | Written inside the connection lock, as `reset_public_url` does | Written after the lock was released, it could race a reset |
+| The echo test (T7) | It asserts that the confirmation's "yes" was echoed before asserting that the password was not | Without a positive control, a capture that recorded nothing passed |
+
+Deferred with rulings (see "After this plan"):
+- On Linux with `bindv6only=0`, `[::]:P` together with `0.0.0.0:P` fails with `EADDRINUSE`.
+- `/readyz`'s 503 path is untested.
+- `config.toml`'s owner is not checked.
+- `setup_link` can race `set_up` and leave a dead link.
+- Dropping an `AdminSocket` removes whatever is at its path.
+- `hennery admin` has no client-side timeout, and `reset-password` prompts before it checks that the socket exists.
+
+Tests: 475 in the workspace, up from 441 before this plan: the plan's 472, plus 3 added in review.
 
 ## Scope
 

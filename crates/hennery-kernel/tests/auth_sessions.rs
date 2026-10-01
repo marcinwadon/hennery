@@ -3,29 +3,35 @@
 
 use axum::http::{HeaderMap, HeaderValue, header};
 use hennery_kernel::operator::{
-    MAX_SESSION_COOKIES, Operator, SESSION_SLIDE_SECS, SESSION_TTL_SECS, STEP_UP_SECS, cleared_cookie, session_cookie,
-    session_tokens,
+    MAX_SESSION_COOKIES, Operator, SESSION_SLIDE_SECS, SESSION_TTL_SECS, STEP_UP_SECS, SetupOutcome, cleared_cookie,
+    session_cookie, session_tokens,
 };
 
 const NOW: i64 = 1_800_000_000;
 
-fn set_up(op: &Operator) {
+/// Set `op` up; the stored PHC string, which a session is opened on.
+fn set_up(op: &Operator) -> String {
     let token = op.issue_setup_token(NOW).unwrap().unwrap();
-    op.set_up(&token, "correct horse battery", "https://hennery.example", NOW)
-        .unwrap();
+    let SetupOutcome::Done { phc, .. } = op
+        .set_up(&token, "correct horse battery", "https://hennery.example", NOW)
+        .unwrap()
+    else {
+        panic!("setup failed");
+    };
+    phc
 }
 
 #[test]
 fn there_is_no_session_before_setup() {
     let op = Operator::open_in_memory().unwrap();
-    assert_eq!(op.open_session("browser", NOW).unwrap(), None);
+    assert_eq!(op.open_session("browser", "", NOW).unwrap(), None);
 }
 
 #[test]
 fn a_session_authenticates_until_it_expires_and_use_slides_its_expiry() {
     let op = Operator::open_in_memory().unwrap();
-    set_up(&op);
-    let token = op.open_session("browser", NOW).unwrap().unwrap();
+    let phc = set_up(&op);
+    let token = op.open_session("browser", &phc, NOW).unwrap().unwrap();
     assert_eq!(token.len(), 64);
 
     // Used again within the slide interval: nothing is written.
@@ -50,8 +56,8 @@ fn only_the_hash_of_a_session_token_is_stored() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("hennery.db");
     let op = Operator::open(&db).unwrap();
-    set_up(&op);
-    let token = op.open_session("browser", NOW).unwrap().unwrap();
+    let phc = set_up(&op);
+    let token = op.open_session("browser", &phc, NOW).unwrap().unwrap();
     let conn = rusqlite::Connection::open(&db).unwrap();
     let stored: String = conn
         .query_row("SELECT id_hash FROM auth_sessions", [], |r| r.get(0))
@@ -63,8 +69,8 @@ fn only_the_hash_of_a_session_token_is_stored() {
 #[test]
 fn a_new_session_is_stepped_up_for_five_minutes_and_a_step_up_renews_it() {
     let op = Operator::open_in_memory().unwrap();
-    set_up(&op);
-    let token = op.open_session("browser", NOW).unwrap().unwrap();
+    let phc = set_up(&op);
+    let token = op.open_session("browser", &phc, NOW).unwrap().unwrap();
     let session = op.authenticate(&token, NOW).unwrap().unwrap();
     assert!(session.stepped_up(NOW + STEP_UP_SECS - 1));
     assert!(!session.stepped_up(NOW + STEP_UP_SECS));
@@ -79,9 +85,9 @@ fn a_new_session_is_stepped_up_for_five_minutes_and_a_step_up_renews_it() {
 #[test]
 fn sessions_are_listed_most_recent_first_and_a_revoked_one_is_gone() {
     let op = Operator::open_in_memory().unwrap();
-    set_up(&op);
-    let phone = op.open_session("phone\u{7}", NOW).unwrap().unwrap();
-    let laptop = op.open_session(&"L".repeat(300), NOW + 10).unwrap().unwrap();
+    let phc = set_up(&op);
+    let phone = op.open_session("phone\u{7}", &phc, NOW).unwrap().unwrap();
+    let laptop = op.open_session(&"L".repeat(300), &phc, NOW + 10).unwrap().unwrap();
     let listed = op.sessions(NOW + 10).unwrap();
     assert_eq!(listed.len(), 2);
     // Control characters are dropped and the user agent is capped.
