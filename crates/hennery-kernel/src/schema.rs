@@ -113,3 +113,117 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         last_used_at INTEGER);
     ",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hosts::Hosts;
+    use crate::operator::Operator;
+    use crate::secret::sha256_hex;
+    use rusqlite::{Connection, OptionalExtension};
+
+    const NOW: i64 = 1_800_000_000;
+    const PASSWORD: &str = "correct horse battery";
+    /// RFC 8032's first test key: a valid Ed25519 public key.
+    const HOST_KEY: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+
+    fn kernel_version(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT version FROM schema_versions WHERE component = ?1",
+            [COMPONENT],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn has_table(conn: &Connection, table: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()
+        .unwrap()
+        .is_some()
+    }
+
+    /// Plan 3c's deferred minor: a database at kernel version 4 (before
+    /// passkeys), set up, signed in, with a host and a pairing code, keeps
+    /// every row through migration 5, and its owner can keep passkeys.
+    #[test]
+    fn a_v4_database_upgrades_to_passkeys_keeping_its_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hennery.db");
+        let token = "a".repeat(64);
+        let owner: String = {
+            let mut conn = Connection::open(&db).unwrap();
+            crate::db::migrate_component(&mut conn, COMPONENT, &MIGRATIONS[..4]).unwrap();
+            assert_eq!(kernel_version(&conn), 4);
+            assert!(!has_table(&conn, "passkeys"));
+            let owner: String = conn.query_row("SELECT id FROM owners", [], |r| r.get(0)).unwrap();
+            let phc = password_auth::generate_hash(PASSWORD);
+            let code = sha256_hex(b"AAAAAAAA");
+            conn.execute_batch(&format!(
+                "
+                UPDATE owners SET set_up_at = {NOW};
+                INSERT INTO password_credentials VALUES ('{owner}', '{phc}', {NOW});
+                INSERT INTO settings VALUES ('{owner}', 'public_url', 'https://hennery.example');
+                INSERT INTO auth_sessions(id_hash, owner_id, user_agent, created_at, last_seen_at, expires_at)
+                    VALUES ('{}', '{owner}', 'test', {NOW}, {NOW}, {});
+                INSERT INTO hosts(id, owner_id, name, public_key, platform, host_version, created_at)
+                    VALUES ('host-old', '{owner}', 'laptop', '{HOST_KEY}', 'macos-aarch64', '0.0.0', {NOW});
+                INSERT INTO pairing_codes VALUES ('{code}', '{owner}', {NOW}, {}, NULL);
+                ",
+                sha256_hex(token.as_bytes()),
+                NOW + 3600,
+                NOW + 3600,
+            ))
+            .unwrap();
+            owner
+        };
+
+        let operator = Operator::open(&db).unwrap();
+        assert_eq!(operator.owner_id(), owner);
+        assert!(operator.verify_password(PASSWORD).unwrap().is_some());
+        assert!(operator.authenticate(&token, NOW).unwrap().is_some());
+        let hosts = Hosts::open(&db).unwrap();
+        let listed: Vec<String> = hosts.list().unwrap().into_iter().map(|h| h.id).collect();
+        assert_eq!(listed, ["host-old"]);
+
+        let conn = Connection::open(&db).unwrap();
+        assert_eq!(kernel_version(&conn), MIGRATIONS.len() as i64);
+        let codes: Vec<String> = conn
+            .prepare("SELECT owner_id FROM pairing_codes")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(codes, [owner.as_str()]);
+        let public_url: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE owner_id = ?1 AND key = 'public_url'",
+                [&owner],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(public_url, "https://hennery.example");
+
+        conn.execute(
+            "INSERT INTO passkeys(id, owner_id, credential_id, credential, sign_count, label, created_at)
+             VALUES ('passkey-0000000000000001', ?1, 'c0ffee', '{}', 0, 'laptop', ?2)",
+            rusqlite::params![owner, NOW],
+        )
+        .unwrap();
+        let passkeys: Vec<(String, String)> = operator
+            .passkeys()
+            .unwrap()
+            .into_iter()
+            .map(|p| (p.id, p.label))
+            .collect();
+        assert_eq!(
+            passkeys,
+            [("passkey-0000000000000001".to_string(), "laptop".to_string())]
+        );
+    }
+}

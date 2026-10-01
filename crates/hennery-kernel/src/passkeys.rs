@@ -771,6 +771,23 @@ mod tests {
         assert!(ceremonies.take(&sessions[2], NOW).is_some());
     }
 
+    /// `with_capacity(logins, sessions)`: unequal pools pin the order, so
+    /// swapped arguments keep both logins and only the last registration.
+    #[test]
+    fn each_pool_has_the_capacity_given_for_it() {
+        let ceremonies = Ceremonies::with_capacity(1, 3);
+        let sessions: Vec<String> = (0..3)
+            .map(|n| ceremonies.begin(register(&format!("s{n}")), NOW))
+            .collect();
+        let logins: Vec<String> = (0..2).map(|_| ceremonies.begin(login(), NOW)).collect();
+        assert_eq!(ceremonies.len(), 4);
+        assert!(ceremonies.take(&logins[0], NOW).is_none());
+        assert!(ceremonies.take(&logins[1], NOW).is_some());
+        for id in &sessions {
+            assert!(ceremonies.take(id, NOW).is_some());
+        }
+    }
+
     #[test]
     fn clear_drops_every_ceremony() {
         let ceremonies = Ceremonies::default();

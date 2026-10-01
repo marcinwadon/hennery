@@ -1206,6 +1206,7 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "url",
  "webauthn-authenticator-rs",
  "webauthn-rs",
