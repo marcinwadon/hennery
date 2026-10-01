@@ -2506,6 +2506,35 @@ fn service_file(dir: &std::path::Path, role: &str) -> std::path::PathBuf {
     }
 }
 
+/// `--role host` on a data directory with no pairing, and a second role
+/// beside an installed one, are refused before anything is written or run.
+#[test]
+fn service_install_refuses_an_unpaired_host_and_a_second_role() {
+    let dir = scratch_dir("svcinstall");
+    let _cleanup = RemoveDir(dir.clone());
+    let empty = dir.join("empty");
+    let empty = empty.to_str().unwrap();
+    let out = service(&dir, &["install", "--role", "host", "--data-dir", empty]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("holds no pairing"), "{stderr}");
+    assert!(!service_file(&dir, "host").exists());
+
+    let up = service_file(&dir, "up");
+    std::fs::create_dir_all(up.parent().unwrap()).unwrap();
+    std::fs::write(&up, "").unwrap();
+    let out = service(&dir, &["install", "--role", "collector"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("uninstall --role up"), "{stderr}");
+    assert!(!service_file(&dir, "collector").exists());
+    assert!(
+        !dir.join("ran").exists(),
+        "{:?}",
+        std::fs::read_to_string(dir.join("ran"))
+    );
+}
+
 #[test]
 fn service_help_lists_install_uninstall_and_status() {
     let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
@@ -2529,35 +2558,6 @@ fn service_status_with_nothing_installed_fails_without_asking_the_manager() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("no hennery service is installed"));
     let out = service(&dir, &["uninstall"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(
-        !dir.join("ran").exists(),
-        "{:?}",
-        std::fs::read_to_string(dir.join("ran"))
-    );
-}
-
-/// `--role host` on a data directory with no pairing, and a second role
-/// beside an installed one, are refused before anything is written or run.
-#[test]
-fn service_install_refuses_an_unpaired_host_and_a_second_role() {
-    let dir = scratch_dir("svcinstall");
-    let _cleanup = RemoveDir(dir.clone());
-    let empty = dir.join("empty");
-    let empty = empty.to_str().unwrap();
-    let out = service(&dir, &["install", "--role", "host", "--data-dir", empty]);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success());
-    assert!(stderr.contains("holds no pairing"), "{stderr}");
-    assert!(!service_file(&dir, "host").exists());
-
-    let up = service_file(&dir, "up");
-    std::fs::create_dir_all(up.parent().unwrap()).unwrap();
-    std::fs::write(&up, "").unwrap();
-    let out = service(&dir, &["install", "--role", "collector"]);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success());
-    assert!(stderr.contains("uninstall --role up"), "{stderr}");
-    assert!(!service_file(&dir, "collector").exists());
     assert!(
         !dir.join("ran").exists(),
         "{:?}",

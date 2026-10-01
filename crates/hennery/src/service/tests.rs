@@ -126,10 +126,10 @@ fn installing_on_macos_writes_and_bootstraps_the_agent() {
         ]
     );
     let text = std::fs::read_to_string(&plist).unwrap();
-    let argv = unit::plist_command_line(&text).unwrap();
     let data = cx.home.join("Library/Application Support/hennery");
-    assert_eq!(argv[1..], ["up", "--data-dir", data.to_str().unwrap()]);
-    assert_eq!(argv[0], cx.exe.to_str().unwrap());
+    let argv = unit::command_line(Role::Up, &cx.exe, &data).unwrap();
+    let args: String = argv.iter().map(|a| format!("\t\t<string>{a}</string>\n")).collect();
+    assert!(text.contains(&format!("<array>\n{args}\t</array>")), "{text}");
     assert!(text.contains("/usr/bin:/bin:/usr/sbin:/sbin</string>"), "{text}");
     assert!(text.contains("<string>Aqua</string>"), "{text}");
     let logs = cx.home.join("Library/Logs/hennery");
@@ -219,8 +219,12 @@ fn installing_on_linux_writes_enables_and_starts_the_unit() {
     );
     let unit_file = config.join("systemd/user/hennery-host.service");
     let text = std::fs::read_to_string(&unit_file).unwrap();
-    let argv = unit::systemd_command_line(&text).unwrap();
-    assert_eq!(argv[1..], ["host", "run", "--data-dir", data.to_str().unwrap()]);
+    let exec = format!(
+        "ExecStart=\"{}\" \"host\" \"run\" \"--data-dir\" \"{}\"\n",
+        cx.exe.display(),
+        data.display()
+    );
+    assert!(text.contains(&exec), "{text}");
     let env_file = config.join("hennery/service.env");
     assert!(
         text.contains(&format!("EnvironmentFile={}\n", env_file.display())),
@@ -255,9 +259,10 @@ fn linger_on_is_not_mentioned() {
     assert!(!out.contains("linger"), "{out}");
     assert!(out.contains("restarted"), "{out}");
     let unit_file = cx.home.join(".config/systemd/user/hennery-collector.service");
-    let argv = unit::systemd_command_line(&std::fs::read_to_string(unit_file).unwrap()).unwrap();
+    let text = std::fs::read_to_string(unit_file).unwrap();
     let data = cx.home.join(".local/share/hennery");
-    assert_eq!(argv[1..], ["collector", "--data-dir", data.to_str().unwrap()]);
+    let exec = format!("\"collector\" \"--data-dir\" \"{}\"\n", data.display());
+    assert!(text.contains(&exec), "{text}");
 }
 
 /// A host data directory with no pairing would crash-loop: refused before

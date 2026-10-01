@@ -298,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn the_plist_holds_what_section_6_2_names_and_reads_back() {
+    fn the_plist_holds_what_section_6_2_names() {
         let argv = command_line(Role::Up, Path::new("/opt/bin/hennery"), &awkward()).unwrap();
         let text = plist(
             Role::Up,
@@ -320,11 +320,10 @@ mod tests {
             assert!(text.contains(wanted), "{wanted:?} not in:\n{text}");
         }
         assert!(!text.contains("CLAUDE"), "{text}");
-        assert_eq!(plist_command_line(&text).unwrap(), argv);
     }
 
     #[test]
-    fn the_unit_holds_what_section_6_3_names_and_reads_back() {
+    fn the_unit_holds_what_section_6_3_names() {
         let exe = Path::new("/home/me/.local/bin/hen nery");
         let argv = command_line(Role::Host, exe, &awkward()).unwrap();
         let text = systemd_unit(Role::Host, &argv, "/home/me/.config/hennery 100%/service.env").unwrap();
@@ -345,7 +344,6 @@ mod tests {
             assert!(text.contains(wanted), "{wanted:?} not in:\n{text}");
         }
         assert!(text.contains("with %%h $$HOME \\\"quotes\\\""), "{text}");
-        assert_eq!(systemd_command_line(&text).unwrap(), argv);
         assert!(systemd_unit(Role::Host, &argv, "/home/me/a\\b/service.env").is_err());
         assert!(systemd_unit(Role::Host, &argv, "/home/me/a\"b/service.env").is_err());
     }
@@ -405,5 +403,21 @@ mod tests {
             assert!(out.status.success(), "{role}: {stderr}");
             assert!(!stderr.contains(role.unit()), "{role}: {stderr}");
         }
+    }
+
+    /// What `status` and `uninstall` read back is what `install` wrote, for
+    /// every character the files escape.
+    #[test]
+    fn the_command_line_reads_back_from_either_file() {
+        let exe = Path::new("/home/me/.local/bin/hen nery");
+        for role in Role::ALL {
+            let argv = command_line(role, exe, &awkward()).unwrap();
+            let text = plist(role, &argv, "/usr/bin", "/tmp/a & b.log");
+            assert_eq!(plist_command_line(&text).unwrap(), argv, "{role}");
+            let text = systemd_unit(role, &argv, "/tmp/env").unwrap();
+            assert_eq!(systemd_command_line(&text).unwrap(), argv, "{role}");
+        }
+        assert_eq!(systemd_command_line("ExecStart=/bin/true"), None);
+        assert_eq!(plist_command_line("<plist/>"), None);
     }
 }
