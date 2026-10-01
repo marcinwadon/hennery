@@ -78,6 +78,11 @@ struct HostToml {
     /// The collector's host WebSocket, e.g. `wss://c.example/api/hosts/ws`.
     collector: String,
     host_id: String,
+    /// The public key enrolled under `host_id`, hex. Written by `join`, so
+    /// that a staged pairing is rolled forward only onto its own key; absent
+    /// from pairings stored before it, and then not checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    public_key: Option<String>,
 }
 
 /// A paired host: what `hennery host run` needs to connect.
@@ -92,6 +97,7 @@ impl Paired {
     /// The pairing stored in `data_dir`: `None` if the host was never
     /// paired there, an error if only half of it is there.
     pub fn load(data_dir: &Path) -> Result<Option<Self>> {
+        finish_interrupted_pairing(data_dir)?;
         let key_path = data_dir.join(KEY_FILE);
         let config_path = data_dir.join(CONFIG_FILE);
         match (key_path.exists(), config_path.exists()) {
@@ -108,12 +114,19 @@ impl Paired {
                 config_path.display()
             ),
         }
-        let text = std::fs::read_to_string(&config_path).with_context(|| format!("read {}", config_path.display()))?;
-        let config: HostToml = toml::from_str(&text).with_context(|| format!("parse {}", config_path.display()))?;
+        let config = read_config(&config_path)?;
+        let key = HostKey::load(&key_path)?;
+        if config.public_key.as_ref().is_some_and(|k| *k != key.public_key_hex()) {
+            bail!(
+                "{} is not the key {} was paired with: remove both to pair this host again",
+                key_path.display(),
+                config_path.display()
+            );
+        }
         Ok(Some(Self {
             collector_url: config.collector,
             host_id: config.host_id,
-            key: HostKey::load(&key_path)?,
+            key,
         }))
     }
 
@@ -122,19 +135,76 @@ impl Paired {
     pub fn save(&self, data_dir: &Path) -> Result<()> {
         create_private_dir(data_dir)?;
         self.key.save(&data_dir.join(KEY_FILE))?;
-        write_config(data_dir, &self.collector_url, &self.host_id)
+        write_config_to(
+            &data_dir.join(CONFIG_FILE),
+            &self.collector_url,
+            &self.host_id,
+            &self.key,
+        )
     }
 }
 
-/// Write `host.toml` alone. Used by `Paired::save` (which writes the key
-/// first) and by `pairing::join`, which puts the key in place itself by
-/// renaming its pending file rather than writing the seed a second time.
-pub(crate) fn write_config(data_dir: &Path, collector_url: &str, host_id: &str) -> Result<()> {
+fn read_config(path: &Path) -> Result<HostToml> {
+    let text = std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("parse {}", path.display()))
+}
+
+/// Write a `host.toml` at `path`, naming `key`'s public half:
+/// `pairing::join` writes it as `pending_path(CONFIG_FILE)` first (see
+/// `finish_interrupted_pairing`).
+pub(crate) fn write_config_to(path: &Path, collector_url: &str, host_id: &str, key: &HostKey) -> Result<()> {
     let config = toml::to_string(&HostToml {
         collector: collector_url.to_string(),
         host_id: host_id.to_string(),
+        public_key: Some(key.public_key_hex()),
     })?;
-    write_private(&data_dir.join(CONFIG_FILE), config.as_bytes())
+    write_private(path, config.as_bytes())
+}
+
+/// Where `join` stages `file` (`host.key` or `host.toml`) before renaming it
+/// into place.
+pub(crate) fn pending_path(data_dir: &Path, file: &str) -> PathBuf {
+    data_dir.join(format!("{file}.pending"))
+}
+
+/// Finish a pairing that `join` committed but did not put in place (a crash
+/// between its renames). `join` writes `host.toml.pending` only once the
+/// collector has enrolled the key, and before it renames anything, so a
+/// `host.toml.pending` means: the new key is `host.key.pending`, or already
+/// `host.key`, and it belongs with that file, not with an older `host.toml`
+/// (a revoked identity's, which the collector would refuse as `bad_proof`).
+/// Roll both forward, in `join`'s order.
+fn finish_interrupted_pairing(data_dir: &Path) -> Result<()> {
+    let config_pending = pending_path(data_dir, CONFIG_FILE);
+    if !config_pending.exists() {
+        return Ok(());
+    }
+    let staged = read_config(&config_pending)?;
+    let key_path = data_dir.join(KEY_FILE);
+    let key_pending = pending_path(data_dir, KEY_FILE);
+    let key_at = if key_pending.exists() { &key_pending } else { &key_path };
+    // Rolled forward only onto the key it was enrolled with: never onto an
+    // older identity's `host.key`.
+    let matches = key_at.exists() && staged.public_key == Some(HostKey::load(key_at)?.public_key_hex());
+    if !matches {
+        bail!(
+            "{} holds a {} without the key it was paired with: remove it to pair this host again",
+            data_dir.display(),
+            config_pending.display()
+        );
+    }
+    if key_at == &key_pending {
+        std::fs::rename(&key_pending, &key_path)
+            .with_context(|| format!("rename {} to {}", key_pending.display(), key_path.display()))?;
+        fsync_parent(&key_path)?;
+    }
+    crate::pairing::orphan_outbox(data_dir, "unpaired")?;
+    let config_path = data_dir.join(CONFIG_FILE);
+    std::fs::rename(&config_pending, &config_path)
+        .with_context(|| format!("rename {} to {}", config_pending.display(), config_path.display()))?;
+    fsync_parent(&config_path)?;
+    tracing::warn!(dir = %data_dir.display(), host_id = %staged.host_id, "finished a pairing that was interrupted");
+    Ok(())
 }
 
 /// Create `dir` (and its parents) with mode 0700: it holds the host key
@@ -234,6 +304,96 @@ cdf6b48fb39bfaa9b5a3cd01538280ec9e6d50c8831e9aae4d791f68112a6c04";
         std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(!is_private(&key).unwrap());
         HostKey::load(&key).expect("still usable, with a warning");
+    }
+
+    /// 3a's M4: `join` crashed after enrolling a new key, at either point
+    /// between its two renames. The older (revoked) `host.toml` must not be
+    /// loaded beside the new key: the pairing is rolled forward.
+    #[test]
+    fn a_pairing_interrupted_between_its_renames_is_rolled_forward() {
+        let new_key = HostKey::from_seed([2; 32]);
+        for key_renamed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            Paired {
+                collector_url: "ws://127.0.0.1:7117/api/hosts/ws".into(),
+                host_id: "host-old".into(),
+                key: HostKey::from_seed([1; 32]),
+            }
+            .save(dir.path())
+            .unwrap();
+            let key_at = if key_renamed {
+                dir.path().join(KEY_FILE)
+            } else {
+                pending_path(dir.path(), KEY_FILE)
+            };
+            new_key.save(&key_at).unwrap();
+            write_config_to(
+                &pending_path(dir.path(), CONFIG_FILE),
+                "ws://127.0.0.1:7117/api/hosts/ws",
+                "host-new",
+                &new_key,
+            )
+            .unwrap();
+            let loaded = Paired::load(dir.path()).unwrap().unwrap();
+            assert_eq!(loaded.host_id, "host-new", "key renamed: {key_renamed}");
+            assert_eq!(loaded.key.public_key_hex(), new_key.public_key_hex());
+            for file in [KEY_FILE, CONFIG_FILE] {
+                assert!(
+                    !pending_path(dir.path(), file).exists(),
+                    "{file}, key renamed: {key_renamed}"
+                );
+            }
+        }
+    }
+
+    /// A staged `host.toml` without the key it names is refused, never
+    /// rolled forward: with no key at all, or beside an older identity's
+    /// `host.key` (a `join` whose staged key was lost after enrolling).
+    #[test]
+    fn a_staged_pairing_without_its_own_key_is_refused() {
+        let url = "ws://127.0.0.1:1/api/hosts/ws";
+        let dir = tempfile::tempdir().unwrap();
+        let staged = pending_path(dir.path(), CONFIG_FILE);
+        write_config_to(&staged, url, "host-new", &HostKey::from_seed([2; 32])).unwrap();
+        let err = Paired::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("host.toml.pending") && err.contains("remove"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let old = Paired {
+            collector_url: url.into(),
+            host_id: "host-old".into(),
+            key: HostKey::from_seed([1; 32]),
+        };
+        old.save(dir.path()).unwrap();
+        let staged = pending_path(dir.path(), CONFIG_FILE);
+        write_config_to(&staged, url, "host-new", &HostKey::from_seed([2; 32])).unwrap();
+        let err = Paired::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("host.toml.pending"), "{err}");
+        assert!(staged.exists(), "left for the operator");
+        // A pairing whose `host.toml` names another key is refused too.
+        std::fs::remove_file(&staged).unwrap();
+        write_config_to(
+            &dir.path().join(CONFIG_FILE),
+            url,
+            "host-old",
+            &HostKey::from_seed([3; 32]),
+        )
+        .unwrap();
+        let err = Paired::load(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("is not the key"), "{err}");
+    }
+
+    /// A `host.toml` stored before it named its key still loads.
+    #[test]
+    fn a_pairing_stored_without_its_public_key_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        HostKey::from_seed([1; 32]).save(&dir.path().join(KEY_FILE)).unwrap();
+        std::fs::write(
+            dir.path().join(CONFIG_FILE),
+            "collector = \"ws://127.0.0.1:1/api/hosts/ws\"\nhost_id = \"host-1\"\n",
+        )
+        .unwrap();
+        assert_eq!(Paired::load(dir.path()).unwrap().unwrap().host_id, "host-1");
     }
 
     #[test]
