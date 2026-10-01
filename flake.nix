@@ -23,6 +23,10 @@
             # `webauthn-rs` links OpenSSL (plan 3c).
             openssl
             pkg-config
+            # The PATH-capture tests run each login shell (plan 7c).
+            bashInteractive
+            zsh
+            fish
           ];
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         };

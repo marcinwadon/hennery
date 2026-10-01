@@ -2448,8 +2448,7 @@ fn a_killed_child_is_started_again() {
 
     unsafe { libc::kill(collector, libc::SIGKILL) };
     up.wait_until("the collector reported running again", || {
-        supervisor_state(&data)
-            .is_some_and(|s| s["collector"]["restarts"] == 1 && s["collector"]["state"] == "running")
+        supervisor_state(&data).is_some_and(|s| s["collector"]["restarts"] == 1 && s["collector"]["state"] == "running")
     });
     up.children.extend(children_of(up_pid));
     // The same port, and the session from before the crash.
@@ -2459,4 +2458,109 @@ fn a_killed_child_is_started_again() {
     let state = supervisor_state(&data).unwrap();
     assert_eq!(state["pid"], up_pid, "{state}");
     assert_eq!(state["host"]["last_exit"], "signal: 9 (SIGKILL)", "{state}");
+}
+
+/// `hennery service …` in a scratch home: HOME and the XDG directories in
+/// `dir`, and PATH starting with stand-ins for `launchctl`, `systemctl` and
+/// `loginctl` that only record that they ran. Every command these tests
+/// run refuses before it would reach the service manager, and the
+/// stand-ins prove it.
+fn service(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+    use std::os::unix::fs::PermissionsExt;
+    let stubs = dir.join("stubs");
+    std::fs::create_dir_all(&stubs).unwrap();
+    for name in ["launchctl", "systemctl", "loginctl"] {
+        let stub = stubs.join(name);
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho {name} \"$@\" >> \"{}\"\nexit 1\n",
+                dir.join("ran").display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .arg("service")
+        .args(args)
+        .env("HOME", dir.join("home"))
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
+        .output()
+        .unwrap()
+}
+
+/// The service file of `role` in `service`'s scratch home.
+fn service_file(dir: &std::path::Path, role: &str) -> std::path::PathBuf {
+    if cfg!(target_os = "macos") {
+        dir.join("home/Library/LaunchAgents")
+            .join(format!("dev.hennery.{role}.plist"))
+    } else {
+        let unit = match role {
+            "up" => "hennery.service".to_string(),
+            other => format!("hennery-{other}.service"),
+        };
+        dir.join("config/systemd/user").join(unit)
+    }
+}
+
+#[test]
+fn service_help_lists_install_uninstall_and_status() {
+    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["service", "--help"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    for command in ["install", "uninstall", "status"] {
+        assert!(text.contains(command), "{text}");
+    }
+}
+
+/// Nothing installed: `status` says so and exits 1, `uninstall` has nothing
+/// to do; neither asks the service manager.
+#[test]
+fn service_status_with_nothing_installed_fails_without_asking_the_manager() {
+    let dir = scratch_dir("svcstatus");
+    let _cleanup = RemoveDir(dir.clone());
+    let out = service(&dir, &["status"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("no hennery service is installed"));
+    let out = service(&dir, &["uninstall"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        !dir.join("ran").exists(),
+        "{:?}",
+        std::fs::read_to_string(dir.join("ran"))
+    );
+}
+
+/// `--role host` on a data directory with no pairing, and a second role
+/// beside an installed one, are refused before anything is written or run.
+#[test]
+fn service_install_refuses_an_unpaired_host_and_a_second_role() {
+    let dir = scratch_dir("svcinstall");
+    let _cleanup = RemoveDir(dir.clone());
+    let empty = dir.join("empty");
+    let empty = empty.to_str().unwrap();
+    let out = service(&dir, &["install", "--role", "host", "--data-dir", empty]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("holds no pairing"), "{stderr}");
+    assert!(!service_file(&dir, "host").exists());
+
+    let up = service_file(&dir, "up");
+    std::fs::create_dir_all(up.parent().unwrap()).unwrap();
+    std::fs::write(&up, "").unwrap();
+    let out = service(&dir, &["install", "--role", "collector"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(stderr.contains("uninstall --role up"), "{stderr}");
+    assert!(!service_file(&dir, "collector").exists());
+    assert!(
+        !dir.join("ran").exists(),
+        "{:?}",
+        std::fs::read_to_string(dir.join("ran"))
+    );
 }

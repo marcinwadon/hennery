@@ -57,7 +57,8 @@ pub fn acquire(dir: &Path, name: &str, command: &str) -> Result<Lock> {
         }
         return Err(err).with_context(|| format!("lock {}", path.display()));
     }
-    file.set_len(0).with_context(|| format!("truncate {}", path.display()))?;
+    file.set_len(0)
+        .with_context(|| format!("truncate {}", path.display()))?;
     file.rewind()?;
     writeln!(file, "{}", std::process::id()).with_context(|| format!("write {}", path.display()))?;
     Ok(Lock { _file: file })
@@ -77,7 +78,9 @@ mod tests {
         let text = std::fs::read_to_string(dir.path().join(HOST_LOCK)).unwrap();
         assert_eq!(text.trim(), std::process::id().to_string());
 
-        let err = acquire(dir.path(), HOST_LOCK, "hennery host run").unwrap_err().to_string();
+        let err = acquire(dir.path(), HOST_LOCK, "hennery host run")
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("host.lock"), "{err}");
         assert!(err.contains(&format!("pid {}", std::process::id())), "{err}");
         assert!(err.contains("another `hennery host run`"), "{err}");
@@ -85,8 +88,15 @@ mod tests {
         let text = std::fs::read_to_string(dir.path().join(HOST_LOCK)).unwrap();
         assert_eq!(text.trim(), std::process::id().to_string());
 
+        // Free once dropped. A process another test forks meanwhile holds a
+        // copy of the descriptor until it execs (close-on-exec closes it
+        // then), so this may take a moment.
         drop(first);
-        let _again = acquire(dir.path(), HOST_LOCK, "hennery host run").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while let Err(err) = acquire(dir.path(), HOST_LOCK, "hennery host run") {
+            assert!(std::time::Instant::now() < deadline, "{err}");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// The lock's descriptor is close-on-exec, and its file private.
@@ -98,7 +108,10 @@ mod tests {
         // SAFETY: fcntl(2) reads the flags of a descriptor `lock` owns.
         let flags = unsafe { libc::fcntl(lock._file.as_raw_fd(), libc::F_GETFD) };
         assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0, "flags {flags}");
-        let mode = std::fs::metadata(dir.path().join(UP_LOCK)).unwrap().permissions().mode();
+        let mode = std::fs::metadata(dir.path().join(UP_LOCK))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o600, "{mode:o}");
     }
 }

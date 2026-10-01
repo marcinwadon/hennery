@@ -196,6 +196,19 @@ pub fn write_state(dir: &Path, state: &State) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `dir`'s `STATE_FILE`, if `up` has written one there.
+pub fn read_state(dir: &Path) -> anyhow::Result<Option<State>> {
+    use anyhow::Context;
+    let path = dir.join(STATE_FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => Ok(Some(
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?,
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
+    }
+}
+
 enum Slot<C> {
     Running { child: C, since: Instant, first: bool },
     Waiting { until: Instant },

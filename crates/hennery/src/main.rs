@@ -6,6 +6,7 @@ mod admin;
 mod config;
 mod inherit;
 mod lock;
+mod service;
 mod supervisor;
 
 use anyhow::{Context, Result, bail};
@@ -41,6 +42,8 @@ enum Command {
     Up(UpArgs),
     /// Recovery commands for a running collector, over its admin socket.
     Admin(admin::AdminArgs),
+    /// Run hennery as a per-user service (launchd, systemd).
+    Service(service::ServiceArgs),
 }
 
 #[derive(Subcommand)]
@@ -206,6 +209,7 @@ async fn main() -> std::process::ExitCode {
         } => run_host(args).await,
         Command::Up(args) => run_up(args).await,
         Command::Admin(args) => admin::run(args).await.map(|()| std::process::ExitCode::SUCCESS),
+        Command::Service(args) => service::run(args),
     };
     match result {
         Ok(code) => code,
