@@ -66,9 +66,12 @@ pub fn login_environment(
     env: &[(String, String)],
     timeout: Duration,
 ) -> Result<BTreeMap<String, String>> {
+    // Unique within this process too: two captures may start in one tick.
+    static CAPTURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let out = std::env::temp_dir().join(format!(
-        "hennery-env-{}-{}",
+        "hennery-env-{}-{}-{}",
         std::process::id(),
+        CAPTURES.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -80,6 +83,9 @@ pub fn login_environment(
         .mode(0o600)
         .open(&out)
         .with_context(|| format!("create {}", out.display()))?;
+    // It holds the whole login environment for a moment, whatever tokens
+    // the startup files export among it: private, and removed below
+    // however the capture ends.
     let result = run_shell(shell, env, &out, timeout).and_then(|()| {
         let size = std::fs::metadata(&out)?.len();
         if size > MAX_ENVIRONMENT {
@@ -118,12 +124,15 @@ fn run_shell(shell: &Path, env: &[(String, String)], out: &Path, timeout: Durati
         .with_context(|| format!("start the login shell {}", shell.display()))?;
     let group = child.id() as libc::pid_t;
     let deadline = Instant::now() + timeout;
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break Some(status);
+    // Watched without being reaped: until it is, its pid (the group's id)
+    // cannot be another process's, so the kill below reaches only what the
+    // shell left behind.
+    let finished = loop {
+        if exited(group)? {
+            break true;
         }
         if Instant::now() >= deadline {
-            break None;
+            break false;
         }
         std::thread::sleep(Duration::from_millis(20));
     };
@@ -132,18 +141,36 @@ fn run_shell(shell: &Path, env: &[(String, String)], out: &Path, timeout: Durati
     unsafe {
         libc::kill(-group, libc::SIGKILL);
     }
-    let Some(status) = status else {
-        let _ = child.wait();
+    let status = child.wait()?;
+    if !finished {
         bail!(
             "{} -l -i did not finish within {} s",
             shell.display(),
             timeout.as_secs()
         );
-    };
+    }
     if !status.success() {
         bail!("{} -l -i -c env failed ({status})", shell.display());
     }
     Ok(())
+}
+
+/// Whether child `pid` has exited, leaving it unreaped (`WNOWAIT`).
+fn exited(pid: libc::pid_t) -> std::io::Result<bool> {
+    // SAFETY: all-zero bytes are a valid `siginfo_t`; waitid(2) fills it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let flags = libc::WEXITED | libc::WNOWAIT | libc::WNOHANG;
+    // SAFETY: waitid(2) on our own child, into a local `siginfo_t`.
+    if unsafe { libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, flags) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // With `WNOHANG`, a child that has not changed state leaves `si_pid` 0.
+    #[cfg(target_os = "linux")]
+    // SAFETY: waitid(2) filled `info` for a `SIGCHLD`.
+    let changed = unsafe { info.si_pid() };
+    #[cfg(not(target_os = "linux"))]
+    let changed = info.si_pid;
+    Ok(changed != 0)
 }
 
 /// `env -0`'s output as variables; a record without `=` is skipped.
