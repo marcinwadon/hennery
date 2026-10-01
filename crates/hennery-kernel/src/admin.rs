@@ -321,7 +321,15 @@ pub async fn serve(socket: AdminSocket, admin: Admin, shutdown: impl std::future
 
 /// One connection: check the peer, read its request, answer it.
 async fn answer(mut stream: tokio::net::UnixStream, admin: &Admin) -> Result<()> {
-    let peer = stream.peer_cred().context("the peer's credentials")?;
+    let peer = match stream.peer_cred() {
+        // Gone already: `hennery admin` checks the socket before it prompts
+        // by connecting and closing at once (`probe`).
+        Err(err) if err.raw_os_error() == Some(libc::ENOTCONN) => {
+            tracing::debug!("admin socket: a connection closed before it was read");
+            return Ok(());
+        }
+        peer => peer.context("the peer's credentials")?,
+    };
     // SAFETY: geteuid(2) cannot fail.
     let own = unsafe { libc::geteuid() };
     if peer.uid() != own {
@@ -337,6 +345,11 @@ async fn answer(mut stream: tokio::net::UnixStream, admin: &Admin) -> Result<()>
     let mut reader = BufReader::new(read.take(MAX_REQUEST_BYTES));
     let response = match tokio::time::timeout(REQUEST_TIMEOUT, reader.read_line(&mut line)).await {
         Err(_) => bail!("no request within {REQUEST_TIMEOUT:?}"),
+        // Closed without a byte: the same check as above, a little later.
+        Ok(Ok(0)) => {
+            tracing::debug!("admin socket: a connection closed without a request");
+            return Ok(());
+        }
         Ok(Err(err)) => refused(format!("the request is not a line of UTF-8: {err}")),
         Ok(Ok(_)) if !line.ends_with('\n') => refused(format!(
             "the request must be one line of at most {MAX_REQUEST_BYTES} bytes"
