@@ -2628,3 +2628,89 @@ fn a_pairing_code_from_the_admin_socket_pairs_a_host() {
     let listed = String::from_utf8_lossy(&out.stdout);
     assert!(listed.contains("\tlaptop\t") && listed.contains("\tpaired"), "{listed}");
 }
+
+/// `hennery collector healthcheck` (distribution spec §1, §4.1), as the
+/// image's `HEALTHCHECK` runs it: the address from `--listen` or
+/// `HENNERY_LISTEN` (the image sets the variable), with `HENNERY_DATA_DIR`
+/// set too. 0 while the collector serves, 1 once it is gone.
+#[test]
+fn the_healthcheck_passes_while_the_collector_serves_and_fails_once_it_stops() {
+    let dir = scratch_dir("healthcheck");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    let log = dir.join("collector.log");
+    let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["collector", "--listen", "127.0.0.1:0"])
+        .arg("--data-dir")
+        .arg(&data)
+        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
+        .spawn()
+        .unwrap();
+    let mut collector = KillTree::new(collector, &log);
+    let address = collector.listening();
+    let healthcheck = |how: &dyn Fn(&mut Command)| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
+        command
+            .args(["collector", "healthcheck"])
+            .env_remove("HENNERY_LISTEN")
+            .env_remove("HENNERY_DATA_DIR");
+        how(&mut command);
+        command.output().unwrap()
+    };
+    let by_flag = |command: &mut Command| {
+        command.arg("--listen").arg(&address);
+    };
+    let by_environment = |command: &mut Command| {
+        command.env("HENNERY_LISTEN", &address).env("HENNERY_DATA_DIR", &data);
+    };
+    for (how, set) in [
+        ("--listen", &by_flag as &dyn Fn(&mut Command)),
+        ("HENNERY_LISTEN", &by_environment),
+    ] {
+        let out = healthcheck(set);
+        assert!(
+            out.status.success(),
+            "{how}: {:?} {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    drop(collector);
+    for (how, set) in [
+        ("--listen", &by_flag as &dyn Fn(&mut Command)),
+        ("HENNERY_LISTEN", &by_environment),
+    ] {
+        let out = healthcheck(set);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{how}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("unhealthy"),
+            "{how}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// `collector` still needs its data directory; `collector healthcheck`
+/// takes none of the collector's own flags.
+#[test]
+fn the_collector_without_a_data_dir_or_with_the_healthcheck_and_its_flags_is_refused() {
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_hennery"))
+            .args(args)
+            .env_remove("HENNERY_DATA_DIR")
+            .env_remove("HENNERY_LISTEN")
+            .output()
+            .unwrap()
+    };
+    let out = run(&["collector"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--data-dir"));
+    let out = run(&["collector", "--data-dir", "/nonexistent", "healthcheck"]);
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+}
