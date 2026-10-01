@@ -57,17 +57,10 @@ document.getElementById("setup").addEventListener("submit", async (event) => {
 });
 "#;
 
-/// Kernel spec §7.2's policy, without the theme bootstrap this page has not.
-const CSP: &str =
-    "script-src 'self'; img-src 'self' data: blob:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'";
-
-/// `GET /setup`.
+/// `GET /setup`. Its `Content-Security-Policy` is set by `csp::on_html`,
+/// over the whole router.
 pub(crate) async fn page() -> Response {
-    let mut response = ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], PAGE).into_response();
-    response
-        .headers_mut()
-        .insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
-    response
+    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], PAGE).into_response()
 }
 
 /// `GET /setup.js`.

@@ -5,6 +5,7 @@
 pub mod admin;
 pub mod auth;
 pub mod auth_api;
+pub mod csp;
 pub mod db;
 pub mod health;
 pub mod hosts;

@@ -149,6 +149,19 @@ const OPERATOR_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/api/auth/sessions/0000"),
 ];
 
+/// Every route outside the operator's session, as a method and a path:
+/// the pages, setup, enrollment, the host WebSocket and the health checks.
+const EXEMPT_ROUTES: &[(&str, &str)] = &[
+    ("GET", "/"),
+    ("GET", "/setup"),
+    ("GET", "/setup.js"),
+    ("POST", "/api/setup"),
+    ("POST", "/api/hosts/enroll"),
+    ("GET", "/api/hosts/ws"),
+    ("GET", "/healthz"),
+    ("GET", "/readyz"),
+];
+
 /// Every operator route on every listener of `collector`.
 fn every_route(collector: &Collector) -> Vec<(SocketAddr, &'static str, &'static str)> {
     let on = |addr: SocketAddr| OPERATOR_ROUTES.iter().map(move |&(method, path)| (addr, method, path));
@@ -540,4 +553,36 @@ fn every_json_body_is_read_through_api_json() {
     }
     assert!(checked > 20, "checked only {checked} files");
     assert!(found.is_empty(), "take ApiJson, not Json:\n{}", found.join("\n"));
+}
+
+/// Kernel spec §7.2: every HTML response carries the
+/// `Content-Security-Policy`, whichever route sends it. Every `GET` in the
+/// route tables is fetched signed in, and each HTML answer is checked; the
+/// policy comes from one layer over the whole router, not from each page.
+#[tokio::test]
+async fn every_html_response_carries_the_content_security_policy() {
+    let collector = Collector::start().await;
+    let signed_in = hennery_testkit::operator_client(&collector.state.operator);
+    let mut html = Vec::new();
+    for &(method, path) in OPERATOR_ROUTES.iter().chain(EXEMPT_ROUTES) {
+        if method != "GET" || path.starts_with("/api/stream/") {
+            continue;
+        }
+        let resp = request(&signed_in, collector.addr, method, path).send().await.unwrap();
+        let is_html = resp
+            .headers()
+            .get("content-type")
+            .is_some_and(|t| t.to_str().unwrap().starts_with("text/html"));
+        if is_html {
+            let csp = resp
+                .headers()
+                .get("content-security-policy")
+                .map(|v| v.to_str().unwrap().to_string());
+            assert_eq!(csp.as_deref(), Some(hennery_kernel::csp::POLICY), "{path}");
+            html.push(path);
+        }
+    }
+    // Not vacuous: the pages the tables name are HTML.
+    assert!(html.contains(&"/") && html.contains(&"/setup"), "{html:?}");
+    collector.stop().await;
 }

@@ -7,8 +7,6 @@ mod config;
 mod inherit;
 
 use anyhow::{Context, Result, bail};
-use axum::response::Html;
-use axum::routing::get;
 use clap::{Args, Parser, Subcommand};
 use hennery_host::identity::Paired;
 use hennery_host::pairing::Joined;
@@ -182,8 +180,6 @@ fn bind_all(addresses: &[String]) -> Result<Vec<std::net::TcpListener>> {
         .collect()
 }
 
-const PLACEHOLDER: &str = "<!doctype html><meta charset=utf-8><title>hennery</title><h1>hennery</h1><p>Walking skeleton. The UI is not built yet.</p>";
-
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     tracing_subscriber::fmt()
@@ -330,8 +326,12 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
             state.shutdown.clone().cancelled_owned(),
         ))
     });
-    let app = hennery_sessions::router(state.clone()).route("/", get(|| async { Html(PLACEHOLDER) }));
-    let served = hennery_sessions::serve_all(listeners, app, state.shutdown.clone()).await;
+    let served = hennery_sessions::serve_all(
+        listeners,
+        hennery_sessions::router(state.clone()),
+        state.shutdown.clone(),
+    )
+    .await;
     // Also when serving failed: the admin socket is removed once it stops.
     state.shutdown.cancel();
     if let Some(admin) = admin {

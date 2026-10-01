@@ -101,8 +101,8 @@ pub async fn serve_all(
     result
 }
 
-/// Every session, host and operator route, the health checks and the host
-/// WebSocket. Serve it with
+/// Every session, host and operator route, the health checks, the host
+/// WebSocket and the placeholder page. Serve it with
 /// `into_make_service_with_connect_info::<SocketAddr>()`: enrollment reads
 /// the client's address.
 pub fn router(state: AppState) -> Router {
@@ -111,4 +111,10 @@ pub fn router(state: AppState) -> Router {
         .merge(hennery_kernel::auth_api::router(state.operator.clone()))
         .merge(hennery_kernel::health::router(state.operator.clone()))
         .merge(ws::router(state))
+        .route("/", axum::routing::get(|| async { axum::response::Html(PLACEHOLDER) }))
+        // Last, so it covers every route above (kernel spec §7.2).
+        .layer(axum::middleware::map_response(hennery_kernel::csp::on_html))
 }
+
+/// `GET /` until the frontend is built.
+const PLACEHOLDER: &str = "<!doctype html><meta charset=utf-8><title>hennery</title><h1>hennery</h1><p>Walking skeleton. The UI is not built yet.</p>";
