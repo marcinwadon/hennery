@@ -1493,6 +1493,136 @@ fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
     assert!(!data.exists(), "the data directory was made");
 }
 
+/// 3a/3b's deferred check: the pairing pipe's ends `up` hands its children,
+/// `collector --pairing-code-fd` and `host run --join-code-fd`, must be open
+/// pipes, as `--listen-fd` must be a listening socket. A closed descriptor,
+/// a file (`/dev/null`) and a socket are refused at once with a message
+/// naming the flag and the descriptor, before the data directory is made;
+/// so is a standard stream's number. A paired host checks it too, before it
+/// closes the descriptor as not needed.
+#[test]
+fn the_code_descriptors_must_be_open_pipes() {
+    use std::os::fd::{AsRawFd, OwnedFd};
+    let dir = scratch_dir("badcodefd");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let file: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+    // The other end is held open: a read from this one would block.
+    let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let socket: OwnedFd = socket.into();
+    // `--listen 127.0.0.1:0`: should a check let it through, this collector
+    // must not take a port another one may be serving.
+    let collector = |data: &std::path::Path, fd: &str| -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
+        cmd.args(["collector", "--listen", "127.0.0.1:0", "--pairing-code-fd", fd])
+            .arg("--data-dir")
+            .arg(data);
+        cmd
+    };
+    let host = |data: &std::path::Path, fd: &str| -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
+        cmd.args(["host", "run", "--join-url", "http://127.0.0.1:1", "--join-code-fd", fd])
+            .arg("--data-dir")
+            .arg(data);
+        cmd
+    };
+    let run = |mut cmd: Command, fd: Option<&OwnedFd>| {
+        for var in [
+            "HENNERY_LISTEN",
+            "HENNERY_DATA_DIR",
+            "HENNERY_HOST_DATA_DIR",
+            "HENNERY_PUBLIC_URL",
+        ] {
+            cmd.env_remove(var);
+        }
+        let fd = fd.map(|fd| fd.as_raw_fd());
+        // SAFETY: dup2 and close in the forked child, before exec;
+        // async-signal-safe.
+        unsafe {
+            cmd.pre_exec(move || {
+                let rc = match fd {
+                    // Already 50: `dup2` onto itself would keep close-on-exec.
+                    Some(50) => libc::fcntl(50, libc::F_SETFD, 0),
+                    Some(fd) => libc::dup2(fd, 50),
+                    // Closed for certain: something another thread opened
+                    // without close-on-exec may sit at 50.
+                    None => {
+                        libc::close(50);
+                        0
+                    }
+                };
+                if rc < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let status = wait_with_timeout(&mut child, Duration::from_secs(15));
+        let _ = child.kill();
+        let _ = child.wait();
+        let mut stderr = String::new();
+        child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+        (status, stderr)
+    };
+    type Make<'a> = &'a dyn Fn(&std::path::Path, &str) -> Command;
+    for (flag, make) in [("--pairing-code-fd", &collector as Make), ("--join-code-fd", &host)] {
+        for (what, fd, expected) in [
+            ("a closed descriptor", None, "is not an open descriptor"),
+            ("a file", Some(&file), "is not a pipe"),
+            ("a socket", Some(&socket), "is not a pipe"),
+        ] {
+            // 50: well above what the child's own runtime opens at start.
+            let (status, stderr) = run(make(&data, "50"), fd);
+            let status = status.unwrap_or_else(|| panic!("{flag}, {what}: the child hung"));
+            assert!(!status.success(), "{flag}, {what}: taken");
+            assert!(
+                stderr.contains(&format!("{flag} 50 {expected}")),
+                "{flag}, {what}: {stderr}"
+            );
+            assert!(!data.exists(), "{flag}, {what}: the data directory was made");
+        }
+        // Standard error is a pipe here, so only the range refuses it: a
+        // collector would write the code to it, a host would take it over.
+        let (status, stderr) = run(make(&data, "2"), None);
+        assert!(!status.unwrap().success(), "{flag} 2 was taken: {stderr}");
+        assert!(
+            stderr.contains(&format!("invalid value '2' for '{flag}")),
+            "{flag} 2: {stderr}"
+        );
+        assert!(!data.exists(), "{flag} 2: the data directory was made");
+    }
+
+    // A paired host does not need the code, but still refuses a bad
+    // descriptor rather than closing whatever is at that number.
+    let (_rt, addr, code) = collector_with_a_pairing_code(&dir);
+    let paired = dir.join("paired");
+    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["host", "join", &format!("http://{addr}"), &code, "--name", "laptop"])
+        .arg("--data-dir")
+        .arg(&paired)
+        .env_remove("HENNERY_HOST_DATA_DIR")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    for (what, fd, expected) in [
+        ("a closed descriptor", None, "is not an open descriptor"),
+        ("a socket", Some(&socket), "is not a pipe"),
+    ] {
+        let (status, stderr) = run(host(&paired, "50"), fd);
+        let status = status.unwrap_or_else(|| panic!("paired, {what}: the host ran"));
+        assert!(!status.success(), "paired, {what}: taken");
+        assert!(
+            stderr.contains(&format!("--join-code-fd 50 {expected}")),
+            "paired, {what}: {stderr}"
+        );
+    }
+}
+
 /// Kernel spec §3.1: a collector that is not set up writes its one-time
 /// setup link to `setup-url` (0600, under `umask 022` too) and, its output
 /// not being a terminal, logs only that file's path: the token itself must
@@ -1531,16 +1661,11 @@ fn an_unset_collector_writes_its_setup_link_to_a_private_file_and_never_to_its_o
     assert!(stdout.contains(&file.display().to_string()), "{stdout}");
 }
 
-/// 3a's deferred M5: a pairing code on the command line is in the process
-/// list and the shell history, so `host join` also takes it on standard
-/// input when it is left out, and refuses an empty one.
-#[test]
-fn join_reads_the_code_from_standard_input_when_it_is_left_out() {
+/// A collector served in this process on `dir`'s database, with one pairing
+/// code minted: the runtime serving it (keep it alive), its address and the
+/// code.
+fn collector_with_a_pairing_code(dir: &std::path::Path) -> (tokio::runtime::Runtime, std::net::SocketAddr, String) {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let dir = std::env::temp_dir().join(format!("hennery-cli-stdin-code-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let _cleanup = RemoveDir(dir.clone());
     let (addr, code) = rt.block_on(async {
         let db = dir.join("hennery.db");
         let state = hennery_sessions::AppState::new(
@@ -1558,16 +1683,34 @@ fn join_reads_the_code_from_standard_input_when_it_is_left_out() {
         tokio::spawn(hennery_sessions::serve(listener, state));
         (addr, code)
     });
+    (rt, addr, code)
+}
+
+/// `hennery host join` to the collector at `addr`, into `host`, with the
+/// code left out (so read from standard input) and every stream piped.
+fn join_from_stdin(addr: std::net::SocketAddr, host: &std::path::Path) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["host", "join", &format!("http://{addr}"), "--name", "laptop"])
+        .arg("--data-dir")
+        .arg(host)
+        .env_remove("HENNERY_HOST_DATA_DIR")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// 3a's deferred M5: a pairing code on the command line is in the process
+/// list and the shell history, so `host join` also takes it on standard
+/// input when it is left out, and refuses an empty one.
+#[test]
+fn join_reads_the_code_from_standard_input_when_it_is_left_out() {
+    let dir = scratch_dir("stdin-code");
+    let _cleanup = RemoveDir(dir.clone());
+    let (_rt, addr, code) = collector_with_a_pairing_code(&dir);
     let join = |stdin: &str| {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_hennery"))
-            .args(["host", "join", &format!("http://{addr}"), "--name", "laptop"])
-            .arg("--data-dir")
-            .arg(dir.join("host"))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = join_from_stdin(addr, &dir.join("host"));
         child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
         child.wait_with_output().unwrap()
     };
@@ -1584,6 +1727,55 @@ fn join_reads_the_code_from_standard_input_when_it_is_left_out() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("paired as"));
+}
+
+/// 3a/3b's deferred bound on that read: a line of standard input longer than
+/// any code is refused as soon as the bound is hit, without waiting for a
+/// newline or the end, without echoing it and without pairing; the code it
+/// began with still pairs afterwards.
+#[test]
+fn join_refuses_an_overlong_line_on_standard_input_at_once() {
+    let dir = scratch_dir("stdin-overlong");
+    let _cleanup = RemoveDir(dir.clone());
+    let (_rt, addr, code) = collector_with_a_pairing_code(&dir);
+    let host = dir.join("host");
+    let mut child = join_from_stdin(addr, &host);
+    let mut stdin = child.stdin.take().unwrap();
+    // The real code, then 1 MiB with no newline, and standard input held
+    // open: an unbounded read waits for more forever. The child stops
+    // reading early, so the write may well fail (EPIPE); that is the point.
+    let overlong = format!("{code}{}", "x".repeat(1 << 20));
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(overlong.as_bytes());
+        stdin
+    });
+    let status = wait_with_timeout(&mut child, Duration::from_secs(15));
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(writer.join().unwrap());
+    let mut stderr = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+    let status = status.unwrap_or_else(|| panic!("join kept reading: {stderr}"));
+    assert!(!status.success(), "{stderr}");
+    assert!(
+        stderr.contains("the pairing code on standard input is longer than 256 bytes"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains(&code) && !stderr.contains("xxxxxxxx"),
+        "echoed: {stderr}"
+    );
+    assert!(!host.exists(), "a pairing was stored");
+
+    let mut child = join_from_stdin(addr, &host);
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{code}\n").as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 /// `POST path` with no body on the collector at `listen`, with the owner's

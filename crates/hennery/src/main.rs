@@ -84,7 +84,7 @@ struct CollectorArgs {
     host_offline_secs: u64,
     /// `hennery up` only: once listening, write one pairing code to this
     /// inherited descriptor (kernel spec §4.2).
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, value_parser = clap::value_parser!(i32).range(3..))]
     pairing_code_fd: Option<i32>,
     /// `hennery up` only: serve on this inherited listening socket, which
     /// `up` bound, in place of binding `--listen`. Repeatable.
@@ -107,7 +107,7 @@ struct HostArgs {
     /// paired, with the code read from `--join-code-fd`.
     #[arg(long, hide = true, requires = "join_code_fd")]
     join_url: Option<String>,
-    #[arg(long, hide = true, requires = "join_url")]
+    #[arg(long, hide = true, requires = "join_url", value_parser = clap::value_parser!(i32).range(3..))]
     join_code_fd: Option<i32>,
     /// `hennery up` only: the collector's host WebSocket as it listens now,
     /// in place of the stored one (its port may have changed).
@@ -222,6 +222,11 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     // the admin socket, instead of killing the collector by the default
     // action while it starts.
     let mut signals = Signals::new()?;
+    // Before anything is created: the pipe `up` hands over, or a clear
+    // refusal.
+    if let Some(fd) = args.pairing_code_fd {
+        inherit::check_pipe("--pairing-code-fd", fd)?;
+    }
     warn_if_dev_token();
     let file = config::FileConfig::load(&args.data_dir)?;
     // Named by its source: an operator cannot otherwise tell whether a flag,
@@ -519,18 +524,33 @@ async fn join_host(args: JoinArgs) -> Result<()> {
     Ok(())
 }
 
-/// One line of standard input, prompted for on a terminal.
+/// The most bytes of standard input `host join` takes for one code: a code
+/// is 9 characters, so this leaves room for whitespace and nothing else.
+const MAX_CODE_LINE: usize = 256;
+
+/// One line of standard input, prompted for on a terminal. Read only up to
+/// `MAX_CODE_LINE` bytes: a longer line is refused once that many have come,
+/// not waited on to its end, and never echoed.
 fn read_code_from_stdin() -> Result<String> {
-    use std::io::{BufRead, IsTerminal, Write};
+    use std::io::{BufRead, IsTerminal, Read, Write};
     if std::io::stdin().is_terminal() {
         eprint!("Pairing code: ");
         std::io::stderr().flush()?;
     }
-    let mut line = String::new();
+    // One byte over the bound: `MAX_CODE_LINE` bytes and then the newline
+    // is still a line within it.
+    let mut line = Vec::new();
     std::io::stdin()
         .lock()
-        .read_line(&mut line)
+        .take(MAX_CODE_LINE as u64 + 1)
+        .read_until(b'\n', &mut line)
         .context("read the pairing code from standard input")?;
+    if line.len() > MAX_CODE_LINE && line.last() != Some(&b'\n') {
+        bail!("the pairing code on standard input is longer than {MAX_CODE_LINE} bytes");
+    }
+    let Ok(line) = String::from_utf8(line) else {
+        bail!("the pairing code on standard input is not UTF-8");
+    };
     let code = line.trim().to_string();
     if code.is_empty() {
         bail!("no pairing code: give it after the URL, or on standard input");
@@ -539,6 +559,11 @@ fn read_code_from_stdin() -> Result<String> {
 }
 
 async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
+    // Before anything else, the paired branch's `close` included: the pipe
+    // `up` hands over, or a clear refusal.
+    if let Some(fd) = args.join_code_fd {
+        inherit::check_pipe("--join-code-fd", fd)?;
+    }
     warn_if_dev_token();
     let paired = match Paired::load(&args.data_dir)? {
         Some(paired) => {

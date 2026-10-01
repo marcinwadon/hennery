@@ -23,6 +23,15 @@ pub fn unix_now() -> i64 {
         .as_secs() as i64
 }
 
+/// RFC 3339, in UTC, for a kernel timestamp (seconds since the epoch), as
+/// the REST API shows it; empty for one out of range.
+pub fn rfc3339(unix: i64) -> String {
+    time::OffsetDateTime::from_unix_timestamp(unix)
+        .ok()
+        .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
+        .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -38,5 +47,12 @@ mod tests {
             sha256_hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[test]
+    fn rfc3339_formats_kernel_timestamps_in_utc_and_out_of_range_as_empty() {
+        assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(rfc3339(i64::MAX), "");
     }
 }

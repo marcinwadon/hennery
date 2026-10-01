@@ -13,7 +13,7 @@ use axum::{Json, Router, middleware};
 use hennery_kernel::hosts::{EnrollOutcome, Enrollment, HostRecord, Revoke, TooManyPairingCodes};
 use hennery_kernel::json::ApiJson;
 use hennery_kernel::lifecycle::LifecycleHooks;
-use hennery_kernel::secret::unix_now;
+use hennery_kernel::secret::{rfc3339, unix_now};
 use hennery_proto::rest::{EnrollRequest, EnrollResponse, HostItem, PairingCodeResponse};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -41,14 +41,6 @@ pub fn router(state: AppState) -> Router {
     );
     let code_authenticated = Router::new().route("/api/hosts/enroll", post(enroll));
     operator.merge(code_authenticated).with_state(state)
-}
-
-/// RFC 3339 for a kernel timestamp (seconds since the epoch).
-pub(crate) fn rfc3339(unix: i64) -> String {
-    time::OffsetDateTime::from_unix_timestamp(unix)
-        .ok()
-        .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
-        .unwrap_or_default()
 }
 
 /// `POST /api/hosts/pairing-codes`: 201 with a fresh code.

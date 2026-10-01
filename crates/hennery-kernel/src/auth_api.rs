@@ -4,7 +4,7 @@
 use crate::json::ApiJson;
 use crate::operator::{Authenticated, Operator, PublicUrl, SetupOutcome, cleared_cookie, session_cookie};
 use crate::passkeys::{PasskeyRecord, Refused, Start};
-use crate::secret::unix_now;
+use crate::secret::{rfc3339, unix_now};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -260,14 +260,6 @@ async fn step_up(
         Ok(false) => error(StatusCode::UNAUTHORIZED, "unauthenticated", "sign in first"),
         Err(err) => internal(err),
     }
-}
-
-/// RFC 3339 for a kernel timestamp (seconds since the epoch).
-fn rfc3339(unix: i64) -> String {
-    time::OffsetDateTime::from_unix_timestamp(unix)
-        .ok()
-        .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok())
-        .unwrap_or_default()
 }
 
 /// `GET /api/auth/sessions`: every signed-in session, most recently used
