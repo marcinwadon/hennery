@@ -202,6 +202,10 @@ export type HostItem = { host_id: string, name: string, platform: string, host_v
  */
 capabilities: Capabilities, 
 /**
+ * The hat of its sessions that no path rule claims (kernel spec §5.1).
+ */
+default_hat_id: string, 
+/**
  * Connected and reconciled: requests reach it now.
  */
 connected: boolean, 
@@ -257,3 +261,38 @@ id: string, label: string,
  * RFC 3339.
  */
 created_at: string, last_used_at?: string | undefined, };
+
+export type UpdateHostRequest = { name?: string | undefined, default_hat_id?: string | undefined, };
+
+export type HatItem = { id: string, name: string, 
+/**
+ * `#rrggbb`, lowercase.
+ */
+colour: string, 
+/**
+ * RFC 3339.
+ */
+created_at: string, 
+/**
+ * The hat newly paired hosts get as their default.
+ */
+default_for_new_hosts: boolean, };
+
+export type CreateHatRequest = { name: string, colour?: string | undefined, };
+
+export type UpdateHatRequest = { name?: string | undefined, colour?: string | undefined, default_for_new_hosts?: boolean | undefined, };
+
+export type PathRuleItem = { id: string, 
+/**
+ * Canonical: absolute, no `.` or `..`, no trailing slash.
+ */
+prefix: string, hat_id: string, 
+/**
+ * The host resolved the prefix when the rule was saved; an unverified
+ * rule is the path as typed, normalised by its text alone.
+ */
+verified: boolean, };
+
+export type PathRuleInput = { prefix: string, hat_id: string, };
+
+export type PathRulesRequest = { rules: Array<PathRuleInput>, };

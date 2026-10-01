@@ -1,5 +1,5 @@
 //! Host endpoints (kernel spec §4, §8): the host list, minting pairing
-//! codes, enrollment and revoke. They live beside the session API because the collector's
+//! codes, enrollment, renaming or re-hatting a host, and revoke. They live beside the session API because the collector's
 //! only HTTP router is here for now; the registry itself is the kernel's
 //! (`hennery_kernel::hosts`).
 
@@ -10,21 +10,22 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router, middleware};
+use hennery_kernel::hats::HostChange;
 use hennery_kernel::hosts::{EnrollOutcome, Enrollment, HostRecord, Revoke, TooManyPairingCodes};
 use hennery_kernel::json::ApiJson;
 use hennery_kernel::lifecycle::LifecycleHooks;
 use hennery_kernel::secret::{rfc3339, unix_now};
-use hennery_proto::rest::{EnrollRequest, EnrollResponse, HostItem, PairingCodeResponse};
+use hennery_proto::rest::{EnrollRequest, EnrollResponse, HostItem, PairingCodeResponse, UpdateHostRequest};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 /// How long a revoke waits for the host's socket task to let go.
 const REVOKE_DISCONNECT_BOUND: Duration = Duration::from_secs(10);
 
-/// Routes that need the operator's session (minting a code and revoking a
-/// host a fresh step-up too, kernel spec §3.4), and enrollment, which is
-/// authenticated by its code alone and so sits outside that layer (kernel
-/// spec §3.3).
+/// Routes that need the operator's session (minting a code, changing a
+/// host and revoking one a fresh step-up too: kernel spec §3.4, plan 5a
+/// decision 8), and enrollment, which is authenticated by its code alone
+/// and so sits outside that layer (kernel spec §3.3).
 pub fn router(state: AppState) -> Router {
     let operator = hennery_kernel::auth::operator_only(
         Router::new()
@@ -35,7 +36,9 @@ pub fn router(state: AppState) -> Router {
             )
             .route(
                 "/api/hosts/{id}",
-                delete(revoke_host).route_layer(middleware::from_fn(hennery_kernel::auth::require_step_up)),
+                delete(revoke_host)
+                    .patch(update_host)
+                    .route_layer(middleware::from_fn(hennery_kernel::auth::require_step_up)),
             ),
         state.operator.clone(),
     );
@@ -133,6 +136,33 @@ async fn revoke_host(State(state): State<AppState>, Path(host_id): Path<String>)
     }
 }
 
+/// `PATCH /api/hosts/{id}`: rename a host or change its default hat
+/// (kernel spec §4.3), 200 with its entry. A new default hat applies to the
+/// sessions started on the host from now on. Stored sessions keep their hat
+/// (umbrella §8.2: changing rules does not re-bucket history), so a parked
+/// one that no rule covers is refused at its resume (`hat_mismatch`, ACP
+/// core §4.3) until the operator re-assigns it.
+async fn update_host(
+    State(state): State<AppState>,
+    Path(host_id): Path<String>,
+    ApiJson(req): ApiJson<UpdateHostRequest>,
+) -> Response {
+    match state
+        .hosts
+        .update_host(&host_id, req.name.as_deref(), req.default_hat_id.as_deref())
+    {
+        Ok(HostChange::Done) => {}
+        Ok(HostChange::NotFound) => return error(StatusCode::NOT_FOUND, "not_found", "no such host"),
+        Ok(HostChange::Invalid(why)) => return error(StatusCode::BAD_REQUEST, "invalid", why),
+        Err(err) => return internal(err),
+    }
+    match state.hosts.host(&host_id) {
+        Ok(Some(record)) => Json(host_item(&state, record)).into_response(),
+        Ok(None) => error(StatusCode::NOT_FOUND, "not_found", "no such host"),
+        Err(err) => internal(err),
+    }
+}
+
 /// A registry entry as the API shows it, with whether it is connected.
 pub(crate) fn host_item(state: &AppState, record: HostRecord) -> HostItem {
     HostItem {
@@ -142,6 +172,7 @@ pub(crate) fn host_item(state: &AppState, record: HostRecord) -> HostItem {
         platform: record.platform,
         host_version: record.host_version,
         capabilities: record.capabilities,
+        default_hat_id: record.default_hat_id,
         created_at: rfc3339(record.created_at),
         last_seen_at: record.last_seen_at.map(rfc3339),
         revoked_at: record.revoked_at.map(rfc3339),

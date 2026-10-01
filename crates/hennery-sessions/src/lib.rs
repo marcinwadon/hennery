@@ -1,6 +1,7 @@
 //! Collector-side session module (ACP core spec §4, §8, §9).
 
 pub mod api;
+pub mod hats;
 pub mod hosts;
 pub mod hub;
 pub mod offline;
@@ -108,6 +109,7 @@ pub async fn serve_all(
 pub fn router(state: AppState) -> Router {
     api::router(state.clone())
         .merge(hosts::router(state.clone()))
+        .merge(hats::router(state.clone()))
         .merge(hennery_kernel::auth_api::router(state.operator.clone()))
         .merge(hennery_kernel::health::router(state.operator.clone()))
         .merge(ws::router(state))
