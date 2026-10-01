@@ -1,7 +1,7 @@
 //! Passkeys (kernel spec §3.2, §11; plan 3c), with a software passkey in
 //! place of a browser and its authenticator (decision 10).
 
-use hennery_kernel::operator::{Operator, PublicUrl, STEP_UP_SECS, SetupOutcome};
+use hennery_kernel::operator::{Operator, PublicUrl, Reset, STEP_UP_SECS, SetupOutcome};
 use hennery_kernel::passkeys::{
     CEREMONY_TTL_SECS, MAX_LABEL_CHARS, PasskeyRecord, Refused, Start, counter_moves_on, relying_party, user_handle,
 };
@@ -827,4 +827,119 @@ fn another_owners_passkey_signs_nobody_in() {
     };
     assert_eq!(options["publicKey"]["allowCredentials"].as_array().unwrap().len(), 1);
     assert_eq!(op.sessions(NOW).unwrap().len(), sessions);
+}
+
+/// Decision 9, kernel spec §3.2: moving `public_url` to another host name
+/// changes the RP id, so the passkeys stop working: they are removed, and
+/// every ceremony under way ends.
+#[test]
+fn moving_public_url_to_another_host_removes_the_passkeys() {
+    let op = Operator::open_in_memory().unwrap();
+    let session_id = set_up(&op, PUBLIC_URL);
+    let mut passkey = authenticator();
+    register(&op, &session_id, &mut passkey, "laptop");
+    register(&op, &session_id, &mut authenticator(), "phone");
+    let (ceremony_id, assertion) = begin_login(&op, &mut passkey, PUBLIC_URL, NOW);
+    assert_eq!(
+        op.reset_public_url("https://moved.example").unwrap(),
+        Reset::Done {
+            sessions_ended: 1,
+            passkeys_removed: 2
+        }
+    );
+    assert!(op.passkeys().unwrap().is_empty());
+    assert!(op.ceremonies.is_empty());
+    assert_eq!(
+        op.finish_passkey_login(&ceremony_id, &assertion, "", NOW).unwrap(),
+        Err(Refused::Ceremony)
+    );
+    assert_eq!(op.start_passkey_login(NOW).unwrap(), Start::NoPasskeys);
+}
+
+/// Decision 9 (an amendment to kernel spec §3.2): a move to another port
+/// keeps the host name, and so the RP id: the passkeys stay and sign in at
+/// the new origin, not at the old.
+#[test]
+fn moving_public_url_to_another_port_keeps_the_passkeys() {
+    let op = Operator::open_in_memory().unwrap();
+    let session_id = set_up(&op, "http://localhost:7117");
+    let mut passkey = authenticator();
+    let (ceremony_id, credential) =
+        begin_registration(&op, &session_id, &mut passkey, "http://localhost:7117", "laptop");
+    let record = op
+        .finish_passkey_registration(&session_id, &ceremony_id, &credential, NOW)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        op.reset_public_url("http://localhost:8080").unwrap(),
+        Reset::Done {
+            sessions_ended: 1,
+            passkeys_removed: 0
+        }
+    );
+    assert_eq!(op.passkeys().unwrap(), vec![record]);
+    let (ceremony_id, assertion) = begin_login(&op, &mut passkey, "http://localhost:7117", NOW);
+    assert!(matches!(
+        op.finish_passkey_login(&ceremony_id, &assertion, "", NOW).unwrap(),
+        Err(Refused::Credential(_))
+    ));
+    let (ceremony_id, assertion) = begin_login(&op, &mut passkey, "http://localhost:8080", NOW);
+    assert!(
+        op.finish_passkey_login(&ceremony_id, &assertion, "", NOW)
+            .unwrap()
+            .is_ok()
+    );
+}
+
+/// A move to an IP address leaves no RP id: the passkeys are removed.
+#[test]
+fn moving_public_url_to_an_ip_address_removes_the_passkeys() {
+    let op = Operator::open_in_memory().unwrap();
+    let session_id = set_up(&op, "http://localhost:7117");
+    let (ceremony_id, credential) = begin_registration(
+        &op,
+        &session_id,
+        &mut authenticator(),
+        "http://localhost:7117",
+        "laptop",
+    );
+    op.finish_passkey_registration(&session_id, &ceremony_id, &credential, NOW)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        op.reset_public_url("http://127.0.0.1:7117").unwrap(),
+        Reset::Done {
+            sessions_ended: 1,
+            passkeys_removed: 1
+        }
+    );
+    assert_eq!(op.start_passkey_login(NOW).unwrap(), Start::Unavailable);
+}
+
+/// Decision 2 (3c review, A1): a password reset, the admin socket's
+/// recovery, removes every passkey and ends every ceremony, so a passkey
+/// added with a stolen session does not survive it. A login begun before
+/// the reset is refused.
+#[tokio::test]
+async fn a_password_reset_removes_the_passkeys() {
+    let op = std::sync::Arc::new(Operator::open_in_memory().unwrap());
+    let session_id = set_up(&op, PUBLIC_URL);
+    let mut passkey = authenticator();
+    register(&op, &session_id, &mut passkey, "laptop");
+    register(&op, &session_id, &mut authenticator(), "phone");
+    let (ceremony_id, assertion) = begin_login(&op, &mut passkey, PUBLIC_URL, NOW);
+    assert_eq!(
+        op.reset_password("a new long password".into(), NOW).await.unwrap(),
+        Reset::Done {
+            sessions_ended: 1,
+            passkeys_removed: 2
+        }
+    );
+    assert!(op.passkeys().unwrap().is_empty());
+    assert!(op.ceremonies.is_empty());
+    assert_eq!(
+        op.finish_passkey_login(&ceremony_id, &assertion, "", NOW).unwrap(),
+        Err(Refused::Ceremony)
+    );
+    assert_eq!(op.start_passkey_login(NOW).unwrap(), Start::NoPasskeys);
 }

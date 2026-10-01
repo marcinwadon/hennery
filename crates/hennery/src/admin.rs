@@ -28,14 +28,15 @@ enum AdminCommand {
     /// has expired.
     SetupUrl,
     /// Set a new owner password, typed on the terminal. Signs out every
-    /// session.
+    /// session and removes every passkey.
     ResetPassword,
     /// List the paired hosts.
     Hosts,
     /// Mint a pairing code for `hennery host join`, valid for ten minutes.
     PairingCode,
     /// Set where browsers reach hennery, after moving it. Signs out every
-    /// session.
+    /// session; passkeys stop working if the host name changes, and are
+    /// removed.
     ResetPublicUrl {
         /// The new public URL, e.g. https://hennery.example.
         public_url: String,
@@ -63,17 +64,27 @@ pub async fn run(args: AdminArgs) -> Result<()> {
         }
         AdminCommand::ResetPassword => {
             require_terminal("reset-password")?;
+            // Said before the password is asked for (plan 3c review, A1).
+            eprintln!(
+                "This removes every passkey; register them again after signing in. It also signs out every session."
+            );
             let password = read_secret("New password: ")?;
             if read_secret("The same again: ")? != password {
                 bail!("the two passwords differ; nothing changed");
             }
-            confirm("reset-password", "This signs out every session.")?;
+            confirm(
+                "reset-password",
+                "This removes every passkey and signs out every session.",
+            )?;
             AdminRequest::ResetPassword { password }
         }
         AdminCommand::ResetPublicUrl { public_url } => {
             confirm(
                 "reset-public-url",
-                &format!("Browsers will have to reach hennery at {public_url}. This signs out every session."),
+                &format!(
+                    "Browsers will have to reach hennery at {public_url}. Passkeys stop working if the host name \
+                     changes, and are then removed. This signs out every session."
+                ),
             )?;
             AdminRequest::ResetPublicUrl { public_url }
         }
@@ -85,13 +96,19 @@ pub async fn run(args: AdminArgs) -> Result<()> {
         AdminResponse::NotSetUp => {
             bail!("hennery is not set up yet: `hennery admin setup-url` prints the setup link")
         }
-        AdminResponse::PasswordReset { sessions_ended } => {
-            println!("The password is reset; {sessions_ended} session(s) signed out.")
-        }
+        AdminResponse::PasswordReset {
+            sessions_ended,
+            passkeys_removed,
+        } => println!(
+            "The password is reset; {sessions_ended} session(s) signed out, {passkeys_removed} passkey(s) removed."
+        ),
         AdminResponse::PublicUrlReset {
             public_url,
             sessions_ended,
-        } => println!("public_url is now {public_url}; {sessions_ended} session(s) signed out."),
+            passkeys_removed,
+        } => println!(
+            "public_url is now {public_url}; {sessions_ended} session(s) signed out, {passkeys_removed} passkey(s) removed."
+        ),
         AdminResponse::Hosts { hosts } => {
             for host in hosts {
                 let state = if host.revoked_at.is_some() { "revoked" } else { "paired" };

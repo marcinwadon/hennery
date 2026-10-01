@@ -76,7 +76,10 @@ async fn the_admin_socket_is_private_and_carries_out_each_command() {
     operator.open_session("browser", &phc, unix_now()).unwrap().unwrap();
     assert_eq!(
         ask(reset).await.unwrap(),
-        AdminResponse::PasswordReset { sessions_ended: 1 }
+        AdminResponse::PasswordReset {
+            sessions_ended: 1,
+            passkeys_removed: 0
+        }
     );
     assert!(operator.verify_password("a new long password").unwrap().is_some());
     assert!(matches!(
@@ -97,7 +100,8 @@ async fn the_admin_socket_is_private_and_carries_out_each_command() {
         .unwrap(),
         AdminResponse::PublicUrlReset {
             public_url: "https://moved.example".into(),
-            sessions_ended: 0
+            sessions_ended: 0,
+            passkeys_removed: 0
         }
     );
     assert_eq!(operator.public_url().unwrap().origin(), "https://moved.example");

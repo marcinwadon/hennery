@@ -2050,12 +2050,23 @@ fn a_moved_collector_is_recovered_over_the_admin_socket() {
     let refused = admin_on_a_terminal(&data, &["reset-public-url", &new], "no\n");
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("not confirmed"));
+    // Kernel spec §3.2: it says passkeys stop working before it asks.
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("Passkeys stop working if the host name changes"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
     assert_eq!(login(&listen, &new, PASSWORD), Some(403), "moved without a yes");
 
     let out = admin_on_a_terminal(&data, &["reset-public-url", &new], "yes\n");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(
         String::from_utf8_lossy(&out.stdout).contains(&format!("public_url is now {new}")),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("0 passkey(s) removed"),
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
@@ -2083,6 +2094,11 @@ fn a_password_reset_over_the_admin_socket_signs_everyone_out() {
     let differ = admin_on_a_terminal(&data, &["reset-password"], &format!("{NEW}\nsomething else\n"));
     assert!(!differ.status.success());
     assert!(String::from_utf8_lossy(&differ.stderr).contains("differ"));
+    // 3c review, A1: it says, before it asks for the password, that every
+    // passkey goes.
+    let stderr = String::from_utf8_lossy(&differ.stderr);
+    let warned = stderr.find("This removes every passkey").expect("the passkey warning");
+    assert!(warned < stderr.find("New password: ").unwrap(), "{stderr}");
     assert!(get_json(&listen, "/api/hosts", &session).is_some());
 
     // Typed only once each prompt is shown, as a person would: none of it
@@ -2104,7 +2120,10 @@ fn a_password_reset_over_the_admin_socket_signs_everyone_out() {
     assert!(!shown.contains(NEW), "the terminal echoed the password: {shown:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(stdout.contains("1 session(s) signed out"), "{stdout}");
+    assert!(
+        stdout.contains("1 session(s) signed out, 0 passkey(s) removed"),
+        "{stdout}"
+    );
     assert!(!stdout.contains(NEW) && !String::from_utf8_lossy(&out.stderr).contains(NEW));
     assert!(
         get_json(&listen, "/api/hosts", &session).is_none(),
