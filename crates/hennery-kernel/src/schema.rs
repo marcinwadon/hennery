@@ -49,4 +49,15 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         value TEXT NOT NULL,
         PRIMARY KEY (owner_id, key));
     ",
+    // `owner_id` everywhere (plan 3b-iii decision 1): the owner exists from
+    // the first start, before setup, so what is written then (`up`'s
+    // pairing code and host) has an owner to carry. `set_up_at` marks the
+    // setup that completes it; an owner already here was made by setup.
+    "
+    ALTER TABLE owners ADD COLUMN set_up_at INTEGER;
+    UPDATE owners SET set_up_at = created_at;
+    INSERT INTO owners(id, created_at)
+        SELECT 'owner-' || lower(hex(randomblob(8))), unixepoch()
+        WHERE NOT EXISTS (SELECT 1 FROM owners);
+    ",
 ];

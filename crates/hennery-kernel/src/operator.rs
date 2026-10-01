@@ -1,7 +1,9 @@
 //! The operator (kernel spec §3): the one owner, their password, the
-//! `public_url` setting, and the one-time setup link that creates them.
+//! `public_url` setting, and the one-time setup link that sets them up.
 //!
-//! - **One owner.** Setup creates it, once; a second setup is refused.
+//! - **One owner.** It exists from the first start (the kernel's
+//!   migrations create it, plan 3b-iii decision 1); setup sets it up, once,
+//!   and a second setup is refused.
 //! - **The setup token lives in memory only.** A restart before setup
 //!   issues a new one, and the old one is dead by construction (kernel
 //!   spec §3.1). Only its SHA-256 is kept.
@@ -13,9 +15,9 @@
 //!
 //! Every time is seconds since the Unix epoch, passed in by the caller.
 
+use crate::db;
 use crate::ratelimit::{Limiter, Policy};
 use crate::secret::{random_bytes, sha256_hex};
-use crate::{db, schema};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::io::Write;
@@ -103,7 +105,7 @@ pub enum SetupOutcome {
         /// it (`open_session`).
         phc: String,
     },
-    /// There is an owner already.
+    /// The owner is set up already.
     AlreadySetUp,
     /// Unknown, used or expired: one answer for all three.
     InvalidToken,
@@ -117,7 +119,7 @@ pub enum SetupOutcome {
 pub enum Reset {
     /// Done; this many signed-in sessions were ended.
     Done { sessions_ended: usize },
-    /// There is no owner to reset yet: setup is the way in.
+    /// The owner is not set up yet: setup is the way in.
     NotSetUp,
     /// The new password or `public_url` is not acceptable (why); nothing
     /// changed.
@@ -151,6 +153,8 @@ impl std::fmt::Debug for SetupLink {
 
 pub struct Operator {
     conn: Mutex<Connection>,
+    /// The database's owner (`db::kernel_owner`), whom every query names.
+    owner: String,
     /// Loaded at open and replaced by setup and by `reset_public_url`: read
     /// on every browser request.
     public_url: RwLock<Option<PublicUrl>>,
@@ -196,10 +200,11 @@ impl Operator {
     }
 
     fn init(mut conn: Connection) -> Result<Self> {
-        db::migrate_component(&mut conn, schema::COMPONENT, schema::MIGRATIONS)?;
+        let owner = db::kernel_owner(&mut conn)?;
         let public_url = load_public_url(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            owner,
             public_url: RwLock::new(public_url),
             setup: Mutex::new(None),
             announced: Mutex::new(None),
@@ -221,16 +226,19 @@ impl Operator {
         self.conn.lock().expect("operator lock")
     }
 
-    /// The owner's id, once setup has created it.
-    pub fn owner_id(&self) -> Result<Option<String>> {
-        Ok(self
-            .conn()
-            .query_row("SELECT id FROM owners ORDER BY created_at LIMIT 1", [], |r| r.get(0))
-            .optional()?)
+    /// The owner's id. The owner exists from the first start, set up or
+    /// not (`is_set_up`).
+    pub fn owner_id(&self) -> &str {
+        &self.owner
     }
 
+    /// Whether setup has run: the owner has a password and a `public_url`.
     pub fn is_set_up(&self) -> Result<bool> {
-        Ok(self.owner_id()?.is_some())
+        Ok(self.conn().query_row(
+            "SELECT set_up_at IS NOT NULL FROM owners WHERE id = ?1",
+            [&self.owner],
+            |r| r.get(0),
+        )?)
     }
 
     /// Whether the database answers a query (`/readyz`).
@@ -311,7 +319,7 @@ impl Operator {
         self.announce_setup(dir, base_url, now)
     }
 
-    /// Create the owner with `password` and store `public_url` (kernel spec
+    /// Set the owner up with `password` and store `public_url` (kernel spec
     /// §3.1), if `token` is the live setup token. The token is used up only
     /// once the owner is committed. Hashes the password: call it on a
     /// blocking thread. It takes no `check_password` slot: only the token's
@@ -336,14 +344,19 @@ impl Operator {
             Err(problem) => return Ok(SetupOutcome::Invalid(problem)),
         };
         let phc = password_auth::generate_hash(password);
-        let owner_id = format!("owner-{}", hex::encode(random_bytes::<8>()));
+        let owner_id = self.owner.clone();
         {
             let mut conn = self.conn();
             let tx = conn.transaction()?;
-            tx.execute(
-                "INSERT INTO owners(id, created_at) VALUES (?1, ?2)",
+            // Marked in the write, not only checked above: of two setups,
+            // one marks the owner and the other finds it marked.
+            let marked = tx.execute(
+                "UPDATE owners SET set_up_at = ?2 WHERE id = ?1 AND set_up_at IS NULL",
                 params![owner_id, now],
             )?;
+            if marked == 0 {
+                return Ok(SetupOutcome::AlreadySetUp);
+            }
             tx.execute(
                 "INSERT INTO password_credentials(owner_id, phc, updated_at) VALUES (?1, ?2, ?3)",
                 params![owner_id, phc, now],
@@ -424,13 +437,16 @@ impl Operator {
     /// hash runs on a blocking thread and takes a `check_password` slot like
     /// any other, so a reset cannot add a third Argon2 run to a login
     /// flood. The limiters are cleared: the operator proved local access.
+    /// It fails, changing nothing, unless it replaced exactly one password
+    /// (3b-ii's O9): an owner with none (a passkey-only owner, in 3c) has
+    /// nothing to reset.
     pub async fn reset_password(self: &Arc<Self>, password: String, now: i64) -> Result<Reset> {
         if let Some(problem) = password_problem(&password) {
             return Ok(Reset::Invalid(problem));
         }
-        let Some(owner_id) = self.owner_id()? else {
+        if !self.is_set_up()? {
             return Ok(Reset::NotSetUp);
-        };
+        }
         let permit = self
             .hashing
             .clone()
@@ -449,11 +465,13 @@ impl Operator {
         let ended = {
             let mut conn = self.conn();
             let tx = conn.transaction()?;
-            tx.execute(
+            let replaced = tx.execute(
                 "UPDATE password_credentials SET phc = ?2, updated_at = ?3 WHERE owner_id = ?1",
-                params![owner_id, phc, now],
+                params![self.owner, phc, now],
             )?;
-            let ended = tx.execute("DELETE FROM auth_sessions WHERE owner_id = ?1", [&owner_id])?;
+            // Otherwise the transaction rolls back: no session ends.
+            anyhow::ensure!(replaced == 1, "the owner has no password to reset");
+            let ended = tx.execute("DELETE FROM auth_sessions WHERE owner_id = ?1", [&self.owner])?;
             tx.commit()?;
             ended
         };
@@ -473,18 +491,18 @@ impl Operator {
             Ok(url) => url,
             Err(problem) => return Ok(Reset::Invalid(problem)),
         };
-        let Some(owner_id) = self.owner_id()? else {
+        if !self.is_set_up()? {
             return Ok(Reset::NotSetUp);
-        };
+        }
         let ended = {
             let mut conn = self.conn();
             let tx = conn.transaction()?;
             tx.execute(
                 "INSERT INTO settings(owner_id, key, value) VALUES (?1, ?2, ?3)
                  ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value",
-                params![owner_id, PUBLIC_URL_KEY, public_url.origin()],
+                params![self.owner, PUBLIC_URL_KEY, public_url.origin()],
             )?;
-            let ended = tx.execute("DELETE FROM auth_sessions WHERE owner_id = ?1", [&owner_id])?;
+            let ended = tx.execute("DELETE FROM auth_sessions WHERE owner_id = ?1", [&self.owner])?;
             tx.commit()?;
             // Still under the connection's lock: no other reset lands
             // between the row and the cache.
@@ -594,11 +612,8 @@ impl Operator {
     /// string that check verified against (`verify_password`): the session
     /// is opened only while it is still the owner's, so a login whose check
     /// raced a password reset gets no session (`None`), like one before
-    /// setup.
+    /// setup, when the owner has no password.
     pub fn open_session(&self, user_agent: &str, verified: &str, now: i64) -> Result<Option<String>> {
-        let Some(owner_id) = self.owner_id()? else {
-            return Ok(None);
-        };
         let token = hex::encode(random_bytes::<32>());
         let user_agent: String = user_agent
             .chars()
@@ -613,7 +628,7 @@ impl Operator {
              WHERE EXISTS (SELECT 1 FROM password_credentials WHERE owner_id = ?2 AND phc = ?6)",
             params![
                 sha256_hex(token.as_bytes()),
-                owner_id,
+                self.owner,
                 user_agent,
                 now,
                 now + SESSION_TTL_SECS,

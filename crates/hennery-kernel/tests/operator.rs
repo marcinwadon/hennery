@@ -12,8 +12,9 @@ const NOW: i64 = 1_800_000_000;
 const PASSWORD: &str = "correct horse battery";
 
 #[test]
-fn a_setup_token_is_single_use_and_creates_one_owner() {
+fn a_setup_token_is_single_use_and_sets_the_owner_up() {
     let op = Operator::open_in_memory().unwrap();
+    let owner = op.owner_id().to_string();
     let token = op.issue_setup_token(NOW).unwrap().unwrap();
     assert_eq!(
         op.set_up("0".repeat(64).as_str(), PASSWORD, "https://hennery.example", NOW)
@@ -24,7 +25,9 @@ fn a_setup_token_is_single_use_and_creates_one_owner() {
     else {
         panic!("setup failed");
     };
-    assert_eq!(op.owner_id().unwrap(), Some(owner_id));
+    assert_eq!(owner_id, owner);
+    assert_eq!(op.owner_id(), owner);
+    assert!(op.is_set_up().unwrap());
     assert_eq!(
         op.set_up(&token, PASSWORD, "https://hennery.example", NOW).unwrap(),
         SetupOutcome::AlreadySetUp
@@ -42,7 +45,7 @@ fn a_setup_token_expires_after_an_hour() {
         op.set_up(&token, PASSWORD, "https://hennery.example", later).unwrap(),
         SetupOutcome::InvalidToken
     );
-    assert_eq!(op.owner_id().unwrap(), None);
+    assert!(!op.is_set_up().unwrap());
 }
 
 /// Kernel spec §3.1: a restart before setup issues a new token and
@@ -400,4 +403,31 @@ async fn a_login_checked_before_a_password_reset_opens_no_session_after_it() {
         .unwrap()
         .expect("the new password");
     assert!(op.open_session("browser", &fresh, NOW).unwrap().is_some());
+}
+
+/// 3b-ii's O9: a reset replaces the password only when there is exactly
+/// one to replace. With none (deleted here; a passkey-only owner, in 3c)
+/// it fails and changes nothing: the sessions stay.
+#[tokio::test]
+async fn a_password_reset_with_no_password_to_replace_fails_and_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    let op = Arc::new(Operator::open(&db).unwrap());
+    let token = op.issue_setup_token(NOW).unwrap().unwrap();
+    let SetupOutcome::Done { phc, .. } = op.set_up(&token, PASSWORD, "https://hennery.example", NOW).unwrap() else {
+        panic!("setup failed");
+    };
+    let session = op.open_session("browser", &phc, NOW).unwrap().unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("DELETE FROM password_credentials", []).unwrap();
+    let err = op
+        .reset_password("a new long password".into(), NOW)
+        .await
+        .expect_err("a reset with no password to replace succeeded");
+    assert!(format!("{err:#}").contains("no password to reset"), "{err:#}");
+    assert!(op.authenticate(&session, NOW).unwrap().is_some());
+    let left: i64 = conn
+        .query_row("SELECT count(*) FROM password_credentials", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(left, 0);
 }

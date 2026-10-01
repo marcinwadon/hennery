@@ -145,6 +145,21 @@ pub fn migrate_component(conn: &mut Connection, component: &str, migrations: &[&
     }
 }
 
+/// Migrate the kernel's tables (`schema`), then return the database's
+/// owner (plan 3b-iii decisions 1 and 2): the oldest row of `owners`,
+/// which the kernel's migrations create at the first start. Every store on
+/// `hennery.db` binds to it when it opens, so they agree whichever opens
+/// first. This is the one query that does not filter by the owner: it
+/// finds the owner.
+pub fn kernel_owner(conn: &mut Connection) -> Result<String> {
+    migrate_component(conn, crate::schema::COMPONENT, crate::schema::MIGRATIONS)?;
+    conn.query_row("SELECT id FROM owners ORDER BY created_at, id LIMIT 1", [], |r| {
+        r.get(0)
+    })
+    .optional()?
+    .context("the database has no owner")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
