@@ -329,3 +329,46 @@ pub struct AuthSessionItem {
     /// The session this request came with.
     pub current: bool,
 }
+
+/// `POST /api/auth/passkeys/register/start` (kernel spec §3.2, plan 3c):
+/// the new passkey's label, 1 to 64 characters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PasskeyRegisterRequest {
+    pub label: String,
+}
+
+/// 200 to the start of every passkey ceremony: registration, login and
+/// step-up. `options` is WebAuthn's JSON, for
+/// `navigator.credentials.create()` (registration) or `.get()` (login,
+/// step-up): its `publicKey` goes through
+/// `PublicKeyCredential.parseCreationOptionsFromJSON` or
+/// `parseRequestOptionsFromJSON`. The finish names `ceremony_id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PasskeyCeremony {
+    pub ceremony_id: String,
+    #[ts(type = "unknown")]
+    pub options: Value,
+}
+
+/// The finish of every passkey ceremony: the credential the browser
+/// returned, as `PublicKeyCredential.toJSON()` gives it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PasskeyFinishRequest {
+    pub ceremony_id: String,
+    #[ts(type = "unknown")]
+    pub credential: Value,
+}
+
+/// One of the owner's passkeys: an entry of `GET /api/auth/passkeys`, and
+/// 201 to a registration's finish.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PasskeyItem {
+    /// What `DELETE /api/auth/passkeys/{id}` takes.
+    pub id: String,
+    pub label: String,
+    /// RFC 3339.
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub last_used_at: Option<String>,
+}

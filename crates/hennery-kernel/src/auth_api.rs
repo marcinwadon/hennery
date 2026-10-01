@@ -1,21 +1,26 @@
 //! Operator auth over HTTP (kernel spec §3, §8): the one-time setup, login
-//! and logout, step-up, and the signed-in sessions.
+//! and logout, step-up, the signed-in sessions, and passkeys (plan 3c).
 
 use crate::operator::{Authenticated, Operator, PublicUrl, SetupOutcome, cleared_cookie, session_cookie};
+use crate::passkeys::{PasskeyRecord, Refused, Start};
 use crate::secret::unix_now;
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router, middleware};
-use hennery_proto::rest::{ApiError, AuthSessionItem, LoginRequest, SetupRequest, SetupResponse, StepUpRequest};
+use hennery_proto::rest::{
+    ApiError, AuthSessionItem, LoginRequest, PasskeyCeremony, PasskeyFinishRequest, PasskeyItem,
+    PasskeyRegisterRequest, SetupRequest, SetupResponse, StepUpRequest,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// The largest request body the auth routes read: a password is at most
-/// 1024 bytes (`MAX_PASSWORD_BYTES`), so anything much larger is refused
-/// with 413 before it is parsed.
+/// 1024 bytes (`MAX_PASSWORD_BYTES`), and a passkey's answer, with no
+/// attestation asked for (plan 3c decision 4), about one, so anything much
+/// larger is refused with 413 before it is parsed.
 pub const MAX_BODY_BYTES: usize = 16 * 1024;
 
 /// The operator auth routes. Setup has its own `Origin` rule; the rest are
@@ -25,17 +30,35 @@ pub fn router(operator: Arc<Operator>) -> Router {
     let browser = Router::new()
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
+        .route("/api/auth/passkeys/login/start", post(passkey_login_start))
+        .route("/api/auth/passkeys/login/finish", post(passkey_login_finish))
         .layer(middleware::from_fn_with_state(
             operator.clone(),
             crate::origin::browser_rules,
         ));
+    let step_up_first = || middleware::from_fn(crate::auth::require_step_up);
     let signed_in = crate::auth::operator_only(
         Router::new()
             .route("/api/auth/step-up/password", post(step_up))
+            .route("/api/auth/step-up/passkey/start", post(passkey_step_up_start))
+            .route("/api/auth/step-up/passkey/finish", post(passkey_step_up_finish))
             .route("/api/auth/sessions", get(list_sessions))
             .route(
                 "/api/auth/sessions/{id}",
-                delete(revoke_session).route_layer(middleware::from_fn(crate::auth::require_step_up)),
+                delete(revoke_session).route_layer(step_up_first()),
+            )
+            .route("/api/auth/passkeys", get(list_passkeys))
+            .route(
+                "/api/auth/passkeys/{id}",
+                delete(remove_passkey).route_layer(step_up_first()),
+            )
+            .route(
+                "/api/auth/passkeys/register/start",
+                post(passkey_register_start).route_layer(step_up_first()),
+            )
+            .route(
+                "/api/auth/passkeys/register/finish",
+                post(passkey_register_finish).route_layer(step_up_first()),
             ),
         operator.clone(),
     );
@@ -282,6 +305,171 @@ async fn revoke_session(
         ),
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) => internal(err),
+    }
+}
+
+/// The answer to a ceremony's start (plan 3c decision 11): 200 and the
+/// options, or why it did not begin.
+fn started(outcome: anyhow::Result<Start>) -> Response {
+    match outcome {
+        Ok(Start::Begun { ceremony_id, options }) => Json(PasskeyCeremony { ceremony_id, options }).into_response(),
+        Ok(Start::Unavailable) => passkeys_unavailable(),
+        Ok(Start::NoPasskeys) => error(StatusCode::CONFLICT, "no_passkeys", "there is no passkey to use"),
+        Ok(Start::Invalid(why)) => error(StatusCode::BAD_REQUEST, "invalid", why),
+        Err(err) => internal(err),
+    }
+}
+
+fn passkeys_unavailable() -> Response {
+    error(
+        StatusCode::CONFLICT,
+        "passkeys_unavailable",
+        "passkeys need public_url to name a host, not an IP address",
+    )
+}
+
+/// The answer to a refused finish (plan 3c decision 11). Nothing changed.
+fn refused(why: Refused) -> Response {
+    match why {
+        Refused::Ceremony => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_ceremony",
+            "the passkey ceremony is unknown, used or expired; start again",
+        ),
+        Refused::Credential(why) => {
+            // `?`, not `%`: the reason can quote the client's input, and
+            // `Debug` escapes it (3c review, O4).
+            tracing::debug!(?why, "passkey refused: the answer did not verify");
+            error(
+                StatusCode::UNAUTHORIZED,
+                "passkey_refused",
+                "the passkey was not accepted",
+            )
+        }
+        // Logged where it was caught, with the passkey's id.
+        Refused::Passkey | Refused::CounterWentBack => error(
+            StatusCode::UNAUTHORIZED,
+            "passkey_refused",
+            "the passkey was not accepted",
+        ),
+        Refused::AlreadyRegistered => error(
+            StatusCode::CONFLICT,
+            "already_registered",
+            "this passkey is registered already",
+        ),
+        Refused::Unavailable => passkeys_unavailable(),
+    }
+}
+
+fn passkey_item(record: PasskeyRecord) -> PasskeyItem {
+    PasskeyItem {
+        id: record.id,
+        label: record.label,
+        created_at: rfc3339(record.created_at),
+        last_used_at: record.last_used_at.map(rfc3339),
+    }
+}
+
+/// `POST /api/auth/passkeys/login/start`: a login ceremony over the
+/// owner's passkeys. Every start counts against the client's address on
+/// the passkey budget until a login succeeds (plan 3c decision 8).
+async fn passkey_login_start(
+    State(operator): State<Arc<Operator>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(retry_after) = operator.passkey_limiter.attempt(peer.ip(), Instant::now()) {
+        return rate_limited(
+            retry_after,
+            "too many passkey logins begun from this address; try again later",
+        );
+    }
+    started(operator.start_passkey_login(unix_now()))
+}
+
+/// `POST /api/auth/passkeys/login/finish`: 204 and a new session cookie,
+/// the session stepped up, as a password login's is.
+async fn passkey_login_finish(
+    State(operator): State<Arc<Operator>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<PasskeyFinishRequest>,
+) -> Response {
+    match operator.finish_passkey_login(&req.ceremony_id, &req.credential, &user_agent(&headers), unix_now()) {
+        Ok(Ok(token)) => {
+            operator.passkey_limiter.succeeded(peer.ip());
+            with_cookie(
+                StatusCode::NO_CONTENT.into_response(),
+                &session_cookie(&token, secure_cookies(&operator)),
+            )
+        }
+        Ok(Err(why)) => refused(why),
+        Err(err) => internal(err),
+    }
+}
+
+/// `POST /api/auth/step-up/passkey/start`: a step-up ceremony for the
+/// request's session (kernel spec §3.4).
+async fn passkey_step_up_start(
+    State(operator): State<Arc<Operator>>,
+    Extension(session): Extension<Authenticated>,
+) -> Response {
+    started(operator.start_passkey_step_up(&session.session_id, unix_now()))
+}
+
+/// `POST /api/auth/step-up/passkey/finish`: 204, the session stepped up
+/// for five minutes.
+async fn passkey_step_up_finish(
+    State(operator): State<Arc<Operator>>,
+    Extension(session): Extension<Authenticated>,
+    Json(req): Json<PasskeyFinishRequest>,
+) -> Response {
+    match operator.finish_passkey_step_up(&session.session_id, &req.ceremony_id, &req.credential, unix_now()) {
+        Ok(Ok(true)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(Ok(false)) => error(StatusCode::UNAUTHORIZED, "unauthenticated", "sign in first"),
+        Ok(Err(why)) => refused(why),
+        Err(err) => internal(err),
+    }
+}
+
+/// `GET /api/auth/passkeys`: the owner's passkeys, oldest first.
+async fn list_passkeys(State(operator): State<Arc<Operator>>) -> Response {
+    match operator.passkeys() {
+        Ok(records) => Json(records.into_iter().map(passkey_item).collect::<Vec<_>>()).into_response(),
+        Err(err) => internal(err),
+    }
+}
+
+/// `DELETE /api/auth/passkeys/{id}` (step-up): 204, or 404 if there is no
+/// such passkey. The password stays (plan 3c decision 2).
+async fn remove_passkey(State(operator): State<Arc<Operator>>, Path(id): Path<String>) -> Response {
+    match operator.remove_passkey(&id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => error(StatusCode::NOT_FOUND, "not_found", "no such passkey"),
+        Err(err) => internal(err),
+    }
+}
+
+/// `POST /api/auth/passkeys/register/start` (step-up, plan 3c decision 7):
+/// a registration ceremony for the request's session.
+async fn passkey_register_start(
+    State(operator): State<Arc<Operator>>,
+    Extension(session): Extension<Authenticated>,
+    Json(req): Json<PasskeyRegisterRequest>,
+) -> Response {
+    started(operator.start_passkey_registration(&session.session_id, &req.label, unix_now()))
+}
+
+/// `POST /api/auth/passkeys/register/finish` (step-up): 201 and the new
+/// passkey.
+async fn passkey_register_finish(
+    State(operator): State<Arc<Operator>>,
+    Extension(session): Extension<Authenticated>,
+    Json(req): Json<PasskeyFinishRequest>,
+) -> Response {
+    match operator.finish_passkey_registration(&session.session_id, &req.ceremony_id, &req.credential, unix_now()) {
+        Ok(Ok(record)) => (StatusCode::CREATED, Json(passkey_item(record))).into_response(),
+        Ok(Err(why)) => refused(why),
         Err(err) => internal(err),
     }
 }

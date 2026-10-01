@@ -76,6 +76,18 @@ impl Policy {
         first_lockout: Duration::from_secs(60),
         max_lockout: Duration::from_secs(60 * 60),
     };
+
+    /// Passkey logins begun and not finished: 30 a minute, then the same
+    /// backoff (plan 3c decision 8). A budget of its own, so a password
+    /// lockout does not stop passkey login (3b-i's obligation). Every start
+    /// counts, and a page that offers passkeys on load starts one each
+    /// time, hence more than a password's five.
+    pub const PASSKEY_LOGIN: Policy = Policy {
+        free_failures: 30,
+        window: Duration::from_secs(60),
+        first_lockout: Duration::from_secs(60),
+        max_lockout: Duration::from_secs(60 * 60),
+    };
 }
 
 /// Addresses tracked by default.

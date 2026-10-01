@@ -182,6 +182,9 @@ pub struct Operator {
     /// (3b decision 10): a login flood from a shared address does not stop
     /// a signed-in owner stepping up, nor step-up guesses lock out login.
     pub step_up_limiter: Limiter,
+    /// Passkey logins begun per client address (plan 3c decision 8): a
+    /// budget of its own, untouched by wrong passwords.
+    pub passkey_limiter: Limiter,
     /// Bumped whenever a session ends (revoked or signed out), and by
     /// `reset_password` and `reset_public_url`, each of which ends every
     /// session: streams held open by a session re-check it on every bump
@@ -226,6 +229,7 @@ impl Operator {
             verifications: AtomicU64::new(0),
             login_limiter: Limiter::new(Policy::LOGIN),
             step_up_limiter: Limiter::new(Policy::LOGIN),
+            passkey_limiter: Limiter::new(Policy::PASSKEY_LOGIN),
             ended: tokio::sync::watch::Sender::new(0),
             ceremonies: Default::default(),
             #[cfg(test)]

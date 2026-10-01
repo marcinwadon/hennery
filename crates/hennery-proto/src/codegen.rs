@@ -57,6 +57,10 @@ pub fn render_schema() -> String {
         rest::LoginRequest,
         rest::StepUpRequest,
         rest::AuthSessionItem,
+        rest::PasskeyRegisterRequest,
+        rest::PasskeyCeremony,
+        rest::PasskeyFinishRequest,
+        rest::PasskeyItem,
     );
     // `serde_json::Map` is a `BTreeMap` (always iterates sorted) by default,
     // or an `IndexMap` (iterates in insertion order) when serde_json's
@@ -154,6 +158,10 @@ pub fn render_ts() -> String {
         rest::LoginRequest,
         rest::StepUpRequest,
         rest::AuthSessionItem,
+        rest::PasskeyRegisterRequest,
+        rest::PasskeyCeremony,
+        rest::PasskeyFinishRequest,
+        rest::PasskeyItem,
     );
     out
 }

@@ -1263,6 +1263,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "webauthn-authenticator-rs",
+ "webauthn-rs",
 ]
 
 [[package]]
