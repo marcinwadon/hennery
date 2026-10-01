@@ -249,7 +249,13 @@ async fn a_reset_ends_every_session_and_its_streams() {
         .reset_password("a new long password".into(), unix_now())
         .await
         .unwrap();
-    assert_eq!(reset, hennery_kernel::operator::Reset::Done { sessions_ended: 3 });
+    assert_eq!(
+        reset,
+        hennery_kernel::operator::Reset::Done {
+            sessions_ended: 3,
+            passkeys_removed: 0
+        }
+    );
     for stream in streams {
         assert!(
             ends(stream, Duration::from_secs(1)).await,
@@ -272,7 +278,13 @@ async fn a_reset_ends_every_session_and_its_streams() {
         .unwrap();
     let stream = open_stream(&c, &session).await;
     let reset = c.state.operator.reset_public_url(PUBLIC_URL).unwrap();
-    assert_eq!(reset, hennery_kernel::operator::Reset::Done { sessions_ended: 1 });
+    assert_eq!(
+        reset,
+        hennery_kernel::operator::Reset::Done {
+            sessions_ended: 1,
+            passkeys_removed: 0
+        }
+    );
     assert!(
         ends(stream, Duration::from_secs(1)).await,
         "a stream outlived the public_url reset"

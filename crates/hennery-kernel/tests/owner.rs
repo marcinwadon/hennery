@@ -279,11 +279,17 @@ async fn another_owners_password_and_sessions_are_invisible_to_the_operator() {
     // owner's `public_url` and password.
     assert_eq!(
         op.reset_public_url("https://moved.example").unwrap(),
-        Reset::Done { sessions_ended: 2 }
+        Reset::Done {
+            sessions_ended: 2,
+            passkeys_removed: 0
+        }
     );
     assert_eq!(
         op.reset_password("a new long password".into(), NOW).await.unwrap(),
-        Reset::Done { sessions_ended: 0 }
+        Reset::Done {
+            sessions_ended: 0,
+            passkeys_removed: 0
+        }
     );
     assert_eq!(rows_of(&conn, OPERATOR_TABLES, OTHER), theirs);
     drop(op);

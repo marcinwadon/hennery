@@ -235,3 +235,19 @@ created_at: string, last_seen_at: string, expires_at: string,
  * The session this request came with.
  */
 current: boolean, };
+
+export type PasskeyRegisterRequest = { label: string, };
+
+export type PasskeyCeremony = { ceremony_id: string, options: unknown, };
+
+export type PasskeyFinishRequest = { ceremony_id: string, credential: unknown, };
+
+export type PasskeyItem = { 
+/**
+ * What `DELETE /api/auth/passkeys/{id}` takes.
+ */
+id: string, label: string, 
+/**
+ * RFC 3339.
+ */
+created_at: string, last_used_at?: string | undefined, };

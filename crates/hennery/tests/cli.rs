@@ -1970,16 +1970,20 @@ fn open_pty() -> (std::fs::File, std::os::fd::OwnedFd) {
 }
 
 /// `POST /api/auth/login` with `password`, from `origin`: the status.
+///
+/// The request goes out in one write. A refused origin is answered before
+/// the body is read, and the collector then closes: a body still unread, or
+/// still on its way (`write!` sends each piece apart), resets the
+/// connection, and the 403 already received is lost to the reset.
 fn login(listen: &str, origin: &str, password: &str) -> Option<u16> {
     let body = serde_json::json!({ "password": password }).to_string();
     let mut stream = TcpStream::connect(listen).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(15))).ok()?;
-    write!(
-        stream,
+    let request = format!(
         "POST /api/auth/login HTTP/1.1\r\nHost: {listen}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
-    )
-    .ok()?;
+    );
+    stream.write_all(request.as_bytes()).ok()?;
     let mut response = String::new();
     stream.read_to_string(&mut response).ok()?;
     response.split(' ').nth(1)?.parse().ok()
@@ -2050,12 +2054,23 @@ fn a_moved_collector_is_recovered_over_the_admin_socket() {
     let refused = admin_on_a_terminal(&data, &["reset-public-url", &new], "no\n");
     assert!(!refused.status.success());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("not confirmed"));
+    // Kernel spec §3.2: it says passkeys stop working before it asks.
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("Passkeys stop working if the host name changes"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
     assert_eq!(login(&listen, &new, PASSWORD), Some(403), "moved without a yes");
 
     let out = admin_on_a_terminal(&data, &["reset-public-url", &new], "yes\n");
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert!(
         String::from_utf8_lossy(&out.stdout).contains(&format!("public_url is now {new}")),
+        "{}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("0 passkey(s) removed"),
         "{}",
         String::from_utf8_lossy(&out.stdout)
     );
@@ -2083,6 +2098,11 @@ fn a_password_reset_over_the_admin_socket_signs_everyone_out() {
     let differ = admin_on_a_terminal(&data, &["reset-password"], &format!("{NEW}\nsomething else\n"));
     assert!(!differ.status.success());
     assert!(String::from_utf8_lossy(&differ.stderr).contains("differ"));
+    // 3c review, A1: it says, before it asks for the password, that every
+    // passkey goes.
+    let stderr = String::from_utf8_lossy(&differ.stderr);
+    let warned = stderr.find("This removes every passkey").expect("the passkey warning");
+    assert!(warned < stderr.find("New password: ").unwrap(), "{stderr}");
     assert!(get_json(&listen, "/api/hosts", &session).is_some());
 
     // Typed only once each prompt is shown, as a person would: none of it
@@ -2104,7 +2124,10 @@ fn a_password_reset_over_the_admin_socket_signs_everyone_out() {
     assert!(!shown.contains(NEW), "the terminal echoed the password: {shown:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(stdout.contains("1 session(s) signed out"), "{stdout}");
+    assert!(
+        stdout.contains("1 session(s) signed out, 0 passkey(s) removed"),
+        "{stdout}"
+    );
     assert!(!stdout.contains(NEW) && !String::from_utf8_lossy(&out.stderr).contains(NEW));
     assert!(
         get_json(&listen, "/api/hosts", &session).is_none(),

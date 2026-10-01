@@ -54,8 +54,9 @@ fn unauthenticated() -> Response {
 }
 
 /// Axum middleware, inside `require_operator`: the session's last password
-/// check must be within the last five minutes (kernel spec §3.4), or the
-/// answer is 403 `step_up_required` and the client asks again.
+/// or passkey check must be within the last five minutes (kernel spec
+/// §3.4), or the answer is 403 `step_up_required` and the client asks
+/// again.
 pub async fn require_step_up(req: Request, next: Next) -> Response {
     let fresh = req
         .extensions()
@@ -65,7 +66,7 @@ pub async fn require_step_up(req: Request, next: Next) -> Response {
         return error(
             StatusCode::FORBIDDEN,
             "step_up_required",
-            "confirm your password again (POST /api/auth/step-up/password)",
+            "confirm your password or a passkey again (POST /api/auth/step-up/password or /api/auth/step-up/passkey/start)",
         );
     }
     next.run(req).await

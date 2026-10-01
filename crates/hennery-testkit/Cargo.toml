@@ -29,3 +29,5 @@ hex.workspace = true
 rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = "3"
 tokio-tungstenite.workspace = true
+webauthn-authenticator-rs.workspace = true
+webauthn-rs.workspace = true

@@ -55,6 +55,8 @@ const PUBLIC_URL_KEY: &str = "public_url";
 pub struct PublicUrl {
     origin: String,
     https: bool,
+    /// The host, when it is a domain rather than an IP address.
+    rp_id: Option<String>,
 }
 
 impl PublicUrl {
@@ -73,7 +75,8 @@ impl PublicUrl {
             _ => return Err("public_url must be https:// or http://".into()),
         };
         let origin = url.origin().ascii_serialization();
-        Ok(Self { origin, https })
+        let rp_id = url.domain().map(str::to_string);
+        Ok(Self { origin, https, rp_id })
     }
 
     /// `scheme://host[:port]`, as a browser's `Origin` header has it.
@@ -85,6 +88,13 @@ impl PublicUrl {
     /// `http://` (kernel spec §3.2).
     pub fn is_https(&self) -> bool {
         self.https
+    }
+
+    /// The passkeys' relying party id (kernel spec §3.2): the host, in
+    /// lowercase. `None` when the host is an IP address, which WebAuthn
+    /// cannot bind a credential to.
+    pub fn rp_id(&self) -> Option<&str> {
+        self.rp_id.as_deref()
     }
 }
 
@@ -118,8 +128,14 @@ pub enum SetupOutcome {
 /// The outcome of `Operator::reset_password` and `reset_public_url`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reset {
-    /// Done; this many signed-in sessions were ended.
-    Done { sessions_ended: usize },
+    /// Done; this many signed-in sessions were ended, and this many
+    /// passkeys removed: every one, by a password reset (plan 3c decision
+    /// 2), or those bound to a host name `public_url` no longer has
+    /// (decision 9).
+    Done {
+        sessions_ended: usize,
+        passkeys_removed: usize,
+    },
     /// The owner is not set up yet: setup is the way in.
     NotSetUp,
     /// The new password or `public_url` is not acceptable (why); nothing
@@ -172,11 +188,17 @@ pub struct Operator {
     /// (3b decision 10): a login flood from a shared address does not stop
     /// a signed-in owner stepping up, nor step-up guesses lock out login.
     pub step_up_limiter: Limiter,
+    /// Passkey logins begun per client address (plan 3c decision 8): a
+    /// budget of its own, untouched by wrong passwords.
+    pub passkey_limiter: Limiter,
     /// Bumped whenever a session ends (revoked or signed out), and by
     /// `reset_password` and `reset_public_url`, each of which ends every
     /// session: streams held open by a session re-check it on every bump
     /// (3b decision 7).
     ended: tokio::sync::watch::Sender<u64>,
+    /// The passkey ceremonies begun and not yet finished (plan 3c
+    /// decision 5).
+    pub ceremonies: crate::passkeys::Ceremonies,
     /// Verifies running now, and the most ever at once (`check_password`'s
     /// bound, pinned by the unit tests below).
     #[cfg(test)]
@@ -213,7 +235,9 @@ impl Operator {
             verifications: AtomicU64::new(0),
             login_limiter: Limiter::new(Policy::LOGIN),
             step_up_limiter: Limiter::new(Policy::LOGIN),
+            passkey_limiter: Limiter::new(Policy::PASSKEY_LOGIN),
             ended: tokio::sync::watch::Sender::new(0),
+            ceremonies: Default::default(),
             #[cfg(test)]
             in_flight: Default::default(),
             #[cfg(test)]
@@ -223,7 +247,7 @@ impl Operator {
         })
     }
 
-    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("operator lock")
     }
 
@@ -444,7 +468,12 @@ impl Operator {
     /// flood. The limiters are cleared: the operator proved local access.
     /// It fails, changing nothing, unless it replaced exactly one password
     /// (3b-ii's O9): an owner with none (a passkey-only owner, in 3c) has
-    /// nothing to reset.
+    /// nothing to reset. Every passkey is removed and every passkey
+    /// ceremony begun before it ends, a finish re-checking under the lock
+    /// in any case (plan 3c decision 2, amended by its review's A1): a
+    /// passkey added with a stolen session must not survive the recovery.
+    /// With no change-password route, every password change costs the
+    /// passkeys.
     pub async fn reset_password(self: &Arc<Self>, password: String, now: i64) -> Result<Reset> {
         if let Some(problem) = password_problem(&password) {
             return Ok(Reset::Invalid(problem));
@@ -467,7 +496,7 @@ impl Operator {
             password_auth::generate_hash(password)
         })
         .await?;
-        let ended = {
+        let (ended, passkeys_removed) = {
             let mut conn = self.conn();
             let tx = conn.transaction()?;
             let replaced = tx.execute(
@@ -477,20 +506,32 @@ impl Operator {
             // Otherwise the transaction rolls back: no session ends.
             anyhow::ensure!(replaced == 1, "the owner has no password to reset");
             let ended = tx.execute("DELETE FROM auth_sessions WHERE owner_id = ?1", [&self.owner])?;
+            let passkeys_removed = tx.execute("DELETE FROM passkeys WHERE owner_id = ?1", [&self.owner])?;
             tx.commit()?;
-            ended
+            // Still under the connection's lock, which every finish holds
+            // from its check to its write: none lands after this.
+            self.ceremonies.clear();
+            (ended, passkeys_removed)
         };
         self.sessions_ended();
         self.login_limiter.clear();
         self.step_up_limiter.clear();
-        Ok(Reset::Done { sessions_ended: ended })
+        self.passkey_limiter.clear();
+        Ok(Reset::Done {
+            sessions_ended: ended,
+            passkeys_removed,
+        })
     }
 
     /// Replace `public_url` (the admin socket's recovery when the collector
     /// moved, 3b decision 4): the stored row and the origin every browser
     /// request is checked against, which is cached here. Every signed-in
     /// session ends: they were opened at the old origin, and the new one
-    /// signs in afresh.
+    /// signs in afresh. Passkeys are bound to the host name, the RP id
+    /// (kernel spec §3.2): when it changes they stop working, and are
+    /// removed; a move to another port or scheme keeps them (plan 3c
+    /// decision 9). Every passkey ceremony begun before it ends too, a
+    /// finish re-checking under the lock in any case.
     pub fn reset_public_url(&self, input: &str) -> Result<Reset> {
         let public_url = match PublicUrl::parse(input) {
             Ok(url) => url,
@@ -499,7 +540,7 @@ impl Operator {
         if !self.is_set_up()? {
             return Ok(Reset::NotSetUp);
         }
-        let ended = {
+        let (ended, passkeys_removed) = {
             let mut conn = self.conn();
             let tx = conn.transaction()?;
             tx.execute(
@@ -508,14 +549,24 @@ impl Operator {
                 params![self.owner, PUBLIC_URL_KEY, public_url.origin()],
             )?;
             let ended = tx.execute("DELETE FROM auth_sessions WHERE owner_id = ?1", [&self.owner])?;
+            let same_host = self.public_url().as_ref().and_then(PublicUrl::rp_id) == public_url.rp_id();
+            let passkeys_removed = if same_host {
+                0
+            } else {
+                tx.execute("DELETE FROM passkeys WHERE owner_id = ?1", [&self.owner])?
+            };
             tx.commit()?;
             // Still under the connection's lock: no other reset lands
             // between the row and the cache.
             *self.public_url.write().expect("public_url lock") = Some(public_url);
-            ended
+            self.ceremonies.clear();
+            (ended, passkeys_removed)
         };
         self.sessions_ended();
-        Ok(Reset::Done { sessions_ended: ended })
+        Ok(Reset::Done {
+            sessions_ended: ended,
+            passkeys_removed,
+        })
     }
 
     /// Wake every stream held open by a session: some have ended.
@@ -580,6 +631,16 @@ pub const SESSION_COOKIE: &str = "hennery_session";
 /// The longest `User-Agent` kept with a session, in characters.
 const MAX_USER_AGENT: usize = 256;
 
+/// `user_agent` as a session keeps it: no control characters, at most
+/// `MAX_USER_AGENT` characters.
+pub(crate) fn kept_user_agent(user_agent: &str) -> String {
+    user_agent
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_USER_AGENT)
+        .collect()
+}
+
 /// A request's session, once its cookie checks out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authenticated {
@@ -620,11 +681,7 @@ impl Operator {
     /// setup, when the owner has no password.
     pub fn open_session(&self, user_agent: &str, verified: &str, now: i64) -> Result<Option<String>> {
         let token = hex::encode(random_bytes::<32>());
-        let user_agent: String = user_agent
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(MAX_USER_AGENT)
-            .collect();
+        let user_agent = kept_user_agent(user_agent);
         let conn = self.conn();
         conn.execute(
             "DELETE FROM auth_sessions WHERE expires_at <= ?1 AND owner_id = ?2",
@@ -878,7 +935,13 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(op.reset_hashes.load(Ordering::SeqCst), 0, "hashed without a slot");
         drop(held);
-        assert_eq!(reset.await.unwrap().unwrap(), Reset::Done { sessions_ended: 0 });
+        assert_eq!(
+            reset.await.unwrap().unwrap(),
+            Reset::Done {
+                sessions_ended: 0,
+                passkeys_removed: 0
+            }
+        );
         assert_eq!(op.reset_hashes.load(Ordering::SeqCst), 1);
     }
 

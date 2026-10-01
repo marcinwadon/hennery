@@ -38,6 +38,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ts-rs = { version = "12", features = ["serde-json-impl"] }
 url = "=2.5.8"
 uuid = { version = "1", features = ["v7", "serde"] }
+# Passkeys (plan 3c). Default features off: passkeys ask for no attestation.
+webauthn-rs = { version = "=0.5.5", default-features = false }
+# Tests only: a software passkey, so no browser is needed.
+webauthn-authenticator-rs = { version = "=0.5.5", features = ["softpasskey"] }
 hennery-proto = { path = "crates/hennery-proto" }
 hennery-kernel = { path = "crates/hennery-kernel" }
 hennery-sessions = { path = "crates/hennery-sessions" }

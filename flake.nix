@@ -20,6 +20,9 @@
             nodejs_24
             pnpm
             sqlite
+            # `webauthn-rs` links OpenSSL (plan 3c).
+            openssl
+            pkg-config
           ];
           RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
         };

@@ -290,6 +290,10 @@ async fn a_password_reset_replaces_the_password_and_ends_every_session() {
         let _ = op.step_up_limiter.attempt(peer, std::time::Instant::now());
     }
     assert!(op.login_limiter.attempt(peer, std::time::Instant::now()).is_err());
+    for _ in 0..hennery_kernel::ratelimit::Policy::PASSKEY_LOGIN.free_failures {
+        let _ = op.passkey_limiter.attempt(peer, std::time::Instant::now());
+    }
+    assert!(op.passkey_limiter.attempt(peer, std::time::Instant::now()).is_err());
     let ends = op.session_ends();
 
     assert_eq!(
@@ -301,7 +305,10 @@ async fn a_password_reset_replaces_the_password_and_ends_every_session() {
 
     assert_eq!(
         op.reset_password("a new long password".into(), NOW + 1).await.unwrap(),
-        Reset::Done { sessions_ended: 2 }
+        Reset::Done {
+            sessions_ended: 2,
+            passkeys_removed: 0
+        }
     );
     assert!(op.verify_password("a new long password").unwrap().is_some());
     assert!(op.verify_password(PASSWORD).unwrap().is_none());
@@ -311,6 +318,7 @@ async fn a_password_reset_replaces_the_password_and_ends_every_session() {
     assert!(ends.has_changed().unwrap(), "the ending was not announced");
     assert!(op.login_limiter.attempt(peer, std::time::Instant::now()).is_ok());
     assert!(op.step_up_limiter.attempt(peer, std::time::Instant::now()).is_ok());
+    assert!(op.passkey_limiter.attempt(peer, std::time::Instant::now()).is_ok());
 }
 
 /// The admin socket's `public_url` reset (3b decision 4's recovery): the
@@ -337,7 +345,10 @@ fn a_public_url_reset_replaces_the_cached_origin_and_ends_every_session() {
 
     assert_eq!(
         op.reset_public_url("https://Moved.Example/").unwrap(),
-        Reset::Done { sessions_ended: 1 }
+        Reset::Done {
+            sessions_ended: 1,
+            passkeys_removed: 0
+        }
     );
     assert_eq!(op.public_url().unwrap().origin(), "https://moved.example");
     assert!(op.public_url().unwrap().is_https());
@@ -393,7 +404,10 @@ async fn a_login_checked_before_a_password_reset_opens_no_session_after_it() {
         .expect("the old password");
     assert_eq!(
         op.reset_password("a new long password".into(), NOW).await.unwrap(),
-        Reset::Done { sessions_ended: 0 }
+        Reset::Done {
+            sessions_ended: 0,
+            passkeys_removed: 0
+        }
     );
     assert_eq!(op.open_session("browser", &stale, NOW).unwrap(), None);
     assert!(op.sessions(NOW).unwrap().is_empty());

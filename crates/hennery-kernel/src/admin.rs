@@ -111,10 +111,14 @@ pub enum AdminResponse {
     NotSetUp,
     PasswordReset {
         sessions_ended: usize,
+        /// Every passkey (plan 3c decision 2).
+        passkeys_removed: usize,
     },
     PublicUrlReset {
         public_url: String,
         sessions_ended: usize,
+        /// Passkeys bound to the old host name (plan 3c decision 9).
+        passkeys_removed: usize,
     },
     Hosts {
         hosts: Vec<AdminHost>,
@@ -142,17 +146,23 @@ impl std::fmt::Debug for AdminResponse {
             Self::SetupUrl { .. } => f.debug_struct("SetupUrl").field("url", &redacted).finish(),
             Self::AlreadySetUp => f.write_str("AlreadySetUp"),
             Self::NotSetUp => f.write_str("NotSetUp"),
-            Self::PasswordReset { sessions_ended } => f
+            Self::PasswordReset {
+                sessions_ended,
+                passkeys_removed,
+            } => f
                 .debug_struct("PasswordReset")
                 .field("sessions_ended", sessions_ended)
+                .field("passkeys_removed", passkeys_removed)
                 .finish(),
             Self::PublicUrlReset {
                 public_url,
                 sessions_ended,
+                passkeys_removed,
             } => f
                 .debug_struct("PublicUrlReset")
                 .field("public_url", public_url)
                 .field("sessions_ended", sessions_ended)
+                .field("passkeys_removed", passkeys_removed)
                 .finish(),
             Self::Hosts { hosts } => f.debug_struct("Hosts").field("hosts", hosts).finish(),
             Self::PairingCode { expires_at, .. } => f
@@ -369,7 +379,13 @@ async fn carry_out(request: AdminRequest, admin: &Admin) -> AdminResponse {
                 .reset_password(password, now)
                 .await
                 .map(|reset| match reset {
-                    Reset::Done { sessions_ended } => AdminResponse::PasswordReset { sessions_ended },
+                    Reset::Done {
+                        sessions_ended,
+                        passkeys_removed,
+                    } => AdminResponse::PasswordReset {
+                        sessions_ended,
+                        passkeys_removed,
+                    },
                     Reset::NotSetUp => AdminResponse::NotSetUp,
                     Reset::Invalid(message) => AdminResponse::Refused { message },
                 })
@@ -397,13 +413,17 @@ async fn carry_out(request: AdminRequest, admin: &Admin) -> AdminResponse {
             }),
         AdminRequest::ResetPublicUrl { public_url } => {
             admin.operator.reset_public_url(&public_url).map(|reset| match reset {
-                Reset::Done { sessions_ended } => AdminResponse::PublicUrlReset {
+                Reset::Done {
+                    sessions_ended,
+                    passkeys_removed,
+                } => AdminResponse::PublicUrlReset {
                     public_url: admin
                         .operator
                         .public_url()
                         .map(|url| url.origin().to_string())
                         .unwrap_or_default(),
                     sessions_ended,
+                    passkeys_removed,
                 },
                 Reset::NotSetUp => AdminResponse::NotSetUp,
                 Reset::Invalid(message) => AdminResponse::Refused { message },

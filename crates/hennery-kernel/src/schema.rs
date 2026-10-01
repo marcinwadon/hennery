@@ -96,4 +96,20 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     DROP TABLE pairing_codes;
     ALTER TABLE pairing_codes_owned RENAME TO pairing_codes;
     ",
+    // Passkeys (kernel spec §1.1, §3.2; plan 3c decision 3). `credential`
+    // is `webauthn-rs`'s `Passkey` as JSON. `credential_id` (hex) is
+    // unique across owners: one credential, one account. `sign_count` is
+    // the authenticator's counter as last accepted, kept beside the JSON
+    // so a login can compare and set it in one statement (decision 6).
+    "
+    CREATE TABLE passkeys (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL REFERENCES owners(id),
+        credential_id TEXT NOT NULL UNIQUE,
+        credential TEXT NOT NULL,
+        sign_count INTEGER NOT NULL,
+        label TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_used_at INTEGER);
+    ",
 ];

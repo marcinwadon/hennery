@@ -951,6 +951,74 @@
       ],
       "type": "string"
     },
+    "PasskeyCeremony": {
+      "description": "200 to the start of every passkey ceremony: registration, login and\nstep-up. `options` is WebAuthn's JSON, for\n`navigator.credentials.create()` (registration) or `.get()` (login,\nstep-up): its `publicKey` goes through\n`PublicKeyCredential.parseCreationOptionsFromJSON` or\n`parseRequestOptionsFromJSON`. The finish names `ceremony_id`.",
+      "properties": {
+        "ceremony_id": {
+          "type": "string"
+        },
+        "options": true
+      },
+      "required": [
+        "ceremony_id",
+        "options"
+      ],
+      "type": "object"
+    },
+    "PasskeyFinishRequest": {
+      "description": "The finish of every passkey ceremony: the credential the browser\nreturned, as `PublicKeyCredential.toJSON()` gives it.",
+      "properties": {
+        "ceremony_id": {
+          "type": "string"
+        },
+        "credential": true
+      },
+      "required": [
+        "ceremony_id",
+        "credential"
+      ],
+      "type": "object"
+    },
+    "PasskeyItem": {
+      "description": "One of the owner's passkeys: an entry of `GET /api/auth/passkeys`, and\n201 to a registration's finish.",
+      "properties": {
+        "created_at": {
+          "description": "RFC 3339.",
+          "type": "string"
+        },
+        "id": {
+          "description": "What `DELETE /api/auth/passkeys/{id}` takes.",
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "last_used_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "id",
+        "label",
+        "created_at"
+      ],
+      "type": "object"
+    },
+    "PasskeyRegisterRequest": {
+      "description": "`POST /api/auth/passkeys/register/start` (kernel spec §3.2, plan 3c):\nthe new passkey's label, 1 to 64 characters.",
+      "properties": {
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "label"
+      ],
+      "type": "object"
+    },
     "PendingExtract": {
       "description": "The `pending` extract (ACP core §3.2): what the collector needs to hold\na pending request and validate its answer, without reading the payload.",
       "properties": {
