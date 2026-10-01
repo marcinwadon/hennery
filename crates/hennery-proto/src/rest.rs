@@ -31,6 +31,39 @@ pub struct PromptResponse {
     pub turn_id: String,
 }
 
+/// One block of a prompt as the collector stores it (ACP core §7, plan 6a):
+/// in `turns.content` and in the `user_turn` event's `content`. Text as it
+/// was sent; an image as the attachment it was stored as, never its bytes.
+/// `GET /api/attachments/{sha256}` serves the image.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StoredBlock {
+    Text {
+        text: String,
+    },
+    Image {
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        /// The SHA-256 of the image's bytes, 64 lowercase hex digits.
+        sha256: String,
+        /// The image's size in bytes, decoded.
+        #[ts(type = "number")]
+        size: u64,
+    },
+}
+
+/// `GET /api/settings/attachments` (plan 6a): the owner's attachment store,
+/// for Settings (ACP core §15, maintainer decision 6a).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct AttachmentUsage {
+    /// Stored images, each counted once however often it was sent.
+    #[ts(type = "number")]
+    pub count: u64,
+    /// Their size in bytes, decoded.
+    #[ts(type = "number")]
+    pub bytes: u64,
+}
+
 /// One stored timeline event, as served by REST and SSE.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct EventDto {

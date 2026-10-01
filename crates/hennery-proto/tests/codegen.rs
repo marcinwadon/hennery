@@ -104,3 +104,28 @@ fn config_fields_are_flat_in_typescript() {
         .expect("StartSessionRequest");
     assert!(start.contains("model?") && start.contains("axes?"), "{start}");
 }
+
+/// Plan 6a: the frontend renders stored images from these, so they are
+/// exported, with sizes as numbers.
+#[test]
+fn stored_images_and_their_usage_are_exported() {
+    let ts = render_ts();
+    // A declaration runs to the next one (doc comments split it in lines).
+    let decl = |name: &str| {
+        let start = ts.find(&format!("export type {name} =")).expect(name);
+        let rest = &ts[start + 1..];
+        rest[..rest.find("export type").unwrap_or(rest.len())].to_string()
+    };
+    let block = decl("StoredBlock");
+    assert!(
+        block.contains("\"type\": \"image\", mimeType: string,")
+            && block.contains("sha256: string")
+            && block.contains("size: number"),
+        "{block}"
+    );
+    let usage = decl("AttachmentUsage");
+    assert!(
+        usage.contains("count: number") && usage.contains("bytes: number"),
+        "{usage}"
+    );
+}

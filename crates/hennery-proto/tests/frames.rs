@@ -511,3 +511,34 @@ fn a_rest_answer_is_an_option_or_an_elicitation_action() {
         assert!(serde_json::from_value::<AnswerRequest>(bad.clone()).is_err(), "{bad}");
     }
 }
+
+/// Plan 6a: a stored prompt names its images by the attachment they were
+/// stored as, and never carries their bytes (ACP core §7).
+#[test]
+fn stored_blocks_name_the_attachment_and_never_carry_its_bytes() {
+    use hennery_proto::rest::{AttachmentUsage, StoredBlock};
+    let blocks = vec![
+        StoredBlock::Text { text: "look".into() },
+        StoredBlock::Image {
+            mime_type: "image/png".into(),
+            sha256: "ab".repeat(32),
+            size: 3,
+        },
+    ];
+    let value = serde_json::to_value(&blocks).unwrap();
+    assert_eq!(
+        value,
+        json!([
+            {"type": "text", "text": "look"},
+            {"type": "image", "mimeType": "image/png", "sha256": "ab".repeat(32), "size": 3}
+        ])
+    );
+    assert_eq!(serde_json::from_value::<Vec<StoredBlock>>(value).unwrap(), blocks);
+    // An ACP image block, with its bytes and no attachment, is not one.
+    let acp = json!({"type": "image", "mimeType": "image/png", "data": "iVBORw0KGgo="});
+    assert!(serde_json::from_value::<StoredBlock>(acp).is_err());
+    assert_eq!(
+        serde_json::to_value(AttachmentUsage { count: 2, bytes: 10 }).unwrap(),
+        json!({"count": 2, "bytes": 10})
+    );
+}

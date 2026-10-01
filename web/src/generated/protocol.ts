@@ -102,6 +102,26 @@ export type PromptRequest = { content: unknown[], };
 
 export type PromptResponse = { turn_id: string, };
 
+export type StoredBlock = { "type": "text", text: string, } | { "type": "image", mimeType: string, 
+/**
+ * The SHA-256 of the image's bytes, 64 lowercase hex digits.
+ */
+sha256: string, 
+/**
+ * The image's size in bytes, decoded.
+ */
+size: number, };
+
+export type AttachmentUsage = { 
+/**
+ * Stored images, each counted once however often it was sent.
+ */
+count: number, 
+/**
+ * Their size in bytes, decoded.
+ */
+bytes: number, };
+
 export type EventDto = { event_id: number, session_id: string, host_seq?: number | undefined, kind: string, body: unknown, ts: string, };
 
 export type ApiError = { code: string, message: string, 

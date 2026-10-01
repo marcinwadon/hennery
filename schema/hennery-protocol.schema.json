@@ -91,6 +91,28 @@
       ],
       "type": "object"
     },
+    "AttachmentUsage": {
+      "description": "`GET /api/settings/attachments` (plan 6a): the owner's attachment store,\nfor Settings (ACP core §15, maintainer decision 6a).",
+      "properties": {
+        "bytes": {
+          "description": "Their size in bytes, decoded.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "count": {
+          "description": "Stored images, each counted once however often it was sent.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "count",
+        "bytes"
+      ],
+      "type": "object"
+    },
     "AuthSessionItem": {
       "description": "One entry of `GET /api/auth/sessions` (kernel spec §3.2): a signed-in\ndevice, most recently used first.",
       "properties": {
@@ -1819,6 +1841,55 @@
         "password"
       ],
       "type": "object"
+    },
+    "StoredBlock": {
+      "description": "One block of a prompt as the collector stores it (ACP core §7, plan 6a):\nin `turns.content` and in the `user_turn` event's `content`. Text as it\nwas sent; an image as the attachment it was stored as, never its bytes.\n`GET /api/attachments/{sha256}` serves the image.",
+      "oneOf": [
+        {
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "mimeType": {
+              "type": "string"
+            },
+            "sha256": {
+              "description": "The SHA-256 of the image's bytes, 64 lowercase hex digits.",
+              "type": "string"
+            },
+            "size": {
+              "description": "The image's size in bytes, decoded.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "image",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "mimeType",
+            "sha256",
+            "size"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "TurnOutcome": {
       "description": "How a turn ended. Exactly one `turn_ended` per accepted turn (ACP core §4.4).",
