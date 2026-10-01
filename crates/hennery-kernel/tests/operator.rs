@@ -249,6 +249,32 @@ fn a_symlink_at_the_setup_link_is_replaced_and_its_target_left_alone() {
     assert_eq!(mode(&link.file), 0o600);
 }
 
+/// A hard link planted at `setup-url` is replaced too, never written
+/// through: its other name keeps its contents, and the two names no longer
+/// share an inode (plan 3b-i, "Found in execution").
+#[test]
+fn a_hard_link_at_the_setup_link_is_replaced_and_its_other_name_left_alone() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("elsewhere");
+    std::fs::write(&target, "untouched").unwrap();
+    std::fs::hard_link(&target, dir.path().join(SETUP_URL_FILE)).unwrap();
+    let op = Operator::open_in_memory().unwrap();
+    let link = op
+        .announce_setup(dir.path(), "http://localhost:1", NOW)
+        .unwrap()
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "untouched");
+    assert_eq!(std::fs::read_to_string(&link.file).unwrap(), format!("{}\n", link.url));
+    let (target, file) = (
+        std::fs::metadata(&target).unwrap(),
+        std::fs::metadata(&link.file).unwrap(),
+    );
+    assert_ne!(file.ino(), target.ino(), "setup-url still shares the target's inode");
+    assert_eq!((file.nlink(), target.nlink()), (1, 1));
+    assert_eq!(mode(&link.file), 0o600);
+}
+
 /// A failing assertion or a log line that shows a `SetupLink` must not
 /// show the live setup token.
 #[test]
