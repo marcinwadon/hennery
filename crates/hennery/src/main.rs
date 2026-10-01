@@ -84,7 +84,7 @@ struct CollectorArgs {
     host_offline_secs: u64,
     /// `hennery up` only: once listening, write one pairing code to this
     /// inherited descriptor (kernel spec §4.2).
-    #[arg(long, hide = true)]
+    #[arg(long, hide = true, value_parser = clap::value_parser!(i32).range(3..))]
     pairing_code_fd: Option<i32>,
     /// `hennery up` only: serve on this inherited listening socket, which
     /// `up` bound, in place of binding `--listen`. Repeatable.
@@ -107,7 +107,7 @@ struct HostArgs {
     /// paired, with the code read from `--join-code-fd`.
     #[arg(long, hide = true, requires = "join_code_fd")]
     join_url: Option<String>,
-    #[arg(long, hide = true, requires = "join_url")]
+    #[arg(long, hide = true, requires = "join_url", value_parser = clap::value_parser!(i32).range(3..))]
     join_code_fd: Option<i32>,
     /// `hennery up` only: the collector's host WebSocket as it listens now,
     /// in place of the stored one (its port may have changed).
@@ -222,6 +222,11 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     // the admin socket, instead of killing the collector by the default
     // action while it starts.
     let mut signals = Signals::new()?;
+    // Before anything is created: the pipe `up` hands over, or a clear
+    // refusal.
+    if let Some(fd) = args.pairing_code_fd {
+        inherit::check_pipe("--pairing-code-fd", fd)?;
+    }
     warn_if_dev_token();
     let file = config::FileConfig::load(&args.data_dir)?;
     // Named by its source: an operator cannot otherwise tell whether a flag,
@@ -554,6 +559,11 @@ fn read_code_from_stdin() -> Result<String> {
 }
 
 async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
+    // Before anything else, the paired branch's `close` included: the pipe
+    // `up` hands over, or a clear refusal.
+    if let Some(fd) = args.join_code_fd {
+        inherit::check_pipe("--join-code-fd", fd)?;
+    }
     warn_if_dev_token();
     let paired = match Paired::load(&args.data_dir)? {
         Some(paired) => {

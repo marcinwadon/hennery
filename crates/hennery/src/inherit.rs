@@ -58,6 +58,31 @@ pub fn pass_to_child(cmd: &mut tokio::process::Command, fds: &[(RawFd, RawFd)]) 
     }
 }
 
+/// Check the descriptor `flag` names before it is taken: it must be open
+/// and a pipe (or FIFO). Anything else is refused, not taken: a closed
+/// descriptor would abort the process when its `File` is dropped, a socket
+/// would hang the host's read, and a file would be written to or read from
+/// in place of the supervisor's pipe. Only inspected, never wrapped (so
+/// never closed) here.
+pub fn check_pipe(flag: &str, fd: RawFd) -> Result<()> {
+    // SAFETY: fcntl(2) on a descriptor number; it only reads its flags.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        bail!(
+            "{flag} {fd} is not an open descriptor: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+    // SAFETY: fstat(2) into local storage; all-zero bytes are a valid `stat`.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } < 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("{flag} {fd}: fstat"));
+    }
+    if stat.st_mode & libc::S_IFMT != libc::S_IFIFO {
+        bail!("{flag} {fd} is not a pipe");
+    }
+    Ok(())
+}
+
 /// The collector's side: write the code and close the descriptor.
 pub fn write_code(fd: RawFd, code: &str) -> Result<()> {
     // SAFETY: `fd` was inherited for exactly this and nothing else owns it.
