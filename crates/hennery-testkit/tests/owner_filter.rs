@@ -15,9 +15,8 @@
 //! it changes nothing there and does not select from it).
 //!
 //! A statement is any string literal that begins with `SELECT`, `INSERT`,
-//! `REPLACE`, `UPDATE`, `DELETE` or `WITH`, in any case (ED4), and the
-//! rules read its text case-insensitively too, where a miss would let it
-//! pass.
+//! `REPLACE`, `UPDATE`, `DELETE` or `WITH`, in any case (ED4), and every
+//! rule reads its text in any case too.
 //!
 //! A statement that does not prepare, a `{CONST}` that does not resolve,
 //! or a source with fewer statements than it has fails the test too, so a
@@ -341,9 +340,11 @@ fn without_sql_comments(sql: &str) -> String {
 /// (A1). A comma right after `owners` (`FROM owners, hosts`) is the next
 /// item of an old-style join, not an alias: the comma is kept as its own
 /// token so the next word is never mistaken for one (3b-iii review re-review
-/// N1; ED6).
+/// N1; ED6). Keywords and names are read in any case (ED4): a `from hosts`
+/// missed for its case would leave `owners`, named only in a subquery, as
+/// the statement's only table, and `hosts`' own `id` would count.
 fn compares_owner_with_a_parameter(sql: &str) -> bool {
-    let sql = without_sql_comments(sql);
+    let sql = without_sql_comments(sql).to_ascii_lowercase();
     let tokens: Vec<&str> = sql
         .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')'))
         .filter(|t| !t.is_empty())
@@ -360,18 +361,17 @@ fn compares_owner_with_a_parameter(sql: &str) -> bool {
             parts
         })
         .collect();
-    // The tables this statement names (`FROM`/`JOIN`/`UPDATE`/`INSERT
-    // INTO`), and any alias declared right after `owners` there. Textual,
+    // The tables this statement names (`FROM`/`JOIN`/`UPDATE`/`INTO`, the
+    // last of `INSERT`, `REPLACE` and `INSERT OR REPLACE`), and any alias declared right after `owners` there. Textual,
     // like the rest of this check: it does not track a subquery's own
     // scope, only the word that follows a source keyword.
     let mut tables: BTreeSet<&str> = BTreeSet::new();
     let mut owners_aliases: BTreeSet<&str> = BTreeSet::new();
     const NOT_AN_ALIAS: &[&str] = &[
-        "WHERE", "ON", "SET", "VALUES", "JOIN", "ORDER", "GROUP", "LIMIT", "AS", "SELECT", ",",
+        "where", "on", "set", "values", "join", "order", "group", "limit", "as", "select", ",",
     ];
     for i in 0..tokens.len() {
-        let names_a_table = matches!(tokens[i], "FROM" | "JOIN" | "UPDATE")
-            || (tokens[i] == "INTO" && i > 0 && tokens[i - 1] == "INSERT");
+        let names_a_table = matches!(tokens[i], "from" | "join" | "update" | "into");
         if !names_a_table {
             continue;
         }
@@ -382,7 +382,7 @@ fn compares_owner_with_a_parameter(sql: &str) -> bool {
         }
         owners_aliases.insert(table);
         let next = tokens.get(i + 2).copied();
-        let alias = if next == Some("AS") {
+        let alias = if next == Some("as") {
             tokens.get(i + 3).copied()
         } else {
             next
@@ -602,6 +602,11 @@ fn the_audit_catches_a_query_without_the_owner() {
         // tables as the schema does (`events`), whatever case the statement
         // wrote them in.
         "SELECT body FROM EVENTS WHERE event_id = ?1",
+        // ED3's hosts case with its outer keywords in lowercase: the A1
+        // rule must not miss `from hosts`, take `owners` (named only in the
+        // subquery) for the statement's only table, and so count `hosts`'
+        // own `id = ?1` as the owner comparison.
+        "select name from hosts where id = ?1 and owner_id in (SELECT id FROM owners)",
         "insert into events(session_id, kind, body, ts, owner_id)
          select session_id, kind, body, ts, ?1 from events where event_id = ?2",
         "insert into events(session_id, kind, body, ts, owner_id)
@@ -634,6 +639,7 @@ fn the_audit_catches_a_query_without_the_owner() {
          SELECT ?1, ?2, 'x', 0, 0, 0 FROM password_credentials WHERE owner_id = ?2 AND phc = ?3",
         "SELECT 1",
         "select body from events where event_id = ?1 and owner_id = ?2",
+        "select set_up_at from Owners o where O.ID = ?1",
         "REPLACE INTO session_catalog(session_id, config_options, updated_at, owner_id) VALUES (?1, ?2, ?3, ?4)",
         "INSERT OR REPLACE INTO session_catalog(session_id, config_options, updated_at, owner_id)
          VALUES (?1, ?2, ?3, ?4)",
