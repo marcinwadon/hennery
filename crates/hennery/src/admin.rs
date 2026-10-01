@@ -20,7 +20,7 @@ pub struct AdminArgs {
     #[arg(long, env = "HENNERY_DATA_DIR")]
     data_dir: PathBuf,
     /// How long to wait for the collector, in milliseconds: for tests.
-    #[arg(long, env = "HENNERY_ADMIN_TIMEOUT_MS", hide = true)]
+    #[arg(long, env = "HENNERY_ADMIN_TIMEOUT_MS", hide = true, value_parser = clap::value_parser!(u64).range(1..=600_000))]
     timeout_ms: Option<u64>,
     #[command(subcommand)]
     command: AdminCommand,

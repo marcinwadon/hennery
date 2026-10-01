@@ -58,6 +58,10 @@ async fn a_connection_closed_without_a_request_is_not_warned_about() {
         request(&socket, &AdminRequest::SetupUrl).await.unwrap(),
         AdminResponse::SetupUrl { .. }
     ));
+    // Let the closed connection's task finish too, before the log is read.
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
     let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
     assert!(log.contains("admin command"), "{log}");
     assert!(!log.contains("WARN"), "{log}");

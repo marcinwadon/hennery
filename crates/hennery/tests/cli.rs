@@ -2374,6 +2374,9 @@ fn admin_gives_up_on_a_collector_that_never_answers() {
         let _ = child.wait();
     }
     done.send(()).unwrap();
+    // Unblocks `accept` if the client never connected, so the join cannot
+    // hang the test.
+    let _ = std::os::unix::net::UnixStream::connect(&socket);
     mute.join().unwrap();
     let status = status.expect("`hennery admin hosts` still waited for an answer");
     let mut stderr = Vec::new();
@@ -2398,7 +2401,11 @@ fn max_socket_path_bytes() -> usize {
 /// whose collector's, one directory down, does not.
 #[test]
 fn admin_names_a_socket_path_too_long_for_a_unix_socket() {
-    let dir = scratch_dir("adminlong");
+    // Under /tmp, not the temporary directory: a long `TMPDIR` could leave
+    // no room to pad the paths below to exactly one byte too long.
+    let dir = std::path::Path::new("/tmp").join(format!("hennery-cli-adminlong-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
     let _cleanup = RemoveDir(dir.clone());
     let max = max_socket_path_bytes();
     let long = dir.join("d".repeat(max));
