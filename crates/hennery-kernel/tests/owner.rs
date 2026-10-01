@@ -194,14 +194,24 @@ fn a_3b_ii_database_keeps_its_owner_or_gets_one() {
         for table in ["hosts", "pairing_codes"] {
             assert_eq!(owners_of(&conn, table), vec![owner.clone()], "{table}");
         }
-        // Every column of the rebuilt rows, by name: what was inserted,
-        // and the owner.
+        // Every column of the rebuilt rows, by name: what was inserted, the
+        // owner, and for the host the owner's default hat (plan 5a).
+        let default_hat: String = conn
+            .query_row(
+                "SELECT value FROM settings WHERE owner_id = ?1 AND key = 'default_hat_id'",
+                [&owner],
+                |r| r.get(0),
+            )
+            .unwrap();
         for (table, inserted) in [("hosts", host_old()), ("pairing_codes", code_old())] {
             let mut expected: std::collections::BTreeMap<String, Value> = inserted
                 .into_iter()
                 .map(|(name, value)| (name.to_string(), value))
                 .collect();
             expected.insert("owner_id".into(), Value::Text(owner.clone()));
+            if table == "hosts" {
+                expected.insert("default_hat_id".into(), Value::Text(default_hat.clone()));
+            }
             assert_eq!(named_rows(&conn, table), vec![expected], "{table}");
         }
         let hosts = Hosts::open(&db).unwrap();
