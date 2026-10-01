@@ -42,7 +42,7 @@ const SOURCES: &[(&str, &str, usize)] = &[
     (
         "hennery-kernel/src/passkeys.rs",
         include_str!("../../hennery-kernel/src/passkeys.rs"),
-        5,
+        11,
     ),
     (
         "hennery-kernel/src/hosts.rs",

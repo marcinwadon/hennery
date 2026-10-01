@@ -594,6 +594,16 @@ pub const SESSION_COOKIE: &str = "hennery_session";
 /// The longest `User-Agent` kept with a session, in characters.
 const MAX_USER_AGENT: usize = 256;
 
+/// `user_agent` as a session keeps it: no control characters, at most
+/// `MAX_USER_AGENT` characters.
+pub(crate) fn kept_user_agent(user_agent: &str) -> String {
+    user_agent
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_USER_AGENT)
+        .collect()
+}
+
 /// A request's session, once its cookie checks out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Authenticated {
@@ -634,11 +644,7 @@ impl Operator {
     /// setup, when the owner has no password.
     pub fn open_session(&self, user_agent: &str, verified: &str, now: i64) -> Result<Option<String>> {
         let token = hex::encode(random_bytes::<32>());
-        let user_agent: String = user_agent
-            .chars()
-            .filter(|c| !c.is_control())
-            .take(MAX_USER_AGENT)
-            .collect();
+        let user_agent = kept_user_agent(user_agent);
         let conn = self.conn();
         conn.execute(
             "DELETE FROM auth_sessions WHERE expires_at <= ?1 AND owner_id = ?2",

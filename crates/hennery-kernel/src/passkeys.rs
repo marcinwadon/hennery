@@ -14,16 +14,16 @@
 //!   a stepped-up session (decision 7), and removing one always leaves the
 //!   password. Every query names the owner (kernel spec §1).
 
-use crate::operator::{Operator, PublicUrl, STEP_UP_SECS};
-use crate::secret::random_bytes;
+use crate::operator::{Operator, PublicUrl, SESSION_TTL_SECS, STEP_UP_SECS, kept_user_agent};
+use crate::secret::{random_bytes, sha256_hex};
 use anyhow::Result;
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use webauthn_rs::prelude::{
-    Passkey, PasskeyAuthentication, PasskeyRegistration, RegisterPublicKeyCredential, Url, Uuid, Webauthn,
-    WebauthnBuilder,
+    AuthenticationResult, Passkey, PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential,
+    RegisterPublicKeyCredential, Url, Uuid, Webauthn, WebauthnBuilder, WebauthnError,
 };
 
 /// How long a ceremony may take from its start to its finish, and the
@@ -242,8 +242,13 @@ pub enum Refused {
     /// The credential is registered already, to this owner or another
     /// (decision 3).
     AlreadyRegistered,
-    /// The passkey is gone, or its counter did not move on (decision 6).
+    /// The passkey is gone: removed since the ceremony began, or not the
+    /// owner's.
     Passkey,
+    /// The passkey's counter did not move on: it may have been cloned
+    /// (decision 6). Logged at `warn` with the passkey's id, whichever check
+    /// caught it (3c review, A3).
+    CounterWentBack,
     /// `public_url` no longer names a host (decision 1).
     Unavailable,
 }
@@ -263,6 +268,50 @@ fn label_problem(label: &str) -> Option<String> {
 /// How a credential id is stored: lowercase hex of its bytes.
 fn stored_id(id: &[u8]) -> String {
     hex::encode(id)
+}
+
+/// Whether an authenticator's signature counter `sent` may follow
+/// `stored`, the one last accepted (decision 6): it must move on, unless
+/// both are 0, as they stay for an authenticator with no counter (synced
+/// passkeys). One that does not may be a clone.
+pub fn counter_moves_on(stored: u32, sent: u32) -> bool {
+    sent > stored || (stored == 0 && sent == 0)
+}
+
+/// The browser's answer to an authentication, checked against `state`.
+/// `webauthn-rs` checks the counter against the ceremony's snapshot first,
+/// and refuses one that did not move on as `CredentialPossibleCompromise`:
+/// the path a real clone takes. That is logged as `record_use` logs its
+/// own check, with the passkey's id, read from `conn` (3c review, A3).
+fn verify_assertion(
+    conn: &rusqlite::Connection,
+    owner: &str,
+    rp: &Webauthn,
+    state: &PasskeyAuthentication,
+    credential: &serde_json::Value,
+) -> Result<std::result::Result<AuthenticationResult, Refused>> {
+    let credential: PublicKeyCredential = match serde_json::from_value(credential.clone()) {
+        Ok(credential) => credential,
+        Err(err) => return Ok(Err(Refused::Credential(format!("malformed: {err}")))),
+    };
+    match rp.finish_passkey_authentication(&credential, state) {
+        Ok(result) => Ok(Ok(result)),
+        Err(WebauthnError::CredentialPossibleCompromise) => {
+            let id: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM passkeys WHERE credential_id = ?1 AND owner_id = ?2",
+                    params![stored_id(credential.raw_id.as_ref()), owner],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            tracing::warn!(
+                passkey = ?id,
+                "a passkey's counter did not move on, so it may have been cloned: refused"
+            );
+            Ok(Err(Refused::CounterWentBack))
+        }
+        Err(err) => Ok(Err(Refused::Credential(err.to_string()))),
+    }
 }
 
 impl Operator {
@@ -422,6 +471,181 @@ impl Operator {
         )?;
         Ok(removed > 0)
     }
+
+    /// Begin an authentication over every passkey of the owner's.
+    fn begin_authentication(
+        &self,
+        ceremony: impl FnOnce(PasskeyAuthentication) -> Ceremony,
+        now: i64,
+    ) -> Result<Start> {
+        let Some(rp) = self.relying_party() else {
+            return Ok(Start::Unavailable);
+        };
+        let passkeys = self.owner_passkeys()?;
+        if passkeys.is_empty() {
+            return Ok(Start::NoPasskeys);
+        }
+        let (options, state) = rp.start_passkey_authentication(&passkeys)?;
+        Ok(Start::Begun {
+            ceremony_id: self.ceremonies.begin(ceremony(state), now),
+            options: serde_json::to_value(options)?,
+        })
+    }
+
+    /// Begin signing in with a passkey (decision 8).
+    pub fn start_passkey_login(&self, now: i64) -> Result<Start> {
+        self.begin_authentication(|state| Ceremony::Login { state }, now)
+    }
+
+    /// Finish the login `ceremony_id` names with the browser's
+    /// `credential` (`PublicKeyCredential` as JSON), and open a session:
+    /// its token, the cookie's value. The session starts stepped up, as a
+    /// password login's does. The passkey's counter moves on and the
+    /// session opens in one transaction, and only while the passkey is
+    /// still stored: one removed since the ceremony began opens nothing.
+    pub fn finish_passkey_login(
+        &self,
+        ceremony_id: &str,
+        credential: &serde_json::Value,
+        user_agent: &str,
+        now: i64,
+    ) -> Result<std::result::Result<String, Refused>> {
+        let Some(Ceremony::Login { state }) = self.ceremonies.take(ceremony_id, now) else {
+            return Ok(Err(Refused::Ceremony));
+        };
+        // Held from the relying party's read to the commit (3c review, A4),
+        // as in every finish.
+        let mut conn = self.conn();
+        let Some(rp) = self.relying_party() else {
+            return Ok(Err(Refused::Unavailable));
+        };
+        let result = match verify_assertion(&conn, self.owner_id(), &rp, &state, credential)? {
+            Ok(result) => result,
+            Err(why) => return Ok(Err(why)),
+        };
+        let token = hex::encode(random_bytes::<32>());
+        let tx = conn.transaction()?;
+        if let Err(why) = record_use(&tx, self.owner_id(), &result, now)? {
+            return Ok(Err(why));
+        }
+        tx.execute(
+            "DELETE FROM auth_sessions WHERE expires_at <= ?1 AND owner_id = ?2",
+            params![now, self.owner_id()],
+        )?;
+        tx.execute(
+            "INSERT INTO auth_sessions(id_hash, owner_id, user_agent, created_at, last_seen_at, last_step_up_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?4, ?4, ?5)",
+            params![
+                sha256_hex(token.as_bytes()),
+                self.owner_id(),
+                kept_user_agent(user_agent),
+                now,
+                now + SESSION_TTL_SECS
+            ],
+        )?;
+        tx.commit()?;
+        Ok(Ok(token))
+    }
+
+    /// Begin stepping the session `session_id` up with a passkey (kernel
+    /// spec §3.4, decision 8).
+    pub fn start_passkey_step_up(&self, session_id: &str, now: i64) -> Result<Start> {
+        let session_id = session_id.to_string();
+        self.begin_authentication(|state| Ceremony::StepUp { session_id, state }, now)
+    }
+
+    /// Finish the step-up `ceremony_id` names, begun by `session_id`, and
+    /// record it on the session, in one transaction with the passkey's
+    /// counter. `Ok(false)` when the session has ended meanwhile.
+    pub fn finish_passkey_step_up(
+        &self,
+        session_id: &str,
+        ceremony_id: &str,
+        credential: &serde_json::Value,
+        now: i64,
+    ) -> Result<std::result::Result<bool, Refused>> {
+        let Some(Ceremony::StepUp {
+            session_id: begun_by,
+            state,
+        }) = self.ceremonies.take(ceremony_id, now)
+        else {
+            return Ok(Err(Refused::Ceremony));
+        };
+        if begun_by != session_id {
+            return Ok(Err(Refused::Ceremony));
+        }
+        // Held from the relying party's read to the commit (3c review, A4).
+        let mut conn = self.conn();
+        let Some(rp) = self.relying_party() else {
+            return Ok(Err(Refused::Unavailable));
+        };
+        let result = match verify_assertion(&conn, self.owner_id(), &rp, &state, credential)? {
+            Ok(result) => result,
+            Err(why) => return Ok(Err(why)),
+        };
+        let tx = conn.transaction()?;
+        if let Err(why) = record_use(&tx, self.owner_id(), &result, now)? {
+            return Ok(Err(why));
+        }
+        let stepped_up = tx.execute(
+            "UPDATE auth_sessions SET last_step_up_at = ?2 WHERE id_hash = ?1 AND owner_id = ?3",
+            params![session_id, now, self.owner_id()],
+        )?;
+        if stepped_up == 0 {
+            return Ok(Ok(false));
+        }
+        tx.commit()?;
+        Ok(Ok(true))
+    }
+}
+
+/// Move the counter of the passkey `result` names on, and mark it used at
+/// `now`, in `tx` (decision 6). Refused, changing nothing, when the owner
+/// has no such passkey (removed since the ceremony began) or its counter
+/// did not move on. The counter is compared and set in one statement.
+fn record_use(
+    tx: &rusqlite::Transaction<'_>,
+    owner: &str,
+    result: &AuthenticationResult,
+    now: i64,
+) -> Result<std::result::Result<(), Refused>> {
+    let stored: Option<(String, String, i64)> = tx
+        .query_row(
+            "SELECT id, credential, sign_count FROM passkeys WHERE credential_id = ?1 AND owner_id = ?2",
+            params![stored_id(result.cred_id().as_ref()), owner],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((id, credential, sign_count)) = stored else {
+        return Ok(Err(Refused::Passkey));
+    };
+    if !counter_moves_on(sign_count as u32, result.counter()) {
+        tracing::warn!(
+            passkey = %id,
+            stored = sign_count,
+            sent = result.counter(),
+            "a passkey's counter did not move on, so it may have been cloned: refused"
+        );
+        return Ok(Err(Refused::CounterWentBack));
+    }
+    let mut passkey: Passkey = serde_json::from_str(&credential)?;
+    passkey.update_credential(result);
+    let updated = tx.execute(
+        "UPDATE passkeys SET credential = ?1, sign_count = ?2, last_used_at = ?3
+         WHERE id = ?4 AND owner_id = ?5 AND sign_count = ?6",
+        params![
+            serde_json::to_string(&passkey)?,
+            result.counter(),
+            now,
+            id,
+            owner,
+            sign_count
+        ],
+    )?;
+    if updated != 1 {
+        return Ok(Err(Refused::Passkey));
+    }
+    Ok(Ok(()))
 }
 
 #[cfg(test)]

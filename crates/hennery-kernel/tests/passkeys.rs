@@ -3,12 +3,14 @@
 
 use hennery_kernel::operator::{Operator, PublicUrl, STEP_UP_SECS, SetupOutcome};
 use hennery_kernel::passkeys::{
-    CEREMONY_TTL_SECS, MAX_LABEL_CHARS, PasskeyRecord, Refused, Start, relying_party, user_handle,
+    CEREMONY_TTL_SECS, MAX_LABEL_CHARS, PasskeyRecord, Refused, Start, counter_moves_on, relying_party, user_handle,
 };
 use std::path::Path;
 use webauthn_authenticator_rs::WebauthnAuthenticator;
 use webauthn_authenticator_rs::softpasskey::SoftPasskey;
-use webauthn_rs::prelude::{CreationChallengeResponse, RegisterPublicKeyCredential, Url, Uuid};
+use webauthn_rs::prelude::{
+    CreationChallengeResponse, RegisterPublicKeyCredential, RequestChallengeResponse, Url, Uuid,
+};
 
 const NOW: i64 = 1_800_000_000;
 const PASSWORD: &str = "correct horse battery";
@@ -430,4 +432,399 @@ fn another_owners_passkeys_are_invisible_to_registration_and_the_list() {
         })
         .unwrap();
     assert_eq!(still_there, 1);
+}
+
+/// The authenticator's answer to `options`, made at `origin`.
+fn assert_with(
+    authenticator: &mut WebauthnAuthenticator<SoftPasskey>,
+    origin: &str,
+    options: serde_json::Value,
+) -> serde_json::Value {
+    let options: RequestChallengeResponse = serde_json::from_value(options).unwrap();
+    let assertion = authenticator
+        .do_authentication(Url::parse(origin).unwrap(), options)
+        .unwrap();
+    serde_json::to_value(assertion).unwrap()
+}
+
+/// A login begun at `now`: its ceremony id and the authenticator's answer,
+/// made at `origin`.
+fn begin_login(
+    op: &Operator,
+    authenticator: &mut WebauthnAuthenticator<SoftPasskey>,
+    origin: &str,
+    now: i64,
+) -> (String, serde_json::Value) {
+    let Start::Begun { ceremony_id, options } = op.start_passkey_login(now).unwrap() else {
+        panic!("the login did not begin");
+    };
+    // 3c review, O2: user verification is required.
+    assert_eq!(options["publicKey"]["userVerification"], "required");
+    (ceremony_id, assert_with(authenticator, origin, options))
+}
+
+/// A step-up of `session_id` begun at `now`, answered at `PUBLIC_URL`.
+fn begin_step_up(
+    op: &Operator,
+    session_id: &str,
+    authenticator: &mut WebauthnAuthenticator<SoftPasskey>,
+    now: i64,
+) -> (String, serde_json::Value) {
+    let Start::Begun { ceremony_id, options } = op.start_passkey_step_up(session_id, now).unwrap() else {
+        panic!("the step-up did not begin");
+    };
+    assert_eq!(options["publicKey"]["userVerification"], "required");
+    (ceremony_id, assert_with(authenticator, PUBLIC_URL, options))
+}
+
+/// Decision 6: the counter must move on, unless it stays at 0.
+#[test]
+fn a_counter_must_move_on_unless_it_stays_at_zero() {
+    for (stored, sent, accepted) in [
+        (0, 0, true),
+        (0, 1, true),
+        (5, 6, true),
+        (5, 5, false),
+        (5, 4, false),
+        (5, 0, false),
+        (u32::MAX - 1, u32::MAX, true),
+    ] {
+        assert_eq!(counter_moves_on(stored, sent), accepted, "{stored} then {sent}");
+    }
+}
+
+/// Decision 8: a passkey signs the owner in, stepped up, and is marked
+/// used.
+#[test]
+fn a_passkey_signs_in_stepped_up_and_is_marked_used() {
+    let op = Operator::open_in_memory().unwrap();
+    let session_id = set_up(&op, PUBLIC_URL);
+    let mut passkey = authenticator();
+    let record = register(&op, &session_id, &mut passkey, "laptop");
+    let later = NOW + 60;
+    let (ceremony_id, assertion) = begin_login(&op, &mut passkey, PUBLIC_URL, later);
+    let token = op
+        .finish_passkey_login(&ceremony_id, &assertion, "Firefox\n", later)
+        .unwrap()
+        .unwrap();
+    let session = op.authenticate(&token, later).unwrap().unwrap();
+    assert!(session.stepped_up(later));
+    let listed = op.sessions(later).unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|s| s.id == session.session_id && s.user_agent == "Firefox")
+    );
+    assert_eq!(op.passkeys().unwrap()[0].last_used_at, Some(later));
+    assert_eq!(op.passkeys().unwrap()[0].id, record.id);
+}
+
+/// Kernel spec §3.4: a passkey check steps a session up, as a password
+/// check does.
+#[test]
+fn a_passkey_steps_a_session_up() {
+    let op = Operator::open_in_memory().unwrap();
+    let setup_session = set_up(&op, PUBLIC_URL);
+    let mut passkey = authenticator();
+    register(&op, &setup_session, &mut passkey, "laptop");
+    let phc = op.verify_password(PASSWORD).unwrap().unwrap();
+    let token = op.open_session("old", &phc, NOW - 600).unwrap().unwrap();
+    let stale = op.authenticate(&token, NOW).unwrap().unwrap();
+    assert!(!stale.stepped_up(NOW));
+    let (ceremony_id, assertion) = begin_step_up(&op, &stale.session_id, &mut passkey, NOW);
+    assert_eq!(
+        op.finish_passkey_step_up(&stale.session_id, &ceremony_id, &assertion, NOW)
+            .unwrap(),
+        Ok(true)
+    );
+    assert!(op.authenticate(&token, NOW).unwrap().unwrap().stepped_up(NOW));
+    // A session that has ended is not stepped up, and the counter stays.
+    let (ceremony_id, assertion) = begin_step_up(&op, &stale.session_id, &mut passkey, NOW);
+    assert!(op.revoke_session(&stale.session_id, NOW).unwrap());
+    let used = op.passkeys().unwrap()[0].last_used_at;
+    assert_eq!(
+        op.finish_passkey_step_up(&stale.session_id, &ceremony_id, &assertion, NOW + 1)
+            .unwrap(),
+        Ok(false)
+    );
+    assert_eq!(op.passkeys().unwrap()[0].last_used_at, used);
+}
+
+/// Decision 5: an authentication ceremony is taken once, for its own kind,
+/// by its own session, within its time.
+#[test]
+fn an_authentication_ceremony_is_single_use_and_of_its_kind() {
+    let op = Operator::open_in_memory().unwrap();
+    let session_id = set_up(&op, PUBLIC_URL);
+    let mut passkey = authenticator();
+    register(&op, &session_id, &mut passkey, "laptop");
+
+    // A finished login cannot be finished again.
+    let (ceremony_id, assertion) = begin_login(&op, &mut passkey, PUBLIC_URL, NOW);
+    assert!(
+        op.finish_passkey_login(&ceremony_id, &assertion, "", NOW)
+            .unwrap()
+            .is_ok()
+    );
+    assert_eq!(
+        op.finish_passkey_login(&ceremony_id, &assertion, "", NOW).unwrap(),
+        Err(Refused::Ceremony)
+    );
+    // A login ceremony does not step up, and is used up trying.
+    let (ceremony_id, assertion) = begin_login(&op, &mut passkey, PUBLIC_URL, NOW);
+    assert_eq!(
+        op.finish_passkey_step_up(&session_id, &ceremony_id, &assertion, NOW)
+            .unwrap(),
+        Err(Refused::Ceremony)
+    );
+    assert_eq!(
+        op.finish_passkey_login(&ceremony_id, &assertion, "", NOW).unwrap(),
+        Err(Refused::Ceremony)
+    );
+    // A step-up ceremony neither signs in nor steps up another session.
+    let (ceremony_id, assertion) = begin_step_up(&op, &session_id, &mut passkey, NOW);
+    assert_eq!(
+        op.finish_passkey_login(&ceremony_id, &assertion, "", NOW).unwrap(),
+        Err(Refused::Ceremony)
+    );
+    let (ceremony_id, assertion) = begin_step_up(&op, &session_id, &mut passkey, NOW);
+    // ED1: a made-up session id would not exercise the session-mismatch
+    // check (A2-style checks could refuse it anyway); use a real second
+    // session, as the registration test does.
+    let phc = op.verify_password(PASSWORD).unwrap().unwrap();
+    let other_token = op.open_session("other", &phc, NOW).unwrap().unwrap();
+    let other_session = op.authenticate(&other_token, NOW).unwrap().unwrap().session_id;
+    assert_eq!(
+        op.finish_passkey_step_up(&other_session, &ceremony_id, &assertion, NOW)
+            .unwrap(),
+        Err(Refused::Ceremony)
+    );
+    // A registration ceremony does not sign in.
+    let (ceremony_id, credential) = begin_registration(&op, &session_id, &mut authenticator(), PUBLIC_URL, "x");
+    assert_eq!(
+        op.finish_passkey_login(&ceremony_id, &credential, "", NOW).unwrap(),
+        Err(Refused::Ceremony)
+    );
+    // An expired login is refused.
+    let (ceremony_id, assertion) = begin_login(&op, &mut passkey, PUBLIC_URL, NOW);
+    assert_eq!(
+        op.finish_passkey_login(&ceremony_id, &assertion, "", NOW + CEREMONY_TTL_SECS)
+            .unwrap(),
+        Err(Refused::Ceremony)
+    );
+}
+
+/// Kernel spec §3.2: an answer made at another origin is refused and
+/// opens nothing.
+#[test]
+fn an_assertion_from_another_origin_signs_nobody_in() {
+    let op = Operator::open_in_memory().unwrap();
+    let session_id = set_up(&op, PUBLIC_URL);
+    let mut passkey = authenticator();
+    register(&op, &session_id, &mut passkey, "laptop");
+    let sessions = op.sessions(NOW).unwrap().len();
+    for origin in ["https://sub.hennery.example", "https://hennery.example:8443"] {
+        let (ceremony_id, assertion) = begin_login(&op, &mut passkey, origin, NOW);
+        assert!(matches!(
+            op.finish_passkey_login(&ceremony_id, &assertion, "", NOW).unwrap(),
+            Err(Refused::Credential(_))
+        ));
+    }
+    assert_eq!(op.sessions(NOW).unwrap().len(), sessions);
+    assert_eq!(op.passkeys().unwrap()[0].last_used_at, None);
+}
+
+/// 3c review, O2: user verification is required by the server too, not
+/// only asked for. The options handed to the software passkey are relaxed
+/// to `discouraged`, so it answers without the UV flag; the operator's
+/// finishes refuse that answer, and nothing is stored or opened.
+///
+/// ED2: the refusal's reason must name user verification, not just be any
+/// `Credential` refusal: `webauthn-rs` (pinned `=0.5.5`) refuses a missing
+/// UV flag with `WebauthnError::UserNotVerified`, whose message is "The
+/// user verified bit is not set, and required by policy" (checked against
+/// `webauthn-rs-core-0.5.5/src/error.rs` and the `UserNotVerified` call
+/// sites in `core.rs`'s registration and authentication finishes).
+#[test]
+fn an_answer_without_user_verification_is_refused() {
+    let op = Operator::open_in_memory().unwrap();
+    let session_id = set_up(&op, PUBLIC_URL);
+    let Start::Begun {
+        ceremony_id,
+        mut options,
+    } = op.start_passkey_registration(&session_id, "laptop", NOW).unwrap()
+    else {
+        panic!("the registration did not begin");
+    };
+    options["publicKey"]["authenticatorSelection"]["userVerification"] = "discouraged".into();
+    let options: CreationChallengeResponse = serde_json::from_value(options).unwrap();
+    let credential = authenticator()
+        .do_registration(Url::parse(PUBLIC_URL).unwrap(), options)
+        .unwrap();
+    let refused = op
+        .finish_passkey_registration(
+            &session_id,
+            &ceremony_id,
+            &serde_json::to_value(credential).unwrap(),
+            NOW,
+        )
+        .unwrap();
+    let Err(Refused::Credential(reason)) = &refused else {
+        panic!("{refused:?}");
+    };
+    assert!(reason.contains("user verified"), "{reason}");
+    assert!(op.passkeys().unwrap().is_empty());
+
+    let mut passkey = authenticator();
+    register(&op, &session_id, &mut passkey, "laptop");
+    let sessions = op.sessions(NOW).unwrap().len();
+    let Start::Begun {
+        ceremony_id,
+        mut options,
+    } = op.start_passkey_login(NOW).unwrap()
+    else {
+        panic!("the login did not begin");
+    };
+    options["publicKey"]["userVerification"] = "discouraged".into();
+    let assertion = assert_with(&mut passkey, PUBLIC_URL, options);
+    let refused = op.finish_passkey_login(&ceremony_id, &assertion, "", NOW).unwrap();
+    let Err(Refused::Credential(reason)) = &refused else {
+        panic!("{refused:?}");
+    };
+    assert!(reason.contains("user verified"), "{reason}");
+    assert_eq!(op.sessions(NOW).unwrap().len(), sessions);
+}
+
+/// Decision 6 (3c review, A3): an assertion whose counter is not above the
+/// one stored (a cloned authenticator's) is refused as `CounterWentBack`,
+/// opens no session and changes nothing. The soft passkey's counter only
+/// goes up, so the stored one is raised behind the operator's back, in
+/// three ways:
+/// - in the credential's JSON only: the ceremony's snapshot carries it,
+///   and `webauthn-rs` refuses first (`CredentialPossibleCompromise`), the
+///   path a real clone takes;
+/// - in `sign_count` only: `webauthn-rs` passes, and hennery's own check
+///   in the transaction refuses, the path of two ceremonies begun
+///   together;
+/// - in both.
+#[test]
+fn a_counter_that_does_not_move_on_is_refused() {
+    for (json, column) in [(true, false), (false, true), (true, true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hennery.db");
+        let (op, session_id) = on_file(&path);
+        let mut passkey = authenticator();
+        register(&op, &session_id, &mut passkey, "laptop");
+        let (ceremony_id, assertion) = begin_login(&op, &mut passkey, PUBLIC_URL, NOW);
+        op.finish_passkey_login(&ceremony_id, &assertion, "", NOW)
+            .unwrap()
+            .unwrap();
+        let stored = |conn: &rusqlite::Connection| -> (i64, i64) {
+            conn.query_row(
+                "SELECT sign_count, json_extract(credential, '$.cred.counter') FROM passkeys",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap()
+        };
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        assert_eq!(stored(&conn), (1, 1));
+        if json {
+            conn.execute(
+                "UPDATE passkeys SET credential = json_set(credential, '$.cred.counter', 100)",
+                [],
+            )
+            .unwrap();
+        }
+        if column {
+            conn.execute("UPDATE passkeys SET sign_count = 100", []).unwrap();
+        }
+        let before = stored(&conn);
+
+        let sessions = op.sessions(NOW).unwrap().len();
+        let (ceremony_id, assertion) = begin_login(&op, &mut passkey, PUBLIC_URL, NOW + 1);
+        assert_eq!(
+            op.finish_passkey_login(&ceremony_id, &assertion, "", NOW + 1).unwrap(),
+            Err(Refused::CounterWentBack),
+            "json {json}, column {column}"
+        );
+        let (ceremony_id, assertion) = begin_step_up(&op, &session_id, &mut passkey, NOW + 1);
+        assert_eq!(
+            op.finish_passkey_step_up(&session_id, &ceremony_id, &assertion, NOW + 1)
+                .unwrap(),
+            Err(Refused::CounterWentBack),
+            "json {json}, column {column}"
+        );
+        assert_eq!(op.sessions(NOW).unwrap().len(), sessions);
+        assert_eq!(stored(&conn), before);
+        assert_eq!(op.passkeys().unwrap()[0].last_used_at, Some(NOW));
+    }
+}
+
+/// Decision 8: the ceremony holds the passkeys as they were when it began.
+/// One removed before its finish signs nobody in and steps nothing up.
+#[test]
+fn a_passkey_removed_during_its_ceremony_is_refused() {
+    let op = Operator::open_in_memory().unwrap();
+    let session_id = set_up(&op, PUBLIC_URL);
+    let mut passkey = authenticator();
+    let record = register(&op, &session_id, &mut passkey, "laptop");
+    let (login, login_assertion) = begin_login(&op, &mut passkey, PUBLIC_URL, NOW);
+    let (step_up, step_up_assertion) = begin_step_up(&op, &session_id, &mut passkey, NOW);
+    let sessions = op.sessions(NOW).unwrap().len();
+    assert!(op.remove_passkey(&record.id).unwrap());
+    assert_eq!(
+        op.finish_passkey_login(&login, &login_assertion, "", NOW).unwrap(),
+        Err(Refused::Passkey)
+    );
+    assert_eq!(
+        op.finish_passkey_step_up(&session_id, &step_up, &step_up_assertion, NOW)
+            .unwrap(),
+        Err(Refused::Passkey)
+    );
+    assert_eq!(op.sessions(NOW).unwrap().len(), sessions);
+}
+
+#[test]
+fn without_a_passkey_there_is_nothing_to_sign_in_with() {
+    let op = Operator::open_in_memory().unwrap();
+    assert_eq!(op.start_passkey_login(NOW).unwrap(), Start::Unavailable);
+    let session_id = set_up(&op, PUBLIC_URL);
+    assert_eq!(op.start_passkey_login(NOW).unwrap(), Start::NoPasskeys);
+    assert_eq!(op.start_passkey_step_up(&session_id, NOW).unwrap(), Start::NoPasskeys);
+    assert!(op.ceremonies.is_empty());
+}
+
+/// Another owner's passkey is not offered at login, and an answer made
+/// with it signs nobody in, even from a ceremony begun while it was the
+/// owner's. (Asked for the owner's passkeys only, the soft passkey that
+/// holds the other's has nothing to answer with, as a real one would.)
+#[test]
+fn another_owners_passkey_signs_nobody_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hennery.db");
+    let (op, session_id) = on_file(&path);
+    another_owner(&path);
+    let mut mine = authenticator();
+    let mut theirs = authenticator();
+    register(&op, &session_id, &mut mine, "mine");
+    let moved = register(&op, &session_id, &mut theirs, "theirs");
+    let (begun_before, assertion) = begin_login(&op, &mut theirs, PUBLIC_URL, NOW);
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "UPDATE passkeys SET owner_id = ?1 WHERE id = ?2",
+            rusqlite::params![OTHER, moved.id],
+        )
+        .unwrap();
+    let sessions = op.sessions(NOW).unwrap().len();
+    assert_eq!(
+        op.finish_passkey_login(&begun_before, &assertion, "", NOW).unwrap(),
+        Err(Refused::Passkey)
+    );
+    let Start::Begun { options, .. } = op.start_passkey_login(NOW).unwrap() else {
+        panic!("the login did not begin");
+    };
+    assert_eq!(options["publicKey"]["allowCredentials"].as_array().unwrap().len(), 1);
+    assert_eq!(op.sessions(NOW).unwrap().len(), sessions);
 }
