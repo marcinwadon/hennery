@@ -519,18 +519,33 @@ async fn join_host(args: JoinArgs) -> Result<()> {
     Ok(())
 }
 
-/// One line of standard input, prompted for on a terminal.
+/// The most bytes of standard input `host join` takes for one code: a code
+/// is 9 characters, so this leaves room for whitespace and nothing else.
+const MAX_CODE_LINE: usize = 256;
+
+/// One line of standard input, prompted for on a terminal. Read only up to
+/// `MAX_CODE_LINE` bytes: a longer line is refused once that many have come,
+/// not waited on to its end, and never echoed.
 fn read_code_from_stdin() -> Result<String> {
-    use std::io::{BufRead, IsTerminal, Write};
+    use std::io::{BufRead, IsTerminal, Read, Write};
     if std::io::stdin().is_terminal() {
         eprint!("Pairing code: ");
         std::io::stderr().flush()?;
     }
-    let mut line = String::new();
+    // One byte over the bound: `MAX_CODE_LINE` bytes and then the newline
+    // is still a line within it.
+    let mut line = Vec::new();
     std::io::stdin()
         .lock()
-        .read_line(&mut line)
+        .take(MAX_CODE_LINE as u64 + 1)
+        .read_until(b'\n', &mut line)
         .context("read the pairing code from standard input")?;
+    if line.len() > MAX_CODE_LINE && line.last() != Some(&b'\n') {
+        bail!("the pairing code on standard input is longer than {MAX_CODE_LINE} bytes");
+    }
+    let Ok(line) = String::from_utf8(line) else {
+        bail!("the pairing code on standard input is not UTF-8");
+    };
     let code = line.trim().to_string();
     if code.is_empty() {
         bail!("no pairing code: give it after the URL, or on standard input");

@@ -1531,16 +1531,11 @@ fn an_unset_collector_writes_its_setup_link_to_a_private_file_and_never_to_its_o
     assert!(stdout.contains(&file.display().to_string()), "{stdout}");
 }
 
-/// 3a's deferred M5: a pairing code on the command line is in the process
-/// list and the shell history, so `host join` also takes it on standard
-/// input when it is left out, and refuses an empty one.
-#[test]
-fn join_reads_the_code_from_standard_input_when_it_is_left_out() {
+/// A collector served in this process on `dir`'s database, with one pairing
+/// code minted: the runtime serving it (keep it alive), its address and the
+/// code.
+fn collector_with_a_pairing_code(dir: &std::path::Path) -> (tokio::runtime::Runtime, std::net::SocketAddr, String) {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let dir = std::env::temp_dir().join(format!("hennery-cli-stdin-code-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let _cleanup = RemoveDir(dir.clone());
     let (addr, code) = rt.block_on(async {
         let db = dir.join("hennery.db");
         let state = hennery_sessions::AppState::new(
@@ -1558,16 +1553,34 @@ fn join_reads_the_code_from_standard_input_when_it_is_left_out() {
         tokio::spawn(hennery_sessions::serve(listener, state));
         (addr, code)
     });
+    (rt, addr, code)
+}
+
+/// `hennery host join` to the collector at `addr`, into `host`, with the
+/// code left out (so read from standard input) and every stream piped.
+fn join_from_stdin(addr: std::net::SocketAddr, host: &std::path::Path) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["host", "join", &format!("http://{addr}"), "--name", "laptop"])
+        .arg("--data-dir")
+        .arg(host)
+        .env_remove("HENNERY_HOST_DATA_DIR")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+/// 3a's deferred M5: a pairing code on the command line is in the process
+/// list and the shell history, so `host join` also takes it on standard
+/// input when it is left out, and refuses an empty one.
+#[test]
+fn join_reads_the_code_from_standard_input_when_it_is_left_out() {
+    let dir = scratch_dir("stdin-code");
+    let _cleanup = RemoveDir(dir.clone());
+    let (_rt, addr, code) = collector_with_a_pairing_code(&dir);
     let join = |stdin: &str| {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_hennery"))
-            .args(["host", "join", &format!("http://{addr}"), "--name", "laptop"])
-            .arg("--data-dir")
-            .arg(dir.join("host"))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = join_from_stdin(addr, &dir.join("host"));
         child.stdin.take().unwrap().write_all(stdin.as_bytes()).unwrap();
         child.wait_with_output().unwrap()
     };
@@ -1584,6 +1597,55 @@ fn join_reads_the_code_from_standard_input_when_it_is_left_out() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(String::from_utf8_lossy(&out.stdout).contains("paired as"));
+}
+
+/// 3a/3b's deferred bound on that read: a line of standard input longer than
+/// any code is refused as soon as the bound is hit, without waiting for a
+/// newline or the end, without echoing it and without pairing; the code it
+/// began with still pairs afterwards.
+#[test]
+fn join_refuses_an_overlong_line_on_standard_input_at_once() {
+    let dir = scratch_dir("stdin-overlong");
+    let _cleanup = RemoveDir(dir.clone());
+    let (_rt, addr, code) = collector_with_a_pairing_code(&dir);
+    let host = dir.join("host");
+    let mut child = join_from_stdin(addr, &host);
+    let mut stdin = child.stdin.take().unwrap();
+    // The real code, then 1 MiB with no newline, and standard input held
+    // open: an unbounded read waits for more forever. The child stops
+    // reading early, so the write may well fail (EPIPE); that is the point.
+    let overlong = format!("{code}{}", "x".repeat(1 << 20));
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(overlong.as_bytes());
+        stdin
+    });
+    let status = wait_with_timeout(&mut child, Duration::from_secs(15));
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(writer.join().unwrap());
+    let mut stderr = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+    let status = status.unwrap_or_else(|| panic!("join kept reading: {stderr}"));
+    assert!(!status.success(), "{stderr}");
+    assert!(
+        stderr.contains("the pairing code on standard input is longer than 256 bytes"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains(&code) && !stderr.contains("xxxxxxxx"),
+        "echoed: {stderr}"
+    );
+    assert!(!host.exists(), "a pairing was stored");
+
+    let mut child = join_from_stdin(addr, &host);
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(format!("{code}\n").as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 /// `POST path` with no body on the collector at `listen`, with the owner's
