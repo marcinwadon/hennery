@@ -1599,6 +1599,166 @@ fn the_code_descriptors_must_be_open_pipes() {
     }
 }
 
+/// Plan 3a's deferred EOF fail-safe (kernel spec §4.2): the collector
+/// child dies before it writes the pairing code, so the host's read of
+/// `--join-code-fd` gets end-of-file. The host must fail, saying so, and
+/// pair nothing: no pairing stored, no host enrolled, although a live code
+/// and a collector to spend it on are there.
+///
+/// The shell makes the pipe and runs `:` as the collector, which exits
+/// without writing: no end of it is ever open in this (multithreaded) test
+/// process, so no spawn on another thread can inherit the writer and hold
+/// the end-of-file back. Only the host's side is pinned here: that `up`
+/// drops its own copies of both ends is what lets the end-of-file arrive.
+#[test]
+fn the_host_fails_and_pairs_nothing_when_the_collector_dies_before_the_code() {
+    let dir = scratch_dir("codeeof");
+    let _cleanup = RemoveDir(dir.clone());
+    let (_rt, addr, _code) = collector_with_a_pairing_code(&dir);
+    let host_dir = dir.join("host");
+    let mut child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            ": | exec \"$0\" \"$@\" 3<&0 </dev/null",
+            env!("CARGO_BIN_EXE_hennery"),
+        ])
+        .args([
+            "host",
+            "run",
+            "--join-url",
+            &format!("http://{addr}"),
+            "--join-code-fd",
+            "3",
+        ])
+        .arg("--data-dir")
+        .arg(&host_dir)
+        .env_remove("HENNERY_HOST_DATA_DIR")
+        .env_remove("HENNERY_DEV_TOKEN")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        // Its own group: on a hang, the whole pipeline is killed below.
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let status = wait_with_timeout(&mut child, Duration::from_secs(30));
+    if status.is_none() {
+        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+    }
+    let _ = child.wait();
+    let mut stderr = String::new();
+    child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+    let status = status.unwrap_or_else(|| panic!("the host hung on the closed pipe: {stderr}"));
+    assert!(!status.success(), "the host ran without a code: {stderr}");
+    assert!(
+        stderr.contains("the collector exited without handing over a pairing code"),
+        "{stderr}"
+    );
+    for file in ["host.key", "host.toml"] {
+        assert!(!host_dir.join(file).exists(), "{file} was stored");
+    }
+    let hosts = hennery_kernel::hosts::Hosts::open(&dir.join("hennery.db")).unwrap();
+    assert!(hosts.list().unwrap().is_empty(), "a host was enrolled");
+}
+
+/// Everything `pid`'s command line and environment hold, as text: from
+/// `/proc` on Linux, and from `ps -E` elsewhere (macOS), which prints the
+/// environment after the command line.
+fn argv_and_environment(pid: i32) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let read = |what: &str| {
+            let bytes =
+                std::fs::read(format!("/proc/{pid}/{what}")).unwrap_or_else(|err| panic!("{pid} {what}: {err}"));
+            String::from_utf8_lossy(&bytes).replace('\0', " ")
+        };
+        format!("{}\n{}", read("cmdline"), read("environ"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let out = Command::new("ps")
+            .args(["-E", "-ww", "-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "ps failed for {pid}: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+}
+
+/// Plan 3a's deferred check (kernel spec §4.2): the pairing code travels
+/// from `up`'s collector child to its host child over the pipe only, never
+/// on either child's command line or in its environment, where any process
+/// of the user's (and, for the command line, any user) could read it.
+///
+/// `up` runs with an environment of its own making, so nothing inherited
+/// is shaped like a code. The probe is first shown to see a code's shape in
+/// a process's arguments and in its environment, and then to see both
+/// children's own flags and `up`'s marker variable. Read once the host has
+/// paired, so the code has been handed over by then.
+#[test]
+fn the_pairing_code_never_reaches_ups_childrens_argv_or_environment() {
+    let dir = scratch_dir("codeargv");
+    let _cleanup = RemoveDir(dir.clone());
+
+    // Control: the probe reads a process's arguments and its environment.
+    // `hennery` itself, not a shell: macOS shows no platform binary's
+    // environment (`/bin/sh`'s, say) to `ps -E`. `host join` with the code
+    // left out waits on standard input, and gives up once that closes.
+    let mut control = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["host", "join", "http://127.0.0.1:1", "--name", "ABCD-EFGH"])
+        .arg("--data-dir")
+        .arg(dir.join("control"))
+        .env("HENNERY_PROBE_CONTROL", "WXYZ-2345")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let seen = argv_and_environment(control.id() as i32);
+    drop(control.stdin.take());
+    assert!(wait_with_timeout(&mut control, Duration::from_secs(15)).is_some());
+    let _ = control.kill();
+    let _ = control.wait();
+    assert!(seen.contains("ABCD-EFGH"), "the probe missed an argument: {seen}");
+    assert!(
+        seen.contains("HENNERY_PROBE_CONTROL=WXYZ-2345"),
+        "the probe missed the environment: {seen}"
+    );
+    assert!(contains_a_pairing_code_shape(&seen));
+
+    let data = dir.join("data");
+    let log = dir.join("up.log");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HENNERY_PROBE_MARKER", "yes");
+    let mut up = up_logging_to_with(command, &data, &log, &[]);
+    let paired = data.join("host").join("host.toml");
+    up.wait_until("the host paired", || paired.exists());
+    let children = children_of(up.up.id() as i32);
+    up.children.extend(&children);
+    assert_eq!(children.len(), 2, "{children:?}");
+    let seen: Vec<String> = children.iter().map(|&pid| argv_and_environment(pid)).collect();
+    // The probe sees both children's own arguments and environment.
+    for flag in ["--pairing-code-fd", "--join-code-fd"] {
+        assert!(
+            seen.iter().any(|text| text.contains(flag)),
+            "no child has {flag}: {seen:?}"
+        );
+    }
+    for text in &seen {
+        assert!(text.contains("HENNERY_PROBE_MARKER=yes"), "{text}");
+        assert!(
+            !contains_a_pairing_code_shape(text),
+            "a pairing code reached a child's argv or environment: {text}"
+        );
+    }
+
+    unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
+    assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
+}
+
 /// Kernel spec §3.1: a collector that is not set up writes its one-time
 /// setup link to `setup-url` (0600, under `umask 022` too) and, its output
 /// not being a terminal, logs only that file's path: the token itself must
