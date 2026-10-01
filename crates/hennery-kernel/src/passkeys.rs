@@ -10,13 +10,21 @@
 //!   a random id: each is taken once, whatever its finish then finds, and
 //!   lives at most `CEREMONY_TTL_SECS`. A restart drops them all; the
 //!   browser starts again.
+//! - **Passkeys add to the password** (decision 2): registering one needs
+//!   a stepped-up session (decision 7), and removing one always leaves the
+//!   password. Every query names the owner (kernel spec §1).
 
-use crate::operator::PublicUrl;
+use crate::operator::{Operator, PublicUrl, STEP_UP_SECS};
 use crate::secret::random_bytes;
+use anyhow::Result;
+use rusqlite::params;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use webauthn_rs::prelude::{PasskeyAuthentication, PasskeyRegistration, Url, Uuid, Webauthn, WebauthnBuilder};
+use webauthn_rs::prelude::{
+    Passkey, PasskeyAuthentication, PasskeyRegistration, RegisterPublicKeyCredential, Url, Uuid, Webauthn,
+    WebauthnBuilder,
+};
 
 /// How long a ceremony may take from its start to its finish, and the
 /// timeout the browser is given (decision 5).
@@ -184,6 +192,235 @@ impl Ceremonies {
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+}
+
+/// The longest label a passkey takes, in characters.
+pub const MAX_LABEL_CHARS: usize = 64;
+
+/// The account name and display name an authenticator stores with the
+/// passkey and may show beside the RP id. The label is hennery's own.
+const USER_NAME: &str = "owner";
+const USER_DISPLAY_NAME: &str = "hennery owner";
+
+/// One of the owner's passkeys, as Settings lists them (kernel spec §3.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PasskeyRecord {
+    pub id: String,
+    pub label: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+}
+
+/// The outcome of starting a ceremony.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Start {
+    /// Begun: `options` go to the browser's `navigator.credentials`, and
+    /// the finish names `ceremony_id`.
+    Begun {
+        ceremony_id: String,
+        options: serde_json::Value,
+    },
+    /// There is no `public_url` yet, or its host is an IP address
+    /// (decision 1).
+    Unavailable,
+    /// The owner has no passkey to sign in or step up with.
+    NoPasskeys,
+    /// The label is not acceptable (why).
+    Invalid(String),
+}
+
+/// Why a finish was refused. Nothing changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refused {
+    /// The ceremony is unknown, used, expired, or of another kind or
+    /// session: one answer for all.
+    Ceremony,
+    /// The authenticator's answer is malformed or did not verify (why, for
+    /// the log).
+    Credential(String),
+    /// The credential is registered already, to this owner or another
+    /// (decision 3).
+    AlreadyRegistered,
+    /// The passkey is gone, or its counter did not move on (decision 6).
+    Passkey,
+    /// `public_url` no longer names a host (decision 1).
+    Unavailable,
+}
+
+/// Why `label` cannot name a passkey, if it cannot.
+fn label_problem(label: &str) -> Option<String> {
+    let chars = label.chars().count();
+    if chars == 0 || chars > MAX_LABEL_CHARS {
+        return Some(format!("a passkey's label is 1 to {MAX_LABEL_CHARS} characters"));
+    }
+    if label.chars().any(char::is_control) {
+        return Some("a passkey's label has no control characters".into());
+    }
+    None
+}
+
+/// How a credential id is stored: lowercase hex of its bytes.
+fn stored_id(id: &[u8]) -> String {
+    hex::encode(id)
+}
+
+impl Operator {
+    /// The relying party for the `public_url` in effect (decision 1).
+    fn relying_party(&self) -> Option<Webauthn> {
+        self.public_url().as_ref().and_then(relying_party)
+    }
+
+    /// The owner's passkeys, oldest first, as `webauthn-rs` reads them.
+    fn owner_passkeys(&self) -> Result<Vec<Passkey>> {
+        let conn = self.conn();
+        let mut stmt =
+            conn.prepare("SELECT credential FROM passkeys WHERE owner_id = ?1 ORDER BY created_at, rowid")?;
+        let rows = stmt.query_map([self.owner_id()], |r| r.get::<_, String>(0))?;
+        let mut passkeys = Vec::new();
+        for json in rows {
+            passkeys.push(serde_json::from_str(&json?)?);
+        }
+        Ok(passkeys)
+    }
+
+    /// Begin registering a passkey labelled `label` for the signed-in
+    /// session `session_id` (decision 7: the route requires step-up). The
+    /// owner's passkeys are excluded, so an authenticator that holds one
+    /// says so rather than making a second.
+    pub fn start_passkey_registration(&self, session_id: &str, label: &str, now: i64) -> Result<Start> {
+        let label = label.trim();
+        if let Some(problem) = label_problem(label) {
+            return Ok(Start::Invalid(problem));
+        }
+        let Some(rp) = self.relying_party() else {
+            return Ok(Start::Unavailable);
+        };
+        let exclude = self.owner_passkeys()?.iter().map(|p| p.cred_id().clone()).collect();
+        let (options, state) = rp.start_passkey_registration(
+            user_handle(self.owner_id()),
+            USER_NAME,
+            USER_DISPLAY_NAME,
+            Some(exclude),
+        )?;
+        let ceremony = Ceremony::Register {
+            session_id: session_id.into(),
+            label: label.into(),
+            state,
+        };
+        Ok(Start::Begun {
+            ceremony_id: self.ceremonies.begin(ceremony, now),
+            options: serde_json::to_value(options)?,
+        })
+    }
+
+    /// Finish the registration `ceremony_id` names, begun by `session_id`,
+    /// with the browser's `credential` (`RegisterPublicKeyCredential` as
+    /// JSON), and store the passkey.
+    pub fn finish_passkey_registration(
+        &self,
+        session_id: &str,
+        ceremony_id: &str,
+        credential: &serde_json::Value,
+        now: i64,
+    ) -> Result<std::result::Result<PasskeyRecord, Refused>> {
+        let Some(Ceremony::Register {
+            session_id: begun_by,
+            label,
+            state,
+        }) = self.ceremonies.take(ceremony_id, now)
+        else {
+            return Ok(Err(Refused::Ceremony));
+        };
+        if begun_by != session_id {
+            return Ok(Err(Refused::Ceremony));
+        }
+        // Held from the relying party's read to the write (3c review, A4):
+        // a `public_url` reset, which takes this lock too, lands before or
+        // after the whole finish, never between its check and its write.
+        let conn = self.conn();
+        let Some(rp) = self.relying_party() else {
+            return Ok(Err(Refused::Unavailable));
+        };
+        let credential: RegisterPublicKeyCredential = match serde_json::from_value(credential.clone()) {
+            Ok(credential) => credential,
+            Err(err) => return Ok(Err(Refused::Credential(format!("malformed: {err}")))),
+        };
+        let passkey = match rp.finish_passkey_registration(&credential, &state) {
+            Ok(passkey) => passkey,
+            Err(err) => return Ok(Err(Refused::Credential(err.to_string()))),
+        };
+        let record = PasskeyRecord {
+            id: format!("passkey-{}", hex::encode(random_bytes::<8>())),
+            label,
+            created_at: now,
+            last_used_at: None,
+        };
+        // The counter starts at 0, below any the authenticator sends next
+        // (decision 6). The write itself requires the session to be live
+        // and stepped up (decision 7; 3c review, A2), as `open_session`
+        // requires its password: a session ended, or a step-up lapsed,
+        // since the route's check stores nothing.
+        let inserted = conn.execute(
+            "INSERT INTO passkeys(id, owner_id, credential_id, credential, sign_count, label, created_at)
+             SELECT ?1, ?2, ?3, ?4, 0, ?5, ?6
+             WHERE EXISTS (SELECT 1 FROM auth_sessions
+                           WHERE id_hash = ?7 AND owner_id = ?2 AND expires_at > ?6 AND last_step_up_at > ?6 - ?8)
+             ON CONFLICT(credential_id) DO NOTHING",
+            params![
+                record.id,
+                self.owner_id(),
+                stored_id(passkey.cred_id().as_ref()),
+                serde_json::to_string(&passkey)?,
+                record.label,
+                now,
+                session_id,
+                STEP_UP_SECS
+            ],
+        )?;
+        if inserted == 0 {
+            // Nothing written: the session, or else a clash (decision 3).
+            let live: bool = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM auth_sessions
+                     WHERE id_hash = ?1 AND owner_id = ?2 AND expires_at > ?3 AND last_step_up_at > ?3 - ?4)",
+                params![session_id, self.owner_id(), now, STEP_UP_SECS],
+                |r| r.get(0),
+            )?;
+            return Ok(Err(if live {
+                Refused::AlreadyRegistered
+            } else {
+                Refused::Ceremony
+            }));
+        }
+        Ok(Ok(record))
+    }
+
+    /// The owner's passkeys, oldest first.
+    pub fn passkeys(&self) -> Result<Vec<PasskeyRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, label, created_at, last_used_at FROM passkeys WHERE owner_id = ?1 ORDER BY created_at, rowid",
+        )?;
+        let rows = stmt.query_map([self.owner_id()], |r| {
+            Ok(PasskeyRecord {
+                id: r.get(0)?,
+                label: r.get(1)?,
+                created_at: r.get(2)?,
+                last_used_at: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Remove the passkey `id` (the route requires step-up, kernel spec
+    /// §3.4). Whether there was one. The password stays, so a login method
+    /// always remains (decision 2).
+    pub fn remove_passkey(&self, id: &str) -> Result<bool> {
+        let removed = self.conn().execute(
+            "DELETE FROM passkeys WHERE id = ?1 AND owner_id = ?2",
+            params![id, self.owner_id()],
+        )?;
+        Ok(removed > 0)
     }
 }
 

@@ -187,6 +187,9 @@ pub struct Operator {
     /// session: streams held open by a session re-check it on every bump
     /// (3b decision 7).
     ended: tokio::sync::watch::Sender<u64>,
+    /// The passkey ceremonies begun and not yet finished (plan 3c
+    /// decision 5).
+    pub ceremonies: crate::passkeys::Ceremonies,
     /// Verifies running now, and the most ever at once (`check_password`'s
     /// bound, pinned by the unit tests below).
     #[cfg(test)]
@@ -224,6 +227,7 @@ impl Operator {
             login_limiter: Limiter::new(Policy::LOGIN),
             step_up_limiter: Limiter::new(Policy::LOGIN),
             ended: tokio::sync::watch::Sender::new(0),
+            ceremonies: Default::default(),
             #[cfg(test)]
             in_flight: Default::default(),
             #[cfg(test)]
@@ -233,7 +237,7 @@ impl Operator {
         })
     }
 
-    fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn.lock().expect("operator lock")
     }
 
