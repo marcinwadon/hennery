@@ -234,12 +234,19 @@ impl Drop for RemoveOnDrop<'_> {
     }
 }
 
-/// The longest path a Unix socket address holds, its terminating NUL
-/// included (104 bytes on macOS, 108 on Linux).
-fn max_socket_path() -> usize {
+/// The longest path a Unix socket can be bound or reached at, in bytes:
+/// `sun_path` less its terminating NUL (103 on macOS, 107 on Linux).
+pub fn max_socket_path_bytes() -> usize {
     // SAFETY: all-zero bytes are a valid `sockaddr_un`.
     let addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    addr.sun_path.len()
+    addr.sun_path.len() - 1
+}
+
+/// Whether `path` is too long for a Unix socket: the collector then runs
+/// without its admin socket, and the client says so rather than failing
+/// to connect (3b-ii's O7).
+pub fn socket_path_too_long(path: &Path) -> bool {
+    path.as_os_str().len() > max_socket_path_bytes()
 }
 
 /// Bind `dir/admin.sock`, mode 0600. `Ok(None)`, with a warning, when that
@@ -250,7 +257,7 @@ fn max_socket_path() -> usize {
 /// is named.
 pub fn bind(dir: &Path) -> Result<Option<AdminSocket>> {
     let path = dir.join(ADMIN_SOCKET);
-    if path.as_os_str().len() >= max_socket_path() {
+    if socket_path_too_long(&path) {
         tracing::warn!(
             path = %path.display(),
             "the data directory's path is too long for a Unix socket: `hennery admin` cannot reach this collector"
@@ -435,14 +442,78 @@ async fn carry_out(request: AdminRequest, admin: &Admin) -> AdminResponse {
     })
 }
 
+/// How long the client waits for the whole exchange: connecting, sending
+/// the request and reading the answer. The slowest command is a password
+/// reset, one Argon2 hash on a blocking thread: about 0.1 s, measured in a
+/// debug build (where `argon2` is built optimised), run at most
+/// `MAX_CONCURRENT_HASHES` at a time with the logins'. Only a login flood
+/// queued ahead of it (rate limited per address, not in total) could take
+/// it past this; the client then says the outcome is unknown.
+pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// The client's side: send `request` to the collector at `socket` and read
-/// its answer, one line. Not to the end of the stream: a collector that
-/// closes with part of a request unread resets the connection on Linux,
-/// after its answer.
+/// its answer, within `CLIENT_TIMEOUT`.
 pub async fn request(socket: &Path, request: &AdminRequest) -> Result<AdminResponse> {
-    let mut stream = tokio::net::UnixStream::connect(socket)
-        .await
-        .with_context(|| format!("connect to {} (is the collector running?)", socket.display()))?;
+    request_within(socket, request, CLIENT_TIMEOUT).await
+}
+
+/// `request`, bounded by `timeout`. The answer is read one line, not to
+/// the end of the stream: a collector that closes with part of a request
+/// unread resets the connection on Linux, after its answer.
+pub async fn request_within(socket: &Path, request: &AdminRequest, timeout: Duration) -> Result<AdminResponse> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut stream = connect_by(socket, deadline, timeout).await?;
+    let mut line = serde_json::to_vec(request)?;
+    line.push(b'\n');
+    let exchange = async {
+        stream.write_all(&line).await?;
+        read_answer(&mut stream).await
+    };
+    match tokio::time::timeout_at(deadline, exchange).await {
+        Ok(answer) => answer,
+        // Part of the request, or all of it, may have arrived.
+        Err(_) => bail!(
+            "the collector at {} did not answer within {timeout:?}; the command's outcome is unknown",
+            socket.display()
+        ),
+    }
+}
+
+/// Check, sending nothing, that a collector of this user's serves
+/// `socket`: what a command that prompts does first, so that nothing is
+/// typed into a dead end. The connection is closed unused. Bounded by
+/// `timeout`, like `request_within`.
+pub async fn probe(socket: &Path, timeout: Duration) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    connect_by(socket, deadline, timeout).await.map(drop)
+}
+
+/// Connect to the collector at `socket` by `deadline`, and check that it
+/// runs as this user. Nothing is sent yet.
+async fn connect_by(
+    socket: &Path,
+    deadline: tokio::time::Instant,
+    timeout: Duration,
+) -> Result<tokio::net::UnixStream> {
+    if socket_path_too_long(socket) {
+        bail!(
+            "{} is {} bytes long, longer than a Unix socket path can be ({} bytes at most): \
+             the collector serving that data directory has no admin socket; \
+             move the data directory to a shorter path",
+            socket.display(),
+            socket.as_os_str().len(),
+            max_socket_path_bytes()
+        );
+    }
+    let stream = match tokio::time::timeout_at(deadline, tokio::net::UnixStream::connect(socket)).await {
+        Ok(connected) => {
+            connected.with_context(|| format!("connect to {} (is the collector running?)", socket.display()))?
+        }
+        Err(_) => bail!(
+            "connecting to {} took over {timeout:?}; nothing was sent",
+            socket.display()
+        ),
+    };
     // The other way round too: a password is sent only to a collector of
     // this user's.
     let server = stream.peer_cred().context("the collector's credentials")?.uid();
@@ -454,10 +525,7 @@ pub async fn request(socket: &Path, request: &AdminRequest) -> Result<AdminRespo
             socket.display()
         );
     }
-    let mut line = serde_json::to_vec(request)?;
-    line.push(b'\n');
-    stream.write_all(&line).await?;
-    read_answer(&mut stream).await
+    Ok(stream)
 }
 
 /// One `AdminResponse` line from `stream`, at most `MAX_RESPONSE_BYTES`.

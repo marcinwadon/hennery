@@ -8,9 +8,10 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
-use hennery_kernel::admin::{ADMIN_SOCKET, AdminRequest, AdminResponse};
+use hennery_kernel::admin::{ADMIN_SOCKET, AdminRequest, AdminResponse, CLIENT_TIMEOUT};
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 #[derive(Args)]
 pub struct AdminArgs {
@@ -18,6 +19,9 @@ pub struct AdminArgs {
     /// keeps its own in `collector/`).
     #[arg(long, env = "HENNERY_DATA_DIR")]
     data_dir: PathBuf,
+    /// How long to wait for the collector, in milliseconds: for tests.
+    #[arg(long, env = "HENNERY_ADMIN_TIMEOUT_MS", hide = true)]
+    timeout_ms: Option<u64>,
     #[command(subcommand)]
     command: AdminCommand,
 }
@@ -43,15 +47,32 @@ enum AdminCommand {
     },
 }
 
-/// The socket in `dir`, or in `dir/collector` when only that one exists
-/// (`dir` is then `hennery up`'s data directory).
+/// The socket in `dir`, or in `dir/collector` when there is no socket in
+/// `dir` and that directory exists (`dir` is then `hennery up`'s data
+/// directory). A collector there whose socket path is too long has none,
+/// and the directory alone says it is `up`'s: the path checked for its
+/// length is then the one that collector would have used.
 fn socket_path(dir: &Path) -> PathBuf {
     let own = dir.join(ADMIN_SOCKET);
-    let ups = dir.join("collector").join(ADMIN_SOCKET);
-    if !own.exists() && ups.exists() { ups } else { own }
+    let ups = dir.join("collector");
+    if !own.exists() && ups.is_dir() {
+        ups.join(ADMIN_SOCKET)
+    } else {
+        own
+    }
 }
 
 pub async fn run(args: AdminArgs) -> Result<()> {
+    let socket = socket_path(&args.data_dir);
+    let timeout = args.timeout_ms.map_or(CLIENT_TIMEOUT, Duration::from_millis);
+    // What prompts checks first that a collector answers there, so nothing
+    // is typed into a dead end (3b-ii's deferred item); the terminal is
+    // checked before that, sending nothing.
+    let prompts = !matches!(args.command, AdminCommand::SetupUrl | AdminCommand::Hosts);
+    if prompts {
+        require_terminal(args.command.name())?;
+        hennery_kernel::admin::probe(&socket, timeout).await?;
+    }
     let request = match args.command {
         AdminCommand::SetupUrl => AdminRequest::SetupUrl,
         AdminCommand::Hosts => AdminRequest::ListHosts,
@@ -63,7 +84,6 @@ pub async fn run(args: AdminArgs) -> Result<()> {
             AdminRequest::MintPairingCode
         }
         AdminCommand::ResetPassword => {
-            require_terminal("reset-password")?;
             // Said before the password is asked for (plan 3c review, A1).
             eprintln!(
                 "This removes every passkey; register them again after signing in. It also signs out every session."
@@ -89,8 +109,7 @@ pub async fn run(args: AdminArgs) -> Result<()> {
             AdminRequest::ResetPublicUrl { public_url }
         }
     };
-    let socket = socket_path(&args.data_dir);
-    match hennery_kernel::admin::request(&socket, &request).await? {
+    match hennery_kernel::admin::request_within(&socket, &request, timeout).await? {
         AdminResponse::SetupUrl { url } => println!("{url}"),
         AdminResponse::AlreadySetUp => bail!("hennery is set up already: there is no setup link"),
         AdminResponse::NotSetUp => {
@@ -123,6 +142,19 @@ pub async fn run(args: AdminArgs) -> Result<()> {
         AdminResponse::Failed { message } => bail!("the collector failed: {message}"),
     }
     Ok(())
+}
+
+impl AdminCommand {
+    /// Its name on the command line.
+    fn name(&self) -> &'static str {
+        match self {
+            Self::SetupUrl => "setup-url",
+            Self::ResetPassword => "reset-password",
+            Self::Hosts => "hosts",
+            Self::PairingCode => "pairing-code",
+            Self::ResetPublicUrl { .. } => "reset-public-url",
+        }
+    }
 }
 
 fn require_terminal(command: &str) -> Result<()> {

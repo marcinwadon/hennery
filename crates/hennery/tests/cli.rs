@@ -2316,6 +2316,117 @@ fn a_password_reset_over_the_admin_socket_signs_everyone_out() {
     assert_eq!(login(&listen, &origin, NEW), Some(204));
 }
 
+/// 3b-ii's deferred item: with no collector serving the data directory,
+/// the commands that prompt fail before they ask for anything, so no
+/// password is typed into a dead end.
+#[test]
+fn admin_commands_that_prompt_check_the_socket_first() {
+    let dir = scratch_dir("adminnone");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    std::fs::create_dir_all(&data).unwrap();
+    for args in [
+        &["reset-password"][..],
+        &["pairing-code"],
+        &["reset-public-url", "https://moved.example"],
+    ] {
+        let out = admin_on_a_terminal(&data, args, "a new long password\na new long password\nyes\n");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{args:?}: {stderr}");
+        assert!(stderr.contains("is the collector running?"), "{args:?}: {stderr}");
+        assert!(
+            !stderr.contains("New password") && !stderr.contains("Type yes"),
+            "{args:?} prompted first: {stderr}"
+        );
+    }
+}
+
+/// A collector whose admin socket takes the connection and never answers:
+/// `hennery admin` gives up, saying the command's outcome is unknown,
+/// rather than waiting for ever. The bound is shortened for the test.
+#[test]
+fn admin_gives_up_on_a_collector_that_never_answers() {
+    let dir = scratch_dir("adminmute");
+    let _cleanup = RemoveDir(dir.clone());
+    let socket = dir.join("admin.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let (done, wait) = std::sync::mpsc::channel::<()>();
+    let mute = std::thread::spawn(move || {
+        // Taken, held unanswered until the test is done, then closed.
+        let held = listener.accept().map(|(stream, _)| stream);
+        let _ = wait.recv();
+        drop(held);
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .arg("admin")
+        .arg("--data-dir")
+        .arg(&dir)
+        .arg("hosts")
+        .env("HENNERY_ADMIN_TIMEOUT_MS", "500")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = wait_with_timeout(&mut child, Duration::from_secs(15));
+    if status.is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    done.send(()).unwrap();
+    mute.join().unwrap();
+    let status = status.expect("`hennery admin hosts` still waited for an answer");
+    let mut stderr = Vec::new();
+    child.stderr.take().unwrap().read_to_end(&mut stderr).unwrap();
+    let stderr = String::from_utf8_lossy(&stderr);
+    assert!(!status.success(), "{stderr}");
+    assert!(stderr.contains("did not answer within 500ms"), "{stderr}");
+    assert!(stderr.contains("outcome is unknown"), "{stderr}");
+}
+
+/// The longest path a Unix socket can be bound at, in bytes.
+fn max_socket_path_bytes() -> usize {
+    // SAFETY: all-zero bytes are a valid `sockaddr_un`.
+    let addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_path.len() - 1
+}
+
+/// 3b-ii's O7: when the data directory's `admin.sock` path is too long for
+/// a Unix socket (the collector then runs without one), `hennery admin`
+/// says so, naming the path and the limit, before it prompts. Also for
+/// `hennery up`'s data directory whose own `admin.sock` would fit, but
+/// whose collector's, one directory down, does not.
+#[test]
+fn admin_names_a_socket_path_too_long_for_a_unix_socket() {
+    let dir = scratch_dir("adminlong");
+    let _cleanup = RemoveDir(dir.clone());
+    let max = max_socket_path_bytes();
+    let long = dir.join("d".repeat(max));
+    std::fs::create_dir_all(&long).unwrap();
+    // Padded so that `<ups>/collector/admin.sock` is one byte too long.
+    let base = dir.join("u").as_os_str().len() + "/collector/admin.sock".len();
+    let ups = dir.join(format!("u{}", "u".repeat(max + 1 - base)));
+    std::fs::create_dir_all(ups.join("collector")).unwrap();
+    assert!(ups.join("admin.sock").as_os_str().len() <= max);
+    let too_long = format!("longer than a Unix socket path can be ({max} bytes at most)");
+    for (data, socket) in [
+        (&long, long.join("admin.sock")),
+        (&ups, ups.join("collector").join("admin.sock")),
+    ] {
+        assert!(socket.as_os_str().len() > max);
+        let out = admin(data, &["hosts"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(stderr.contains(&too_long), "{stderr}");
+        assert!(stderr.contains(&socket.display().to_string()), "{stderr}");
+        let out = admin_on_a_terminal(data, &["reset-password"], "a new long password\n");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(stderr.contains(&too_long), "{stderr}");
+        assert!(!stderr.contains("New password"), "it prompted first: {stderr}");
+    }
+}
+
 /// `hennery admin pairing-code`, confirmed on a terminal, prints a code
 /// that `host join` pairs with; `hennery admin hosts` then lists the host,
 /// also given `hennery up`'s data directory rather than the collector's.
