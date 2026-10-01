@@ -643,6 +643,10 @@ fn record_use(
         ],
     )?;
     if updated != 1 {
+        tracing::debug!(
+            passkey = %id,
+            "a passkey changed or was removed while its use was recorded: refused"
+        );
         return Ok(Err(Refused::Passkey));
     }
     Ok(Ok(()))

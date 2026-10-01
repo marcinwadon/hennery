@@ -347,7 +347,10 @@ fn refused(why: Refused) -> Response {
                 "the passkey was not accepted",
             )
         }
-        // Logged where it was caught, with the passkey's id.
+        // Logged where they were caught: a counter that went back at `warn`
+        // with the passkey's id, a passkey changed since it was read at
+        // `debug` with its id. A passkey removed since its ceremony began,
+        // or not the owner's, has no row to name, and is not logged.
         Refused::Passkey | Refused::CounterWentBack => error(
             StatusCode::UNAUTHORIZED,
             "passkey_refused",
