@@ -403,6 +403,14 @@ pub fn install(
     } else {
         linger(cx, out)?;
     }
+    // A service has no terminal: the setup link is only in a file.
+    if role != Role::Host {
+        writeln!(
+            out,
+            "  not set up yet? `hennery admin --data-dir {} setup-url` prints the setup link",
+            data_dir.display()
+        )?;
+    }
     Ok(())
 }
 
@@ -619,12 +627,13 @@ fn status_of(cx: &Context, role: Role, out: &mut dyn Write) -> Result<bool> {
             }
         }
     }
-    let running = match cx.platform {
+    // Whether it runs, and as which process, as the service manager says.
+    let (running, pid) = match cx.platform {
         Platform::MacOs => {
             let ran = cx.run("launchctl", &["print", &cx.launchd_target(role)])?;
             if !ran.ok {
                 writeln!(out, "  launchd: not loaded (it loads at your next GUI login)")?;
-                false
+                (false, None)
             } else {
                 let field = |name: &str| {
                     ran.stdout
@@ -632,37 +641,68 @@ fn status_of(cx: &Context, role: Role, out: &mut dyn Write) -> Result<bool> {
                         .find_map(|l| l.trim().strip_prefix(name)?.trim().strip_prefix('=').map(str::trim))
                 };
                 let state = field("state").unwrap_or("unknown");
-                match field("pid") {
+                let pid = field("pid").and_then(|pid| pid.parse::<u32>().ok());
+                match pid {
                     Some(pid) => writeln!(out, "  launchd: {state}, pid {pid}")?,
                     None => writeln!(out, "  launchd: {state}")?,
                 }
-                state == "running"
+                (state == "running", pid)
             }
         }
         Platform::Linux => {
             let active = cx.run("systemctl", &["--user", "is-active", role.unit()])?;
             let enabled = cx.run("systemctl", &["--user", "is-enabled", role.unit()])?;
             writeln!(out, "  systemd: {}, {}", active.stdout.trim(), enabled.stdout.trim())?;
+            let pid = cx
+                .run(
+                    "systemctl",
+                    &["--user", "show", "-p", "MainPID", "--value", role.unit()],
+                )?
+                .stdout
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|&pid| pid != 0);
             linger(cx, out)?;
-            active.stdout.trim() == "active"
+            (active.stdout.trim() == "active", pid)
         }
     };
     healthy &= running;
     if role == Role::Up
         && let Some(data) = data_dir_of(&argv)
     {
-        healthy &= children(&data, out)?;
+        healthy &= children(&data, pid, out)?;
     }
     Ok(healthy)
 }
 
+/// Whether process `pid` exists.
+fn alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: kill(2) with signal 0 sends nothing; it only checks.
+    unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
+}
+
 /// `up`'s report of its children (`supervisor.json`): `false` when one was
-/// given up on or revoked.
-fn children(data: &Path, out: &mut dyn Write) -> Result<bool> {
+/// given up on or revoked. A report from a process that is gone, or that
+/// is not the one the service manager runs (`pid`, when it says), is shown
+/// as stale and judged by nothing: an `up` killed outright leaves one
+/// behind, and so does an `up` run by hand on the same data directory.
+fn children(data: &Path, pid: Option<u32>, out: &mut dyn Write) -> Result<bool> {
     let Some(state) = supervisor::read_state(data)? else {
         writeln!(out, "  children: no report yet in {}", data.display())?;
         return Ok(true);
     };
+    if !alive(state.pid) || pid.is_some_and(|pid| pid != state.pid) {
+        writeln!(
+            out,
+            "  children: the last report is stale (from pid {}, which is not the service's process)",
+            state.pid
+        )?;
+        return Ok(true);
+    }
     let mut healthy = true;
     for (name, child) in [("collector", &state.collector), ("host", &state.host)] {
         let last = child

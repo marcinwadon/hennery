@@ -138,6 +138,10 @@ fn installing_on_macos_writes_and_bootstraps_the_agent() {
     assert_eq!(mode(&plist), 0o644);
     assert!(out.contains(&plist.display().to_string()), "{out}");
     assert!(out.contains("PATH (in the plist): "), "{out}");
+    assert!(
+        out.contains(&format!("hennery admin --data-dir {} setup-url", data.display())),
+        "{out}"
+    );
     assert!(!out.contains("restarted"), "{out}");
 }
 
@@ -388,9 +392,13 @@ fn uninstalling_on_macos_boots_out_and_removes_the_plist() {
 #[test]
 fn status_reports_the_service_and_ups_children() {
     let dir = tempfile::tempdir().unwrap();
-    let fake = Fake::new(|line, _| {
+    // This test's own process stands in for `up`, so the report is live.
+    let pid = std::process::id();
+    let fake = Fake::new(move |line, _| {
         if line.contains(" print ") {
-            ok("gui/501/dev.hennery.up = {\n\tstate = running\n\tpid = 4242\n}")
+            ok(&format!(
+                "gui/501/dev.hennery.up = {{\n\tstate = running\n\tpid = {pid}\n}}"
+            ))
         } else {
             ok("")
         }
@@ -409,7 +417,7 @@ fn status_reports_the_service_and_ups_children() {
         last_exit: Some("exit status: 1".into()),
     };
     let mut state = supervisor::State {
-        pid: 4242,
+        pid,
         updated_at: 0,
         collector: report(supervisor::ChildState::Running),
         host: report(supervisor::ChildState::Running),
@@ -418,7 +426,7 @@ fn status_reports_the_service_and_ups_children() {
     let mut out = Vec::new();
     assert_eq!(status(&cx, None, &mut out).unwrap(), ExitCode::SUCCESS);
     let text = String::from_utf8(out).unwrap();
-    assert!(text.contains("launchd: running, pid 4242"), "{text}");
+    assert!(text.contains(&format!("launchd: running, pid {pid}")), "{text}");
     assert!(text.contains(&format!("runs: {}", argv.join(" "))), "{text}");
 
     state.host = report(supervisor::ChildState::GaveUp);
@@ -427,6 +435,17 @@ fn status_reports_the_service_and_ups_children() {
     assert_eq!(status(&cx, None, &mut out).unwrap(), ExitCode::FAILURE);
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains("host: given up on after 10 crashes"), "{text}");
+
+    // Written by a process that is gone: stale, and judged by nothing.
+    let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+    gone.wait().unwrap();
+    state.pid = gone.id();
+    supervisor::write_state(&data, &state).unwrap();
+    let mut out = Vec::new();
+    assert_eq!(status(&cx, None, &mut out).unwrap(), ExitCode::SUCCESS);
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("the last report is stale"), "{text}");
+    assert!(!text.contains("given up on"), "{text}");
 }
 
 /// Status: nothing installed, a missing binary, a unit that is not active.
