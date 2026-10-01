@@ -2,7 +2,9 @@
 //! key, enroll it with a pairing code, and store the pairing.
 
 use crate::connection::{Standing, probe};
-use crate::identity::{CONFIG_FILE, HostKey, KEY_FILE, Paired, create_private_dir, fsync_parent, write_config};
+use crate::identity::{
+    CONFIG_FILE, HostKey, KEY_FILE, Paired, create_private_dir, fsync_parent, pending_path, write_config_to,
+};
 use crate::outbox::FILE as OUTBOX_FILE;
 use anyhow::{Context, Result, bail};
 use hennery_proto::rest::{ApiError, EnrollRequest, EnrollResponse};
@@ -103,6 +105,8 @@ pub fn orphan_outbox(data_dir: &Path, label: &str) -> Result<Option<PathBuf>> {
             std::fs::rename(&from, &to).with_context(|| format!("move {} aside", from.display()))?;
         }
     }
+    // Durable before anything goes on to use the new identity.
+    fsync_parent(&db)?;
     tracing::warn!(kept = %base.display(), "moved an outbox of an earlier identity aside");
     Ok(Some(base))
 }
@@ -181,7 +185,7 @@ pub async fn join(public_url: &str, code: &str, data_dir: &Path, name: &str) -> 
     // `host.key` (see `finish_pairing`) rather than the seed being written
     // out a second time: exactly one copy of the private key ever touches
     // disk.
-    let pending = data_dir.join(format!("{KEY_FILE}.pending"));
+    let pending = pending_path(data_dir, KEY_FILE);
     key.save(&pending)?;
     let host_id = match enroll(&base, code, &key, name).await {
         Ok(host_id) => host_id,
@@ -190,27 +194,34 @@ pub async fn join(public_url: &str, code: &str, data_dir: &Path, name: &str) -> 
             return Err(err);
         }
     };
-    // The code is spent from here on: `join` is not retried automatically,
-    // so every failure path below must still remove the pending file —
-    // otherwise a repeat run would trip over a leftover `host.key.pending`
-    // next to a `host.key` (or no `host.key` at all) it does not expect.
-    if let Err(err) = finish_pairing(data_dir, &pending, &collector_url, &host_id) {
-        let _ = std::fs::remove_file(&pending);
-        return Err(err);
-    }
+    // The code is spent from here on, and `host.key.pending` is the only
+    // copy of the key the collector enrolled: no failure below removes it.
+    // Once `host.toml.pending` is written, `Paired::load` rolls the pairing
+    // forward; before that, a leftover `host.key.pending` is ignored, and
+    // overwritten by the next `join`.
+    finish_pairing(data_dir, &pending, &collector_url, &host_id, &key)?;
     Ok(Joined::Paired { host_id })
 }
 
-/// Once enrollment has spent the code: move the pending key into `host.key`,
-/// set aside any outbox left by an earlier identity, and write `host.toml`.
-fn finish_pairing(data_dir: &Path, pending: &Path, collector_url: &str, host_id: &str) -> Result<()> {
+/// Once enrollment has spent the code: stage `host.toml.pending`, move the
+/// pending key into `host.key`, set aside any outbox left by an earlier
+/// identity, and move `host.toml.pending` into `host.toml`. Once the staged
+/// `host.toml` is written the pairing is committed: a crash after it is
+/// rolled forward by `Paired::load`, so the new key never sits beside an
+/// older `host.toml`.
+fn finish_pairing(data_dir: &Path, pending: &Path, collector_url: &str, host_id: &str, key: &HostKey) -> Result<()> {
+    let config_pending = pending_path(data_dir, CONFIG_FILE);
+    write_config_to(&config_pending, collector_url, host_id, key)?;
     let key_path = data_dir.join(KEY_FILE);
     std::fs::rename(pending, &key_path)
         .with_context(|| format!("rename {} to {}", pending.display(), key_path.display()))?;
     fsync_parent(&key_path)?;
     // Frames an earlier, unpaired host left behind are not this identity's.
     orphan_outbox(data_dir, "unpaired")?;
-    write_config(data_dir, collector_url, host_id)
+    let config_path = data_dir.join(CONFIG_FILE);
+    std::fs::rename(&config_pending, &config_path)
+        .with_context(|| format!("rename {} to {}", config_pending.display(), config_path.display()))?;
+    fsync_parent(&config_path)
 }
 
 async fn enroll(base: &Url, code: &str, key: &HostKey, name: &str) -> Result<String> {
