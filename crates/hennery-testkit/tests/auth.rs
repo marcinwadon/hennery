@@ -500,3 +500,51 @@ async fn a_revoked_host_is_told_so_but_only_with_a_valid_proof() {
     assert!(collector.connected().is_empty());
     collector.stop().await;
 }
+
+/// Every JSON body is read through `ApiJson`, whose rejections are fixed
+/// `ApiError`s, never through axum's `Json`, whose rejections are plain
+/// text with serde's message. A new handler that takes `Json` fails here.
+/// The session API is not converted yet; it is the one file allowed.
+#[test]
+fn every_json_body_is_read_through_api_json() {
+    const NOT_YET: &[&str] = &["hennery-sessions/src/api.rs"];
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+    let mut checked = 0;
+    let mut found = Vec::new();
+    for member in ["hennery-kernel", "hennery-sessions", "hennery"] {
+        let mut dirs = vec![crates.join(member).join("src")];
+        while let Some(dir) = dirs.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    dirs.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                let name = path.strip_prefix(crates).unwrap().to_string_lossy().into_owned();
+                checked += 1;
+                let source = std::fs::read_to_string(&path).unwrap();
+                let takes_json: Vec<String> = source
+                    .lines()
+                    .enumerate()
+                    .filter(|(_, line)| {
+                        [": Json<", ": axum::Json<", "<Json<", "<axum::Json<"]
+                            .iter()
+                            .any(|p| line.contains(p))
+                    })
+                    .map(|(n, line)| format!("{name}:{}: {}", n + 1, line.trim()))
+                    .collect();
+                if NOT_YET.contains(&name.as_str()) {
+                    // Off the list once it is converted.
+                    assert!(!takes_json.is_empty(), "{name} takes no Json: remove it from NOT_YET");
+                    continue;
+                }
+                found.extend(takes_json);
+            }
+        }
+    }
+    assert!(checked > 20, "checked only {checked} files");
+    assert!(found.is_empty(), "take ApiJson, not Json:\n{}", found.join("\n"));
+}

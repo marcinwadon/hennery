@@ -1,6 +1,7 @@
 //! Operator auth over HTTP (kernel spec §3, §8): the one-time setup, login
 //! and logout, step-up, the signed-in sessions, and passkeys (plan 3c).
 
+use crate::json::ApiJson;
 use crate::operator::{Authenticated, Operator, PublicUrl, SetupOutcome, cleared_cookie, session_cookie};
 use crate::passkeys::{PasskeyRecord, Refused, Start};
 use crate::secret::unix_now;
@@ -127,7 +128,11 @@ pub(crate) fn with_cookie(mut response: Response, cookie: &str) -> Response {
 /// yet to check `Origin` against, so it must be the origin of the
 /// `public_url` being stored: the browser that sets hennery up is the one
 /// that can use it afterwards. The token is what authenticates.
-async fn setup(State(operator): State<Arc<Operator>>, headers: HeaderMap, Json(req): Json<SetupRequest>) -> Response {
+async fn setup(
+    State(operator): State<Arc<Operator>>,
+    headers: HeaderMap,
+    ApiJson(req): ApiJson<SetupRequest>,
+) -> Response {
     let public_url = match PublicUrl::parse(&req.public_url) {
         Ok(url) => url,
         Err(why) => return error(StatusCode::BAD_REQUEST, "invalid", why),
@@ -186,7 +191,7 @@ async fn login(
     State(operator): State<Arc<Operator>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(req): Json<LoginRequest>,
+    ApiJson(req): ApiJson<LoginRequest>,
 ) -> Response {
     if let Err(retry_after) = operator.login_limiter.attempt(peer.ip(), Instant::now()) {
         return rate_limited(
@@ -236,7 +241,7 @@ async fn step_up(
     State(operator): State<Arc<Operator>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Extension(session): Extension<Authenticated>,
-    Json(req): Json<StepUpRequest>,
+    ApiJson(req): ApiJson<StepUpRequest>,
 ) -> Response {
     if let Err(retry_after) = operator.step_up_limiter.attempt(peer.ip(), Instant::now()) {
         return rate_limited(
@@ -396,7 +401,7 @@ async fn passkey_login_finish(
     State(operator): State<Arc<Operator>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
-    Json(req): Json<PasskeyFinishRequest>,
+    ApiJson(req): ApiJson<PasskeyFinishRequest>,
 ) -> Response {
     match operator.finish_passkey_login(&req.ceremony_id, &req.credential, &user_agent(&headers), unix_now()) {
         Ok(Ok(token)) => {
@@ -425,7 +430,7 @@ async fn passkey_step_up_start(
 async fn passkey_step_up_finish(
     State(operator): State<Arc<Operator>>,
     Extension(session): Extension<Authenticated>,
-    Json(req): Json<PasskeyFinishRequest>,
+    ApiJson(req): ApiJson<PasskeyFinishRequest>,
 ) -> Response {
     match operator.finish_passkey_step_up(&session.session_id, &req.ceremony_id, &req.credential, unix_now()) {
         Ok(Ok(true)) => StatusCode::NO_CONTENT.into_response(),
@@ -458,7 +463,7 @@ async fn remove_passkey(State(operator): State<Arc<Operator>>, Path(id): Path<St
 async fn passkey_register_start(
     State(operator): State<Arc<Operator>>,
     Extension(session): Extension<Authenticated>,
-    Json(req): Json<PasskeyRegisterRequest>,
+    ApiJson(req): ApiJson<PasskeyRegisterRequest>,
 ) -> Response {
     started(operator.start_passkey_registration(&session.session_id, &req.label, unix_now()))
 }
@@ -468,7 +473,7 @@ async fn passkey_register_start(
 async fn passkey_register_finish(
     State(operator): State<Arc<Operator>>,
     Extension(session): Extension<Authenticated>,
-    Json(req): Json<PasskeyFinishRequest>,
+    ApiJson(req): ApiJson<PasskeyFinishRequest>,
 ) -> Response {
     match operator.finish_passkey_registration(&session.session_id, &req.ceremony_id, &req.credential, unix_now()) {
         Ok(Ok(record)) => (StatusCode::CREATED, Json(passkey_item(record))).into_response(),
