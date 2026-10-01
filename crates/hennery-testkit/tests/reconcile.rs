@@ -107,6 +107,7 @@ impl ScriptedHost {
             host_id: HOST.into(),
             proof: host_key().sign_hello(&nonce, HOST, PROTOCOL_VERSION),
             capabilities,
+            workspace_roots: vec![],
             attached_sessions: attached,
         })
         .await;
@@ -129,6 +130,7 @@ impl ScriptedHost {
             host_id: HOST.into(),
             proof: host_key().sign_hello(&nonce, HOST, PROTOCOL_VERSION),
             capabilities: Capabilities::default(),
+            workspace_roots: vec![],
             attached_sessions: vec![],
         })
         .await;

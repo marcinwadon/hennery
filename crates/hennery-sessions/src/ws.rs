@@ -62,6 +62,7 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
         host_id,
         proof,
         capabilities,
+        workspace_roots: _,
         attached_sessions,
     }) = hello
     else {
@@ -277,6 +278,11 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                 code,
                 message,
             } => {
+                // A probe of this connection is answered by its rejection;
+                // it has nothing to undo (ACP core §3.3).
+                if state.hub.probe_rejected(conn_id, &request_id, &code, &message) {
+                    continue;
+                }
                 if let Some(session_id) = reconcile_closes.remove(&request_id) {
                     if code == "not_attached" {
                         match state.store.close_after_rejected_reconcile_close(&session_id) {
@@ -375,6 +381,11 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                 }
             }
             HostFrame::ResendComplete => tracing::warn!(%host_id, "ignoring repeated resend_complete"),
+            // Probe replies answer the probe of this connection that they
+            // name, if it still waits (ACP core §3.3).
+            frame @ (HostFrame::Projects { .. } | HostFrame::Directory { .. }) => {
+                state.hub.probe_reply(&host_id, conn_id, frame);
+            }
             HostFrame::Hello { .. } => tracing::warn!(%host_id, "ignoring repeated hello"),
         }
     }

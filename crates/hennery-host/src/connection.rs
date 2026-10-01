@@ -252,6 +252,7 @@ async fn handshake(
             // agent offers none refuses them (plan 6a, decision 2).
             // `projects` comes with the probes.
             capabilities: Capabilities(vec![Capability::Park, Capability::Images]),
+            workspace_roots: Vec::new(),
             attached_sessions: attached()?,
         },
     )
@@ -638,6 +639,13 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
             Answer::Elicitation { action, content },
         ),
         CollectorFrame::Ack { session_id, ack_seq } => uplink.ack(&session_id, ack_seq)?,
+        // Not announced (`projects`), so a collector does not send them.
+        CollectorFrame::ListProjects { request_id } | CollectorFrame::BrowseDirectory { request_id, .. } => uplink
+            .reply(HostFrame::Error {
+                request_id,
+                code: "unsupported".into(),
+                message: "this host does not serve projects".into(),
+            }),
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }
     Ok(())

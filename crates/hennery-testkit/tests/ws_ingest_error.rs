@@ -79,6 +79,7 @@ async fn a_failed_ingest_drops_the_connection_instead_of_acking_past_it() {
             host_id: "host-1".into(),
             proof: host_key().sign_hello(&nonce, "host-1", PROTOCOL_VERSION),
             capabilities: Default::default(),
+            workspace_roots: vec![],
             attached_sessions: vec![],
         })
         .unwrap(),
@@ -157,6 +158,7 @@ async fn an_undo_error_answers_delivery_unknown_and_drops_the_connection() {
             host_id: "host-1".into(),
             proof: host_key().sign_hello(&nonce, "host-1", PROTOCOL_VERSION),
             capabilities: Capabilities::default(),
+            workspace_roots: vec![],
             attached_sessions: vec![],
         })
         .unwrap(),

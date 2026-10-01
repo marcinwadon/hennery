@@ -140,6 +140,8 @@ pub fn render_ts() -> String {
         frames::PendingExtract,
         frames::Indexed,
         frames::SessionBody,
+        frames::Project,
+        frames::DirEntry,
         frames::HostFrame,
         frames::CollectorFrame,
         rest::StartSessionRequest,

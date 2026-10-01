@@ -275,6 +275,7 @@ fn hello_capabilities_skip_unknown_entries_and_default_to_none() {
         host_id: "h".into(),
         proof: "p".into(),
         capabilities: Capabilities(vec![Capability::Park]),
+        workspace_roots: vec![],
         attached_sessions: vec![],
     };
     assert_eq!(serde_json::to_value(&sent).unwrap()["capabilities"], json!(["park"]));
@@ -541,4 +542,94 @@ fn stored_blocks_name_the_attachment_and_never_carry_its_bytes() {
         serde_json::to_value(AttachmentUsage { count: 2, bytes: 10 }).unwrap(),
         json!({"count": 2, "bytes": 10})
     );
+}
+
+// Plan 6c: the project picker's probes (ACP core §3.3, §7).
+
+fn projects_reply() -> HostFrame {
+    HostFrame::Projects {
+        request_id: "r".into(),
+        items: vec![hennery_proto::frames::Project { path: "/p/a".into() }],
+        partial: true,
+        home: None,
+    }
+}
+
+fn directory_reply() -> HostFrame {
+    HostFrame::Directory {
+        request_id: "r".into(),
+        path: "/p".into(),
+        parent: Some("/".into()),
+        entries: vec![hennery_proto::frames::DirEntry {
+            name: "a".into(),
+            git: true,
+        }],
+        truncated: false,
+    }
+}
+
+#[test]
+fn probe_frames_use_the_spec_field_names() {
+    for (frame, expected) in [
+        (
+            CollectorFrame::ListProjects { request_id: "r".into() },
+            json!({"type": "list_projects", "request_id": "r"}),
+        ),
+        (
+            CollectorFrame::BrowseDirectory {
+                request_id: "r".into(),
+                path: "/p".into(),
+            },
+            json!({"type": "browse_directory", "request_id": "r", "path": "/p"}),
+        ),
+    ] {
+        assert_eq!(serde_json::to_value(&frame).unwrap(), expected);
+        assert_eq!(serde_json::from_value::<CollectorFrame>(expected).unwrap(), frame);
+    }
+    for (frame, expected) in [
+        (
+            projects_reply(),
+            json!({"type": "projects", "request_id": "r", "items": [{"path": "/p/a"}], "partial": true}),
+        ),
+        (
+            directory_reply(),
+            json!({
+                "type": "directory", "request_id": "r", "path": "/p", "parent": "/",
+                "entries": [{"name": "a", "git": true}], "truncated": false
+            }),
+        ),
+    ] {
+        assert_eq!(serde_json::to_value(&frame).unwrap(), expected);
+        assert_eq!(serde_json::from_value::<HostFrame>(expected).unwrap(), frame);
+    }
+}
+
+#[test]
+fn only_probe_replies_name_a_probe() {
+    assert_eq!(projects_reply().probe_request_id(), Some("r"));
+    assert_eq!(directory_reply().probe_request_id(), Some("r"));
+    let error = HostFrame::Error {
+        request_id: "r".into(),
+        code: "invalid".into(),
+        message: "no".into(),
+    };
+    assert_eq!(error.probe_request_id(), None);
+    assert_eq!(HostFrame::ResendComplete.probe_request_id(), None);
+}
+
+#[test]
+fn a_hello_without_workspace_roots_has_none() {
+    let hello = |extra: serde_json::Value| {
+        let mut v = json!({
+            "type": "hello", "protocol_version": "1.0", "host_version": "0", "host_id": "h",
+            "proof": "p", "attached_sessions": []
+        });
+        v.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        match serde_json::from_value::<HostFrame>(v).unwrap() {
+            HostFrame::Hello { workspace_roots, .. } => workspace_roots,
+            other => panic!("expected hello, got {other:?}"),
+        }
+    };
+    assert!(hello(json!({})).is_empty());
+    assert_eq!(hello(json!({"workspace_roots": ["/p", "~/src"]})), ["/p", "~/src"]);
 }

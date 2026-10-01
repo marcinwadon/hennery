@@ -132,6 +132,9 @@ fn request_failed(err: RequestError) -> Response {
             "delivery_unknown",
             "host disconnected; delivery unknown",
         ),
+        // Probes only (`Hub::probe`); a session request never meets them.
+        RequestError::Unsupported => error(StatusCode::CONFLICT, "unsupported", "the host does not support this"),
+        RequestError::Busy => error(StatusCode::SERVICE_UNAVAILABLE, "busy", "the host is busy; try again"),
     }
 }
 

@@ -313,6 +313,23 @@ impl SessionBody {
     }
 }
 
+/// One git repository `list_projects` found under a workspace root (ACP
+/// core §7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct Project {
+    /// Absolute and canonical (symlinks resolved), as the host sees it.
+    pub path: String,
+}
+
+/// One subdirectory in a `browse_directory` answer (ACP core §7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct DirEntry {
+    /// The entry's file name, not a path.
+    pub name: String,
+    /// It holds `.git`: a repository, or a worktree of one.
+    pub git: bool,
+}
+
 /// Host -> collector.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -331,6 +348,10 @@ pub enum HostFrame {
         /// rejected (see `Capabilities`). Absent means none.
         #[serde(default)]
         capabilities: Capabilities,
+        /// The workspace roots from the host's config (ACP core §7), as
+        /// configured. Absent means none (an older host).
+        #[serde(default)]
+        workspace_roots: Vec<String>,
         attached_sessions: Vec<AttachedSession>,
     },
     /// Every state-bearing fact is a sequenced frame: it goes through the host
@@ -353,6 +374,44 @@ pub enum HostFrame {
     /// frame, so a resent `turn_ended` is never duplicated by a synthesised
     /// one (ACP core §5.2).
     ResendComplete,
+    /// The answer to `list_projects` (ACP core §3.3, §7): the git
+    /// repositories under the workspace roots. A probe reply: not outboxed,
+    /// it answers only the connection it was asked on.
+    Projects {
+        request_id: String,
+        items: Vec<Project>,
+        /// A bound cut the enumeration short: there may be more.
+        partial: bool,
+        /// The host user's home directory, canonical, so the picker can
+        /// expand `~` (frontend §7). Absent if the host has none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        home: Option<String>,
+    },
+    /// The answer to `browse_directory` (ACP core §3.3, §7): the
+    /// subdirectories of `path`. A probe reply, like `projects`.
+    Directory {
+        request_id: String,
+        /// The browsed directory, canonical.
+        path: String,
+        /// Its parent, canonical, if browsing it is allowed too.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parent: Option<String>,
+        entries: Vec<DirEntry>,
+        /// Not every subdirectory is listed.
+        truncated: bool,
+    },
+}
+
+impl HostFrame {
+    /// The probe this frame answers, if it is a probe reply (ACP core §3.3).
+    /// Exhaustive on purpose: a new host frame must say whether it is one,
+    /// or this does not compile (umbrella §5.4).
+    pub fn probe_request_id(&self) -> Option<&str> {
+        match self {
+            Self::Projects { request_id, .. } | Self::Directory { request_id, .. } => Some(request_id),
+            Self::Hello { .. } | Self::Session { .. } | Self::Error { .. } | Self::ResendComplete => None,
+        }
+    }
 }
 
 /// Collector -> host.
@@ -464,5 +523,18 @@ pub enum CollectorFrame {
     CloseSession {
         request_id: String,
         session_id: String,
+    },
+    /// Enumerate the git repositories under the host's workspace roots
+    /// (ACP core §7). Answered by `projects`; only to a host with the
+    /// `projects` capability.
+    ListProjects {
+        request_id: String,
+    },
+    /// List the subdirectories of `path`, an absolute path inside the host's
+    /// browse fence (ACP core §7). Answered by `directory` | `error`; only to
+    /// a host with the `projects` capability.
+    BrowseDirectory {
+        request_id: String,
+        path: String,
     },
 }

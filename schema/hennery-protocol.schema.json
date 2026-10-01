@@ -563,6 +563,44 @@
             "session_id"
           ],
           "type": "object"
+        },
+        {
+          "description": "Enumerate the git repositories under the host's workspace roots\n(ACP core §7). Answered by `projects`; only to a host with the\n`projects` capability.",
+          "properties": {
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "list_projects",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "List the subdirectories of `path`, an absolute path inside the host's\nbrowse fence (ACP core §7). Answered by `directory` | `error`; only to\na host with the `projects` capability.",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "browse_directory",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "path"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -608,6 +646,24 @@
       },
       "required": [
         "name"
+      ],
+      "type": "object"
+    },
+    "DirEntry": {
+      "description": "One subdirectory in a `browse_directory` answer (ACP core §7).",
+      "properties": {
+        "git": {
+          "description": "It holds `.git`: a repository, or a worktree of one.",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "The entry's file name, not a path.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "git"
       ],
       "type": "object"
     },
@@ -759,6 +815,14 @@
             "type": {
               "const": "hello",
               "type": "string"
+            },
+            "workspace_roots": {
+              "default": [],
+              "description": "The workspace roots from the host's config (ACP core §7), as\nconfigured. Absent means none (an older host).",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             }
           },
           "required": [
@@ -833,6 +897,83 @@
           },
           "required": [
             "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The answer to `list_projects` (ACP core §3.3, §7): the git\nrepositories under the workspace roots. A probe reply: not outboxed,\nit answers only the connection it was asked on.",
+          "properties": {
+            "home": {
+              "description": "The host user's home directory, canonical, so the picker can\nexpand `~` (frontend §7). Absent if the host has none.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "items": {
+              "items": {
+                "$ref": "#/$defs/Project"
+              },
+              "type": "array"
+            },
+            "partial": {
+              "description": "A bound cut the enumeration short: there may be more.",
+              "type": "boolean"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "projects",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "items",
+            "partial"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The answer to `browse_directory` (ACP core §3.3, §7): the\nsubdirectories of `path`. A probe reply, like `projects`.",
+          "properties": {
+            "entries": {
+              "items": {
+                "$ref": "#/$defs/DirEntry"
+              },
+              "type": "array"
+            },
+            "parent": {
+              "description": "Its parent, canonical, if browsing it is allowed too.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "description": "The browsed directory, canonical.",
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "truncated": {
+              "description": "Not every subdirectory is listed.",
+              "type": "boolean"
+            },
+            "type": {
+              "const": "directory",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "path",
+            "entries",
+            "truncated"
           ],
           "type": "object"
         }
@@ -1309,6 +1450,19 @@
         "cancelled"
       ],
       "type": "string"
+    },
+    "Project": {
+      "description": "One git repository `list_projects` found under a workspace root (ACP\ncore §7).",
+      "properties": {
+        "path": {
+          "description": "Absolute and canonical (symlinks resolved), as the host sees it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
     },
     "PromptRequest": {
       "properties": {
