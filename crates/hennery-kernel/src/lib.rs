@@ -8,6 +8,7 @@ pub mod auth_api;
 pub mod db;
 pub mod health;
 pub mod hosts;
+pub mod json;
 pub mod lifecycle;
 pub mod operator;
 pub mod origin;

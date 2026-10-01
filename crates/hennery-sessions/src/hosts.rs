@@ -11,6 +11,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router, middleware};
 use hennery_kernel::hosts::{EnrollOutcome, Enrollment, HostRecord, Revoke};
+use hennery_kernel::json::ApiJson;
 use hennery_kernel::lifecycle::LifecycleHooks;
 use hennery_kernel::secret::unix_now;
 use hennery_proto::rest::{EnrollRequest, EnrollResponse, HostItem, PairingCodeResponse};
@@ -72,7 +73,7 @@ async fn mint_pairing_code(State(state): State<AppState>) -> Response {
 async fn enroll(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    Json(req): Json<EnrollRequest>,
+    ApiJson(req): ApiJson<EnrollRequest>,
 ) -> Response {
     let now = Instant::now();
     if let Err(retry_after) = state.enroll_limiter.attempt(peer.ip(), now) {

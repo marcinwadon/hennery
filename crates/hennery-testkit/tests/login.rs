@@ -238,3 +238,76 @@ fn a_login_request_does_not_show_its_password_in_debug() {
     );
     assert!(!shown.contains(PASSWORD), "{shown}");
 }
+
+/// A body the extractor refuses (wrong type, not JSON, a wrong field type,
+/// too large) is answered with the fixed `ApiError` shape, never with
+/// serde's message: that text quotes the request back and changes with
+/// every serde release. Setup has no browser rules in front of it, so its
+/// 415 is the extractor's own.
+#[tokio::test]
+async fn a_body_the_extractor_refuses_gets_a_fixed_api_error() {
+    let unset = Collector::start(false).await;
+    let raw = |content_type: &'static str, body: String| {
+        unset
+            .post("/api/setup")
+            .header("content-type", content_type)
+            .body(body)
+            .send()
+    };
+    let cases = [
+        (
+            raw("text/plain", "{}".into()).await.unwrap(),
+            415,
+            "unsupported_media_type",
+        ),
+        (
+            raw("application/json", "{not json".into()).await.unwrap(),
+            400,
+            "invalid_body",
+        ),
+        (
+            raw(
+                "application/json",
+                r#"{"token": 1, "password": "p", "public_url": "u"}"#.into(),
+            )
+            .await
+            .unwrap(),
+            422,
+            "invalid_body",
+        ),
+        (
+            raw(
+                "application/json",
+                format!(r#"{{"x": "{}"}}"#, "y".repeat(hennery_kernel::auth_api::MAX_BODY_BYTES)),
+            )
+            .await
+            .unwrap(),
+            413,
+            "body_too_large",
+        ),
+    ];
+    for (resp, status, code) in cases {
+        assert_eq!(resp.status().as_u16(), status, "{code}");
+        let text = resp.text().await.unwrap();
+        let error: ApiError = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{status}: {e}: {text}"));
+        assert_eq!(error.code, code, "{text}");
+        assert!(!text.contains("invalid type") && !text.contains("line 1"), "{text}");
+    }
+
+    let c = Collector::start(true).await;
+    let resp = c
+        .post("/api/auth/login")
+        .json(&serde_json::json!({ "password": 1 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(code_of(resp).await, (422, "invalid_body".into()));
+    let resp = c
+        .post("/api/hosts/enroll")
+        .json(&serde_json::json!({ "code": ["a"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(code_of(resp).await, (422, "invalid_body".into()));
+    assert_eq!(c.state.operator.verifications(), 0);
+}
