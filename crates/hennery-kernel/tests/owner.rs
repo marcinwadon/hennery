@@ -2,8 +2,14 @@
 //! owner exists from the first start, every row carries it, and every
 //! query filters by it.
 
+use ed25519_dalek::{Signer, SigningKey};
+use hennery_kernel::hosts::{
+    EnrollOutcome, Enrollment, HelloCheck, Hosts, PAIRING_CODE_TTL_SECS, Revoke, normalize_code,
+};
 use hennery_kernel::operator::{Operator, Reset, SESSION_TTL_SECS, SetupOutcome};
 use hennery_kernel::secret::sha256_hex;
+use hennery_proto::frames::Capabilities;
+use hennery_proto::hello_proof_message;
 use rusqlite::types::Value;
 use std::path::Path;
 use std::sync::Arc;
@@ -115,9 +121,18 @@ fn the_owner_exists_from_the_first_start_and_setup_keeps_it() {
     assert_eq!(owners, 1);
 }
 
+/// The `owner_id` of every row of `table`, in order.
+fn owners_of(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare(&format!("SELECT owner_id FROM {table} ORDER BY rowid"))
+        .unwrap();
+    stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+}
+
 /// The backfill (3b-iii decision 1): a database 3b-ii set up keeps its
 /// owner, set up, its password and its `public_url`. One 3b-ii left before
-/// setup gets an owner, not set up, which setup then keeps.
+/// setup gets an owner, not set up, which setup then keeps. Either way,
+/// the host and the pairing code written before carry that owner.
 #[test]
 fn a_3b_ii_database_keeps_its_owner_or_gets_one() {
     for set_up in [true, false] {
@@ -127,6 +142,15 @@ fn a_3b_ii_database_keeps_its_owner_or_gets_one() {
         let op = Operator::open(&db).unwrap();
         assert_eq!(op.is_set_up().unwrap(), set_up);
         let owner = op.owner_id().to_string();
+        // The host and the pairing code written before carry it.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        for table in ["hosts", "pairing_codes"] {
+            assert_eq!(owners_of(&conn, table), vec![owner.clone()], "{table}");
+        }
+        let hosts = Hosts::open(&db).unwrap();
+        assert_eq!(hosts.owner_id(), owner);
+        let listed: Vec<String> = hosts.list().unwrap().into_iter().map(|h| h.id).collect();
+        assert_eq!(listed, ["host-old"]);
         if set_up {
             assert_eq!(owner, OLD_OWNER);
             assert!(op.verify_password(PASSWORD).unwrap().is_some());
@@ -266,4 +290,129 @@ async fn another_owners_password_and_sessions_are_invisible_to_the_operator() {
     let reopened = Operator::open(&db).unwrap();
     assert_eq!(reopened.public_url().unwrap().origin(), "https://moved.example");
     assert!(reopened.verify_password("a new long password").unwrap().is_some());
+}
+
+fn key(seed: u8) -> SigningKey {
+    SigningKey::from_bytes(&[seed; 32])
+}
+
+fn enrollment(seed: u8) -> Enrollment {
+    Enrollment {
+        public_key: hex::encode(key(seed).verifying_key().as_bytes()),
+        name: "laptop".into(),
+        host_version: "0.0.0".into(),
+        platform: "macos-aarch64".into(),
+    }
+}
+
+/// A paired host of `owner`'s, as `enroll` writes one, keyed by `seed`.
+fn write_host(conn: &rusqlite::Connection, owner: &str, host_id: &str, seed: u8) {
+    conn.execute(
+        "INSERT INTO hosts(id, owner_id, name, public_key, platform, host_version, created_at)
+         VALUES (?1, ?2, 'laptop', ?3, 'macos-aarch64', '0.0.0', ?4)",
+        rusqlite::params![host_id, owner, enrollment(seed).public_key, NOW],
+    )
+    .unwrap();
+}
+
+/// A live pairing code of `owner`'s, as `mint_pairing_code` writes one.
+fn write_code(conn: &rusqlite::Connection, owner: &str, code: &str) {
+    let hash = sha256_hex(normalize_code(code).unwrap().as_bytes());
+    conn.execute(
+        "INSERT INTO pairing_codes(code_hash, owner_id, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![hash, owner, NOW, NOW + PAIRING_CODE_TTL_SECS],
+    )
+    .unwrap();
+}
+
+fn proof(seed: u8, nonce: &[u8], host_id: &str) -> String {
+    hex::encode(key(seed).sign(&hello_proof_message(nonce, host_id, "1.0")).to_bytes())
+}
+
+/// 3b-iii decision 1, the question it answers: `up` mints a pairing code
+/// and enrolls its host before setup. Both carry the owner that setup
+/// then sets up, and the registry lists the host after setup.
+#[test]
+fn a_host_paired_before_setup_belongs_to_the_owner_setup_sets_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    let hosts = Hosts::open(&db).unwrap();
+    let code = hosts.mint_pairing_code(NOW).unwrap();
+    let EnrollOutcome::Enrolled { host_id } = hosts.enroll(&code.code, &enrollment(1), NOW).unwrap() else {
+        panic!("the host did not enroll");
+    };
+    let op = Operator::open(&db).unwrap();
+    let token = op.issue_setup_token(NOW).unwrap().unwrap();
+    let SetupOutcome::Done { owner_id, .. } = op.set_up(&token, PASSWORD, "https://hennery.example", NOW).unwrap()
+    else {
+        panic!("setup failed");
+    };
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    assert_eq!(owners_of(&conn, "hosts"), vec![owner_id.clone()]);
+    assert_eq!(owners_of(&conn, "pairing_codes"), vec![owner_id.clone()]);
+    assert_eq!(hosts.owner_id(), owner_id);
+    let listed: Vec<String> = hosts.list().unwrap().into_iter().map(|h| h.id).collect();
+    assert_eq!(listed, [host_id]);
+}
+
+const HOST_TABLES: &[&str] = &["hosts", "pairing_codes"];
+
+/// Kernel spec §1: every query of the host registry's filters by the
+/// owner. Another owner's host and pairing code, in the same database,
+/// are neither seen nor changed: its host's valid proof is refused like an
+/// unknown host's, it is not listed and cannot be revoked, and its code
+/// pairs nothing. The real owner's, written the same way, work (the
+/// control). The other owner's key cannot be paired again under this
+/// owner either: keys are unique across owners (3b-iii decision 7).
+#[test]
+fn another_owners_hosts_and_codes_are_invisible_to_the_registry() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    let hosts = Hosts::open(&db).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    write_other_owner(&conn);
+    write_host(&conn, OTHER, "host-b2", 2);
+    write_code(&conn, OTHER, "BBBB-BBBB");
+    write_host(&conn, hosts.owner_id(), "host-a1", 1);
+    write_code(&conn, hosts.owner_id(), "AAAA-AAAA");
+    let theirs = rows_of(&conn, HOST_TABLES, OTHER);
+    let nonce = [7u8; 32];
+
+    assert_eq!(
+        hosts
+            .check_hello("host-a1", &nonce, "1.0", &proof(1, &nonce, "host-a1"))
+            .unwrap(),
+        HelloCheck::Accepted
+    );
+    assert!(hosts.host("host-a1").unwrap().is_some());
+
+    assert_eq!(
+        hosts
+            .check_hello("host-b2", &nonce, "1.0", &proof(2, &nonce, "host-b2"))
+            .unwrap(),
+        HelloCheck::BadProof
+    );
+    assert_eq!(hosts.host("host-b2").unwrap(), None);
+    let listed: Vec<String> = hosts.list().unwrap().into_iter().map(|h| h.id).collect();
+    assert_eq!(listed, ["host-a1"]);
+    assert_eq!(hosts.revoke("host-b2", NOW).unwrap(), Revoke::NotFound);
+    assert!(!hosts.is_revoked("host-b2").unwrap());
+    hosts
+        .record_hello("host-b2", "9.9.9", &Capabilities::default(), NOW + 5)
+        .unwrap();
+    assert_eq!(
+        hosts.enroll("BBBB-BBBB", &enrollment(3), NOW).unwrap(),
+        EnrollOutcome::InvalidCode
+    );
+    assert!(hosts.enroll("AAAA-AAAA", &enrollment(2), NOW).is_err());
+    assert_eq!(rows_of(&conn, HOST_TABLES, OTHER), theirs);
+
+    // The owner's code is still live: the refused pairing above spent
+    // nothing.
+    assert!(matches!(
+        hosts.enroll("AAAA-AAAA", &enrollment(4), NOW).unwrap(),
+        EnrollOutcome::Enrolled { .. }
+    ));
+    assert_eq!(hosts.revoke("host-a1", NOW).unwrap(), Revoke::Revoked);
+    assert!(hosts.is_revoked("host-a1").unwrap());
 }

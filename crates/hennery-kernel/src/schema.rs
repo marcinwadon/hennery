@@ -25,7 +25,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         used_at INTEGER);
     ",
     // Operator auth (kernel spec §3). The new tables carry `owner_id` from
-    // the start; the older ones get it with the backfill (plan 3b-ii).
+    // the start; the older ones get it with the backfill (plan 3b-iii).
     "
     CREATE TABLE owners (
         id TEXT PRIMARY KEY,
@@ -59,5 +59,41 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     INSERT INTO owners(id, created_at)
         SELECT 'owner-' || lower(hex(randomblob(8))), unixepoch()
         WHERE NOT EXISTS (SELECT 1 FROM owners);
+    ",
+    // `owner_id` on the tables from before operator auth, filled with the
+    // database's owner (plan 3b-iii decision 4). Rebuilt: SQLite cannot add
+    // a column that is both NOT NULL and a foreign key, and nothing
+    // references either table.
+    "
+    CREATE TABLE hosts_owned (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL REFERENCES owners(id),
+        name TEXT NOT NULL,
+        public_key TEXT NOT NULL UNIQUE,
+        platform TEXT NOT NULL,
+        host_version TEXT NOT NULL,
+        capabilities TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL,
+        last_seen_at INTEGER,
+        revoked_at INTEGER);
+    INSERT INTO hosts_owned(id, owner_id, name, public_key, platform, host_version, capabilities,
+                            created_at, last_seen_at, revoked_at)
+        SELECT id, (SELECT id FROM owners ORDER BY created_at, id LIMIT 1), name, public_key, platform,
+               host_version, capabilities, created_at, last_seen_at, revoked_at
+        FROM hosts;
+    DROP TABLE hosts;
+    ALTER TABLE hosts_owned RENAME TO hosts;
+    CREATE TABLE pairing_codes_owned (
+        code_hash TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL REFERENCES owners(id),
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        used_at INTEGER);
+    INSERT INTO pairing_codes_owned(code_hash, owner_id, created_at, expires_at, used_at)
+        SELECT code_hash, (SELECT id FROM owners ORDER BY created_at, id LIMIT 1), created_at, expires_at,
+               used_at
+        FROM pairing_codes;
+    DROP TABLE pairing_codes;
+    ALTER TABLE pairing_codes_owned RENAME TO pairing_codes;
     ",
 ];

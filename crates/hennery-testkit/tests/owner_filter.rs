@@ -19,11 +19,18 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 /// The audited sources, and the fewest statements each holds.
-const SOURCES: &[(&str, &str, usize)] = &[(
-    "hennery-kernel/src/operator.rs",
-    include_str!("../../hennery-kernel/src/operator.rs"),
-    19,
-)];
+const SOURCES: &[(&str, &str, usize)] = &[
+    (
+        "hennery-kernel/src/operator.rs",
+        include_str!("../../hennery-kernel/src/operator.rs"),
+        19,
+    ),
+    (
+        "hennery-kernel/src/hosts.rs",
+        include_str!("../../hennery-kernel/src/hosts.rs"),
+        13,
+    ),
+];
 
 /// Every string literal in `source`, in order, skipping comments and char
 /// literals. Enough of Rust's lexer for these files: plain and raw
@@ -241,12 +248,27 @@ fn without_sql_comments(sql: &str) -> String {
 /// to a parameter and pass, as long as the statement named `owners`
 /// somewhere, even in an unconnected subquery. A join that compares two
 /// owner columns to each other, not to a parameter, still does not count
-/// (A1).
+/// (A1). A comma right after `owners` (`FROM owners, hosts`) is the next
+/// item of an old-style join, not an alias: the comma is kept as its own
+/// token so the next word is never mistaken for one (3b-iii review re-review
+/// N1; ED6).
 fn compares_owner_with_a_parameter(sql: &str) -> bool {
     let sql = without_sql_comments(sql);
     let tokens: Vec<&str> = sql
-        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ','))
+        .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')'))
         .filter(|t| !t.is_empty())
+        .flat_map(|word| {
+            let mut parts = Vec::new();
+            for (at, part) in word.split(',').enumerate() {
+                if at > 0 {
+                    parts.push(",");
+                }
+                if !part.is_empty() {
+                    parts.push(part);
+                }
+            }
+            parts
+        })
         .collect();
     // The tables this statement names (`FROM`/`JOIN`/`UPDATE`/`INSERT
     // INTO`), and any alias declared right after `owners` there. Textual,
@@ -255,7 +277,7 @@ fn compares_owner_with_a_parameter(sql: &str) -> bool {
     let mut tables: BTreeSet<&str> = BTreeSet::new();
     let mut owners_aliases: BTreeSet<&str> = BTreeSet::new();
     const NOT_AN_ALIAS: &[&str] = &[
-        "WHERE", "ON", "SET", "VALUES", "JOIN", "ORDER", "GROUP", "LIMIT", "AS", "SELECT",
+        "WHERE", "ON", "SET", "VALUES", "JOIN", "ORDER", "GROUP", "LIMIT", "AS", "SELECT", ",",
     ];
     for i in 0..tokens.len() {
         let names_a_table = matches!(tokens[i], "FROM" | "JOIN" | "UPDATE")
@@ -401,6 +423,18 @@ fn the_audit_catches_a_query_without_the_owner() {
         // comparison. `owner_id` is read (so rule 1 passes), but the only
         // `= ?N` naming it is commented out.
         "SELECT phc FROM password_credentials WHERE owner_id IS NOT NULL -- owner_id = ?1",
+        // 3b-iii Task 4, ED3: the same gap as above, now that `hosts` also
+        // has an `owner_id`. `owners` is named, but only in an unconnected
+        // subquery; the real filter, `hosts.id = ?1`, is not an owner
+        // comparison at all.
+        "SELECT name FROM hosts WHERE id = ?1 AND owner_id IN (SELECT id FROM owners)",
+        // 3b-iii Task 4, ED3 re-review N1 / ED6: a comma join. The alias
+        // scan must not take `hosts`, the next table name after the comma,
+        // for an alias of `owners`: `hosts.id = ?1` is not an owner
+        // comparison, even though `hosts.owner_id = owners.id` (two owner
+        // columns compared to each other, not to a parameter, A1) is
+        // right next to it.
+        "SELECT name FROM owners, hosts WHERE hosts.owner_id = owners.id AND hosts.id = ?1",
     ] {
         assert!(!problems(&conn, bad).is_empty(), "passed: {bad}");
     }
