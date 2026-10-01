@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 const SOURCES: &[(&str, &str, usize)] = &[(
     "hennery-kernel/src/operator.rs",
     include_str!("../../hennery-kernel/src/operator.rs"),
-    17,
+    19,
 )];
 
 /// Every string literal in `source`, in order, skipping comments and char
@@ -204,19 +204,99 @@ fn inserts_owner(sql: &str, table: &str) -> bool {
     columns.split(',').any(|c| c.trim() == "owner_id")
 }
 
+/// `sql` with its own comments removed (`-- … ` to end of line, `/* … */`):
+/// neither can satisfy `compares_owner_with_a_parameter` (3b-iii review,
+/// M2) — a commented-out comparison is not a real one.
+fn without_sql_comments(sql: &str) -> String {
+    let s: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        if s[i] == '-' && s.get(i + 1) == Some(&'-') {
+            while i < s.len() && s[i] != '\n' {
+                i += 1;
+            }
+        } else if s[i] == '/' && s.get(i + 1) == Some(&'*') {
+            i += 2;
+            while i + 1 < s.len() && !(s[i] == '*' && s[i + 1] == '/') {
+                i += 1;
+            }
+            i += 2;
+        } else {
+            out.push(s[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// Whether `sql` compares an owner column with a parameter: `owner_id = ?N`
-/// or `?N = owner_id`, qualified (`p.owner_id`) or not, or `id = ?N` when it
-/// names `owners`. A join that compares two owner columns ties the rows to
-/// each other, not to the owner (3b-iii review, A1).
+/// or `?N = owner_id`, qualified (`p.owner_id`) or not, or `id = ?N` when
+/// `id` names `owners` — the statement's only table (`FROM owners`,
+/// `UPDATE owners`, with no other `FROM`/`JOIN`/`UPDATE`/`INSERT INTO`), or
+/// qualified with `owners` itself or an alias declared right after it
+/// (`owners o`, `owners AS o`). `owners` appearing anywhere in the
+/// statement is not enough on its own (3b-iii review, I1; ED3): before
+/// this, a join or a subquery could tie some other table's unrelated `id`
+/// to a parameter and pass, as long as the statement named `owners`
+/// somewhere, even in an unconnected subquery. A join that compares two
+/// owner columns to each other, not to a parameter, still does not count
+/// (A1).
 fn compares_owner_with_a_parameter(sql: &str) -> bool {
+    let sql = without_sql_comments(sql);
     let tokens: Vec<&str> = sql
         .split(|c: char| c.is_whitespace() || matches!(c, '(' | ')' | ','))
         .filter(|t| !t.is_empty())
         .collect();
-    let names_owners = tokens.contains(&"owners");
+    // The tables this statement names (`FROM`/`JOIN`/`UPDATE`/`INSERT
+    // INTO`), and any alias declared right after `owners` there. Textual,
+    // like the rest of this check: it does not track a subquery's own
+    // scope, only the word that follows a source keyword.
+    let mut tables: BTreeSet<&str> = BTreeSet::new();
+    let mut owners_aliases: BTreeSet<&str> = BTreeSet::new();
+    const NOT_AN_ALIAS: &[&str] = &[
+        "WHERE", "ON", "SET", "VALUES", "JOIN", "ORDER", "GROUP", "LIMIT", "AS", "SELECT",
+    ];
+    for i in 0..tokens.len() {
+        let names_a_table = matches!(tokens[i], "FROM" | "JOIN" | "UPDATE")
+            || (tokens[i] == "INTO" && i > 0 && tokens[i - 1] == "INSERT");
+        if !names_a_table {
+            continue;
+        }
+        let Some(&table) = tokens.get(i + 1) else { continue };
+        tables.insert(table);
+        if table != "owners" {
+            continue;
+        }
+        owners_aliases.insert(table);
+        let next = tokens.get(i + 2).copied();
+        let alias = if next == Some("AS") {
+            tokens.get(i + 3).copied()
+        } else {
+            next
+        };
+        if let Some(alias) = alias
+            && !NOT_AN_ALIAS.contains(&alias)
+        {
+            owners_aliases.insert(alias);
+        }
+    }
+    let only_owners = tables.len() == 1 && tables.contains("owners");
     let column = |t: &str| {
-        let name = t.rsplit('.').next().unwrap_or(t);
-        name == "owner_id" || (names_owners && name == "id")
+        let (qualifier, name) = match t.rsplit_once('.') {
+            Some((q, n)) => (Some(q), n),
+            None => (None, t),
+        };
+        if name == "owner_id" {
+            return true;
+        }
+        if name != "id" {
+            return false;
+        }
+        match qualifier {
+            Some(q) => owners_aliases.contains(q),
+            None => only_owners,
+        }
     };
     let parameter = |t: &str| t.len() > 1 && t.starts_with('?') && t[1..].chars().all(|c| c.is_ascii_digit());
     tokens
@@ -310,6 +390,17 @@ fn the_audit_catches_a_query_without_the_owner() {
          SELECT ?1, owner_id, 'x', 0, 0, 0 FROM password_credentials WHERE phc = ?2",
         "SELECT s.user_agent FROM auth_sessions s JOIN password_credentials c ON c.owner_id = s.owner_id
          WHERE s.id_hash = ?1",
+        // 3b-iii review I1 / ED3: `owners` appearing anywhere in the
+        // statement used to make any `id`, however unrelated, count as the
+        // owner comparison. Here `p` is a derived table drawing from
+        // `owners.id`, not an alias of `owners` itself, and the only real
+        // comparison (`ps.owner_id = p.id`) does not involve a parameter.
+        "SELECT ps.phc FROM password_credentials ps, (SELECT id FROM owners WHERE set_up_at IS NOT NULL) p
+         WHERE ps.owner_id = p.id AND p.id = ?1",
+        // 3b-iii review M2: a comment cannot stand in for a real
+        // comparison. `owner_id` is read (so rule 1 passes), but the only
+        // `= ?N` naming it is commented out.
+        "SELECT phc FROM password_credentials WHERE owner_id IS NOT NULL -- owner_id = ?1",
     ] {
         assert!(!problems(&conn, bad).is_empty(), "passed: {bad}");
     }
