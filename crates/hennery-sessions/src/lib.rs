@@ -1,6 +1,7 @@
 //! Collector-side session module (ACP core spec §4, §8, §9).
 
 pub mod api;
+pub mod attachments;
 pub mod content;
 pub mod hats;
 pub mod hosts;
