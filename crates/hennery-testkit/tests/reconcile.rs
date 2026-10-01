@@ -1445,13 +1445,13 @@ async fn set_config_refusals_answer_with_their_codes() {
         assert_eq!((got, body["code"].as_str()), (status, Some(code)), "{body}");
     }
     // Not a string or a boolean: refused before anything is sent.
-    let (status, _) = post(
+    let (status, body) = post(
         &client(&collector),
         config_url(&collector, &session),
         json!({ "config_id": "x", "value": 3 }),
     )
     .await;
-    assert_eq!(status, 422);
+    assert_eq!((status, body["code"].as_str()), (422, Some("invalid_body")), "{body}");
     let (status, _) = post(
         &client(&collector),
         config_url(&collector, "nope"),
@@ -1701,8 +1701,9 @@ async fn answers_are_checked_against_the_stored_request() {
     assert_eq!((status, body["code"].as_str()), (400, Some("invalid")), "{body}");
     let (status, _) = post(&client(&collector), url.clone(), json!({"action": "accept"})).await;
     assert_eq!(status, 400, "an elicitation's answer to a permission request");
-    let (status, _) = post(&client(&collector), url, json!({"action": "whatever"})).await;
-    assert_eq!(status, 422);
+    // A fixed error, not serde's message quoting the body back.
+    let (status, body) = post(&client(&collector), url, json!({"action": "whatever"})).await;
+    assert_eq!((status, body["code"].as_str()), (422, Some("invalid_body")), "{body}");
     let (status, body) = post(
         &client(&collector),
         answer_url(&collector, &session, "no-such-question"),
