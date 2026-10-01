@@ -772,11 +772,9 @@ fn a_failed_pairing_code_write_is_logged_without_the_code_and_does_not_kill_the_
                 return Err(std::io::Error::last_os_error());
             }
             let [reader, writer] = fds;
-            // Nobody will ever read: every write is EPIPE. A `dup2` onto
-            // the reader's number closes it too.
-            if writer != 3 && libc::dup2(writer, 3) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+            // Nobody will ever read: every write is EPIPE. Placed onto the
+            // reader's number, the writer closes it too.
+            hennery_testkit::place_fd(writer, 3)?;
             for fd in [reader, writer] {
                 if fd != 3 {
                     libc::close(fd);
@@ -981,9 +979,8 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     unsafe {
         control.pre_exec(|| {
             close_leaked_descriptors();
-            if libc::dup2(1, 3) < 0 || libc::dup2(1, 4) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+            hennery_testkit::place_fd(1, 3)?;
+            hennery_testkit::place_fd(1, 4)?;
             Ok(())
         });
     }
@@ -1002,9 +999,7 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     unsafe {
         command.pre_exec(|| {
             close_leaked_descriptors();
-            if libc::dup2(2, 7) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+            hennery_testkit::place_fd(2, 7)?;
             Ok(())
         });
     }
@@ -1425,19 +1420,8 @@ fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
             let fd = fd.as_raw_fd();
             // SAFETY: dup2 in the forked child, before exec; async-signal-safe.
             unsafe {
-                cmd.pre_exec(move || {
-                    // Already 50 (a busy test binary has that many open):
-                    // `dup2` onto itself would keep close-on-exec set.
-                    let rc = if fd == 50 {
-                        libc::fcntl(fd, libc::F_SETFD, 0)
-                    } else {
-                        libc::dup2(fd, 50)
-                    };
-                    if rc < 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
+                // Already 50, maybe: a busy test binary has that many open.
+                cmd.pre_exec(move || hennery_testkit::place_fd(fd, 50));
             }
         }
         let mut child = cmd
@@ -1539,22 +1523,14 @@ fn the_code_descriptors_must_be_open_pipes() {
         // SAFETY: dup2 and close in the forked child, before exec;
         // async-signal-safe.
         unsafe {
-            cmd.pre_exec(move || {
-                let rc = match fd {
-                    // Already 50: `dup2` onto itself would keep close-on-exec.
-                    Some(50) => libc::fcntl(50, libc::F_SETFD, 0),
-                    Some(fd) => libc::dup2(fd, 50),
-                    // Closed for certain: something another thread opened
-                    // without close-on-exec may sit at 50.
-                    None => {
-                        libc::close(50);
-                        0
-                    }
-                };
-                if rc < 0 {
-                    return Err(std::io::Error::last_os_error());
+            cmd.pre_exec(move || match fd {
+                Some(fd) => hennery_testkit::place_fd(fd, 50),
+                // Closed for certain: something another thread opened
+                // without close-on-exec may sit at 50.
+                None => {
+                    libc::close(50);
+                    Ok(())
                 }
-                Ok(())
             });
         }
         let mut child = cmd
