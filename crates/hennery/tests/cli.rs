@@ -188,7 +188,7 @@ fn the_development_token_in_the_environment_is_warned_about_and_never_printed() 
     }
 }
 
-/// Kills this test's `up` process tree and removes its scratch dir
+/// Stops this test's `up` process tree and removes its scratch dir
 /// unconditionally, including on an assertion panic mid-test — nothing below
 /// is allowed to leave a process running just because a `assert!` fired
 /// first.
@@ -200,8 +200,8 @@ struct KillTree {
     /// gracefully or via the `kill()` below — any child still alive is
     /// immediately reparented away from `up`'s pid, so a *fresh* `pgrep -P
     /// up_pid` at drop time can no longer find it. The recorded list is the
-    /// only reliable way to reach it; a fresh query is kept only as a
-    /// fallback for a panic that happened before anything was recorded.
+    /// only reliable way to reach it once `up` is gone; a fresh query is made
+    /// only while `up` is stopped and still alive (drop's fallback).
     children: Vec<i32>,
     /// Where `up`'s standard output goes, with its standard error next to it
     /// (`.err`): printed when it dies while a test waits on it.
@@ -308,13 +308,24 @@ fn strip_ansi(line: &str) -> String {
 
 impl Drop for KillTree {
     fn drop(&mut self) {
-        let up_pid = self.up.id() as i32;
-        let targets = if self.children.is_empty() {
-            children_of(up_pid)
-        } else {
-            std::mem::take(&mut self.children)
-        };
-        for pid in targets {
+        // SIGTERM first, and wait: `up` (and a collector) catches it from
+        // before it starts any child, so it stops its children itself, host
+        // then collector, also one it spawns after this signal. Killing `up`
+        // outright cannot: a test may end before `up` spawns its host, which
+        // a `pgrep` made first would miss and `up`'s death would orphan.
+        // Never signalled once reaped (a test may have stopped it already):
+        // its pid may be another process's by now. The bound is past `up`'s
+        // own (10 s for each child).
+        if matches!(self.up.try_wait(), Ok(None)) {
+            let up_pid = self.up.id() as i32;
+            unsafe { libc::kill(up_pid, libc::SIGTERM) };
+            if wait_with_timeout(&mut self.up, Duration::from_secs(30)).is_none() {
+                // Stopped, `up` spawns no child after the `pgrep` below.
+                unsafe { libc::kill(up_pid, libc::SIGSTOP) };
+                self.children.extend(children_of(up_pid));
+            }
+        }
+        for pid in std::mem::take(&mut self.children) {
             unsafe {
                 // Each child leads its own process group (`run_up` sets
                 // `process_group(0)`), so kill both the pid and that group.
