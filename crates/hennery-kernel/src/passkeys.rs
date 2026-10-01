@@ -14,8 +14,8 @@
 //!   a stepped-up session (decision 7), and removing one always leaves the
 //!   password. Every query names the owner (kernel spec §1).
 
-use crate::operator::{Operator, PublicUrl, SESSION_TTL_SECS, STEP_UP_SECS, kept_user_agent};
-use crate::secret::{random_bytes, sha256_hex};
+use crate::operator::{Operator, PublicUrl, STEP_UP_SECS, insert_auth_session};
+use crate::secret::random_bytes;
 use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -41,11 +41,20 @@ pub const MAX_SESSION_CEREMONIES: usize = 1024;
 const RP_NAME: &str = "hennery";
 
 /// The relying party for `public_url`: `None` when its host is an IP
-/// address (decision 1).
+/// address (decision 1). Any other `None` is a parsed `public_url` that
+/// `webauthn-rs` refuses, unreachable as `PublicUrl::parse` stands; it is
+/// logged, so passkeys never stop working unexplained.
 pub fn relying_party(public_url: &PublicUrl) -> Option<Webauthn> {
     let rp_id = public_url.rp_id()?;
-    let origin = Url::parse(public_url.origin()).ok()?;
+    let origin = Url::parse(public_url.origin())
+        .inspect_err(|err| {
+            tracing::warn!(origin = ?public_url.origin(), error = %err, "public_url's origin does not parse: passkeys are unavailable");
+        })
+        .ok()?;
     WebauthnBuilder::new(rp_id, &origin)
+        .inspect_err(|err| {
+            tracing::warn!(rp_id = ?rp_id, origin = ?public_url.origin(), error = %err, "no relying party for public_url: passkeys are unavailable");
+        })
         .ok()?
         .rp_name(RP_NAME)
         .allow_subdomains(false)
@@ -530,21 +539,10 @@ impl Operator {
         if let Err(why) = record_use(&tx, self.owner_id(), &result, now)? {
             return Ok(Err(why));
         }
-        tx.execute(
-            "DELETE FROM auth_sessions WHERE expires_at <= ?1 AND owner_id = ?2",
-            params![now, self.owner_id()],
-        )?;
-        tx.execute(
-            "INSERT INTO auth_sessions(id_hash, owner_id, user_agent, created_at, last_seen_at, last_step_up_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?4, ?4, ?5)",
-            params![
-                sha256_hex(token.as_bytes()),
-                self.owner_id(),
-                kept_user_agent(user_agent),
-                now,
-                now + SESSION_TTL_SECS
-            ],
-        )?;
+        // `record_use` just proved the passkey, in this transaction: the
+        // session needs no password binding.
+        let opened = insert_auth_session(&tx, self.owner_id(), &token, user_agent, None, now)?;
+        anyhow::ensure!(opened, "a passkey login's session was not stored");
         tx.commit()?;
         Ok(Ok(token))
     }

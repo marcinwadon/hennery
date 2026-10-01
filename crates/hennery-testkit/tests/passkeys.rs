@@ -213,6 +213,20 @@ fn session_token(resp: &reqwest::Response) -> String {
         .to_string()
 }
 
+/// A logged finish shows which ceremony it names, never the credential.
+#[test]
+fn a_passkey_finish_does_not_show_its_credential_in_debug() {
+    let shown = format!(
+        "{:?}",
+        PasskeyFinishRequest {
+            ceremony_id: "ceremony-0123".into(),
+            credential: serde_json::json!({ "response": { "signature": "sig-sentinel-4567" } }),
+        }
+    );
+    assert!(!shown.contains("sig-sentinel-4567"), "{shown}");
+    assert!(shown.contains("ceremony-0123"), "{shown}");
+}
+
 /// Kernel spec §3.1: setup "then offers passkey registration". The session
 /// setup opens is stepped up, so it registers a passkey at once; the
 /// passkey then signs in, steps a stale session up, and is removed.

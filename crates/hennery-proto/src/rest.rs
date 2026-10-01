@@ -351,12 +351,21 @@ pub struct PasskeyCeremony {
 }
 
 /// The finish of every passkey ceremony: the credential the browser
-/// returned, as `PublicKeyCredential.toJSON()` gives it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+/// returned, as `PublicKeyCredential.toJSON()` gives it. `Debug` leaves
+/// the credential out.
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct PasskeyFinishRequest {
     pub ceremony_id: String,
     #[ts(type = "unknown")]
     pub credential: Value,
+}
+
+impl std::fmt::Debug for PasskeyFinishRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasskeyFinishRequest")
+            .field("ceremony_id", &self.ceremony_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// One of the owner's passkeys: an entry of `GET /api/auth/passkeys`, and
