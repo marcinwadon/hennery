@@ -286,6 +286,26 @@ pub fn pid_alive(pid: i32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 }
 }
 
+/// Make `fd` this process's descriptor `at`, open across `exec`: for a
+/// `pre_exec` hook that hands a child a descriptor at a fixed number. When
+/// `fd` already is `at`, `dup2` would be a no-op that keeps close-on-exec,
+/// so the flag is cleared instead. Async-signal-safe (`dup2`, `fcntl`).
+pub fn place_fd(fd: i32, at: i32) -> std::io::Result<()> {
+    // SAFETY: dup2(2) and fcntl(2) on descriptor numbers; neither allocates.
+    let rc = unsafe {
+        if fd == at {
+            libc::fcntl(at, libc::F_SETFD, 0)
+        } else {
+            libc::dup2(fd, at)
+        }
+    };
+    if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 /// A config catalogue like a real adapter's, for `FakeScript::config_options`:
 /// `model` (category `model`: `small` | `large`, current `small`), `effort`
 /// (category `thought_level`: `low` | `high`, current `low`), `fast` (a

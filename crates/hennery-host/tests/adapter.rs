@@ -314,9 +314,8 @@ async fn a_descriptor_above_a_lowered_soft_limit_is_closed_too() {
     // nothing is allocated.
     unsafe {
         std::os::unix::process::CommandExt::pre_exec(&mut child, move || {
-            if libc::dup2(fd, ABOVE_THE_LIMIT) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
+            // A busy test binary may have opened the file at 60 already.
+            hennery_testkit::place_fd(fd, ABOVE_THE_LIMIT)?;
             let lowered = libc::rlimit {
                 rlim_cur: 50,
                 rlim_max: hard.rlim_max,
