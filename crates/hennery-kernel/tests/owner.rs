@@ -360,8 +360,8 @@ const HOST_TABLES: &[&str] = &["hosts", "pairing_codes"];
 /// Kernel spec §1: every query of the host registry's filters by the
 /// owner. Another owner's host and pairing code, in the same database,
 /// are neither seen nor changed: its host's valid proof is refused like an
-/// unknown host's, it is not listed and cannot be revoked, and its code
-/// pairs nothing. The real owner's, written the same way, work (the
+/// unknown host's, it is not listed, cannot be revoked and, revoked
+/// already, is not seen as revoked either, and its code pairs nothing. The real owner's, written the same way, work (the
 /// control). The other owner's key cannot be paired again under this
 /// owner either: keys are unique across owners (3b-iii decision 7).
 #[test]
@@ -372,6 +372,10 @@ fn another_owners_hosts_and_codes_are_invisible_to_the_registry() {
     let conn = rusqlite::Connection::open(&db).unwrap();
     write_other_owner(&conn);
     write_host(&conn, OTHER, "host-b2", 2);
+    // Revoked, so that only the owner filter keeps `is_revoked` from
+    // seeing it (3b-iii final review, T4-M1): it gates the host socket.
+    conn.execute("UPDATE hosts SET revoked_at = ?1 WHERE id = 'host-b2'", [NOW])
+        .unwrap();
     write_code(&conn, OTHER, "BBBB-BBBB");
     write_host(&conn, hosts.owner_id(), "host-a1", 1);
     write_code(&conn, hosts.owner_id(), "AAAA-AAAA");
@@ -413,6 +417,7 @@ fn another_owners_hosts_and_codes_are_invisible_to_the_registry() {
         hosts.enroll("AAAA-AAAA", &enrollment(4), NOW).unwrap(),
         EnrollOutcome::Enrolled { .. }
     ));
+    assert!(!hosts.is_revoked("host-a1").unwrap());
     assert_eq!(hosts.revoke("host-a1", NOW).unwrap(), Revoke::Revoked);
     assert!(hosts.is_revoked("host-a1").unwrap());
 }
