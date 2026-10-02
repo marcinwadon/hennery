@@ -88,9 +88,9 @@ is the signed-in session that subscribed (`auth_sessions.id_hash`); a
 subscription's `endpoint` is unique across owners, like a credential id.
 
 *Built so far:* `hosts` lacks `default_hat_id` (hats), `agents`,
-`workspace_roots` (`probe_agents`) and `last_doctor`; `purged_hats` does not
-exist yet. `push_subscriptions` and `hat_push_policies`
-are kernel migration 9 (plan 10a).
+`workspace_roots` (`probe_agents`) and `last_doctor`. `push_subscriptions` and
+`hat_push_policies` are kernel migration 9 (plan 10a); `purged_hats` is kernel
+migration 10 (plan 9c).
 
 ## 2. Configuration
 
@@ -532,10 +532,32 @@ The kernel defines a `LifecycleHooks` trait with `on_host_revoked(host_id)`
 and `on_hat_purged(hat_id)`; `hennery-sessions` and `hennery-gateway` each
 implement it, so the kernel never imports either. Hooks must be idempotent: a
 repeated revoke, and a revoked host's socket ending, call them again (§4.3).
-*Built so far:* only `on_host_revoked`, implemented by the sessions module.
+*Built so far:* `on_host_revoked` and `on_hat_purged`, implemented by the sessions module; the gateway's purge hook is plan 8's.
 
 **Purge a hat** (`POST /api/hats/{id}/purge`, step-up; the default hat of any
-host cannot be purged until the hosts are moved to another hat):
+host, revoked ones included, and the `default_hat_id` setting's hat cannot be
+purged until they are moved to another hat: 409 `hat_is_default`). As built
+(plan 9c):
+
+- **Refused before anything changes:** 404 for an unknown hat; 409
+  `sessions_running` while a session of the hat is `starting` or `active` on a
+  reachable host (close it first). Sessions no adapter the collector can reach
+  holds (presumed parked; active or starting on a host that is away) are
+  closed collector-side and deleted, and listed in the result as
+  `unconfirmed`: their host closes them when it returns.
+- **Freeze first:** one transaction checks the defaults again, records the
+  hat in `purged_hats` and deletes its path rules. From then on no session
+  starts, resumes or is re-assigned into or out of the hat, and no rule or
+  default names it (409 `hat_purging`); `HatItem.purging` shows it.
+- **Then** the gateway's hook (plan 8), each session's delete in its own
+  transaction, and last the hat row, its project recents and push policies
+  with it. A refusal or a crash after the freeze leaves the hat frozen; a
+  re-POST finishes the purge. The WAL is checkpointed once, after the last
+  delete, the debt recorded before the first (ACP core §4.10).
+- **`GET /api/hats/{id}/purge`** previews it (no step-up): the counts of
+  sessions, rules and recents, the sessions that would refuse it, and the
+  sessions with no hat (`hat_id = ''`), which no purge deletes.
+- 200 `PurgeResult {sessions, rules, unconfirmed}`.
 
 - sessions: every session of the hat is deleted as in ACP core §4.10;
 - gateway: its connections with their grants, mounts, session tokens,
@@ -543,9 +565,10 @@ host cannot be purged until the hosts are moved to another hat):
 - kernel: its path rules, project recents and the hat row are deleted, and the
   hat is recorded in `purged_hats`;
 - hosts: after every handshake the collector sends `forget_hat{hat_id}` for
-  each hat in `purged_hats` (kept 30 days); the host deletes its composed agent
-  home for that hat (ACP core §6) once no process of that hat runs. Deletion
-  is idempotent.
+  each hat in `purged_hats` (kept for good: a host away for any time still
+  forgets); the host deletes its composed agent home for that hat (ACP core
+  §6) once no process of that hat runs, and only for a `hat-<hex>` id.
+  Deletion is idempotent.
 
 ## 6. Push
 
