@@ -3228,6 +3228,11 @@ fn agent_home() -> hennery_proto::frames::AgentHome {
 /// A `claude` session started through the API, its `session_started`
 /// reporting `agent_home()`, then parked by the host.
 async fn parked_claude_session(collector: &Collector, host: &mut ScriptedHost) -> String {
+    parked_claude_session_as(collector, host, AGENT_SESSION).await
+}
+
+/// `parked_claude_session`, its agent's session being `agent_session_id`.
+async fn parked_claude_session_as(collector: &Collector, host: &mut ScriptedHost, agent_session_id: &str) -> String {
     let c = client(collector);
     let url = collector.url("/api/sessions");
     let call =
@@ -3242,7 +3247,7 @@ async fn parked_claude_session(collector: &Collector, host: &mut ScriptedHost) -
         &session_id,
         SessionBody::SessionStarted {
             request_id,
-            agent_session_id: AGENT_SESSION.into(),
+            agent_session_id: agent_session_id.into(),
             indexed: Default::default(),
             agent_home: Some(agent_home()),
         },
@@ -3502,4 +3507,85 @@ async fn a_record_whose_agent_session_is_in_use_again_is_not_sent() {
         (listed[0].state, listed[0].attempts),
         (hennery_proto::rest::HostRemovalState::Final, 0)
     );
+}
+
+/// Plan 9d decision 7, the 9c hand-off: a purge removes its sessions'
+/// transcripts on their hosts as a delete does: a record for each, written
+/// in each session's delete before its scrub, sent within the purge's one
+/// wait, and counted in `PurgeResult.host_transcripts`, with the sessions
+/// still pending.
+#[tokio::test]
+async fn a_purge_forgets_its_sessions_on_their_hosts_and_counts_them() {
+    use hennery_proto::frames::{ForgetKind, ForgetReason, ForgetRemaining, ForgetWhat};
+    const OTHER: &str = "1b9c1d2e-3f40-4a5b-8c6d-7e8f90a1b2c3";
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect_with(&collector, vec![], 0, forgetting()).await;
+    let removed = parked_claude_session_as(&collector, &mut host, AGENT_SESSION).await;
+    let waiting = parked_claude_session_as(&collector, &mut host, OTHER).await;
+    // One from before 9d: an agent session, no home.
+    let store = &collector.state.store;
+    store
+        .create_session("s-old", HOST, "claude", "/tmp", "x", None)
+        .unwrap();
+    store
+        .ingest("s-old", 1, &SessionBody::session_started("r", "c0"))
+        .unwrap();
+    store.close_now("s-old").unwrap();
+    let hat = match collector.state.hosts.create_hat("Acme", None, 0).unwrap() {
+        hennery_kernel::hats::HatChange::Done(hat) => hat.id,
+        other => panic!("{other:?}"),
+    };
+    for id in [&removed, &waiting, &"s-old".to_string()] {
+        assert!(matches!(
+            store.reassign_hat(id, &hat).unwrap(),
+            hennery_sessions::store::Reassign::Done(_)
+        ));
+    }
+    let c = client(&collector);
+    let url = collector.url(&format!("/api/hats/{hat}/purge"));
+    let call = tokio::spawn(async move {
+        let resp = c.post(url).timeout(Duration::from_secs(40)).send().await.unwrap();
+        (
+            resp.status().as_u16(),
+            resp.json::<Value>().await.unwrap_or(Value::Null),
+        )
+    });
+    for _ in 0..2 {
+        let CollectorFrame::ForgetSession {
+            request_id,
+            agent_session_id,
+            ..
+        } = host.next().await
+        else {
+            panic!("expected forget_session");
+        };
+        let left = if agent_session_id == OTHER {
+            vec![ForgetRemaining {
+                what: ForgetWhat {
+                    kind: ForgetKind::Session,
+                    count: 0,
+                },
+                reason: ForgetReason::Attached,
+                retry: true,
+            }]
+        } else {
+            vec![]
+        };
+        host.send(&forgotten(request_id, left)).await;
+    }
+    let (status, body) = call.await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["host_transcripts"],
+        json!({ "removed": 1, "partial": 1, "pending": 1, "pending_sessions": [waiting] }),
+        "{body}"
+    );
+    let listed: Vec<(String, hennery_proto::rest::HostRemovalState)> = removals(&collector)
+        .await
+        .into_iter()
+        .map(|r| (r.session_id, r.state))
+        .collect();
+    assert_eq!(listed.len(), 2, "{listed:?}");
+    assert!(listed.contains(&(waiting.clone(), hennery_proto::rest::HostRemovalState::Pending)));
+    assert!(listed.contains(&("s-old".to_string(), hennery_proto::rest::HostRemovalState::Final)));
 }
