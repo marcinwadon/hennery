@@ -76,7 +76,9 @@ pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
 
   installPhase = ''
     runHook preInstall
-    # The page loads the entry script the build made, not a stale name.
+    # The page loads the entry script the build made, not a stale name. The
+    # pattern is the tag Vite writes today: after a Vite upgrade, a failure
+    # here may mean a new format rather than a bad build.
     entry=$(sed -n 's|.*<script type="module" crossorigin src="/\(assets/[^"]*\.js\)".*|\1|p' dist/index.html)
     if [ -z "$entry" ] || [ ! -f "dist/$entry" ]; then
       echo "dist/index.html loads no script the build made" >&2

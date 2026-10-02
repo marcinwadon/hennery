@@ -21,8 +21,9 @@ backup=$(mktemp)
 log=$(mktemp)
 cp "$file" "$backup"
 # Interrupted, the file gets its old hash back, never the placeholder.
-trap 'cp "$backup" "$file"; rm -f "$backup" "$log"; exit 130' INT TERM
-trap 'rm -f "$backup" "$log"' EXIT
+trap 'cp "$backup" "$file"; rm -f "$backup" "$log" "$file.tmp"; exit 130' INT
+trap 'cp "$backup" "$file"; rm -f "$backup" "$log" "$file.tmp"; exit 143' TERM
+trap 'rm -f "$backup" "$log" "$file.tmp"' EXIT
 write() {
     sed "s|\"$old\"|\"$1\"|" "$backup" > "$file.tmp" && mv "$file.tmp" "$file"
 }
