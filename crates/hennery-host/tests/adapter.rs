@@ -185,6 +185,25 @@ async fn the_operator_token_is_removed_from_the_adapter_environment() {
     assert!(!env.contains("operator-token-never-for-agents"), "{env}");
 }
 
+/// Plan 7c-iii: how a service-run host picks its own log
+/// (`HENNERY_SERVICE`, `HENNERY_LOG_DIR`) is not passed to an agent, which
+/// could otherwise run `hennery` into the host's log directory.
+#[tokio::test]
+async fn the_service_logging_variables_are_removed_from_the_adapter_environment() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("env.txt");
+    let mut cmd = sh(&format!("env > {}", out.display()));
+    cmd.env.push(("HENNERY_SERVICE".into(), "launchd".into()));
+    cmd.env.push(("HENNERY_LOG_DIR".into(), "/var/log/elsewhere".into()));
+    cmd.env.push(("HENNERY_KEEP".into(), "yes".into()));
+    let (mut adapter, _io) = Adapter::spawn(&cmd, dir.path()).unwrap();
+    adapter.exited().await;
+    let env = std::fs::read_to_string(&out).unwrap();
+    assert!(env.contains("HENNERY_KEEP=yes"), "{env}");
+    assert!(!env.contains("HENNERY_SERVICE="), "{env}");
+    assert!(!env.contains("HENNERY_LOG_DIR="), "{env}");
+}
+
 #[test]
 fn scrub_redacts_token_like_strings_and_leaves_words_alone() {
     let cases = [

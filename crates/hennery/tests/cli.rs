@@ -4,12 +4,24 @@ use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+/// The variables that send a long-running `hennery` to a log file (plan
+/// 7c-iii): a test run from a service-run host's agent, or a shell that set
+/// them, must not log into a real log directory, nor away from the output
+/// these tests read.
+const LOG_VARS: [&str; 2] = ["HENNERY_SERVICE", "HENNERY_LOG_DIR"];
+
+/// The `hennery` binary under test, without `LOG_VARS`.
+fn hennery() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
+    for var in LOG_VARS {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 #[test]
 fn help_lists_the_skeleton_commands() {
-    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
-        .arg("--help")
-        .output()
-        .unwrap();
+    let out = hennery().arg("--help").output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     for cmd in ["collector", "host", "up", "admin"] {
         assert!(text.contains(cmd), "missing {cmd} in help:\n{text}");
@@ -18,10 +30,7 @@ fn help_lists_the_skeleton_commands() {
 
 #[test]
 fn host_help_lists_join_and_run() {
-    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
-        .args(["host", "--help"])
-        .output()
-        .unwrap();
+    let out = hennery().args(["host", "--help"]).output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     for cmd in ["join", "run"] {
         assert!(text.contains(cmd), "missing {cmd} in help:\n{text}");
@@ -71,7 +80,7 @@ fn joining_over_http_ignores_a_configured_proxy() {
     let host_dir = std::env::temp_dir().join(format!("hennery-cli-noproxy-host-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&host_dir);
 
-    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let out = hennery()
         .args(["host", "join", &format!("http://{addr}"), &code, "--name", "laptop"])
         .arg("--data-dir")
         .arg(&host_dir)
@@ -101,7 +110,7 @@ fn joining_over_http_ignores_a_configured_proxy() {
 
 #[test]
 fn a_malformed_agent_flag_is_rejected() {
-    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let out = hennery()
         .args(["host", "run", "--data-dir", "/tmp/x", "--agent", "noequals"])
         .output()
         .unwrap();
@@ -114,7 +123,7 @@ fn a_malformed_agent_flag_is_rejected() {
 #[test]
 fn a_bad_workspace_root_fails_before_pairing() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let out = hennery()
         .args(["host", "run", "--data-dir"])
         .arg(dir.path())
         .args(["--workspace-root", "relative/dir"])
@@ -131,7 +140,7 @@ fn a_bad_workspace_root_fails_before_pairing() {
 #[test]
 fn the_development_token_flag_is_gone() {
     for command in ["collector", "up"] {
-        let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        let out = hennery()
             .args([command, "--dev-token", "dev-token-for-tests"])
             .args(["--data-dir", "/nonexistent/hennery-cli-dev-token"])
             .output()
@@ -188,7 +197,7 @@ fn the_development_token_in_the_environment_is_warned_about_and_never_printed() 
         ),
     ];
     for (name, args) in runs {
-        let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        let out = hennery()
             .args(args)
             .env("HENNERY_DEV_TOKEN", TOKEN)
             .env("RUST_LOG", "info")
@@ -380,7 +389,7 @@ fn sigint_to_ups_process_group_still_shuts_down_cleanly() {
     let dir = scratch_dir("pgtest");
     let log = dir.join("up.log");
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
+    let mut command = hennery();
     command
         .args(["up", "--listen", "127.0.0.1:0"])
         .arg("--data-dir")
@@ -632,7 +641,7 @@ fn delete(listen: &str, path: &str, session: &str) -> Option<u16> {
 
 /// Start `up` on port 0 with its log in `log`.
 fn up_logging_to(dir: &std::path::Path, log: &std::path::Path) -> KillTree {
-    up_logging_to_with(Command::new(env!("CARGO_BIN_EXE_hennery")), dir, log, &[])
+    up_logging_to_with(hennery(), dir, log, &[])
 }
 
 /// Like `up_logging_to`, from `command` (`hennery` itself, or a shell in
@@ -736,7 +745,7 @@ fn a_non_loopback_listen_is_refused_and_touches_neither_data_dir() {
     // TEST-NET-3 (RFC 5737): never routable, and not loopback either, so
     // `collector_ws_url` refuses it (plain http off loopback) before `up`
     // spawns anything that could bind or listen on it.
-    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let out = hennery()
         .args(["up", "--listen", "203.0.113.5:7117"])
         .arg("--data-dir")
         .arg(&dir)
@@ -768,7 +777,7 @@ fn a_failed_pairing_code_write_is_logged_without_the_code_and_does_not_kill_the_
     let _cleanup = RemoveDir(dir.clone());
     let log = dir.join("collector.log");
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
+    let mut cmd = hennery();
     cmd.args(["collector", "--listen", "127.0.0.1:0"])
         .arg("--data-dir")
         .arg(dir.join("data"))
@@ -883,7 +892,7 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
 
     let log = dir.join("up.log");
     let mut up = up_logging_to_with(
-        Command::new(env!("CARGO_BIN_EXE_hennery")),
+        hennery(),
         &dir.join("data"),
         &log,
         &["--agent", &format!("slow=/bin/sh {}", script.display())],
@@ -954,8 +963,11 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
 /// host child, nor through it to any agent.
 ///
 /// The agent is a shell script that dumps its environment, and which of the
-/// descriptors 3 to 9 it holds (3 is the pairing pipe's number in the host
-/// child, 4 the listening socket's in the collector child), then exits.
+/// descriptors 3 to 9 and 12 it holds (3 is the pairing pipe's number in the
+/// host child, 4 the listening socket's in the collector child, 12 the
+/// parent pipe's in both), then exits. 12 is looked for at `/dev/fd/12`
+/// first thing, before the shell itself opens anything: a shell such as dash
+/// takes no descriptor above 9 in a redirection.
 ///
 /// `up` itself is started holding descriptor 7 open across `exec`, as a
 /// service manager or a shell can leave one: the host's adapter spawn must
@@ -979,7 +991,9 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     std::fs::write(
         &script,
         format!(
-            "for n in 3 4 5 6 7 8 9; do if ( eval \": <&$n\" ) 2>/dev/null; then echo $n; fi; done > {fd}.tmp\n\
+            "if [ -e /dev/fd/12 ]; then twelve=12; fi\n\
+             {{ for n in 3 4 5 6 7 8 9; do if ( eval \": <&$n\" ) 2>/dev/null; then echo $n; fi; done; \
+             if [ -n \"$twelve\" ]; then echo 12; fi; }} > {fd}.tmp\n\
              env > {env}.tmp\nmv {fd}.tmp {fd}\nmv {env}.tmp {env}\n",
             fd = report("fds.txt").display(),
             env = report("env.txt").display(),
@@ -998,16 +1012,17 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
             close_leaked_descriptors();
             hennery_testkit::place_fd(1, 3)?;
             hennery_testkit::place_fd(1, 4)?;
+            hennery_testkit::place_fd(1, 12)?;
             Ok(())
         });
     }
     assert!(control.status().unwrap().success());
-    assert_eq!(std::fs::read_to_string(report("fds.txt")).unwrap(), "3\n4\n");
+    assert_eq!(std::fs::read_to_string(report("fds.txt")).unwrap(), "3\n4\n12\n");
     std::fs::remove_file(report("fds.txt")).unwrap();
     std::fs::remove_file(report("env.txt")).unwrap();
 
     let log = dir.join("up.log");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
+    let mut command = hennery();
     command
         .env("HENNERY_DEV_TOKEN", TOKEN)
         .env("HENNERY_AGENT_MAY_SEE", "yes")
@@ -1096,6 +1111,9 @@ fn close_leaked_descriptors() {
 fn under_umask_022() -> Command {
     let mut cmd = Command::new("/bin/sh");
     cmd.args(["-c", "umask 022; exec \"$0\" \"$@\"", env!("CARGO_BIN_EXE_hennery")]);
+    for var in LOG_VARS {
+        cmd.env_remove(var);
+    }
     cmd
 }
 
@@ -1170,7 +1188,7 @@ fn a_sigterm_during_the_start_leaves_no_admin_socket() {
     let data = dir.join("data");
     let log = dir.join("collector.log");
 
-    let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let collector = hennery()
         .args(["collector", "--listen", "127.0.0.1:0"])
         .arg("--data-dir")
         .arg(&data)
@@ -1440,7 +1458,7 @@ fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
     let unix: OwnedFd = std::os::unix::net::UnixListener::bind(dir.join("s")).unwrap().into();
     let listening: OwnedFd = std::net::TcpListener::bind("127.0.0.1:0").unwrap().into();
     let collector = |fd: Option<&OwnedFd>, args: &[&str]| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
+        let mut cmd = hennery();
         cmd.arg("collector").args(args).arg("--data-dir").arg(&data);
         if fd.is_none() {
             // Another test's spawn can leak a descriptor into this child for
@@ -1536,14 +1554,14 @@ fn the_code_descriptors_must_be_open_pipes() {
     // `--listen 127.0.0.1:0`: should a check let it through, this collector
     // must not take a port another one may be serving.
     let collector = |data: &std::path::Path, fd: &str| -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
+        let mut cmd = hennery();
         cmd.args(["collector", "--listen", "127.0.0.1:0", "--pairing-code-fd", fd])
             .arg("--data-dir")
             .arg(data);
         cmd
     };
     let host = |data: &std::path::Path, fd: &str| -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
+        let mut cmd = hennery();
         cmd.args(["host", "run", "--join-url", "http://127.0.0.1:1", "--join-code-fd", fd])
             .arg("--data-dir")
             .arg(data);
@@ -1584,8 +1602,26 @@ fn the_code_descriptors_must_be_open_pipes() {
         child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
         (status, stderr)
     };
+    // Plan 7c-iii: the parent pipe's end, `--parent-fd`, alike.
+    let collector_parent = |data: &std::path::Path, fd: &str| -> Command {
+        let mut cmd = hennery();
+        cmd.args(["collector", "--listen", "127.0.0.1:0", "--parent-fd", fd])
+            .arg("--data-dir")
+            .arg(data);
+        cmd
+    };
+    let host_parent = |data: &std::path::Path, fd: &str| -> Command {
+        let mut cmd = hennery();
+        cmd.args(["host", "run", "--parent-fd", fd]).arg("--data-dir").arg(data);
+        cmd
+    };
     type Make<'a> = &'a dyn Fn(&std::path::Path, &str) -> Command;
-    for (flag, make) in [("--pairing-code-fd", &collector as Make), ("--join-code-fd", &host)] {
+    for (flag, make) in [
+        ("--pairing-code-fd", &collector as Make),
+        ("--join-code-fd", &host),
+        ("--parent-fd", &collector_parent),
+        ("--parent-fd", &host_parent),
+    ] {
         for (what, fd, expected) in [
             ("a closed descriptor", None, "is not an open descriptor"),
             ("a file", Some(&file), "is not a pipe"),
@@ -1616,7 +1652,7 @@ fn the_code_descriptors_must_be_open_pipes() {
     // descriptor rather than closing whatever is at that number.
     let (_rt, addr, code) = collector_with_a_pairing_code(&dir);
     let paired = dir.join("paired");
-    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let out = hennery()
         .args(["host", "join", &format!("http://{addr}"), &code, "--name", "laptop"])
         .arg("--data-dir")
         .arg(&paired)
@@ -1673,6 +1709,8 @@ fn the_host_fails_and_pairs_nothing_when_the_collector_dies_before_the_code() {
         .arg(&host_dir)
         .env_remove("HENNERY_HOST_DATA_DIR")
         .env_remove("HENNERY_DEV_TOKEN")
+        .env_remove(LOG_VARS[0])
+        .env_remove(LOG_VARS[1])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -1743,7 +1781,7 @@ fn the_pairing_code_never_reaches_ups_childrens_argv_or_environment() {
     // `hennery` itself, not a shell: macOS shows no platform binary's
     // environment (`/bin/sh`'s, say) to `ps -E`. `host join` with the code
     // left out waits on standard input, and gives up once that closes.
-    let mut control = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let mut control = hennery()
         .args(["host", "join", "http://127.0.0.1:1", "--name", "ABCD-EFGH"])
         .arg("--data-dir")
         .arg(dir.join("control"))
@@ -1776,7 +1814,7 @@ fn the_pairing_code_never_reaches_ups_childrens_argv_or_environment() {
 
     let data = dir.join("data");
     let log = dir.join("up.log");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
+    let mut command = hennery();
     command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -1873,7 +1911,7 @@ fn collector_with_a_pairing_code(dir: &std::path::Path) -> (tokio::runtime::Runt
 /// `hennery host join` to the collector at `addr`, into `host`, with the
 /// code left out (so read from standard input) and every stream piped.
 fn join_from_stdin(addr: std::net::SocketAddr, host: &std::path::Path) -> std::process::Child {
-    Command::new(env!("CARGO_BIN_EXE_hennery"))
+    hennery()
         .args(["host", "join", &format!("http://{addr}"), "--name", "laptop"])
         .arg("--data-dir")
         .arg(host)
@@ -2004,7 +2042,7 @@ fn every_listen_address_serves_the_same_collector() {
     let _cleanup = RemoveDir(dir.clone());
     let data = dir.join("collector");
     let log = dir.join("collector.log");
-    let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let collector = hennery()
         .args(["collector", "--listen", "127.0.0.1:0", "--listen", "127.0.0.1:0"])
         .arg("--data-dir")
         .arg(&data)
@@ -2046,7 +2084,7 @@ fn a_taken_listen_address_fails_the_start_before_the_data_dir_is_touched() {
     let taken = taken.local_addr().unwrap().to_string();
     for command in ["collector", "up"] {
         let data = dir.join(command);
-        let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        let out = hennery()
             .args([command, "--listen", "127.0.0.1:0", "--listen", &taken])
             .arg("--data-dir")
             .arg(&data)
@@ -2070,7 +2108,7 @@ fn up_hands_every_listen_address_to_its_collector() {
     let _cleanup = RemoveDir(dir.clone());
     let data = dir.join("data");
     let log = dir.join("up.log");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
+    let mut command = hennery();
     command.env("HENNERY_LISTEN", "127.0.0.1:0");
     let mut up = up_logging_to_with(command, &data, &log, &["--listen", "127.0.0.1:0"]);
     let addresses = up.listening_on(2);
@@ -2107,7 +2145,7 @@ fn config_toml_yields_to_the_environment_and_the_environment_to_flags() {
     .unwrap();
     let run = |env: &[(&str, &str)], args: &[&str], name: &str| {
         let log = dir.join(format!("{name}.log"));
-        let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        let collector = hennery()
             .arg("collector")
             .args(args)
             .arg("--data-dir")
@@ -2169,7 +2207,7 @@ fn a_bad_config_toml_stops_the_start() {
         std::fs::set_permissions(data.join("config.toml"), std::fs::Permissions::from_mode(mode)).unwrap();
         // On port 0, and bounded: a collector that ignored the file would
         // serve rather than stop, and never on the default port.
-        let mut child = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        let mut child = hennery()
             .args(["collector", "--listen", "127.0.0.1:0", "--data-dir"])
             .arg(&data)
             .stdout(std::process::Stdio::null())
@@ -2196,7 +2234,7 @@ fn up_hands_its_public_url_to_its_collector() {
     let _cleanup = RemoveDir(dir.clone());
     let data = dir.join("data");
     let mut up = up_logging_to_with(
-        Command::new(env!("CARGO_BIN_EXE_hennery")),
+        hennery(),
         &data,
         &dir.join("up.log"),
         &["--public-url", "https://up.example"],
@@ -2210,7 +2248,7 @@ fn up_hands_its_public_url_to_its_collector() {
 /// A collector on port 0 in `data`, logging to `log`, once it serves: the
 /// guard, and the address it listens on.
 fn collector_on(data: &std::path::Path, log: &std::path::Path) -> (KillTree, String) {
-    let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let collector = hennery()
         .args(["collector", "--listen", "127.0.0.1:0"])
         .arg("--data-dir")
         .arg(data)
@@ -2227,7 +2265,7 @@ fn collector_on(data: &std::path::Path, log: &std::path::Path) -> (KillTree, Str
 /// `hennery admin --data-dir <data> <args…>` with no terminal: standard
 /// input is empty.
 fn admin(data: &std::path::Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_hennery"))
+    hennery()
         .arg("admin")
         .arg("--data-dir")
         .arg(data)
@@ -2243,7 +2281,7 @@ fn admin(data: &std::path::Path, args: &[&str]) -> std::process::Output {
 /// killed and fails the test.
 fn admin_on_a_terminal(data: &std::path::Path, args: &[&str], typed: &str) -> std::process::Output {
     let (master, slave) = open_pty();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let mut child = hennery()
         .arg("admin")
         .arg("--data-dir")
         .arg(data)
@@ -2273,7 +2311,7 @@ fn admin_on_a_terminal(data: &std::path::Path, args: &[&str], typed: &str) -> st
 fn admin_conversation(data: &std::path::Path, args: &[&str], steps: &[(&str, &str)]) -> (std::process::Output, String) {
     use std::sync::{Arc, Mutex};
     let (master, slave) = open_pty();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let mut child = hennery()
         .arg("admin")
         .arg("--data-dir")
         .arg(data)
@@ -2565,7 +2603,7 @@ fn admin_gives_up_on_a_collector_that_never_answers() {
         let _ = wait.recv();
         drop(held);
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let mut child = hennery()
         .arg("admin")
         .arg("--data-dir")
         .arg(&dir)
@@ -2655,7 +2693,7 @@ fn a_pairing_code_from_the_admin_socket_pairs_a_host() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(contains_a_pairing_code_shape(&code), "{code}");
-    let join = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let join = hennery()
         .args(["host", "join", &format!("http://{listen}"), &code, "--name", "laptop"])
         .arg("--data-dir")
         .arg(dir.join("host"))
@@ -2678,7 +2716,7 @@ fn the_healthcheck_passes_while_the_collector_serves_and_fails_once_it_stops() {
     let _cleanup = RemoveDir(dir.clone());
     let data = dir.join("collector");
     let log = dir.join("collector.log");
-    let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let collector = hennery()
         .args(["collector", "--listen", "127.0.0.1:0"])
         .arg("--data-dir")
         .arg(&data)
@@ -2689,7 +2727,7 @@ fn the_healthcheck_passes_while_the_collector_serves_and_fails_once_it_stops() {
     let mut collector = KillTree::new(collector, &log);
     let address = collector.listening();
     let healthcheck = |how: &dyn Fn(&mut Command)| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
+        let mut command = hennery();
         command
             .args(["collector", "healthcheck"])
             .env_remove("HENNERY_LISTEN")
@@ -2740,7 +2778,7 @@ fn the_healthcheck_passes_while_the_collector_serves_and_fails_once_it_stops() {
 #[test]
 fn the_collector_without_a_data_dir_or_with_the_healthcheck_and_its_flags_is_refused() {
     let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_hennery"))
+        hennery()
             .args(args)
             .env_remove("HENNERY_DATA_DIR")
             .env_remove("HENNERY_LISTEN")
@@ -2783,7 +2821,7 @@ fn a_second_host_on_one_data_directory_refuses_to_start() {
     );
     std::fs::write(&pending, &staged).unwrap();
 
-    let mut second = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let mut second = hennery()
         .args(["host", "run"])
         .arg("--data-dir")
         .arg(data.join("host"))
@@ -2918,7 +2956,7 @@ fn service(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
         .unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    Command::new(env!("CARGO_BIN_EXE_hennery"))
+    hennery()
         .arg("service")
         .args(args)
         .env("HOME", dir.join("home"))
@@ -2974,10 +3012,7 @@ fn service_install_refuses_an_unpaired_host_and_a_second_role() {
 
 #[test]
 fn service_help_lists_install_uninstall_and_status() {
-    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
-        .args(["service", "--help"])
-        .output()
-        .unwrap();
+    let out = hennery().args(["service", "--help"]).output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     for command in ["install", "uninstall", "status"] {
         assert!(text.contains(command), "{text}");
@@ -3000,4 +3035,234 @@ fn service_status_with_nothing_installed_fails_without_asking_the_manager() {
         "{:?}",
         std::fs::read_to_string(dir.join("ran"))
     );
+}
+
+/// `path`'s text, or nothing while it is not there.
+fn text_of(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Whether `pid` runs: alive, and not a zombie its new parent has yet to
+/// reap (`kill(pid, 0)` succeeds on one).
+fn running(pid: i32) -> bool {
+    pid_alive(pid)
+        && Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .is_ok_and(|out| {
+                let stat = String::from_utf8_lossy(&out.stdout);
+                let stat = stat.trim();
+                !stat.is_empty() && !stat.starts_with('Z')
+            })
+}
+
+/// Poll `probe` until it holds, failing after 40 seconds: for when the
+/// process that would explain a failure is gone.
+fn poll_until(what: &str, mut probe: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !probe() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `up`'s two children once both run, polled: the host's pid from
+/// `host.lock`, the collector's from `pgrep`. Both are recorded in `up`, so
+/// they are killed should the test fail.
+fn ups_children(up: &mut KillTree, lock: &std::path::Path) -> (i32, i32) {
+    let up_pid = up.up.id() as i32;
+    let (mut host, mut collector) = (0, 0);
+    up.wait_until("up's two children", || {
+        host = pid_from(lock).unwrap_or(0);
+        let children = children_of(up_pid);
+        collector = children.iter().copied().find(|&pid| pid != host).unwrap_or(0);
+        children.len() == 2 && children.contains(&host) && collector != 0
+    });
+    up.children.extend([host, collector]);
+    (host, collector)
+}
+
+/// Plan 7c-iii: run by a service (`HENNERY_SERVICE` set, as both units set
+/// it), `up` and its two children each log to a file of their own in
+/// distribution spec §8's directory, private. Standard output, which launchd
+/// keeps as `<role>.log`, gets nothing; standard error one line from each
+/// naming its file. HOME and XDG_STATE_HOME are scratch directories: no real
+/// log directory is touched.
+///
+/// `up` is then killed outright on its first start, when its host holds the
+/// pairing pipe as well as the parent pipe: each child says, in its own
+/// file, that `up` is gone.
+#[test]
+fn a_service_run_logs_to_its_own_files_and_not_to_its_output() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch_dir("svclog");
+    let _cleanup = RemoveDir(dir.clone());
+    let (home, state) = (dir.join("home"), dir.join("state"));
+    let logs = if cfg!(target_os = "macos") {
+        home.join("Library/Logs/hennery")
+    } else {
+        state.join("hennery/log")
+    };
+    let mut command = hennery();
+    command
+        .env("HENNERY_SERVICE", "systemd")
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state)
+        .env("RUST_LOG", "info");
+    let log = dir.join("up.log");
+    let data = dir.join("data");
+    let mut up = up_logging_to_with(command, &data, &log, &[]);
+    let collector_log = logs.join("hennery-collector.log");
+    let host_log = logs.join("hennery-host.log");
+    up.wait_until("the collector's line in its own file", || {
+        text_of(&collector_log).contains("collector listening")
+    });
+    up.wait_until("the host's line in its own file", || {
+        text_of(&host_log).contains("connected to collector")
+    });
+    let (host, collector) = ups_children(&mut up, &data.join("host").join("host.lock"));
+
+    unsafe { libc::kill(up.up.id() as i32, libc::SIGKILL) };
+    let _ = up.up.wait();
+    for file in [&collector_log, &host_log] {
+        poll_until("each child saying up is gone", || {
+            text_of(file).contains("hennery up is gone; stopping")
+        });
+    }
+    // Gone, so nothing more can reach standard error after it is read.
+    poll_until("both children gone", || !running(host) && !running(collector));
+    assert!(
+        !text_of(&host_log).contains("collector listening"),
+        "one file per process"
+    );
+    assert!(
+        !text_of(&collector_log).contains("connected to collector"),
+        "one file per process"
+    );
+    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&logs), 0o700);
+    let names = ["hennery-up.log", "hennery-collector.log", "hennery-host.log"];
+    for name in names {
+        assert_eq!(mode(&logs.join(name)), 0o600, "{name}");
+    }
+    // No colour codes in a file.
+    assert!(!text_of(&collector_log).contains('\u{1b}'));
+    let stdout = text_of(&log);
+    assert!(stdout.is_empty(), "stdout:\n{stdout}");
+    let stderr = text_of(&log.with_extension("err"));
+    let mut lines: Vec<&str> = stderr.lines().collect();
+    lines.sort_unstable();
+    let mut expected: Vec<String> = names
+        .iter()
+        .map(|name| format!("hennery: logging to {}", logs.join(name).display()))
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(lines, expected, "stderr:\n{stderr}");
+}
+
+/// Whether `path` can be locked as `lock::acquire` locks it, now: nobody
+/// holds it.
+fn lockable(path: &std::path::Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(path) else {
+        return false;
+    };
+    // SAFETY: flock(2) on a descriptor this function owns; closing it below
+    // releases the lock.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+/// Plan 7c-iii: `up` killed outright (launchd's SIGKILL after
+/// `ExitTimeOut`, the OOM killer) leaves nothing running. Each child reads
+/// end-of-file on the pipe whose writing end only `up` held and stops as on
+/// SIGTERM: the host stops its adapter, and the port and `host.lock` are
+/// free, so a relaunch on the same port and data directory serves again,
+/// its host connected. The host is one `up` started again after a crash, so
+/// a restart hands the pipe on too.
+#[test]
+fn ups_children_stop_when_up_is_killed() {
+    let dir = scratch_dir("parentdeath");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    // An adapter that never answers, with a grandchild, as in
+    // `a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound`.
+    let adapter_pid_file = dir.join("adapter.pid");
+    let grandchild_pid_file = dir.join("grandchild.pid");
+    let script = dir.join("slow.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "echo $$ > {}\nsleep 7117 &\necho $! > {}\nwait\n",
+            adapter_pid_file.display(),
+            grandchild_pid_file.display()
+        ),
+    )
+    .unwrap();
+    let _kill_adapter = KillAdapter(adapter_pid_file.clone());
+    let log = dir.join("up.log");
+    let mut up = up_logging_to_with(
+        hennery(),
+        &data,
+        &log,
+        &["--agent", &format!("slow=/bin/sh {}", script.display())],
+    );
+    let listen = up.listening();
+    let session = sign_in(&mut up, &listen, &data.join("collector"));
+    let connections = |log: &std::path::Path| text_of(log).matches("connected to collector").count();
+    up.wait_until("the host connected", || connections(&log) >= 1);
+
+    // Past the startup grace (5 s), then the host killed: `up` starts it
+    // again, and that host must get the pipe as well.
+    std::thread::sleep(Duration::from_secs(6));
+    let lock = data.join("host").join("host.lock");
+    let first = pid_from(&lock).expect("the host's pid");
+    up.children.push(first);
+    unsafe { libc::kill(first, libc::SIGKILL) };
+    up.wait_until("the host started again", || {
+        pid_from(&lock).is_some_and(|pid| pid != first && pid_alive(pid))
+    });
+    up.wait_until("the host connected again", || connections(&log) >= 2);
+    let (host, collector) = ups_children(&mut up, &lock);
+    let hosts = get_json(&listen, "/api/hosts", &session).unwrap();
+    let host_id = hosts[0]["host_id"].as_str().unwrap().to_string();
+    post_json(
+        &listen,
+        "/api/sessions",
+        &session,
+        &serde_json::json!({ "host_id": host_id, "agent": "slow", "cwd": dir }).to_string(),
+    );
+    let mut grandchild = None;
+    up.wait_until("the adapter started", || {
+        grandchild = pid_from(&grandchild_pid_file);
+        grandchild.is_some()
+    });
+    let grandchild = grandchild.unwrap();
+
+    unsafe { libc::kill(up.up.id() as i32, libc::SIGKILL) };
+    let _ = up.up.wait();
+    poll_until("both children saying up is gone", || {
+        text_of(&log).matches("hennery up is gone; stopping").count() == 2
+    });
+    // The positive signals: the port and the lock taken back, and the
+    // relaunch below. A pid alone could be a zombie not yet reaped.
+    poll_until("the port free", || std::net::TcpListener::bind(&listen).is_ok());
+    poll_until("host.lock free", || lockable(&lock));
+    poll_until("the adapter stopped", || !running(grandchild));
+    poll_until("both children gone", || !running(host) && !running(collector));
+
+    // The same port: another test binding port 0 could take it meanwhile,
+    // which would fail the relaunch; not seen in the load runs.
+    let again_log = dir.join("again.log");
+    let again = hennery()
+        .args(["up", "--listen", &listen, "--data-dir"])
+        .arg(&data)
+        .stdout(std::fs::File::create(&again_log).unwrap())
+        .stderr(std::fs::File::create(again_log.with_extension("err")).unwrap())
+        .spawn()
+        .unwrap();
+    let mut again = KillTree::new(again, &again_log);
+    again.wait_until("the relaunched host connected", || {
+        get_json(&listen, "/api/hosts", &session)
+            .is_some_and(|hosts| hosts[0]["host_id"] == host_id.as_str() && hosts[0]["connected"] == true)
+    });
 }

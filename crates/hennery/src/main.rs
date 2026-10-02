@@ -7,6 +7,7 @@ mod config;
 mod healthcheck;
 mod inherit;
 mod lock;
+mod log;
 mod service;
 mod supervisor;
 
@@ -124,6 +125,10 @@ struct CollectorArgs {
     /// `up` bound, in place of binding `--listen`. Repeatable.
     #[arg(long = "listen-fd", hide = true, conflicts_with = "listen", value_parser = clap::value_parser!(i32).range(3..))]
     listen_fd: Vec<i32>,
+    /// `hennery up` only: the reading end of a pipe only `up` writes to.
+    /// At its end-of-file `up` is gone, and the collector stops.
+    #[arg(long, hide = true, value_parser = clap::value_parser!(i32).range(3..))]
+    parent_fd: Option<i32>,
 }
 
 #[derive(Args, Clone)]
@@ -147,6 +152,10 @@ struct HostArgs {
     /// in place of the stored one (its port may have changed).
     #[arg(long, hide = true)]
     collector_url: Option<String>,
+    /// `hennery up` only: as for `collector`; at its end-of-file the host
+    /// stops, as on SIGTERM.
+    #[arg(long, hide = true, value_parser = clap::value_parser!(i32).range(3..))]
+    parent_fd: Option<i32>,
     /// A directory to find projects in and to allow browsing under (ACP
     /// core §7): absolute, or `~/…`. Repeatable; when given, replaces
     /// `workspace_roots` in `host.toml`.
@@ -223,11 +232,31 @@ fn bind_all(addresses: &[String]) -> Result<Vec<std::net::TcpListener>> {
         .collect()
 }
 
+impl Command {
+    /// The name of the log this command writes when run by a service
+    /// (`log::init`): only the long-running ones have one.
+    fn log_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Up(_) => Some("up"),
+            Self::Collector(CollectorCli {
+                run: Some(_),
+                command: None,
+            }) => Some("collector"),
+            Self::Host {
+                command: HostCommand::Run(_),
+            } => Some("host"),
+            _ => None,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+    let cli = Cli::parse();
+    if let Err(why) = log::init(cli.command.log_name()) {
+        eprintln!("Error: {why}");
+        return std::process::ExitCode::FAILURE;
+    }
     // Every arm returns a `Result<ExitCode>` (not just `Result<()>`), and
     // nothing on this path ever calls `std::process::exit`: that call tears
     // down the whole process immediately, without unwinding this `async fn`
@@ -237,7 +266,7 @@ async fn main() -> std::process::ExitCode {
     // group. Returning an `ExitCode` here instead lets the runtime finish
     // and drop normally first, exactly like a plain `Ok(())` return always
     // did; only then does the process actually exit with that code.
-    let result = match Cli::parse().command {
+    let result = match cli.command {
         Command::Collector(CollectorCli {
             command: Some(CollectorCommand::Healthcheck(args)),
             ..
@@ -302,6 +331,7 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     if let Some(fd) = args.pairing_code_fd {
         inherit::check_pipe("--pairing-code-fd", fd)?;
     }
+    let parent = args.parent_fd.map(inherit::watch_parent).transpose()?;
     warn_if_dev_token();
     let file = config::FileConfig::load(&args.data_dir)?;
     // Named by its source: an operator cannot otherwise tell whether a flag,
@@ -389,7 +419,10 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     }
     let shutdown = state.shutdown.clone();
     tokio::spawn(async move {
-        signals.recv().await;
+        tokio::select! {
+            () = signals.recv() => {}
+            () = inherit::parent_gone(parent) => {}
+        }
         shutdown.cancel();
     });
     // Served on the router's own operator and registry (kernel spec §4.2).
@@ -639,6 +672,7 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
     if let Some(fd) = args.join_code_fd {
         inherit::check_pipe("--join-code-fd", fd)?;
     }
+    let parent = args.parent_fd.map(inherit::watch_parent).transpose()?;
     warn_if_dev_token();
     let home = hennery_host::projects::home_dir();
     // The flags first, before anything is paired: a bad one must not spend
@@ -700,7 +734,14 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
     // slow adapter, say), by dropping its still-running task and, with it,
     // the `Adapter` whose `Drop` kills the whole process group. A bare
     // `std::process::exit` here would skip all of that.
-    match hennery_host::run_until(cfg, terminated()).await {
+    // `up` gone (its pipe's end-of-file) stops the host as a signal does.
+    let shutdown = async {
+        tokio::select! {
+            () = terminated() => {}
+            () = inherit::parent_gone(parent) => {}
+        }
+    };
+    match hennery_host::run_until(cfg, shutdown).await {
         // Its own exit code, so `hennery up` can tell a revoke apart.
         Err(err) if hennery_host::connection::revoked(&err) => {
             eprintln!("Error: {err:#}");
@@ -833,6 +874,11 @@ struct UpChildren<'a> {
     /// started again serves the same ports, which the host's URL names.
     /// While none runs, connections wait in the backlog.
     listeners: Vec<std::net::TcpListener>,
+    /// Made before the first child and held until `up` ends: every child
+    /// gets the reading end (`--parent-fd`), and only `up` holds the
+    /// writing end, so however `up` dies, each child reads end-of-file and
+    /// stops (plan 7c-iii).
+    parent: (std::io::PipeReader, std::io::PipeWriter),
 }
 
 impl UpChildren<'_> {
@@ -867,6 +913,8 @@ impl UpChildren<'_> {
             fds.push((writer.as_raw_fd(), inherit::CHILD_FD));
             cmd.arg("--pairing-code-fd").arg(inherit::CHILD_FD.to_string());
         }
+        fds.push((self.parent.0.as_raw_fd(), inherit::PARENT_FD));
+        cmd.arg("--parent-fd").arg(inherit::PARENT_FD.to_string());
         inherit::pass_to_child(&mut cmd, &fds);
         cmd
     }
@@ -875,13 +923,16 @@ impl UpChildren<'_> {
     /// it is not paired.
     fn host(&self, pairing: Option<&std::io::PipeReader>) -> tokio::process::Command {
         let mut cmd = host_command(&self.exe, &self.host_dir, &self.collector_ws_url, self.args);
+        let mut fds = vec![(self.parent.0.as_raw_fd(), inherit::PARENT_FD)];
+        cmd.arg("--parent-fd").arg(inherit::PARENT_FD.to_string());
         if let Some(reader) = pairing {
-            inherit::pass_to_child(&mut cmd, &[(reader.as_raw_fd(), inherit::CHILD_FD)]);
+            fds.push((reader.as_raw_fd(), inherit::CHILD_FD));
             cmd.arg("--join-url")
                 .arg(&self.collector_url)
                 .arg("--join-code-fd")
                 .arg(inherit::CHILD_FD.to_string());
         }
+        inherit::pass_to_child(&mut cmd, &fds);
         cmd
     }
 }
@@ -964,6 +1015,11 @@ async fn run_up(args: UpArgs) -> Result<std::process::ExitCode> {
         collector_url,
         collector_ws_url,
         listeners,
+        // Made here, before any child: on macOS `std::io::pipe` marks its
+        // ends close-on-exec only after making them, so a spawn on another
+        // thread meanwhile could inherit the writing end and keep it open.
+        // Nothing else spawns while `up` starts, and it is never made again.
+        parent: std::io::pipe()?,
     };
     // A low `ulimit -n` can make `pass_to_child`'s `F_DUPFD_CLOEXEC` at
     // `MOVE_FLOOR` fail with a bare "Invalid argument (os error 22)": named
