@@ -4,12 +4,23 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    # The package and its checks (plan 7e-i, distribution spec §4.3).
+    crane.url = "github:ipetkov/crane/v0.24.0";
+    advisory-db = {
+      url = "github:rustsec/advisory-db";
+      flake = false;
+    };
   };
 
-  outputs = { nixpkgs, flake-utils, ... }:
-    flake-utils.lib.eachDefaultSystem (system:
-      let pkgs = import nixpkgs { inherit system; };
+  outputs = { nixpkgs, flake-utils, crane, advisory-db, ... }:
+    # The v1 platforms (distribution spec §1): Intel Macs are not one.
+    flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (system:
+      let
+        pkgs = import nixpkgs { inherit system; };
+        hennery = import ./nix/package.nix { inherit pkgs crane advisory-db; };
       in {
+        packages.default = hennery.package;
+        checks = hennery.checks;
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             cargo

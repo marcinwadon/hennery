@@ -1,0 +1,45 @@
+# The Nix flake (distribution spec §4.3, §9; plan 7e-i): `nix flake check`
+# builds the package and runs clippy, rustfmt and cargo-audit through crane,
+# on Linux and on macOS, and the package's binary runs. Nothing is pushed to
+# a binary cache: that would publish. The tests stay `ci.yml`'s.
+#
+# The Nix installer is pinned by commit. The job's own read-only token goes
+# to Nix only to fetch the locked GitHub inputs without hitting the
+# anonymous API rate limit that shared runners share.
+name: nix
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # A pull request's superseded run is cancelled; on `main` every commit is
+  # its own group, so each keeps its run.
+  group: nix-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  flake:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest]
+    runs-on: ${{ matrix.os }}
+    # A cold build takes about 9 minutes; a hung one should not run for hours.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ github.token }}
+      - name: Flake checks (package, clippy, rustfmt, cargo-audit)
+        run: nix flake check -L
+      - name: The package runs
+        run: nix run . -- --version
