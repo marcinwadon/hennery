@@ -380,6 +380,9 @@ pub fn install(
     }
     let argv = unit::command_line(role, &cx.exe, &data_dir)?;
     let shell = shell.unwrap_or(&cx.shell);
+    // Recorded beside the PATH, so doctor runs the same shell again.
+    let shell_text = unit::plain(shell)
+        .with_context(|| format!("the login shell {} (pick another with --shell)", shell.display()))?;
     let macos = cx.platform == Platform::MacOs;
     let env = path::shell_environment(&cx.env, shell, macos);
     let captured = path::login_environment(shell, &env, path::CAPTURE_TIMEOUT).with_context(|| {
@@ -391,8 +394,8 @@ pub fn install(
     let service_path = path::service_path(&captured, &cx.home, macos)?;
     let file = cx.service_file(role);
     let restarted = match cx.platform {
-        Platform::MacOs => install_launchd(cx, role, &argv, &service_path.path, &file)?,
-        Platform::Linux => install_systemd(cx, role, &argv, &service_path.path, &file)?,
+        Platform::MacOs => install_launchd(cx, role, &argv, &service_path.path, &shell_text, &file)?,
+        Platform::Linux => install_systemd(cx, role, &argv, &service_path.path, &shell_text, &file)?,
     };
     writeln!(out, "installed the {role} service: {}", file.display())?;
     writeln!(out, "  runs: {}", argv.join(" "))?;
@@ -400,6 +403,7 @@ pub fn install(
         Platform::MacOs => writeln!(out, "  PATH (in the plist): {}", service_path.path)?,
         Platform::Linux => writeln!(out, "  PATH (in {}): {}", cx.env_file().display(), service_path.path)?,
     }
+    writeln!(out, "  from the login shell: {shell_text}")?;
     for note in &service_path.notes {
         writeln!(out, "  note: {note}")?;
     }
@@ -455,7 +459,7 @@ fn bootout(cx: &Context, role: Role) -> Result<bool> {
     Ok(true)
 }
 
-fn install_launchd(cx: &Context, role: Role, argv: &[String], path: &str, file: &Path) -> Result<bool> {
+fn install_launchd(cx: &Context, role: Role, argv: &[String], path: &str, shell: &str, file: &Path) -> Result<bool> {
     // Private: the log is the service's whole output.
     let log = cx.log_file(role);
     create_dir(log.parent().expect("a log directory"), 0o700)?;
@@ -467,7 +471,7 @@ fn install_launchd(cx: &Context, role: Role, argv: &[String], path: &str, file: 
         .with_context(|| format!("create {}", log.display()))?;
     create_dir(file.parent().expect("LaunchAgents"), 0o755)?;
     let restarted = bootout(cx, role)?;
-    write_file(file, &unit::plist(role, argv, path, &unit::plain(&log)?), 0o644)?;
+    write_file(file, &unit::plist(role, argv, path, shell, &unit::plain(&log)?), 0o644)?;
     let plist = unit::plain(file)?;
     let ran = cx.run("launchctl", &["bootstrap", &cx.launchd_domain(), &plist])?;
     if !ran.ok {
@@ -493,10 +497,10 @@ fn systemctl(cx: &Context, args: &[&str]) -> Result<Ran> {
     Ok(ran)
 }
 
-fn install_systemd(cx: &Context, role: Role, argv: &[String], path: &str, file: &Path) -> Result<bool> {
+fn install_systemd(cx: &Context, role: Role, argv: &[String], path: &str, shell: &str, file: &Path) -> Result<bool> {
     let env_file = cx.env_file();
     create_dir(env_file.parent().expect("a config directory"), 0o700)?;
-    write_file(&env_file, &unit::env_file(path), 0o600)?;
+    write_file(&env_file, &unit::env_file(path, shell), 0o600)?;
     create_dir(file.parent().expect("systemd/user"), 0o755)?;
     let restarted = cx
         .run("systemctl", &["--user", "is-active", "--quiet", role.unit()])?
