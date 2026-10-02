@@ -3,9 +3,10 @@
 // goes through, and the path tester asking that host, at 1280 px and at
 // 390 px, each width with a collector and a host of its own.
 import { expect, test, type Page } from '@playwright/test'
-import { mkdirSync, realpathSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { startCollector, type Collector } from './collector'
+import { scratchEnv, startCollector, type Collector } from './collector'
 import { testHost, type TestHost } from './host'
 
 const PASSWORD = 'correct horse battery staple'
@@ -18,12 +19,27 @@ for (const width of [1280, 390]) {
     let host: TestHost
     let page: Page
     const violations: string[] = []
+    // A log directory in the runner's own environment, as a developer's
+    // shell may have: no binary started here may write to it.
+    let sentinel: string
+    let runnerLogDir: string | undefined
 
     test.beforeAll(async ({ browser }) => {
+      sentinel = mkdtempSync(join(tmpdir(), 'hennery-e2e-sentinel-'))
+      runnerLogDir = process.env.HENNERY_LOG_DIR
+      process.env.HENNERY_LOG_DIR = sentinel
+      expect(scratchEnv(sentinel).HENNERY_LOG_DIR).toBeUndefined()
       collector = await startCollector()
       host = testHost()
       const context = await browser.newContext({ baseURL: collector.origin, viewport: { width, height: 844 } })
       page = await context.newPage()
+      // Every CSP violation the page sees, whatever its source.
+      await page.addInitScript(() => {
+        document.addEventListener('securitypolicyviolation', (e) => {
+          const seen = ((window as unknown as { __csp?: string[] }).__csp ??= [])
+          seen.push(`${e.violatedDirective} ${e.blockedURI}`)
+        })
+      })
       page.on('console', (m) => {
         if (m.text().includes('Content Security Policy')) violations.push(m.text())
       })
@@ -44,7 +60,13 @@ for (const width of [1280, 390]) {
         try {
           await host?.stop()
         } finally {
-          await collector?.stop()
+          try {
+            await collector?.stop()
+          } finally {
+            if (runnerLogDir === undefined) delete process.env.HENNERY_LOG_DIR
+            else process.env.HENNERY_LOG_DIR = runnerLogDir
+            if (sentinel) rmSync(sentinel, { recursive: true, force: true })
+          }
         }
       }
     })
@@ -134,7 +156,7 @@ for (const width of [1280, 390]) {
       // field only while no passkey is offered.
       await expect(stepUp.getByRole('button', { name: 'Confirm with passkey' })).toHaveCount(0)
       await page.keyboard.press('Shift+Tab')
-      expect(await page.evaluate(() => document.activeElement?.closest('.page') ?? null)).toBeNull()
+      expect(await page.evaluate(() => !!document.activeElement?.closest('.page'))).toBe(false)
       await stepUp.getByLabel('Your password').focus()
       await stepUp.getByLabel('Your password').fill(PASSWORD)
       await stepUp.getByRole('button', { name: 'Confirm' }).click()
@@ -146,6 +168,12 @@ for (const width of [1280, 390]) {
 
     test('broke no Content-Security-Policy rule', async () => {
       expect(violations).toEqual([])
+      const seen = await page.evaluate(() => (window as unknown as { __csp?: string[] }).__csp ?? [])
+      expect(seen).toEqual([])
+    })
+
+    test('wrote nothing where the runner’s own environment pointed', async () => {
+      expect(readdirSync(sentinel)).toEqual([])
     })
   })
 }

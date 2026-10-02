@@ -1,7 +1,9 @@
 // A real collector for the browser checks: the built `hennery` binary
 // (`HENNERY_BIN`, else the workspace's debug build), on a fresh data
 // directory and a port of its own choosing, read from the setup link it
-// writes. Stopped by its own process id.
+// writes. Stopped by its own process id. Every binary the browser checks
+// start runs in `scratchEnv`: nothing of the runner's own hennery setup,
+// home or XDG directories reaches it.
 import { spawn, type ChildProcess } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -17,11 +19,27 @@ export interface Collector {
 
 export const BIN = process.env.HENNERY_BIN ?? resolve(process.cwd(), '../target/debug/hennery')
 
+/** The runner's environment without any `HENNERY_*` variable (a data or
+ *  log directory, a service flag: each would send the binary to the
+ *  runner's own files), with its home and XDG directories under `dir`. */
+export function scratchEnv(dir: string): NodeJS.ProcessEnv {
+  const env = { ...process.env }
+  for (const key of Object.keys(env)) if (/^HENNERY_/.test(key)) delete env[key]
+  return {
+    ...env,
+    HOME: dir,
+    XDG_DATA_HOME: join(dir, 'xdg-data'),
+    XDG_CONFIG_HOME: join(dir, 'xdg-config'),
+    XDG_CACHE_HOME: join(dir, 'xdg-cache'),
+    XDG_STATE_HOME: join(dir, 'xdg-state'),
+  }
+}
+
 export async function startCollector(): Promise<Collector> {
   const dir = mkdtempSync(join(tmpdir(), 'hennery-e2e-'))
   const child: ChildProcess = spawn(BIN, ['collector', '--data-dir', dir, '--listen', '127.0.0.1:0'], {
     stdio: ['ignore', 'ignore', 'pipe'],
-    env: { ...process.env, RUST_LOG: 'warn' },
+    env: { ...scratchEnv(dir), RUST_LOG: 'warn' },
   })
   let stderr = ''
   child.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
