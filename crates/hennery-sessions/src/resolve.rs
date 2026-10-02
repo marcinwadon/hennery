@@ -119,7 +119,8 @@ pub(crate) async fn resolve_on_host(state: &AppState, host_id: &str, path: &str)
         Err(RequestError::NotConnected) => Err(NotResolved::HostOffline),
         Err(RequestError::Rejected { code, message }) => Err(NotResolved::Refused { code, message }),
         Err(RequestError::DeliveryUnknown) => Err(NotResolved::NoAnswer),
-        Err(RequestError::Unsupported) => Err(NotResolved::Unsupported),
+        // A probe carries no servers: `McpUndeliverable` cannot happen.
+        Err(RequestError::Unsupported | RequestError::McpUndeliverable) => Err(NotResolved::Unsupported),
         Err(RequestError::Busy) => Err(NotResolved::Busy),
     }
 }

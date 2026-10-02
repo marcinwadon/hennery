@@ -31,6 +31,12 @@ pub enum Capability {
     /// Removing a deleted session's transcript from the agent's own data
     /// (`forget_session`, plan 9d decision 4).
     ForgetSession,
+    /// A session's MCP servers (plan 8c): the host passes a start's or
+    /// resume's `mcp_servers` into `session/new` / `session/load` with the
+    /// agent's isolation, as `hello.mcp_isolation` reports it, and refuses
+    /// servers it cannot isolate unless the collector waived that
+    /// (`mcp_isolation_unavailable`). A host without it gets no servers.
+    McpServers,
 }
 
 /// The longest agent data root a host may report (plan 9d, O12's shape
@@ -188,6 +194,241 @@ impl<'de> Deserialize<'de> for Capabilities {
         let raw: Vec<Value> = Deserialize::deserialize(deserializer)?;
         Ok(Self(
             raw.into_iter().filter_map(|v| serde_json::from_value(v).ok()).collect(),
+        ))
+    }
+}
+
+/// A name and a value: an HTTP header of an MCP server, or an environment
+/// variable of a stdio one. The value can be a secret (a gateway session
+/// token, a stdio server's key), so `Debug` never shows it (ACP core §8).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct NameValue {
+    pub name: String,
+    pub value: String,
+}
+
+impl NameValue {
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+}
+
+impl std::fmt::Debug for NameValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NameValue")
+            .field("name", &self.name)
+            .field("value", &"<redacted>")
+            .finish()
+    }
+}
+
+/// One MCP server for a session (gateway spec §3.2, §3.4): an entry of ACP
+/// `session/new` / `session/load` `mcpServers`, tagged by `type` here (ACP
+/// itself leaves stdio entries untagged; the host builds those). A new
+/// server type or a new required field needs a new capability: a host that
+/// cannot decode a start drops it unanswered, and the collector's timeout
+/// then drops the connection.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum McpServer {
+    /// A streamable-HTTP server: the gateway's `/mcp/<slug>`, with the
+    /// session's token in `Authorization`.
+    Http {
+        name: String,
+        url: String,
+        #[serde(default)]
+        headers: Vec<NameValue>,
+    },
+    /// A local server the agent runs as its own child.
+    Stdio {
+        name: String,
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: Vec<NameValue>,
+    },
+}
+
+impl McpServer {
+    /// Every part that may be a secret, as `Debug` hides them: the
+    /// headers' and the env's values, an HTTP server's URL past its origin
+    /// and its userinfo (`url_secrets`), a stdio server's arguments.
+    pub fn secret_values(&self) -> Vec<&str> {
+        match self {
+            Self::Http { url, headers, .. } => headers
+                .iter()
+                .map(|pair| pair.value.as_str())
+                .chain(url_secrets(url))
+                .collect(),
+            Self::Stdio { args, env, .. } => env
+                .iter()
+                .map(|pair| pair.value.as_str())
+                .chain(args.iter().map(String::as_str))
+                .collect(),
+        }
+    }
+}
+
+/// `url` cut at its authority: `(scheme, userinfo, host[:port], rest)`, or
+/// `None` when it does not read one way only. Fails closed: a scheme other
+/// than `http` or `https` (an MCP server's only ones), a backslash, an `@` past the authority (`u:ab/cd@h`, a
+/// userinfo with a `/` in it), or a host or port of other characters than
+/// theirs, and the whole URL counts as a secret. Not a URL parser.
+fn url_parts(url: &str) -> Option<(&str, Option<&str>, &str, &str)> {
+    let (scheme, rest) = url.split_once("://")?;
+    if !(scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")) || url.contains('\\') {
+        return None;
+    }
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, after) = rest.split_at(end);
+    if after.contains('@') {
+        return None;
+    }
+    let (userinfo, host_port) = match authority.rsplit_once('@') {
+        Some((userinfo, host_port)) => (Some(userinfo), host_port),
+        None => (None, authority),
+    };
+    let port = if let Some(v6) = host_port.strip_prefix('[') {
+        // An IPv6 literal, `[…]`, with an optional port.
+        let (inside, tail) = v6.split_once(']')?;
+        if inside.is_empty() || !inside.chars().all(|c| c.is_ascii_hexdigit() || ":.".contains(c)) {
+            return None;
+        }
+        match tail {
+            "" => None,
+            tail => Some(tail.strip_prefix(':')?),
+        }
+    } else {
+        let (host, port) = match host_port.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (host_port, None),
+        };
+        if host.is_empty() || !host.chars().all(|c| c.is_ascii_alphanumeric() || "-._".contains(c)) {
+            return None;
+        }
+        port
+    };
+    if port.is_some_and(|port| port.is_empty() || !port.chars().all(|c| c.is_ascii_digit())) {
+        return None;
+    }
+    Some((scheme, userinfo, host_port, after))
+}
+
+/// `url` as `scheme://host[:port]`: the one form of an upstream URL any
+/// log, error body or `Debug` shows (the gateway lane's rule L11). Its
+/// path, query, fragment and userinfo can carry a secret. A URL that does
+/// not read one way only (`url_parts`) shows as `<redacted>`.
+pub fn url_origin(url: &str) -> String {
+    match url_parts(url) {
+        Some((scheme, _, host_port, _)) => format!("{scheme}://{host_port}"),
+        None => "<redacted>".into(),
+    }
+}
+
+/// What `url_origin` leaves out: the userinfo, and everything after the
+/// authority (path, query, fragment). Empty parts are left out; all of the
+/// URL when it does not read one way only.
+pub fn url_secrets(url: &str) -> Vec<&str> {
+    let Some((_, userinfo, _, after)) = url_parts(url) else {
+        return vec![url];
+    };
+    userinfo
+        .into_iter()
+        .chain(Some(after))
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+/// Shows names, the URL's origin (`url_origin`) and the command; never a
+/// header's or an env variable's value, the URL's path, nor a stdio
+/// server's arguments (which may carry a key).
+impl std::fmt::Debug for McpServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Http { name, url, headers } => f
+                .debug_struct("Http")
+                .field("name", name)
+                .field("url", &url_origin(url))
+                .field("headers", headers)
+                .finish(),
+            Self::Stdio {
+                name,
+                command,
+                args,
+                env,
+            } => f
+                .debug_struct("Stdio")
+                .field("name", name)
+                .field("command", command)
+                .field("args", &format_args!("<{} redacted>", args.len()))
+                .field("env", env)
+                .finish(),
+        }
+    }
+}
+
+/// The MCP part of a `start_session` / `resume_session` (ACP core §3.3,
+/// §4.3; plan 8c). Flattened into the frame; empty fields are left out, so
+/// a frame without servers is what an older host expects.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct McpDelivery {
+    /// Passed in `session/new` / `session/load`. Only to a host that
+    /// announced `mcp_servers`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_servers: Vec<McpServer>,
+    /// The collector knowingly delivers to an agent the host cannot isolate
+    /// (the mixed-host fallback's default hat, or a single-hat host,
+    /// umbrella §8.5). Absent, the host refuses servers for such an agent
+    /// (`mcp_isolation_unavailable`): isolation is never lost by omission.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub isolation_waived: bool,
+}
+
+/// How a host keeps an agent's sessions to the servers hennery passes (ACP
+/// core §6). Lenient: a mechanism this build does not know reads as `none`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum McpIsolation {
+    /// `--strict-mcp-config` through `_meta` on every `session/new` and
+    /// `session/load` (the pinned Claude adapter, its own CLI).
+    ClaudeStrict,
+    /// None: the agent also loads the user's own MCP configuration.
+    None,
+}
+
+/// `hello.mcp_isolation`: per agent id, how the host isolates its MCP
+/// servers. An agent left out is not isolated. Deserialized leniently, like
+/// `Capabilities`: an unknown mechanism counts as `none`, never as isolated
+/// and never a reason to refuse the `hello`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, JsonSchema, TS)]
+pub struct AgentIsolation(pub BTreeMap<String, McpIsolation>);
+
+impl AgentIsolation {
+    pub fn get(&self, agent: &str) -> McpIsolation {
+        self.0.get(agent).copied().unwrap_or(McpIsolation::None)
+    }
+
+    /// The host keeps `agent`'s sessions to the servers it is given.
+    pub fn isolates(&self, agent: &str) -> bool {
+        self.get(agent) != McpIsolation::None
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentIsolation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Not a map at all reads as empty too: never a reason to refuse
+        // the `hello`.
+        let Value::Object(raw) = Value::deserialize(deserializer)? else {
+            return Ok(Self::default());
+        };
+        Ok(Self(
+            raw.into_iter()
+                .map(|(agent, v)| (agent, serde_json::from_value(v).unwrap_or(McpIsolation::None)))
+                .collect(),
         ))
     }
 }
@@ -542,6 +783,10 @@ pub enum HostFrame {
         /// rejected (see `Capabilities`). Absent means none.
         #[serde(default)]
         capabilities: Capabilities,
+        /// Per agent, how this host isolates its MCP servers (plan 8c).
+        /// Absent means none is isolated (an older host).
+        #[serde(default)]
+        mcp_isolation: AgentIsolation,
         /// The workspace roots from the host's config (ACP core §7), as
         /// configured. Absent means none (an older host).
         #[serde(default)]
@@ -648,6 +893,39 @@ impl CollectorFrame {
             | Self::ForgetHat { .. } => Err(NotAProbe),
         }
     }
+
+    /// A start's or resume's MCP part; `None` for every other frame. The
+    /// hub's guard reads it (plan 8c), so it is exhaustive on purpose: a
+    /// new frame must say whether it carries servers, or this does not
+    /// compile.
+    pub fn mcp_delivery(&self) -> Option<&McpDelivery> {
+        match self {
+            Self::StartSession { mcp, .. } | Self::ResumeSession { mcp, .. } => Some(mcp),
+            Self::HelloAck { .. }
+            | Self::HelloError { .. }
+            | Self::Prompt { .. }
+            | Self::CancelTurn { .. }
+            | Self::SetConfig { .. }
+            | Self::AnswerPermission { .. }
+            | Self::AnswerElicitation { .. }
+            | Self::Ack { .. }
+            | Self::ResolvePath { .. }
+            | Self::ParkSession { .. }
+            | Self::CloseSession { .. }
+            | Self::ListProjects { .. }
+            | Self::BrowseDirectory { .. }
+            | Self::ForgetHat { .. }
+            | Self::ForgetSession { .. } => None,
+        }
+    }
+
+    /// The agent a start or resume names.
+    pub fn agent(&self) -> Option<&str> {
+        match self {
+            Self::StartSession { agent, .. } | Self::ResumeSession { agent, .. } => Some(agent),
+            _ => None,
+        }
+    }
 }
 
 impl HostFrame {
@@ -697,6 +975,12 @@ pub enum CollectorFrame {
         /// mode (ACP core §4.3).
         #[serde(flatten)]
         config: SessionConfig,
+        /// The session's hat (`sessions.hat_id`); empty for a session from
+        /// before hats. Carried, not yet used by the host (plan 8c).
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        hat_id: String,
+        #[serde(flatten)]
+        mcp: McpDelivery,
     },
     /// Attach a parked, closed or failed session again: spawn the adapter and
     /// `session/load` it with replay suppression (ACP core §4.3, §4.5).
@@ -716,6 +1000,13 @@ pub enum CollectorFrame {
         /// §4.3). A switch that fails is a `host_note`, not a failed resume.
         #[serde(flatten)]
         config: SessionConfig,
+        /// As on `start_session`.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        hat_id: String,
+        /// Sent again on every resume: an agent keeps no servers across
+        /// `session/load` (the spike).
+        #[serde(flatten)]
+        mcp: McpDelivery,
     },
     Prompt {
         request_id: String,

@@ -9,6 +9,7 @@
 
 use crate::adapter::{Adapter, ExitInfo, KILL_GRACE, scrub};
 pub use crate::adapter::{AgentCommand, NESTING_VARS};
+use crate::profile::{Profile, Secrets};
 use crate::uplink::Uplink;
 use agent_client_protocol::schema::v1::{
     BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
@@ -20,8 +21,8 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::schema::{MaybeUndefined, ProtocolVersion};
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, ErrorCode, Responder, UntypedMessage};
 use hennery_proto::frames::{
-    ConfigValue, ElicitationAction, HostFrame, Indexed, ParkReason, PendingExtract, PendingKind, PendingReason,
-    PendingResolution, SessionBody, SessionConfig, TurnOutcome,
+    ConfigValue, ElicitationAction, HostFrame, Indexed, McpServer, ParkReason, PendingExtract, PendingKind,
+    PendingReason, PendingResolution, SessionBody, SessionConfig, TurnOutcome,
 };
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet, VecDeque};
@@ -237,6 +238,12 @@ pub struct Launch {
     pub config: SessionConfig,
     pub agent: AgentCommand,
     pub cwd: PathBuf,
+    /// The agent's profile: Claude's strict MCP flag goes on every
+    /// `session/new` and `session/load` (ACP core §6).
+    pub profile: Profile,
+    /// Passed in `session/new` / `session/load` (plan 8c); their secret
+    /// values are redacted from what the session reports.
+    pub mcp_servers: Vec<McpServer>,
 }
 
 /// The connection task's handle on a session actor.
@@ -332,6 +339,8 @@ pub fn spawn(
         config: SessionConfig::default(),
         agent,
         cwd,
+        profile: Profile::default(),
+        mcp_servers: Vec::new(),
     };
     self::launch(uplink, launch, options)
 }
@@ -355,6 +364,8 @@ pub fn resume(
         config: SessionConfig::default(),
         agent,
         cwd,
+        profile: Profile::default(),
+        mcp_servers: Vec::new(),
     };
     self::launch(uplink, launch, options)
 }
@@ -381,6 +392,7 @@ pub fn launch(uplink: Uplink, launch: Launch, options: SessionOptions) -> Sessio
         probe: Mutex::new(None),
         base_probe: Mutex::new(None),
         ending: ending.clone(),
+        secrets: Secrets::of(&launch.mcp_servers),
     };
     let done = CancellationToken::new();
     let finished = done.clone().drop_guard();
@@ -714,8 +726,9 @@ impl Replay {
         })
     }
 
-    /// The `host_note` for dropped unknown kinds, if any were dropped.
-    fn note(&self) -> Option<SessionBody> {
+    /// The `host_note` for dropped unknown kinds, if any were dropped, the
+    /// session's `secrets` redacted before `scrub`.
+    fn note(&self, secrets: &Secrets) -> Option<SessionBody> {
         if self.unknown.is_empty() {
             return None;
         }
@@ -723,10 +736,10 @@ impl Replay {
         let kinds: Vec<String> = self.unknown.iter().map(|(k, n)| format!("{k} ×{n}")).collect();
         Some(SessionBody::HostNote {
             note: "replay_unknown_dropped".into(),
-            text: scrub(&format!(
+            text: scrub(&secrets.redact(&format!(
                 "dropped {total} update(s) of unknown kind during session/load: {}",
                 kinds.join(", ")
-            )),
+            ))),
         })
     }
 }
@@ -764,6 +777,8 @@ struct Actor {
     ending: Arc<AtomicBool>,
     /// Shared with the handle (`SessionHandle::agent_session_id`).
     agent_session_id: Arc<Mutex<Option<String>>>,
+    /// The secret values of the session's MCP servers (ACP core §8).
+    secrets: Secrets,
 }
 
 /// What the actor knows of its adapter's config options.
@@ -794,9 +809,18 @@ impl Actor {
         self.ending.store(true, Ordering::SeqCst);
     }
 
+    /// `err`'s text with the session's secret values redacted: an
+    /// adapter's error can quote its MCP config (ACP core §8).
+    fn redacted(&self, err: &dyn std::fmt::Display) -> String {
+        self.secrets.redact(&err.to_string())
+    }
+
     fn emit(&self, body: SessionBody) {
+        // ACP core §8: an adapter can echo its MCP config in an error or on
+        // stderr.
+        let body = self.secrets.redact_body(body);
         if let Err(err) = self.uplink.emit(&self.session_id, body) {
-            tracing::error!(session_id = %self.session_id, error = %err, "failed to persist a session frame");
+            tracing::error!(session_id = %self.session_id, error = %self.redacted(&err), "failed to persist a session frame");
         }
     }
 
@@ -841,11 +865,13 @@ impl Actor {
     }
 
     fn start_failed(&self, request_id: String, error: StartError) {
-        tracing::warn!(session_id = %self.session_id, code = error.code, message = %error.message, "session start failed");
+        // Redacted before it is logged too, not only when emitted.
+        let message = self.secrets.redact(&error.message);
+        tracing::warn!(session_id = %self.session_id, code = error.code, %message, "session start failed");
         self.emit(SessionBody::StartFailed {
             request_id,
             code: error.code.into(),
-            message: error.message,
+            message,
         });
     }
 
@@ -895,8 +921,14 @@ impl Actor {
             config,
             agent,
             cwd,
+            profile,
+            mcp_servers,
             ..
         } = launch;
+        let mcp = SessionMcp {
+            servers: crate::profile::acp_servers(&mcp_servers),
+            meta: profile.session_meta(),
+        };
         // For the git probe: `cwd` goes to the adapter's start.
         let probe_cwd = cwd.clone();
         // Where the agent's data is resolved from (plan 9d decision 1).
@@ -908,6 +940,7 @@ impl Actor {
                 return self.start_failed(request_id, StartError::other(format!("spawn {}: {err}", agent.program)));
             }
         };
+        adapter.redact_with(self.secrets.clone());
         let (updates_tx, mut updates) = mpsc::unbounded_channel::<Inbound>();
         // Kept for `send_next_switch`'s own `on_receiving_result` callbacks
         // (fix round 2): the notification handler below moves its own clone
@@ -919,6 +952,7 @@ impl Actor {
         let (_stop_tx, stop_rx) = oneshot::channel::<()>();
         let transport = ByteStreams::new(io.stdin.compat_write(), io.stdout.compat());
         let session_id = self.session_id.clone();
+        let secrets = self.secrets.clone();
         #[cfg(feature = "test-hooks")]
         let hooks = self.options.test_hooks.clone();
         let _acp = AcpTask(tokio::spawn(async move {
@@ -973,7 +1007,8 @@ impl Actor {
                 })
                 .await;
             if let Err(err) = result {
-                tracing::debug!(%session_id, error = %err, "ACP connection ended");
+                let error = secrets.redact(&err.to_string());
+                tracing::debug!(%session_id, %error, "ACP connection ended");
             }
         }));
 
@@ -995,7 +1030,7 @@ impl Actor {
         let started = tokio::select! {
             result = async {
                 let (session, catalogue, images) =
-                    match tokio::time::timeout_at(deadline, negotiate(&conn, cwd, &attach, &mut updates, &mut replay)).await {
+                    match tokio::time::timeout_at(deadline, negotiate(&conn, cwd, &attach, &mcp, &mut updates, &mut replay)).await {
                         Ok(result) => result?,
                         Err(_) => {
                             return Err(StartError::other(format!(
@@ -1054,7 +1089,7 @@ impl Actor {
                 Early::Question(question) => self.open_question(question, None),
             }
         }
-        if let Some(note) = replay.note() {
+        if let Some(note) = replay.note(&self.secrets) {
             self.emit(note);
         }
         if !applied.failures.is_empty() {
@@ -1064,7 +1099,8 @@ impl Actor {
             };
             self.emit(SessionBody::HostNote {
                 note: note.into(),
-                text: scrub(&format!("{what}: {}", applied.failures.join("; "))),
+                // Redacted before `scrub`, which would cut a secret in part.
+                text: scrub(&self.secrets.redact(&format!("{what}: {}", applied.failures.join("; ")))),
             });
         }
         // The git state after the start; a new session's names the commit
@@ -1180,7 +1216,7 @@ impl Actor {
                                     hooks.cancel_read();
                                 }
                                 if let Err(err) = conn.send_notification(CancelNotification::new(agent_session.clone())) {
-                                    tracing::warn!(session_id = %self.session_id, error = %err, "session/cancel not sent");
+                                    tracing::warn!(session_id = %self.session_id, error = %self.redacted(&err), "session/cancel not sent");
                                 }
                                 running.cancel_deadline = Some(Instant::now() + self.options.cancel_grace);
                                 // ACP: after `session/cancel`, every pending
@@ -1349,10 +1385,11 @@ impl Actor {
     }
 
     fn reject(&self, request_id: String, code: &str, message: String) {
+        // The message can quote the adapter's error (ACP core §8).
         self.uplink.reply(HostFrame::Error {
             request_id,
             code: code.into(),
-            message,
+            message: self.secrets.redact(&message),
         });
     }
 
@@ -1438,7 +1475,7 @@ impl Actor {
                 // can answer it: answered now, and not left out to block
                 // every switch behind it until its deadline (final review
                 // M2).
-                tracing::warn!(session_id = %self.session_id, error = %err, "set_config not sent");
+                tracing::warn!(session_id = %self.session_id, error = %self.redacted(&err), "set_config not sent");
                 self.reject(
                     next.request_id,
                     "config_failed",
@@ -1705,7 +1742,7 @@ impl Actor {
     fn resolve_cancelled(&self, question: OpenQuestion, reason: PendingReason) {
         // An adapter that is gone cannot hear it; the collector still must.
         if let Err(err) = question.responder.respond(cancelled_response(question.kind)) {
-            tracing::debug!(session_id = %self.session_id, error = %err, "cancellation not sent to the adapter");
+            tracing::debug!(session_id = %self.session_id, error = %self.redacted(&err), "cancellation not sent to the adapter");
         }
         self.emit(SessionBody::PendingResolved {
             pending_id: question.pending_id,
@@ -1730,7 +1767,7 @@ impl Actor {
         };
         let cancelled = agent_client_protocol::Error::request_cancelled();
         if let Err(err) = question.responder.respond_with_error(cancelled) {
-            tracing::debug!(session_id = %self.session_id, error = %err, "withdrawal not acknowledged to the adapter");
+            tracing::debug!(session_id = %self.session_id, error = %self.redacted(&err), "withdrawal not acknowledged to the adapter");
         }
         self.emit(SessionBody::PendingResolved {
             pending_id,
@@ -1770,7 +1807,7 @@ impl Actor {
             Ok(()) => (PendingResolution::Delivered, None),
             // The connection to the adapter is gone: so is the question.
             Err(err) => {
-                tracing::warn!(session_id = %self.session_id, error = %err, "answer not sent to the adapter");
+                tracing::warn!(session_id = %self.session_id, error = %self.redacted(&err), "answer not sent to the adapter");
                 (PendingResolution::Cancelled, Some(PendingReason::AdapterLost))
             }
         };
@@ -2010,6 +2047,7 @@ async fn negotiate(
     conn: &ConnectionTo<Agent>,
     cwd: PathBuf,
     attach: &Attach,
+    mcp: &SessionMcp,
     updates: &mut mpsc::UnboundedReceiver<Inbound>,
     replay: &mut Replay,
 ) -> Result<(SessionId, Announced, bool), StartError> {
@@ -2022,7 +2060,11 @@ async fn negotiate(
     let agent_session_id = match attach {
         Attach::New => {
             let created = conn
-                .send_request(NewSessionRequest::new(cwd))
+                .send_request(
+                    NewSessionRequest::new(cwd)
+                        .mcp_servers(mcp.servers.clone())
+                        .meta(mcp.meta.clone()),
+                )
                 .block_task()
                 .await
                 .map_err(|err| StartError::acp(err, false))?;
@@ -2051,7 +2093,15 @@ async fn negotiate(
         });
     }
     let id = SessionId::new(agent_session_id.clone());
-    let load = conn.send_request(LoadSessionRequest::new(id.clone(), cwd)).block_task();
+    // The same servers and `_meta` as on `session/new`: the adapter keeps
+    // neither across a load (the spike).
+    let load = conn
+        .send_request(
+            LoadSessionRequest::new(id.clone(), cwd)
+                .mcp_servers(mcp.servers.clone())
+                .meta(mcp.meta.clone()),
+        )
+        .block_task();
     tokio::pin!(load);
     loop {
         tokio::select! {
@@ -2075,6 +2125,14 @@ async fn negotiate(
             }
         }
     }
+}
+
+/// What `session/new` and `session/load` carry besides the cwd (plan 8c):
+/// the session's MCP servers as ACP entries, and the profile's `_meta`.
+/// Never `Debug`: the entries hold the session's secrets.
+struct SessionMcp {
+    servers: Vec<agent_client_protocol::schema::v1::McpServer>,
+    meta: Option<serde_json::Map<String, Value>>,
 }
 
 /// The config options a new or loaded session starts with, and whether they

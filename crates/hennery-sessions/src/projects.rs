@@ -141,7 +141,8 @@ fn reachable(state: &AppState, host_id: &str) -> Result<u64, Box<Response>> {
 fn probe_failed(err: RequestError) -> Response {
     match err {
         RequestError::NotConnected => error(StatusCode::CONFLICT, "host_offline", "the host is not connected"),
-        RequestError::Unsupported => error(
+        // A probe carries no servers: `McpUndeliverable` cannot happen.
+        RequestError::Unsupported | RequestError::McpUndeliverable => error(
             StatusCode::CONFLICT,
             "projects_unsupported",
             "this host cannot list or browse projects; update it",
