@@ -199,6 +199,7 @@ pub fn cli_overrides(doctor: &Doctor) -> Finding {
                             "{agent} runs {} (your own CLI: the pin's guarantee does not cover it)",
                             path.display()
                         ));
+                        super::agents::override_gap(doctor, host, &agent, &path, &mut verdict);
                         for p in [path.as_path(), path.parent().unwrap_or(&path)] {
                             if writable_by_others(p, doctor.cx.uid) {
                                 verdict.warn(

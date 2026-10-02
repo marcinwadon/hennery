@@ -1436,3 +1436,351 @@ fn proc_locks_names_the_real_holder() {
     );
     drop(lock);
 }
+
+/// A pinned set whose programs are stand-ins (`fake_agents`): `node` runs
+/// an adapter that answers `initialize` with the version written in its
+/// entry file (`silent` never answers), or, given Codex's script, the fake
+/// CLI; Claude's bundled CLI is the fake CLI too. Each program records its
+/// pid, its environment and its working directory in `dir/runs`, and
+/// prints a canary on both outputs. The fake CLI says `--version` from
+/// `dir/<agent>-version` and is logged in while `dir/<agent>-logged-in`
+/// exists.
+struct FakeAgents {
+    host: PathBuf,
+    set: PathBuf,
+    runs: PathBuf,
+    dir: PathBuf,
+}
+
+fn fake_agents(dir: &Path) -> Option<FakeAgents> {
+    let host = paired(&dir.join("host"));
+    let (_, set) = pinned_set(&host)?;
+    let runs = dir.join("runs");
+    std::fs::create_dir_all(&runs).unwrap();
+    let write = |path: &Path, text: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let cli = dir.join("fake-cli");
+    write(
+        &cli,
+        &format!(
+            "#!/bin/sh\nagent=$1; shift\nenv > \"{runs}/env-cli-$$\"; pwd > \"{runs}/cwd-cli-$$\"\n\
+             echo canary-7d-cli-out; echo canary-7d-cli-err >&2\n\
+             case \"$1\" in --version) cat \"{dir}/$agent-version\"; exit 0;; esac\n\
+             test -e \"{dir}/$agent-logged-in\"\n",
+            runs = runs.display(),
+            dir = dir.display()
+        ),
+    );
+    let node = std::fs::read_dir(host.join("runtimes"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("bin/node");
+    write(
+        &node,
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in *codex.js) shift; exec \"{cli}\" codex \"$@\";; esac\n\
+             echo $$ > \"{runs}/pid-$$\"; env > \"{runs}/env-$$\"; pwd > \"{runs}/cwd-$$\"\n\
+             echo canary-7d-adapter-err >&2\nread line\nv=$(cat \"$1\")\n\
+             test \"$v\" = silent && exec sleep 60\n\
+             printf '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"protocolVersion\":1,\"agentCapabilities\":{{}},\"agentInfo\":{{\"name\":\"canary-7d-name\",\"version\":\"%s\"}}}}}}\\n' \"$v\"\n\
+             exec sleep 60\n",
+            cli = cli.display(),
+            runs = runs.display()
+        ),
+    );
+    let record: hennery_host::runtime::install::SetRecord =
+        serde_json::from_str(&std::fs::read_to_string(set.join("hennery-set.json")).unwrap()).unwrap();
+    for (name, adapter) in &record.adapters {
+        std::fs::write(set.join(name).join(&adapter.entry), &adapter.version).unwrap();
+    }
+    write(
+        &set.join(format!(
+            "claude/node_modules/@anthropic-ai/claude-agent-sdk-{}/claude",
+            record.platform
+        )),
+        &format!("#!/bin/sh\nexec \"{}\" claude \"$@\"\n", cli.display()),
+    );
+    write(&set.join("codex/node_modules/@openai/codex/bin/codex.js"), "// codex\n");
+    for (agent, version) in [("claude", "2.1.3 (Claude Code)\n"), ("codex", "codex-cli 0.155.1\n")] {
+        std::fs::write(dir.join(format!("{agent}-version")), version).unwrap();
+    }
+    Some(FakeAgents {
+        host,
+        set,
+        runs,
+        dir: dir.to_path_buf(),
+    })
+}
+
+impl FakeAgents {
+    /// The entry file of `agent`, whose text is the version it answers.
+    fn entry(&self, agent: &str) -> PathBuf {
+        let record: hennery_host::runtime::install::SetRecord =
+            serde_json::from_str(&std::fs::read_to_string(self.set.join("hennery-set.json")).unwrap()).unwrap();
+        self.set.join(agent).join(&record.adapters[agent].entry)
+    }
+
+    /// Every file of `runs` whose name starts with `prefix`, read.
+    fn runs(&self, prefix: &str) -> Vec<String> {
+        std::fs::read_dir(&self.runs)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect()
+    }
+}
+
+/// Every pid the fake adapters recorded is gone: their groups were killed.
+/// Polled, as the kernel reaps the group's other members on its own time.
+fn all_gone(fake: &FakeAgents) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    for pid in fake.runs("pid-") {
+        let pid: i32 = pid.trim().parse().unwrap();
+        // SAFETY: kill(2) with signal 0 only checks.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(std::time::Instant::now() < deadline, "pid {pid} is still running");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+/// Check 3: each adapter answers `initialize` with its pinned version; one
+/// that answers another warns; one that never answers fails within its
+/// budget. Each was started in the home directory, with an environment
+/// built rather than inherited, and its whole group is gone afterwards.
+#[test]
+fn adapters_start_as_the_host_starts_them_and_are_all_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let mut cx = machine(dir.path(), Platform::Linux, &fake);
+    cx.env.insert("CLAUDECODE".into(), "canary-7d-nesting".into());
+    let Some(agents) = fake_agents(dir.path()) else {
+        return;
+    };
+    let dirs = Dirs::by_contents(agents.host.clone(), Found::Given);
+    let check3 = || line(&checked(&cx, dirs.clone(), &nothing, &agents.host), 3).clone();
+    let check = check3();
+    assert_eq!(check.status, Status::Ok, "{check:?}");
+    assert!(check.summary.contains("claude 0.81.0 answers"), "{check:?}");
+    all_gone(&agents);
+    for env in agents.runs("env-") {
+        assert!(!env.contains("CLAUDECODE"), "{env}");
+        assert!(env.contains(&format!("HOME={}", cx.home.display())), "{env}");
+        assert!(env.contains("PATH=/usr/bin:/bin"), "{env}");
+    }
+    for cwd in agents.runs("cwd-") {
+        assert_eq!(
+            Path::new(cwd.trim()).canonicalize().unwrap(),
+            cx.home.canonicalize().unwrap()
+        );
+    }
+
+    std::fs::write(agents.entry("claude"), "0.80.9").unwrap();
+    let check = check3();
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("not the pinned 0.81.0"), "{check:?}");
+
+    std::fs::write(agents.entry("claude"), "silent").unwrap();
+    let started = std::time::Instant::now();
+    let check = check3();
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    assert!(check.summary.contains("did not answer `initialize`"), "{check:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(40),
+        "{:?}",
+        started.elapsed()
+    );
+    all_gone(&agents);
+    let text = report(&dirs, &[Finding::Checked(check)]);
+    assert!(!text.contains("canary-7d"), "{text}");
+}
+
+/// The adapter's answer is read for its version alone, and one that
+/// writes noise first, or answers with an error, is told apart.
+#[test]
+fn initialize_reads_its_answer_and_nothing_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = dir.path().join("adapter");
+    let answer = |text: &str| {
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nread line\nprintf '%s\\n' '{text}'\nexec sleep 60\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let agent = hennery_host::AgentCommand {
+            program: script.display().to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+        };
+        let env = vec![("HOME".to_string(), dir.path().display().to_string())];
+        spawn::initialize(&agent, &env, std::time::Duration::from_secs(5))
+    };
+    assert_eq!(
+        answer(r#"{"jsonrpc":"2.0","id":0,"result":{"agentInfo":{"name":"a","version":"1.2.3"}}}"#),
+        spawn::Started::Answered(Some("1.2.3".into()))
+    );
+    assert_eq!(
+        answer(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#),
+        spawn::Started::Answered(None)
+    );
+    assert!(matches!(
+        answer(r#"{"jsonrpc":"2.0","id":0,"error":{"code":-1,"message":"canary-7d"}}"#),
+        spawn::Started::Failed(why) if !why.contains("canary")
+    ));
+    assert!(matches!(
+        answer(r#"{"jsonrpc":"2.0","id":7,"result":{}}"#),
+        spawn::Started::Failed(why) if why.contains("did not answer")
+    ));
+    assert_eq!(spawn::version_in("2.1.3 (Claude Code)"), Some((2, 1, 3)));
+    assert_eq!(spawn::version_in("codex-cli 0.155.1"), Some((0, 155, 1)));
+    assert_eq!(spawn::version_in("no version"), None);
+    assert!(spawn::far_apart((2, 1, 3), (2, 2, 0)) && spawn::far_apart((2, 1, 3), (3, 1, 3)));
+    assert!(!spawn::far_apart((2, 1, 3), (2, 1, 9)));
+}
+
+/// Check 4: a CLI that says it is logged in is ok, one that does not warns
+/// with how to log in; its output, which may name the account, is never
+/// read.
+#[test]
+fn logged_in_is_the_clis_exit_code_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let Some(agents) = fake_agents(dir.path()) else {
+        return;
+    };
+    let dirs = Dirs::by_contents(agents.host.clone(), Found::Given);
+    let check4 = || {
+        let findings = checked(&cx, dirs.clone(), &nothing, &agents.host);
+        assert!(!report(&dirs, &findings).contains("canary-7d"));
+        line(&findings, 4).clone()
+    };
+    let check = check4();
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(
+        check
+            .summary
+            .contains("claude is not logged in; codex is not logged in"),
+        "{check:?}"
+    );
+    assert!(check.fix.contains("doctor never logs in"), "{check:?}");
+    for agent in ["claude", "codex"] {
+        std::fs::write(agents.dir.join(format!("{agent}-logged-in")), "").unwrap();
+    }
+    let check = check4();
+    assert_eq!(check.status, Status::Ok, "{check:?}");
+    assert_eq!(check.summary, "claude is logged in; codex is logged in");
+    for cwd in agents.runs("cwd-cli-") {
+        assert_eq!(
+            Path::new(cwd.trim()).canonicalize().unwrap(),
+            cx.home.canonicalize().unwrap()
+        );
+    }
+}
+
+/// Check 13: the bundled CLI against the terminal's: another minor warns,
+/// the same is ok, none on PATH is ok. Check 17: an override against the
+/// bundled CLI.
+#[test]
+fn bundled_and_terminal_clis_are_compared() {
+    use hennery_host::runtime::agents::{UseCli, set_cli_override};
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let mut cx = machine(dir.path(), Platform::Linux, &fake);
+    let Some(agents) = fake_agents(dir.path()) else {
+        return;
+    };
+    let dirs = Dirs::by_contents(agents.host.clone(), Found::Given);
+    let check = |n| line(&checked(&cx, dirs.clone(), &nothing, &agents.host), n).clone();
+    let thirteen = check(13);
+    assert_eq!(
+        thirteen.summary,
+        "claude: bundled 2.1.3, none on PATH; codex: bundled 0.155.1, none on PATH"
+    );
+
+    let terminal = dir.path().join("terminal");
+    std::fs::create_dir_all(&terminal).unwrap();
+    std::fs::write(terminal.join("claude"), "#!/bin/sh\necho '2.4.0 (Claude Code)'\n").unwrap();
+    std::fs::set_permissions(terminal.join("claude"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    cx.env
+        .insert("PATH".into(), format!("{}:/usr/bin:/bin", terminal.display()));
+    let thirteen = line(&checked(&cx, dirs.clone(), &nothing, &agents.host), 13).clone();
+    assert_eq!(thirteen.status, Status::Warn, "{thirteen:?}");
+    assert!(
+        thirteen.summary.contains("bundled 2.1.3, terminal 2.4.0"),
+        "{thirteen:?}"
+    );
+    std::fs::write(terminal.join("claude"), "#!/bin/sh\necho '2.1.9 (Claude Code)'\n").unwrap();
+    assert_eq!(
+        line(&checked(&cx, dirs.clone(), &nothing, &agents.host), 13).status,
+        Status::Ok
+    );
+
+    set_cli_override(
+        &agents.host,
+        &UseCli {
+            agent: "claude".into(),
+            path: Some(terminal.join("claude")),
+        },
+    )
+    .unwrap();
+    let seventeen = line(&checked(&cx, dirs.clone(), &nothing, &agents.host), 17).clone();
+    assert!(
+        seventeen.summary.contains("your CLI 2.1.9, the pinned 2.1.3"),
+        "{seventeen:?}"
+    );
+    std::fs::write(terminal.join("claude"), "#!/bin/sh\necho '3.0.0 (Claude Code)'\n").unwrap();
+    let seventeen = line(&checked(&cx, dirs, &nothing, &agents.host), 17).clone();
+    assert_eq!(seventeen.status, Status::Warn, "{seventeen:?}");
+    assert!(
+        seventeen.summary.contains("your CLI is 3.0.0, the pinned one 2.1.3"),
+        "{seventeen:?}"
+    );
+}
+
+/// The service's `--agent` commands are started in place of a set, and
+/// its PATH and `HENNERY_SERVICE` are the agents'.
+#[test]
+fn a_services_agents_and_path_are_the_ones_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = systemd("active", 1, "yes");
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let host = paired(&dir.path().join("host"));
+    let script = dir.path().join("given-adapter");
+    let env_out = dir.path().join("given-env");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nenv > \"{}\"\nread line\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"agentInfo\":{{\"name\":\"n\",\"version\":\"9.9.9\"}}}}}}'\nexec sleep 60\n",
+            env_out.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut argv = unit::command_line(Role::Host, &cx.exe, &host).unwrap();
+    argv.extend(["--agent".to_string(), format!("nix={}", script.display())]);
+    let file = cx.service_file(Role::Host);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(cx.env_file().parent().unwrap()).unwrap();
+    std::fs::write(cx.env_file(), unit::env_file("/service/bin:/usr/bin:/bin")).unwrap();
+    std::fs::write(
+        &file,
+        unit::systemd_unit(Role::Host, &argv, "/tmp/service.env").unwrap(),
+    )
+    .unwrap();
+    let dirs = Dirs::by_contents(host.clone(), Found::Given);
+    let findings = checked(&cx, dirs, &nothing, &host);
+    let check = line(&findings, 3);
+    assert_eq!(check.summary, "nix answers (9.9.9; given by --agent, no pin)");
+    let env = std::fs::read_to_string(&env_out).unwrap();
+    assert!(env.contains("PATH=/service/bin:/usr/bin:/bin"), "{env}");
+    assert!(env.contains("HENNERY_SERVICE=systemd"), "{env}");
+}

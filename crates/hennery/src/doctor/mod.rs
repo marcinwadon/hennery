@@ -8,6 +8,7 @@
 //! through the service commands' `Context` and a `Runner`, which the tests
 //! replace.
 
+mod agents;
 mod dirs;
 mod disk;
 mod env;
@@ -15,6 +16,7 @@ mod platform;
 mod process;
 mod runtime;
 mod service;
+mod spawn;
 
 #[cfg(test)]
 mod tests;
@@ -144,20 +146,37 @@ impl Doctor<'_> {
     /// managed set, and needs neither glibc nor nix-ld for one (decision 4).
     /// A service of another directory says nothing of this one.
     pub fn agents_given(&self) -> bool {
+        self.given_agents().is_some()
+    }
+
+    /// The `--agent` commands of that service's command line, parsed as
+    /// `host run` parses them; `None` when it gives none.
+    pub fn given_agents(&self) -> Option<Vec<(String, hennery_host::AgentCommand)>> {
         use crate::service::unit::Role;
-        let Some(host) = self.dirs.host.as_ref().and_then(|h| h.canonicalize().ok()) else {
-            return false;
-        };
-        self.cx.installed().into_iter().any(|role| {
-            let Some(argv) = crate::service::read_command_line(self.cx, role) else {
-                return false;
-            };
+        let host = self.dirs.host.as_ref().and_then(|h| h.canonicalize().ok())?;
+        self.cx.installed().into_iter().find_map(|role| {
+            let argv = crate::service::read_command_line(self.cx, role)?;
             let served = match (role, crate::service::data_dir_of(&argv)) {
                 (Role::Up, Some(data)) => data.join("host"),
                 (Role::Host, Some(data)) => data,
-                _ => return false,
+                _ => return None,
             };
-            served.canonicalize().ok() == Some(host.clone()) && argv.iter().any(|a| a == "--agent")
+            if served.canonicalize().ok() != Some(host.clone()) {
+                return None;
+            }
+            let mut given = Vec::new();
+            let mut words = argv.iter();
+            while let Some(word) = words.next() {
+                let spec = match word.strip_prefix("--agent=") {
+                    Some(spec) => Some(spec),
+                    None if word == "--agent" => words.next().map(String::as_str),
+                    None => None,
+                };
+                if let Some(agent) = spec.and_then(|spec| crate::parse_agent(spec).ok()) {
+                    given.push(agent);
+                }
+            }
+            (!given.is_empty()).then_some(given)
         })
     }
 }
@@ -167,12 +186,15 @@ pub fn checks(doctor: &Doctor) -> Vec<Finding> {
     vec![
         runtime::binary_and_set(doctor),
         platform::platform(doctor),
+        agents::adapters_start(doctor),
+        agents::logged_in(doctor),
         service::service_path(doctor),
         env::environment(doctor),
         disk::disk(doctor),
         service::service(doctor),
         env::hennery_on_path(doctor),
         runtime::adapter_set(doctor),
+        agents::bundled_and_terminal(doctor),
         service::host_directory(doctor),
         runtime::cli_overrides(doctor),
     ]
@@ -236,9 +258,30 @@ pub fn run(args: DoctorArgs) -> Result<ExitCode> {
         dirs,
         run: &run_bounded,
     };
+    stop_children_on_signals()?;
     let findings = checks(&doctor);
     render(&doctor.dirs, &findings, &mut std::io::stdout())?;
     Ok(exit_code(&findings))
+}
+
+/// On SIGINT or SIGTERM to doctor, kill every program it started, then
+/// exit 130: they run in groups of their own, so a terminal's Ctrl-C does
+/// not reach them. The handlers exist from here on: they are made now, on
+/// `main`'s runtime, whose other threads run the task while the checks run
+/// on this one.
+fn stop_children_on_signals() -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+        spawn::kill_all();
+        std::process::exit(130);
+    });
+    Ok(())
 }
 
 /// 1 when a check failed; warnings alone exit 0.

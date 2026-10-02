@@ -187,6 +187,14 @@ fn installed_path(doctor: &Doctor, role: Role) -> Option<String> {
     }
 }
 
+/// The PATH the one installed service gives the host, if there is one.
+pub fn service_path_of(doctor: &Doctor) -> Option<String> {
+    match doctor.cx.installed()[..] {
+        [role] => installed_path(doctor, role),
+        _ => None,
+    }
+}
+
 /// Whether an executable `name` is in one of `entries`.
 fn on_path(entries: &[&str], name: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
