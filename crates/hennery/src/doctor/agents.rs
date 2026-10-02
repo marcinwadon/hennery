@@ -1,6 +1,6 @@
 //! The checks that start the agents' programs (distribution spec §7):
-//! each adapter answering `initialize` (check 3), and each agent's CLI
-//! logged in (check 4).
+//! each adapter answering `initialize` (check 3), each agent's CLI logged
+//! in (check 4), and the bundled CLIs against the terminal's (check 13).
 //! Every program runs in the environment a service-run host gives its
 //! agents (decision 14), in a group of its own that is killed afterwards.
 //! Nothing is ever logged in, and nothing a CLI prints reaches the report.
@@ -12,6 +12,7 @@ use super::{Doctor, Finding, Verdict};
 use hennery_host::AgentCommand;
 use hennery_host::runtime::agents;
 use hennery_host::runtime::install::{InstalledSet, Layout};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// Why the agent checks did not run.
@@ -238,4 +239,144 @@ pub fn logged_in(doctor: &Doctor) -> Finding {
         verdict.ok("checked over SSH: a service runs in the GUI login session, whose keychain may differ");
     }
     Finding::Checked(verdict.check(4, "logged in"))
+}
+
+/// The first executable `name` on doctor's own PATH (absolute entries
+/// only), outside `host`'s directory: the CLI the user's terminal runs.
+fn terminal_cli(doctor: &Doctor, name: &str, host: &Path) -> Option<Cli> {
+    let path = doctor.cx.env.get("PATH")?;
+    std::env::split_paths(path)
+        .filter(|dir| dir.is_absolute() && !dir.starts_with(host))
+        .map(|dir| dir.join(name))
+        .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0))
+        .map(Cli::plain)
+}
+
+/// Check 13: each bundled CLI against the one the user's terminal runs. A
+/// session resumed from the terminal meets the format of the terminal's.
+pub fn bundled_and_terminal(doctor: &Doctor) -> Finding {
+    let Some(host) = &doctor.dirs.host else {
+        return Finding::NotRun {
+            number: 13,
+            why: NO_HOST,
+        };
+    };
+    let set = Layout::new(host)
+        .ok()
+        .and_then(|layout| layout.current().ok().flatten());
+    let Some(set) = set else {
+        return Finding::NotRun {
+            number: 13,
+            why: NO_AGENTS,
+        };
+    };
+    let env = spawn::agent_env(doctor);
+    let mut terminal_env = env.clone();
+    if let Some(path) = doctor.cx.env.get("PATH") {
+        terminal_env.retain(|(k, _)| k != "PATH");
+        terminal_env.push(("PATH".to_string(), path.clone()));
+    }
+    let mut verdict = Verdict::default();
+    let mut names: Vec<&String> = set.record.adapters.keys().collect();
+    names.sort();
+    for name in names {
+        let Some(bundled) = bundled_cli(&set, name) else {
+            verdict.ok(format!("{name}: no bundled CLI in the set"));
+            continue;
+        };
+        let Some(ours) = spawn::cli_version(&bundled, &env) else {
+            verdict.warn(
+                format!(
+                    "{name}'s bundled CLI does not say its version{}",
+                    first_run_note(doctor)
+                ),
+                "run `hennery host adapters update`",
+            );
+            continue;
+        };
+        let Some(theirs_cli) = terminal_cli(doctor, name, host) else {
+            verdict.ok(format!(
+                "{name}: bundled {}.{}.{}, none on PATH",
+                ours.0, ours.1, ours.2
+            ));
+            continue;
+        };
+        if let Some(writable) = others_can_change(doctor, &theirs_cli) {
+            verdict.warn(
+                format!(
+                    "{} is not run: other users can write to {}",
+                    theirs_cli.shown(),
+                    writable.display()
+                ),
+                format!("run `chmod go-w {}`", writable.display()),
+            );
+            continue;
+        }
+        match spawn::cli_version(&theirs_cli, &terminal_env) {
+            None => verdict.warn(
+                format!("{} does not say its version{}", theirs_cli.shown(), first_run_note(doctor)),
+                format!("run `{} --version` in a terminal", theirs_cli.shown()),
+            ),
+            Some(theirs) if spawn::far_apart(ours, theirs) => verdict.warn(
+                format!(
+                    "{name}: bundled {}.{}.{}, terminal {}.{}.{}: sessions resumed from the terminal may meet another format",
+                    ours.0, ours.1, ours.2, theirs.0, theirs.1, theirs.2
+                ),
+                format!(
+                    "bring {} near {}.{}, or resume sessions only in hennery",
+                    theirs_cli.shown(),
+                    ours.0,
+                    ours.1
+                ),
+            ),
+            Some(theirs) => verdict.ok(format!(
+                "{name}: bundled {}.{}.{}, terminal {}.{}.{}",
+                ours.0, ours.1, ours.2, theirs.0, theirs.1, theirs.2
+            )),
+        }
+    }
+    Finding::Checked(verdict.check(13, "bundled and terminal CLIs"))
+}
+
+/// Check 17's version gap: `agent`'s override (`cli`) against the set's
+/// bundled CLI, when the set still has it.
+pub fn override_gap(doctor: &Doctor, host: &Path, agent: &str, cli: &Path, verdict: &mut Verdict) {
+    let set = Layout::new(host)
+        .ok()
+        .and_then(|layout| layout.current().ok().flatten());
+    let Some(bundled) = set.as_ref().and_then(|set| bundled_cli(set, agent)) else {
+        verdict.ok(format!("{agent}: the pinned CLI is not installed here to compare with"));
+        return;
+    };
+    if others_can_change(doctor, &Cli::plain(cli)).is_some() {
+        // The warning that says so, with its fix, is check 17's own.
+        verdict.ok(format!(
+            "{agent}: its version is not read (other users can write to it)"
+        ));
+        return;
+    }
+    let env = spawn::agent_env(doctor);
+    match (
+        spawn::cli_version(&Cli::plain(cli), &env),
+        spawn::cli_version(&bundled, &env),
+    ) {
+        (Some(theirs), Some(ours)) if spawn::far_apart(ours, theirs) => verdict.warn(
+            format!(
+                "{agent}: your CLI is {}.{}.{}, the pinned one {}.{}.{}",
+                theirs.0, theirs.1, theirs.2, ours.0, ours.1, ours.2
+            ),
+            format!(
+                "use a {agent} near {}.{}, or `--use-cli {agent}=bundled`",
+                ours.0, ours.1
+            ),
+        ),
+        (Some(theirs), Some(ours)) => verdict.ok(format!(
+            "{agent}: your CLI {}.{}.{}, the pinned {}.{}.{}",
+            theirs.0, theirs.1, theirs.2, ours.0, ours.1, ours.2
+        )),
+        _ => verdict.warn(
+            format!("{agent}: a CLI's version cannot be read{}", first_run_note(doctor)),
+            format!("run `{} --version` in a terminal", cli.display()),
+        ),
+    }
 }

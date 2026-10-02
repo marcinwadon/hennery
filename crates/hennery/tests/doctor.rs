@@ -84,7 +84,7 @@ fn doctor_reports_on_a_host_directory_and_changes_nothing() {
         assert!(stdout.contains(check), "{check}: {stdout}");
     }
     assert!(
-        stdout.contains("not run here: 3, 4 (no adapter set installed and no --agent); 5 (no service installed)"),
+        stdout.contains("not run here: 3, 4, 13 (no adapter set installed and no --agent); 5 (no service installed)"),
         "{stdout}"
     );
     // Warnings (no service, no adapter set) exit 0; no check fails here.

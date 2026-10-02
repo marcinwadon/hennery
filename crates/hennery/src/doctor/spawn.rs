@@ -317,6 +317,24 @@ pub fn initialize(agent: &AgentCommand, env: &[(String, String)], timeout: Durat
     started
 }
 
+/// The first `x.y.z` in `text`, as numbers.
+pub fn version_in(text: &str) -> Option<(u64, u64, u64)> {
+    text.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .find_map(|word| {
+            let mut parts = word.split('.');
+            let major = parts.next()?.parse().ok()?;
+            let minor = parts.next()?.parse().ok()?;
+            let patch = parts.next()?.parse().ok()?;
+            Some((major, minor, patch))
+        })
+}
+
+/// A large gap between two CLI versions (checks 13, 17): another major, or
+/// another minor.
+pub fn far_apart(a: (u64, u64, u64), b: (u64, u64, u64)) -> bool {
+    a.0 != b.0 || a.1 != b.1
+}
+
 /// A CLI as a host's agent runs it: a program, and the arguments before
 /// its own (`node <set>/codex/…/codex.js`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,4 +369,13 @@ impl Cli {
             .collect::<Vec<_>>()
             .join(" ")
     }
+}
+
+/// `cli --version`, with `env`: the version it prints.
+pub fn cli_version(cli: &Cli, env: &[(String, String)]) -> Option<(u64, u64, u64)> {
+    let ran = cli.run(&["--version"], env, true)?;
+    if !ran.ok {
+        return None;
+    }
+    version_in(&ran.stdout)
 }

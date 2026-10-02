@@ -1778,6 +1778,11 @@ fn initialize_reads_its_answer_and_nothing_else() {
     for name in ["CLAUDECODE", "HENNERY_DEV_TOKEN", "HENNERY_LOG_DIR", "HENNERY_SERVICE"] {
         assert!(!seen.contains(name), "{name}: {seen}");
     }
+    assert_eq!(spawn::version_in("2.1.3 (Claude Code)"), Some((2, 1, 3)));
+    assert_eq!(spawn::version_in("codex-cli 0.155.1"), Some((0, 155, 1)));
+    assert_eq!(spawn::version_in("no version"), None);
+    assert!(spawn::far_apart((2, 1, 3), (2, 2, 0)) && spawn::far_apart((2, 1, 3), (3, 1, 3)));
+    assert!(!spawn::far_apart((2, 1, 3), (2, 1, 9)));
 }
 
 /// A process the adapter put in a group of its own, holding the adapter's
@@ -1890,6 +1895,90 @@ fn logged_in_is_the_clis_exit_code_alone() {
             cx.home.canonicalize().unwrap()
         );
     }
+}
+
+/// Check 13: the bundled CLI against the terminal's: another minor warns,
+/// the same is ok, none on PATH is ok. Check 17: an override against the
+/// bundled CLI.
+#[test]
+fn bundled_and_terminal_clis_are_compared() {
+    use hennery_host::runtime::agents::{UseCli, set_cli_override};
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let mut cx = machine(dir.path(), Platform::Linux, &fake);
+    let Some(agents) = fake_agents(dir.path()) else {
+        return;
+    };
+    let dirs = Dirs::by_contents(agents.host.clone(), Found::Given);
+    let check = |n| line(&checked(&cx, dirs.clone(), &nothing, &agents.host), n).clone();
+    let thirteen = check(13);
+    assert_eq!(
+        thirteen.summary,
+        "claude: bundled 2.1.3, none on PATH; codex: bundled 0.155.1, none on PATH"
+    );
+
+    let terminal = dir.path().join("terminal");
+    std::fs::create_dir_all(&terminal).unwrap();
+    script(&terminal.join("claude"), "#!/bin/sh\necho '2.4.0 (Claude Code)'\n");
+    cx.env
+        .insert("PATH".into(), format!("{}:/usr/bin:/bin", terminal.display()));
+    let thirteen = line(&checked(&cx, dirs.clone(), &nothing, &agents.host), 13).clone();
+    assert_eq!(thirteen.status, Status::Warn, "{thirteen:?}");
+    assert!(
+        thirteen.summary.contains("bundled 2.1.3, terminal 2.4.0"),
+        "{thirteen:?}"
+    );
+    script(&terminal.join("claude"), "#!/bin/sh\necho '2.1.9 (Claude Code)'\n");
+    assert_eq!(
+        line(&checked(&cx, dirs.clone(), &nothing, &agents.host), 13).status,
+        Status::Ok
+    );
+
+    set_cli_override(
+        &agents.host,
+        &UseCli {
+            agent: "claude".into(),
+            path: Some(terminal.join("claude")),
+        },
+    )
+    .unwrap();
+    let seventeen = line(&checked(&cx, dirs.clone(), &nothing, &agents.host), 17).clone();
+    assert!(
+        seventeen.summary.contains("your CLI 2.1.9, the pinned 2.1.3"),
+        "{seventeen:?}"
+    );
+    script(&terminal.join("claude"), "#!/bin/sh\necho '3.0.0 (Claude Code)'\n");
+    let seventeen = line(&checked(&cx, dirs.clone(), &nothing, &agents.host), 17).clone();
+    assert_eq!(seventeen.status, Status::Warn, "{seventeen:?}");
+    assert!(
+        seventeen.summary.contains("your CLI is 3.0.0, the pinned one 2.1.3"),
+        "{seventeen:?}"
+    );
+
+    // Other users can write to its directory: doctor runs it for no check.
+    let ran = dir.path().join("terminal-ran");
+    script(
+        &terminal.join("claude"),
+        &format!("#!/bin/sh\ntouch \"{}\"\necho '2.1.3 (Claude Code)'\n", ran.display()),
+    );
+    std::fs::set_permissions(&terminal, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let findings = checked(&cx, dirs, &nothing, &agents.host);
+    std::fs::set_permissions(&terminal, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!ran.exists(), "{findings:?}");
+    let four = line(&findings, 4);
+    assert!(
+        four.summary
+            .contains("claude's CLI is not run: other users can write to"),
+        "{four:?}"
+    );
+    let thirteen = line(&findings, 13);
+    assert_eq!(thirteen.status, Status::Warn, "{thirteen:?}");
+    assert!(
+        thirteen.summary.contains("is not run: other users can write to"),
+        "{thirteen:?}"
+    );
+    let seventeen = line(&findings, 17);
+    assert!(seventeen.summary.contains("its version is not read"), "{seventeen:?}");
 }
 
 /// The service's `--agent` commands are started in place of a set, with

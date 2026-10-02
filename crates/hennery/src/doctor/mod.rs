@@ -194,6 +194,7 @@ pub fn checks(doctor: &Doctor) -> Vec<Finding> {
         service::service(doctor),
         env::hennery_on_path(doctor),
         runtime::adapter_set(doctor),
+        agents::bundled_and_terminal(doctor),
         service::host_directory(doctor),
         runtime::cli_overrides(doctor),
     ]
