@@ -10,8 +10,11 @@ mod jsonrpc;
 pub mod key;
 pub mod model;
 pub mod proxy;
+pub mod revocation;
 mod schema;
 pub mod scope;
+pub mod session;
+pub mod stdio;
 pub mod store;
 pub mod tokens;
 
@@ -43,5 +46,6 @@ pub fn open(db: &Path, keys: &key::KeySource, operator: Arc<Operator>) -> Result
         store: Arc::new(store),
         key: Arc::new(key),
         operator,
+        revocations: revocation::Revocations::new(),
     })
 }

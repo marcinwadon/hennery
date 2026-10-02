@@ -237,6 +237,7 @@ fn session_detail_leaves_out_absent_optionals() {
             state: "started".into(),
         }),
         pending: vec![],
+        mcp_delivery: None,
     };
     assert_eq!(
         serde_json::to_value(&detail).unwrap(),

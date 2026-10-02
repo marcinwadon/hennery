@@ -131,7 +131,7 @@ fn stored_images_and_their_usage_are_exported() {
 }
 
 /// The gateway's wire types (plan 8a), which the frontend builds on.
-const GATEWAY_TYPES: [&str; 7] = [
+const GATEWAY_TYPES: [&str; 16] = [
     "McpCredKind",
     "McpConnectionStatus",
     "McpConnectionItem",
@@ -139,6 +139,16 @@ const GATEWAY_TYPES: [&str; 7] = [
     "UpdateMcpConnectionRequest",
     "McpMountsRequest",
     "McpCredentialRequest",
+    // Plan 8e.
+    "McpAgentDelivery",
+    "McpSessionDeliveryMode",
+    "McpSessionDelivery",
+    "McpStdioEnvItem",
+    "McpStdioServerItem",
+    "McpStdioServerSet",
+    "McpStdioEnvInput",
+    "McpStdioServerInput",
+    "McpStdioServersRequest",
 ];
 
 /// Plan 8a, Task 5: the gateway's API is a contract with the frontend, so
@@ -188,6 +198,9 @@ fn a_types_doc_reaches_the_typescript() {
         "slug_taken",
         "too_many_connections",
         "wrong_cred_kind",
+        "host_revoked",
+        "env_value_missing",
+        "too_many_stdio_servers",
         "internal",
     ] {
         assert!(ts.contains(&format!("`{code}`")), "no doc names `{code}`");

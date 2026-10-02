@@ -227,6 +227,12 @@ pub struct FakeScript {
     /// held in flight for exactly as long as the test says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_waits_for_file: Option<String>,
+    /// At the start of every prompt, print the `mcpServers` of the latest
+    /// `session/new` or `session/load` as an agent message chunk, their
+    /// headers' values included: an agent that prints its gateway token
+    /// (plan 8e decision 11).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub echo_servers: bool,
 }
 
 /// One question the fake asks its client during a prompt, and the chunk it
@@ -300,6 +306,7 @@ impl Default for FakeScript {
             session_id: None,
             delete_log: None,
             delete_waits_for_file: None,
+            echo_servers: false,
         }
     }
 }

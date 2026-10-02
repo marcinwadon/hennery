@@ -1462,6 +1462,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-util",
  "toml",
  "tower",
  "tracing",
@@ -1574,6 +1575,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "futures",
+ "hennery-gateway",
  "hennery-kernel",
  "hennery-proto",
  "hex",
@@ -1596,6 +1598,7 @@ version = "0.0.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
+ "axum",
  "base64 0.22.1",
  "futures",
  "hennery-gateway",

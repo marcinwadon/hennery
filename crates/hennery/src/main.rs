@@ -432,18 +432,7 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     // credentials are stored, or that does not open them, stops the start
     // (plan 8a decision 8; `KeyUnavailable` tells that case apart).
     let keys = hennery_gateway::key::KeySource::from_env(&args.data_dir)?;
-    let gateway = hennery_gateway::open(&db, &keys, state.operator.clone())?;
-    // The gateway's proxy (plan 8d), `/mcp/<slug>`: bearer tokens, beside
-    // the operator's routes and outside them (lane L8), sending only
-    // through the kernel's egress policy, the collector's one `Egress`
-    // above, shared with Web Push.
-    let proxy = hennery_gateway::proxy::ProxyState::full(
-        std::sync::Arc::new(hennery_gateway::scope::ProxyStore::open(&db)?),
-        gateway.store.clone(),
-        gateway.key.clone(),
-        egress.clone(),
-        hennery_gateway::proxy::Limits::default(),
-    );
+    let gateway_routes = gateway(&state, &db, &keys, &egress)?;
     state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
     hennery_sessions::offline::after_startup(&state);
     hennery_sessions::sweep::after_startup(&state);
@@ -509,9 +498,7 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     });
     let served = hennery_sessions::serve_all(
         listeners,
-        hennery_sessions::router(state.clone())
-            .merge(hennery_gateway::api::router(gateway))
-            .merge(hennery_gateway::proxy::router(proxy)),
+        hennery_sessions::router(state.clone()).merge(gateway_routes),
         state.shutdown.clone(),
     )
     .await;
@@ -1158,6 +1145,32 @@ async fn run_up(args: UpArgs) -> Result<std::process::ExitCode> {
     }
 }
 
+/// The gateway on the collector's `hennery.db` (plan 8a), wired into the
+/// sessions `state` serves, and its routes. Sessions mint and revoke their
+/// tokens through it, inside their own transactions (plan 8e, lane L1);
+/// its proxy (plan 8d), `/mcp/<slug>`, watches the same revocations, so a
+/// revoke cuts what is open on the token. The proxy takes bearer tokens,
+/// beside the operator's routes and outside them (lane L8), and sends only
+/// through `egress`, the collector's one, shared with Web Push.
+fn gateway(
+    state: &AppState,
+    db: &std::path::Path,
+    keys: &hennery_gateway::key::KeySource,
+    egress: &hennery_kernel::egress::Egress,
+) -> Result<axum::Router> {
+    let gateway = hennery_gateway::open(db, keys, state.operator.clone())?;
+    state
+        .store
+        .set_session_mcp(std::sync::Arc::new(hennery_gateway::session::GatewayMcp::new(&gateway)));
+    let proxy = hennery_gateway::proxy::ProxyState::full(
+        std::sync::Arc::new(hennery_gateway::scope::ProxyStore::open(db)?),
+        &gateway,
+        egress.clone(),
+        hennery_gateway::proxy::Limits::default(),
+    );
+    Ok(hennery_gateway::api::router(gateway).merge(hennery_gateway::proxy::router(proxy)))
+}
+
 /// Web Push delivery (plan 10b-ii): the state's notices go to a task that
 /// sends them through `egress`, public addresses only.
 fn start_push(state: &mut AppState, egress: &hennery_kernel::egress::Egress) {
@@ -1168,6 +1181,25 @@ fn start_push(state: &mut AppState, egress: &hennery_kernel::egress::Egress) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan 8e: the collector gives its sessions the gateway (lane L1), or
+    /// no session would ever get a server (plan 8c's release blocker, lane
+    /// L15). The same function `run_collector` calls.
+    #[test]
+    fn the_collector_gives_its_sessions_the_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hennery.db");
+        let state = AppState::new(
+            Store::open(&db).unwrap(),
+            Hosts::open(&db).unwrap(),
+            Operator::open(&db).unwrap(),
+        );
+        assert!(!state.store.has_session_mcp());
+        let keys = hennery_gateway::key::KeySource::from_vars(dir.path(), Some("07".repeat(32).into()), None).unwrap();
+        let egress = hennery_kernel::egress::Egress::new(hennery_kernel::egress::Timeouts::DEFAULT).unwrap();
+        let _routes = gateway(&state, &db, &keys, &egress).unwrap();
+        assert!(state.store.has_session_mcp());
+    }
 
     /// Plan 10b-ii: the collector's notices reach delivery, and delivery is
     /// public only. A subscription at a loopback address gets a notice

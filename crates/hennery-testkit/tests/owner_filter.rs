@@ -53,7 +53,7 @@ const SOURCES: &[(&str, &str, usize)] = &[
     (
         "hennery-kernel/src/hosts.rs",
         include_str!("../../hennery-kernel/src/hosts.rs"),
-        16,
+        17,
     ),
     (
         "hennery-kernel/src/push.rs",
@@ -68,7 +68,7 @@ const SOURCES: &[(&str, &str, usize)] = &[
     (
         "hennery-sessions/src/store.rs",
         include_str!("../../hennery-sessions/src/store.rs"),
-        128,
+        134,
     ),
     (
         "hennery-gateway/src/store.rs",
@@ -79,18 +79,29 @@ const SOURCES: &[(&str, &str, usize)] = &[
     (
         "hennery-gateway/src/tokens.rs",
         include_str!("../../hennery-gateway/src/tokens.rs"),
-        4,
+        7,
     ),
     (
         "hennery-gateway/src/scope.rs",
         include_str!("../../hennery-gateway/src/scope.rs"),
         5,
     ),
+    // Plan 8e: what a session gets, and the stdio servers.
+    (
+        "hennery-gateway/src/session.rs",
+        include_str!("../../hennery-gateway/src/session.rs"),
+        1,
+    ),
+    (
+        "hennery-gateway/src/stdio.rs",
+        include_str!("../../hennery-gateway/src/stdio.rs"),
+        7,
+    ),
 ];
 
 /// The gateway store's statements (plan 8a), apart from the list above so
 /// that other lanes' changes to it stay apart from this one.
-const GATEWAY_STATEMENTS: usize = 23;
+const GATEWAY_STATEMENTS: usize = 25;
 
 /// Files under `crates/*/src` with SQL that the audit does not read, and
 /// why (3b-iii review, A3). Any other such file fails

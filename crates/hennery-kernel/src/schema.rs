@@ -237,6 +237,13 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         owner_id TEXT NOT NULL REFERENCES owners(id),
         purged_at INTEGER NOT NULL);
     ",
+    // Plan 8e decision E7 (8c's decision 2 deferred it here): per agent,
+    // how the host isolates its MCP servers, from its latest accepted
+    // `hello`, so the host list shows it while the host is away. `NULL`:
+    // no such `hello` recorded yet.
+    "
+    ALTER TABLE hosts ADD COLUMN mcp_isolation TEXT;
+    ",
 ];
 
 #[cfg(test)]
