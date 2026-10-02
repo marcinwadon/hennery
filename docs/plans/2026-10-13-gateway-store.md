@@ -57,19 +57,19 @@ It builds on the merged hats plans [5a](2026-10-06-hats.md) (composite foreign k
 
 ## Execution status (2026-10-02)
 
-**Executed** on branch `feat/gateway-8a-store`, rebased onto `main` at `d2d2894` (plan 9a, 10b-iii, the SSE fix, the adapter process-group fix, the first-run Node fix and CI's concurrency merged meanwhile). The plan's anchors are `ef75d4f`'s. Each task was applied from the plan's own text (`replay.py`, Step 1 then the rest) by one implementer, then reviewed (opus). Every task tree matched the scratch reference byte for byte, outside `docs/plans`. The rebase merged without a conflict; the generated files regenerated unchanged.
+**Executed** on branch `feat/gateway-8a-store`, rebased onto `main` at `d2d2894` (plan 9a, 10b-iii, the SSE fix, the adapter process-group fix, the first-run Node fix and CI's concurrency merged meanwhile), then onto `522e802` (10b-ii push delivery, #71, and 8b-ii, #75): the conflicts in `Cargo.lock` (main's lock, 8a's crates added by cargo), `codegen.rs` and `rest.rs` (both sides' types kept), `main.rs` (push's `Egress` and delivery as main has them, the gateway's key, store and router beside them) and the generated files (regenerated) were resolved keeping both sides. The plan's anchors are `ef75d4f`'s. Each task was applied from the plan's own text (`replay.py`, Step 1 then the rest) by one implementer, then reviewed (opus). Every task tree matched the scratch reference byte for byte, outside `docs/plans`. The rebase merged without a conflict; the generated files regenerated unchanged.
 
 | Area | As built | Why |
 |---|---|---|
 | Tasks 1–4 | As written. Every review approved. | Their minor findings are under "After this plan" (follow-ups). |
 | Task 5 review: changes required, one fix round | The docs of `label` say "1 to 64 bytes of UTF-8 once trimmed (stored trimmed), with no control or invisible format character"; `McpConnectionItem.url` is whole in every answer of the API, not only the list; the mounts limits count the ids as sent, before the connection is looked up. A scoped re-review confirmed it. These lines on the branch supersede the same lines in Task 5's blocks. | The label check (`hosts::is_displayable_text`) counts UTF-8 bytes, so a frontend using `maxLength=64` would accept labels the server refuses. |
-| Whole-branch review: ready after fixes | `internal_network`'s doc says plain `http` to anything but loopback is sent from plan 8b-ii on. Decision 13 says that only an id over 64 bytes is not echoed back (an unknown or revoked host's id is named in the error). The file table names `hennery_gateway::open` and only `chacha20poly1305` as new. | 8b's `check_url` sends plain `http` only to loopback under every allowance until 8b-ii (L12); the wire doc promised more. The rest were the plan's prose, not the code. |
+| Whole-branch review: ready after fixes | `internal_network`'s doc says plain `http` goes only to an internal address, under 8b-ii (merged first; at the review it said "from plan 8b-ii on"). Decision 13 says that only an id over 64 bytes is not echoed back (an unknown or revoked host's id is named in the error). The file table names `hennery_gateway::open` and only `chacha20poly1305` as new. | 8b's `check_url` sends plain `http` only to loopback under every allowance until 8b-ii (L12); the wire doc promised more. The rest were the plan's prose, not the code. |
 | Spec write-back | The "Spec amendments" below are in the gateway spec (§2, §4.6, §5.7, §5.8, §6, §9 as built, §11), the kernel spec §3.4 and ACP core §1. | |
 | Lane rulings (2026-10-02) | Q5 (the origin and owner in the AAD) is not a maintainer question: declined by the security review, confirmed by the lane parent; decision 7 stands. The `http`-to-loopback mismatch with 8b's egress stays as reviewed: 8a refuses it at save time, which is stricter; 8b-ii and 8d settle it. | The lane parent's rulings. |
 
 Checks:
 - After every task the five checks passed: 1040, 1058, 1069, 1073 and 1075 tests, from 1019 on `ef75d4f`.
-- After the rebase onto `d2d2894` the five checks passed again, with 1128 tests in the workspace (plan 8a's 56 on top of `main`'s 1072).
+- After the rebase onto `522e802` the five checks passed again, with 1153 tests in the workspace (plan 8a's 56 on top of `main`'s 1097).
 - The 94 revert-probes were run when the plan was built (`probes.log` in the ledger); execution applied the same code.
 - The run was macOS only, so ubuntu CI is the Linux check.
 
@@ -6048,7 +6048,7 @@ After round 1, two rulings came through the lane: the operator's on `http` (deci
 ## After this plan
 
 **What later sub-plans inherit:**
-- **8b-ii (egress; 8b merged as #63):** connections are saved with any public or private address; refuse non-public ones at request time unless `internal_network` (decision 9, L7). `http` URLs exist only on internal connections, and 8a saves `http` to a LAN address on one, but 8b's `check_url` sends plain `http` only to loopback under every allowance: 8b-ii makes it accept plain `http` to a non-public address under `InternalNetwork` (L12), and changes `plain_http_only_to_loopback` with it. 8b-ii and 8d also settle `http` to loopback on an unmarked connection, which 8a refuses when saving and egress would send (decision 9; the lane parent's ruling: 8a stays as reviewed).
+- **8b-ii (egress, merged as #75 before 8a):** under `InternalNetwork`, `check_url` sends plain `http` to internal addresses only (L12), which is what 8a's `internal_network` saves. Connections are saved with any public or private address; egress refuses non-public ones at request time unless the connection is internal (decision 9, L7). Left for 8d: `http` to loopback on an unmarked connection, which 8a refuses when saving and egress would send (decision 9; the lane parent's ruling: 8a stays as reviewed).
 - **8d (proxy):**
   - find a connection by the token's owner and the slug (`UNIQUE (owner_id, slug)`); take its token **and** where it goes from `GatewayStore::static_credential(id, &key)` alone (`StaticCredential`, one statement), never the URL from a second read (decision 14);
   - when `static_header` is not `Authorization`, drop the agent's own `Authorization` (its session token) before forwarding, with a test (gateway §5.2);
@@ -6067,7 +6067,7 @@ After round 1, two rulings came through the lane: the operator's on `http` (deci
 - **Purge (plan 9c):** call `GatewayStore::purge_hat(hat_id)` from `on_hat_purged`, before the kernel deletes the hat row: the foreign key refuses the delete while the hat has connections. A frozen hat (`purged_hats`) should be refused by the gateway's create too, and a connection created between the hook and the hat's delete makes that delete fail on the foreign key: retry the hook (it is idempotent), or refuse a create on a frozen hat. Whoever merges second adds the check beside the hat's.
 - **Frontend (plan 4):** the MCP view, on the documented types (decision 21: each request type's doc names its route's answer and codes); on 403 `step_up_required` step up and retry; `has_credential` and "applies to new and resumed sessions"; the slug and the hat are fixed once created.
 
-- **Capabilities (L14):** `crates/hennery-kernel/src/capabilities.rs` is not on `main` at `d2d2894`. Whoever merges second of 8a and frontend 4b adds `mcp_connections` to `features()`, with a test that `GET /api/capabilities` lists it.
+- **Capabilities (L14):** `crates/hennery-kernel/src/capabilities.rs` is not on `main` at `522e802`. Whoever merges second of 8a and frontend 4b adds `mcp_connections` to `features()`, with a test that `GET /api/capabilities` lists it.
 - **Follow-ups from the execution's reviews** (minor, none blocking):
   - `model::url_for_logs` and `rest::url_origin` are the same function in two crates; make one call the other.
   - `api.rs` maps a status string it does not know to `NotConnected` silently; 8f, adding a status, should make the model hold an enum, or log the fallback.

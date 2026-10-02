@@ -466,8 +466,9 @@ unmarked plain `http` is refused (400 `invalid`), loopback included, and
 clearing the mark while the URL is `http` is refused and changes nothing
 (move the URL to `https` in the same `PATCH`). This is stricter than the
 egress policy's scheme rule (kernel §7.1: `https`, or `http` to loopback);
-which of the two holds is settled by the egress and proxy plans (8b-ii, 8d).
-Plain `http` beyond loopback is sent from plan 8b-ii on. Non-public addresses
+which of the two holds is settled by the proxy plan (8d). Under a connection's
+`internal_network` mark, egress sends plain `http` to internal addresses only
+(kernel §7.1, plan 8b-ii). Non-public addresses
 are not refused when saving: the egress policy refuses them at request time
 unless the connection is internal.
 

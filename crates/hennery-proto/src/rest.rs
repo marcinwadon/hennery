@@ -956,8 +956,8 @@ pub struct McpConnectionItem {
     #[ts(type = "string[] | null")]
     pub tool_allowlist: Option<Vec<String>>,
     /// The upstream is on the operator's own network: its URL may be
-    /// `http`, and its requests may reach private addresses (plan 8b).
-    /// Plain `http` to anything but loopback is sent from plan 8b-ii on.
+    /// `http`, and its requests may reach internal addresses; plain `http`
+    /// goes only to an internal address (plans 8b and 8b-ii).
     pub internal_network: bool,
     /// Its health.
     pub status: McpConnectionStatus,

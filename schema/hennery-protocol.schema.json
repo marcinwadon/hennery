@@ -1412,7 +1412,7 @@
           "type": "string"
         },
         "internal_network": {
-          "description": "The upstream is on the operator's own network: its URL may be\n`http`, and its requests may reach private addresses (plan 8b).\nPlain `http` to anything but loopback is sent from plan 8b-ii on.",
+          "description": "The upstream is on the operator's own network: its URL may be\n`http`, and its requests may reach internal addresses; plain `http`\ngoes only to an internal address (plans 8b and 8b-ii).",
           "type": "boolean"
         },
         "label": {
