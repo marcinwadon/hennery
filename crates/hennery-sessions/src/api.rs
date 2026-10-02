@@ -161,6 +161,13 @@ fn request_failed(err: RequestError) -> Response {
         // themselves (`projects::probe_failed`): unreachable here.
         RequestError::Unsupported => error(StatusCode::CONFLICT, "unsupported", "the host does not support this"),
         RequestError::Busy => error(StatusCode::SERVICE_UNAVAILABLE, "busy", "the host is busy; try again"),
+        // Unreachable until plan 8e sends servers; 8e also fails the
+        // session it left `starting`.
+        RequestError::McpUndeliverable => error(
+            StatusCode::CONFLICT,
+            "mcp_isolation_unavailable",
+            "the host cannot keep this agent's session to its MCP servers",
+        ),
     }
 }
 
@@ -312,6 +319,10 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
         agent: req.agent,
         cwd,
         config: req.config,
+        // The hat just stored. No servers yet: minting and the delivery
+        // decision are plan 8e's.
+        hat_id: hat.hat_id.clone(),
+        mcp: Default::default(),
     };
     let undo = Undo::Start {
         session_id: session_id.clone(),
@@ -620,6 +631,9 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         agent_session_id,
         // Re-applied after the load (ACP core §4.3).
         config,
+        // The hat the resume just re-resolved, equal to the stored one.
+        hat_id: hat.hat_id.clone(),
+        mcp: Default::default(),
     };
     let undo = Undo::Start { session_id: id.clone() };
     match state
@@ -1572,7 +1586,7 @@ mod delete_race_tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let conn_id = state
             .hub
-            .register(HOST, tx.clone(), Capabilities::default())
+            .register(HOST, tx.clone(), Capabilities::default(), Default::default())
             .unwrap()
             .conn_id;
         Fixture {

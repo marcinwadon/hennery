@@ -16,7 +16,7 @@ use crate::uplink::Uplink;
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
 use hennery_proto::frames::{
-    AttachedSession, Capabilities, Capability, CollectorFrame, ForgetReason, HostFrame, SessionConfig,
+    AgentIsolation, AttachedSession, Capabilities, Capability, CollectorFrame, ForgetReason, HostFrame, SessionConfig,
 };
 use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION};
 use std::collections::HashMap;
@@ -307,6 +307,9 @@ async fn handshake(
                 Capability::ResolvePath,
                 Capability::ForgetSession,
             ]),
+            // Nothing isolated yet: the host takes no servers until it
+            // announces `mcp_servers` (plan 8c, Task 2).
+            mcp_isolation: AgentIsolation::default(),
             workspace_roots,
             attached_sessions: attached()?,
         },
@@ -631,6 +634,8 @@ fn handle(
             agent,
             cwd,
             config,
+            hat_id: _,
+            mcp: _,
         } => attach(
             cfg,
             uplink,
@@ -654,6 +659,8 @@ fn handle(
             cwd,
             agent_session_id,
             config,
+            hat_id: _,
+            mcp: _,
         } => attach(
             cfg,
             uplink,
