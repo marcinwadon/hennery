@@ -216,7 +216,7 @@ export type ForgetKind = "session" | "transcript" | "file_history" | "session_en
  * Why something named was not removed: a fixed code the host chooses
  * (plan 9d B2), never free text.
  */
-export type ForgetReason = "attached" | "unsupported_agent" | "no_recorded_home" | "unknown_to_host" | "shared" | "unsafe_root" | "root_missing" | "symlink" | "not_a_directory" | "unsafe_directory" | "mount_point" | "too_deep" | "still_present" | "io_error" | "invalid_id" | "host_revoked";
+export type ForgetReason = "attached" | "in_progress" | "unsupported_agent" | "no_recorded_home" | "unknown_to_host" | "shared" | "unsafe_root" | "root_missing" | "symlink" | "not_a_directory" | "unsafe_directory" | "mount_point" | "too_deep" | "timed_out" | "still_present" | "io_error" | "invalid_id" | "host_revoked";
 
 /**
  * One kind of entry and how many of them (plan 9d B2).

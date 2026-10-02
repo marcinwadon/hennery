@@ -15,7 +15,7 @@ use crate::hub::RequestError;
 use crate::store::{ForgetRecord, HostForgets, final_result};
 use hennery_proto::frames::{CollectorFrame, ForgetOutcome, ForgetReason, ForgetRemaining, ForgetWhat, HostFrame};
 use hennery_proto::rest::{HostRemovalItem, RemovalItem, RemovalPending, RemovalState, TranscriptRemoval};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -45,28 +45,48 @@ pub fn notes(agent: &str) -> Vec<String> {
     }
 }
 
-/// The records with an attempt in flight (B7): one at a time each.
+/// The records with an attempt in flight (B7): one at a time each. Each
+/// says whether another attempt was asked for meanwhile (the review's
+/// item 11): the holder then goes again, so a `session_closed` that lands
+/// while an `attached` answer is on its way is not lost.
 #[derive(Default)]
-pub struct InFlight(Mutex<HashSet<String>>);
+pub struct InFlight(Mutex<HashMap<String, bool>>);
 
 impl InFlight {
-    /// Take `id`, unless an attempt holds it: released when the claim is
-    /// dropped, however the attempt ends (its HTTP client gone included).
+    /// Take `id`, unless an attempt holds it, in which case that attempt is
+    /// asked to go again. Released when the claim is dropped, however the
+    /// attempt ends (its HTTP client gone included).
     fn claim(self: &Arc<Self>, id: &str) -> Option<Claim> {
-        self.0
-            .lock()
-            .expect("in-flight lock")
-            .insert(id.to_string())
-            .then(|| Claim {
-                set: self.clone(),
-                id: id.to_string(),
-            })
+        let mut held = self.0.lock().expect("in-flight lock");
+        if let Some(again) = held.get_mut(id) {
+            *again = true;
+            return None;
+        }
+        held.insert(id.to_string(), false);
+        Some(Claim {
+            set: self.clone(),
+            id: id.to_string(),
+        })
     }
 }
 
 struct Claim {
     set: Arc<InFlight>,
     id: String,
+}
+
+impl Claim {
+    /// Whether another attempt was asked for since the claim was taken (or
+    /// last asked), clearing the request.
+    fn asked_again(&self) -> bool {
+        self.set
+            .0
+            .lock()
+            .expect("in-flight lock")
+            .get_mut(&self.id)
+            .map(std::mem::take)
+            .unwrap_or(false)
+    }
 }
 
 impl Drop for Claim {
@@ -112,14 +132,24 @@ pub fn answered(outcome: ForgetOutcome, remaining: &[ForgetRemaining]) -> (Trans
         })
         .collect();
     let retryable: Vec<&ForgetRemaining> = remaining.iter().filter(|r| r.retry).collect();
-    let attached_only = !retryable.is_empty() && retryable.iter().all(|r| r.reason == ForgetReason::Attached);
+    // Waiting on the host only: its adapter (attached), or another forget
+    // of the same agent session running there (in progress).
+    let waiting = !retryable.is_empty()
+        && retryable
+            .iter()
+            .all(|r| matches!(r.reason, ForgetReason::Attached | ForgetReason::InProgress));
+    let why = if retryable.iter().any(|r| r.reason == ForgetReason::Attached) {
+        RemovalPending::Attached
+    } else {
+        RemovalPending::InProgress
+    };
     let result = TranscriptRemoval {
-        state: if attached_only {
+        state: if waiting {
             RemovalState::Pending
         } else {
             RemovalState::Partial
         },
-        pending: attached_only.then_some(RemovalPending::Attached),
+        pending: waiting.then_some(why),
         remaining: items,
         notes: Vec::new(),
     };
@@ -128,17 +158,52 @@ pub fn answered(outcome: ForgetOutcome, remaining: &[ForgetRemaining]) -> (Trans
 
 /// One attempt at `record`, waiting at most `wait` for the host: its result,
 /// stored unless another attempt holds the record (`in_progress`, nothing
-/// stored).
+/// stored; the holder goes again once it is done, within its own wait).
 pub async fn attempt(state: &AppState, record: &ForgetRecord, wait: Duration) -> TranscriptRemoval {
+    let Some(claim) = state.forgets.claim(&record.id) else {
+        return pending(RemovalPending::InProgress);
+    };
+    let until = tokio::time::Instant::now() + wait;
+    loop {
+        let (result, done) = attempt_once(
+            state,
+            record,
+            until.saturating_duration_since(tokio::time::Instant::now()),
+        )
+        .await;
+        if done || !claim.asked_again() || tokio::time::Instant::now() >= until {
+            return result;
+        }
+    }
+}
+
+/// One `forget_session` for `record`, under its claim: the result and
+/// whether the record is done with.
+async fn attempt_once(state: &AppState, record: &ForgetRecord, wait: Duration) -> (TranscriptRemoval, bool) {
     let Some(home) = record.agent_home.clone() else {
-        return record
+        let known = record
             .last_result
             .clone()
             .unwrap_or_else(|| final_result(ForgetReason::NoRecordedHome));
+        return (known, true);
     };
-    let Some(_claim) = state.forgets.claim(&record.id) else {
-        return pending(RemovalPending::InProgress);
-    };
+    // Another kept session may have taken up the agent session since the
+    // delete (a resume of a session that shares it): not forgotten then,
+    // final (B8, the review's item 13).
+    match state.store.forget_is_shared(record) {
+        Ok(false) => {}
+        Ok(true) => {
+            let result = final_result(ForgetReason::Shared);
+            if let Err(err) = state.store.forget_attempted(&record.id, &result, false, true) {
+                tracing::error!(host_id = %record.host_id, error = %err, "recording a forget's result failed");
+            }
+            return (result, true);
+        }
+        Err(err) => {
+            tracing::error!(host_id = %record.host_id, error = %err, "checking whether a forget is shared failed");
+            return (pending(RemovalPending::NoReply), false);
+        }
+    }
     let request_id = uuid::Uuid::now_v7().to_string();
     let frame = CollectorFrame::ForgetSession {
         request_id: request_id.clone(),
@@ -177,7 +242,7 @@ pub async fn attempt(state: &AppState, record: &ForgetRecord, wait: Duration) ->
     if let Err(err) = state.store.forget_attempted(&record.id, &result, sent, done) {
         tracing::error!(host_id = %record.host_id, error = %err, "recording a forget's result failed");
     }
-    result
+    (result, done)
 }
 
 /// Right after a delete committed (plan 9d decision 5): each of its pending
@@ -320,6 +385,12 @@ mod tests {
             (result.state, result.pending, done),
             (RemovalState::Pending, Some(RemovalPending::Attached), false)
         );
+        let busy = left(ForgetKind::Session, ForgetReason::InProgress, true);
+        let (result, done) = answered(ForgetOutcome::Partial, &[busy]);
+        assert_eq!(
+            (result.state, result.pending, done),
+            (RemovalState::Pending, Some(RemovalPending::InProgress), false)
+        );
     }
 
     #[test]
@@ -350,7 +421,11 @@ mod tests {
     fn one_attempt_at_a_time_per_record() {
         let set = Arc::new(InFlight::default());
         let first = set.claim("f1").expect("free");
+        assert!(!first.asked_again());
         assert!(set.claim("f1").is_none());
+        // The refused claim asked the holder to go again, once.
+        assert!(first.asked_again());
+        assert!(!first.asked_again());
         assert!(set.claim("f2").is_some());
         drop(first);
         assert!(set.claim("f1").is_some());

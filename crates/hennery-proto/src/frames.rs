@@ -101,6 +101,9 @@ impl ForgetKind {
 pub enum ForgetReason {
     /// A live actor on the host has that agent session id (decision 13, B7).
     Attached,
+    /// Another forget of the same agent session is running on the host
+    /// (B7; the review's item 3).
+    InProgress,
     /// This host cannot forget for that agent (yet).
     UnsupportedAgent,
     /// The session recorded no agent home (decision 11).
@@ -124,6 +127,8 @@ pub enum ForgetReason {
     MountPoint,
     /// The walk reached its depth bound (R2).
     TooDeep,
+    /// The forget's deadline passed before the removal was done (B6).
+    TimedOut,
     /// Still there after the removal (B4).
     StillPresent,
     /// The removal failed midway (B3).

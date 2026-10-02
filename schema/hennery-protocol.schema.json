@@ -1000,6 +1000,11 @@
           "type": "string"
         },
         {
+          "const": "in_progress",
+          "description": "Another forget of the same agent session is running on the host\n(B7; the review's item 3).",
+          "type": "string"
+        },
+        {
           "const": "unsupported_agent",
           "description": "This host cannot forget for that agent (yet).",
           "type": "string"
@@ -1052,6 +1057,11 @@
         {
           "const": "too_deep",
           "description": "The walk reached its depth bound (R2).",
+          "type": "string"
+        },
+        {
+          "const": "timed_out",
+          "description": "The forget's deadline passed before the removal was done (B6).",
           "type": "string"
         },
         {
