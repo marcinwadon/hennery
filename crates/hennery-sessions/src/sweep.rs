@@ -26,6 +26,25 @@ pub const INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// logged, and the next one runs as planned.
 pub fn after_startup(state: &AppState) -> tokio::task::JoinHandle<()> {
     let state = state.clone();
-    // Not yet: no sweep, only the wait for shutdown.
-    tokio::spawn(async move { state.shutdown.cancelled().await })
+    tokio::spawn(async move {
+        loop {
+            let store = state.store.clone();
+            let swept =
+                tokio::task::spawn_blocking(move || store.sweep_attachments(std::time::SystemTime::now())).await;
+            match swept {
+                Ok(Ok(report)) => tracing::info!(
+                    rows = report.rows,
+                    files = report.files,
+                    temps = report.temps,
+                    "attachments swept"
+                ),
+                Ok(Err(err)) => tracing::error!("the attachment sweep failed: {err:#}"),
+                Err(err) => tracing::error!("the attachment sweep panicked: {err}"),
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(state.sweep_interval) => {}
+                _ = state.shutdown.cancelled() => return,
+            }
+        }
+    })
 }

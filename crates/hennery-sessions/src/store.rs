@@ -622,6 +622,51 @@ fn drop_unreferenced(tx: &Transaction<'_>, owner: &str, hashes: &BTreeSet<String
     Ok(dropped)
 }
 
+/// How many files a sweep looks at under one hold of the store's lock
+/// (A14), so a prompt waits for a few files, not the whole directory.
+const SWEEP_BATCH: usize = 32;
+
+/// What `sweep_file` removed.
+enum Swept {
+    Image,
+    Temp,
+}
+
+/// Remove `name` from `dir` if it is still a regular file older than the
+/// grace at `now` and, for an image, no row of any owner names it (A6);
+/// under the store's lock (`Store::sweep_attachments`).
+fn sweep_file(conn: &Connection, dir: &Path, name: &str, now: std::time::SystemTime) -> Result<Option<Swept>> {
+    let path = dir.join(name);
+    let meta = match std::fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    if !meta.file_type().is_file() {
+        return Ok(None);
+    }
+    // An mtime ahead of `now` is young.
+    let old = now
+        .duration_since(meta.modified()?)
+        .is_ok_and(|age| age > crate::sweep::GRACE);
+    if !old {
+        return Ok(None);
+    }
+    let swept = if crate::attachments::is_sha256(name) {
+        if crate::shared_files::hash_named_by_any_owner(conn, name)? {
+            return Ok(None);
+        }
+        Swept::Image
+    } else {
+        Swept::Temp
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(Some(swept)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err.into()),
+    }
+}
+
 /// Close an open turn that the host will never end, as `interrupted`.
 fn synthesize_turn_end(
     tx: &Transaction<'_>,
@@ -1846,7 +1891,9 @@ impl Store {
     }
 
     /// Save each image's file (plan 6a), before `open_prompt` records it.
-    /// An image already stored is kept as it is.
+    /// An image already stored is kept as it is, its mtime refreshed: until
+    /// `open_prompt` records it, no row may name it, and only the sweep's
+    /// grace keeps it (plan 9b decision 9).
     pub fn save_images(&self, images: &[Image]) -> Result<()> {
         if images.is_empty() {
             return Ok(());
@@ -1856,8 +1903,12 @@ impl Store {
             .as_deref()
             .context("an in-memory store keeps no attachment files")?;
         for image in images {
-            crate::attachments::write(dir, &image.sha256, &image.bytes)
-                .with_context(|| format!("store attachment {}", image.sha256))?;
+            let refreshed = crate::attachments::refresh(dir, &image.sha256)
+                .with_context(|| format!("refresh attachment {}", image.sha256))?;
+            if !refreshed {
+                crate::attachments::write(dir, &image.sha256, &image.bytes)
+                    .with_context(|| format!("store attachment {}", image.sha256))?;
+            }
         }
         Ok(())
     }
@@ -1952,9 +2003,63 @@ impl Store {
         }
     }
 
-    /// Sweep the attachments (plan 9b). Not yet: sweeps nothing.
-    pub fn sweep_attachments(&self, _now: std::time::SystemTime) -> Result<SweepReport> {
-        Ok(SweepReport::default())
+    /// Sweep the attachments (plan 9b decision 9, A14), at `now`:
+    /// - the owner's rows that no turn and no event of theirs shows go;
+    /// - then `attachments/` is listed without the store's lock, and only
+    ///   two kinds of name are taken from it: an image's (`is_sha256`) and
+    ///   a write's temporary file (`is_temp`). Under the lock, a few at a
+    ///   time, each is looked at again and removed if it is a regular file
+    ///   (never through a link), its mtime is older than `sweep::GRACE`,
+    ///   and, for an image, no row of any owner names it.
+    ///
+    /// The checks are made under the lock so they hold at the unlink:
+    /// `open_prompt` records an image under it (and re-writes a file gone
+    /// meanwhile, decision 6), and `save_images`, which does not take it,
+    /// refreshes a file's mtime first. A file that cannot be looked at or
+    /// removed is logged and left for the next sweep.
+    pub fn sweep_attachments(&self, now: std::time::SystemTime) -> Result<SweepReport> {
+        let rows = self.conn().execute(
+            "DELETE FROM attachments WHERE owner_id = ?1
+                 AND NOT EXISTS (SELECT 1 FROM turn_attachments
+                     WHERE turn_attachments.owner_id = ?1 AND turn_attachments.sha256 = attachments.sha256)
+                 AND NOT EXISTS (SELECT 1 FROM event_attachments
+                     WHERE event_attachments.owner_id = ?1 AND event_attachments.sha256 = attachments.sha256)",
+            [&self.owner],
+        )?;
+        let mut report = SweepReport {
+            rows: rows as u64,
+            ..SweepReport::default()
+        };
+        let Some(dir) = self.attachments.as_deref() else {
+            return Ok(report);
+        };
+        let listed = match std::fs::read_dir(dir) {
+            Ok(listed) => listed,
+            // Nothing sent yet.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(report),
+            Err(err) => return Err(err).context("list the attachment files"),
+        };
+        let mut names = Vec::new();
+        for entry in listed {
+            let Ok(name) = entry.context("list the attachment files")?.file_name().into_string() else {
+                continue;
+            };
+            if crate::attachments::is_sha256(&name) || crate::attachments::is_temp(&name) {
+                names.push(name);
+            }
+        }
+        for batch in names.chunks(SWEEP_BATCH) {
+            let conn = self.conn();
+            for name in batch {
+                match sweep_file(&conn, dir, name, now) {
+                    Ok(Some(Swept::Image)) => report.files += 1,
+                    Ok(Some(Swept::Temp)) => report.temps += 1,
+                    Ok(None) => {}
+                    Err(err) => tracing::warn!(%name, "an attachment file was not swept: {err:#}"),
+                }
+            }
+        }
+        Ok(report)
     }
 
     /// Delete a session (ACP core §4.10; plan 9a decisions 1, 5 and 6), in

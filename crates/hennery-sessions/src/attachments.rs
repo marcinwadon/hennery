@@ -35,8 +35,23 @@ fn temp_name(sha256: &str, random: [u8; 8]) -> String {
 
 /// `name` is a temporary file as `write` names one, which a crash may
 /// leave (plan 9b): the only other name the sweep removes.
-pub fn is_temp(_name: &str) -> bool {
-    false
+pub fn is_temp(name: &str) -> bool {
+    let is_hex = |s: &str| s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+    name.strip_prefix('.')
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .and_then(|rest| rest.split_once('.'))
+        .is_some_and(|(sha256, random)| is_sha256(sha256) && random.len() == 16 && is_hex(random))
+}
+
+/// Refresh the mtime of the file stored as `sha256` in `dir`, if there is
+/// one (plan 9b): whether there was. The sweep removes a file no row names
+/// only once its mtime is older than its grace.
+pub fn refresh(dir: &Path, sha256: &str) -> std::io::Result<bool> {
+    match std::fs::File::open(path(dir, sha256)?) {
+        Ok(file) => file.set_modified(std::time::SystemTime::now()).map(|()| true),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err),
+    }
 }
 
 fn path(dir: &Path, sha256: &str) -> std::io::Result<PathBuf> {

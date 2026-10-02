@@ -435,6 +435,7 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     let gateway = hennery_gateway::open(&db, &keys, state.operator.clone())?;
     state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
     hennery_sessions::offline::after_startup(&state);
+    hennery_sessions::sweep::after_startup(&state);
     let listeners = listeners
         .into_iter()
         .map(tokio::net::TcpListener::from_std)

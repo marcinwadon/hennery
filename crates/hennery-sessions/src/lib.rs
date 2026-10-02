@@ -96,6 +96,7 @@ pub async fn serve(listener: tokio::net::TcpListener, state: AppState) -> std::i
 /// cancelled (kernel spec §7).
 pub async fn serve_on(listeners: Vec<tokio::net::TcpListener>, state: AppState) -> std::io::Result<()> {
     offline::after_startup(&state);
+    sweep::after_startup(&state);
     serve_all(listeners, router(state.clone()), state.shutdown.clone()).await
 }
 
