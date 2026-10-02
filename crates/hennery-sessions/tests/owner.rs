@@ -362,3 +362,129 @@ fn another_owners_attachment_is_neither_served_nor_counted() {
         .collect();
     assert_eq!(owners, [store.owner_id(), OTHER]);
 }
+
+/// The view's reads (plan 4a-ii; A-10) name the owner too: the other
+/// owner's events, group starts, questions and sessions are not there for
+/// them, even where they would be the newest or the only ones.
+#[test]
+fn the_views_reads_see_only_the_owners_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    let store = Store::open(&db).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO owners(id, created_at, set_up_at) VALUES (?1, ?2, ?2)",
+        rusqlite::params![OTHER, OTHER_CREATED_AT],
+    )
+    .unwrap();
+    write_world(&conn, store.owner_id(), "a");
+    write_world(&conn, OTHER, "b");
+    // Each owner's session gets a turn, a question with no answer (and one
+    // cancelled, which no one can answer) and a turn not delivered, the
+    // other owner's last: its events are the newest of all.
+    for (owner, x) in [(store.owner_id(), "a"), (OTHER, "b")] {
+        conn.execute_batch(&format!(
+            "
+            INSERT INTO events(session_id, host_seq, kind, body, ts, owner_id)
+                VALUES ('session-{x}', NULL, 'user_turn', '{{\"turn_id\":\"turn-{x}\",\"content\":[]}}',
+                        '2026-10-01T00:00:01Z', '{owner}');
+            INSERT INTO events(session_id, host_seq, kind, body, ts, owner_id)
+                VALUES ('session-{x}', 2, 'pending_opened', '{{\"pending_id\":\"open-{x}\"}}',
+                        '2026-10-01T00:00:02Z', '{owner}');
+            INSERT INTO pending(pending_id, session_id, kind, turn_id, payload, state, opened_at, owner_id)
+                VALUES ('open-{x}', 'session-{x}', 'permission', 'turn-{x}', '{{}}', 'open',
+                        '2026-10-01T00:00:02Z', '{owner}');
+            INSERT INTO pending(pending_id, session_id, kind, turn_id, payload, state, opened_at, owner_id)
+                VALUES ('gone-{x}', 'session-{x}', 'permission', 'turn-{x}', '{{}}', 'cancelled',
+                        '2026-10-01T00:00:02Z', '{owner}');
+            INSERT INTO turns(turn_id, session_id, content, created_at, owner_id, state)
+                VALUES ('lost-{x}', 'session-{x}', '[]', '2026-10-01T00:00:03Z', '{owner}', 'not_delivered');
+            "
+        ))
+        .unwrap();
+    }
+    let last = |x: &str| -> i64 {
+        conn.query_row(
+            "SELECT MAX(event_id) FROM events WHERE session_id = ?1",
+            [format!("session-{x}")],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let (a, b) = (last("a"), last("b"));
+    assert!(b > a);
+
+    // The control: the owner's rows are found.
+    assert_eq!(store.revision("session-a").unwrap(), a);
+    assert_eq!(store.max_event_id().unwrap(), a);
+    assert_eq!(store.group_starts("session-a", i64::MAX, 10).unwrap(), [a - 1]);
+    assert_eq!(store.turn_start("session-a", "turn-a").unwrap(), Some(a - 1));
+    assert_eq!(
+        store.group_start_at("session-a", a).unwrap(),
+        (a - 1, Some("turn-a".into()))
+    );
+    assert_eq!(store.events_between("session-a", 0, i64::MAX, 10).unwrap().len(), 3);
+    assert_eq!(store.count_after("session-a", 0, 10, 10).unwrap(), (3, 1));
+    assert!(store.session_pending("session-a", "open-a").unwrap().is_some());
+    assert_eq!(store.pending_last_event("session-a", "open-a").unwrap(), Some(a));
+    assert_eq!(store.pending_touched_after("session-a", 0).unwrap(), ["open-a"]);
+    assert_eq!(store.sessions_waiting().unwrap(), ["session-a".to_string()].into());
+    // The count: `session-a` waits; the other owner's (blocked, with an
+    // open question) does not count, nor does the other owner's open
+    // question naming a session of the owner's that waits for nothing.
+    conn.execute_batch(&format!(
+        "
+        INSERT INTO sessions(id, host_id, agent, cwd, lifecycle, activity, created_at, last_event_at, owner_id)
+            VALUES ('session-c', 'host-a', 'fake', '/tmp', 'active', 'idle', '2026-10-01T00:00:00Z',
+                    '2026-10-01T00:00:00Z', '{owner}');
+        INSERT INTO pending(pending_id, session_id, kind, turn_id, payload, state, opened_at, owner_id)
+            VALUES ('sneak', 'session-c', 'permission', 'turn-c', '{{}}', 'open', '2026-10-01T00:00:02Z', '{OTHER}');
+        ",
+        owner = store.owner_id()
+    ))
+    .unwrap();
+    assert_eq!(store.waiting_count(None).unwrap(), 1);
+    assert_eq!(store.waiting_count(Some("")).unwrap(), 1);
+    assert_eq!(store.sessions_changed_after(0).unwrap(), ["session-a"]);
+    assert!(store.event_ts(a).unwrap().is_some());
+    assert_eq!(
+        store.undelivered_turn("session-a", "lost-a").unwrap().as_deref(),
+        Some("[]")
+    );
+    // A question's opening event: by its body when its record names none
+    // (a question from before plan 10b-iii), else the one its record names.
+    let opened_a = store.pending_opened_at("session-a", "open-a").unwrap();
+    assert_eq!(opened_a.as_ref().map(|(id, _)| *id), Some(a));
+    let name = |event_id: i64| {
+        conn.execute(
+            "UPDATE pending SET opened_event_id = ?1 WHERE pending_id = 'open-a'",
+            [event_id],
+        )
+        .unwrap();
+    };
+    name(a);
+    assert_eq!(store.pending_opened_at("session-a", "open-a").unwrap(), opened_a);
+    // A record naming another owner's event finds nothing.
+    name(b);
+    assert_eq!(store.pending_opened_at("session-a", "open-a").unwrap(), None);
+    name(a);
+
+    // The other owner's.
+    assert_eq!(store.revision("session-b").unwrap(), 0);
+    assert!(store.group_starts("session-b", i64::MAX, 10).unwrap().is_empty());
+    assert_eq!(store.turn_start("session-b", "turn-b").unwrap(), None);
+    assert_eq!(store.group_start_at("session-b", b).unwrap(), (0, None));
+    assert_eq!(store.first_event_after("session-b", 0).unwrap(), None);
+    assert!(!store.has_events_before("session-b", b + 1).unwrap());
+    assert!(store.events_between("session-b", 0, i64::MAX, 10).unwrap().is_empty());
+    assert_eq!(store.count_after("session-b", 0, 10, 10).unwrap(), (0, 0));
+    assert_eq!(store.session_pending("session-b", "open-b").unwrap(), None);
+    // Nor through the owner's own session.
+    assert_eq!(store.session_pending("session-a", "open-b").unwrap(), None);
+    assert_eq!(store.pending_last_event("session-b", "open-b").unwrap(), None);
+    assert_eq!(store.pending_opened_at("session-b", "open-b").unwrap(), None);
+    assert!(store.pending_touched_after("session-b", 0).unwrap().is_empty());
+    assert_eq!(store.event_ts(b).unwrap(), None);
+    assert_eq!(store.undelivered_turn("session-b", "lost-b").unwrap(), None);
+    assert_eq!(store.undelivered_turn("session-a", "lost-b").unwrap(), None);
+}

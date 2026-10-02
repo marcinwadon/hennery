@@ -20,9 +20,9 @@ use hennery_proto::rest::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -683,6 +683,8 @@ pub struct Store {
     /// The checkpoint a delete owes (plan 9a A8); an in-memory store has
     /// none.
     checkpoints: Option<Arc<Checkpoints>>,
+    /// The view's reads so far (`view_reads`).
+    view_reads: AtomicU64,
 }
 
 /// What one sweep removed (plan 9b): the owner's rows nothing of theirs
@@ -1756,6 +1758,7 @@ impl Store {
             owner,
             attachments,
             checkpoints,
+            view_reads: AtomicU64::new(0),
         })
     }
 
@@ -3802,29 +3805,359 @@ impl Store {
     pub fn events(&self, session_id: &str, after: i64, limit: u32) -> Result<Vec<EventDto>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(EVENTS_AFTER)?;
-        let rows = stmt.query_map(params![session_id, after, limit, self.owner], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, Option<i64>>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-            ))
-        })?;
+        let rows = stmt.query_map(params![session_id, after, limit, self.owner], EventRow::read)?;
         let mut out = Vec::new();
         for row in rows {
-            let (event_id, host_seq, kind, body, ts) = row?;
-            out.push(EventDto {
-                event_id,
-                session_id: session_id.to_string(),
-                host_seq: host_seq.map(|s| s as u64),
-                kind,
-                body: serde_json::from_str(&body)?,
-                ts,
-            });
+            out.push(row?.event(session_id)?);
         }
         Ok(out)
     }
+}
+
+/// A range of a session's applied events, in order (`events_between`).
+const EVENTS_BETWEEN: &str = "SELECT event_id, host_seq, kind, body, ts FROM events
+     WHERE session_id = ?1 AND event_id > ?2 AND event_id <= ?3 AND applied = 1 AND owner_id = ?4
+     ORDER BY event_id LIMIT ?5";
+
+/// A session's group starts before an event, newest first (`group_starts`).
+const GROUP_STARTS: &str = "SELECT event_id FROM events
+     WHERE session_id = ?1 AND kind = 'user_turn' AND event_id < ?2 AND applied = 1 AND owner_id = ?3
+     ORDER BY event_id DESC LIMIT ?4";
+
+/// A question's last applied event (`pending_last_event`): of the kinds
+/// that ask it and that change where its answer stands, each body naming
+/// its `pending_id`.
+const PENDING_LAST_EVENT: &str = "SELECT MAX(event_id) FROM events
+     WHERE session_id = ?1
+           AND kind IN ('pending_opened', 'answer_submitted', 'answer_result', 'pending_resolved', 'pending_cancelled')
+           AND json_extract(body, '$.pending_id') = ?2 AND applied = 1 AND owner_id = ?3";
+
+/// A question's `pending_opened` event (`pending_opened_at`): the one its
+/// record names, else the first applied one whose body names it. SQLite's
+/// `coalesce` stops at its first value that is not NULL, so the search by
+/// body runs only for a question with no `opened_event_id`.
+const PENDING_OPENED_AT: &str = "SELECT event_id, ts FROM events
+     WHERE event_id = coalesce(
+               (SELECT opened_event_id FROM pending WHERE pending_id = ?2 AND session_id = ?1 AND owner_id = ?3),
+               (SELECT event_id FROM events
+                WHERE session_id = ?1 AND kind = 'pending_opened' AND json_extract(body, '$.pending_id') = ?2
+                      AND applied = 1 AND owner_id = ?3
+                ORDER BY event_id LIMIT 1))
+           AND session_id = ?1 AND applied = 1 AND owner_id = ?3";
+
+/// The owner's sessions with an applied event after one (`sessions_changed_after`).
+/// `+session_id` keeps the grouping off the session indexes: the events
+/// after the cursor are a range of the table, read alone.
+const SESSIONS_CHANGED: &str = "SELECT session_id FROM events WHERE event_id > ?1 AND applied = 1 AND owner_id = ?2
+     GROUP BY +session_id ORDER BY MAX(event_id)";
+
+/// One `events` row, as read.
+struct EventRow {
+    event_id: i64,
+    host_seq: Option<i64>,
+    kind: String,
+    body: String,
+    ts: String,
+}
+
+impl EventRow {
+    /// A row of `event_id, host_seq, kind, body, ts`.
+    fn read(r: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            event_id: r.get(0)?,
+            host_seq: r.get(1)?,
+            kind: r.get(2)?,
+            body: r.get(3)?,
+            ts: r.get(4)?,
+        })
+    }
+
+    fn event(self, session_id: &str) -> Result<EventDto> {
+        Ok(EventDto {
+            event_id: self.event_id,
+            session_id: session_id.to_string(),
+            host_seq: self.host_seq.map(|s| s as u64),
+            kind: self.kind,
+            body: serde_json::from_str(&self.body)?,
+            ts: self.ts,
+        })
+    }
+}
+
+/// A JSON value read from a body as text, when it is one.
+fn text(value: rusqlite::types::Value) -> Option<String> {
+    match value {
+        rusqlite::types::Value::Text(text) => Some(text),
+        _ => None,
+    }
+}
+
+/// The view's reads (client view spec §4; plan 4a-ii). Each reads the
+/// owner's applied events, or their questions, and counts itself in
+/// `view_reads`.
+impl Store {
+    /// How many reads the view has made: for the tests that a route
+    /// answering 404 reads no history (client view §4.1; the smoke test's
+    /// F2). It counts statements, not rows: another owner's rows are never
+    /// returned, so a read made before the 404 would return none.
+    pub fn view_reads(&self) -> u64 {
+        self.view_reads.load(Ordering::Relaxed)
+    }
+
+    /// The connection, for one of the view's reads.
+    fn view_conn(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.view_reads.fetch_add(1, Ordering::Relaxed);
+        self.conn()
+    }
+
+    /// A session's revision: its greatest applied event id, 0 for none.
+    pub fn revision(&self, session_id: &str) -> Result<i64> {
+        Ok(self
+            .view_conn()
+            .query_row(
+                "SELECT event_id FROM events WHERE session_id = ?1 AND applied = 1 AND owner_id = ?2
+                 ORDER BY event_id DESC LIMIT 1",
+                [session_id, &self.owner],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    /// The owner's greatest applied event id, of any session; 0 for none.
+    pub fn max_event_id(&self) -> Result<i64> {
+        Ok(self
+            .view_conn()
+            .query_row(
+                "SELECT event_id FROM events WHERE owner_id = ?1 AND applied = 1 ORDER BY event_id DESC LIMIT 1",
+                [&self.owner],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    /// The event ids of a session's group starts (its `user_turn`s) before
+    /// `before`, newest first, at most `limit`.
+    pub fn group_starts(&self, session_id: &str, before: i64, limit: u32) -> Result<Vec<i64>> {
+        let conn = self.view_conn();
+        let mut stmt = conn.prepare(GROUP_STARTS)?;
+        let rows = stmt.query_map(params![session_id, before, self.owner, limit], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The event id of the `user_turn` that starts the turn `turn_id` of
+    /// the session.
+    pub fn turn_start(&self, session_id: &str, turn_id: &str) -> Result<Option<i64>> {
+        Ok(self
+            .view_conn()
+            .query_row(
+                "SELECT event_id FROM events
+                 WHERE session_id = ?1 AND kind = 'user_turn' AND json_extract(body, '$.turn_id') = ?2
+                       AND applied = 1 AND owner_id = ?3
+                 ORDER BY event_id LIMIT 1",
+                [session_id, turn_id, &self.owner],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The start of the group holding the event `at`: its `user_turn`'s
+    /// event id and turn id (when that is text), or `(0, None)` in the
+    /// preamble.
+    pub fn group_start_at(&self, session_id: &str, at: i64) -> Result<(i64, Option<String>)> {
+        let found = self
+            .view_conn()
+            .query_row(
+                "SELECT event_id, json_extract(body, '$.turn_id') FROM events
+                 WHERE session_id = ?1 AND kind = 'user_turn' AND event_id <= ?2 AND applied = 1 AND owner_id = ?3
+                 ORDER BY event_id DESC LIMIT 1",
+                params![session_id, at, self.owner],
+                |r| Ok((r.get(0)?, text(r.get(1)?))),
+            )
+            .optional()?;
+        Ok(found.unwrap_or((0, None)))
+    }
+
+    /// The session's first applied event after `after`.
+    pub fn first_event_after(&self, session_id: &str, after: i64) -> Result<Option<i64>> {
+        Ok(self
+            .view_conn()
+            .query_row(
+                "SELECT event_id FROM events WHERE session_id = ?1 AND event_id > ?2 AND applied = 1 AND owner_id = ?3
+                 ORDER BY event_id LIMIT 1",
+                params![session_id, after, self.owner],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Whether the session has an applied event before `event_id`.
+    pub fn has_events_before(&self, session_id: &str, event_id: i64) -> Result<bool> {
+        Ok(self.view_conn().query_row(
+            "SELECT EXISTS (SELECT 1 FROM events
+                            WHERE session_id = ?1 AND event_id < ?2 AND applied = 1 AND owner_id = ?3)",
+            params![session_id, event_id, self.owner],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The session's applied events with `after < event_id <= until`,
+    /// oldest first, at most `limit`: the view folds them a batch at a
+    /// time.
+    pub fn events_between(&self, session_id: &str, after: i64, until: i64, limit: u32) -> Result<Vec<EventDto>> {
+        let conn = self.view_conn();
+        let mut stmt = conn.prepare(EVENTS_BETWEEN)?;
+        let rows = stmt.query_map(params![session_id, after, until, self.owner, limit], EventRow::read)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?.event(session_id)?);
+        }
+        Ok(out)
+    }
+
+    /// How many of the session's applied events lie after `after`, and how
+    /// many of them start a group, each counted no further than one past
+    /// its cap: what a resume would send is bounded before it is read.
+    pub fn count_after(&self, session_id: &str, after: i64, max_events: u32, max_groups: u32) -> Result<(u32, u32)> {
+        Ok(self.view_conn().query_row(
+            "SELECT (SELECT count(*) FROM (SELECT 1 FROM events
+                     WHERE session_id = ?1 AND event_id > ?2 AND applied = 1 AND owner_id = ?3 LIMIT ?4)),
+                    (SELECT count(*) FROM (SELECT 1 FROM events
+                     WHERE session_id = ?1 AND kind = 'user_turn' AND event_id > ?2 AND applied = 1 AND owner_id = ?3
+                     LIMIT ?5))",
+            params![session_id, after, self.owner, max_events + 1, max_groups + 1],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }
+
+    /// One question of the session, whatever its state: by its id, the
+    /// session's and the owner's (the review's A-8).
+    pub fn session_pending(&self, session_id: &str, pending_id: &str) -> Result<Option<PendingItem>> {
+        let row = self
+            .view_conn()
+            .query_row(
+                &format!("SELECT {PENDING_COLUMNS} WHERE p.pending_id = ?1 AND p.session_id = ?2 AND p.owner_id = ?3"),
+                [pending_id, session_id, &self.owner],
+                PendingRow::read,
+            )
+            .optional()?;
+        row.map(PendingRow::item).transpose()
+    }
+
+    /// The last applied event of a question of the session: the version
+    /// its item has when built from the store's record.
+    pub fn pending_last_event(&self, session_id: &str, pending_id: &str) -> Result<Option<i64>> {
+        Ok(self
+            .view_conn()
+            .query_row(PENDING_LAST_EVENT, [session_id, pending_id, &self.owner], |r| r.get(0))?)
+    }
+
+    /// The `pending_opened` event of a question of the session: its id and
+    /// when it was stored. The question's record names it
+    /// (`opened_event_id`, plan 10b-iii); one opened before that column,
+    /// or with no record, is found among the session's `pending_opened`
+    /// events by its body (`events_by_kind`).
+    pub fn pending_opened_at(&self, session_id: &str, pending_id: &str) -> Result<Option<(i64, String)>> {
+        Ok(self
+            .view_conn()
+            .query_row(PENDING_OPENED_AT, [session_id, pending_id, &self.owner], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?)
+    }
+
+    /// The prompt of the session's turn `turn_id` if that turn was not
+    /// delivered (`turn_not_delivered`): its stored content, as JSON text.
+    /// A turn that was delivered has its `user_turn` event instead.
+    pub fn undelivered_turn(&self, session_id: &str, turn_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .view_conn()
+            .query_row(
+                "SELECT content FROM turns
+                 WHERE turn_id = ?1 AND session_id = ?2 AND state = 'not_delivered' AND owner_id = ?3",
+                [turn_id, session_id, &self.owner],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The questions of the session with an applied event after `after`,
+    /// in the order of their first such event.
+    pub fn pending_touched_after(&self, session_id: &str, after: i64) -> Result<Vec<String>> {
+        let conn = self.view_conn();
+        let mut stmt = conn.prepare(
+            "SELECT json_extract(body, '$.pending_id') AS pending_id FROM events
+             WHERE session_id = ?1
+                   AND kind IN ('pending_opened', 'answer_submitted', 'answer_result', 'pending_resolved',
+                                'pending_cancelled')
+                   AND event_id > ?2 AND applied = 1 AND owner_id = ?3
+             GROUP BY pending_id ORDER BY MIN(event_id)",
+        )?;
+        let rows = stmt.query_map(params![session_id, after, self.owner], |r| r.get(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.extend(text(row?));
+        }
+        Ok(out)
+    }
+
+    /// The owner's sessions with an open question: the agent waits on it,
+    /// whether or not an answer is queued for it (the security review's
+    /// B-5; as plan 10b-iii's push edge and `still_open` read it).
+    pub fn sessions_waiting(&self) -> Result<HashSet<String>> {
+        let conn = self.view_conn();
+        let mut stmt =
+            conn.prepare("SELECT DISTINCT p.session_id FROM pending p WHERE p.state = 'open' AND p.owner_id = ?1")?;
+        let rows = stmt.query_map([&self.owner], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// How many of the owner's sessions wait for the operator (frontend §5;
+    /// 4c's request): `blocked`, or with an open question, as
+    /// `sessions_waiting` reads one. Within `hat` when given; every
+    /// lifecycle but `deleted`. Sessions, not questions: two open questions
+    /// of one session count once.
+    pub fn waiting_count(&self, hat: Option<&str>) -> Result<u32> {
+        Ok(self.view_conn().query_row(
+            "SELECT count(*) FROM sessions s
+             WHERE s.owner_id = ?1 AND s.lifecycle <> 'deleted' AND (?2 IS NULL OR s.hat_id = ?2)
+                   AND (s.activity = 'blocked'
+                        OR EXISTS (SELECT 1 FROM pending p
+                                   WHERE p.session_id = s.id AND p.state = 'open' AND p.owner_id = ?1))",
+            params![self.owner, hat],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// The owner's sessions with an applied event after `after`, the one
+    /// changed longest ago first.
+    pub fn sessions_changed_after(&self, after: i64) -> Result<Vec<String>> {
+        let conn = self.view_conn();
+        let mut stmt = conn.prepare(SESSIONS_CHANGED)?;
+        let rows = stmt.query_map(params![after, self.owner], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// When the owner's applied event `event_id`, of any session, was
+    /// stored.
+    pub fn event_ts(&self, event_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .view_conn()
+            .query_row(
+                "SELECT ts FROM events WHERE event_id = ?1 AND applied = 1 AND owner_id = ?2",
+                params![event_id, self.owner],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+}
+
+/// The store's stamp of the instant `age` ago: stamps compare as text in
+/// time order (plan 6b decision 5), so an event stored before it has a
+/// smaller `ts`.
+pub fn stamp_ago(age: std::time::Duration) -> String {
+    stamp(time::OffsetDateTime::now_utc() - age)
 }
 
 fn body_kind(body: &SessionBody) -> &'static str {
@@ -3915,6 +4248,59 @@ mod tests {
             for pattern in [Some("%x%"), None] {
                 let plan = list_plan(&conn, by_hat, pattern);
                 assert!(plan.contains(&format!("USING INDEX {index}")), "{plan}");
+                assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+            }
+        }
+    }
+
+    /// The review's A-9: the view's reads of a session's events walk an
+    /// index of that session's, and sort nothing; the owner's changed
+    /// sessions are a range of the table. The indexes are those plan
+    /// 10b-iii (`events_by_kind`) and the smoke test's F2 fix
+    /// (`events_by_session`) made: the view adds none.
+    #[test]
+    fn the_views_reads_walk_their_indexes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hennery.db");
+        Store::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let plan = |sql: &str, args: usize| -> String {
+            let args: Vec<i64> = vec![1; args];
+            conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(args), |r| r.get::<_, String>(3))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        for (sql, args, uses) in [
+            (
+                EVENTS_BETWEEN,
+                5,
+                "USING INDEX events_by_session (session_id=? AND event_id>? AND event_id<?)",
+            ),
+            (
+                GROUP_STARTS,
+                4,
+                "USING INDEX events_by_kind (session_id=? AND kind=? AND event_id<?)",
+            ),
+            (
+                PENDING_LAST_EVENT,
+                3,
+                "USING INDEX events_by_kind (session_id=? AND kind=?)",
+            ),
+            (
+                PENDING_OPENED_AT,
+                3,
+                "USING INDEX events_by_kind (session_id=? AND kind=?)",
+            ),
+            (SESSIONS_CHANGED, 2, "USING INTEGER PRIMARY KEY (rowid>?)"),
+        ] {
+            let plan = plan(sql, args);
+            assert!(plan.contains(uses), "{plan}");
+            assert!(!plan.contains("SCAN "), "{plan}");
+            if sql != SESSIONS_CHANGED {
                 assert!(!plan.contains("TEMP B-TREE"), "{plan}");
             }
         }
