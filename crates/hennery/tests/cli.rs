@@ -1811,6 +1811,8 @@ fn the_pairing_code_never_reaches_ups_childrens_argv_or_environment() {
     let mut command = hennery();
     command
         .env_clear()
+        .env("HENNERY_NPM_REGISTRY", OFFLINE)
+        .env("HENNERY_NODE_MIRROR", OFFLINE)
         .env("PATH", "/usr/bin:/bin")
         .env("HENNERY_PROBE_MARKER", "yes");
     let mut up = up_logging_to_with(command, &data, &log, &[]);
@@ -3069,20 +3071,35 @@ fn every_spawn_of_the_binary_is_offline() {
         "spawn the binary through hennery() or under_umask_022(), which keep it offline"
     );
     assert_eq!(source.matches(concat!("offline(&mut ", "cmd)")).count(), 2);
-    // `offline` and the one spawn through a shell of its own set both
-    // mirrors.
+    // `offline`, the one spawn through a shell of its own, and the one test
+    // that clears the environment set both mirrors (the Task 7 review: a
+    // cleared environment reached the real registry).
     assert_eq!(
         source
             .matches(concat!(".env(\"HENNERY_NPM_REGISTRY\", ", "OFFLINE)"))
             .count(),
-        2
+        3
     );
     assert_eq!(
         source
             .matches(concat!(".env(\"HENNERY_NODE_MIRROR\", ", "OFFLINE)"))
             .count(),
-        2
+        3
     );
+    // A cleared environment is offline again on the very next lines.
+    let lines: Vec<&str> = source.lines().map(str::trim).collect();
+    for (i, line) in lines.iter().enumerate() {
+        if line.contains(concat!(".env_", "clear()")) {
+            let next = lines[i + 1..(i + 3).min(lines.len())].join(" ");
+            assert!(
+                next.contains("HENNERY_NPM_REGISTRY")
+                    && next.contains("HENNERY_NODE_MIRROR")
+                    && next.matches("OFFLINE").count() == 2,
+                "line {}: a cleared environment must set both mirrors again",
+                i + 1
+            );
+        }
+    }
 }
 
 /// A loopback mirror serving `bodies` (path → bytes), else 404: as the
@@ -3320,9 +3337,29 @@ fn use_cli_is_recorded_in_host_toml_and_bundled_removes_it() {
         );
     }
     // A mirror must be https (or loopback http): an update refuses one.
-    let out = update(&["--npm-registry", "http://npm.example/"]);
+    let out = update(&["--npm-registry", "http://npm.example/", "--use-cli", "codex=/bin/sh"]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("must be https://"));
+    // Refused before anything is recorded (the Task 7 review).
+    let toml = std::fs::read_to_string(host.join("host.toml")).unwrap();
+    assert!(!toml.contains("codex"), "{toml}");
+    // `join` refuses one before it spends the code, and pairs nothing.
+    let refused = hennery()
+        .args([
+            "host",
+            "join",
+            "http://127.0.0.1:1",
+            "AAAA-AAAA",
+            "--npm-registry",
+            "http://npm.example/",
+        ])
+        .arg("--data-dir")
+        .arg(dir.join("bad-mirror"))
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("must be https://"));
+    assert!(!dir.join("bad-mirror").join("host.key").exists());
     let both = hennery()
         .args([
             "host",

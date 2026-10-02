@@ -152,7 +152,7 @@ struct HostArgs {
     /// `claude` and `codex` come from the installed adapter set. An agent
     /// never inherits CLAUDE_CODE_EXECUTABLE, CODEX_PATH, CODEX_CONFIG,
     /// DISABLE_MCP_CONFIG_FILTERING or APP_SERVER_LOGS: a command that needs
-    /// one sets it itself (e.g. through `env`).
+    /// one sets it itself, e.g. `name=/usr/bin/env CODEX_PATH=… <cmd>`.
     #[arg(long = "agent", value_parser = parse_agent)]
     agents: Vec<(String, AgentCommand)>,
     /// Park sessions idle for this many seconds; 0 turns the reaper off.
@@ -615,6 +615,10 @@ fn private_data_dir(dir: &std::path::Path) -> Result<()> {
 }
 
 async fn join_host(args: JoinArgs) -> Result<()> {
+    // Before the code is spent: a bad mirror stops the join here.
+    if !args.no_runtime {
+        args.mirrors.sources()?;
+    }
     let name = args.name.unwrap_or_else(hennery_host::pairing::default_name);
     let code = match args.code {
         Some(code) => code,

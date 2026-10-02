@@ -66,6 +66,8 @@ pub fn parse_use_cli(arg: &str) -> Result<UseCli, String> {
 pub async fn run(command: AdaptersCommand) -> Result<()> {
     match command {
         AdaptersCommand::Update(args) => {
+            // Before anything is recorded: a bad mirror changes nothing.
+            args.mirrors.sources()?;
             record_cli_choices(&args.data_dir, &args.use_cli)?;
             update(&args.data_dir, &args.mirrors).await?;
             println!(
@@ -83,6 +85,10 @@ pub async fn run(command: AdaptersCommand) -> Result<()> {
                 back.to.id,
                 versions(&back.to)
             );
+            println!(
+                "A running host keeps starting agents from the set it started with until it restarts; \
+                 restart it to use this one."
+            );
             Ok(())
         }
     }
@@ -95,8 +101,9 @@ pub fn record_cli_choices(data_dir: &Path, choices: &[UseCli]) -> Result<()> {
         match &choice.path {
             Some(path) => eprintln!(
                 "{agent} will run {path} instead of its bundled CLI. It loses the pin's guarantee (this release \
-                 was tested with the bundled one); on a host shared by several hats it gets the MCP fallback \
-                 unless you accept unverified isolation. `--use-cli {agent}=bundled` undoes this.",
+                 was tested with the bundled one). On a host shared by several hats it is meant to get the MCP \
+                 fallback unless you accept unverified isolation; this release does not enforce that yet. \
+                 `--use-cli {agent}=bundled` undoes this.",
                 agent = choice.agent,
                 path = path.display()
             ),
