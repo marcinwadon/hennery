@@ -11,6 +11,7 @@ pub mod notify;
 pub mod offline;
 pub mod projects;
 pub mod push;
+mod redact;
 mod resolve;
 mod shared_files;
 pub mod store;
@@ -93,10 +94,15 @@ impl hennery_kernel::lifecycle::LifecycleHooks for AppState {
 
     /// The session module's part of a hat's purge (plan 9c decision 10d):
     /// `hats::purge_sessions`, which the purge route calls itself for what
-    /// it deleted, and the one checkpoint its deletes owe.
+    /// it deleted, then the gateway's part (lane L6, plan 8e: its tokens,
+    /// stdio servers and connections, with their open streams cut), and
+    /// the one checkpoint the deletes owe. Each is idempotent: a purge that
+    /// stopped runs both again.
     fn on_hat_purged(&self, hat_id: &str) -> anyhow::Result<()> {
         self.store.owe_checkpoint();
-        let purged = hats::purge_sessions(self, hat_id).map(drop);
+        let purged = hats::purge_sessions(self, hat_id)
+            .map(drop)
+            .and_then(|()| self.store.purge_gateway_hat(hat_id));
         self.store.checkpoint();
         purged
     }
