@@ -40,7 +40,10 @@ fn paired_hosts() -> Hosts {
     hosts
 }
 
-#[tokio::test]
+/// On several threads: the collector's ingest blocks the thread it runs on
+/// in SQLite's busy wait, and on the test's only thread that would stop the
+/// deadline below from firing at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failed_ingest_drops_the_connection_instead_of_acking_past_it() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("hennery.db");
@@ -108,7 +111,12 @@ async fn a_failed_ingest_drops_the_connection_instead_of_acking_past_it() {
 
     // No ack ever arrives: the write blocks behind the lock, then errors,
     // and the reader must drop the connection rather than skip silently.
-    let outcome = tokio::time::timeout(Duration::from_secs(15), async {
+    // The ingest is not the only writer kept waiting: the attachment sweep
+    // the collector runs at startup (plan 9b) holds the store's connection
+    // through its own busy wait first. Both together took about 23 s on a
+    // loaded macOS machine, past the 15 s this once had (PR #82's CI).
+    // So as long as the undo test below: the drop ends the wait anyway.
+    let outcome = tokio::time::timeout(Duration::from_secs(120), async {
         loop {
             match stream.next().await {
                 Some(Ok(Message::Text(t))) => panic!("unexpected frame while ingest was blocked: {t}"),
