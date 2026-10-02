@@ -118,8 +118,15 @@ pub fn body(body: &SessionBody) -> Result<Option<SessionBody>> {
         .context("a session frame with a token redacted no longer reads")
 }
 
+// The gateway's differential harness (lane L16): its decoders read what
+// this module stores and forwards.
+#[cfg(test)]
+#[path = "../../hennery-gateway/tests/support/differential.rs"]
+mod differential;
+
 #[cfg(test)]
 mod tests {
+    use super::differential::{DECODERS, Decoder, Node};
     use super::*;
     use serde_json::json;
 
@@ -160,6 +167,71 @@ mod tests {
             "plain text",
         ] {
             assert_eq!(text(kept), None, "{kept}");
+        }
+    }
+
+    /// A token-shaped run, judged apart from `text`: the prefix in any
+    /// case, then 8 or more hexadecimal digits.
+    fn has_token(s: &str) -> bool {
+        let lower = s.to_ascii_lowercase();
+        lower.match_indices(SESSION_TOKEN_PREFIX).any(|(at, prefix)| {
+            lower[at + prefix.len()..]
+                .bytes()
+                .take_while(u8::is_ascii_hexdigit)
+                .count()
+                >= MIN_DIGITS
+        })
+    }
+
+    /// Every string and key of `node` as `decoder` hands it on.
+    fn strings(decoder: Decoder, node: &Node, out: &mut Vec<String>) {
+        match node {
+            Node::Str(_) => out.extend(decoder.str(Some(node))),
+            Node::Arr(items) => items.iter().for_each(|item| strings(decoder, item, out)),
+            Node::Obj(entries) => {
+                for (key, value) in entries {
+                    out.push(decoder.key(key));
+                    out.push(key.clone());
+                    strings(decoder, value, out);
+                }
+            }
+            Node::Null | Node::Bool | Node::Num(_) => {}
+        }
+    }
+
+    /// Lane L16: a payload as a host may send it, read as serde reads a
+    /// frame, redacted, and written back as hennery stores and forwards
+    /// it; then read by each of the six decoders, which find no
+    /// token-shaped run in any string or key. A token in a key repeated
+    /// (the first or the last copy), spelled with escapes, upper-cased, or
+    /// in a key a decoder folds, is redacted or gone.
+    #[test]
+    fn no_decoder_reads_a_token_in_what_is_stored() {
+        let t = token();
+        let upper = t.to_uppercase();
+        let escaped = t.replace('_', "\\u005f");
+        let vectors = [
+            format!(r#"{{"text":"{t}"}}"#),
+            format!(r#"{{"text":"{t}","text":"clean"}}"#),
+            format!(r#"{{"text":"clean","text":"{t}"}}"#),
+            format!(r#"{{"text":"{escaped}"}}"#),
+            format!(r#"{{"Text":"{upper}","text":"clean"}}"#),
+            format!(r#"{{"{t}":1,"{t}":2}}"#),
+            format!(r#"{{"te\u0000xt":"{t}"}}"#),
+            format!(r#"{{"\u017fession":"{t}","session":"x"}}"#),
+            format!(r#"[{{"a":["x","{t}"]}},"{t} and {t}"]"#),
+        ];
+        for raw in vectors {
+            let mut payload: Value = serde_json::from_str(&raw).unwrap();
+            value(&mut payload);
+            let stored = serde_json::to_vec(&payload).unwrap();
+            assert!(!has_token(&String::from_utf8_lossy(&stored)), "{raw}");
+            let node: Node = serde_json::from_slice(&stored).unwrap();
+            for &decoder in DECODERS {
+                let mut seen = Vec::new();
+                strings(decoder, &node, &mut seen);
+                assert!(!seen.iter().any(|s| has_token(s)), "{decoder:?} reads a token in {raw}");
+            }
         }
     }
 
