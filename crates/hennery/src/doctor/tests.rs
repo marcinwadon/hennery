@@ -1823,6 +1823,10 @@ fn logged_in_is_the_clis_exit_code_alone() {
     let check = check4();
     assert_eq!(check.status, Status::Ok, "{check:?}");
     assert_eq!(check.summary, "claude is logged in; codex is logged in");
+    // A CLI doctor runs installs nothing: its auto-updater is off.
+    for env in agents.runs("env-cli-") {
+        assert!(env.contains("DISABLE_AUTOUPDATER=1"), "{env}");
+    }
     for cwd in agents.runs("cwd-cli-") {
         assert_eq!(
             Path::new(cwd.trim()).canonicalize().unwrap(),
@@ -2163,6 +2167,14 @@ fn each_step_to_the_collector_fails_on_its_own() {
     assert!(seven.summary.contains("answered 503"), "{seven:?}");
     assert!(seven.summary.contains(&format!("http://{unavailable}/")), "{seven:?}");
     assert!(!report(&dirs, &findings).contains("canary-7d"), "{findings:?}");
+
+    // A redirect is not followed: its own status is the answer.
+    let moved = answering(format!(
+        "HTTP/1.1 302 Found\r\nLocation: http://{unavailable}/healthz\r\nContent-Length: 0\r\n\r\n"
+    ));
+    point_at(&host, &format!("ws://{moved}/api/hosts/ws"));
+    let seven = line(&run(), 7).clone();
+    assert!(seven.summary.contains("answered 302"), "{seven:?}");
 
     // A connection closed without an answer, over plain http: not a TLS
     // failure, whatever the URL's words (the error is judged without it).
