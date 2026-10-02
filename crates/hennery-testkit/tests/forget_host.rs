@@ -222,6 +222,8 @@ impl Setup {
             agent: "claude".into(),
             cwd: self.base.join("work").to_str().unwrap().into(),
             config: Default::default(),
+            hat_id: String::new(),
+            mcp: Default::default(),
         }
     }
 }
@@ -328,6 +330,8 @@ async fn a_load_under_another_root_registers_both_and_says_so() {
             cwd: setup.base.join("work").to_str().unwrap().into(),
             agent_session_id: AGENT_SESSION.into(),
             config: Default::default(),
+            hat_id: String::new(),
+            mcp: Default::default(),
         })
         .await;
     let SessionBody::SessionStarted { agent_home, .. } = collector.fact().await else {
@@ -411,6 +415,8 @@ async fn an_attach_waits_out_a_forget_of_the_same_agent_session() {
         cwd: setup.base.join("work").to_str().unwrap().into(),
         agent_session_id: AGENT_SESSION.into(),
         config: Default::default(),
+        hat_id: String::new(),
+        mcp: Default::default(),
     };
     collector.send(&resume("r2")).await;
     loop {
