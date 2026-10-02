@@ -214,7 +214,7 @@ WantedBy=default.target
 
 /// The `ExecStart` of a unit `systemd_unit` wrote.
 pub fn systemd_command_line(text: &str) -> Option<Vec<String>> {
-    let line = text.lines().find_map(|l| l.strip_prefix("ExecStart="))?;
+    let line = text.lines().find_map(|l| l.trim_end().strip_prefix("ExecStart="))?;
     let mut words = Vec::new();
     let mut chars = line.chars().peekable();
     loop {
@@ -418,6 +418,11 @@ mod tests {
             assert_eq!(systemd_command_line(&text).unwrap(), argv, "{role}");
         }
         assert_eq!(systemd_command_line("ExecStart=/bin/true"), None);
+        let argv = command_line(Role::Up, exe, &awkward()).unwrap();
+        let edited = systemd_unit(Role::Up, &argv, "/tmp/env")
+            .unwrap()
+            .replace('\n', " \r\n");
+        assert_eq!(systemd_command_line(&edited).unwrap(), argv);
         assert_eq!(plist_command_line("<plist/>"), None);
     }
 }

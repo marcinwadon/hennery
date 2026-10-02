@@ -394,12 +394,31 @@ fn uninstalling_on_macos_boots_out_and_removes_the_plist() {
     let plist = cx.service_file(Role::Host);
     std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
     std::fs::write(&plist, unit::plist(Role::Host, &["/x".into()], "/usr/bin", "/tmp/l")).unwrap();
-    uninstall(&cx, Some(Role::Host), &mut Vec::new()).unwrap();
+    let mut out = Vec::new();
+    uninstall(&cx, Some(Role::Host), &mut out).unwrap();
     assert!(
         fake.calls()
             .contains(&"launchctl bootout gui/501/dev.hennery.host".to_string())
     );
     assert!(!plist.exists());
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("its log is kept"), "{out}");
+}
+
+/// `service.env` is every role's: with two roles installed (which `status`
+/// warns about), removing one keeps it for the other.
+#[test]
+fn uninstalling_one_of_two_roles_keeps_the_env_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::new(|_, _| ok("Linger=yes"));
+    let cx = linux(dir.path(), &fake);
+    install(&cx, Role::Collector, None, None, &mut Vec::new()).unwrap();
+    let up = cx.service_file(Role::Up);
+    std::fs::write(&up, "").unwrap();
+    uninstall(&cx, Some(Role::Up), &mut Vec::new()).unwrap();
+    assert!(cx.env_file().exists());
+    uninstall(&cx, Some(Role::Collector), &mut Vec::new()).unwrap();
+    assert!(!cx.env_file().exists());
 }
 
 /// Status names the installed role, what it runs, what launchd says, and
@@ -461,6 +480,78 @@ fn status_reports_the_service_and_ups_children() {
     let text = String::from_utf8(out).unwrap();
     assert!(text.contains("the last report is stale"), "{text}");
     assert!(!text.contains("given up on"), "{text}");
+}
+
+/// Either condition alone makes the report stale: a live pid that is not
+/// the one launchd names, or a dead pid when launchd names none. And a
+/// report that cannot be read is said, and fails `status`.
+#[test]
+fn a_report_is_stale_by_either_condition_and_an_unreadable_one_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let launchd_pid = std::rc::Rc::new(std::cell::Cell::new(None::<u32>));
+    let named = launchd_pid.clone();
+    let fake = Fake::new(move |line, _| {
+        if line.contains(" print ") {
+            match named.get() {
+                Some(pid) => ok(&format!("state = running\npid = {pid}\n")),
+                None => ok("state = running\n"),
+            }
+        } else {
+            ok("")
+        }
+    });
+    let cx = machine(dir.path(), Platform::MacOs, &fake);
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let argv = unit::command_line(Role::Up, &cx.exe, &data).unwrap();
+    let plist = cx.service_file(Role::Up);
+    std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    std::fs::write(&plist, unit::plist(Role::Up, &argv, "/usr/bin", "/tmp/l")).unwrap();
+    let gave_up = supervisor::ChildReport {
+        state: supervisor::ChildState::GaveUp,
+        crashes_in_window: 10,
+        restarts: 9,
+        last_exit: None,
+    };
+    let report = |pid| supervisor::State {
+        pid,
+        updated_at: 0,
+        collector: gave_up.clone(),
+        host: gave_up.clone(),
+    };
+    let stale = |cx: &Context| {
+        let mut out = Vec::new();
+        let code = status(cx, None, &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        (code, text.contains("the last report is stale"), text)
+    };
+
+    // Alive, but not the process launchd runs.
+    supervisor::write_state(&data, &report(std::process::id())).unwrap();
+    launchd_pid.set(Some(1));
+    let (code, is_stale, text) = stale(&cx);
+    assert!(is_stale, "{text}");
+    assert_eq!(code, ExitCode::SUCCESS, "{text}");
+
+    // launchd names no pid, and the report's is gone.
+    let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+    gone.wait().unwrap();
+    supervisor::write_state(&data, &report(gone.id())).unwrap();
+    launchd_pid.set(None);
+    let (_, is_stale, text) = stale(&cx);
+    assert!(is_stale, "{text}");
+
+    // Neither: the report counts, and its give-up fails `status`.
+    supervisor::write_state(&data, &report(std::process::id())).unwrap();
+    let (code, is_stale, text) = stale(&cx);
+    assert!(!is_stale, "{text}");
+    assert_eq!(code, ExitCode::FAILURE, "{text}");
+
+    std::fs::write(data.join(supervisor::STATE_FILE), "{not json").unwrap();
+    let mut out = Vec::new();
+    assert_eq!(status(&cx, None, &mut out).unwrap(), ExitCode::FAILURE);
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("the report cannot be read"), "{text}");
 }
 
 /// Status: nothing installed, a missing binary, a unit that is not active.

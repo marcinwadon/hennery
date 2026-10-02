@@ -558,7 +558,10 @@ pub fn uninstall(cx: &Context, role: Option<Role>, out: &mut dyn Write) -> Resul
                     writeln!(out, "  warning: {err:#}")?;
                 }
                 std::fs::remove_file(&file).with_context(|| format!("remove {}", file.display()))?;
-                let _ = std::fs::remove_file(cx.env_file());
+                // Every role's unit names it: kept while one is left.
+                if cx.installed().is_empty() {
+                    let _ = std::fs::remove_file(cx.env_file());
+                }
                 if let Err(err) = systemctl(cx, &["daemon-reload"]) {
                     writeln!(out, "  warning: {err:#}")?;
                 }
@@ -671,8 +674,13 @@ fn status_of(cx: &Context, role: Role, out: &mut dyn Write) -> Result<bool> {
             }
         }
         Platform::Linux => {
-            let active = cx.run("systemctl", &["--user", "is-active", role.unit()])?;
-            let enabled = cx.run("systemctl", &["--user", "is-enabled", role.unit()])?;
+            let (Ok(active), Ok(enabled)) = (
+                cx.run("systemctl", &["--user", "is-active", role.unit()]),
+                cx.run("systemctl", &["--user", "is-enabled", role.unit()]),
+            ) else {
+                writeln!(out, "  systemd: unavailable (`systemctl --user` cannot be run)")?;
+                return Ok(false);
+            };
             writeln!(out, "  systemd: {}, {}", active.stdout.trim(), enabled.stdout.trim())?;
             let pid = cx
                 .run(
@@ -712,9 +720,16 @@ fn alive(pid: u32) -> bool {
 /// as stale and judged by nothing: an `up` killed outright leaves one
 /// behind, and so does an `up` run by hand on the same data directory.
 fn children(data: &Path, pid: Option<u32>, out: &mut dyn Write) -> Result<bool> {
-    let Some(state) = supervisor::read_state(data)? else {
-        writeln!(out, "  children: no report yet in {}", data.display())?;
-        return Ok(true);
+    let state = match supervisor::read_state(data) {
+        Ok(Some(state)) => state,
+        Ok(None) => {
+            writeln!(out, "  children: no report yet in {}", data.display())?;
+            return Ok(true);
+        }
+        Err(err) => {
+            writeln!(out, "  children: the report cannot be read ({err:#})")?;
+            return Ok(false);
+        }
     };
     if !alive(state.pid) || pid.is_some_and(|pid| pid != state.pid) {
         writeln!(
