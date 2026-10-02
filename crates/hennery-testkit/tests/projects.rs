@@ -128,9 +128,15 @@ impl ScriptedHost {
         .await;
     }
 
-    /// `connect` announcing the `projects` capability and no roots.
+    /// `connect` announcing the `projects` capability and no roots, and
+    /// `resolve_path`, which a start needs (plan 5c).
     async fn with_projects(collector: &Collector) -> Self {
-        Self::connect(collector, Capabilities(vec![Capability::Projects]), vec![]).await
+        Self::connect(
+            collector,
+            Capabilities(vec![Capability::Projects, Capability::ResolvePath]),
+            vec![],
+        )
+        .await
     }
 
     async fn send(&mut self, frame: &HostFrame) {
@@ -688,18 +694,63 @@ fn default_hat(collector: &Collector) -> String {
 
 // Task 6: recent projects, per hat (decision 11).
 
-/// Start a session in `cwd` through the API, the host answering
-/// `session_started` if `starts`, `start_failed` otherwise.
+/// Start a session in `cwd` through the API, the host resolving it to
+/// itself (plan 5c) and answering `session_started` if `starts`,
+/// `start_failed` otherwise.
 async fn start_in(collector: &Collector, host: &mut ScriptedHost, cwd: &str, starts: bool) {
+    let start = begin_start(collector, host, cwd, cwd).await;
+    finish_start(host, start, starts).await;
+}
+
+/// A start in flight: the call, and the `start_session` the host got.
+struct Starting {
+    call: tokio::task::JoinHandle<u16>,
+    request_id: String,
+    session_id: String,
+}
+
+/// Start a session in `typed` through the API, the host resolving it to
+/// `canonical`, up to the `start_session` the host gets.
+async fn begin_start(collector: &Collector, host: &mut ScriptedHost, typed: &str, canonical: &str) -> Starting {
     let (c, url) = (client(collector), format!("http://{}/api/sessions", collector.addr));
-    let body = json!({ "host_id": HOST, "agent": "fake", "cwd": cwd });
+    let body = json!({ "host_id": HOST, "agent": "fake", "cwd": typed });
     let call = tokio::spawn(async move { c.post(url).json(&body).send().await.unwrap().status().as_u16() });
+    let CollectorFrame::ResolvePath { request_id, path } = host.next().await else {
+        panic!("expected resolve_path");
+    };
+    assert_eq!(path, typed);
+    host.send(&HostFrame::ResolvedPath {
+        request_id,
+        canonical: canonical.into(),
+        exists: true,
+        is_dir: true,
+    })
+    .await;
     let CollectorFrame::StartSession {
-        request_id, session_id, ..
+        request_id,
+        session_id,
+        cwd,
+        ..
     } = host.next().await
     else {
         panic!("expected start_session");
     };
+    assert_eq!(cwd, canonical);
+    Starting {
+        call,
+        request_id,
+        session_id,
+    }
+}
+
+/// The host answers a start in flight: `session_started` if `starts`,
+/// `start_failed` otherwise.
+async fn finish_start(host: &mut ScriptedHost, start: Starting, starts: bool) {
+    let Starting {
+        call,
+        request_id,
+        session_id,
+    } = start;
     let body = if starts {
         hennery_proto::frames::SessionBody::session_started(request_id, "agent-1")
     } else {
@@ -741,12 +792,27 @@ async fn a_session_that_starts_makes_its_canonical_cwd_a_recent_project() {
         body["recents"][0]["last_used_at"].as_str().unwrap().ends_with('Z'),
         "{body}"
     );
-    // A start that fails, and a cwd that is not canonical, are not
-    // remembered; recents are read afresh, past the cache.
+    // A start that fails is not remembered; a typed cwd is remembered as
+    // its host resolved it (plan 5c), and one the host answers in a form
+    // that is not canonical starts nothing. Recents are read afresh, past
+    // the cache.
     start_in(&collector, &mut host, "/p/broken", false).await;
-    start_in(&collector, &mut host, "relative/dir", true).await;
-    start_in(&collector, &mut host, "/p/app/", true).await;
-    start_in(&collector, &mut host, "/p/../etc", true).await;
+    let start = begin_start(&collector, &mut host, "/p/../p/app/", "/p/app").await;
+    finish_start(&mut host, start, true).await;
+    let (c, url) = (client(&collector), format!("http://{}/api/sessions", collector.addr));
+    let body = json!({ "host_id": HOST, "agent": "fake", "cwd": "/p/odd" });
+    let call = tokio::spawn(async move { c.post(url).json(&body).send().await.unwrap().status().as_u16() });
+    let CollectorFrame::ResolvePath { request_id, .. } = host.next().await else {
+        panic!("expected resolve_path");
+    };
+    host.send(&HostFrame::ResolvedPath {
+        request_id,
+        canonical: "/p/odd/".into(),
+        exists: true,
+        is_dir: true,
+    })
+    .await;
+    assert_eq!(call.await.unwrap(), 502);
     let (_, body) = get(&collector, &format!("/api/hosts/{HOST}/projects")).await;
     assert_eq!(recent_paths(&body), ["/p/app"]);
     start_in(&collector, &mut host, "/p/lib", true).await;
@@ -794,6 +860,48 @@ async fn recents_are_those_of_the_hat_the_path_resolves_to() {
     let mut paths = recent_paths(&body);
     paths.sort();
     assert_eq!(paths, ["/p/home-project", "/p/work/client"]);
+}
+
+/// Plan 6c's A3 iii (plan 5c): a recent is remembered under the hat its
+/// session was given at its start, as stored, not under what its cwd
+/// resolves to when the start is confirmed: a rule saved in between
+/// changes nothing.
+#[tokio::test]
+async fn a_recent_is_remembered_under_the_hat_its_session_was_given() {
+    use hennery_kernel::hats::{HatChange, NewRule};
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::with_projects(&collector).await;
+    let hosts = &collector.state.hosts;
+    let HatChange::Done(work) = hosts.create_hat("Work", None, 0).unwrap() else {
+        panic!("a hat");
+    };
+    let start = begin_start(&collector, &mut host, "/p/app", "/p/app").await;
+    let stored = collector
+        .state
+        .store
+        .session(&start.session_id)
+        .unwrap()
+        .unwrap()
+        .hat_id;
+    assert_eq!(stored, default_hat(&collector));
+    let rule = NewRule {
+        prefix: "/p".into(),
+        hat_id: work.id.clone(),
+        verified: true,
+    };
+    hosts.replace_path_rules(HOST, &[rule]).unwrap();
+    finish_start(&mut host, start, true).await;
+    let db = collector._dir.path().join("hennery.db");
+    let remembered = wait_for("the recent", || async {
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row("SELECT hat_id FROM project_recents WHERE path = '/p/app'", [], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok()
+    })
+    .await;
+    assert_eq!(remembered, stored);
 }
 
 /// The review's A2: `path` is checked first, whatever the host's state.

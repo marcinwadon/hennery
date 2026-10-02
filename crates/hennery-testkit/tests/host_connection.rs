@@ -338,13 +338,23 @@ fn error_for(request: &str) -> impl Fn(&HostFrame) -> bool {
     move |f| matches!(f, HostFrame::Error { request_id, .. } if *request_id == request)
 }
 
+/// The system's temporary directory in canonical form (on macOS
+/// `/var/folders/…` is under a symlink): a start or resume must name its cwd
+/// canonically (plan 5c decision 5).
+fn canonical_temp_dir() -> String {
+    std::fs::canonicalize(std::env::temp_dir())
+        .unwrap()
+        .to_string_lossy()
+        .into_owned()
+}
+
 fn start(request_id: &str, session_id: &str) -> CollectorFrame {
     CollectorFrame::StartSession {
         request_id: request_id.into(),
         session_id: session_id.into(),
         committed_seq: 0,
         agent: "fake".into(),
-        cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+        cwd: canonical_temp_dir(),
         config: Default::default(),
     }
 }
@@ -636,7 +646,7 @@ fn resume(request_id: &str, session_id: &str, committed_seq: u64, agent_session_
         session_id: session_id.into(),
         committed_seq,
         agent: "fake".into(),
-        cwd: std::env::temp_dir().to_string_lossy().into_owned(),
+        cwd: canonical_temp_dir(),
         agent_session_id: agent_session_id.into(),
         config: Default::default(),
     }
@@ -1254,4 +1264,80 @@ async fn a_collector_that_sends_no_nonce_gets_no_hello() {
         "the host sent a frame without a nonce to sign: {first:?}"
     );
     host.abort();
+}
+
+/// Plan 5c decision 5: the adapter starts in exactly the directory whose
+/// hat was decided. A start or resume naming a cwd that is not its own
+/// canonical form (a symlink, a trailing slash) or not a directory is
+/// refused, and no adapter is spawned; `resolve_path` answers it.
+#[tokio::test]
+async fn a_start_or_resume_in_a_cwd_that_is_not_canonical_is_refused() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("real")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+    let spawns = dir.path().join("spawns");
+    tokio::spawn(run(host_with_fake(addr, "cwd-not-canonical", counting_fake(&spawns))));
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    let real = std::fs::canonicalize(dir.path().join("real")).unwrap();
+    let real = real.to_str().unwrap().to_string();
+    let link = dir.path().join("link").to_str().unwrap().to_string();
+
+    let cases = [
+        (format!("{real}/"), "start"),
+        (link.clone(), "start"),
+        (format!("{real}/missing"), "start"),
+        (link.clone(), "resume"),
+    ];
+    for (i, (cwd, kind)) in cases.iter().enumerate() {
+        let request_id = format!("r{i}");
+        let mut frame = if *kind == "start" {
+            start(&request_id, "s1")
+        } else {
+            resume(&request_id, "s1", 0, "agent-1")
+        };
+        match &mut frame {
+            CollectorFrame::StartSession { cwd: c, .. } | CollectorFrame::ResumeSession { cwd: c, .. } => {
+                *c = cwd.clone()
+            }
+            _ => unreachable!(),
+        }
+        send_frame(&mut sink, &frame).await;
+        match read_until(&mut stream, error_for(&request_id)).await {
+            HostFrame::Error { code, .. } => assert_eq!(code, "cwd_not_canonical", "{kind} in {cwd}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(!spawns.exists(), "an adapter was spawned");
+
+    send_frame(
+        &mut sink,
+        &CollectorFrame::ResolvePath {
+            request_id: "p1".into(),
+            path: format!("{link}/"),
+        },
+    )
+    .await;
+    let answer = read_until(
+        &mut stream,
+        |f| matches!(f, HostFrame::ResolvedPath { request_id, .. } if request_id == "p1"),
+    )
+    .await;
+    assert_eq!(
+        answer,
+        HostFrame::ResolvedPath {
+            request_id: "p1".into(),
+            canonical: real.clone(),
+            exists: true,
+            is_dir: true,
+        }
+    );
+    // In the canonical form it names, it starts.
+    let mut frame = start("r9", "s1");
+    if let CollectorFrame::StartSession { cwd, .. } = &mut frame {
+        *cwd = real;
+    }
+    send_frame(&mut sink, &frame).await;
+    read_until(&mut stream, body_is("s1", "session_started")).await;
 }

@@ -72,6 +72,16 @@ pub struct Resolution {
     pub rule_id: Option<String>,
 }
 
+/// The hat a session's canonical cwd gets (`Hosts::session_hat`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionHat {
+    Decided(Resolution),
+    /// A rule would cover the path but for case, and would give another hat
+    /// than what decided it (`near_miss`): the hat is in doubt, so the
+    /// session does not start or resume.
+    Ambiguous(PathRule),
+}
+
 /// The outcome of `Hosts::create_hat` and `Hosts::update_hat`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HatChange {
@@ -174,6 +184,28 @@ pub fn resolve(rules: &[PathRule], default_hat: &str, path: &str) -> Resolution 
             hat_id: default_hat.to_string(),
             rule_id: None,
         })
+}
+
+/// A rule that does not cover `path` byte for byte but would if case were
+/// ignored, that would then win over `decided` (a longer prefix than its
+/// rule's, or any prefix when no rule decided), and that names another hat
+/// (the review's P4). A case-insensitive volume is where that happens: the
+/// rule's prefix holds another case than the directory has now, because it
+/// was saved before the directory existed, or the directory was renamed
+/// since (the review's B2, which is why verified rules count too). Its
+/// sessions would fall silently to another hat (plan 5c decision 3).
+pub fn near_miss<'a>(rules: &'a [PathRule], path: &str, decided: &Resolution) -> Option<&'a PathRule> {
+    let decided_len = decided
+        .rule_id
+        .as_ref()
+        .and_then(|id| rules.iter().find(|rule| &rule.id == id))
+        .map_or(0, |rule| rule.prefix.len());
+    let folded_path = path.to_lowercase();
+    rules
+        .iter()
+        .filter(|rule| rule.prefix.len() > decided_len && rule.hat_id != decided.hat_id)
+        .filter(|rule| !covers(&rule.prefix, path) && covers(&rule.prefix.to_lowercase(), &folded_path))
+        .max_by_key(|rule| rule.prefix.len())
 }
 
 fn new_id(kind: &str) -> String {
@@ -427,6 +459,28 @@ impl Hosts {
         Ok(Some(resolve(&rules, &default_hat, path)))
     }
 
+    /// The hat a session whose canonical cwd is `path` gets on `host_id`
+    /// (umbrella §8.2), unless a rule that misses only by case makes it
+    /// ambiguous (`near_miss`); `None` for an unknown host. `path` must be
+    /// canonical. The host's default hat and its rules are read in one
+    /// transaction, so a rules change or a default change committed in
+    /// between cannot mix the old one with the new (plan 5a's final review).
+    pub fn session_hat(&self, host_id: &str, path: &str) -> Result<Option<SessionHat>> {
+        anyhow::ensure!(is_canonical(path), "not a canonical path: {path:?}");
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let Some(default_hat) = host_default_hat(&tx, self.owner_id(), host_id)? else {
+            return Ok(None);
+        };
+        let rules = rules_of(&tx, self.owner_id(), host_id)?;
+        tx.commit()?;
+        let decided = resolve(&rules, &default_hat, path);
+        Ok(Some(match near_miss(&rules, path, &decided) {
+            Some(rule) => SessionHat::Ambiguous(rule.clone()),
+            None => SessionHat::Decided(decided),
+        }))
+    }
+
     /// Whether one of the host's rules names a hat other than its default:
     /// rules only. This is half of whether the host is mixed (umbrella
     /// §8.5), which the gateway's fallback needs; the other half is a live
@@ -536,6 +590,33 @@ mod tests {
             resolve(&reversed, "hat-default", "/p/acme/secret/x").hat_id,
             "hat-secret"
         );
+    }
+
+    /// Plan 5c decision 3: a rule that misses only by case, would win, and
+    /// names another hat is a near miss, verified or not (the review's B2:
+    /// a directory renamed since the rule was saved); a shorter one, one
+    /// that matches anyway, or one of the deciding hat (P4) is not.
+    #[test]
+    fn a_near_miss_is_a_rule_that_misses_only_by_case() {
+        let rules = [
+            PathRule {
+                verified: false,
+                ..rule("r-acme", "/Users/me/acme", "hat-x")
+            },
+            rule("r-users", "/Users/me", "hat-me"),
+            rule("r-renamed", "/Users/me/Other", "hat-o"),
+            rule("r-same", "/Users/me/Same", "hat-me"),
+            rule("r-short", "/users", "hat-x"),
+        ];
+        let decided = |path: &str| resolve(&rules, "d", path);
+        let miss = |path: &str| near_miss(&rules, path, &decided(path)).map(|r| r.id.clone());
+        assert_eq!(miss("/Users/me/Acme/x").as_deref(), Some("r-acme"));
+        assert_eq!(miss("/Users/me/acme/x"), None, "it matches as it is");
+        assert_eq!(miss("/Users/me/other").as_deref(), Some("r-renamed"));
+        assert_eq!(miss("/Users/me/same"), None, "the same hat decides anyway");
+        // `/users` is shorter than `/Users/me`, which decided: no doubt.
+        assert_eq!(miss("/Users/me/x"), None);
+        assert_eq!(miss("/USERS/x").as_deref(), Some("r-short"));
     }
 
     #[test]

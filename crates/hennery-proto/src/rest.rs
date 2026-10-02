@@ -191,7 +191,12 @@ pub struct SessionItem {
     pub session_id: String,
     pub host_id: String,
     pub agent: String,
+    /// Canonical on its host since hats (umbrella §8.2).
     pub cwd: String,
+    /// The hat the session belongs to (umbrella §8.2), decided at its
+    /// start: a hat's id, or empty for a session from before hats whose
+    /// host and owner had no default hat to give it.
+    pub hat_id: String,
     /// The title the agent reported, on one line and capped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "string | undefined", optional)]

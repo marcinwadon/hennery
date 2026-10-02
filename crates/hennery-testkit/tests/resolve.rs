@@ -1,5 +1,7 @@
-//! Resolving paths through their host (kernel spec §5.2, §5.4; plan 5b):
-//! `POST /api/hats/resolve` and the path rules a connected host resolves.
+//! Resolving paths through their host (kernel spec §5.2, §5.4; plans 5b
+//! and 5c): `POST /api/hats/resolve`, the path rules a connected host
+//! resolves, and the hat a session gets at its start and keeps at its
+//! resume.
 //! A scripted host plays the wire frame by frame, so its answers can be
 //! wrong on purpose; a real host resolves real symlinks.
 
@@ -70,6 +72,8 @@ type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<t
 /// The test playing the host.
 struct ScriptedHost {
     ws: Ws,
+    /// The last seq sent, per session.
+    seqs: std::collections::HashMap<String, u64>,
 }
 
 impl ScriptedHost {
@@ -85,7 +89,10 @@ impl ScriptedHost {
             .await
             .unwrap();
         let nonce = hex::decode(response.headers()[HELLO_NONCE_HEADER].to_str().unwrap()).unwrap();
-        let mut host = Self { ws };
+        let mut host = Self {
+            ws,
+            seqs: Default::default(),
+        };
         host.send(&HostFrame::Hello {
             protocol_version: PROTOCOL_VERSION.into(),
             host_version: "test".into(),
@@ -109,7 +116,8 @@ impl ScriptedHost {
             .unwrap();
     }
 
-    async fn next(&mut self) -> CollectorFrame {
+    /// The next collector frame.
+    async fn next_any(&mut self) -> CollectorFrame {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match self.ws.next().await {
@@ -121,6 +129,17 @@ impl ScriptedHost {
         })
         .await
         .expect("a collector frame within 10s")
+    }
+
+    /// The next collector frame that is not an `ack`: the sessions this
+    /// host runs are acked (plan 5c).
+    async fn next(&mut self) -> CollectorFrame {
+        loop {
+            match self.next_any().await {
+                CollectorFrame::Ack { .. } => {}
+                frame => return frame,
+            }
+        }
     }
 
     /// The next `resolve_path`: its request id and path.
@@ -375,7 +394,7 @@ async fn a_host_without_resolve_path_is_refused_without_a_frame() {
             ack_seq: 0,
         },
     ));
-    assert!(matches!(host.next().await, CollectorFrame::Ack { .. }));
+    assert!(matches!(host.next_any().await, CollectorFrame::Ack { .. }));
 }
 
 /// Kernel spec §5.2: a rule's prefix is resolved through its host when it
@@ -585,4 +604,222 @@ async fn a_real_host_resolves_symlinks_for_the_resolver_and_for_rules() {
     let (status, body) = resolve(&collector, "not/absolute").await.unwrap();
     assert_eq!((status, body["code"].as_str()), (400, Some("invalid")), "{body}");
     host.abort();
+}
+
+/// How many sessions the store holds, read from the file.
+fn session_count(collector: &Collector) -> i64 {
+    let conn = rusqlite::Connection::open(collector._dir.path().join("hennery.db")).unwrap();
+    conn.query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .unwrap()
+}
+
+fn start(collector: &Collector, cwd: &str) -> tokio::task::JoinHandle<(u16, Value)> {
+    send(
+        collector,
+        "POST",
+        "/api/sessions",
+        json!({ "host_id": HOST, "agent": "fake", "cwd": cwd, "hat_id": "hat-chosen-by-the-client" }),
+    )
+}
+
+fn rule(collector: &Collector, prefix: &str, hat_id: &str, verified: bool) {
+    let stored = collector
+        .state
+        .hosts
+        .replace_path_rules(
+            HOST,
+            &[NewRule {
+                prefix: prefix.into(),
+                hat_id: hat_id.into(),
+                verified,
+            }],
+        )
+        .unwrap();
+    assert!(
+        matches!(stored, hennery_kernel::hats::RulesChange::Done(_)),
+        "{stored:?}"
+    );
+}
+
+impl ScriptedHost {
+    /// Answer the next `start_session` or `resume_session` with
+    /// `session_started`: its session id and cwd.
+    async fn started(&mut self) -> (String, String) {
+        let (request_id, session_id, cwd) = match self.next().await {
+            CollectorFrame::StartSession {
+                request_id,
+                session_id,
+                cwd,
+                ..
+            }
+            | CollectorFrame::ResumeSession {
+                request_id,
+                session_id,
+                cwd,
+                ..
+            } => (request_id, session_id, cwd),
+            other => panic!("expected a start or resume, got {other:?}"),
+        };
+        let body = hennery_proto::frames::SessionBody::session_started(request_id, "agent-1");
+        self.emit(&session_id, body).await;
+        (session_id, cwd)
+    }
+
+    async fn parked(&mut self, session_id: &str) {
+        let body = hennery_proto::frames::SessionBody::SessionParked {
+            reason: hennery_proto::frames::ParkReason::Idle,
+        };
+        self.emit(session_id, body).await;
+    }
+
+    /// Send the session's next sequenced frame.
+    async fn emit(&mut self, session_id: &str, body: hennery_proto::frames::SessionBody) {
+        let seq = self.seqs.entry(session_id.to_string()).or_insert(0);
+        *seq += 1;
+        let frame = HostFrame::Session {
+            session_id: session_id.into(),
+            seq: *seq,
+            body,
+        };
+        self.send(&frame).await;
+    }
+}
+
+/// Umbrella §8.2: the host resolves the typed path, the collector matches
+/// the rules, the hat is stored with the canonical cwd, and only then does
+/// the session start, in that cwd. Whatever hat the client names is not
+/// asked for and changes nothing.
+#[tokio::test]
+async fn a_start_stores_the_canonical_cwd_and_the_hat_its_rules_give() {
+    let collector = Collector::start().await;
+    let acme = collector.hat("Acme");
+    rule(&collector, "/home/me/acme", &acme, true);
+    let mut host = ScriptedHost::connect(&collector).await;
+
+    let call = start(&collector, "~/acme/x/");
+    assert_eq!(host.answer("/home/me/acme/x", true).await, "~/acme/x/");
+    let (session, cwd) = host.started().await;
+    assert_eq!(cwd, "/home/me/acme/x");
+    let (status, body) = call.await.unwrap();
+    assert_eq!(status, 202, "{body}");
+    let row = collector.state.store.session(&session).unwrap().unwrap();
+    assert_eq!(
+        (row.cwd.as_str(), row.hat_id.as_str()),
+        ("/home/me/acme/x", acme.as_str())
+    );
+    let (status, detail) = send(&collector, "GET", &format!("/api/sessions/{session}"), Value::Null)
+        .await
+        .unwrap();
+    assert_eq!((status, detail["hat_id"].as_str()), (200, Some(acme.as_str())));
+    let conn = rusqlite::Connection::open(collector._dir.path().join("hennery.db")).unwrap();
+    let rule_id: Option<String> = conn
+        .query_row("SELECT hat_rule_id FROM sessions WHERE id = ?1", [&session], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert!(rule_id.is_some_and(|id| id.starts_with("rule-")));
+
+    // No rule covers a sibling: the host's default hat, and no rule.
+    let call = start(&collector, "/home/me/acme-infra");
+    host.answer("/home/me/acme-infra", true).await;
+    let (session, _) = host.started().await;
+    assert_eq!(call.await.unwrap().0, 202);
+    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let default = collector.state.hosts.host(HOST).unwrap().unwrap().default_hat_id;
+    assert_eq!(row.hat_id, default);
+}
+
+/// Plan 5c decision 2: a start is refused before any session exists when
+/// its host is away, its cwd is not a directory there, or its hat is in
+/// doubt (decision 3).
+#[tokio::test]
+async fn a_start_that_cannot_resolve_its_hat_creates_no_session() {
+    let collector = Collector::start().await;
+    let (status, body) = start(&collector, "/p").await.unwrap();
+    assert_eq!((status, body["code"].as_str()), (409, Some("host_offline")));
+
+    let mut host = ScriptedHost::connect(&collector).await;
+    let call = start(&collector, "/p/file");
+    host.answer("/p/file", false).await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!((status, body["code"].as_str()), (400, Some("invalid_cwd")), "{body}");
+
+    // A rule whose case the directory no longer has: saved before the
+    // directory was made (unverified), or verified and renamed since (the
+    // review's B2). The hat tester agrees with the start (P1).
+    let acme = collector.hat("Acme");
+    for verified in [false, true] {
+        rule(&collector, "/Users/me/acme", &acme, verified);
+        let call = start(&collector, "/Users/me/Acme");
+        host.answer("/Users/me/Acme", true).await;
+        let (status, body) = call.await.unwrap();
+        assert_eq!((status, body["code"].as_str()), (409, Some("hat_ambiguous")), "{body}");
+        assert!(body["message"].as_str().unwrap().contains("/Users/me/acme"), "{body}");
+        let call = resolve(&collector, "/Users/me/Acme");
+        host.answer("/Users/me/Acme", true).await;
+        let (status, body) = call.await.unwrap();
+        assert_eq!((status, body["code"].as_str()), (409, Some("hat_ambiguous")), "{body}");
+    }
+    assert_eq!(session_count(&collector), 0);
+}
+
+/// ACP core §4.3: a resume re-resolves its cwd on the host and its hat.
+/// Another hat refuses it (`hat_mismatch`, naming both); a cwd that now
+/// resolves elsewhere refuses it (`cwd_moved`, plan 5c decision 4).
+/// Nothing changes either way, and the same hat resumes.
+#[tokio::test]
+async fn a_resume_re_resolves_its_cwd_and_hat_and_refuses_a_change() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector).await;
+    let call = start(&collector, "/home/me/acme");
+    host.answer("/home/me/acme", true).await;
+    let (session, _) = host.started().await;
+    assert_eq!(call.await.unwrap().0, 202);
+    host.parked(&session).await;
+    wait_for("parked", || async {
+        let row = collector.state.store.session(&session).unwrap().unwrap();
+        (row.lifecycle == "parked").then_some(())
+    })
+    .await;
+    let resume = || {
+        send(
+            &collector,
+            "POST",
+            &format!("/api/sessions/{session}/resume"),
+            json!({}),
+        )
+    };
+
+    let acme = collector.hat("Acme");
+    rule(&collector, "/home/me", &acme, true);
+    let call = resume();
+    assert_eq!(host.answer("/home/me/acme", true).await, "/home/me/acme");
+    let (status, body) = call.await.unwrap();
+    assert_eq!((status, body["code"].as_str()), (409, Some("hat_mismatch")), "{body}");
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains("\"Personal\"") && message.contains("\"Acme\""),
+        "{message}"
+    );
+
+    collector.state.hosts.replace_path_rules(HOST, &[]).unwrap();
+    let call = resume();
+    host.answer("/srv/elsewhere", true).await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!((status, body["code"].as_str()), (409, Some("cwd_moved")), "{body}");
+    let call = resume();
+    host.answer("/home/me/acme", false).await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!((status, body["code"].as_str()), (400, Some("invalid_cwd")), "{body}");
+    assert_eq!(
+        collector.state.store.session(&session).unwrap().unwrap().lifecycle,
+        "parked"
+    );
+
+    let call = resume();
+    host.answer("/home/me/acme", true).await;
+    let (_, cwd) = host.started().await;
+    assert_eq!(cwd, "/home/me/acme");
+    let (status, body) = call.await.unwrap();
+    assert_eq!(status, 202, "{body}");
 }

@@ -86,7 +86,13 @@ struct ScriptedHost {
 impl ScriptedHost {
     /// Connect and complete `hello` / `hello_ack`, without `resend_complete`.
     async fn hello(collector: &Collector, attached: Vec<AttachedSession>, seq: u64) -> Self {
-        Self::hello_with(collector, attached, seq, Capabilities(vec![Capability::Park])).await
+        Self::hello_with(
+            collector,
+            attached,
+            seq,
+            Capabilities(vec![Capability::Park, Capability::ResolvePath]),
+        )
+        .await
     }
 
     /// `hello` announcing `capabilities`.
@@ -153,7 +159,13 @@ impl ScriptedHost {
     /// `hello` then `resend_complete`, and wait until the collector lists
     /// the host as connected (reconciled).
     async fn connect(collector: &Collector, attached: Vec<AttachedSession>, seq: u64) -> Self {
-        Self::connect_with(collector, attached, seq, Capabilities(vec![Capability::Park])).await
+        Self::connect_with(
+            collector,
+            attached,
+            seq,
+            Capabilities(vec![Capability::Park, Capability::ResolvePath]),
+        )
+        .await
     }
 
     /// `connect` announcing `capabilities`.
@@ -195,13 +207,27 @@ impl ScriptedHost {
         self.send(&frame).await;
     }
 
-    /// The next collector frame that is not an `ack`.
+    /// The next collector frame that is not an `ack`, or a `resolve_path`:
+    /// this host resolves every path to itself (plan 5c), as a host with no
+    /// symlinks would.
     async fn next(&mut self) -> CollectorFrame {
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 match self.ws.next().await {
                     Some(Ok(Message::Text(text))) => match serde_json::from_str(&text).unwrap() {
                         CollectorFrame::Ack { .. } => {}
+                        CollectorFrame::ResolvePath { request_id, path } => {
+                            let answer = HostFrame::ResolvedPath {
+                                request_id,
+                                canonical: path,
+                                exists: true,
+                                is_dir: true,
+                            };
+                            self.ws
+                                .send(Message::text(serde_json::to_string(&answer).unwrap()))
+                                .await
+                                .unwrap();
+                        }
                         frame => return frame,
                     },
                     Some(Ok(_)) => {}
@@ -686,7 +712,7 @@ async fn a_host_that_never_returns_after_a_collector_restart_is_presumed_offline
     let dir = tempfile::tempdir().unwrap();
     {
         let store = Store::open(&dir.path().join("hennery.db")).unwrap();
-        store.create_session("s1", HOST, "fake", "/tmp").unwrap();
+        store.create_session("s1", HOST, "fake", "/tmp", "hat-1", None).unwrap();
         store
             .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
             .unwrap();
@@ -701,7 +727,7 @@ async fn a_host_that_returns_after_a_collector_restart_is_not_presumed_offline()
     let dir = tempfile::tempdir().unwrap();
     {
         let store = Store::open(&dir.path().join("hennery.db")).unwrap();
-        store.create_session("s1", HOST, "fake", "/tmp").unwrap();
+        store.create_session("s1", HOST, "fake", "/tmp", "hat-1", None).unwrap();
         store
             .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
             .unwrap();
@@ -982,10 +1008,12 @@ async fn the_session_detail_shows_the_open_turn() {
     let (status, body) = get(&client(&collector), collector.url(&format!("/api/sessions/{session}"))).await;
     assert_eq!(status, 200, "{body}");
     let item = collector.state.store.session_item(&session).unwrap().unwrap();
+    // No rule: the host's default hat (umbrella §8.2).
+    let hat = collector.state.hosts.host(HOST).unwrap().unwrap().default_hat_id;
     assert_eq!(
         body,
         json!({
-            "session_id": session, "host_id": HOST, "agent": "fake", "cwd": "/tmp",
+            "session_id": session, "host_id": HOST, "agent": "fake", "cwd": "/tmp", "hat_id": hat,
             "lifecycle": "active", "activity": "running", "presumed_parked": false,
             "created_at": item.created_at, "last_event_at": item.last_event_at,
             "open_turn": { "turn_id": turn, "state": "started" }, "pending": []
@@ -1235,7 +1263,8 @@ async fn a_cancel_is_refused_without_a_turn_the_host_runs() {
 #[tokio::test]
 async fn park_goes_only_to_a_host_that_announced_it_can_park() {
     let collector = Collector::start().await;
-    let mut host = ScriptedHost::connect_with(&collector, vec![], 0, Capabilities::default()).await;
+    // It resolves paths, which a start needs (plan 5c), but cannot park.
+    let mut host = ScriptedHost::connect_with(&collector, vec![], 0, Capabilities(vec![Capability::ResolvePath])).await;
     let session = started_session(&collector, &mut host).await;
     let park_url = collector.url(&format!("/api/sessions/{session}/park"));
     let (status, body) = post(&client(&collector), park_url.clone(), json!({})).await;
@@ -2370,7 +2399,8 @@ async fn a_start_names_a_paired_host_and_an_agent_of_at_most_32_bytes() {
         .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
         .unwrap();
     assert_eq!(sessions, 0);
-    // A paired host that is offline still gets a session, failed as before.
+    // A paired host that is offline: 409, and no session either, since its
+    // cwd cannot be resolved there (plan 5c decision 2).
     let (status, body) = post(
         &c,
         collector.url("/api/sessions"),
@@ -2378,18 +2408,27 @@ async fn a_start_names_a_paired_host_and_an_agent_of_at_most_32_bytes() {
     )
     .await;
     assert_eq!((status, body["code"].as_str()), (409, Some("host_offline")), "{body}");
+    let sessions: i64 = rusqlite::Connection::open(collector._dir.path().join("hennery.db"))
+        .unwrap()
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(sessions, 0);
 }
 
 // Plan 6b: `GET /api/sessions` (ACP core §9).
 
-/// Pages, searches and filters; every parameter it cannot honour is
-/// refused, never ignored: `hat` until sessions have hats (plan 5).
+/// Pages, searches and filters, by hat too (plan 5c); every parameter it
+/// cannot honour is refused, never ignored.
 #[tokio::test]
 async fn the_session_list_pages_searches_filters_and_refuses_what_it_cannot_honour() {
     let collector = Collector::start().await;
     let store = &collector.state.store;
-    for (id, cwd) in [("a", "/src/alpha"), ("b", "/src/beta"), ("c", "/src/gamma")] {
-        store.create_session(id, HOST, "fake", cwd).unwrap();
+    for (id, cwd, hat) in [
+        ("a", "/src/alpha", "hat-1"),
+        ("b", "/src/beta", "hat-2"),
+        ("c", "/src/gamma", "hat-1"),
+    ] {
+        store.create_session(id, HOST, "fake", cwd, hat, None).unwrap();
         // One millisecond apart at least, so the order is known.
         tokio::time::sleep(Duration::from_millis(3)).await;
     }
@@ -2410,6 +2449,7 @@ async fn the_session_list_pages_searches_filters_and_refuses_what_it_cannot_hono
     assert_eq!(ids(&page), ["a", "c", "b"]);
     assert_eq!(page.get("next_cursor"), None);
     assert_eq!(page["sessions"][0]["lifecycle"], "closed");
+    assert_eq!(page["sessions"][0]["hat_id"], "hat-1");
 
     let (_, first) = list("?limit=2").await;
     assert_eq!(ids(&first), ["a", "c"]);
@@ -2428,13 +2468,29 @@ async fn the_session_list_pages_searches_filters_and_refuses_what_it_cannot_hono
     let (_, blank) = list("?q=%20%20").await;
     assert_eq!(ids(&blank), ["a", "c", "b"]);
 
+    // The hat filters, with the lifecycle's, with a search (which bypasses
+    // every filter but the hat's: frontend §5), and across pages.
+    assert_eq!(ids(&list("?hat=hat-1").await.1), ["a", "c"]);
+    assert_eq!(ids(&list("?hat=hat-2").await.1), ["b"]);
+    assert_eq!(ids(&list("?hat=hat-1&lifecycle=starting").await.1), ["c"]);
+    assert_eq!(ids(&list("?hat=hat-1&lifecycle=starting&q=ALPHA").await.1), ["a"]);
+    assert!(ids(&list("?hat=hat-2&q=alpha").await.1).is_empty());
+    let (_, first) = list("?hat=hat-1&limit=1").await;
+    assert_eq!(ids(&first), ["a"]);
+    let cursor = first["next_cursor"].as_str().unwrap().to_string();
+    assert_eq!(
+        ids(&list(&format!("?hat=hat-1&limit=1&cursor={cursor}")).await.1),
+        ["c"]
+    );
+    // An unknown hat has no sessions; an empty one names none.
+    assert!(ids(&list("?hat=work").await.1).is_empty());
+
     for (query, code) in [
-        ("?hat=work", "hat_filter_unavailable"),
-        ("?hat=", "hat_filter_unavailable"),
         ("?cursor=zz", "invalid_cursor"),
         ("?limit=x", "invalid"),
         ("?limit=-1", "invalid"),
         ("?lifecycle=active,bogus", "invalid"),
+        ("?hat=", "invalid"),
     ] {
         let (status, body) = list(query).await;
         assert_eq!((status, body["code"].as_str()), (400, Some(code)), "{query}: {body}");

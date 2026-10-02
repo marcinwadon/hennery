@@ -3,7 +3,7 @@ use hennery_sessions::store::Store;
 use serde_json::json;
 
 fn started(store: &Store) {
-    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store
         .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
         .unwrap();
@@ -62,7 +62,7 @@ fn only_one_turn_can_be_open() {
 #[test]
 fn a_turn_cannot_open_on_a_session_that_is_not_active() {
     let store = Store::open_in_memory().unwrap();
-    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     assert!(
         !store
             .open_turn("s1", "t1", &[json!({"type": "text", "text": "a"})])
@@ -199,7 +199,7 @@ fn session_parked_and_session_closed_detach_an_active_session() {
     let s = store.session("s1").unwrap().unwrap();
     assert_eq!((s.lifecycle.as_str(), s.activity.as_deref()), ("parked", None));
 
-    store.create_session("s2", "h1", "fake", "/tmp").unwrap();
+    store.create_session("s2", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store.ingest("s2", 1, &SessionBody::session_started("r", "a")).unwrap();
     store.ingest("s2", 2, &SessionBody::SessionClosed).unwrap();
     assert_eq!(store.session("s2").unwrap().unwrap().lifecycle, "closed");
@@ -244,9 +244,15 @@ fn close_now_closes_an_unattached_session_once() {
 #[test]
 fn reconcile_fails_a_start_the_host_never_received_and_leaves_a_running_start_alone() {
     let store = Store::open_in_memory().unwrap();
-    store.create_session("lost", "h1", "fake", "/tmp").unwrap();
-    store.create_session("pending", "h1", "fake", "/tmp").unwrap();
-    store.create_session("other-host", "h2", "fake", "/tmp").unwrap();
+    store
+        .create_session("lost", "h1", "fake", "/tmp", "hat-1", None)
+        .unwrap();
+    store
+        .create_session("pending", "h1", "fake", "/tmp", "hat-1", None)
+        .unwrap();
+    store
+        .create_session("other-host", "h2", "fake", "/tmp", "hat-1", None)
+        .unwrap();
     let r = store.reconcile_host("h1", &[attached("pending", None)]).unwrap();
     assert_eq!(kinds(&r.events), ["start_not_delivered"]);
     let lost = store.session("lost").unwrap().unwrap();
@@ -341,11 +347,11 @@ fn reconcile_asks_to_close_attached_sessions_the_operator_closed() {
     started(&store);
     store.close_now("s1").unwrap();
     // Close requested, delivery unknown, still attached.
-    store.create_session("s2", "h1", "fake", "/tmp").unwrap();
+    store.create_session("s2", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store.ingest("s2", 1, &SessionBody::session_started("r", "a")).unwrap();
     store.record_close_request("s2").unwrap();
     // Close requested, and the host restarted meanwhile.
-    store.create_session("s3", "h1", "fake", "/tmp").unwrap();
+    store.create_session("s3", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store.ingest("s3", 1, &SessionBody::session_started("r", "a")).unwrap();
     store.record_close_request("s3").unwrap();
 
@@ -370,7 +376,10 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
-            "DROP INDEX sessions_by_recency;
+            "DROP INDEX sessions_by_hat;
+             ALTER TABLE sessions DROP COLUMN hat_id;
+             ALTER TABLE sessions DROP COLUMN hat_rule_id;
+             DROP INDEX sessions_by_recency;
              ALTER TABLE sessions DROP COLUMN title;
              ALTER TABLE sessions DROP COLUMN git_branch;
              ALTER TABLE sessions DROP COLUMN git_dirty;
@@ -612,7 +621,7 @@ fn a_resume_moves_a_parked_session_to_starting_with_what_the_host_needs() {
         agent_session_id,
         committed_seq,
         ..
-    } = store.request_resume("s1").unwrap()
+    } = store.request_resume("s1", "hat-1").unwrap()
     else {
         panic!("not resumable");
     };
@@ -632,16 +641,16 @@ fn a_second_concurrent_resume_is_refused_while_the_first_is_starting() {
     let store = Store::open_in_memory().unwrap();
     started(&store);
     assert_eq!(
-        store.request_resume("s1").unwrap(),
+        store.request_resume("s1", "hat-1").unwrap(),
         ResumeRequest::Busy("active".into())
     );
     parked(&store, 2);
     assert!(matches!(
-        store.request_resume("s1").unwrap(),
+        store.request_resume("s1", "hat-1").unwrap(),
         ResumeRequest::Starting { .. }
     ));
     assert_eq!(
-        store.request_resume("s1").unwrap(),
+        store.request_resume("s1", "hat-1").unwrap(),
         ResumeRequest::Busy("starting".into())
     );
     assert_eq!(
@@ -672,7 +681,7 @@ fn a_resume_of_a_failed_or_closed_session_clears_what_stopped_it() {
     assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "active");
     store.close_now("s1").unwrap();
     assert!(matches!(
-        store.request_resume("s1").unwrap(),
+        store.request_resume("s1", "hat-1").unwrap(),
         ResumeRequest::Starting { .. }
     ));
     store
@@ -692,7 +701,7 @@ fn a_resume_of_a_failed_or_closed_session_clears_what_stopped_it() {
         ("failed", Some("agent_has_no_record"))
     );
     assert!(matches!(
-        store.request_resume("s1").unwrap(),
+        store.request_resume("s1", "hat-1").unwrap(),
         ResumeRequest::Starting { .. }
     ));
     assert_eq!(store.session("s1").unwrap().unwrap().failure_reason, None);
@@ -701,11 +710,11 @@ fn a_resume_of_a_failed_or_closed_session_clears_what_stopped_it() {
 #[test]
 fn a_session_the_agent_never_created_cannot_be_resumed() {
     let store = Store::open_in_memory().unwrap();
-    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store.mark_failed("s1", "start_not_delivered").unwrap();
-    assert_eq!(store.request_resume("s1").unwrap(), ResumeRequest::NoRecord);
+    assert_eq!(store.request_resume("s1", "hat-1").unwrap(), ResumeRequest::NoRecord);
     assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "failed");
-    assert_eq!(store.request_resume("nope").unwrap(), ResumeRequest::NotFound);
+    assert_eq!(store.request_resume("nope", "hat-1").unwrap(), ResumeRequest::NotFound);
 }
 
 #[test]
@@ -727,7 +736,7 @@ fn detaching_releases_a_prompt_the_host_never_acknowledged() {
     assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("not_delivered"));
     assert_eq!(store.session("s1").unwrap().unwrap().open_turn_id, None);
 
-    store.create_session("s2", "h1", "fake", "/tmp").unwrap();
+    store.create_session("s2", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store.ingest("s2", 1, &SessionBody::session_started("r", "a2")).unwrap();
     assert!(store.open_turn("s2", "t2", &prompt_text()).unwrap());
     let created = store.ingest("s2", 2, &SessionBody::SessionClosed).unwrap();
@@ -750,7 +759,7 @@ fn a_resume_releases_a_turn_an_older_database_left_open() {
         .execute("UPDATE sessions SET lifecycle = 'parked', activity = NULL", [])
         .unwrap();
     let store = Store::open(&db).unwrap();
-    let ResumeRequest::Starting { events, .. } = store.request_resume("s1").unwrap() else {
+    let ResumeRequest::Starting { events, .. } = store.request_resume("s1", "hat-1").unwrap() else {
         panic!("not resumable");
     };
     assert_eq!(kinds(&events), ["turn_not_delivered", "operator_resumed"]);
@@ -870,7 +879,7 @@ fn a_late_update_after_a_synthesized_end_is_not_listed() {
 #[test]
 fn a_start_that_ran_after_all_revives_the_session_without_its_failure_reason() {
     let store = Store::open_in_memory().unwrap();
-    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store.reconcile_host("h1", &[]).unwrap();
     assert_eq!(
         store.session("s1").unwrap().unwrap().failure_reason.as_deref(),
@@ -892,7 +901,7 @@ fn a_start_that_ran_after_all_revives_the_session_without_its_failure_reason() {
 #[test]
 fn a_start_failed_replaces_a_reconciled_guess_of_start_not_delivered() {
     let store = Store::open_in_memory().unwrap();
-    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store.reconcile_host("h1", &[]).unwrap();
     assert_eq!(
         store.session("s1").unwrap().unwrap().failure_reason.as_deref(),
@@ -924,7 +933,7 @@ fn two_hosts(store: &Store) {
     started(store);
     store.open_turn("s1", "t1", &prompt_text()).unwrap();
     store.ingest("s1", 2, &turn_started("t1")).unwrap();
-    store.create_session("s2", "h2", "fake", "/tmp").unwrap();
+    store.create_session("s2", "h2", "fake", "/tmp", "hat-1", None).unwrap();
     store.ingest("s2", 1, &SessionBody::session_started("r", "a2")).unwrap();
 }
 
@@ -1014,7 +1023,7 @@ fn closing_or_resuming_a_presumed_session_ends_the_presumption() {
     two_hosts(&store);
     store.presume_parked("h1").unwrap();
     assert!(matches!(
-        store.request_resume("s1").unwrap(),
+        store.request_resume("s1", "hat-1").unwrap(),
         ResumeRequest::Starting { .. }
     ));
     assert!(!store.session("s1").unwrap().unwrap().presumed_parked);
@@ -1099,7 +1108,7 @@ fn a_rejected_reconcile_close_closes_only_a_session_still_waiting_on_that_close(
 
     // Closed, then resumed: the late rejection must leave the start alone.
     assert!(matches!(
-        store.request_resume("s1").unwrap(),
+        store.request_resume("s1", "hat-1").unwrap(),
         ResumeRequest::Starting { .. }
     ));
     let before = store.events("s1", 0, 100).unwrap();
@@ -1120,7 +1129,7 @@ fn a_failed_resume_fails_only_a_session_still_starting() {
         "an active session was overwritten"
     );
     parked(&store, 2);
-    store.request_resume("s1").unwrap();
+    store.request_resume("s1", "hat-1").unwrap();
     store.mark_failed_if_starting("s1", "not_attached").unwrap();
     let s = store.session("s1").unwrap().unwrap();
     assert_eq!(
@@ -1138,7 +1147,7 @@ fn an_old_actors_detach_after_a_resume_began_changes_nothing() {
     started(&store);
     parked(&store, 2);
     assert!(matches!(
-        store.request_resume("s1").unwrap(),
+        store.request_resume("s1", "hat-1").unwrap(),
         ResumeRequest::Starting { .. }
     ));
     let before = store.events("s1", 0, 100).unwrap();
@@ -1190,7 +1199,7 @@ fn config(model: &str, mode: &str) -> SessionConfig {
 }
 
 fn started_with(store: &Store, indexed: Indexed) {
-    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store
         .ingest(
             "s1",
@@ -1293,7 +1302,7 @@ fn a_resume_hands_back_the_config_to_re_apply() {
     let store = Store::open_in_memory().unwrap();
     started_with(&store, catalogue("large", "plan"));
     parked(&store, 2);
-    let ResumeRequest::Starting { config: wanted, .. } = store.request_resume("s1").unwrap() else {
+    let ResumeRequest::Starting { config: wanted, .. } = store.request_resume("s1", "hat-1").unwrap() else {
         panic!("not resumable");
     };
     assert_eq!(wanted, config("large", "plan"));
@@ -1684,7 +1693,7 @@ fn the_session_store_and_the_host_registry_share_one_database_in_either_order() 
 fn a_revoked_hosts_sessions_are_parked_for_good_and_what_they_held_is_cancelled() {
     let store = Store::open_in_memory().unwrap();
     // s3: presumed parked while its host was away, its turn still open.
-    store.create_session("s3", "h1", "fake", "/tmp").unwrap();
+    store.create_session("s3", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store
         .ingest("s3", 1, &SessionBody::session_started("r3", "a3"))
         .unwrap();
@@ -1700,13 +1709,13 @@ fn a_revoked_hosts_sessions_are_parked_for_good_and_what_they_held_is_cancelled(
     ));
     // s2: still starting; s5: active, the operator's close not confirmed;
     // s4: on another host.
-    store.create_session("s2", "h1", "fake", "/tmp").unwrap();
-    store.create_session("s5", "h1", "fake", "/tmp").unwrap();
+    store.create_session("s2", "h1", "fake", "/tmp", "hat-1", None).unwrap();
+    store.create_session("s5", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store
         .ingest("s5", 1, &SessionBody::session_started("r5", "a5"))
         .unwrap();
     store.record_close_request("s5").unwrap();
-    store.create_session("s4", "h2", "fake", "/tmp").unwrap();
+    store.create_session("s4", "h2", "fake", "/tmp", "hat-1", None).unwrap();
     store
         .ingest("s4", 1, &SessionBody::session_started("r4", "a4"))
         .unwrap();
@@ -1830,7 +1839,7 @@ fn recency(store: &Store) -> (String, Option<i64>) {
 #[test]
 fn recency_moves_only_with_a_listed_event() {
     let store = Store::open_in_memory().unwrap();
-    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     let (created_at, none) = recency(&store);
     assert_eq!(none, None);
     let first = store
@@ -1959,7 +1968,7 @@ fn an_early_title_only_fills_an_empty_one() {
 #[test]
 fn commands_replace_the_stored_list_and_never_touch_the_config() {
     let store = Store::open_in_memory().unwrap();
-    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     let snapshot = Indexed {
         config_options: Some(vec![json!({"id": "mode", "currentValue": "plan"})]),
         current_mode: Some("plan".into()),
@@ -2020,7 +2029,7 @@ fn commands_reported_before_any_config_are_served_with_an_empty_catalogue() {
 fn a_session_item_is_the_row_with_its_title_and_current_model_and_mode() {
     let store = Store::open_in_memory().unwrap();
     let cwd = format!("/home/someone/{}", "deep/".repeat(40));
-    store.create_session("s1", "h1", "fake", &cwd).unwrap();
+    store.create_session("s1", "h1", "fake", &cwd, "hat-1", None).unwrap();
     let snapshot = Indexed {
         config_options: Some(vec![json!({"id": "model"}), json!({"id": "mode"})]),
         current_model: Some("opus".into()),
@@ -2049,6 +2058,7 @@ fn a_session_item_is_the_row_with_its_title_and_current_model_and_mode() {
             host_id: "h1".into(),
             agent: "fake".into(),
             cwd,
+            hat_id: "hat-1".into(),
             title: Some("Fix the login bug".into()),
             lifecycle: "active".into(),
             activity: Some("idle".into()),
@@ -2076,7 +2086,7 @@ fn listed_store(dir: &std::path::Path, sessions: &[(&str, &str, Option<&str>, &s
     let db = dir.join("hennery.db");
     let store = Store::open(&db).unwrap();
     for (id, _, _, cwd) in sessions {
-        store.create_session(id, "h1", "fake", cwd).unwrap();
+        store.create_session(id, "h1", "fake", cwd, "hat-1", None).unwrap();
     }
     let conn = rusqlite::Connection::open(&db).unwrap();
     for (id, at, title, _) in sessions {
@@ -2363,4 +2373,133 @@ fn a_git_state_for_a_closed_session_or_with_a_strange_base_changes_nothing() {
         (item.git_branch.as_deref(), item.git_dirty),
         (Some("main"), Some(false))
     );
+}
+
+/// ACP core §4.3: a resume whose path now resolves to another hat is
+/// refused with the stored hat, and nothing changes; the same hat goes on.
+#[test]
+fn a_resume_in_another_hat_than_the_sessions_is_refused_and_changes_nothing() {
+    let store = Store::open_in_memory().unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp", "hat-a", None).unwrap();
+    store
+        .ingest("s1", 1, &SessionBody::session_started("r1", "agent-1"))
+        .unwrap();
+    store
+        .ingest(
+            "s1",
+            2,
+            &SessionBody::SessionParked {
+                reason: ParkReason::Idle,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store.request_resume("s1", "hat-b").unwrap(),
+        ResumeRequest::HatMismatch("hat-a".into())
+    );
+    let row = store.session("s1").unwrap().unwrap();
+    assert_eq!((row.lifecycle.as_str(), row.hat_id.as_str()), ("parked", "hat-a"));
+    assert!(matches!(
+        store.request_resume("s1", "hat-a").unwrap(),
+        ResumeRequest::Starting { .. }
+    ));
+}
+
+/// Plan 5c decision 1: a session from before hats gets its host's default
+/// hat; one whose host is gone, the owner's default for new hosts.
+#[test]
+fn the_hat_migration_gives_each_session_its_hosts_default_hat() {
+    use hennery_kernel::hats::HatChange;
+    use hennery_kernel::hosts::{Enrollment, Hosts};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    let hosts = Hosts::open(&db).unwrap();
+    let personal = hosts.default_hat_for_new_hosts().unwrap();
+    let HatChange::Done(acme) = hosts.create_hat("Acme", None, 1).unwrap() else {
+        panic!("no hat");
+    };
+    let enrollment = Enrollment {
+        public_key: "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a".into(),
+        name: "laptop".into(),
+        host_version: "0".into(),
+        platform: "linux".into(),
+    };
+    hosts.register("h1", &enrollment, 1).unwrap();
+    hosts.update_host("h1", None, Some(&acme.id)).unwrap();
+    {
+        let store = Store::open(&db).unwrap();
+        store
+            .create_session("s-on-h1", "h1", "fake", "/tmp", "x", None)
+            .unwrap();
+        store
+            .create_session("s-gone", "h-gone", "fake", "/tmp", "x", None)
+            .unwrap();
+    }
+    // Back to the store's schema before hats (version 9).
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "DROP INDEX sessions_by_hat;
+         ALTER TABLE sessions DROP COLUMN hat_id;
+         ALTER TABLE sessions DROP COLUMN hat_rule_id;
+         PRAGMA user_version = 9;",
+    )
+    .unwrap();
+    let store = Store::open(&db).unwrap();
+    assert_eq!(store.session("s-on-h1").unwrap().unwrap().hat_id, acme.id);
+    assert_eq!(store.session("s-gone").unwrap().unwrap().hat_id, personal);
+}
+
+/// Plan 5c (plan 6b's "After this plan"): the list is filtered by the hat
+/// a session belongs to, with the lifecycle filter, and with a search,
+/// which bypasses every filter but the hat's (frontend §5); its pages
+/// follow the cursor within the hat.
+#[test]
+fn the_list_filters_by_hat_with_or_without_a_search() {
+    let store = Store::open_in_memory().unwrap();
+    for (id, cwd, hat) in [
+        ("s1", "/src/alpha", "hat-a"),
+        ("s2", "/src/alpha-b", "hat-b"),
+        ("s3", "/src/gamma", "hat-a"),
+        ("s4", "/src/old", ""),
+    ] {
+        store.create_session(id, "h1", "fake", cwd, hat, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+    }
+    store.close_now("s1").unwrap();
+    let list = |hat: Option<&str>, lifecycles: Option<&[&str]>, search: Option<&str>, limit: u32| {
+        store
+            .list(&ListQuery {
+                hat,
+                lifecycles,
+                search,
+                limit,
+                ..ListQuery::default()
+            })
+            .unwrap()
+    };
+    let page = list(Some("hat-a"), None, None, 50);
+    assert_eq!(ids(&page), ["s1", "s3"]);
+    assert!(page.sessions.iter().all(|s| s.hat_id == "hat-a"));
+    assert_eq!(ids(&list(Some("hat-a"), Some(&["starting"]), None, 50)), ["s3"]);
+    assert_eq!(
+        ids(&list(Some("hat-a"), Some(&["starting"]), Some("alpha"), 50)),
+        ["s1"]
+    );
+    assert_eq!(ids(&list(Some("hat-b"), None, Some("alpha"), 50)), ["s2"]);
+    assert_eq!(ids(&list(Some(""), None, None, 50)), ["s4"]);
+    assert!(ids(&list(Some("hat-x"), None, None, 50)).is_empty());
+    assert_eq!(list(None, None, None, 50).sessions.len(), 4);
+    let first = list(Some("hat-a"), None, None, 1);
+    assert_eq!(ids(&first), ["s1"]);
+    let cursor = Cursor::decode(first.next_cursor.as_deref().unwrap()).unwrap();
+    let rest = store
+        .list(&ListQuery {
+            after: Some(&cursor),
+            limit: 1,
+            hat: Some("hat-a"),
+            ..ListQuery::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&rest), ["s3"]);
+    assert_eq!(rest.next_cursor, None);
 }

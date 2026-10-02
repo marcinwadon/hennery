@@ -3,6 +3,7 @@
 use crate::AppState;
 use crate::content::{self, Refusal};
 use crate::hub::{RequestError, Undo};
+use crate::resolve::{NotResolved, OnHost, resolve_on_host};
 use crate::store::{
     AnswerSubmission, Cursor, LIFECYCLES, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT, ListQuery, ResumeRequest, Store,
 };
@@ -13,6 +14,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use futures::stream::{self, Stream, StreamExt};
+use hennery_kernel::hats::{Resolution, SessionHat};
 use hennery_kernel::json::ApiJson;
 use hennery_kernel::operator::Authenticated;
 use hennery_proto::frames::{Capability, CollectorFrame, Indexed, SessionBody};
@@ -152,6 +154,70 @@ fn resume_failed(err: RequestError) -> Response {
     }
 }
 
+/// Why a session cannot start or resume where it would, and the answer
+/// each gives.
+pub(crate) enum Unplaceable {
+    /// Its cwd did not resolve on its host.
+    NotResolved(NotResolved),
+    /// 400 `invalid_cwd`: the canonical cwd is not a directory there.
+    NotADirectory(String),
+    /// 409 `hat_ambiguous`: a rule (this prefix) that misses only by case makes its hat
+    /// doubtful (plan 5c decision 3).
+    Ambiguous(String),
+    /// 404: no such host.
+    UnknownHost,
+    Internal(anyhow::Error),
+}
+
+impl IntoResponse for Unplaceable {
+    fn into_response(self) -> Response {
+        match self {
+            Self::NotResolved(why) => why.into_response(),
+            Self::NotADirectory(cwd) => error(
+                StatusCode::BAD_REQUEST,
+                "invalid_cwd",
+                format!("{cwd:?} is not a directory on that host"),
+            ),
+            Self::Ambiguous(prefix) => error(
+                StatusCode::CONFLICT,
+                "hat_ambiguous",
+                format!(
+                    "the rule for {prefix:?} matches this path only in another case (the directory was made or renamed since the rule was saved): save the host's rules again with the path as it is now"
+                ),
+            ),
+            Self::UnknownHost => error(StatusCode::NOT_FOUND, "not_found", "no such host"),
+            Self::Internal(err) => internal(err),
+        }
+    }
+}
+
+/// The hat a session whose canonical cwd is `cwd` gets on `host_id`
+/// (umbrella §8.2), unless a rule that misses only by case makes it doubtful.
+fn session_hat(state: &AppState, host_id: &str, cwd: &str) -> Result<Resolution, Unplaceable> {
+    match state.hosts.session_hat(host_id, cwd) {
+        Ok(Some(SessionHat::Decided(resolution))) => Ok(resolution),
+        Ok(Some(SessionHat::Ambiguous(rule))) => Err(Unplaceable::Ambiguous(rule.prefix)),
+        Ok(None) => Err(Unplaceable::UnknownHost),
+        Err(err) => Err(Unplaceable::Internal(err)),
+    }
+}
+
+/// A cwd as its host resolved it, if it is a directory there.
+async fn session_cwd(state: &AppState, host_id: &str, cwd: &str) -> Result<OnHost, Unplaceable> {
+    let on_host = resolve_on_host(state, host_id, cwd)
+        .await
+        .map_err(Unplaceable::NotResolved)?;
+    if !on_host.is_dir {
+        return Err(Unplaceable::NotADirectory(on_host.canonical));
+    }
+    Ok(on_host)
+}
+
+/// Start a session (ACP core §4.3): its cwd is resolved on its host, its
+/// hat decided by that host's rules, and both stored before the host is
+/// asked to start anything (umbrella §8.2). The client never names a hat.
+/// A host that is not connected and reconciled gets no session at all
+/// (plan 5c decision 2).
 async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<StartSessionRequest>) -> Response {
     // What a list item shows must be bounded (plan 6b, the review's A1): a
     // paired host's id, and an agent's name within its cap. Refused before
@@ -174,11 +240,31 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
         }
         Err(err) => return internal(err),
     }
+    let cwd = match session_cwd(&state, &req.host_id, &req.cwd).await {
+        Ok(on_host) => on_host.canonical,
+        Err(why) => return why.into_response(),
+    };
+    let hat = match session_hat(&state, &req.host_id, &cwd) {
+        Ok(hat) => hat,
+        // Unpaired since the check above: the same answer as that check.
+        Err(Unplaceable::UnknownHost) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "unknown_host",
+                "no host is paired with that id",
+            );
+        }
+        Err(why) => return why.into_response(),
+    };
     let session_id = uuid::Uuid::now_v7().to_string();
-    if let Err(err) = state
-        .store
-        .create_session(&session_id, &req.host_id, &req.agent, &req.cwd)
-    {
+    if let Err(err) = state.store.create_session(
+        &session_id,
+        &req.host_id,
+        &req.agent,
+        &cwd,
+        &hat.hat_id,
+        hat.rule_id.as_deref(),
+    ) {
         return internal(err);
     }
     let request_id = uuid::Uuid::now_v7().to_string();
@@ -188,7 +274,7 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
         // A session minted just now has nothing committed.
         committed_seq: 0,
         agent: req.agent,
-        cwd: req.cwd,
+        cwd,
         config: req.config,
     };
     let undo = Undo::Start {
@@ -238,18 +324,11 @@ struct ListParams {
 /// The session list (ACP core §9; plan 6b decision 8): newest
 /// `last_event_at` first, in pages of `limit` (50 by default, clamped to
 /// 1..=200) after `cursor`; only the comma-separated `lifecycle`s, unless
-/// `q` searches the title, cwd, branch and id of every session.
+/// `q` searches the title, cwd, branch and id of every session; and only
+/// the sessions of `hat`, with or without `q` (frontend §5; plan 5c). The
+/// hat is matched as given: an empty one lists the sessions from before
+/// hats that got none.
 async fn list_sessions(State(state): State<AppState>, Query(params): Query<ListParams>) -> Response {
-    // Sessions have no hat until hats (plan 5) gives them `hat_id`; a
-    // filter that cannot be honoured is refused, never ignored. The seam
-    // hats fills.
-    if params.hat.is_some() {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "hat_filter_unavailable",
-            "sessions have no hat yet, so the list cannot be filtered by one",
-        );
-    }
     let limit = match params.limit.as_deref().map(str::parse::<u32>) {
         None => LIST_DEFAULT_LIMIT,
         Some(Ok(limit)) => limit.clamp(1, LIST_MAX_LIMIT),
@@ -296,11 +375,18 @@ async fn list_sessions(State(state): State<AppState>, Query(params): Query<ListP
         }
         lifecycles.push(name);
     }
+    // An empty hat names none: refused, so that "no hat chosen" sent as
+    // `hat=` is not answered with an empty list (6b: a filter it cannot
+    // honour is refused, never ignored).
+    if params.hat.as_deref() == Some("") {
+        return error(StatusCode::BAD_REQUEST, "invalid", "hat names no hat");
+    }
     let query = ListQuery {
         after: cursor.as_ref(),
         limit,
         lifecycles: (!lifecycles.is_empty()).then_some(lifecycles.as_slice()),
         search,
+        hat: params.hat.as_deref(),
     };
     match state.store.list(&query) {
         Ok(page) => Json(page).into_response(),
@@ -339,8 +425,24 @@ async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -
     .into_response()
 }
 
+/// `hat_id` for a message: by its name, by its id when it has none, or "no
+/// hat" for a session from before hats that got none.
+fn hat_name(state: &AppState, hat_id: &str) -> String {
+    if hat_id.is_empty() {
+        return "no hat".to_string();
+    }
+    match state.hosts.hat(hat_id) {
+        Ok(Some(hat)) => format!("hat {:?}", hat.name),
+        _ => format!("hat {hat_id}"),
+    }
+}
+
 /// Resume a parked, closed or failed session (ACP core §4.3): 202 with the
-/// lifecycle once the host's `session_started` is ingested.
+/// lifecycle once the host's `session_started` is ingested. Its cwd is
+/// resolved on its host again first, and must still be the same directory
+/// (409 `cwd_moved`, plan 5c decision 4), and its hat re-resolved: a
+/// different one refuses the resume (409 `hat_mismatch`) until the session
+/// is re-assigned.
 async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let session = match state.store.session(&id) {
         Ok(Some(s)) => s,
@@ -362,7 +464,29 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
     if !state.hub.is_ready(&session.host_id) {
         return request_failed(RequestError::NotConnected);
     }
-    let (agent_session_id, committed_seq, config) = match state.store.request_resume(&id) {
+    // Before the host is asked anything (ACP core §4.3).
+    if session.agent_session_id.is_none() {
+        return no_record();
+    }
+    let on_host = match session_cwd(&state, &session.host_id, &session.cwd).await {
+        Ok(on_host) => on_host,
+        Err(why) => return why.into_response(),
+    };
+    if on_host.canonical != session.cwd {
+        return error(
+            StatusCode::CONFLICT,
+            "cwd_moved",
+            format!(
+                "the session's directory {:?} now resolves to {:?} on its host; start a new session there",
+                session.cwd, on_host.canonical
+            ),
+        );
+    }
+    let hat = match session_hat(&state, &session.host_id, &session.cwd) {
+        Ok(hat) => hat,
+        Err(why) => return why.into_response(),
+    };
+    let (agent_session_id, committed_seq, config) = match state.store.request_resume(&id, &hat.hat_id) {
         Ok(ResumeRequest::Starting {
             events,
             agent_session_id,
@@ -376,11 +500,16 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         }
         // A concurrent resume got there first (ACP core §12 scenario 11).
         Ok(ResumeRequest::Busy(lifecycle)) => return busy(&lifecycle),
-        Ok(ResumeRequest::NoRecord) => {
+        Ok(ResumeRequest::NoRecord) => return no_record(),
+        Ok(ResumeRequest::HatMismatch(stored)) => {
             return error(
                 StatusCode::CONFLICT,
-                "agent_has_no_record",
-                "the agent never created this session; start a new one in the same project",
+                "hat_mismatch",
+                format!(
+                    "the session belongs to {}, but its directory now resolves to {}; re-assign the session, or change the path rules",
+                    hat_name(&state, &stored),
+                    hat_name(&state, &hat.hat_id)
+                ),
             );
         }
         Ok(ResumeRequest::NotFound) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
@@ -685,6 +814,14 @@ async fn answer(
         Ok(AnswerSubmission::Invalid(why)) => error(StatusCode::BAD_REQUEST, "invalid", why),
         Err(err) => internal(err),
     }
+}
+
+fn no_record() -> Response {
+    error(
+        StatusCode::CONFLICT,
+        "agent_has_no_record",
+        "the agent never created this session; start a new one in the same project",
+    )
 }
 
 fn lifecycle_response(state: &AppState, id: &str) -> Response {

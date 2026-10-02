@@ -473,6 +473,17 @@ fn attach(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, req: AttachReq
         });
         return Ok(());
     };
+    // The adapter starts in exactly the directory whose hat the collector
+    // decided (plan 5c decision 5): a cwd that no longer resolves to itself
+    // (a symlink swapped in since, or one sent from before hats) is refused.
+    if let Some(problem) = cwd_problem(&req.cwd) {
+        uplink.reply(HostFrame::Error {
+            request_id: req.request_id,
+            code: "cwd_not_canonical".into(),
+            message: problem,
+        });
+        return Ok(());
+    }
     // Before anything can be enqueued for this session: continue from the
     // larger of this host's counter and the collector's (ACP core §5.1), so
     // a session resumed after the outbox was lost never reuses a seq.
@@ -480,6 +491,17 @@ fn attach(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, req: AttachReq
     let options = cfg.session_options();
     spawn_or_restart(uplink, sessions, req, command, options);
     Ok(())
+}
+
+/// Why `cwd` cannot be a session's directory here, if it cannot: it must be
+/// a directory and in its canonical form (kernel spec §5.2).
+fn cwd_problem(cwd: &str) -> Option<String> {
+    match crate::paths::resolve(cwd, None) {
+        Ok(resolved) if resolved.is_dir && resolved.canonical == cwd => None,
+        Ok(resolved) if resolved.is_dir => Some(format!("{cwd:?} resolves to {:?} on this host", resolved.canonical)),
+        Ok(_) => Some(format!("{cwd:?} is not a directory on this host")),
+        Err(why) => Some(format!("{cwd:?}: {why}")),
+    }
 }
 
 /// Re-emit `session_started` from a live actor (never a second adapter), or

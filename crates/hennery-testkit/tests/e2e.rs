@@ -5,6 +5,7 @@ use hennery_host::identity::HostKey;
 use hennery_host::{AgentCommand, HostConfig};
 use hennery_kernel::hosts::{Enrollment, Hosts};
 use hennery_kernel::operator::Operator;
+use hennery_proto::frames::{Capabilities, Capability, CollectorFrame, HostFrame};
 use hennery_proto::rest::{EventDto, HostItem, PromptResponse, StartSessionResponse};
 use hennery_sessions::{AppState, store::Store};
 use hennery_testkit::{FakeScript, SCRIPT_ENV};
@@ -366,20 +367,31 @@ async fn a_start_with_unknown_delivery_reports_503_with_the_session_id() {
     let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
     let c = client(&collector);
 
-    // Register a fake host connection directly (no real socket): once the
-    // collector sends `start_session` on it, drop the connection before any
-    // reply arrives, so the request resolves as DeliveryUnknown rather than
-    // a rejection.
+    // Register a fake host connection directly (no real socket): it answers
+    // the cwd's `resolve_path` as a host would (plan 5c), and once the
+    // collector sends `start_session` on it, drops the connection before
+    // any reply arrives, so the request resolves as DeliveryUnknown rather
+    // than a rejection.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let conn_id = collector
         .state
         .hub
-        .register("host-1", tx, Default::default())
+        .register("host-1", tx, Capabilities(vec![Capability::ResolvePath]))
         .expect("register fake host")
         .conn_id;
     collector.state.hub.mark_ready("host-1", conn_id);
     let hub = collector.state.hub.clone();
+    let canonical = std::fs::canonicalize(std::env::temp_dir()).unwrap();
     tokio::spawn(async move {
+        if let Some(CollectorFrame::ResolvePath { request_id, .. }) = rx.recv().await {
+            let answer = HostFrame::ResolvedPath {
+                request_id,
+                canonical: canonical.to_str().unwrap().into(),
+                exists: true,
+                is_dir: true,
+            };
+            hub.probe_reply("host-1", conn_id, answer);
+        }
         rx.recv().await; // the StartSession frame; proves it was delivered
         hub.unregister("host-1", conn_id);
     });

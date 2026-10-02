@@ -457,13 +457,17 @@ async fn retry_repark(state: AppState, host_id: String) {
 }
 
 /// Remember the cwd of a session that just started or resumed as one of its
-/// host's recent projects, under the hat the cwd resolves to (kernel spec
-/// §5.3; plan 6c decision 11). Only a canonical cwd: until the host
-/// resolves it (hats 5b), it is what the client sent. Recents are not
-/// state: a failure is logged, and the fact is acked as usual.
+/// host's recent projects, under the session's hat (kernel spec §5.3; plan
+/// 6c decision 11). Only a canonical cwd: a start stores the cwd as its
+/// host resolved it (plan 5c), but a session from before that stored what
+/// the client sent. Recents are not state: a failure is logged, and the
+/// fact is acked as usual.
 fn remember_project(state: &AppState, host_id: &str, session_id: &str) {
-    let cwd = match state.store.session(session_id) {
-        Ok(Some(row)) => row.cwd,
+    // Under the hat the session belongs to, as stored at its start (plan
+    // 6c's A3 iii), not what its cwd resolves to now: a recent is where
+    // that hat's sessions ran.
+    let (cwd, hat_id) = match state.store.session(session_id) {
+        Ok(Some(row)) => (row.cwd, row.hat_id),
         Ok(None) => return,
         Err(err) => {
             tracing::warn!(%host_id, %session_id, error = %err, "reading a started session's cwd failed");
@@ -474,14 +478,11 @@ fn remember_project(state: &AppState, host_id: &str, session_id: &str) {
         tracing::debug!(%host_id, %session_id, "not remembering a cwd that is not canonical");
         return;
     }
-    let hat_id = match state.hosts.resolve_hat(host_id, &cwd) {
-        Ok(Some(resolution)) => resolution.hat_id,
-        Ok(None) => return,
-        Err(err) => {
-            tracing::warn!(%host_id, %session_id, error = %err, "resolving a started session's hat failed");
-            return;
-        }
-    };
+    // A session from before hats that got none (plan 5c decision 1).
+    if hat_id.is_empty() {
+        tracing::debug!(%host_id, %session_id, "not remembering the cwd of a session with no hat");
+        return;
+    }
     match state.hosts.remember(host_id, &hat_id, &cwd, unix_now()) {
         Ok(true) => {}
         Ok(false) => tracing::debug!(%host_id, %session_id, "not remembering a cwd that cannot be shown"),

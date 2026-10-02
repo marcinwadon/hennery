@@ -13,7 +13,7 @@ use futures::{SinkExt, StreamExt};
 use hennery_host::identity::HostKey;
 use hennery_kernel::hosts::{Enrollment, Hosts};
 use hennery_kernel::operator::Operator;
-use hennery_proto::frames::{Capabilities, CollectorFrame, HostFrame, SessionBody};
+use hennery_proto::frames::{Capabilities, Capability, CollectorFrame, HostFrame, SessionBody};
 use hennery_proto::rest::HostItem;
 use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION};
 use hennery_sessions::AppState;
@@ -45,7 +45,9 @@ async fn a_failed_ingest_drops_the_connection_instead_of_acking_past_it() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("hennery.db");
     let store = Store::open(&db).unwrap();
-    store.create_session("s1", "host-1", "fake", "/tmp").unwrap();
+    store
+        .create_session("s1", "host-1", "fake", "/tmp", "hat-1", None)
+        .unwrap();
 
     let state = AppState::new(store, paired_hosts(), Operator::open_in_memory().unwrap());
     let shutdown = state.shutdown.clone();
@@ -157,7 +159,8 @@ async fn an_undo_error_answers_delivery_unknown_and_drops_the_connection() {
             host_version: "0".into(),
             host_id: "host-1".into(),
             proof: host_key().sign_hello(&nonce, "host-1", PROTOCOL_VERSION),
-            capabilities: Capabilities::default(),
+            // It starts a session, so it resolves paths (plan 5c).
+            capabilities: Capabilities(vec![Capability::ResolvePath]),
             workspace_roots: vec![],
             attached_sessions: vec![],
         })
@@ -200,6 +203,26 @@ async fn an_undo_error_answers_delivery_unknown_and_drops_the_connection() {
                 .unwrap()
         }
     });
+
+    // The cwd is resolved on the host first (plan 5c): to itself.
+    match stream.next().await {
+        Some(Ok(Message::Text(t))) => match serde_json::from_str::<CollectorFrame>(&t).unwrap() {
+            CollectorFrame::ResolvePath { request_id, path } => sink
+                .send(Message::text(
+                    serde_json::to_string(&HostFrame::ResolvedPath {
+                        request_id,
+                        canonical: path,
+                        exists: true,
+                        is_dir: true,
+                    })
+                    .unwrap(),
+                ))
+                .await
+                .unwrap(),
+            other => panic!("expected resolve_path, got {other:?}"),
+        },
+        other => panic!("expected resolve_path frame, got {other:?}"),
+    }
 
     // Only once `create_session` has committed and the request is on its
     // way (proven by receiving the frame) does the lock go up: the start
