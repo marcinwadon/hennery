@@ -864,3 +864,329 @@ pub struct PushPayload {
     pub url: String,
     pub tag: String,
 }
+
+/// How an MCP gateway connection authenticates to its upstream (gateway
+/// spec §2): `none`; `static`, a token the operator sets; `oauth_dcr` and
+/// `oauth_client`, OAuth (plan 8f). Plan 8a takes `none` and `static`;
+/// naming an OAuth kind in a create or a change answers 400
+/// `unsupported_cred_kind` until plan 8f.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum McpCredKind {
+    /// No credential: the gateway sends the agents' requests as they are.
+    None,
+    /// A token the operator sets (`PUT /api/mcp/connections/{id}/credential`),
+    /// sent as `<static_header>: <static_prefix><token>`.
+    Static,
+    /// OAuth, the client registered dynamically (plan 8f).
+    OauthDcr,
+    /// OAuth, with a client the operator registered with the vendor (plan 8f).
+    OauthClient,
+}
+
+/// A connection's health (gateway spec §7): `not_connected`, not checked
+/// yet; `ok`; `needs_auth`, the operator must sign in again; `error`, with
+/// `status_note`. Plan 8a only ever reports `not_connected`; the probe
+/// (plan 8f) sets the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum McpConnectionStatus {
+    /// Not checked yet: since it was created, or since another origin or
+    /// kind deleted its credential.
+    NotConnected,
+    /// The last check reached the upstream with its credential.
+    Ok,
+    /// The upstream wants the operator to sign in again.
+    NeedsAuth,
+    /// The last check failed; `status_note` says how.
+    Error,
+}
+
+/// One MCP gateway connection (gateway spec §2, §9): an entry of
+/// `GET /api/mcp/connections` (200, an array, oldest first), and the answer
+/// to `POST` (201), `PATCH` (200) and `PUT …/{id}/mounts` (200). Never its
+/// secret: `has_credential` says whether one is stored.
+///
+/// Every `/api/mcp/*` route is the operator's and answers
+/// `Cache-Control: no-store`. An error is an `ApiError`; the codes every
+/// route may answer:
+/// - 401 `unauthenticated`: no live session: sign in.
+/// - 403 `setup_required`, `origin_mismatch` or `cross_site`: the browser
+///   rules refused the request (kernel spec §3.2).
+/// - 415 `unsupported_media_type`: a body that is not `application/json`.
+/// - 400 `invalid_body`: a body that is not JSON; 422 `invalid_body`: one
+///   that is not the route's shape, an unknown field included. The body is
+///   never quoted back.
+/// - 413 `body_too_large`: a body over 256 KiB.
+/// - 405, with no body: a method the path does not take.
+/// - 500 `internal`.
+///
+/// Each request type names the codes of its own route. A 403
+/// `step_up_required` asks for a password or passkey check
+/// (`POST /api/auth/step-up/…`); retry after it.
+///
+/// `DELETE /api/mcp/connections/{id}` (step-up) takes no body: 204, its
+/// mounts and credential deleted with it; 403 `step_up_required`, 404
+/// `not_found`.
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct McpConnectionItem {
+    /// `conn-` and 16 hexadecimal digits: the `{id}` of the routes.
+    pub id: String,
+    /// `^[a-z0-9][a-z0-9-]{0,47}$`, unique per owner; fixed once created.
+    /// Agents see the server as `hennery-<slug>`.
+    pub slug: String,
+    /// The operator's name for it: 1 to 64 bytes of UTF-8 once trimmed
+    /// (stored trimmed), with no control or invisible format character.
+    pub label: String,
+    /// The upstream MCP endpoint, as stored (parsed and serialised). Only
+    /// the API's answers show it whole: logs and errors show only its origin.
+    pub url: String,
+    /// The hat whose sessions may use it. Fixed once created: a grant stays
+    /// in its hat.
+    pub hat_id: String,
+    /// How it authenticates to its upstream.
+    pub cred_kind: McpCredKind,
+    /// The header a `static` token is sent in (by default `Authorization`).
+    pub static_header: String,
+    /// What goes before the token in that header (by default `Bearer `);
+    /// may be empty.
+    pub static_prefix: String,
+    /// The tools an agent may call: `null`, every tool; `[]`, none; else
+    /// these names, in order, without duplicates.
+    #[ts(type = "string[] | null")]
+    pub tool_allowlist: Option<Vec<String>>,
+    /// The upstream is on the operator's own network: its URL may be
+    /// `http`, and its requests may reach internal addresses; plain `http`
+    /// goes only to an internal address (plans 8b and 8b-ii).
+    pub internal_network: bool,
+    /// Its health.
+    pub status: McpConnectionStatus,
+    /// Why `status` is what it is, when the probe (plan 8f) says; absent
+    /// otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub status_note: Option<String>,
+    /// The upstream account it is signed in as, when the probe (plan 8f)
+    /// learns it; absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub account_label: Option<String>,
+    /// When `status` last changed: RFC 3339, as the other stamps.
+    pub status_at: String,
+    /// When it was created: RFC 3339.
+    pub created_at: String,
+    /// When a `PATCH` last changed it: RFC 3339. Mounts and the credential
+    /// do not move it.
+    pub updated_at: String,
+    /// Whether a credential is stored. No route answers the credential.
+    pub has_credential: bool,
+    /// The hosts it is mounted on, by id, sorted; revoked hosts are left out.
+    pub mounts: Vec<String>,
+}
+
+/// `POST /api/mcp/connections` (step-up): 201 with the new
+/// `McpConnectionItem`, `not_connected`, with no credential and no mounts.
+/// Absent: the `Authorization` header with `Bearer `, every tool, a public
+/// upstream. Unknown fields are refused.
+///
+/// Its own codes, beyond every route's (see `McpConnectionItem`): 403
+/// `step_up_required`; 400 `invalid` (a field refused, `message` says
+/// which, or a hat that is not the owner's); 400 `unsupported_cred_kind`
+/// (an OAuth kind, until plan 8f); 409 `slug_taken` (another of the owner's
+/// connections has the slug); 409 `too_many_connections` (at most 256 per
+/// owner).
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct CreateMcpConnectionRequest {
+    /// `^[a-z0-9][a-z0-9-]{0,47}$`, unique per owner; fixed once created.
+    pub slug: String,
+    /// 1 to 64 bytes of UTF-8 once trimmed (stored trimmed), with no
+    /// control or invisible format character.
+    pub label: String,
+    /// Absolute `https`, or `http` only with `internal_network`; with a
+    /// host, without a user name, password or fragment; at most 2048 bytes.
+    /// A query is kept, but a secret belongs in the credential.
+    pub url: String,
+    /// One of the owner's hats; fixed once created.
+    pub hat_id: String,
+    /// `none` or `static` until plan 8f.
+    pub cred_kind: McpCredKind,
+    /// Absent: `Authorization`. An HTTP header name of at most 64 bytes,
+    /// not one the gateway sets or filters itself (`host`, `content-type`,
+    /// `cookie`, `mcp-session-id`, `proxy-*`, `sec-*` and the like).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub static_header: Option<String>,
+    /// Absent: `Bearer `. At most 32 visible ASCII characters or spaces;
+    /// `""` for none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub static_prefix: Option<String>,
+    /// Absent or `null`: every tool. Else at most 1024 names, each 1 to 128
+    /// visible ASCII characters; duplicates are dropped, the order kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string[] | null | undefined", optional)]
+    pub tool_allowlist: Option<Vec<String>>,
+    /// Absent: `false`. The upstream is on the operator's own network.
+    #[serde(default)]
+    #[ts(type = "boolean | undefined", optional)]
+    pub internal_network: bool,
+}
+
+/// `PATCH /api/mcp/connections/{id}`: 200 with the `McpConnectionItem` as
+/// it is now. An absent field keeps its value; a `null` allowlist clears it
+/// (every tool), `""` clears the prefix (gateway spec §4.6); a `null` for
+/// another field reads as absent. Naming `url`, `cred_kind`,
+/// `internal_network`, `static_header` or `static_prefix` needs step-up,
+/// even with its stored value. Another origin (scheme, host, port) or
+/// another kind deletes the stored credential and starts the status over
+/// at `not_connected`, in the same change. The slug and the hat cannot
+/// change: naming them is an unknown field.
+///
+/// Its own codes, beyond every route's (see `McpConnectionItem`): 403
+/// `step_up_required`; 404 `not_found`; 400 `invalid` (`message` says
+/// which field); 400 `unsupported_cred_kind`. A refused change changes
+/// nothing.
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateMcpConnectionRequest {
+    /// 1 to 64 bytes of UTF-8 once trimmed (stored trimmed), with no
+    /// control or invisible format character.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub label: Option<String>,
+    /// Step-up. As on create; another origin deletes the credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub url: Option<String>,
+    /// Step-up. Another kind deletes the credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "McpCredKind | undefined", optional)]
+    pub cred_kind: Option<McpCredKind>,
+    /// Step-up. As on create; cannot be empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub static_header: Option<String>,
+    /// Step-up. As on create; `""` clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub static_prefix: Option<String>,
+    /// Absent: kept. `null`: cleared (every tool). A list: set, as on
+    /// create.
+    #[serde(default, with = "present", skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<Vec<String>>")]
+    #[ts(type = "string[] | null | undefined", optional)]
+    pub tool_allowlist: Option<Option<Vec<String>>>,
+    /// Step-up. `false` is refused while the URL is `http`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "boolean | undefined", optional)]
+    pub internal_network: Option<bool>,
+}
+
+/// A field that may be absent, `null` or a value, kept apart: absent is
+/// `None` (`#[serde(default)]`), `null` is `Some(None)`.
+mod present {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer, T: Serialize>(value: &Option<Option<T>>, serializer: S) -> Result<S::Ok, S::Error> {
+        value.as_ref().and_then(Option::as_ref).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Option<T>>, D::Error> {
+        Option::<T>::deserialize(deserializer).map(Some)
+    }
+}
+
+/// `PUT /api/mcp/connections/{id}/mounts`: the whole set of hosts the
+/// connection is mounted on, replacing the one before, never a delta
+/// (gateway spec §9). No step-up: a mount reaches only a host the owner
+/// paired. 200 with the `McpConnectionItem`.
+///
+/// Its own codes, beyond every route's (see `McpConnectionItem`): 404
+/// `not_found`; 400 `invalid` (a host that is not one of the owner's
+/// paired, unrevoked hosts; more than 1024 hosts; an id over 64 bytes,
+/// which is not quoted back). The limits count the ids as sent, and are
+/// checked before the connection is looked up. A refused set changes
+/// nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct McpMountsRequest {
+    /// Host ids; `[]` unmounts it everywhere. A repeated id counts once.
+    pub host_ids: Vec<String>,
+}
+
+/// `PUT /api/mcp/connections/{id}/credential` (step-up): a static token,
+/// write-only: 204, the token sealed and stored, replacing any before it.
+/// No route reads it back or clears it; changing the kind or the origin,
+/// or deleting the connection, deletes it. Its `Debug` never shows the
+/// token.
+///
+/// Its own codes, beyond every route's (see `McpConnectionItem`): 403
+/// `step_up_required`; 404 `not_found`; 409 `wrong_cred_kind` (the
+/// connection is not `static`); 400 `invalid` (the token is not 1 to 8192
+/// visible ASCII characters without spaces; never quoted).
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct McpCredentialRequest {
+    /// The token, as the upstream takes it after `static_prefix`.
+    pub token: String,
+}
+
+impl std::fmt::Debug for McpCredentialRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpCredentialRequest")
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// What of an upstream URL a `Debug` may show (plan 8a decision 19):
+/// `scheme://host[:port]`, without a user name, path, query or fragment,
+/// any of which may hold a secret. Parsed as the gateway parses a URL
+/// (`url::Url`), so raw input, before any check, fails closed: what does
+/// not parse shows as `<not a url>`, a scheme without an origin as `null`
+/// (the re-confirmation's finding 1).
+pub fn url_origin(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(url) => url.origin().ascii_serialization(),
+        Err(_) => "<not a url>".into(),
+    }
+}
+
+impl std::fmt::Debug for McpConnectionItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpConnectionItem")
+            .field("id", &self.id)
+            .field("slug", &self.slug)
+            .field("url", &url_origin(&self.url))
+            .field("hat_id", &self.hat_id)
+            .field("cred_kind", &self.cred_kind)
+            .field("status", &self.status)
+            .field("has_credential", &self.has_credential)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for CreateMcpConnectionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateMcpConnectionRequest")
+            .field("slug", &self.slug)
+            .field("url", &url_origin(&self.url))
+            .field("hat_id", &self.hat_id)
+            .field("cred_kind", &self.cred_kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for UpdateMcpConnectionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateMcpConnectionRequest")
+            .field("label", &self.label)
+            .field("url", &self.url.as_deref().map(url_origin))
+            .field("cred_kind", &self.cred_kind)
+            .field("internal_network", &self.internal_network)
+            .finish_non_exhaustive()
+    }
+}

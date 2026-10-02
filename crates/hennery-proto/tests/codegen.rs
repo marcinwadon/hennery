@@ -129,3 +129,67 @@ fn stored_images_and_their_usage_are_exported() {
         "{usage}"
     );
 }
+
+/// The gateway's wire types (plan 8a), which the frontend builds on.
+const GATEWAY_TYPES: [&str; 7] = [
+    "McpCredKind",
+    "McpConnectionStatus",
+    "McpConnectionItem",
+    "CreateMcpConnectionRequest",
+    "UpdateMcpConnectionRequest",
+    "McpMountsRequest",
+    "McpCredentialRequest",
+];
+
+/// Plan 8a, Task 5: the gateway's API is a contract with the frontend, so
+/// each of its wire types, each of their fields and each variant says what
+/// it is. An enum whose variants have no doc is rendered as a bare `enum`
+/// list, which fails here too.
+#[test]
+fn the_gateways_wire_types_document_every_field_and_variant() {
+    let schema: serde_json::Value = serde_json::from_str(&render_schema()).unwrap();
+    let described = |v: &serde_json::Value| v["description"].as_str().is_some_and(|d| !d.trim().is_empty());
+    for name in GATEWAY_TYPES {
+        let def = &schema["$defs"][name];
+        assert!(described(def), "{name} has no doc: {def}");
+        assert!(def.get("enum").is_none(), "{name}'s variants have no doc: {def}");
+        for (field, prop) in def["properties"].as_object().into_iter().flatten() {
+            assert!(described(prop), "{name}.{field} has no doc: {prop}");
+        }
+        for variant in def["oneOf"].as_array().into_iter().flatten() {
+            assert!(described(variant), "{name}: a variant has no doc: {variant}");
+        }
+    }
+}
+
+/// Plan 8a, Task 5: a type's own doc (for the gateway's: its route, whether
+/// it needs step-up, its answers and its error codes) reaches the
+/// TypeScript, above its declaration, as it reaches the schema.
+#[test]
+fn a_types_doc_reaches_the_typescript() {
+    let ts = render_ts();
+    for name in GATEWAY_TYPES {
+        let at = ts.find(&format!("\nexport type {name} =")).expect(name);
+        assert!(ts[..at].ends_with("*/"), "{name}'s doc is not above its declaration");
+    }
+    // Every error code a gateway route answers, named in a doc.
+    for code in [
+        "unauthenticated",
+        "setup_required",
+        "origin_mismatch",
+        "cross_site",
+        "unsupported_media_type",
+        "step_up_required",
+        "invalid_body",
+        "body_too_large",
+        "not_found",
+        "invalid",
+        "unsupported_cred_kind",
+        "slug_taken",
+        "too_many_connections",
+        "wrong_cred_kind",
+        "internal",
+    ] {
+        assert!(ts.contains(&format!("`{code}`")), "no doc names `{code}`");
+    }
+}

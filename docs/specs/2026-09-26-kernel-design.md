@@ -278,8 +278,9 @@ Some actions require a password or passkey check within the last **5
 minutes** (`auth_sessions.last_step_up_at`), even inside a valid session:
 
 - minting pairing codes;
-- creating or editing gateway connection URLs, credentials, pre-registered
-  clients or the "internal network" flag;
+- creating or deleting gateway connections, or editing their URLs,
+  credential kinds, credentials, static header or prefix, pre-registered
+  clients or the "internal network" flag (gateway spec §9);
 - local stdio server configuration;
 - registering or revoking passkeys; revoking hosts or auth sessions;
 - deleting sessions, re-assigning a session to another hat, and purging hats;
@@ -298,8 +299,10 @@ and stepped up, so a session revoked or a password reset mid-ceremony stores
 nothing.
 
 *Built so far:* step-up guards minting pairing codes, revoking hosts and auth
-sessions, and registering and removing passkeys; the other actions get it with
-their endpoints.
+sessions, registering and removing passkeys, and the gateway's connections
+(creating, deleting, setting a static credential, and a `PATCH` naming the
+URL, kind, internal flag, header or prefix; plan 8a); the other actions get it
+with their endpoints.
 
 ## 4. Host identity and pairing
 

@@ -18,6 +18,10 @@ anyhow = "1"
 base64 = "=0.22.1"
 axum = { version = "0.8.9", features = ["ws"] }
 clap = { version = "4", features = ["derive", "env"] }
+# The MCP gateway's credentials at rest (plan 8a): XChaCha20-Poly1305.
+# Default features off: no random number generator of its own (nonces come
+# from the kernel's), and its key state zeroized when dropped.
+chacha20poly1305 = { version = "=0.11.0", default-features = false, features = ["alloc", "zeroize"] }
 ed25519-dalek = "=2.2.0"
 # Package and Node archives (plan 7b): pure Rust, no liblzma.
 flate2 = "=1.1.10"
@@ -65,6 +69,7 @@ hennery-proto = { path = "crates/hennery-proto" }
 hennery-kernel = { path = "crates/hennery-kernel" }
 hennery-sessions = { path = "crates/hennery-sessions" }
 hennery-host = { path = "crates/hennery-host" }
+hennery-gateway = { path = "crates/hennery-gateway" }
 
 # Argon2 is unusably slow unoptimised; every test that logs in pays for it.
 [profile.dev.package.argon2]

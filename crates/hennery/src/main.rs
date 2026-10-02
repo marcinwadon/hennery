@@ -426,6 +426,13 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     // reads (plan 10b-ii).
     let egress = hennery_kernel::egress::Egress::new(hennery_kernel::egress::Timeouts::DEFAULT)?;
     start_push(&mut state, &egress);
+    // Before serving: the gateway's store, and the master key that opens
+    // what it holds (plan 8a), from `HENNERY_MASTER_KEY`, a systemd
+    // credential or `<data>/master.key`. A key that is missing while
+    // credentials are stored, or that does not open them, stops the start
+    // (plan 8a decision 8; `KeyUnavailable` tells that case apart).
+    let keys = hennery_gateway::key::KeySource::from_env(&args.data_dir)?;
+    let gateway = hennery_gateway::open(&db, &keys, state.operator.clone())?;
     state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
     hennery_sessions::offline::after_startup(&state);
     let listeners = listeners
@@ -490,7 +497,7 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     });
     let served = hennery_sessions::serve_all(
         listeners,
-        hennery_sessions::router(state.clone()),
+        hennery_sessions::router(state.clone()).merge(hennery_gateway::api::router(gateway)),
         state.shutdown.clone(),
     )
     .await;
@@ -1234,6 +1241,34 @@ mod tests {
             .get_envs()
             .any(|(key, value)| key == "HENNERY_DEV_TOKEN" && value.is_none());
         assert!(removed, "the host child inherits HENNERY_DEV_TOKEN");
+    }
+
+    /// Plan 8a decision 6: the master key may come from the environment
+    /// (`HENNERY_MASTER_KEY`), which `up` passes to its collector; its host
+    /// child, and so every agent, must not inherit it. The adapter spawn
+    /// strips the same list (`HOST_SECRET_VARS`).
+    #[test]
+    fn ups_host_child_does_not_inherit_the_master_key() {
+        assert!(hennery_host::adapter::HOST_SECRET_VARS.contains(&hennery_gateway::key::KEY_ENV));
+        let args = UpArgs {
+            listen: vec!["127.0.0.1:7117".into()],
+            public_url: None,
+            data_dir: "/nonexistent".into(),
+            agents: Vec::new(),
+            idle_timeout_secs: 0,
+            workspace_roots: Vec::new(),
+        };
+        let cmd = host_command(
+            std::path::Path::new("/bin/hennery"),
+            std::path::Path::new("/nonexistent/host"),
+            "ws://127.0.0.1:7117/api/hosts/ws",
+            &args,
+        );
+        let removed = cmd
+            .as_std()
+            .get_envs()
+            .any(|(key, value)| key == hennery_gateway::key::KEY_ENV && value.is_none());
+        assert!(removed, "the host child inherits HENNERY_MASTER_KEY");
     }
 
     /// Decision 6: `up` hands its `--workspace-root` flags to its host

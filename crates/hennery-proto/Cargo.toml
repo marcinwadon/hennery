@@ -11,3 +11,5 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ts-rs.workspace = true
+# `url_origin`: an upstream URL in a `Debug`, parsed as the gateway parses it (plan 8a).
+url.workspace = true

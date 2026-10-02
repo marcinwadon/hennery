@@ -89,6 +89,13 @@ pub fn render_schema() -> String {
         rest::SettingsResponse,
         rest::SettingsUpdateRequest,
         rest::PushPayload,
+        rest::McpCredKind,
+        rest::McpConnectionStatus,
+        rest::McpConnectionItem,
+        rest::CreateMcpConnectionRequest,
+        rest::UpdateMcpConnectionRequest,
+        rest::McpMountsRequest,
+        rest::McpCredentialRequest,
     );
     // `serde_json::Map` is a `BTreeMap` (always iterates sorted) by default,
     // or an `IndexMap` (iterates in insertion order) when serde_json's
@@ -133,13 +140,18 @@ fn sort_keys(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
-/// One TypeScript module exporting every hennery wire type.
+/// One TypeScript module exporting every hennery wire type, each with its
+/// own doc comment above it, as ts-rs's own export writes it (plan 8a: the
+/// frontend reads a route's answers and error codes there). `decl` carries
+/// only the fields' docs.
 pub fn render_ts() -> String {
     let cfg = Config::default();
     let mut out = String::from(HEADER);
     macro_rules! add {
         ($($t:ty),* $(,)?) => {$(
-            out.push_str("\nexport ");
+            out.push('\n');
+            out.push_str(&<$t as TS>::docs().unwrap_or_default());
+            out.push_str("export ");
             out.push_str(&<$t as TS>::decl(&cfg));
             out.push('\n');
         )*};
@@ -220,6 +232,13 @@ pub fn render_ts() -> String {
         rest::SettingsResponse,
         rest::SettingsUpdateRequest,
         rest::PushPayload,
+        rest::McpCredKind,
+        rest::McpConnectionStatus,
+        rest::McpConnectionItem,
+        rest::CreateMcpConnectionRequest,
+        rest::UpdateMcpConnectionRequest,
+        rest::McpMountsRequest,
+        rest::McpCredentialRequest,
     );
     out
 }

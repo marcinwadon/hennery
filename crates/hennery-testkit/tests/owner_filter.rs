@@ -24,6 +24,7 @@
 //! workspace's `src` that holds SQL is in `SOURCES` or, with its reason, in
 //! `EXEMPT`.
 
+use hennery_gateway::store::GatewayStore;
 use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::Operator;
 use hennery_sessions::store::Store;
@@ -69,7 +70,16 @@ const SOURCES: &[(&str, &str, usize)] = &[
         include_str!("../../hennery-sessions/src/store.rs"),
         106,
     ),
+    (
+        "hennery-gateway/src/store.rs",
+        include_str!("../../hennery-gateway/src/store.rs"),
+        GATEWAY_STATEMENTS,
+    ),
 ];
+
+/// The gateway store's statements (plan 8a), apart from the list above so
+/// that other lanes' changes to it stay apart from this one.
+const GATEWAY_STATEMENTS: usize = 23;
 
 /// Files under `crates/*/src` with SQL that the audit does not read, and
 /// why (3b-iii review, A3). Any other such file fails
@@ -616,6 +626,7 @@ fn every_query_of_the_stores_filters_by_the_owner() {
     Operator::open(&db).unwrap();
     Hosts::open(&db).unwrap();
     Store::open(&db).unwrap();
+    GatewayStore::open(&db).unwrap();
     let conn = audit_connection(&db);
     let mut found = Vec::new();
     for (path, source, at_least) in SOURCES {

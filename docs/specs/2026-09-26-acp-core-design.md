@@ -41,8 +41,10 @@ The Cargo workspace (Rust, umbrella §9.1):
 | `hennery` | bin | CLI (including `hennery mcp apply`, which wires the gateway's renderers), supervisor, wiring. |
 | `hennery-testkit` | lib + bin (dev only) | The fake ACP adapter (§12) and shared test helpers. Never a dependency of a shipped crate. |
 
-*Built so far:* no `hennery-gateway` crate and no `SessionMcp` trait; they come
-with the gateway.
+*Built so far:* the `hennery-gateway` crate exists (plan 8a): connections,
+mounts and static credentials at rest, and their API. No `SessionMcp` trait
+yet (plan 8e), so `hennery-sessions` does not depend on the gateway; the
+binary merges the two routers side by side.
 
 **Sessions → gateway interface.** `hennery-sessions` obtains a session's MCP
 servers through a trait that `hennery-gateway` defines and implements:
