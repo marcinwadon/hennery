@@ -1515,6 +1515,7 @@ fn fake_agents(dir: &Path) -> Option<FakeAgents> {
         &format!(
             "#!/bin/sh\ncase \"$1\" in *codex.js) shift; exec \"{cli}\" codex \"$@\";; esac\n\
              echo $$ > \"{runs}/pid-$$\"; env > \"{runs}/env-$$\"; pwd > \"{runs}/cwd-$$\"\n\
+             sleep 60 & echo $! > \"{runs}/pid-child-$$\"\n\
              echo canary-7d-adapter-err >&2\nread line\nv=$(cat \"$1\")\n\
              test \"$v\" = silent && exec sleep 60\n\
              printf '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"protocolVersion\":1,\"agentCapabilities\":{{}},\"agentInfo\":{{\"name\":\"canary-7d-name\",\"version\":\"%s\"}}}}}}\\n' \"$v\"\n\
@@ -1592,6 +1593,7 @@ fn adapters_start_as_the_host_starts_them_and_are_all_stopped() {
     let fake = Fake::none();
     let mut cx = machine(dir.path(), Platform::Linux, &fake);
     cx.env.insert("CLAUDECODE".into(), "canary-7d-nesting".into());
+    cx.env.insert("HENNERY_DOCTOR_SHELL_ONLY".into(), "canary-7d-shell".into());
     let Some(agents) = fake_agents(dir.path()) else {
         return;
     };
@@ -1603,6 +1605,7 @@ fn adapters_start_as_the_host_starts_them_and_are_all_stopped() {
     all_gone(&agents);
     for env in agents.runs("env-") {
         assert!(!env.contains("CLAUDECODE"), "{env}");
+        assert!(!env.contains("HENNERY_DOCTOR_SHELL_ONLY"), "{env}");
         assert!(env.contains(&format!("HOME={}", cx.home.display())), "{env}");
         assert!(env.contains("PATH=/usr/bin:/bin"), "{env}");
     }
@@ -1734,7 +1737,7 @@ fn a_process_that_left_the_group_does_not_hold_initialize() {
     script(
         &adapter,
         &format!(
-            "#!/bin/sh\nperl -e 'setpgrp(0, 0); sleep 30' &\necho $! > \"{0}.tmp\"\nmv \"{0}.tmp\" \"{0}\"\nread line\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{}}}}'\nexec sleep 60\n",
+            "#!/bin/sh\nperl -e 'setpgrp(0, 0); open(my $f, \">\", \"{0}.tmp\"); print $f $$; close($f); rename(\"{0}.tmp\", \"{0}\"); sleep 30' &\nwhile [ ! -s \"{0}\" ]; do sleep 0.05; done\nread line\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{}}}}'\nexec sleep 60\n",
             escaped.display()
         ),
     );
