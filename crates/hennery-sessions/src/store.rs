@@ -2155,7 +2155,10 @@ impl Store {
     /// leaves files no row names, for plan 9b's sweep (decision 7).
     pub fn delete_session(&self, session_id: &str, unattached: Option<&Unattached>) -> Result<Deletion> {
         let deletion = self.delete_rows(session_id, unattached)?;
-        if let Some(checkpoints) = &self.checkpoints {
+        // Only a delete that deleted something owes one.
+        if matches!(deletion, Deletion::Done { .. })
+            && let Some(checkpoints) = &self.checkpoints
+        {
             checkpoints.run();
         }
         Ok(deletion)

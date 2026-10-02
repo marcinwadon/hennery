@@ -753,6 +753,11 @@ default_for_new_hosts: boolean,
  */
 purging: boolean, };
 
+/**
+ * `GET /api/hats/{id}/purge` (kernel spec §5.5; plan 9c decision 11, A13):
+ * what a purge of the hat would delete, read only. Tombstones are not
+ * counted.
+ */
 export type PurgePreview = { hat_id: string, 
 /**
  * A purge began and has not finished: a purge resumes it.
@@ -786,6 +791,11 @@ unassigned: Array<SessionItem>,
  */
 unassigned_count: number, };
 
+/**
+ * 200 to `POST /api/hats/{id}/purge` (plan 9c decision 10, A13): what
+ * this purge deleted. A purge that resumes one that stopped counts only
+ * what it deleted itself.
+ */
 export type PurgeResult = { sessions: number, rules: number, 
 /**
  * Sessions closed here, collector-side, while their host may still run

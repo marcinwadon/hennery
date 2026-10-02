@@ -629,7 +629,7 @@
           "type": "object"
         },
         {
-          "description": "A hat the operator purged (kernel spec §5.5; plan 9c decisions 10\nand 12, A7): sent after every reconciled handshake, one per purged\nhat, for good. The host forgets what it keeps for the hat (its\ncomposed agent home, plan 8). No answer; a host that does not know\nthe frame logs and ignores it, so no capability is needed.",
+          "description": "A hat the operator purged (kernel spec §5.5; plan 9c decisions 10\nand 12, A7): sent after every reconciled handshake, one per purged\nhat, for good. The host forgets what it keeps for the hat (its\ncomposed agent home, plan 8): only for an id that is `hat-<hex>`,\nand only once no adapter of that hat runs. No answer; a host that\ndoes not know the frame logs and ignores it, so no capability is\nneeded.",
           "properties": {
             "hat_id": {
               "type": "string"
