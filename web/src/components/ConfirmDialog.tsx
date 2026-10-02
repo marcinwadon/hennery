@@ -2,9 +2,10 @@
 // §8: renaming or revoking a host, purging a hat, removing a passkey or a
 // device). The action runs from here: while it runs the dialog stays open,
 // so a step-up dialog can open over it, and a refusal is shown in it, as
-// text. Focus moves in, stays in (Tab cycles within it), and goes back
-// where it was when it closes.
-import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
+// text. Focus moves in, stays in (Tab cycles within it, and a click on the
+// backdrop keeps it), and goes back where it was when it closes, or to
+// `returnFocus` when that is gone.
+import { useEffect, useId, useRef, useState, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
 import { messageOf } from '../api/errors'
 import { Text } from '../lib/text'
 
@@ -19,13 +20,20 @@ interface Props {
   /** Runs on the confirm button; the dialog closes when it resolves. */
   action: () => Promise<void>
   onClose: () => void
+  /** Where focus goes on close when what opened the dialog is gone (the
+   *  action removed it, or it was gone before the dialog opened). Read on
+   *  close. */
+  returnFocus?: () => HTMLElement | null
 }
 
-export default function ConfirmDialog({ title, children, confirm, danger, disabled, action, onClose }: Props) {
+export default function ConfirmDialog({ title, children, confirm, danger, disabled, action, onClose, returnFocus }: Props) {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const dialog = useRef<HTMLDivElement>(null)
   const live = useRef(true)
+  const titleId = useId()
+  const fallback = useRef(returnFocus)
+  fallback.current = returnFocus
 
   useEffect(() => {
     live.current = true
@@ -33,9 +41,20 @@ export default function ConfirmDialog({ title, children, confirm, danger, disabl
     dialog.current?.querySelector<HTMLElement>('[data-autofocus]')?.focus()
     return () => {
       live.current = false
-      before?.focus?.()
+      // An opener removed as the dialog opened leaves focus on the body.
+      const gone = !before || before === document.body || !before.isConnected
+      const back = gone ? fallback.current?.() : before
+      back?.focus?.()
     }
   }, [])
+
+  // A click on the backdrop would move focus to the body, out of the trap
+  // and out of reach of Escape: it is kept in the dialog.
+  const holdFocus = (e: MouseEvent<HTMLDivElement>) => {
+    if (e.target !== e.currentTarget) return
+    e.preventDefault()
+    dialog.current?.focus()
+  }
 
   const run = async () => {
     // Its buttons are disabled while the action runs: focus is held by the
@@ -83,10 +102,10 @@ export default function ConfirmDialog({ title, children, confirm, danger, disabl
   }
 
   return (
-    <div className="overlay" onKeyDown={trap}>
-      <div className="modal dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title" ref={dialog} tabIndex={-1}>
+    <div className="overlay" onKeyDown={trap} onMouseDown={holdFocus}>
+      <div className="modal dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} ref={dialog} tabIndex={-1}>
         <div className="modal-head">
-          <h2 className="modal-title" id="confirm-title">
+          <h2 className="modal-title" id={titleId}>
             {title}
           </h2>
         </div>
