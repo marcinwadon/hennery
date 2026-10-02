@@ -50,6 +50,9 @@ fn ping(id: i64) -> Value {
 #[tokio::test]
 async fn a_request_goes_up_with_the_credential_and_the_allowed_headers_only() {
     let s = setup(CredKind::Static, None).await;
+    let session =
+        s.h.session_id(&s.upstream, "linear", &s.token, "upstream-session-1")
+            .await;
     s.upstream.reply(|_, _| {
         Response::builder()
             .header(header::CONTENT_TYPE, "application/json")
@@ -67,7 +70,7 @@ async fn a_request_goes_up_with_the_credential_and_the_allowed_headers_only() {
             .bearer_auth(&s.token)
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, "application/json, text/event-stream")
-            .header("mcp-session-id", "upstream-session-1")
+            .header("mcp-session-id", &session)
             .header("mcp-protocol-version", "2025-06-18")
             .header("last-event-id", "41")
             .header(header::COOKIE, "hennery_session=browser-cookie")
@@ -82,7 +85,9 @@ async fn a_request_goes_up_with_the_credential_and_the_allowed_headers_only() {
     assert_eq!(resp.status(), StatusCode::OK);
     let headers = resp.headers().clone();
     assert_eq!(headers["content-type"], "application/json");
-    assert_eq!(headers["mcp-session-id"], "upstream-session-1");
+    // Wrapped for this token and connection (plan 8e decision 13): the
+    // same upstream id, the same wrapped id.
+    assert_eq!(headers["mcp-session-id"], session.as_str());
     // Plan 8d decision 19: never the upstream's caching, always `no-store`.
     assert_eq!(headers["cache-control"], "no-store");
     assert_eq!(headers["x-content-type-options"], "nosniff");
@@ -97,8 +102,8 @@ async fn a_request_goes_up_with_the_credential_and_the_allowed_headers_only() {
     assert_eq!(resp.text().await.unwrap(), r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
 
     let seen = s.upstream.seen();
-    assert_eq!(seen.len(), 1);
-    let up = &seen[0];
+    assert_eq!(seen.len(), 2, "the session's ping, then the request");
+    let up = &seen[1];
     assert_eq!(up.method, "POST");
     // The connection's URL, not the client's query.
     assert_eq!(up.uri, "/mcp");
@@ -468,7 +473,11 @@ async fn only_json_and_event_streams_pass() {
     let note = json!({ "jsonrpc": "2.0", "method": "notifications/initialized" });
     let resp = s.h.post("linear", &s.token, &note).await;
     assert_eq!(resp.status(), StatusCode::ACCEPTED);
-    // A `DELETE` ends the upstream session (G-16): forwarded, 204 back.
+    // A `DELETE` ends the upstream session (G-16): forwarded, 204 back,
+    // its id unwrapped (plan 8e decision 13).
+    let session =
+        s.h.session_id(&s.upstream, "linear", &s.token, "upstream-session-9")
+            .await;
     s.upstream.reply(|_, _| {
         Response::builder()
             .status(StatusCode::NO_CONTENT)
@@ -479,7 +488,7 @@ async fn only_json_and_event_streams_pass() {
         s.h.client
             .delete(s.h.url("linear"))
             .bearer_auth(&s.token)
-            .header("mcp-session-id", "upstream-session-9")
+            .header("mcp-session-id", &session)
             .send()
             .await
             .unwrap();
@@ -1105,6 +1114,51 @@ async fn a_get_stream_takes_no_request_permit() {
     drop(stream);
 }
 
+/// Spaces of JSON whitespace, one every 50 ms: `Some(n)` of them, then a
+/// JSON-RPC result; `None`, forever. An upstream that trickles its answer.
+fn trickle(spaces: Option<usize>) -> Response {
+    let body = futures::stream::unfold(0, move |n| async move {
+        let chunk: &'static [u8] = match spaces {
+            Some(spaces) if n > spaces => return None,
+            Some(spaces) if n == spaces => br#"{"jsonrpc":"2.0","id":1,"result":{}}"#,
+            _ => b" ",
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Some((Ok::<_, std::io::Error>(axum::body::Bytes::from_static(chunk)), n + 1))
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(body))
+        .unwrap()
+}
+
+/// Plan 8e decision 14: a JSON answer, read whole before any of it goes
+/// down, has `answer_timeout` from its head to arrive. One that trickles
+/// and never ends is 502 `upstream_unreachable` then, not when the client
+/// gives up, and its request permit is free again; one that trickles and
+/// ends in time passes.
+#[tokio::test]
+async fn a_json_answer_that_trickles_past_the_answer_timeout_is_502() {
+    let deadline = Duration::from_secs(2);
+    let limits = Limits::new(1, 8, Duration::from_secs(10), Duration::from_secs(2)).with_answer_timeout(deadline);
+    let s = setup_with(Harness::with_limits(limits).await, CredKind::None, None).await;
+    s.upstream.reply(|_, _| trickle(None));
+    let started = std::time::Instant::now();
+    let resp = tokio::time::timeout(Duration::from_secs(10), s.h.post("linear", &s.token, &ping(1)))
+        .await
+        .expect("no answer within 10 s: the answer timeout did not fire");
+    assert!(started.elapsed() >= deadline, "{:?}", started.elapsed());
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], "upstream_unreachable");
+    // The one request permit is free: a trickle that ends in time passes.
+    s.upstream.reply(|_, _| trickle(Some(6)));
+    let resp = s.h.post("linear", &s.token, &ping(1)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["id"], 1);
+}
+
 /// Plan 8d decision 10: the response head has `head_timeout` to arrive (300
 /// s by default, past the egress client's own deadline); an upstream that
 /// takes the request and never answers is 502 `upstream_unreachable` then
@@ -1148,6 +1202,9 @@ async fn a_refused_server_request_s_answer_takes_the_request_s_session_and_a_per
             None,
         )
         .await;
+        let session =
+            s.h.session_id(&s.upstream, "linear", &s.token, "client-session-9")
+                .await;
         let sampling =
             event(&json!({"jsonrpc": "2.0", "id": "srv-1", "method": "sampling/createMessage", "params": {}}));
         s.upstream.reply(move |seen, hold| {
@@ -1167,7 +1224,7 @@ async fn a_refused_server_request_s_answer_takes_the_request_s_session_and_a_per
                 .post(s.h.url("linear"))
                 .bearer_auth(&s.token)
                 .header(header::CONTENT_TYPE, "application/json")
-                .header("mcp-session-id", "client-session-9")
+                .header("mcp-session-id", &session)
                 .body(ping(1).to_string())
                 .send()
                 .await
