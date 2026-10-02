@@ -27,7 +27,13 @@ export type PendingExtract = { id: string, kind: PendingKind,
  * The permission's option ids. Absent for an elicitation, and for a
  * permission request whose options hennery could not parse.
  */
-option_ids?: Array<string> | null, };
+option_ids?: Array<string> | null, 
+/**
+ * What the question is about, as the agent put it: a permission's tool
+ * call title, an elicitation's message (plan 10b). A push shows it
+ * only under a hat with `details` (kernel spec §6).
+ */
+title?: string | null, };
 
 export type Indexed = { turn_id?: string | null, 
 /**
@@ -68,7 +74,7 @@ current_mode?: string | null,
  */
 current_axes?: { [key in string]: ConfigValue } | null, 
 /**
- * On `pending_opened`: the request's id, kind and option ids.
+ * On `pending_opened`: the request's id, kind, option ids and title.
  */
 pending?: PendingExtract | null, };
 

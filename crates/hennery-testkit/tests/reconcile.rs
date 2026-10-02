@@ -1623,11 +1623,12 @@ fn opened(pending_id: &str, turn_id: &str) -> SessionBody {
         pending_id: pending_id.into(),
         indexed: Indexed {
             turn_id: Some(turn_id.into()),
-            pending: Some(PendingExtract {
+            pending: Some(Box::new(PendingExtract {
                 id: pending_id.into(),
                 kind: PendingKind::Permission,
                 option_ids: Some(vec!["allow".into(), "reject".into()]),
-            }),
+                title: None,
+            })),
             ..Indexed::default()
         },
         payload: json!({"toolCall": {"toolCallId": "call-1"}}),

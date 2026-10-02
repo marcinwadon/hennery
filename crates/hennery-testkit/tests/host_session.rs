@@ -2861,7 +2861,7 @@ fn opened(frames: &[HostFrame]) -> Vec<(PendingExtract, Option<String>, serde_js
                 body: SessionBody::PendingOpened { indexed, payload, .. },
                 ..
             } => Some((
-                indexed.pending.clone().unwrap(),
+                *indexed.pending.clone().unwrap(),
                 indexed.turn_id.clone(),
                 payload.clone(),
             )),
@@ -2931,6 +2931,8 @@ async fn a_permission_request_waits_for_the_operator_and_the_answer_reaches_the_
     );
     // Verbatim, `_meta` and all.
     assert_eq!(payload["toolCall"]["toolCallId"], "call-1");
+    // Its tool call's title, for a push with details (plan 10b).
+    assert_eq!(extract.title.as_deref(), Some("Write notes.txt"));
 
     assert!(handle.send(choose("ra", &pending, "allow")));
     let frames = wait_until(&uplink, has("turn_ended")).await;
@@ -2992,7 +2994,10 @@ async fn an_elicitation_reaches_the_operator_and_the_form_content_reaches_the_ag
     let pending = nth_pending(&uplink, 0).await;
     let frames = uplink.pending().unwrap();
     let (extract, _, payload) = opened(&frames).remove(0);
-    assert_eq!((extract.kind, extract.option_ids), (PendingKind::Elicitation, None));
+    assert_eq!(
+        (extract.kind, extract.option_ids, extract.title.as_deref()),
+        (PendingKind::Elicitation, None, Some("What should the file be called?"))
+    );
     assert_eq!(payload["mode"], "form");
     assert!(handle.send(SessionCmd::Answer {
         request_id: "ra".into(),

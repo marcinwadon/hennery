@@ -436,6 +436,23 @@ fn option_ids(params: &Value) -> Option<Vec<String>> {
     )
 }
 
+/// The most a question's title carries to the collector, in characters.
+const MAX_QUESTION_TITLE: usize = 200;
+
+/// What a question is about, as the agent put it (plan 10b): a permission's
+/// tool call title, an elicitation's message, cut to
+/// `MAX_QUESTION_TITLE` characters. Read from the raw request, as its
+/// option ids are; the collector puts it on one line.
+fn question_title(kind: PendingKind, params: &Value) -> Option<String> {
+    let title = match kind {
+        PendingKind::Permission => params.pointer("/toolCall/title"),
+        PendingKind::Elicitation => params.get("message"),
+    }?
+    .as_str()?;
+    let title: String = title.chars().take(MAX_QUESTION_TITLE).collect();
+    (!title.trim().is_empty()).then_some(title)
+}
+
 /// The adapter's questions waiting for the operator (ACP core §4.6), oldest
 /// first. No timeout: each waits until it is answered or cancelled.
 #[derive(Default)]
@@ -1566,15 +1583,17 @@ impl Actor {
             PendingKind::Permission => option_ids(&params),
             PendingKind::Elicitation => None,
         };
+        let title = question_title(kind, &params);
         self.emit(SessionBody::PendingOpened {
             pending_id: pending_id.clone(),
             indexed: Indexed {
                 turn_id: turn.map(str::to_string),
-                pending: Some(PendingExtract {
+                pending: Some(Box::new(PendingExtract {
                     id: pending_id.clone(),
                     kind,
                     option_ids,
-                }),
+                    title,
+                })),
                 ..Indexed::default()
             },
             payload: params,
