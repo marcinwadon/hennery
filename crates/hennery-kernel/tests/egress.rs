@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use hennery_kernel::egress::{Allowance, Egress, EgressError, Method, Refused, Request, Timeouts, Url};
+use hennery_kernel::egress::{Allowance, Egress, EgressError, Method, Refused, Request, StatusCode, Timeouts, Url};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -158,7 +158,9 @@ async fn a_non_public_literal_is_refused_before_connecting() {
 
 /// Plan 8b (d): a name is resolved by hennery and refused when any address
 /// it resolves to is non-public; the refusal reaches the caller as
-/// `Refused`, not as a transport error.
+/// `Refused`, not as a transport error. `localhost` is answered without the
+/// system resolver; there is no portable name that resolves inward through
+/// it, so the system answer's check is the unit test on `checked`.
 #[tokio::test]
 async fn a_name_resolving_to_a_non_public_address_is_refused() {
     let server = Server::start(Answer::Ok).await;
@@ -198,6 +200,9 @@ async fn a_public_only_request_never_reuses_an_internal_network_connection() {
         .await
         .unwrap();
     assert_eq!(response.text().await.unwrap(), "ok");
+    // Let the finished connection go back to its pool, so a shared pool
+    // would offer it (as in `clones_share_the_policy`).
+    tokio::time::sleep(Duration::from_millis(200)).await;
     let err = within(egress.client(Allowance::PublicOnly).send(get(url)))
         .await
         .unwrap_err();
@@ -319,6 +324,18 @@ async fn a_streaming_body_outlives_the_deadline() {
         body.extend_from_slice(&chunk);
     }
     assert_eq!(body, b"firstlast");
+}
+
+/// Plan 8b (g): `send`'s deadline bounds the whole exchange, body included:
+/// a body still arriving after it fails to read, as a timeout.
+#[tokio::test]
+async fn send_s_deadline_covers_the_body() {
+    let server = Server::start(Answer::SlowBody(Duration::from_millis(2500))).await;
+    let client = short().client(Allowance::InternalNetwork);
+    let response = within(client.send(get(server.url("127.0.0.1")))).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let err = within(response.bytes()).await.unwrap_err();
+    assert!(err.is_timeout(), "{err:?}");
 }
 
 /// Plan 8b (g): a request's own timeout wins over the default, on both
