@@ -840,6 +840,7 @@ fn forget(
         agents: cfg.agents.clone(),
         data_dir: cfg.data_dir.clone(),
         home: cfg.home.clone(),
+        hooks: crate::walk::Hooks::default(),
     };
     let (uplink, sessions) = (uplink.clone(), sessions.clone());
     tokio::spawn(async move {
