@@ -3,7 +3,7 @@
 // "this path resolves to" tester, and purge a hat after seeing what goes.
 // Every change but creating needs a fresh step-up, which the client asks
 // for when the server refuses.
-import { useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { messageOf } from '../api/errors'
 import { createHat, hats as listHats, hosts as listHosts, purgeHat, purgePreview, updateHat } from '../api/manage'
 import { useClient } from '../app-client'
@@ -26,10 +26,16 @@ export default function Hats() {
   const [purge, setPurge] = useState<{ hat: HatItem; preview: PurgePreview } | null>(null)
   const [purged, setPurged] = useState<{ name: string; result: PurgeResult } | null>(null)
   const [error, setError] = useState<string | null>(null)
+  // A purge deletes the hat's path rules on the server: every purge tried,
+  // whether it finished or not, has the rules read again.
+  const [purges, setPurges] = useState(0)
+  const purgeTried = useRef(false)
 
+  // As functions of the list held, so two changes landing together both
+  // stay.
   const replace = (hat: HatItem) =>
-    hats.set(
-      (hats.data ?? []).map((h) => {
+    hats.set((prev) =>
+      (prev ?? []).map((h) => {
         if (h.id === hat.id) return hat
         // Only one hat is the default for new hosts.
         return hat.default_for_new_hosts ? { ...h, default_for_new_hosts: false } : h
@@ -45,17 +51,18 @@ export default function Hats() {
     }
   }
 
-  const shownError = hats.error ?? error
-
   return (
     <div className="manage">
       <header className="manage-head">
         <h1>Hats</h1>
       </header>
-      {shownError && (
-        <p className="form-error" role="alert">
-          <Text>{shownError}</Text>
-        </p>
+      {[hats.error, hosts.error, error].map(
+        (shown, i) =>
+          shown && (
+            <p key={i} className="form-error" role="alert">
+              <Text>{shown}</Text>
+            </p>
+          ),
       )}
       {purged && (
         <PurgeOutcome name={purged.name} result={purged.result} onClose={() => setPurged(null)} />
@@ -71,18 +78,29 @@ export default function Hats() {
           />
         ))}
       </ul>
-      <NewHat onCreated={(hat) => hats.set([...(hats.data ?? []), hat])} />
-      <PathRules hosts={(hosts.data ?? []).filter((h) => h.revoked_at === undefined)} hats={hats.data ?? []} />
+      <NewHat onCreated={(hat) => hats.set((prev) => [...(prev ?? []), hat])} />
+      <PathRules
+        hosts={(hosts.data ?? []).filter((h) => h.revoked_at === undefined)}
+        hats={hats.data ?? []}
+        purges={purges}
+      />
       {purge && (
         <PurgeDialog
           hat={purge.hat}
           preview={purge.preview}
           hosts={hosts.data ?? []}
-          onPurged={(result) => {
-            setPurged({ name: purge.hat.name, result })
-            hats.reload()
+          onTried={() => (purgeTried.current = true)}
+          onPurged={(result) => setPurged({ name: purge.hat.name, result })}
+          onClose={() => {
+            setPurge(null)
+            // A purge that failed may have frozen the hat ("Resume purge")
+            // and deleted its rules already: both are read again.
+            if (purgeTried.current) {
+              purgeTried.current = false
+              hats.reload()
+              setPurges((n) => n + 1)
+            }
           }}
-          onClose={() => setPurge(null)}
         />
       )}
     </div>
@@ -112,12 +130,29 @@ function HatCard({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const titleId = `hat-${hat.id}`
+  // A closed form or a done "Make default for new hosts" takes the focused
+  // control away: focus goes to "Edit", or to the card's title.
+  const title = useRef<HTMLHeadingElement>(null)
+  const editButton = useRef<HTMLButtonElement>(null)
+  const refocus = useRef<'edit' | 'title' | null>(null)
+  useEffect(() => {
+    if (refocus.current === null) return
+    const to = refocus.current === 'edit' ? editButton.current : title.current
+    refocus.current = null
+    to?.focus()
+  })
 
-  const change = async (body: Parameters<typeof updateHat>[2]) => {
+  const closeForm = () => {
+    refocus.current = 'edit'
+    setEditing(false)
+  }
+
+  const change = async (body: Parameters<typeof updateHat>[2], then: 'edit' | 'title') => {
     setBusy(true)
     setError(null)
     try {
       onChanged(await updateHat(client, hat.id, body))
+      refocus.current = then
       setEditing(false)
     } catch (err) {
       setError(messageOf(err))
@@ -131,15 +166,15 @@ function HatCard({
     const body: Parameters<typeof updateHat>[2] = {}
     if (name.trim() !== hat.name) body.name = name.trim()
     if (colour !== hat.colour) body.colour = colour
-    if (Object.keys(body).length === 0) setEditing(false)
-    else change(body)
+    if (Object.keys(body).length === 0) closeForm()
+    else change(body, 'edit')
   }
 
   return (
     <li className="card hat" aria-labelledby={titleId}>
       <div className="card-head">
         <Swatch colour={hat.colour} />
-        <h2 className="card-title" id={titleId}>
+        <h2 className="card-title" id={titleId} ref={title} tabIndex={-1}>
           <Text>{hat.name}</Text>
         </h2>
         {hat.default_for_new_hosts && <span className="tag">Default for new hosts</span>}
@@ -158,7 +193,7 @@ function HatCard({
           <button type="submit" className="btn btn-primary btn-sm" disabled={busy}>
             Save
           </button>
-          <button type="button" className="btn btn-ghost btn-sm" onClick={() => setEditing(false)} disabled={busy}>
+          <button type="button" className="btn btn-ghost btn-sm" onClick={closeForm} disabled={busy}>
             Cancel
           </button>
         </form>
@@ -167,6 +202,7 @@ function HatCard({
           <button
             type="button"
             className="btn btn-ghost btn-sm"
+            ref={editButton}
             onClick={() => {
               setName(hat.name)
               setColour(safeColour(hat.colour) ?? NEW_COLOUR)
@@ -180,7 +216,7 @@ function HatCard({
             <button
               type="button"
               className="btn btn-ghost btn-sm"
-              onClick={() => change({ default_for_new_hosts: true })}
+              onClick={() => change({ default_for_new_hosts: true }, 'title')}
               disabled={busy}
             >
               Make default for new hosts
@@ -210,6 +246,7 @@ function NewHat({ onCreated }: { onCreated: (hat: HatItem) => void }) {
   const [colour, setColour] = useState(NEW_COLOUR)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const nameInput = useRef<HTMLInputElement>(null)
 
   const submit = async (e: FormEvent) => {
     e.preventDefault()
@@ -218,6 +255,9 @@ function NewHat({ onCreated }: { onCreated: (hat: HatItem) => void }) {
     try {
       onCreated(await createHat(client, { name: name.trim(), colour }))
       setName('')
+      // "Create" is disabled with the name empty: focus goes to the name,
+      // ready for the next hat.
+      nameInput.current?.focus()
     } catch (err) {
       setError(messageOf(err))
     } finally {
@@ -233,7 +273,14 @@ function NewHat({ onCreated }: { onCreated: (hat: HatItem) => void }) {
       <form className="inline-form" onSubmit={submit}>
         <label className="field">
           <span className="field-label">Name</span>
-          <input className="text-input" value={name} maxLength={64} required onChange={(e) => setName(e.target.value)} />
+          <input
+            ref={nameInput}
+            className="text-input"
+            value={name}
+            maxLength={64}
+            required
+            onChange={(e) => setName(e.target.value)}
+          />
         </label>
         <label className="field">
           <span className="field-label">Colour</span>
@@ -256,12 +303,14 @@ function PurgeDialog({
   hat,
   preview,
   hosts,
+  onTried,
   onPurged,
   onClose,
 }: {
   hat: HatItem
   preview: PurgePreview
   hosts: HostItem[]
+  onTried: () => void
   onPurged: (result: PurgeResult) => void
   onClose: () => void
 }) {
@@ -274,7 +323,10 @@ function PurgeDialog({
       confirm={state === 'resume' ? 'Resume purge' : 'Purge'}
       danger
       disabled={blocked}
-      action={async () => onPurged(await purgeHat(client, hat.id))}
+      action={async () => {
+        onTried()
+        onPurged(await purgeHat(client, hat.id))
+      }}
       onClose={onClose}
     >
       <p>

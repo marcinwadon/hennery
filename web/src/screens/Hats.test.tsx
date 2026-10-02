@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it } from 'vitest'
 import App from '../App'
 import { hat, host, preview } from '../test-fixtures'
 import { FULL, json, stubServer, type Answer } from '../test-server'
+import { loadManageCss, shortTargets } from '../test-targets'
 
 const STEP_UP = json(403, { code: 'step_up_required', message: 'm' })
 const PERSONAL = hat({ id: 'hat-a', name: 'Personal', colour: '#4c5fd5', default_for_new_hosts: true })
@@ -93,6 +94,83 @@ describe('the hats', () => {
       { default_for_new_hosts: true },
     ])
   })
+
+  it('keeps both of two changes that land together', async () => {
+    let answerPatch: (r: Response) => void = () => {}
+    open({
+      'PATCH /api/hats/hat-b': () => new Promise<Response>((resolve) => (answerPatch = resolve)),
+      'POST /api/hats': json(201, hat({ id: 'hat-c', name: 'Clients' })),
+    })
+    const work = await screen.findByRole('listitem', { name: 'Work' })
+    await userEvent.click(within(work).getByRole('button', { name: 'Make default for new hosts' }))
+    await userEvent.type(screen.getByRole('textbox', { name: 'Name' }), 'Clients')
+    await userEvent.click(screen.getByRole('button', { name: 'Create' }))
+    expect(await screen.findByRole('listitem', { name: 'Clients' })).toBeInTheDocument()
+    answerPatch(json(200, hat({ default_for_new_hosts: true })))
+    await waitFor(() => expect(within(screen.getByRole('listitem', { name: 'Work' })).getByText('Default for new hosts')).toBeInTheDocument())
+    expect(screen.getByRole('listitem', { name: 'Clients' })).toBeInTheDocument()
+    expect(within(screen.getByRole('listitem', { name: 'Personal' })).queryByText('Default for new hosts')).toBeNull()
+  })
+
+  it('keeps a change that lands while a new hat is being created', async () => {
+    let answerCreate: (r: Response) => void = () => {}
+    open({
+      'PATCH /api/hats/hat-b': json(200, hat({ default_for_new_hosts: true })),
+      'POST /api/hats': () => new Promise<Response>((resolve) => (answerCreate = resolve)),
+    })
+    await userEvent.type(await screen.findByRole('textbox', { name: 'Name' }), 'Clients')
+    await userEvent.click(screen.getByRole('button', { name: 'Create' }))
+    await userEvent.click(within(screen.getByRole('listitem', { name: 'Work' })).getByRole('button', { name: 'Make default for new hosts' }))
+    await waitFor(() => expect(within(screen.getByRole('listitem', { name: 'Work' })).getByText('Default for new hosts')).toBeInTheDocument())
+    answerCreate(json(201, hat({ id: 'hat-c', name: 'Clients' })))
+    expect(await screen.findByRole('listitem', { name: 'Clients' })).toBeInTheDocument()
+    expect(within(screen.getByRole('listitem', { name: 'Work' })).getByText('Default for new hosts')).toBeInTheDocument()
+  })
+
+  it('returns focus to Edit after an edit is saved', async () => {
+    open({ 'PATCH /api/hats/hat-b': json(200, hat({ name: 'Day job' })) })
+    const work = await screen.findByRole('listitem', { name: 'Work' })
+    await userEvent.click(within(work).getByRole('button', { name: 'Edit' }))
+    await userEvent.type(within(work).getByRole('textbox', { name: 'Name' }), ' 2')
+    await userEvent.click(within(work).getByRole('button', { name: 'Save' }))
+    const dayJob = await screen.findByRole('listitem', { name: 'Day job' })
+    await waitFor(() => expect(within(dayJob).getByRole('button', { name: 'Edit' })).toHaveFocus())
+  })
+
+  it('puts focus on the card’s title once “Make default for new hosts” is gone', async () => {
+    open({ 'PATCH /api/hats/hat-b': json(200, hat({ default_for_new_hosts: true })) })
+    const work = await screen.findByRole('listitem', { name: 'Work' })
+    await userEvent.click(within(work).getByRole('button', { name: 'Make default for new hosts' }))
+    await waitFor(() => expect(within(work).queryByRole('button', { name: 'Make default for new hosts' })).toBeNull())
+    expect(within(work).getByRole('heading', { name: 'Work' })).toHaveFocus()
+  })
+
+  it('puts focus back in the name after a hat is created', async () => {
+    open({ 'POST /api/hats': json(201, hat({ id: 'hat-c', name: 'Clients' })) })
+    const name = await screen.findByRole('textbox', { name: 'Name' })
+    await userEvent.type(name, 'Clients')
+    await userEvent.click(screen.getByRole('button', { name: 'Create' }))
+    expect(await screen.findByRole('listitem', { name: 'Clients' })).toBeInTheDocument()
+    expect(name).toHaveFocus()
+  })
+
+  it('says so when the hosts cannot be read', async () => {
+    open({ 'GET /api/hosts': json(500, { code: 'internal', message: 'the hosts are away' }) })
+    expect(await screen.findByRole('alert')).toHaveTextContent('the hosts are away')
+  })
+
+  it('has every button, picker and colour at least 44 px tall under 768 px', async () => {
+    const unload = loadManageCss()
+    try {
+      open({ 'GET /api/hosts/host-1/path-rules': json(200, [{ id: 'r-1', prefix: '/home/me/work', hat_id: 'hat-b', verified: true }]) })
+      await screen.findByDisplayValue('/home/me/work')
+      const work = screen.getByRole('listitem', { name: 'Work' })
+      await userEvent.click(within(work).getByRole('button', { name: 'Edit' }))
+      expect(shortTargets(document.querySelector('.manage')!)).toEqual([])
+    } finally {
+      unload()
+    }
+  })
 })
 
 describe('purging a hat', () => {
@@ -145,6 +223,41 @@ describe('purging a hat', () => {
     await userEvent.click(within(dialog).getByRole('button', { name: 'Resume purge' }))
     expect(await screen.findByRole('status', { name: 'Purged Work' })).toBeInTheDocument()
     expect(sent(server, 'POST', '/api/hats/hat-b/purge')).toHaveLength(1)
+  })
+
+  it('reads the hats again when a purge fails, so a hat it froze offers “Resume purge”', async () => {
+    open({
+      'GET /api/hats': [json(200, [PERSONAL, WORK]), json(200, [PERSONAL, hat({ purging: true })])],
+      'GET /api/hats/hat-b/purge': json(200, preview()),
+      'POST /api/hats/hat-b/purge': json(500, { code: 'internal', message: 'stopped half way' }),
+    })
+    await userEvent.click(within(await screen.findByRole('listitem', { name: 'Work' })).getByRole('button', { name: 'Purge' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Purge this hat?' })
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Purge' }))
+    expect(await within(dialog).findByRole('alert')).toHaveTextContent('stopped half way')
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+    expect(await within(screen.getByRole('listitem', { name: 'Work' })).findByRole('button', { name: 'Resume purge' })).toBeInTheDocument()
+  })
+
+  it('reads the rules again after a purge, which deleted the hat’s, and asks the tester again', async () => {
+    const server = open({
+      'GET /api/hosts/host-1/path-rules': [json(200, [{ id: 'r-1', prefix: '/home/me/work', hat_id: 'hat-b', verified: true }]), json(200, [])],
+      'GET /api/hats/hat-b/purge': json(200, preview()),
+      'POST /api/hats/hat-b/purge': json(200, result),
+      'POST /api/hats/resolve': [
+        json(200, { canonical: '/home/me/work/app', exists: true, is_dir: true, hat_id: 'hat-b', rule_id: 'r-1' }),
+        json(200, { canonical: '/home/me/work/app', exists: true, is_dir: true, hat_id: 'hat-a' }),
+      ],
+    })
+    await screen.findByDisplayValue('/home/me/work')
+    await userEvent.type(screen.getByLabelText('Test a path'), '/home/me/work/app')
+    expect(await screen.findByLabelText('Resolution', {}, { timeout: 2000 })).toHaveTextContent('a path rule')
+    await userEvent.click(within(screen.getByRole('listitem', { name: 'Work' })).getByRole('button', { name: 'Purge' }))
+    await userEvent.click(within(await screen.findByRole('dialog', { name: 'Purge this hat?' })).getByRole('button', { name: 'Purge' }))
+    expect(await screen.findByText('No rules: every session on this host gets its default hat.')).toBeInTheDocument()
+    expect(screen.queryByDisplayValue('/home/me/work')).toBeNull()
+    await waitFor(() => expect(screen.getByLabelText('Resolution')).toHaveTextContent('the host’s default hat'), { timeout: 2000 })
+    expect(sent(server, 'POST', '/api/hats/resolve')).toHaveLength(2)
   })
 
   it('lists the sessions of no hat, which no purge deletes', async () => {
@@ -205,6 +318,30 @@ describe('path rules', () => {
     expect(within(picker).getByRole('option', { name: 'Work' })).toBeDisabled()
   })
 
+  it('cannot save a rule with no path, and says why', async () => {
+    open({ 'GET /api/hosts/host-1/path-rules': json(200, RULES) })
+    await screen.findByDisplayValue('/home/me/work')
+    expect(screen.getByRole('button', { name: 'Save rules' })).toBeEnabled()
+    await userEvent.click(screen.getByRole('button', { name: 'Add rule' }))
+    await userEvent.type(screen.getByLabelText('Path 2'), '   ')
+    expect(screen.getByRole('button', { name: 'Save rules' })).toBeDisabled()
+    expect(screen.getByText('Every rule needs a path.')).toBeInTheDocument()
+    await userEvent.type(screen.getByLabelText('Path 2'), '/srv')
+    expect(screen.getByRole('button', { name: 'Save rules' })).toBeEnabled()
+  })
+
+  it('moves focus to the next rule when one is removed, and to “Add rule” after the last', async () => {
+    open({
+      'GET /api/hosts/host-1/path-rules': json(200, [...RULES, { id: 'r-2', prefix: '/srv', hat_id: 'hat-a', verified: true }]),
+    })
+    await screen.findByDisplayValue('/home/me/work')
+    await userEvent.click(screen.getByRole('button', { name: 'Remove rule 1' }))
+    expect(screen.getByLabelText('Path 1')).toHaveValue('/srv')
+    expect(screen.getByLabelText('Path 1')).toHaveFocus()
+    await userEvent.click(screen.getByRole('button', { name: 'Remove rule 1' }))
+    expect(screen.getByRole('button', { name: 'Add rule' })).toHaveFocus()
+  })
+
   it('says why a set was refused', async () => {
     open({
       'GET /api/hosts/host-1/path-rules': json(200, RULES),
@@ -259,6 +396,52 @@ describe('the path tester', () => {
     answerFirst(json(200, { canonical: '/srv/a', exists: true, is_dir: true, hat_id: 'hat-b' }))
     await new Promise((r) => setTimeout(r, 50))
     expect(screen.getByLabelText('Resolution')).toHaveTextContent('/srv/b')
+  })
+
+  it('asks again after the rules are saved, since it answers under the rules as saved', async () => {
+    open({
+      'GET /api/hosts/host-1/path-rules': json(200, []),
+      'PUT /api/hosts/host-1/path-rules': json(200, [{ id: 'r-1', prefix: '/srv', hat_id: 'hat-b', verified: true }]),
+      'POST /api/hats/resolve': [
+        json(200, { canonical: '/srv/x', exists: true, is_dir: true, hat_id: 'hat-a' }),
+        json(200, { canonical: '/srv/x', exists: true, is_dir: true, hat_id: 'hat-b', rule_id: 'r-1' }),
+      ],
+    })
+    await userEvent.type(await screen.findByLabelText('Test a path'), '/srv/x')
+    expect(await screen.findByLabelText('Resolution', {}, { timeout: 2000 })).toHaveTextContent('the host’s default hat')
+    await userEvent.click(screen.getByRole('button', { name: 'Add rule' }))
+    await userEvent.type(screen.getByLabelText('Path 1'), '/srv')
+    await userEvent.click(screen.getByRole('button', { name: 'Save rules' }))
+    await waitFor(() => expect(screen.getByLabelText('Resolution')).toHaveTextContent('a path rule'), { timeout: 2000 })
+    expect(screen.getByLabelText('Test a path')).toHaveValue('/srv/x')
+  })
+
+  it('shows no answer for a path typed after it', async () => {
+    open({ 'POST /api/hats/resolve': json(200, { canonical: '/srv/x', exists: true, is_dir: true, hat_id: 'hat-a' }) })
+    const tester = await screen.findByLabelText('Test a path')
+    await userEvent.type(tester, '/srv/x')
+    expect(await screen.findByLabelText('Resolution', {}, { timeout: 2000 })).toBeInTheDocument()
+    await userEvent.type(tester, 'y')
+    expect(screen.queryByLabelText('Resolution')).toBeNull()
+  })
+
+  it('announces each answer once: in one live region, nested in none', async () => {
+    open({
+      'POST /api/hats/resolve': [
+        json(409, { code: 'host_offline', message: 'm' }),
+        json(200, { canonical: '/srv/xy', exists: true, is_dir: true, hat_id: 'hat-a' }),
+      ],
+    })
+    const LIVE = '[role="status"], [role="alert"], [aria-live]:not([aria-live="off"])'
+    const nested = () => [...document.querySelectorAll(LIVE)].filter((r) => r.parentElement?.closest(LIVE))
+    const tester = await screen.findByLabelText('Test a path')
+    await userEvent.type(tester, '/srv/x')
+    await screen.findByText('The host is offline: it resolves the path.', {}, { timeout: 2000 })
+    expect(nested()).toEqual([])
+    await userEvent.type(tester, 'y')
+    const resolution = await screen.findByLabelText('Resolution', {}, { timeout: 2000 })
+    expect(resolution.closest(LIVE)).not.toBeNull()
+    expect(nested()).toEqual([])
   })
 
   it.each([

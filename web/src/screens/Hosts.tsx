@@ -1,7 +1,7 @@
 // Hosts (frontend spec §8, kernel spec §4): every paired host, revoked ones
 // included, with its online state and versions; pairing a new one; and
 // renaming, re-hatting or revoking one, each confirmed, then stepped up.
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { messageOf } from '../api/errors'
 import { hats as listHats, hosts as listHosts, mintPairingCode, revokeHost, settings, updateHost } from '../api/manage'
 import { useClient } from '../app-client'
@@ -14,16 +14,26 @@ import { Text, visible } from '../lib/text'
 import When from '../components/When'
 import '../manage.css'
 
+/** Each carries where focus goes when the confirmation closes and what
+ *  opened it is gone. */
 type Pending =
-  | { kind: 'rename'; host: HostItem; name: string }
-  | { kind: 'default_hat'; host: HostItem; hat: HatItem }
-  | { kind: 'revoke'; host: HostItem }
+  | { kind: 'rename'; host: HostItem; name: string; back: () => HTMLElement | null }
+  | { kind: 'default_hat'; host: HostItem; hat: HatItem; back: () => HTMLElement | null }
+  | { kind: 'revoke'; host: HostItem; back: () => HTMLElement | null }
+
+/** The pairing panel: a new one per code (`n`), and the code itself until
+ *  it is spent. */
+interface Panel {
+  n: number
+  minted: Minted | null
+}
 
 export default function Hosts() {
   const client = useClient()
   const list = useResource(() => listHosts(client))
   const hatList = useResource(() => listHats(client))
-  const [minted, setMinted] = useState<Minted | null>(null)
+  const [panel, setPanel] = useState<Panel | null>(null)
+  const minted = panel?.minted ?? null
   const [adding, setAdding] = useState(false)
   const [addError, setAddError] = useState<string | null>(null)
   const [pending, setPending] = useState<Pending | null>(null)
@@ -38,7 +48,7 @@ export default function Hosts() {
       const s = await settings(client)
       const known = (await listHosts(client)).map((h) => h.host_id)
       const code = await mintPairingCode(client)
-      setMinted({ code: code.code, publicUrl: s.public_url, known })
+      setPanel((p) => ({ n: (p?.n ?? 0) + 1, minted: { code: code.code, publicUrl: s.public_url, known } }))
     } catch (err) {
       setAddError(messageOf(err))
     } finally {
@@ -49,12 +59,12 @@ export default function Hosts() {
   // A page restored from the back-forward cache must not show a code: it
   // is dropped as the page is hidden. Switching tabs to paste it keeps it.
   useEffect(() => {
-    const drop = () => setMinted(null)
+    const drop = () => setPanel(null)
     window.addEventListener('pagehide', drop)
     return () => window.removeEventListener('pagehide', drop)
   }, [])
 
-  const replace = (host: HostItem) => list.set((list.data ?? []).map((h) => (h.host_id === host.host_id ? host : h)))
+  const replace = (host: HostItem) => list.set((prev) => (prev ?? []).map((h) => (h.host_id === host.host_id ? host : h)))
 
   const hatName = (id: string) => hatList.data?.find((h) => h.id === id)?.name
 
@@ -71,16 +81,23 @@ export default function Hosts() {
           <Text>{addError}</Text>
         </p>
       )}
-      {minted && (
+      {panel && (
         <Pairing
-          minted={minted}
+          key={panel.n}
+          minted={panel.minted}
           onPaired={list.reload}
-          onClose={() => setMinted(null)}
+          onSpent={() => setPanel((p) => p && { ...p, minted: null })}
+          onClose={() => setPanel(null)}
         />
       )}
       {list.error && (
         <p className="form-error" role="alert">
           <Text>{list.error}</Text>
+        </p>
+      )}
+      {hatList.error && (
+        <p className="form-error" role="alert">
+          <Text>{hatList.error}</Text>
         </p>
       )}
       {list.data && list.data.length === 0 && <p className="empty">No host is paired yet.</p>}
@@ -91,9 +108,9 @@ export default function Hosts() {
             host={host}
             hats={hatList.data ?? []}
             hatName={hatName(host.default_hat_id)}
-            onRename={(name) => setPending({ kind: 'rename', host, name })}
-            onDefaultHat={(hat) => setPending({ kind: 'default_hat', host, hat })}
-            onRevoke={() => setPending({ kind: 'revoke', host })}
+            onRename={(name, back) => setPending({ kind: 'rename', host, name, back })}
+            onDefaultHat={(hat, back) => setPending({ kind: 'default_hat', host, hat, back })}
+            onRevoke={(back) => setPending({ kind: 'revoke', host, back })}
           />
         ))}
       </ul>
@@ -103,6 +120,7 @@ export default function Hosts() {
           confirm="Rename"
           action={async () => replace(await updateHost(client, pending.host.host_id, { name: pending.name }))}
           onClose={() => setPending(null)}
+          returnFocus={pending.back}
         >
           <p>
             <Text>{pending.host.name}</Text> becomes <Text>{pending.name}</Text>.
@@ -115,6 +133,7 @@ export default function Hosts() {
           confirm="Change"
           action={async () => replace(await updateHost(client, pending.host.host_id, { default_hat_id: pending.hat.id }))}
           onClose={() => setPending(null)}
+          returnFocus={pending.back}
         >
           <p>
             Sessions on <Text>{pending.host.name}</Text> that no path rule covers will belong to{' '}
@@ -133,6 +152,7 @@ export default function Hosts() {
           danger
           action={async () => replace(await revokeHost(client, pending.host.host_id))}
           onClose={() => setPending(null)}
+          returnFocus={pending.back}
         >
           <p>
             <Text>{pending.host.name}</Text> can no longer connect, and its sessions are parked. Pairing it again
@@ -145,13 +165,17 @@ export default function Hosts() {
   )
 }
 
+/** Where focus goes when a confirmation closes and what opened it is
+ *  gone. */
+type Back = () => HTMLElement | null
+
 interface CardProps {
   host: HostItem
   hats: HatItem[]
   hatName?: string
-  onRename: (name: string) => void
-  onDefaultHat: (hat: HatItem) => void
-  onRevoke: () => void
+  onRename: (name: string, back: Back) => void
+  onDefaultHat: (hat: HatItem, back: Back) => void
+  onRevoke: (back: Back) => void
 }
 
 function HostCard({ host, hats, hatName, onRename, onDefaultHat, onRevoke }: CardProps) {
@@ -159,11 +183,31 @@ function HostCard({ host, hats, hatName, onRename, onDefaultHat, onRevoke }: Car
   const [renaming, setRenaming] = useState(false)
   const [name, setName] = useState(host.name)
   const titleId = `host-${host.host_id}`
+  // The rename form hides as it closes, taking focus with it: focus goes
+  // back to "Rename". A revoke takes every button away: focus goes to the
+  // card's title.
+  const title = useRef<HTMLHeadingElement>(null)
+  const rename = useRef<HTMLButtonElement>(null)
+  const refocus = useRef(false)
+  const toRename = () => rename.current
+  const toTitle = () => title.current
+
+  useEffect(() => {
+    if (!renaming && refocus.current) {
+      refocus.current = false
+      rename.current?.focus()
+    }
+  }, [renaming])
+
+  const closeForm = () => {
+    refocus.current = true
+    setRenaming(false)
+  }
 
   return (
     <li className={`card host host-${state}`} aria-labelledby={titleId}>
       <div className="card-head">
-        <h2 className="card-title" id={titleId}>
+        <h2 className="card-title" id={titleId} ref={title} tabIndex={-1}>
           <Text>{host.name}</Text>
         </h2>
         <span className={`state state-${state}`}>{HOST_STATE_LABEL[state]}</span>
@@ -203,8 +247,14 @@ function HostCard({ host, hats, hatName, onRename, onDefaultHat, onRevoke }: Car
               className="inline-form"
               onSubmit={(e) => {
                 e.preventDefault()
+                const trimmed = name.trim()
+                if (trimmed === '' || trimmed === host.name) {
+                  closeForm()
+                  return
+                }
+                // The confirmation returns focus to "Rename".
                 setRenaming(false)
-                if (name.trim() !== '' && name !== host.name) onRename(name.trim())
+                onRename(trimmed, toRename)
               }}
             >
               <label className="field">
@@ -220,7 +270,7 @@ function HostCard({ host, hats, hatName, onRename, onDefaultHat, onRevoke }: Car
               <button type="submit" className="btn btn-primary btn-sm">
                 Save
               </button>
-              <button type="button" className="btn btn-ghost btn-sm" onClick={() => setRenaming(false)}>
+              <button type="button" className="btn btn-ghost btn-sm" onClick={closeForm}>
                 Cancel
               </button>
             </form>
@@ -229,6 +279,7 @@ function HostCard({ host, hats, hatName, onRename, onDefaultHat, onRevoke }: Car
               <button
                 type="button"
                 className="btn btn-ghost btn-sm"
+                ref={rename}
                 onClick={() => {
                   setName(host.name)
                   setRenaming(true)
@@ -242,7 +293,7 @@ function HostCard({ host, hats, hatName, onRename, onDefaultHat, onRevoke }: Car
                   value={host.default_hat_id}
                   onChange={(e) => {
                     const hat = hats.find((h) => h.id === e.target.value)
-                    if (hat) onDefaultHat(hat)
+                    if (hat) onDefaultHat(hat, toTitle)
                   }}
                 >
                   {hats
@@ -255,7 +306,7 @@ function HostCard({ host, hats, hatName, onRename, onDefaultHat, onRevoke }: Car
                 </select>
               </label>
               <span className="spacer" />
-              <button type="button" className="btn btn-danger btn-sm" onClick={onRevoke}>
+              <button type="button" className="btn btn-danger btn-sm" onClick={() => onRevoke(toTitle)}>
                 Revoke
               </button>
             </>

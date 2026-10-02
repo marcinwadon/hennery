@@ -2,7 +2,7 @@
 // sent back whole (step-up; the host must be connected, since it resolves
 // each prefix). Beside it, a live tester: which hat a path on that host
 // resolves to under the rules as SAVED, as a session started there would
-// get.
+// get: it asks again whenever they are saved, or a purge deleted some.
 import { useEffect, useRef, useState } from 'react'
 import { ApiFailure, messageOf } from '../api/errors'
 import { pathRules, replacePathRules, resolveHat } from '../api/manage'
@@ -14,8 +14,10 @@ import { Text, visible } from '../lib/text'
 /** How long typing pauses before the tester asks the host. */
 export const TEST_DELAY_MS = 400
 
-export default function PathRules({ hosts, hats }: { hosts: HostItem[]; hats: HatItem[] }) {
+/** `purges` counts the purges tried: each may have deleted rules here. */
+export default function PathRules({ hosts, hats, purges }: { hosts: HostItem[]; hats: HatItem[]; purges: number }) {
   const [hostId, setHostId] = useState<string | null>(null)
+  const [saves, setSaves] = useState(0)
   const host = hosts.find((h) => h.host_id === hostId) ?? hosts[0]
 
   if (!host) {
@@ -47,8 +49,10 @@ export default function PathRules({ hosts, hats }: { hosts: HostItem[]; hats: Ha
           ))}
         </select>
       </label>
-      <Rules key={host.host_id} host={host} hats={hats} />
-      <Tester key={`t-${host.host_id}`} host={host} hats={hats} />
+      {/* After a purge the rules are read again; after a save, the answer
+          is the set as stored already. The tester asks again after both. */}
+      <Rules key={`${host.host_id}-${purges}`} host={host} hats={hats} onSaved={() => setSaves((n) => n + 1)} />
+      <Tester key={`t-${host.host_id}`} host={host} hats={hats} rules={`${purges}.${saves}`} />
     </section>
   )
 }
@@ -64,7 +68,7 @@ function rowsOf(rules: PathRuleItem[], next: () => number): Row[] {
   return rules.map((r) => ({ key: next(), prefix: r.prefix, hat_id: r.hat_id, verified: r.verified }))
 }
 
-function Rules({ host, hats }: { host: HostItem; hats: HatItem[] }) {
+function Rules({ host, hats, onSaved }: { host: HostItem; hats: HatItem[]; onSaved: () => void }) {
   const client = useClient()
   const counter = useRef(0)
   const next = () => ++counter.current
@@ -74,6 +78,17 @@ function Rules({ host, hats }: { host: HostItem; hats: HatItem[] }) {
   const [saved, setSaved] = useState(false)
   const stored = useResource(() => pathRules(client, host.host_id), [host.host_id])
   const usable = hats.filter((h) => !h.purging)
+  // A removed row takes its focused button away: focus goes to the next
+  // row's path, or to "Add rule" after the last.
+  const inputs = useRef(new Map<number, HTMLInputElement>())
+  const addRule = useRef<HTMLButtonElement>(null)
+  const refocus = useRef<number | 'add' | null>(null)
+  useEffect(() => {
+    if (refocus.current === null) return
+    const to = refocus.current === 'add' ? addRule.current : inputs.current.get(refocus.current)
+    refocus.current = null
+    to?.focus()
+  })
 
   useEffect(() => {
     if (stored.data) setRows(rowsOf(stored.data, next))
@@ -94,6 +109,7 @@ function Rules({ host, hats }: { host: HostItem; hats: HatItem[] }) {
       // it, never from what was typed.
       stored.set(await replacePathRules(client, host.host_id, body))
       setSaved(true)
+      onSaved()
     } catch (err) {
       setError(messageOf(err))
     } finally {
@@ -109,6 +125,8 @@ function Rules({ host, hats }: { host: HostItem; hats: HatItem[] }) {
     )
   }
   if (!rows) return <p role="status">Loading the rules…</p>
+  // The server refuses a whole set for one blank path.
+  const blank = rows.some((r) => r.prefix.trim() === '')
 
   return (
     <div className="rules">
@@ -119,6 +137,10 @@ function Rules({ host, hats }: { host: HostItem; hats: HatItem[] }) {
             <label className="field rule-prefix">
               <span className="field-label">Path {i + 1}</span>
               <input
+                ref={(el) => {
+                  if (el) inputs.current.set(row.key, el)
+                  else inputs.current.delete(row.key)
+                }}
                 className="text-input mono"
                 value={row.prefix}
                 placeholder="/home/me/work"
@@ -153,6 +175,7 @@ function Rules({ host, hats }: { host: HostItem; hats: HatItem[] }) {
               aria-label={`Remove rule ${i + 1}`}
               onClick={() => {
                 setSaved(false)
+                refocus.current = rows[i + 1]?.key ?? 'add'
                 setRows(rows.filter((r) => r.key !== row.key))
               }}
             >
@@ -165,6 +188,7 @@ function Rules({ host, hats }: { host: HostItem; hats: HatItem[] }) {
         <button
           type="button"
           className="btn btn-ghost btn-sm"
+          ref={addRule}
           disabled={usable.length === 0}
           onClick={() => {
             setSaved(false)
@@ -174,10 +198,11 @@ function Rules({ host, hats }: { host: HostItem; hats: HatItem[] }) {
           Add rule
         </button>
         <span className="spacer" />
-        <button type="button" className="btn btn-primary btn-sm" onClick={save} disabled={busy}>
+        <button type="button" className="btn btn-primary btn-sm" onClick={save} disabled={busy || blank}>
           Save rules
         </button>
       </div>
+      {blank && <p className="hint">Every rule needs a path.</p>}
       {!host.connected && <p className="hint">The host is offline: rules can be saved only while it is connected.</p>}
       {saved && <p role="status">Saved.</p>}
       {error && (
@@ -191,19 +216,19 @@ function Rules({ host, hats }: { host: HostItem; hats: HatItem[] }) {
 
 type Verdict = { kind: 'idle' } | { kind: 'asking' } | { kind: 'resolved'; resolution: HatResolution } | { kind: 'failed'; error: string }
 
-function Tester({ host, hats }: { host: HostItem; hats: HatItem[] }) {
+/** `rules` names the saved set: a new value asks again. */
+function Tester({ host, hats, rules }: { host: HostItem; hats: HatItem[]; rules: string }) {
   const client = useClient()
   const [path, setPath] = useState('')
   const [verdict, setVerdict] = useState<Verdict>({ kind: 'idle' })
 
   // Each change waits for typing to pause, then asks; a newer path aborts
-  // the older question, so an answer never lands on the wrong path.
+  // the older question, so an answer never lands on the wrong path, and
+  // the last answer goes as soon as the path or the rules change.
   useEffect(() => {
+    setVerdict({ kind: 'idle' })
     const typed = path.trim()
-    if (typed === '') {
-      setVerdict({ kind: 'idle' })
-      return
-    }
+    if (typed === '') return
     const abort = new AbortController()
     const timer = setTimeout(() => {
       setVerdict({ kind: 'asking' })
@@ -221,7 +246,7 @@ function Tester({ host, hats }: { host: HostItem; hats: HatItem[] }) {
       clearTimeout(timer)
       abort.abort()
     }
-  }, [client, host.host_id, path])
+  }, [client, host.host_id, path, rules])
 
   const hatName = (id: string) => hats.find((h) => h.id === id)?.name ?? id
 
@@ -237,7 +262,9 @@ function Tester({ host, hats }: { host: HostItem; hats: HatItem[] }) {
         />
       </label>
       <p className="hint">Resolved by the host, under the rules as saved.</p>
-      <div aria-live="polite" className="tester-out">
+      {/* Each answer is its own live region, nested in none: announced
+          once. */}
+      <div className="tester-out">
         {verdict.kind === 'asking' && <p role="status">Asking the host…</p>}
         {verdict.kind === 'failed' && (
           <p className="form-error" role="alert">
@@ -245,30 +272,32 @@ function Tester({ host, hats }: { host: HostItem; hats: HatItem[] }) {
           </p>
         )}
         {verdict.kind === 'resolved' && (
-          <dl className="facts" aria-label="Resolution">
-            <dt>Resolves to</dt>
-            <dd className="mono">
-              <Text>{verdict.resolution.canonical}</Text>
-            </dd>
-            <dt>Hat</dt>
-            <dd>
-              <Text>{hatName(verdict.resolution.hat_id)}</Text>
-            </dd>
-            <dt>Decided by</dt>
-            <dd>{verdict.resolution.rule_id ? 'a path rule' : 'the host’s default hat'}</dd>
-            {!verdict.resolution.exists && (
-              <>
-                <dt>Note</dt>
-                <dd>This path does not exist on the host.</dd>
-              </>
-            )}
-            {verdict.resolution.exists && !verdict.resolution.is_dir && (
-              <>
-                <dt>Note</dt>
-                <dd>This is not a directory: no session can start in it.</dd>
-              </>
-            )}
-          </dl>
+          <div role="status">
+            <dl className="facts" aria-label="Resolution">
+              <dt>Resolves to</dt>
+              <dd className="mono">
+                <Text>{verdict.resolution.canonical}</Text>
+              </dd>
+              <dt>Hat</dt>
+              <dd>
+                <Text>{hatName(verdict.resolution.hat_id)}</Text>
+              </dd>
+              <dt>Decided by</dt>
+              <dd>{verdict.resolution.rule_id ? 'a path rule' : 'the host’s default hat'}</dd>
+              {!verdict.resolution.exists && (
+                <>
+                  <dt>Note</dt>
+                  <dd>This path does not exist on the host.</dd>
+                </>
+              )}
+              {verdict.resolution.exists && !verdict.resolution.is_dir && (
+                <>
+                  <dt>Note</dt>
+                  <dd>This is not a directory: no session can start in it.</dd>
+                </>
+              )}
+            </dl>
+          </div>
         )}
       </div>
     </div>

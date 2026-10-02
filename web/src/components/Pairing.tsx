@@ -5,7 +5,9 @@
 // The code is shown once. It lives in the Hosts screen's state and this
 // panel only: never in the address bar, the title, storage or the console.
 // It is dropped from the page when it expires, when a new host pairs, and
-// when the panel closes or unmounts.
+// when the panel closes or unmounts. Expired or paired, the code is spent:
+// the panel tells Hosts, which drops it and offers "Add host" again while
+// the panel still says what happened.
 import { useEffect, useRef, useState } from 'react'
 import { hosts as listHosts } from '../api/manage'
 import { useClient } from '../app-client'
@@ -29,12 +31,15 @@ export interface Minted {
 type Stage = { kind: 'live' } | { kind: 'expired' } | { kind: 'paired'; host: HostItem }
 
 interface Props {
-  minted: Minted
+  /** `null` once the code is spent. */
+  minted: Minted | null
   onPaired: () => void
+  /** The code expired or a host paired with it: it is of no use now. */
+  onSpent: () => void
   onClose: () => void
 }
 
-export default function Pairing({ minted, onPaired, onClose }: Props) {
+export default function Pairing({ minted, onPaired, onSpent, onClose }: Props) {
   const client = useClient()
   const [stage, setStage] = useState<Stage>({ kind: 'live' })
   // Counted from the answer's arrival, on the monotonic clock: the server's
@@ -43,8 +48,11 @@ export default function Pairing({ minted, onPaired, onClose }: Props) {
   // this.
   const [deadline] = useState(() => performance.now() + CODE_LIFETIME_S * 1000)
   const [left, setLeft] = useState(CODE_LIFETIME_S)
-  const before = useRef(new Set(minted.known))
-  const command = `hennery host join ${minted.publicUrl} ${minted.code}`
+  const before = useRef(new Set(minted?.known))
+  // The parent's callbacks, current at each tick, without restarting the
+  // poll whenever the parent renders.
+  const told = useRef({ onPaired, onSpent })
+  told.current = { onPaired, onSpent }
 
   // The countdown, and the code's end at zero.
   const counting = stage.kind === 'live'
@@ -53,7 +61,10 @@ export default function Pairing({ minted, onPaired, onClose }: Props) {
     const tick = () => {
       const s = Math.max(0, Math.ceil((deadline - performance.now()) / 1000))
       setLeft(s)
-      if (s === 0) setStage({ kind: 'expired' })
+      if (s === 0) {
+        setStage({ kind: 'expired' })
+        told.current.onSpent()
+      }
     }
     tick()
     const timer = setInterval(tick, 1000)
@@ -61,22 +72,29 @@ export default function Pairing({ minted, onPaired, onClose }: Props) {
   }, [counting, deadline])
 
   // A host that pairs while the code is live ends it here: the code is
-  // spent.
+  // spent. A tick while a read is still out is skipped, so reads never
+  // pile up on a slow link.
   const waiting = stage.kind === 'live'
   useEffect(() => {
     if (!waiting) return
     let live = true
+    let reading = false
     const timer = setInterval(() => {
+      if (reading) return
+      reading = true
       listHosts(client).then(
         (list) => {
+          reading = false
           const fresh = list.find((h) => !before.current.has(h.host_id))
           if (live && fresh) {
             setStage({ kind: 'paired', host: fresh })
-            onPaired()
+            told.current.onSpent()
+            told.current.onPaired()
           }
         },
         () => {
           // A failed read is tried again at the next tick.
+          reading = false
         },
       )
     }, PAIRED_POLL_MS)
@@ -84,18 +102,18 @@ export default function Pairing({ minted, onPaired, onClose }: Props) {
       live = false
       clearInterval(timer)
     }
-  }, [client, waiting, onPaired])
+  }, [client, waiting])
 
   return (
     <section className="card pairing" aria-labelledby="pairing-title">
       <h2 id="pairing-title" className="card-title">
         Add a host
       </h2>
-      {stage.kind === 'live' && (
+      {stage.kind === 'live' && minted && (
         <>
           <p>On the machine to pair, run:</p>
           <pre className="command" aria-label="Pairing command">
-            <code>{command}</code>
+            <code>{`hennery host join ${minted.publicUrl} ${minted.code}`}</code>
           </pre>
           <p className="pairing-code">
             Code <code>{minted.code}</code>, valid for{' '}

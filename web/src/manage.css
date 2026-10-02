@@ -53,6 +53,6 @@
 @media (max-width:767px) {
   .manage { padding:16px 14px calc(24px + env(safe-area-inset-bottom)); }
   .manage-head h1 { font-size:22px; }
-  .card-actions .btn, .inline-form .btn, .rule .btn { min-height:44px; }
-  .select-field select { min-height:44px; }
+  .manage-head .btn, .card-actions .btn, .inline-form .btn, .rule .btn { min-height:44px; }
+  .select-field select, .colour-input { min-height:44px; }
 }

@@ -5,6 +5,7 @@ import App from '../App'
 import { formatLeft } from '../components/Pairing'
 import { hat, host } from '../test-fixtures'
 import { FULL, json, stubServer, type Answer } from '../test-server'
+import { loadManageCss, shortTargets } from '../test-targets'
 
 const STEP_UP = json(403, { code: 'step_up_required', message: 'm' })
 const STEPPED_UP = new Response(null, { status: 204 })
@@ -75,6 +76,31 @@ describe('the host list', () => {
     open({ 'GET /api/hosts': json(200, []) })
     expect(await screen.findByText('No host is paired yet.')).toBeInTheDocument()
   })
+
+  it('says so when the hats cannot be read', async () => {
+    open({ 'GET /api/hosts': json(200, [host()]), 'GET /api/hats': json(500, { code: 'internal', message: 'the hats are away' }) })
+    expect(await screen.findByRole('alert')).toHaveTextContent('the hats are away')
+  })
+
+  it('has every button and picker at least 44 px tall under 768 px', async () => {
+    const unload = loadManageCss()
+    try {
+      open({
+        'GET /api/hosts': json(200, [host()]),
+        'POST /api/hosts/pairing-codes': json(201, { code: 'ABCD-EFGH', expires_at: new Date(Date.now() + 600_000).toISOString() }),
+      })
+      const laptop = await screen.findByRole('listitem', { name: 'laptop' })
+      await waitFor(() => expect(within(laptop).getByRole('option', { name: 'Work' })).toBeInTheDocument())
+      const page = document.querySelector('.manage')!
+      expect(shortTargets(page)).toEqual([])
+      await userEvent.click(screen.getByRole('button', { name: 'Add host' }))
+      expect(await screen.findByLabelText('Pairing command')).toBeInTheDocument()
+      await userEvent.click(within(laptop).getByRole('button', { name: 'Rename' }))
+      expect(shortTargets(page)).toEqual([])
+    } finally {
+      unload()
+    }
+  })
 })
 
 describe('adding a host', () => {
@@ -116,6 +142,52 @@ describe('adding a host', () => {
     expect(location.href).not.toContain('ABCD')
   })
 
+  it('offers a new code once the last one expired, counting from the start again', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const expires = new Date(Date.now() + 600_000).toISOString()
+    open({
+      'GET /api/hosts': json(200, [host()]),
+      'POST /api/hosts/pairing-codes': [
+        json(201, { code: 'ABCD-EFGH', expires_at: expires }),
+        json(201, { code: 'JKLM-NPQR', expires_at: expires }),
+      ],
+    })
+    const add = await screen.findByRole('button', { name: 'Add host' })
+    await userEvent.click(add)
+    expect(await screen.findByLabelText('Pairing command')).toBeInTheDocument()
+    expect(add).toBeDisabled()
+    await act(async () => {
+      vi.advanceTimersByTime(601_000)
+    })
+    expect(await screen.findByText('The code has expired. Add a host again for a new one.')).toBeInTheDocument()
+    expect(add).toBeEnabled()
+    await userEvent.click(add)
+    expect(await screen.findByLabelText('Pairing command')).toHaveTextContent('JKLM-NPQR')
+    expect(screen.getByRole('timer').textContent).toMatch(/^(10:00|9:5\d)$/)
+    expect(document.body.textContent).not.toContain('ABCD-EFGH')
+  })
+
+  it('reads the hosts once at a time while it waits, however slow a read is', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const server = open({
+      // The list, the read before the mint, then a poll that never answers.
+      'GET /api/hosts': [json(200, [host()]), json(200, [host()]), () => new Promise<Response>(() => {})],
+      'POST /api/hosts/pairing-codes': json(201, { code: 'ABCD-EFGH', expires_at: new Date(Date.now() + 600_000).toISOString() }),
+    })
+    await userEvent.click(await screen.findByRole('button', { name: 'Add host' }))
+    expect(await screen.findByLabelText('Pairing command')).toBeInTheDocument()
+    await act(async () => {
+      vi.advanceTimersByTime(3_100)
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(3_000)
+    })
+    await act(async () => {
+      vi.advanceTimersByTime(3_000)
+    })
+    expect(sent(server, 'GET', '/api/hosts')).toHaveLength(3)
+  })
+
   it('ends the code when the new host pairs, and lists it', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     const expires = new Date(Date.now() + 600_000).toISOString()
@@ -132,6 +204,8 @@ describe('adding a host', () => {
     expect(await screen.findByText(/^Paired:/)).toHaveTextContent('Paired: new box')
     expect(document.body.textContent).not.toContain('ABCD-EFGH')
     expect(await screen.findByRole('listitem', { name: 'new box' })).toBeInTheDocument()
+    // The code is spent: another can be minted.
+    expect(screen.getByRole('button', { name: 'Add host' })).toBeEnabled()
   })
 
   it('tells a new host from those before it even when the list never loaded', async () => {
@@ -232,6 +306,53 @@ describe('changing a host', () => {
     const patches = sent(server, 'PATCH', '/api/hosts/host-1')
     expect(patches.map((p) => p.body)).toEqual([{ name: 'desk' }, { name: 'desk' }])
     expect(screen.queryByRole('dialog')).toBeNull()
+  })
+
+  it('returns focus to Rename after a rename, done or cancelled', async () => {
+    open({
+      'GET /api/hosts': json(200, [host()]),
+      'PATCH /api/hosts/host-1': json(200, host({ name: 'desk' })),
+    })
+    await userEvent.click(await within(await screen.findByRole('listitem', { name: 'laptop' })).findByRole('button', { name: 'Rename' }))
+    await userEvent.type(screen.getByLabelText('New name'), ' 2')
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await userEvent.click(within(await screen.findByRole('dialog', { name: 'Rename this host?' })).getByRole('button', { name: 'Cancel' }))
+    expect(within(card('laptop')).getByRole('button', { name: 'Rename' })).toHaveFocus()
+    await userEvent.click(within(card('laptop')).getByRole('button', { name: 'Rename' }))
+    await userEvent.type(screen.getByLabelText('New name'), ' 2')
+    await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await userEvent.click(within(await screen.findByRole('dialog', { name: 'Rename this host?' })).getByRole('button', { name: 'Rename' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(within(card('desk')).getByRole('button', { name: 'Rename' })).toHaveFocus()
+  })
+
+  it('sends no rename when the trimmed name is empty or unchanged', async () => {
+    const server = open({ 'GET /api/hosts': json(200, [host()]) })
+    const laptop = await screen.findByRole('listitem', { name: 'laptop' })
+    for (const typed of ['laptop  ', '   ']) {
+      await userEvent.click(within(laptop).getByRole('button', { name: 'Rename' }))
+      const input = screen.getByLabelText('New name')
+      await userEvent.clear(input)
+      await userEvent.type(input, typed)
+      await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+      expect(screen.queryByRole('dialog')).toBeNull()
+      expect(within(laptop).getByRole('button', { name: 'Rename' })).toHaveFocus()
+    }
+    await userEvent.click(within(laptop).getByRole('button', { name: 'Rename' }))
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    expect(within(laptop).getByRole('button', { name: 'Rename' })).toHaveFocus()
+    expect(sent(server, 'PATCH', '/api/hosts/host-1')).toHaveLength(0)
+  })
+
+  it('puts focus on the card’s title once a revoke took its buttons away', async () => {
+    open({
+      'GET /api/hosts': json(200, [host()]),
+      'DELETE /api/hosts/host-1': json(200, host({ connected: false, revoked_at: '2026-10-02T12:00:00Z' })),
+    })
+    await userEvent.click(await within(await screen.findByRole('listitem', { name: 'laptop' })).findByRole('button', { name: 'Revoke' }))
+    await userEvent.click(within(await screen.findByRole('dialog', { name: 'Revoke this host?' })).getByRole('button', { name: 'Revoke' }))
+    await waitFor(() => expect(within(card('laptop')).getByText('Revoked')).toBeInTheDocument())
+    expect(within(card('laptop')).getByRole('heading', { name: 'laptop' })).toHaveFocus()
   })
 
   it('revokes it after a confirmation that says its agents stop when it next connects', async () => {
