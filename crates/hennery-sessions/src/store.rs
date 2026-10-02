@@ -263,6 +263,21 @@ pub enum ResumeRequest {
     NotFound,
 }
 
+/// The outcome of `Store::reassign_hat` (ACP core §4.9).
+#[derive(Debug, PartialEq)]
+pub enum Reassign {
+    /// Its `hat_reassigned` event.
+    Done(EventDto),
+    /// It is in that hat already: nothing written.
+    Unchanged,
+    /// It may have a running adapter (this lifecycle, or `presumed_parked`
+    /// while its host is away): refused (plan 5d decision 1).
+    Attached(String),
+    /// No such hat of the owner's.
+    UnknownHat,
+    NotFound,
+}
+
 /// The outcome of `Store::submit_answer` (ACP core §4.6).
 #[derive(Debug, PartialEq)]
 pub enum AnswerSubmission {
@@ -1613,6 +1628,64 @@ impl Store {
             committed_seq: committed.unwrap_or(0) as u64,
             config: stored_config(config)?,
         })
+    }
+
+    /// Move a session with no running adapter to another hat (ACP core
+    /// §4.9): `parked` (and not only presumed so), `closed` or `failed`. The
+    /// hat must be the owner's. Writes `hat_reassigned{from, to}`. The rule
+    /// that decided the old hat no longer did, so it is cleared. The next
+    /// resume must agree with the new hat (`hat_mismatch` otherwise).
+    pub fn reassign_hat(&self, session_id: &str, hat_id: &str) -> Result<Reassign> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let row: Option<(String, bool, String)> = tx
+            .query_row(
+                "SELECT lifecycle, presumed_parked, hat_id FROM sessions WHERE id = ?1 AND owner_id = ?2",
+                [session_id, &self.owner],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((lifecycle, presumed, from)) = row else {
+            return Ok(Reassign::NotFound);
+        };
+        if presumed {
+            return Ok(Reassign::Attached("presumed_parked".into()));
+        }
+        if !matches!(lifecycle.as_str(), "parked" | "closed" | "failed") {
+            return Ok(Reassign::Attached(lifecycle));
+        }
+        let known = tx
+            .query_row(
+                "SELECT 1 FROM hats WHERE id = ?1 AND owner_id = ?2",
+                [hat_id, &self.owner],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !known {
+            return Ok(Reassign::UnknownHat);
+        }
+        if from == hat_id {
+            return Ok(Reassign::Unchanged);
+        }
+        let changed = tx.execute(
+            "UPDATE sessions SET hat_id = ?2, hat_rule_id = NULL
+             WHERE id = ?1 AND lifecycle IN ('parked', 'closed', 'failed') AND presumed_parked = 0 AND owner_id = ?3",
+            params![session_id, hat_id, self.owner],
+        )?;
+        // The checks above read the same row in this transaction; an event
+        // without the change it records would be worse than an error.
+        anyhow::ensure!(changed == 1, "re-assigning {session_id} changed {changed} rows");
+        let event = collector_event(
+            &tx,
+            &self.owner,
+            session_id,
+            "hat_reassigned",
+            json!({ "from": from, "to": hat_id }),
+            &now(),
+        )?;
+        tx.commit()?;
+        Ok(Reassign::Done(event))
     }
 
     /// The host has been offline past the threshold: presume its `active`

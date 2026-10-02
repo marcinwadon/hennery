@@ -63,13 +63,19 @@ pub async fn require_step_up(req: Request, next: Next) -> Response {
         .get::<Authenticated>()
         .is_some_and(|session| session.stepped_up(unix_now()));
     if !fresh {
-        return error(
-            StatusCode::FORBIDDEN,
-            "step_up_required",
-            "confirm your password or a passkey again (POST /api/auth/step-up/password or /api/auth/step-up/passkey/start)",
-        );
+        return step_up_required();
     }
     next.run(req).await
+}
+
+/// 403 `step_up_required`: what `require_step_up` answers, for a handler
+/// that needs a fresh step-up for only some of what it does.
+pub fn step_up_required() -> Response {
+    error(
+        StatusCode::FORBIDDEN,
+        "step_up_required",
+        "confirm your password or a passkey again (POST /api/auth/step-up/password or /api/auth/step-up/passkey/start)",
+    )
 }
 
 /// The longest a stream waits before it re-checks its session, however far

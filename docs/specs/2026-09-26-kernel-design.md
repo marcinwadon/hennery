@@ -274,7 +274,7 @@ minutes** (`auth_sessions.last_step_up_at`), even inside a valid session:
   clients or the "internal network" flag;
 - local stdio server configuration;
 - registering or revoking passkeys; revoking hosts or auth sessions;
-- deleting sessions and purging hats;
+- deleting sessions, re-assigning a session to another hat, and purging hats;
 - changing `public_url`.
 
 Without a fresh check the endpoint answers 403 `step_up_required`; the
