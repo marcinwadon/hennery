@@ -3,12 +3,11 @@
 //! meant to go through uses `Allowance::InternalNetwork`; a test that one is
 //! refused uses `PublicOnly` and checks the listener saw nothing.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-use hennery_kernel::egress::{Allowance, Egress, EgressError, Refused, Request, Timeouts};
-use reqwest::{Method, Url};
+use hennery_kernel::egress::{Allowance, Egress, EgressError, Method, Refused, Request, Timeouts, Url};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -25,10 +24,12 @@ enum Answer {
     SlowBody(Duration),
 }
 
-/// A listener on 127.0.0.1 counting the connections it accepted.
+/// A listener on 127.0.0.1 counting the connections it accepted and keeping
+/// the request heads it read.
 struct Server {
     port: u16,
     accepted: Arc<AtomicUsize>,
+    heads: Arc<Mutex<Vec<String>>>,
 }
 
 impl Server {
@@ -36,21 +37,26 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let accepted = Arc::new(AtomicUsize::new(0));
-        let count = accepted.clone();
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let (count, kept) = (accepted.clone(), heads.clone());
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     return;
                 };
                 count.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(serve(stream, answer));
+                tokio::spawn(serve(stream, answer, kept.clone()));
             }
         });
-        Server { port, accepted }
+        Server { port, accepted, heads }
     }
 
     fn accepted(&self) -> usize {
         self.accepted.load(Ordering::SeqCst)
+    }
+
+    fn heads(&self) -> Vec<String> {
+        self.heads.lock().unwrap().clone()
     }
 
     fn url(&self, host: &str) -> Url {
@@ -58,7 +64,7 @@ impl Server {
     }
 }
 
-async fn serve(mut stream: TcpStream, answer: Answer) {
+async fn serve(mut stream: TcpStream, answer: Answer, heads: Arc<Mutex<Vec<String>>>) {
     let mut buf = Vec::new();
     loop {
         // Read one request head (the tests send no bodies).
@@ -69,6 +75,7 @@ async fn serve(mut stream: TcpStream, answer: Answer) {
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
             }
         }
+        heads.lock().unwrap().push(String::from_utf8_lossy(&buf).into_owned());
         buf.clear();
         match answer {
             Answer::Ok => {
@@ -314,20 +321,70 @@ async fn a_streaming_body_outlives_the_deadline() {
     assert_eq!(body, b"firstlast");
 }
 
-/// An `Egress` is cheap to clone and its clones share the clients.
+/// Plan 8b (g): a request's own timeout wins over the default, on both
+/// send paths (a caller asks for less, or for more).
+#[tokio::test]
+async fn a_request_s_own_timeout_wins_over_the_default() {
+    let server = Server::start(Answer::Silent).await;
+    let client = Egress::new(Timeouts {
+        connect: Duration::from_secs(2),
+        request: Duration::from_secs(8),
+    })
+    .unwrap()
+    .client(Allowance::InternalNetwork);
+    for streaming in [false, true] {
+        let mut request = get(server.url("127.0.0.1"));
+        *request.timeout_mut() = Some(Duration::from_millis(200));
+        let started = Instant::now();
+        let sent = if streaming {
+            within(client.send_streaming(request)).await
+        } else {
+            within(client.send(request)).await
+        };
+        assert!(
+            matches!(sent, Err(EgressError::Timeout)),
+            "streaming {streaming}: {sent:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "streaming {streaming}: waited {:?}, the default's 8 s",
+            started.elapsed()
+        );
+    }
+}
+
+/// Plan 8b decision 11: every request says it is hennery.
+#[tokio::test]
+async fn requests_say_they_are_hennery() {
+    let server = Server::start(Answer::Ok).await;
+    let client = egress().client(Allowance::InternalNetwork);
+    within(client.send(get(server.url("127.0.0.1")))).await.unwrap();
+    let heads = server.heads();
+    assert_eq!(heads.len(), 1);
+    let expected = concat!("user-agent: hennery/", env!("CARGO_PKG_VERSION"), "\r\n");
+    assert!(heads[0].to_ascii_lowercase().contains(expected), "{}", heads[0]);
+}
+
+/// An `Egress` is cheap to clone: a clone shares its clients, and so their
+/// connection pools (L9: the binary builds one and hands out clones).
 #[tokio::test]
 async fn clones_share_the_policy() {
     let server = Server::start(Answer::Ok).await;
     let egress = egress();
     let clone = egress.clone();
+    let url = server.url("localhost");
+    let response = within(egress.client(Allowance::InternalNetwork).send(get(url.clone())))
+        .await
+        .unwrap();
+    assert_eq!(response.text().await.unwrap(), "ok");
     drop(egress);
-    let response = within(
-        clone
-            .client(Allowance::InternalNetwork)
-            .send(get(server.url("localhost"))),
-    )
-    .await
-    .unwrap();
-    assert_eq!(response.status(), 200);
+    // The finished connection goes back to the shared pool from a task of
+    // its own; give it a moment.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let response = within(clone.client(Allowance::InternalNetwork).send(get(url)))
+        .await
+        .unwrap();
+    assert_eq!(response.text().await.unwrap(), "ok");
+    assert_eq!(server.accepted(), 1, "the clone reused the original's connection");
     assert_eq!(clone.client(Allowance::PublicOnly).allowance(), Allowance::PublicOnly);
 }

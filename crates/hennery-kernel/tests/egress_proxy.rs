@@ -9,8 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use hennery_kernel::egress::{Allowance, Egress, Request, Timeouts};
-use reqwest::{Method, Url};
+use hennery_kernel::egress::{Allowance, Egress, Method, Request, Timeouts, Url};
 
 #[test]
 fn the_environment_s_proxy_is_never_used() {
