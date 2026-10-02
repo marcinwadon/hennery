@@ -17,7 +17,7 @@ import SignOut from './SignOut'
 import SessionView from '../screens/Session'
 import { useMediaQuery } from '../hooks/useMediaQuery'
 import SessionList from './SessionList'
-import SessionScope, { WaitingBadge } from './SessionScope'
+import SessionScope, { WaitingBadge, useSessionScope } from './SessionScope'
 
 /** The rail's width and up (frontend spec §2). */
 export const DESKTOP = '(min-width: 768px)'
@@ -29,6 +29,16 @@ const ICON: Record<View, (p: { size?: number }) => React.JSX.Element> = {
   mcp: Icon.Wrench,
   hats: Icon.Sparkle,
   settings: Icon.Shield,
+}
+
+/** `/sessions/:id`: the session, its header fed by the list store's summary
+ *  (kept current by the list stream) when the list holds it. While the
+ *  list's first page is on its way the header waits for it; only a session
+ *  the list does not hold fetches its detail. The address is the selection
+ *  (F-11, F-19): shown whatever the hat, and whether or not the list holds it. */
+function SessionRoute({ id }: { id: string }) {
+  const list = useSessionScope()?.list
+  return <SessionView id={id} summary={list?.all.get(id)} awaitSummary={!!list && list.loading && !list.error} />
 }
 
 export default function Shell({ route }: { route: Route }) {
@@ -133,7 +143,11 @@ export default function Shell({ route }: { route: Route }) {
           ) : route.name === 'sessions' && !desktop ? (
             <SessionList screen />
           ) : route.name === 'session' ? (
-            <SessionView key={route.id} id={route.id ?? ''} />
+            <SessionRoute key={route.id} id={route.id ?? ''} />
+          ) : route.name === 'sessions' ? (
+            // A desktop at /sessions with no row to open: an empty hat, a
+            // search with no match, or before the first page has come.
+            <Placeholder title={title} text="Pick a session from the list, or start a new one." />
           ) : (
             <Placeholder title={title} text="This screen arrives in a later part of the web UI." />
           )}

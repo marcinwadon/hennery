@@ -521,6 +521,16 @@ describe('selection (F-11)', () => {
     expect(current.map((l) => l.querySelector('.sess-name')?.textContent)).toEqual(['a'])
   })
 
+  it('on a desktop, /sessions with no row to open says to pick one, not that the screen comes later', async () => {
+    width(true)
+    at('/sessions')
+    const s = server()
+    render(<App fetchImpl={s.fetch} />)
+    expect(await screen.findByText('Pick a session from the list, or start a new one.')).toBeInTheDocument()
+    expect(screen.queryByText('This screen arrives in a later part of the web UI.')).toBeNull()
+    expect(location.pathname).toBe('/sessions')
+  })
+
   it('on a phone, /sessions stays the list', async () => {
     at('/sessions')
     const s = server({ list: rows })
