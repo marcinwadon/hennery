@@ -318,22 +318,19 @@ fn create_dir(dir: &Path, mode: u32) -> Result<()> {
 /// which would roll an interrupted pairing forward (renames, the outbox
 /// moved aside) without the host's lock (decision 8).
 fn host_pairing(dir: &Path) -> Result<()> {
-    use hennery_host::identity::{CONFIG_FILE, KEY_FILE};
-    if dir.join(format!("{CONFIG_FILE}.pending")).exists() {
-        bail!(
+    match crate::pairing_in(dir) {
+        crate::Pairing::Whole => Ok(()),
+        crate::Pairing::Interrupted => bail!(
             "{} holds a pairing that was interrupted: run `hennery host run --data-dir {}` once to finish it, then install",
             dir.display(),
             dir.display()
-        );
-    }
-    if !(dir.join(KEY_FILE).is_file() && dir.join(CONFIG_FILE).is_file()) {
-        bail!(
+        ),
+        crate::Pairing::None => bail!(
             "{} holds no pairing: run `hennery host join <url> --data-dir {}` first",
             dir.display(),
             dir.display()
-        );
+        ),
     }
-    Ok(())
 }
 
 /// Why there is no systemd user manager to install into, if there is none.
