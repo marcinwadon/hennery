@@ -18,13 +18,23 @@
 
 Anchors are `main` at `c05d642` (PR #43).
 
-**Status:** not executed; amended after the security review. The security review of 2026-10-02 (binding on the maintainer's behalf) approved with one amendment, A1: the audit check revert-probed (Task 1, Step 4). Taken, with O1–O4; O5 and O6 recorded under "After this plan"; decisions 1–8 confirmed.
+**Status:** executed 2026-10-02 (see "Execution status"); amended after the security review. The security review of 2026-10-02 (binding on the maintainer's behalf) approved with one amendment, A1: the audit check revert-probed (Task 1, Step 4). Taken, with O1–O4; O5 and O6 recorded under "After this plan"; decisions 1–8 confirmed.
 
 The code was built on `feat/nix-package` and its CI run on PR #45 (run 36952694016, before the amendments): both `flake` jobs green, the audit loading 1279 advisories, `hennery 0.0.0` from the package. Every revert-probe of Task 1 was run here and failed as written. The plan was replayed from its own text onto `c05d642`, task by task, and the tree matched the branch byte for byte. The dev shell's checks are unaffected: no Rust file changes.
 
-## Execution status
+## Execution status (2026-10-02)
 
-Not executed yet.
+**Executed** on branch `exec/nix-package`, pushed as `feat/nix-package` (PR #45), on `main` at `b2aee2e` (PR #46). `flake.nix` and `flake.lock` are the same there as at the anchors' `c05d642`. Task 1 was done by one implementer and reviewed (opus): approved. Task 2 is a single new workflow, so its review was folded into the whole-branch review (opus), which found it "ready after fixes"; the fixes are below, and a scoped re-review followed. The code is byte-identical to the planning branch, whose CI run after the review's amendments (36953876775) passed both `flake` jobs: 1279 advisories loaded, `hennery 0.0.0` from the package. Every revert-probe of Task 1 was run again in execution, each failing as written; the audit's against an advisory database copied to `/private/tmp`.
+
+| Area | As built | Why |
+|---|---|---|
+| `nix.yml`'s `concurrency` (final review) | `group: nix-${{ github.event_name == 'pull_request' && github.ref || github.sha }}` with `cancel-in-progress: true` | The planned `cancel-in-progress: false` for `main` keeps one running and one pending run per group, so a third quick merge cancels the second's pending run. A group per commit on `main` keeps every one |
+| "`aarch64-linux` is evaluated, not built" (final review) | Corrected: neither evaluated nor built by CI | `nix flake check` without `--all-systems` skips other systems entirely: the logs say "omitted these incompatible systems" |
+| Decision 9 (Task 1 review) | It says Intel Macs lose `nix develop` too | `eachSystem` limits the dev shell as well as the package |
+
+Deferred minors: `dist-workspace.toml` rides in the build source (an edit to it rebuilds the dependency cache); the flake's clippy check mirrors only `ci.yml`'s workspace lane, not its `-p hennery` one; the token install-nix-action writes into `nix.conf` is readable by unsandboxed macOS builds (read-only, job-scoped, and `ci.yml`'s checkout exposes the same); `actions/checkout@v4`'s Node 20 deprecation, for all three workflows together.
+
+Tests: none added; the workspace's are unchanged. CI on the final commit: PR #45's last run, both `flake` jobs green.
 
 ## Scope
 
@@ -42,9 +52,9 @@ That is **2 tasks:** (1) the package and its checks; (2) CI.
 4. **`cargo audit` with a pinned advisory database, yanked crates unchecked.** The audit is §4.3's. In the sandbox it has no network, so its check for yanked crates prints one error line per crate and does not fail. It reports vulnerabilities from the database `flake.lock` pins (`6de4455`, 2026-10-01). Silencing the yanked lines would need an `audit.toml` that turns the check off for developers too.
 5. **The source filter names the compiled-in files.** crane's Cargo sources are `.rs`, `.toml` and the lock. `adapters/manifest.json`, which plan 7b's host crate `include_str!`s, is added with `lib.fileset.maybeMissing` (the review's O2), so this plan and 7b-i can land in either order. Today nothing but `.rs` files is compiled in (`git grep include_str!` on `main`: the testkit's `owner_filter.rs` reads `.rs` files only).
 6. **The version comes from the workspace's `Cargo.toml`** (`workspace.package.version`), read by the flake, so it cannot drift from the binary's.
-7. **A Nix CI job on every pull request, on both systems,** as §9 asks. A lane that adds a compiled-in file, or a clippy warning only nixpkgs' clippy sees, is caught on its own PR. About 9 minutes per system from a cold store, in parallel with the other jobs. No cache action: Cachix needs a token and pushes; GitHub's cache action is a third-party cache to pin and trust. Recorded under "After this plan". A pull request's superseded run is cancelled; a push to `main` keeps its own run (the review's O3). A job stops after 30 minutes (O4).
+7. **A Nix CI job on every pull request, on both systems,** as §9 asks. A lane that adds a compiled-in file, or a clippy warning only nixpkgs' clippy sees, is caught on its own PR. About 9 minutes per system from a cold store, in parallel with the other jobs. No cache action: Cachix needs a token and pushes; GitHub's cache action is a third-party cache to pin and trust. Recorded under "After this plan". A pull request's superseded run is cancelled; on `main` every commit is its own concurrency group and keeps its run (the review's O3, as built after the final review). A job stops after 30 minutes (O4).
 8. **The job's read-only token goes to Nix,** so fetching the locked GitHub inputs is not refused by the anonymous API limit that shared runners share. It has `contents: read` only, and nothing in the job writes.
-9. **The three v1 platforms, not `eachDefaultSystem`** (the review's O1): `x86_64-linux`, `aarch64-linux`, `aarch64-darwin` (§1), and `meta.platforms` the same. An Intel Mac gets no package rather than an untested one. CI builds `x86_64-linux` and `aarch64-darwin`; `aarch64-linux` is evaluated, not built.
+9. **The three v1 platforms, not `eachDefaultSystem`** (the review's O1): `x86_64-linux`, `aarch64-linux`, `aarch64-darwin` (§1), and `meta.platforms` the same. An Intel Mac gets no package rather than an untested one, and no `nix develop` either: the dev shell is limited with the rest. CI builds `x86_64-linux` and `aarch64-darwin`; `aarch64-linux` is neither evaluated nor built (`nix flake check` skips other systems without `--all-systems`).
 
 ## Global Constraints
 
@@ -412,7 +422,7 @@ That is **2 tasks:** (1) the package and its checks; (2) CI.
 - **The toolchain overlay** (§4.3) is not used (decision 1); spec amendment.
 - **`cargo audit` fails only on vulnerabilities;** unsound and unmaintained advisories only warn. `--deny unsound` would fail on those too: the maintainer's policy (the review's O5).
 - **A new advisory shows only after a lock bump.** A scheduled job running a networked `cargo audit` against the live database, read-only and with no secret, would catch it, and yanked crates too (O6).
-- **`aarch64-linux` is evaluated, not built,** by CI.
+- **`aarch64-linux` is neither evaluated nor built** by CI. `nix flake check --all-systems` would evaluate it; building it needs an arm64 Linux runner.
 - **Spec amendments:** §4.3: the toolchain is nixpkgs' (decision 1); the tests run in `ci.yml`, not as a flake check (decision 3); §9: the Nix CI job exists for the binary; the adapter derivation's check comes with 7e-ii.
 
 ---
