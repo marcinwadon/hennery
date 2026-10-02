@@ -14,6 +14,7 @@ import Hats from '../screens/Hats'
 import Hosts from '../screens/Hosts'
 import Placeholder from '../screens/Placeholder'
 import SignOut from './SignOut'
+import SessionView from '../screens/Session'
 import { useMediaQuery } from '../hooks/useMediaQuery'
 import SessionList from './SessionList'
 import SessionScope, { WaitingBadge } from './SessionScope'
@@ -132,7 +133,7 @@ export default function Shell({ route }: { route: Route }) {
           ) : route.name === 'sessions' && !desktop ? (
             <SessionList screen />
           ) : route.name === 'session' ? (
-            <Placeholder title="Session" detail={route.id} text="The session view arrives with the transcript." />
+            <SessionView key={route.id} id={route.id ?? ''} />
           ) : (
             <Placeholder title={title} text="This screen arrives in a later part of the web UI." />
           )}

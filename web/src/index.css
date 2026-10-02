@@ -147,6 +147,8 @@ input,textarea { font-family:inherit; }
 .badge-wait { background:rgba(232,145,12,.14); color:#B26A00; }
 .badge-run  { background:rgba(47,158,68,.13); color:#247A33; }
 .badge-idle { background:var(--surface-3); color:var(--fg-muted); }
+/* Failed: a hollow red ring, as the list's marker; red fill means a question. */
+.badge-fail { background:transparent; color:var(--st-attn); box-shadow:inset 0 0 0 1px var(--st-attn); }
 .conv-name { font-family:var(--font-display); font-weight:800; font-size:18px; letter-spacing:-.01em; flex:1; min-width:0; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .icon-btn { flex:none; padding:6px 8px; margin-left:auto; }
 .conv-meta { display:flex; align-items:center; gap:7px; flex-wrap:wrap; margin-top:8px; }
@@ -568,3 +570,53 @@ h2.grp-head { margin:0; font-size:inherit; font-weight:inherit; }
 .sess-reason { margin:0 10px 6px; font-size:12px; color:var(--fg-2); overflow-wrap:anywhere; }
 .led-fail { background:transparent; box-shadow:inset 0 0 0 2px var(--st-attn); }
 .rail-head .badge, .mtopbar .badge { margin-left:auto; }
+
+/* ── The session view (frontend spec §6) ──
+   The view fills .main and only .transcript scrolls. Scroll anchoring is
+   off: the view keeps the reader's place itself when older turns are
+   prepended, and the browser's own anchoring would move it twice. */
+.session { flex:1; min-height:0; display:flex; flex-direction:column; }
+.session .transcript { overflow-anchor:none; }
+.session .transcript-inner { max-width:900px; }
+.session-head .conv-name { margin:0; }
+.back-btn { display:none; }
+.rot-180 { transform:rotate(180deg); }
+.stream-state:empty { display:none; }
+.stream-state { flex:none; padding:6px 20px; font-size:12.5px; font-weight:600; color:var(--st-wait); background:var(--surface-2); border-bottom:1px solid var(--border); }
+.session-error { padding:8px 20px 0; margin:0; }
+.transcript-empty { color:var(--fg-quiet); padding:20px 0; }
+.load-earlier { display:flex; justify-content:center; margin:0 0 18px; }
+.item-note { font-size:12.5px; color:var(--fg-muted); margin:6px 0 0; }
+.item-failed { color:var(--st-attn); }
+.user-text { white-space:pre-wrap; overflow-wrap:anywhere; margin:0 0 8px; }
+.user-text:last-child { margin-bottom:0; }
+.user-image, .tool-image { display:block; max-width:min(100%, 480px); height:auto; border-radius:var(--r-sm); margin:6px 0; }
+.md-img-link { font-style:italic; }
+.tool-detail { display:flex; flex-direction:column; }
+.tool-diff pre { margin:0 0 6px; white-space:pre-wrap; font:inherit; }
+.tool-diff .diff-old { color:#E5766B; }
+.tool-diff .diff-new { color:#B7D88C; }
+.tool-locations { margin:6px 0 0; padding:0; list-style:none; font-family:var(--font-mono); font-size:12px; color:var(--fg-muted); }
+.marker { margin:0 0 22px; }
+.marker .divider { margin-bottom:4px; }
+.marker-when { font-weight:500; color:var(--fg-quiet); }
+.marker-text summary, .unrec summary { cursor:pointer; font-size:12.5px; color:var(--fg-muted); }
+.marker-text pre { white-space:pre-wrap; overflow-wrap:anywhere; font-family:var(--font-mono); font-size:12px; background:var(--surface-2); border:1px solid var(--border); border-radius:var(--r-sm); padding:9px 12px; margin:6px 0 0; }
+.unrec { margin:0 0 22px; }
+.ask { margin:0 0 22px; }
+.q-opts { display:flex; flex-wrap:wrap; gap:8px; margin:0; padding:0; list-style:none; }
+.q-opt { border-radius:var(--r-full); padding:6px 14px; font-size:13px; font-weight:600; border:1.5px solid var(--border-strong); background:var(--surface); }
+.q-opt-allow { border-color:var(--accent); color:var(--accent); }
+.q-opt-always { border-style:dashed; color:var(--fg-2); }
+.q-opt-reject { border-color:var(--st-attn); color:var(--st-attn); }
+.q-state { margin:12px 0 0; font-size:13px; font-weight:700; color:var(--fg-2); }
+.elic-opts { list-style:none; margin:0; padding:0; }
+.steps-item { border:1px solid var(--border); border-radius:var(--r-sm); }
+.meta-dirty { color:var(--st-wait); font-weight:600; }
+
+@media (max-width:767px) {
+  /* The session's header is the bar: a way back, and its title shown. */
+  .back-btn { display:flex; align-items:center; justify-content:center; width:44px; height:44px; flex:none; border-radius:11px; border:1px solid var(--border); background:var(--surface); color:var(--fg-1); }
+  .session-head .conv-name { display:block; font-size:16px; }
+  .q-opts { flex-direction:column; }
+}
