@@ -256,37 +256,164 @@ async fn a_started_session_registers_its_agent_home_and_the_collector_records_it
     );
 }
 
-/// Decision 7, 9d-i's Codex rule: a Codex session's home is recorded, and
-/// its host answers `unsupported_agent`, retryable: the record stays
-/// pending, listed, its attempt counted. No root reaches the answer (B2).
+/// A Codex rollout of `AGENT_SESSION` under `root`, as Codex names it, and
+/// another thread's beside it.
+fn codex_rollouts(root: &Path) -> (PathBuf, PathBuf) {
+    let day = root.join("sessions/2026/10/02");
+    std::fs::create_dir_all(&day).unwrap();
+    let own = day.join(format!("rollout-2026-10-02T10-00-00-{AGENT_SESSION}.jsonl"));
+    let other = day.join("rollout-2026-10-02T10-00-00-1b9c1d2e-3f40-4a5b-8c6d-7e8f90a1b2c3.jsonl");
+    std::fs::write(&own, "rollout").unwrap();
+    std::fs::write(&other, "keep").unwrap();
+    (own, other)
+}
+
+/// The fake app-server (Codex 0.155.1), logging to `log`.
+fn fake_codex(log: &Path) -> AgentCommand {
+    let script = hennery_testkit::FakeCodex {
+        version: "0.155.1".into(),
+        log: log.to_str().unwrap().into(),
+        ..hennery_testkit::FakeCodex::default()
+    };
+    let mut command = AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-codex")).unwrap();
+    command.env.push((
+        hennery_testkit::CODEX_SCRIPT_ENV.into(),
+        serde_json::to_string(&script).unwrap(),
+    ));
+    command
+}
+
+/// Decision 9 end to end: a Codex session deleted over HTTP has its thread
+/// deleted by the bundled app-server under its recorded home: `removed`,
+/// the record gone, Codex's other residue named in the notes (O12), and no
+/// root in the answer (B2).
 #[tokio::test]
-async fn a_codex_sessions_removal_is_left_pending_for_a_later_host() {
+async fn a_delete_over_http_deletes_the_codex_thread_through_the_app_server() {
     let roots = Roots::new();
     let db = roots.base.join("hennery.db");
     let collector = Collector::start(&db).await;
-    start_host(host_config(collector.addr, &roots, &answering(AGENT_SESSION)));
+    let log = roots.base.join("codex.log");
+    let mut cfg = host_config(collector.addr, &roots, &answering(AGENT_SESSION));
+    cfg.codex_app_server = Some(fake_codex(&log));
+    start_host(cfg);
     connected(&collector, true).await;
     let session = start_session(&collector, "codex", &roots).await;
+    let (own, other) = codex_rollouts(&roots.codex());
+    let (result, body) = deleted(&collector, &session).await;
+    let removal = result.host_transcript;
+    assert_eq!(removal.state, RemovalState::Removed, "{body}");
+    assert_eq!(removal.notes, hennery_sessions::forget::CODEX_NOTES, "{body}");
+    assert!(!own.exists() && other.exists());
+    assert!(std::fs::read_to_string(&log).unwrap().contains("thread/delete"));
+    assert!(!body.contains(roots.base.to_str().unwrap()), "{body}");
+    assert!(removals(&collector).await.is_empty());
+}
+
+/// Decision 10 end to end: with no app-server to run, the fallback
+/// archives through the adapter and removes the rollouts itself: `partial`,
+/// with `codex_database_copies` left for good, its notes with it, and the
+/// record final.
+#[tokio::test]
+async fn a_codex_delete_without_the_app_server_falls_back_and_says_what_remains() {
+    let roots = Roots::new();
+    let db = roots.base.join("hennery.db");
+    let collector = Collector::start(&db).await;
+    let archive_log = roots.base.join("archive.log");
+    let script = FakeScript {
+        codex_archive_log: Some(archive_log.to_str().unwrap().into()),
+        ..answering(AGENT_SESSION)
+    };
+    start_host(host_config(collector.addr, &roots, &script));
+    connected(&collector, true).await;
+    let session = start_session(&collector, "codex", &roots).await;
+    let (own, other) = codex_rollouts(&roots.codex());
     let (result, body) = deleted(&collector, &session).await;
     let removal = result.host_transcript;
     assert_eq!(removal.state, RemovalState::Partial, "{body}");
     assert_eq!(
         removal.remaining.iter().map(|r| (r.kind, r.reason)).collect::<Vec<_>>(),
-        [(ForgetKind::Session, ForgetReason::UnsupportedAgent)]
+        [(ForgetKind::CodexDatabaseCopies, ForgetReason::FallbackOnly)],
+        "{body}"
     );
-    assert!(removal.notes.is_empty());
-    assert!(!body.contains(roots.base.to_str().unwrap()), "{body}");
+    for note in hennery_sessions::forget::CODEX_FALLBACK_NOTES {
+        assert!(removal.notes.iter().any(|n| n == note), "{note}: {body}");
+    }
+    assert!(!own.exists() && other.exists());
+    assert!(std::fs::read_to_string(&archive_log).unwrap().contains("CODEX_HOME="));
     let listed = removals(&collector).await;
     let [item] = listed.as_slice() else {
         panic!("{listed:?}");
     };
-    // The delete's own attempt; the close's `session_closed` may ask for
-    // one more (the review's item 11). One or two, never a runaway loop.
+    assert_eq!((item.agent.as_str(), item.state), ("codex", HostRemovalState::Final));
+    // The list says what the fallback leaves too.
+    let listed_notes = &item.last_result.as_ref().expect("a result").notes;
+    for note in hennery_sessions::forget::CODEX_FALLBACK_NOTES {
+        assert!(listed_notes.iter().any(|n| n == note), "{note}: {listed_notes:?}");
+    }
+}
+
+/// The parent's rule, B1: a Codex forget for a home the host never
+/// registered spawns no app-server and no adapter; and a Codex session
+/// with no recorded home (its `CODEX_HOME` did not resolve at the start)
+/// is final, `no_recorded_home`, with nothing sent to the host at all.
+#[tokio::test]
+async fn a_codex_home_mismatched_or_absent_spawns_nothing() {
+    let roots = Roots::new();
+    let db = roots.base.join("hennery.db");
+    let collector = Collector::start(&db).await;
+    let log = roots.base.join("codex.log");
+    let archive_log = roots.base.join("archive.log");
+    let script = FakeScript {
+        codex_archive_log: Some(archive_log.to_str().unwrap().into()),
+        ..answering(AGENT_SESSION)
+    };
+    let mut cfg = host_config(collector.addr, &roots, &script);
+    cfg.codex_app_server = Some(fake_codex(&log));
+    start_host(cfg);
+    connected(&collector, true).await;
+    // Mismatched: the stored home rewritten to another root.
+    let session = start_session(&collector, "codex", &roots).await;
+    let elsewhere = roots.base.join("elsewhere");
+    let (theirs, _) = codex_rollouts(&elsewhere);
+    let lie = json!([{ "agent_session_id": AGENT_SESSION, "root": elsewhere.to_str().unwrap() }]);
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE sessions SET agent_home = ?1 WHERE id = ?2",
+            [lie.to_string(), session.clone()],
+        )
+        .unwrap();
+    let (result, body) = deleted(&collector, &session).await;
     assert_eq!(
-        (item.session_id.as_str(), item.agent.as_str(), item.state),
-        (session.as_str(), "codex", HostRemovalState::Pending)
+        result
+            .host_transcript
+            .remaining
+            .iter()
+            .map(|r| r.reason)
+            .collect::<Vec<_>>(),
+        [ForgetReason::UnknownToHost],
+        "{body}"
     );
-    assert!((1..=2).contains(&item.attempts), "{item:?}");
+    assert!(theirs.exists());
+    // Absent: no recorded home at all.
+    let session = start_session(&collector, "codex", &roots).await;
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute("UPDATE sessions SET agent_home = NULL WHERE id = ?1", [session.clone()])
+        .unwrap();
+    let (result, body) = deleted(&collector, &session).await;
+    assert_eq!(
+        result
+            .host_transcript
+            .remaining
+            .iter()
+            .map(|r| r.reason)
+            .collect::<Vec<_>>(),
+        [ForgetReason::NoRecordedHome],
+        "{body}"
+    );
+    assert!(!log.exists(), "an app-server was spawned");
+    assert!(!archive_log.exists(), "an adapter's delete ran");
 }
 
 /// Decision 5: a delete while the host is away answers `pending,

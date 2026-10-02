@@ -227,6 +227,16 @@ pub struct FakeScript {
     /// held in flight for exactly as long as the test says.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_waits_for_file: Option<String>,
+    /// On `session/delete`, act as codex-acp 1.13.0 does instead of
+    /// Claude's SDK (plan 9d-ii, decision 10): Codex's `thread/archive`,
+    /// which moves each rollout of the session under
+    /// `$CODEX_HOME/sessions/` (at most three levels down) to
+    /// `$CODEX_HOME/archived_sessions/`, deleting nothing. It appends the
+    /// environment and cwd it ran with to this file first: `CODEX_HOME`,
+    /// `cwd` and `CODEX_SQLITE_HOME` (`-` when unset). With no `CODEX_HOME`
+    /// it moves nothing: the fake never touches a real home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_archive_log: Option<String>,
 }
 
 /// One question the fake asks its client during a prompt, and the chunk it
@@ -300,6 +310,7 @@ impl Default for FakeScript {
             session_id: None,
             delete_log: None,
             delete_waits_for_file: None,
+            codex_archive_log: None,
         }
     }
 }
@@ -347,6 +358,115 @@ pub fn operator_client(operator: &hennery_kernel::operator::Operator) -> reqwest
 
 /// Environment variable carrying the script.
 pub const SCRIPT_ENV: &str = "HENNERY_FAKE_ACP_SCRIPT";
+
+/// Environment variable carrying `hennery-fake-codex`'s script.
+pub const CODEX_SCRIPT_ENV: &str = "HENNERY_FAKE_CODEX_SCRIPT";
+
+/// Behaviour of `hennery-fake-codex`, a stand-in for Codex 0.155.1's CLI
+/// as a forget runs it (plan 9d-ii, decision 9): `--version`, and
+/// `app-server` speaking its JSON-RPC (one JSON object per line, no
+/// `jsonrpc` field) as 0.155.1 does.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FakeCodex {
+    /// What `--version` prints after `codex-cli `.
+    pub version: String,
+    /// Appended to, one JSON object per line: first `{"spawn": …}` (the
+    /// arguments, `CODEX_HOME`, `CODEX_SQLITE_HOME`,
+    /// `CLAUDE_CODE_PROJECT_DIR_NAME` and the cwd), then `{"recv": line}`
+    /// for every line the app-server reads, verbatim.
+    pub log: String,
+    #[serde(default)]
+    pub initialize: FakeInitialize,
+    /// `codexHome` in `initialize`'s answer; else `$CODEX_HOME`
+    /// canonicalised, as Codex answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_home: Option<String>,
+    #[serde(default)]
+    pub delete: FakeDelete,
+    /// The app-server writes its pid here, and ignores SIGTERM if
+    /// `ignore_term`: only the group's SIGKILL ends it then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid_file: Option<String>,
+    #[serde(default)]
+    pub ignore_term: bool,
+    /// `--version` never ends (writing `pid_file` first).
+    #[serde(default)]
+    pub hang_version: bool,
+}
+
+/// Whether `name` is one of `thread`'s rollout files, as Codex names them
+/// (`rollout-<timestamp>-<thread>[_<rollout>].jsonl[.zst]`): what the fakes
+/// standing in for Codex find, as Codex finds them by its own index. Loose
+/// on the timestamp; the host's own matcher is the strict one.
+pub fn names_rollout_of(name: &str, thread: &str) -> bool {
+    let Some(rest) = name.strip_prefix("rollout-").and_then(|r| r.get(20..)) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix(thread) else {
+        return false;
+    };
+    let rest = rest.strip_suffix(".zst").unwrap_or(rest);
+    let Some(rest) = rest.strip_suffix(".jsonl") else {
+        return false;
+    };
+    rest.is_empty() || rest.starts_with('_')
+}
+
+/// Whether `name` is a date directory `depth` levels under `sessions/`
+/// (`YYYY`, then `MM`, then `DD`), as Codex lays them out.
+pub fn is_codex_date_dir(name: &str, depth: usize) -> bool {
+    let len = if depth == 1 { 4 } else { 2 };
+    name.len() == len && name.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// How the fake answers `initialize`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FakeInitialize {
+    /// As Codex does: `userAgent`, `codexHome`, `platformFamily`,
+    /// `platformOs`, then a `remoteControl/status/changed` notification.
+    #[default]
+    Answer,
+    /// `-32600`, as Codex answers a client name it cannot use.
+    Error,
+    /// Never.
+    Hang,
+    /// It exits at once, answering nothing.
+    Exit,
+}
+
+/// How the fake answers `thread/delete` (after `initialize`; before it,
+/// `-32600 Not initialized`, as Codex does).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FakeDelete {
+    /// As Codex does: each rollout of the thread under `sessions/` (at most
+    /// three levels down) and `archived_sessions/` is removed, then `{}`
+    /// and a `thread/deleted` notification; with none, `-32600 no rollout
+    /// found for thread id <id>`.
+    #[default]
+    Delete,
+    /// `{}`, but the rollouts stay: for the check afterwards (B4).
+    AnswerButKeep,
+    /// `-32600 cannot delete thread <id>: forked history still references it`.
+    ForkedHistory,
+    /// `-32600 thread is not persisted and cannot be deleted: <id>`.
+    Ephemeral,
+    /// `-32600 live internal threads can only be removed by their owner`.
+    LiveWorker,
+    /// The method is unknown to this Codex: `-32600 Invalid request:
+    /// unknown variant`, as 0.155.1 answers any method it does not know.
+    UnknownMethod,
+    /// `-32601`, JSON-RPC's own method not found.
+    MethodNotFound,
+    /// `-32603 failed to delete thread: …`: a failure midway.
+    Internal,
+    /// Never.
+    Hang,
+    /// The app-server exits once it has read the request, answering
+    /// nothing: the delete may have run.
+    Exit,
+}
 
 /// Exit status of the fake adapter when `exit_after_chunks` fires.
 pub const CRASH_EXIT_CODE: i32 = 3;

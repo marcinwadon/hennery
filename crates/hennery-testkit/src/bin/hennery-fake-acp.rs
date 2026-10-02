@@ -356,7 +356,11 @@ async fn main() -> agent_client_protocol::Result<()> {
                 async move |req: DeleteSessionRequest, responder, cx| {
                     let script = script.clone();
                     cx.spawn(async move {
-                        let deleted = delete_session(&script, &req.session_id);
+                        let deleted = if script.codex_archive_log.is_some() {
+                            codex_archive(&script, &req.session_id)
+                        } else {
+                            delete_session(&script, &req.session_id)
+                        };
                         if let Some(gate) = &script.delete_waits_for_file {
                             while !std::path::Path::new(gate).exists() {
                                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -550,6 +554,62 @@ fn delete_session(script: &FakeScript, session: &SessionId) -> Result<(), String
         }
     }
     Err(format!("Session {id} not found in any project directory"))
+}
+
+/// `session/delete` as codex-acp 1.13.0 runs it
+/// (`FakeScript::codex_archive_log`): Codex's `thread/archive`, which moves
+/// each of the session's rollouts under `$CODEX_HOME/sessions/` (at most
+/// three levels down) to `$CODEX_HOME/archived_sessions/`, keeping its name.
+/// None is "no rollout found", as Codex 0.155.1 answers.
+fn codex_archive(script: &FakeScript, session: &SessionId) -> Result<(), String> {
+    let var = |name: &str| std::env::var(name).unwrap_or_else(|_| "-".into());
+    if let Some(log) = &script.codex_archive_log {
+        let cwd = std::env::current_dir()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .expect("open codex_archive_log");
+        writeln!(
+            file,
+            "CODEX_HOME={}\ncwd={cwd}\nCODEX_SQLITE_HOME={}",
+            var("CODEX_HOME"),
+            var("CODEX_SQLITE_HOME"),
+        )
+        .expect("write codex_archive_log");
+    }
+    let Some(home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) else {
+        return Err("no CODEX_HOME".into());
+    };
+    let home = std::path::Path::new(&home);
+    let id = session.to_string();
+    fn walk(dir: &std::path::Path, depth: usize, id: &str, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            match std::fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_file() && hennery_testkit::names_rollout_of(&name, id) => out.push(path),
+                Ok(meta) if meta.is_dir() && depth < 3 && hennery_testkit::is_codex_date_dir(&name, depth + 1) => {
+                    walk(&path, depth + 1, id, out)
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&home.join("sessions"), 0, &id, &mut found);
+    if found.is_empty() {
+        return Err(format!("no rollout found for thread id {id}"));
+    }
+    let archived = home.join("archived_sessions");
+    std::fs::create_dir_all(&archived).map_err(|e| e.to_string())?;
+    for path in found {
+        let name = path.file_name().expect("a rollout's name").to_owned();
+        std::fs::rename(&path, archived.join(name)).map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn answer_load(

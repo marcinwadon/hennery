@@ -98,6 +98,9 @@ impl Root {
             hooks,
             // Looked up by the forget itself, as the host's connection does.
             account: None,
+            codex_app_server: None,
+            codex_pin: None,
+            deadline: hennery_host::forget::FORGET_DEADLINE,
         }
     }
 
@@ -433,13 +436,19 @@ async fn a_tree_past_the_depth_bound_is_left_reported() {
     assert_eq!(reasons(&forgotten), [(ForgetKind::Tasks, ForgetReason::TooDeep, false)]);
 }
 
-/// Decision 8: other agents are not forgotten yet (9d-ii).
+/// Decision 8, 9d-ii: an agent this host cannot forget for (neither
+/// Claude nor Codex) is answered `unsupported_agent`, retryable, and
+/// nothing is touched.
 #[tokio::test]
-async fn a_codex_forget_is_unsupported_for_now() {
+async fn an_agent_with_no_forget_is_unsupported() {
     let root = Root::new();
-    let mut codex = root.forget_at(&root.root());
-    codex.agent = "codex".into();
-    let forgotten = forget(&root.ctx(Hooks::default()), &codex).await;
+    root.populate();
+    let before = root.tree();
+    let mut other = root.forget_at(&root.root());
+    other.agent = "gemini".into();
+    let forgotten = forget(&root.ctx(Hooks::default()), &other).await;
+    assert_eq!(root.tree(), before);
+    assert_eq!(root.adapter_ran(), None);
     assert_eq!(
         reasons(&forgotten),
         [(ForgetKind::Session, ForgetReason::UnsupportedAgent, true)]

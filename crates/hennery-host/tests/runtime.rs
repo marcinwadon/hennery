@@ -562,6 +562,24 @@ async fn a_host_start_installs_the_pinned_set_and_launches_from_its_absolute_pat
     use hennery_host::profile::Profile;
     assert_eq!(prepared.agents.profiles["claude"], Profile::Claude);
     assert_eq!(prepared.agents.profiles["codex"], Profile::Generic);
+    // Plan 9d decision 9: a forget's app-server is the set's bundled Codex,
+    // `<node> <set>/codex/<the pinned launcher>`, once the set has it.
+    assert!(
+        prepared.agents.codex_app_server.is_none(),
+        "this set bundles no launcher"
+    );
+    let pin = hennery_host::runtime::manifest::Manifest::embedded()
+        .codex_app_server
+        .unwrap();
+    let launcher = set.path.join("codex").join(&pin.bin);
+    std::fs::create_dir_all(launcher.parent().unwrap()).unwrap();
+    std::fs::write(&launcher, "// codex.js").unwrap();
+    let app_server = agents::from_set(&set, &std::collections::BTreeMap::new())
+        .codex_app_server
+        .expect("the bundled app-server");
+    assert_eq!(app_server.program, set.node.to_string_lossy());
+    assert_eq!(app_server.args, [launcher.to_string_lossy().into_owned()]);
+    assert!(app_server.env.is_empty());
 }
 
 #[tokio::test]
@@ -671,6 +689,16 @@ async fn a_set_without_its_cli_launches_that_agent_only_with_an_override() {
         prepared.agents.profiles["claude"],
         hennery_host::profile::Profile::ClaudeOwnCli
     );
+    // Plan 9d decision 9: `--use-cli codex=…` is the app-server too.
+    std::fs::write(
+        dir.join("host.toml"),
+        "[cli]\nclaude = \"/bin/sh\"\ncodex = \"/bin/cat\"\n",
+    )
+    .unwrap();
+    let prepared = agents::prepare(&dir, Some(&selection), Some(&server.sources()), &quiet).await;
+    let app_server = prepared.agents.codex_app_server.expect("the operator's codex");
+    assert_eq!((app_server.program.as_str(), app_server.args.len()), ("/bin/cat", 0));
+    std::fs::write(dir.join("host.toml"), "[cli]\nclaude = \"/bin/sh\"\n").unwrap();
     // The override gone (a hand edit, say): claude is unavailable.
     std::fs::write(dir.join("host.toml"), "").unwrap();
     let prepared = agents::prepare(&dir, Some(&selection), Some(&server.sources()), &quiet).await;
