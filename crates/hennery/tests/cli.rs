@@ -3055,22 +3055,50 @@ fn the_healthcheck_passes_while_the_collector_serves_and_fails_once_it_stops() {
     }
 }
 
-/// `collector` still needs its data directory; `collector healthcheck`
-/// takes none of the collector's own flags.
+/// `collector` with no data directory takes the platform's (distribution
+/// spec §8), here under a home that cannot be created, so it fails at once
+/// naming it; `collector healthcheck` takes none of the collector's own
+/// flags.
 #[test]
-fn the_collector_without_a_data_dir_or_with_the_healthcheck_and_its_flags_is_refused() {
-    let run = |args: &[&str]| {
-        hennery()
-            .args(args)
-            .env_remove("HENNERY_LISTEN")
-            .output()
-            .unwrap()
-    };
+fn the_collector_without_a_data_dir_takes_the_default_and_the_healthcheck_no_collector_flags() {
+    let run = |args: &[&str]| hennery().args(args).env_remove("HENNERY_LISTEN").output().unwrap();
     let out = run(&["collector"]);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("--data-dir"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("/nonexistent-hennery-test/home"), "{stderr}");
     let out = run(&["collector", "--data-dir", "/nonexistent", "healthcheck"]);
     assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// `host join` with no data directory, where the platform's default is
+/// `hennery up`'s, refuses before reaching any collector, and names
+/// `--data-dir`: up pairs its own host.
+#[test]
+fn host_join_with_no_data_dir_refuses_ups_default_directory() {
+    let dir = scratch_dir("joinup");
+    let _cleanup = RemoveDir(dir.clone());
+    let home = dir.join("home");
+    let data = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/hennery")
+    } else {
+        dir.join("xdg-data/hennery")
+    };
+    std::fs::create_dir_all(data.join("host")).unwrap();
+    std::fs::write(data.join("host").join(hennery_host::identity::CONFIG_FILE), "").unwrap();
+    let out = hennery()
+        .args(["host", "join", "http://127.0.0.1:1", "AAAA-AAAA"])
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", dir.join("xdg-data"))
+        .env("XDG_CONFIG_HOME", dir.join("xdg-config"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("up pairs its own host") && stderr.contains("--data-dir"),
+        "{stderr}"
+    );
+    assert!(!data.join("host.key").exists() && !data.join(hennery_host::identity::CONFIG_FILE).exists());
 }
 
 /// `host.lock` (distribution spec §8): while `up`'s host child runs on
