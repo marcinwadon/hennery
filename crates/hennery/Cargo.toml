@@ -21,6 +21,7 @@ axum.workspace = true
 clap.workspace = true
 libc = "0.2"
 openssl = { workspace = true, optional = true }
+hennery-gateway.workspace = true
 hennery-host.workspace = true
 hennery-kernel.workspace = true
 hennery-sessions.workspace = true

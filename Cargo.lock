@@ -1424,6 +1424,7 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "hennery-gateway",
  "hennery-host",
  "hennery-kernel",
  "hennery-sessions",

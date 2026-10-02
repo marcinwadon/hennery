@@ -26,7 +26,11 @@ fn hennery() -> Command {
 /// Offline (plan 7b), and without `LOG_VARS` (plan 7c-iii).
 fn offline(cmd: &mut Command) {
     cmd.env("HENNERY_NPM_REGISTRY", OFFLINE)
-        .env("HENNERY_NODE_MIRROR", OFFLINE);
+        .env("HENNERY_NODE_MIRROR", OFFLINE)
+        // And never the gateway's key from whoever runs the tests (plan 8a):
+        // a test that wants one sets it.
+        .env_remove("HENNERY_MASTER_KEY")
+        .env_remove("CREDENTIALS_DIRECTORY");
     for var in LOG_VARS {
         cmd.env_remove(var);
     }
@@ -1184,12 +1188,14 @@ fn the_collectors_data_is_private_to_its_user() {
     // removes the `-wal` and `-shm`.
     assert_eq!(mode_of(&dir.join("root")), 0o700);
     assert_eq!(mode_of(&data), 0o700);
+    // The gateway's master key too (plan 8a).
     for file in [
         "hennery.db",
         "hennery.db-wal",
         "hennery.db-shm",
         "admin.sock",
         "vapid.key",
+        "master.key",
     ] {
         assert_eq!(mode_of(&data.join(file)), 0o600, "{file}");
     }
@@ -1199,6 +1205,162 @@ fn the_collectors_data_is_private_to_its_user() {
         !data.join("admin.sock").exists(),
         "the admin socket outlived the collector"
     );
+}
+
+/// `method path` on the collector at `listen` with the owner's `session`,
+/// from its `public_url`, with a JSON `body` if any: the status and the
+/// body.
+fn send_json(listen: &str, method: &str, path: &str, session: &str, body: Option<&str>) -> Option<(u16, String)> {
+    let mut stream = TcpStream::connect(listen).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(15))).ok()?;
+    let body = body.unwrap_or_default();
+    write!(
+        stream,
+        "{method} {path} HTTP/1.1\r\nHost: {listen}\r\nCookie: hennery_session={session}\r\nOrigin: http://{listen}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    let (head, body) = response.split_once("\r\n\r\n")?;
+    Some((head.split(' ').nth(1)?.parse().ok()?, body.to_string()))
+}
+
+/// Stop `collector` with SIGTERM, and wait for it.
+fn stop(collector: &mut KillTree) {
+    unsafe { libc::kill(collector.up.id() as i32, libc::SIGTERM) };
+    assert!(wait_with_timeout(&mut collector.up, Duration::from_secs(15)).is_some());
+}
+
+/// Plan 8a (gateway spec §6, kernel spec §10): the collector makes its
+/// master key at its first start and keeps it, serves the gateway's
+/// connections, and a credential stored under it opens after a restart.
+/// With the key gone while a credential is stored, the start fails, and no
+/// new key is made.
+#[test]
+fn the_collector_keeps_its_master_key_and_will_not_start_without_it() {
+    let dir = scratch_dir("master-key");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    let (mut collector, listen) = collector_on(&data, &dir.join("first.log"));
+    let session = sign_in(&mut collector, &listen, &data);
+    let key = data.join("master.key");
+    let made = std::fs::read(&key).unwrap();
+    assert_eq!(made.len(), 32);
+    assert_eq!(
+        get_json(&listen, "/api/mcp/connections", &session),
+        Some(serde_json::json!([]))
+    );
+    let hats = get_json(&listen, "/api/hats", &session).unwrap();
+    let body = serde_json::json!({
+        "slug": "linear",
+        "label": "Linear",
+        "url": "https://mcp.linear.example/mcp",
+        "hat_id": hats[0]["id"],
+        "cred_kind": "static",
+    })
+    .to_string();
+    let (status, created) = send_json(&listen, "POST", "/api/mcp/connections", &session, Some(&body)).unwrap();
+    assert_eq!(status, 201, "{created}");
+    let id = serde_json::from_str::<serde_json::Value>(&created).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let credential = format!("/api/mcp/connections/{id}/credential");
+    let (status, _) = send_json(&listen, "PUT", &credential, &session, Some(r#"{"token":"tok"}"#)).unwrap();
+    assert_eq!(status, 204);
+    let (status, _) = send_json(
+        &listen,
+        "PUT",
+        "/api/mcp/connections/conn-0000000000000000/credential",
+        &session,
+        Some(r#"{"token":"tok"}"#),
+    )
+    .unwrap();
+    assert_eq!(status, 404);
+    stop(&mut collector);
+
+    let (mut again, listen) = collector_on(&data, &dir.join("second.log"));
+    assert_eq!(std::fs::read(&key).unwrap(), made, "the key was replaced");
+    let listed = get_json(&listen, "/api/mcp/connections", &session).unwrap();
+    assert_eq!(listed[0]["has_credential"], true, "{listed}");
+    stop(&mut again);
+
+    // Another key does not open the stored credential: refused.
+    std::fs::write(&key, [9u8; 32]).unwrap();
+    let stderr = refused_start(&data);
+    assert!(stderr.contains("does not open the stored credential"), "{stderr}");
+    // No key at all: refused, and none is made.
+    std::fs::remove_file(&key).unwrap();
+    let stderr = refused_start(&data);
+    assert!(stderr.contains("master.key is missing"), "{stderr}");
+    assert!(!key.exists(), "a new key was made");
+}
+
+/// Plan 8a decision 6 (the review's O4): a key from `HENNERY_MASTER_KEY`
+/// is used and no `master.key` is made; started again without it once a
+/// credential is stored, the collector refuses, and makes none either.
+#[test]
+fn a_master_key_from_the_environment_is_used_and_never_written_down() {
+    let dir = scratch_dir("master-key-env");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    let log = dir.join("collector.log");
+    let child = hennery()
+        .args(["collector", "--listen", "127.0.0.1:0"])
+        .arg("--data-dir")
+        .arg(&data)
+        .env("HENNERY_MASTER_KEY", "ab".repeat(32))
+        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(std::fs::File::create(log.with_extension("err")).unwrap())
+        .spawn()
+        .unwrap();
+    let mut collector = KillTree::new(child, &log);
+    let listen = collector.listening();
+    let session = sign_in(&mut collector, &listen, &data);
+    let hats = get_json(&listen, "/api/hats", &session).unwrap();
+    let body = serde_json::json!({
+        "slug": "linear",
+        "label": "Linear",
+        "url": "https://mcp.linear.example/mcp",
+        "hat_id": hats[0]["id"],
+        "cred_kind": "static",
+    })
+    .to_string();
+    let (status, created) = send_json(&listen, "POST", "/api/mcp/connections", &session, Some(&body)).unwrap();
+    assert_eq!(status, 201, "{created}");
+    let id = serde_json::from_str::<serde_json::Value>(&created).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let credential = format!("/api/mcp/connections/{id}/credential");
+    let (status, _) = send_json(&listen, "PUT", &credential, &session, Some(r#"{"token":"tok"}"#)).unwrap();
+    assert_eq!(status, 204);
+    stop(&mut collector);
+    assert!(!data.join("master.key").exists(), "the key was written down");
+
+    let stderr = refused_start(&data);
+    assert!(stderr.contains("master.key is missing"), "{stderr}");
+    assert!(!data.join("master.key").exists(), "a new key was made");
+}
+
+/// Start a collector on `data` that must fail to start: its standard error.
+fn refused_start(data: &std::path::Path) -> String {
+    let mut refused = hennery()
+        .args(["collector", "--listen", "127.0.0.1:0", "--data-dir"])
+        .arg(data)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let Some(status) = wait_with_timeout(&mut refused, Duration::from_secs(30)) else {
+        let _ = refused.kill();
+        panic!("the collector started");
+    };
+    let mut stderr = String::new();
+    refused.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
+    assert!(!status.success(), "{stderr}");
+    stderr
 }
 
 /// Review I1: `the_collectors_data_is_private_to_its_user` only sends its
