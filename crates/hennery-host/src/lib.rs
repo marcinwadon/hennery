@@ -7,6 +7,7 @@ pub mod git;
 pub mod identity;
 pub mod outbox;
 pub mod pairing;
+pub mod paths;
 pub mod projects;
 pub mod runtime;
 pub mod session;
