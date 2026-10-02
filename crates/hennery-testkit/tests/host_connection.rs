@@ -213,16 +213,16 @@ async fn backoff_resets_to_reconnect_min_after_every_acked_frame() {
     );
     cfg.reconnect_min = Duration::from_millis(20);
     // Deliberately far above reconnect_min: if backoff never resets, repeated
-    // doubling (20, 40, 80, 160, 320, 640ms, ...) would blow well past the
-    // per-gap threshold below by the 6th reconnect.
+    // doubling (20, 40, 80, … 2560, 5120 ms) passes `BACKOFF_RESET_GAP` by
+    // the 8th reconnect and doubles past it once more.
     cfg.reconnect_max = Duration::from_secs(10);
     tokio::spawn(run(cfg));
 
     let mut timestamps = Vec::new();
-    for _ in 0..7 {
-        let t = tokio::time::timeout(Duration::from_secs(2), hellos.recv())
+    for _ in 0..10 {
+        let t = tokio::time::timeout(HELLO_WAIT, hellos.recv())
             .await
-            .expect("hello within 2s")
+            .expect("a hello within HELLO_WAIT")
             .expect("hello channel open");
         timestamps.push(t);
     }
@@ -230,13 +230,23 @@ async fn backoff_resets_to_reconnect_min_after_every_acked_frame() {
     let gaps: Vec<Duration> = timestamps.windows(2).map(|w| w[1] - w[0]).collect();
     for (i, gap) in gaps.iter().enumerate() {
         assert!(
-            *gap < Duration::from_millis(200),
-            "gap {i} was {gap:?}; backoff should stay near reconnect_min (20ms) \
-             after every successful handshake instead of doubling \
-             (an unreset backoff would exceed 200ms well before the 6th reconnect)"
+            *gap < BACKOFF_RESET_GAP,
+            "gap {i} was {gap:?}; gaps {gaps:?}; backoff should stay near reconnect_min (20ms) \
+             after every successful handshake instead of doubling"
         );
     }
 }
+
+/// The most a reconnect may take when the backoff was reset: the 20 ms
+/// `reconnect_min` (plus, in the healthy-reset test, its 150 ms hold) and
+/// a reconnect, handshake and ack on a loaded machine. A loaded machine
+/// once took a gap past the old 200 ms; an unreset backoff passes this one
+/// by seconds, and load only makes its gaps longer, so it never passes.
+const BACKOFF_RESET_GAP: Duration = Duration::from_millis(1500);
+
+/// The wait for each hello: past the longest gap an unreset backoff makes
+/// in these tests (5 s), so such a backoff fails on the gap, not here.
+const HELLO_WAIT: Duration = Duration::from_secs(10);
 
 /// The disk-full-collector scenario: the handshake always succeeds, but
 /// nothing is ever acked. A handshake alone must not be enough to reset
@@ -600,18 +610,18 @@ async fn backoff_resets_after_a_healthy_connection_even_without_acks() {
     tokio::spawn(run(cfg));
 
     let mut timestamps = Vec::new();
-    for _ in 0..6 {
-        let t = tokio::time::timeout(Duration::from_secs(3), hellos.recv())
+    for _ in 0..10 {
+        let t = tokio::time::timeout(HELLO_WAIT, hellos.recv())
             .await
-            .expect("hello within 3s")
+            .expect("a hello within HELLO_WAIT")
             .expect("hello channel open");
         timestamps.push(t);
     }
     // Each gap is the 150 ms hold plus the backoff; without the reset the
-    // backoff alone would pass 300 ms by the fifth reconnect.
+    // backoff alone passes `BACKOFF_RESET_GAP` by the eighth reconnect.
     let gaps: Vec<Duration> = timestamps.windows(2).map(|w| w[1] - w[0]).collect();
     for (i, gap) in gaps.iter().enumerate() {
-        assert!(*gap < Duration::from_millis(350), "gap {i} was {gap:?}; gaps {gaps:?}");
+        assert!(*gap < BACKOFF_RESET_GAP, "gap {i} was {gap:?}; gaps {gaps:?}");
     }
 }
 

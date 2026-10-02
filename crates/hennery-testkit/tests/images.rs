@@ -129,7 +129,12 @@ impl ScriptedHost {
     /// this host resolves every path to itself (plan 5c), as a host with no
     /// symlinks would.
     async fn next(&mut self) -> CollectorFrame {
-        tokio::time::timeout(Duration::from_secs(20), async {
+        self.next_within(Duration::from_secs(20)).await
+    }
+
+    /// `next`, waiting at most `limit`.
+    async fn next_within(&mut self, limit: Duration) -> CollectorFrame {
+        tokio::time::timeout(limit, async {
             loop {
                 match self.ws.next().await {
                     Some(Ok(Message::Text(text))) => match serde_json::from_str(&text).unwrap() {
@@ -151,7 +156,7 @@ impl ScriptedHost {
             }
         })
         .await
-        .expect("a collector frame within 20s")
+        .unwrap_or_else(|_| panic!("a collector frame within {limit:?}"))
     }
 
     /// Nothing but acks arrives for a while.
@@ -217,12 +222,17 @@ fn sha(bytes: &[u8]) -> String {
 /// Answer the prompt the collector sends with `turn_started`, and return
 /// its content.
 async fn accept_prompt(host: &mut ScriptedHost, session: &str) -> Vec<Value> {
+    accept_prompt_within(host, session, Duration::from_secs(20)).await
+}
+
+/// `accept_prompt`, waiting at most `limit` for the prompt.
+async fn accept_prompt_within(host: &mut ScriptedHost, session: &str, limit: Duration) -> Vec<Value> {
     let CollectorFrame::Prompt {
         request_id,
         turn_id,
         content,
         ..
-    } = host.next().await
+    } = host.next_within(limit).await
     else {
         panic!("expected a prompt");
     };
@@ -261,7 +271,13 @@ async fn a_prompt_at_the_limit_reaches_the_host_whole_and_is_stored_by_reference
     let c2 = c.clone();
     let url = prompt_url(&collector, &session);
     let call = tokio::spawn(async move { post(&c2, url, &body).await });
-    let sent = accept_prompt(&mut host, &session).await;
+    // The 22 MiB upload, its decoding and storing, and the frame to the
+    // host take 3.5 s alone. With 16 copies of this test and 18 CPU burners
+    // (a load of about 70), the old 20 s failed 14 runs in 32, and a whole
+    // run took up to 42 s. A shared CI runner is slower still. So it is
+    // given as long as the collector gives a prompt: past that the prompt
+    // fails anyway, so a longer wait could never pass.
+    let sent = accept_prompt_within(&mut host, &session, hennery_sessions::api::PROMPT_TIMEOUT).await;
     assert!(sent == checked, "the host is sent only what was checked");
     let (status, answer) = call.await.unwrap();
     assert_eq!(status, 202, "{answer}");

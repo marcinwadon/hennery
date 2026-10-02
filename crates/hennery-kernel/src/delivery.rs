@@ -185,8 +185,11 @@ pub enum Outcome {
 
 /// The notice's payload under `policy`, or `None` for a muted hat (kernel
 /// spec §6; `Notice`'s documented rules):
-/// - `generic_title`: the generic title, and no body;
-/// - `details`: the notice's `detail`, when it has one, as the body.
+/// - the title: the notice's generic title under `generic_title`, else its
+///   title;
+/// - the body: the notice's `detail` when `details` is on and it has one,
+///   with `generic_title` too; otherwise none under `generic_title`, else
+///   the notice's body.
 pub fn payload_for(notice: &Notice, policy: PushPolicy) -> Option<PushPayload> {
     if policy.muted {
         return None;
