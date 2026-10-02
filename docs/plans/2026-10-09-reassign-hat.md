@@ -33,7 +33,7 @@ This completes plan 5's sessions side.
 
 It builds on the executed plans [5a](2026-10-06-hats.md), [5b](2026-10-07-resolve-path.md) and [5c](2026-10-08-session-hats.md), and on plan 6b's session list. Every anchor was taken from the tree 5c leaves on `main`.
 
-**Status:** not executed; amended after the security review.
+**Status:** executed 2026-10-02 (see "Execution status"); amended after the security review.
 
 The security review of 2026-10-02 covered 5b, 5c and 5d. It approved after amendments, then re-confirmed "confirmed with notes"; 5d itself needed none.
 
@@ -42,6 +42,24 @@ The security review of 2026-10-02 covered 5b, 5c and 5d. It approved after amend
 - The plan was replayed from its own text onto `3f666f1` (`main` with 5c merged). The tree matched the tests-only and task commits, byte for byte.
 - After every task the five checks passed: 880 and 882 tests, from 879.
 - The guards were revert-probed.
+
+## Execution status (2026-10-02)
+
+**Executed** on `main` at `3f666f1` (5c merged). As with 5c, the code was first built and reviewed on an older base and covered by the security review of 5b–5d. Then one opus implementer ported it onto 5c's PR head, and an opus review checked the port against the reviewed code. The task commits were staged file by file from the port, rebased onto `3f666f1`, and the plan replayed there.
+
+| Area | As built | Why |
+|---|---|---|
+| The port | The store method, the handler, `step_up_required()` and `UpdateSessionRequest` are unchanged from the reviewed code. `PATCH` sits on the existing `GET /api/sessions/{id}` route. `SessionDetail` flattens 5c's `SessionItem`, so `hat_id` is still on the answer. | 5c moved `hat_id` onto the list item. Nothing else in the reviewed code changed meaning. |
+| The list's `?hat=` (5c) | `a_reassigned_session_resumes_in_its_new_hat_once_the_rules_agree` checks the session is listed under its old hat before the PATCH, and only under its new hat after. | The list reads `sessions.hat_id`, the column re-assignment writes. The test pins that no stale hat remains. |
+| Hardening (controller) | The `UPDATE` must change exactly one row, or the transaction rolls back with no event. | The porter noticed a 0-row update would still write `hat_reassigned`. The store's single connection rules this out today; an event without its change would be worse than an error. |
+| The port review (opus): approve | Three tests added, each revert-probed: the event is published on the session stream (`drop(event)` fails); a PATCH naming no hat needs no step-up (checking step-up first fails); another owner's hat is `UnknownHat` with no event written (dropping `owner_id` from the check fails). One dead step was dropped from the reconcile test. | Each was a side effect, or a conditional, that no test pinned. A `title` added later would otherwise have quietly inherited step-up. |
+
+Checks:
+- After every task the five checks passed (880 and 882 tests, from 879).
+- The 6 revert-probes each failed as expected.
+- The run was macOS only, so ubuntu CI is the Linux check.
+
+Systemic note (the port review): a revert-probe for every side-effect line (publish calls, conditional auth) belongs in a plan's Step 5. Two of the three gaps above were of that kind.
 
 ## Scope
 
