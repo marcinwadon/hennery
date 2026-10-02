@@ -9,7 +9,11 @@ use axum::http::{Request, StatusCode};
 use ed25519_dalek::SigningKey;
 use hennery_gateway::api::{GatewayState, router};
 use hennery_gateway::key::MasterKey;
+use hennery_gateway::notify::Silent;
+use hennery_gateway::runtime::Runtime;
+use hennery_gateway::scope::ProxyStore;
 use hennery_gateway::store::GatewayStore;
+use hennery_kernel::egress::{Egress, Timeouts};
 use hennery_kernel::hosts::{Enrollment, Hosts};
 use hennery_kernel::operator::{Operator, SetupOutcome};
 use hennery_kernel::secret::unix_now;
@@ -42,9 +46,15 @@ impl Api {
         };
         let store = Arc::new(GatewayStore::open(&db).unwrap());
         let key = Arc::new(MasterKey::from_bytes([5; 32]));
+        let runtime = Arc::new(Runtime::new(
+            store.clone(),
+            Arc::new(ProxyStore::open(&db).unwrap()),
+            key.clone(),
+            Egress::new(Timeouts::DEFAULT).unwrap(),
+            Arc::new(Silent),
+        ));
         let app = router(GatewayState {
-            store: store.clone(),
-            key: key.clone(),
+            runtime,
             operator: operator.clone(),
         });
         Self {
@@ -327,8 +337,6 @@ async fn refusals_answer_with_their_code_and_write_nothing() {
     none["cred_kind"] = json!("none");
     let (_, public) = api.send(&s, "POST", "/api/mcp/connections", Some(&none)).await;
     let public = public["id"].as_str().unwrap().to_string();
-    let mut oauth = api.new_body("oauth");
-    oauth["cred_kind"] = json!("oauth_dcr");
     let mut bad_slug = api.new_body("Bad Slug");
     bad_slug["slug"] = json!("Bad Slug");
     let mut http = api.new_body("lan");
@@ -343,23 +351,9 @@ async fn refusals_answer_with_their_code_and_write_nothing() {
             409,
             "slug_taken",
         ),
-        (
-            "POST",
-            "/api/mcp/connections".to_string(),
-            oauth,
-            400,
-            "unsupported_cred_kind",
-        ),
         ("POST", "/api/mcp/connections".to_string(), bad_slug, 400, "invalid"),
         ("POST", "/api/mcp/connections".to_string(), http, 400, "invalid"),
         ("POST", "/api/mcp/connections".to_string(), extra, 422, "invalid_body"),
-        (
-            "PATCH",
-            path.clone(),
-            json!({ "cred_kind": "oauth_client" }),
-            400,
-            "unsupported_cred_kind",
-        ),
         // The slug and the hat cannot change: naming them is refused.
         ("PATCH", path.clone(), json!({ "slug": "renamed" }), 422, "invalid_body"),
         (

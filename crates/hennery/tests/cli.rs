@@ -1471,6 +1471,44 @@ fn the_collector_serves_the_mcp_proxy_outside_the_operator_s_routes() {
     stop(&mut collector);
 }
 
+/// Plan 8f (api-8e-8f B5, R7): the collector serves the OAuth callback
+/// outside the operator's routes and the browser rules: the vendor's
+/// redirect arrives cross-site without the session cookie, and gets the
+/// callback's own page (an unknown `state` here), with the kernel's CSP,
+/// `no-store` and `no-referrer`; its script is served too.
+#[test]
+fn the_collector_serves_the_oauth_callback_outside_the_operator_s_routes() {
+    let dir = scratch_dir("mcp-callback");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    let (mut collector, listen) = collector_on(&data, &dir.join("collector.log"));
+    for (path, status, kind) in [
+        ("/api/mcp/oauth/callback?code=c&state=unknown", "400", "text/html"),
+        ("/api/mcp/oauth/callback.js", "200", "text/javascript"),
+    ] {
+        let mut stream = TcpStream::connect(&listen).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: {listen}\r\nOrigin: https://vendor.example\r\nSec-Fetch-Site: cross-site\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        let head = head.to_ascii_lowercase();
+        assert!(head.starts_with(&format!("http/1.1 {status}")), "{path}: {response}");
+        assert!(head.contains(&format!("content-type: {kind}")), "{path}: {head}");
+        assert!(head.contains("cache-control: no-store"), "{path}: {head}");
+        assert!(head.contains("referrer-policy: no-referrer"), "{path}: {head}");
+        if kind == "text/html" {
+            assert!(head.contains("content-security-policy: script-src 'self'"), "{head}");
+            assert!(body.contains("data-result=\"flow_unknown\""), "{body}");
+        }
+    }
+    stop(&mut collector);
+}
+
 /// Start a collector on `data` that must fail to start: its standard error.
 fn refused_start(data: &std::path::Path) -> String {
     let mut refused = hennery()

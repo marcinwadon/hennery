@@ -18,13 +18,6 @@
       ],
       "type": "object"
     },
-    "AgentIsolation": {
-      "additionalProperties": {
-        "$ref": "#/$defs/McpIsolation"
-      },
-      "description": "`hello.mcp_isolation`: per agent id, how the host isolates its MCP\nservers. An agent left out is not isolated. Deserialized leniently, like\n`Capabilities`: an unknown mechanism counts as `none`, never as isolated\nand never a reason to refuse the `hello`.",
-      "type": "object"
-    },
     "AnswerRequest": {
       "anyOf": [
         {
@@ -242,11 +235,6 @@
           "const": "forget_session",
           "description": "Removing a deleted session's transcript from the agent's own data\n(`forget_session`, plan 9d decision 4).",
           "type": "string"
-        },
-        {
-          "const": "mcp_servers",
-          "description": "A session's MCP servers (plan 8c): the host passes a start's or\nresume's `mcp_servers` into `session/new` / `session/load` with the\nagent's isolation, as `hello.mcp_isolation` reports it, and refuses\nservers it cannot isolate unless the collector waived that\n(`mcp_isolation_unavailable`). A host without it gets no servers.",
-          "type": "string"
         }
       ]
     },
@@ -324,21 +312,6 @@
             "cwd": {
               "type": "string"
             },
-            "hat_id": {
-              "description": "The session's hat (`sessions.hat_id`); empty for a session from\nbefore hats. Carried, not yet used by the host (plan 8c).",
-              "type": "string"
-            },
-            "isolation_waived": {
-              "description": "The collector knowingly delivers to an agent the host cannot isolate\n(the mixed-host fallback's default hat, or a single-hat host,\numbrella §8.5). Absent, the host refuses servers for such an agent\n(`mcp_isolation_unavailable`): isolation is never lost by omission.",
-              "type": "boolean"
-            },
-            "mcp_servers": {
-              "description": "Passed in `session/new` / `session/load`. Only to a host that\nannounced `mcp_servers`.",
-              "items": {
-                "$ref": "#/$defs/McpServer"
-              },
-              "type": "array"
-            },
             "mode": {
               "type": [
                 "string",
@@ -396,21 +369,6 @@
             },
             "cwd": {
               "type": "string"
-            },
-            "hat_id": {
-              "description": "As on `start_session`.",
-              "type": "string"
-            },
-            "isolation_waived": {
-              "description": "The collector knowingly delivers to an agent the host cannot isolate\n(the mixed-host fallback's default hat, or a single-hat host,\numbrella §8.5). Absent, the host refuses servers for such an agent\n(`mcp_isolation_unavailable`): isolation is never lost by omission.",
-              "type": "boolean"
-            },
-            "mcp_servers": {
-              "description": "Passed in `session/new` / `session/load`. Only to a host that\nannounced `mcp_servers`.",
-              "items": {
-                "$ref": "#/$defs/McpServer"
-              },
-              "type": "array"
             },
             "mode": {
               "type": [
@@ -741,10 +699,6 @@
             "agent_session_id": {
               "type": "string"
             },
-            "fallback": {
-              "description": "Plan 9d-ii, B5 as ruled (the hybrid): the record's last\n`APP_SERVER_TIMEOUTS_BEFORE_FALLBACK` answers were all\n`app_server_timed_out`, so a Codex host spawns no Codex and runs\nthe fallback at once, after the same checks. Only ever a\ndowngrade of this session's own removal; other agents ignore it.\nAbsent when false.",
-              "type": "boolean"
-            },
             "request_id": {
               "type": "string"
             },
@@ -811,11 +765,11 @@
     },
     "CreateMcpConnectionRequest": {
       "additionalProperties": false,
-      "description": "`POST /api/mcp/connections` (step-up): 201 with the new\n`McpConnectionItem`, `not_connected`, with no credential and no mounts.\nAbsent: the `Authorization` header with `Bearer `, every tool, a public\nupstream. Unknown fields are refused.\n\nIts own codes, beyond every route's (see `McpConnectionItem`): 403\n`step_up_required`; 400 `invalid` (a field refused, `message` says\nwhich, or a hat that is not the owner's); 400 `unsupported_cred_kind`\n(an OAuth kind, until plan 8f); 409 `slug_taken` (another of the owner's\nconnections has the slug); 409 `too_many_connections` (at most 256 per\nowner).",
+      "description": "`POST /api/mcp/connections` (step-up): 201 with the new\n`McpConnectionItem`, `not_connected`, with no credential and no mounts.\nAbsent: the `Authorization` header with `Bearer `, every tool, a public\nupstream. Unknown fields are refused.\n\nIts own codes, beyond every route's (see `McpConnectionItem`): 403\n`step_up_required`; 400 `invalid` (a field refused, `message` says\nwhich, or a hat that is not the owner's); 409 `slug_taken` (another of\nthe owner's connections has the slug); 409 `too_many_connections` (at\nmost 256 per owner).",
       "properties": {
         "cred_kind": {
           "$ref": "#/$defs/McpCredKind",
-          "description": "`none` or `static` until plan 8f."
+          "description": "Any kind; an OAuth one is connected with `…/authorize` afterwards."
         },
         "hat_id": {
           "description": "One of the owner's hats; fixed once created.",
@@ -1046,7 +1000,7 @@
         },
         {
           "const": "transcript",
-          "description": "The transcript and its family in each project directory (B9); for\nCodex, its rollout files in `sessions/` and `archived_sessions/`\n(plan 9d-ii).",
+          "description": "The transcript and its family in each project directory (B9).",
           "type": "string"
         },
         {
@@ -1134,12 +1088,7 @@
         },
         {
           "const": "timed_out",
-          "description": "The forget's deadline passed before the removal was done (B6). For\nCodex: after `thread/delete` was written, so it may have run.",
-          "type": "string"
-        },
-        {
-          "const": "app_server_timed_out",
-          "description": "Codex's app-server did not answer in time before `thread/delete`\nwas written (`--version`, its start, `initialize`): retried, and\ncounted by the collector, which flags the record's next forget\n`fallback` after `APP_SERVER_TIMEOUTS_BEFORE_FALLBACK` in a row\n(plan 9d-ii, B5 as ruled).",
+          "description": "The forget's deadline passed before the removal was done (B6).",
           "type": "string"
         },
         {
@@ -1150,26 +1099,6 @@
         {
           "const": "io_error",
           "description": "The removal failed midway (B3).",
-          "type": "string"
-        },
-        {
-          "const": "forked_history",
-          "description": "Codex's `thread/delete` refused: forked history in another thread\nstill references the rollout (plan 9d-ii, decision 9). Final, and\nnever followed by the fallback (B5).",
-          "type": "string"
-        },
-        {
-          "const": "ephemeral",
-          "description": "Codex's `thread/delete` refused: the thread was never persisted\n(plan 9d-ii, decision 9). Final.",
-          "type": "string"
-        },
-        {
-          "const": "home_mismatch",
-          "description": "The app-server named another `CODEX_HOME` than the session's\nrecorded one in its `initialize` answer: nothing was asked of it, and\nno fallback ran (plan 9d-ii, the parent's rule).",
-          "type": "string"
-        },
-        {
-          "const": "fallback_only",
-          "description": "Only the fallback ran (plan 9d-ii, decision 10): Codex's own database\nmay still hold copies of the conversation. Final.",
           "type": "string"
         },
         {
@@ -1239,13 +1168,6 @@
         },
         "id": {
           "type": "string"
-        },
-        "logo": {
-          "description": "The hat's logo's `ETag`, without its quotes, when it has a logo\n(plan 4d-B2); absent when it has none. `GET /api/hats/{id}/logo`\nserves it; a client may add `?v=<logo>` to that URL so a new logo is\na new URL to its cache.",
-          "type": [
-            "string",
-            "null"
-          ]
         },
         "name": {
           "type": "string"
@@ -1332,11 +1254,6 @@
             },
             "host_version": {
               "type": "string"
-            },
-            "mcp_isolation": {
-              "$ref": "#/$defs/AgentIsolation",
-              "default": {},
-              "description": "Per agent, how this host isolates its MCP servers (plan 8c).\nAbsent means none is isolated (an older host)."
             },
             "proof": {
               "description": "Proof of possession of the host's key (ACP core §3.5): its\nEd25519 signature, hex, over `hello_proof_message(nonce, host_id,\nprotocol_version)`, where the nonce is the one the collector sent\nin the upgrade response's `hennery-hello-nonce` header.",
@@ -1879,11 +1796,50 @@
       ],
       "type": "object"
     },
+    "McpAuthorizeRequest": {
+      "additionalProperties": false,
+      "description": "`POST /api/mcp/connections/{id}/authorize` (step-up): starts OAuth\n(gateway spec §4.1–§4.3). Discovery and, for `oauth_dcr`, registration\nhappen here, through the egress policy. 200 with the consent URL; the\nanswer sets the flow's own cookie (`hennery_mcp_flow_<16 hex of\nsha256(state)>`, `HttpOnly`, `SameSite=Lax`, `Secure` unless\n`public_url` is loopback `http`, `Path=/api/mcp/oauth/callback`,\n`Max-Age=900`). The frontend never reads the cookie. Send `{}` when\naccepting nothing: a body is required.\n\nIts own codes, beyond every route's (see `McpConnectionItem`):\n- 403 `step_up_required`; 404 `not_found`;\n- 409 `wrong_cred_kind`: the connection is `none` or `static`;\n- 409 `no_oauth_client`: an `oauth_client` connection with no client yet:\n  `PUT …/oauth-client` first;\n- 409 `no_registration_endpoint`: `oauth_dcr`, and the authorization\n  server offers no dynamic registration: switch to `oauth_client`;\n- 409 `resource_mismatch`: the protected-resource document names another\n  `resource` (in `oauth.resource_mismatch`); accept it with\n  `accept_resource`, or fix the URL;\n- 409 `issuer_changed`: an `oauth_client` whose pinned issuer differs\n  from what discovery finds now: `PUT …/oauth-client` again;\n- 400 `invalid`: an `accept_resource` that is not the one found now;\n- 502 `resource_foreign`: the protected-resource document names a\n  `resource` on another origin, or one that is not `https`; it cannot be\n  accepted;\n- 429 `too_many_flows`: 16 Connects are in flight;\n- 502 `discovery_failed`: no protected-resource or authorization-server\n  document with both endpoints, or authorization-server metadata whose\n  `issuer` is not the identifier it was fetched for (the message names\n  only origins);\n- 502 `insecure_metadata`: a metadata document, an endpoint or the\n  consent URL is not `https` (loopback `http` excepted);\n- 502 `pkce_unsupported`: the server does not advertise `S256`;\n- 502 `registration_refused`: the vendor refused registration; `message`\n  holds its RFC 7591 `error` and `error_description`, control and bidi\n  characters stripped, cut to 300 characters, after \"The vendor said: \",\n  to be rendered as text;\n- 502 `egress_refused`: an address the egress policy refuses (a\n  non-public one: mark the connection internal network, if it is);\n- 502 `upstream_unreachable`: a timeout or a transport failure.\n\nEach failure after the connection was found is also kept in\n`oauth_error`.",
+      "properties": {
+        "accept_resource": {
+          "description": "The mismatching `resource` the operator accepts, exactly as\n`oauth.resource_mismatch` showed it (gateway spec §4.1, G-4).",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "McpAuthorizeResponse": {
+      "description": "The answer to `POST /api/mcp/connections/{id}/authorize`.\n\nThe callback, `GET /api/mcp/oauth/callback`, is the vendor's redirect\ntarget, outside the operator's routes (the flow cookie and `state`\nauthenticate it): a static page, `<body data-outcome=\"connected|failed\"\ndata-result=\"<code>\" data-connection=\"<id or empty>\">`, whose script\nposts `{type: \"done\", connection_id, outcome, result}` on\n`BroadcastChannel(\"hennery-mcp-oauth\")` and closes the window on\n`connected`. Its results: 200 `connected`; 400 `flow_unknown`,\n`flow_mismatch`, `session_ended`, `issuer_mismatch`, `consent_denied`,\n`connection_changed`; 502 `exchange_failed`, `upstream_unreachable`,\n`egress_refused`; 500 `internal`. The broadcast is a hint: refetch the\nitem.",
+      "properties": {
+        "consent_url": {
+          "description": "`https`, at the vendor (loopback `http` excepted): navigate the\npopup to it, and show it as a link if the popup was blocked.",
+          "type": "string"
+        },
+        "expires_at": {
+          "description": "RFC 3339: when the flow expires (15 minutes).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "consent_url",
+        "expires_at"
+      ],
+      "type": "object"
+    },
     "McpConnectionItem": {
-      "description": "One MCP gateway connection (gateway spec §2, §9): an entry of\n`GET /api/mcp/connections` (200, an array, oldest first), and the answer\nto `POST` (201), `PATCH` (200) and `PUT …/{id}/mounts` (200). Never its\nsecret: `has_credential` says whether one is stored.\n\nEvery `/api/mcp/*` route is the operator's and answers\n`Cache-Control: no-store`. An error is an `ApiError`; the codes every\nroute may answer:\n- 401 `unauthenticated`: no live session: sign in.\n- 403 `setup_required`, `origin_mismatch` or `cross_site`: the browser\n  rules refused the request (kernel spec §3.2).\n- 415 `unsupported_media_type`: a body that is not `application/json`.\n- 400 `invalid_body`: a body that is not JSON; 422 `invalid_body`: one\n  that is not the route's shape, an unknown field included. The body is\n  never quoted back.\n- 413 `body_too_large`: a body over 256 KiB.\n- 405, with no body: a method the path does not take.\n- 500 `internal`.\n\nEach request type names the codes of its own route. A 403\n`step_up_required` asks for a password or passkey check\n(`POST /api/auth/step-up/…`); retry after it.\n\n`DELETE /api/mcp/connections/{id}` (step-up) takes no body: 204, its\nmounts and credential deleted with it; 403 `step_up_required`, 404\n`not_found`.",
+      "description": "One MCP gateway connection (gateway spec §2, §9): an entry of\n`GET /api/mcp/connections` (200, an array, oldest first), and the answer\nto `POST` (201), `PATCH` (200) and `PUT …/{id}/mounts` (200). Never its\nsecret: `has_credential` says whether one is stored.\n\nEvery `/api/mcp/*` route is the operator's and answers\n`Cache-Control: no-store`. An error is an `ApiError`; the codes every\nroute may answer:\n- 401 `unauthenticated`: no live session: sign in.\n- 403 `setup_required`, `origin_mismatch` or `cross_site`: the browser\n  rules refused the request (kernel spec §3.2).\n- 415 `unsupported_media_type`: a body that is not `application/json`.\n- 400 `invalid_body`: a body that is not JSON; 422 `invalid_body`: one\n  that is not the route's shape, an unknown field included. The body is\n  never quoted back.\n- 413 `body_too_large`: a body over 256 KiB.\n- 405, with no body: a method the path does not take.\n- 500 `internal`.\n\nEach request type names the codes of its own route. A 403\n`step_up_required` asks for a password or passkey check\n(`POST /api/auth/step-up/…`); retry after it.\n\n`DELETE /api/mcp/connections/{id}` (step-up) takes no body: 204, its\nmounts, credential and OAuth client deleted with it, its OAuth flows in\nflight dropped; 403 `step_up_required`, 404 `not_found`.\n\n`POST /api/mcp/connections/{id}/probe` (no step-up; may change) takes\n`{}`: the gateway spec §7 handshake now, through the proxy's forwarding\npath, and 200 with the item after it. Single-flight per connection; a\ncall within 10 s of a completed probe answers its result without a new\nrequest; bounded at 30 s (`error`, \"the probe timed out\"). Its own\ncodes, beyond every route's: 404 `not_found`; 409 `no_credential` (a\n`static` or OAuth connection with none stored: set the token or Connect\nfirst).",
       "properties": {
         "account_label": {
-          "description": "The upstream account it is signed in as, when the probe (plan 8f)\nlearns it; absent otherwise.",
+          "description": "The upstream account it is signed in as, when the vendor reports one;\nabsent otherwise (none is learned yet: plan 8f's Q3).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "checked_at": {
+          "description": "When the gateway last learned the status, from the 15-minute probe,\na probe the operator asked for, or live traffic: RFC 3339.\n`status_at` is when it last changed. Absent: never checked.",
           "type": [
             "string",
             "null"
@@ -1924,6 +1880,28 @@
           },
           "type": "array"
         },
+        "oauth": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpOauthState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "OAuth set-up, for `oauth_dcr` and `oauth_client` only; absent for the\nother kinds."
+        },
+        "oauth_error": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpOauthError"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the latest Connect did not complete; cleared by the next\ncompleted one and by the next authorize. Not the status: a failed\nreconnect of a working grant leaves `ok`."
+        },
         "slug": {
           "description": "`^[a-z0-9][a-z0-9-]{0,47}$`, unique per owner; fixed once created.\nAgents see the server as `hennery-<slug>`.",
           "type": "string"
@@ -1945,7 +1923,7 @@
           "type": "string"
         },
         "status_note": {
-          "description": "Why `status` is what it is, when the probe (plan 8f) says; absent\notherwise.",
+          "description": "Why `status` is what it is (`needs_auth`, `error`), as text; absent\notherwise.",
           "type": [
             "string",
             "null"
@@ -1990,7 +1968,7 @@
       "type": "object"
     },
     "McpConnectionStatus": {
-      "description": "A connection's health (gateway spec §7): `not_connected`, not checked\nyet; `ok`; `needs_auth`, the operator must sign in again; `error`, with\n`status_note`. Plan 8a only ever reports `not_connected`; the probe\n(plan 8f) sets the others.",
+      "description": "A connection's health (gateway spec §7): `not_connected`, no credential\nyet (offer Connect); `ok`; `needs_auth`, the vendor refused the\ncredential (offer Reconnect, or \"set the token again\"); `error`, an\noutage, with `status_note` (never offer a reconnect). Live traffic, the\n15-minute probe of OAuth connections, and a probe the operator asks for\nset it; a `needs_auth` connection stays mounted.",
       "oneOf": [
         {
           "const": "not_connected",
@@ -2015,7 +1993,7 @@
       ]
     },
     "McpCredKind": {
-      "description": "How an MCP gateway connection authenticates to its upstream (gateway\nspec §2): `none`; `static`, a token the operator sets; `oauth_dcr` and\n`oauth_client`, OAuth (plan 8f). Plan 8a takes `none` and `static`;\nnaming an OAuth kind in a create or a change answers 400\n`unsupported_cred_kind` until plan 8f.",
+      "description": "How an MCP gateway connection authenticates to its upstream (gateway\nspec §2): `none`; `static`, a token the operator sets; `oauth_dcr` and\n`oauth_client`, OAuth (plan 8f): Connect with\n`POST /api/mcp/connections/{id}/authorize`.",
       "oneOf": [
         {
           "const": "none",
@@ -2029,12 +2007,12 @@
         },
         {
           "const": "oauth_dcr",
-          "description": "OAuth, the client registered dynamically (plan 8f).",
+          "description": "OAuth, the client registered dynamically as a public client at the\nfirst Connect (RFC 7591).",
           "type": "string"
         },
         {
           "const": "oauth_client",
-          "description": "OAuth, with a client the operator registered with the vendor (plan 8f).",
+          "description": "OAuth, with a client the operator registered with the vendor\n(`PUT /api/mcp/connections/{id}/oauth-client`).",
           "type": "string"
         }
       ]
@@ -2053,21 +2031,6 @@
       ],
       "type": "object"
     },
-    "McpIsolation": {
-      "description": "How a host keeps an agent's sessions to the servers hennery passes (ACP\ncore §6). Lenient: a mechanism this build does not know reads as `none`.",
-      "oneOf": [
-        {
-          "const": "claude_strict",
-          "description": "`--strict-mcp-config` through `_meta` on every `session/new` and\n`session/load` (the pinned Claude adapter, its own CLI).",
-          "type": "string"
-        },
-        {
-          "const": "none",
-          "description": "None: the agent also loads the user's own MCP configuration.",
-          "type": "string"
-        }
-      ]
-    },
     "McpMountsRequest": {
       "additionalProperties": false,
       "description": "`PUT /api/mcp/connections/{id}/mounts`: the whole set of hosts the\nconnection is mounted on, replacing the one before, never a delta\n(gateway spec §9). No step-up: a mount reaches only a host the owner\npaired. 200 with the `McpConnectionItem`.\n\nIts own codes, beyond every route's (see `McpConnectionItem`): 404\n`not_found`; 400 `invalid` (a host that is not one of the owner's\npaired, unrevoked hosts; more than 1024 hosts; an id over 64 bytes,\nwhich is not quoted back). The limits count the ids as sent, and are\nchecked before the connection is looked up. A refused set changes\nnothing.",
@@ -2085,87 +2048,128 @@
       ],
       "type": "object"
     },
-    "McpServer": {
-      "description": "One MCP server for a session (gateway spec §3.2, §3.4): an entry of ACP\n`session/new` / `session/load` `mcpServers`, tagged by `type` here (ACP\nitself leaves stdio entries untagged; the host builds those). A new\nserver type or a new required field needs a new capability: a host that\ncannot decode a start drops it unanswered, and the collector's timeout\nthen drops the connection.",
-      "oneOf": [
-        {
-          "description": "A streamable-HTTP server: the gateway's `/mcp/<slug>`, with the\nsession's token in `Authorization`.",
-          "properties": {
-            "headers": {
-              "default": [],
-              "items": {
-                "$ref": "#/$defs/NameValue"
-              },
-              "type": "array"
-            },
-            "name": {
-              "type": "string"
-            },
-            "type": {
-              "const": "http",
-              "type": "string"
-            },
-            "url": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "name",
-            "url"
-          ],
-          "type": "object"
-        },
-        {
-          "description": "A local server the agent runs as its own child.",
-          "properties": {
-            "args": {
-              "default": [],
-              "items": {
-                "type": "string"
-              },
-              "type": "array"
-            },
-            "command": {
-              "type": "string"
-            },
-            "env": {
-              "default": [],
-              "items": {
-                "$ref": "#/$defs/NameValue"
-              },
-              "type": "array"
-            },
-            "name": {
-              "type": "string"
-            },
-            "type": {
-              "const": "stdio",
-              "type": "string"
-            }
-          },
-          "required": [
-            "type",
-            "name",
-            "command"
-          ],
-          "type": "object"
-        }
-      ]
-    },
-    "NameValue": {
-      "description": "A name and a value: an HTTP header of an MCP server, or an environment\nvariable of a stdio one. The value can be a secret (a gateway session\ntoken, a stdio server's key), so `Debug` never shows it (ACP core §8).",
+    "McpOauthClientRequest": {
+      "additionalProperties": false,
+      "description": "`PUT /api/mcp/connections/{id}/oauth-client` (step-up): the client the\noperator registered at the vendor (gateway spec §4.2, G-1). 200 with the\n`McpConnectionItem`. Write-only for the secret: `client_secret` absent\nkeeps the stored one, but only while `client_id` equals the client this\n`PUT` replaces (the pending one if any, else the active one); a secret\nnever moves to another client id. `null` stores none (a public client);\na string sets it. The first authorize with a client pins its `issuer`\nand `token_endpoint`; the secret is only ever sent to that token\nendpoint. A `PUT` drops the connection's live flows. With a live grant\nthe client is saved as `oauth.pending_client` and takes effect when a\nConnect with it completes (G-7); without one it takes effect at once.\nIts `Debug` never shows the secret.\n\nIts own codes, beyond every route's (see `McpConnectionItem`): 403\n`step_up_required`; 404 `not_found`; 409 `wrong_cred_kind` (the\nconnection is not `oauth_client`); 400 `invalid` (`client_id` not 1 to\n512 visible ASCII characters; a secret not 1 to 8192 visible ASCII\ncharacters without spaces, never quoted; a new `client_id` without\n`client_secret`: send the secret, or `null` for a public client).",
       "properties": {
-        "name": {
+        "client_id": {
+          "description": "The client id registered at the vendor: 1 to 512 visible ASCII\ncharacters.",
           "type": "string"
         },
-        "value": {
+        "client_secret": {
+          "description": "Absent: kept (same `client_id` only). `null`: none. A string: set.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "client_id"
+      ],
+      "type": "object"
+    },
+    "McpOauthError": {
+      "description": "Why the latest Connect failed. `code` is one of the authorize or\ncallback codes; `message` is rendered as text, any vendor text in it\ncut to 300 characters.",
+      "properties": {
+        "at": {
+          "description": "RFC 3339.",
+          "type": "string"
+        },
+        "code": {
+          "description": "An authorize code (`discovery_failed`, `registration_refused`, …) or\na callback result (`consent_denied`, `exchange_failed`, …).",
+          "type": "string"
+        },
+        "message": {
+          "description": "What to show, as text.",
           "type": "string"
         }
       },
       "required": [
-        "name",
-        "value"
+        "code",
+        "message",
+        "at"
+      ],
+      "type": "object"
+    },
+    "McpOauthPendingClient": {
+      "description": "A pre-registered client waiting for a Connect to complete (G-7).",
+      "properties": {
+        "client_id": {
+          "description": "The client id the operator saved. Not a secret.",
+          "type": "string"
+        },
+        "has_client_secret": {
+          "description": "A client secret is stored with it. No route answers it.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "client_id",
+        "has_client_secret"
+      ],
+      "type": "object"
+    },
+    "McpOauthRedirect": {
+      "description": "`GET /api/mcp/oauth/redirect-uri` (200): the redirect URI to register at\na vendor for an `oauth_client` connection, before any connection exists\n(the add form). Changes only with `public_url`.",
+      "properties": {
+        "redirect_uri": {
+          "description": "`<public_url>/api/mcp/oauth/callback`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "redirect_uri"
+      ],
+      "type": "object"
+    },
+    "McpOauthState": {
+      "description": "A connection's OAuth set-up (gateway spec §4), without a secret. Its\n`Debug` shows neither `resource` value (lane L11: they are URLs).",
+      "properties": {
+        "accepted_resource": {
+          "description": "The mismatching `resource` the operator accepted; cleared by any\nchange of `url`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "client_id": {
+          "description": "The client in use: the pre-registered one, or the one registered\ndynamically. Absent: none yet (an `oauth_dcr` before its first\nConnect, an `oauth_client` before `PUT …/oauth-client`). Not a\nsecret.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "has_client_secret": {
+          "description": "A client secret is stored. No route answers it.",
+          "type": "boolean"
+        },
+        "pending_client": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpOauthPendingClient"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "[may change] A pre-registered client saved while a grant is live: it\nreplaces `client_id` only when a Connect with it completes (G-7)."
+        },
+        "redirect_uri": {
+          "description": "What to register at the vendor for `oauth_client`:\n`<public_url>/api/mcp/oauth/callback`.",
+          "type": "string"
+        },
+        "resource_mismatch": {
+          "description": "The protected-resource document's `resource` that does not match the\nURL (gateway spec §4.1, G-4), as the latest authorize found it, not\nyet accepted. Shown with `url` for the operator to compare.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "redirect_uri",
+        "has_client_secret"
       ],
       "type": "object"
     },
@@ -2536,26 +2540,6 @@
       },
       "required": [
         "turn_id"
-      ],
-      "type": "object"
-    },
-    "PublicUrlChanged": {
-      "description": "What a `public_url` change ended, as `hennery admin reset-public-url`\nreports it: every signed-in session (the caller's own among them), and\nthe passkeys of a host name `public_url` no longer has.",
-      "properties": {
-        "passkeys_removed": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        },
-        "sessions_ended": {
-          "format": "uint64",
-          "minimum": 0,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "sessions_ended",
-        "passkeys_removed"
       ],
       "type": "object"
     },
@@ -3579,21 +3563,8 @@
       ],
       "type": "object"
     },
-    "SetHatLogoRequest": {
-      "additionalProperties": false,
-      "description": "`PUT /api/hats/{id}/logo` (kernel spec §5.1, §8; plan 4d-B2): a PNG, at\nmost 64 KiB, as standard base64 with its padding and nothing around it\n(no `data:` prefix, no whitespace). The body is at most 96 KiB. Step-up.\nThe collector decodes it and writes it afresh, so what is served is\nnever the upload's bytes. 200 with the `HatItem`.\n\nIts own codes: 400 `invalid_logo` (not base64; not a readable PNG; over\n1024 pixels either way); 413 `logo_too_large` (over 64 KiB, or over 256\nKiB once re-encoded); 413 `body_too_large`; 415 `unsupported_logo` (not\na PNG: the web UI turns an SVG, a WebP or a JPEG into one first); 404\n`not_found`; 409 `hat_purging` (a hat frozen for its purge takes no new\nlogo). `DELETE /api/hats/{id}/logo` (step-up) removes it: 200 with the\n`HatItem`, a frozen hat's too, or 404.",
-      "properties": {
-        "data": {
-          "type": "string"
-        }
-      },
-      "required": [
-        "data"
-      ],
-      "type": "object"
-    },
     "SettingsResponse": {
-      "description": "`GET /api/settings` (kernel spec §8).",
+      "description": "`GET /api/settings` (kernel spec §8), and the answer to its `PATCH`.",
       "properties": {
         "contact": {
           "description": "The owner's push contact (kernel spec §6): an e-mail address the\npush services may write to. Absent: they are given an `https`\n`public_url`, and nothing for an `http` one, which Apple refuses.",
@@ -3613,49 +3584,15 @@
     },
     "SettingsUpdateRequest": {
       "additionalProperties": false,
-      "description": "`PATCH /api/settings`: absent fields stay as they are, and so does a\n`null` one. `contact` is an e-mail address, trimmed, or empty (or blank)\nto clear it.\n\n`public_url` moves the collector (kernel spec §3.2), as\n`hennery admin reset-public-url` does (§4.2), and needs a fresh step-up\n(§3.4). It ends every signed-in session, this one included (its cookie\nis cleared), and so every stream and push subscription; it removes\nevery passkey when the host name changes. The browser must then sign in\nat the new origin: requests from the old one are refused. A typo is\nrecovered on the collector's machine, with `hennery admin\nreset-public-url`. A body with both fields changes both or neither.",
+      "description": "`PATCH /api/settings`: absent fields stay as they are. `contact` is an\ne-mail address, trimmed, or empty (or blank) to clear it. `public_url` is not changed here\nyet: `hennery admin reset-public-url` does that (kernel spec §4.2).",
       "properties": {
         "contact": {
           "type": [
             "string",
             "null"
           ]
-        },
-        "public_url": {
-          "type": [
-            "string",
-            "null"
-          ]
         }
       },
-      "type": "object"
-    },
-    "SettingsUpdateResponse": {
-      "description": "The answer to `PATCH /api/settings`: the settings as they are now and,\nwhen `public_url` was changed, what the change ended. Without\n`public_url_changed` it is exactly `SettingsResponse`.",
-      "properties": {
-        "contact": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "public_url": {
-          "type": "string"
-        },
-        "public_url_changed": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PublicUrlChanged"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        }
-      },
-      "required": [
-        "public_url"
-      ],
       "type": "object"
     },
     "SetupRequest": {
@@ -3898,7 +3835,7 @@
     },
     "UpdateMcpConnectionRequest": {
       "additionalProperties": false,
-      "description": "`PATCH /api/mcp/connections/{id}`: 200 with the `McpConnectionItem` as\nit is now. An absent field keeps its value; a `null` allowlist clears it\n(every tool), `\"\"` clears the prefix (gateway spec §4.6); a `null` for\nanother field reads as absent. Naming `url`, `cred_kind`,\n`internal_network`, `static_header` or `static_prefix` needs step-up,\neven with its stored value. Another origin (scheme, host, port) or\nanother kind deletes the stored credential and starts the status over\nat `not_connected`, in the same change. The slug and the hat cannot\nchange: naming them is an unknown field.\n\nIts own codes, beyond every route's (see `McpConnectionItem`): 403\n`step_up_required`; 404 `not_found`; 400 `invalid` (`message` says\nwhich field); 400 `unsupported_cred_kind`. A refused change changes\nnothing.",
+      "description": "`PATCH /api/mcp/connections/{id}`: 200 with the `McpConnectionItem` as\nit is now. An absent field keeps its value; a `null` allowlist clears it\n(every tool), `\"\"` clears the prefix (gateway spec §4.6); a `null` for\nanother field reads as absent. Naming `url`, `cred_kind`,\n`internal_network`, `static_header` or `static_prefix` needs step-up,\neven with its stored value. Another origin (scheme, host, port) or\nanother kind deletes the stored credential and the OAuth client and\nstarts the status over at `not_connected`, in the same change: the\nclient has to be entered again and Connect run again. Any change of the\nURL, a path's too, clears `oauth.resource_mismatch` and\n`oauth.accepted_resource`; a change of the URL, the kind or the\ninternal marking drops the connection's OAuth flows in flight. The slug\nand the hat cannot change: naming them is an unknown field.\n\nIts own codes, beyond every route's (see `McpConnectionItem`): 403\n`step_up_required`; 404 `not_found`; 400 `invalid` (`message` says\nwhich field). A refused change changes nothing.",
       "properties": {
         "cred_kind": {
           "anyOf": [

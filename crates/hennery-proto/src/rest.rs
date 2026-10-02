@@ -998,9 +998,8 @@ pub struct PushPayload {
 
 /// How an MCP gateway connection authenticates to its upstream (gateway
 /// spec §2): `none`; `static`, a token the operator sets; `oauth_dcr` and
-/// `oauth_client`, OAuth (plan 8f). Plan 8a takes `none` and `static`;
-/// naming an OAuth kind in a create or a change answers 400
-/// `unsupported_cred_kind` until plan 8f.
+/// `oauth_client`, OAuth (plan 8f): Connect with
+/// `POST /api/mcp/connections/{id}/authorize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum McpCredKind {
@@ -1009,16 +1008,20 @@ pub enum McpCredKind {
     /// A token the operator sets (`PUT /api/mcp/connections/{id}/credential`),
     /// sent as `<static_header>: <static_prefix><token>`.
     Static,
-    /// OAuth, the client registered dynamically (plan 8f).
+    /// OAuth, the client registered dynamically as a public client at the
+    /// first Connect (RFC 7591).
     OauthDcr,
-    /// OAuth, with a client the operator registered with the vendor (plan 8f).
+    /// OAuth, with a client the operator registered with the vendor
+    /// (`PUT /api/mcp/connections/{id}/oauth-client`).
     OauthClient,
 }
 
-/// A connection's health (gateway spec §7): `not_connected`, not checked
-/// yet; `ok`; `needs_auth`, the operator must sign in again; `error`, with
-/// `status_note`. Plan 8a only ever reports `not_connected`; the probe
-/// (plan 8f) sets the others.
+/// A connection's health (gateway spec §7): `not_connected`, no credential
+/// yet (offer Connect); `ok`; `needs_auth`, the vendor refused the
+/// credential (offer Reconnect, or "set the token again"); `error`, an
+/// outage, with `status_note` (never offer a reconnect). Live traffic, the
+/// 15-minute probe of OAuth connections, and a probe the operator asks for
+/// set it; a `needs_auth` connection stays mounted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum McpConnectionStatus {
@@ -1057,8 +1060,17 @@ pub enum McpConnectionStatus {
 /// (`POST /api/auth/step-up/…`); retry after it.
 ///
 /// `DELETE /api/mcp/connections/{id}` (step-up) takes no body: 204, its
-/// mounts and credential deleted with it; 403 `step_up_required`, 404
-/// `not_found`.
+/// mounts, credential and OAuth client deleted with it, its OAuth flows in
+/// flight dropped; 403 `step_up_required`, 404 `not_found`.
+///
+/// `POST /api/mcp/connections/{id}/probe` (no step-up; may change) takes
+/// `{}`: the gateway spec §7 handshake now, through the proxy's forwarding
+/// path, and 200 with the item after it. Single-flight per connection; a
+/// call within 10 s of a completed probe answers its result without a new
+/// request; bounded at 30 s (`error`, "the probe timed out"). Its own
+/// codes, beyond every route's: 404 `not_found`; 409 `no_credential` (a
+/// `static` or OAuth connection with none stored: set the token or Connect
+/// first).
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct McpConnectionItem {
     /// `conn-` and 16 hexadecimal digits: the `{id}` of the routes.
@@ -1092,13 +1104,13 @@ pub struct McpConnectionItem {
     pub internal_network: bool,
     /// Its health.
     pub status: McpConnectionStatus,
-    /// Why `status` is what it is, when the probe (plan 8f) says; absent
+    /// Why `status` is what it is (`needs_auth`, `error`), as text; absent
     /// otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "string | undefined", optional)]
     pub status_note: Option<String>,
-    /// The upstream account it is signed in as, when the probe (plan 8f)
-    /// learns it; absent otherwise.
+    /// The upstream account it is signed in as, when the vendor reports one;
+    /// absent otherwise (none is learned yet: plan 8f's Q3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "string | undefined", optional)]
     pub account_label: Option<String>,
@@ -1113,6 +1125,220 @@ pub struct McpConnectionItem {
     pub has_credential: bool,
     /// The hosts it is mounted on, by id, sorted; revoked hosts are left out.
     pub mounts: Vec<String>,
+    /// When the gateway last learned the status, from the 15-minute probe,
+    /// a probe the operator asked for, or live traffic: RFC 3339.
+    /// `status_at` is when it last changed. Absent: never checked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub checked_at: Option<String>,
+    /// OAuth set-up, for `oauth_dcr` and `oauth_client` only; absent for the
+    /// other kinds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "McpOauthState | undefined", optional)]
+    pub oauth: Option<McpOauthState>,
+    /// Why the latest Connect did not complete; cleared by the next
+    /// completed one and by the next authorize. Not the status: a failed
+    /// reconnect of a working grant leaves `ok`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "McpOauthError | undefined", optional)]
+    pub oauth_error: Option<McpOauthError>,
+}
+
+/// A connection's OAuth set-up (gateway spec §4), without a secret. Its
+/// `Debug` shows neither `resource` value (lane L11: they are URLs).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct McpOauthState {
+    /// What to register at the vendor for `oauth_client`:
+    /// `<public_url>/api/mcp/oauth/callback`.
+    pub redirect_uri: String,
+    /// The client in use: the pre-registered one, or the one registered
+    /// dynamically. Absent: none yet (an `oauth_dcr` before its first
+    /// Connect, an `oauth_client` before `PUT …/oauth-client`). Not a
+    /// secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub client_id: Option<String>,
+    /// A client secret is stored. No route answers it.
+    pub has_client_secret: bool,
+    /// [may change] A pre-registered client saved while a grant is live: it
+    /// replaces `client_id` only when a Connect with it completes (G-7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "McpOauthPendingClient | undefined", optional)]
+    pub pending_client: Option<McpOauthPendingClient>,
+    /// The protected-resource document's `resource` that does not match the
+    /// URL (gateway spec §4.1, G-4), as the latest authorize found it, not
+    /// yet accepted. Shown with `url` for the operator to compare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub resource_mismatch: Option<String>,
+    /// The mismatching `resource` the operator accepted; cleared by any
+    /// change of `url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub accepted_resource: Option<String>,
+}
+
+/// A pre-registered client waiting for a Connect to complete (G-7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct McpOauthPendingClient {
+    /// The client id the operator saved. Not a secret.
+    pub client_id: String,
+    /// A client secret is stored with it. No route answers it.
+    pub has_client_secret: bool,
+}
+
+/// Why the latest Connect failed. `code` is one of the authorize or
+/// callback codes; `message` is rendered as text, any vendor text in it
+/// cut to 300 characters.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct McpOauthError {
+    /// An authorize code (`discovery_failed`, `registration_refused`, …) or
+    /// a callback result (`consent_denied`, `exchange_failed`, …).
+    pub code: String,
+    /// What to show, as text.
+    pub message: String,
+    /// RFC 3339.
+    pub at: String,
+}
+
+/// `GET /api/mcp/oauth/redirect-uri` (200): the redirect URI to register at
+/// a vendor for an `oauth_client` connection, before any connection exists
+/// (the add form). Changes only with `public_url`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct McpOauthRedirect {
+    /// `<public_url>/api/mcp/oauth/callback`.
+    pub redirect_uri: String,
+}
+
+/// `PUT /api/mcp/connections/{id}/oauth-client` (step-up): the client the
+/// operator registered at the vendor (gateway spec §4.2, G-1). 200 with the
+/// `McpConnectionItem`. Write-only for the secret: `client_secret` absent
+/// keeps the stored one, but only while `client_id` equals the client this
+/// `PUT` replaces (the pending one if any, else the active one); a secret
+/// never moves to another client id. `null` stores none (a public client);
+/// a string sets it. The first authorize with a client pins its `issuer`
+/// and `token_endpoint`; the secret is only ever sent to that token
+/// endpoint. A `PUT` drops the connection's live flows. With a live grant
+/// the client is saved as `oauth.pending_client` and takes effect when a
+/// Connect with it completes (G-7); without one it takes effect at once.
+/// Its `Debug` never shows the secret.
+///
+/// Its own codes, beyond every route's (see `McpConnectionItem`): 403
+/// `step_up_required`; 404 `not_found`; 409 `wrong_cred_kind` (the
+/// connection is not `oauth_client`); 400 `invalid` (`client_id` not 1 to
+/// 512 visible ASCII characters; a secret not 1 to 8192 visible ASCII
+/// characters without spaces, never quoted; a new `client_id` without
+/// `client_secret`: send the secret, or `null` for a public client).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct McpOauthClientRequest {
+    /// The client id registered at the vendor: 1 to 512 visible ASCII
+    /// characters.
+    pub client_id: String,
+    /// Absent: kept (same `client_id` only). `null`: none. A string: set.
+    #[serde(default, with = "present", skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    #[ts(type = "string | null | undefined", optional)]
+    pub client_secret: Option<Option<String>>,
+}
+
+impl std::fmt::Debug for McpOauthState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpOauthState")
+            .field("client_id", &self.client_id)
+            .field("has_client_secret", &self.has_client_secret)
+            .field("pending_client", &self.pending_client)
+            .field("resource_mismatch", &self.resource_mismatch.is_some())
+            .field("accepted_resource", &self.accepted_resource.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for McpOauthClientRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpOauthClientRequest")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|s| s.as_ref().map(|_| "<redacted>")),
+            )
+            .finish()
+    }
+}
+
+/// `POST /api/mcp/connections/{id}/authorize` (step-up): starts OAuth
+/// (gateway spec §4.1–§4.3). Discovery and, for `oauth_dcr`, registration
+/// happen here, through the egress policy. 200 with the consent URL; the
+/// answer sets the flow's own cookie (`hennery_mcp_flow_<16 hex of
+/// sha256(state)>`, `HttpOnly`, `SameSite=Lax`, `Secure` unless
+/// `public_url` is loopback `http`, `Path=/api/mcp/oauth/callback`,
+/// `Max-Age=900`). The frontend never reads the cookie. Send `{}` when
+/// accepting nothing: a body is required.
+///
+/// Its own codes, beyond every route's (see `McpConnectionItem`):
+/// - 403 `step_up_required`; 404 `not_found`;
+/// - 409 `wrong_cred_kind`: the connection is `none` or `static`;
+/// - 409 `no_oauth_client`: an `oauth_client` connection with no client yet:
+///   `PUT …/oauth-client` first;
+/// - 409 `no_registration_endpoint`: `oauth_dcr`, and the authorization
+///   server offers no dynamic registration: switch to `oauth_client`;
+/// - 409 `resource_mismatch`: the protected-resource document names another
+///   `resource` (in `oauth.resource_mismatch`); accept it with
+///   `accept_resource`, or fix the URL;
+/// - 409 `issuer_changed`: an `oauth_client` whose pinned issuer differs
+///   from what discovery finds now: `PUT …/oauth-client` again;
+/// - 400 `invalid`: an `accept_resource` that is not the one found now;
+/// - 502 `resource_foreign`: the protected-resource document names a
+///   `resource` on another origin, or one that is not `https`; it cannot be
+///   accepted;
+/// - 429 `too_many_flows`: 16 Connects are in flight;
+/// - 502 `discovery_failed`: no protected-resource or authorization-server
+///   document with both endpoints, or authorization-server metadata whose
+///   `issuer` is not the identifier it was fetched for (the message names
+///   only origins);
+/// - 502 `insecure_metadata`: a metadata document, an endpoint or the
+///   consent URL is not `https` (loopback `http` excepted);
+/// - 502 `pkce_unsupported`: the server does not advertise `S256`;
+/// - 502 `registration_refused`: the vendor refused registration; `message`
+///   holds its RFC 7591 `error` and `error_description`, control and bidi
+///   characters stripped, cut to 300 characters, after "The vendor said: ",
+///   to be rendered as text;
+/// - 502 `egress_refused`: an address the egress policy refuses (a
+///   non-public one: mark the connection internal network, if it is);
+/// - 502 `upstream_unreachable`: a timeout or a transport failure.
+///
+/// Each failure after the connection was found is also kept in
+/// `oauth_error`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct McpAuthorizeRequest {
+    /// The mismatching `resource` the operator accepts, exactly as
+    /// `oauth.resource_mismatch` showed it (gateway spec §4.1, G-4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub accept_resource: Option<String>,
+}
+
+/// The answer to `POST /api/mcp/connections/{id}/authorize`.
+///
+/// The callback, `GET /api/mcp/oauth/callback`, is the vendor's redirect
+/// target, outside the operator's routes (the flow cookie and `state`
+/// authenticate it): a static page, `<body data-outcome="connected|failed"
+/// data-result="<code>" data-connection="<id or empty>">`, whose script
+/// posts `{type: "done", connection_id, outcome, result}` on
+/// `BroadcastChannel("hennery-mcp-oauth")` and closes the window on
+/// `connected`. Its results: 200 `connected`; 400 `flow_unknown`,
+/// `flow_mismatch`, `session_ended`, `issuer_mismatch`, `consent_denied`,
+/// `connection_changed`; 502 `exchange_failed`, `upstream_unreachable`,
+/// `egress_refused`; 500 `internal`. The broadcast is a hint: refetch the
+/// item.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct McpAuthorizeResponse {
+    /// `https`, at the vendor (loopback `http` excepted): navigate the
+    /// popup to it, and show it as a link if the popup was blocked.
+    pub consent_url: String,
+    /// RFC 3339: when the flow expires (15 minutes).
+    pub expires_at: String,
 }
 
 /// `POST /api/mcp/connections` (step-up): 201 with the new
@@ -1122,10 +1348,9 @@ pub struct McpConnectionItem {
 ///
 /// Its own codes, beyond every route's (see `McpConnectionItem`): 403
 /// `step_up_required`; 400 `invalid` (a field refused, `message` says
-/// which, or a hat that is not the owner's); 400 `unsupported_cred_kind`
-/// (an OAuth kind, until plan 8f); 409 `slug_taken` (another of the owner's
-/// connections has the slug); 409 `too_many_connections` (at most 256 per
-/// owner).
+/// which, or a hat that is not the owner's); 409 `slug_taken` (another of
+/// the owner's connections has the slug); 409 `too_many_connections` (at
+/// most 256 per owner).
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]
 pub struct CreateMcpConnectionRequest {
@@ -1140,7 +1365,7 @@ pub struct CreateMcpConnectionRequest {
     pub url: String,
     /// One of the owner's hats; fixed once created.
     pub hat_id: String,
-    /// `none` or `static` until plan 8f.
+    /// Any kind; an OAuth one is connected with `…/authorize` afterwards.
     pub cred_kind: McpCredKind,
     /// Absent: `Authorization`. An HTTP header name of at most 64 bytes,
     /// not one the gateway sets or filters itself (`host`, `content-type`,
@@ -1170,14 +1395,17 @@ pub struct CreateMcpConnectionRequest {
 /// another field reads as absent. Naming `url`, `cred_kind`,
 /// `internal_network`, `static_header` or `static_prefix` needs step-up,
 /// even with its stored value. Another origin (scheme, host, port) or
-/// another kind deletes the stored credential and starts the status over
-/// at `not_connected`, in the same change. The slug and the hat cannot
-/// change: naming them is an unknown field.
+/// another kind deletes the stored credential and the OAuth client and
+/// starts the status over at `not_connected`, in the same change: the
+/// client has to be entered again and Connect run again. Any change of the
+/// URL, a path's too, clears `oauth.resource_mismatch` and
+/// `oauth.accepted_resource`; a change of the URL, the kind or the
+/// internal marking drops the connection's OAuth flows in flight. The slug
+/// and the hat cannot change: naming them is an unknown field.
 ///
 /// Its own codes, beyond every route's (see `McpConnectionItem`): 403
 /// `step_up_required`; 404 `not_found`; 400 `invalid` (`message` says
-/// which field); 400 `unsupported_cred_kind`. A refused change changes
-/// nothing.
+/// which field). A refused change changes nothing.
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateMcpConnectionRequest {

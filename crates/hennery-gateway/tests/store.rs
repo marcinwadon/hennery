@@ -212,21 +212,27 @@ fn a_slug_is_unique_per_owner_and_a_hat_must_be_the_owners() {
     assert_eq!(done(w.store.create(&work, NOW).unwrap()).hat_id, work.hat_id);
 }
 
+/// Plan 8f: the OAuth kinds are taken, on create and by a change, and an
+/// OAuth connection shows its (empty) client in the list.
 #[test]
-fn oauth_kinds_wait_for_plan_8f() {
+fn oauth_kinds_are_taken() {
     let w = World::new();
     for kind in [CredKind::OauthDcr, CredKind::OauthClient] {
-        let mut oauth = w.new_connection("oauth");
+        let slug = format!("o-{}", kind.as_str().replace('_', "-"));
+        let mut oauth = w.new_connection(&slug);
         oauth.cred_kind = kind;
-        assert!(matches!(w.store.create(&oauth, NOW).unwrap(), Change::Unsupported(k) if k == kind));
+        let created = done(w.store.create(&oauth, NOW).unwrap());
+        assert_eq!(created.cred_kind, kind);
+        assert_eq!(created.oauth_client, Some(Default::default()));
         let id = w.create(&format!("s-{}", kind.as_str().replace('_', "-")));
+        assert_eq!(w.store.connection(&id).unwrap().unwrap().oauth_client, None);
         let patch = ConnectionPatch {
             cred_kind: Some(kind),
             ..ConnectionPatch::default()
         };
-        assert!(matches!(w.store.update(&id, &patch, NOW).unwrap(), Change::Unsupported(k) if k == kind));
+        assert_eq!(done(w.store.update(&id, &patch, NOW).unwrap()).cred_kind, kind);
     }
-    assert_eq!(w.count("gw_connections"), 2);
+    assert_eq!(w.count("gw_connections"), 4);
 }
 
 #[test]
@@ -633,8 +639,9 @@ fn the_store_and_the_kernel_agree_on_the_owner_whichever_opens_first() {
             |r| r.get(0),
         )
         .unwrap();
-    // Plan 8a's tables, then plan 8d's session tokens.
-    assert_eq!(version, 2);
+    // Plan 8a's tables, then plan 8d's session tokens, then plan 8f's OAuth
+    // clients.
+    assert_eq!(version, 3);
 }
 
 /// Plan 8a decision 19 (lane L11): a connection's `Debug` shows only its
