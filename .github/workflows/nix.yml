@@ -92,7 +92,7 @@ jobs:
           extra_nix_config: |
             system-features = nixos-test benchmark big-parallel kvm
       - name: Linux revert-probes
-        run: PROBE_SCRATCH=/tmp/probes python3 .github/scratch-probes.py . linux
+        run: PROBE_SCRATCH=/tmp/probes python3 .github/scratch-probes.py . linux hm-doctor-dollar vm-doctor vm-host-log vm-host-mode
       - name: Probe logs
         if: always()
         run: tail -n 60 /tmp/probes/*.log
