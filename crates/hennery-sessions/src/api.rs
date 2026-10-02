@@ -161,6 +161,13 @@ fn request_failed(err: RequestError) -> Response {
         // themselves (`projects::probe_failed`): unreachable here.
         RequestError::Unsupported => error(StatusCode::CONFLICT, "unsupported", "the host does not support this"),
         RequestError::Busy => error(StatusCode::SERVICE_UNAVAILABLE, "busy", "the host is busy; try again"),
+        // Unreachable until plan 8e sends servers; 8e also fails the
+        // session it left `starting`.
+        RequestError::McpUndeliverable => error(
+            StatusCode::CONFLICT,
+            "mcp_isolation_unavailable",
+            "the host cannot keep this agent's session to its MCP servers",
+        ),
     }
 }
 
@@ -312,6 +319,10 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
         agent: req.agent,
         cwd,
         config: req.config,
+        // The hat just stored. No servers yet: minting and the delivery
+        // decision are plan 8e's.
+        hat_id: hat.hat_id.clone(),
+        mcp: Default::default(),
     };
     let undo = Undo::Start {
         session_id: session_id.clone(),
@@ -338,7 +349,9 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
             request_failed(RequestError::NotConnected)
         }
         // The socket task has already failed the session with the host's
-        // code (`Undo::Start`).
+        // code (`Undo::Start`); not for `McpUndeliverable`, which the hub
+        // refused before sending: that leaves the session `starting`, and
+        // plan 8e fails it (unreachable in 8c, which sends no servers).
         Err(err) => request_failed(err),
     }
 }
@@ -620,6 +633,9 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         agent_session_id,
         // Re-applied after the load (ACP core §4.3).
         config,
+        // The hat the resume just re-resolved, equal to the stored one.
+        hat_id: hat.hat_id.clone(),
+        mcp: Default::default(),
     };
     let undo = Undo::Start { session_id: id.clone() };
     match state
@@ -638,7 +654,9 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
             resume_failed(RequestError::NotConnected)
         }
         // The socket task has already failed the session with the host's
-        // code (`Undo::Start`).
+        // code (`Undo::Start`); not for `McpUndeliverable`, which the hub
+        // refused before sending: that leaves the session `starting`, and
+        // plan 8e fails it (unreachable in 8c, which sends no servers).
         Err(err) => resume_failed(err),
     }
 }
@@ -1532,6 +1550,21 @@ mod tests {
         let sent: Vec<_> = replay_then_follow(replay, one_message_each, one_live()).collect().await;
         assert_eq!(sent.len(), 2);
     }
+
+    /// Plan 8c: the hub's refusal to send servers answers 409
+    /// `mcp_isolation_unavailable`, on a start and on a resume alike.
+    #[tokio::test]
+    async fn an_undeliverable_mcp_delivery_answers_409_mcp_isolation_unavailable() {
+        for response in [
+            request_failed(RequestError::McpUndeliverable),
+            resume_failed(RequestError::McpUndeliverable),
+        ] {
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["code"], "mcp_isolation_unavailable", "{body}");
+        }
+    }
 }
 
 /// A delete against a host's reconciliation (plan 9a, the whole-branch
@@ -1572,7 +1605,7 @@ mod delete_race_tests {
         let (tx, rx) = mpsc::unbounded_channel();
         let conn_id = state
             .hub
-            .register(HOST, tx.clone(), Capabilities::default())
+            .register(HOST, tx.clone(), Capabilities::default(), Default::default())
             .unwrap()
             .conn_id;
         Fixture {
