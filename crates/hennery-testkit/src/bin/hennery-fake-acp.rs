@@ -3,12 +3,13 @@
 //! wire format real adapters use.
 
 use agent_client_protocol::schema::v1::{
-    AgentCapabilities, CancelNotification, ConfigOptionUpdate, ContentBlock, ContentChunk, InitializeRequest,
-    InitializeResponse, LoadSessionRequest, LoadSessionResponse, NewSessionRequest, NewSessionResponse,
-    PromptCapabilities, PromptRequest, PromptResponse, SessionConfigKind, SessionConfigOption,
-    SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelect, SessionConfigSelectOption,
-    SessionConfigSelectOptions, SessionConfigValueId, SessionId, SessionNotification, SessionUpdate,
-    SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason, TextContent,
+    AgentCapabilities, CancelNotification, ConfigOptionUpdate, ContentBlock, ContentChunk, DeleteSessionRequest,
+    DeleteSessionResponse, InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
+    NewSessionRequest, NewSessionResponse, PromptCapabilities, PromptRequest, PromptResponse, SessionCapabilities,
+    SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory, SessionConfigOptionValue, SessionConfigSelect,
+    SessionConfigSelectOption, SessionConfigSelectOptions, SessionConfigValueId, SessionDeleteCapabilities, SessionId,
+    SessionNotification, SessionUpdate, SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
+    TextContent,
 };
 use agent_client_protocol::{Agent, Client, ConnectionTo, Responder, SentRequest, Stdio, UntypedMessage};
 use hennery_testkit::{CRASH_EXIT_CODE, FakeAsk, FakeScript, SCRIPT_ENV};
@@ -101,6 +102,9 @@ async fn main() -> agent_client_protocol::Result<()> {
                         InitializeResponse::new(req.protocol_version).agent_capabilities(
                             AgentCapabilities::new()
                                 .load_session(load_session)
+                                .session_capabilities(
+                                    SessionCapabilities::new().delete(SessionDeleteCapabilities::new()),
+                                )
                                 .prompt_capabilities(PromptCapabilities::new().image(images)),
                         ),
                     )
@@ -330,6 +334,29 @@ async fn main() -> agent_client_protocol::Result<()> {
             },
             agent_client_protocol::on_receive_request!(),
         )
+        .on_receive_request(
+            {
+                let script = script.clone();
+                async move |req: DeleteSessionRequest, responder, cx| {
+                    let script = script.clone();
+                    cx.spawn(async move {
+                        let deleted = delete_session(&script, &req.session_id);
+                        if let Some(gate) = &script.delete_waits_for_file {
+                            while !std::path::Path::new(gate).exists() {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }
+                        match deleted {
+                            Ok(()) => responder.respond(DeleteSessionResponse::new()),
+                            Err(message) => {
+                                responder.respond_with_error(agent_client_protocol::Error::new(-32603, message))
+                            }
+                        }
+                    })
+                }
+            },
+            agent_client_protocol::on_receive_request!(),
+        )
         .on_receive_notification(
             {
                 let cancel = cancel.clone();
@@ -465,6 +492,46 @@ async fn main() -> agent_client_protocol::Result<()> {
 /// the immediate path and the `ask_on_load_waits` path, which only defers
 /// reaching this until the load-time question is answered — the same rules
 /// apply either way.
+/// `session/delete` as Claude's SDK runs it (`FakeScript::delete_log`):
+/// the first project directory under `$CLAUDE_CONFIG_DIR/projects` with a
+/// non-empty `<id>.jsonl` loses it and the `<id>/` beside it, through
+/// paths (links followed, as the SDK's `fs` calls do); none is an error.
+fn delete_session(script: &FakeScript, session: &SessionId) -> Result<(), String> {
+    let var = |name: &str| std::env::var(name).unwrap_or_else(|_| "-".into());
+    if let Some(log) = &script.delete_log {
+        let cwd = std::env::current_dir()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log)
+            .expect("open delete_log");
+        writeln!(
+            file,
+            "CLAUDE_CONFIG_DIR={}\ncwd={cwd}\nCLAUDE_CODE_PROJECT_DIR_NAME={}\nCODEX_SQLITE_HOME={}",
+            var("CLAUDE_CONFIG_DIR"),
+            var("CLAUDE_CODE_PROJECT_DIR_NAME"),
+            var("CODEX_SQLITE_HOME"),
+        )
+        .expect("write delete_log");
+    }
+    let Some(root) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) else {
+        return Err("no CLAUDE_CONFIG_DIR".into());
+    };
+    let id = session.to_string();
+    let projects = std::path::Path::new(&root).join("projects");
+    for dir in std::fs::read_dir(projects).into_iter().flatten().flatten() {
+        let transcript = dir.path().join(format!("{id}.jsonl"));
+        if std::fs::metadata(&transcript).is_ok_and(|m| m.len() > 0) {
+            let _ = std::fs::remove_file(&transcript);
+            let _ = std::fs::remove_dir_all(dir.path().join(&id));
+            return Ok(());
+        }
+    }
+    Err(format!("Session {id} not found in any project directory"))
+}
+
 fn answer_load(
     script: &FakeScript,
     announced: impl FnOnce() -> Option<Vec<SessionConfigOption>>,

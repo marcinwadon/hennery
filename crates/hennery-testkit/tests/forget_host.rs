@@ -151,6 +151,14 @@ fn reasons(frame: &HostFrame) -> Vec<(ForgetKind, ForgetReason, bool)> {
     }
 }
 
+/// The umask these tests assume: the root and kind directories must not be
+/// writable by group or others (B3), and a 002 umask would make every one
+/// so. Set for the whole test binary; every test here wants the same.
+fn usual_umask() {
+    // SAFETY: umask(2) cannot fail.
+    unsafe { libc::umask(0o022) };
+}
+
 struct Setup {
     _dir: tempfile::TempDir,
     base: PathBuf,
@@ -159,6 +167,7 @@ struct Setup {
 
 impl Setup {
     async fn new() -> Self {
+        usual_umask();
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
         for sub in ["claude", "host", "work"] {
@@ -181,10 +190,13 @@ impl Setup {
     }
 
     fn start_host(&self) {
-        let script = FakeScript {
+        self.start_host_with(FakeScript {
             session_id: Some(AGENT_SESSION.into()),
             ..FakeScript::default()
-        };
+        });
+    }
+
+    fn start_host_with(&self, script: FakeScript) {
         let mut fake = AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
         fake.env
             .push((SCRIPT_ENV.into(), serde_json::to_string(&script).unwrap()));
@@ -268,11 +280,9 @@ async fn a_forget_runs_only_for_a_registered_home_with_no_live_actor() {
     let HostFrame::SessionForgotten { outcome, .. } = &ran else {
         unreachable!()
     };
-    assert_eq!(*outcome, ForgetOutcome::Partial);
-    assert_eq!(
-        reasons(&ran),
-        [(ForgetKind::Session, ForgetReason::UnsupportedAgent, true)]
-    );
+    // Nothing of the session is under the root: complete.
+    assert_eq!(*outcome, ForgetOutcome::Complete);
+    assert_eq!(reasons(&ran), []);
 }
 
 /// Decision 1, B1: a home the host cannot register is never reported, so
@@ -339,4 +349,90 @@ async fn a_load_under_another_root_registers_both_and_says_so() {
             .contains("claude", AGENT_SESSION, &home(&setup.base.join("work")))
             .unwrap()
     );
+}
+
+/// B7: while a forget runs, the agent session it removes is not attached:
+/// a resume of it is refused `forgetting`, and attaches once it is over.
+#[tokio::test]
+async fn an_attach_waits_out_a_forget_of_the_same_agent_session() {
+    let setup = Setup::new().await;
+    let (log, gate) = (setup.base.join("delete.log"), setup.base.join("gate"));
+    setup.start_host_with(FakeScript {
+        session_id: Some(AGENT_SESSION.into()),
+        delete_log: Some(log.to_str().unwrap().into()),
+        delete_waits_for_file: Some(gate.to_str().unwrap().into()),
+        ..FakeScript::default()
+    });
+    let (mut collector, _) = Collector::accept(&setup.listener).await;
+    collector.send(&setup.start()).await;
+    let SessionBody::SessionStarted { .. } = collector.fact().await else {
+        panic!("expected session_started");
+    };
+    collector
+        .send(&CollectorFrame::CloseSession {
+            request_id: "c1".into(),
+            session_id: "s1".into(),
+        })
+        .await;
+    loop {
+        if let SessionBody::SessionClosed = collector.fact().await {
+            break;
+        }
+    }
+    collector
+        .send(&CollectorFrame::ForgetSession {
+            request_id: "f1".into(),
+            agent: "claude".into(),
+            agent_session_id: AGENT_SESSION.into(),
+            agent_home: home(&setup.root()),
+        })
+        .await;
+    // The forget's adapter has its `session/delete`, and holds it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !log.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the forget's adapter never got session/delete"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // A second forget of the same agent session meanwhile: refused, in
+    // progress, retryable (the review's item 3).
+    let second = collector.forget("f2", AGENT_SESSION, &setup.root()).await.unwrap();
+    assert_eq!(
+        reasons(&second),
+        [(ForgetKind::Session, ForgetReason::InProgress, true)]
+    );
+    let resume = |request_id: &str| CollectorFrame::ResumeSession {
+        request_id: request_id.into(),
+        session_id: "s1".into(),
+        committed_seq: 0,
+        agent: "claude".into(),
+        cwd: setup.base.join("work").to_str().unwrap().into(),
+        agent_session_id: AGENT_SESSION.into(),
+        config: Default::default(),
+    };
+    collector.send(&resume("r2")).await;
+    loop {
+        match collector.next().await {
+            HostFrame::Error { request_id, code, .. } if request_id == "r2" => {
+                assert_eq!(code, "forgetting");
+                break;
+            }
+            HostFrame::Session { body, .. } => panic!("attached during the forget: {body:?}"),
+            _ => {}
+        }
+    }
+    std::fs::write(&gate, "").unwrap();
+    loop {
+        if let frame @ HostFrame::SessionForgotten { .. } = collector.next().await {
+            assert_eq!(frame.probe_request_id(), Some("f1"));
+            break;
+        }
+    }
+    collector.send(&resume("r3")).await;
+    let SessionBody::SessionStarted { request_id, .. } = collector.fact().await else {
+        panic!("expected session_started");
+    };
+    assert_eq!(request_id, "r3");
 }
