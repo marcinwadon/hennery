@@ -61,8 +61,10 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
-pub use reqwest::{Request, Response};
-use url::{Host, Url};
+/// What a caller needs to build a request and read its answer, so it
+/// depends on the kernel, not on reqwest.
+pub use reqwest::{Method, Request, Response, Url, header};
+use url::Host;
 
 /// Whether a request may reach non-public addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -636,6 +638,17 @@ mod tests {
             panic!("localhost was not refused");
         };
     }
+
+    /// The contract's types cross tasks: the proxy moves a `Permit` into a
+    /// response body stream, and every caller shares its clients.
+    const _: fn() = || {
+        fn send_sync<T: Send + Sync + 'static>() {}
+        send_sync::<Egress>();
+        send_sync::<EgressClient>();
+        send_sync::<Limiter>();
+        send_sync::<Permit>();
+        send_sync::<EgressError>();
+    };
 
     #[test]
     fn a_limiter_refuses_past_its_cap_per_key_and_forgets_released_keys() {
