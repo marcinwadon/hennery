@@ -15,6 +15,7 @@ mod resolve;
 mod shared_files;
 pub mod store;
 pub mod sweep;
+pub mod view;
 pub mod ws;
 
 use axum::Router;
@@ -155,6 +156,7 @@ pub fn router(state: AppState) -> Router {
         .merge(hats::router(state.clone()))
         .merge(projects::router(state.clone()))
         .merge(push::router(state.clone()))
+        .merge(view::router(state.clone()))
         .merge(hennery_kernel::auth_api::router(state.operator.clone()))
         .merge(hennery_kernel::capabilities::router(state.operator.clone()))
         .merge(hennery_kernel::health::router(state.operator.clone()))
