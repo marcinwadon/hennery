@@ -106,11 +106,13 @@ fn each_bound_but_depth_makes_the_enumeration_partial() {
         paths(&[&root], &per_root),
         (vec![format!("{root}/a"), format!("{root}/b")], true)
     );
+    // The root and the first child by name: whatever order the filesystem
+    // lists them in.
     let dirs = Limits {
         dirs_per_root: 2,
         ..Limits::default()
     };
-    assert!(paths(&[&root], &dirs).1);
+    assert_eq!(paths(&[&root], &dirs), (vec![format!("{root}/a")], true));
     let budget = Limits {
         budget: Duration::ZERO,
         ..Limits::default()
@@ -239,6 +241,7 @@ fn a_path_must_be_absolute_and_plain() {
         format!("{root}//a"),
         format!("{root}/a/../a"),
         format!("{root}/a\n"),
+        "//".into(),
         format!("/{}", "x".repeat(4096)),
     ] {
         assert_eq!(

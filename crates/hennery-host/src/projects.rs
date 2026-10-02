@@ -184,7 +184,8 @@ fn walk(root: &str, limits: &Limits, deadline: Instant, found: &mut BTreeSet<Str
             if repos == limits.per_root {
                 return true;
             }
-            if let Some(path) = dir.to_str() {
+            // A path the collector could not show is not sent.
+            if let Some(path) = dir.to_str().filter(|path| !path.chars().any(char::is_control)) {
                 found.insert(path.to_string());
                 repos += 1;
             }
@@ -196,9 +197,17 @@ fn walk(root: &str, limits: &Limits, deadline: Instant, found: &mut BTreeSet<Str
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        // Sorted, so the same tree gives the same answer, bounds included.
-        let mut children = Vec::new();
-        for entry in entries.flatten() {
+        // The first children by name that the visit bound leaves room for,
+        // so the same tree gives the same answer, bounds included, whatever
+        // order the filesystem lists them in (Task 3's review).
+        let room = limits.dirs_per_root.saturating_sub(visited + queue.len());
+        let mut children = BTreeSet::new();
+        for (n, entry) in entries.flatten().enumerate() {
+            // A directory with a huge number of entries is still bounded in
+            // time.
+            if n % 256 == 255 && Instant::now() >= deadline {
+                return true;
+            }
             if entry.file_name().as_encoded_bytes().starts_with(b".") {
                 continue;
             }
@@ -207,13 +216,12 @@ fn walk(root: &str, limits: &Limits, deadline: Instant, found: &mut BTreeSet<Str
             if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
                 continue;
             }
-            if visited + queue.len() + children.len() >= limits.dirs_per_root {
+            children.insert(entry.path());
+            if children.len() > room {
+                children.pop_last();
                 cut = true;
-                break;
             }
-            children.push(entry.path());
         }
-        children.sort();
         queue.extend(children.into_iter().map(|child| (child, depth + 1)));
     }
     cut
@@ -285,6 +293,10 @@ fn is_plain_absolute(path: &str) -> bool {
     let Some(rest) = path.strip_prefix('/') else {
         return false;
     };
+    // `//` is an empty segment, not a trailing slash.
+    if rest.starts_with('/') {
+        return false;
+    }
     let rest = rest.strip_suffix('/').unwrap_or(rest);
     path.len() <= MAX_PATH
         && !path.chars().any(char::is_control)
@@ -429,13 +441,19 @@ impl Probes {
         let (uplink, limits) = (uplink.clone(), self.limits);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let (items, partial) = list_projects(&roots, &limits);
-            let home = home.and_then(|home| canonical(&home).ok());
-            uplink.reply(HostFrame::Projects {
-                request_id,
-                items,
-                partial,
-                home,
+            let listed = std::panic::catch_unwind(|| {
+                let (items, partial) = list_projects(&roots, &limits);
+                (items, partial, home.and_then(|home| canonical(&home).ok()))
+            });
+            uplink.reply(match listed {
+                Ok((items, partial, home)) => HostFrame::Projects {
+                    request_id,
+                    items,
+                    partial,
+                    home,
+                },
+                // Answered, not left to the collector's timeout.
+                Err(_) => refusal(request_id, BrowseError::Unreadable),
             });
         });
     }
@@ -456,8 +474,9 @@ impl Probes {
         let (uplink, limits) = (uplink.clone(), self.limits);
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let fence = Fence::new(&roots, home.as_deref());
-            uplink.reply(match browse(&fence, &path, &limits) {
+            let listed = std::panic::catch_unwind(|| browse(&Fence::new(&roots, home.as_deref()), &path, &limits))
+                .unwrap_or(Err(BrowseError::Unreadable));
+            uplink.reply(match listed {
                 Ok(listing) => HostFrame::Directory {
                     request_id,
                     path: listing.path,
@@ -465,13 +484,17 @@ impl Probes {
                     entries: listing.entries,
                     truncated: listing.truncated,
                 },
-                Err(refused) => HostFrame::Error {
-                    request_id,
-                    code: refused.code().into(),
-                    message: refused.message().into(),
-                },
+                Err(refused) => refusal(request_id, refused),
             });
         });
+    }
+}
+
+fn refusal(request_id: String, refused: BrowseError) -> HostFrame {
+    HostFrame::Error {
+        request_id,
+        code: refused.code().into(),
+        message: refused.message().into(),
     }
 }
 

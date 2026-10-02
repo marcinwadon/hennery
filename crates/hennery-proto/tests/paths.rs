@@ -16,6 +16,9 @@ fn a_root_holds_itself_and_what_lies_under_it_by_whole_segments() {
         ("/anything", "/", true),
         ("/", "/", true),
         ("relative", "/", false),
+        ("/x", "", false),
+        ("/x", "relative", false),
+        ("relative/x", "relative", false),
     ] {
         assert_eq!(is_within(path, root), within, "{path} in {root}");
     }

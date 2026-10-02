@@ -10,6 +10,10 @@
 /// case is never folded: on a case-insensitive filesystem a path spelled
 /// differently from its root is outside it, which fails closed.
 pub fn is_within(path: &str, root: &str) -> bool {
+    // Fails closed on anything that is not absolute, an empty root included.
+    if !root.starts_with('/') || !path.starts_with('/') {
+        return false;
+    }
     if root == "/" {
         return path.starts_with('/');
     }
