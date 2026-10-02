@@ -626,10 +626,51 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
             pending_id,
             Answer::Elicitation { action, content },
         ),
+        CollectorFrame::ResolvePath { request_id, path } => resolve_path(uplink, request_id, path),
         CollectorFrame::Ack { session_id, ack_seq } => uplink.ack(&session_id, ack_seq)?,
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }
     Ok(())
+}
+
+/// Answer `resolve_path` (kernel spec §5.4) from a blocking thread: the
+/// filesystem may be slow (a network mount), and the connection loop must
+/// not wait on it.
+fn resolve_path(uplink: &Uplink, request_id: String, path: String) {
+    // At most this many at once (the review's P6): a slow mount must not
+    // pile up blocking threads; the collector drops the connection anyway.
+    static RESOLVING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(4);
+    let uplink = uplink.clone();
+    tokio::spawn(async move {
+        let Ok(_slot) = RESOLVING.acquire().await else {
+            return;
+        };
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let resolved = tokio::task::spawn_blocking(move || crate::paths::resolve(&path, home.as_deref())).await;
+        let frame = match resolved {
+            Ok(resolved) => resolved_path_frame(request_id, resolved),
+            // The resolution panicked: the collector's timeout answers.
+            Err(_) => return,
+        };
+        uplink.reply(frame);
+    });
+}
+
+/// The answer to `resolve_path`: the resolved path, or `invalid` and why.
+fn resolved_path_frame(request_id: String, resolved: Result<crate::paths::Resolved, String>) -> HostFrame {
+    match resolved {
+        Ok(resolved) => HostFrame::ResolvedPath {
+            request_id,
+            canonical: resolved.canonical,
+            exists: resolved.exists,
+            is_dir: resolved.is_dir,
+        },
+        Err(message) => HostFrame::Error {
+            request_id,
+            code: "invalid".into(),
+            message,
+        },
+    }
 }
 
 /// An operator's answer goes to the session's live actor, which reports

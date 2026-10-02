@@ -129,6 +129,10 @@ fn every_collector_frame_round_trips() {
             action: hennery_proto::frames::ElicitationAction::Cancel,
             content: None,
         },
+        CollectorFrame::ResolvePath {
+            request_id: "r".into(),
+            path: "~/Projects".into(),
+        },
     ];
     for f in frames {
         let back: CollectorFrame = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
@@ -510,4 +514,28 @@ fn a_rest_answer_is_an_option_or_an_elicitation_action() {
     for bad in [json!({}), json!({"action": "maybe"}), json!({"option_id": 3})] {
         assert!(serde_json::from_value::<AnswerRequest>(bad.clone()).is_err(), "{bad}");
     }
+}
+
+/// Kernel spec §5.4: `resolve_path{path}` → `resolved_path{canonical,
+/// exists, is_dir}`, each with its request id.
+#[test]
+fn resolve_path_and_its_answer_use_the_spec_field_names() {
+    let request = CollectorFrame::ResolvePath {
+        request_id: "r".into(),
+        path: "~/p".into(),
+    };
+    let wire = json!({"type": "resolve_path", "request_id": "r", "path": "~/p"});
+    assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+    assert_eq!(serde_json::from_value::<CollectorFrame>(wire).unwrap(), request);
+    let answer = HostFrame::ResolvedPath {
+        request_id: "r".into(),
+        canonical: "/home/me/p".into(),
+        exists: true,
+        is_dir: false,
+    };
+    let wire = json!({
+        "type": "resolved_path", "request_id": "r", "canonical": "/home/me/p", "exists": true, "is_dir": false
+    });
+    assert_eq!(serde_json::to_value(&answer).unwrap(), wire);
+    assert_eq!(serde_json::from_value::<HostFrame>(wire).unwrap(), answer);
 }

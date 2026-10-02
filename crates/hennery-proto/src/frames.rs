@@ -348,6 +348,17 @@ pub enum HostFrame {
         code: String,
         message: String,
     },
+    /// The answer to `resolve_path` (kernel spec §5.4). Not outboxed: a
+    /// probe changes nothing, so a lost answer costs only a retry.
+    /// `canonical` is absolute, symlinks resolved, with no `.`, `..` or
+    /// trailing slash; for a path that does not exist, its deepest existing
+    /// ancestor is resolved and the rest normalised by its text.
+    ResolvedPath {
+        request_id: String,
+        canonical: String,
+        exists: bool,
+        is_dir: bool,
+    },
     /// Sent once per connection after the unacked outbox has been resent.
     /// The collector reconciles `hello.attached_sessions` only after this
     /// frame, so a resent `turn_ended` is never duplicated by a synthesised
@@ -454,6 +465,13 @@ pub enum CollectorFrame {
         session_id: String,
         #[ts(type = "number")]
         ack_seq: u64,
+    },
+    /// Resolve a typed path on the host, where the filesystem is (kernel
+    /// spec §5.2, §5.4): absolute, or `~` / `~/…` for the host user's home.
+    /// Completed by `resolved_path` | `error{invalid}`.
+    ResolvePath {
+        request_id: String,
+        path: String,
     },
     /// Completed by `session_parked{operator}` (ACP core §4.8).
     ParkSession {

@@ -1,6 +1,6 @@
 //! Connected hosts and in-flight collector→host requests.
 
-use hennery_proto::frames::{Capabilities, Capability, CollectorFrame, SessionBody};
+use hennery_proto::frames::{Capabilities, Capability, CollectorFrame, HostFrame, SessionBody};
 use hennery_proto::rest::EventDto;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,6 +59,15 @@ struct Waiter {
     tx: oneshot::Sender<Result<SessionBody, RequestError>>,
 }
 
+/// A probe in flight (`Hub::probe`): a request whose answer is a reply
+/// frame of its own, not an outboxed fact (kernel spec §5.4). Only the
+/// connection it went out on can answer it.
+struct ProbeWaiter {
+    host_id: String,
+    conn_id: u64,
+    tx: oneshot::Sender<Result<HostFrame, RequestError>>,
+}
+
 struct HostConn {
     conn_id: u64,
     tx: mpsc::UnboundedSender<CollectorFrame>,
@@ -101,6 +110,8 @@ pub struct Hub {
     last_conn: Mutex<HashMap<String, u64>>,
     /// Shared with each waiter's watchdog (`expire`).
     waiters: Arc<Mutex<HashMap<String, Waiter>>>,
+    /// Probes in flight, by request id.
+    probes: Arc<Mutex<HashMap<String, ProbeWaiter>>>,
     events: broadcast::Sender<EventDto>,
 }
 
@@ -117,6 +128,7 @@ impl Hub {
             hosts: Mutex::new(HashMap::new()),
             last_conn: Mutex::new(HashMap::new()),
             waiters: Arc::new(Mutex::new(HashMap::new())),
+            probes: Arc::new(Mutex::new(HashMap::new())),
             events: broadcast::channel(1024).0,
         }
     }
@@ -194,6 +206,18 @@ impl Hub {
         for id in ids {
             if let Some(w) = waiters.remove(&id) {
                 let _ = w.tx.send(Err(RequestError::DeliveryUnknown));
+            }
+        }
+        drop(waiters);
+        let mut probes = self.probes.lock().expect("probes lock");
+        let ids: Vec<String> = probes
+            .iter()
+            .filter(|(_, p)| p.conn_id == conn_id)
+            .map(|(k, _)| k.clone())
+            .collect();
+        for id in ids {
+            if let Some(p) = probes.remove(&id) {
+                let _ = p.tx.send(Err(RequestError::DeliveryUnknown));
             }
         }
     }
@@ -404,6 +428,96 @@ impl Hub {
         }
     }
 
+    /// Send a probe (`resolve_path`) to a host that is connected and
+    /// reconciled, and wait for its reply frame (`probe_reply`), its
+    /// rejection (`reject_probe`), the connection's end, or `timeout`. A
+    /// probe changes nothing on the host, but its timeout is treated like
+    /// any request's (ACP core §3.4): a live connection that answers neither
+    /// way is dropped. A reply that comes after is logged and dropped.
+    pub async fn probe(
+        &self,
+        host_id: &str,
+        request_id: &str,
+        frame: CollectorFrame,
+        timeout: Duration,
+    ) -> Result<HostFrame, RequestError> {
+        let (tx, rx) = oneshot::channel();
+        let (conn_id, kicked) = {
+            let hosts = self.hosts.lock().expect("hosts lock");
+            let Some(host) = hosts.get(host_id).filter(|h| h.routable()) else {
+                return Err(RequestError::NotConnected);
+            };
+            self.probes.lock().expect("probes lock").insert(
+                request_id.to_string(),
+                ProbeWaiter {
+                    host_id: host_id.to_string(),
+                    conn_id: host.conn_id,
+                    tx,
+                },
+            );
+            if host.tx.send(frame).is_err() {
+                self.probes.lock().expect("probes lock").remove(request_id);
+                return Err(RequestError::NotConnected);
+            }
+            (host.conn_id, host.kicked.clone())
+        };
+        // As for requests: the deadline is the hub's, so a probe whose
+        // handler is gone (its client disconnected) still ends.
+        let watchdog = tokio::spawn(expire_probe(
+            self.probes.clone(),
+            host_id.to_string(),
+            request_id.to_string(),
+            conn_id,
+            kicked,
+            timeout,
+        ));
+        let result = tokio::time::timeout(timeout, rx).await;
+        watchdog.abort();
+        match result {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => Err(RequestError::DeliveryUnknown),
+            Err(_elapsed) => {
+                if self.probes.lock().expect("probes lock").remove(request_id).is_some() {
+                    tracing::warn!(%host_id, %request_id, "probe timed out; dropping the host connection");
+                    self.disconnect_conn(host_id, conn_id);
+                }
+                Err(RequestError::DeliveryUnknown)
+            }
+        }
+    }
+
+    /// A reply frame for a probe, from `host_id`'s connection `conn_id`.
+    /// `false` if no probe of that connection waits for it: a late reply,
+    /// or one naming another host's probe.
+    pub fn probe_reply(&self, host_id: &str, conn_id: u64, request_id: &str, frame: HostFrame) -> bool {
+        match self.take_probe(host_id, conn_id, request_id) {
+            Some(p) => {
+                let _ = p.tx.send(Ok(frame));
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// A rejection (`error`) of a probe, scoped like `probe_reply`.
+    pub fn reject_probe(&self, host_id: &str, conn_id: u64, request_id: &str, code: String, message: String) -> bool {
+        match self.take_probe(host_id, conn_id, request_id) {
+            Some(p) => {
+                let _ = p.tx.send(Err(RequestError::Rejected { code, message }));
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn take_probe(&self, host_id: &str, conn_id: u64, request_id: &str) -> Option<ProbeWaiter> {
+        let mut probes = self.probes.lock().expect("probes lock");
+        let ours = probes
+            .get(request_id)
+            .is_some_and(|p| p.host_id == host_id && p.conn_id == conn_id);
+        ours.then(|| probes.remove(request_id)).flatten()
+    }
+
     pub fn resolve(&self, request_id: &str, fact: SessionBody) {
         if let Some(w) = self.waiters.lock().expect("waiters lock").remove(request_id) {
             let _ = w.tx.send(Ok(fact));
@@ -457,9 +571,9 @@ impl Hub {
         }
     }
 
-    /// Requests still waiting for their answer.
+    /// Requests still waiting for their answer, probes included.
     pub fn pending_requests(&self) -> usize {
-        self.waiters.lock().expect("waiters lock").len()
+        self.waiters.lock().expect("waiters lock").len() + self.probes.lock().expect("probes lock").len()
     }
 
     pub fn publish(&self, event: EventDto) {
@@ -496,6 +610,30 @@ impl Rejection {
     /// as any other request whose outcome is not known.
     pub fn delivery_unknown(self) {
         let _ = self.tx.send(Err(RequestError::DeliveryUnknown));
+    }
+}
+
+/// One probe's deadline, owned by the hub, like `expire`'s for a request.
+async fn expire_probe(
+    probes: Arc<Mutex<HashMap<String, ProbeWaiter>>>,
+    host_id: String,
+    request_id: String,
+    conn_id: u64,
+    kicked: CancellationToken,
+    timeout: Duration,
+) {
+    tokio::time::sleep(timeout).await;
+    let expired = {
+        let mut probes = probes.lock().expect("probes lock");
+        match probes.get(&request_id) {
+            Some(p) if p.conn_id == conn_id => probes.remove(&request_id),
+            _ => None,
+        }
+    };
+    if let Some(p) = expired {
+        tracing::warn!(%host_id, %request_id, "probe timed out with no handler left; dropping the host connection");
+        kicked.cancel();
+        let _ = p.tx.send(Err(RequestError::DeliveryUnknown));
     }
 }
 

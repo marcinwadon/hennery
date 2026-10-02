@@ -1,8 +1,11 @@
 //! The hub's waiters belong to the connection their request went out on
 //! (plan A's "After this plan"): an old connection of a host that has
 //! already reconnected must not fail or kick what the new one carries.
+//! Probes (plan 5b) too, and only their own host answers them.
 
-use hennery_proto::frames::{Capabilities, Capability, CollectorFrame, ParkReason, SessionBody, TurnOutcome};
+use hennery_proto::frames::{
+    Capabilities, Capability, CollectorFrame, HostFrame, ParkReason, SessionBody, TurnOutcome,
+};
 use hennery_sessions::hub::{Hub, Registration, RequestError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -240,5 +243,107 @@ async fn a_kicked_connection_is_not_routed_to_while_it_lingers() {
     hub.mark_ready("h", registration.conn_id);
     assert!(!hub.is_ready("h"), "a late mark_ready revived a kicked connection");
     assert!(rx.try_recv().is_err(), "a frame went out on the kicked connection");
+    assert_eq!(hub.pending_requests(), 0);
+}
+
+fn resolve_path(request_id: &str) -> CollectorFrame {
+    CollectorFrame::ResolvePath {
+        request_id: request_id.into(),
+        path: "~/p".into(),
+    }
+}
+
+fn resolved(request_id: &str) -> HostFrame {
+    HostFrame::ResolvedPath {
+        request_id: request_id.into(),
+        canonical: "/home/me/p".into(),
+        exists: true,
+        is_dir: true,
+    }
+}
+
+/// Plan 5b decision 2: a probe is answered only by the connection it went
+/// out on. Another host naming its request id, or the same host's old
+/// connection, completes nothing (final review M1's rule for turns).
+#[tokio::test]
+async fn a_probe_is_answered_only_by_its_own_hosts_connection() {
+    let hub = Arc::new(Hub::new());
+    let (reg, mut rx) = connect(&hub);
+    let (other_tx, _other_rx) = mpsc::unbounded_channel();
+    let other = hub.register("other", other_tx, Capabilities::default()).unwrap();
+    hub.mark_ready("other", other.conn_id);
+    let probe = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.probe("h", "p1", resolve_path("p1"), Duration::from_secs(5)).await }
+    });
+    assert_eq!(rx.recv().await, Some(resolve_path("p1")));
+
+    assert!(!hub.probe_reply("other", other.conn_id, "p1", resolved("p1")));
+    assert!(!hub.reject_probe("other", other.conn_id, "p1", "invalid".into(), "no".into()));
+    assert!(!hub.probe_reply("h", reg.conn_id + 1000, "p1", resolved("p1")));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!probe.is_finished(), "answered by a connection it did not go out on");
+
+    assert!(hub.probe_reply("h", reg.conn_id, "p1", resolved("p1")));
+    assert_eq!(probe.await.unwrap(), Ok(resolved("p1")));
+    // Late: nobody waits any more.
+    assert!(!hub.probe_reply("h", reg.conn_id, "p1", resolved("p1")));
+    assert_eq!(hub.pending_requests(), 0);
+}
+
+#[tokio::test]
+async fn a_probe_is_rejected_refused_offline_and_failed_with_its_connection() {
+    let hub = Arc::new(Hub::new());
+    assert_eq!(
+        hub.probe("h", "p0", resolve_path("p0"), Duration::from_secs(5)).await,
+        Err(RequestError::NotConnected)
+    );
+    let (reg, mut rx) = connect(&hub);
+    let probe = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.probe("h", "p1", resolve_path("p1"), Duration::from_secs(5)).await }
+    });
+    rx.recv().await.unwrap();
+    assert!(hub.reject_probe("h", reg.conn_id, "p1", "invalid".into(), "relative".into()));
+    assert_eq!(
+        probe.await.unwrap(),
+        Err(RequestError::Rejected {
+            code: "invalid".into(),
+            message: "relative".into()
+        })
+    );
+
+    // At once, not at its deadline.
+    let probe = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.probe("h", "p2", resolve_path("p2"), Duration::from_secs(600)).await }
+    });
+    rx.recv().await.unwrap();
+    hub.unregister("h", reg.conn_id);
+    let failed = tokio::time::timeout(Duration::from_secs(5), probe)
+        .await
+        .expect("the probe was not failed with its connection");
+    assert_eq!(failed.unwrap(), Err(RequestError::DeliveryUnknown));
+    assert_eq!(hub.pending_requests(), 0);
+}
+
+/// ACP core §3.4, as for requests: a probe nobody answers drops the
+/// connection at its deadline, even when its caller is gone.
+#[tokio::test]
+async fn a_dropped_probes_deadline_still_kicks_the_connection_and_frees_its_waiter() {
+    let hub = Arc::new(Hub::new());
+    let (reg, mut rx) = connect(&hub);
+    let probe = tokio::spawn({
+        let hub = hub.clone();
+        async move {
+            hub.probe("h", "p1", resolve_path("p1"), Duration::from_millis(200))
+                .await
+        }
+    });
+    rx.recv().await.unwrap();
+    probe.abort();
+    tokio::time::timeout(Duration::from_secs(5), reg.kicked.cancelled())
+        .await
+        .expect("the connection was not kicked");
     assert_eq!(hub.pending_requests(), 0);
 }

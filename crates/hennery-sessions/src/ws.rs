@@ -271,6 +271,21 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                     }
                 }
             }
+            // A probe's reply (kernel spec §5.4): only to a probe this
+            // connection was sent.
+            HostFrame::ResolvedPath { ref request_id, .. } => {
+                let request_id = request_id.clone();
+                if !state.hub.probe_reply(&host_id, conn_id, &request_id, frame) {
+                    tracing::warn!(%host_id, %request_id, "a probe reply nobody waits for");
+                }
+            }
+            HostFrame::Error {
+                request_id,
+                code,
+                message,
+            } if state
+                .hub
+                .reject_probe(&host_id, conn_id, &request_id, code.clone(), message.clone()) => {}
             HostFrame::Error {
                 request_id,
                 code,

@@ -501,6 +501,27 @@
           "type": "object"
         },
         {
+          "description": "Resolve a typed path on the host, where the filesystem is (kernel\nspec §5.2, §5.4): absolute, or `~` / `~/…` for the host user's home.\nCompleted by `resolved_path` | `error{invalid}`.",
+          "properties": {
+            "path": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "resolve_path",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
           "description": "Completed by `session_parked{operator}` (ACP core §4.8).",
           "properties": {
             "request_id": {
@@ -798,6 +819,35 @@
             "request_id",
             "code",
             "message"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The answer to `resolve_path` (kernel spec §5.4). Not outboxed: a\nprobe changes nothing, so a lost answer costs only a retry.\n`canonical` is absolute, symlinks resolved, with no `.`, `..` or\ntrailing slash; for a path that does not exist, its deepest existing\nancestor is resolved and the rest normalised by its text.",
+          "properties": {
+            "canonical": {
+              "type": "string"
+            },
+            "exists": {
+              "type": "boolean"
+            },
+            "is_dir": {
+              "type": "boolean"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "resolved_path",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "canonical",
+            "exists",
+            "is_dir"
           ],
           "type": "object"
         },

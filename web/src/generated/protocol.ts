@@ -67,7 +67,7 @@ proof: string,
  * the values this version knows; an unknown one is ignored, not
  * rejected (see `Capabilities`). Absent means none.
  */
-capabilities: Capabilities, attached_sessions: Array<AttachedSession>, } | { "type": "session", session_id: string, seq: number, body: SessionBody, } | { "type": "error", request_id: string, code: string, message: string, } | { "type": "resend_complete" };
+capabilities: Capabilities, attached_sessions: Array<AttachedSession>, } | { "type": "session", session_id: string, seq: number, body: SessionBody, } | { "type": "error", request_id: string, code: string, message: string, } | { "type": "resolved_path", request_id: string, canonical: string, exists: boolean, is_dir: boolean, } | { "type": "resend_complete" };
 
 export type CollectorFrame = { "type": "hello_ack", protocol_version: string, collector_version: string, 
 /**
@@ -92,7 +92,7 @@ agent_session_id: string, model?: string | null, mode?: string | null, axes?: { 
 /**
  * ACP ContentBlocks, built by the frontend.
  */
-content: unknown[], } | { "type": "cancel_turn", request_id: string, session_id: string, turn_id: string, } | { "type": "set_config", request_id: string, session_id: string, config_id: string, value: ConfigValue, } | { "type": "answer_permission", request_id: string, session_id: string, pending_id: string, option_id: string, } | { "type": "answer_elicitation", request_id: string, session_id: string, pending_id: string, action: ElicitationAction, content?: unknown, } | { "type": "ack", session_id: string, ack_seq: number, } | { "type": "park_session", request_id: string, session_id: string, } | { "type": "close_session", request_id: string, session_id: string, };
+content: unknown[], } | { "type": "cancel_turn", request_id: string, session_id: string, turn_id: string, } | { "type": "set_config", request_id: string, session_id: string, config_id: string, value: ConfigValue, } | { "type": "answer_permission", request_id: string, session_id: string, pending_id: string, option_id: string, } | { "type": "answer_elicitation", request_id: string, session_id: string, pending_id: string, action: ElicitationAction, content?: unknown, } | { "type": "ack", session_id: string, ack_seq: number, } | { "type": "resolve_path", request_id: string, path: string, } | { "type": "park_session", request_id: string, session_id: string, } | { "type": "close_session", request_id: string, session_id: string, };
 
 export type StartSessionRequest = { host_id: string, agent: string, cwd: string, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, };
 
