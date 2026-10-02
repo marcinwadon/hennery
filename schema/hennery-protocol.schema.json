@@ -2110,6 +2110,7 @@
           "type": "string"
         },
         "cwd": {
+          "description": "Canonical on its host since hats (umbrella §8.2).",
           "type": "string"
         },
         "failure_reason": {
@@ -2131,6 +2132,10 @@
             "boolean",
             "null"
           ]
+        },
+        "hat_id": {
+          "description": "The hat the session belongs to (umbrella §8.2), decided at its\nstart: a hat's id, or empty for a session from before hats whose\nhost and owner had no default hat to give it.",
+          "type": "string"
         },
         "host_id": {
           "type": "string"
@@ -2193,6 +2198,7 @@
         "host_id",
         "agent",
         "cwd",
+        "hat_id",
         "lifecycle",
         "presumed_parked",
         "created_at",
@@ -2217,6 +2223,7 @@
           "type": "string"
         },
         "cwd": {
+          "description": "Canonical on its host since hats (umbrella §8.2).",
           "type": "string"
         },
         "failure_reason": {
@@ -2238,6 +2245,10 @@
             "boolean",
             "null"
           ]
+        },
+        "hat_id": {
+          "description": "The hat the session belongs to (umbrella §8.2), decided at its\nstart: a hat's id, or empty for a session from before hats whose\nhost and owner had no default hat to give it.",
+          "type": "string"
         },
         "host_id": {
           "type": "string"
@@ -2282,6 +2293,7 @@
         "host_id",
         "agent",
         "cwd",
+        "hat_id",
         "lifecycle",
         "presumed_parked",
         "created_at",

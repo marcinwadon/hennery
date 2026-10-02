@@ -180,6 +180,22 @@ const MIGRATIONS: &[&str] = &[
         WHERE e.session_id = sessions.id AND e.applied = 1 AND e.owner_id = sessions.owner_id);
     CREATE INDEX sessions_by_recency ON sessions(owner_id, last_event_at DESC, id DESC);
 ",
+    // Hats (umbrella §8.2; plan 5c decision 1): the hat a session belongs
+    // to, decided once at its start, and the rule that decided it (none:
+    // its host's default hat), for audit. A session from before hats gets
+    // its host's default hat, or the owner's default for new hosts if its
+    // host is gone; the kernel's migrations ran first (`Store::init`). The
+    // list filtered by hat walks an index of its own (plan 6b's "After this
+    // plan").
+    "
+    ALTER TABLE sessions ADD COLUMN hat_id TEXT NOT NULL DEFAULT '';
+    ALTER TABLE sessions ADD COLUMN hat_rule_id TEXT;
+    UPDATE sessions SET hat_id = COALESCE(
+        (SELECT h.default_hat_id FROM hosts h WHERE h.id = sessions.host_id AND h.owner_id = sessions.owner_id),
+        (SELECT s.value FROM settings s WHERE s.owner_id = sessions.owner_id AND s.key = 'default_hat_id'),
+        '');
+    CREATE INDEX sessions_by_hat ON sessions(owner_id, hat_id, last_event_at DESC, id DESC);
+",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -187,7 +203,13 @@ pub struct SessionRow {
     pub id: String,
     pub host_id: String,
     pub agent: String,
+    /// Canonical on its host since plan 5c (umbrella §8.2).
     pub cwd: String,
+    /// The hat it belongs to (umbrella §8.2), decided at its start.
+    pub hat_id: String,
+    /// The adapter's own session id, once a start produced one: a resume
+    /// needs it (ACP core §4.3).
+    pub agent_session_id: Option<String>,
     pub lifecycle: String,
     pub activity: Option<String>,
     pub open_turn_id: Option<String>,
@@ -215,6 +237,10 @@ pub struct SessionRow {
     pub base_commit: Option<String>,
 }
 
+/// What `request_resume` reads: lifecycle, agent session id, open turn,
+/// config and hat.
+type ResumeRow = (String, Option<String>, Option<String>, ConfigColumns, String);
+
 /// The outcome of `Store::request_resume`.
 #[derive(Debug, PartialEq)]
 pub enum ResumeRequest {
@@ -231,6 +257,9 @@ pub enum ResumeRequest {
     Busy(String),
     /// The agent never created a session for it: there is nothing to load.
     NoRecord,
+    /// Its path now resolves to another hat than the one it belongs to
+    /// (ACP core §4.3): the stored hat. Nothing changed.
+    HatMismatch(String),
     NotFound,
 }
 
@@ -612,7 +641,7 @@ fn store_state(tx: &Transaction<'_>, owner: &str, session_id: &str, indexed: &In
 
 /// The columns of a list item, in `read_item`'s order.
 const SESSION_ITEM_COLUMNS: &str = "id, host_id, agent, cwd, title, lifecycle, activity, failure_reason,
-     presumed_parked, git_branch, git_dirty, model, mode, created_at, last_event_at";
+     presumed_parked, git_branch, git_dirty, model, mode, created_at, last_event_at, hat_id";
 
 /// A row of `SESSION_ITEM_COLUMNS` as a list item, as stored.
 fn read_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionItem> {
@@ -632,6 +661,7 @@ fn read_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionItem> {
         mode: r.get(12)?,
         created_at: r.get(13)?,
         last_event_at: r.get(14)?,
+        hat_id: r.get(15)?,
     })
 }
 
@@ -686,6 +716,9 @@ pub struct ListQuery<'a> {
     pub lifecycles: Option<&'a [&'a str]>,
     /// Only sessions whose title, cwd, branch or id holds this text.
     pub search: Option<&'a str>,
+    /// Only sessions of this hat (plan 5c), with or without `search`
+    /// (frontend §5: a search bypasses every filter but the hat's).
+    pub hat: Option<&'a str>,
 }
 
 impl Default for ListQuery<'_> {
@@ -695,6 +728,7 @@ impl Default for ListQuery<'_> {
             limit: LIST_DEFAULT_LIMIT,
             lifecycles: None,
             search: None,
+            hat: None,
         }
     }
 }
@@ -714,19 +748,33 @@ fn like_pattern(search: &str) -> String {
     pattern
 }
 
-/// The session list's one statement (decision 8): the owner's sessions
-/// after the cursor `(?2, ?3)`, in one of the lifecycles `?4`…`?8` (a NULL
-/// slot matches nothing), matching the pattern `?9` unless it is NULL, the
-/// newest `last_event_at` first and the id breaking ties, at most `?10`. It
-/// walks `sessions_by_recency` and sorts nothing (the review's A11).
-fn list_statement() -> String {
-    format!(
-        "SELECT {SESSION_ITEM_COLUMNS} FROM sessions
-         WHERE owner_id = ?1 AND (last_event_at, id) < (?2, ?3) AND lifecycle IN (?4, ?5, ?6, ?7, ?8)
+/// What every page of the session list filters on (decision 8): the
+/// owner's sessions after the cursor `(?2, ?3)`, in one of the lifecycles
+/// `?4`…`?8` (a NULL slot matches nothing), matching the pattern `?9`
+/// unless it is NULL.
+const LIST_FILTERS: &str = "owner_id = ?1 AND (last_event_at, id) < (?2, ?3) AND lifecycle IN (?4, ?5, ?6, ?7, ?8)
              AND (?9 IS NULL OR title LIKE ?9 ESCAPE '\\' OR cwd LIKE ?9 ESCAPE '\\'
-                  OR git_branch LIKE ?9 ESCAPE '\\' OR id LIKE ?9 ESCAPE '\\')
-         ORDER BY last_event_at DESC, id DESC LIMIT ?10"
-    )
+                  OR git_branch LIKE ?9 ESCAPE '\\' OR id LIKE ?9 ESCAPE '\\')";
+
+/// The session list's statement (decision 8): `LIST_FILTERS`, the newest
+/// `last_event_at` first and the id breaking ties, at most `?10`; with
+/// `by_hat`, only the sessions of the hat `?11` (plan 5c). It walks
+/// `sessions_by_recency`, or `sessions_by_hat` for one hat, and sorts
+/// nothing (the review's A11). The hat has a statement of its own: a plan
+/// is made before `?11` is known, so `?11 IS NULL OR hat_id = ?11` would
+/// never take the hat's index.
+fn list_statement(by_hat: bool) -> String {
+    if by_hat {
+        format!(
+            "SELECT {SESSION_ITEM_COLUMNS} FROM sessions WHERE {LIST_FILTERS} AND hat_id = ?11
+             ORDER BY last_event_at DESC, id DESC LIMIT ?10"
+        )
+    } else {
+        format!(
+            "SELECT {SESSION_ITEM_COLUMNS} FROM sessions WHERE {LIST_FILTERS} AND ?11 IS NULL
+             ORDER BY last_event_at DESC, id DESC LIMIT ?10"
+        )
+    }
 }
 
 /// A session's `model`, `mode` and `config_axes` columns.
@@ -983,12 +1031,23 @@ impl Store {
         &self.owner
     }
 
-    pub fn create_session(&self, id: &str, host_id: &str, agent: &str, cwd: &str) -> Result<()> {
+    /// A new session, `starting`, in `hat_id` as `rule_id` decided (none:
+    /// its host's default hat). `cwd` is canonical on its host.
+    pub fn create_session(
+        &self,
+        id: &str,
+        host_id: &str,
+        agent: &str,
+        cwd: &str,
+        hat_id: &str,
+        rule_id: Option<&str>,
+    ) -> Result<()> {
         let ts = now();
         self.conn().execute(
-            "INSERT INTO sessions(id, host_id, agent, cwd, lifecycle, created_at, last_event_at, owner_id)
-             VALUES (?1, ?2, ?3, ?4, 'starting', ?5, ?5, ?6)",
-            params![id, host_id, agent, cwd, ts, self.owner],
+            "INSERT INTO sessions(id, host_id, agent, cwd, hat_id, hat_rule_id, lifecycle, created_at, last_event_at,
+                                  owner_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'starting', ?7, ?7, ?8)",
+            params![id, host_id, agent, cwd, hat_id, rule_id, ts, self.owner],
         )?;
         Ok(())
     }
@@ -1020,7 +1079,7 @@ impl Store {
             .query_row(
                 "SELECT id, host_id, agent, cwd, lifecycle, activity, open_turn_id, failure_reason, close_requested,
                         presumed_parked, model, mode, config_axes, last_event_at, last_event_id, title,
-                        git_worktree, base_commit
+                        git_worktree, base_commit, hat_id, agent_session_id
                  FROM sessions WHERE id = ?1 AND owner_id = ?2",
                 [id, &self.owner],
                 |r| {
@@ -1030,6 +1089,8 @@ impl Store {
                         host_id: r.get(1)?,
                         agent: r.get(2)?,
                         cwd: r.get(3)?,
+                        hat_id: r.get(18)?,
+                        agent_session_id: r.get(19)?,
                         lifecycle: r.get(4)?,
                         activity: r.get(5)?,
                         open_turn_id: r.get(6)?,
@@ -1082,7 +1143,7 @@ impl Store {
             None => LIFECYCLES.map(Some),
         };
         let conn = self.conn();
-        let mut stmt = conn.prepare(&list_statement())?;
+        let mut stmt = conn.prepare(&list_statement(query.hat.is_some()))?;
         let rows = stmt.query_map(
             params![
                 self.owner,
@@ -1094,7 +1155,8 @@ impl Store {
                 slots[3],
                 slots[4],
                 pattern,
-                limit + 1
+                limit + 1,
+                query.hat
             ],
             read_item,
         )?;
@@ -1483,21 +1545,32 @@ impl Store {
     }
 
     /// Move a `parked`, `closed` or `failed` session to `starting` for a
-    /// resume (ACP core §4.2). Atomic: of two concurrent resumes, the second
-    /// sees `starting` and is refused (§12 scenario 11). A turn still open
-    /// (a database written before plan B) is released first.
-    pub fn request_resume(&self, session_id: &str) -> Result<ResumeRequest> {
+    /// resume (ACP core §4.2), if its path still resolves to its own hat:
+    /// `hat_id` is what it resolves to now (ACP core §4.3). Atomic: of two
+    /// concurrent resumes, the second sees `starting` and is refused (§12
+    /// scenario 11), and a re-assignment that lands in between is seen. A
+    /// turn still open (a database written before plan B) is released
+    /// first.
+    pub fn request_resume(&self, session_id: &str, hat_id: &str) -> Result<ResumeRequest> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let row: Option<(String, Option<String>, Option<String>, ConfigColumns)> = tx
+        let row: Option<ResumeRow> = tx
             .query_row(
-                "SELECT lifecycle, agent_session_id, open_turn_id, model, mode, config_axes FROM sessions
+                "SELECT lifecycle, agent_session_id, open_turn_id, model, mode, config_axes, hat_id FROM sessions
                  WHERE id = ?1 AND owner_id = ?2",
                 [session_id, &self.owner],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, (r.get(3)?, r.get(4)?, r.get(5)?))),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        (r.get(3)?, r.get(4)?, r.get(5)?),
+                        r.get(6)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((lifecycle, agent_session_id, open_turn, config)) = row else {
+        let Some((lifecycle, agent_session_id, open_turn, config, stored_hat)) = row else {
             return Ok(ResumeRequest::NotFound);
         };
         if !matches!(lifecycle.as_str(), "parked" | "closed" | "failed") {
@@ -1506,6 +1579,9 @@ impl Store {
         let Some(agent_session_id) = agent_session_id else {
             return Ok(ResumeRequest::NoRecord);
         };
+        if stored_hat != hat_id {
+            return Ok(ResumeRequest::HatMismatch(stored_hat));
+        }
         let ts = now();
         let mut events = Vec::new();
         if let Some(turn) = open_turn.as_deref() {
@@ -2318,16 +2394,27 @@ mod tests {
         );
     }
 
-    /// The review's A11: the list's one statement walks the recency index,
-    /// with no sort of its own, with or without a search.
+    /// The review's A11: the list's statement walks the recency index, or
+    /// for one hat the hat's (plan 5c), with no sort of its own, with or
+    /// without a search.
     #[test]
     fn the_list_walks_the_recency_index() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("hennery.db");
         Store::open(&db).unwrap();
         let conn = Connection::open(&db).unwrap();
+        for (by_hat, index) in [(false, "sessions_by_recency"), (true, "sessions_by_hat")] {
+            for pattern in [Some("%x%"), None] {
+                let plan = list_plan(&conn, by_hat, pattern);
+                assert!(plan.contains(&format!("USING INDEX {index}")), "{plan}");
+                assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+            }
+        }
+    }
+
+    fn list_plan(conn: &Connection, by_hat: bool, pattern: Option<&str>) -> String {
         let plan: Vec<String> = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {}", list_statement()))
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", list_statement(by_hat)))
             .unwrap()
             .query_map(
                 params![
@@ -2339,17 +2426,16 @@ mod tests {
                     None::<String>,
                     None::<String>,
                     None::<String>,
-                    "%x%",
-                    50
+                    pattern,
+                    50,
+                    by_hat.then_some("hat-1")
                 ],
                 |r| r.get(3),
             )
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        let plan = plan.join("\n");
-        assert!(plan.contains("USING INDEX sessions_by_recency"), "{plan}");
-        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+        plan.join("\n")
     }
 
     /// Decision 8, the review's O4: a cursor goes out opaque and comes back

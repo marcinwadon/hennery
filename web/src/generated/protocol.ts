@@ -224,7 +224,17 @@ export type OpenTurn = { turn_id: string,
  */
 state: string, };
 
-export type SessionItem = { session_id: string, host_id: string, agent: string, cwd: string, 
+export type SessionItem = { session_id: string, host_id: string, agent: string, 
+/**
+ * Canonical on its host since hats (umbrella §8.2).
+ */
+cwd: string, 
+/**
+ * The hat the session belongs to (umbrella §8.2), decided at its
+ * start: a hat's id, or empty for a session from before hats whose
+ * host and owner had no default hat to give it.
+ */
+hat_id: string, 
 /**
  * The title the agent reported, on one line and capped.
  */
@@ -267,7 +277,17 @@ export type SessionDetail = { open_turn?: OpenTurn | undefined,
 /**
  * Open pending requests, oldest first: what the operator can answer.
  */
-pending: Array<PendingItem>, session_id: string, host_id: string, agent: string, cwd: string, 
+pending: Array<PendingItem>, session_id: string, host_id: string, agent: string, 
+/**
+ * Canonical on its host since hats (umbrella §8.2).
+ */
+cwd: string, 
+/**
+ * The hat the session belongs to (umbrella §8.2), decided at its
+ * start: a hat's id, or empty for a session from before hats whose
+ * host and owner had no default hat to give it.
+ */
+hat_id: string, 
 /**
  * The title the agent reported, on one line and capped.
  */

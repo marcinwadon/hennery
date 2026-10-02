@@ -5,6 +5,7 @@
 //! (`resolve`).
 
 use crate::AppState;
+use crate::api::Unplaceable;
 use crate::api::{error, internal};
 use crate::resolve::{NotResolved, resolve_on_host};
 use axum::extract::{Path, State};
@@ -14,7 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router, middleware};
 use futures::stream::{self, StreamExt};
-use hennery_kernel::hats::{HatChange, HatRecord, MAX_RULES, NewRule, PathRule, RulesChange};
+use hennery_kernel::hats::{HatChange, HatRecord, MAX_RULES, NewRule, PathRule, RulesChange, SessionHat};
 use hennery_kernel::json::ApiJson;
 use hennery_kernel::secret::{rfc3339, unix_now};
 use hennery_proto::rest::{
@@ -203,14 +204,17 @@ async fn rules_through_host(
 }
 
 /// `POST /api/hats/resolve` (kernel spec §8): the path resolved by its host,
-/// and the hat it resolves to there.
+/// and the hat a session there would get. Where a start would be refused
+/// `hat_ambiguous`, so is this (the review's P1): the hat tester must agree
+/// with the start.
 async fn resolve_hat(State(state): State<AppState>, ApiJson(req): ApiJson<HatResolveRequest>) -> Response {
     let on_host = match resolve_on_host(&state, &req.host_id, &req.path).await {
         Ok(on_host) => on_host,
         Err(why) => return why.into_response(),
     };
-    match state.hosts.resolve_hat(&req.host_id, &on_host.canonical) {
-        Ok(Some(resolution)) => Json(HatResolution {
+    match state.hosts.session_hat(&req.host_id, &on_host.canonical) {
+        Ok(Some(SessionHat::Ambiguous(rule))) => Unplaceable::Ambiguous(rule.prefix).into_response(),
+        Ok(Some(SessionHat::Decided(resolution))) => Json(HatResolution {
             canonical: on_host.canonical,
             exists: on_host.exists,
             is_dir: on_host.is_dir,
