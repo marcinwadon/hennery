@@ -31,15 +31,35 @@
 
 It builds on [passkeys 3c](2026-10-05-passkeys.md), whose "After this plan" hands it on: "`PATCH /api/settings` (`public_url`, step-up, kernel §3.4) must remove the passkeys and clear the ceremonies as `reset_public_url` does (decision 9), in the same transaction as the change." It also builds on [3b-ii](2026-10-03-operator-auth-2.md) decision 12 (the cached origin, and its recorded `Origin` race) and [push 10a](2026-10-14-push.md) decision 4 (subscriptions end with their sessions). Every anchor below was taken from `main` at `ecc50cd`, which merged PR #93 (the gateway's differential tests). The plan was first built on `27fa020` (PR #82, plan 4b); `27fa020..ecc50cd` shares no file with it, and every block applied unchanged.
 
-**Status:** not executed; amended after the security review. The security review of 2026-10-02 (an opus subagent, binding on the maintainer's behalf) approved after amendments: A1–A4 required and done, O2 taken, O1 declined; its scoped re-confirmation of the same day confirmed every amendment, the A2 deviation included, with two notes (the 401's `Secure` flag read from the cache, harmless; the password-login race named in kernel §3.2, taken).
+**Status:** executed 2026-10-03 (see "Execution status"); amended after the security review. The security review of 2026-10-02 (an opus subagent, binding on the maintainer's behalf) approved after amendments: A1–A4 required and done, O2 taken, O1 declined; its scoped re-confirmation of the same day confirmed every amendment, the A2 deviation included, with two notes (the 401's `Secure` flag read from the cache, harmless; the password-login race named in kernel §3.2, taken).
 
 Every code block below was built and tested in a scratch copy of `ecc50cd`, two commits per task (the tests alone, then the task), and generated from those commits. The plan was then replayed from its own text, task by task, onto a fresh copy of `ecc50cd`: after each Step 1 the tree matched the scratch's tests-only commit, and after each task the scratch's task commit, byte for byte (the same git tree), `Cargo.lock` and the generated files included. The workspace's tests went from 1399 to 1412 (Task 1: 1401; Task 2: 1412). Every revert-probe below was run on the scratch's tree (26 in all, P5 both ways) and every one was caught. The scratch ran on ubuntu and macOS in the scratch CI PR (#97).
 
 After the scoped re-confirmation, the re-check on `ecc50cd` added one test and seven probes, and no line of code: `a_step_up_lapsed_while_its_body_arrives_changes_nothing` (the handler's answer to the write's `StepUpRequired`, which had been listed as not tested), and P20–P26 (the operator's `NotSetUp` and contact `Invalid`, that answer, `deny_unknown_fields`, and `reset_public_url`'s mapping back to `Reset`), so that every outcome of `PublicUrlChange` has its own test and probe.
 
-## Execution status
+## Execution status (2026-10-03)
 
-Not executed yet.
+**Executed** on branch `plan/frontend-4d-b4` with subagent-driven development: one implementer per task (each applied the plan's blocks with the replay harness, then ran every command of its task), then a review by a stronger model (opus), then a whole-branch review (opus). Every task review approved with no Critical finding; the whole-branch review said "ready to merge". Each task's tree equalled the replayed scratch commit (`git diff` against it listed only this plan). The commits are named by subject, as the final rebase changed their ids.
+
+| Task | Commit | Review |
+|---|---|---|
+| Plan | `docs(plan): plan 4d-B4, public_url over the HTTP API` | — |
+| 1 | `feat(kernel): one function changes public_url for the admin socket and the API` | Approved; 1401 tests |
+| 2 | `feat(settings): PATCH /api/settings moves public_url behind a fresh step-up` | Approved; 1412 tests; the `public_url` tests passed 12 copies (four at once, three rounds) |
+| 3 | `docs(spec): Settings changes public_url as the admin socket does` | Approved |
+| Final review | `docs(spec): any request already in flight, not one per session` | Its one docs finding |
+
+Deviations and rulings:
+
+| Area | As built | Why |
+|---|---|---|
+| Task 2's revert-probes (T2 review, Important) | Not run again on the execution tree | The task's tree is the scratch tree they ran on, blob for blob; the 26 probes stand |
+| Kernel §3.2's race note (final review) | "any request already in flight", in the spec and in Task 3's block | It said "one in-flight request per session"; nothing limits a session to one request |
+| Rebase onto `ffe2531` (PR #87, #103 and others) | Task 2 no longer changes `crates/hennery-testkit/Cargo.toml` or `Cargo.lock` | PR #87 had already given the testkit `tracing` and `tracing-subscriber` as dev-dependencies; the conflict took main's lines. The generated files merged cleanly and `gen` left them unchanged. Every check was run again on the rebased tree |
+| `cargo run -p hennery-view --bin gen-view -- --check` | Not run | No such binary on `ecc50cd` or `ffe2531`; it comes with plan 4a-ii |
+| Deferred minors (all triaged "fine to leave" by the whole-branch review) | Unchanged | The unreachable `bail!` arm of `reset_public_url`; `is_set_up()` read before the transaction (setup never goes back); no separate expired-session `SignedOut` test; the 401's `Secure` flag read from the cache; `with_cleared_cookie` beside the kernel's `pub(crate)` `with_cookie`; a 500 after a completed move if reading the contact fails; parity on the URL-only path (the admin socket takes no contact) |
+
+On `ffe2531`, after the rebase: `cargo fmt --all --check`, both clippy runs, `gen -- --check` and the web checks (145 tests) pass; **1450 tests** pass (this plan adds 13). Rebased again onto `f122101` (PRs #106, #107), conflict-free, with `gen` leaving the generated files unchanged: the same checks pass, **1488 tests**.
 
 ## Scope
 
