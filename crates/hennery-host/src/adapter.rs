@@ -24,6 +24,22 @@ pub const NESTING_VARS: &[&str] = &["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLA
 /// script, say) are an agent's to read.
 pub const HOST_SECRET_VARS: &[&str] = &["HENNERY_DEV_TOKEN"];
 
+/// Variables that point an adapter at another agent CLI or configuration
+/// (plan 7b, A1): `CLAUDE_CODE_EXECUTABLE` and `CODEX_PATH` replace the
+/// pinned CLI, `CODEX_CONFIG` and `DISABLE_MCP_CONFIG_FILTERING` let MCP
+/// servers past the composed `CODEX_HOME`, `APP_SERVER_LOGS` writes Codex's
+/// auth request to a log unredacted. One the host merely inherited would
+/// silently void the pin and the isolation, so it is never passed on; an
+/// agent's own configuration (`--use-cli`, recorded in `host.toml`) sets
+/// one explicitly.
+pub const INHERITED_OVERRIDE_VARS: &[&str] = &[
+    "CLAUDE_CODE_EXECUTABLE",
+    "CODEX_PATH",
+    "CODEX_CONFIG",
+    "DISABLE_MCP_CONFIG_FILTERING",
+    "APP_SERVER_LOGS",
+];
+
 /// Bytes of adapter stderr kept for `adapter_exited` (ACP core §11).
 pub const STDERR_TAIL_BYTES: usize = 64 * 1024;
 
@@ -92,6 +108,11 @@ impl Adapter {
     /// Spawn `agent` in `cwd` as the leader of a new process group.
     pub fn spawn(agent: &AgentCommand, cwd: &Path) -> std::io::Result<(Self, AdapterIo)> {
         let mut command = tokio::process::Command::new(&agent.program);
+        // Before `envs`: inherited, these are dropped; set by the agent's
+        // own configuration, they pass.
+        for var in INHERITED_OVERRIDE_VARS {
+            command.env_remove(var);
+        }
         command
             .args(&agent.args)
             .envs(agent.env.iter().cloned())

@@ -164,7 +164,8 @@ fn read_config(path: &Path) -> Result<HostToml> {
 /// `pairing::join` writes it as `pending_path(CONFIG_FILE)` first (see
 /// `finish_interrupted_pairing`). Every other key of the `host.toml` in
 /// place beside `path` is kept: the operator's `workspace_roots` survive a
-/// re-pair after a revoke (plan 6c decision 6).
+/// re-pair after a revoke (plan 6c decision 6), and so do the `[cli]`
+/// overrides (plan 7b).
 pub(crate) fn write_config_to(path: &Path, collector_url: &str, host_id: &str, key: &HostKey) -> Result<()> {
     write_config_with(path, |table| set_pairing(table, collector_url, host_id, key))
 }
@@ -178,15 +179,20 @@ fn set_pairing(table: &mut toml::Table, collector_url: &str, host_id: &str, key:
 /// Write the table of the `host.toml` beside `path` (an empty one if there
 /// is none yet), with `change` applied, to `path`: mode 0600, atomically. A
 /// `host.toml` that does not parse is an error, never replaced.
-fn write_config_with(path: &Path, change: impl FnOnce(&mut toml::Table)) -> Result<()> {
-    let current = path.with_file_name(CONFIG_FILE);
-    let mut table = match std::fs::read_to_string(&current) {
-        Ok(text) => toml::from_str::<toml::Table>(&text).with_context(|| format!("parse {}", current.display()))?,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
-        Err(err) => return Err(err).with_context(|| format!("read {}", current.display())),
-    };
+pub(crate) fn write_config_with(path: &Path, change: impl FnOnce(&mut toml::Table)) -> Result<()> {
+    let mut table = read_table(&path.with_file_name(CONFIG_FILE))?;
     change(&mut table);
     write_private(path, toml::to_string(&table)?.as_bytes())
+}
+
+/// `path` as a TOML table: empty if there is no file, an error if it does
+/// not parse.
+pub(crate) fn read_table(path: &Path) -> Result<toml::Table> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => toml::from_str(&text).with_context(|| format!("parse {}", path.display())),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(toml::Table::new()),
+        Err(err) => Err(err).with_context(|| format!("read {}", path.display())),
+    }
 }
 
 /// Where `join` stages `file` (`host.key` or `host.toml`) before renaming it
@@ -254,7 +260,9 @@ pub fn is_private(path: &Path) -> Result<bool> {
     Ok(mode & 0o077 == 0)
 }
 
-fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
+/// Write `path` with mode 0600, atomically (a temporary file in the same
+/// directory, then a rename).
+pub(crate) fn write_private(path: &Path, contents: &[u8]) -> Result<()> {
     let tmp: PathBuf = {
         let mut name = path.file_name().context("a file path")?.to_os_string();
         name.push(".tmp");
@@ -426,6 +434,32 @@ cdf6b48fb39bfaa9b5a3cd01538280ec9e6d50c8831e9aae4d791f68112a6c04";
         )
         .unwrap();
         assert_eq!(Paired::load(dir.path()).unwrap().unwrap().host_id, "host-1");
+    }
+
+    /// Plan 7b, A2: a pairing written beside an existing `host.toml` (a
+    /// re-pair stages it as `host.toml.pending`) keeps its `[cli]` table; a
+    /// fresh one is the pairing's keys alone, as before.
+    #[test]
+    fn pairing_again_keeps_the_other_keys_of_host_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(CONFIG_FILE);
+        let key = HostKey::from_seed([1; 32]);
+        write_config_to(&config, "ws://a/api/hosts/ws", "host-1", &key).unwrap();
+        let fresh = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(
+            fresh,
+            format!(
+                "collector = \"ws://a/api/hosts/ws\"\nhost_id = \"host-1\"\npublic_key = \"{}\"\n",
+                key.public_key_hex()
+            )
+        );
+        std::fs::write(&config, format!("{fresh}\n[cli]\nclaude = \"/opt/claude\"\n")).unwrap();
+        let staged = pending_path(dir.path(), CONFIG_FILE);
+        write_config_to(&staged, "ws://b/api/hosts/ws", "host-2", &HostKey::from_seed([2; 32])).unwrap();
+        let table = read_table(&staged).unwrap();
+        assert_eq!(table["host_id"].as_str(), Some("host-2"));
+        assert_eq!(table["collector"].as_str(), Some("ws://b/api/hosts/ws"));
+        assert_eq!(table["cli"]["claude"].as_str(), Some("/opt/claude"));
     }
 
     #[test]

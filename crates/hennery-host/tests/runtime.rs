@@ -3,6 +3,7 @@
 
 mod support;
 
+use hennery_host::runtime::agents;
 use hennery_host::runtime::install::{self, Installed, Selection};
 use std::collections::BTreeSet;
 use std::os::unix::fs::PermissionsExt;
@@ -522,4 +523,247 @@ fn an_entry_that_needs_an_install_script_is_refused() {
     }
     let err = Selection::new(&fixture.manifest, &fixture.hash(), here(), &BTreeSet::new()).unwrap_err();
     assert!(err.to_string().contains("install script"), "{err}");
+}
+
+/// A mirror nothing answers on: the host is offline.
+fn offline() -> hennery_host::runtime::download::Sources {
+    hennery_host::runtime::download::Sources::new(Some("http://127.0.0.1:1/"), Some("http://127.0.0.1:1/")).unwrap()
+}
+
+fn host_dir(layout: &install::Layout) -> std::path::PathBuf {
+    layout.adapters().parent().unwrap().to_path_buf()
+}
+
+#[tokio::test]
+async fn a_host_start_installs_the_pinned_set_and_launches_from_its_absolute_path() {
+    let server = Server::start().await;
+    let fixture = Fixture::new("1.0.0");
+    fixture.serve(&server);
+    let (_dir, layout) = data_dir();
+    let selection = selection(&fixture, &[]);
+    let prepared = agents::prepare(&host_dir(&layout), Some(&selection), Some(&server.sources()), &quiet).await;
+    assert!(prepared.agents.notes.is_empty(), "{:?}", prepared.agents.notes);
+    let set = prepared.set.clone().unwrap();
+    assert_eq!(set.id, selection.set_id());
+    let claude = &prepared.agents.agents["claude"];
+    assert_eq!(claude.program, set.node.to_string_lossy());
+    assert_eq!(
+        claude.args,
+        [set.path
+            .join("claude/node_modules/@acp/claude/dist/index.js")
+            .to_string_lossy()
+            .into_owned()]
+    );
+    assert!(!claude.args[0].contains("/current/"), "never through current");
+    assert!(claude.env.is_empty());
+    assert!(prepared.agents.agents.contains_key("codex"));
+    assert!(prepared.in_use.is_some());
+}
+
+#[tokio::test]
+async fn an_offline_start_keeps_the_installed_set_and_a_held_one_does_not_install() {
+    let server = Server::start().await;
+    let (one, two) = (Fixture::new("1.0.0"), Fixture::new("2.0.0"));
+    one.serve(&server);
+    let (_dir, layout) = data_dir();
+    install::install(&layout, &selection(&one, &[]), &server.sources(), &quiet)
+        .await
+        .unwrap();
+    // Offline, with a newer pin: the old set runs, and the notes say why.
+    let prepared = agents::prepare(
+        &host_dir(&layout),
+        Some(&selection(&two, &[])),
+        Some(&offline()),
+        &quiet,
+    )
+    .await;
+    assert_eq!(prepared.set.unwrap().id, selection(&one, &[]).set_id());
+    assert_eq!(prepared.agents.agents.len(), 2);
+    let notes = prepared.agents.notes.join("\n");
+    assert!(
+        notes.contains("was not installed") && notes.contains("not the pinned"),
+        "{notes}"
+    );
+    // Held by a rollback: no install is even tried.
+    two.serve(&server);
+    install::install(&layout, &selection(&two, &[]), &server.sources(), &quiet)
+        .await
+        .unwrap();
+    install::rollback(&layout, &quiet).await.unwrap();
+    let before = server.requests().len();
+    let prepared = agents::prepare(
+        &host_dir(&layout),
+        Some(&selection(&two, &[])),
+        Some(&server.sources()),
+        &quiet,
+    )
+    .await;
+    assert_eq!(server.requests().len(), before);
+    assert_eq!(prepared.set.unwrap().id, selection(&one, &[]).set_id());
+    assert!(
+        prepared.agents.notes.join("\n").contains("rollback holds"),
+        "{:?}",
+        prepared.agents.notes
+    );
+}
+
+/// No valid mirror (a bad `HENNERY_NPM_REGISTRY`): nothing is fetched,
+/// not even from the public registry, and the installed set still runs.
+#[tokio::test]
+async fn without_valid_sources_nothing_is_installed_and_the_installed_set_runs() {
+    let server = Server::start().await;
+    let (one, two) = (Fixture::new("1.0.0"), Fixture::new("2.0.0"));
+    one.serve(&server);
+    two.serve(&server);
+    let (_dir, layout) = data_dir();
+    install::install(&layout, &selection(&one, &[]), &server.sources(), &quiet)
+        .await
+        .unwrap();
+    let before = server.requests().len();
+    let prepared = agents::prepare(&host_dir(&layout), Some(&selection(&two, &[])), None, &quiet).await;
+    assert_eq!(server.requests().len(), before);
+    assert_eq!(prepared.set.unwrap().id, selection(&one, &[]).set_id());
+    assert!(
+        prepared.agents.notes.join("\n").contains("no valid mirror"),
+        "{:?}",
+        prepared.agents.notes
+    );
+}
+
+#[tokio::test]
+async fn with_no_set_and_no_network_the_host_runs_without_agents() {
+    let fixture = Fixture::new("1.0.0");
+    let (_dir, layout) = data_dir();
+    let prepared = agents::prepare(
+        &host_dir(&layout),
+        Some(&selection(&fixture, &[])),
+        Some(&offline()),
+        &quiet,
+    )
+    .await;
+    assert!(prepared.agents.agents.is_empty() && prepared.set.is_none() && prepared.in_use.is_none());
+    let notes = prepared.agents.notes.join("\n");
+    assert!(notes.contains("no adapter set is installed"), "{notes}");
+}
+
+#[tokio::test]
+async fn a_set_without_its_cli_launches_that_agent_only_with_an_override() {
+    let server = Server::start().await;
+    let fixture = Fixture::new("1.0.0");
+    fixture.serve(&server);
+    let (_dir, layout) = data_dir();
+    let dir = host_dir(&layout);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("host.toml"), "[cli]\nclaude = \"/bin/sh\"\n").unwrap();
+    let selection = selection(&fixture, &["claude"]);
+    let prepared = agents::prepare(&dir, Some(&selection), Some(&server.sources()), &quiet).await;
+    assert_eq!(
+        prepared.agents.agents["claude"].env,
+        [("CLAUDE_CODE_EXECUTABLE".to_string(), "/bin/sh".to_string())]
+    );
+    assert!(prepared.agents.agents["codex"].env.is_empty());
+    // The override gone (a hand edit, say): claude is unavailable.
+    std::fs::write(dir.join("host.toml"), "").unwrap();
+    let prepared = agents::prepare(&dir, Some(&selection), Some(&server.sources()), &quiet).await;
+    assert!(!prepared.agents.agents.contains_key("claude"));
+    assert!(prepared.agents.agents.contains_key("codex"));
+    assert!(
+        prepared.agents.notes.join("\n").contains("claude is unavailable"),
+        "{:?}",
+        prepared.agents.notes
+    );
+    // An override that is no longer executable: unavailable too.
+    std::fs::write(dir.join("host.toml"), "[cli]\nclaude = \"/nonexistent/claude\"\n").unwrap();
+    let prepared = agents::prepare(&dir, Some(&selection), Some(&server.sources()), &quiet).await;
+    assert!(!prepared.agents.agents.contains_key("claude"));
+    let notes = prepared.agents.notes.join("\n");
+    assert!(
+        notes.contains("claude is unavailable") && notes.contains("/nonexistent/claude"),
+        "{notes}"
+    );
+}
+
+/// An override beside a set that has its bundled CLI is used, and the
+/// notes say the bundled one is not (A6, the Task 6 review).
+#[tokio::test]
+async fn an_override_beside_a_bundled_cli_is_used_with_a_note() {
+    let server = Server::start().await;
+    let fixture = Fixture::new("1.0.0");
+    fixture.serve(&server);
+    let (_dir, layout) = data_dir();
+    let dir = host_dir(&layout);
+    // The set is installed with every CLI; the override comes afterwards.
+    install::install(&layout, &selection(&fixture, &[]), &server.sources(), &quiet)
+        .await
+        .unwrap();
+    std::fs::write(dir.join("host.toml"), "[cli]\nclaude = \"/bin/sh\"\n").unwrap();
+    let prepared = agents::prepare(&dir, Some(&selection(&fixture, &[])), None, &quiet).await;
+    assert_eq!(
+        prepared.agents.agents["claude"].env,
+        [("CLAUDE_CODE_EXECUTABLE".to_string(), "/bin/sh".to_string())]
+    );
+    let notes = prepared.agents.notes.join("\n");
+    assert!(notes.contains("rather than the set's bundled CLI"), "{notes}");
+}
+
+/// A current set whose Node is gone: a start installs it again; offline, it
+/// runs no agents and says why (the Task 6 review).
+#[tokio::test]
+async fn a_start_puts_a_missing_node_back_or_says_it_is_missing() {
+    let server = Server::start().await;
+    let fixture = Fixture::new("1.0.0");
+    fixture.serve(&server);
+    let (_dir, layout) = data_dir();
+    let selection = selection(&fixture, &[]);
+    let set = install::install(&layout, &selection, &server.sources(), &quiet)
+        .await
+        .unwrap()
+        .set()
+        .clone();
+    std::fs::remove_file(&set.node).unwrap();
+    let prepared = agents::prepare(&host_dir(&layout), Some(&selection), Some(&offline()), &quiet).await;
+    assert!(prepared.agents.agents.is_empty());
+    let notes = prepared.agents.notes.join("\n");
+    assert!(notes.contains("Node") && notes.contains("is missing"), "{notes}");
+    drop(prepared);
+    let prepared = agents::prepare(&host_dir(&layout), Some(&selection), Some(&server.sources()), &quiet).await;
+    assert!(set.node.is_file(), "the start put Node back");
+    assert_eq!(prepared.agents.agents.len(), 2, "{:?}", prepared.agents.notes);
+}
+
+/// A host start never waits on another install (an `adapters update`
+/// running meanwhile): it runs on what it has, and says so.
+#[tokio::test]
+async fn a_start_does_not_wait_on_another_install() {
+    use std::os::fd::AsRawFd;
+    let server = Server::start().await;
+    let (one, two) = (Fixture::new("1.0.0"), Fixture::new("2.0.0"));
+    one.serve(&server);
+    two.serve(&server);
+    let (_dir, layout) = data_dir();
+    install::install(&layout, &selection(&one, &[]), &server.sources(), &quiet)
+        .await
+        .unwrap();
+    let lock = std::fs::File::open(layout.install_lock()).unwrap();
+    // SAFETY: flock(2) on a descriptor this test holds.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    let before = server.requests().len();
+    let prepared = agents::prepare(
+        &host_dir(&layout),
+        Some(&selection(&two, &[])),
+        Some(&server.sources()),
+        &quiet,
+    )
+    .await;
+    assert_eq!(server.requests().len(), before);
+    assert_eq!(prepared.set.unwrap().id, selection(&one, &[]).set_id());
+    assert!(
+        prepared
+            .agents
+            .notes
+            .join("\n")
+            .contains("another install of it is running"),
+        "{:?}",
+        prepared.agents.notes
+    );
 }

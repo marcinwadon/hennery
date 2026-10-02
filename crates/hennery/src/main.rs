@@ -7,6 +7,7 @@ mod config;
 mod healthcheck;
 mod inherit;
 mod lock;
+mod runtime;
 mod service;
 mod supervisor;
 
@@ -53,6 +54,11 @@ enum HostCommand {
     Join(JoinArgs),
     /// Run a host.
     Run(HostArgs),
+    /// The managed adapter set (distribution spec §3.2).
+    Adapters {
+        #[command(subcommand)]
+        command: runtime::AdaptersCommand,
+    },
 }
 
 #[derive(Args)]
@@ -68,6 +74,17 @@ struct JoinArgs {
     name: Option<String>,
     #[arg(long, env = "HENNERY_HOST_DATA_DIR")]
     data_dir: PathBuf,
+    /// Run this agent with your own CLI instead of the bundled one
+    /// (`claude=/path/to/claude`, `codex=/path/to/codex`). Recorded in
+    /// `host.toml`; repeatable. Advanced: the agent loses the pin's guarantee.
+    #[arg(long = "use-cli", value_parser = runtime::parse_use_cli)]
+    use_cli: Vec<hennery_host::runtime::agents::UseCli>,
+    /// Pair only: install no adapter runtime (a host that runs only
+    /// `--agent` commands, e.g. Nix-provided adapters).
+    #[arg(long, conflicts_with = "use_cli")]
+    no_runtime: bool,
+    #[command(flatten)]
+    mirrors: runtime::MirrorArgs,
 }
 
 /// `collector` runs the collector; `collector healthcheck` checks one.
@@ -131,7 +148,11 @@ struct HostArgs {
     /// Holds the pairing `hennery host join` stored (`host.key`, `host.toml`).
     #[arg(long, env = "HENNERY_HOST_DATA_DIR")]
     data_dir: PathBuf,
-    /// Agent adapter, as `name=command args…`. Repeatable.
+    /// Agent adapter, as `name=command args…`. Repeatable. With none,
+    /// `claude` and `codex` come from the installed adapter set. An agent
+    /// never inherits CLAUDE_CODE_EXECUTABLE, CODEX_PATH, CODEX_CONFIG,
+    /// DISABLE_MCP_CONFIG_FILTERING or APP_SERVER_LOGS: a command that needs
+    /// one sets it itself, e.g. `name=/usr/bin/env CODEX_PATH=… <cmd>`.
     #[arg(long = "agent", value_parser = parse_agent)]
     agents: Vec<(String, AgentCommand)>,
     /// Park sessions idle for this many seconds; 0 turns the reaper off.
@@ -152,6 +173,10 @@ struct HostArgs {
     /// `workspace_roots` in `host.toml`.
     #[arg(long = "workspace-root")]
     workspace_roots: Vec<String>,
+    /// With no `--agent`: where the pinned adapter set comes from, if it is
+    /// installed at start.
+    #[command(flatten)]
+    mirrors: runtime::MirrorArgs,
 }
 
 #[derive(Args)]
@@ -166,6 +191,12 @@ struct UpArgs {
     public_url: Option<String>,
     #[arg(long, env = "HENNERY_DATA_DIR")]
     data_dir: PathBuf,
+    /// Agent adapter for the host child, as for `host run --agent`. With
+    /// none, `claude` and `codex` come from the host's installed adapter set
+    /// (`<data-dir>/host`; the mirrors from `HENNERY_NPM_REGISTRY` and
+    /// `HENNERY_NODE_MIRROR`). No agent inherits CLAUDE_CODE_EXECUTABLE,
+    /// CODEX_PATH, CODEX_CONFIG, DISABLE_MCP_CONFIG_FILTERING or
+    /// APP_SERVER_LOGS.
     #[arg(long = "agent", value_parser = parse_agent)]
     agents: Vec<(String, AgentCommand)>,
     /// Park sessions idle for this many seconds; 0 turns the reaper off.
@@ -256,6 +287,9 @@ async fn main() -> std::process::ExitCode {
         Command::Host {
             command: HostCommand::Run(args),
         } => run_host(args).await,
+        Command::Host {
+            command: HostCommand::Adapters { command },
+        } => runtime::run(command).await.map(|()| std::process::ExitCode::SUCCESS),
         Command::Up(args) => run_up(args).await,
         Command::Admin(args) => admin::run(args).await.map(|()| std::process::ExitCode::SUCCESS),
         Command::Service(args) => service::run(args),
@@ -587,16 +621,30 @@ fn private_data_dir(dir: &std::path::Path) -> Result<()> {
 }
 
 async fn join_host(args: JoinArgs) -> Result<()> {
+    // Before the code is spent: a bad mirror stops the join here.
+    if !args.no_runtime {
+        args.mirrors.sources()?;
+    }
     let name = args.name.unwrap_or_else(hennery_host::pairing::default_name);
     let code = match args.code {
         Some(code) => code,
         None => read_code_from_stdin()?,
     };
-    match hennery_host::pairing::join(&args.url, &code, &args.data_dir, &name).await? {
-        Joined::Paired { host_id } => println!("paired as {host_id}"),
-        Joined::AlreadyPaired { host_id } => println!("already paired as {host_id}; nothing to do"),
+    let host_id = match hennery_host::pairing::join(&args.url, &code, &args.data_dir, &name).await? {
+        Joined::Paired { host_id } => {
+            println!("paired as {host_id}");
+            host_id
+        }
+        Joined::AlreadyPaired { host_id } => {
+            println!("already paired as {host_id}");
+            host_id
+        }
+    };
+    if args.no_runtime {
+        return Ok(());
     }
-    Ok(())
+    // Then the runtime (distribution spec §3.2); the pairing stands either way.
+    runtime::after_join(&args.data_dir, &host_id, &args.use_cli, &args.mirrors).await
 }
 
 /// The most bytes of standard input `host join` takes for one code: a code
@@ -685,11 +733,19 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
     // Checked before connecting: a bad root fails the start (decision 6).
     let workspace_roots =
         hennery_host::projects::workspace_roots(&args.workspace_roots, &paired.workspace_roots, home.as_deref())?;
+    // No `--agent`: `claude` and `codex` from the installed set, the pinned
+    // one installed first if it is not current (distribution spec §3.2).
+    // The set stays held in use while the host runs.
+    let (agents, _set_in_use) = if args.agents.is_empty() {
+        runtime::default_agents(&args.data_dir, &args.mirrors).await
+    } else {
+        (args.agents.into_iter().collect(), None)
+    };
     let collector_url = args.collector_url.unwrap_or(paired.collector_url);
     let mut cfg = HostConfig::new(collector_url, paired.host_id, paired.key, args.data_dir);
     cfg.workspace_roots = workspace_roots;
     cfg.home = home;
-    cfg.agents = args.agents.into_iter().collect();
+    cfg.agents = agents;
     cfg.idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
     // On SIGINT/SIGTERM, and on a revoke, the host stops its connection and
     // waits (bounded) for every session actor to SIGTERM its adapter's group
