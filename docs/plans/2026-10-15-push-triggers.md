@@ -34,7 +34,7 @@ Each notice goes to a queue that never blocks the host's ingest. Delivery (plan 
 
 It builds on plan [10a](2026-10-14-push.md) (the VAPID key, subscriptions, hat policies), on plan (2)'s pending questions and on plan A's teardown. Every anchor was taken from `plan/push` at `6855342` (10a, PR #60).
 
-**Status:** written 2026-10-02. Amended after:
+**Status:** written 2026-10-02; executed 2026-10-02 (see "Execution status"). Amended after:
 - the security review of 2026-10-02 (A1–A5; O1, O2 recorded);
 - its scoped re-confirmation, "confirmed" with A6 (taken) and N1, N2 recorded;
 - the task review.
@@ -45,9 +45,24 @@ It builds on plan [10a](2026-10-14-push.md) (the VAPID key, subscriptions, hat p
 - After every task the five checks passed: 972 tests after Task 1, 982 after Task 2 and 996 after Task 3 (from 971), apart from `hennery-host`'s runtime tests while this machine's DNS was down; they failed on `main` too, and passed once it was back.
 - Every side-effect line and every guard was revert-probed (the lists in each task's Step 5).
 
-## Execution status
+## Execution status (2026-10-02)
 
-Not executed yet.
+**Executed** on `main` at `0955dce` (10a merged). As with 10a, the code was built first and reviewed. It was then cut into the three tasks' commits (tests first, then code), and the plan was replayed from its text until the trees matched.
+
+| Area | As built | Why |
+|---|---|---|
+| The security review (opus, on the maintainer's behalf) | Approved after A1–A5: a resend notifies only once reconciled and only what still holds; a withdrawn-and-asked-again question is quiet; a per-tag coalescing queue; the session read in the fact's transaction; the directory name on one line; named caps. | A resent backlog could have pushed a question already withdrawn. An agent could have flooded urgent pushes on its own pace. One session could have filled the queue for the rest. |
+| Its re-confirmation | "Confirmed", with A6 taken: per session, the latest blocking question and the latest notifying turn end are deferred, and an edge that notifies nothing replaces nothing. N1 and N2 are recorded. A connection that drops mid-resend losing its deferred edges is accepted. | A later quiet edge would otherwise hide a "finished". |
+| The task review (opus) | Task 1: `question_title` moved below `option_ids`, whose doc comment it had split. Task 3: the socket tests poll the queue for the notice they expect, rather than reading it once after the store shows the fact. The reconciliation test ends on a notifying fact, so a late notice would show. | A notice is queued after its fact's commit, so a single read raced it. |
+| The whole-branch review (opus): approve with fixes | `Deferred::keep` names every edge, so a new one does not compile without a slot. `Notice::url` is a same-origin path. The extract's boxing note is kept out of the published schema. The queue's lock survives poisoning. Two tests were added for claims decisions 1 and 2 made (a question with no turn id that blocks; a close mid-turn), and the dates, counts and one probe row without a probe were corrected. | Hand-off text and docs had drifted after the amendments. |
+| The probes | Two passed at first and were fixed by better tests. Blanking the title on `pending_opened` broke no test: the two `host_session.rs` tests that run the real host now check the title. Notifying a resend at once was masked by the coalescing queue: the resend test now asserts nothing is queued before `resend_complete`. | A guard no test fails without is unverified. |
+
+Checks:
+- After each task the five checks passed: TASKCOUNTS (from 971).
+- The PROBES revert-probes each failed their test.
+- The five socket tests passed in 3 rounds of 4 parallel copies.
+- The run was macOS only, so ubuntu CI is the Linux check.
+
 
 ## Scope
 
