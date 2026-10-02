@@ -858,6 +858,7 @@ async fn a_slow_first_run_is_waited_for_and_said_why() {
         // the same scan queue, so the bound is generous.
         std::time::Duration::from_secs(120),
         std::time::Duration::from_millis(200),
+        "the downloaded Node",
         &note,
     )
     .await
@@ -881,6 +882,7 @@ async fn a_first_run_that_never_answers_fails_at_the_deadline_saying_why() {
         &node,
         std::time::Duration::from_secs(1),
         std::time::Duration::from_secs(10),
+        "the downloaded Node",
         &quiet,
     )
     .await
@@ -911,6 +913,7 @@ async fn a_node_that_cannot_run_fails_at_once() {
         &node,
         std::time::Duration::from_secs(60),
         std::time::Duration::from_secs(10),
+        "the downloaded Node",
         &quiet,
     )
     .await
@@ -933,4 +936,83 @@ fn macos_gives_a_first_run_more_time() {
     } else {
         assert_eq!(deadline, 20);
     }
+}
+
+/// On macOS a new program's first run waits for Gatekeeper's online check,
+/// so an install runs each bundled CLI's native program once, with a
+/// progress line, rather than leaving that wait to a session's start
+/// limit. Elsewhere nothing is run. A script is not a native program.
+#[tokio::test]
+async fn an_install_runs_the_native_programs_once_on_macos_only() {
+    let server = Server::start().await;
+    let fixture = Fixture::with_native_cli("1.0.0", &std::fs::read("/usr/bin/true").unwrap());
+    fixture.serve(&server);
+    let (_dir, layout) = data_dir();
+    let native = selection(&fixture, &[]);
+    let lines = std::sync::Mutex::new(Vec::new());
+    let note = |line: &str| lines.lock().unwrap().push(line.to_string());
+    let installed = install::install(&layout, &native, &server.sources(), &note)
+        .await
+        .unwrap();
+    let set = installed.set();
+    let programs = install::native_programs(&set.path, &native);
+    let cli = |agent: &str| {
+        set.path
+            .join(agent)
+            .join(format!("node_modules/@vendor/{agent}-cli-{}/cli", here().key()))
+    };
+    assert_eq!(programs, [cli("claude"), cli("codex")]);
+    let ran = lines
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .filter(|line| line.starts_with("running cli once"))
+        .count();
+    assert_eq!(ran, if cfg!(target_os = "macos") { 2 } else { 0 });
+
+    // The usual fixture's CLI is a script, and a skipped CLI is not there.
+    let fixture = Fixture::new("2.0.0");
+    let (_dir, layout) = data_dir();
+    fixture.serve(&server);
+    let scripts = selection(&fixture, &["codex"]);
+    let installed = install::install(&layout, &scripts, &server.sources(), &quiet)
+        .await
+        .unwrap();
+    assert!(install::native_programs(&installed.set().path, &scripts).is_empty());
+}
+
+/// A first run only costs time: one that fails or does not answer is a
+/// progress line, and the next program still runs.
+#[tokio::test]
+async fn a_first_run_that_fails_or_hangs_is_only_noted() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = |name: &str, body: &str| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    };
+    let ran = dir.path().join("ran");
+    let failing = [dir.path().join("missing"), script("hangs", "exec sleep 60")];
+    let answers = [script("answers", &format!("touch {}", ran.display()))];
+    let lines = std::sync::Mutex::new(Vec::new());
+    let note = |line: &str| lines.lock().unwrap().push(line.to_string());
+    let started = std::time::Instant::now();
+    install::first_runs(&failing, std::time::Duration::from_secs(1), &note).await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    // Its own, generous limit: a loaded machine is slow to start a shell.
+    install::first_runs(&answers, std::time::Duration::from_secs(60), &note).await;
+    let lines = lines.into_inner().unwrap().join("\n");
+    assert!(lines.contains("missing: No such file"), "{lines}");
+    assert!(lines.contains("hangs did not answer --version within 1 s"), "{lines}");
+    assert_eq!(
+        lines.matches("its first session may start slowly").count(),
+        2,
+        "{lines}"
+    );
+    assert!(ran.exists(), "{lines}");
 }

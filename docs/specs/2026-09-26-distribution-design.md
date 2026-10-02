@@ -136,6 +136,12 @@ CI and read by both the host and the Nix flake:
   resolving outside the target; preserve the executable bit.
 - **No install scripts run** (neither adapter has any; the installer would
   refuse a manifest entry that required one).
+- **First runs on macOS:** once a set is installed, each native program of
+  its bundled CLIs (`claude`, `codex`, `rg`) is run once (`--version`, at
+  most 90 s each, with a progress line). A new program's first run waits for
+  Gatekeeper's online check, which the machine runs one at a time and which
+  is slow when DNS is bad. Done here, that wait is not under a session's
+  start limit. A failure is only a progress line. Elsewhere nothing is run.
 - **Layout:** `<data>/adapters/sets/<manifest-hash>/` plus an atomically swapped
   `current` symlink. Each adapter process is started from the **absolute path of
   its set**, never through `current`, so an update never changes files under a

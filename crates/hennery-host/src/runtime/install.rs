@@ -464,7 +464,83 @@ async fn install_locked(
     if let Err(err) = collect(layout) {
         tracing::warn!("the adapter set is installed, but collecting older ones failed: {err:#}");
     }
+    if cfg!(target_os = "macos") {
+        first_runs(&native_programs(&set.path, selection), FIRST_RUN_DEADLINE, progress).await;
+    }
     Ok(Installed::Switched { set, previous })
+}
+
+/// The native programs of `selection`'s bundled CLIs as installed in the
+/// set at `set_path`: each regular, executable file of a CLI package that
+/// is neither a script (`#!`) nor a library. These are the agents' own
+/// programs (`claude`, `codex`, `rg`), which an adapter first runs at a
+/// session's start.
+pub fn native_programs(set_path: &Path, selection: &Selection) -> Vec<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut found = Vec::new();
+    let mut dirs: Vec<PathBuf> = selection
+        .adapters
+        .iter()
+        .filter(|adapter| !adapter.cli_skipped)
+        .flat_map(|adapter| {
+            adapter
+                .files
+                .iter()
+                .filter(|file| file.cli)
+                .map(|file| set_path.join(&adapter.name).join(&file.path))
+        })
+        .collect();
+    while let Some(dir) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // Not followed: a link is not a program of the package's own.
+            let Ok(meta) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.is_dir() {
+                // A nested package is a package of its own, not this one's.
+                if entry.file_name() != "node_modules" {
+                    dirs.push(path);
+                }
+                continue;
+            }
+            let library = path
+                .extension()
+                .is_some_and(|ext| ["node", "dylib", "so"].iter().any(|lib| ext == *lib));
+            if meta.is_file() && meta.permissions().mode() & 0o111 != 0 && !library && !is_script(&path) {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+fn is_script(path: &Path) -> bool {
+    use std::io::Read;
+    let mut start = [0u8; 2];
+    std::fs::File::open(path)
+        .and_then(|mut file| file.read_exact(&mut start))
+        .map_or(true, |()| start == *b"#!")
+}
+
+/// Run each of `programs` once (`--version`), within `limit` each, so that
+/// macOS checks a newly written program at install rather than under a
+/// session's start limit. Only time is at stake, so a program that fails or
+/// does not answer is a progress line, not a failed install.
+pub async fn first_runs(programs: &[PathBuf], limit: std::time::Duration, progress: &(dyn Fn(&str) + Sync)) {
+    for program in programs {
+        let name = program.file_name().unwrap_or_default().to_string_lossy();
+        progress(&format!(
+            "running {name} once, so that macOS checks it now and not when a session starts"
+        ));
+        if let Err(err) = first_run_version(program, limit, FIRST_RUN_NOTE_AFTER, &name, progress).await {
+            progress(&format!("{err:#}; its first session may start slowly"));
+        }
+    }
 }
 
 /// What `rollback` did.
@@ -696,7 +772,14 @@ async fn install_node(
     tokio::task::spawn_blocking(move || extract::node_binary(&part, &version, &platform, &target, size)).await??;
     // Before anything depends on it: a data directory mounted noexec, or a
     // Linux without the loader Node needs, fails here, not at a session.
-    let output = first_run_version(&binary, FIRST_RUN_DEADLINE, FIRST_RUN_NOTE_AFTER, progress).await?;
+    let output = first_run_version(
+        &binary,
+        FIRST_RUN_DEADLINE,
+        FIRST_RUN_NOTE_AFTER,
+        "the downloaded Node",
+        progress,
+    )
+    .await?;
     let answered = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() || answered != format!("v{}", selection.node_version) {
         bail!(
@@ -748,7 +831,8 @@ const FIRST_RUN_ADVICE: &str = if cfg!(target_os = "macos") {
 };
 
 /// Run `binary --version` for the first time: its output, or an error when
-/// it cannot be run or does not answer within `deadline`. A spawn that
+/// it cannot be run or does not answer within `deadline`. `what` names it
+/// in the progress line and the error ("the downloaded Node"). A spawn that
 /// fails (not executable, no loader) fails at once, as an answer that is
 /// not one does in the caller; only waiting is given time, with a progress
 /// line after `note_after` saying why.
@@ -756,6 +840,7 @@ pub async fn first_run_version(
     binary: &Path,
     deadline: std::time::Duration,
     note_after: std::time::Duration,
+    what: &str,
     progress: &(dyn Fn(&str) + Sync),
 ) -> Result<std::process::Output> {
     let run = async {
@@ -787,10 +872,10 @@ pub async fn first_run_version(
             ran = &mut run => return ran,
             () = &mut note, if !noted => {
                 noted = true;
-                progress(&format!("the downloaded Node has not answered yet: {SLOW_FIRST_RUN}"));
+                progress(&format!("{what} has not answered yet: {SLOW_FIRST_RUN}"));
             }
             () = &mut give_up => bail!(
-                "the downloaded Node did not answer --version within {} s: {SLOW_FIRST_RUN}; {FIRST_RUN_ADVICE}",
+                "{what} did not answer --version within {} s: {SLOW_FIRST_RUN}; {FIRST_RUN_ADVICE}",
                 deadline.as_secs()
             ),
         }
