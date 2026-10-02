@@ -27,6 +27,10 @@
 //   cards whether it is connected. Through it, a turn that was not delivered comes
 //   back as a draft ("Send again"), and a question the agent stopped
 //   waiting on is answered as a new message; neither sends on its own.
+// - A session the New Session screen opened with a notice (its start's
+//   delivery unknown, or its first prompt refused: lib/start.ts) shows it
+//   above the composer. The notice is read from the link once, then dropped
+//   from the address, so a reload does not show it again.
 // - A deleted session says so, nothing more is fetched, and its draft and
 //   images are dropped.
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
@@ -47,8 +51,9 @@ import { useMediaQuery } from '../hooks/useMediaQuery'
 import { agentLabel } from '../lib/agent'
 import { forgetAttachments } from '../lib/attachments'
 import { saveDraft } from '../lib/drafts'
+import { readStartNotice, startNoticeText } from '../lib/start'
 import { Icon } from '../lib/ui'
-import { Link } from '../router'
+import { Link, navigate, useLocation } from '../router'
 import { useAnswering } from '../store/useAnswer'
 import { useSessionItems, type Timing } from '../store/useSessionItems'
 
@@ -164,6 +169,24 @@ function connectedOf(hosts: unknown, hostId: string | undefined): boolean | unde
   return undefined
 }
 
+/** The notice a start left in the link to session `id`, in words: shown
+ *  while the view shows that session, the link cleaned at once (replacing
+ *  the history entry) so a reload does not show it again. */
+function useStartNotice(id: string): string | null {
+  const { pathname, search } = useLocation()
+  const fromLink = useMemo(() => {
+    const notice = readStartNotice(search)
+    return notice ? startNoticeText(notice) : null
+  }, [search])
+  const [held, setHeld] = useState<{ id: string; text: string } | null>(null)
+  useEffect(() => {
+    if (fromLink === null) return
+    setHeld({ id, text: fromLink })
+    navigate(pathname, { replace: true })
+  }, [fromLink, id, pathname])
+  return fromLink ?? (held && held.id === id ? held.text : null)
+}
+
 /** Where the transcript's window starts: the pinned item's index, or the
  *  newest `size` items when nothing is pinned for these `loads`; earlier
  *  when a question that can be answered is held above it. Decided while
@@ -218,7 +241,8 @@ export default function SessionView({ id, summary, awaitSummary = false, tail = 
   const hatItems = useList('hats', wantsHats)
   const hats = useMemo(() => namesOf(hatItems, 'id'), [hatItems])
   const plan = useMemo(() => latestPlan(s.items), [s.items])
-  const answers = useAnswering(id, info, s.items, s.loading, connectedOf(hostItems, info?.host_id))
+  const startNotice = useStartNotice(id)
+  const answers = useAnswering(id, info, s.items, s.loading, s.loads, connectedOf(hostItems, info?.host_id))
   const announcement = useAnnouncement(answers)
 
   // The composer's handle: the item seams reach the draft through it, and
@@ -296,6 +320,11 @@ export default function SessionView({ id, summary, awaitSummary = false, tail = 
       >
         {s.loading ? <p className="transcript-empty">Loading…</p> : <Transcript items={win.visible} env={env} />}
       </Scroller>
+      {startNotice && (
+        <p className="start-notice" role="status">
+          {startNotice}
+        </p>
+      )}
       <Composer
         handle={composer}
         sessionId={id}

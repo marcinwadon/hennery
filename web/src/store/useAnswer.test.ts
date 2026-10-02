@@ -28,10 +28,13 @@ function hosts(list: unknown) {
   return routed((call) => (call.path === '/api/hosts' ? json(list) : json({ code: 'not_found', message: 'no' }, 404)))
 }
 
-type Props = { info?: { presumed_parked: boolean }; items: Item[]; loading: boolean; connected?: boolean }
+type Props = { info?: { presumed_parked: boolean }; items: Item[]; loading: boolean; loads?: number; connected?: boolean }
 
 function use(t: ReturnType<typeof routed>, initial: Props) {
-  return renderHook((p: Props) => useAnswering('s1', p.info, p.items, p.loading, p.connected), { initialProps: initial, wrapper: t.wrapper })
+  return renderHook((p: Props) => useAnswering('s1', p.info, p.items, p.loading, p.loads ?? 1, p.connected), {
+    initialProps: initial,
+    wrapper: t.wrapper,
+  })
 }
 
 describe('useAnswering', () => {
@@ -70,6 +73,38 @@ describe('useAnswering', () => {
     expect(h.result.current.hostAway).toBe(false)
   })
 
+  it('reads host markers newer than the first page only, the first page’s time taken once', async () => {
+    const t = hosts([])
+    const info = { presumed_parked: false }
+    const mark = (kind: string, ts: string) => ({ id: `${kind}${ts}`, version: 1, ts, kind: 'marker', marker: kind }) as Item
+    const page = [mark('host_back', '2026-10-02T09:00:00.000Z'), sent('q')]
+    const h = use(t, { info, items: [], loading: true, connected: false })
+    // Before the first page: the seed alone.
+    await waitFor(() => expect(h.result.current.hostAway).toBe(true))
+    h.rerender({ info, items: page, loading: false, connected: false })
+    await Promise.resolve()
+    // The first page's host_back is history the seed already says.
+    expect(h.result.current.hostAway).toBe(true)
+    const back = [...page, mark('host_back', '2026-10-02T10:05:00.000Z')]
+    h.rerender({ info, items: back, loading: false, connected: false })
+    await waitFor(() => expect(h.result.current.hostAway).toBe(false))
+    // A resync (a new first page) keeps the first time: its new marker counts.
+    h.rerender({ info, items: [...back, mark('host_offline', '2026-10-02T10:09:00.000Z')], loading: false, loads: 2, connected: false })
+    await waitFor(() => expect(h.result.current.hostAway).toBe(true))
+    expect(t.calls).toHaveLength(0)
+  })
+
+  it('reads a seed that comes after the first page, the items unchanged', async () => {
+    const t = hosts([])
+    const info = { presumed_parked: false }
+    const items = [sent('q')]
+    const h = use(t, { info, items, loading: false })
+    await Promise.resolve()
+    expect(h.result.current.hostAway).toBe(false)
+    h.rerender({ info, items, loading: false, connected: false })
+    await waitFor(() => expect(h.result.current.hostAway).toBe(true))
+  })
+
   it('marks fresh only a question opened at the tail after the first page', () => {
     const t = hosts([])
     const h = use(t, { items: [], loading: true })
@@ -80,6 +115,19 @@ describe('useAnswering', () => {
     expect(book.claimFocus('older')).toBe(false)
     expect(book.claimFocus('new')).toBe(true)
     expect(book.claimFocus('new')).toBe(false)
+  })
+
+  it('marks nothing fresh that came with a resync, even after the last item seen; then marks the tail again', () => {
+    const t = hosts([])
+    const h = use(t, { items: [], loading: true, loads: 0 })
+    h.rerender({ items: [msg('a')], loading: false, loads: 1 })
+    // The resync's page: the last item seen survives, a question after it.
+    h.rerender({ items: [msg('a'), question('came'), msg('b')], loading: false, loads: 2 })
+    const book = h.result.current
+    expect(book.claimFocus('came')).toBe(false)
+    h.rerender({ items: [msg('a'), question('came'), msg('b'), question('new')], loading: false, loads: 2 })
+    expect(book.claimFocus('came')).toBe(false)
+    expect(book.claimFocus('new')).toBe(true)
   })
 
   it('takes nothing in while the first page loads', () => {

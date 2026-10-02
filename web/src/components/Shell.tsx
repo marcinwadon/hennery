@@ -12,6 +12,7 @@ import { Icon } from '../lib/ui'
 import { Link, type Route } from '../router'
 import Hats from '../screens/Hats'
 import Hosts from '../screens/Hosts'
+import NewSession from '../screens/NewSession'
 import Placeholder from '../screens/Placeholder'
 import SignOut from './SignOut'
 import SessionView from '../screens/Session'
@@ -142,6 +143,8 @@ export default function Shell({ route }: { route: Route }) {
             <Hats />
           ) : route.name === 'sessions' && !desktop ? (
             <SessionList screen />
+          ) : route.name === 'new' ? (
+            <NewSession />
           ) : route.name === 'session' ? (
             <SessionRoute key={route.id} id={route.id ?? ''} />
           ) : route.name === 'sessions' ? (

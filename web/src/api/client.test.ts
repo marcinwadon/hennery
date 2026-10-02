@@ -127,6 +127,16 @@ describe('request', () => {
     },
   )
 
+  it('keeps the session a refused start still names', async () => {
+    const body = { code: 'delivery_unknown', message: 'host disconnected; delivery unknown', session_id: 's-9' }
+    const { client } = stub([json(503, body), json(409, { code: 'x', message: 'm', session_id: 7 })])
+    await expect(client.request('POST', '/api/sessions', {})).rejects.toMatchObject({ status: 503, sessionId: 's-9' })
+    // Anything but a string is no session id.
+    const err = await client.request('POST', '/api/sessions', {}).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ApiFailure)
+    expect((err as ApiFailure).sessionId).toBeUndefined()
+  })
+
   it('reads Retry-After on a 429', async () => {
     const { client } = stub([json(429, { code: 'rate_limited', message: 'm' }, { 'Retry-After': '42' })])
     await expect(client.request('POST', '/api/auth/login', {})).rejects.toMatchObject({ retryAfter: 42 })
