@@ -11,12 +11,18 @@ use serde_json::json;
 
 #[test]
 fn claude_strict_is_isolated() {
-    assert_eq!(McpAgentDelivery::of(McpIsolation::ClaudeStrict), McpAgentDelivery::Isolated);
+    assert_eq!(
+        McpAgentDelivery::of(McpIsolation::ClaudeStrict),
+        McpAgentDelivery::Isolated
+    );
 }
 
 #[test]
 fn no_isolation_is_default_hat_only() {
-    assert_eq!(McpAgentDelivery::of(McpIsolation::None), McpAgentDelivery::DefaultHatOnly);
+    assert_eq!(
+        McpAgentDelivery::of(McpIsolation::None),
+        McpAgentDelivery::DefaultHatOnly
+    );
 }
 
 #[test]

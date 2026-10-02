@@ -122,7 +122,9 @@ fn problem(servers: &[StdioInput]) -> Option<StdioChange> {
         if !names.insert(at.as_str()) {
             return Some(StdioChange::Invalid(format!("server {at:?} is named twice")));
         }
-        if server.command.is_empty() || server.command.len() > MAX_COMMAND || server.command.chars().any(char::is_control)
+        if server.command.is_empty()
+            || server.command.len() > MAX_COMMAND
+            || server.command.chars().any(char::is_control)
         {
             return Some(StdioChange::Invalid(format!(
                 "server {at:?}: the command is 1 to {MAX_COMMAND} bytes, with no control characters"
@@ -231,12 +233,7 @@ fn listed(rows: Vec<(String, Row)>) -> Vec<StdioServer> {
 
 /// A row's values, opened. An error if they do not open (another key, a
 /// blob moved from another row, host or hat) or do not read.
-fn values(
-    key: &MasterKey,
-    host_id: &str,
-    hat_id: &str,
-    row: &Row,
-) -> Result<BTreeMap<String, Zeroizing<String>>> {
+fn values(key: &MasterKey, host_id: &str, hat_id: &str, row: &Row) -> Result<BTreeMap<String, Zeroizing<String>>> {
     let (Some(version), Some(blob)) = (row.key_version, row.ciphertext.as_deref()) else {
         return Ok(BTreeMap::new());
     };
@@ -279,7 +276,12 @@ impl GatewayStore {
         if place(&conn, self.owner_id(), host_id, hat_id)?.is_none() {
             return Ok(StdioChange::NotFound);
         }
-        Ok(StdioChange::Done(listed(rows(&conn, self.owner_id(), host_id, hat_id)?)))
+        Ok(StdioChange::Done(listed(rows(
+            &conn,
+            self.owner_id(),
+            host_id,
+            hat_id,
+        )?)))
     }
 
     /// Replace the (host, hat)'s set with `servers` (gateway spec §3.4;
@@ -384,7 +386,10 @@ impl GatewayStore {
             } else {
                 let plain: BTreeMap<&str, &str> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
                 let plain = Zeroizing::new(serde_json::to_vec(&plain)?);
-                (Some(key.version()), Some(crypto::seal_stdio(key, &id, host_id, hat_id, &plain)))
+                (
+                    Some(key.version()),
+                    Some(crypto::seal_stdio(key, &id, host_id, hat_id, &plain)),
+                )
             };
             let changed = before.is_none_or(|b| {
                 b.command != server.command

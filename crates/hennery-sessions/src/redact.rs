@@ -76,7 +76,15 @@ pub fn value(value: &mut Value) -> bool {
             }
             None => false,
         },
-        Value::Array(items) => items.iter_mut().fold(false, |changed, item| self::value(item) || changed),
+        // Every item, never stopping at the first: `any` would leave the
+        // rest unredacted.
+        Value::Array(items) => {
+            let mut changed = false;
+            for item in items {
+                changed |= self::value(item);
+            }
+            changed
+        }
         Value::Object(map) => {
             let mut changed = false;
             let keys: Vec<String> = map.keys().filter(|key| text(key).is_some()).cloned().collect();
@@ -127,7 +135,10 @@ mod tests {
             text(&format!("Bearer {t}, again {t}.")).as_deref(),
             Some(format!("Bearer {REDACTED}, again {REDACTED}.").as_str())
         );
-        assert_eq!(text(&format!("é{t}é")).as_deref(), Some(format!("é{REDACTED}é").as_str()));
+        assert_eq!(
+            text(&format!("é{t}é")).as_deref(),
+            Some(format!("é{REDACTED}é").as_str())
+        );
     }
 
     #[test]

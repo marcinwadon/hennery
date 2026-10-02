@@ -56,11 +56,9 @@ fn env_of(servers: &[hennery_proto::frames::McpServer], name: &str) -> Vec<(Stri
     servers
         .iter()
         .find_map(|s| match s {
-            hennery_proto::frames::McpServer::Stdio { name: n, env, .. } if n == name => Some(
-                env.iter()
-                    .map(|pair| (pair.name.clone(), pair.value.clone()))
-                    .collect(),
-            ),
+            hennery_proto::frames::McpServer::Stdio { name: n, env, .. } if n == name => {
+                Some(env.iter().map(|pair| (pair.name.clone(), pair.value.clone())).collect())
+            }
             _ => None,
         })
         .unwrap_or_else(|| panic!("no {name}"))
@@ -105,9 +103,7 @@ fn a_set_is_stored_listed_and_replaced_whole() {
         [("KEY".to_string(), SECRET.to_string())]
     );
     // `[]` deletes them all.
-    assert!(
-        done(w.store.replace_stdio_set("host-a", &hat, &[], &w.key, 300).unwrap()).is_empty()
-    );
+    assert!(done(w.store.replace_stdio_set("host-a", &hat, &[], &w.key, 300).unwrap()).is_empty());
 }
 
 /// Decision E3: absent keeps the stored value, a string sets it (`""` too),

@@ -60,7 +60,10 @@ fn http(name: &str, url: &str, token: &str) -> McpServer {
     McpServer::Http {
         name: name.into(),
         url: url.into(),
-        headers: vec![hennery_proto::frames::NameValue::new("Authorization", format!("Bearer {token}"))],
+        headers: vec![hennery_proto::frames::NameValue::new(
+            "Authorization",
+            format!("Bearer {token}"),
+        )],
     }
 }
 
@@ -85,12 +88,14 @@ fn a_session_gets_its_hats_mounted_connections_then_its_stdio_servers() {
         args: vec!["--root".into(), "/srv".into()],
         env: vec![("KEY".into(), Some("v".into()))],
     };
-    let _ = w
-        .store
-        .replace_stdio_set("host-a", &hat, &[files], &w.key, 1)
-        .unwrap();
+    let _ = w.store.replace_stdio_set("host-a", &hat, &[files], &w.key, 1).unwrap();
     let mcp = GatewayMcp::new(&w.gateway());
-    let (servers, cut) = deliver(&w, &mcp, session("s1", "host-a", &hat), McpSessionDeliveryMode::Isolated);
+    let (servers, cut) = deliver(
+        &w,
+        &mcp,
+        session("s1", "host-a", &hat),
+        McpSessionDeliveryMode::Isolated,
+    );
     assert_eq!(cut, 0, "a first start supersedes nothing");
     let token = token_of(&servers);
     assert!(is_session_token(&token));
@@ -119,7 +124,12 @@ fn unisolated_delivers_as_isolated_does() {
     let linear = w.connection_in("linear", "http://127.0.0.1:9/mcp", CredKind::None, &hat, None);
     w.mount(&linear, &["host-a"]);
     let mcp = GatewayMcp::new(&w.gateway());
-    let (servers, _) = deliver(&w, &mcp, session("s1", "host-a", &hat), McpSessionDeliveryMode::Unisolated);
+    let (servers, _) = deliver(
+        &w,
+        &mcp,
+        session("s1", "host-a", &hat),
+        McpSessionDeliveryMode::Unisolated,
+    );
     assert_eq!(servers.len(), 1);
     assert!(w.proxy_store_resolve(&token_of(&servers)).is_some());
 }
@@ -160,7 +170,12 @@ fn no_connection_no_token() {
     w.host("host-a", 1);
     let hat = w.hat();
     let mcp = GatewayMcp::new(&w.gateway());
-    let (servers, _) = deliver(&w, &mcp, session("s1", "host-a", &hat), McpSessionDeliveryMode::Isolated);
+    let (servers, _) = deliver(
+        &w,
+        &mcp,
+        session("s1", "host-a", &hat),
+        McpSessionDeliveryMode::Isolated,
+    );
     assert!(servers.is_empty());
     assert_eq!(w.token_rows(), 0);
 }
@@ -175,7 +190,12 @@ fn a_revoked_hosts_mounts_are_not_delivered() {
     w.mount(&linear, &["host-a"]);
     w.hosts.revoke("host-a", unix_now()).unwrap();
     let mcp = GatewayMcp::new(&w.gateway());
-    let (servers, _) = deliver(&w, &mcp, session("s1", "host-a", &hat), McpSessionDeliveryMode::Isolated);
+    let (servers, _) = deliver(
+        &w,
+        &mcp,
+        session("s1", "host-a", &hat),
+        McpSessionDeliveryMode::Isolated,
+    );
     assert!(servers.is_empty(), "{servers:?}");
 }
 
@@ -199,10 +219,20 @@ fn a_resume_supersedes_and_cuts_the_old_token() {
     let linear = w.connection_in("linear", "http://127.0.0.1:9/mcp", CredKind::None, &hat, None);
     w.mount(&linear, &["host-a"]);
     let mcp = GatewayMcp::new(&w.gateway());
-    let (first, _) = deliver(&w, &mcp, session("s1", "host-a", &hat), McpSessionDeliveryMode::Isolated);
+    let (first, _) = deliver(
+        &w,
+        &mcp,
+        session("s1", "host-a", &hat),
+        McpSessionDeliveryMode::Isolated,
+    );
     let old = token_of(&first);
     let watch = w.revocations.watch(&hennery_kernel::secret::sha256_hex(old.as_bytes()));
-    let (second, cut) = deliver(&w, &mcp, session("s1", "host-a", &hat), McpSessionDeliveryMode::Isolated);
+    let (second, cut) = deliver(
+        &w,
+        &mcp,
+        session("s1", "host-a", &hat),
+        McpSessionDeliveryMode::Isolated,
+    );
     let new = token_of(&second);
     assert_ne!(old, new);
     assert_eq!(cut, 1);
@@ -211,7 +241,12 @@ fn a_resume_supersedes_and_cuts_the_old_token() {
     assert!(w.proxy_store_resolve(&new).is_some());
     // A resume that delivers nothing revokes the token, and cuts it.
     let watch = w.revocations.watch(&hennery_kernel::secret::sha256_hex(new.as_bytes()));
-    let (none, cut) = deliver(&w, &mcp, session("s1", "host-a", &hat), McpSessionDeliveryMode::Fallback);
+    let (none, cut) = deliver(
+        &w,
+        &mcp,
+        session("s1", "host-a", &hat),
+        McpSessionDeliveryMode::Fallback,
+    );
     assert!(none.is_empty());
     assert_eq!(cut, 1);
     assert!(watch.token().is_cancelled());
@@ -228,7 +263,12 @@ fn a_rolled_back_mint_leaves_no_token_and_cuts_nothing() {
     let linear = w.connection_in("linear", "http://127.0.0.1:9/mcp", CredKind::None, &hat, None);
     w.mount(&linear, &["host-a"]);
     let mcp = GatewayMcp::new(&w.gateway());
-    let (first, _) = deliver(&w, &mcp, session("s1", "host-a", &hat), McpSessionDeliveryMode::Isolated);
+    let (first, _) = deliver(
+        &w,
+        &mcp,
+        session("s1", "host-a", &hat),
+        McpSessionDeliveryMode::Isolated,
+    );
     let old = token_of(&first);
     let watch = w.revocations.watch(&hennery_kernel::secret::sha256_hex(old.as_bytes()));
     {
@@ -253,8 +293,18 @@ fn revoke_in_cuts_a_live_token_and_only_that() {
     let linear = w.connection_in("linear", "http://127.0.0.1:9/mcp", CredKind::None, &hat, None);
     w.mount(&linear, &["host-a"]);
     let mcp = GatewayMcp::new(&w.gateway());
-    let (one, _) = deliver(&w, &mcp, session("s1", "host-a", &hat), McpSessionDeliveryMode::Isolated);
-    let (two, _) = deliver(&w, &mcp, session("s2", "host-a", &hat), McpSessionDeliveryMode::Isolated);
+    let (one, _) = deliver(
+        &w,
+        &mcp,
+        session("s1", "host-a", &hat),
+        McpSessionDeliveryMode::Isolated,
+    );
+    let (two, _) = deliver(
+        &w,
+        &mcp,
+        session("s2", "host-a", &hat),
+        McpSessionDeliveryMode::Isolated,
+    );
     let revoke = |id: &str| -> Cut {
         let mut conn = w.raw();
         let tx = conn.transaction().unwrap();
@@ -280,9 +330,24 @@ fn revoke_host_in_cuts_every_live_token_of_the_host() {
     let linear = w.connection_in("linear", "http://127.0.0.1:9/mcp", CredKind::None, &hat, None);
     w.mount(&linear, &["host-a", "host-b"]);
     let mcp = GatewayMcp::new(&w.gateway());
-    let (a1, _) = deliver(&w, &mcp, session("s1", "host-a", &hat), McpSessionDeliveryMode::Isolated);
-    let (a2, _) = deliver(&w, &mcp, session("s2", "host-a", &hat), McpSessionDeliveryMode::Isolated);
-    let (b, _) = deliver(&w, &mcp, session("s3", "host-b", &hat), McpSessionDeliveryMode::Isolated);
+    let (a1, _) = deliver(
+        &w,
+        &mcp,
+        session("s1", "host-a", &hat),
+        McpSessionDeliveryMode::Isolated,
+    );
+    let (a2, _) = deliver(
+        &w,
+        &mcp,
+        session("s2", "host-a", &hat),
+        McpSessionDeliveryMode::Isolated,
+    );
+    let (b, _) = deliver(
+        &w,
+        &mcp,
+        session("s3", "host-b", &hat),
+        McpSessionDeliveryMode::Isolated,
+    );
     let mut conn = w.raw();
     let tx = conn.transaction().unwrap();
     let cut = mcp.revoke_host_in(&tx, "host-a").unwrap();
@@ -304,9 +369,16 @@ fn a_hat_purge_cuts_its_tokens() {
     let theirs = w.connection_in("theirs", "http://127.0.0.1:9/mcp", CredKind::None, &work, None);
     w.mount(&theirs, &["host-a"]);
     let mcp = GatewayMcp::new(&w.gateway());
-    let (servers, _) = deliver(&w, &mcp, session("s1", "host-a", &work), McpSessionDeliveryMode::Isolated);
+    let (servers, _) = deliver(
+        &w,
+        &mcp,
+        session("s1", "host-a", &work),
+        McpSessionDeliveryMode::Isolated,
+    );
     let token = token_of(&servers);
-    let watch = w.revocations.watch(&hennery_kernel::secret::sha256_hex(token.as_bytes()));
+    let watch = w
+        .revocations
+        .watch(&hennery_kernel::secret::sha256_hex(token.as_bytes()));
     mcp.purge_hat(&work).unwrap();
     assert!(watch.token().is_cancelled());
     assert!(w.proxy_store_resolve(&token).is_none());

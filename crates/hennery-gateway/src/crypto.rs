@@ -216,7 +216,10 @@ mod tests {
     fn a_stdio_blob_opens_only_for_its_row_host_and_hat() {
         let key = MasterKey::from_bytes([5; 32]);
         let blob = seal_stdio(&key, "stdio-1", "host-a", "hat-a", b"{}");
-        assert_eq!(&*open_stdio(&key, "stdio-1", "host-a", "hat-a", 1, &blob).unwrap(), b"{}");
+        assert_eq!(
+            &*open_stdio(&key, "stdio-1", "host-a", "hat-a", 1, &blob).unwrap(),
+            b"{}"
+        );
         for (row, host, hat) in [
             ("stdio-2", "host-a", "hat-a"),
             ("stdio-1", "host-b", "hat-a"),

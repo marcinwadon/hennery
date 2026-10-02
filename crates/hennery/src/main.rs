@@ -1182,6 +1182,25 @@ fn start_push(state: &mut AppState, egress: &hennery_kernel::egress::Egress) {
 mod tests {
     use super::*;
 
+    /// Plan 8e: the collector gives its sessions the gateway (lane L1), or
+    /// no session would ever get a server (plan 8c's release blocker, lane
+    /// L15). The same function `run_collector` calls.
+    #[test]
+    fn the_collector_gives_its_sessions_the_gateway() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hennery.db");
+        let state = AppState::new(
+            Store::open(&db).unwrap(),
+            Hosts::open(&db).unwrap(),
+            Operator::open(&db).unwrap(),
+        );
+        assert!(!state.store.has_session_mcp());
+        let keys = hennery_gateway::key::KeySource::from_vars(dir.path(), Some("07".repeat(32).into()), None).unwrap();
+        let egress = hennery_kernel::egress::Egress::new(hennery_kernel::egress::Timeouts::DEFAULT).unwrap();
+        let _routes = gateway(&state, &db, &keys, &egress).unwrap();
+        assert!(state.store.has_session_mcp());
+    }
+
     /// Plan 10b-ii: the collector's notices reach delivery, and delivery is
     /// public only. A subscription at a loopback address gets a notice
     /// refused, recorded on it; nothing is sent.

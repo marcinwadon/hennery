@@ -657,7 +657,7 @@ async fn the_stdio_routes_answer_their_codes() {
     let long = "h".repeat(65);
     for path in [
         "/api/mcp/stdio-servers".to_string(),
-        format!("/api/mcp/stdio-servers?host_id=host-a"),
+        "/api/mcp/stdio-servers?host_id=host-a".to_string(),
         format!("/api/mcp/stdio-servers?hat_id={hat}"),
         at(&long, &hat),
         at("host-a", &long),
@@ -681,7 +681,9 @@ async fn the_stdio_routes_answer_their_codes() {
     api.create("linear").await;
     let (status, body) = put(at("host-a", &hat), one("linear", json!([]))).await;
     assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "slug_taken"));
-    let many: Vec<Value> = (0..33).map(|i| json!({"name": format!("s{i}"), "command": "c"})).collect();
+    let many: Vec<Value> = (0..33)
+        .map(|i| json!({"name": format!("s{i}"), "command": "c"}))
+        .collect();
     let (status, body) = put(at("host-a", &hat), json!({ "servers": many })).await;
     assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "too_many_stdio_servers"));
     let (status, body) = put(at("host-a", &hat), json!({"servers": [], "extra": 1})).await;

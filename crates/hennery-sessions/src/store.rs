@@ -835,12 +835,7 @@ fn fact_applies(tx: &Transaction<'_>, owner: &str, session_id: &str, turn_id: Op
 /// `Store::close_now`'s body, inside the caller's transaction, with the
 /// session's token revoked there too (lane L4): the cut is the caller's to
 /// make once it commits. A tombstone is left alone (plan 9a A1).
-fn close_in(
-    tx: &Transaction<'_>,
-    owner: &str,
-    mcp: &dyn SessionMcp,
-    session_id: &str,
-) -> Result<(Vec<EventDto>, Cut)> {
+fn close_in(tx: &Transaction<'_>, owner: &str, mcp: &dyn SessionMcp, session_id: &str) -> Result<(Vec<EventDto>, Cut)> {
     let events = close_session_in(tx, owner, session_id)?;
     // Whether or not this closed it: a closed session's token is revoked
     // already, so this is a no-op then, never a fresh token's revoke (a

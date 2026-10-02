@@ -142,7 +142,10 @@ async fn a_revoke_ends_a_request_not_yet_answered() {
     // Positive signal: the proxy is watching the token.
     let deadline = tokio::time::Instant::now() + BOUND;
     while h.revocations.watched() == 0 {
-        assert!(tokio::time::Instant::now() < deadline, "the request never reached the proxy");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the request never reached the proxy"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     revoke(&h, "s1");

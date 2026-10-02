@@ -322,7 +322,7 @@ struct StdioQuery {
 }
 
 /// Both ids, each 1 to 64 bytes; neither is quoted back when refused.
-fn stdio_place(query: Result<Query<StdioQuery>, QueryRejection>) -> Result<(String, String), Response> {
+fn stdio_place(query: Result<Query<StdioQuery>, QueryRejection>) -> Result<(String, String), Box<Response>> {
     let refused = || {
         error(
             StatusCode::BAD_REQUEST,
@@ -331,7 +331,7 @@ fn stdio_place(query: Result<Query<StdioQuery>, QueryRejection>) -> Result<(Stri
         )
     };
     let Ok(Query(query)) = query else {
-        return Err(refused());
+        return Err(Box::new(refused()));
     };
     match (query.host_id, query.hat_id) {
         (Some(host), Some(hat))
@@ -339,7 +339,7 @@ fn stdio_place(query: Result<Query<StdioQuery>, QueryRejection>) -> Result<(Stri
         {
             Ok((host, hat))
         }
-        _ => Err(refused()),
+        _ => Err(Box::new(refused())),
     }
 }
 
@@ -380,13 +380,10 @@ fn stdio_answer(host_id: String, hat_id: String, change: StdioChange) -> Respons
 }
 
 /// `GET /api/mcp/stdio-servers?host_id=&hat_id=`: the set, without a value.
-async fn stdio_set(
-    State(state): State<GatewayState>,
-    query: Result<Query<StdioQuery>, QueryRejection>,
-) -> Response {
+async fn stdio_set(State(state): State<GatewayState>, query: Result<Query<StdioQuery>, QueryRejection>) -> Response {
     let (host_id, hat_id) = match stdio_place(query) {
         Ok(place) => place,
-        Err(refused) => return refused,
+        Err(refused) => return *refused,
     };
     match state.store.stdio_set(&host_id, &hat_id) {
         Ok(change) => stdio_answer(host_id, hat_id, change),
@@ -404,7 +401,7 @@ async fn replace_stdio_set(
 ) -> Response {
     let (host_id, hat_id) = match stdio_place(query) {
         Ok(place) => place,
-        Err(refused) => return refused,
+        Err(refused) => return *refused,
     };
     let servers: Vec<StdioInput> = req
         .servers
