@@ -1,7 +1,8 @@
-// A session's status marker in the list (frontend spec §5; plan 4c
-// decisions 7 and 8). It reads the server's two axes, lifecycle and
-// activity, plus `question_waits` and `presumed_parked`, directly: there is
-// no staleness heuristic and no "actionable" guess (F-9).
+// A session's status marker in the list and in the session's header
+// (frontend spec §5; plan 4c decisions 7 and 8): one rule for both. It
+// reads the server's two axes, lifecycle and activity, plus
+// `question_waits` and `presumed_parked`, directly: there is no staleness
+// heuristic and no "actionable" guess (F-9).
 
 /** The marker's colour: `attn` is the strongest and means only "waiting on
  *  a question"; `fail` is a hollow red ring. */

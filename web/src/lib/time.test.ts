@@ -12,6 +12,14 @@ describe('relTime', () => {
 })
 describe('clockTime', () => {
   it('empty -> empty', () => expect(clockTime('')).toBe(''))
+  it('unparseable -> empty', () => expect(clockTime('not a time')).toBe(''))
+  it('hours and minutes in the browser’s own form, the same on every call', () => {
+    const iso = '2026-06-09T11:45:00Z'
+    const expected = new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    expect(clockTime(iso)).toBe(expected)
+    expect(clockTime('2026-06-09T13:05:00Z')).toBe(new Date('2026-06-09T13:05:00Z').toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }))
+    expect(clockTime(iso)).toBe(expected)
+  })
 })
 describe('bucketOf', () => {
   // Local-time strings (no trailing Z) on purpose: buckets are local-calendar,

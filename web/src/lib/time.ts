@@ -8,10 +8,15 @@ export function relTime(iso: string): string {
   const h = Math.floor(m / 60); if (h < 24) return `${h}h ago`
   return `${Math.floor(h / 24)}d ago`
 }
+// One formatter for every call: `toLocaleTimeString` builds a new one each
+// time, which a transcript of a thousand items pays a thousand times.
+let clock: Intl.DateTimeFormat | undefined
 export function clockTime(iso: string): string {
   if (!iso) return ''
   const d = new Date(iso)
-  return isNaN(d.getTime()) ? '' : d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  if (isNaN(d.getTime())) return ''
+  clock ??= new Intl.DateTimeFormat([], { hour: '2-digit', minute: '2-digit' })
+  return clock.format(d)
 }
 export function basename(p: string): string {
   if (!p) return ''
