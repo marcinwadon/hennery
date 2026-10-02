@@ -1,0 +1,490 @@
+[
+  {
+    "id": "00000000-0000-7000-8000-000000000006:0",
+    "version": 6,
+    "turn_id": "00000000-0000-7000-8000-000000000006",
+    "ts": "2026-10-02T08:30:46.572Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "Reply with the single word OK"
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000006:1",
+    "version": 9,
+    "turn_id": "00000000-0000-7000-8000-000000000006",
+    "ts": "2026-10-02T08:30:50.589Z",
+    "kind": "message",
+    "text": "OK"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000008:0",
+    "version": 16,
+    "turn_id": "00000000-0000-7000-8000-000000000008",
+    "ts": "2026-10-02T08:31:09.662Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "Create a file named allow.txt in the current directory containing exactly the word yes. Use your file write tool. Do not do anything else."
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000008:tool:toolu_0001",
+    "version": 27,
+    "turn_id": "00000000-0000-7000-8000-000000000008",
+    "ts": "2026-10-02T08:31:12.117Z",
+    "kind": "tool_call",
+    "tool_call_id": "toolu_0001",
+    "title": "Write allow.txt",
+    "tool_kind": "edit",
+    "status": "completed",
+    "input": {
+      "file_path": "/tmp/smoke/project/allow.txt",
+      "content": "yes"
+    },
+    "content": [
+      {
+        "type": "diff",
+        "path": "/tmp/smoke/project/allow.txt",
+        "new_text": "yes"
+      }
+    ],
+    "locations": [
+      {
+        "path": "/tmp/smoke/project/allow.txt"
+      }
+    ],
+    "output": "File created successfully at: /tmp/smoke/project/allow.txt (file state is current in your context — no need to Read it back)"
+  },
+  {
+    "id": "question:00000000-0000-7000-8000-000000000009",
+    "version": 25,
+    "turn_id": "00000000-0000-7000-8000-000000000008",
+    "ts": "2026-10-02T08:31:12.416Z",
+    "kind": "question",
+    "pending_id": "00000000-0000-7000-8000-000000000009",
+    "question_kind": "permission",
+    "request": {
+      "type": "permission",
+      "title": "Write allow.txt",
+      "tool_call_id": "toolu_0001",
+      "options": [
+        {
+          "option_id": "allow-once",
+          "name": "Yes",
+          "option_kind": "allow_once"
+        },
+        {
+          "option_id": "allow-with-updates",
+          "name": "Yes, allow all edits during this session",
+          "option_kind": "allow_always"
+        },
+        {
+          "option_id": "reject",
+          "name": "No",
+          "option_kind": "reject_once"
+        }
+      ]
+    },
+    "answerable": false,
+    "state": "delivered",
+    "answered": true,
+    "delivered": true
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000008:1",
+    "version": 38,
+    "turn_id": "00000000-0000-7000-8000-000000000008",
+    "ts": "2026-10-02T08:31:23.817Z",
+    "kind": "message",
+    "text": "Done. Created `allow.txt` in the current directory with the content `yes`."
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000000c:0",
+    "version": 44,
+    "turn_id": "00000000-0000-7000-8000-00000000000c",
+    "ts": "2026-10-02T08:31:37.871Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "Create a file named deny.txt in the current directory containing exactly the word no. Use your file write tool. If the write is refused, stop and reply DENIED."
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000000c:tool:toolu_0002",
+    "version": 54,
+    "turn_id": "00000000-0000-7000-8000-00000000000c",
+    "ts": "2026-10-02T08:31:40.056Z",
+    "kind": "tool_call",
+    "tool_call_id": "toolu_0002",
+    "title": "Write deny.txt",
+    "tool_kind": "edit",
+    "status": "failed",
+    "input": {
+      "file_path": "/tmp/smoke/project/deny.txt",
+      "content": "no"
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "```\nUser refused permission to run tool\n```"
+      }
+    ],
+    "locations": [
+      {
+        "path": "/tmp/smoke/project/deny.txt"
+      }
+    ],
+    "output": "User refused permission to run tool"
+  },
+  {
+    "id": "question:00000000-0000-7000-8000-00000000000d",
+    "version": 53,
+    "turn_id": "00000000-0000-7000-8000-00000000000c",
+    "ts": "2026-10-02T08:31:40.570Z",
+    "kind": "question",
+    "pending_id": "00000000-0000-7000-8000-00000000000d",
+    "question_kind": "permission",
+    "request": {
+      "type": "permission",
+      "title": "Write deny.txt",
+      "tool_call_id": "toolu_0002",
+      "options": [
+        {
+          "option_id": "allow-once",
+          "name": "Yes",
+          "option_kind": "allow_once"
+        },
+        {
+          "option_id": "allow-with-updates",
+          "name": "Yes, allow all edits during this session",
+          "option_kind": "allow_always"
+        },
+        {
+          "option_id": "reject",
+          "name": "No",
+          "option_kind": "reject_once"
+        }
+      ]
+    },
+    "answerable": false,
+    "state": "delivered",
+    "answered": true,
+    "delivered": true
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000000c:1",
+    "version": 56,
+    "turn_id": "00000000-0000-7000-8000-00000000000c",
+    "ts": "2026-10-02T08:31:43.112Z",
+    "kind": "message",
+    "text": "DENIED"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000010:0",
+    "version": 62,
+    "turn_id": "00000000-0000-7000-8000-000000000010",
+    "ts": "2026-10-02T08:31:52.823Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "Use your AskUserQuestion tool to ask me one question: red or blue? Then reply with only my answer."
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000010:tool:toolu_0003",
+    "version": 72,
+    "turn_id": "00000000-0000-7000-8000-000000000010",
+    "ts": "2026-10-02T08:31:54.947Z",
+    "kind": "tool_call",
+    "tool_call_id": "toolu_0003",
+    "title": "Red or blue?",
+    "tool_kind": "other",
+    "status": "completed",
+    "input": {
+      "questions": [
+        {
+          "question": "Red or blue?",
+          "header": "Color",
+          "options": [
+            {
+              "label": "Red",
+              "description": "The color red"
+            },
+            {
+              "label": "Blue",
+              "description": "The color blue"
+            }
+          ],
+          "multiSelect": false
+        }
+      ]
+    },
+    "content": [
+      {
+        "type": "text",
+        "text": "Your questions have been answered: \"Red or blue?\"=\"Blue\". You can now continue with these answers in mind."
+      }
+    ],
+    "output": "Your questions have been answered: \"Red or blue?\"=\"Blue\". You can now continue with these answers in mind."
+  },
+  {
+    "id": "question:00000000-0000-7000-8000-000000000011",
+    "version": 70,
+    "turn_id": "00000000-0000-7000-8000-000000000010",
+    "ts": "2026-10-02T08:31:55.654Z",
+    "kind": "question",
+    "pending_id": "00000000-0000-7000-8000-000000000011",
+    "question_kind": "elicitation",
+    "request": {
+      "type": "elicitation",
+      "message": "Red or blue?",
+      "fields": [
+        {
+          "key": "question_0",
+          "label": "Color",
+          "field_kind": "single",
+          "options": [
+            {
+              "value": "Red",
+              "label": "Red",
+              "description": "The color red"
+            },
+            {
+              "value": "Blue",
+              "label": "Blue",
+              "description": "The color blue"
+            }
+          ]
+        },
+        {
+          "key": "question_0_custom",
+          "label": "Other",
+          "hint": "Type your own answer, or add a note to the option you chose above (optional).",
+          "field_kind": "text",
+          "pairing": {
+            "with": "question_0",
+            "kind": "exclusive"
+          }
+        }
+      ],
+      "form_supported": true
+    },
+    "answerable": false,
+    "state": "delivered",
+    "answered": true,
+    "delivered": true
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000010:1",
+    "version": 74,
+    "turn_id": "00000000-0000-7000-8000-000000000010",
+    "ts": "2026-10-02T08:32:03.021Z",
+    "kind": "message",
+    "text": "Blue"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000014:0",
+    "version": 80,
+    "turn_id": "00000000-0000-7000-8000-000000000014",
+    "ts": "2026-10-02T08:32:09.146Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "Count from 1 to 400, one number per line, no tools."
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000014:1",
+    "version": 192,
+    "turn_id": "00000000-0000-7000-8000-000000000014",
+    "ts": "2026-10-02T08:32:10.513Z",
+    "kind": "message",
+    "text": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n57\n58\n59\n60\n61\n62\n63\n64\n65\n66\n67\n68\n69\n70\n71\n72\n73\n74\n75\n76\n77\n78\n79\n80\n81\n82\n83\n84\n85\n86\n87\n88\n89\n90\n91\n92\n93\n94\n95\n96\n97\n98\n99\n100\n101\n102\n103\n104\n105\n106\n107\n108\n109\n110\n111\n112\n113\n114\n115\n116\n117\n118\n119\n120\n121\n122\n123\n124\n125\n126\n127\n128\n129\n130\n131\n132\n133\n134\n135\n136\n137\n138\n139\n140\n141\n142\n143\n144\n145\n146\n147\n148\n149\n150\n151\n152\n153\n154\n155\n156\n157\n158\n159\n160\n161\n162\n163\n164\n165\n166\n167\n168\n169\n170\n171\n172\n173\n174\n175\n176\n177\n178\n179\n180\n181\n182\n183\n184\n185\n186\n187\n188\n189\n190\n191\n192\n193\n194\n195\n196\n197\n198\n199\n200\n201\n202\n203\n204\n205\n206\n207\n208\n209\n210\n211\n212\n213\n214\n215\n216\n217\n218\n219\n220\n221\n222\n223\n224\n225\n226\n227\n228\n229\n230\n231\n232\n233\n234\n235\n236\n237\n238\n239\n240\n241\n242\n243\n244\n245\n246\n247\n248\n249\n250\n251\n252\n253\n254\n255\n256\n257\n258\n259\n260\n261\n262\n263\n264\n265\n266\n267\n268\n269\n270\n271\n272\n273\n274\n275\n276\n277\n278\n279\n280\n281\n282\n283\n284\n285\n286\n287\n288\n289\n290\n291\n292\n293\n294\n295\n296\n297\n298\n299\n300\n301\n302\n303\n304\n305\n306\n307\n308\n309\n310\n311\n312\n313\n314\n315\n316\n317\n318\n319\n320\n321\n322\n323\n324\n325\n326\n327\n328\n329\n330\n331"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000014:2",
+    "version": 194,
+    "turn_id": "00000000-0000-7000-8000-000000000014",
+    "ts": "2026-10-02T08:32:13.299Z",
+    "kind": "marker",
+    "marker": "turn_cancelled"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000016:0",
+    "version": 197,
+    "turn_id": "00000000-0000-7000-8000-000000000016",
+    "ts": "2026-10-02T08:32:21.741Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "What single colour is this image? Reply with one word."
+      },
+      {
+        "type": "image",
+        "mimeType": "image/png",
+        "sha256": "57cda64cead0869cd5f90dfebb024f4bd9a922aaea91d513de6fa3e949d88921",
+        "size": 75
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000016:tool:toolu_0004",
+    "version": 203,
+    "turn_id": "00000000-0000-7000-8000-000000000016",
+    "ts": "2026-10-02T08:32:23.360Z",
+    "kind": "tool_call",
+    "tool_call_id": "toolu_0004",
+    "title": "Read /tmp/agent/-tmp-smoke-project/00000000-0000-7000-8000-000000000003/images/1.png",
+    "tool_kind": "read",
+    "status": "completed",
+    "input": {
+      "file_path": "/tmp/agent/-tmp-smoke-project/00000000-0000-7000-8000-000000000003/images/1.png"
+    },
+    "content": [
+      {
+        "type": "image",
+        "mime_type": "image/png",
+        "data": "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEklEQVR4nGP4z8CAFWEXHbQSACj/P8Fu7N9hAAAAAElFTkSuQmCC"
+      }
+    ],
+    "locations": [
+      {
+        "path": "/tmp/agent/-tmp-smoke-project/00000000-0000-7000-8000-000000000003/images/1.png",
+        "line": 1
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000016:1",
+    "version": 205,
+    "turn_id": "00000000-0000-7000-8000-000000000016",
+    "ts": "2026-10-02T08:32:25.775Z",
+    "kind": "message",
+    "text": "Red"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000016:2",
+    "version": 211,
+    "turn_id": "00000000-0000-7000-8000-000000000016",
+    "ts": "2026-10-02T08:32:32.254Z",
+    "kind": "marker",
+    "marker": "parked",
+    "reason": "operator"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000016:3",
+    "version": 212,
+    "turn_id": "00000000-0000-7000-8000-000000000016",
+    "ts": "2026-10-02T08:32:39.281Z",
+    "kind": "marker",
+    "marker": "resumed"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000019:0",
+    "version": 217,
+    "turn_id": "00000000-0000-7000-8000-000000000019",
+    "ts": "2026-10-02T08:32:45.222Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "What colour did I pick earlier in this conversation? One word."
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000019:1",
+    "version": 220,
+    "turn_id": "00000000-0000-7000-8000-000000000019",
+    "ts": "2026-10-02T08:32:47.656Z",
+    "kind": "message",
+    "text": "Blue"
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000001b:0",
+    "version": 228,
+    "turn_id": "00000000-0000-7000-8000-00000000001b",
+    "ts": "2026-10-02T08:33:14.102Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "Count from 1 to 300, one number per line, no tools."
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000001b:1",
+    "version": 289,
+    "turn_id": "00000000-0000-7000-8000-00000000001b",
+    "ts": "2026-10-02T08:33:15.695Z",
+    "kind": "message",
+    "text": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36\n37\n38\n39\n40\n41\n42\n43\n44\n45\n46\n47\n48\n49\n50\n51\n52\n53\n54\n55\n56\n57\n58\n59\n60\n61\n62\n63\n64\n65\n66\n67\n68\n69\n70\n71\n72\n73\n74\n75\n76\n77\n78\n79\n80\n81\n82\n83\n84\n85\n86\n87\n88\n89\n90\n91\n92\n93\n94\n95\n96\n97\n98\n99\n100\n101\n102\n103\n104\n105\n106\n107\n108\n109\n110\n111\n112\n113\n114\n115\n116\n117\n118\n119\n120\n121\n122\n123\n124\n125\n126\n127\n128\n129\n130\n131\n132\n133\n134\n135\n136\n137\n138\n139\n140\n141\n142\n143\n144\n145\n146\n147\n148\n149\n150\n151\n152\n153\n154\n155\n156\n157\n158\n159\n160\n161\n162\n163\n164\n165\n166\n167\n168\n169\n170\n171\n172\n173\n174\n175\n176\n177\n178\n179\n180"
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000001b:2",
+    "version": 290,
+    "turn_id": "00000000-0000-7000-8000-00000000001b",
+    "ts": "2026-10-02T08:33:18.278Z",
+    "kind": "marker",
+    "marker": "host_restarted"
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000001b:3",
+    "version": 291,
+    "turn_id": "00000000-0000-7000-8000-00000000001b",
+    "ts": "2026-10-02T08:33:18.278Z",
+    "kind": "marker",
+    "marker": "turn_interrupted"
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000001b:4",
+    "version": 292,
+    "turn_id": "00000000-0000-7000-8000-00000000001b",
+    "ts": "2026-10-02T08:33:45.957Z",
+    "kind": "marker",
+    "marker": "resumed"
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000001e:0",
+    "version": 296,
+    "turn_id": "00000000-0000-7000-8000-00000000001e",
+    "ts": "2026-10-02T08:33:58.092Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "Reply with the single word OK"
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000001e:1",
+    "version": 300,
+    "turn_id": "00000000-0000-7000-8000-00000000001e",
+    "ts": "2026-10-02T08:34:03.826Z",
+    "kind": "message",
+    "text": "OK"
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000001e:2",
+    "version": 307,
+    "turn_id": "00000000-0000-7000-8000-00000000001e",
+    "ts": "2026-10-02T08:34:10.272Z",
+    "kind": "marker",
+    "marker": "closed"
+  }
+]

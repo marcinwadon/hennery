@@ -1,0 +1,16 @@
+[package]
+name = "hennery-view"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+hennery-proto.workspace = true
+schemars.workspace = true
+serde.workspace = true
+# The adapter's order of an elicitation's fields is the order its form
+# shows them in: kept whatever else the build enables.
+serde_json = { workspace = true, features = ["preserve_order"] }
+ts-rs.workspace = true
