@@ -98,6 +98,8 @@ pub fn render_schema() -> String {
         rest::UpdateMcpConnectionRequest,
         rest::McpMountsRequest,
         rest::McpCredentialRequest,
+        rest::DeleteResult,
+        rest::HostRemovalItem,
     );
     // `serde_json::Map` is a `BTreeMap` (always iterates sorted) by default,
     // or an `IndexMap` (iterates in insertion order) when serde_json's
@@ -175,6 +177,12 @@ pub fn render_ts() -> String {
         frames::SessionBody,
         frames::Project,
         frames::DirEntry,
+        frames::AgentHome,
+        frames::ForgetKind,
+        frames::ForgetReason,
+        frames::ForgetWhat,
+        frames::ForgetRemaining,
+        frames::ForgetOutcome,
         frames::HostFrame,
         frames::CollectorFrame,
         rest::StartSessionRequest,
@@ -243,6 +251,14 @@ pub fn render_ts() -> String {
         rest::UpdateMcpConnectionRequest,
         rest::McpMountsRequest,
         rest::McpCredentialRequest,
+        rest::RemovalState,
+        rest::RemovalPending,
+        rest::RemovalItem,
+        rest::TranscriptRemoval,
+        rest::DeleteResult,
+        rest::HostRemovalState,
+        rest::HostRemovalItem,
+        rest::HostTranscripts,
     );
     out
 }

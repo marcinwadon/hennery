@@ -818,3 +818,98 @@ fn forget_hat_uses_the_spec_field_names_and_is_no_probe() {
     assert_eq!(serde_json::from_value::<CollectorFrame>(wire).unwrap(), frame);
     assert!(frame.probe_capability().is_err());
 }
+
+// Plan 9d: the agent's own transcript on its host.
+
+#[test]
+fn forget_frames_use_the_spec_field_names_and_name_kinds_never_paths() {
+    use hennery_proto::frames::{AgentHome, ForgetKind, ForgetOutcome, ForgetReason, ForgetRemaining, ForgetWhat};
+    let forget = CollectorFrame::ForgetSession {
+        request_id: "r".into(),
+        agent: "claude".into(),
+        agent_session_id: "a1".into(),
+        agent_home: AgentHome {
+            root: "/h/.claude".into(),
+            sqlite_root: None,
+        },
+    };
+    let expected = json!({
+        "type": "forget_session", "request_id": "r", "agent": "claude", "agent_session_id": "a1",
+        "agent_home": {"root": "/h/.claude"}
+    });
+    assert_eq!(serde_json::to_value(&forget).unwrap(), expected);
+    assert_eq!(serde_json::from_value::<CollectorFrame>(expected).unwrap(), forget);
+    assert_eq!(
+        forget.probe_capability(),
+        Ok(Some(hennery_proto::frames::Capability::ForgetSession))
+    );
+
+    let answer = HostFrame::SessionForgotten {
+        request_id: "r".into(),
+        outcome: ForgetOutcome::Partial,
+        removed: vec![ForgetWhat {
+            kind: ForgetKind::Transcript,
+            count: 2,
+        }],
+        remaining: vec![ForgetRemaining {
+            what: ForgetWhat {
+                kind: ForgetKind::FileHistory,
+                count: 1,
+            },
+            reason: ForgetReason::Symlink,
+            retry: false,
+        }],
+    };
+    let expected = json!({
+        "type": "session_forgotten", "request_id": "r", "outcome": "partial",
+        "removed": [{"kind": "transcript", "count": 2}],
+        "remaining": [{"what": {"kind": "file_history", "count": 1}, "reason": "symlink", "retry": false}]
+    });
+    assert_eq!(serde_json::to_value(&answer).unwrap(), expected);
+    assert_eq!(serde_json::from_value::<HostFrame>(expected).unwrap(), answer);
+    assert_eq!(answer.probe_request_id(), Some("r"));
+    // A reason is a closed set: free text from a host does not parse.
+    let free = json!({
+        "type": "session_forgotten", "request_id": "r", "outcome": "partial", "removed": [],
+        "remaining": [{"what": {"kind": "debug", "count": 1}, "reason": "/home/me/.claude/debug", "retry": true}]
+    });
+    assert!(serde_json::from_value::<HostFrame>(free).is_err());
+}
+
+#[test]
+fn session_started_carries_the_agent_home_only_when_there_is_one() {
+    use hennery_proto::frames::AgentHome;
+    let plain = SessionBody::session_started("r", "a1");
+    assert!(serde_json::to_value(&plain).unwrap().get("agent_home").is_none());
+    let with = json!({
+        "kind": "session_started", "request_id": "r", "agent_session_id": "a1",
+        "agent_home": {"root": "/h/.codex", "sqlite_root": "/h/db"}
+    });
+    let SessionBody::SessionStarted { agent_home, .. } = serde_json::from_value(with).unwrap() else {
+        panic!("not a session_started");
+    };
+    assert_eq!(
+        agent_home,
+        Some(AgentHome {
+            root: "/h/.codex".into(),
+            sqlite_root: Some("/h/db".into())
+        })
+    );
+}
+
+#[test]
+fn an_agent_home_is_well_formed_only_absolute_bounded_and_without_nul() {
+    use hennery_proto::frames::{AGENT_HOME_MAX_BYTES, AgentHome};
+    let home = |root: &str, sqlite: Option<&str>| AgentHome {
+        root: root.into(),
+        sqlite_root: sqlite.map(Into::into),
+    };
+    assert!(home("/h/.claude", None).is_well_formed());
+    assert!(home("/h/.codex", Some("/db")).is_well_formed());
+    assert!(!home("h/.claude", None).is_well_formed());
+    assert!(!home("", None).is_well_formed());
+    assert!(!home("/h/\0x", None).is_well_formed());
+    assert!(!home("/h", Some("db")).is_well_formed());
+    assert!(!home(&format!("/{}", "a".repeat(AGENT_HOME_MAX_BYTES)), None).is_well_formed());
+    assert!(home(&format!("/{}", "a".repeat(AGENT_HOME_MAX_BYTES - 1)), None).is_well_formed());
+}

@@ -1,5 +1,23 @@
 {
   "$defs": {
+    "AgentHome": {
+      "description": "Where an agent keeps its own data for a session, as its host resolved\nit from the adapter's environment (plan 9d decision 1): `root` is\nClaude's `CLAUDE_CONFIG_DIR` or `~/.claude`, Codex's `CODEX_HOME` or\n`~/.codex`; `sqlite_root` is Codex's `CODEX_SQLITE_HOME` if set.\nCanonical, its bytes as the filesystem gave them (O11). A host's report\nis not verified by the collector beyond its shape (`is_well_formed`).",
+      "properties": {
+        "root": {
+          "type": "string"
+        },
+        "sqlite_root": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "root"
+      ],
+      "type": "object"
+    },
     "AnswerRequest": {
       "anyOf": [
         {
@@ -192,6 +210,11 @@
         {
           "const": "resolve_path",
           "description": "Resolving typed paths (`resolve_path`, kernel spec §5.4).",
+          "type": "string"
+        },
+        {
+          "const": "forget_session",
+          "description": "Removing a deleted session's transcript from the agent's own data\n(`forget_session`, plan 9d decision 4).",
           "type": "string"
         }
       ]
@@ -644,6 +667,35 @@
             "hat_id"
           ],
           "type": "object"
+        },
+        {
+          "description": "Remove a deleted session's transcript from the agent's own data on\nthe host (plan 9d decision 4): only to a host with the\n`forget_session` capability. The host acts only on an exact match\nof its own registry (B1). Answered by `session_forgotten` |\n`error{invalid}`.",
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "agent_home": {
+              "$ref": "#/$defs/AgentHome"
+            },
+            "agent_session_id": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "forget_session",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "agent",
+            "agent_session_id",
+            "agent_home"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -752,6 +804,18 @@
         "url",
         "hat_id",
         "cred_kind"
+      ],
+      "type": "object"
+    },
+    "DeleteResult": {
+      "description": "`DELETE /api/sessions/{id}` (ACP core §4.10; plan 9d decision 7).",
+      "properties": {
+        "host_transcript": {
+          "$ref": "#/$defs/TranscriptRemoval"
+        }
+      },
+      "required": [
+        "host_transcript"
       ],
       "type": "object"
     },
@@ -887,6 +951,176 @@
         "kind",
         "body",
         "ts"
+      ],
+      "type": "object"
+    },
+    "ForgetKind": {
+      "description": "What a forget names on the host (plan 9d decision 4, B2): a kind of\nentry, never a path. The masked path each stands for is `masked`.",
+      "oneOf": [
+        {
+          "enum": [
+            "file_history",
+            "session_env",
+            "tasks",
+            "debug"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "session",
+          "description": "The whole forget, when it could not start (no home, an unknown id,\nan agent this host cannot forget for yet).",
+          "type": "string"
+        },
+        {
+          "const": "transcript",
+          "description": "The transcript and its family in each project directory (B9).",
+          "type": "string"
+        },
+        {
+          "const": "codex_database_copies",
+          "description": "Codex's own database copies of the conversation (plan 9d-ii).",
+          "type": "string"
+        }
+      ]
+    },
+    "ForgetOutcome": {
+      "description": "How a forget ended (plan 9d decision 4): `complete` when the check\nafterwards found nothing named left (B4).",
+      "enum": [
+        "complete",
+        "partial"
+      ],
+      "type": "string"
+    },
+    "ForgetReason": {
+      "description": "Why something named was not removed: a fixed code the host chooses\n(plan 9d B2), never free text.",
+      "oneOf": [
+        {
+          "const": "attached",
+          "description": "A live actor on the host has that agent session id (decision 13, B7).",
+          "type": "string"
+        },
+        {
+          "const": "in_progress",
+          "description": "Another forget of the same agent session is running on the host\n(B7; the review's item 3).",
+          "type": "string"
+        },
+        {
+          "const": "unsupported_agent",
+          "description": "This host cannot forget for that agent (yet).",
+          "type": "string"
+        },
+        {
+          "const": "no_recorded_home",
+          "description": "The session recorded no agent home (decision 11).",
+          "type": "string"
+        },
+        {
+          "const": "unknown_to_host",
+          "description": "The host's registry has no such (agent, id, home) (B1).",
+          "type": "string"
+        },
+        {
+          "const": "shared",
+          "description": "Another kept session refers to the same agent session (B8).",
+          "type": "string"
+        },
+        {
+          "const": "unsafe_root",
+          "description": "The root failed a check: `/`, `$HOME` or an ancestor, the host's data\ndirectory, not canonical, not the host user's, writable by others.",
+          "type": "string"
+        },
+        {
+          "const": "root_missing",
+          "description": "The root is not there (any more).",
+          "type": "string"
+        },
+        {
+          "const": "symlink",
+          "description": "A symlink, reported and never followed or removed (decision 8).",
+          "type": "string"
+        },
+        {
+          "const": "not_a_directory",
+          "description": "A kind directory that is not a real directory.",
+          "type": "string"
+        },
+        {
+          "const": "unsafe_directory",
+          "description": "A kind directory not the host user's, or writable by others (B3).",
+          "type": "string"
+        },
+        {
+          "const": "mount_point",
+          "description": "The walk reached another file system (R2).",
+          "type": "string"
+        },
+        {
+          "const": "too_deep",
+          "description": "The walk reached its depth bound (R2).",
+          "type": "string"
+        },
+        {
+          "const": "timed_out",
+          "description": "The forget's deadline passed before the removal was done (B6).",
+          "type": "string"
+        },
+        {
+          "const": "still_present",
+          "description": "Still there after the removal (B4).",
+          "type": "string"
+        },
+        {
+          "const": "io_error",
+          "description": "The removal failed midway (B3).",
+          "type": "string"
+        },
+        {
+          "const": "invalid_id",
+          "description": "The collector's own: the host answered `error{invalid}` for the id\n(decision 8, O10).",
+          "type": "string"
+        },
+        {
+          "const": "host_revoked",
+          "description": "The collector's own: the host was revoked and never connects again\n(O10).",
+          "type": "string"
+        }
+      ]
+    },
+    "ForgetRemaining": {
+      "description": "Something a forget left (plan 9d decision 4). `retry: false` marks what\na retry cannot change.",
+      "properties": {
+        "reason": {
+          "$ref": "#/$defs/ForgetReason"
+        },
+        "retry": {
+          "type": "boolean"
+        },
+        "what": {
+          "$ref": "#/$defs/ForgetWhat"
+        }
+      },
+      "required": [
+        "what",
+        "reason",
+        "retry"
+      ],
+      "type": "object"
+    },
+    "ForgetWhat": {
+      "description": "One kind of entry and how many of them (plan 9d B2).",
+      "properties": {
+        "count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "$ref": "#/$defs/ForgetKind"
+        }
+      },
+      "required": [
+        "kind",
+        "count"
       ],
       "type": "object"
     },
@@ -1155,6 +1389,41 @@
           "type": "object"
         },
         {
+          "description": "The answer to `forget_session` (plan 9d decision 4): what was\nremoved and what is left, as kinds and counts (B2). Like a probe's\nreply it is not outboxed and answers only the connection it was\nasked on: a forget is idempotent, so a lost answer costs a retry.",
+          "properties": {
+            "outcome": {
+              "$ref": "#/$defs/ForgetOutcome"
+            },
+            "remaining": {
+              "items": {
+                "$ref": "#/$defs/ForgetRemaining"
+              },
+              "type": "array"
+            },
+            "removed": {
+              "items": {
+                "$ref": "#/$defs/ForgetWhat"
+              },
+              "type": "array"
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "session_forgotten",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id",
+            "outcome",
+            "removed",
+            "remaining"
+          ],
+          "type": "object"
+        },
+        {
           "description": "The answer to `browse_directory` (ACP core §3.3, §7): the\nsubdirectories of `path`. A probe reply, like `projects`.",
           "properties": {
             "entries": {
@@ -1298,6 +1567,103 @@
         "recents",
         "items",
         "partial"
+      ],
+      "type": "object"
+    },
+    "HostRemovalItem": {
+      "description": "One entry of `GET /api/settings/host-removals` (plan 9d decision 7).",
+      "properties": {
+        "agent": {
+          "type": "string"
+        },
+        "attempts": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "host_id": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "last_result": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TranscriptRemoval"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "session_id": {
+          "description": "The deleted session (a tombstone).",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/HostRemovalState"
+        }
+      },
+      "required": [
+        "id",
+        "host_id",
+        "session_id",
+        "agent",
+        "state",
+        "attempts",
+        "created_at"
+      ],
+      "type": "object"
+    },
+    "HostRemovalState": {
+      "description": "Whether a host removal is still retried (plan 9d decision 6, O10).",
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Retried at the host's next handshake.",
+          "type": "string"
+        },
+        {
+          "const": "final",
+          "description": "Done with something left that no retry changes: listed until it is\ndismissed.",
+          "type": "string"
+        }
+      ]
+    },
+    "HostTranscripts": {
+      "description": "How many purged sessions' transcripts their hosts removed, removed in\npart, or have still to remove (plan 9d decision 7), as each session's\n`TranscriptRemoval.state`; a session with no agent record counts in\nnone. The pending ones are retried at their host's next handshake.",
+      "properties": {
+        "partial": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pending": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pending_sessions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "removed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "removed",
+        "partial",
+        "pending",
+        "pending_sessions"
       ],
       "type": "object"
     },
@@ -2028,6 +2394,10 @@
     "PurgeResult": {
       "description": "200 to `POST /api/hats/{id}/purge` (plan 9c decision 10, A13): what\nthis purge deleted. A purge that resumes one that stopped counts only\nwhat it deleted itself.",
       "properties": {
+        "host_transcripts": {
+          "$ref": "#/$defs/HostTranscripts",
+          "description": "The agents' own transcripts of the purged sessions on their hosts\n(plan 9d decision 7)."
+        },
         "rules": {
           "format": "uint64",
           "minimum": 0,
@@ -2049,7 +2419,8 @@
       "required": [
         "sessions",
         "rules",
-        "unconfirmed"
+        "unconfirmed",
+        "host_transcripts"
       ],
       "type": "object"
     },
@@ -2265,12 +2636,101 @@
       ],
       "type": "object"
     },
+    "RemovalItem": {
+      "description": "One kind of entry left on the host, how many, and why (plan 9d B2). Its\npath is `kind`'s masked one (`ForgetKind::masked`).",
+      "properties": {
+        "count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "kind": {
+          "$ref": "#/$defs/ForgetKind"
+        },
+        "reason": {
+          "$ref": "#/$defs/ForgetReason"
+        }
+      },
+      "required": [
+        "kind",
+        "count",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "RemovalPending": {
+      "description": "Why a removal is still pending (plan 9d decision 7).",
+      "oneOf": [
+        {
+          "enum": [
+            "host_offline"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "host_needs_update",
+          "description": "The host does not announce `forget_session`.",
+          "type": "string"
+        },
+        {
+          "const": "no_reply",
+          "description": "No answer within the wait (30 s).",
+          "type": "string"
+        },
+        {
+          "const": "attached",
+          "description": "The host still has the agent's session attached.",
+          "type": "string"
+        },
+        {
+          "const": "in_progress",
+          "description": "Another attempt is running right now.",
+          "type": "string"
+        }
+      ]
+    },
+    "RemovalState": {
+      "description": "Where removing the agent's own transcript of a deleted session stands\n(plan 9d decision 7).",
+      "oneOf": [
+        {
+          "const": "removed",
+          "description": "Its host removed everything it names.",
+          "type": "string"
+        },
+        {
+          "const": "partial",
+          "description": "Something is left (`remaining`), or could not be looked for.",
+          "type": "string"
+        },
+        {
+          "const": "pending",
+          "description": "Not done yet (`pending`): retried when the host reconnects.",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "description": "The session had no agent record: nothing on the host.",
+          "type": "string"
+        }
+      ]
+    },
     "SessionBody": {
       "description": "The body of a sequenced, outboxed session frame.",
       "oneOf": [
         {
           "description": "The adapter session exists. Resolves the collector's start waiter.\n`indexed` carries the catalogue after the start's config switches\n(ACP core §4.3, P-13).",
           "properties": {
+            "agent_home": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AgentHome"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Where the agent keeps its data for this session (plan 9d\ndecision 1), registered on the host before this was sent (B1).\nAbsent from an older host, for an agent hennery cannot forget\nfor, or when the host could not resolve or register it."
+            },
             "agent_session_id": {
               "type": "string"
             },
@@ -3071,6 +3531,42 @@
           "type": "object"
         }
       ]
+    },
+    "TranscriptRemoval": {
+      "description": "The agent's own transcript of a deleted session on its host (plan 9d\ndecision 7): best effort. `notes` name what is never removed, whatever\nthe state.",
+      "properties": {
+        "notes": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "pending": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemovalPending"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "remaining": {
+          "items": {
+            "$ref": "#/$defs/RemovalItem"
+          },
+          "type": "array"
+        },
+        "state": {
+          "$ref": "#/$defs/RemovalState"
+        }
+      },
+      "required": [
+        "state",
+        "remaining",
+        "notes"
+      ],
+      "type": "object"
     },
     "TurnOutcome": {
       "description": "How a turn ended. Exactly one `turn_ended` per accepted turn (ACP core §4.4).",

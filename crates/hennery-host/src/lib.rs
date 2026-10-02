@@ -2,7 +2,9 @@
 //! sessions to the collector (ACP core spec §2).
 
 pub mod adapter;
+pub mod agent_home;
 pub mod connection;
+pub mod forget;
 pub mod git;
 pub mod identity;
 pub mod outbox;

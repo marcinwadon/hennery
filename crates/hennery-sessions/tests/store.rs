@@ -383,6 +383,8 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
              DROP TRIGGER catalog_of_a_tombstone;
              DROP TRIGGER a_tombstone_stays;
              DROP TABLE turn_attachments;
+             DROP TABLE host_forgets;
+             ALTER TABLE sessions DROP COLUMN agent_home;
              DROP INDEX events_by_kind;
              ALTER TABLE pending DROP COLUMN opened_event_id;
              DROP INDEX sessions_by_hat;
@@ -1217,6 +1219,7 @@ fn started_with(store: &Store, indexed: Indexed) {
                 request_id: "r0".into(),
                 agent_session_id: "a1".into(),
                 indexed,
+                agent_home: None,
             },
         )
         .unwrap();
@@ -1996,6 +1999,7 @@ fn commands_replace_the_stored_list_and_never_touch_the_config() {
                 request_id: "r0".into(),
                 agent_session_id: "a1".into(),
                 indexed: snapshot,
+                agent_home: None,
             },
         )
         .unwrap();
@@ -2058,6 +2062,7 @@ fn a_session_item_is_the_row_with_its_title_and_current_model_and_mode() {
                 request_id: "r0".into(),
                 agent_session_id: "a1".into(),
                 indexed: snapshot,
+                agent_home: None,
             },
         )
         .unwrap();
@@ -2459,6 +2464,8 @@ fn the_hat_migration_gives_each_session_its_hosts_default_hat() {
          DROP TRIGGER catalog_of_a_tombstone;
          DROP TRIGGER a_tombstone_stays;
          DROP TABLE turn_attachments;
+         DROP TABLE host_forgets;
+         ALTER TABLE sessions DROP COLUMN agent_home;
          DROP INDEX attachments_by_hash;
          DROP INDEX events_by_kind;
          ALTER TABLE pending DROP COLUMN opened_event_id;
@@ -2619,6 +2626,7 @@ fn delete(store: &Store, id: &str) -> EventDto {
         Deletion::Done {
             event,
             unconfirmed: false,
+            ..
         } => event,
         other => panic!("not deleted: {other:?}"),
     }
@@ -2806,8 +2814,10 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
     ] {
         assert!(walked.contains(&table), "{table} not walked: {walked:?}");
     }
+    // `host_forgets` is written by the delete itself (plan 9d decision 2):
+    // empty before it.
     assert!(
-        before.iter().all(|(_, n)| *n > 0),
+        before.iter().all(|(t, n)| *n > 0 || t == "host_forgets"),
         "nothing to delete somewhere: {before:?}"
     );
     let s2_before = {
@@ -2832,6 +2842,9 @@ fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
     for (table, n) in &after {
         let left = match table.as_str() {
             "sessions" | "events" => 1,
+            // s2 still uses the agent session s1 had (`a0`): nothing is
+            // left to remove on the host for it (plan 9d B8).
+            "host_forgets" => 0,
             _ => 0,
         };
         assert_eq!(*n, left, "{table}: {after:?}");
@@ -2867,6 +2880,10 @@ fn a_tombstone_is_scrubbed_and_found_by_no_accessor_or_list() {
                 request_id: "r0".into(),
                 agent_session_id: "agent-1".into(),
                 indexed: catalogue("opus", "plan"),
+                agent_home: Some(hennery_proto::frames::AgentHome {
+                    root: "/home/me/.claude".into(),
+                    sqlite_root: None,
+                }),
             },
         )
         .unwrap();
@@ -2881,7 +2898,7 @@ fn a_tombstone_is_scrubbed_and_found_by_no_accessor_or_list() {
     let created_at: String = conn
         .query_row("SELECT created_at FROM sessions WHERE id = 's1'", [], |r| r.get(0))
         .unwrap();
-    let Deletion::Done { event, unconfirmed } = store
+    let Deletion::Done { event, unconfirmed, .. } = store
         .delete_session(
             "s1",
             Some(&Unattached {
@@ -2953,6 +2970,12 @@ fn a_tombstone_is_scrubbed_and_found_by_no_accessor_or_list() {
             (event.ts.clone(), Some(event.event_id), true),
         )
     );
+    // The agent's recorded home goes too (plan 9d B8), after it was copied
+    // into the session's forget record.
+    let home: Option<String> = conn
+        .query_row("SELECT agent_home FROM sessions WHERE id = 's1'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(home, None);
 
     // The columns no closed session holds set are cleared too.
     store
@@ -3294,7 +3317,7 @@ fn a_session_not_closed_is_deleted_only_as_the_route_judged_it() {
     // `unconfirmed`: its host may still run it (A13).
     let deleted =
         |id: &str, unattached: &Unattached, may_run: bool| match store.delete_session(id, Some(unattached)).unwrap() {
-            Deletion::Done { event, unconfirmed } => {
+            Deletion::Done { event, unconfirmed, .. } => {
                 assert_eq!(unconfirmed, may_run, "{id}");
                 assert_eq!(event.kind, "session_deleted");
                 assert_eq!(event_kinds(&conn, id), ["session_deleted"]);

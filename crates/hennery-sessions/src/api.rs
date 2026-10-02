@@ -5,8 +5,8 @@ use crate::content::{self, Refusal};
 use crate::hub::{RequestError, Undo};
 use crate::resolve::{NotResolved, OnHost, resolve_on_host};
 use crate::store::{
-    AnswerSubmission, Cursor, Deletion, LIFECYCLES, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT, ListQuery, Reassign,
-    ResumeRequest, SessionRow, Store, Unattached,
+    AnswerSubmission, Cursor, Deletion, HostForgets, LIFECYCLES, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT, ListQuery,
+    Reassign, ResumeRequest, SessionRow, Store, Unattached,
 };
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::handler::Handler;
@@ -22,9 +22,9 @@ use hennery_kernel::operator::Authenticated;
 use hennery_kernel::secret::unix_now;
 use hennery_proto::frames::{Capability, CollectorFrame, Indexed, SessionBody};
 use hennery_proto::rest::{
-    AGENT_MAX_JSON_BYTES, AnswerRequest, AnswerResponse, ApiError, CancelResponse, ConfigRequest, EventDto,
-    LifecycleResponse, OpenTurn, PendingItem, PromptRequest, PromptResponse, SessionDetail, StartSessionRequest,
-    StartSessionResponse, UpdateSessionRequest, json_width,
+    AGENT_MAX_JSON_BYTES, AnswerRequest, AnswerResponse, ApiError, CancelResponse, ConfigRequest, DeleteResult,
+    EventDto, HostRemovalItem, LifecycleResponse, OpenTurn, PendingItem, PromptRequest, PromptResponse, SessionDetail,
+    StartSessionRequest, StartSessionResponse, UpdateSessionRequest, json_width,
 };
 use serde::Deserialize;
 use std::convert::Infallible;
@@ -95,7 +95,14 @@ pub fn router(state: AppState) -> Router {
         .route("/api/sessions/{id}/events", get(events))
         .route("/api/stream/sessions/{id}", get(stream_session))
         .route("/api/attachments/{sha256}", get(attachment))
-        .route("/api/settings/attachments", get(attachment_usage));
+        .route("/api/settings/attachments", get(attachment_usage))
+        .route("/api/settings/host-removals", get(host_removals))
+        .route(
+            "/api/settings/host-removals/{id}",
+            axum::routing::delete(
+                dismiss_host_removal.layer(middleware::from_fn(hennery_kernel::auth::require_step_up)),
+            ),
+        );
     hennery_kernel::auth::operator_only(routes, state.operator.clone()).with_state(state)
 }
 
@@ -1061,7 +1068,8 @@ async fn close(State(state): State<AppState>, Path(id): Path<String>) -> Respons
 /// route checks before this reads anything. Closed as `close` closes it,
 /// then deleted in one transaction that requires it closed, or closes it
 /// there while it is still as judged unattached (A4): 409 with the
-/// lifecycle if something moved it on meanwhile (a resume). 204.
+/// lifecycle if something moved it on meanwhile (a resume). 200 with what
+/// became of the agent's own transcript on the host (plan 9d decision 7).
 ///
 /// A session closed without its host (`unconfirmed`) is closed by that
 /// host when it reconciles next (decision 4). Its host may be back by the
@@ -1085,29 +1093,68 @@ async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -
         Closing::Unattached(judged) => Some(judged),
         Closing::Answer(response) => return response,
     };
-    finish_delete(&state, &session, unattached.as_ref())
+    let forgets = match finish_delete(&state, &session, unattached.as_ref()) {
+        Ok(forgets) => forgets,
+        Err(response) => return *response,
+    };
+    // The agent's own transcript on the host, best effort (plan 9d
+    // decisions 5 and 7): what the host answers within the wait, or why it
+    // is still pending. A purge counts these (`forget::after_purge`).
+    let host_transcript = crate::forget::after_delete(&state, &forgets).await;
+    (StatusCode::OK, Json(DeleteResult { host_transcript })).into_response()
 }
 
-/// The delete itself, once `close_through_host` has judged `session`.
-pub(crate) fn finish_delete(state: &AppState, session: &SessionRow, unattached: Option<&Unattached>) -> Response {
+/// The delete itself, once `close_through_host` has judged `session`: what
+/// it left for the host to remove (plan 9d decision 2), or the answer.
+pub(crate) fn finish_delete(
+    state: &AppState,
+    session: &SessionRow,
+    unattached: Option<&Unattached>,
+) -> Result<HostForgets, Box<Response>> {
     let id = &session.id;
     match state.store.delete_session(id, unattached) {
         // Only `session_deleted`: what a collector-side close wrote went
         // with the session, in the same transaction.
-        Ok(Deletion::Done { event, unconfirmed }) => {
+        Ok(Deletion::Done {
+            event,
+            unconfirmed,
+            forgets,
+        }) => {
             tracing::info!(session_id = %id, unconfirmed, "session deleted");
             state.hub.publish(event);
             if unconfirmed {
                 close_deleted_on_host(state, &session.host_id, id);
             }
-            StatusCode::NO_CONTENT.into_response()
+            Ok(*forgets)
         }
-        Ok(Deletion::Refused(lifecycle)) => error(
+        Ok(Deletion::Refused(lifecycle)) => Err(Box::new(error(
             StatusCode::CONFLICT,
             &lifecycle,
             format!("the session is {lifecycle} now; delete it again once that settles"),
-        ),
-        Ok(Deletion::NotFound) => error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        ))),
+        Ok(Deletion::NotFound) => Err(Box::new(error(StatusCode::NOT_FOUND, "not_found", "no such session"))),
+        Err(err) => Err(Box::new(internal(err))),
+    }
+}
+
+/// `GET /api/settings/host-removals` (plan 9d decision 7): what deletes
+/// left to remove on hosts, pending or final. Read-only, so no step-up.
+async fn host_removals(State(state): State<AppState>) -> Response {
+    match state.store.host_removals() {
+        Ok(records) => {
+            let items: Vec<HostRemovalItem> = records.into_iter().map(crate::forget::listed).collect();
+            Json(items).into_response()
+        }
+        Err(err) => internal(err),
+    }
+}
+
+/// `DELETE /api/settings/host-removals/{id}` (plan 9d O10), behind step-up:
+/// dismiss one, which is then neither retried nor listed. 204, or 404.
+async fn dismiss_host_removal(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    match state.store.dismiss_forget(&id) {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => error(StatusCode::NOT_FOUND, "not_found", "no such host removal"),
         Err(err) => internal(err),
     }
 }
@@ -1592,8 +1639,7 @@ mod delete_race_tests {
         let closed = after_reconcile(&f.state, HOST, &[], done, &f.tx, &mut reconcile_closes);
         assert!(closed.is_empty());
         let judged = judged_unattached(&f, &s).await;
-        let response = finish_delete(&f.state, &s, Some(&judged));
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(finish_delete(&f.state, &s, Some(&judged)).is_ok());
         assert!(
             closes(&mut f).is_empty(),
             "the host is not ready: the route sends nothing"
@@ -1636,8 +1682,7 @@ mod delete_race_tests {
         )
         .unwrap();
         assert!(closes(&mut f).is_empty(), "nothing is deleted yet");
-        let response = finish_delete(&f.state, &s, Some(&judged));
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(finish_delete(&f.state, &s, Some(&judged)).is_ok());
         assert_eq!(closes(&mut f), ["s1"]);
     }
 
@@ -1681,10 +1726,7 @@ mod delete_race_tests {
         let s = session(&f, "s1", true);
         let attached = listed("s1");
         let judged = judged_unattached(&f, &s).await;
-        assert_eq!(
-            finish_delete(&f.state, &s, Some(&judged)).status(),
-            StatusCode::NO_CONTENT
-        );
+        assert!(finish_delete(&f.state, &s, Some(&judged)).is_ok());
         let mut reconcile_closes = HashMap::new();
         let done = f.state.store.reconcile_host(HOST, &attached).unwrap();
         let closed = after_reconcile(&f.state, HOST, &[], done, &f.tx, &mut reconcile_closes);

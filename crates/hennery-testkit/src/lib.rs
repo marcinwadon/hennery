@@ -182,6 +182,10 @@ pub struct FakeScript {
     /// like `replay`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub prompt_updates: Vec<serde_json::Value>,
+    /// The agent session id `session/new` answers with, instead of
+    /// `fake-session-1`: a lowercase UUID, as Claude's SDK makes (plan 9d).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
 }
 
 /// One question the fake asks its client during a prompt, and the chunk it
@@ -247,6 +251,7 @@ impl Default for FakeScript {
             withdraw_asks: false,
             no_images: false,
             prompt_updates: Vec::new(),
+            session_id: None,
         }
     }
 }

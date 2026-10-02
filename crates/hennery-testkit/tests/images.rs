@@ -575,7 +575,7 @@ async fn attachments_are_served_only_to_the_operator() {
 }
 
 /// Plan 9a decision 5: deleting an active session on a connected host
-/// closes it there first, then deletes it: 204, 404 after, off the list, its
+/// closes it there first, then deletes it: 200, 404 after, off the list, its
 /// image no longer served, its file gone and the usage down.
 #[tokio::test]
 async fn deleting_an_active_session_closes_it_on_its_host_then_removes_it_and_its_images() {
@@ -609,7 +609,7 @@ async fn deleting_an_active_session_closes_it_on_its_host_then_removes_it_and_it
     };
     assert_eq!(session_id, session);
     host.emit(&session, SessionBody::SessionClosed).await;
-    assert_eq!(call.await.unwrap().status(), 204);
+    assert_eq!(call.await.unwrap().status(), 200);
 
     for path in [
         format!("/api/sessions/{session}"),

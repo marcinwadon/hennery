@@ -277,6 +277,12 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                             // name only the session (ACP core §3.2).
                             SessionBody::SessionParked { .. } | SessionBody::SessionClosed => {
                                 state.hub.resolve_session(&session_id, body.clone());
+                                // A deleted session's adapter is gone now:
+                                // what an `attached` answer left goes again
+                                // (plan 9d O10). Only a tombstone has records.
+                                if matches!(body, SessionBody::SessionClosed) {
+                                    crate::forget::retry_session(&state, &session_id);
+                                }
                             }
                             // `cancel_turn` is completed by its turn's end,
                             // scoped to the session it belongs to (final
@@ -388,6 +394,9 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                             tracing::error!(%host_id, error = %err, "reading the answer queue failed; dropping connection");
                             break;
                         }
+                        // What deletes left this host to remove (plan 9d
+                        // decision 5), now that requests may flow.
+                        crate::forget::retry_host(&state, &host_id);
                         for (_, held) in deferred.drain() {
                             if let Some(edge) = held.into_edge(&state) {
                                 notify(&state, &edge);
@@ -416,7 +425,10 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
             HostFrame::ResendComplete => tracing::warn!(%host_id, "ignoring repeated resend_complete"),
             // Probe replies answer the probe of this connection that they
             // name, if it still waits (ACP core §3.3).
-            frame @ (HostFrame::Projects { .. } | HostFrame::Directory { .. } | HostFrame::ResolvedPath { .. }) => {
+            frame @ (HostFrame::Projects { .. }
+            | HostFrame::Directory { .. }
+            | HostFrame::ResolvedPath { .. }
+            | HostFrame::SessionForgotten { .. }) => {
                 state.hub.probe_reply(&host_id, conn_id, frame);
             }
             HostFrame::Hello { .. } => tracing::warn!(%host_id, "ignoring repeated hello"),

@@ -28,6 +28,142 @@ pub enum Capability {
     Park,
     /// Resolving typed paths (`resolve_path`, kernel spec §5.4).
     ResolvePath,
+    /// Removing a deleted session's transcript from the agent's own data
+    /// (`forget_session`, plan 9d decision 4).
+    ForgetSession,
+}
+
+/// The longest agent data root a host may report (plan 9d, O12's shape
+/// check): Linux's `PATH_MAX`.
+pub const AGENT_HOME_MAX_BYTES: usize = 4096;
+
+/// Where an agent keeps its own data for a session, as its host resolved
+/// it from the adapter's environment (plan 9d decision 1): `root` is
+/// Claude's `CLAUDE_CONFIG_DIR` or `~/.claude`, Codex's `CODEX_HOME` or
+/// `~/.codex`; `sqlite_root` is Codex's `CODEX_SQLITE_HOME` if set.
+/// Canonical, its bytes as the filesystem gave them (O11). A host's report
+/// is not verified by the collector beyond its shape (`is_well_formed`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema, TS)]
+pub struct AgentHome {
+    pub root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub sqlite_root: Option<String>,
+}
+
+impl AgentHome {
+    /// Absolute, bounded and with no NUL, each path (plan 9d, the shape
+    /// check the collector makes before it stores a home).
+    pub fn is_well_formed(&self) -> bool {
+        let ok = |p: &str| p.starts_with('/') && p.len() <= AGENT_HOME_MAX_BYTES && !p.contains('\0');
+        ok(&self.root) && self.sqlite_root.as_deref().is_none_or(ok)
+    }
+}
+
+/// What a forget names on the host (plan 9d decision 4, B2): a kind of
+/// entry, never a path. The masked path each stands for is `masked`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ForgetKind {
+    /// The whole forget, when it could not start (no home, an unknown id,
+    /// an agent this host cannot forget for yet).
+    Session,
+    /// The transcript and its family in each project directory (B9).
+    Transcript,
+    FileHistory,
+    SessionEnv,
+    Tasks,
+    Debug,
+    /// Codex's own database copies of the conversation (plan 9d-ii).
+    CodexDatabaseCopies,
+}
+
+impl ForgetKind {
+    /// The entries this kind stands for, relative to the agent's root, with
+    /// the project directory masked (B2).
+    pub fn masked(self) -> &'static str {
+        match self {
+            Self::Session => "<session>",
+            Self::Transcript => "projects/*/<id>.jsonl (and its family)",
+            Self::FileHistory => "file-history/<id>/",
+            Self::SessionEnv => "session-env/<id>/",
+            Self::Tasks => "tasks/<id>/",
+            Self::Debug => "debug/<id>.txt",
+            Self::CodexDatabaseCopies => "<codex database>",
+        }
+    }
+}
+
+/// Why something named was not removed: a fixed code the host chooses
+/// (plan 9d B2), never free text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ForgetReason {
+    /// A live actor on the host has that agent session id (decision 13, B7).
+    Attached,
+    /// Another forget of the same agent session is running on the host
+    /// (B7; the review's item 3).
+    InProgress,
+    /// This host cannot forget for that agent (yet).
+    UnsupportedAgent,
+    /// The session recorded no agent home (decision 11).
+    NoRecordedHome,
+    /// The host's registry has no such (agent, id, home) (B1).
+    UnknownToHost,
+    /// Another kept session refers to the same agent session (B8).
+    Shared,
+    /// The root failed a check: `/`, `$HOME` or an ancestor, the host's data
+    /// directory, not canonical, not the host user's, writable by others.
+    UnsafeRoot,
+    /// The root is not there (any more).
+    RootMissing,
+    /// A symlink, reported and never followed or removed (decision 8).
+    Symlink,
+    /// A kind directory that is not a real directory.
+    NotADirectory,
+    /// A kind directory not the host user's, or writable by others (B3).
+    UnsafeDirectory,
+    /// The walk reached another file system (R2).
+    MountPoint,
+    /// The walk reached its depth bound (R2).
+    TooDeep,
+    /// The forget's deadline passed before the removal was done (B6).
+    TimedOut,
+    /// Still there after the removal (B4).
+    StillPresent,
+    /// The removal failed midway (B3).
+    IoError,
+    /// The collector's own: the host answered `error{invalid}` for the id
+    /// (decision 8, O10).
+    InvalidId,
+    /// The collector's own: the host was revoked and never connects again
+    /// (O10).
+    HostRevoked,
+}
+
+/// One kind of entry and how many of them (plan 9d B2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct ForgetWhat {
+    pub kind: ForgetKind,
+    pub count: u32,
+}
+
+/// Something a forget left (plan 9d decision 4). `retry: false` marks what
+/// a retry cannot change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct ForgetRemaining {
+    pub what: ForgetWhat,
+    pub reason: ForgetReason,
+    pub retry: bool,
+}
+
+/// How a forget ended (plan 9d decision 4): `complete` when the check
+/// afterwards found nothing named left (B4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum ForgetOutcome {
+    Complete,
+    Partial,
 }
 
 /// `hello.capabilities`. Deserialized leniently: a capability this build
@@ -247,6 +383,13 @@ pub enum SessionBody {
         agent_session_id: String,
         #[serde(default)]
         indexed: Indexed,
+        /// Where the agent keeps its data for this session (plan 9d
+        /// decision 1), registered on the host before this was sent (B1).
+        /// Absent from an older host, for an agent hennery cannot forget
+        /// for, or when the host could not resolve or register it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "AgentHome | undefined", optional)]
+        agent_home: Option<AgentHome>,
     },
     /// The host accepted a start but could not create the adapter session
     /// (spawn, `initialize` or `session/new` failed). Rejects the start waiter.
@@ -359,6 +502,7 @@ impl SessionBody {
             request_id: request_id.into(),
             agent_session_id: agent_session_id.into(),
             indexed: Indexed::default(),
+            agent_home: None,
         }
     }
 }
@@ -448,6 +592,16 @@ pub enum HostFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         home: Option<String>,
     },
+    /// The answer to `forget_session` (plan 9d decision 4): what was
+    /// removed and what is left, as kinds and counts (B2). Like a probe's
+    /// reply it is not outboxed and answers only the connection it was
+    /// asked on: a forget is idempotent, so a lost answer costs a retry.
+    SessionForgotten {
+        request_id: String,
+        outcome: ForgetOutcome,
+        removed: Vec<ForgetWhat>,
+        remaining: Vec<ForgetRemaining>,
+    },
     /// The answer to `browse_directory` (ACP core §3.3, §7): the
     /// subdirectories of `path`. A probe reply, like `projects`.
     Directory {
@@ -477,6 +631,8 @@ impl CollectorFrame {
         match self {
             Self::ListProjects { .. } | Self::BrowseDirectory { .. } => Ok(Some(Capability::Projects)),
             Self::ResolvePath { .. } => Ok(Some(Capability::ResolvePath)),
+            // Not a probe of state, but carried as one (`session_forgotten`).
+            Self::ForgetSession { .. } => Ok(Some(Capability::ForgetSession)),
             Self::HelloAck { .. }
             | Self::HelloError { .. }
             | Self::StartSession { .. }
@@ -502,7 +658,8 @@ impl HostFrame {
         match self {
             Self::Projects { request_id, .. }
             | Self::Directory { request_id, .. }
-            | Self::ResolvedPath { request_id, .. } => Some(request_id),
+            | Self::ResolvedPath { request_id, .. }
+            | Self::SessionForgotten { request_id, .. } => Some(request_id),
             Self::Hello { .. } | Self::Session { .. } | Self::Error { .. } | Self::ResendComplete => None,
         }
     }
@@ -647,5 +804,16 @@ pub enum CollectorFrame {
     /// needed.
     ForgetHat {
         hat_id: String,
+    },
+    /// Remove a deleted session's transcript from the agent's own data on
+    /// the host (plan 9d decision 4): only to a host with the
+    /// `forget_session` capability. The host acts only on an exact match
+    /// of its own registry (B1). Answered by `session_forgotten` |
+    /// `error{invalid}`.
+    ForgetSession {
+        request_id: String,
+        agent: String,
+        agent_session_id: String,
+        agent_home: AgentHome,
     },
 }

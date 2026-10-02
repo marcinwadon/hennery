@@ -124,6 +124,8 @@ async fn minting_changing_revoking_a_host_and_revoking_a_session_need_a_fresh_pa
         // Checked before anything is read: an unknown session is 403 when
         // stale, 404 only once stepped up (plan 9a decision 5).
         ("DELETE", "/api/sessions/s-9".to_string(), None, 404),
+        // Dismissing a host removal (plan 9d O10); listing them is a read.
+        ("DELETE", "/api/settings/host-removals/f-9".to_string(), None, 404),
         ("DELETE", format!("/api/auth/sessions/{}", c.id_of(&other)), None, 204),
     ];
     let send = |session: &str, method: &str, path: &str, body: Option<&str>| {
@@ -158,6 +160,8 @@ async fn minting_changing_revoking_a_host_and_revoking_a_session_need_a_fresh_pa
     assert_eq!(resp.status(), 404);
     let resp = send(&stale, "GET", "/api/hats/hat-9/purge", None).await.unwrap();
     assert_eq!(code_of(resp).await, (404, "not_found".into()));
+    let resp = send(&stale, "GET", "/api/settings/host-removals", None).await.unwrap();
+    assert_eq!(resp.status(), 200);
     assert!(c.state.operator.authenticate(&other, unix_now()).unwrap().is_some());
     // A wrong password does not step up.
     assert_eq!(
