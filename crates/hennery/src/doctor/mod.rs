@@ -153,10 +153,30 @@ impl Doctor<'_> {
     /// The `--agent` commands of that service's command line, parsed as
     /// `host run` parses them; `None` when it gives none.
     pub fn given_agents(&self) -> Option<Vec<(String, hennery_host::AgentCommand)>> {
+        self.given().map(|(_, agents)| agents)
+    }
+
+    /// Whether the agents are given by the NixOS module's system unit, not
+    /// by a user service: no other check sees that unit.
+    pub fn agents_given_by_system_unit(&self) -> bool {
+        self.given().is_some_and(|(system, _)| system)
+    }
+
+    /// The agents given, and whether by a system unit. The service is a
+    /// user service, or the NixOS module's system unit for a host
+    /// (`/etc/systemd/system/hennery-host.service`, plan 7e-ii-a), read for
+    /// its `ExecStart` alone (drop-ins in `hennery-host.service.d/` are not
+    /// seen).
+    fn given(&self) -> Option<(bool, Vec<(String, hennery_host::AgentCommand)>)> {
         use crate::service::unit::Role;
         let host = self.dirs.host.as_ref().and_then(|h| h.canonicalize().ok())?;
-        self.cx.installed().into_iter().find_map(|role| {
-            let argv = crate::service::read_command_line(self.cx, role)?;
+        let user = self
+            .cx
+            .installed()
+            .into_iter()
+            .filter_map(|role| crate::service::read_command_line(self.cx, role).map(|argv| (false, role, argv)));
+        let system = crate::service::read_system_command_line(self.cx, Role::Host).map(|argv| (true, Role::Host, argv));
+        user.chain(system).find_map(|(system, role, argv)| {
             let served = match (role, crate::service::data_dir_of(&argv)) {
                 (Role::Up, Some(data)) => data.join("host"),
                 (Role::Host, Some(data)) => data,
@@ -177,7 +197,7 @@ impl Doctor<'_> {
                     given.push(agent);
                 }
             }
-            (!given.is_empty()).then_some(given)
+            (!given.is_empty()).then_some((system, given))
         })
     }
 }

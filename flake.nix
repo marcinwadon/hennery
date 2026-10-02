@@ -17,7 +17,18 @@
     };
   };
 
-  outputs = { nixpkgs, nixpkgs-web, flake-utils, crane, advisory-db, ... }:
+  outputs = { self, nixpkgs, nixpkgs-web, flake-utils, crane, advisory-db, ... }:
+    let
+      # The modules run this flake's own package (plan 7e-ii-a).
+      henneryFor = system: self.packages.${system}.default;
+      nixosModule = import ./nix/modules/nixos.nix { inherit henneryFor; };
+      homeManagerModule = import ./nix/modules/home-manager.nix { inherit henneryFor; };
+    in
+    {
+      nixosModules.default = nixosModule;
+      homeManagerModules.default = homeManagerModule;
+    }
+    //
     # The v1 platforms (distribution spec §1): Intel Macs are not one.
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" "aarch64-darwin" ] (system:
       let
@@ -33,9 +44,20 @@
           withFfmpeg = false;
         };
         webTools = [ web.nodejs_24 web.pnpm ];
+        # The pinned adapters, their checks and the modules' (plan 7e-ii-a).
+        nixOutputs = import ./nix/outputs.nix {
+          inherit pkgs nixpkgs system nixosModule homeManagerModule;
+          hennery = hennery.package;
+        };
       in {
         packages.default = hennery.package;
-        checks = hennery.checks;
+        # The free adapter. The Claude adapter is unfree (distribution spec
+        # §3.3), so it is no package of the flake's, which `nix flake check`
+        # would evaluate: `nix build .#claude-acp` builds it once the
+        # operator accepts its licence (`NIXPKGS_ALLOW_UNFREE=1 --impure`).
+        packages.codex-acp = nixOutputs.codex-acp;
+        legacyPackages = nixOutputs.legacyPackages;
+        checks = hennery.checks // nixOutputs.checks;
         # Building the web UI only (CI's Rust and release jobs): no browsers.
         devShells.web = pkgs.mkShell { packages = webTools; };
         devShells.default = pkgs.mkShell {
