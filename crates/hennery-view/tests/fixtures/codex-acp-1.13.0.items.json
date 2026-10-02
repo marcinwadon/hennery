@@ -1,0 +1,462 @@
+[
+  {
+    "id": "00000000-0000-7000-8000-000000000007:0",
+    "version": 315,
+    "turn_id": "00000000-0000-7000-8000-000000000007",
+    "ts": "2026-10-02T08:34:28.245Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "Reply with the single word OK"
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000007:1",
+    "version": 317,
+    "turn_id": "00000000-0000-7000-8000-000000000007",
+    "ts": "2026-10-02T08:34:32.187Z",
+    "kind": "message",
+    "text": "OK"
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000000a:0",
+    "version": 326,
+    "turn_id": "00000000-0000-7000-8000-00000000000a",
+    "ts": "2026-10-02T08:34:39.973Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "Create a file named codex-allow.txt in the current directory containing exactly the word yes. Do nothing else."
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000000a:1",
+    "version": 329,
+    "turn_id": "00000000-0000-7000-8000-00000000000a",
+    "ts": "2026-10-02T08:34:44.021Z",
+    "kind": "thinking",
+    "text": "\n\n**Applying patch creation**"
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000000a:tool:exec-00000000-0000-7000-8000-00000000000b",
+    "version": 331,
+    "turn_id": "00000000-0000-7000-8000-00000000000a",
+    "ts": "2026-10-02T08:34:45.513Z",
+    "kind": "tool_call",
+    "tool_call_id": "exec-00000000-0000-7000-8000-00000000000b",
+    "title": "Editing files",
+    "tool_kind": "edit",
+    "status": "completed",
+    "content": [
+      {
+        "type": "diff",
+        "path": "/tmp/smoke/project/codex-allow.txt",
+        "new_text": "yes\n"
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000000d:0",
+    "version": 338,
+    "turn_id": "00000000-0000-7000-8000-00000000000d",
+    "ts": "2026-10-02T08:35:02.394Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "Create the file /tmp/smoke/codex-outside-allow.txt containing exactly yes. Do nothing else."
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000000d:1",
+    "version": 341,
+    "turn_id": "00000000-0000-7000-8000-00000000000d",
+    "ts": "2026-10-02T08:35:09.283Z",
+    "kind": "thinking",
+    "text": "\n\n**Applying patch with writable root**"
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000000d:tool:exec-00000000-0000-7000-8000-00000000000e",
+    "version": 349,
+    "turn_id": "00000000-0000-7000-8000-00000000000d",
+    "ts": "2026-10-02T08:35:09.755Z",
+    "kind": "tool_call",
+    "tool_call_id": "exec-00000000-0000-7000-8000-00000000000e",
+    "title": "Editing files",
+    "tool_kind": "edit",
+    "status": "completed",
+    "content": [
+      {
+        "type": "diff",
+        "path": "/tmp/smoke/codex-outside-allow.txt",
+        "new_text": "yes\n"
+      }
+    ]
+  },
+  {
+    "id": "question:00000000-0000-7000-8000-00000000000f",
+    "version": 347,
+    "turn_id": "00000000-0000-7000-8000-00000000000d",
+    "ts": "2026-10-02T08:35:09.757Z",
+    "kind": "question",
+    "pending_id": "00000000-0000-7000-8000-00000000000f",
+    "question_kind": "permission",
+    "request": {
+      "type": "permission",
+      "title": "Edit files",
+      "tool_call_id": "exec-00000000-0000-7000-8000-00000000000e",
+      "options": [
+        {
+          "option_id": "allow_once",
+          "name": "Yes, proceed",
+          "option_kind": "allow_once"
+        },
+        {
+          "option_id": "allow_for_session",
+          "name": "Yes, and don't ask again for these files",
+          "option_kind": "allow_always"
+        },
+        {
+          "option_id": "cancel",
+          "name": "No, and tell Codex what to do differently",
+          "option_kind": "reject_once"
+        }
+      ]
+    },
+    "answerable": false,
+    "state": "delivered",
+    "answered": true,
+    "delivered": true
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000012:0",
+    "version": 356,
+    "turn_id": "00000000-0000-7000-8000-000000000012",
+    "ts": "2026-10-02T08:35:25.259Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "Create the file /tmp/smoke/codex-outside-deny.txt containing exactly no. If refused, stop."
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000012:1",
+    "version": 359,
+    "turn_id": "00000000-0000-7000-8000-000000000012",
+    "ts": "2026-10-02T08:35:31.659Z",
+    "kind": "thinking",
+    "text": "\n\n**Verifying write permissions for patching**"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000012:tool:exec-00000000-0000-7000-8000-000000000013",
+    "version": 370,
+    "turn_id": "00000000-0000-7000-8000-000000000012",
+    "ts": "2026-10-02T08:35:32.283Z",
+    "kind": "tool_call",
+    "tool_call_id": "exec-00000000-0000-7000-8000-000000000013",
+    "title": "Editing files",
+    "tool_kind": "edit",
+    "status": "failed",
+    "content": [
+      {
+        "type": "diff",
+        "path": "/tmp/smoke/codex-outside-deny.txt",
+        "new_text": "no\n"
+      }
+    ]
+  },
+  {
+    "id": "question:00000000-0000-7000-8000-000000000014",
+    "version": 365,
+    "turn_id": "00000000-0000-7000-8000-000000000012",
+    "ts": "2026-10-02T08:35:32.312Z",
+    "kind": "question",
+    "pending_id": "00000000-0000-7000-8000-000000000014",
+    "question_kind": "permission",
+    "request": {
+      "type": "permission",
+      "title": "Edit files",
+      "tool_call_id": "exec-00000000-0000-7000-8000-000000000013",
+      "options": [
+        {
+          "option_id": "allow_once",
+          "name": "Yes, proceed",
+          "option_kind": "allow_once"
+        },
+        {
+          "option_id": "allow_for_session",
+          "name": "Yes, and don't ask again for these files",
+          "option_kind": "allow_always"
+        },
+        {
+          "option_id": "cancel",
+          "name": "No, and tell Codex what to do differently",
+          "option_kind": "reject_once"
+        }
+      ]
+    },
+    "answerable": false,
+    "state": "delivered",
+    "answered": true,
+    "delivered": true
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000012:2",
+    "version": 369,
+    "turn_id": "00000000-0000-7000-8000-000000000012",
+    "ts": "2026-10-02T08:35:32.540Z",
+    "kind": "marker",
+    "marker": "turn_cancelled"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000017:0",
+    "version": 373,
+    "turn_id": "00000000-0000-7000-8000-000000000017",
+    "ts": "2026-10-02T08:35:40.336Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "Use your request_user_input tool (if you have one) to ask me: red or blue? If you have no such tool, reply NOTOOL."
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000017:1",
+    "version": 376,
+    "turn_id": "00000000-0000-7000-8000-000000000017",
+    "ts": "2026-10-02T08:35:46.779Z",
+    "kind": "thinking",
+    "text": "\n\n**Confirming tool availability and mode**"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000017:2",
+    "version": 379,
+    "turn_id": "00000000-0000-7000-8000-000000000017",
+    "ts": "2026-10-02T08:35:52.590Z",
+    "kind": "message",
+    "text": "NOTOOL"
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000001a:0",
+    "version": 386,
+    "turn_id": "00000000-0000-7000-8000-00000000001a",
+    "ts": "2026-10-02T08:36:09.949Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "Use your request_user_input tool to ask me one question: red or blue? If you have no such tool, reply NOTOOL."
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000001a:1",
+    "version": 389,
+    "turn_id": "00000000-0000-7000-8000-00000000001a",
+    "ts": "2026-10-02T08:36:15.290Z",
+    "kind": "thinking",
+    "text": "\n\n**Planning next tool invocation**"
+  },
+  {
+    "id": "question:00000000-0000-7000-8000-00000000001b",
+    "version": 394,
+    "turn_id": "00000000-0000-7000-8000-00000000001a",
+    "ts": "2026-10-02T08:36:15.999Z",
+    "kind": "question",
+    "pending_id": "00000000-0000-7000-8000-00000000001b",
+    "question_kind": "elicitation",
+    "request": {
+      "type": "elicitation",
+      "message": "Codex needs your input to continue.",
+      "fields": [
+        {
+          "key": "color",
+          "label": "red or blue?",
+          "hint": "Color",
+          "field_kind": "single",
+          "options": [
+            {
+              "value": "Red",
+              "label": "Red",
+              "description": "Choose red."
+            },
+            {
+              "value": "Blue",
+              "label": "Blue",
+              "description": "Choose blue."
+            },
+            {
+              "value": "None of the above",
+              "label": "None of the above",
+              "description": "Provide a different answer in the note field."
+            }
+          ]
+        },
+        {
+          "key": "color_note",
+          "label": "Additional answer or note",
+          "field_kind": "text",
+          "pairing": {
+            "with": "color",
+            "kind": "note"
+          }
+        }
+      ],
+      "required": [
+        "color"
+      ],
+      "form_supported": true
+    },
+    "answerable": false,
+    "state": "delivered",
+    "answered": true,
+    "delivered": true
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000001f:0",
+    "version": 403,
+    "turn_id": "00000000-0000-7000-8000-00000000001f",
+    "ts": "2026-10-02T08:36:34.433Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "Count from 1 to 400, one number per line, no tools."
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000001f:1",
+    "version": 475,
+    "turn_id": "00000000-0000-7000-8000-00000000001f",
+    "ts": "2026-10-02T08:36:38.465Z",
+    "kind": "message",
+    "text": "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n19\n20\n21\n22\n23\n24\n25\n26\n27\n28\n29\n30\n31\n32\n33\n34\n35\n36"
+  },
+  {
+    "id": "00000000-0000-7000-8000-00000000001f:2",
+    "version": 478,
+    "turn_id": "00000000-0000-7000-8000-00000000001f",
+    "ts": "2026-10-02T08:36:39.625Z",
+    "kind": "marker",
+    "marker": "turn_cancelled"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000021:0",
+    "version": 481,
+    "turn_id": "00000000-0000-7000-8000-000000000021",
+    "ts": "2026-10-02T08:36:39.693Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "What single colour is this image? Reply with one word."
+      },
+      {
+        "type": "image",
+        "mimeType": "image/png",
+        "sha256": "57cda64cead0869cd5f90dfebb024f4bd9a922aaea91d513de6fa3e949d88921",
+        "size": 75
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000021:1",
+    "version": 483,
+    "turn_id": "00000000-0000-7000-8000-000000000021",
+    "ts": "2026-10-02T08:36:44.514Z",
+    "kind": "message",
+    "text": "Red"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000021:2",
+    "version": 489,
+    "turn_id": "00000000-0000-7000-8000-000000000021",
+    "ts": "2026-10-02T08:36:53.402Z",
+    "kind": "marker",
+    "marker": "parked",
+    "reason": "operator"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000021:3",
+    "version": 490,
+    "turn_id": "00000000-0000-7000-8000-000000000021",
+    "ts": "2026-10-02T08:36:53.456Z",
+    "kind": "marker",
+    "marker": "resumed"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000024:0",
+    "version": 497,
+    "turn_id": "00000000-0000-7000-8000-000000000024",
+    "ts": "2026-10-02T08:36:54.636Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "What colour did I choose when you asked me red or blue? One word."
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000024:1",
+    "version": 499,
+    "turn_id": "00000000-0000-7000-8000-000000000024",
+    "ts": "2026-10-02T08:37:01.276Z",
+    "kind": "message",
+    "text": "Blue"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000024:2",
+    "version": 504,
+    "turn_id": "00000000-0000-7000-8000-000000000024",
+    "ts": "2026-10-02T08:37:13.276Z",
+    "kind": "marker",
+    "marker": "host_restarted"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000024:3",
+    "version": 505,
+    "turn_id": "00000000-0000-7000-8000-000000000024",
+    "ts": "2026-10-02T08:37:21.823Z",
+    "kind": "marker",
+    "marker": "resumed"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000027:0",
+    "version": 512,
+    "turn_id": "00000000-0000-7000-8000-000000000027",
+    "ts": "2026-10-02T08:37:22.858Z",
+    "kind": "user_turn",
+    "content": [
+      {
+        "type": "text",
+        "text": "Reply with the single word OK"
+      }
+    ]
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000027:1",
+    "version": 514,
+    "turn_id": "00000000-0000-7000-8000-000000000027",
+    "ts": "2026-10-02T08:37:31.229Z",
+    "kind": "message",
+    "text": "OK"
+  },
+  {
+    "id": "00000000-0000-7000-8000-000000000027:2",
+    "version": 519,
+    "turn_id": "00000000-0000-7000-8000-000000000027",
+    "ts": "2026-10-02T08:37:32.161Z",
+    "kind": "marker",
+    "marker": "closed"
+  }
+]
