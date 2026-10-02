@@ -47,7 +47,7 @@ No proxy, session tokens, OAuth, egress, renderers or standalone mode: plans 8b�
 
 It builds on the merged hats plans [5a](2026-10-06-hats.md) (composite foreign keys, decision 3) to [5d](2026-10-09-reassign-hat.md), and on the lane note's decisions L1, L6 and L8 (plan 8's split, kept with the gateway lane). Every anchor was taken from `main` at `ef75d4f`. Where the code and a spec disagree, the code wins, and the plan says so.
 
-**Status:** not executed. The security review's answers are under "The security review's answers".
+**Status:** executed 2026-10-02 (see "Execution status"); amended after the security review and its two re-confirmations, whose answers are under "The security review's answers".
 
 **How the code blocks were made and checked:**
 - Every block below was generated from a scratch branch on `ef75d4f`, two commits per task: the task's tests alone, then the whole task.
@@ -55,9 +55,23 @@ It builds on the merged hats plans [5a](2026-10-06-hats.md) (composite foreign k
 - After every task the five checks passed. The workspace has 1075 tests at the end, up from 1019 on `ef75d4f`.
 - Every guard and side-effect line was revert-probed (each task's Step 5): 94 probes, each caught by the test named. Task 4's were run again after the rebase onto `0955dce`; the later rebase onto `ef75d4f` (plans 8b and 10b-i) touched no file of 8a's but `Cargo.lock` and the generated files, and merged without a conflict.
 
-## Execution status
+## Execution status (2026-10-02)
 
-Not executed yet.
+**Executed** on branch `feat/gateway-8a-store`, rebased onto `main` at `d2d2894` (plan 9a, 10b-iii, the SSE fix, the adapter process-group fix, the first-run Node fix and CI's concurrency merged meanwhile). The plan's anchors are `ef75d4f`'s. Each task was applied from the plan's own text (`replay.py`, Step 1 then the rest) by one implementer, then reviewed (opus). Every task tree matched the scratch reference byte for byte, outside `docs/plans`. The rebase merged without a conflict; the generated files regenerated unchanged.
+
+| Area | As built | Why |
+|---|---|---|
+| Tasks 1–4 | As written. Every review approved. | Their minor findings are under "After this plan" (follow-ups). |
+| Task 5 review: changes required, one fix round | The docs of `label` say "1 to 64 bytes of UTF-8 once trimmed (stored trimmed), with no control or invisible format character"; `McpConnectionItem.url` is whole in every answer of the API, not only the list; the mounts limits count the ids as sent, before the connection is looked up. A scoped re-review confirmed it. These lines on the branch supersede the same lines in Task 5's blocks. | The label check (`hosts::is_displayable_text`) counts UTF-8 bytes, so a frontend using `maxLength=64` would accept labels the server refuses. |
+| Whole-branch review: ready after fixes | `internal_network`'s doc says plain `http` to anything but loopback is sent from plan 8b-ii on. Decision 13 says that only an id over 64 bytes is not echoed back (an unknown or revoked host's id is named in the error). The file table names `hennery_gateway::open` and only `chacha20poly1305` as new. | 8b's `check_url` sends plain `http` only to loopback under every allowance until 8b-ii (L12); the wire doc promised more. The rest were the plan's prose, not the code. |
+| Spec write-back | The "Spec amendments" below are in the gateway spec (§2, §4.6, §5.7, §5.8, §6, §9 as built, §11), the kernel spec §3.4 and ACP core §1. | |
+| Lane rulings (2026-10-02) | Q5 (the origin and owner in the AAD) is not a maintainer question: declined by the security review, confirmed by the lane parent; decision 7 stands. The `http`-to-loopback mismatch with 8b's egress stays as reviewed: 8a refuses it at save time, which is stricter; 8b-ii and 8d settle it. | The lane parent's rulings. |
+
+Checks:
+- After every task the five checks passed: 1040, 1058, 1069, 1073 and 1075 tests, from 1019 on `ef75d4f`.
+- After the rebase onto `d2d2894` the five checks passed again, with 1128 tests in the workspace (plan 8a's 56 on top of `main`'s 1072).
+- The 94 revert-probes were run when the plan was built (`probes.log` in the ledger); execution applied the same code.
+- The run was macOS only, so ubuntu CI is the Linux check.
 
 ## Scope
 
@@ -109,7 +123,7 @@ The security reviews of 2026-10-02 answered these on the maintainer's behalf; th
    - AAD = `len ‖ connection_id ‖ len ‖ field ‖ len ‖ key_version`, each `len` 4 bytes big-endian, the version 4 bytes big-endian: no two (id, field) pairs give one AAD. A unit test opens a version-1 blob as version 2 with the same key and nonce and sees it refused: the version is bound by the tag, not only checked beside it.
    - The blob is `key_version` (4 bytes, big-endian) ‖ the 24-byte nonce ‖ the ciphertext with its 16-byte tag. The row's `key_version` column must equal the blob's prefix (else `Malformed`), and both must be the key's (else `KeyVersion`).
    - The field is named by table and kind, `gw_credentials.static_token`, and taken from the connection's kind: a row left under another kind does not open as another field (G-14, a second guard behind §4.6), and later tables (`gw_oauth_clients`, `gw_stdio_servers`) never share a field with this one.
-   - The origin and the owner are not in the AAD (the review's O5; **Q5, open for the maintainer**). Binding them would cost little: §4.6 already deletes the credential on every origin change, and the owner never changes. (An earlier draft argued that binding the URL would force a re-seal on every edit; the re-confirmation pointed out that O5 asked for the origin, not the URL.) What it would buy: someone who can write `hennery.db` but not read the key (a copied volume or a restored backup, the key supplied by the environment or systemd) could not point a stored token at another origin. Whether that attacker is in the threat model, kernel §10 does not say. Default: not bound; reversible by a re-seal at start with the key, as `rotate-key` does (once 8a serves its routes, real tokens can be stored); to be answered before 8d reads `static_credential`.
+   - The origin and the owner are not in the AAD (the review's O5; Q5: **declined by the security review, confirmed by the lane parent**, 2026-10-02). Binding them would cost little: §4.6 already deletes the credential on every origin change, and the owner never changes. (An earlier draft argued that binding the URL would force a re-seal on every edit; the re-confirmation pointed out that O5 asked for the origin, not the URL.) What it would buy: someone who can write `hennery.db` but not read the key (a copied volume or a restored backup, the key supplied by the environment or systemd) could not point a stored token at another origin. Whether that attacker is in the threat model, kernel §10 does not say. Not bound; reversible by a re-seal at start with the key, as `rotate-key` does (once 8a serves its routes, real tokens can be stored). 8d does not wait on it.
    - The version is `1` (`KEY_VERSION`) until `rotate-key` (8g) adds others.
 8. **A key that does not open the stored credentials stops the start.** (Amended: the review's finding 1; Q1 below.)
    - At start the collector opens the owner's newest credential (`check_key`); failing, it does not start, and neither does it when the key is missing while credentials are stored. Starting would seal new rows under one key beside rows only another opens. Only the newest row is opened: a damaged older row shows when it is used, and does not stop the start.
@@ -134,7 +148,7 @@ The security reviews of 2026-10-02 answered these on the maintainer's behalf; th
    - Revoking a host does not reach the gateway. Its mounts stay, and the list leaves them out (it joins `hosts` on `revoked_at IS NULL`). A `PUT …/mounts` naming a revoked host is refused, and the next full set drops it.
    - A revoked host never becomes live again: ids are primary keys, a revoke is never undone, and the key of a revoked host cannot pair again.
    - 8d and 8e must apply the same join wherever a mount decides delivery or access; 8d's `on_host_revoked` may delete them instead (the review's N3), and must before any plan deletes host rows.
-13. **Limits.** (Amended: the review's O3, N6.) At most 256 connections per owner (409 `too_many_connections`). A label is 1 to 64 printable characters. An allowlist names at most 1024 tools, each 1 to 128 visible ASCII characters; duplicates are dropped, the order kept. A mounts request names at most 1024 hosts, each id at most 64 bytes, checked before the transaction; a refused id is not echoed back. A static token is 1 to 8192 visible ASCII characters, no space, nothing a header breaks on. The header is an HTTP token of at most 64 bytes, not one the proxy sets or filters (`host`, `content-length`, `content-type`, `content-encoding`, `transfer-encoding`, `connection`, `keep-alive`, `upgrade`, `te`, `trailer`, `cookie`, `accept`, `accept-encoding`, `mcp-session-id`, `mcp-protocol-version`, `last-event-id`, `expect`, `forwarded`, `via`, `max-forwards`, `proxy-*`, `sec-*`). The prefix is at most 32 visible ASCII characters or spaces. A body is at most 256 KiB (413 `body_too_large`).
+13. **Limits.** (Amended: the review's O3, N6.) At most 256 connections per owner (409 `too_many_connections`). A label is 1 to 64 bytes of UTF-8 once trimmed, with no control or invisible format character (amended at execution: the check counts bytes). An allowlist names at most 1024 tools, each 1 to 128 visible ASCII characters; duplicates are dropped, the order kept. A mounts request names at most 1024 hosts, each id at most 64 bytes, checked before the transaction; an id over 64 bytes is not echoed back (amended at execution: an unknown or revoked host's id is named in the error). A static token is 1 to 8192 visible ASCII characters, no space, nothing a header breaks on. The header is an HTTP token of at most 64 bytes, not one the proxy sets or filters (`host`, `content-length`, `content-type`, `content-encoding`, `transfer-encoding`, `connection`, `keep-alive`, `upgrade`, `te`, `trailer`, `cookie`, `accept`, `accept-encoding`, `mcp-session-id`, `mcp-protocol-version`, `last-event-id`, `expect`, `forwarded`, `via`, `max-forwards`, `proxy-*`, `sec-*`). The prefix is at most 32 visible ASCII characters or spaces. A body is at most 256 KiB (413 `body_too_large`).
 14. **The credential route, and its read.** (Amended: the review's R2, O8.) `PUT …/credential {token}` answers 204. A connection that is not `static` answers 409 `wrong_cred_kind`; an invalid token 400 `invalid`, with a message that does not quote it. No route reads a credential back, and none clears one: changing the kind or deleting the connection does (Q3, confirmed below).
     - `GatewayStore::static_credential` answers `StaticCredential {token, url, static_header, static_prefix, internal_network}`, from one statement: an edit that moves the URL cannot land between reading the token and reading where it goes. Its `Debug` redacts the token. The opened bytes are moved out of their zeroizing buffer, not copied, and wiped on the error path too.
 15. **The answers.** 404 `not_found` for an unknown connection or another owner's, on every route; 409 `slug_taken`; 400 `invalid` with the reason; 422 `invalid_body` for an unknown field or a wrong type, from `ApiJson`, which never quotes the body back. A connection's answers are `McpConnectionItem`, stamps in RFC 3339; `DELETE` answers 204. An error's body is the shared `ApiError`, with exactly `code` and `message` (the fleet parent's ruling of 2026-10-02, pinned by `an_error_is_the_shared_api_error_and_nothing_more`).
@@ -181,7 +195,7 @@ The security reviews of 2026-10-02 answered these on the maintainer's behalf; th
 
 | Path | Responsibility | Task |
 |---|---|---|
-| `Cargo.toml`, `Cargo.lock` | `chacha20poly1305`, `zeroize`, `hennery-gateway` | 1–4 |
+| `Cargo.toml`, `Cargo.lock` | `chacha20poly1305` (new; `zeroize` was in the workspace already), `hennery-gateway` | 1–4 |
 | `crates/hennery-gateway/Cargo.toml`, `src/lib.rs` | The crate | 1–3 |
 | `crates/hennery-gateway/src/key.rs` | The master key | 1 |
 | `crates/hennery-gateway/src/crypto.rs` | Sealing and opening | 1 |
@@ -190,7 +204,7 @@ The security reviews of 2026-10-02 answered these on the maintainer's behalf; th
 | `crates/hennery-gateway/src/store.rs` | `GatewayStore`: every statement | 2 |
 | `crates/hennery-gateway/src/api.rs` | The routes | 3 |
 | `crates/hennery-proto/src/rest.rs`, `codegen.rs`, generated files | The wire types, and their docs in the TypeScript | 3, 5 |
-| `crates/hennery/Cargo.toml`, `src/main.rs` | `open_gateway`, the merged router | 4 |
+| `crates/hennery/Cargo.toml`, `src/main.rs` | `hennery_gateway::open` in `run_collector`, the merged router | 4 |
 | `crates/hennery-host/src/adapter.rs` | `HENNERY_MASTER_KEY` in `HOST_SECRET_VARS` | 4 |
 | Tests: `crates/hennery-gateway/tests/{key,crypto,store,owner,boundary,api,api_log}.rs`; `crates/hennery-testkit/{Cargo.toml,tests/owner_filter.rs}`; `crates/hennery/tests/cli.rs`; `crates/hennery-proto/tests/codegen.rs` | | 1–5 |
 
@@ -6001,7 +6015,7 @@ Two security reviews ran on the maintainer's behalf (opus, 2026-10-02), on the p
 - Q2, a secret inside a vendor's URL: **open for the maintainer, default chosen, reversible** — documented, never logged whole (decisions 9 and 19); to be answered before 8d.
 - Q3, a `DELETE …/credential` route: **confirmed by the lane parent** — none (decision 14).
 - Q4, step-up on deleting a connection: **confirmed by the lane parent** — needed (decision 4).
-- Q5, binding the origin and the owner into the AAD (the re-confirmation's finding 2): **open for the maintainer, default chosen, reversible by a re-seal** — not bound (decision 7); to be answered before 8d.
+- Q5, binding the origin and the owner into the AAD (the re-confirmation's finding 2): **declined by the security review; confirmed by the lane parent** (2026-10-02) — not bound (decision 7), reversible by a re-seal; not a maintainer question, and 8d does not wait on it.
 
 Decision 19 (an upstream URL is shown only as its origin) came from the fleet parent, through the lane (L11), after the reviews.
 
@@ -6029,12 +6043,12 @@ After round 1, two rulings came through the lane: the operator's on `http` (deci
 | The probe log names each probe and its outcome, not its change | the Step 5 tables name each change |
 | The kernel's own refusals have the `{code, message}` shape by reading `auth_api::error`, not by a test | recorded: the shared `ApiError` with `session_id` skipped when absent |
 
-**Who confirmed what:** the two security reviews and both rounds of the re-confirmation were opus subagents acting on the maintainer's behalf; Q3 and Q4 were confirmed by the gateway lane parent; decision 9's `http` ruling is the operator's, decision 15's error body and decision 19 (L11) the fleet parent's, decision 21 the lane parent's; Q1, Q2 and Q5 are open for the maintainer, each with its default in place.
+**Who confirmed what:** the two security reviews and both rounds of the re-confirmation were opus subagents acting on the maintainer's behalf; Q3 and Q4 were confirmed by the gateway lane parent; decision 9's `http` ruling is the operator's, decision 15's error body and decision 19 (L11) the fleet parent's, decision 21 the lane parent's; Q5 declined by the security review and confirmed by the lane parent; Q1 and Q2 are open for the maintainer, each with its default in place.
 
 ## After this plan
 
 **What later sub-plans inherit:**
-- **8b-ii (egress, after 8b's merge):** connections are saved with any public or private address; refuse non-public ones at request time unless `internal_network` (decision 9, L7). `http` URLs exist only on internal connections. 8b-ii settles `http` to loopback on an unmarked connection, which 8a refuses when saving (decision 9).
+- **8b-ii (egress; 8b merged as #63):** connections are saved with any public or private address; refuse non-public ones at request time unless `internal_network` (decision 9, L7). `http` URLs exist only on internal connections, and 8a saves `http` to a LAN address on one, but 8b's `check_url` sends plain `http` only to loopback under every allowance: 8b-ii makes it accept plain `http` to a non-public address under `InternalNetwork` (L12), and changes `plain_http_only_to_loopback` with it. 8b-ii and 8d also settle `http` to loopback on an unmarked connection, which 8a refuses when saving and egress would send (decision 9; the lane parent's ruling: 8a stays as reviewed).
 - **8d (proxy):**
   - find a connection by the token's owner and the slug (`UNIQUE (owner_id, slug)`); take its token **and** where it goes from `GatewayStore::static_credential(id, &key)` alone (`StaticCredential`, one statement), never the URL from a second read (decision 14);
   - when `static_header` is not `Authorization`, drop the agent's own `Authorization` (its session token) before forwarding, with a test (gateway §5.2);
@@ -6053,9 +6067,20 @@ After round 1, two rulings came through the lane: the operator's on `http` (deci
 - **Purge (plan 9c):** call `GatewayStore::purge_hat(hat_id)` from `on_hat_purged`, before the kernel deletes the hat row: the foreign key refuses the delete while the hat has connections. A frozen hat (`purged_hats`) should be refused by the gateway's create too, and a connection created between the hook and the hat's delete makes that delete fail on the foreign key: retry the hook (it is idempotent), or refuse a create on a frozen hat. Whoever merges second adds the check beside the hat's.
 - **Frontend (plan 4):** the MCP view, on the documented types (decision 21: each request type's doc names its route's answer and codes); on 403 `step_up_required` step up and retry; `has_credential` and "applies to new and resumed sessions"; the slug and the hat are fixed once created.
 
+- **Capabilities (L14):** `crates/hennery-kernel/src/capabilities.rs` is not on `main` at `d2d2894`. Whoever merges second of 8a and frontend 4b adds `mcp_connections` to `features()`, with a test that `GET /api/capabilities` lists it.
+- **Follow-ups from the execution's reviews** (minor, none blocking):
+  - `model::url_for_logs` and `rest::url_origin` are the same function in two crates; make one call the other.
+  - `api.rs` maps a status string it does not know to `NotConnected` silently; 8f, adding a status, should make the model hold an enum, or log the fallback.
+  - The incoming token is a plain `String` until it is sealed (the review's O8, recorded); `Zeroizing<String>` in the handler would wipe it.
+  - `store.rs` echoes `hat_id` with no bound (`no hat …`); bound it before the transaction as host ids are, and do not echo it.
+  - `model::label_problem`'s message still says "printable characters"; it counts bytes.
+  - `render_ts` does not escape `*/` in a doc; a codegen test that no description contains it would guard `protocol.ts`.
+  - Untested small guards: the directory sync after making `master.key`, the warning on an empty `$CREDENTIALS_DIRECTORY`, a credential that is a directory or FIFO, a `master.key` look-up error other than not-found, `StaticCredential`'s `Debug` of the URL.
+  - The CLI's end-to-end test does not check that the merged router keeps the session and `no-store` (Task 3's router tests do).
+
 **Operator items:** none for 8a. Live calls to vendors start with 8d (L10).
 
-**Open for the maintainer:** Q1, Q2 and Q5 ("The security review's answers"); each default is in place and reversible. Q5 is to be answered before 8d.
+**Open for the maintainer:** Q1 and Q2 ("The security review's answers"); each default is in place and reversible.
 
 **Spec amendments (written back with the execution record):**
 - decision 1: gateway §2: slugs unique per owner.
