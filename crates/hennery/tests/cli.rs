@@ -1407,16 +1407,25 @@ fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
     let data = dir.join("data");
     let file: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
     let udp: OwnedFd = std::net::UdpSocket::bind("127.0.0.1:0").unwrap().into();
-    // SAFETY: socket(2), owned at once.
-    let tcp = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
-    assert!(tcp >= 0);
-    let tcp: OwnedFd = unsafe { std::os::fd::FromRawFd::from_raw_fd(tcp) };
+    // Close-on-exec, so it leaks into no child another test spawns: at
+    // once on Linux, right after socket(2) on macOS (no SOCK_CLOEXEC).
+    // SAFETY: socket(2) and fcntl(2) on the new descriptor, owned at once.
+    let stream_socket = || -> OwnedFd {
+        #[cfg(target_os = "linux")]
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+        #[cfg(not(target_os = "linux"))]
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0);
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) }, 0);
+        unsafe { std::os::fd::FromRawFd::from_raw_fd(fd) }
+    };
+    let tcp = stream_socket();
     // Bound to a port (port 0: the system picks one), never listened on:
     // macOS used to take this one.
-    // SAFETY: socket(2) and bind(2) on a local address, owned at once.
+    // SAFETY: bind(2) on a local address.
     let bound: OwnedFd = unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
-        assert!(fd >= 0);
+        let socket = stream_socket();
+        let fd = socket.as_raw_fd();
         let mut addr: libc::sockaddr_in = std::mem::zeroed();
         addr.sin_family = libc::AF_INET as libc::sa_family_t;
         addr.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
@@ -1426,7 +1435,7 @@ fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
             std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
         );
         assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
-        std::os::fd::FromRawFd::from_raw_fd(fd)
+        socket
     };
     let unix: OwnedFd = std::os::unix::net::UnixListener::bind(dir.join("s")).unwrap().into();
     let listening: OwnedFd = std::net::TcpListener::bind("127.0.0.1:0").unwrap().into();
