@@ -648,6 +648,51 @@ impl Hosts {
         Ok(removed > 0)
     }
 
+    // Delivery's three outcomes name the endpoint the push went to, as
+    // well as the subscription: a browser rotating it meanwhile keeps the
+    // id, and the old endpoint's answer is not the new one's (plan 10b-ii).
+
+    /// Record that a push to `endpoint` reached its push service at `now`,
+    /// clearing the subscription `id`'s last error (plan 10b-ii).
+    pub fn record_push_success(&self, id: &str, endpoint: &str, now: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE push_subscriptions SET last_success_at = ?2, last_error = NULL
+             WHERE id = ?1 AND endpoint = ?4 AND owner_id = ?3",
+            params![id, now, self.owner_id(), endpoint],
+        )?;
+        Ok(())
+    }
+
+    /// Record why a push to the subscription `id` at `endpoint` failed: a
+    /// short reason of delivery's own, never the endpoint or the service's
+    /// answer (plan 10a's review, O2).
+    pub fn record_push_error(&self, id: &str, endpoint: &str, error: &str) -> Result<()> {
+        self.conn().execute(
+            "UPDATE push_subscriptions SET last_error = ?2 WHERE id = ?1 AND endpoint = ?4 AND owner_id = ?3",
+            params![id, error, self.owner_id(), endpoint],
+        )?;
+        Ok(())
+    }
+
+    /// Remove the subscription `id` its push service says is gone, if it
+    /// still has the `endpoint` the push went to (plan 10b-ii).
+    pub fn remove_gone_subscription(&self, id: &str, endpoint: &str) -> Result<bool> {
+        let removed = self.conn().execute(
+            "DELETE FROM push_subscriptions WHERE id = ?1 AND endpoint = ?2 AND owner_id = ?3",
+            params![id, endpoint, self.owner_id()],
+        )?;
+        Ok(removed > 0)
+    }
+
+    /// Remove the subscriptions whose `expirationTime` has passed at `now`
+    /// (plan 10b-ii): how many.
+    pub fn prune_expired_subscriptions(&self, now: i64) -> Result<usize> {
+        Ok(self.conn().execute(
+            "DELETE FROM push_subscriptions WHERE expires_at IS NOT NULL AND expires_at <= ?1 AND owner_id = ?2",
+            params![now, self.owner_id()],
+        )?)
+    }
+
     /// Every hat's push policy, the hats oldest first: the default for a
     /// hat that never had one set.
     pub fn push_policies(&self) -> Result<Vec<(String, PushPolicy)>> {

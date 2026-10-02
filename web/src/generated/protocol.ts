@@ -610,3 +610,9 @@ export type SettingsResponse = { public_url: string,
 contact?: string | undefined, };
 
 export type SettingsUpdateRequest = { contact?: string | undefined, };
+
+export type PushPayload = { title: string, body: string, 
+/**
+ * `/sessions/<id>`, or `/mcp`: always a path, never a URL.
+ */
+url: string, tag: string, };

@@ -28,10 +28,13 @@ tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 webauthn-rs.workspace = true
+web-push-native.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+# Delivery's retry waits run on a paused clock (plan 10b-ii).
+tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber.workspace = true
 webauthn-authenticator-rs.workspace = true
