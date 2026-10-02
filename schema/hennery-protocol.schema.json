@@ -667,6 +667,38 @@
       ],
       "type": "object"
     },
+    "DirectoryListing": {
+      "description": "`GET /api/hosts/{id}/browse?path=` (ACP core §7, §9): the\nsubdirectories of a directory on the host.",
+      "properties": {
+        "entries": {
+          "items": {
+            "$ref": "#/$defs/DirEntry"
+          },
+          "type": "array"
+        },
+        "parent": {
+          "description": "Its parent, if browsing it is allowed too.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "The directory, canonical (symlinks resolved).",
+          "type": "string"
+        },
+        "truncated": {
+          "description": "Not every subdirectory is listed.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "path",
+        "entries",
+        "truncated"
+      ],
+      "type": "object"
+    },
     "ElicitationAction": {
       "description": "The operator's answer to an elicitation (ACP `elicitation/create`).",
       "enum": [
@@ -1040,6 +1072,33 @@
         "default_hat_id",
         "connected",
         "created_at"
+      ],
+      "type": "object"
+    },
+    "HostProjects": {
+      "description": "`GET /api/hosts/{id}/projects` (ACP core §7, §9): the git repositories\nunder the host's workspace roots.",
+      "properties": {
+        "home": {
+          "description": "The host user's home directory, for expanding `~` (frontend §7).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/Project"
+          },
+          "type": "array"
+        },
+        "partial": {
+          "description": "The host cut its enumeration short: there may be more.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "partial"
       ],
       "type": "object"
     },

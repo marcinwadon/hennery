@@ -1425,3 +1425,83 @@ async fn an_agent_that_takes_no_images_is_never_sent_one() {
     assert_eq!(agent_text(&evs), "Hello world");
     assert_eq!(of_kind(&evs, "user_turn").len(), 1);
 }
+
+/// Plan 6c: the project picker against a real host, from its workspace
+/// roots (ACP core §7, §9).
+#[tokio::test]
+async fn the_project_picker_lists_and_browses_a_real_hosts_projects() {
+    use hennery_proto::frames::{DirEntry, Project};
+    use hennery_proto::rest::{DirectoryListing, HostProjects};
+    let dir = tempfile::tempdir().unwrap();
+    let collector = Collector::start(&dir.path().join("hennery.db"), None).await;
+    let projects = tempfile::tempdir().unwrap();
+    let root = hennery_host::projects::canonical(projects.path()).unwrap();
+    std::fs::create_dir_all(format!("{root}/app/.git")).unwrap();
+    std::fs::create_dir_all(format!("{root}/notes")).unwrap();
+    let fake = AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    let mut cfg = host_config(collector.addr, &dir.path().join("host"), fake);
+    cfg.workspace_roots = vec![root.clone().into()];
+    cfg.home = None;
+    tokio::spawn(async move { hennery_host::run(cfg).await.unwrap() });
+    let c = client(&collector);
+    wait_host_connected(&c, &collector).await;
+
+    let hosts: Vec<HostItem> = c
+        .get(collector.url("/api/hosts"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(hosts[0].workspace_roots, [root.as_str()]);
+    let listed: HostProjects = c
+        .get(collector.url("/api/hosts/host-1/projects"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        listed,
+        HostProjects {
+            items: vec![Project {
+                path: format!("{root}/app")
+            }],
+            partial: false,
+            home: None,
+        }
+    );
+    let listing: DirectoryListing = c
+        .get(collector.url("/api/hosts/host-1/browse"))
+        .query(&[("path", &root)])
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(listing.path, root);
+    assert_eq!(
+        listing.entries,
+        [
+            DirEntry {
+                name: "app".into(),
+                git: true
+            },
+            DirEntry {
+                name: "notes".into(),
+                git: false
+            }
+        ]
+    );
+    let resp = c
+        .get(collector.url("/api/hosts/host-1/browse"))
+        .query(&[("path", "/")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    collector.stop().await;
+}

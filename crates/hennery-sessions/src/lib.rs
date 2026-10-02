@@ -7,6 +7,7 @@ pub mod hats;
 pub mod hosts;
 pub mod hub;
 pub mod offline;
+pub mod projects;
 pub mod store;
 pub mod ws;
 
@@ -34,6 +35,10 @@ pub struct AppState {
     pub shutdown: CancellationToken,
     /// A host gone this long has its sessions presumed parked (ACP core §5.3).
     pub offline_threshold: Duration,
+    /// Enumerations of each host's projects (ACP core §7).
+    pub projects: Arc<projects::ProjectsCache>,
+    /// How long a probe waits for its reply (ACP core §3.4).
+    pub probe_timeout: Duration,
 }
 
 impl AppState {
@@ -46,6 +51,8 @@ impl AppState {
             hub: Arc::new(hub::Hub::new()),
             shutdown: CancellationToken::new(),
             offline_threshold: offline::OFFLINE_THRESHOLD,
+            projects: Arc::new(projects::ProjectsCache::new(projects::CACHE_TTL)),
+            probe_timeout: projects::PROBE_TIMEOUT,
         }
     }
 }
@@ -112,6 +119,7 @@ pub fn router(state: AppState) -> Router {
     api::router(state.clone())
         .merge(hosts::router(state.clone()))
         .merge(hats::router(state.clone()))
+        .merge(projects::router(state.clone()))
         .merge(hennery_kernel::auth_api::router(state.operator.clone()))
         .merge(hennery_kernel::health::router(state.operator.clone()))
         .merge(ws::router(state))

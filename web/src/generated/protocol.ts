@@ -281,6 +281,30 @@ connected: boolean,
  */
 created_at: string, last_seen_at?: string | undefined, revoked_at?: string | undefined, };
 
+export type HostProjects = { items: Array<Project>, 
+/**
+ * The host cut its enumeration short: there may be more.
+ */
+partial: boolean, 
+/**
+ * The host user's home directory, for expanding `~` (frontend §7).
+ */
+home?: string | undefined, };
+
+export type DirectoryListing = { 
+/**
+ * The directory, canonical (symlinks resolved).
+ */
+path: string, 
+/**
+ * Its parent, if browsing it is allowed too.
+ */
+parent?: string | undefined, entries: Array<DirEntry>, 
+/**
+ * Not every subdirectory is listed.
+ */
+truncated: boolean, };
+
 export type SetupRequest = { token: string, password: string, 
 /**
  * `https://…`, or `http://` to a loopback address; an origin only.

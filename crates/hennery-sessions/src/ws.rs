@@ -115,6 +115,8 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
             .await;
         return;
     };
+    // A new connection may bring other workspace roots (decision 10).
+    state.projects.forget(&host_id);
     // A revoke that landed after the proof was checked but before this
     // registration found no connection to close: this one must not live
     // on to reconcile what the revoke parked (kernel spec §4.3).

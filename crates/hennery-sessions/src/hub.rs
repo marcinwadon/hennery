@@ -275,6 +275,16 @@ impl Hub {
         ids
     }
 
+    /// The host's current connection, if it is reconciled and not kicked.
+    pub fn routable_conn(&self, host_id: &str) -> Option<u64> {
+        self.hosts
+            .lock()
+            .expect("hosts lock")
+            .get(host_id)
+            .filter(|h| h.routable())
+            .map(|h| h.conn_id)
+    }
+
     /// The host is connected, reconciled and not kicked.
     pub fn is_ready(&self, host_id: &str) -> bool {
         self.hosts

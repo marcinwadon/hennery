@@ -301,6 +301,34 @@ pub struct HostItem {
     pub revoked_at: Option<String>,
 }
 
+/// `GET /api/hosts/{id}/projects` (ACP core §7, §9): the git repositories
+/// under the host's workspace roots.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HostProjects {
+    pub items: Vec<crate::frames::Project>,
+    /// The host cut its enumeration short: there may be more.
+    pub partial: bool,
+    /// The host user's home directory, for expanding `~` (frontend §7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub home: Option<String>,
+}
+
+/// `GET /api/hosts/{id}/browse?path=` (ACP core §7, §9): the
+/// subdirectories of a directory on the host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct DirectoryListing {
+    /// The directory, canonical (symlinks resolved).
+    pub path: String,
+    /// Its parent, if browsing it is allowed too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub parent: Option<String>,
+    pub entries: Vec<crate::frames::DirEntry>,
+    /// Not every subdirectory is listed.
+    pub truncated: bool,
+}
+
 /// `POST /api/setup` (kernel spec §3.1): the one-time owner setup, with the
 /// token from the setup link. `Debug` leaves the password out.
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
