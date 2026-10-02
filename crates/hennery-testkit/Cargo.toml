@@ -34,5 +34,7 @@ hex.workspace = true
 rusqlite = { workspace = true, features = ["hooks"] }
 tempfile = "3"
 tokio-tungstenite.workspace = true
+# `public_url_log.rs` reads what the collector logs (plan 4d-B4, A2).
+tracing-subscriber.workspace = true
 webauthn-authenticator-rs.workspace = true
 webauthn-rs.workspace = true
