@@ -391,7 +391,7 @@ host.)*
 | `hello_ack` | protocol_version, collector_version, server_time, committed{session_id: seq} | Reply to `hello`; `committed` holds the collector's highest committed seq for every session listed in `attached_sessions` (§5.1). |
 | `hello_error` | code (`incompatible` \| `revoked` \| `already_connected` \| `bad_proof`), message | Then the socket closes. `incompatible`: another protocol major; `bad_proof`: the credential does not verify. |
 | `ack` | session_id, ack_seq | Highest seq committed for that session (§3.6). |
-| `forget_hat` | hat_id | Sent after each handshake for recently purged hats; the host deletes that hat's composed agent home once no process of the hat runs. Idempotent (kernel spec §5.5). |
+| `forget_hat` | hat_id | Sent after each reconciled handshake for every purged hat; the host deletes that hat's composed agent home once no process of the hat runs, for a `hat-<hex>` id only. Idempotent (kernel spec §5.5). A host that does not know it logs and ignores it. |
 
 **Host → collector:**
 

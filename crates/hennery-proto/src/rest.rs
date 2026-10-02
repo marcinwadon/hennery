@@ -638,6 +638,54 @@ pub struct HatItem {
     pub created_at: String,
     /// The hat newly paired hosts get as their default.
     pub default_for_new_hosts: bool,
+    /// A purge of it began and has not finished (plan 9c A12): it is
+    /// frozen, so nothing starts, resumes or moves in or out of it, and a
+    /// `POST /api/hats/{id}/purge` again resumes the purge.
+    pub purging: bool,
+}
+
+/// `GET /api/hats/{id}/purge` (kernel spec §5.5; plan 9c decision 11, A13):
+/// what a purge of the hat would delete, read only. Tombstones are not
+/// counted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PurgePreview {
+    pub hat_id: String,
+    /// A purge began and has not finished: a purge resumes it.
+    pub purging: bool,
+    /// The hat's sessions, in every lifecycle and on every host.
+    #[ts(type = "number")]
+    pub sessions: u64,
+    /// Those `starting` or `active` on a host the collector reaches: a
+    /// purge is refused (409 `sessions_running`) until they are closed.
+    pub running: Vec<String>,
+    /// The path rules that name the hat, on every host.
+    #[ts(type = "number")]
+    pub rules: u64,
+    /// The project recents of the hat, on every host.
+    #[ts(type = "number")]
+    pub recents: u64,
+    /// The sessions of no hat (from before hats, when no default hat could
+    /// be found), the newest first and at most 100: a purge never deletes
+    /// them, so they are listed for the operator to look at (plan 5c).
+    pub unassigned: Vec<SessionItem>,
+    /// How many sessions of no hat there are in all.
+    #[ts(type = "number")]
+    pub unassigned_count: u64,
+}
+
+/// 200 to `POST /api/hats/{id}/purge` (plan 9c decision 10, A13): what
+/// this purge deleted. A purge that resumes one that stopped counts only
+/// what it deleted itself.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PurgeResult {
+    #[ts(type = "number")]
+    pub sessions: u64,
+    #[ts(type = "number")]
+    pub rules: u64,
+    /// Sessions closed here, collector-side, while their host may still run
+    /// them (presumed parked, or starting or active on a host away): that
+    /// host closes them when it is back.
+    pub unconfirmed: Vec<String>,
 }
 
 /// `POST /api/hats`: a name, 1 to 64 printable characters, unique in any

@@ -146,6 +146,8 @@ const OPERATOR_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/sessions/s-1/pending/p-1/answer"),
     ("GET", "/api/sessions/s-1/events"),
     ("GET", "/api/stream/sessions/s-1"),
+    ("GET", "/api/hats/hat-9/purge"),
+    ("POST", "/api/hats/hat-9/purge"),
     ("POST", "/api/auth/step-up/password"),
     ("GET", "/api/auth/sessions"),
     ("DELETE", "/api/auth/sessions/0000"),

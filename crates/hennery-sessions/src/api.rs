@@ -283,7 +283,7 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
         Err(why) => return why.into_response(),
     };
     let session_id = uuid::Uuid::now_v7().to_string();
-    if let Err(err) = state.store.create_session(
+    match state.store.create_session(
         &session_id,
         &req.host_id,
         &req.agent,
@@ -291,7 +291,10 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
         &hat.hat_id,
         hat.rule_id.as_deref(),
     ) {
-        return internal(err);
+        Ok(true) => {}
+        // The hat resolved before its purge froze it (plan 9c decision 10c).
+        Ok(false) => return hat_purging(&state, &hat.hat_id),
+        Err(err) => return internal(err),
     }
     let request_id = uuid::Uuid::now_v7().to_string();
     let frame = CollectorFrame::StartSession {
@@ -451,6 +454,16 @@ async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -
     .into_response()
 }
 
+/// 409 `hat_purging` (plan 9c decision 10c): the hat is frozen for its
+/// purge, so nothing starts, resumes or moves in or out of it.
+pub(crate) fn hat_purging(state: &AppState, hat_id: &str) -> Response {
+    error(
+        StatusCode::CONFLICT,
+        "hat_purging",
+        format!("{} is being purged", hat_name(state, hat_id)),
+    )
+}
+
 /// `hat_id` for a message: by its name, by its id when it has none, or "no
 /// hat" for a session from before hats that got none.
 fn hat_name(state: &AppState, hat_id: &str) -> String {
@@ -498,6 +511,13 @@ async fn update_session(
             );
         }
         Ok(Reassign::UnknownHat) => return error(StatusCode::BAD_REQUEST, "invalid", "no such hat"),
+        Ok(Reassign::HatPurging) => {
+            return error(
+                StatusCode::CONFLICT,
+                "hat_purging",
+                "the session's hat or the one it would move to is being purged",
+            );
+        }
         Ok(Reassign::NotFound) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
         Err(err) => return internal(err),
     }
@@ -579,6 +599,7 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
                 ),
             );
         }
+        Ok(ResumeRequest::HatPurging) => return hat_purging(&state, &session.hat_id),
         Ok(ResumeRequest::NotFound) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
         Err(err) => return internal(err),
     };
@@ -1077,17 +1098,7 @@ pub(crate) fn finish_delete(state: &AppState, session: &SessionRow, unattached: 
             tracing::info!(session_id = %id, unconfirmed, "session deleted");
             state.hub.publish(event);
             if unconfirmed {
-                // Its host may be ready by now (it reconciled after the
-                // judgement): nobody waits for the answer, which changes
-                // nothing on a tombstone. `notify` sends only to a host that
-                // is ready.
-                state.hub.notify(
-                    &session.host_id,
-                    CollectorFrame::CloseSession {
-                        request_id: uuid::Uuid::now_v7().to_string(),
-                        session_id: id.clone(),
-                    },
-                );
+                close_deleted_on_host(state, &session.host_id, id);
             }
             StatusCode::NO_CONTENT.into_response()
         }
@@ -1099,6 +1110,21 @@ pub(crate) fn finish_delete(state: &AppState, session: &SessionRow, unattached: 
         Ok(Deletion::NotFound) => error(StatusCode::NOT_FOUND, "not_found", "no such session"),
         Err(err) => internal(err),
     }
+}
+
+/// A session deleted `unconfirmed` (closed without its host): its host may
+/// be ready by now (it reconciled after the judgement), so it is sent
+/// `close_session`. Nobody waits for the answer, which changes nothing on a
+/// tombstone. `notify` sends only to a host that is ready. A delete's and a
+/// purge's (plan 9c decision 10d) both.
+pub(crate) fn close_deleted_on_host(state: &AppState, host_id: &str, session_id: &str) {
+    state.hub.notify(
+        host_id,
+        CollectorFrame::CloseSession {
+            request_id: uuid::Uuid::now_v7().to_string(),
+            session_id: session_id.to_string(),
+        },
+    );
 }
 
 #[derive(Deserialize)]
@@ -1612,6 +1638,38 @@ mod delete_race_tests {
         assert!(closes(&mut f).is_empty(), "nothing is deleted yet");
         let response = finish_delete(&f.state, &s, Some(&judged));
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(closes(&mut f), ["s1"]);
+    }
+
+    /// The same window for a purge (plan 9c decision 10d): the purge read
+    /// the hat's session while its host was not ready, and deletes it once
+    /// the host is, so the purge closes it.
+    #[tokio::test]
+    async fn a_purge_committed_after_the_host_is_ready_closes_the_session_on_it() {
+        let mut f = fixture();
+        session(&f, "s1", true);
+        let attached = listed("s1");
+        let mut reconcile_closes = HashMap::new();
+        let read = f.state.store.hat_sessions("hat-1").unwrap();
+        let done = f.state.store.reconcile_host(HOST, &attached).unwrap();
+        let closed = after_reconcile(&f.state, HOST, &[], done, &f.tx, &mut reconcile_closes);
+        ready(
+            &f.state,
+            HOST,
+            f.conn_id,
+            &attached,
+            &closed,
+            &f.tx,
+            &mut reconcile_closes,
+        )
+        .unwrap();
+        assert!(closes(&mut f).is_empty(), "nothing is deleted yet");
+        let mut purged = crate::hats::PurgedSessions::default();
+        for session in read {
+            crate::hats::delete_as_read(&f.state, session, &mut purged).unwrap();
+        }
+        assert_eq!(purged.deleted, 1);
+        assert_eq!(purged.unconfirmed, ["s1"]);
         assert_eq!(closes(&mut f), ["s1"]);
     }
 

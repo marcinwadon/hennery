@@ -9,4 +9,11 @@ pub trait LifecycleHooks: Send + Sync {
     /// nothing it held will ever be reconciled. Must be idempotent: a
     /// repeated revoke calls it again.
     fn on_host_revoked(&self, host_id: &str) -> anyhow::Result<()>;
+
+    /// The hat is frozen for its purge (kernel spec §5.5; plan 9c decision
+    /// 10d): delete everything of it the module keeps, before the kernel
+    /// deletes the hat's row. Runs in transactions of its own. Must be
+    /// idempotent: a purge that stopped is resumed by running it again. An
+    /// error leaves the hat frozen, for a later purge to resume.
+    fn on_hat_purged(&self, hat_id: &str) -> anyhow::Result<()>;
 }

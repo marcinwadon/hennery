@@ -226,6 +226,17 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         generic_title INTEGER NOT NULL CHECK (generic_title IN (0, 1)),
         FOREIGN KEY (hat_id, owner_id) REFERENCES hats(id, owner_id) ON DELETE CASCADE);
     ",
+    // A hat's purge (kernel spec §5.5; plan 9c decisions 10 and 12, A7):
+    // the hats a purge began on. A row freezes its hat until the purge
+    // deletes the hat's row, and stays for good after it, an id and a
+    // time, so `forget_hat` reaches a host away for any time. No foreign
+    // key to `hats`: the hat's row goes, this one stays.
+    "
+    CREATE TABLE purged_hats (
+        hat_id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL REFERENCES owners(id),
+        purged_at INTEGER NOT NULL);
+    ",
 ];
 
 #[cfg(test)]

@@ -6,8 +6,9 @@
 
 use crate::AppState;
 use crate::api::Unplaceable;
-use crate::api::{error, internal};
+use crate::api::{close_deleted_on_host, error, internal};
 use crate::resolve::{NotResolved, resolve_on_host};
+use crate::store::{Deletion, HatSession, Unattached};
 use axum::extract::{Path, State};
 use axum::handler::Handler;
 use axum::http::StatusCode;
@@ -15,29 +16,40 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router, middleware};
 use futures::stream::{self, StreamExt};
-use hennery_kernel::hats::{HatChange, HatRecord, MAX_RULES, NewRule, PathRule, RulesChange, SessionHat};
+use hennery_kernel::hats::{HatChange, HatRecord, MAX_RULES, NewRule, PathRule, PurgeStart, RulesChange, SessionHat};
 use hennery_kernel::json::ApiJson;
 use hennery_kernel::secret::{rfc3339, unix_now};
 use hennery_proto::rest::{
     CreateHatRequest, HatItem, HatResolution, HatResolveRequest, PathRuleInput, PathRuleItem, PathRulesRequest,
-    UpdateHatRequest,
+    PurgePreview, PurgeResult, UpdateHatRequest,
 };
 
 /// Rule prefixes resolved through the host at once, at most: matches the
 /// host's own resolution semaphore (the review's P6).
 const RESOLVING_AT_ONCE: usize = 4;
 
+/// The sessions of no hat a purge's preview lists, at most (plan 9c
+/// decision 11).
+const UNASSIGNED_SHOWN: u32 = 100;
+
 /// Every route needs the operator's session. Changing a hat and replacing a
 /// host's path rules need a fresh step-up too (plan 5a decision 7): the
 /// rules move the boundary of every later session on that host, a new
 /// default for new hosts that of every later host, and a swapped name or
-/// colour would point the next stepped-up change at the wrong hat.
+/// colour would point the next stepped-up change at the wrong hat. So does
+/// a purge (plan 9c decision 10), which deletes what it cannot give back;
+/// its preview only reads.
 pub fn router(state: AppState) -> Router {
     let routes = Router::new()
         .route("/api/hats", get(list_hats).post(create_hat))
         .route(
             "/api/hats/{id}",
             patch(update_hat).route_layer(middleware::from_fn(hennery_kernel::auth::require_step_up)),
+        )
+        .route(
+            "/api/hats/{id}/purge",
+            // As for the path rules: step-up on `post` alone.
+            get(purge_preview).post(purge_hat.layer(middleware::from_fn(hennery_kernel::auth::require_step_up))),
         )
         .route("/api/hats/resolve", post(resolve_hat))
         .route(
@@ -57,6 +69,7 @@ pub(crate) fn hat_item(record: HatRecord) -> HatItem {
         colour: record.colour,
         created_at: rfc3339(record.created_at),
         default_for_new_hosts: record.default_for_new_hosts,
+        purging: record.purging,
     }
 }
 
@@ -74,6 +87,7 @@ fn hat_changed(change: HatChange, status: StatusCode) -> Response {
         HatChange::Done(record) => (status, Json(hat_item(record))).into_response(),
         HatChange::NotFound => error(StatusCode::NOT_FOUND, "not_found", "no such hat"),
         HatChange::NameTaken => error(StatusCode::CONFLICT, "name_taken", "another hat has this name"),
+        HatChange::Purging => error(StatusCode::CONFLICT, "hat_purging", "the hat is being purged"),
         HatChange::Invalid(why) => error(StatusCode::BAD_REQUEST, "invalid", why),
     }
 }
@@ -150,8 +164,10 @@ async fn replace_path_rules(
     }
     for rule in &req.rules {
         match state.hosts.hat(&rule.hat_id) {
-            Ok(Some(_)) => {}
-            Ok(None) => return error(StatusCode::BAD_REQUEST, "invalid", format!("no hat {:?}", rule.hat_id)),
+            // A frozen hat is no hat for a rule (plan 9c A2); the registry
+            // refuses it again in its own transaction.
+            Ok(Some(hat)) if !hat.purging => {}
+            Ok(_) => return error(StatusCode::BAD_REQUEST, "invalid", format!("no hat {:?}", rule.hat_id)),
             Err(err) => return internal(err),
         }
     }
@@ -225,4 +241,213 @@ async fn resolve_hat(State(state): State<AppState>, ApiJson(req): ApiJson<HatRes
         Ok(None) => error(StatusCode::NOT_FOUND, "not_found", "no such host"),
         Err(err) => internal(err),
     }
+}
+
+/// What the sessions module's part of a purge deleted (plan 9c A13).
+#[derive(Debug, Default, PartialEq)]
+pub struct PurgedSessions {
+    pub deleted: u64,
+    /// Closed collector-side while their host may still run them.
+    pub unconfirmed: Vec<String>,
+}
+
+/// Sessions of a hat being purged that may have an adapter the collector
+/// can reach, or that changed while the purge read them (plan 9c decision
+/// 10d): the purge stops, the hat stays frozen, and a purge again resumes
+/// once they are closed.
+#[derive(Debug, PartialEq)]
+pub struct SessionsRunning(pub Vec<String>);
+
+impl std::fmt::Display for SessionsRunning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "close these sessions first: {}", self.0.join(", "))
+    }
+}
+
+impl std::error::Error for SessionsRunning {}
+
+/// Whether `session` may have an adapter the collector reaches (plan 9c
+/// decision 10b): `starting` or `active` on a host connected and
+/// reconciled. One presumed parked, or starting or active on a host away
+/// or revoked, is closed collector-side instead, as a delete closes it
+/// (plan 9a decision 5).
+fn running(state: &AppState, session: &HatSession) -> bool {
+    matches!(session.lifecycle.as_str(), "starting" | "active") && state.hub.is_ready(&session.host_id)
+}
+
+fn running_ids(state: &AppState, sessions: &[HatSession]) -> Vec<String> {
+    sessions
+        .iter()
+        .filter(|session| running(state, session))
+        .map(|session| session.id.clone())
+        .collect()
+}
+
+/// Delete every kept session of `hat_id`, frozen for its purge (plan 9c
+/// decision 10d): each as a delete does (plan 9a decision 5), in a
+/// transaction of its own, so the store's lock is not held across hundreds;
+/// its `session_deleted` goes to its streams, which end on it (A10). One not
+/// closed is closed collector-side first, only while it is still what was
+/// read here (A4). Any that may be running, or that changed since, stops it
+/// with `SessionsRunning`: what was deleted stays deleted, and running it
+/// again goes on from there. The deletes leave the WAL's checkpoint to the
+/// caller, once after the last (`Store::owe_checkpoint`, `Store::checkpoint`).
+pub fn purge_sessions(state: &AppState, hat_id: &str) -> anyhow::Result<PurgedSessions> {
+    let sessions = state.store.hat_sessions(hat_id)?;
+    let found = running_ids(state, &sessions);
+    if !found.is_empty() {
+        return Err(SessionsRunning(found).into());
+    }
+    let mut purged = PurgedSessions::default();
+    for session in sessions {
+        // Its host may have come back since the read above, with hundreds
+        // of deletes in between: asked again, just before its own. Defence
+        // in depth: one that returns between this and the delete is closed
+        // by `delete_as_read`, or by its connection (decision 4).
+        if running(state, &session) {
+            return Err(SessionsRunning(vec![session.id]).into());
+        }
+        delete_as_read(state, session, &mut purged)?;
+    }
+    Ok(purged)
+}
+
+/// Delete one session of a purge, as `session` was read and judged not
+/// running (plan 9c decision 10d; plan 9a decision 5, A4), counting it in
+/// `purged`. Its host may have reconciled after that judgement and be
+/// ready by the commit, as a delete's may: one deleted `unconfirmed` is
+/// then sent `close_session` here, as `api::finish_delete` sends it; if the
+/// commit came before its host was ready, its connection finds the
+/// tombstone once it is (`ws::ready`, after `mark_ready`).
+pub(crate) fn delete_as_read(state: &AppState, session: HatSession, purged: &mut PurgedSessions) -> anyhow::Result<()> {
+    let unattached = (session.lifecycle != "closed").then(|| Unattached {
+        lifecycle: session.lifecycle.clone(),
+        presumed_parked: session.presumed_parked,
+    });
+    match state
+        .store
+        .delete_session_owing_checkpoint(&session.id, unattached.as_ref())?
+    {
+        Deletion::Done { event, unconfirmed } => {
+            state.hub.publish(event);
+            purged.deleted += 1;
+            if unconfirmed {
+                close_deleted_on_host(state, &session.host_id, &session.id);
+                purged.unconfirmed.push(session.id);
+            }
+        }
+        // A resume, or its host back with it, since it was read.
+        Deletion::Refused(_) => return Err(SessionsRunning(vec![session.id]).into()),
+        // Deleted meanwhile, by a delete of its own.
+        Deletion::NotFound => {}
+    }
+    Ok(())
+}
+
+fn sessions_running(ids: Vec<String>) -> Response {
+    error(
+        StatusCode::CONFLICT,
+        "sessions_running",
+        SessionsRunning(ids).to_string(),
+    )
+}
+
+fn hat_is_default() -> Response {
+    error(
+        StatusCode::CONFLICT,
+        "hat_is_default",
+        "the hat is the default for new hosts or a host's default hat: make another hat that default first",
+    )
+}
+
+/// `GET /api/hats/{id}/purge` (plan 9c decision 11): what a purge of the hat
+/// would delete, and what stops it now. Reads only.
+async fn purge_preview(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let hat = match state.hosts.hat(&id) {
+        Ok(Some(hat)) => hat,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such hat"),
+        Err(err) => return internal(err),
+    };
+    let preview = (|| -> anyhow::Result<PurgePreview> {
+        let sessions = state.store.hat_sessions(&id)?;
+        let (rules, recents) = state.hosts.purge_counts(&id)?;
+        let (unassigned, unassigned_count) = state.store.unassigned(UNASSIGNED_SHOWN)?;
+        Ok(PurgePreview {
+            hat_id: id.clone(),
+            purging: hat.purging,
+            sessions: sessions.len() as u64,
+            running: running_ids(&state, &sessions),
+            rules,
+            recents,
+            unassigned,
+            unassigned_count,
+        })
+    })();
+    match preview {
+        Ok(preview) => Json(preview).into_response(),
+        Err(err) => internal(err),
+    }
+}
+
+/// `POST /api/hats/{id}/purge` (kernel spec §5.5; plan 9c decision 10): 200
+/// with what it deleted. 404 for an unknown hat, or one whose purge is done;
+/// 409 `hat_is_default` for a default hat (a), and 409 `sessions_running`,
+/// with their ids, while any of its sessions may run where the collector
+/// can reach (b): nothing changed. Then the hat is frozen and its rules go
+/// (c); the modules delete what they keep of it (d); and the hat's row goes,
+/// its recents with it (e). Anything that stops it after the freeze leaves
+/// the hat frozen, and a purge again resumes it (A12).
+async fn purge_hat(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    match state.hosts.hat(&id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such hat"),
+        Err(err) => return internal(err),
+    }
+    // (a) before (b); the freeze checks it again in its transaction.
+    match state.hosts.is_default_hat(&id) {
+        Ok(false) => {}
+        Ok(true) => return hat_is_default(),
+        Err(err) => return internal(err),
+    }
+    let running = match state.store.hat_sessions(&id) {
+        Ok(sessions) => running_ids(&state, &sessions),
+        Err(err) => return internal(err),
+    };
+    if !running.is_empty() {
+        return sessions_running(running);
+    }
+    let rules = match state.hosts.begin_purge(&id, unix_now()) {
+        Ok(PurgeStart::Frozen { rules }) => rules,
+        Ok(PurgeStart::NotFound) => return error(StatusCode::NOT_FOUND, "not_found", "no such hat"),
+        Ok(PurgeStart::IsDefault) => return hat_is_default(),
+        Err(err) => return internal(err),
+    };
+    tracing::info!(hat_id = %id, "hat frozen for its purge");
+    // plan 8: the gateway's `on_hat_purged` runs here, before the sessions'
+    // (A15), so a hat stuck frozen cannot reach MCP meanwhile.
+    // One checkpoint for the whole purge, on every way out from here (plan
+    // 9a A8): owed before the first delete, so a crash leaves it owed.
+    state.store.owe_checkpoint();
+    let purged = purge_sessions(&state, &id).and_then(|purged| {
+        // `false`: a purge alongside got there first; it is done either way.
+        state.hosts.finish_purge(&id)?;
+        Ok(purged)
+    });
+    state.store.checkpoint();
+    let purged = match purged {
+        Ok(purged) => purged,
+        Err(err) => {
+            return match err.downcast::<SessionsRunning>() {
+                Ok(SessionsRunning(ids)) => sessions_running(ids),
+                Err(err) => internal(err),
+            };
+        }
+    };
+    tracing::info!(hat_id = %id, sessions = purged.deleted, rules, "hat purged");
+    Json(PurgeResult {
+        sessions: purged.deleted,
+        rules,
+        unconfirmed: purged.unconfirmed,
+    })
+    .into_response()
 }

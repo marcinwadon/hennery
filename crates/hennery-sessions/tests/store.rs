@@ -3106,6 +3106,27 @@ fn a_checkpoint_a_reader_holds_past_the_deadline_is_owed_until_it_completes() {
     }
 }
 
+/// A8: a delete that deleted nothing (an unknown session, or one refused)
+/// owes no checkpoint: with a reader holding the WAL, it records no debt.
+#[test]
+fn a_delete_that_deletes_nothing_owes_no_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    active(&store, "s1", "/srv/zq-kept");
+    let reader = Connection::open(&db).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(store.delete_session("nope", None).unwrap(), Deletion::NotFound);
+    assert!(matches!(
+        store.delete_session("s1", None).unwrap(),
+        Deletion::Refused(_)
+    ));
+    assert!(!dir.path().join("hennery.db-checkpoint-owed").exists());
+    reader.execute_batch("COMMIT").unwrap();
+}
+
 /// A8: a checkpoint owed at a restart (the record left beside the
 /// database) is paid when the store opens.
 #[test]

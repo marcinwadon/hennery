@@ -714,6 +714,16 @@ fn handle(
             probes.browse(uplink, request_id, path, cfg.workspace_roots.clone(), cfg.home.clone())
         }
         CollectorFrame::ResolvePath { request_id, path } => probes.resolve(uplink, request_id, path, cfg.home.clone()),
+        // A purged hat (plan 9c decision 12): nothing of it is kept here
+        // yet. Plan 8 deletes the hat's composed agent home here, after
+        // checking that the id is `hat-<hex>` before building a path from
+        // it (A7).
+        // A purged hat (kernel spec §5.5). Plan 8 deletes the hat's
+        // composed agent home here, and is bound by plan 9c's review: only
+        // for an id that is `hat-<hex>`, never building a path from
+        // anything else, and only once no adapter of that hat runs; until
+        // then, deferred. Idempotent: it comes after every handshake.
+        CollectorFrame::ForgetHat { hat_id } => tracing::info!(%hat_id, "the collector purged a hat"),
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }
     Ok(())

@@ -488,7 +488,8 @@ impl CollectorFrame {
             | Self::AnswerElicitation { .. }
             | Self::Ack { .. }
             | Self::ParkSession { .. }
-            | Self::CloseSession { .. } => Err(NotAProbe),
+            | Self::CloseSession { .. }
+            | Self::ForgetHat { .. } => Err(NotAProbe),
         }
     }
 }
@@ -636,5 +637,15 @@ pub enum CollectorFrame {
     BrowseDirectory {
         request_id: String,
         path: String,
+    },
+    /// A hat the operator purged (kernel spec §5.5; plan 9c decisions 10
+    /// and 12, A7): sent after every reconciled handshake, one per purged
+    /// hat, for good. The host forgets what it keeps for the hat (its
+    /// composed agent home, plan 8): only for an id that is `hat-<hex>`,
+    /// and only once no adapter of that hat runs. No answer; a host that
+    /// does not know the frame logs and ignores it, so no capability is
+    /// needed.
+    ForgetHat {
+        hat_id: String,
     },
 }
