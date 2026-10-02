@@ -45,6 +45,14 @@ describe('itemsReducer', () => {
     expect(state.items[0]).toBe(same)
   })
 
+  it('keeps a question’s verdict delivered when a later version says not delivered', () => {
+    const q = (version: number, patch: object) =>
+      ({ id: 'q', version, ts: '2026-10-02T10:00:00.000Z', turn_id: 't1', kind: 'question', pending_id: 'p', question_kind: 'permission', request: { type: 'permission', options: [] }, state: 'open', answered: true, answerable: false, ...patch }) as Item
+    let state = loaded([q(1, { delivered: true })])
+    state = itemsReducer(state, { type: 'upsert', item: q(2, { delivered: false, state: 'cancelled', reason: 'turn_cancelled' }) })
+    expect(state.items[0]).toMatchObject({ version: 2, delivered: true, state: 'cancelled', answerable: false })
+  })
+
   it('never goes back to an older version', () => {
     const state = loaded([message('a', 't1', 5)])
     const after = itemsReducer(state, { type: 'upsert', item: message('a', 't1', 4) })
