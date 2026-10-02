@@ -13,6 +13,7 @@ base64.workspace = true
 futures.workspace = true
 hennery-kernel.workspace = true
 hennery-proto.workspace = true
+hennery-view.workspace = true
 hex.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
