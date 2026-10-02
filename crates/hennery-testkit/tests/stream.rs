@@ -61,6 +61,15 @@ impl Collector {
         .expect("the stream answered")
         .unwrap()
     }
+
+    /// The timeline's answer, `GET /api/sessions/{session}/events`.
+    async fn events(&self, session: &str) -> reqwest::Response {
+        self.client
+            .get(format!("http://{}/api/sessions/{session}/events", self.addr))
+            .send()
+            .await
+            .unwrap()
+    }
 }
 
 fn update(n: usize) -> SessionBody {
@@ -84,10 +93,12 @@ async fn not_found(resp: reqwest::Response) {
     assert_eq!(resp.json::<ApiError>().await.unwrap().code, "not_found");
 }
 
+/// The stream and the timeline alike (ACP core §9, "Common answers").
 #[tokio::test]
 async fn an_unknown_session_is_404() {
     let c = Collector::start().await;
     not_found(c.open("does-not-exist").await).await;
+    not_found(c.events("does-not-exist").await).await;
 }
 
 /// No existence oracle: another owner's session answers as an unknown one.
@@ -107,6 +118,7 @@ async fn another_owners_session_is_404() {
     )
     .unwrap();
     not_found(c.open("theirs").await).await;
+    not_found(c.events("theirs").await).await;
 }
 
 /// A history of more than two pages replays every event once, in order;

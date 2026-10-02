@@ -2434,6 +2434,7 @@ async fn a_flooding_adapter_cannot_hold_off_a_cancel() {
     let script = FakeScript {
         chunks: vec!["flood".into()],
         flood: true,
+        cancel_received_file: Some(dir.path().join("cancel").to_string_lossy().into_owned()),
         ..FakeScript::default()
     };
     let handle = session::start(
@@ -2451,13 +2452,31 @@ async fn a_flooding_adapter_cannot_hold_off_a_cancel() {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     assert!(handle.send(cancel("rc", "t1")));
-    let cancel_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    // What the flood must not hold off: the cancel reaching the adapter,
+    // which the fake marks the instant it arrives. It took 24 ms alone and
+    // at most 0.15 s with 8 copies of this suite and 18 CPU burners; held
+    // off, it never arrives while the flood runs.
+    let marker = dir.path().join("cancel");
+    let forward_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while !marker.exists() {
+        assert!(
+            tokio::time::Instant::now() < forward_deadline,
+            "the cancel was never forwarded: the flood held it off"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // The turn then ends once the agent's reply and every update queued
+    // before it are through, each a synchronous outbox commit: 0.26 s
+    // alone, up to 5.3 s under that load, and once past 20 s in a full
+    // workspace run on a loaded machine. That is drain time, not the flood
+    // holding anything off, so this bound is only "not forever".
+    let cancel_deadline = tokio::time::Instant::now() + Duration::from_secs(60);
     // Polled on the handle: reading a flooded outbox every few ms would
     // itself slow the actor down.
     while handle.open_turn_id().is_some() {
         assert!(
             tokio::time::Instant::now() < cancel_deadline,
-            "the cancel was never read: the flood held it off"
+            "the turn did not end within 60 s of the forwarded cancel"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
