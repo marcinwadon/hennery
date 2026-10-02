@@ -5,6 +5,9 @@
 # repositories, never in this image. The `build` workflow stages the binary
 # at `dist/linux-<arch>/hennery` (plan 7a). Every image is pinned by its
 # multi-arch index digest, the tag beside it for the reader.
+# The binary embeds the web UI: the archive job builds it first, with
+# HENNERY_WEB_REQUIRE=1, and checks the placeholder is absent
+# (`packaging/check-web-ui.sh`, plan 4b). Nothing here builds.
 
 # The data directory, owned by the image's user. A volume Docker creates on
 # a path the image lacks would be root's, and the collector, running as

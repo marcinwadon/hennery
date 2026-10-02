@@ -17,12 +17,53 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # The web UI (plan 4b): its types, unit tests and build, then the browser
+  # checks against the binary it is embedded in. Node, pnpm, the Rust
+  # toolchain and Chromium all come from the flake's dev shell.
+  web:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    env:
+      HENNERY_WEB_REQUIRE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ github.token }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: web
+      - name: Install
+        run: nix develop -c pnpm --dir web install --frozen-lockfile
+      - name: Types
+        run: nix develop -c pnpm --dir web typecheck
+      - name: Unit tests
+        run: nix develop -c pnpm --dir web test
+      - name: Build
+        run: nix develop -c pnpm --dir web build
+      - name: The binary, with the UI embedded
+        run: nix develop -c cargo build -p hennery --locked
+      - name: Browser checks
+        run: nix develop -c pnpm --dir web e2e
+        env:
+          CI: "1"
+
   rust:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # Every build here embeds the real UI, built first (plan 4b): the
+    # kernel's build script fails without it.
+    env:
+      HENNERY_WEB_REQUIRE: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master @ 2026-09-12
@@ -30,6 +71,11 @@ jobs:
           toolchain: stable
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ github.token }}
+      - name: The web UI
+        run: nix develop .#web -c sh -c 'pnpm --dir web install --frozen-lockfile && pnpm --dir web build'
       # `webauthn-rs` links OpenSSL (plan 3c): the system's for these checks.
       # Release builds build their own (`vendored-openssl`, build.yml).
       - name: OpenSSL headers (ubuntu)
