@@ -17,6 +17,7 @@ hex.workspace = true
 libc = "0.2"
 p256.workspace = true
 password-auth.workspace = true
+png.workspace = true
 # Outbound HTTP (plan 8b): the egress policy's clients.
 reqwest.workspace = true
 rusqlite.workspace = true
