@@ -268,11 +268,9 @@ async fn a_forget_runs_only_for_a_registered_home_with_no_live_actor() {
     let HostFrame::SessionForgotten { outcome, .. } = &ran else {
         unreachable!()
     };
-    assert_eq!(*outcome, ForgetOutcome::Partial);
-    assert_eq!(
-        reasons(&ran),
-        [(ForgetKind::Session, ForgetReason::UnsupportedAgent, true)]
-    );
+    // Nothing of the session is under the root: complete.
+    assert_eq!(*outcome, ForgetOutcome::Complete);
+    assert_eq!(reasons(&ran), []);
 }
 
 /// Decision 1, B1: a home the host cannot register is never reported, so
