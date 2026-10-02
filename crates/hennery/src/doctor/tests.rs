@@ -1593,7 +1593,8 @@ fn adapters_start_as_the_host_starts_them_and_are_all_stopped() {
     let fake = Fake::none();
     let mut cx = machine(dir.path(), Platform::Linux, &fake);
     cx.env.insert("CLAUDECODE".into(), "canary-7d-nesting".into());
-    cx.env.insert("HENNERY_DOCTOR_SHELL_ONLY".into(), "canary-7d-shell".into());
+    cx.env
+        .insert("HENNERY_DOCTOR_SHELL_ONLY".into(), "canary-7d-shell".into());
     let Some(agents) = fake_agents(dir.path()) else {
         return;
     };
