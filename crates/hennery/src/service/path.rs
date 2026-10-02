@@ -87,11 +87,17 @@ pub fn login_environment(
     // the startup files export among it: private, and removed below
     // however the capture ends.
     let result = run_shell(shell, env, &out, timeout).and_then(|()| {
-        let size = std::fs::metadata(&out)?.len();
-        if size > MAX_ENVIRONMENT {
-            bail!("the login shell's environment is {size} bytes; at most {MAX_ENVIRONMENT} are read");
+        // Bounded as it is read: a process the startup files detached may
+        // still be writing.
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(&out)?
+            .take(MAX_ENVIRONMENT + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > MAX_ENVIRONMENT {
+            bail!("the login shell's environment is over {MAX_ENVIRONMENT} bytes");
         }
-        Ok(parse_env0(&std::fs::read(&out)?))
+        Ok(parse_env0(&bytes))
     });
     let _ = std::fs::remove_file(&out);
     let captured = result?;
@@ -223,6 +229,11 @@ pub fn service_path(captured: &BTreeMap<String, String>, home: &Path, macos: boo
         }
         if entry.chars().any(char::is_control) {
             notes.push(format!("dropped {entry:?}: it holds a control character"));
+            continue;
+        }
+        // `parse_env0` decodes lossily: this was not valid UTF-8.
+        if entry.contains('\u{fffd}') {
+            notes.push(format!("dropped {entry:?}: it is not valid UTF-8"));
             continue;
         }
         if !entry.starts_with('/') {
@@ -393,6 +404,14 @@ mod tests {
         assert!(service_path(&BTreeMap::new(), home.path(), false).is_err());
         let control = service_path(&captured("/opt/a\nb/bin:/opt/c"), home.path(), false).unwrap();
         assert_eq!(control.path, "/opt/c:/usr/bin:/bin");
+        let lossy = parse_env0(b"PATH=/opt/\xff/bin:/opt/c\0");
+        let lossy = service_path(&lossy, home.path(), false).unwrap();
+        assert_eq!(lossy.path, "/opt/c:/usr/bin:/bin");
+        assert!(
+            lossy.notes.iter().any(|n| n.contains("not valid UTF-8")),
+            "{:?}",
+            lossy.notes
+        );
     }
 
     /// fnm's per-shell directory is replaced by its default alias, found

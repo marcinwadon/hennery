@@ -294,6 +294,28 @@ fn create_dir(dir: &Path, mode: u32) -> Result<()> {
         .with_context(|| format!("create {}", dir.display()))
 }
 
+/// Whether `dir` holds a host's pairing, looked at without `Paired::load`,
+/// which would roll an interrupted pairing forward (renames, the outbox
+/// moved aside) without the host's lock (decision 8).
+fn host_pairing(dir: &Path) -> Result<()> {
+    use hennery_host::identity::{CONFIG_FILE, KEY_FILE};
+    if dir.join(format!("{CONFIG_FILE}.pending")).exists() {
+        bail!(
+            "{} holds a pairing that was interrupted: run `hennery host run --data-dir {}` once to finish it, then install",
+            dir.display(),
+            dir.display()
+        );
+    }
+    if !(dir.join(KEY_FILE).is_file() && dir.join(CONFIG_FILE).is_file()) {
+        bail!(
+            "{} holds no pairing: run `hennery host join <url> --data-dir {}` first",
+            dir.display(),
+            dir.display()
+        );
+    }
+    Ok(())
+}
+
 /// Why there is no systemd user manager to install into, if there is none.
 fn no_systemd(cx: &Context) -> Option<String> {
     if cx.root.join("run/systemd/system").is_dir() {
@@ -331,12 +353,8 @@ pub fn install(
         Some(dir) => std::path::absolute(dir)?,
         None => cx.default_data_dir(),
     };
-    if role == Role::Host && !matches!(hennery_host::identity::Paired::load(&data_dir), Ok(Some(_))) {
-        bail!(
-            "{} holds no pairing: run `hennery host join <url> --data-dir {}` first",
-            data_dir.display(),
-            data_dir.display()
-        );
+    if role == Role::Host {
+        host_pairing(&data_dir)?;
     }
     if cx.platform == Platform::Linux
         && let Some(why) = no_systemd(cx)

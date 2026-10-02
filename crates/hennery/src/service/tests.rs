@@ -286,6 +286,16 @@ fn a_host_without_a_pairing_is_refused() {
     assert!(err.to_string().contains("hennery host join"), "{err}");
     assert!(fake.calls().is_empty());
     assert!(!cx.home.join(".config").exists());
+
+    // A pairing left half-done is refused too, and left as it is: putting
+    // it in place is the host's, under its lock (decision 8).
+    let data = paired(dir.path());
+    let pending = data.join("host.toml.pending");
+    std::fs::write(&pending, "staged").unwrap();
+    let err = install(&cx, Role::Host, Some(&data), None, &mut Vec::new()).unwrap_err();
+    assert!(err.to_string().contains("was interrupted"), "{err}");
+    assert_eq!(std::fs::read_to_string(&pending).unwrap(), "staged");
+    assert!(fake.calls().is_empty());
 }
 
 /// Distribution spec §7 check 10: one role per machine.
