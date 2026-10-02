@@ -16,6 +16,14 @@ export interface ItemEnv {
   questionActions?: (item: ItemOf<'question'>) => ReactNode
   /** "Send again" for a turn that was not delivered; absent, none is offered. */
   onSendAgain?: (item: ItemOf<'marker'>) => void
+  /** "Answer as a new message": `question` is the question's own text. The
+   *  composer's draft gets `You asked: <question>. My answer: `
+   *  (composerWords' `answerAsMessage`), labelled, the cursor at its end.
+   *  Nothing is sent: the operator writes the answer and sends it. */
+  onAnswerAsMessage?: (question: string) => void
+  /** The composer holds no draft (no text, no image): only then may a newly
+   *  opened answerable card take the focus (brief item 25, §10). */
+  composerEmpty?: () => boolean
 }
 
 /** The session's raw events, where a cut or elided item can be read whole. */
