@@ -2,7 +2,7 @@
 // older pages prepended, and the item stream's upserts and removals.
 //
 // - An item is replaced in place by id, only by a version at least the
-//   one held.
+//   one held; a question's verdict `delivered: true` sticks (ACP core §4.6).
 // - A new id joins its group (`turn_id`, or `start` before the first turn)
 //   at the group's end when that group is loaded; it starts a new group at
 //   the end when it is newer than every loaded group (no older groups left,
@@ -11,6 +11,7 @@
 // - `turn_id` is an opaque key: never parsed.
 // - Anything that is not an item is ignored: the reducer never throws.
 import type { Item, ItemPage } from '../generated/view'
+import { foldVerdict } from '../lib/delivery'
 
 export interface ItemsState {
   items: Item[]
@@ -106,7 +107,7 @@ export function itemsReducer(state: ItemsState, action: ItemsAction): ItemsState
       if (at >= 0) {
         if (item.version < state.items[at].version) return state
         const items = state.items.slice()
-        items[at] = item
+        items[at] = foldVerdict(state.items[at], item)
         return { ...state, items }
       }
       const group = groupOf(item)
