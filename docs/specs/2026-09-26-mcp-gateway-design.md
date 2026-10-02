@@ -38,16 +38,19 @@ never repeats consent per machine.
 
 ```sql
 gw_connections(
-  id TEXT PK, owner_id, slug UNIQUE, label, url, hat_id,
+  id TEXT PK, owner_id, slug, label, url, hat_id,
   cred_kind,               -- none | static | oauth_dcr | oauth_client
+  static_header,           -- default 'Authorization' (static only)
+  static_prefix,           -- default 'Bearer ', may be empty
   tool_allowlist JSON,     -- null = all tools
   internal_network BOOL,   -- operator allows non-public upstream addresses (§5.7)
   status,                  -- not_connected | ok | needs_auth | error
-  status_note, account_label NULL, status_at, created_at, updated_at)
+  status_note, account_label NULL, status_at, created_at, updated_at,
+  UNIQUE(owner_id, slug))
 gw_credentials(
-  connection_id PK, key_version, ciphertext BLOB,   -- AEAD, §6
+  connection_id PK, owner_id, key_version, ciphertext BLOB,   -- AEAD, §6
   expires_at, updated_at)
-gw_mounts(connection_id, host_id, PRIMARY KEY(connection_id, host_id))
+gw_mounts(connection_id, host_id, owner_id, PRIMARY KEY(connection_id, host_id))
 gw_session_tokens(                  -- one per session, minted at every start/resume
   session_id PK, owner_id, host_id, hat_id, token_hash,
   created_at, last_used_at, revoked_at)
@@ -67,6 +70,14 @@ gw_stdio_servers(                   -- §3.4
 `gw_mounts` has no hat column: the hat is the connection's. `gw_session_tokens`
 holds session ids as opaque values; the gateway never reads session tables.
 
+Every `gw_*` table carries `owner_id`. A connection's hat, a mount's host and
+a credential's or mount's connection are the owner's by composite foreign
+keys (`(hat_id, owner_id)`, `(host_id, owner_id)`, `(connection_id,
+owner_id)`). Nothing cascades: the store deletes a connection's credential
+and mounts itself. The `CHECK`s list every kind and status above, OAuth
+included, since a table with children cannot be rebuilt later to widen one
+(plan 8a).
+
 - **`cred_kind`:**
   - `none` — no credential (public or network-trusted upstreams).
   - `static` — a personal access token or API key, sent as
@@ -81,11 +92,49 @@ holds session ids as opaque values; the gateway never reads session tables.
     the time of measurement — could not be connected at all.)*
 - **The secret payload** (access/refresh token, static token, client secret)
   lives only in `gw_credentials` / `gw_oauth_clients` ciphertext. List
-  endpoints never read those tables.
+  endpoints never read those tables' secret columns: whether a credential
+  exists (`has_credential`) is read by its key alone,
+  `EXISTS (… WHERE k.connection_id = c.id AND k.owner_id = ?)`. A unit test
+  prepares the list's statements under SQLite's authorizer and finds
+  `connection_id` and `owner_id` the only columns of `gw_credentials` read
+  (plan 8a).
 - A connection belongs to **exactly one hat**. The same vendor in two hats is
-  two connections with separate grants (umbrella §8.3).
-- **Slugs:** `^[a-z0-9][a-z0-9-]{0,47}$`, unique per installation. They become
+  two connections with separate grants (umbrella §8.3). Its slug and its hat
+  never change once created (moving it would carry its grant into another
+  hat; a new slug would rename the agents' server).
+- **Slugs:** `^[a-z0-9][a-z0-9-]{0,47}$`, unique **per owner**
+  (`UNIQUE(owner_id, slug)`; plan 8a). v1 has one owner per installation, so
+  this reads as per installation today; unique across owners, a create's
+  `slug_taken` would tell one owner another's slugs (umbrella §7.4). The
+  proxy finds a connection by the token's owner and the slug. Slugs become
   MCP server names (`hennery-<slug>`) and URL segments.
+- **Mounts on a revoked host** are kept but unused and unlisted: revoking a
+  host does not reach the gateway, the list joins `hosts` on
+  `revoked_at IS NULL`, a mounts request naming a revoked host is refused, and
+  the next full set drops it. A revoked host never becomes live again. Every
+  later reader of mounts (proxy scope, delivery) applies the same join, or
+  the gateway's `on_host_revoked` deletes them; the proxy's plan (8d) must
+  implement that delete before any plan deletes host rows (plan 8a).
+- **Limits** (plan 8a), checked before anything is written:
+  - at most 256 connections per owner (409 `too_many_connections`);
+  - a label is 1 to 64 bytes of UTF-8 once trimmed (stored trimmed), with no
+    control or invisible format character;
+  - a URL is at most 2048 bytes, and meets §5.7's rules for connection URLs;
+  - an allowlist names at most 1024 tools, each 1 to 128 visible ASCII
+    characters; duplicates are dropped, the order kept;
+  - a mounts request names at most 1024 hosts, each id at most 64 bytes,
+    counted as sent and checked before the connection is looked up; an id
+    over 64 bytes is not quoted back (an unknown or revoked host's id is
+    named in the message);
+  - a static token is 1 to 8192 visible ASCII characters, no space;
+  - the static header is an HTTP header name of at most 64 bytes, never one
+    the proxy sets, frames or filters (`host`, `content-length`,
+    `content-type`, `content-encoding`, `transfer-encoding`, `connection`,
+    `keep-alive`, `upgrade`, `te`, `trailer`, `cookie`, `accept`,
+    `accept-encoding`, `mcp-session-id`, `mcp-protocol-version`,
+    `last-event-id`, `expect`, `forwarded`, `via`, `max-forwards`, `proxy-*`,
+    `sec-*`); the prefix is at most 32 visible ASCII characters or spaces;
+  - a request body is at most 256 KiB (413 `body_too_large`).
 - **Hat purge** (kernel §5.5): the gateway's purge hook deletes the hat's
   connections with their credentials, OAuth clients and mounts, its session
   tokens, standalone clients and stdio servers.
@@ -294,6 +343,16 @@ rejected — a grant that "refreshes fine and never works".)*
   token would be sent as an OAuth access token.)*
 - An omitted field in an update keeps its stored value; an explicit empty value
   clears it.
+- As built (plan 8a): the delete runs in the update's own transaction, after
+  every check and before the row is saved, so a refused update deletes
+  nothing. It also starts the status over (`not_connected`, no note, no
+  account label, `status_at` now). The origin compared is `Url::origin()`
+  (scheme, host, port, the default port filled in); another path, header,
+  prefix or `internal_network` keeps the credential, each behind step-up
+  (§9). A `null` allowlist clears it (every tool), `[]` allows none, `""`
+  clears the prefix; the label, URL, kind and header cannot be empty, and a
+  `null` for any field but the allowlist reads as absent. The OAuth plan
+  deletes the OAuth client in the same place.
 
 ---
 
@@ -398,6 +457,35 @@ use it without depending on the gateway:
 - Per connection, a cap on concurrent upstream requests and on idle streaming
   responses; beyond it the proxy answers 503.
 
+**Connection URLs** (plan 8a, at save time): `http` or `https`, absolute,
+with a host, no user name or password, no fragment, at most 2048 bytes; a
+query is kept, but a secret belongs in the credential. Stored as `url::Url`
+serialises it. **`http` is saved only on a connection marked
+`internal_network`**, on create or by one `PATCH` naming both (step-up):
+unmarked plain `http` is refused (400 `invalid`), loopback included, and
+clearing the mark while the URL is `http` is refused and changes nothing
+(move the URL to `https` in the same `PATCH`). This is stricter than the
+egress policy's scheme rule (kernel §7.1: `https`, or `http` to loopback);
+which of the two holds is settled by the egress and proxy plans (8b-ii, 8d).
+Plain `http` beyond loopback is sent from plan 8b-ii on. Non-public addresses
+are not refused when saving: the egress policy refuses them at request time
+unless the connection is internal.
+
+### 5.8 Upstream URLs in logs
+
+An upstream URL is **logged and shown only as its origin**,
+`scheme://host[:port]`, with the connection's id (plan 8a): no log line,
+error body, trace or `Debug` of a connection type shows its path, query or
+user info, where some vendors put a secret. The gateway's `url_for_logs` and
+the wire crate's `url_origin` parse with `url::Url`, as the store does, so
+raw input fails closed (`<not a url>`, or `null` for a scheme without an
+origin). The connection types' `Debug` is written by hand. Only the API's
+answers (`McpConnectionItem`, from the list, create, update and mounts
+routes) show the URL whole, as stored: it is the owner's data, behind the
+operator's session. Whether a secret inside a vendor's URL should be sealed
+or refused instead is open for the maintainer (plan 8a's Q2; default:
+documented, never logged whole).
+
 ---
 
 ## 6. Credentials at rest
@@ -413,6 +501,75 @@ use it without depending on the gateway:
   every row.
 - Without the master key, credentials are unrecoverable; backups must carry it
   (umbrella §12.4). *(G-20: the predecessor stored credentials in plaintext.)*
+
+**As built (plan 8a).**
+
+- **The encoding.** AAD = `len ‖ connection_id ‖ len ‖ field ‖ len ‖
+  key_version`, each `len` 4 bytes big-endian and the version 4 bytes
+  big-endian, so no two (id, field) pairs give one AAD and the version is
+  bound by the tag, not only checked beside it. The blob is `key_version`
+  (4 bytes, big-endian) ‖ the 24-byte nonce ‖ the ciphertext with its 16-byte
+  tag; the row's `key_version` column must equal the blob's prefix
+  (else malformed), and both must be the key's. The nonce comes from the
+  operating system's generator. The **field is named by table**:
+  `gw_credentials.static_token`, taken from the connection's kind, so a row
+  left under another kind does not open as another field (a second guard
+  behind §4.6), and later tables (`gw_oauth_clients.client_secret`, the stdio
+  servers' environments) never share a field. The version is `1` until
+  `rotate-key`.
+- **Not in the AAD:** the connection's origin and owner. Binding them would
+  cost little (§4.6 already deletes the credential on every origin change,
+  and the owner never changes) and would stop someone who can write
+  `hennery.db` but not read the key (a copied volume or a restored backup,
+  the key supplied by the environment or systemd) from pointing a stored
+  token at another origin. Not binding them was decided after the security
+  review and confirmed by the gateway lane parent; reversible by a re-seal
+  at start with the key.
+- **The key's sources, in order:** `HENNERY_MASTER_KEY` (64 hexadecimal
+  digits); the systemd credential `$CREDENTIALS_DIRECTORY/hennery-master-key`
+  (32 raw bytes, or 64 hexadecimal digits with an optional newline, for
+  `SetCredential=`); `<data>/master.key` (32 raw bytes).
+  - Both of the first two at once is refused: which one sealed the stored
+    credentials would be a guess. A supplied key with a `master.key` beside
+    it warns that the file is not used.
+  - A source the operator set that cannot be read is an error, never a
+    reason to make a key file: a `HENNERY_MASTER_KEY` that is not text, a
+    credential whose look-up fails other than "not found".
+    `$CREDENTIALS_DIRECTORY` set without the credential warns before a key
+    file is made.
+  - `master.key` is opened without following a symlink and checked through
+    its descriptor: a regular file, no group or other bits, one link, exactly
+    32 bytes. A credential file: a regular file, not a symlink, no bits for
+    other users (systemd owns it, so its owner and group bits are not
+    checked).
+  - A new `master.key` is created exclusively, 0600 whatever the umask,
+    written and synced, and its directory synced; a write cut short leaves a
+    file of the wrong length, which the next start refuses rather than
+    replaces.
+  - The variable is read by the collector itself, never as a CLI argument
+    (it would show in `--help`), and is stripped from what the host child and
+    every agent inherit. Error messages never quote the key.
+- **A missing or wrong key stops the start.** The collector opens the
+  gateway after the admin socket's bind and before serving. A key missing
+  while the owner has a stored credential is an error (no new key is made);
+  so is one that does not open the owner's newest credential (only the
+  newest is checked, so a damaged older row shows when it is used). Starting
+  would seal new rows under one key beside rows only another opens. Both
+  errors name the way out: restore the key (or supply it through the
+  variable or the credential), or stop the collector and give the
+  credentials up (`sqlite3 <data>/hennery.db 'DELETE FROM gw_credentials'`),
+  then set each one again. `hennery_gateway::open` wraps every key error it
+  meets in `KeyUnavailable`, so the binary can tell them from a store that
+  does not open.
+  - *Built so far:* the other key errors name no way out yet (a `master.key`
+    of the wrong length, a systemd credential that does not read, and
+    `KeySource::from_env`'s own, which `run_collector` gets before `open` and
+    so without `KeyUnavailable`); plan 8g, with `rotate-key` and the key's
+    docs.
+  - **Open for the maintainer (plan 8a's Q1):** whether a lost or wrong key
+    should refuse the start (the default, built) or start with the gateway
+    disabled (its routes 503, sessions without gateway servers). Switching
+    is `run_collector` matching `KeyUnavailable`.
 
 **Stated plainly in the docs:** the collector holding the gateway is a single
 point of compromise for every integration it holds. Hats limit what one
@@ -484,21 +641,50 @@ Docker image); `hennery up` warns in that situation (kernel §10). In v1
 All operator endpoints require an operator session. Endpoints marked
 **step-up** also require a fresh passkey or password check (kernel §3.4).
 
+The connection routes are built (plan 8a); their wire types in
+`hennery-proto` (`McpConnectionItem`, `CreateMcpConnectionRequest`,
+`UpdateMcpConnectionRequest`, `McpMountsRequest`, `McpCredentialRequest`)
+document each route's answer and codes, and reach the TypeScript with their
+docs. Every one of them answers `Cache-Control: no-store`, its refusals
+included, and an error is the shared `ApiError`, exactly `{code, message}`.
+Codes every route may answer:
+
+- 401 `unauthenticated` (no live session);
+- 403 `setup_required`, `origin_mismatch` or `cross_site` (the browser rules,
+  kernel §3.2); 403 `step_up_required` on the routes marked step-up;
+- 415 `unsupported_media_type` (a body that is not `application/json`);
+- 400 `invalid_body` (not JSON), 422 `invalid_body` (not the route's shape,
+  an unknown field included: every request type refuses unknown fields); the
+  body is never quoted back;
+- 413 `body_too_large` (over 256 KiB);
+- 405 with no body (a method the path does not take);
+- 500 `internal`;
+- 404 `not_found` for an unknown connection or another owner's, on every
+  route with `{id}`.
+
+Step-up on `POST`, `DELETE` and `PUT …/credential` is layered per method, so
+`GET` stays free and a method added later gets none unless layered too.
+`PATCH` checks it in its handler on what the body names, before anything is
+read.
+
 | Method & path | Purpose |
 |---|---|
-| `GET /api/mcp/connections` | List (no secrets; `has_credential`, status, `account_label`, mounts). |
-| `POST /api/mcp/connections` | Create (**step-up**). |
-| `PATCH /api/mcp/connections/{id}` | Update (**step-up** when the URL, credential kind or `internal_network` changes); origin or kind change clears credentials (§4.6). |
-| `DELETE /api/mcp/connections/{id}` | Delete with mounts, credential, OAuth client. |
-| `PUT /api/mcp/connections/{id}/mounts` | Replace the host set (full set, never a delta). |
-| `PUT /api/mcp/connections/{id}/credential` | Set a static token (write-only, 204; **step-up**). |
-| `PUT /api/mcp/connections/{id}/oauth-client` | Set a pre-registered client (**step-up**). |
-| `POST /api/mcp/connections/{id}/authorize` | Start OAuth; sets the flow cookie, returns the consent URL. |
-| `GET /api/mcp/oauth/callback` | OAuth redirect target (`state` plus flow cookie). |
-| `GET/PUT /api/mcp/stdio-servers?host_id&hat_id` | Local stdio servers for one (host, hat), full set (§3.4; **step-up** on `PUT`). |
-| `GET /api/mcp/clients` / `POST` / `DELETE /{id}` | Standalone clients. `POST {label, hat_id, connection_ids[]}` creates the client and its pins; the token is shown once. |
-| `PUT /api/mcp/clients/{id}/pins` | Replace a client's pinned connections (`{connection_ids[]}`). |
-| `GET /api/mcp/manifest` | Manifest for the presenting standalone client token (renderers). |
+| `GET /api/mcp/connections` | List: 200, an array of `McpConnectionItem`, oldest first (no secrets; `has_credential`, status, `account_label`, mounts on unrevoked hosts, sorted). |
+| `POST /api/mcp/connections` | Create (**step-up**): `CreateMcpConnectionRequest` → 201 `McpConnectionItem`, `not_connected`, no credential, no mounts. 400 `invalid` (a field refused, or a hat that is not the owner's); 400 `unsupported_cred_kind` (an OAuth kind, until plan 8f); 409 `slug_taken`; 409 `too_many_connections`. |
+| `PATCH /api/mcp/connections/{id}` | Update: `UpdateMcpConnectionRequest` → 200 `McpConnectionItem`. **Step-up** when the body names `url`, `cred_kind`, `internal_network`, `static_header` or `static_prefix`, even with the stored value (a `null` reads as absent); the label and the allowlist need none. Origin or kind change clears the credential (§4.6). The slug and hat cannot change (an unknown field, 422). 400 `invalid`; 400 `unsupported_cred_kind`. A refused change changes nothing. |
+| `DELETE /api/mcp/connections/{id}` | Delete (**step-up**: it destroys a grant that may need a consent to get back, as revoking a host does) with mounts and credential (and, from plan 8f, OAuth client): 204. |
+| `PUT /api/mcp/connections/{id}/mounts` | Replace the host set (full set, never a delta): `McpMountsRequest {host_ids}` → 200 `McpConnectionItem`. No step-up: a mount reaches only a host the owner paired, and pairing needs it. 400 `invalid` (a host not the owner's or revoked, more than 1024 hosts, an id over 64 bytes). |
+| `PUT /api/mcp/connections/{id}/credential` | Set a static token (write-only, **step-up**): `McpCredentialRequest {token}` → 204, sealed, replacing any before it. 409 `wrong_cred_kind` (not `static`); 400 `invalid` (the token is never quoted). No route reads a credential back or clears one: changing the origin or kind, or deleting the connection, does. |
+| `PUT /api/mcp/connections/{id}/oauth-client` | Set a pre-registered client (**step-up**). *Later: plan 8f.* |
+| `POST /api/mcp/connections/{id}/authorize` | Start OAuth; sets the flow cookie, returns the consent URL. *Later: plan 8f.* |
+| `GET /api/mcp/oauth/callback` | OAuth redirect target (`state` plus flow cookie). *Later: plan 8f.* |
+| `GET/PUT /api/mcp/stdio-servers?host_id&hat_id` | Local stdio servers for one (host, hat), full set (§3.4; **step-up** on `PUT`). *Later.* |
+| `GET /api/mcp/clients` / `POST` / `DELETE /{id}` | Standalone clients. `POST {label, hat_id, connection_ids[]}` creates the client and its pins; the token is shown once. *Later: plan 8g.* |
+| `PUT /api/mcp/clients/{id}/pins` | Replace a client's pinned connections (`{connection_ids[]}`). *Later: plan 8g.* |
+| `GET /api/mcp/manifest` | Manifest for the presenting standalone client token (renderers). *Later: plan 8g.* |
+
+The collector merges the gateway's router beside the sessions module's; the
+kernel's CSP layer does not cover these routes, which answer only JSON.
 
 No endpoint returns a session token, and no endpoint lets one host read another
 host's tokens. *(G-25: the predecessor's pull endpoint took the target machine
@@ -547,6 +733,10 @@ the boundary: the `hennery-gateway` crate does not depend on `hennery-sessions`.
   superseded session → 404; standalone client outside its pins → 404.
 - **Token hygiene:** no token or `mcp_servers` header appears in logs, events
   or SSE output.
+- **Upstream URLs** (§5.8; plan 8a): a canary in a connection URL's path and
+  query, through create, patch, list and refused requests at `TRACE` (raw
+  input `url_origin` must not show, and a 422 whose canary is a string in a
+  boolean field), appears in no log line and no error body.
 - **Allowlist:** JSON and SSE `tools/list` filtering, batch, empty result `[]`,
   blocked `tools/call`.
 - **Capabilities:** `initialize` upstream lacks `sampling`/`elicitation`/`roots`.
@@ -556,7 +746,10 @@ the boundary: the `hennery-gateway` crate does not depend on `hennery-sessions`.
   malformed input refused, mode 0600, entries survive a `codex mcp add/remove`
   rewrite.
 - **Encryption:** AAD binding (swapping ciphertext between rows fails),
-  key rotation, missing key → clear error.
+  key rotation, missing key → clear error. As built (plan 8a): a blob moved
+  to another row, read as another field or relabelled with another version
+  does not open; a missing key while credentials exist, or a wrong one,
+  stops the start and creates nothing.
 - **Live gate** (per release, optional vendor accounts): one static-token
   connection and one OAuth connection end to end through a real agent session.
 
