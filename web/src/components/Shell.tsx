@@ -3,14 +3,15 @@
 // it a top bar and a bottom tab bar. Which views exist comes from
 // `GET /api/capabilities`, which also tells a signed-out browser to sign in.
 import { useEffect, useState } from 'react'
-import { capabilities, logOut } from '../api/auth'
+import { capabilities } from '../api/auth'
 import { messageOf } from '../api/errors'
 import { useClient } from '../app-client'
 import type { CapabilitiesResponse } from '../generated/protocol'
 import { LABEL, PATH, tabsOf, viewOf, viewsOf, type View } from '../lib/views'
 import { Icon } from '../lib/ui'
-import { Link, navigate, type Route } from '../router'
+import { Link, type Route } from '../router'
 import Placeholder from '../screens/Placeholder'
+import SignOut from './SignOut'
 
 const ICON: Record<View, (p: { size?: number }) => React.JSX.Element> = {
   sessions: Icon.List,
@@ -68,14 +69,6 @@ export default function Shell({ route }: { route: Route }) {
   const shown = current !== null && views.includes(current)
   const title = route.name === 'not_found' ? 'Not found' : current ? LABEL[current] : 'hennery'
 
-  const signOut = async () => {
-    try {
-      await logOut(client)
-    } finally {
-      navigate('/login')
-    }
-  }
-
   return (
     <div className="app">
       <aside className="rail" aria-label="Views">
@@ -106,9 +99,7 @@ export default function Shell({ route }: { route: Route }) {
         </nav>
         <div className="rail-scroll" />
         <div className="rail-foot">
-          <button type="button" className="btn btn-ghost btn-sm" onClick={signOut}>
-            Sign out
-          </button>
+          <SignOut />
         </div>
       </aside>
       <div className="shell">
