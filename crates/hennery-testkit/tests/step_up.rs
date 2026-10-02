@@ -1,8 +1,9 @@
 //! Step-up (kernel spec §3.4, §11) and the signed-in sessions (§3.2):
 //! minting a pairing code, changing or revoking a host, replacing its path
-//! rules, changing a hat (plan 5a decisions 7 and 8) and revoking a session
-//! need a password check within the last five minutes, and are refused
-//! without one, accepted within five minutes, and refused after.
+//! rules, changing a hat (plan 5a decisions 7 and 8), re-assigning a
+//! session to another hat (plan 5d decision 2) and revoking a session need
+//! a password check within the last five minutes, and are refused without
+//! one, accepted within five minutes, and refused after.
 
 use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::Operator;
@@ -95,6 +96,12 @@ async fn minting_changing_revoking_a_host_and_revoking_a_session_need_a_fresh_pa
             404,
         ),
         ("PATCH", "/api/hats/hat-9".to_string(), Some(r#"{"name":"x"}"#), 404),
+        (
+            "PATCH",
+            "/api/sessions/s-9".to_string(),
+            Some(r#"{"hat_id":"hat-9"}"#),
+            404,
+        ),
         ("DELETE", "/api/hosts/host-9".to_string(), None, 404),
         ("DELETE", format!("/api/auth/sessions/{}", c.id_of(&other)), None, 204),
     ];
@@ -112,6 +119,9 @@ async fn minting_changing_revoking_a_host_and_revoking_a_session_need_a_fresh_pa
         let resp = send(&stale, method, path, *body).await.unwrap();
         assert_eq!(code_of(resp).await, (403, "step_up_required".into()), "{method} {path}");
     }
+    // A PATCH that names no hat needs no step-up (plan 5d decision 2).
+    let resp = send(&stale, "PATCH", "/api/sessions/s-9", Some("{}")).await.unwrap();
+    assert_eq!(resp.status(), 404);
     assert!(c.state.operator.authenticate(&other, unix_now()).unwrap().is_some());
     // A wrong password does not step up.
     assert_eq!(

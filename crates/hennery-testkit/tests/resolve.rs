@@ -823,3 +823,104 @@ async fn a_resume_re_resolves_its_cwd_and_hat_and_refuses_a_change() {
     let (status, body) = call.await.unwrap();
     assert_eq!(status, 202, "{body}");
 }
+
+/// ACP core §4.9: re-assigning a parked session moves it to another hat,
+/// with a `hat_reassigned` event; its next resume must agree with the new
+/// hat. A session in another lifecycle is refused, and so is a stale
+/// step-up (`step_up.rs`).
+#[tokio::test]
+async fn a_reassigned_session_resumes_in_its_new_hat_once_the_rules_agree() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector).await;
+    let call = start(&collector, "/home/me/acme");
+    host.answer("/home/me/acme", true).await;
+    let (session, _) = host.started().await;
+    assert_eq!(call.await.unwrap().0, 202);
+    let acme = collector.hat("Acme");
+    // The session list, by hat: (session id, hat id).
+    let listed = |hat: String| {
+        let call = send(&collector, "GET", &format!("/api/sessions?hat={hat}"), json!({}));
+        async move {
+            let (status, body) = call.await.unwrap();
+            assert_eq!(status, 200, "{body}");
+            body["sessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|s| {
+                    (
+                        s["session_id"].as_str().unwrap().to_string(),
+                        s["hat_id"].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    let default = collector.state.hosts.host(HOST).unwrap().unwrap().default_hat_id;
+    assert_eq!(listed(default.clone()).await, [(session.clone(), default.clone())]);
+    assert!(listed(acme.clone()).await.is_empty());
+    let patch = |hat: &str| {
+        send(
+            &collector,
+            "PATCH",
+            &format!("/api/sessions/{session}"),
+            json!({ "hat_id": hat }),
+        )
+    };
+    let (status, body) = patch(&acme).await.unwrap();
+    assert_eq!((status, body["code"].as_str()), (409, Some("active")), "{body}");
+
+    host.parked(&session).await;
+    wait_for("parked", || async {
+        let row = collector.state.store.session(&session).unwrap().unwrap();
+        (row.lifecycle == "parked").then_some(())
+    })
+    .await;
+    let mut stream = collector.state.hub.subscribe();
+    let (status, body) = patch(&acme).await.unwrap();
+    assert_eq!((status, body["hat_id"].as_str()), (200, Some(acme.as_str())), "{body}");
+    // Published on the session's stream, not only stored.
+    let published = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let event = stream.recv().await.unwrap();
+            if event.session_id == session && event.kind == "hat_reassigned" {
+                return event.body;
+            }
+        }
+    })
+    .await
+    .expect("hat_reassigned published within 10s");
+    assert_eq!(published, json!({ "from": default, "to": acme }));
+    let kinds: Vec<String> = collector
+        .state
+        .store
+        .events(&session, 0, 100)
+        .unwrap()
+        .into_iter()
+        .map(|e| e.kind)
+        .collect();
+    assert_eq!(kinds.last().map(String::as_str), Some("hat_reassigned"));
+    // The session list shows it under its new hat, and no longer the old.
+    assert_eq!(listed(acme.clone()).await, [(session.clone(), acme.clone())]);
+    assert!(listed(default).await.is_empty());
+
+    // The path still resolves to the host's default hat: refused.
+    let resume = || {
+        send(
+            &collector,
+            "POST",
+            &format!("/api/sessions/{session}/resume"),
+            json!({}),
+        )
+    };
+    let call = resume();
+    host.answer("/home/me/acme", true).await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!((status, body["code"].as_str()), (409, Some("hat_mismatch")), "{body}");
+    // Once a rule agrees, it resumes.
+    rule(&collector, "/home/me/acme", &acme, true);
+    let call = resume();
+    host.answer("/home/me/acme", true).await;
+    host.started().await;
+    assert_eq!(call.await.unwrap().0, 202);
+}

@@ -2502,3 +2502,40 @@ async fn the_session_list_pages_searches_filters_and_refuses_what_it_cannot_hono
     assert_eq!((status, body["code"].as_str()), (400, Some("invalid")), "{body}");
     assert_eq!(list(&format!("?q={}", "q".repeat(200))).await.0, 200);
 }
+
+/// ACP core §5.1: an attached session the collector has closed, and then
+/// re-assigned to another hat while its host was away, is closed on that
+/// host when it comes back, so no adapter of the old hat runs on.
+#[tokio::test]
+async fn a_session_closed_and_reassigned_while_its_host_was_away_is_closed_on_its_return() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let seq = host.seq;
+    host.drop_connection(&collector).await;
+    let (status, body) = post(
+        &client(&collector),
+        collector.url(&format!("/api/sessions/{session}/close")),
+        json!({}),
+    )
+    .await;
+    assert_eq!((status, body["lifecycle"].as_str()), (202, Some("closed")), "{body}");
+    let hennery_kernel::hats::HatChange::Done(acme) = collector.state.hosts.create_hat("Acme", None, 1).unwrap() else {
+        panic!("no hat");
+    };
+    let resp = client(&collector)
+        .patch(collector.url(&format!("/api/sessions/{session}")))
+        .json(&json!({ "hat_id": acme.id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let mut host = ScriptedHost::connect(&collector, vec![attached(&session, seq)], seq).await;
+    let CollectorFrame::CloseSession { session_id, .. } = host.next().await else {
+        panic!("expected the reconcile-driven close_session");
+    };
+    assert_eq!(session_id, session);
+    let row = collector.state.store.session(&session).unwrap().unwrap();
+    assert_eq!((row.lifecycle.as_str(), row.hat_id), ("closed", acme.id));
+}
