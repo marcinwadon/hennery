@@ -91,6 +91,7 @@ pub fn healthz(base: &Url) -> Health {
     let Ok(url) = base.join("/healthz") else {
         return Health::Failed(format!("{} cannot take a path", shown_url(base.as_str())));
     };
+    let https = url.scheme() == "https";
     block_on(async move {
         let client = match reqwest::Client::builder()
             .no_proxy()
@@ -114,12 +115,23 @@ pub fn healthz(base: &Url) -> Health {
                 // Without the URL: a name with "tls" in it is not a TLS
                 // failure, and a URL's credentials are not printed.
                 let err = err.without_url();
-                let chain = format!("{err:#}");
-                let why = std::error::Error::source(&err)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| err.to_string());
+                // reqwest's own text names none of its causes: the chain is
+                // walked, and the innermost cause is the one shown.
+                let mut chain = err.to_string();
+                let mut why = chain.clone();
+                let mut cause = std::error::Error::source(&err);
+                while let Some(inner) = cause {
+                    why = inner.to_string();
+                    chain = format!("{chain}: {why}");
+                    cause = inner.source();
+                }
                 let lower = chain.to_ascii_lowercase();
-                if lower.contains("certificate") || lower.contains("tls") {
+                // Over https, step 3 has just reached this address: a
+                // connect that fails, not out of time, is the handshake's,
+                // even when its words name neither TLS nor a certificate
+                // (plain http behind an https URL: "corrupt message").
+                let handshake = https && err.is_connect() && !err.is_timeout();
+                if handshake || lower.contains("certificate") || lower.contains("tls") {
                     Health::Tls(quoted(&why))
                 } else {
                     Health::Failed(quoted(&why))
@@ -239,6 +251,12 @@ fn now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+/// The `/healthz` URL as the report shows it, from the shown base URL:
+/// `up`'s has no path (`http://127.0.0.1:7117`), `host.toml`'s ends in `/`.
+pub fn health_shown(shown: &str) -> String {
+    format!("{}/healthz", shown.trim_end_matches('/'))
+}
+
 /// Check 7's steps, each stopping the check where it fails: the URL's rule,
 /// DNS, TCP, TLS, `/healthz`, then the `hello`. The collector's `Date`, or
 /// `None` when it did not answer (then check 8 cannot run); `Some(None)`
@@ -253,6 +271,7 @@ fn reach(doctor: &Doctor, host: &std::path::Path, paired: &Paired, verdict: &mut
     };
     let rejoin = "pair this host again: `hennery host join <the collector's URL>`";
     let shown = shown_url(&base);
+    let health = health_shown(&shown);
     let url = match hennery_host::pairing::parse_public_url(&base) {
         Ok(url) => url,
         Err(err) => {
@@ -296,12 +315,12 @@ fn reach(doctor: &Doctor, host: &std::path::Path, paired: &Paired, verdict: &mut
             return None;
         }
         Health::Failed(why) => {
-            verdict.fail(format!("{shown}healthz: {why}"), "check the collector's log");
+            verdict.fail(format!("{health}: {why}"), "check the collector's log");
             return None;
         }
         Health::Answered { status, .. } if status != 200 => {
             verdict.fail(
-                format!("{shown}healthz answered {status}"),
+                format!("{health} answered {status}"),
                 "check that this URL is the collector's, and its log",
             );
             return None;

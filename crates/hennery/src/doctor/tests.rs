@@ -2254,6 +2254,7 @@ fn each_step_to_the_collector_fails_on_its_own() {
     let findings = run();
     let seven = line(&findings, 7);
     assert_eq!(seven.status, Status::Fail, "{seven:?}");
+    assert!(seven.summary.contains("TLS failed"), "{seven:?}");
     assert!(not_run(&findings, 8), "{findings:?}");
     assert!(!report(&dirs, &findings).contains("canary-7d"), "{findings:?}");
     assert_eq!(
@@ -2264,6 +2265,9 @@ fn each_step_to_the_collector_fails_on_its_own() {
         collector::shown_url("https://doctor:canary-7d-secret@[127.0.0.1"),
         "an unreadable URL"
     );
+    for base in ["http://127.0.0.1:7117", "http://127.0.0.1:7117/"] {
+        assert_eq!(collector::health_shown(base), "http://127.0.0.1:7117/healthz");
+    }
 
     let old =
         "HTTP/1.1 200 OK\r\nDate: Thu, 01 Oct 2026 00:00:00 GMT\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
