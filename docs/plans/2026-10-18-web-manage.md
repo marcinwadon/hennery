@@ -29,7 +29,7 @@
 - `src/lib/manage.ts`: the classifiers (a host's state, whether a hat can be purged, a safe colour).
 - `src/hooks/useResource.ts`.
 - `e2e/host.ts`, `e2e/manage.spec.ts`: a real host paired with the command the page shows.
-- Shared files, touched minimally (4c edits them too): `App.tsx` (the `inert` wrapper), `components/Shell.tsx` (two routes and the sign-out button), `api/errors.ts` (nine messages and `Object.hasOwn`), `e2e/collector.ts` (exports `BIN`, listens for `'error'`).
+- Shared files, touched minimally (4c edits them too): `App.tsx` (the `inert` wrapper), `components/Shell.tsx` (two routes and the sign-out button), `api/errors.ts` (nine messages and `Object.hasOwn`), `e2e/collector.ts` (exports `BIN` and `scratchEnv`, runs the collector in the scratch environment, listens for `'error'`).
 
 **Tech Stack:** as plan 4b: React 19.3.0, TypeScript 7.0.2, Vite 8.3.1, Tailwind 4.3.3, Vitest 5.0.3, Testing Library, `@playwright/test` 1.63.0 with the flake's Chromium. pnpm only.
 
@@ -40,7 +40,7 @@
 
 It builds on [plan 4b](2026-10-16-web-shell.md) (the client, `useClient`, `ApiFailure`, `messageOf`, the router, the step-up dialog, `startCollector()`) and takes up the frontend hand-offs of plans 3a, 3b-i, 5a, 5b, 5c, 9c and 9d (see "Where the hand-offs land"). Every anchor was taken from `main` at `ecc50cd0`.
 
-**Status:** written 2026-10-02. Amended after the security review of 2026-10-02 (A1–A6 and O1–O5 taken, O6 in part, O7 recorded). Its scoped re-confirmation (a fresh opus subagent, 2026-10-02) found every amendment in the code and re-confirmed with notes, both taken: R1 (required), the browser check's scripted focus aimed at a button that is disabled while the action waits, so it proved nothing; it now aims at the confirmation itself. R2, the Shift+Tab check first asserts no passkey is offered, so the password is the dialog's first field. It judged the Tab trap's wider selector sound for every dialog this plan renders.
+**Status:** written 2026-10-02. Amended after the security review of 2026-10-02 (A1–A6 and O1–O5 taken, O6 in part, O7 recorded). Its scoped re-confirmation (a fresh opus subagent, 2026-10-02) found every amendment in the code and re-confirmed with notes, both taken: R1 (required), the browser check's scripted focus aimed at a button that is disabled while the action waits, so it proved nothing; it now aims at the confirmation itself. R2, the Shift+Tab check first asserts no passkey is offered, so the password is the dialog's first field. It judged the Tab trap's wider selector sound for every dialog this plan renders. The per-task reviews of the execution then fixed focus, stale reads and the browser checks' environment (four `fix(web)` commits; see "Execution status"); the whole-branch review (opus) judged that they tighten what the security review ruled on and loosen nothing, so they need no further re-confirmation.
 
 **How the code blocks were made and checked:**
 - Nothing is imported from the predecessor (decision 1): every file is new or a change to 4b's, embedded verbatim.
@@ -138,7 +138,7 @@ Optional hardening taken: O1 (read before minting), O2 (count from arrival), O3 
 11. **Hats (kernel §5, 5a).**
     - Creating needs no step-up; renaming, recolouring and "make default for new hosts" do (`PATCH /api/hats/{id}`). Only purging is confirmed first (frontend §8); the others are undone as easily as done.
     - Only one hat is the default for new hosts: after one is made so, the others lose the mark.
-    - Each answer is folded into the list as it is when it lands, not as it was when the action began, so two changes that land together both stay (amended after the Task 3 review). Focus returns to "Edit" after an edit, to the card's title once "Make default for new hosts" is gone, and to the name after a hat is created.
+    - Each answer is folded into the list as it is when it lands, not as it was when the action began, so two changes that land together both stay (amended after the Task 3 review). A name of spaces only cannot be saved (amended after the whole-branch review). Focus returns to "Edit" after an edit, to the card's title once "Make default for new hosts" is gone, and to the name after a hat is created.
     - A hat being purged (`purging`) can be neither edited nor made a default; its button reads "Resume purge".
 12. **Path rules and the tester (kernel §5.2; 5a, 5b).**
     - **The set:** a host's rules are edited as rows and sent whole (`PUT …/path-rules`, step-up). The answer is the set as the host resolved and stored it, which replaces the rows: a typed `/tmp/x` comes back as `/private/tmp/x`, and the next edit starts from that.
@@ -160,11 +160,11 @@ Optional hardening taken: O1 (read before minting), O2 (count from arrival), O3 
       The first two disable the confirm button; the card's "Purge" is disabled for a default hat already.
     - **Sessions with no hat** are listed as links: no purge deletes them; the operator re-assigns or deletes them one by one (4c's screens).
     - **A tried purge**, finished or not, reads the hats again, so a hat the server froze offers "Resume purge" (amended after the Task 3 review).
-    - **Afterwards** a notice shows what was deleted, the sessions deleted while their host was away (`unconfirmed`, as text: they no longer exist), and the agents' transcripts on the hosts: removed, removed in part, still to remove.
+    - **Afterwards** a notice, which takes focus (the purged card and its button are gone; amended after the whole-branch review), shows what was deleted, the sessions deleted while their host was away (`unconfirmed`, as text: they no longer exist), and the agents' transcripts on the hosts: removed, removed in part, still to remove.
 15. **The browser checks run a real host, hermetically (frontend §12).**
     - **Pairing:** the test reads the command from the page and runs it, `hennery host join <url> <code>`, adding `--name` and `--no-runtime` (no adapter download), with `HENNERY_HOST_DATA_DIR`, `HOME` and the `XDG_*` directories in a fresh directory (amended: O4). It then runs `hennery host run` with one stand-in agent (`--agent stand-in=<the binary>`, a path that exists everywhere), which is never started, so the host connects without any adapter set. The tester resolves real paths through it.
     - **Step-up on revoke:** a session is stepped up for 5 minutes after setup, so no real 403 comes during the run. The test answers the first `DELETE /api/hosts/{id}` with 403 `step_up_required` (`page.route`) and lets the retry reach the server. That the server refuses an unstepped revoke is the Rust tests' (`step_up.rs`).
-    - **Both widths** run the same three checks, each with a collector and a host of its own, then check that no page broke the Content-Security-Policy, by the console and by `securitypolicyviolation` events, as 4b's checks do.
+    - **Both widths** run the same three checks, each with a collector and a host of its own, then check that no page broke the Content-Security-Policy: by the console on every page, and by `securitypolicyviolation` events on the last page loaded (an init script's list starts again on each navigation), as 4b's checks do.
     - **Every binary the checks start** (the collector, `host join`, `host run`) runs in `scratchEnv(dir)`: the runner's environment with every `HENNERY_*` variable removed, and `HOME` and `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` in the test's directory. A sentinel `HENNERY_LOG_DIR` set in the runner's own environment must stay empty (amended after the Task 4 review: the collector inherited the runner's environment, and with it a log directory or `HENNERY_SERVICE`'s home logs). `host run`'s standard error is shown when it fails.
     - Every process is stopped by its own id, SIGTERM then SIGKILL, the `join` included (amended: A5), and every directory is removed, on every path. A process that never started is not waited for.
     - **`inert` in Chromium** (amended: O4, then at the re-confirmation): while the step-up dialog is open, the page under it is `inert`; focus is in the dialog; a script's `focus()` on the confirmation itself leaves it there (not on its buttons: they are disabled while its action waits, and a disabled button takes no focus, `inert` or not); and Shift+Tab from the dialog's first field, the password while no passkey is offered (asserted), lands nowhere on the page. A click on the covered confirmation is not checked: Playwright refuses it because the overlay is on top, `inert` or not, so it proved nothing.
@@ -178,7 +178,7 @@ Optional hardening taken: O1 (read before minting), O2 (count from arrival), O3 
   No Rust file changes, so the Rust checks stand as on `main`; CI runs them.
 - pnpm only; no new dependency, so `pnpm-lock.yaml` does not change.
 - **Repository hygiene** (public repository), before every commit: the contract's two greps (tracked text, and `web/` with binary files) find none of the predecessor's name, the two company names, the commercial font's name, or home-directory paths. Commit subjects say what the code does.
-- Shared files (`App.tsx`, `Shell.tsx`, `errors.ts`) change by small hunks only: 4c edits them too.
+- Shared files (`App.tsx`, `Shell.tsx`, `errors.ts`, `e2e/collector.ts`) change by small hunks only: 4c edits them too.
 
 ## Review Focus
 
@@ -201,16 +201,17 @@ Optional hardening taken: O1 (read before minting), O2 (count from arrival), O3 
 
 | Path | Responsibility | Task |
 |---|---|---|
-| `web/src/lib/text.tsx` (new) | `visible`, `<Text>` | 1 |
-| `web/src/api/errors.ts` | nine messages; `Object.hasOwn` | 1 |
+| `web/src/lib/text.tsx`, `web/src/lib/text.test.tsx` (new) | `visible`, `<Text>` | 1 |
+| `web/src/api/errors.ts`, `web/src/api/client.test.ts` | nine messages; `Object.hasOwn` | 1 |
+| `web/src/components/When.test.tsx`, `web/src/components/SignOut.test.tsx` (new), `web/src/components/StepUpDialog.test.tsx` | A time, escaped; sign-out; the `inert` page | 1 |
 | `web/src/components/{ConfirmDialog,SignOut,When}.tsx` (new), `web/src/components/ConfirmDialog.test.tsx` (new) | The confirmation, sign-out, a time | 1 |
 | `web/src/hooks/useResource.ts`, `web/src/hooks/useResource.test.ts` (new) | One server read per screen | 1 |
 | `web/src/App.tsx`, `web/src/components/Shell.tsx` | The `inert` page; the sign-out button; the two routes | 1, 2, 3 |
 | `web/src/security.test.ts` | No literal hidden characters | 1 |
-| `web/src/api/manage.ts`, `web/src/lib/manage.ts` (new) | The routes; the classifiers | 2 |
-| `web/src/components/Pairing.tsx`, `web/src/screens/Hosts.tsx`, `web/src/manage.css` (new) | Hosts | 2 |
+| `web/src/api/manage.ts`, `web/src/lib/manage.ts`, `web/src/lib/manage.test.ts` (new) | The routes; the classifiers | 2 |
+| `web/src/components/Pairing.tsx`, `web/src/screens/Hosts.tsx`, `web/src/screens/Hosts.test.tsx`, `web/src/manage.css` (new) | Hosts | 2 |
 | `web/src/test-fixtures.ts`, `web/src/test-targets.ts` (new) | One of each item, every field set; the narrow screen's 44 px rules read into jsdom | 2 |
-| `web/src/components/PathRules.tsx`, `web/src/screens/Hats.tsx` (new) | Hats | 3 |
+| `web/src/components/PathRules.tsx`, `web/src/screens/Hats.tsx`, `web/src/screens/Hats.test.tsx` (new) | Hats | 3 |
 | `web/e2e/host.ts`, `web/e2e/manage.spec.ts` (new), `web/e2e/collector.ts` | Playwright | 4 |
 
 All commands run from the repository root inside the dev shell (`nix develop -c …`). Work on a feature branch off `main`.
@@ -480,6 +481,31 @@ with:
     it('closes on Escape, as a cancel', async () => {
   ```
 
+Create `web/src/components/When.test.tsx`:
+
+  ```tsx
+  import { render, screen } from '@testing-library/react'
+  import { describe, expect, it } from 'vitest'
+  import When from './When'
+
+  describe('a server time', () => {
+    it('shows one it cannot read as the server sent it, escaped, in its text and its attributes', () => {
+      render(<When at={'2026\u202e-10-02'} />)
+      const time = screen.getByText('2026<U+202E>-10-02')
+      expect(time.tagName).toBe('TIME')
+      expect(time).toHaveAttribute('dateTime', '2026<U+202E>-10-02')
+      expect(time).toHaveAttribute('title', '2026<U+202E>-10-02')
+    })
+
+    it('shows one it can read in this browser’s own words, the exact value a hover away', () => {
+      render(<When at="2026-10-02T12:00:00Z" />)
+      const time = screen.getByTitle('2026-10-02T12:00:00Z')
+      expect(time).toHaveAttribute('dateTime', '2026-10-02T12:00:00Z')
+      expect(time).toHaveTextContent(new Date('2026-10-02T12:00:00Z').toLocaleString())
+    })
+  })
+  ```
+
 Create `web/src/hooks/useResource.test.ts`:
 
   ```ts
@@ -640,7 +666,7 @@ with:
 - [ ] **Step 2: Run them, and see them fail**
 
   Run: `nix develop -c pnpm --dir web test`
-  Expected: `text.test.tsx`, `ConfirmDialog.test.tsx`, `useResource.test.ts` and `SignOut.test.tsx` fail (their modules do not exist); the new rows of `client.test.ts` (the nine messages, the inherited names) and the `inert` test fail.
+  Expected: `text.test.tsx`, `ConfirmDialog.test.tsx`, `When.test.tsx`, `useResource.test.ts` and `SignOut.test.tsx` fail (their modules do not exist); the new rows of `client.test.ts` (the nine messages, the inherited names) and the `inert` test fail.
 
 - [ ] **Step 3: The code**
 
@@ -1043,7 +1069,7 @@ Create `web/src/lib/text.tsx`:
 - [ ] **Step 4: Run the checks**
 
   Run: `nix develop -c sh -c 'pnpm --dir web typecheck && pnpm --dir web test'`
-  Expected: all pass. 191 Vitest tests.
+  Expected: all pass. 193 Vitest tests.
 
 - [ ] **Step 5: Revert-probes** (each must fail the named test file; restore after each; all were run)
   - `text.tsx`: drop `\p{Cf}`, then `\p{Cc}`, then `\p{Zl}\p{Zp}`, then `\p{Default_Ignorable_Code_Point}` from `HIDDEN` (each fails `text.test.tsx`); `<bdi>` → `<span>` (`text.test.tsx`); render `children` unescaped (`Hosts.test.tsx`'s escaped name).
@@ -1052,6 +1078,7 @@ Create `web/src/lib/text.tsx`:
   - `App.tsx`: drop `inert={…}` (`StepUpDialog.test.tsx`).
   - `SignOut.tsx`: drop the `return` after a failure, so it navigates anyway; drop `navigate('/login')` (each fails `SignOut.test.tsx`).
   - `ConfirmDialog.tsx`: Cancel runs the action; close on a failure; drop the focus return; drop `|| disabled`; drop the Tab trap; drop the dialog's own focus while the action runs (each fails `Hosts.test.tsx` or `Hats.test.tsx`); the Tab trap's selector back to buttons, links and inputs only; drop the backdrop's focus hold; a fixed title id; drop the `returnFocus` fallback (each fails `ConfirmDialog.test.tsx`).
+  - `When.tsx`: show the server's time unescaped (`When.test.tsx`).
   - `useResource.ts`: keep the old key's data; drop it on a reload of the same key; `set` taking only a value (each fails `useResource.test.ts`).
 
 - [ ] **Step 6: Commit**
@@ -2384,7 +2411,7 @@ Create `web/src/screens/Hosts.tsx`:
 - [ ] **Step 4: Run the checks**
 
   Run: `nix develop -c sh -c 'pnpm --dir web typecheck && pnpm --dir web test'`
-  Expected: all pass. 234 Vitest tests.
+  Expected: all pass. 236 Vitest tests.
 
 - [ ] **Step 5: Revert-probes** (each must fail the named test file; all were run)
   - `manage.ts`: drop the revoked line; `connected` always online; always offline (each an outcome of `hostState`; `manage.test.ts`).
@@ -2395,7 +2422,7 @@ Create `web/src/screens/Hosts.tsx`:
     - the hosts before the mint taken as none ("tells a new host from those before it even when the list never loaded");
     - the command from `location.origin` ("steps up, then shows the code and the exact command").
   - `Hosts.tsx`: mint before the reads ("reads the URL and the hosts before minting"); drop the `pagehide` listener; actions on a revoked host; drop the revoke dialog's sentence about running agents; drop the default-hat warning; drop each `returnFocus` (the revoked card's title, Rename) and the title's `tabIndex`; compare the untrimmed name; drop the hats' error; keep a spent code, at its expiry and on pairing; one panel for every code (each fails `Hosts.test.tsx`).
-  - `Pairing.tsx`: drop the read-in-flight skip ("reads the hosts once at a time").
+  - `Pairing.tsx`: drop the read-in-flight skip ("reads the hosts once at a time"); `onPaired` not reloading the list; `replace` not called after a revoke.
   - `manage.css`: drop `.manage-head .btn` from the 44 px rule ("every button and picker at least 44 px").
   - `manage.ts` (`purgeState`, `isDefault`, `safeColour`; tested here, used in Task 3): drop each of the `default`, `running` and `resume` lines, and answer `resume` for `ready` (four outcomes); `isDefault` without the hosts' defaults; `COLOUR` as `/^#/` (each fails `manage.test.ts`).
 
@@ -2551,6 +2578,16 @@ Create `web/src/screens/Hats.test.tsx`:
       await waitFor(() => expect(within(dayJob).getByRole('button', { name: 'Edit' })).toHaveFocus())
     })
 
+    it('cannot save a name of spaces only', async () => {
+      const server = open({})
+      const work = await screen.findByRole('listitem', { name: 'Work' })
+      await userEvent.click(within(work).getByRole('button', { name: 'Edit' }))
+      await userEvent.clear(within(work).getByRole('textbox', { name: 'Name' }))
+      await userEvent.type(within(work).getByRole('textbox', { name: 'Name' }), '   ')
+      expect(within(work).getByRole('button', { name: 'Save' })).toBeDisabled()
+      expect(sent(server, 'PATCH', '/api/hats/hat-b')).toHaveLength(0)
+    })
+
     it('puts focus on the card’s title once “Make default for new hosts” is gone', async () => {
       open({ 'PATCH /api/hats/hat-b': json(200, hat({ default_for_new_hosts: true })) })
       const work = await screen.findByRole('listitem', { name: 'Work' })
@@ -2608,6 +2645,18 @@ Create `web/src/screens/Hats.test.tsx`:
       expect(outcome).toHaveTextContent('s-9')
       expect(outcome).toHaveTextContent('2 removed, 0 removed in part, 1 still to remove')
       expect(sent(server, 'POST', '/api/hats/hat-b/purge')).toHaveLength(2)
+    })
+
+    it('puts focus on what the purge deleted, once the dialog has gone', async () => {
+      open({
+        'GET /api/hats/hat-b/purge': json(200, preview()),
+        'POST /api/hats/hat-b/purge': json(200, result),
+      })
+      await userEvent.click(within(await screen.findByRole('listitem', { name: 'Work' })).getByRole('button', { name: 'Purge' }))
+      await userEvent.click(within(await screen.findByRole('dialog', { name: 'Purge this hat?' })).getByRole('button', { name: 'Purge' }))
+      const outcome = await screen.findByRole('status', { name: 'Purged Work' })
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+      await waitFor(() => expect(within(outcome).getByRole('heading', { name: 'Purged Work' })).toHaveFocus())
     })
 
     it('cannot purge while a session runs, and names it', async () => {
@@ -3429,7 +3478,7 @@ Create `web/src/screens/Hats.tsx`:
               <span className="field-label">Colour</span>
               <input type="color" className="colour-input" value={colour} onChange={(e) => setColour(e.target.value.toLowerCase())} />
             </label>
-            <button type="submit" className="btn btn-primary btn-sm" disabled={busy}>
+            <button type="submit" className="btn btn-primary btn-sm" disabled={busy || name.trim() === ''}>
               Save
             </button>
             <button type="button" className="btn btn-ghost btn-sm" onClick={closeForm} disabled={busy}>
@@ -3631,9 +3680,13 @@ Create `web/src/screens/Hats.tsx`:
 
   function PurgeOutcome({ name, result, onClose }: { name: string; result: PurgeResult; onClose: () => void }) {
     const t = result.host_transcripts
+    // The purged hat's card, and the button that opened the dialog, are
+    // gone: focus comes here.
+    const title = useRef<HTMLHeadingElement>(null)
+    useEffect(() => title.current?.focus(), [])
     return (
       <section className="card notice" aria-labelledby="purged-title" role="status">
-        <h2 className="card-title" id="purged-title">
+        <h2 className="card-title" id="purged-title" ref={title} tabIndex={-1}>
           Purged <Text>{name}</Text>
         </h2>
         <p>
@@ -3666,7 +3719,7 @@ Create `web/src/screens/Hats.tsx`:
 - [ ] **Step 4: Run the checks**
 
   Run: `nix develop -c sh -c 'pnpm --dir web typecheck && pnpm --dir web test'`
-  Expected: all pass. 270 Vitest tests.
+  Expected: all pass. 274 Vitest tests.
 
 - [ ] **Step 5: Revert-probes** (each must fail `Hats.test.tsx`; all were run)
   - `Hats.tsx`: drop the dialog's `disabled={blocked}`; the card's purge button enabled for a default hat.
@@ -3680,7 +3733,7 @@ Create `web/src/screens/Hats.tsx`:
     - drop the purge or the save from the tester's dependencies, or from the rules' key ("reads the rules again after a purge", "asks again after the rules are saved");
     - drop the blank-path check or its words; drop the tester's reset to idle; nest its answer in a second live region;
     - drop the focus move after removing a rule.
-  - `Hats.tsx`: fold an answer into the list as it was when the action began (both updaters); drop each focus return (Edit, the title and its `tabIndex`, the name); drop the hosts' error; drop the reload when the purge dialog closes.
+  - `Hats.tsx`: fold an answer into the list as it was when the action began (both updaters); keep the other hats' default mark when one is made the default; `replace` not called after a rename; `onPurged` dropped; drop the outcome's focus or its `tabIndex`; let a name of spaces be saved; drop each focus return (Edit, the title and its `tabIndex`, the name); drop the hosts' error; drop the reload when the purge dialog closes.
   - `manage.css`: drop `.colour-input` from the 44 px rule.
 
 - [ ] **Step 6: Commit**
