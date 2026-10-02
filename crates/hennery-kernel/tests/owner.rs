@@ -211,6 +211,8 @@ fn a_3b_ii_database_keeps_its_owner_or_gets_one() {
             expected.insert("owner_id".into(), Value::Text(owner.clone()));
             if table == "hosts" {
                 expected.insert("default_hat_id".into(), Value::Text(default_hat.clone()));
+                // Plan 6c's migration: no roots until a host reports some.
+                expected.insert("workspace_roots".into(), Value::Text("[]".into()));
             }
             assert_eq!(named_rows(&conn, table), vec![expected], "{table}");
         }
@@ -506,6 +508,7 @@ fn another_owners_hosts_and_codes_are_invisible_to_the_registry() {
     hosts
         .record_hello("host-b2", "9.9.9", &Capabilities::default(), NOW + 5)
         .unwrap();
+    hosts.record_workspace_roots("host-b2", &["/theirs".into()]).unwrap();
     assert_eq!(
         hosts.enroll("BBBB-BBBB", &enrollment(3), NOW).unwrap(),
         EnrollOutcome::InvalidCode

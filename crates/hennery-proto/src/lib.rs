@@ -5,6 +5,7 @@
 //! ACP payloads travel inside them as raw JSON and are never modelled here.
 
 pub mod frames;
+pub mod paths;
 pub mod rest;
 
 /// Version of the host<->collector protocol, `MAJOR.MINOR`. Sent only in

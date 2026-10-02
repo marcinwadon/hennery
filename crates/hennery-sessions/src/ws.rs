@@ -62,6 +62,7 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
         host_id,
         proof,
         capabilities,
+        workspace_roots,
         attached_sessions,
     }) = hello
     else {
@@ -114,6 +115,8 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
             .await;
         return;
     };
+    // A new connection may bring other workspace roots (decision 10).
+    state.projects.forget(&host_id);
     // A revoke that landed after the proof was checked but before this
     // registration found no connection to close: this one must not live
     // on to reconcile what the revoke parked (kernel spec §4.3).
@@ -277,6 +280,11 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                 code,
                 message,
             } => {
+                // A probe of this connection is answered by its rejection;
+                // it has nothing to undo (ACP core §3.3).
+                if state.hub.probe_rejected(conn_id, &request_id, &code, &message) {
+                    continue;
+                }
                 if let Some(session_id) = reconcile_closes.remove(&request_id) {
                     if code == "not_attached" {
                         match state.store.close_after_rejected_reconcile_close(&session_id) {
@@ -343,6 +351,12 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                         for event in done.events {
                             state.hub.publish(event);
                         }
+                        // Only a reconciled connection's roots are stored
+                        // (decision 7), before the host is listed as
+                        // connected with them.
+                        if let Err(err) = state.hosts.record_workspace_roots(&host_id, &workspace_roots) {
+                            tracing::warn!(%host_id, error = %err, "recording the host's workspace roots failed");
+                        }
                         for session_id in done.close {
                             let request_id = uuid::Uuid::now_v7().to_string();
                             reconcile_closes.insert(request_id.clone(), session_id.clone());
@@ -375,6 +389,11 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                 }
             }
             HostFrame::ResendComplete => tracing::warn!(%host_id, "ignoring repeated resend_complete"),
+            // Probe replies answer the probe of this connection that they
+            // name, if it still waits (ACP core §3.3).
+            frame @ (HostFrame::Projects { .. } | HostFrame::Directory { .. }) => {
+                state.hub.probe_reply(&host_id, conn_id, frame);
+            }
             HostFrame::Hello { .. } => tracing::warn!(%host_id, "ignoring repeated hello"),
         }
     }

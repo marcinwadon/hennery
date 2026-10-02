@@ -3,7 +3,7 @@
 //! the collector still accepts is left alone, and one it revoked pairs anew.
 
 use hennery_host::HostConfig;
-use hennery_host::identity::{KEY_FILE, Paired};
+use hennery_host::identity::{CONFIG_FILE, KEY_FILE, Paired};
 use hennery_host::pairing::{Joined, join};
 use hennery_kernel::hosts::{EnrollOutcome, Enrollment, HelloCheck, Hosts};
 use hennery_kernel::operator::Operator;
@@ -223,6 +223,28 @@ async fn joining_again_after_a_revoke_pairs_anew_and_moves_the_old_outbox_aside(
     let hosts = collector.state.hosts.list().unwrap();
     assert_eq!(hosts.len(), 2);
     assert!(hosts.iter().any(|h| h.id == old_id && h.revoked_at.is_some()));
+}
+
+/// Decision 6: a re-pair rewrites the pairing in `host.toml` and keeps the
+/// operator's workspace roots.
+#[tokio::test]
+async fn joining_again_after_a_revoke_keeps_the_workspace_roots() {
+    let collector = Collector::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let old_id = joined(&collector, dir.path()).await;
+    let config = dir.path().join(CONFIG_FILE);
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("workspace_roots = [\"/srv/projects\", \"~/src\"]\n");
+    std::fs::write(&config, text).unwrap();
+    collector
+        .state
+        .hosts
+        .revoke(&old_id, hennery_kernel::secret::unix_now())
+        .unwrap();
+    let new_id = joined(&collector, dir.path()).await;
+    let paired = Paired::load(dir.path()).unwrap().unwrap();
+    assert_eq!(paired.host_id, new_id);
+    assert_eq!(paired.workspace_roots, ["/srv/projects", "~/src"]);
 }
 
 /// Two collectors on loopback count as one (the all-in-one collector may

@@ -175,6 +175,11 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         FOREIGN KEY (host_id, owner_id) REFERENCES hosts(id, owner_id),
         FOREIGN KEY (hat_id, owner_id) REFERENCES hats(id, owner_id));
     ",
+    // The project picker (kernel spec §1.1; plan 6c decision 7): the
+    // workspace roots a host's reconciled connection reported, as JSON.
+    "
+    ALTER TABLE hosts ADD COLUMN workspace_roots TEXT NOT NULL DEFAULT '[]';
+    ",
 ];
 
 #[cfg(test)]
@@ -288,5 +293,33 @@ mod tests {
             passkeys,
             [("passkey-0000000000000001".to_string(), "laptop".to_string())]
         );
+    }
+
+    /// Plan 6c: the roots a host reported survive every later migration.
+    /// It passes trivially until a later migration rebuilds `hosts`; then
+    /// it fails unless that rebuild carries the column across.
+    #[test]
+    fn workspace_roots_survive_every_later_migration() {
+        let added = MIGRATIONS
+            .iter()
+            .position(|m| m.contains("ADD COLUMN workspace_roots"))
+            .unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate_component(&mut conn, COMPONENT, &MIGRATIONS[..=added]).unwrap();
+        conn.execute(
+            "INSERT INTO hosts(id, owner_id, name, public_key, platform, host_version, default_hat_id, created_at,
+                               workspace_roots)
+             SELECT 'host-1', s.owner_id, 'n', 'k', 'p', 'v', s.value, 0, '[\"/srv/projects\"]'
+             FROM settings s WHERE s.key = 'default_hat_id'",
+            [],
+        )
+        .unwrap();
+        crate::db::migrate_component(&mut conn, COMPONENT, MIGRATIONS).unwrap();
+        let roots: String = conn
+            .query_row("SELECT workspace_roots FROM hosts WHERE id = 'host-1'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(roots, "[\"/srv/projects\"]");
     }
 }

@@ -107,6 +107,7 @@ async fn hello(ws: &mut Ws, host_id: &str, proof: String) -> CollectorFrame {
             host_id: host_id.into(),
             proof,
             capabilities: Default::default(),
+            workspace_roots: vec![],
             attached_sessions: vec![],
         })
         .unwrap(),

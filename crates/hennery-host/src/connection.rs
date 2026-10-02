@@ -6,6 +6,7 @@
 
 use crate::identity::HostKey;
 use crate::outbox::Outbox;
+use crate::projects::Probes;
 use crate::session::{self, AgentCommand, Answer, Attach, Launch, SessionCmd, SessionHandle, SessionOptions};
 use crate::uplink::Uplink;
 use anyhow::{Context, Result, bail};
@@ -46,6 +47,14 @@ pub struct HostConfig {
     /// A connection that stays up this long resets the reconnect backoff,
     /// even if nothing was acked (an idle host sends nothing to ack).
     pub healthy_after: Duration,
+    /// Where projects are enumerated, and browsing is allowed (ACP core §7):
+    /// absolute, as configured (`projects::workspace_roots`). Reported in
+    /// `hello`.
+    pub workspace_roots: Vec<PathBuf>,
+    /// The host user's home directory (`projects::home_dir`): browsing is
+    /// allowed under it too. None unless set, so no test reads the real one;
+    /// `hennery host run` sets it.
+    pub home: Option<PathBuf>,
 }
 
 impl HostConfig {
@@ -63,7 +72,17 @@ impl HostConfig {
             idle_timeout: session::IDLE_TIMEOUT,
             connect_timeout: Duration::from_secs(10),
             healthy_after: Duration::from_secs(60),
+            workspace_roots: Vec::new(),
+            home: None,
         }
+    }
+
+    /// `hello.workspace_roots`: the roots as configured.
+    pub fn reported_roots(&self) -> Vec<String> {
+        self.workspace_roots
+            .iter()
+            .filter_map(|root| root.to_str().map(str::to_string))
+            .collect()
     }
 
     /// Options for every session actor this host spawns.
@@ -101,11 +120,13 @@ pub async fn run_until(cfg: HostConfig, shutdown: impl Future<Output = ()>) -> R
     let outbox = Outbox::open(&cfg.data_dir.join(crate::outbox::FILE))?;
     let (uplink, mut replies) = Uplink::new(outbox);
     let sessions: Sessions = Arc::new(Mutex::new(SessionMap::default()));
+    // Outlives each connection, so its bounds hold across reconnects.
+    let probes = Probes::default();
     // Ends only when the collector says this host is revoked.
     let serve = async {
         let mut backoff = cfg.reconnect_min;
         loop {
-            if let Err(err) = connect_once(&cfg, &uplink, &sessions, &mut replies, &mut backoff).await {
+            if let Err(err) = connect_once(&cfg, &uplink, &sessions, &probes, &mut replies, &mut backoff).await {
                 if revoked(&err) {
                     return err;
                 }
@@ -183,10 +204,13 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 /// rather than being displaced by a probe that never sends `resend_complete`
 /// and holds nothing open.
 pub async fn probe(collector_url: &str, host_id: &str, key: &HostKey) -> Result<Standing> {
+    // No roots: the collector stores them only from a reconciled
+    // connection, which a probe never becomes (decision 7).
     let (mut sink, _stream, answer) = handshake(
         collector_url,
         host_id,
         key,
+        Vec::new(),
         || Ok(Vec::new()),
         PROBE_TIMEOUT,
         PROBE_TIMEOUT,
@@ -219,6 +243,7 @@ async fn handshake(
     collector_url: &str,
     host_id: &str,
     key: &HostKey,
+    workspace_roots: Vec<String>,
     attached: impl FnOnce() -> Result<Vec<AttachedSession>>,
     connect_timeout: Duration,
     read_timeout: Duration,
@@ -248,10 +273,11 @@ async fn handshake(
             host_version: env!("CARGO_PKG_VERSION").into(),
             host_id: host_id.to_string(),
             proof: key.sign_hello(&nonce, host_id, PROTOCOL_VERSION),
-            // Every hennery host can park, and take images: a session whose
-            // agent offers none refuses them (plan 6a, decision 2).
-            // `projects` comes with the probes.
-            capabilities: Capabilities(vec![Capability::Park, Capability::Images]),
+            // Every hennery host can park, take images (a session whose
+            // agent offers none refuses them, plan 6a decision 2) and serve
+            // the project picker (browsing under home works without roots).
+            capabilities: Capabilities(vec![Capability::Park, Capability::Images, Capability::Projects]),
+            workspace_roots,
             attached_sessions: attached()?,
         },
     )
@@ -288,6 +314,7 @@ async fn connect_once(
     cfg: &HostConfig,
     uplink: &Uplink,
     sessions: &Sessions,
+    probes: &Probes,
     replies: &mut mpsc::UnboundedReceiver<HostFrame>,
     backoff: &mut Duration,
 ) -> Result<()> {
@@ -295,6 +322,7 @@ async fn connect_once(
         &cfg.collector_url,
         &cfg.host_id,
         &cfg.key,
+        cfg.reported_roots(),
         || attached_sessions(uplink, sessions),
         cfg.connect_timeout,
         cfg.read_timeout,
@@ -363,7 +391,7 @@ async fn connect_once(
                                 // accumulated from earlier failed attempts.
                                 *backoff = cfg.reconnect_min;
                             }
-                            handle(cfg, uplink, sessions, frame)?
+                            handle(cfg, uplink, sessions, probes, frame)?
                         }
                         Err(err) => tracing::warn!(error = %err, "ignoring unknown or invalid frame"),
                     },
@@ -511,7 +539,13 @@ fn spawn_or_restart(
         .insert(req.session_id, session::launch(uplink.clone(), launch, options));
 }
 
-fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: CollectorFrame) -> Result<()> {
+fn handle(
+    cfg: &HostConfig,
+    uplink: &Uplink,
+    sessions: &Sessions,
+    probes: &Probes,
+    frame: CollectorFrame,
+) -> Result<()> {
     match frame {
         CollectorFrame::StartSession {
             request_id,
@@ -638,6 +672,13 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
             Answer::Elicitation { action, content },
         ),
         CollectorFrame::Ack { session_id, ack_seq } => uplink.ack(&session_id, ack_seq)?,
+        // Probes (ACP core §3.3, §7), answered from blocking threads.
+        CollectorFrame::ListProjects { request_id } => {
+            probes.list(uplink, request_id, cfg.workspace_roots.clone(), cfg.home.clone())
+        }
+        CollectorFrame::BrowseDirectory { request_id, path } => {
+            probes.browse(uplink, request_id, path, cfg.workspace_roots.clone(), cfg.home.clone())
+        }
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }
     Ok(())

@@ -264,6 +264,40 @@ fn a_malformed_host_version_on_hello_is_ignored_but_last_seen_and_capabilities_s
     }
 }
 
+/// Plan 6c decision 7: the roots stored are those that can be shown, at
+/// most `MAX_ROOTS`, and a later report replaces them.
+#[test]
+fn workspace_roots_keep_only_what_can_be_shown() {
+    let hosts = Hosts::open_in_memory().unwrap();
+    hosts.register("host-1", &enrollment(&key(1)), NOW).unwrap();
+    assert!(hosts.host("host-1").unwrap().unwrap().workspace_roots.is_empty());
+    let reported: Vec<String> = [
+        "/srv/projects",
+        "relative",
+        "~/src",
+        "/with\nnewline",
+        "/lap\u{202E}top",
+        &format!("/{}", "x".repeat(4096)),
+        "/home/u",
+    ]
+    .iter()
+    .map(|r| r.to_string())
+    .collect();
+    hosts.record_workspace_roots("host-1", &reported).unwrap();
+    assert_eq!(
+        hosts.host("host-1").unwrap().unwrap().workspace_roots,
+        ["/srv/projects", "/home/u"]
+    );
+    let many: Vec<String> = (0..40).map(|n| format!("/r{n}")).collect();
+    hosts.record_workspace_roots("host-1", &many).unwrap();
+    assert_eq!(
+        hosts.host("host-1").unwrap().unwrap().workspace_roots,
+        many[..hennery_kernel::hosts::MAX_ROOTS]
+    );
+    hosts.record_workspace_roots("host-1", &[]).unwrap();
+    assert!(hosts.list().unwrap()[0].workspace_roots.is_empty());
+}
+
 /// The vector `hennery-host`'s signer is checked against too: a fixed key,
 /// nonce and host id give this exact signature (Ed25519 is deterministic).
 const VECTOR_SIGNATURE: &str = "bd2b7388413c333e9ed69c330b4a8be8ffb6228609979b30607236fcdefab259\

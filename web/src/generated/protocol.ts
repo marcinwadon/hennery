@@ -54,6 +54,22 @@ pending?: PendingExtract | null, };
 
 export type SessionBody = { "kind": "session_started", request_id: string, agent_session_id: string, indexed: Indexed, } | { "kind": "start_failed", request_id: string, code: string, message: string, } | { "kind": "turn_started", request_id: string, turn_id: string, } | { "kind": "acp_update", indexed: Indexed, payload: unknown, } | { "kind": "turn_ended", turn_id: string, outcome: TurnOutcome, stop_reason?: string | null, error?: string | null, } | { "kind": "session_parked", reason: ParkReason, } | { "kind": "session_closed" } | { "kind": "adapter_exited", code?: number | null, signal?: number | null, stderr_tail: string, } | { "kind": "host_note", note: string, text: string, } | { "kind": "config_applied", request_id: string, indexed: Indexed, } | { "kind": "pending_opened", pending_id: string, indexed: Indexed, payload: unknown, } | { "kind": "pending_resolved", pending_id: string, resolution: PendingResolution, reason?: PendingReason | null, } | { "kind": "answer_result", pending_id: string, request_id: string, delivered: boolean, };
 
+export type Project = { 
+/**
+ * Absolute and canonical (symlinks resolved), as the host sees it.
+ */
+path: string, };
+
+export type DirEntry = { 
+/**
+ * The entry's file name, not a path.
+ */
+name: string, 
+/**
+ * It holds `.git`: a repository, or a worktree of one.
+ */
+git: boolean, };
+
 export type HostFrame = { "type": "hello", protocol_version: string, host_version: string, host_id: string, 
 /**
  * Proof of possession of the host's key (ACP core §3.5): its
@@ -67,7 +83,33 @@ proof: string,
  * the values this version knows; an unknown one is ignored, not
  * rejected (see `Capabilities`). Absent means none.
  */
-capabilities: Capabilities, attached_sessions: Array<AttachedSession>, } | { "type": "session", session_id: string, seq: number, body: SessionBody, } | { "type": "error", request_id: string, code: string, message: string, } | { "type": "resend_complete" };
+capabilities: Capabilities, 
+/**
+ * The workspace roots from the host's config (ACP core §7), as
+ * configured. Absent means none (an older host).
+ */
+workspace_roots: Array<string>, attached_sessions: Array<AttachedSession>, } | { "type": "session", session_id: string, seq: number, body: SessionBody, } | { "type": "error", request_id: string, code: string, message: string, } | { "type": "resend_complete" } | { "type": "projects", request_id: string, items: Array<Project>, 
+/**
+ * A bound cut the enumeration short: there may be more.
+ */
+partial: boolean, 
+/**
+ * The host user's home directory, canonical, so the picker can
+ * expand `~` (frontend §7). Absent if the host has none.
+ */
+home?: string | null, } | { "type": "directory", request_id: string, 
+/**
+ * The browsed directory, canonical.
+ */
+path: string, 
+/**
+ * Its parent, canonical, if browsing it is allowed too.
+ */
+parent?: string | null, entries: Array<DirEntry>, 
+/**
+ * Not every subdirectory is listed.
+ */
+truncated: boolean, };
 
 export type CollectorFrame = { "type": "hello_ack", protocol_version: string, collector_version: string, 
 /**
@@ -92,7 +134,7 @@ agent_session_id: string, model?: string | null, mode?: string | null, axes?: { 
 /**
  * ACP ContentBlocks, built by the frontend.
  */
-content: unknown[], } | { "type": "cancel_turn", request_id: string, session_id: string, turn_id: string, } | { "type": "set_config", request_id: string, session_id: string, config_id: string, value: ConfigValue, } | { "type": "answer_permission", request_id: string, session_id: string, pending_id: string, option_id: string, } | { "type": "answer_elicitation", request_id: string, session_id: string, pending_id: string, action: ElicitationAction, content?: unknown, } | { "type": "ack", session_id: string, ack_seq: number, } | { "type": "park_session", request_id: string, session_id: string, } | { "type": "close_session", request_id: string, session_id: string, };
+content: unknown[], } | { "type": "cancel_turn", request_id: string, session_id: string, turn_id: string, } | { "type": "set_config", request_id: string, session_id: string, config_id: string, value: ConfigValue, } | { "type": "answer_permission", request_id: string, session_id: string, pending_id: string, option_id: string, } | { "type": "answer_elicitation", request_id: string, session_id: string, pending_id: string, action: ElicitationAction, content?: unknown, } | { "type": "ack", session_id: string, ack_seq: number, } | { "type": "park_session", request_id: string, session_id: string, } | { "type": "close_session", request_id: string, session_id: string, } | { "type": "list_projects", request_id: string, } | { "type": "browse_directory", request_id: string, path: string, };
 
 export type StartSessionRequest = { host_id: string, agent: string, cwd: string, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, };
 
@@ -226,6 +268,11 @@ capabilities: Capabilities,
  */
 default_hat_id: string, 
 /**
+ * From its latest reconciled connection, as configured on the host
+ * (ACP core §7): where its projects are, and where browsing may start.
+ */
+workspace_roots: Array<string>, 
+/**
  * Connected and reconciled: requests reach it now.
  */
 connected: boolean, 
@@ -233,6 +280,30 @@ connected: boolean,
  * RFC 3339.
  */
 created_at: string, last_seen_at?: string | undefined, revoked_at?: string | undefined, };
+
+export type HostProjects = { items: Array<Project>, 
+/**
+ * The host cut its enumeration short: there may be more.
+ */
+partial: boolean, 
+/**
+ * The host user's home directory, for expanding `~` (frontend §7).
+ */
+home?: string | undefined, };
+
+export type DirectoryListing = { 
+/**
+ * The directory, canonical (symlinks resolved).
+ */
+path: string, 
+/**
+ * Its parent, if browsing it is allowed too.
+ */
+parent?: string | undefined, entries: Array<DirEntry>, 
+/**
+ * Not every subdirectory is listed.
+ */
+truncated: boolean, };
 
 export type SetupRequest = { token: string, password: string, 
 /**

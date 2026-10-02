@@ -142,6 +142,11 @@ struct HostArgs {
     /// in place of the stored one (its port may have changed).
     #[arg(long, hide = true)]
     collector_url: Option<String>,
+    /// A directory to find projects in and to allow browsing under (ACP
+    /// core §7): absolute, or `~/…`. Repeatable; when given, replaces
+    /// `workspace_roots` in `host.toml`.
+    #[arg(long = "workspace-root")]
+    workspace_roots: Vec<String>,
 }
 
 #[derive(Args)]
@@ -161,6 +166,10 @@ struct UpArgs {
     /// Park sessions idle for this many seconds; 0 turns the reaper off.
     #[arg(long, default_value_t = IDLE_TIMEOUT.as_secs())]
     idle_timeout_secs: u64,
+    /// As for `host run`, handed on to the host child: replaces
+    /// `workspace_roots` in its `host.toml` (`<data-dir>/host`).
+    #[arg(long = "workspace-root")]
+    workspace_roots: Vec<String>,
 }
 
 fn parse_agent(s: &str) -> Result<(String, AgentCommand), String> {
@@ -625,6 +634,12 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
         inherit::check_pipe("--join-code-fd", fd)?;
     }
     warn_if_dev_token();
+    let home = hennery_host::projects::home_dir();
+    // The flags first, before anything is paired: a bad one must not spend
+    // a pairing code (decision 6). The file's roots are checked below.
+    if !args.workspace_roots.is_empty() {
+        hennery_host::projects::workspace_roots(&args.workspace_roots, &[], home.as_deref())?;
+    }
     let paired = match Paired::load(&args.data_dir)? {
         Some(paired) => {
             // Paired already (kernel spec §4.2): the code is not needed.
@@ -646,8 +661,13 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
             Paired::load(&args.data_dir)?.context("the pairing just stored")?
         }
     };
+    // Checked before connecting: a bad root fails the start (decision 6).
+    let workspace_roots =
+        hennery_host::projects::workspace_roots(&args.workspace_roots, &paired.workspace_roots, home.as_deref())?;
     let collector_url = args.collector_url.unwrap_or(paired.collector_url);
     let mut cfg = HostConfig::new(collector_url, paired.host_id, paired.key, args.data_dir);
+    cfg.workspace_roots = workspace_roots;
+    cfg.home = home;
     cfg.agents = args.agents.into_iter().collect();
     cfg.idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
     // On SIGINT/SIGTERM, and on a revoke, the host stops its connection and
@@ -754,6 +774,9 @@ fn host_command(
     // again, for a host started by hand.
     for var in hennery_host::adapter::HOST_SECRET_VARS {
         host_cmd.env_remove(var);
+    }
+    for root in &args.workspace_roots {
+        host_cmd.arg("--workspace-root").arg(root);
     }
     for (name, command) in &args.agents {
         let mut spec = format!("{name}={}", command.program);
@@ -914,6 +937,7 @@ mod tests {
             data_dir: "/nonexistent".into(),
             agents: Vec::new(),
             idle_timeout_secs: 0,
+            workspace_roots: Vec::new(),
         };
         let cmd = host_command(
             std::path::Path::new("/bin/hennery"),
@@ -926,5 +950,36 @@ mod tests {
             .get_envs()
             .any(|(key, value)| key == "HENNERY_DEV_TOKEN" && value.is_none());
         assert!(removed, "the host child inherits HENNERY_DEV_TOKEN");
+    }
+
+    /// Decision 6: `up` hands its `--workspace-root` flags to its host
+    /// child, in order.
+    #[test]
+    fn ups_host_child_gets_its_workspace_roots() {
+        let args = UpArgs {
+            listen: vec!["127.0.0.1:7117".into()],
+            public_url: None,
+            data_dir: "/nonexistent".into(),
+            agents: Vec::new(),
+            idle_timeout_secs: 0,
+            workspace_roots: vec!["/srv/projects".into(), "~/src".into()],
+        };
+        let cmd = host_command(
+            std::path::Path::new("/bin/hennery"),
+            std::path::Path::new("/nonexistent/host"),
+            "ws://127.0.0.1:7117/api/hosts/ws",
+            &args,
+        );
+        let argv: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let roots: Vec<&str> = argv
+            .windows(2)
+            .filter(|w| w[0] == "--workspace-root")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(roots, ["/srv/projects", "~/src"]);
     }
 }

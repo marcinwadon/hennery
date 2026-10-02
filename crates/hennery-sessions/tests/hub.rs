@@ -2,7 +2,9 @@
 //! (plan A's "After this plan"): an old connection of a host that has
 //! already reconnected must not fail or kick what the new one carries.
 
-use hennery_proto::frames::{Capabilities, Capability, CollectorFrame, ParkReason, SessionBody, TurnOutcome};
+use hennery_proto::frames::{
+    Capabilities, Capability, CollectorFrame, HostFrame, ParkReason, SessionBody, TurnOutcome,
+};
 use hennery_sessions::hub::{Hub, Registration, RequestError};
 use std::sync::Arc;
 use std::time::Duration;
@@ -241,4 +243,227 @@ async fn a_kicked_connection_is_not_routed_to_while_it_lingers() {
     assert!(!hub.is_ready("h"), "a late mark_ready revived a kicked connection");
     assert!(rx.try_recv().is_err(), "a frame went out on the kicked connection");
     assert_eq!(hub.pending_requests(), 0);
+}
+
+// Plan 6c: probes (ACP core §3.3; decision 1). Kept apart from the session
+// waiters, and scoped to the connection they went out on.
+
+fn list(request_id: &str) -> CollectorFrame {
+    CollectorFrame::ListProjects {
+        request_id: request_id.into(),
+    }
+}
+
+/// `connect`, announcing the `projects` capability.
+fn connect_projects(hub: &Hub) -> (Registration, mpsc::UnboundedReceiver<CollectorFrame>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let registration = hub
+        .register("h", tx, Capabilities(vec![Capability::Projects]))
+        .expect("no live connection for h");
+    hub.mark_ready("h", registration.conn_id);
+    (registration, rx)
+}
+
+fn projects(request_id: &str) -> HostFrame {
+    HostFrame::Projects {
+        request_id: request_id.into(),
+        items: Vec::new(),
+        partial: false,
+        home: None,
+    }
+}
+
+#[tokio::test]
+async fn a_probe_is_answered_only_by_its_own_connections_reply() {
+    let hub = Arc::new(Hub::new());
+    let (registration, mut rx) = connect_projects(&hub);
+    let call = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.probe("h", "p1", list("p1"), Duration::from_secs(5)).await }
+    });
+    assert_eq!(rx.recv().await, Some(list("p1")));
+    hub.probe_reply("h", registration.conn_id + 1, projects("p1"));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!call.is_finished(), "another connection's reply answered the probe");
+    hub.probe_reply("h", registration.conn_id, projects("p1"));
+    assert_eq!(call.await.unwrap(), Ok(projects("p1")));
+    assert_eq!(hub.pending_probes(), 0);
+}
+
+#[tokio::test]
+async fn a_probe_rejected_on_its_connection_answers_rejected() {
+    let hub = Arc::new(Hub::new());
+    let (registration, mut rx) = connect_projects(&hub);
+    let call = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.probe("h", "p1", list("p1"), Duration::from_secs(5)).await }
+    });
+    rx.recv().await.expect("the probe went out");
+    assert!(!hub.probe_rejected(registration.conn_id + 1, "p1", "invalid", "no"));
+    assert!(!hub.probe_rejected(registration.conn_id, "r9", "invalid", "no"));
+    assert!(hub.probe_rejected(registration.conn_id, "p1", "outside_workspace", "no"));
+    assert_eq!(
+        call.await.unwrap(),
+        Err(RequestError::Rejected {
+            code: "outside_workspace".into(),
+            message: "no".into()
+        })
+    );
+}
+
+#[tokio::test]
+async fn an_unanswered_probe_keeps_the_connection_and_its_late_reply_is_dropped() {
+    let hub = Arc::new(Hub::new());
+    let (registration, mut rx) = connect_projects(&hub);
+    let answer = hub.probe("h", "p1", list("p1"), Duration::from_millis(100)).await;
+    assert_eq!(answer, Err(RequestError::DeliveryUnknown));
+    rx.recv().await.expect("the probe went out");
+    assert!(
+        !registration.kicked.is_cancelled(),
+        "a probe timeout dropped the connection"
+    );
+    assert!(hub.is_ready("h"));
+    assert_eq!(hub.pending_probes(), 0);
+    hub.probe_reply("h", registration.conn_id, projects("p1"));
+    // The connection still serves probes.
+    let call = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.probe("h", "p2", list("p2"), Duration::from_secs(5)).await }
+    });
+    assert_eq!(rx.recv().await, Some(list("p2")));
+    hub.probe_reply("h", registration.conn_id, projects("p2"));
+    assert_eq!(call.await.unwrap(), Ok(projects("p2")));
+}
+
+#[tokio::test]
+async fn a_dropped_connection_fails_only_its_own_probes() {
+    let hub = Arc::new(Hub::new());
+    let (old, mut old_rx) = connect_projects(&hub);
+    let on_old = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.probe("h", "p1", list("p1"), Duration::from_secs(5)).await }
+    });
+    old_rx.recv().await.expect("p1 went out on the old connection");
+    drop(old_rx);
+    let (new, mut new_rx) = connect_projects(&hub);
+    let on_new = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.probe("h", "p2", list("p2"), Duration::from_secs(5)).await }
+    });
+    new_rx.recv().await.expect("p2 went out on the new connection");
+    hub.unregister("h", old.conn_id);
+    assert_eq!(on_old.await.unwrap(), Err(RequestError::DeliveryUnknown));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !on_new.is_finished(),
+        "the old connection's end failed the new one's probe"
+    );
+    // The old connection's reply to the new probe's id answers nothing.
+    hub.probe_reply("h", old.conn_id, projects("p2"));
+    assert!(!on_new.is_finished());
+    hub.probe_reply("h", new.conn_id, projects("p2"));
+    assert_eq!(on_new.await.unwrap(), Ok(projects("p2")));
+}
+
+#[tokio::test]
+async fn a_probe_whose_caller_is_gone_is_forgotten() {
+    let hub = Arc::new(Hub::new());
+    let (_registration, mut rx) = connect_projects(&hub);
+    let call = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.probe("h", "p1", list("p1"), Duration::from_secs(30)).await }
+    });
+    rx.recv().await.expect("the probe went out");
+    assert_eq!(hub.pending_probes(), 1);
+    call.abort();
+    let _ = call.await;
+    assert_eq!(hub.pending_probes(), 0);
+}
+
+#[tokio::test]
+async fn a_probe_goes_only_to_a_reconciled_host() {
+    let hub = Hub::new();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let registration = hub.register("h", tx, Capabilities::default()).unwrap();
+    let answer = hub.probe("h", "p1", list("p1"), Duration::from_secs(5)).await;
+    assert_eq!(answer, Err(RequestError::NotConnected));
+    assert!(
+        rx.try_recv().is_err(),
+        "a probe reached a host before its reconciliation"
+    );
+    hub.mark_ready("h", registration.conn_id);
+    assert_eq!(
+        hub.probe("x", "p2", list("p2"), Duration::from_secs(5)).await,
+        Err(RequestError::NotConnected)
+    );
+    assert_eq!(hub.pending_probes(), 0);
+}
+
+/// The review's A5: the capability is checked on the connection the probe
+/// goes out on.
+#[tokio::test]
+async fn a_probe_goes_only_to_a_connection_with_its_capability() {
+    let hub = Hub::new();
+    let (_registration, mut rx) = connect(&hub);
+    let answer = hub.probe("h", "p1", list("p1"), Duration::from_secs(5)).await;
+    assert_eq!(answer, Err(RequestError::Unsupported));
+    assert!(rx.try_recv().is_err(), "a probe reached a host without the capability");
+    assert_eq!(hub.pending_probes(), 0);
+}
+
+/// Task 1's review: only a probe goes through `Hub::probe`, and a request
+/// id in flight is not reused.
+#[tokio::test]
+async fn a_frame_that_is_not_a_probe_or_an_id_in_use_is_refused() {
+    let hub = Arc::new(Hub::new());
+    let (_registration, mut rx) = connect_projects(&hub);
+    let answer = hub.probe("h", "r1", prompt("r1"), Duration::from_secs(5)).await;
+    assert!(
+        matches!(answer, Err(RequestError::Rejected { ref code, .. }) if code == "not_a_probe"),
+        "{answer:?}"
+    );
+    assert!(rx.try_recv().is_err(), "a frame that is not a probe was sent");
+    let call = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.probe("h", "p1", list("p1"), Duration::from_secs(5)).await }
+    });
+    assert_eq!(rx.recv().await, Some(list("p1")));
+    let again = hub.probe("h", "p1", list("p1"), Duration::from_secs(5)).await;
+    assert_eq!(again, Err(RequestError::Busy));
+    assert!(rx.try_recv().is_err());
+    assert_eq!(hub.pending_probes(), 1, "the reused id displaced the first probe");
+    call.abort();
+}
+
+/// The review's O3: a connection has at most `MAX_PROBES` probes in flight.
+#[tokio::test]
+async fn a_connection_has_a_bounded_number_of_probes_in_flight() {
+    let hub = Arc::new(Hub::new());
+    let (registration, mut rx) = connect_projects(&hub);
+    let mut calls = Vec::new();
+    for n in 0..hennery_sessions::hub::MAX_PROBES {
+        let hub = hub.clone();
+        calls.push(tokio::spawn(async move {
+            let id = format!("p{n}");
+            hub.probe("h", &id, list(&id), Duration::from_secs(5)).await
+        }));
+        rx.recv().await.expect("the probe went out");
+    }
+    let answer = hub
+        .probe("h", "one-too-many", list("one-too-many"), Duration::from_secs(5))
+        .await;
+    assert_eq!(answer, Err(RequestError::Busy));
+    assert!(rx.try_recv().is_err(), "a probe past the bound was sent");
+    hub.probe_reply("h", registration.conn_id, projects("p0"));
+    assert_eq!(calls.remove(0).await.unwrap(), Ok(projects("p0")));
+    let call = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.probe("h", "again", list("again"), Duration::from_secs(5)).await }
+    });
+    assert_eq!(rx.recv().await, Some(list("again")));
+    hub.unregister("h", registration.conn_id);
+    assert_eq!(call.await.unwrap(), Err(RequestError::DeliveryUnknown));
+    for call in calls {
+        assert_eq!(call.await.unwrap(), Err(RequestError::DeliveryUnknown));
+    }
 }
