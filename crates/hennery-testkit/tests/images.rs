@@ -401,28 +401,39 @@ async fn refused_content_opens_no_turn_and_writes_no_file() {
 }
 
 /// The prompt route alone reads bodies past axum's default 2 MB, and its
-/// own limit holds too.
+/// own limit holds too: each body is one byte over its route's limit, so
+/// the server has read nearly all of it when it answers (a large unread
+/// rest can turn the close into a reset on Linux, losing the 413).
 #[tokio::test]
 async fn only_the_prompt_route_takes_a_large_body_and_its_limit_holds() {
     let collector = Collector::start().await;
     let mut host = ScriptedHost::connect(&collector, Capabilities(vec![Capability::Images])).await;
     let session = started_session(&collector, &mut host).await;
     let c = client(&collector);
-    let text = "x".repeat(25 << 20);
-    let (status, _) = post(
-        &c,
-        prompt_url(&collector, &session),
-        &json!({ "content": [{ "type": "text", "text": text }] }),
-    )
-    .await;
-    assert_eq!(status, 413);
-    let (status, _) = post(
-        &c,
-        collector.url(&format!("/api/sessions/{session}/config")),
-        &json!({ "config_id": "x".repeat(3 << 20), "value": true }),
-    )
-    .await;
-    assert_eq!(status, 413);
+    let over = |limit: usize, make: &dyn Fn(String) -> Value| {
+        let empty = serde_json::to_vec(&make(String::new())).unwrap().len();
+        let body = make("x".repeat(limit + 1 - empty));
+        assert_eq!(serde_json::to_vec(&body).unwrap().len(), limit + 1);
+        body
+    };
+    let prompt = over(
+        hennery_sessions::content::PROMPT_BODY_LIMIT,
+        &|t| json!({ "content": [{ "type": "text", "text": t }] }),
+    );
+    let (status, answer) = post(&c, prompt_url(&collector, &session), &prompt).await;
+    assert_eq!(
+        (status, answer["code"].as_str()),
+        (413, Some("body_too_large")),
+        "{answer}"
+    );
+    // axum's default limit, 2 MB, on every other route.
+    let config = over(2 << 20, &|id| json!({ "config_id": id, "value": true }));
+    let (status, answer) = post(&c, collector.url(&format!("/api/sessions/{session}/config")), &config).await;
+    assert_eq!(
+        (status, answer["code"].as_str()),
+        (413, Some("body_too_large")),
+        "{answer}"
+    );
     host.nothing_more().await;
 }
 

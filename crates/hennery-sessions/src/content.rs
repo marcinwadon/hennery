@@ -23,6 +23,10 @@ pub const MAX_IMAGE_BYTES: usize = 5 << 20;
 pub const MAX_IMAGES: usize = 20;
 /// The most a prompt's images may take together, decoded (ACP core §11).
 pub const MAX_IMAGES_TOTAL: usize = 16 << 20;
+/// The most a prompt's text may take together (whole-branch review): the
+/// ceiling axum's default body limit gave text before images raised the
+/// route's limit. Text is stored and replayed as it is, unlike images.
+pub const MAX_TEXT_TOTAL: usize = 2 << 20;
 /// The most a prompt request's body may take: 16 MiB of images is 21.4 MiB
 /// of base64, and the rest is for the text and the JSON around it. Below
 /// the host connection's frame limit (`crate::ws::MAX_FRAME`), so a prompt
@@ -85,6 +89,7 @@ pub fn check(content: Vec<Value>) -> Result<Checked, Refusal> {
     let mut sent = Vec::with_capacity(content.len());
     let mut images = Vec::new();
     let mut total = 0usize;
+    let mut text_total = 0usize;
     let mut said_something = false;
     for (n, block) in content.into_iter().enumerate() {
         let Value::Object(mut block) = block else {
@@ -96,6 +101,10 @@ pub fn check(content: Vec<Value>) -> Result<Checked, Refusal> {
                 let Some(Value::String(text)) = block.remove("text") else {
                     return Err(Refusal::Invalid(format!("block {n}: a text block needs its text")));
                 };
+                text_total += text.len();
+                if text_total > MAX_TEXT_TOTAL {
+                    return Err(Refusal::TooLarge("a prompt's text takes at most 2 MiB".to_string()));
+                }
                 said_something |= !text.trim().is_empty();
                 stored.push(StoredBlock::Text { text: text.clone() });
                 sent.push(json!({ "type": "text", "text": text }));
@@ -416,6 +425,15 @@ mod tests {
         content.push(image_block("image/png", &bytes("image/png", rest + 1)));
         let why = check(content).unwrap_err();
         assert!(matches!(&why, Refusal::TooLarge(m) if m.contains("16 MiB")), "{why:?}");
+    }
+
+    #[test]
+    fn a_prompts_text_takes_at_most_two_mib() {
+        let half = "x".repeat(MAX_TEXT_TOTAL / 2);
+        let text = |t: &str| json!({ "type": "text", "text": t });
+        assert!(check(vec![text(&half), text(&half)]).is_ok());
+        let why = refusal(json!([text(&half), text(&half), text("x")]));
+        assert!(matches!(&why, Refusal::TooLarge(m) if m.contains("2 MiB")), "{why:?}");
     }
 
     #[test]

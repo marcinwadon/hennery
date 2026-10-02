@@ -431,7 +431,9 @@ host.)*
 - `capabilities`: `projects` (project enumeration and browsing), `images`
   (image content blocks in prompts), `park` (explicit park). The collector
   never sends a frame, or a prompt containing images, to a host that lacks the
-  capability; the UI hides the feature for that host. **Deserialized
+  capability, as the host's current connection announces it (a host that
+  reconnects on an older build between the check and the send is the one
+  gap, recorded by plan 6a); the UI hides the feature for that host. **Deserialized
   leniently:** an entry this build does not know (a newer host) is skipped,
   never a reason to refuse the `hello`; an absent field means none. The
   generated JSON Schema still lists the known values as a closed set, but that
@@ -1424,7 +1426,7 @@ All endpoints require an operator session (kernel spec §3). Types come from
 | `GET /api/sessions/{id}/events?after=<event_id>&limit` | Timeline page after an event (applied rows only, §8). |
 | `GET /api/sessions/{id}/catalog` | `SessionCatalog {session_id, config_options[], model?, mode?, axes{}}`; commands, plan and usage join it with the plans that produce them. |
 | `POST /api/sessions/{id}/resume` | 202 `LifecycleResponse {session_id, lifecycle}` once `session_started` is ingested; 409 `starting` / `active` (its lifecycle); 409 `agent_has_no_record` (no agent session id, host not contacted); 409 `host_offline` (nothing changes); 409 `hat_mismatch` (§4.3); 502 with the host's code for any rejection or `start_failed` (the session becomes `failed` with it); 503 `delivery_unknown` (stays `starting`, reconciled like a start). |
-| `POST /api/sessions/{id}/prompt` | `{content[]}` → 202 `{turn_id}` once `turn_started` is ingested; 409 `not_attached` (not `active`) / `host_offline` (host not ready) / `turn_in_progress` / `images_unsupported` (the host lacks `images`, nothing sent; or its agent takes none); 400 `empty_prompt`, 400 `invalid_content` (a block other than text or image, an image of another type, or bytes that are not the type they claim), 400 `invalid` (host); 413 `content_too_large` (§11's image limits; a body over 24 MiB gets 413 `body_too_large`); 503 `delivery_unknown` (the turn stays open until reconciled). Everything the collector refuses is checked before a turn opens or a file is written, except the host's per-agent refusal, a failed send and a turn that opens between the files and the turn row, which leave the prompt's images stored but unreferenced. |
+| `POST /api/sessions/{id}/prompt` | `{content[]}` → 202 `{turn_id}` once `turn_started` is ingested; 409 `not_attached` (not `active`) / `host_offline` (host not ready) / `turn_in_progress` / `images_unsupported` (the host lacks `images`, nothing sent; or its agent takes none); 400 `empty_prompt`, 400 `invalid_content` (a block other than text or image, an image of another type, or bytes that are not the type they claim), 400 `invalid` (host); 413 `content_too_large` (§11's image and text limits; a body over 24 MiB gets 413 `body_too_large`); 503 `delivery_unknown` (the turn stays open until reconciled). Everything the collector refuses is checked before a turn opens or a file is written, except the host's per-agent refusal, a failed send and a turn that opens between the files and the turn row, which leave the prompt's images stored but unreferenced. |
 | `POST /api/sessions/{id}/cancel` | Cancel the open turn → 202 `CancelResponse {turn_id, outcome}` once that turn's `turn_ended` is ingested, with its real outcome (`cancelled`; `completed` or `failed` if it ended first; `interrupted` if the session was parked or closed meanwhile, or its adapter exited); 409 `not_attached` / `no_open_turn` / `not_running` (§4.4). |
 | `POST /api/sessions/{id}/park` | Explicit park → 202 `LifecycleResponse` once `session_parked` is ingested; 409 `not_attached` (not `active`, or host not ready); 409 `park_unsupported` (host lacks the `park` capability, nothing sent). |
 | `POST /api/sessions/{id}/close` | Close → 202 `LifecycleResponse` once closed (at once when unattached, parked, presumed parked, failed or the host is offline; on `session_closed` when attached); 409 `starting` while a start is in flight on a reachable host (§4.8). |
@@ -1511,6 +1513,8 @@ Evaluated on ingest, edge-triggered only:
 |---|---|
 | WebSocket frame | 32 MiB |
 | Prompt images | 20 × ≤ 5 MiB, ≤ 16 MiB decoded in total |
+| Prompt text | ≤ 2 MiB in total (6a) |
+| Prompt request body | 24 MiB; every other route 2 MB (6a) |
 | Terminal output buffer | 1 MiB per terminal (or `outputByteLimit`) |
 | Adapter stderr tail | 64 KiB |
 | Outbox | 64 MiB (state-bearing frames kept beyond it, reported) |
