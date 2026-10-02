@@ -7,6 +7,7 @@ use super::download::Sources;
 use super::install::{self, InstalledSet, Layout, Selection};
 use crate::adapter::AgentCommand;
 use crate::identity::{CONFIG_FILE, read_table, write_private};
+use crate::profile::Profile;
 use anyhow::{Context, Result, bail};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::unix::fs::PermissionsExt;
@@ -141,6 +142,9 @@ pub fn skipped(overrides: &BTreeMap<String, PathBuf>) -> BTreeSet<String> {
 #[derive(Debug, Default)]
 pub struct Agents {
     pub agents: HashMap<String, AgentCommand>,
+    /// Each launched agent's profile (`Profile::of_installed`): an agent
+    /// with its `--use-cli` CLI is not the pinned one any more.
+    pub profiles: HashMap<String, Profile>,
     /// One line per agent left out, or launched with a caveat.
     pub notes: Vec<String>,
 }
@@ -158,9 +162,11 @@ pub fn from_set(set: &InstalledSet, overrides: &BTreeMap<String, PathBuf>) -> Ag
             args: vec![entry.to_string_lossy().into_owned()],
             env: Vec::new(),
         };
+        let mut own_cli = false;
         match (overrides.get(name), cli_var(name)) {
             (Some(path), Some(var)) => match check_cli(path) {
                 Ok(path) => {
+                    own_cli = true;
                     command.env.push((var.to_string(), path.to_string_lossy().into_owned()));
                     if !adapter.cli_skipped {
                         out.notes.push(format!(
@@ -191,6 +197,7 @@ pub fn from_set(set: &InstalledSet, overrides: &BTreeMap<String, PathBuf>) -> Ag
             }
             (None, _) => {}
         }
+        out.profiles.insert(name.clone(), Profile::of_installed(name, own_cli));
         out.agents.insert(name.clone(), command);
     }
     out

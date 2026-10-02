@@ -178,12 +178,16 @@ pub async fn after_join(data_dir: &Path, host_id: &str, choices: &[UseCli], mirr
 }
 
 /// `host run`'s agents with no `--agent`: from the installed set, after
-/// installing the pinned one if it is not current. The file returned holds
-/// that set in use for as long as it is kept.
+/// installing the pinned one if it is not current, with their profiles.
+/// The file returned holds that set in use for as long as it is kept.
 pub async fn default_agents(
     data_dir: &Path,
     mirrors: &MirrorArgs,
-) -> (HashMap<String, AgentCommand>, Option<std::fs::File>) {
+) -> (
+    HashMap<String, AgentCommand>,
+    HashMap<String, hennery_host::profile::Profile>,
+    Option<std::fs::File>,
+) {
     // A bad mirror skips the install, and never falls back to the public
     // registry; it does not stop the host either.
     let sources = mirrors
@@ -198,7 +202,7 @@ pub async fn default_agents(
     if let Some(set) = &prepared.set {
         tracing::info!(set = %set.id, "agents from the adapter set: {}", versions(set));
     }
-    (prepared.agents.agents, prepared.in_use)
+    (prepared.agents.agents, prepared.agents.profiles, prepared.in_use)
 }
 
 fn versions(set: &InstalledSet) -> String {
