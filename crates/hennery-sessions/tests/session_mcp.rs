@@ -577,6 +577,16 @@ fn a_delete_revokes() {
         Deletion::Done { .. }
     ));
     w.assert_revoked(&token, &watch, "delete_session");
+    // The tombstone keeps nothing of what it was given (plan 9a's scrub).
+    let kept: (Option<String>, Option<i64>, Option<String>) = rusqlite::Connection::open(&w.db)
+        .unwrap()
+        .query_row(
+            "SELECT mcp_delivery_mode, mcp_delivery_servers, mcp_delivery_at FROM sessions WHERE id = 's1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(kept, (None, None, None));
 }
 
 /// The delete's own revoke (the purge lane's marker), beyond `close_in`'s:

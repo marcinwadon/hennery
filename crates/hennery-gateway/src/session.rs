@@ -161,8 +161,10 @@ impl SessionMcp for GatewayMcp {
         let cut = Cut(tokens::session_hash_in(tx, owner, session.session_id)?
             .into_iter()
             .collect());
-        // A session from before hats has no hat to deliver.
-        if !mode.delivers() || session.hat_id.is_empty() {
+        // Nothing to deliver; the mode decides. (A session from before hats,
+        // hat "", is never given a server: no connection or stdio server
+        // can name that hat, their foreign keys refuse it.)
+        if !mode.delivers() {
             tokens::revoke_in(tx, owner, session.session_id, now)?;
             return Ok(Delivered {
                 servers: Vec::new(),
