@@ -62,11 +62,11 @@ impl UseCli {
 /// not resolved, so a version manager's link keeps working), naming an
 /// executable regular file.
 pub fn check_cli(path: &Path) -> Result<PathBuf> {
-    if !path.is_absolute()
-        || path
-            .components()
-            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
-    {
+    // `components()` drops a `.` inside a path, so a path that is not its
+    // own components joined again had one.
+    // (`Path`'s own `==` compares components, so compare the bytes.)
+    let plain = path.components().collect::<PathBuf>().as_os_str() == path.as_os_str();
+    if !path.is_absolute() || !plain || path.components().any(|c| matches!(c, Component::ParentDir)) {
         bail!("{} is not an absolute path without `.` or `..`", path.display());
     }
     let meta = std::fs::metadata(path).with_context(|| format!("{} cannot be read", path.display()))?;
@@ -128,7 +128,13 @@ pub fn set_cli_override(data_dir: &Path, choice: &UseCli) -> Result<()> {
 
 /// The agents whose bundled CLI an install leaves out.
 pub fn skipped(overrides: &BTreeMap<String, PathBuf>) -> BTreeSet<String> {
-    overrides.keys().cloned().collect()
+    // A hand-written key for an agent with no CLI variable skips nothing:
+    // it would otherwise make every pinned selection fail.
+    overrides
+        .keys()
+        .filter(|agent| cli_var(agent).is_some())
+        .cloned()
+        .collect()
 }
 
 /// The agents a set launches, and what kept any from it.
@@ -232,7 +238,7 @@ pub async fn prepare(
     let current = layout.current().ok().flatten();
     match selection {
         None => notes.push("this platform has no pinned adapter set".into()),
-        Some(selection) if current.as_ref().is_some_and(|c| c.id == selection.set_id()) => {}
+        Some(selection) if current.as_ref().is_some_and(|c| c.id == selection.set_id() && c.node.is_file()) => {}
         Some(_) if layout.held() => notes.push(
             "a rollback holds this host on its adapter set; `hennery host adapters update` returns it to the pinned one"
                 .into(),
@@ -286,6 +292,20 @@ pub async fn prepare(
                 set.id,
                 selection.set_id()
             ));
+        }
+        if !set.node.is_file() {
+            notes.push(format!(
+                "the adapter set's Node ({}) is missing: no agents run; `hennery host adapters update` installs it again",
+                set.node.display()
+            ));
+            return Prepared {
+                agents: Agents {
+                    notes,
+                    ..Agents::default()
+                },
+                in_use: Some(in_use),
+                set: Some(set),
+            };
         }
         let mut agents = from_set(&set, &overrides);
         notes.append(&mut agents.notes);
@@ -347,12 +367,19 @@ mod tests {
             "claude=/nonexistent/claude",
             "claude=/etc/hosts",
             "claude=/bin",
+            "claude=/bin/./sh",
         ] {
             assert!(UseCli::parse(bad).is_err(), "{bad}");
         }
         // Refused for being relative, whatever the working directory holds.
         let err = format!("{:#}", UseCli::parse("claude=bin/sh").unwrap_err());
         assert!(err.contains("not an absolute path"), "{err}");
+        // An override for an agent with no CLI variable skips nothing.
+        let overrides = BTreeMap::from([
+            ("gemini".to_string(), PathBuf::from("/bin/sh")),
+            ("codex".to_string(), PathBuf::from("/bin/sh")),
+        ]);
+        assert_eq!(skipped(&overrides), BTreeSet::from(["codex".to_string()]));
     }
 
     #[test]

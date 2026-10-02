@@ -683,6 +683,54 @@ async fn a_set_without_its_cli_launches_that_agent_only_with_an_override() {
     );
 }
 
+/// An override beside a set that has its bundled CLI is used, and the
+/// notes say the bundled one is not (A6, the Task 6 review).
+#[tokio::test]
+async fn an_override_beside_a_bundled_cli_is_used_with_a_note() {
+    let server = Server::start().await;
+    let fixture = Fixture::new("1.0.0");
+    fixture.serve(&server);
+    let (_dir, layout) = data_dir();
+    let dir = host_dir(&layout);
+    // The set is installed with every CLI; the override comes afterwards.
+    install::install(&layout, &selection(&fixture, &[]), &server.sources(), &quiet)
+        .await
+        .unwrap();
+    std::fs::write(dir.join("host.toml"), "[cli]\nclaude = \"/bin/sh\"\n").unwrap();
+    let prepared = agents::prepare(&dir, Some(&selection(&fixture, &[])), None, &quiet).await;
+    assert_eq!(
+        prepared.agents.agents["claude"].env,
+        [("CLAUDE_CODE_EXECUTABLE".to_string(), "/bin/sh".to_string())]
+    );
+    let notes = prepared.agents.notes.join("\n");
+    assert!(notes.contains("rather than the set's bundled CLI"), "{notes}");
+}
+
+/// A current set whose Node is gone: a start installs it again; offline, it
+/// runs no agents and says why (the Task 6 review).
+#[tokio::test]
+async fn a_start_puts_a_missing_node_back_or_says_it_is_missing() {
+    let server = Server::start().await;
+    let fixture = Fixture::new("1.0.0");
+    fixture.serve(&server);
+    let (_dir, layout) = data_dir();
+    let selection = selection(&fixture, &[]);
+    let set = install::install(&layout, &selection, &server.sources(), &quiet)
+        .await
+        .unwrap()
+        .set()
+        .clone();
+    std::fs::remove_file(&set.node).unwrap();
+    let prepared = agents::prepare(&host_dir(&layout), Some(&selection), Some(&offline()), &quiet).await;
+    assert!(prepared.agents.agents.is_empty());
+    let notes = prepared.agents.notes.join("\n");
+    assert!(notes.contains("Node") && notes.contains("is missing"), "{notes}");
+    drop(prepared);
+    let prepared = agents::prepare(&host_dir(&layout), Some(&selection), Some(&server.sources()), &quiet).await;
+    assert!(set.node.is_file(), "the start put Node back");
+    assert_eq!(prepared.agents.agents.len(), 2, "{:?}", prepared.agents.notes);
+}
+
 /// A host start never waits on another install (an `adapters update`
 /// running meanwhile): it runs on what it has, and says so.
 #[tokio::test]
