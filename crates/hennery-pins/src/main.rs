@@ -99,7 +99,13 @@ async fn extract_all(manifest: &Manifest) -> Result<()> {
     let mut files: BTreeMap<String, manifest::File> = BTreeMap::new();
     for adapter in manifest.adapters.values() {
         for file in adapter.platforms.values().flatten() {
-            files.entry(file.url.clone()).or_insert_with(|| file.clone());
+            let first = files.entry(file.url.clone()).or_insert_with(|| file.clone());
+            // One URL is one package: every entry naming it must agree.
+            if (&first.integrity, first.archive_size, first.unpacked_size)
+                != (&file.integrity, file.archive_size, file.unpacked_size)
+            {
+                bail!("{} is pinned twice, with different digests or sizes", file.url);
+            }
         }
     }
     let client = reqwest::Client::builder()

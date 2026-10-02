@@ -39,6 +39,9 @@ pub fn package(tgz: &Path, dest: &Path, max_bytes: u64) -> Result<()> {
         }
         let raw = entry.path_bytes().into_owned();
         let name = std::str::from_utf8(&raw).map_err(|_| anyhow::anyhow!("an entry name is not UTF-8"))?;
+        if !kind.is_dir() && !kind.is_file() {
+            bail!("{name:?} is not a regular file or a directory ({kind:?}); links and special files are refused");
+        }
         let Some(relative) = strip_first(name)? else {
             // The root directory (`package/`) itself.
             continue;
@@ -47,15 +50,13 @@ pub fn package(tgz: &Path, dest: &Path, max_bytes: u64) -> Result<()> {
         if kind.is_dir() {
             create_dirs_below(dest, &target)?;
             dirs.push(target);
-        } else if kind.is_file() {
+        } else {
             let parent = target.parent().expect("a joined path has a parent");
             create_dirs_below(dest, parent)?;
             let executable = entry.header().mode()? & 0o111 != 0;
             let budget = max_bytes.saturating_sub(written);
             written +=
                 write_file(&mut entry, &target, executable, budget).with_context(|| format!("extract {relative}"))?;
-        } else {
-            bail!("{name:?} is not a regular file or a directory ({kind:?}); links and special files are refused");
         }
     }
     for dir in dirs {
@@ -203,8 +204,13 @@ pub fn barrier(path: &Path) -> Result<()> {
     {
         use std::os::fd::AsRawFd;
         // SAFETY: fcntl(2) F_FULLFSYNC on a descriptor this function holds.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } != 0 {
-            return Err(std::io::Error::last_os_error()).with_context(|| format!("F_FULLFSYNC {}", path.display()));
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
+            let err = std::io::Error::last_os_error();
+            // A filesystem without it (SMB, say): fsync is the most there is.
+            if matches!(err.raw_os_error(), Some(libc::ENOTSUP) | Some(libc::ENOTTY)) {
+                return sync(&file).with_context(|| format!("fsync {}", path.display()));
+            }
+            return Err(err).with_context(|| format!("F_FULLFSYNC {}", path.display()));
         }
         Ok(())
     }
@@ -324,6 +330,54 @@ mod tests {
         result.unwrap();
     }
 
+    /// The budget is the package's, across its files (review, Task 3).
+    #[test]
+    fn the_byte_budget_counts_every_file_of_the_package() {
+        let (_dir, result) = extract(
+            &[
+                ("package/a", Regular, 0o644, &[0u8; 60], ""),
+                ("package/b", Regular, 0o644, &[0u8; 60], ""),
+            ],
+            100,
+        );
+        assert!(format!("{:#}", result.unwrap_err()).contains("more bytes"));
+    }
+
+    /// A package's directory must not exist yet, as a directory or as a
+    /// link; nor may `bin/node` (review, Task 3).
+    #[test]
+    fn an_existing_destination_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let tgz = dir.path().join("p.tgz");
+        std::fs::write(&tgz, tarball(&[("package/a", Regular, 0o644, b"x", "")])).unwrap();
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        assert!(format!("{:#}", package(&tgz, &existing, 1 << 20).unwrap_err()).contains("exists already"));
+        assert!(!existing.join("a").exists());
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+        assert!(package(&tgz, &dangling, 1 << 20).is_err());
+        assert!(!dir.path().join("nowhere").exists());
+        let node = dir.path().join("node.tgz");
+        std::fs::write(
+            &node,
+            tarball(&[("node-v1.0.0-linux-x64/bin/node", Regular, 0o755, b"n", "")]),
+        )
+        .unwrap();
+        let bin = dir.path().join("rt/bin/node");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"old").unwrap();
+        assert!(node_binary(&node, "1.0.0", "linux-x64", &bin, 1).is_err());
+        assert_eq!(std::fs::read(&bin).unwrap(), b"old");
+    }
+
+    /// A link at the archive's root is refused too, not skipped.
+    #[test]
+    fn a_link_at_the_root_is_refused() {
+        let (_dir, result) = extract(&[("package", Symlink, 0o777, b"", "/etc")], 1 << 20);
+        assert!(format!("{:#}", result.unwrap_err()).contains("refused"));
+    }
+
     #[test]
     fn a_file_where_a_directory_is_needed_is_refused() {
         let (_dir, result) = extract(
@@ -347,7 +401,7 @@ mod tests {
         let record = b"18 comment=hello\n";
         global.set_entry_type(tar::EntryType::XGlobalHeader);
         global.set_size(record.len() as u64);
-        global.set_path("pax_global_header").unwrap();
+        global.set_path("package/pax_global_header").unwrap();
         global.set_cksum();
         builder.append(&global, &record[..]).unwrap();
         let mut header = tar::Header::new_gnu();
