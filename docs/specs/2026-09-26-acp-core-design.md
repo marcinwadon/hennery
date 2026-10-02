@@ -474,9 +474,10 @@ since plan 5b: probes, answered only by the connection they went out on.
   capabilities of the live connection (in the hub), so a host that reconnects
   on an older build loses them at once; the host registry also records the
   latest accepted `hello`'s list for display (`HostItem.capabilities`, kernel
-  spec §8). The hennery host announces `park` and `images`: `images` says the
-  host carries image blocks, and each session still refuses them when its
-  agent takes none (`images_unsupported`, above). `mcp_servers` (plan 8c):
+  spec §8). The hennery host announces `park`, `images`, `projects`,
+  `resolve_path` and `mcp_servers`: `images` says the host carries image
+  blocks, and each session still refuses them when its agent takes none
+  (`images_unsupported`, above). `mcp_servers` (plan 8c):
   the host passes a start's or resume's servers into `session/new` /
   `session/load` with each agent's isolation, and refuses those it cannot
   isolate unless waived (`mcp_isolation_unavailable`). `mcp_servers[]`,
