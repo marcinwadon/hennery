@@ -1,0 +1,25 @@
+# cargo-dist (distribution spec §2). Only its build half is wired up: the
+# `build` workflow runs `dist build` and keeps what it makes as workflow
+# artifacts (plan 7a). Publishing (GitHub Releases, the Homebrew tap, the
+# attestations) is the operator's to switch on: `dist generate` would write
+# a workflow that publishes on every version tag, so that workflow is not
+# committed, and `allow-dirty` stops `dist` from asking for it.
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.30.4"
+ci = "github"
+allow-dirty = ["ci"]
+# Linux musl-static for both architectures, macOS arm64 (distribution §1).
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl", "x86_64-unknown-linux-musl"]
+# OpenSSL built in, not linked from the system (distribution §1.1).
+features = ["vendored-openssl"]
+# Only the `hennery` package, so the feature applies to the crate that has it.
+precise-builds = true
+checksum = "sha256"
+installers = ["shell", "homebrew"]
+tap = "marcinwadon/homebrew-tap"
+install-path = "~/.local/bin"
+install-updater = false
+github-attestations = true

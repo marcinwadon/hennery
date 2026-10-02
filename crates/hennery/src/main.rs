@@ -4,6 +4,7 @@
 
 mod admin;
 mod config;
+mod healthcheck;
 mod inherit;
 
 use anyhow::{Context, Result, bail};
@@ -29,7 +30,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Run the collector.
-    Collector(CollectorArgs),
+    Collector(CollectorCli),
     /// Host commands.
     Host {
         #[command(subcommand)]
@@ -62,6 +63,34 @@ struct JoinArgs {
     name: Option<String>,
     #[arg(long, env = "HENNERY_HOST_DATA_DIR")]
     data_dir: PathBuf,
+}
+
+/// `collector` runs the collector; `collector healthcheck` checks one.
+#[derive(Args)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+struct CollectorCli {
+    #[command(subcommand)]
+    command: Option<CollectorCommand>,
+    #[command(flatten)]
+    run: Option<CollectorArgs>,
+}
+
+#[derive(Subcommand)]
+enum CollectorCommand {
+    /// Exit 0 if the collector answers `/healthz`, else 1 (for containers).
+    Healthcheck(HealthcheckArgs),
+}
+
+#[derive(Args)]
+struct HealthcheckArgs {
+    /// The collector's listen address, as for `collector`: the first one
+    /// given is checked, a wildcard one over loopback. Else `listen` in
+    /// `config.toml`, else 127.0.0.1:7117.
+    #[arg(long = "listen", env = "HENNERY_LISTEN", value_delimiter = ',')]
+    listen: Vec<String>,
+    /// Where `config.toml` is read from, when no address is given.
+    #[arg(long, env = "HENNERY_DATA_DIR")]
+    data_dir: Option<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -195,7 +224,18 @@ async fn main() -> std::process::ExitCode {
     // and drop normally first, exactly like a plain `Ok(())` return always
     // did; only then does the process actually exit with that code.
     let result = match Cli::parse().command {
-        Command::Collector(args) => run_collector(args).await.map(|()| std::process::ExitCode::SUCCESS),
+        Command::Collector(CollectorCli {
+            command: Some(CollectorCommand::Healthcheck(args)),
+            ..
+        }) => Ok(collector_healthcheck(args)),
+        Command::Collector(CollectorCli {
+            run: Some(args),
+            command: None,
+        }) => run_collector(args).await.map(|()| std::process::ExitCode::SUCCESS),
+        Command::Collector(CollectorCli {
+            run: None,
+            command: None,
+        }) => unreachable!("clap requires --data-dir when no subcommand is given"),
         Command::Host {
             command: HostCommand::Join(args),
         } => join_host(args).await.map(|()| std::process::ExitCode::SUCCESS),
@@ -212,6 +252,26 @@ async fn main() -> std::process::ExitCode {
         // other tests (and operators) already read the exit-1 path by.
         Err(err) => {
             eprintln!("Error: {err:?}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+/// `collector healthcheck`: 0 if healthy, else 1 and why, on standard
+/// error (Docker keeps it in the container's health log).
+fn collector_healthcheck(args: HealthcheckArgs) -> std::process::ExitCode {
+    let checked = (|| {
+        let file = match &args.data_dir {
+            Some(dir) => config::FileConfig::load(dir)?,
+            None => config::FileConfig::default(),
+        };
+        let addresses = listen_addresses(&file.listen(&args.listen)?)?;
+        healthcheck::check(healthcheck::probe_address(&addresses[0])?, healthcheck::TIMEOUT)
+    })();
+    match checked {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("unhealthy: {err:#}");
             std::process::ExitCode::FAILURE
         }
     }

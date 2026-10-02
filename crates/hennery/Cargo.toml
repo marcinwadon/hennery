@@ -5,12 +5,22 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Self-hosted cockpit for ACP coding agents"
+
+[features]
+# Release builds (plan 7a): build OpenSSL, which `webauthn-rs-core` links,
+# from source and link it statically, so the binary needs no system OpenSSL
+# (distribution spec §1.1). Development and tests use the system one.
+vendored-openssl = ["dep:openssl", "openssl/vendored"]
 
 [dependencies]
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true
 libc = "0.2"
+openssl = { workspace = true, optional = true }
 hennery-host.workspace = true
 hennery-kernel.workspace = true
 hennery-sessions.workspace = true
@@ -24,3 +34,7 @@ tracing-subscriber.workspace = true
 hennery-testkit = { path = "../hennery-testkit" }
 serde_json.workspace = true
 tempfile.workspace = true
+
+# cargo-dist (plan 7a) ships this crate's binary despite `publish = false`.
+[package.metadata.dist]
+dist = true

@@ -8,6 +8,8 @@ edition = "2024"
 license = "AGPL-3.0-only"
 rust-version = "1.88"
 publish = false
+repository = "https://github.com/marcinwadon/hennery"
+homepage = "https://github.com/marcinwadon/hennery"
 
 [workspace.dependencies]
 agent-client-protocol = "=2.2.0"
@@ -44,6 +46,9 @@ uuid = { version = "1", features = ["v7", "serde"] }
 webauthn-rs = { version = "=0.5.5", default-features = false }
 # Tests only: a software passkey, so no browser is needed.
 webauthn-authenticator-rs = { version = "=0.5.5", features = ["softpasskey"] }
+# The release build only (plan 7a): `webauthn-rs-core` links OpenSSL, built
+# from source and linked statically there (distribution spec §1.1).
+openssl = "=0.10.81"
 hennery-proto = { path = "crates/hennery-proto" }
 hennery-kernel = { path = "crates/hennery-kernel" }
 hennery-sessions = { path = "crates/hennery-sessions" }
@@ -63,3 +68,8 @@ opt-level = 3
 
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Release archives (plan 7a): `dist build` builds with this profile.
+[profile.dist]
+inherits = "release"
+lto = "thin"
