@@ -599,6 +599,103 @@ async fn assert_gone(pid_file: &Path) {
     assert!(!hennery_testkit::pid_alive(pid), "the app-server outlived its forget");
 }
 
+/// The review's item 1: before a home's first archive there is no
+/// `archived_sessions/`; codex-acp's archive creates it and moves the
+/// rollouts there. The walk after the archive reopens the kind
+/// directories (with every B3 check) and removes them: nothing is left.
+#[tokio::test]
+async fn a_fallback_into_a_new_archived_sessions_leaves_nothing() {
+    let root = Root::new();
+    for rel in OWN.iter().filter(|r| r.starts_with("sessions/")) {
+        let path = root.at(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "rollout").unwrap();
+    }
+    assert!(!root.at("archived_sessions").exists());
+    let mut ctx = root.ctx(root.fake(FakeDelete::Delete));
+    ctx.codex_app_server = None;
+    let forgotten = root.forget_with(&ctx).await;
+    assert!(root.archived().is_some(), "the archive ran");
+    assert_eq!(
+        reasons(&forgotten),
+        [(ForgetKind::CodexDatabaseCopies, ForgetReason::FallbackOnly, false)],
+        "{forgotten:?}"
+    );
+    assert_eq!(removed(&forgotten, ForgetKind::Transcript), 2);
+    let left: Vec<_> = std::fs::read_dir(root.at("archived_sessions")).unwrap().collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// The review's item 1: the directories reopened after the archive pass
+/// every B3 check again. A root replaced while the adapter ran (another
+/// directory at the path, its device and inode not the first open's) is
+/// refused, `unsafe_root`, and nothing is removed from either; an
+/// `archived_sessions/` the archive left as a symlink is reported, never
+/// followed.
+#[tokio::test]
+async fn the_directories_reopened_after_the_archive_are_checked_again() {
+    fn with_script(root: &Root, edit: impl FnOnce(&mut FakeScript)) -> ForgetContext {
+        let mut ctx = root.ctx(root.fake(FakeDelete::Delete));
+        ctx.codex_app_server = None;
+        let mut script = FakeScript {
+            codex_archive_log: Some(root.archive_log().to_str().unwrap().into()),
+            ..FakeScript::default()
+        };
+        edit(&mut script);
+        let adapter = ctx.agents.get_mut("codex").unwrap();
+        adapter.env.retain(|(k, _)| k != SCRIPT_ENV);
+        adapter
+            .env
+            .push((SCRIPT_ENV.into(), serde_json::to_string(&script).unwrap()));
+        ctx
+    }
+    // A root replaced.
+    let root = Root::new();
+    root.populate();
+    let ctx = with_script(&root, |s| s.codex_archive_replaces_home = true);
+    let forgotten = root.forget_with(&ctx).await;
+    assert_eq!(
+        reasons(&forgotten),
+        [(ForgetKind::Session, ForgetReason::UnsafeRoot, false)],
+        "{forgotten:?}"
+    );
+    let aside = root.root().with_extension("aside");
+    let rollouts_in = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("rollout-")
+            })
+            .count()
+    };
+    assert_eq!(
+        rollouts_in(&aside.join("archived_sessions")),
+        OWN.len(),
+        "nothing was removed from the moved-aside root"
+    );
+    // `archived_sessions/` left as a symlink.
+    let root = Root::new();
+    root.populate();
+    let target = root.outside().join("archived");
+    let ctx = with_script(&root, |s| {
+        s.codex_archive_links_archived = Some(target.to_str().unwrap().into())
+    });
+    let forgotten = root.forget_with(&ctx).await;
+    assert_eq!(
+        reasons(&forgotten),
+        [
+            (ForgetKind::Transcript, ForgetReason::Symlink, false),
+            (ForgetKind::CodexDatabaseCopies, ForgetReason::FallbackOnly, false)
+        ],
+        "{forgotten:?}"
+    );
+    assert_eq!(rollouts_in(&target), OWN.len(), "the link was followed");
+}
+
 /// The review's item 4: a fallback whose adapter never answers is cut its
 /// grace before the forget's deadline, so stopping it still ends within
 /// the deadline (and the host's answer inside the collector's wait). Its

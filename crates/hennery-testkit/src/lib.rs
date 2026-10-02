@@ -237,6 +237,14 @@ pub struct FakeScript {
     /// it moves nothing: the fake never touches a real home.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_archive_log: Option<String>,
+    /// After the archive, move `$CODEX_HOME` aside and make a fresh,
+    /// empty directory in its place: a root swapped while the adapter ran.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub codex_archive_replaces_home: bool,
+    /// After the archive, move `archived_sessions/` here and leave a
+    /// symlink to it in its place.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_archive_links_archived: Option<String>,
 }
 
 /// One question the fake asks its client during a prompt, and the chunk it
@@ -311,6 +319,8 @@ impl Default for FakeScript {
             delete_log: None,
             delete_waits_for_file: None,
             codex_archive_log: None,
+            codex_archive_replaces_home: false,
+            codex_archive_links_archived: None,
         }
     }
 }

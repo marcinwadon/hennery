@@ -609,6 +609,15 @@ fn codex_archive(script: &FakeScript, session: &SessionId) -> Result<(), String>
         let name = path.file_name().expect("a rollout's name").to_owned();
         std::fs::rename(&path, archived.join(name)).map_err(|e| e.to_string())?;
     }
+    if let Some(target) = &script.codex_archive_links_archived {
+        std::fs::rename(&archived, target).map_err(|e| e.to_string())?;
+        std::os::unix::fs::symlink(target, &archived).map_err(|e| e.to_string())?;
+    }
+    if script.codex_archive_replaces_home {
+        let aside = home.with_extension("aside");
+        std::fs::rename(home, &aside).map_err(|e| e.to_string())?;
+        std::fs::create_dir(home).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
