@@ -20,7 +20,7 @@ export type SessionConfig = { model?: string | null, mode?: string | null, axes?
  * collector never sends a frame that needs a capability to a host that
  * lacks it.
  */
-export type Capability = "projects" | "images" | "park" | "resolve_path";
+export type Capability = "projects" | "images" | "park" | "resolve_path" | "mcp_servers";
 
 /**
  * `hello.capabilities`. Deserialized leniently: a capability this build
@@ -33,6 +33,56 @@ export type Capability = "projects" | "images" | "park" | "resolve_path";
  * `hello` on an unknown capability either.
  */
 export type Capabilities = Array<Capability>;
+
+/**
+ * A name and a value: an HTTP header of an MCP server, or an environment
+ * variable of a stdio one. The value can be a secret (a gateway session
+ * token, a stdio server's key), so `Debug` never shows it (ACP core §8).
+ */
+export type NameValue = { name: string, value: string, };
+
+/**
+ * One MCP server for a session (gateway spec §3.2, §3.4): an entry of ACP
+ * `session/new` / `session/load` `mcpServers`, tagged by `type` here (ACP
+ * itself leaves stdio entries untagged; the host builds those). A new
+ * server type or a new required field needs a new capability: a host that
+ * cannot decode a start drops it unanswered, and the collector's timeout
+ * then drops the connection.
+ */
+export type McpServer = { "type": "http", name: string, url: string, headers: Array<NameValue>, } | { "type": "stdio", name: string, command: string, args: Array<string>, env: Array<NameValue>, };
+
+/**
+ * The MCP part of a `start_session` / `resume_session` (ACP core §3.3,
+ * §4.3; plan 8c). Flattened into the frame; empty fields are left out, so
+ * a frame without servers is what an older host expects.
+ */
+export type McpDelivery = { 
+/**
+ * Passed in `session/new` / `session/load`. Only to a host that
+ * announced `mcp_servers`.
+ */
+mcp_servers?: Array<McpServer>, 
+/**
+ * The collector knowingly delivers to an agent the host cannot isolate
+ * (the mixed-host fallback's default hat, or a single-hat host,
+ * umbrella §8.5). Absent, the host refuses servers for such an agent
+ * (`mcp_isolation_unavailable`): isolation is never lost by omission.
+ */
+isolation_waived?: boolean, };
+
+/**
+ * How a host keeps an agent's sessions to the servers hennery passes (ACP
+ * core §6). Lenient: a mechanism this build does not know reads as `none`.
+ */
+export type McpIsolation = "claude_strict" | "none";
+
+/**
+ * `hello.mcp_isolation`: per agent id, how the host isolates its MCP
+ * servers. An agent left out is not isolated. Deserialized leniently, like
+ * `Capabilities`: an unknown mechanism counts as `none`, never as isolated
+ * and never a reason to refuse the `hello`.
+ */
+export type AgentIsolation = { [key in string]: McpIsolation };
 
 /**
  * A session that a host still has an adapter for, reported in `hello`.
@@ -207,6 +257,11 @@ proof: string,
  */
 capabilities: Capabilities, 
 /**
+ * Per agent, how this host isolates its MCP servers (plan 8c).
+ * Absent means none is isolated (an older host).
+ */
+mcp_isolation: AgentIsolation, 
+/**
  * The workspace roots from the host's config (ACP core §7), as
  * configured. Absent means none (an older host).
  */
@@ -246,7 +301,24 @@ committed: Record<string, number>, } | { "type": "hello_error", code: string, me
  * The collector's highest committed seq for this session; the host
  * continues from the larger of this and its own counter (§5.1).
  */
-committed_seq: number, agent: string, cwd: string, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, } | { "type": "resume_session", request_id: string, session_id: string, 
+committed_seq: number, agent: string, cwd: string, 
+/**
+ * The session's hat (`sessions.hat_id`); empty for a session from
+ * before hats. Carried, not yet used by the host (plan 8c).
+ */
+hat_id?: string, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, 
+/**
+ * Passed in `session/new` / `session/load`. Only to a host that
+ * announced `mcp_servers`.
+ */
+mcp_servers?: Array<McpServer>, 
+/**
+ * The collector knowingly delivers to an agent the host cannot isolate
+ * (the mixed-host fallback's default hat, or a single-hat host,
+ * umbrella §8.5). Absent, the host refuses servers for such an agent
+ * (`mcp_isolation_unavailable`): isolation is never lost by omission.
+ */
+isolation_waived?: boolean, } | { "type": "resume_session", request_id: string, session_id: string, 
 /**
  * Fast-forward the host's counter before the first frame (§5.1).
  */
@@ -255,7 +327,23 @@ committed_seq: number, agent: string, cwd: string,
  * The adapter's own session id, from the stored `session_started`:
  * the host keeps no copy across restarts.
  */
-agent_session_id: string, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, } | { "type": "prompt", request_id: string, session_id: string, turn_id: string, 
+agent_session_id: string, 
+/**
+ * As on `start_session`.
+ */
+hat_id?: string, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, 
+/**
+ * Passed in `session/new` / `session/load`. Only to a host that
+ * announced `mcp_servers`.
+ */
+mcp_servers?: Array<McpServer>, 
+/**
+ * The collector knowingly delivers to an agent the host cannot isolate
+ * (the mixed-host fallback's default hat, or a single-hat host,
+ * umbrella §8.5). Absent, the host refuses servers for such an agent
+ * (`mcp_isolation_unavailable`): isolation is never lost by omission.
+ */
+isolation_waived?: boolean, } | { "type": "prompt", request_id: string, session_id: string, turn_id: string, 
 /**
  * ACP ContentBlocks, built by the frontend.
  */

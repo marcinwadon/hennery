@@ -370,8 +370,8 @@ host.)*
 
 | Type | Key fields | Completed by |
 |---|---|---|
-| `start_session` | session_id (collector-minted), committed_seq, agent, cwd (canonical), model?, mode?, axes{}, first_prompt?{turn_id, content[]}, mcp_servers[], hat | `session_started` \| `start_failed` \| `error{unknown_agent}` |
-| `resume_session` | session_id, committed_seq, agent, cwd, agent_session_id, model?, mode?, axes{}, mcp_servers[], hat | `session_started` \| `start_failed` \| `error` (as a start) |
+| `start_session` | session_id (collector-minted), committed_seq, agent, cwd (canonical), model?, mode?, axes{}, first_prompt?{turn_id, content[]}, mcp_servers[], isolation_waived?, hat_id | `session_started` \| `start_failed` \| `error{unknown_agent \| mcp_isolation_unavailable}` |
+| `resume_session` | session_id, committed_seq, agent, cwd, agent_session_id, model?, mode?, axes{}, mcp_servers[], isolation_waived?, hat_id | `session_started` \| `start_failed` \| `error` (as a start) |
 | `prompt` | session_id, turn_id, content[] (ACP ContentBlocks) | `turn_started` \| `error{turn_in_progress \| not_attached \| invalid \| images_unsupported}` |
 | `cancel_turn` | session_id, turn_id | That turn's `turn_ended`, **whatever its outcome** \| `error{not_running \| not_attached}` |
 | `park_session` | session_id | `session_parked{reason: operator}` \| `error{not_attached}` (only to hosts with the `park` capability) |
@@ -430,13 +430,28 @@ host.)*
 - `start_session`, `resume_session`: `cwd_not_canonical` — the cwd does not
   resolve on the host to itself as a directory (a symlink swapped in since the
   collector resolved it); nothing is spawned (plan 5c).
+- `start_session`, `resume_session`: `mcp_isolation_unavailable` — the frame
+  carries `mcp_servers` for an agent the host cannot keep to them (its
+  `hello.mcp_isolation` is `none`), and `isolation_waived` is not set;
+  nothing is spawned. Never dropped, never passed (plan 8c).
+- `mcp_servers[]` are ACP `mcpServers` entries tagged by `type`: `http`
+  `{name, url, headers[{name, value}]}` and `stdio` `{name, command, args[],
+  env[{name, value}]}`. Absent or empty when there are none, as are
+  `isolation_waived` (the collector knowingly delivers to an agent the host
+  cannot isolate: the fallback's default hat, or a single-hat host, umbrella
+  §8.5) and `hat_id` (`sessions.hat_id`, carried for the composed
+  `CODEX_HOME`). The collector sends servers only to a host whose live
+  connection announced `mcp_servers`, and only for an agent it isolates
+  unless it waives that, checked by the hub on the connection the frame goes
+  out on (plan 8c). A resume re-sends the servers: an agent keeps none
+  across `session/load` (the spike).
 - Answers to a session with no live actor are refused `not_attached`. The
   collector logs that refusal; it is no verdict (§4.6).
 - A command queued behind an ending actor is answered `not_attached` at once,
   never left to the collector's timeout (§2.2).
 
-**Not on the wire yet** (they arrive with their subsystems): `first_prompt`,
-`mcp_servers[]` and `hat` on start/resume (gateway, hats); `hello_ack.server_time`;
+**Not on the wire yet** (they arrive with their subsystems): `first_prompt`;
+`hello_ack.server_time`;
 `hello.agents[]` and `workspace_roots[]`; the projects probes and their
 responses; `forget_hat`. `resolve_path` / `resolved_path` are on the wire
 since plan 5b: probes, answered only by the connection they went out on.
@@ -458,9 +473,20 @@ since plan 5b: probes, answered only by the connection they went out on.
   capabilities of the live connection (in the hub), so a host that reconnects
   on an older build loses them at once; the host registry also records the
   latest accepted `hello`'s list for display (`HostItem.capabilities`, kernel
-  spec §8). The hennery host announces `park` and `images`: `images` says the
-  host carries image blocks, and each session still refuses them when its
-  agent takes none (`images_unsupported`, above).
+  spec §8). The hennery host announces `park`, `images`, `projects`,
+  `resolve_path` and `mcp_servers`: `images` says the host carries image
+  blocks, and each session still refuses them when its agent takes none
+  (`images_unsupported`, above). `mcp_servers` (plan 8c):
+  the host passes a start's or resume's servers into `session/new` /
+  `session/load` with each agent's isolation, and refuses those it cannot
+  isolate unless waived (`mcp_isolation_unavailable`). `mcp_servers[]`,
+  `isolation_waived` and `hat_id` have been on the wire since plan 8c; the
+  collector sends no servers until the gateway mints them (plan 8e).
+- `mcp_isolation` (plan 8c): per agent id, how the host keeps its sessions to
+  the servers it is given: `claude_strict` (the strict flag, §6) or `none`.
+  An agent left out is `none`. Deserialized leniently like `capabilities`:
+  an unknown value reads as `none`, never as isolated. The collector keeps
+  it with the live connection (the hub), not in the host registry.
 - `agents[]`: per agent `{id, version, available, auth, catalog}` where
   `catalog` is the profile's **static default catalogue** (§6), so the
   New-session pickers work before the first session on a host exists.
@@ -729,8 +755,9 @@ adapter default, and the next resume applied the default for real.)*
 A failed re-apply is logged on the timeline as a `host_note` and does not fail
 the resume.
 
-**Built so far:** hat resolution, `mcp_servers`, `_meta` and the first prompt
-are not built yet; start and resume carry agent, cwd and the config.
+**Built so far:** the first prompt is not built yet; start and resume carry
+agent, cwd, the config, the hat and (plan 8c) the MCP servers with Claude's
+`_meta`. The collector sends no servers until plan 8e.
 
 **Config axes.** Axes are ACP config options, and model and mode are two of
 them. The model is the option in category `model`; without one, the option
@@ -1266,9 +1293,25 @@ the host's handshake completes. `starting` sessions are reconciled then
 
 A profile is data compiled into the host, selected by `agent`.
 
-**Built so far:** no profiles; an agent is a command line from the host's
-config, and every agent gets the same `initialize` (fs and terminal not
+**Built so far:** every agent gets the same `initialize` (fs and terminal not
 advertised, boolean config options and form elicitation advertised, §2.5).
+Plan 8c builds the profiles' MCP column only, chosen by where the agent came
+from, never by its name alone:
+- the installed set's `claude` (the pinned `claude-agent-acp`): the strict
+  flag in `_meta` on every `session/new` and `session/load`, with servers or
+  without; `hello.mcp_isolation` reports `claude_strict`. **Every Claude
+  session hennery runs therefore loses the user's own MCP servers and
+  claude.ai connectors**: the gateway is the one place MCP is managed
+  (umbrella §8.5; the spike's conclusion 2);
+- the same with the operator's CLI (`--use-cli`, `CLAUDE_CODE_EXECUTABLE`):
+  the strict flag is still sent, but the override is unverified, so it
+  reports `none`;
+- everything else (Codex until its composed `CODEX_HOME`, plan 8h; any
+  `--agent` command): no `_meta`, `none`.
+
+Servers for an agent reported `none` are refused (`mcp_isolation_unavailable`)
+unless the collector waived isolation. The operator's opt-in to unverified
+isolation for an override is not built.
 
 
 | | `claude` | `codex` | `generic` |
@@ -1497,7 +1540,21 @@ other tables arrive with the plans that need them.
   `probe_agents` and is refined from each `session_started`; it powers the
   New-session pickers before a session exists.
 - Gateway tokens and the `headers` of `mcp_servers` entries are never written
-  to the events table and never sent over SSE.
+  to the events table and never sent over SSE. Nor are they logged (plan
+  8c): their `Debug` shows names, and an HTTP server's URL only as
+  `scheme://host[:port]`, never a header's or env variable's value, the
+  URL's path, query or userinfo, nor a stdio server's arguments; the
+  process's log output holds tungstenite, which traces whole messages, at
+  `info` and the ACP crate, which also quotes an adapter's stray stdout in
+  its warnings, at `error`, whatever `RUST_LOG` says; a frame the host
+  cannot decode is logged by its error's kind and place, never its text;
+  and the host redacts a session's secret values (each of those parts, its
+  parts between whitespace or URL delimiters, and its JSON-escaped form)
+  from the text it writes itself, before `scrub`: `start_failed`,
+  `turn_ended.error`, `host_note`, the stderr tail of `adapter_exited`, its
+  `error` answers and its own log lines. Whether ACP payloads are redacted
+  too (a token an agent prints into a tool's output, against §2.3's
+  verbatim payloads) is open, for the maintainer before plan 8e.
 
 ---
 

@@ -18,6 +18,13 @@ pub struct FakeScript {
     /// the host scrubs the stderr tail).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stderr_lines: Vec<String>,
+    /// Lines written raw (not JSON-RPC) to stdout right before answering
+    /// `session/new`: written while that answer does not exist yet, so the
+    /// ACP crate has no JSON-RPC line of its own still being written to the
+    /// same stdout (e.g. a fake token, to test that the host's log never
+    /// shows what an adapter prints to its own stdout, plan 8c).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stdout_lines: Vec<String>,
     /// At startup, spawn a long-lived `sleep` child (a grandchild of the
     /// host) in the adapter's process group and write its pid to this file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -33,6 +40,18 @@ pub struct FakeScript {
     /// Answer `session/new` with this JSON-RPC error code.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_session_error: Option<i32>,
+    /// `new_session_error`'s message quotes the request's `mcpServers` (an
+    /// adapter that echoes the config it refuses, plan 8c).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub new_session_error_echoes: bool,
+    /// Answer every `session/prompt` with a JSON-RPC error carrying this
+    /// message (an adapter whose error quotes its config, plan 8c).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_error: Option<String>,
+    /// Answer every `session/set_config_option` with a JSON-RPC error
+    /// carrying this message, as `prompt_error`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_error: Option<String>,
     /// Advertise `loadSession: false` in `initialize`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_load_session: bool,
@@ -75,6 +94,12 @@ pub struct FakeScript {
     /// this file, refused calls included.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_log: Option<String>,
+    /// Append one JSON line per `session/new` and `session/load` to this
+    /// file: `{"method", "params"}`, the request as the fake parsed it
+    /// (plan 8c: its `mcpServers` and `_meta`). A file, never stderr, which
+    /// would reach `adapter_exited`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_log: Option<String>,
     /// Apply switches but answer them with an empty `configOptions` list (a
     /// read-back the host cannot use).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -215,10 +240,14 @@ impl Default for FakeScript {
             chunk_delay_ms: 0,
             exit_after_chunks: None,
             stderr_lines: Vec::new(),
+            stdout_lines: Vec::new(),
             grandchild_pid_file: None,
             replay: Vec::new(),
             load_error: None,
             new_session_error: None,
+            new_session_error_echoes: false,
+            prompt_error: None,
+            config_error: None,
             no_load_session: false,
             ignore_cancel: false,
             cancel_received_file: None,
@@ -227,6 +256,7 @@ impl Default for FakeScript {
             model_switch_sets_mode: None,
             prompt_sets_mode: None,
             config_log: None,
+            session_log: None,
             empty_config_read_back: false,
             hang_config: false,
             slow_model_switch_ms: None,

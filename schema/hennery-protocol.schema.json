@@ -1,5 +1,12 @@
 {
   "$defs": {
+    "AgentIsolation": {
+      "additionalProperties": {
+        "$ref": "#/$defs/McpIsolation"
+      },
+      "description": "`hello.mcp_isolation`: per agent id, how the host isolates its MCP\nservers. An agent left out is not isolated. Deserialized leniently, like\n`Capabilities`: an unknown mechanism counts as `none`, never as isolated\nand never a reason to refuse the `hello`.",
+      "type": "object"
+    },
     "AnswerRequest": {
       "anyOf": [
         {
@@ -193,6 +200,11 @@
           "const": "resolve_path",
           "description": "Resolving typed paths (`resolve_path`, kernel spec §5.4).",
           "type": "string"
+        },
+        {
+          "const": "mcp_servers",
+          "description": "A session's MCP servers (plan 8c): the host passes a start's or\nresume's `mcp_servers` into `session/new` / `session/load` with the\nagent's isolation, as `hello.mcp_isolation` reports it, and refuses\nservers it cannot isolate unless the collector waived that\n(`mcp_isolation_unavailable`). A host without it gets no servers.",
+          "type": "string"
         }
       ]
     },
@@ -270,6 +282,21 @@
             "cwd": {
               "type": "string"
             },
+            "hat_id": {
+              "description": "The session's hat (`sessions.hat_id`); empty for a session from\nbefore hats. Carried, not yet used by the host (plan 8c).",
+              "type": "string"
+            },
+            "isolation_waived": {
+              "description": "The collector knowingly delivers to an agent the host cannot isolate\n(the mixed-host fallback's default hat, or a single-hat host,\numbrella §8.5). Absent, the host refuses servers for such an agent\n(`mcp_isolation_unavailable`): isolation is never lost by omission.",
+              "type": "boolean"
+            },
+            "mcp_servers": {
+              "description": "Passed in `session/new` / `session/load`. Only to a host that\nannounced `mcp_servers`.",
+              "items": {
+                "$ref": "#/$defs/McpServer"
+              },
+              "type": "array"
+            },
             "mode": {
               "type": [
                 "string",
@@ -327,6 +354,21 @@
             },
             "cwd": {
               "type": "string"
+            },
+            "hat_id": {
+              "description": "As on `start_session`.",
+              "type": "string"
+            },
+            "isolation_waived": {
+              "description": "The collector knowingly delivers to an agent the host cannot isolate\n(the mixed-host fallback's default hat, or a single-hat host,\numbrella §8.5). Absent, the host refuses servers for such an agent\n(`mcp_isolation_unavailable`): isolation is never lost by omission.",
+              "type": "boolean"
+            },
+            "mcp_servers": {
+              "description": "Passed in `session/new` / `session/load`. Only to a host that\nannounced `mcp_servers`.",
+              "items": {
+                "$ref": "#/$defs/McpServer"
+              },
+              "type": "array"
             },
             "mode": {
               "type": [
@@ -994,6 +1036,11 @@
             "host_version": {
               "type": "string"
             },
+            "mcp_isolation": {
+              "$ref": "#/$defs/AgentIsolation",
+              "default": {},
+              "description": "Per agent, how this host isolates its MCP servers (plan 8c).\nAbsent means none is isolated (an older host)."
+            },
             "proof": {
               "description": "Proof of possession of the host's key (ACP core §3.5): its\nEd25519 signature, hex, over `hello_proof_message(nonce, host_id,\nprotocol_version)`, where the nonce is the one the collector sent\nin the upgrade response's `hennery-hello-nonce` header.",
               "type": "string"
@@ -1577,6 +1624,21 @@
       ],
       "type": "object"
     },
+    "McpIsolation": {
+      "description": "How a host keeps an agent's sessions to the servers hennery passes (ACP\ncore §6). Lenient: a mechanism this build does not know reads as `none`.",
+      "oneOf": [
+        {
+          "const": "claude_strict",
+          "description": "`--strict-mcp-config` through `_meta` on every `session/new` and\n`session/load` (the pinned Claude adapter, its own CLI).",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "description": "None: the agent also loads the user's own MCP configuration.",
+          "type": "string"
+        }
+      ]
+    },
     "McpMountsRequest": {
       "additionalProperties": false,
       "description": "`PUT /api/mcp/connections/{id}/mounts`: the whole set of hosts the\nconnection is mounted on, replacing the one before, never a delta\n(gateway spec §9). No step-up: a mount reaches only a host the owner\npaired. 200 with the `McpConnectionItem`.\n\nIts own codes, beyond every route's (see `McpConnectionItem`): 404\n`not_found`; 400 `invalid` (a host that is not one of the owner's\npaired, unrevoked hosts; more than 1024 hosts; an id over 64 bytes,\nwhich is not quoted back). The limits count the ids as sent, and are\nchecked before the connection is looked up. A refused set changes\nnothing.",
@@ -1591,6 +1653,90 @@
       },
       "required": [
         "host_ids"
+      ],
+      "type": "object"
+    },
+    "McpServer": {
+      "description": "One MCP server for a session (gateway spec §3.2, §3.4): an entry of ACP\n`session/new` / `session/load` `mcpServers`, tagged by `type` here (ACP\nitself leaves stdio entries untagged; the host builds those). A new\nserver type or a new required field needs a new capability: a host that\ncannot decode a start drops it unanswered, and the collector's timeout\nthen drops the connection.",
+      "oneOf": [
+        {
+          "description": "A streamable-HTTP server: the gateway's `/mcp/<slug>`, with the\nsession's token in `Authorization`.",
+          "properties": {
+            "headers": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/NameValue"
+              },
+              "type": "array"
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "const": "http",
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "url"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A local server the agent runs as its own child.",
+          "properties": {
+            "args": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "command": {
+              "type": "string"
+            },
+            "env": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/NameValue"
+              },
+              "type": "array"
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "const": "stdio",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "command"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "NameValue": {
+      "description": "A name and a value: an HTTP header of an MCP server, or an environment\nvariable of a stdio one. The value can be a secret (a gateway session\ntoken, a stdio server's key), so `Debug` never shows it (ACP core §8).",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value"
       ],
       "type": "object"
     },

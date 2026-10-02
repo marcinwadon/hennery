@@ -77,6 +77,8 @@ fn every_collector_frame_round_trips() {
             agent: "claude".into(),
             cwd: "/tmp".into(),
             config: Default::default(),
+            hat_id: String::new(),
+            mcp: Default::default(),
         },
         CollectorFrame::ResumeSession {
             request_id: "r".into(),
@@ -86,6 +88,8 @@ fn every_collector_frame_round_trips() {
             cwd: "/tmp".into(),
             agent_session_id: "a1".into(),
             config: Default::default(),
+            hat_id: String::new(),
+            mcp: Default::default(),
         },
         CollectorFrame::Prompt {
             request_id: "r".into(),
@@ -178,6 +182,8 @@ fn resume_frames_and_host_notes_use_the_spec_field_names() {
         cwd: "/tmp".into(),
         agent_session_id: "a1".into(),
         config: Default::default(),
+        hat_id: String::new(),
+        mcp: Default::default(),
     };
     assert_eq!(
         serde_json::to_value(&resume).unwrap(),
@@ -403,6 +409,7 @@ fn hello_capabilities_skip_unknown_entries_and_default_to_none() {
         capabilities: Capabilities(vec![Capability::Park]),
         workspace_roots: vec![],
         attached_sessions: vec![],
+        mcp_isolation: Default::default(),
     };
     assert_eq!(serde_json::to_value(&sent).unwrap()["capabilities"], json!(["park"]));
 }
@@ -440,6 +447,8 @@ fn start_and_resume_carry_model_mode_and_axes_as_flat_fields() {
         agent: "claude".into(),
         cwd: "/tmp".into(),
         config: config(),
+        hat_id: String::new(),
+        mcp: Default::default(),
     };
     let expected = json!({
         "type": "start_session", "request_id": "r", "session_id": "s", "committed_seq": 0,

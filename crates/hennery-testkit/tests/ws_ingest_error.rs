@@ -83,6 +83,7 @@ async fn a_failed_ingest_drops_the_connection_instead_of_acking_past_it() {
             capabilities: Default::default(),
             workspace_roots: vec![],
             attached_sessions: vec![],
+            mcp_isolation: Default::default(),
         })
         .unwrap(),
     ))
@@ -163,6 +164,7 @@ async fn an_undo_error_answers_delivery_unknown_and_drops_the_connection() {
             capabilities: Capabilities(vec![Capability::ResolvePath]),
             workspace_roots: vec![],
             attached_sessions: vec![],
+            mcp_isolation: Default::default(),
         })
         .unwrap(),
     ))
