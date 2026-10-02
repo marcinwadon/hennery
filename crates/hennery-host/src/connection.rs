@@ -6,6 +6,7 @@
 
 use crate::identity::HostKey;
 use crate::outbox::Outbox;
+use crate::projects::Probes;
 use crate::session::{self, AgentCommand, Answer, Attach, Launch, SessionCmd, SessionHandle, SessionOptions};
 use crate::uplink::Uplink;
 use anyhow::{Context, Result, bail};
@@ -118,11 +119,13 @@ pub async fn run_until(cfg: HostConfig, shutdown: impl Future<Output = ()>) -> R
     let outbox = Outbox::open(&cfg.data_dir.join(crate::outbox::FILE))?;
     let (uplink, mut replies) = Uplink::new(outbox);
     let sessions: Sessions = Arc::new(Mutex::new(SessionMap::default()));
+    // Outlives each connection, so its bounds hold across reconnects.
+    let probes = Probes::default();
     // Ends only when the collector says this host is revoked.
     let serve = async {
         let mut backoff = cfg.reconnect_min;
         loop {
-            if let Err(err) = connect_once(&cfg, &uplink, &sessions, &mut replies, &mut backoff).await {
+            if let Err(err) = connect_once(&cfg, &uplink, &sessions, &probes, &mut replies, &mut backoff).await {
                 if revoked(&err) {
                     return err;
                 }
@@ -269,10 +272,10 @@ async fn handshake(
             host_version: env!("CARGO_PKG_VERSION").into(),
             host_id: host_id.to_string(),
             proof: key.sign_hello(&nonce, host_id, PROTOCOL_VERSION),
-            // Every hennery host can park, and take images: a session whose
-            // agent offers none refuses them (plan 6a, decision 2).
-            // `projects` comes with the probes.
-            capabilities: Capabilities(vec![Capability::Park, Capability::Images]),
+            // Every hennery host can park, take images (a session whose
+            // agent offers none refuses them, plan 6a decision 2) and serve
+            // the project picker (browsing under home works without roots).
+            capabilities: Capabilities(vec![Capability::Park, Capability::Images, Capability::Projects]),
             workspace_roots,
             attached_sessions: attached()?,
         },
@@ -310,6 +313,7 @@ async fn connect_once(
     cfg: &HostConfig,
     uplink: &Uplink,
     sessions: &Sessions,
+    probes: &Probes,
     replies: &mut mpsc::UnboundedReceiver<HostFrame>,
     backoff: &mut Duration,
 ) -> Result<()> {
@@ -386,7 +390,7 @@ async fn connect_once(
                                 // accumulated from earlier failed attempts.
                                 *backoff = cfg.reconnect_min;
                             }
-                            handle(cfg, uplink, sessions, frame)?
+                            handle(cfg, uplink, sessions, probes, frame)?
                         }
                         Err(err) => tracing::warn!(error = %err, "ignoring unknown or invalid frame"),
                     },
@@ -534,7 +538,13 @@ fn spawn_or_restart(
         .insert(req.session_id, session::launch(uplink.clone(), launch, options));
 }
 
-fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: CollectorFrame) -> Result<()> {
+fn handle(
+    cfg: &HostConfig,
+    uplink: &Uplink,
+    sessions: &Sessions,
+    probes: &Probes,
+    frame: CollectorFrame,
+) -> Result<()> {
     match frame {
         CollectorFrame::StartSession {
             request_id,
@@ -661,13 +671,13 @@ fn handle(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, frame: Collect
             Answer::Elicitation { action, content },
         ),
         CollectorFrame::Ack { session_id, ack_seq } => uplink.ack(&session_id, ack_seq)?,
-        // Not announced (`projects`), so a collector does not send them.
-        CollectorFrame::ListProjects { request_id } | CollectorFrame::BrowseDirectory { request_id, .. } => uplink
-            .reply(HostFrame::Error {
-                request_id,
-                code: "unsupported".into(),
-                message: "this host does not serve projects".into(),
-            }),
+        // Probes (ACP core §3.3, §7), answered from blocking threads.
+        CollectorFrame::ListProjects { request_id } => {
+            probes.list(uplink, request_id, cfg.workspace_roots.clone(), cfg.home.clone())
+        }
+        CollectorFrame::BrowseDirectory { request_id, path } => {
+            probes.browse(uplink, request_id, path, cfg.workspace_roots.clone(), cfg.home.clone())
+        }
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }
     Ok(())

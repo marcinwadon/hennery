@@ -776,7 +776,7 @@ async fn a_resume_queued_behind_a_close_attaches_a_fresh_adapter_after_the_close
 /// Plan 6a adds `images`: image prompts, refused per agent when its
 /// `initialize` offers none (decision 2).
 #[tokio::test]
-async fn a_host_announces_that_it_can_park_and_take_images() {
+async fn a_host_announces_that_it_can_park_take_images_and_serve_projects() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(run(host_with_fake(addr, "capabilities", slow_fake())));
@@ -789,7 +789,68 @@ async fn a_host_announces_that_it_can_park_and_take_images() {
         panic!("expected hello");
     };
     use hennery_proto::frames::{Capabilities, Capability};
-    assert_eq!(capabilities, Capabilities(vec![Capability::Park, Capability::Images]));
+    assert_eq!(
+        capabilities,
+        Capabilities(vec![Capability::Park, Capability::Images, Capability::Projects])
+    );
+}
+
+/// ACP core §3.3, §7: the host answers its probes on the connection, from
+/// its workspace roots.
+#[tokio::test]
+async fn a_host_answers_list_projects_and_browse_directory() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let root = hennery_host::projects::canonical(dir.path()).unwrap();
+    std::fs::create_dir_all(format!("{root}/repo/.git")).unwrap();
+    let mut cfg = host_with_fake(addr, "probes", slow_fake());
+    cfg.workspace_roots = vec![root.clone().into()];
+    cfg.home = None;
+    tokio::spawn(run(cfg));
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    send_frame(
+        &mut sink,
+        &CollectorFrame::ListProjects {
+            request_id: "l1".into(),
+        },
+    )
+    .await;
+    let reply = read_until(&mut stream, |f| f.probe_request_id() == Some("l1")).await;
+    let HostFrame::Projects { items, home, .. } = reply else {
+        panic!("expected projects, got {reply:?}");
+    };
+    assert_eq!(
+        items.into_iter().map(|p| p.path).collect::<Vec<_>>(),
+        [format!("{root}/repo")]
+    );
+    assert_eq!(home, None);
+    send_frame(
+        &mut sink,
+        &CollectorFrame::BrowseDirectory {
+            request_id: "b1".into(),
+            path: root.clone(),
+        },
+    )
+    .await;
+    let reply = read_until(&mut stream, |f| f.probe_request_id() == Some("b1")).await;
+    let HostFrame::Directory { path, entries, .. } = reply else {
+        panic!("expected a directory, got {reply:?}");
+    };
+    assert_eq!((path.as_str(), entries.len(), entries[0].git), (root.as_str(), 1, true));
+    send_frame(
+        &mut sink,
+        &CollectorFrame::BrowseDirectory {
+            request_id: "b2".into(),
+            path: "/".into(),
+        },
+    )
+    .await;
+    let reply = read_until(&mut stream, error_for("b2")).await;
+    assert!(
+        matches!(reply, HostFrame::Error { ref code, .. } if code == "outside_workspace"),
+        "{reply:?}"
+    );
 }
 
 /// ACP core §3.3, §7: `hello` reports the workspace roots as configured.
