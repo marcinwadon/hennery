@@ -132,3 +132,72 @@ fn notify_sends_no_servers_a_connection_cannot_take() {
     assert!(rx.try_recv().is_err(), "sent anyway");
     assert!(hub.notify("h", start("claude", false, false)));
 }
+
+/// `start(agent, true, waived)` as a resume.
+fn resume(agent: &str, waived: bool) -> CollectorFrame {
+    let CollectorFrame::StartSession {
+        request_id,
+        session_id,
+        committed_seq,
+        agent,
+        cwd,
+        config,
+        hat_id,
+        mcp,
+    } = start(agent, true, waived)
+    else {
+        unreachable!()
+    };
+    CollectorFrame::ResumeSession {
+        request_id,
+        session_id,
+        committed_seq,
+        agent,
+        cwd,
+        agent_session_id: "a1".into(),
+        config,
+        hat_id,
+        mcp,
+    }
+}
+
+/// A resume carries servers as a start does (an agent keeps none across
+/// `session/load`), and the hub checks it the same way: by the agent it
+/// names, on the connection it would go out on.
+#[tokio::test]
+async fn a_resume_with_servers_is_checked_as_a_start_is() {
+    let with = Capabilities(vec![Capability::McpServers]);
+    for (capabilities, agent, waived, delivered) in [
+        // (capabilities, agent, waived, delivered)
+        (with.clone(), "claude", false, true),
+        (with.clone(), "codex", false, false),
+        (with, "codex", true, true),
+        (Capabilities::default(), "claude", true, false),
+    ] {
+        let hub = Hub::new();
+        let mut rx = connect(&hub, capabilities.clone());
+        let result = send(&hub, &mut rx, resume(agent, waived)).await;
+        let case = format!("{capabilities:?} {agent} waived={waived}");
+        if delivered {
+            assert_eq!(result, Ok(()), "{case}");
+        } else {
+            assert_eq!(result, Err(RequestError::McpUndeliverable), "{case}");
+            assert!(rx.try_recv().is_err(), "sent anyway: {case}");
+        }
+    }
+}
+
+/// A frame that carries no delivery (a prompt) is not the guard's to
+/// refuse: it goes out on any connection, one that announced nothing too.
+#[tokio::test]
+async fn a_frame_without_a_delivery_goes_out_on_any_connection() {
+    let hub = Hub::new();
+    let mut rx = connect(&hub, Capabilities::default());
+    let prompt = CollectorFrame::Prompt {
+        request_id: "r1".into(),
+        session_id: "s1".into(),
+        turn_id: "t1".into(),
+        content: vec![],
+    };
+    assert_eq!(send(&hub, &mut rx, prompt).await, Ok(()));
+}
