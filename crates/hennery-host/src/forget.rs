@@ -40,8 +40,11 @@ pub struct ForgetContext {
     /// Test seams of the removal (the `test-hooks` feature): none in a
     /// real build.
     pub hooks: crate::walk::Hooks,
-    /// The host user (`account`), for the ownership checks (B3).
-    pub account: Account,
+    /// The host user, for the ownership checks (B3). `None`: looked up
+    /// (`account`) inside the forget's blocking task, never on the
+    /// connection's frame handler, where a slow directory service (LDAP,
+    /// sssd) would stall the connection loop.
+    pub account: Option<Account>,
 }
 
 /// One forget, as the collector asked for it, checked against the
@@ -429,7 +432,7 @@ fn identity(path: &Path) -> Option<(u64, u64)> {
 /// resolving to itself; not `/`, the host user's home or an ancestor of
 /// it, nor the host's data directory or an ancestor of it; a real
 /// directory of the host user's, not writable by others. With its device.
-fn open_checked_root(ctx: &ForgetContext, root: &Path) -> Result<(OwnedFd, libc::dev_t), ForgetReason> {
+fn open_checked_root(ctx: &ForgetContext, root: &Path, me: &Account) -> Result<(OwnedFd, libc::dev_t), ForgetReason> {
     if !root.is_absolute() {
         return Err(ForgetReason::UnsafeRoot);
     }
@@ -460,7 +463,7 @@ fn open_checked_root(ctx: &ForgetContext, root: &Path) -> Result<(OwnedFd, libc:
             return Err(ForgetReason::UnsafeRoot);
         }
     }
-    if !walk::is_dir(&st) || !safely_owned(&st, &ctx.account) {
+    if !walk::is_dir(&st) || !safely_owned(&st, me) {
         return Err(ForgetReason::UnsafeRoot);
     }
     Ok((fd, st.st_dev))
@@ -553,11 +556,13 @@ struct Kinds {
 }
 
 /// The root and its kind directories, checked (B3). `Err` for the root.
+/// Runs on a blocking thread: the account lookup with it.
 fn check(ctx: &ForgetContext, root: &Path) -> Result<Kinds, ForgetReason> {
-    let (root_fd, dev) = open_checked_root(ctx, root)?;
+    let me = ctx.account.clone().unwrap_or_else(account);
+    let (root_fd, dev) = open_checked_root(ctx, root, &me)?;
     let dirs = CLAUDE_KINDS
         .iter()
-        .map(|&(kind, name)| (kind, name, open_kind(root_fd.as_raw_fd(), name, dev, &ctx.account)))
+        .map(|&(kind, name)| (kind, name, open_kind(root_fd.as_raw_fd(), name, dev, &me)))
         .collect();
     Ok(Kinds {
         root: root_fd,

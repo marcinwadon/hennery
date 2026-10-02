@@ -96,7 +96,8 @@ impl Root {
             data_dir: self.base.join("host"),
             home: Some(self.base.join("home")),
             hooks,
-            account: hennery_host::forget::account(),
+            // Looked up by the forget itself, as the host's connection does.
+            account: None,
         }
     }
 
