@@ -984,8 +984,11 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
 /// host child, nor through it to any agent.
 ///
 /// The agent is a shell script that dumps its environment, and which of the
-/// descriptors 3 to 9 it holds (3 is the pairing pipe's number in the host
-/// child, 4 the listening socket's in the collector child), then exits.
+/// descriptors 3 to 9 and 12 it holds (3 is the pairing pipe's number in the
+/// host child, 4 the listening socket's in the collector child, 12 the
+/// parent pipe's in both), then exits. 12 is looked for at `/dev/fd/12`
+/// first thing, before the shell itself opens anything: a shell such as dash
+/// takes no descriptor above 9 in a redirection.
 ///
 /// `up` itself is started holding descriptor 7 open across `exec`, as a
 /// service manager or a shell can leave one: the host's adapter spawn must
@@ -1009,7 +1012,9 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     std::fs::write(
         &script,
         format!(
-            "for n in 3 4 5 6 7 8 9; do if ( eval \": <&$n\" ) 2>/dev/null; then echo $n; fi; done > {fd}.tmp\n\
+            "if [ -e /dev/fd/12 ]; then twelve=12; fi\n\
+             {{ for n in 3 4 5 6 7 8 9; do if ( eval \": <&$n\" ) 2>/dev/null; then echo $n; fi; done; \
+             if [ -n \"$twelve\" ]; then echo 12; fi; }} > {fd}.tmp\n\
              env > {env}.tmp\nmv {fd}.tmp {fd}\nmv {env}.tmp {env}\n",
             fd = report("fds.txt").display(),
             env = report("env.txt").display(),
@@ -1028,11 +1033,12 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
             close_leaked_descriptors();
             hennery_testkit::place_fd(1, 3)?;
             hennery_testkit::place_fd(1, 4)?;
+            hennery_testkit::place_fd(1, 12)?;
             Ok(())
         });
     }
     assert!(control.status().unwrap().success());
-    assert_eq!(std::fs::read_to_string(report("fds.txt")).unwrap(), "3\n4\n");
+    assert_eq!(std::fs::read_to_string(report("fds.txt")).unwrap(), "3\n4\n12\n");
     std::fs::remove_file(report("fds.txt")).unwrap();
     std::fs::remove_file(report("env.txt")).unwrap();
 
@@ -1615,8 +1621,26 @@ fn the_code_descriptors_must_be_open_pipes() {
         child.stderr.take().unwrap().read_to_string(&mut stderr).unwrap();
         (status, stderr)
     };
+    // Plan 7c-iii: the parent pipe's end, `--parent-fd`, alike.
+    let collector_parent = |data: &std::path::Path, fd: &str| -> Command {
+        let mut cmd = hennery();
+        cmd.args(["collector", "--listen", "127.0.0.1:0", "--parent-fd", fd])
+            .arg("--data-dir")
+            .arg(data);
+        cmd
+    };
+    let host_parent = |data: &std::path::Path, fd: &str| -> Command {
+        let mut cmd = hennery();
+        cmd.args(["host", "run", "--parent-fd", fd]).arg("--data-dir").arg(data);
+        cmd
+    };
     type Make<'a> = &'a dyn Fn(&std::path::Path, &str) -> Command;
-    for (flag, make) in [("--pairing-code-fd", &collector as Make), ("--join-code-fd", &host)] {
+    for (flag, make) in [
+        ("--pairing-code-fd", &collector as Make),
+        ("--join-code-fd", &host),
+        ("--parent-fd", &collector_parent),
+        ("--parent-fd", &host_parent),
+    ] {
         for (what, fd, expected) in [
             ("a closed descriptor", None, "is not an open descriptor"),
             ("a file", Some(&file), "is not a pipe"),
@@ -3573,12 +3597,56 @@ fn a_bad_log_directory_refuses_or_falls_back_to_standard_error() {
     assert!(stderr.contains("holds no pairing"), "the start stopped: {stderr}");
 }
 
+/// Whether `pid` runs: alive, and not a zombie its new parent has yet to
+/// reap (`kill(pid, 0)` succeeds on one).
+fn running(pid: i32) -> bool {
+    pid_alive(pid)
+        && Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .is_ok_and(|out| {
+                let stat = String::from_utf8_lossy(&out.stdout);
+                let stat = stat.trim();
+                !stat.is_empty() && !stat.starts_with('Z')
+            })
+}
+
+/// Poll `probe` until it holds, failing after 40 seconds: for when the
+/// process that would explain a failure is gone.
+fn poll_until(what: &str, mut probe: impl FnMut() -> bool) {
+    let deadline = Instant::now() + Duration::from_secs(40);
+    while !probe() {
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `up`'s two children once both run, polled: the host's pid from
+/// `host.lock`, the collector's from `pgrep`. Both are recorded in `up`, so
+/// they are killed should the test fail.
+fn ups_children(up: &mut KillTree, lock: &std::path::Path) -> (i32, i32) {
+    let up_pid = up.up.id() as i32;
+    let (mut host, mut collector) = (0, 0);
+    up.wait_until("up's two children", || {
+        host = pid_from(lock).unwrap_or(0);
+        let children = children_of(up_pid);
+        collector = children.iter().copied().find(|&pid| pid != host).unwrap_or(0);
+        children.len() == 2 && children.contains(&host) && collector != 0
+    });
+    up.children.extend([host, collector]);
+    (host, collector)
+}
+
 /// Plan 7c-iii: run by a service (`HENNERY_SERVICE` set, as both units set
 /// it), `up` and its two children each log to a file of their own in
 /// distribution spec §8's directory, private. Standard output, which launchd
 /// keeps as `<role>.log`, gets nothing; standard error one line from each
 /// naming its file. HOME and XDG_STATE_HOME are scratch directories: no real
 /// log directory is touched.
+///
+/// `up` is then killed outright on its first start, when its host holds the
+/// pairing pipe as well as the parent pipe: each child says, in its own
+/// file, that `up` is gone.
 #[test]
 fn a_service_run_logs_to_its_own_files_and_not_to_its_output() {
     use std::os::unix::fs::PermissionsExt;
@@ -3614,8 +3682,17 @@ fn a_service_run_logs_to_its_own_files_and_not_to_its_output() {
     up.wait_until("the host's line in its own file", || {
         text_of(&host_log).contains("connected to collector")
     });
-    unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
-    assert!(wait_with_timeout(&mut up.up, Duration::from_secs(30)).is_some_and(|s| s.success()));
+    let (host, collector) = ups_children(&mut up, &data.join("host").join("host.lock"));
+
+    unsafe { libc::kill(up.up.id() as i32, libc::SIGKILL) };
+    let _ = up.up.wait();
+    for file in [&collector_log, &host_log] {
+        poll_until("each child saying up is gone", || {
+            text_of(file).contains("hennery up is gone; stopping")
+        });
+    }
+    // Gone, so nothing more can reach standard error after it is read.
+    poll_until("both children gone", || !running(host) && !running(collector));
     assert!(
         !text_of(&host_log).contains("collector listening"),
         "one file per process"
@@ -3643,4 +3720,111 @@ fn a_service_run_logs_to_its_own_files_and_not_to_its_output() {
         .collect();
     expected.sort_unstable();
     assert_eq!(lines, expected, "stderr:\n{stderr}");
+}
+
+/// Whether `path` can be locked as `lock::acquire` locks it, now: nobody
+/// holds it.
+fn lockable(path: &std::path::Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(file) = std::fs::OpenOptions::new().read(true).write(true).open(path) else {
+        return false;
+    };
+    // SAFETY: flock(2) on a descriptor this function owns; closing it below
+    // releases the lock.
+    unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+/// Plan 7c-iii: `up` killed outright (launchd's SIGKILL after
+/// `ExitTimeOut`, the OOM killer) leaves nothing running. Each child reads
+/// end-of-file on the pipe whose writing end only `up` held and stops as on
+/// SIGTERM: the host stops its adapter, and the port and `host.lock` are
+/// free, so a relaunch on the same port and data directory serves again,
+/// its host connected. The host is one `up` started again after a crash, so
+/// a restart hands the pipe on too.
+#[test]
+fn ups_children_stop_when_up_is_killed() {
+    let dir = scratch_dir("parentdeath");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    // An adapter that never answers, with a grandchild, as in
+    // `a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound`.
+    let adapter_pid_file = dir.join("adapter.pid");
+    let grandchild_pid_file = dir.join("grandchild.pid");
+    let script = dir.join("slow.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "echo $$ > {}\nsleep 7117 &\necho $! > {}\nwait\n",
+            adapter_pid_file.display(),
+            grandchild_pid_file.display()
+        ),
+    )
+    .unwrap();
+    let _kill_adapter = KillAdapter(adapter_pid_file.clone());
+    let log = dir.join("up.log");
+    let mut up = up_logging_to_with(
+        hennery(),
+        &data,
+        &log,
+        &["--agent", &format!("slow=/bin/sh {}", script.display())],
+    );
+    let listen = up.listening();
+    let session = sign_in(&mut up, &listen, &data.join("collector"));
+    let connections = |log: &std::path::Path| text_of(log).matches("connected to collector").count();
+    up.wait_until("the host connected", || connections(&log) >= 1);
+
+    // Past the startup grace (5 s), then the host killed: `up` starts it
+    // again, and that host must get the pipe as well.
+    std::thread::sleep(Duration::from_secs(6));
+    let lock = data.join("host").join("host.lock");
+    let first = pid_from(&lock).expect("the host's pid");
+    up.children.push(first);
+    unsafe { libc::kill(first, libc::SIGKILL) };
+    up.wait_until("the host started again", || {
+        pid_from(&lock).is_some_and(|pid| pid != first && pid_alive(pid))
+    });
+    up.wait_until("the host connected again", || connections(&log) >= 2);
+    let (host, collector) = ups_children(&mut up, &lock);
+    let hosts = get_json(&listen, "/api/hosts", &session).unwrap();
+    let host_id = hosts[0]["host_id"].as_str().unwrap().to_string();
+    post_json(
+        &listen,
+        "/api/sessions",
+        &session,
+        &serde_json::json!({ "host_id": host_id, "agent": "slow", "cwd": dir }).to_string(),
+    );
+    let mut grandchild = None;
+    up.wait_until("the adapter started", || {
+        grandchild = pid_from(&grandchild_pid_file);
+        grandchild.is_some()
+    });
+    let grandchild = grandchild.unwrap();
+
+    unsafe { libc::kill(up.up.id() as i32, libc::SIGKILL) };
+    let _ = up.up.wait();
+    poll_until("both children saying up is gone", || {
+        text_of(&log).matches("hennery up is gone; stopping").count() == 2
+    });
+    // The positive signals: the port and the lock taken back, and the
+    // relaunch below. A pid alone could be a zombie not yet reaped.
+    poll_until("the port free", || std::net::TcpListener::bind(&listen).is_ok());
+    poll_until("host.lock free", || lockable(&lock));
+    poll_until("the adapter stopped", || !running(grandchild));
+    poll_until("both children gone", || !running(host) && !running(collector));
+
+    // The same port: another test binding port 0 could take it meanwhile,
+    // which would fail the relaunch; not seen in the load runs.
+    let again_log = dir.join("again.log");
+    let again = hennery()
+        .args(["up", "--listen", &listen, "--data-dir"])
+        .arg(&data)
+        .stdout(std::fs::File::create(&again_log).unwrap())
+        .stderr(std::fs::File::create(again_log.with_extension("err")).unwrap())
+        .spawn()
+        .unwrap();
+    let mut again = KillTree::new(again, &again_log);
+    again.wait_until("the relaunched host connected", || {
+        get_json(&listen, "/api/hosts", &session)
+            .is_some_and(|hosts| hosts[0]["host_id"] == host_id.as_str() && hosts[0]["connected"] == true)
+    });
 }
