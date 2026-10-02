@@ -677,37 +677,45 @@
     },
     "CreateMcpConnectionRequest": {
       "additionalProperties": false,
-      "description": "`POST /api/mcp/connections` (step-up). Absent: the `Authorization`\nheader with `Bearer `, every tool, a public upstream.",
+      "description": "`POST /api/mcp/connections` (step-up): 201 with the new\n`McpConnectionItem`, `not_connected`, with no credential and no mounts.\nAbsent: the `Authorization` header with `Bearer `, every tool, a public\nupstream. Unknown fields are refused.\n\nIts own codes, beyond every route's (see `McpConnectionItem`): 403\n`step_up_required`; 400 `invalid` (a field refused, `message` says\nwhich, or a hat that is not the owner's); 400 `unsupported_cred_kind`\n(an OAuth kind, until plan 8f); 409 `slug_taken` (another of the owner's\nconnections has the slug); 409 `too_many_connections` (at most 256 per\nowner).",
       "properties": {
         "cred_kind": {
-          "$ref": "#/$defs/McpCredKind"
+          "$ref": "#/$defs/McpCredKind",
+          "description": "`none` or `static` until plan 8f."
         },
         "hat_id": {
+          "description": "One of the owner's hats; fixed once created.",
           "type": "string"
         },
         "internal_network": {
           "default": false,
+          "description": "Absent: `false`. The upstream is on the operator's own network.",
           "type": "boolean"
         },
         "label": {
+          "description": "1 to 64 printable characters.",
           "type": "string"
         },
         "slug": {
+          "description": "`^[a-z0-9][a-z0-9-]{0,47}$`, unique per owner; fixed once created.",
           "type": "string"
         },
         "static_header": {
+          "description": "Absent: `Authorization`. An HTTP header name of at most 64 bytes,\nnot one the gateway sets or filters itself (`host`, `content-type`,\n`cookie`, `mcp-session-id`, `proxy-*`, `sec-*` and the like).",
           "type": [
             "string",
             "null"
           ]
         },
         "static_prefix": {
+          "description": "Absent: `Bearer `. At most 32 visible ASCII characters or spaces;\n`\"\"` for none.",
           "type": [
             "string",
             "null"
           ]
         },
         "tool_allowlist": {
+          "description": "Absent or `null`: every tool. Else at most 1024 names, each 1 to 128\nvisible ASCII characters; duplicates are dropped, the order kept.",
           "items": {
             "type": "string"
           },
@@ -717,6 +725,7 @@
           ]
         },
         "url": {
+          "description": "Absolute `https`, or `http` only with `internal_network`; with a\nhost, without a user name, password or fragment; at most 2048 bytes.\nA query is kept, but a secret belongs in the credential.",
           "type": "string"
         }
       },
@@ -1373,69 +1382,79 @@
       "type": "object"
     },
     "McpConnectionItem": {
-      "description": "One MCP gateway connection (gateway spec §2, §9): an entry of\n`GET /api/mcp/connections`, and the answer to its creation and changes.\nNever its secret: `has_credential` says whether one is stored.",
+      "description": "One MCP gateway connection (gateway spec §2, §9): an entry of\n`GET /api/mcp/connections` (200, an array, oldest first), and the answer\nto `POST` (201), `PATCH` (200) and `PUT …/{id}/mounts` (200). Never its\nsecret: `has_credential` says whether one is stored.\n\nEvery `/api/mcp/*` route is the operator's and answers\n`Cache-Control: no-store`. An error is an `ApiError`; the codes every\nroute may answer:\n- 401 `unauthenticated`: no live session: sign in.\n- 403 `setup_required`, `origin_mismatch` or `cross_site`: the browser\n  rules refused the request (kernel spec §3.2).\n- 415 `unsupported_media_type`: a body that is not `application/json`.\n- 400 `invalid_body`: a body that is not JSON; 422 `invalid_body`: one\n  that is not the route's shape, an unknown field included. The body is\n  never quoted back.\n- 413 `body_too_large`: a body over 256 KiB.\n- 405, with no body: a method the path does not take.\n- 500 `internal`.\n\nEach request type names the codes of its own route. A 403\n`step_up_required` asks for a password or passkey check\n(`POST /api/auth/step-up/…`); retry after it.\n\n`DELETE /api/mcp/connections/{id}` (step-up) takes no body: 204, its\nmounts and credential deleted with it; 403 `step_up_required`, 404\n`not_found`.",
       "properties": {
         "account_label": {
+          "description": "The upstream account it is signed in as, when the probe (plan 8f)\nlearns it; absent otherwise.",
           "type": [
             "string",
             "null"
           ]
         },
         "created_at": {
+          "description": "When it was created: RFC 3339.",
           "type": "string"
         },
         "cred_kind": {
-          "$ref": "#/$defs/McpCredKind"
+          "$ref": "#/$defs/McpCredKind",
+          "description": "How it authenticates to its upstream."
         },
         "has_credential": {
+          "description": "Whether a credential is stored. No route answers the credential.",
           "type": "boolean"
         },
         "hat_id": {
-          "description": "Fixed once created: a grant stays in its hat.",
+          "description": "The hat whose sessions may use it. Fixed once created: a grant stays\nin its hat.",
           "type": "string"
         },
         "id": {
+          "description": "`conn-` and 16 hexadecimal digits: the `{id}` of the routes.",
           "type": "string"
         },
         "internal_network": {
+          "description": "The upstream is on the operator's own network: `http` is allowed,\nand private addresses are not refused (plan 8b).",
           "type": "boolean"
         },
         "label": {
+          "description": "The operator's name for it: 1 to 64 printable characters.",
           "type": "string"
         },
         "mounts": {
-          "description": "The hosts it is mounted on, by id; revoked hosts are left out.",
+          "description": "The hosts it is mounted on, by id, sorted; revoked hosts are left out.",
           "items": {
             "type": "string"
           },
           "type": "array"
         },
         "slug": {
-          "description": "`^[a-z0-9][a-z0-9-]{0,47}$`, unique per owner; fixed once created.",
+          "description": "`^[a-z0-9][a-z0-9-]{0,47}$`, unique per owner; fixed once created.\nAgents see the server as `hennery-<slug>`.",
           "type": "string"
         },
         "static_header": {
-          "description": "The header a static token is sent in, and what goes before it.",
+          "description": "The header a `static` token is sent in (by default `Authorization`).",
           "type": "string"
         },
         "static_prefix": {
+          "description": "What goes before the token in that header (by default `Bearer `);\nmay be empty.",
           "type": "string"
         },
         "status": {
-          "$ref": "#/$defs/McpConnectionStatus"
+          "$ref": "#/$defs/McpConnectionStatus",
+          "description": "Its health."
         },
         "status_at": {
-          "description": "RFC 3339, as the other stamps.",
+          "description": "When `status` last changed: RFC 3339, as the other stamps.",
           "type": "string"
         },
         "status_note": {
+          "description": "Why `status` is what it is, when the probe (plan 8f) says; absent\notherwise.",
           "type": [
             "string",
             "null"
           ]
         },
         "tool_allowlist": {
-          "description": "`null`: every tool.",
+          "description": "The tools an agent may call: `null`, every tool; `[]`, none; else\nthese names, in order, without duplicates.",
           "items": {
             "type": "string"
           },
@@ -1445,9 +1464,11 @@
           ]
         },
         "updated_at": {
+          "description": "When a `PATCH` last changed it: RFC 3339. Mounts and the credential\ndo not move it.",
           "type": "string"
         },
         "url": {
+          "description": "The upstream MCP endpoint, as stored (parsed and serialised). Only\nthis list shows it whole: logs and errors show only its origin.",
           "type": "string"
         }
       },
@@ -1471,30 +1492,61 @@
       "type": "object"
     },
     "McpConnectionStatus": {
-      "description": "A connection's health (gateway spec §7). Plan 8a only ever reports\n`not_connected`; the probe (plan 8f) sets the others.",
-      "enum": [
-        "not_connected",
-        "ok",
-        "needs_auth",
-        "error"
-      ],
-      "type": "string"
+      "description": "A connection's health (gateway spec §7): `not_connected`, not checked\nyet; `ok`; `needs_auth`, the operator must sign in again; `error`, with\n`status_note`. Plan 8a only ever reports `not_connected`; the probe\n(plan 8f) sets the others.",
+      "oneOf": [
+        {
+          "const": "not_connected",
+          "description": "Not checked yet: since it was created, or since another origin or\nkind deleted its credential.",
+          "type": "string"
+        },
+        {
+          "const": "ok",
+          "description": "The last check reached the upstream with its credential.",
+          "type": "string"
+        },
+        {
+          "const": "needs_auth",
+          "description": "The upstream wants the operator to sign in again.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "The last check failed; `status_note` says how.",
+          "type": "string"
+        }
+      ]
     },
     "McpCredKind": {
-      "description": "How an MCP gateway connection authenticates to its upstream (gateway\nspec §2). Plan 8a takes `none` and `static`; the OAuth kinds come with\nplan 8f.",
-      "enum": [
-        "none",
-        "static",
-        "oauth_dcr",
-        "oauth_client"
-      ],
-      "type": "string"
+      "description": "How an MCP gateway connection authenticates to its upstream (gateway\nspec §2): `none`; `static`, a token the operator sets; `oauth_dcr` and\n`oauth_client`, OAuth (plan 8f). Plan 8a takes `none` and `static`;\nnaming an OAuth kind in a create or a change answers 400\n`unsupported_cred_kind` until plan 8f.",
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "No credential: the gateway sends the agents' requests as they are.",
+          "type": "string"
+        },
+        {
+          "const": "static",
+          "description": "A token the operator sets (`PUT /api/mcp/connections/{id}/credential`),\nsent as `<static_header>: <static_prefix><token>`.",
+          "type": "string"
+        },
+        {
+          "const": "oauth_dcr",
+          "description": "OAuth, the client registered dynamically (plan 8f).",
+          "type": "string"
+        },
+        {
+          "const": "oauth_client",
+          "description": "OAuth, with a client the operator registered with the vendor (plan 8f).",
+          "type": "string"
+        }
+      ]
     },
     "McpCredentialRequest": {
       "additionalProperties": false,
-      "description": "`PUT /api/mcp/connections/{id}/credential` (step-up): a static token,\nwrite-only (204). Its `Debug` never shows the token.",
+      "description": "`PUT /api/mcp/connections/{id}/credential` (step-up): a static token,\nwrite-only: 204, the token sealed and stored, replacing any before it.\nNo route reads it back or clears it; changing the kind or the origin,\nor deleting the connection, deletes it. Its `Debug` never shows the\ntoken.\n\nIts own codes, beyond every route's (see `McpConnectionItem`): 403\n`step_up_required`; 404 `not_found`; 409 `wrong_cred_kind` (the\nconnection is not `static`); 400 `invalid` (the token is not 1 to 8192\nvisible ASCII characters without spaces; never quoted).",
       "properties": {
         "token": {
+          "description": "The token, as the upstream takes it after `static_prefix`.",
           "type": "string"
         }
       },
@@ -1505,9 +1557,10 @@
     },
     "McpMountsRequest": {
       "additionalProperties": false,
-      "description": "`PUT /api/mcp/connections/{id}/mounts`: the whole set of hosts the\nconnection is mounted on, replacing the one before (gateway spec §9).",
+      "description": "`PUT /api/mcp/connections/{id}/mounts`: the whole set of hosts the\nconnection is mounted on, replacing the one before, never a delta\n(gateway spec §9). No step-up: a mount reaches only a host the owner\npaired. 200 with the `McpConnectionItem`.\n\nIts own codes, beyond every route's (see `McpConnectionItem`): 404\n`not_found`; 400 `invalid` (a host that is not one of the owner's\npaired, unrevoked hosts; more than 1024 hosts; an id over 64 bytes,\nwhich is not quoted back). A refused set changes nothing.",
       "properties": {
         "host_ids": {
+          "description": "Host ids; `[]` unmounts it everywhere. A repeated id counts once.",
           "items": {
             "type": "string"
           },
@@ -2962,7 +3015,7 @@
     },
     "UpdateMcpConnectionRequest": {
       "additionalProperties": false,
-      "description": "`PATCH /api/mcp/connections/{id}`: an absent field keeps its value; a\n`null` allowlist clears it (every tool), `\"\"` clears the prefix (gateway\nspec §4.6). Naming `url`, `cred_kind`, `internal_network`,\n`static_header` or `static_prefix` needs step-up. Another origin or\nkind deletes the stored credential. The slug and the hat cannot change.",
+      "description": "`PATCH /api/mcp/connections/{id}`: 200 with the `McpConnectionItem` as\nit is now. An absent field keeps its value; a `null` allowlist clears it\n(every tool), `\"\"` clears the prefix (gateway spec §4.6); a `null` for\nanother field reads as absent. Naming `url`, `cred_kind`,\n`internal_network`, `static_header` or `static_prefix` needs step-up,\neven with its stored value. Another origin (scheme, host, port) or\nanother kind deletes the stored credential and starts the status over\nat `not_connected`, in the same change. The slug and the hat cannot\nchange: naming them is an unknown field.\n\nIts own codes, beyond every route's (see `McpConnectionItem`): 403\n`step_up_required`; 404 `not_found`; 400 `invalid` (`message` says\nwhich field); 400 `unsupported_cred_kind`. A refused change changes\nnothing.",
       "properties": {
         "cred_kind": {
           "anyOf": [
@@ -2972,34 +3025,39 @@
             {
               "type": "null"
             }
-          ]
+          ],
+          "description": "Step-up. Another kind deletes the credential."
         },
         "internal_network": {
+          "description": "Step-up. `false` is refused while the URL is `http`.",
           "type": [
             "boolean",
             "null"
           ]
         },
         "label": {
+          "description": "1 to 64 printable characters.",
           "type": [
             "string",
             "null"
           ]
         },
         "static_header": {
+          "description": "Step-up. As on create; cannot be empty.",
           "type": [
             "string",
             "null"
           ]
         },
         "static_prefix": {
+          "description": "Step-up. As on create; `\"\"` clears it.",
           "type": [
             "string",
             "null"
           ]
         },
         "tool_allowlist": {
-          "description": "Absent: kept. `null`: cleared. A list: set.",
+          "description": "Absent: kept. `null`: cleared (every tool). A list: set, as on\ncreate.",
           "items": {
             "type": "string"
           },
@@ -3009,6 +3067,7 @@
           ]
         },
         "url": {
+          "description": "Step-up. As on create; another origin deletes the credential.",
           "type": [
             "string",
             "null"
