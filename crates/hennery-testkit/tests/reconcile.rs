@@ -2224,6 +2224,16 @@ async fn a_replay_sends_the_catalogue_once_after_the_last_event_that_changed_it(
         },
     )
     .await;
+    // `emit` does not wait for the collector: every event must be stored
+    // before the stream opens, or some would arrive live, not replayed.
+    let stored = wait_for("the last event stored", || async {
+        let events = collector.state.store.events(&session, 0, 100).unwrap();
+        events
+            .iter()
+            .any(|e| e.body["payload"]["update"]["marker"] == "last")
+            .then_some(events)
+    })
+    .await;
     let stream = read_stream(&collector, &session, |s| s.contains(r#""marker":"last""#)).await;
     let changed = catalog_messages(&stream);
     assert_eq!(changed.len(), 1, "{stream}");
@@ -2243,6 +2253,46 @@ async fn a_replay_sends_the_catalogue_once_after_the_last_event_that_changed_it(
         json!([{"name": "review", "description": "review"}]),
         "{data}"
     );
+    // From `Last-Event-ID`: after the commands, once, after `bypass`; after
+    // `bypass`, not at all.
+    let id_of = |update: &str, mode: Option<&str>| {
+        stored
+            .iter()
+            .rfind(|e| {
+                e.body["payload"]["update"]["sessionUpdate"] == update
+                    && mode.is_none_or(|m| e.body["indexed"]["current_mode"] == m)
+            })
+            .unwrap()
+            .event_id
+    };
+    let after = async |last: i64| {
+        use futures::StreamExt;
+        let resp = client(&collector)
+            .get(collector.url(&format!("/api/stream/sessions/{session}")))
+            .header("last-event-id", last.to_string())
+            .send()
+            .await
+            .unwrap();
+        let mut body = resp.bytes_stream();
+        let mut buf = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !buf.contains(r#""marker":"last""#) {
+            let chunk = tokio::time::timeout_at(deadline, body.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        buf
+    };
+    let bypass_id = id_of("config_option_update", Some("bypass"));
+    let from_commands = after(id_of("available_commands_update", None)).await;
+    let changed = catalog_messages(&from_commands);
+    assert_eq!(changed.len(), 1, "{from_commands}");
+    assert_eq!(changed[0].0, bypass_id.to_string());
+    let from_bypass = after(bypass_id).await;
+    assert!(catalog_messages(&from_bypass).is_empty(), "{from_bypass}");
 }
 
 // Plan 6b: the list item in the detail; what a start may name (the review's
