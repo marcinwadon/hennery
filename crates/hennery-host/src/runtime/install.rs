@@ -696,23 +696,7 @@ async fn install_node(
     tokio::task::spawn_blocking(move || extract::node_binary(&part, &version, &platform, &target, size)).await??;
     // Before anything depends on it: a data directory mounted noexec, or a
     // Linux without the loader Node needs, fails here, not at a session.
-    let mut attempts = 0;
-    let output = loop {
-        let run = tokio::process::Command::new(&binary)
-            .arg("--version")
-            .kill_on_drop(true)
-            .output();
-        match tokio::time::timeout(std::time::Duration::from_secs(20), run)
-            .await
-            .context("the downloaded Node did not answer --version within 20 s")?
-        {
-            Err(err) if err.raw_os_error() == Some(libc::ETXTBSY) && attempts < 10 => {
-                attempts += 1;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-            result => break result.with_context(|| format!("run {}", binary.display()))?,
-        }
-    };
+    let output = first_run_version(&binary, FIRST_RUN_DEADLINE, FIRST_RUN_NOTE_AFTER, progress).await?;
     let answered = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() || answered != format!("v{}", selection.node_version) {
         bail!(
@@ -732,6 +716,85 @@ async fn install_node(
     std::fs::rename(&staging, &path)?;
     extract::sync_dir(&layout.runtimes())?;
     Ok(())
+}
+
+/// How long a newly installed Node may take to answer its first
+/// `--version`. On macOS the first run of a newly written program waits for
+/// Gatekeeper's scan, which makes an online check; the machine scans one
+/// program at a time, and a check whose lookup fails costs up to 3 s, so on
+/// a busy machine with a bad network the queue can pass 20 s. Elsewhere
+/// nothing waits but the program.
+pub const FIRST_RUN_DEADLINE: std::time::Duration = if cfg!(target_os = "macos") {
+    std::time::Duration::from_secs(90)
+} else {
+    std::time::Duration::from_secs(20)
+};
+
+/// After this long without an answer, the progress lines say why.
+const FIRST_RUN_NOTE_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// What a slow first run is waiting for, as far as hennery can tell.
+const SLOW_FIRST_RUN: &str = if cfg!(target_os = "macos") {
+    "macOS checks a newly written program online on its first run, one program at a time; a slow or unreachable network delays it"
+} else {
+    "it is slow to start"
+};
+
+/// What to do about a first run that never answered.
+const FIRST_RUN_ADVICE: &str = if cfg!(target_os = "macos") {
+    "try again once the network answers"
+} else {
+    "check that the data directory allows running programs (not mounted noexec) and that the machine is not overloaded"
+};
+
+/// Run `binary --version` for the first time: its output, or an error when
+/// it cannot be run or does not answer within `deadline`. A spawn that
+/// fails (not executable, no loader) fails at once, as an answer that is
+/// not one does in the caller; only waiting is given time, with a progress
+/// line after `note_after` saying why.
+pub async fn first_run_version(
+    binary: &Path,
+    deadline: std::time::Duration,
+    note_after: std::time::Duration,
+    progress: &(dyn Fn(&str) + Sync),
+) -> Result<std::process::Output> {
+    let run = async {
+        let mut attempts = 0;
+        loop {
+            let ran = tokio::process::Command::new(binary)
+                .arg("--version")
+                .kill_on_drop(true)
+                .output()
+                .await;
+            match ran {
+                // The extracted file's writer may still be closing it.
+                Err(err) if err.raw_os_error() == Some(libc::ETXTBSY) && attempts < 10 => {
+                    attempts += 1;
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                ran => break ran.with_context(|| format!("run {}", binary.display())),
+            }
+        }
+    };
+    tokio::pin!(run);
+    let note = tokio::time::sleep(note_after);
+    tokio::pin!(note);
+    let give_up = tokio::time::sleep(deadline);
+    tokio::pin!(give_up);
+    let mut noted = false;
+    loop {
+        tokio::select! {
+            ran = &mut run => return ran,
+            () = &mut note, if !noted => {
+                noted = true;
+                progress(&format!("the downloaded Node has not answered yet: {SLOW_FIRST_RUN}"));
+            }
+            () = &mut give_up => bail!(
+                "the downloaded Node did not answer --version within {} s: {SLOW_FIRST_RUN}; {FIRST_RUN_ADVICE}",
+                deadline.as_secs()
+            ),
+        }
+    }
 }
 
 /// Point `link` at `sets/<id>`, atomically: a new link, renamed over it.
