@@ -45,6 +45,13 @@ Platforms v1: Linux x86_64 and aarch64, macOS aarch64. Windows through WSL2
   collector (and the Docker image) but not a host in v1; `doctor` says so.
 - **NixOS hosts** need `programs.nix-ld.enable` for the managed runtime, or use
   the Nix-provided adapters (§4.3).
+- **The host refuses before it installs a set**, judging as `doctor`'s check 2
+  does and with the same fixes:
+  - **Refused:** glibc's loader is missing, is NixOS's stub or musl's, or its
+    `--version` banner (else `getconf GNU_LIBC_VERSION`, never on NixOS) gives
+    a glibc older than 2.28.
+  - **Not refused:** a loader that says nothing readable, or doesn't answer
+    within 2 s. One example is nix-ld run without its environment.
 
 ---
 

@@ -4,5 +4,6 @@
 pub mod agents;
 pub mod download;
 pub mod extract;
+pub mod glibc;
 pub mod install;
 pub mod manifest;
