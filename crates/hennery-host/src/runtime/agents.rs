@@ -246,7 +246,8 @@ pub async fn prepare(
         Some(_) if sources.is_none() => notes.push("the pinned adapter set was not installed: no valid mirror".into()),
         Some(selection) => {
             let sources = sources.expect("checked above");
-            // Bounded: a start never waits on another install, nor on a
+            // Bounded: a start never waits on another install (only out a
+            // lock a fork still shares, `LOCK_GRACE`), nor on a
             // download that trickles; what was fetched resumes next time.
             let attempt = install::try_install(&layout, selection, sources, progress);
             match tokio::time::timeout(START_INSTALL_TIMEOUT, attempt).await {

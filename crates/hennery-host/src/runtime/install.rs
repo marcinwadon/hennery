@@ -396,8 +396,8 @@ pub async fn install(
     install_locked(layout, selection, sources, progress).await
 }
 
-/// `install`, unless another install holds the lock: then `Ok(None)` at
-/// once (a host start never waits on an `adapters update`).
+/// `install`, unless another install holds the lock: then `Ok(None)` after
+/// `LOCK_GRACE` at most (a host start never waits on an `adapters update`).
 pub async fn try_install(
     layout: &Layout,
     selection: &Selection,
@@ -405,7 +405,7 @@ pub async fn try_install(
     progress: &(dyn Fn(&str) + Sync),
 ) -> Result<Option<Installed>> {
     check_host(selection.platform)?;
-    let Some(_lock) = try_lock_install(layout)? else {
+    let Some(_lock) = try_lock_install(layout).await? else {
         return Ok(None);
     };
     install_locked(layout, selection, sources, progress).await.map(Some)
@@ -815,10 +815,27 @@ fn open_install_lock(layout: &Layout) -> Result<std::fs::File> {
         .with_context(|| format!("open {}", path.display()))
 }
 
-/// The install lock if it is free now, else `None`.
-fn try_lock_install(layout: &Layout) -> Result<Option<std::fs::File>> {
+/// How long `try_install` waits for a busy install lock. Not for another
+/// install, which holds it for minutes: a lock an install has dropped stays
+/// held while any child this process forked meanwhile (an adapter, Node's
+/// `--version`) has not yet exec'd, since a fork shares every open file
+/// description, the lock's included, until then.
+const LOCK_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The install lock if it is free, or frees within `LOCK_GRACE`, else
+/// `None`.
+async fn try_lock_install(layout: &Layout) -> Result<Option<std::fs::File>> {
     let file = open_install_lock(layout)?;
-    Ok(flock(&file, libc::LOCK_EX | libc::LOCK_NB)?.then_some(file))
+    let deadline = tokio::time::Instant::now() + LOCK_GRACE;
+    loop {
+        if flock(&file, libc::LOCK_EX | libc::LOCK_NB)? {
+            return Ok(Some(file));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 /// Take the install lock, saying so if another install holds it.
