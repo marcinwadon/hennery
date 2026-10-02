@@ -225,9 +225,12 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                 // store error here (lookup or ingest) must drop the
                 // connection rather than silently skip the frame: acking a
                 // later frame would tell the host this one is safe to
-                // discard forever (ACP core §3.3, §5).
-                match state.store.find_session(&session_id) {
-                    Ok(Some(row)) if row.host_id == host_id => {}
+                // discard forever (ACP core §3.3, §5). Its deleted sessions
+                // are still its own: `ingest` stores nothing for them, and
+                // the frame is acked, so the host prunes it (plan 9a
+                // decision 4).
+                match state.store.session_host(&session_id) {
+                    Ok(Some(owner)) if owner == host_id => {}
                     Ok(_) => {
                         tracing::warn!(%host_id, %session_id, "frame for a session this host does not own");
                         continue;
