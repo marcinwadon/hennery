@@ -197,6 +197,11 @@ pub struct FakeScript {
     /// real home.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete_log: Option<String>,
+    /// Answer `session/delete` only once this file exists, from a task of
+    /// its own (its `delete_log` lines are written on receipt): a forget
+    /// held in flight for exactly as long as the test says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_waits_for_file: Option<String>,
 }
 
 /// One question the fake asks its client during a prompt, and the chunk it
@@ -264,6 +269,7 @@ impl Default for FakeScript {
             prompt_updates: Vec::new(),
             session_id: None,
             delete_log: None,
+            delete_waits_for_file: None,
         }
     }
 }
