@@ -43,8 +43,11 @@ test.beforeAll(async ({ browser }) => {
 })
 
 test.afterAll(async () => {
-  await page?.context().close()
-  await collector?.stop()
+  try {
+    await page?.context().close()
+  } finally {
+    await collector?.stop()
+  }
 })
 
 async function cspViolations(): Promise<string[]> {
@@ -53,9 +56,12 @@ async function cspViolations(): Promise<string[]> {
 }
 
 test('the setup link sets hennery up, its token gone from the address bar', async () => {
+  const entries = await page.evaluate(() => history.length)
   await page.goto(collector.setupLink)
   await expect(page).toHaveURL(`${collector.origin}/setup`)
   expect(await page.evaluate(() => location.hash)).toBe('')
+  // Replaced, not pushed: the visit adds one history entry, without the token.
+  expect(await page.evaluate(() => history.length)).toBe(entries + 1)
   await expect(page.getByLabel('Public URL')).toHaveValue(collector.origin)
   await page.getByLabel(/^Password at least/).fill(PASSWORD)
   await page.getByLabel('Password again').fill(PASSWORD)

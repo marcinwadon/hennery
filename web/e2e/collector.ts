@@ -25,25 +25,44 @@ export async function startCollector(): Promise<Collector> {
   })
   let stderr = ''
   child.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
-  const setupLink = await waitFor(() => {
-    if (child.exitCode !== null) throw new Error(`the collector exited (${child.exitCode}): ${stderr}`)
-    try {
-      return readFileSync(join(dir, 'setup-url'), 'utf8').trim() || null
-    } catch {
-      return null
-    }
-  })
-  return {
-    origin: new URL(setupLink).origin,
-    setupLink,
-    async stop() {
-      if (child.exitCode === null) {
-        child.kill('SIGTERM')
-        await new Promise((done) => child.once('exit', done))
-      }
-      rmSync(dir, { recursive: true, force: true })
-    },
+  // Stopped and removed on every path, a failed start included: the
+  // directory holds a live setup token.
+  const stop = async () => {
+    await end(child)
+    rmSync(dir, { recursive: true, force: true })
   }
+  let setupLink: string
+  try {
+    setupLink = await waitFor(() => {
+      if (!running(child)) {
+        throw new Error(`the collector exited (${child.exitCode ?? child.signalCode}): ${stderr}`)
+      }
+      try {
+        return readFileSync(join(dir, 'setup-url'), 'utf8').trim() || null
+      } catch {
+        return null
+      }
+    })
+  } catch (err) {
+    await stop()
+    throw err
+  }
+  return { origin: new URL(setupLink).origin, setupLink, stop }
+}
+
+// A process killed by a signal keeps `exitCode` null: `signalCode` says so.
+function running(child: ChildProcess): boolean {
+  return child.exitCode === null && child.signalCode === null
+}
+
+// SIGTERM, then SIGKILL if it has not gone within 5 s.
+async function end(child: ChildProcess): Promise<void> {
+  if (!running(child)) return
+  const gone = new Promise((done) => child.once('exit', done))
+  child.kill('SIGTERM')
+  const timer = setTimeout(() => child.kill('SIGKILL'), 5000)
+  await gone
+  clearTimeout(timer)
 }
 
 async function waitFor<T>(probe: () => T | null): Promise<T> {
