@@ -403,3 +403,34 @@ fn without_a_public_url_a_mint_fails() {
         .unwrap_err();
     assert!(format!("{err:#}").contains("public_url"), "{err:#}");
 }
+
+/// A resume after the hat's last connection was unmounted mints none, and
+/// the token before it is revoked and cut, not left live.
+#[test]
+fn a_resume_with_nothing_mounted_revokes_the_old_token() {
+    let w = world();
+    w.host("host-a", 1);
+    let hat = w.hat();
+    let linear = w.connection_in("linear", "http://127.0.0.1:9/mcp", CredKind::None, &hat, None);
+    w.mount(&linear, &["host-a"]);
+    let mcp = GatewayMcp::new(&w.gateway());
+    let (first, _) = deliver(
+        &w,
+        &mcp,
+        session("s1", "host-a", &hat),
+        McpSessionDeliveryMode::Isolated,
+    );
+    let old = token_of(&first);
+    let watch = w.revocations.watch(&hennery_kernel::secret::sha256_hex(old.as_bytes()));
+    w.mount(&linear, &[]);
+    let (none, cut) = deliver(
+        &w,
+        &mcp,
+        session("s1", "host-a", &hat),
+        McpSessionDeliveryMode::Isolated,
+    );
+    assert!(none.is_empty());
+    assert_eq!(cut, 1);
+    assert!(watch.token().is_cancelled());
+    assert!(w.token_revoked(&old));
+}

@@ -1613,9 +1613,9 @@ impl Store {
         if created == 0 {
             return Ok(None);
         }
-        let (given, cut) = self.deliver_in(&tx, id, host_id, hat_id, mcp, &ts)?;
+        // A fresh id had no token before this one: nothing to cut.
+        let (given, _superseded) = self.deliver_in(&tx, id, host_id, hat_id, mcp, &ts)?;
         tx.commit()?;
-        self.mcp().cut(cut);
         Ok(Some(given))
     }
 

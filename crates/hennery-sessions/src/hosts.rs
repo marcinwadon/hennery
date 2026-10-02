@@ -209,3 +209,61 @@ async fn list_hosts(State(state): State<AppState>) -> Response {
         Err(err) => internal(err),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hennery_kernel::operator::Operator;
+    use hennery_proto::frames::{AgentIsolation, Capabilities, McpIsolation};
+
+    fn record(capabilities: Capabilities, isolation: Option<AgentIsolation>) -> HostRecord {
+        HostRecord {
+            id: "h".into(),
+            name: "h".into(),
+            platform: "linux".into(),
+            host_version: "1".into(),
+            capabilities,
+            default_hat_id: "hat".into(),
+            workspace_roots: vec![],
+            created_at: 0,
+            last_seen_at: None,
+            revoked_at: None,
+            mcp_isolation: isolation,
+        }
+    }
+
+    /// Plan 8e decision E7: per agent, through the one mapping, and only for
+    /// a host that takes servers at all; none before its first `hello`.
+    #[test]
+    fn a_hosts_delivery_is_shown_only_when_it_takes_servers() {
+        let state = AppState::new(
+            crate::store::Store::open_in_memory().unwrap(),
+            hennery_kernel::hosts::Hosts::open_in_memory().unwrap(),
+            Operator::open_in_memory().unwrap(),
+        );
+        let isolation = AgentIsolation(
+            [
+                ("claude".to_string(), McpIsolation::ClaudeStrict),
+                ("codex".to_string(), McpIsolation::None),
+            ]
+            .into(),
+        );
+        let takes = Capabilities(vec![Capability::McpServers]);
+        let shown = host_item(&state, record(takes.clone(), Some(isolation.clone()))).mcp_delivery;
+        assert_eq!(
+            shown,
+            Some(
+                [
+                    ("claude".to_string(), McpAgentDelivery::Isolated),
+                    ("codex".to_string(), McpAgentDelivery::DefaultHatOnly),
+                ]
+                .into()
+            )
+        );
+        assert_eq!(
+            host_item(&state, record(Capabilities::default(), Some(isolation))).mcp_delivery,
+            None
+        );
+        assert_eq!(host_item(&state, record(takes, None)).mcp_delivery, None);
+    }
+}

@@ -44,6 +44,8 @@ struct World {
     db: PathBuf,
     store: Store,
     gateway: GatewayStore,
+    /// The gateway as the store was given it, for another store.
+    state: GatewayState,
     proxy: ProxyStore,
     revocations: Revocations,
     key: MasterKey,
@@ -121,6 +123,7 @@ impl World {
         Self {
             proxy: ProxyStore::open(&db).unwrap(),
             gateway: GatewayStore::open(&db).unwrap(),
+            state: gateway,
             _dir: dir,
             db,
             store,
@@ -574,6 +577,67 @@ fn a_delete_revokes() {
         Deletion::Done { .. }
     ));
     w.assert_revoked(&token, &watch, "delete_session");
+}
+
+/// The delete's own revoke (the purge lane's marker), beyond `close_in`'s:
+/// a closed session whose token a missed revoke left live.
+#[test]
+fn a_delete_revokes_a_token_left_live_on_a_closed_session() {
+    let w = World::new();
+    let token = w.active("s1");
+    w.store.ingest("s1", 2, &SessionBody::SessionClosed).unwrap();
+    rusqlite::Connection::open(&w.db)
+        .unwrap()
+        .execute("UPDATE gw_session_tokens SET revoked_at = NULL", [])
+        .unwrap();
+    let watch = w.watch(&token);
+    assert!(matches!(
+        w.store.delete_session("s1", None).unwrap(),
+        Deletion::Done { .. }
+    ));
+    w.assert_revoked(&token, &watch, "delete_session of a closed session");
+}
+
+/// The kernel's purge hook (`LifecycleHooks::on_hat_purged`, lane L6):
+/// the sessions' part, then the gateway's, so the hat's row can go.
+#[test]
+fn the_purge_hook_runs_the_gateways_part_too() {
+    use hennery_kernel::lifecycle::LifecycleHooks;
+    let w = World::new();
+    w.active("s1");
+    let given = w.start("s2", &w.work.clone(), CLAUDE);
+    w.store
+        .ingest("s2", 1, &SessionBody::session_started("r0", "agent-s2"))
+        .unwrap();
+    w.store
+        .ingest(
+            "s2",
+            2,
+            &SessionBody::SessionParked {
+                reason: ParkReason::Idle,
+            },
+        )
+        .unwrap();
+    let hosts = Hosts::open(&w.db).unwrap();
+    assert!(matches!(
+        hosts.begin_purge(&w.work, unix_now()).unwrap(),
+        hennery_kernel::hats::PurgeStart::Frozen { .. }
+    ));
+    let state = hennery_sessions::AppState::new(Store::open(&w.db).unwrap(), hosts, Operator::open(&w.db).unwrap());
+    state.store.set_session_mcp(Arc::new(GatewayMcp::new(&w.state)));
+    state.on_hat_purged(&w.work).unwrap();
+    assert_eq!(w.token_rows("s2"), 0, "the hat's tokens went");
+    assert!(!w.live(&token(&given)));
+    let left: i64 = rusqlite::Connection::open(&w.db)
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM gw_connections WHERE hat_id = ?1",
+            [&w.work],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(left, 0, "the hat's connections went");
+    assert_eq!(w.token_rows("s1"), 1, "another hat's token stays");
 }
 
 /// Lane L6: the gateway's part of a hat's purge deletes the hat's tokens
