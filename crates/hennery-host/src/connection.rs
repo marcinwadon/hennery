@@ -121,6 +121,8 @@ pub async fn run(cfg: HostConfig) -> Result<()> {
 
 /// Run the host until `shutdown` resolves.
 pub async fn run_until(cfg: HostConfig, shutdown: impl Future<Output = ()>) -> Result<()> {
+    // Before the first adapter (smoke test #1, F3); a no-op once made.
+    crate::adapter::prepare_death_pipe().context("the adapters' death pipe")?;
     std::fs::create_dir_all(&cfg.data_dir)?;
     let outbox = Outbox::open(&cfg.data_dir.join(crate::outbox::FILE))?;
     let (uplink, mut replies) = Uplink::new(outbox);

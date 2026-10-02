@@ -446,3 +446,121 @@ async fn a_descriptor_past_the_loops_cap_is_closed_on_linux() {
     assert!(out.status.success(), "{text}{}", String::from_utf8_lossy(&out.stderr));
     assert!(text.contains("1 passed"), "{text}");
 }
+
+/// Set for the copy of this test binary that `host_sigkill_kills_the_whole_adapter_group`
+/// runs as a host: the directory it writes its adapter's pids to.
+const HOST_DIR_VAR: &str = "HENNERY_TEST_SIGKILLED_HOST_DIR";
+/// Set too when that host is to be SIGKILLed during a `terminate`'s grace.
+const TERM_FIRST_VAR: &str = "HENNERY_TEST_SIGKILLED_HOST_TERM_FIRST";
+
+/// Not a test of its own: the host that `host_sigkill_kills_the_whole_adapter_group`
+/// starts and SIGKILLs. Spawns an adapter with a grandchild, both
+/// ignoring SIGTERM, records the adapter's group and its leader's pid,
+/// with `TERM_FIRST_VAR` starts terminating it, and waits to be killed.
+#[tokio::test]
+async fn sigkilled_host() {
+    let Some(dir) = std::env::var_os(HOST_DIR_VAR) else {
+        return;
+    };
+    let dir = Path::new(&dir);
+    let script = sh(&format!(
+        "trap '' TERM; sleep 600 & echo $! > {}; echo $$ > {}; wait",
+        dir.join("grandchild").display(),
+        dir.join("leader").display()
+    ));
+    let (mut adapter, _io) = Adapter::spawn(&script, dir).unwrap();
+    std::fs::write(dir.join("pgid.tmp"), adapter.pgid().to_string()).unwrap();
+    std::fs::rename(dir.join("pgid.tmp"), dir.join("pgid")).unwrap();
+    if std::env::var_os(TERM_FIRST_VAR).is_some() {
+        read_pid(&dir.join("leader")).await;
+        // The group's SIGTERM goes out first thing; its grace is a minute.
+        tokio::spawn(async move { adapter.terminate(Duration::from_secs(60)).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        std::fs::write(dir.join("terminating"), "").unwrap();
+    }
+    std::future::pending::<()>().await;
+}
+
+/// The host copy and its adapter's group, both killed however the test
+/// ends, so a failing test leaves nothing running. `pgid` is cleared once
+/// the group is gone: its number may be some other group's by then.
+struct HostCopy {
+    host: std::process::Child,
+    pgid: Option<i32>,
+}
+
+impl Drop for HostCopy {
+    fn drop(&mut self) {
+        let _ = self.host.kill();
+        let _ = self.host.wait();
+        if let Some(pgid) = self.pgid {
+            // SAFETY: killpg(2) on the group this test's host started.
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// Start a host copy, SIGKILL it (with `term_first`, during a
+/// `terminate`'s grace), and wait for every process of its adapter's group
+/// to be gone.
+async fn sigkill_a_host(term_first: bool) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "sigkilled_host", "--nocapture"])
+        .env(HOST_DIR_VAR, dir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    if term_first {
+        command.env(TERM_FIRST_VAR, "1");
+    }
+    let mut copy = HostCopy {
+        host: command.spawn().unwrap(),
+        pgid: None,
+    };
+    let pgid = read_pid(&dir.path().join("pgid")).await;
+    copy.pgid = Some(pgid);
+    let grandchild = read_pid(&dir.path().join("grandchild")).await;
+    let leader = read_pid(&dir.path().join("leader")).await;
+    if term_first {
+        wait_for_file(&dir.path().join("terminating")).await;
+    }
+    for pid in [pgid, grandchild, leader] {
+        assert!(alive(pid), "pid {pid} is not running");
+    }
+    // SAFETY: getpgid(2) on a process this test's host started.
+    assert_eq!(unsafe { libc::getpgid(grandchild) }, pgid);
+    // SAFETY: kill(2) on the host this test started.
+    assert_eq!(unsafe { libc::kill(copy.host.id() as i32, libc::SIGKILL) }, 0);
+    copy.host.wait().unwrap();
+    for pid in [grandchild, leader, pgid] {
+        wait_dead(pid).await;
+    }
+    copy.pgid = None;
+}
+
+/// Smoke test #1, F3: a host that dies uncleanly runs no `Drop`, and an
+/// agent's own children outlive their parent; the group's guard still
+/// kills all of it, guard included.
+#[tokio::test]
+async fn host_sigkill_kills_the_whole_adapter_group() {
+    sigkill_a_host(false).await;
+}
+
+/// The same during a `terminate`'s grace: its SIGTERM leaves the guard
+/// standing.
+#[tokio::test]
+async fn host_sigkill_during_a_kill_grace_kills_the_whole_adapter_group() {
+    sigkill_a_host(true).await;
+}
+
+/// The guard dies with its adapter: an adapter that exits on its own
+/// leaves no process of its group behind.
+#[tokio::test]
+async fn an_adapters_exit_takes_its_guard_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut adapter, _io) = Adapter::spawn(&sh("exit 0"), dir.path()).unwrap();
+    let guard = adapter.pgid();
+    adapter.exited().await;
+    wait_dead(guard).await;
+}

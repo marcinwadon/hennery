@@ -858,15 +858,19 @@ fn a_failed_pairing_code_write_is_logged_without_the_code_and_does_not_kill_the_
 
 /// Kills an adapter's whole process group on drop, from its pid file. Unlike
 /// `KillTree` (which reaches only `up`'s own two children and their groups),
-/// an adapter the host child spawns leads its *own* process group — this is
-/// the only thing standing between a bug here and a real leaked `sleep`.
+/// an adapter the host child spawns is in a process group of its own, led
+/// by its guard — this is the only thing standing between a bug here and a
+/// real leaked `sleep`.
 struct KillAdapter(std::path::PathBuf);
 
 impl Drop for KillAdapter {
     fn drop(&mut self) {
         if let Some(pid) = pid_from(&self.0) {
             unsafe {
-                libc::kill(-pid, libc::SIGKILL);
+                let pgid = libc::getpgid(pid);
+                if pgid > 0 {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
                 libc::kill(pid, libc::SIGKILL);
             }
         }
