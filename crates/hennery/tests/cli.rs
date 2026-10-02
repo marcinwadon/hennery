@@ -1344,6 +1344,45 @@ fn a_master_key_from_the_environment_is_used_and_never_written_down() {
     assert!(!data.join("master.key").exists(), "a new key was made");
 }
 
+/// Plan 8d (lane L8, kernel spec §3.3): the collector serves the gateway's
+/// proxy at `/mcp/<slug>`, outside the operator's routes. A request with a
+/// foreign `Origin`, a cross-site `Sec-Fetch-Site`, no cookie and no JSON
+/// type, before setup even, gets the proxy's own 404, not the browser
+/// rules' 403 or 415, with `nosniff` and nothing compressed.
+#[test]
+fn the_collector_serves_the_mcp_proxy_outside_the_operator_s_routes() {
+    let dir = scratch_dir("mcp-proxy");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    let (mut collector, listen) = collector_on(&data, &dir.join("collector.log"));
+    let token = format!("hnry_session_{}", "0".repeat(64));
+    for (method, body) in [
+        ("POST", r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#),
+        ("GET", ""),
+        ("DELETE", ""),
+    ] {
+        let mut stream = TcpStream::connect(&listen).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+        write!(
+            stream,
+            "{method} /mcp/linear HTTP/1.1\r\nHost: {listen}\r\nOrigin: https://evil.example\r\nSec-Fetch-Site: cross-site\r\nAuthorization: Bearer {token}\r\nContent-Type: text/plain\r\nAccept-Encoding: gzip, br\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        let head = head.to_ascii_lowercase();
+        assert!(head.starts_with("http/1.1 404"), "{method}: {response}");
+        assert!(head.contains("x-content-type-options: nosniff"), "{method}: {head}");
+        // A guard for later: no compression layer exists yet, and one added
+        // around the merged router would compress this body (kernel spec §7).
+        assert!(!head.contains("content-encoding"), "{method}: {head}");
+        assert!(body.contains(r#""code":"not_found""#), "{method}: {body}");
+    }
+    stop(&mut collector);
+}
+
 /// Start a collector on `data` that must fail to start: its standard error.
 fn refused_start(data: &std::path::Path) -> String {
     let mut refused = hennery()
