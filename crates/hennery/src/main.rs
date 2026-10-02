@@ -191,6 +191,12 @@ struct UpArgs {
     public_url: Option<String>,
     #[arg(long, env = "HENNERY_DATA_DIR")]
     data_dir: PathBuf,
+    /// Agent adapter for the host child, as for `host run --agent`. With
+    /// none, `claude` and `codex` come from the host's installed adapter set
+    /// (`<data-dir>/host`; the mirrors from `HENNERY_NPM_REGISTRY` and
+    /// `HENNERY_NODE_MIRROR`). No agent inherits CLAUDE_CODE_EXECUTABLE,
+    /// CODEX_PATH, CODEX_CONFIG, DISABLE_MCP_CONFIG_FILTERING or
+    /// APP_SERVER_LOGS.
     #[arg(long = "agent", value_parser = parse_agent)]
     agents: Vec<(String, AgentCommand)>,
     /// Park sessions idle for this many seconds; 0 turns the reaper off.

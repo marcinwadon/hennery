@@ -41,6 +41,8 @@ impl MirrorArgs {
 
 #[derive(Args)]
 pub struct UpdateArgs {
+    /// The host's data directory, as for `host run`: for `hennery up`, its
+    /// `<data-dir>/host`.
     #[arg(long, env = "HENNERY_HOST_DATA_DIR")]
     pub data_dir: PathBuf,
     /// Run this agent with your own CLI instead of the bundled one
@@ -55,8 +57,31 @@ pub struct UpdateArgs {
 
 #[derive(Args)]
 pub struct RollbackArgs {
+    /// The host's data directory, as for `host run`: for `hennery up`, its
+    /// `<data-dir>/host`.
     #[arg(long, env = "HENNERY_HOST_DATA_DIR")]
     pub data_dir: PathBuf,
+}
+
+/// The adapter commands act on a paired host's data directory only: one
+/// mistyped, or `hennery up`'s own (whose host is in `host/`), would
+/// otherwise get a set no host ever runs (the 7b-ii review).
+fn require_host_dir(data_dir: &Path) -> Result<()> {
+    if data_dir.join(hennery_host::identity::CONFIG_FILE).is_file() {
+        return Ok(());
+    }
+    let up_host = data_dir.join("host");
+    if up_host.join(hennery_host::identity::CONFIG_FILE).is_file() {
+        anyhow::bail!(
+            "{} is `hennery up`'s data directory; its host's is {}: pass that",
+            data_dir.display(),
+            up_host.display()
+        );
+    }
+    anyhow::bail!(
+        "{} holds no pairing: pass a paired host's data directory, or pair this host first (`hennery host join`)",
+        data_dir.display()
+    )
 }
 
 pub fn parse_use_cli(arg: &str) -> Result<UseCli, String> {
@@ -68,15 +93,18 @@ pub async fn run(command: AdaptersCommand) -> Result<()> {
         AdaptersCommand::Update(args) => {
             // Before anything is recorded: a bad mirror changes nothing.
             args.mirrors.sources()?;
+            require_host_dir(&args.data_dir)?;
             record_cli_choices(&args.data_dir, &args.use_cli)?;
-            update(&args.data_dir, &args.mirrors).await?;
-            println!(
-                "A running host keeps starting agents from the set it started with until it restarts; \
-                 running sessions keep theirs."
-            );
+            if update(&args.data_dir, &args.mirrors).await? {
+                println!(
+                    "A running host keeps starting agents from the set it started with until it restarts; \
+                     running sessions keep theirs."
+                );
+            }
             Ok(())
         }
         AdaptersCommand::Rollback(args) => {
+            require_host_dir(&args.data_dir)?;
             let layout = Layout::new(&args.data_dir)?;
             let back = install::rollback(&layout, &progress).await?;
             println!(
@@ -107,35 +135,41 @@ pub fn record_cli_choices(data_dir: &Path, choices: &[UseCli]) -> Result<()> {
                 agent = choice.agent,
                 path = path.display()
             ),
-            None => eprintln!("{} goes back to its bundled CLI", choice.agent),
+            None => eprintln!(
+                "{} goes back to its bundled CLI once the pinned set with it is installed",
+                choice.agent
+            ),
         }
     }
     Ok(())
 }
 
 /// Install the pinned set (less the CLIs `host.toml` overrides) and say
-/// what is current.
-pub async fn update(data_dir: &Path, mirrors: &MirrorArgs) -> Result<()> {
+/// what is current: `true` when the current set changed.
+pub async fn update(data_dir: &Path, mirrors: &MirrorArgs) -> Result<bool> {
     let sources = mirrors.sources()?;
     let overrides = agents::cli_overrides(data_dir)?;
     let selection = Selection::pinned(&agents::skipped(&overrides))?;
     let layout = Layout::new(data_dir)?;
     match install::install(&layout, &selection, &sources, &progress).await? {
-        Installed::AlreadyCurrent(set) => println!("adapter set {} is current already ({})", set.id, versions(&set)),
+        Installed::AlreadyCurrent(set) => {
+            println!("adapter set {} is current already ({})", set.id, versions(&set));
+            Ok(false)
+        }
         Installed::Switched { set, previous } => {
             println!("adapter set {} is current ({})", set.id, versions(&set));
             if let Some(previous) = previous {
                 println!("the previous set, {previous}, is kept for `hennery host adapters rollback`");
             }
+            Ok(true)
         }
     }
-    Ok(())
 }
 
 /// `join`'s last step: the pairing stands whatever happens here.
 pub async fn after_join(data_dir: &Path, host_id: &str, choices: &[UseCli], mirrors: &MirrorArgs) -> Result<()> {
     record_cli_choices(data_dir, choices)?;
-    update(data_dir, mirrors).await.with_context(|| {
+    update(data_dir, mirrors).await.map(|_| ()).with_context(|| {
         format!(
             "paired as {host_id}, but the adapter runtime was not installed; \
              `hennery host adapters update` retries"

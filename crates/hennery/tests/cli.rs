@@ -3254,6 +3254,7 @@ fn an_update_refuses_bytes_that_do_not_match_and_keeps_the_current_set() {
     let dir = scratch_dir("update-mismatch");
     let _cleanup = RemoveDir(dir.clone());
     let host = dir.join("host");
+    paired_host(&host);
     let old = "0123456789abcdef0123456789abcdef";
     fabricate_set(&host, old, "node-0-test", "exit 0", &[("claude", "e.js")]);
     link_set(&host, "current", old);
@@ -3307,8 +3308,34 @@ fn use_cli_is_recorded_in_host_toml_and_bundled_removes_it() {
     let unpaired = update(&["--use-cli", "claude=/bin/sh"]);
     assert!(!unpaired.status.success());
     assert!(String::from_utf8_lossy(&unpaired.stderr).contains("pair this host first"));
+    // Neither an unpaired directory nor `up`'s own gets a set (the 7b-ii
+    // review): the adapter commands act on a host's directory only.
+    for command in ["update", "rollback"] {
+        let out = hennery()
+            .args(["host", "adapters", command, "--data-dir"])
+            .arg(&dir)
+            .output()
+            .unwrap();
+        assert!(!out.status.success(), "{command}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("holds no pairing"),
+            "{command}"
+        );
+    }
+    assert!(!dir.join("adapters").exists() && !host.join("adapters").exists());
 
     paired_host(&host);
+    let up_root = hennery()
+        .args(["host", "adapters", "update", "--data-dir"])
+        .arg(&dir)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&up_root.stderr);
+    assert!(
+        !up_root.status.success() && stderr.contains("`hennery up`'s data directory"),
+        "{stderr}"
+    );
+    assert!(!dir.join("adapters").exists(), "nothing installed at up's root");
     // Recorded before the install, which fails here (offline).
     let out = update(&["--use-cli", "claude=/bin/sh"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -3384,6 +3411,7 @@ fn rollback_swaps_to_the_previous_set_and_holds_the_host() {
     let dir = scratch_dir("rollback");
     let _cleanup = RemoveDir(dir.clone());
     let host = dir.join("host");
+    paired_host(&host);
     let (new, old) = ("11111111111111111111111111111111", "22222222222222222222222222222222");
     fabricate_set(&host, new, "node-0-test", "exit 0", &[("claude", "e.js")]);
     fabricate_set(&host, old, "node-0-test", "exit 0", &[("claude", "e.js")]);
