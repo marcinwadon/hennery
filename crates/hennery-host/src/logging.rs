@@ -3,25 +3,37 @@
 //! JSON-RPC line it sends (`session/new`, with a session's gateway token in
 //! its MCP headers) and at `debug` the adapter's answers (an error that
 //! quotes its config), and tungstenite logs every WebSocket message (the
-//! `start_session` frame that carries the token, on both ends). Those
-//! targets are held at `info`, whatever `RUST_LOG` says.
+//! `start_session` frame that carries the token, on both ends). The ACP
+//! crate also quotes a misbehaving adapter's raw stdout whole in its own
+//! `warn` (`agent-client-protocol` 2.2.0: a line it cannot parse as
+//! JSON-RPC becomes a parse-error `Error` whose `data` is that line, logged
+//! at `warn`), so it cannot stop at `info` like the others — it is held at
+//! `error`. `tungstenite` and `tokio_tungstenite` only ever trace whole
+//! messages at `debug` and `trace`, so `info` is enough for them. Each
+//! target is held to its own level, whatever `RUST_LOG` says.
 
 use tracing::Subscriber;
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::{Layered, SubscriberExt};
 
-/// The targets whose `debug` and `trace` events can carry a session's
-/// secrets, and are therefore never shown.
-pub const MESSAGE_TRACING_TARGETS: &[&str] = &["agent_client_protocol", "tungstenite", "tokio_tungstenite"];
+/// The targets whose events can carry a session's secrets, and the level
+/// each is held to at most: `agent_client_protocol` quotes a misbehaving
+/// adapter's stray stdout in its own `warn`, so it is held at `error`;
+/// `tungstenite` and `tokio_tungstenite` only trace whole messages at
+/// `debug`/`trace`, so `info` is enough.
+pub const MESSAGE_TRACING_TARGETS: &[(&str, LevelFilter)] = &[
+    ("agent_client_protocol", LevelFilter::ERROR),
+    ("tungstenite", LevelFilter::INFO),
+    ("tokio_tungstenite", LevelFilter::INFO),
+];
 
-/// Every target at any level, but `MESSAGE_TRACING_TARGETS` at `info` at
-/// most.
+/// Every target at any level, but each of `MESSAGE_TRACING_TARGETS` at its
+/// own level at most.
 pub fn secret_cap() -> Targets {
-    MESSAGE_TRACING_TARGETS
-        .iter()
-        .fold(Targets::new().with_default(LevelFilter::TRACE), |targets, target| {
-            targets.with_target(*target, LevelFilter::INFO)
-        })
+    MESSAGE_TRACING_TARGETS.iter().fold(
+        Targets::new().with_default(LevelFilter::TRACE),
+        |targets, (target, level)| targets.with_target(*target, *level),
+    )
 }
 
 /// `subscriber` with `secret_cap` over it, as a global filter: an event it

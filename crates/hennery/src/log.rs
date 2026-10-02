@@ -70,8 +70,8 @@ pub fn target(var: impl Fn(&str) -> Option<OsString>, macos: bool) -> Result<Tar
 /// Set up logging for `process` (`up`, `collector`, `host`), or for a
 /// command that always logs to standard output (`None`). `RUST_LOG`
 /// filters, `info` by default; the targets that trace whole messages stay
-/// at `info` whatever it says, since they would show a session's gateway
-/// token (`hennery_host::logging::capped`, plan 8c).
+/// capped at their own level whatever it says, since they would show a
+/// session's gateway token (`hennery_host::logging::capped`, plan 8c).
 ///
 /// A file that cannot be used (the directory not creatable, not private,
 /// the disk full) falls back to standard error, saying why there, at `warn`
