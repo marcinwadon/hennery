@@ -4,3 +4,6 @@
 
 pub mod crypto;
 pub mod key;
+pub mod model;
+mod schema;
+pub mod store;
