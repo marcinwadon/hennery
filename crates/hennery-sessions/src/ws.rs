@@ -232,8 +232,14 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                 }
                 match state.store.ingest(&session_id, seq, &body) {
                     Ok(created) => {
+                        // An applied `session_started`, of a start or a
+                        // resume: a duplicate or a stale one creates none.
+                        let started = created.iter().any(|event| event.kind == "session_started");
                         for event in created {
                             state.hub.publish(event);
+                        }
+                        if started {
+                            remember_project(&state, &host_id, &session_id);
                         }
                         match &body {
                             SessionBody::SessionStarted { request_id, .. }
@@ -448,6 +454,39 @@ async fn retry_repark(state: AppState, host_id: String) {
         "could not check whether a disconnected host was revoked, or park its sessions; \
          if it was revoked, revoke it again (DELETE /api/hosts/{host_id}) to park them"
     );
+}
+
+/// Remember the cwd of a session that just started or resumed as one of its
+/// host's recent projects, under the hat the cwd resolves to (kernel spec
+/// §5.3; plan 6c decision 11). Only a canonical cwd: until the host
+/// resolves it (hats 5b), it is what the client sent. Recents are not
+/// state: a failure is logged, and the fact is acked as usual.
+fn remember_project(state: &AppState, host_id: &str, session_id: &str) {
+    let cwd = match state.store.session(session_id) {
+        Ok(Some(row)) => row.cwd,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(%host_id, %session_id, error = %err, "reading a started session's cwd failed");
+            return;
+        }
+    };
+    if !hennery_kernel::hats::is_canonical(&cwd) {
+        tracing::debug!(%host_id, %session_id, "not remembering a cwd that is not canonical");
+        return;
+    }
+    let hat_id = match state.hosts.resolve_hat(host_id, &cwd) {
+        Ok(Some(resolution)) => resolution.hat_id,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::warn!(%host_id, %session_id, error = %err, "resolving a started session's hat failed");
+            return;
+        }
+    };
+    match state.hosts.remember(host_id, &hat_id, &cwd, unix_now()) {
+        Ok(true) => {}
+        Ok(false) => tracing::debug!(%host_id, %session_id, "not remembering a cwd that cannot be shown"),
+        Err(err) => tracing::warn!(%host_id, %session_id, error = %err, "remembering a recent project failed"),
+    }
 }
 
 /// Revert what a request the host rejected changed in the store: a start or

@@ -62,6 +62,8 @@ type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<t
 /// The test playing a host.
 struct ScriptedHost {
     ws: Ws,
+    /// The last session frame's seq.
+    seq: u64,
 }
 
 impl ScriptedHost {
@@ -73,7 +75,7 @@ impl ScriptedHost {
             .await
             .unwrap();
         let nonce = hex::decode(response.headers()[HELLO_NONCE_HEADER].to_str().unwrap()).unwrap();
-        let mut host = Self { ws };
+        let mut host = Self { ws, seq: 0 };
         host.send(&HostFrame::Hello {
             protocol_version: PROTOCOL_VERSION.into(),
             host_version: "test".into(),
@@ -102,7 +104,7 @@ impl ScriptedHost {
             .await
             .unwrap();
         let nonce = hex::decode(response.headers()[HELLO_NONCE_HEADER].to_str().unwrap()).unwrap();
-        let mut host = Self { ws };
+        let mut host = Self { ws, seq: 0 };
         host.send(&HostFrame::Hello {
             protocol_version: PROTOCOL_VERSION.into(),
             host_version: "test".into(),
@@ -389,7 +391,10 @@ async fn projects_come_from_the_host_and_are_cached_for_its_connection() {
     let (status, body) = listed_projects(&collector, &mut host, &["/p/a"]).await;
     assert_eq!(
         (status, body),
-        (200, json!({"items": [{"path": "/p/a"}], "partial": false}))
+        (
+            200,
+            json!({"recents_hat_id": default_hat(&collector), "recents": [], "items": [{"path": "/p/a"}], "partial": false})
+        )
     );
     // From the cache: nothing is sent.
     let (status, body) = get(&collector, &format!("/api/hosts/{HOST}/projects")).await;
@@ -552,7 +557,10 @@ async fn a_hosts_reply_is_checked_before_it_is_shown() {
     .await;
     assert_eq!(
         call.await.unwrap(),
-        (200, json!({"items": [{"path": "/ok"}], "partial": false}))
+        (
+            200,
+            json!({"recents_hat_id": default_hat(&collector), "recents": [], "items": [{"path": "/ok"}], "partial": false})
+        )
     );
 
     let browse = |path: &str| get_later(&collector, &format!("/api/hosts/{HOST}/browse?path={path}"));
@@ -671,4 +679,139 @@ async fn an_answer_past_the_collectors_bounds_is_partial_or_truncated() {
     assert_eq!(status, 200);
     assert_eq!(body["entries"].as_array().unwrap().len(), 1000);
     assert_eq!(body["truncated"], json!(true));
+}
+
+/// `HOST`'s default hat.
+fn default_hat(collector: &Collector) -> String {
+    collector.state.hosts.host(HOST).unwrap().unwrap().default_hat_id
+}
+
+// Task 6: recent projects, per hat (decision 11).
+
+/// Start a session in `cwd` through the API, the host answering
+/// `session_started` if `starts`, `start_failed` otherwise.
+async fn start_in(collector: &Collector, host: &mut ScriptedHost, cwd: &str, starts: bool) {
+    let (c, url) = (client(collector), format!("http://{}/api/sessions", collector.addr));
+    let body = json!({ "host_id": HOST, "agent": "fake", "cwd": cwd });
+    let call = tokio::spawn(async move { c.post(url).json(&body).send().await.unwrap().status().as_u16() });
+    let CollectorFrame::StartSession {
+        request_id, session_id, ..
+    } = host.next().await
+    else {
+        panic!("expected start_session");
+    };
+    let body = if starts {
+        hennery_proto::frames::SessionBody::session_started(request_id, "agent-1")
+    } else {
+        hennery_proto::frames::SessionBody::StartFailed {
+            request_id,
+            code: "spawn_failed".into(),
+            message: "no".into(),
+        }
+    };
+    host.seq += 1;
+    let frame = HostFrame::Session {
+        session_id,
+        seq: host.seq,
+        body,
+    };
+    host.send(&frame).await;
+    assert_eq!(call.await.unwrap(), if starts { 202 } else { 502 });
+}
+
+fn recent_paths(body: &serde_json::Value) -> Vec<&str> {
+    body["recents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_session_that_starts_makes_its_canonical_cwd_a_recent_project() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::with_projects(&collector).await;
+    start_in(&collector, &mut host, "/p/app", true).await;
+    let (status, body) = listed_projects(&collector, &mut host, &[]).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["recents_hat_id"], json!(default_hat(&collector)));
+    assert_eq!(recent_paths(&body), ["/p/app"]);
+    assert!(
+        body["recents"][0]["last_used_at"].as_str().unwrap().ends_with('Z'),
+        "{body}"
+    );
+    // A start that fails, and a cwd that is not canonical, are not
+    // remembered; recents are read afresh, past the cache.
+    start_in(&collector, &mut host, "/p/broken", false).await;
+    start_in(&collector, &mut host, "relative/dir", true).await;
+    start_in(&collector, &mut host, "/p/app/", true).await;
+    start_in(&collector, &mut host, "/p/../etc", true).await;
+    let (_, body) = get(&collector, &format!("/api/hosts/{HOST}/projects")).await;
+    assert_eq!(recent_paths(&body), ["/p/app"]);
+    start_in(&collector, &mut host, "/p/lib", true).await;
+    let (_, body) = get(&collector, &format!("/api/hosts/{HOST}/projects")).await;
+    let mut paths = recent_paths(&body);
+    paths.sort();
+    assert_eq!(paths, ["/p/app", "/p/lib"]);
+}
+
+/// Kernel spec §5.3, the review's A1: recents are those of the hat the
+/// browsing path resolves to now, rules changed since included.
+#[tokio::test]
+async fn recents_are_those_of_the_hat_the_path_resolves_to() {
+    use hennery_kernel::hats::{HatChange, NewRule};
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::with_projects(&collector).await;
+    let hosts = &collector.state.hosts;
+    let HatChange::Done(work) = hosts.create_hat("Work", None, 0).unwrap() else {
+        panic!("a hat");
+    };
+    let rule = |prefix: &str| NewRule {
+        prefix: prefix.into(),
+        hat_id: work.id.clone(),
+        verified: true,
+    };
+    hosts.replace_path_rules(HOST, &[rule("/p/work")]).unwrap();
+    start_in(&collector, &mut host, "/p/home-project", true).await;
+    start_in(&collector, &mut host, "/p/work/client", true).await;
+    let (_, body) = listed_projects(&collector, &mut host, &[]).await;
+    assert_eq!(body["recents_hat_id"], json!(default_hat(&collector)));
+    assert_eq!(recent_paths(&body), ["/p/home-project"]);
+    let (status, body) = get(&collector, &format!("/api/hosts/{HOST}/projects?path=/p/work")).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        (&body["recents_hat_id"], recent_paths(&body)),
+        (&json!(work.id), vec!["/p/work/client"])
+    );
+    // A rule added since moves a recent to its new hat, at once.
+    hosts
+        .replace_path_rules(HOST, &[rule("/p/work"), rule("/p/home-project")])
+        .unwrap();
+    let (_, body) = get(&collector, &format!("/api/hosts/{HOST}/projects")).await;
+    assert!(recent_paths(&body).is_empty(), "{body}");
+    let (_, body) = get(&collector, &format!("/api/hosts/{HOST}/projects?path=/p/work/x")).await;
+    let mut paths = recent_paths(&body);
+    paths.sort();
+    assert_eq!(paths, ["/p/home-project", "/p/work/client"]);
+}
+
+/// The review's A2: `path` is checked first, whatever the host's state.
+#[tokio::test]
+async fn a_projects_path_that_is_not_canonical_is_invalid() {
+    let collector = Collector::start().await;
+    let long = format!("/{}", "x".repeat(4096));
+    for query in [
+        "?path=relative",
+        "?path=/p/",
+        "?path=/p/../q",
+        "?path=/a%0Ab",
+        &format!("?path={long}"),
+        "?path=/a&path=/b",
+    ] {
+        let (status, body) = get(&collector, &format!("/api/hosts/{HOST}/projects{query}")).await;
+        assert_eq!((status, body["code"].as_str()), (400, Some("invalid")), "{query:?}");
+    }
+    let (status, body) = get(&collector, &format!("/api/hosts/{HOST}/projects?path=/p")).await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("host_offline")), "{body}");
 }

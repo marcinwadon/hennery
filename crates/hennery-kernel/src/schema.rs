@@ -180,6 +180,22 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE hosts ADD COLUMN workspace_roots TEXT NOT NULL DEFAULT '[]';
     ",
+    // Project recents (kernel spec §1.1, §5.3; plan 6c decision 11), per
+    // (host, hat): a session's cwd, under the hat it resolved to. The host
+    // and the hat are the owner's, by composite foreign keys, as rules';
+    // recents are derived, so they go with their host or hat (the review's
+    // optional cascade, taken).
+    "
+    CREATE TABLE project_recents (
+        owner_id TEXT NOT NULL REFERENCES owners(id),
+        host_id TEXT NOT NULL,
+        hat_id TEXT NOT NULL,
+        path TEXT NOT NULL,
+        last_used_at INTEGER NOT NULL,
+        PRIMARY KEY (host_id, hat_id, path),
+        FOREIGN KEY (host_id, owner_id) REFERENCES hosts(id, owner_id) ON DELETE CASCADE,
+        FOREIGN KEY (hat_id, owner_id) REFERENCES hats(id, owner_id) ON DELETE CASCADE);
+    ",
 ];
 
 #[cfg(test)]

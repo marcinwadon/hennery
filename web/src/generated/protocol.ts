@@ -281,7 +281,22 @@ connected: boolean,
  */
 created_at: string, last_seen_at?: string | undefined, revoked_at?: string | undefined, };
 
-export type HostProjects = { items: Array<Project>, 
+export type RecentProject = { path: string, 
+/**
+ * RFC 3339.
+ */
+last_used_at: string, };
+
+export type HostProjects = { 
+/**
+ * The hat `recents` belong to: the one `path` resolves to on the host,
+ * or the host's default hat without one (kernel spec §5.3).
+ */
+recents_hat_id: string, 
+/**
+ * Newest first: only those whose path resolves to that hat now.
+ */
+recents: Array<RecentProject>, items: Array<Project>, 
 /**
  * The host cut its enumeration short: there may be more.
  */

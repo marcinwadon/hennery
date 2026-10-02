@@ -1466,6 +1466,8 @@ async fn the_project_picker_lists_and_browses_a_real_hosts_projects() {
     assert_eq!(
         listed,
         HostProjects {
+            recents_hat_id: hosts[0].default_hat_id.clone(),
+            recents: vec![],
             items: vec![Project {
                 path: format!("{root}/app")
             }],

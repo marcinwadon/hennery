@@ -301,10 +301,25 @@ pub struct HostItem {
     pub revoked_at: Option<String>,
 }
 
-/// `GET /api/hosts/{id}/projects` (ACP core §7, §9): the git repositories
-/// under the host's workspace roots.
+/// A directory a session started or resumed in on the host (kernel spec
+/// §5.3).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct RecentProject {
+    pub path: String,
+    /// RFC 3339.
+    pub last_used_at: String,
+}
+
+/// `GET /api/hosts/{id}/projects?path=` (ACP core §7, §9): the recent
+/// projects of one hat, and the git repositories under the host's
+/// workspace roots.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct HostProjects {
+    /// The hat `recents` belong to: the one `path` resolves to on the host,
+    /// or the host's default hat without one (kernel spec §5.3).
+    pub recents_hat_id: String,
+    /// Newest first: only those whose path resolves to that hat now.
+    pub recents: Vec<RecentProject>,
     pub items: Vec<crate::frames::Project>,
     /// The host cut its enumeration short: there may be more.
     pub partial: bool,

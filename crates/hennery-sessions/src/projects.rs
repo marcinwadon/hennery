@@ -13,7 +13,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use hennery_kernel::hosts::{MAX_ROOTS, is_displayable_path, is_displayable_text};
 use hennery_proto::frames::{Capability, CollectorFrame, DirEntry, HostFrame, Project};
-use hennery_proto::rest::{DirectoryListing, HostProjects};
+use hennery_proto::rest::{DirectoryListing, HostProjects, RecentProject};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -191,12 +191,52 @@ fn host_refused(code: &str) -> Response {
     error(status, code, message)
 }
 
-/// `GET /api/hosts/{id}/projects`: the repositories under the host's
+#[derive(Deserialize)]
+struct ProjectsQuery {
+    path: Option<String>,
+}
+
+/// `GET /api/hosts/{id}/projects?path=`: the recents of the hat `path`
+/// resolves to (the host's default hat without one), read afresh (kernel
+/// spec §5.3; the review's A7), and the repositories under the host's
 /// workspace roots (ACP core §7), from the cache or a `list_projects`.
-async fn projects(State(state): State<AppState>, Path(host_id): Path<String>) -> Response {
+async fn projects(
+    State(state): State<AppState>,
+    Path(host_id): Path<String>,
+    query: Result<Query<ProjectsQuery>, QueryRejection>,
+) -> Response {
+    // Checked before anything else, whatever the host's state (Task 6's
+    // review, A2). Canonical, as hat rules are: lexically, before hats 5b.
+    let path = match query {
+        Ok(Query(ProjectsQuery { path: None })) => None,
+        Ok(Query(ProjectsQuery { path: Some(path) }))
+            if is_askable(&path) && hennery_kernel::hats::is_canonical(&path) =>
+        {
+            Some(path)
+        }
+        _ => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid",
+                "`path`, if given, must be a canonical absolute path of at most 4096 bytes",
+            );
+        }
+    };
     let conn_id = match reachable(&state, &host_id) {
         Ok(conn_id) => conn_id,
         Err(response) => return *response,
+    };
+    let hat_id = match path {
+        Some(path) => match state.hosts.resolve_hat(&host_id, &path) {
+            Ok(Some(resolution)) => resolution.hat_id,
+            Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such host"),
+            Err(err) => return internal(err),
+        },
+        None => match state.hosts.host(&host_id) {
+            Ok(Some(host)) => host.default_hat_id,
+            Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such host"),
+            Err(err) => return internal(err),
+        },
     };
     let owner = state.hosts.owner_id();
     let enumeration = match state.projects.get(owner, &host_id, conn_id) {
@@ -219,7 +259,19 @@ async fn projects(State(state): State<AppState>, Path(host_id): Path<String>) ->
             }
         }
     };
+    let recents = match state.hosts.recents(&host_id, &hat_id, hennery_kernel::recents::SHOWN) {
+        Ok(recents) => recents,
+        Err(err) => return internal(err),
+    };
     no_store(HostProjects {
+        recents_hat_id: hat_id,
+        recents: recents
+            .into_iter()
+            .map(|recent| RecentProject {
+                path: recent.path,
+                last_used_at: hennery_kernel::secret::rfc3339(recent.last_used_at),
+            })
+            .collect(),
         items: enumeration.items,
         partial: enumeration.partial,
         home: enumeration.home,
