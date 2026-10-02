@@ -844,6 +844,7 @@ fn forget(
         data_dir: cfg.data_dir.clone(),
         home: cfg.home.clone(),
         hooks: crate::walk::Hooks::default(),
+        account: crate::forget::account(),
     };
     let (uplink, sessions) = (uplink.clone(), sessions.clone());
     tokio::spawn(async move {
