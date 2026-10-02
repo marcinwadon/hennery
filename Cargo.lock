@@ -1242,6 +1242,7 @@ dependencies = [
  "hex",
  "libc",
  "password-auth",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
