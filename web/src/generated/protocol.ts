@@ -288,7 +288,8 @@ export type SessionCatalog = { session_id: string,
 config_options: unknown[], 
 /**
  * The adapter's slash commands (ACP `AvailableCommand` objects), as
- * last reported; empty until it reports any (ACP core §7).
+ * last reported; empty until it reports any (ACP core §7). Always
+ * sent, so the schema and the TypeScript type agree that it is there.
  */
 commands: unknown[], model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, };
 

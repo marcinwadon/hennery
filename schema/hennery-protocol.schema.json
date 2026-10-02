@@ -1916,8 +1916,7 @@
           "type": "object"
         },
         "commands": {
-          "default": [],
-          "description": "The adapter's slash commands (ACP `AvailableCommand` objects), as\nlast reported; empty until it reports any (ACP core §7).",
+          "description": "The adapter's slash commands (ACP `AvailableCommand` objects), as\nlast reported; empty until it reports any (ACP core §7). Always\nsent, so the schema and the TypeScript type agree that it is there.",
           "items": true,
           "type": "array"
         },
@@ -1944,7 +1943,8 @@
       },
       "required": [
         "session_id",
-        "config_options"
+        "config_options",
+        "commands"
       ],
       "type": "object"
     },

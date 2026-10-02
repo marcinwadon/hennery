@@ -376,8 +376,8 @@ pub struct SessionCatalog {
     #[ts(type = "unknown[]")]
     pub config_options: Vec<Value>,
     /// The adapter's slash commands (ACP `AvailableCommand` objects), as
-    /// last reported; empty until it reports any (ACP core §7).
-    #[serde(default)]
+    /// last reported; empty until it reports any (ACP core §7). Always
+    /// sent, so the schema and the TypeScript type agree that it is there.
     #[ts(type = "unknown[]")]
     pub commands: Vec<Value>,
     #[serde(flatten)]
