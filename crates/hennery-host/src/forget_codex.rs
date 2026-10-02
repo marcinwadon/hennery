@@ -125,6 +125,14 @@ enum Answer {
     Error { code: i64, message: String },
 }
 
+/// How 0.155.1 answers a request it could not deserialize (seen live):
+/// an unknown method, a missing field, a field of another type.
+const NOT_UNDERSTOOD: [&str; 3] = [
+    "Invalid request: unknown variant",
+    "Invalid request: missing field",
+    "Invalid request: invalid type",
+];
+
 /// `thread/delete`'s answer, as Codex 0.155.1 gives it (its
 /// `thread_delete.rs`, `delete_thread.rs`, `thread_manager.rs` and
 /// `message_processor.rs` at `rust-v0.155.1`). The text only picks the
@@ -137,8 +145,11 @@ fn classify_delete(answer: &Answer) -> Verdict {
     match code {
         -32601 => Verdict::Unavailable(Unavailable::MethodNotFound),
         // The request did not deserialize: an unknown method, or params of
-        // another shape. No handler ran.
-        -32600 if message.starts_with("Invalid request: ") => Verdict::Unavailable(Unavailable::MethodNotFound),
+        // another shape (the prefixes 0.155.1 was seen to give). No handler
+        // ran.
+        -32600 if NOT_UNDERSTOOD.iter().any(|p| message.starts_with(p)) => {
+            Verdict::Unavailable(Unavailable::MethodNotFound)
+        }
         // Nothing of the thread is there (0.155.1 says either).
         -32600 if message.starts_with("no rollout found for thread id") || message.starts_with("thread not found:") => {
             Verdict::Deleted
@@ -721,6 +732,19 @@ mod tests {
         assert_eq!(
             classify_delete(&error(-32600, "Invalid request: missing field `threadId`")),
             Verdict::Unavailable(Unavailable::MethodNotFound)
+        );
+        assert_eq!(
+            classify_delete(&error(
+                -32600,
+                "Invalid request: invalid type: integer `1`, expected a string"
+            )),
+            Verdict::Unavailable(Unavailable::MethodNotFound)
+        );
+        // The review's item 2: only the prefixes seen live mean "not
+        // understood"; another `Invalid request:` is a failure, retried.
+        assert_eq!(
+            classify_delete(&error(-32600, "Invalid request: something new")),
+            Verdict::Failed(ForgetReason::IoError)
         );
         for other in [
             error(-32603, "failed to delete thread: database is locked"),
