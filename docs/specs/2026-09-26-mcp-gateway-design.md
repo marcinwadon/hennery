@@ -129,7 +129,10 @@ ACP**, not through agent config files:
    followed by the stdio servers for that (host, hat) (§3.4).
 2. The host passes them in `session/new` / `session/load`, with the agent's
    isolation mechanism (Claude strict flag, Codex composed home; ACP core §6),
-   or applies the fallback (umbrella §8.5).
+   or applies the fallback (umbrella §8.5). The collector decides the
+   fallback; a frame that delivers to an agent the host cannot isolate says
+   so (`isolation_waived`), and without it the host refuses the servers
+   (`mcp_isolation_unavailable`, plan 8c).
 3. A mount change affects the **next** start or resume of a session on that
    host; a removed mount is refused at request time immediately.
 
