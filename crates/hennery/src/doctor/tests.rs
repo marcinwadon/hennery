@@ -803,11 +803,18 @@ fn the_disk_fails_without_room_for_the_outbox_and_warns_without_room_for_a_set()
     let check = check9();
     assert_eq!(check.status, Status::Warn, "{check:?}");
     assert!(check.summary.contains("the outbox holds 1024 MB"), "{check:?}");
+    // Its write-ahead log counts too.
+    outbox.set_len(disk::LARGE_OUTBOX / 2).unwrap();
+    let wal = std::fs::File::create(host.join("outbox.db-wal")).unwrap();
+    wal.set_len(disk::LARGE_OUTBOX / 2 + 1).unwrap();
+    assert_eq!(check9().status, Status::Warn);
     std::fs::remove_file(host.join("outbox.db")).unwrap();
+    std::fs::remove_file(host.join("outbox.db-wal")).unwrap();
 
     for name in [
         "outbox.db.orphaned-host-1",
         "outbox.db.orphaned-host-1-wal",
+        "outbox.db.orphaned-host-1-shm",
         "outbox.db.orphaned-unpaired.1",
     ] {
         std::fs::write(host.join(name), "").unwrap();
@@ -855,9 +862,16 @@ fn systemd(active: &'static str, pid: u32, linger: &'static str) -> Fake {
 }
 
 /// Check 10's line on `cx`, with `dirs` and `watched` as for `checked`.
+/// The service files and the made-up `/proc` are watched too: doctor must
+/// not rewrite a unit, a plist or an environment file.
 fn check10(cx: &Context, data: &Path) -> Check {
+    let watched = [cx.home.join("Library"), cx.home.join(".config"), cx.root.clone()];
+    let before: Vec<_> = watched.iter().map(|w| snapshot(w)).collect();
     let dirs = Dirs::by_contents(data.to_path_buf(), Found::Given);
-    line(&checked(cx, dirs, &nothing, data), 10).clone()
+    let check = line(&checked(cx, dirs, &nothing, data), 10).clone();
+    let after: Vec<_> = watched.iter().map(|w| snapshot(w)).collect();
+    assert_eq!(after, before, "doctor changed a service file or /proc");
+    check
 }
 
 /// Check 10: none installed warns; two roles fail.
@@ -929,6 +943,7 @@ fn a_running_service_is_ok_and_one_not_running_fails() {
     let mut fake = Fake::none();
     fake.unreachable = true;
     let cx = machine(dir.path(), Platform::Linux, &fake);
+    install(&cx, Role::Host, &cx.exe, &data, "/usr/bin:/bin");
     let check = check10(&cx, &data);
     assert_eq!(check.status, Status::Warn, "{check:?}");
     assert!(check.summary.contains("`systemctl --user` cannot be run"), "{check:?}");
