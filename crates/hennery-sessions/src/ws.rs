@@ -485,11 +485,14 @@ fn notify(state: &AppState, edge: &Edge) {
     }
 }
 
-/// A session's edges deferred during a resend (A1, A6): its latest
-/// question that blocked a turn, and its latest turn end that notifies.
+/// A session's edges deferred during a resend (A1, A6): its latest question
+/// (one that blocked a turn, or one asked outside a turn), and its latest
+/// turn end that notifies.
 #[derive(Default)]
 struct Deferred {
-    blocked: Option<Edge>,
+    /// The latest question: one that blocked a turn, or one asked outside a
+    /// turn.
+    asked: Option<Edge>,
     ended: Option<Edge>,
 }
 
@@ -501,30 +504,28 @@ impl Deferred {
             return;
         }
         match edge.kind {
-            PushEdge::Blocked { .. } => self.blocked = Some(edge),
+            PushEdge::Blocked { .. } | PushEdge::QuestionOutsideTurn { .. } => self.asked = Some(edge),
             PushEdge::TurnEnded(_) => self.ended = Some(edge),
-            // Notifies nothing yet (the maintainer's open question): if it
-            // ever does, it needs a slot and a check of its own here.
-            PushEdge::QuestionOutsideTurn { .. } => {}
         }
     }
 
-    /// What to notify once reconciled: the question if it is still open and
-    /// its turn still blocked (`Store::still_blocked_on`), else the turn's
-    /// end. A failed read is logged and counts as not holding: a push is not
-    /// state.
+    /// What to notify once reconciled: the question if it still holds (one
+    /// that blocked a turn: still open and the turn still blocked,
+    /// `Store::still_blocked_on`; one outside a turn: still open,
+    /// `Store::still_open`), else the turn's end. A failed read is logged
+    /// and counts as not holding: a push is not state.
     fn into_edge(self, state: &AppState) -> Option<Edge> {
-        if let Some(edge) = self.blocked {
-            let PushEdge::Blocked { pending_id, .. } = &edge.kind else {
-                unreachable!("`keep` files only `Blocked` here");
+        if let Some(edge) = self.asked {
+            let id = &edge.session.id;
+            let held = match &edge.kind {
+                PushEdge::Blocked { pending_id, .. } => state.store.still_blocked_on(id, pending_id),
+                PushEdge::QuestionOutsideTurn { pending_id, .. } => state.store.still_open(id, pending_id),
+                PushEdge::TurnEnded(_) => unreachable!("`keep` files only questions here"),
             };
-            let holds = state
-                .store
-                .still_blocked_on(&edge.session.id, pending_id)
-                .unwrap_or_else(|err| {
-                    tracing::warn!(session_id = %edge.session.id, error = %err, "deferred push dropped: store unreadable");
-                    false
-                });
+            let holds = held.unwrap_or_else(|err| {
+                tracing::warn!(session_id = %edge.session.id, error = %err, "deferred push dropped: store unreadable");
+                false
+            });
             if holds {
                 return Some(edge);
             }

@@ -196,6 +196,15 @@ const MIGRATIONS: &[&str] = &[
         '');
     CREATE INDEX sessions_by_hat ON sessions(owner_id, hat_id, last_event_at DESC, id DESC);
 ",
+    // Web Push (plan 10b-iii; its review's A3): the event that opened each
+    // question, so a withdrawal is ordered against the owner's last prompt
+    // by id, without a scan of the session's events; and the index that
+    // finds a session's latest event of a kind. Questions from before have
+    // none, and never count as withdrawn since a prompt.
+    "
+    ALTER TABLE pending ADD COLUMN opened_event_id INTEGER;
+    CREATE INDEX events_by_kind ON events(session_id, kind, event_id);
+",
 ];
 
 /// What `Store::ingest_fact` did with one fact.
@@ -2229,8 +2238,8 @@ impl Store {
                 let inserted = match extract.filter(|_| applies) {
                     Some(extract) => tx.execute(
                         "INSERT INTO pending(pending_id, session_id, kind, turn_id, option_ids, payload, state, opened_at,
-                                             owner_id)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8)
+                                             owner_id, opened_event_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7, ?8, ?9)
                          ON CONFLICT(pending_id) DO NOTHING",
                         params![
                             pending_id,
@@ -2240,7 +2249,8 @@ impl Store {
                             extract.option_ids.as_ref().map(serde_json::to_string).transpose()?,
                             payload.to_string(),
                             ts,
-                            self.owner
+                            self.owner,
+                            fact_id
                         ],
                     )?,
                     None => 0,
@@ -2268,14 +2278,46 @@ impl Store {
                     // urgent push, with no one but it pacing them
                     // (10b-i's review, A2). Answered and asked again is
                     // the operator's pace, and still notifies.
+                    //
+                    // A question with no turn id, in a turn or outside one,
+                    // is bounded by the owner's last prompt instead (10b-i's
+                    // re-confirmation, N1; plan 10b-iii's review, A1): a
+                    // withdrawal counts if its question was opened after
+                    // the session's latest `user_turn`, which only a turn
+                    // the owner prompted writes. Ordered by event id, which
+                    // only grows, not by the clock (the review's N3): the
+                    // question's own (`opened_event_id`) against the
+                    // prompt's, found by `events_by_kind` (A3).
                     let rewithdrawn = blocked > 0
                         && tx.query_row(
-                            "SELECT EXISTS(SELECT 1 FROM pending WHERE session_id = ?1 AND turn_id = ?2
-                                 AND pending_id <> ?3 AND reason = 'agent_withdrew' AND owner_id = ?4)",
+                            "SELECT EXISTS(SELECT 1 FROM pending WHERE session_id = ?1 AND pending_id <> ?3
+                                 AND reason = 'agent_withdrew' AND turn_id = ?2 AND owner_id = ?4)
+                             OR (?2 IS NULL AND EXISTS(SELECT 1 FROM pending WHERE session_id = ?1
+                                 AND pending_id <> ?3 AND owner_id = ?4 AND turn_id IS NULL
+                                 AND reason = 'agent_withdrew'
+                                 AND opened_event_id > coalesce((SELECT max(event_id) FROM events
+                                     WHERE session_id = ?1 AND kind = 'user_turn' AND owner_id = ?4), 0)))",
                             params![session_id, indexed.turn_id, pending_id, self.owner],
                             |r| r.get::<_, bool>(0),
                         )?;
-                    edge = if rewithdrawn {
+                    // Outside a turn the same two rules hold (operator
+                    // decision 2026-10-02): only the first open question
+                    // notifies, and one asked again after the agent withdrew
+                    // one is quiet until the owner's next turn, bounded as
+                    // above.
+                    let outside_quiet = blocked == 0
+                        && indexed.turn_id.is_none()
+                        && tx.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM pending WHERE session_id = ?1 AND pending_id <> ?2
+                                 AND state = 'open' AND owner_id = ?3)
+                             OR EXISTS(SELECT 1 FROM pending WHERE session_id = ?1 AND pending_id <> ?2
+                                 AND owner_id = ?3 AND turn_id IS NULL AND reason = 'agent_withdrew'
+                                 AND opened_event_id > coalesce((SELECT max(event_id) FROM events
+                                     WHERE session_id = ?1 AND kind = 'user_turn' AND owner_id = ?3), 0))",
+                            params![session_id, pending_id, self.owner],
+                            |r| r.get::<_, bool>(0),
+                        )?;
+                    edge = if rewithdrawn || outside_quiet {
                         None
                     } else if blocked > 0 {
                         Some(PushEdge::Blocked {
@@ -2406,6 +2448,18 @@ impl Store {
         };
         tx.commit()?;
         Ok(Ingested { events: created, edge })
+    }
+
+    /// Whether `pending_id` is still open in `session_id`: a question asked
+    /// outside a turn, resent before reconnecting, is notified only if it
+    /// is (operator decision 2026-10-02).
+    pub fn still_open(&self, session_id: &str, pending_id: &str) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending WHERE pending_id = ?1 AND session_id = ?2 AND state = 'open'
+                 AND owner_id = ?3)",
+            [pending_id, session_id, &self.owner],
+            |r| r.get(0),
+        )?)
     }
 
     /// Whether `pending_id` is still open in `session_id`, and the session

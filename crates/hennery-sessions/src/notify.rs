@@ -16,25 +16,25 @@ use hennery_proto::rest::{TITLE_MAX_CHARS, TITLE_MAX_JSON_BYTES};
 /// | Edge | Title / body |
 /// |---|---|
 /// | activity → `blocked` | the session's / "needs your answer" (urgent) |
+/// | a question outside a turn | the same |
 /// | `turn_ended{completed}` | the session's / "finished" |
 /// | `turn_ended{failed}` | the session's / "failed" |
 ///
 /// A cancelled or interrupted turn does not notify: the operator cancelled
 /// it, or the host's restart already shows on the session. A question asked
-/// **outside a turn** does not notify either, until the maintainer decides
-/// whether it should (plan 10b's open question): it leaves the activity
-/// alone, so it is not `blocked`. If it ever notifies, it needs a limit in
-/// time per session: nothing the operator does paces it (10b-i's review).
+/// **outside a turn** leaves the activity alone, so it is not `blocked`, but
+/// it waits on the owner just the same: it notifies as one (operator
+/// decision 2026-10-02). The store bounds it by the owner's pace: only the
+/// session's first open question, and none after a withdrawal until the
+/// owner's next prompt.
 pub fn notice_for(edge: &PushEdge, session: &EdgeSession) -> Option<Notice> {
     let (urgency, generic_title, body, detail) = match edge {
-        PushEdge::Blocked { title, .. } => (
+        PushEdge::Blocked { title, .. } | PushEdge::QuestionOutsideTurn { title, .. } => (
             Urgency::High,
             "Session needs your answer",
             "needs your answer",
             title.clone(),
         ),
-        // The maintainer's open question: no trigger of its own yet.
-        PushEdge::QuestionOutsideTurn { .. } => return None,
         PushEdge::TurnEnded(TurnOutcome::Completed) => (Urgency::Normal, "Session finished", "finished", None),
         PushEdge::TurnEnded(TurnOutcome::Failed) => (Urgency::Normal, "Session failed", "failed", None),
         PushEdge::TurnEnded(TurnOutcome::Cancelled | TurnOutcome::Interrupted) => return None,

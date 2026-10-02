@@ -221,6 +221,44 @@ fn a_question_without_a_turn_id_that_blocks_a_running_turn_is_blocked() {
         edge(&store, 3, &question("p1", None, None)),
         Some(PushEdge::Blocked { .. })
     ));
+    // Withdrawn, and asked again with no turn id: quiet, as in a turn
+    // (plan 10b-iii's review, A1).
+    use hennery_proto::frames::{PendingReason, PendingResolution};
+    let withdrawn = SessionBody::PendingResolved {
+        pending_id: "p1".into(),
+        resolution: PendingResolution::Cancelled,
+        reason: Some(PendingReason::AgentWithdrew),
+    };
+    store.ingest("s1", 4, &withdrawn).unwrap();
+    assert_eq!(edge(&store, 5, &question("p2", None, None)), None);
+    // The owner's next prompt resets the bound: withdrawn, the turn ended,
+    // a new turn prompted, and a question with no turn id blocks it again.
+    let withdrawn_p2 = SessionBody::PendingResolved {
+        pending_id: "p2".into(),
+        resolution: PendingResolution::Cancelled,
+        reason: Some(PendingReason::AgentWithdrew),
+    };
+    store.ingest("s1", 6, &withdrawn_p2).unwrap();
+    store.ingest("s1", 7, &ended("t1", TurnOutcome::Completed)).unwrap();
+    assert!(
+        store
+            .open_turn("s1", "t2", &[json!({"type": "text", "text": "go on"})])
+            .unwrap()
+    );
+    store
+        .ingest(
+            "s1",
+            8,
+            &SessionBody::TurnStarted {
+                request_id: "req-t2".into(),
+                turn_id: "t2".into(),
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        edge(&store, 9, &question("p3", None, None)),
+        Some(PushEdge::Blocked { .. })
+    ));
 }
 
 #[test]
@@ -230,6 +268,68 @@ fn a_close_mid_turn_ends_it_without_an_edge() {
     let closed = store.ingest_fact("s1", 3, &SessionBody::SessionClosed).unwrap();
     assert!(closed.events.iter().any(|e| e.kind == "turn_ended_synthesized"));
     assert_eq!(closed.edge, None);
+}
+
+/// `s1`, started, idle: no turn running.
+fn idle(store: &Store) {
+    store
+        .create_session("s1", "h1", "fake", "/home/me/project", "hat-1", None)
+        .unwrap();
+    store
+        .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
+        .unwrap();
+}
+
+/// Operator decision 2026-10-02, with 10b-i's dedup: outside a turn, only
+/// the session's first open question crosses an edge.
+#[test]
+fn only_the_first_open_question_outside_a_turn_crosses_an_edge() {
+    let store = Store::open_in_memory().unwrap();
+    idle(&store);
+    assert!(matches!(
+        edge(&store, 2, &question("p1", None, None)),
+        Some(PushEdge::QuestionOutsideTurn { .. })
+    ));
+    assert_eq!(edge(&store, 3, &question("p2", None, None)), None);
+}
+
+/// Asked, withdrawn by the agent, asked again outside a turn: quiet, until
+/// the owner's next turn starts.
+#[test]
+fn a_question_asked_again_outside_a_turn_after_a_withdrawal_waits_for_the_owners_turn() {
+    use hennery_proto::frames::{PendingReason, PendingResolution};
+    let store = Store::open_in_memory().unwrap();
+    idle(&store);
+    let withdrawn = |id: &str| SessionBody::PendingResolved {
+        pending_id: id.into(),
+        resolution: PendingResolution::Cancelled,
+        reason: Some(PendingReason::AgentWithdrew),
+    };
+    assert!(edge(&store, 2, &question("p1", None, None)).is_some());
+    store.ingest("s1", 3, &withdrawn("p1")).unwrap();
+    assert_eq!(edge(&store, 4, &question("p2", None, None)), None);
+    store.ingest("s1", 5, &withdrawn("p2")).unwrap();
+    // The owner's prompt: a turn, started and ended.
+    assert!(
+        store
+            .open_turn("s1", "t1", &[json!({"type": "text", "text": "go on"})])
+            .unwrap()
+    );
+    store
+        .ingest(
+            "s1",
+            6,
+            &SessionBody::TurnStarted {
+                request_id: "req-t1".into(),
+                turn_id: "t1".into(),
+            },
+        )
+        .unwrap();
+    store.ingest("s1", 7, &ended("t1", TurnOutcome::Completed)).unwrap();
+    assert!(matches!(
+        edge(&store, 8, &question("p3", None, None)),
+        Some(PushEdge::QuestionOutsideTurn { .. })
+    ));
 }
 
 fn session(store: &Store) -> EdgeSession {
@@ -275,18 +375,22 @@ fn only_blocked_finished_and_failed_notify() {
     }
 }
 
-/// The maintainer's open question (plan 10b): until it is answered, a
-/// question asked outside a turn does not notify. Answering it changes
-/// `notice_for` and this test.
+/// Operator decision 2026-10-02: a question asked outside a turn notifies
+/// like a blocked turn.
 #[test]
-fn a_question_outside_a_turn_does_not_notify_yet() {
+fn a_question_outside_a_turn_notifies_like_a_blocked_turn() {
     let store = Store::open_in_memory().unwrap();
     running(&store);
     let edge = PushEdge::QuestionOutsideTurn {
         pending_id: "p1".into(),
-        title: None,
+        title: Some("Which branch?".into()),
     };
-    assert_eq!(notice_for(&edge, &session(&store)), None);
+    let notice = notice_for(&edge, &session(&store)).unwrap();
+    assert_eq!(
+        (notice.urgency, notice.body.as_str(), notice.generic_title.as_str()),
+        (Urgency::High, "needs your answer", "Session needs your answer")
+    );
+    assert_eq!(notice.detail.as_deref(), Some("Which branch?"));
 }
 
 #[test]
