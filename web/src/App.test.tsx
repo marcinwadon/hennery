@@ -2,6 +2,7 @@ import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it } from 'vitest'
 import App from './App'
+import { heldFor, hold } from './lib/attachments'
 import { FULL, GATEWAY, json, stubServer } from './test-server'
 
 function at(path: string) {
@@ -96,8 +97,9 @@ describe('the shell', () => {
     expect(location.pathname + location.search).toBe('/login?next=%2Fhosts%3Fx%3D1')
   })
 
-  it('signs out', async () => {
+  it('signs out, forgetting the images held for every draft', async () => {
     at('/settings')
+    hold('s1', { attachments: [{ n: 1, file: new File(['x'], 'a.png', { type: 'image/png' }) }], nextN: 2 })
     const server = stubServer({
       'GET /api/capabilities': json(200, FULL),
       'POST /api/auth/logout': new Response(null, { status: 204 }),
@@ -107,5 +109,6 @@ describe('the shell', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Sign out' }))
     await waitFor(() => expect(location.pathname).toBe('/login'))
     expect(server.sent.some((s) => s.method === 'POST' && s.path === '/api/auth/logout')).toBe(true)
+    expect(heldFor('s1').attachments).toEqual([])
   })
 })

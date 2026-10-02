@@ -8,6 +8,7 @@ import { logOut } from '../api/auth'
 import { messageOf } from '../api/errors'
 import { Text } from '../lib/text'
 import { useClient } from '../app-client'
+import { forgetAllAttachments } from '../lib/attachments'
 import { navigate } from '../router'
 
 export default function SignOut({ className = 'btn btn-ghost btn-sm' }: { className?: string }) {
@@ -25,6 +26,8 @@ export default function SignOut({ className = 'btn btn-ghost btn-sm' }: { classN
       setBusy(false)
       return
     }
+    // Signed out: the drafts' images held in memory go with the session.
+    forgetAllAttachments()
     navigate('/login')
   }
 

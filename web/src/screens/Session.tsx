@@ -14,18 +14,29 @@
 //   items replaced) goes back to the tail, and to the end.
 // - The stream's state shows as "Reconnecting…", and "Resynced" for a moment
 //   after the items were replaced.
-// - A deleted session says so, and nothing more is fetched.
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+// - The composer sits under the transcript: the session's own (F-17), fed
+//   the header's session, the item store's catalogue and the capabilities
+//   of the session's host. Through it, a turn that was not delivered comes
+//   back as a draft ("Send again"), and a question the agent stopped
+//   waiting on is answered as a new message; neither sends on its own.
+// - A deleted session says so, nothing more is fetched, and its draft and
+//   images are dropped.
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { hatList, hostList, namesOf } from '../api/names'
 import { sessionDetail } from '../api/view'
 import { useClient } from '../app-client'
+import { Composer, type ComposerHandle } from '../components/Composer'
+import { ANSWER_LABEL, answerAsMessage } from '../components/composerWords'
 import SessionHeader, { type HeaderInfo } from '../components/SessionHeader'
 import Transcript from '../components/Transcript'
 import type { ItemEnv } from '../components/items/types'
+import type { Capabilities } from '../generated/protocol'
 import type { SessionSummary } from '../generated/view'
 import type { Item } from '../generated/view'
 import { useMediaQuery } from '../hooks/useMediaQuery'
 import { agentLabel } from '../lib/agent'
+import { forgetAttachments } from '../lib/attachments'
+import { saveDraft } from '../lib/drafts'
 import { Icon } from '../lib/ui'
 import { Link } from '../router'
 import { useSessionItems, type Timing } from '../store/useSessionItems'
@@ -50,8 +61,8 @@ interface Props {
   tail?: number
   /** The item store's timing (tests). */
   timing?: Partial<Timing>
-  /** Seams for later tasks: question actions and "Send again". */
-  env?: Pick<ItemEnv, 'questionActions' | 'onSendAgain'>
+  /** The seam for the cards: question actions. */
+  env?: Pick<ItemEnv, 'questionActions'>
 }
 
 /** The newest plan among the loaded items. */
@@ -87,23 +98,35 @@ function useHeaderInfo(id: string, summary: SessionSummary | undefined, awaitSum
   return summary ?? detail ?? last.current
 }
 
-/** `id → name` from a list fetched once, when `wanted`; on failure, none. */
-function useNames(fetch: 'hosts' | 'hats', wanted: boolean): Map<string, string> {
+/** A list fetched once, when `wanted`; on failure, none (`undefined`). */
+function useList(fetch: 'hosts' | 'hats', wanted: boolean): unknown {
   const client = useClient()
-  const [names, setNames] = useState<Map<string, string>>(() => new Map())
+  const [list, setList] = useState<unknown>(undefined)
   useEffect(() => {
     if (!wanted) return
     let live = true
     const request = fetch === 'hosts' ? hostList(client) : hatList(client)
     request.then(
-      (list) => live && setNames(namesOf(list, fetch === 'hosts' ? 'host_id' : 'id')),
+      (answer) => live && setList(answer),
       () => {},
     )
     return () => {
       live = false
     }
   }, [client, fetch, wanted])
-  return names
+  return list
+}
+
+/** The capabilities `GET /api/hosts` reports for host `hostId`; null while
+ *  unknown (no list yet, the host not in it, or no list of capabilities). */
+function capabilitiesOf(hosts: unknown, hostId: string | undefined): Capabilities | null {
+  if (hostId === undefined || !Array.isArray(hosts)) return null
+  for (const entry of hosts as unknown[]) {
+    if (!entry || typeof entry !== 'object') continue
+    const host = entry as Record<string, unknown>
+    if (host.host_id === hostId) return Array.isArray(host.capabilities) ? (host.capabilities as Capabilities) : null
+  }
+  return null
 }
 
 /** Where the transcript's window starts: the pinned item's index, or the
@@ -150,20 +173,44 @@ export default function SessionView({ id, summary, awaitSummary = false, tail = 
   const info = useHeaderInfo(id, summary, awaitSummary)
   const win = useTailWindow(s.items, s.loads, tail)
   const narrow = useMediaQuery('(max-width: 767px)')
-  const hosts = useNames('hosts', true)
+  const hostItems = useList('hosts', true)
+  const hosts = useMemo(() => namesOf(hostItems, 'host_id'), [hostItems])
   const wantsHats = useMemo(() => s.items.some((i) => i.kind === 'marker' && i.marker === 'hat_reassigned'), [s.items])
-  const hats = useNames('hats', wantsHats)
+  const hatItems = useList('hats', wantsHats)
+  const hats = useMemo(() => namesOf(hatItems, 'id'), [hatItems])
   const plan = useMemo(() => latestPlan(s.items), [s.items])
+
+  // The composer's handle: the item seams reach the draft through it, and
+  // stay the same functions for as long as the view is shown.
+  const composer = useRef<ComposerHandle>(null)
+  const onSendAgain = useCallback((item: Extract<Item, { kind: 'marker' }>) => {
+    if (item.about_turn) void composer.current?.refill(item.about_turn)
+  }, [])
+  const onAnswerAsMessage = useCallback(
+    (question: string) => composer.current?.prefill(answerAsMessage(question), ANSWER_LABEL),
+    [],
+  )
+  const composerEmpty = useCallback(() => composer.current?.isEmpty() ?? true, [])
 
   const env: ItemEnv = useMemo(
     () => ({
       sessionId: id,
       agent: agentLabel(info?.agent),
       hatName: (hat: string) => hats.get(hat),
+      onSendAgain,
+      onAnswerAsMessage,
+      composerEmpty,
       ...seams,
     }),
-    [id, info?.agent, hats, seams],
+    [id, info?.agent, hats, onSendAgain, onAnswerAsMessage, composerEmpty, seams],
   )
+
+  // A deleted session's draft and images can never be sent: drop them.
+  useEffect(() => {
+    if (!s.removed) return
+    saveDraft(id, '')
+    forgetAttachments(id)
+  }, [id, s.removed])
 
   if (s.removed) {
     return (
@@ -203,6 +250,14 @@ export default function SessionView({ id, summary, awaitSummary = false, tail = 
       >
         {s.loading ? <p className="transcript-empty">Loading…</p> : <Transcript items={win.visible} env={env} />}
       </Scroller>
+      <Composer
+        handle={composer}
+        sessionId={id}
+        session={info ? { activity: info.activity, lifecycle: info.lifecycle } : null}
+        capabilities={capabilitiesOf(hostItems, info?.host_id)}
+        catalog={s.catalog}
+        onCatalog={s.setCatalog}
+      />
     </div>
   )
 }
