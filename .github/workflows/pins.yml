@@ -52,7 +52,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master @ 2026-09-12
         with:
           toolchain: stable
       # npm 11 for `--libc`. No `cache:` input: nothing is cached.
@@ -86,6 +86,8 @@ jobs:
               echo "::group::$agent on $platform"
               (
                 cd "adapters/$agent"
+                # Gone whatever happens below: nothing downloaded is kept.
+                trap 'rm -rf node_modules "$RUNNER_TEMP/npm-cache"' EXIT
                 npm=(--userconfig="$RUNNER_TEMP/npmrc-user" --globalconfig="$RUNNER_TEMP/npmrc-global"
                      --registry="$REGISTRY" --cache="$RUNNER_TEMP/npm-cache")
                 npm ci "${npm[@]}" --ignore-scripts --no-audit --no-fund "${flags[@]}"
@@ -95,7 +97,6 @@ jobs:
                 # An error object ({"error": …}) has neither list, so it fails.
                 jq -e '.invalid == [] and .missing == []' "$RUNNER_TEMP/audit.json"
                 jq -r '.packages | keys[] | select(. != "")' node_modules/.package-lock.json | sort > "$RUNNER_TEMP/installed"
-                rm -rf node_modules "$RUNNER_TEMP/npm-cache"
               )
               jq -r --arg agent "$agent" --arg platform "$platform" \
                 '.adapters[$agent].platforms[$platform][].path' adapters/manifest.json | sort > "$RUNNER_TEMP/pinned"

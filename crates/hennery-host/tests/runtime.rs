@@ -266,8 +266,8 @@ async fn a_download_longer_than_pinned_is_cut_off() {
 }
 
 /// A mirror may redirect to https, never down to plain http elsewhere: the
-/// redirect is refused before anything connects to it (a documentation
-/// address, so this test stays offline either way).
+/// redirect is refused before anything connects to it (an unspecified
+/// address, which is not loopback and never leaves the machine).
 #[tokio::test]
 async fn a_redirect_down_to_plain_http_is_refused() {
     let server = Server::start().await;
