@@ -46,8 +46,19 @@ pub fn is_temp(name: &str) -> bool {
 /// Refresh the mtime of the file stored as `sha256` in `dir`, if there is
 /// one (plan 9b): whether there was. The sweep removes a file no row names
 /// only once its mtime is older than its grace.
+///
+/// Only a regular file is refreshed: anything else under that name is
+/// not one, and opening it could follow a link out of the directory or
+/// block on a FIFO.
 pub fn refresh(dir: &Path, sha256: &str) -> std::io::Result<bool> {
-    match std::fs::File::open(path(dir, sha256)?) {
+    let path = path(dir, sha256)?;
+    match std::fs::symlink_metadata(&path) {
+        Ok(meta) if meta.file_type().is_file() => {}
+        Ok(_) => return Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    }
+    match std::fs::File::open(path) {
         Ok(file) => file.set_modified(std::time::SystemTime::now()).map(|()| true),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err),
@@ -166,6 +177,49 @@ mod tests {
         ] {
             assert!(!is_temp(&other), "{other}");
         }
+    }
+
+    /// Plan 9b: `refresh` touches a regular file only. It never follows a
+    /// link out of the directory, and never opens a FIFO, which would
+    /// block it until a writer came.
+    #[test]
+    fn only_a_regular_file_is_refreshed() {
+        let data = tempfile::tempdir().unwrap();
+        let dir = data.path().join(DIR);
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+        assert!(!refresh(&dir, SHA).unwrap(), "a missing file was refreshed");
+        write(&dir, SHA, b"test").unwrap();
+        std::fs::File::open(dir.join(SHA)).unwrap().set_modified(old).unwrap();
+        assert!(refresh(&dir, SHA).unwrap());
+        assert!(std::fs::metadata(dir.join(SHA)).unwrap().modified().unwrap() > old);
+
+        let outside = data.path().join("outside");
+        std::fs::write(&outside, b"keep").unwrap();
+        std::fs::File::open(&outside).unwrap().set_modified(old).unwrap();
+        let link = "0".repeat(64);
+        std::os::unix::fs::symlink(&outside, dir.join(&link)).unwrap();
+        assert!(!refresh(&dir, &link).unwrap(), "a symlink was refreshed");
+        assert_eq!(std::fs::metadata(&outside).unwrap().modified().unwrap(), old);
+
+        let directory = "1".repeat(64);
+        std::fs::create_dir(dir.join(&directory)).unwrap();
+        assert!(!refresh(&dir, &directory).unwrap(), "a directory was refreshed");
+
+        let fifo = "2".repeat(64);
+        let made = std::process::Command::new("mkfifo")
+            .arg(dir.join(&fifo))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let (sent, received) = std::sync::mpsc::channel();
+        let (in_dir, name) = (dir.clone(), fifo.clone());
+        std::thread::spawn(move || sent.send(refresh(&in_dir, &name).map_err(|e| e.to_string())));
+        let refreshed = received.recv_timeout(std::time::Duration::from_secs(20));
+        if refreshed.is_err() {
+            // Release the thread blocked in `open`.
+            let _ = std::fs::OpenOptions::new().write(true).open(dir.join(&fifo));
+        }
+        assert_eq!(refreshed.expect("refresh blocked on a FIFO"), Ok(false));
     }
 
     #[test]

@@ -14,6 +14,7 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+use tokio_util::sync::CancellationToken;
 
 const HOUR: Duration = Duration::from_secs(3600);
 const OTHER_OWNER: &str = "owner-00000000000000b2";
@@ -99,6 +100,22 @@ fn rows(db: &Path) -> Vec<(String, String)> {
         .collect()
 }
 
+/// One sweep at `now` that nothing cancels.
+fn sweep(store: &Store, now: SystemTime) -> SweepReport {
+    store.sweep_attachments(now, &CancellationToken::new()).unwrap()
+}
+
+/// `count` image files no row names, past the grace of a sweep two hours
+/// ahead, each of its own hash.
+fn plant_orphans(db: &Path, count: u8) -> Vec<PathBuf> {
+    (0..count)
+        .map(|seed| {
+            let bytes = png(seed, 100);
+            plant(&files(db), &sha(&bytes), &bytes)
+        })
+        .collect()
+}
+
 /// A temporary file's name as `attachments::write` makes it.
 fn temp_name(sha256: &str, random: &str) -> String {
     format!(".{sha256}.{random}.tmp")
@@ -139,7 +156,7 @@ fn the_sweep_deletes_the_owners_rows_nothing_of_theirs_shows() {
     .unwrap();
     other_owner_row(&db, &sha(&foreign));
 
-    let report = store.sweep_attachments(SystemTime::now()).unwrap();
+    let report = sweep(&store, SystemTime::now());
     assert_eq!(report.rows, 1, "{report:?}");
     let owner = store.owner_id().to_string();
     let mut kept = vec![
@@ -178,7 +195,7 @@ fn an_orphan_file_goes_past_the_grace_and_a_young_or_named_one_stays() {
         )
         .unwrap();
 
-    let report = store.sweep_attachments(now).unwrap();
+    let report = sweep(&store, now);
     assert_eq!(
         report,
         SweepReport {
@@ -203,7 +220,7 @@ fn a_file_another_owners_row_names_stays() {
     let path = plant(&files(&db), &sha(&theirs), &theirs);
     other_owner_row(&db, &sha(&theirs));
 
-    let report = store.sweep_attachments(SystemTime::now() + 2 * HOUR).unwrap();
+    let report = sweep(&store, SystemTime::now() + 2 * HOUR);
     assert_eq!(report, SweepReport::default());
     assert!(path.exists(), "another owner's image lost its file");
 }
@@ -221,7 +238,7 @@ fn a_stale_temporary_file_goes_and_a_fresh_one_stays() {
     let fresh = plant(&dir, &temp_name(&sha(&bytes), "fedcba9876543210"), &bytes);
     set_mtime(&fresh, now - HOUR + Duration::from_secs(60));
 
-    let report = store.sweep_attachments(now).unwrap();
+    let report = sweep(&store, now);
     assert_eq!(
         report,
         SweepReport {
@@ -273,7 +290,7 @@ fn the_sweep_leaves_links_directories_and_other_names_alone() {
         plant(&dir, name, b"other");
     }
 
-    let report = store.sweep_attachments(now).unwrap();
+    let report = sweep(&store, now);
     assert_eq!(report, SweepReport::default());
     for name in &links {
         let meta = std::fs::symlink_metadata(dir.join(name)).unwrap();
@@ -285,6 +302,39 @@ fn the_sweep_leaves_links_directories_and_other_names_alone() {
     }
 }
 
+/// A14: the file pass works in batches under the store's lock, and every
+/// batch is swept, not just the first: more files than two batches hold
+/// all go.
+#[test]
+fn every_batch_of_files_is_swept() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    plant_orphans(&db, 70);
+
+    let report = sweep(&store, SystemTime::now() + 2 * HOUR);
+    assert_eq!(report.files, 70, "{report:?}");
+    let left: Vec<_> = std::fs::read_dir(files(&db))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// A sweep checks its token before each batch: once shutdown has
+/// cancelled it, no further file is removed. The row pass still runs.
+#[test]
+fn a_cancelled_sweep_removes_no_further_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    let planted = plant_orphans(&db, 70);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let report = store.sweep_attachments(SystemTime::now() + 2 * HOUR, &cancel).unwrap();
+    assert_eq!(report, SweepReport::default());
+    assert!(planted.iter().all(|path| path.exists()));
+}
+
 /// With no `attachments/` yet (nothing sent), or an in-memory store, a
 /// sweep is the row pass alone.
 #[test]
@@ -292,15 +342,9 @@ fn a_sweep_with_no_files_is_the_row_pass_alone() {
     let dir = tempfile::tempdir().unwrap();
     let (store, db) = file_store(dir.path());
     assert!(!files(&db).exists());
-    assert_eq!(
-        store.sweep_attachments(SystemTime::now()).unwrap(),
-        SweepReport::default()
-    );
+    assert_eq!(sweep(&store, SystemTime::now()), SweepReport::default());
     let memory = Store::open_in_memory().unwrap();
-    assert_eq!(
-        memory.sweep_attachments(SystemTime::now()).unwrap(),
-        SweepReport::default()
-    );
+    assert_eq!(sweep(&memory, SystemTime::now()), SweepReport::default());
 }
 
 /// Decision 9: a turn abandoned before plan 9a's clean-up existed left
@@ -326,7 +370,7 @@ fn a_row_left_by_a_turn_abandoned_before_the_clean_up_goes_with_its_file() {
     assert_eq!(rows(&db), vec![(store.owner_id().to_string(), sha(&bytes))]);
     assert!(path.exists());
 
-    let report = store.sweep_attachments(SystemTime::now() + 2 * HOUR).unwrap();
+    let report = sweep(&store, SystemTime::now() + 2 * HOUR);
     assert_eq!(
         report,
         SweepReport {
@@ -353,14 +397,11 @@ fn an_image_just_saved_is_kept_until_its_turn_records_it() {
     assert!(path.exists());
 
     let within = SystemTime::now() + HOUR - Duration::from_secs(60);
-    assert_eq!(store.sweep_attachments(within).unwrap(), SweepReport::default());
+    assert_eq!(sweep(&store, within), SweepReport::default());
     assert!(path.exists(), "an image just saved was swept");
     active(&store, "s1");
     assert!(store.open_prompt("s1", "t1", &checked).unwrap());
-    assert_eq!(
-        store.sweep_attachments(SystemTime::now() + 2 * HOUR).unwrap(),
-        SweepReport::default()
-    );
+    assert_eq!(sweep(&store, SystemTime::now() + 2 * HOUR), SweepReport::default());
     assert!(path.exists());
 }
 
@@ -380,12 +421,9 @@ fn saving_an_image_already_stored_refreshes_it_for_the_grace() {
     store.save_images(&checked.images).unwrap();
     assert!(mtime(&path) >= before, "{:?}", mtime(&path));
     // No row names it yet: only the grace keeps it.
-    assert_eq!(
-        store.sweep_attachments(SystemTime::now()).unwrap(),
-        SweepReport::default()
-    );
+    assert_eq!(sweep(&store, SystemTime::now()), SweepReport::default());
     assert!(path.exists());
-    assert_eq!(store.sweep_attachments(SystemTime::now() + 2 * HOUR).unwrap().files, 1);
+    assert_eq!(sweep(&store, SystemTime::now() + 2 * HOUR).files, 1);
     assert!(!path.exists());
 }
 
@@ -431,6 +469,27 @@ async fn the_sweep_runs_at_startup_and_ends_on_shutdown() {
         .await
         .expect("the sweep task ended on shutdown")
         .unwrap();
+}
+
+/// A sweep is cancelled by the collector's shutdown: one that starts after
+/// it has fired removes no files, and the task ends.
+#[tokio::test]
+async fn the_sweep_stops_on_the_collectors_shutdown() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    let planted = plant_orphans(&db, 70);
+    for path in &planted {
+        set_mtime(path, SystemTime::now() - 2 * HOUR);
+    }
+    let state = state(store, &db);
+    state.shutdown.cancel();
+
+    let task = hennery_sessions::sweep::after_startup(&state);
+    tokio::time::timeout(Duration::from_secs(20), task)
+        .await
+        .expect("the sweep task ended on shutdown")
+        .unwrap();
+    assert!(planted.iter().all(|path| path.exists()));
 }
 
 /// Decision 9: after the sweep at startup, the collector sweeps again

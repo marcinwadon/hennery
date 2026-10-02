@@ -626,47 +626,6 @@ fn drop_unreferenced(tx: &Transaction<'_>, owner: &str, hashes: &BTreeSet<String
 /// (A14), so a prompt waits for a few files, not the whole directory.
 const SWEEP_BATCH: usize = 32;
 
-/// What `sweep_file` removed.
-enum Swept {
-    Image,
-    Temp,
-}
-
-/// Remove `name` from `dir` if it is still a regular file older than the
-/// grace at `now` and, for an image, no row of any owner names it (A6);
-/// under the store's lock (`Store::sweep_attachments`).
-fn sweep_file(conn: &Connection, dir: &Path, name: &str, now: std::time::SystemTime) -> Result<Option<Swept>> {
-    let path = dir.join(name);
-    let meta = match std::fs::symlink_metadata(&path) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => return Err(err.into()),
-    };
-    if !meta.file_type().is_file() {
-        return Ok(None);
-    }
-    // An mtime ahead of `now` is young.
-    let old = now
-        .duration_since(meta.modified()?)
-        .is_ok_and(|age| age > crate::sweep::GRACE);
-    if !old {
-        return Ok(None);
-    }
-    let swept = if crate::attachments::is_sha256(name) {
-        if crate::shared_files::hash_named_by_any_owner(conn, name)? {
-            return Ok(None);
-        }
-        Swept::Image
-    } else {
-        Swept::Temp
-    };
-    match std::fs::remove_file(&path) {
-        Ok(()) => Ok(Some(swept)),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(err) => Err(err.into()),
-    }
-}
-
 /// Close an open turn that the host will never end, as `interrupted`.
 fn synthesize_turn_end(
     tx: &Transaction<'_>,
@@ -1871,6 +1830,9 @@ impl Store {
                 params![turn_id, session_id, serde_json::to_string(content)?, ts, self.owner],
             )?;
             for image in images {
+                // The row and its turn's link (`link_turn_attachments`) go in
+                // this one transaction: the sweep gives rows no grace, and
+                // deletes one no turn or event links.
                 tx.execute(
                     "INSERT INTO attachments(owner_id, sha256, mime, size, created_at) VALUES (?1, ?2, ?3, ?4, ?5)
                      ON CONFLICT(owner_id, sha256) DO NOTHING",
@@ -2016,8 +1978,13 @@ impl Store {
     /// `open_prompt` records an image under it (and re-writes a file gone
     /// meanwhile, decision 6), and `save_images`, which does not take it,
     /// refreshes a file's mtime first. A file that cannot be looked at or
-    /// removed is logged and left for the next sweep.
-    pub fn sweep_attachments(&self, now: std::time::SystemTime) -> Result<SweepReport> {
+    /// removed is logged and left for the next sweep. Once `cancel` fires
+    /// (the collector's shutdown), no further batch is begun.
+    pub fn sweep_attachments(
+        &self,
+        now: std::time::SystemTime,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> Result<SweepReport> {
         let rows = self.conn().execute(
             "DELETE FROM attachments WHERE owner_id = ?1
                  AND NOT EXISTS (SELECT 1 FROM turn_attachments
@@ -2049,11 +2016,14 @@ impl Store {
             }
         }
         for batch in names.chunks(SWEEP_BATCH) {
+            if cancel.is_cancelled() {
+                break;
+            }
             let conn = self.conn();
             for name in batch {
-                match sweep_file(&conn, dir, name, now) {
-                    Ok(Some(Swept::Image)) => report.files += 1,
-                    Ok(Some(Swept::Temp)) => report.temps += 1,
+                match crate::sweep::sweep_file(&conn, dir, name, now) {
+                    Ok(Some(crate::sweep::Swept::Image)) => report.files += 1,
+                    Ok(Some(crate::sweep::Swept::Temp)) => report.temps += 1,
                     Ok(None) => {}
                     Err(err) => tracing::warn!(%name, "an attachment file was not swept: {err:#}"),
                 }
