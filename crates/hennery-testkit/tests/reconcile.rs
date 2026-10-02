@@ -2655,11 +2655,25 @@ async fn a_resent_backlog_notifies_only_what_still_holds() {
     )
     .await;
     host.emit(&session, turn_ended(&turn, TurnOutcome::Completed)).await;
-    // A6: a later edge that notifies nothing (a question outside any turn)
-    // must not hide the "finished".
+    // A question outside a turn, asked and withdrawn in the backlog: it no
+    // longer holds at the flush, and must not hide the "finished" (A6).
     host.emit(&session, outside("p2")).await;
+    host.emit(
+        &session,
+        SessionBody::PendingResolved {
+            pending_id: "p2".into(),
+            resolution: PendingResolution::Cancelled,
+            reason: Some(PendingReason::AgentWithdrew),
+        },
+    )
+    .await;
     wait_for("the backlog", || async {
-        (!collector.state.store.open_pending(&session).unwrap().is_empty()).then_some(())
+        let resolved = collector
+            .event_kinds(&session)
+            .iter()
+            .filter(|k| *k == "pending_resolved")
+            .count();
+        (resolved == 2).then_some(())
     })
     .await;
     // Ingested, and nothing queued while the resend runs.
@@ -2752,4 +2766,52 @@ fn outside(pending_id: &str) -> SessionBody {
         indexed,
         payload,
     }
+}
+
+/// Operator decision 2026-10-02: a question asked while no turn runs asks
+/// the owner like a blocked turn; a second one while it is open does not.
+/// The queue keeps one notice per tag, so the second is checked by ending
+/// on another session's notice: none of this session's may come after the
+/// first (plan 10b-iii's review, A2).
+#[tokio::test]
+async fn a_question_outside_a_turn_queues_one_urgent_notice() {
+    use hennery_kernel::push::Urgency;
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    host.emit(&session, outside("p1")).await;
+    let notices = collector.notices_until("needs your answer").await;
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(
+        (notices[0].urgency, notices[0].tag.as_str()),
+        (Urgency::High, session.as_str())
+    );
+    host.emit(&session, outside("p2")).await;
+    // A sentinel on the same socket: another session's turn, blocked.
+    let other = started_session(&collector, &mut host).await;
+    let turn = started_turn(&collector, &mut host, &other).await;
+    host.emit(&other, opened("q1", &turn)).await;
+    let notices = collector.notices_until("needs your answer").await;
+    assert!(notices.iter().all(|n| n.tag == other), "{notices:?}");
+}
+
+/// The same reconnect rule as a blocked turn: a resent question outside a
+/// turn notifies once reconciled, if it is still open.
+#[tokio::test]
+async fn a_resent_question_outside_a_turn_still_open_notifies_after_reconciliation() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let seq = host.seq;
+    host.drop_connection(&collector).await;
+    let mut host = ScriptedHost::hello(&collector, vec![attached(&session, seq)], seq).await;
+    host.emit(&session, outside("p1")).await;
+    wait_for("the question", || async {
+        (!collector.state.store.open_pending(&session).unwrap().is_empty()).then_some(())
+    })
+    .await;
+    assert!(collector.notices().is_empty());
+    host.send(&HostFrame::ResendComplete).await;
+    let notices = collector.notices_until("needs your answer").await;
+    assert_eq!(notices.len(), 1, "{notices:?}");
 }
