@@ -176,7 +176,7 @@ names it in `id`; migration bookkeeping has none).
 | `owners`, `password_credentials`, `passkeys`, `auth_sessions` | kernel §1.1 | Exactly one owner in v1. |
 | `hosts`, `pairing_codes` | kernel §1.1 | Per-host credential (§7.6). |
 | `hats`, `hat_path_rules` | kernel §5.1 | A default hat exists from setup (§8.2). |
-| `settings`, `project_recents`, `push_subscriptions`, `purged_hats` | kernel §1.1 | `settings` includes `public_url`; recents are per (host, hat). |
+| `settings`, `project_recents`, `push_subscriptions`, `hat_push_policies`, `purged_hats` | kernel §1.1 | `settings` includes `public_url`; recents are per (host, hat). |
 | `sessions` | ACP core §8 | `source_kind` = `acp` in v1; reserves room for `observed`. |
 | `events` | ACP core §8 | Global monotonic `event_id`; unique on `(session_id, host_seq)`; collector-originated events have `host_seq` NULL. |
 | `turns`, `pending`, `answer_queue` | ACP core §8 | Pending states: open / delivered / cancelled. |
@@ -408,7 +408,8 @@ dedicated fix plus a database cleanup across dozens of sessions.
 - `blocked` = a running turn waits on at least one pending permission or
   elicitation. This is what triggers Web Push and the blocked marker in lists.
   A question the agent asks outside a turn is pending too, but leaves the
-  activity alone (ACP core §4.2).
+  activity alone (ACP core §4.2); it notifies "needs your answer" like a
+  blocked turn (ACP core §10; operator decision 2026-10-02).
 
 *Rejected:* one flat status enum. The predecessor mixed "what the adapter is
 doing" with "whether the adapter exists" in one field, which produced states
@@ -1027,7 +1028,8 @@ re-created. Both facts are documented next to the backup instructions.
   - **Settings** — account, passkeys, push devices, `public_url`.
 - `gateway` mode shows only MCP and Settings: one app, views gated by collector
   capabilities.
-- Mobile-first PWA; Web Push on `blocked` and on turn end.
+- Mobile-first PWA; Web Push on `blocked`, on a question outside a turn and on
+  turn end (ACP core §10).
 - Markdown pipeline order is load-bearing:
   `remark-gfm → remark-breaks → rehype-sanitize → rehype-highlight`, with
   unknown code languages ignored rather than thrown. Raw HTML in agent output
