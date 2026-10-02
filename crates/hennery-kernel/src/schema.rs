@@ -196,6 +196,36 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         FOREIGN KEY (host_id, owner_id) REFERENCES hosts(id, owner_id) ON DELETE CASCADE,
         FOREIGN KEY (hat_id, owner_id) REFERENCES hats(id, owner_id) ON DELETE CASCADE);
     ",
+    // Web Push (kernel spec §1.1, §6; plan 10a decisions 3 to 6). A
+    // subscription is one browser's: `endpoint` is unique across owners, as
+    // a passkey's credential is, and `p256dh`/`auth` are its keys as the
+    // browser sent them (base64url). `auth_session` is the signed-in
+    // session that subscribed it: ending that session ends the
+    // subscription (decision 4). `expires_at` is the browser's
+    // `expirationTime`, in seconds, when it gave one. A hat with no policy
+    // row has the default (decision 6); a row goes with its hat.
+    "
+    CREATE TABLE push_subscriptions (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL REFERENCES owners(id),
+        endpoint TEXT NOT NULL UNIQUE,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        device_label TEXT NOT NULL,
+        auth_session TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER,
+        last_success_at INTEGER,
+        last_error TEXT);
+    CREATE INDEX push_subscriptions_by_session ON push_subscriptions(owner_id, auth_session);
+    CREATE TABLE hat_push_policies (
+        hat_id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL REFERENCES owners(id),
+        muted INTEGER NOT NULL CHECK (muted IN (0, 1)),
+        details INTEGER NOT NULL CHECK (details IN (0, 1)),
+        generic_title INTEGER NOT NULL CHECK (generic_title IN (0, 1)),
+        FOREIGN KEY (hat_id, owner_id) REFERENCES hats(id, owner_id) ON DELETE CASCADE);
+    ",
 ];
 
 #[cfg(test)]

@@ -25,6 +25,9 @@ futures = "0.3"
 getrandom = "=0.3.4"
 hex = "=0.4.3"
 password-auth = "=1.0.0"
+# Web Push (plan 10a): the VAPID key pair (kernel spec §6); `ecdsa` signs
+# its tokens (RFC 8292).
+p256 = { version = "=0.13.2", features = ["ecdsa"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 schemars = "1.2"
@@ -48,6 +51,8 @@ url = "=2.5.8"
 uuid = { version = "1", features = ["v7", "serde"] }
 # Passkeys (plan 3c). Default features off: passkeys ask for no attestation.
 webauthn-rs = { version = "=0.5.5", default-features = false }
+# The VAPID key's bytes (plan 10a) are wiped from memory once read.
+zeroize = "=1.9.0"
 # Tests only: a software passkey, so no browser is needed.
 webauthn-authenticator-rs = { version = "=0.5.5", features = ["softpasskey"] }
 # The release build only (plan 7a): `webauthn-rs-core` links OpenSSL, built
