@@ -23,7 +23,9 @@
       let
         pkgs = import nixpkgs { inherit system; };
         web = import nixpkgs-web { inherit system; };
-        hennery = import ./nix/package.nix { inherit pkgs crane advisory-db; };
+        # The web UI (plan 7e-ii-b), built with nixpkgs-web's Node and pnpm.
+        webUi = import ./nix/web.nix { pkgs = web; };
+        hennery = import ./nix/package.nix { inherit pkgs crane advisory-db webUi; };
         # Chromium alone (headless): what the browser checks run on.
         browsers = web.playwright-driver.browsers.override {
           withChromium = false;
@@ -35,6 +37,7 @@
         webTools = [ web.nodejs_24 web.pnpm ];
       in {
         packages.default = hennery.package;
+        packages.web = webUi;
         checks = hennery.checks;
         # Building the web UI only (CI's Rust and release jobs): no browsers.
         devShells.web = pkgs.mkShell { packages = webTools; };
