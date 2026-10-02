@@ -2962,3 +2962,33 @@ fn service_install_refuses_an_unpaired_host_and_a_second_role() {
         std::fs::read_to_string(dir.join("ran"))
     );
 }
+
+#[test]
+fn service_help_lists_install_uninstall_and_status() {
+    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["service", "--help"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    for command in ["install", "uninstall", "status"] {
+        assert!(text.contains(command), "{text}");
+    }
+}
+
+/// Nothing installed: `status` says so and exits 1, `uninstall` has nothing
+/// to do; neither asks the service manager.
+#[test]
+fn service_status_with_nothing_installed_fails_without_asking_the_manager() {
+    let dir = scratch_dir("svcstatus");
+    let _cleanup = RemoveDir(dir.clone());
+    let out = service(&dir, &["status"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("no hennery service is installed"));
+    let out = service(&dir, &["uninstall"]);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        !dir.join("ran").exists(),
+        "{:?}",
+        std::fs::read_to_string(dir.join("ran"))
+    );
+}

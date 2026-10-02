@@ -7,6 +7,7 @@
 pub mod path;
 pub mod unit;
 
+use crate::supervisor;
 use anyhow::{Context as _, Result, bail};
 use clap::{Args, Subcommand};
 use std::collections::BTreeMap;
@@ -41,6 +42,20 @@ enum ServiceCommand {
         #[arg(long)]
         shell: Option<PathBuf>,
     },
+    /// Stop and remove the service; its data directory and logs are kept.
+    Uninstall {
+        /// By default, whichever role is installed.
+        #[arg(long, value_enum)]
+        role: Option<Role>,
+    },
+    /// Show the installed service: what it runs, whether it runs, and, for
+    /// `up`, its children. Exits 1 unless it is installed and running, with
+    /// no child given up on or revoked.
+    Status {
+        /// By default, whichever role is installed.
+        #[arg(long, value_enum)]
+        role: Option<Role>,
+    },
 }
 
 pub fn run(args: ServiceArgs) -> Result<ExitCode> {
@@ -52,6 +67,11 @@ pub fn run(args: ServiceArgs) -> Result<ExitCode> {
             install(&cx, role, data_dir.as_deref(), shell.as_deref(), &mut out)?;
             Ok(ExitCode::SUCCESS)
         }
+        ServiceCommand::Uninstall { role } => {
+            uninstall(&cx, role, &mut out)?;
+            Ok(ExitCode::SUCCESS)
+        }
+        ServiceCommand::Status { role } => status(&cx, role, &mut out),
     }
 }
 
@@ -509,6 +529,228 @@ fn linger(cx: &Context, out: &mut dyn Write) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// `hennery service uninstall`.
+pub fn uninstall(cx: &Context, role: Option<Role>, out: &mut dyn Write) -> Result<()> {
+    let roles = match role {
+        Some(role) if !cx.service_file(role).exists() => {
+            writeln!(out, "the {role} service is not installed")?;
+            return Ok(());
+        }
+        Some(role) => vec![role],
+        None => cx.installed(),
+    };
+    if roles.is_empty() {
+        writeln!(out, "no hennery service is installed")?;
+        return Ok(());
+    }
+    for role in roles {
+        let file = cx.service_file(role);
+        let data = read_command_line(cx, role).and_then(|argv| data_dir_of(&argv));
+        match cx.platform {
+            Platform::MacOs => {
+                bootout(cx, role)?;
+                std::fs::remove_file(&file).with_context(|| format!("remove {}", file.display()))?;
+            }
+            Platform::Linux => {
+                if let Err(err) = systemctl(cx, &["disable", "--now", role.unit()]) {
+                    writeln!(out, "  warning: {err:#}")?;
+                }
+                std::fs::remove_file(&file).with_context(|| format!("remove {}", file.display()))?;
+                let _ = std::fs::remove_file(cx.env_file());
+                if let Err(err) = systemctl(cx, &["daemon-reload"]) {
+                    writeln!(out, "  warning: {err:#}")?;
+                }
+            }
+        }
+        writeln!(out, "removed the {role} service: {}", file.display())?;
+        if let Some(data) = data {
+            writeln!(out, "  its data directory is kept: {}", data.display())?;
+        }
+        if cx.platform == Platform::MacOs {
+            writeln!(out, "  its log is kept: {}", cx.log_file(role).display())?;
+        }
+    }
+    Ok(())
+}
+
+fn read_command_line(cx: &Context, role: Role) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(cx.service_file(role)).ok()?;
+    match cx.platform {
+        Platform::MacOs => unit::plist_command_line(&text),
+        Platform::Linux => unit::systemd_command_line(&text),
+    }
+}
+
+fn data_dir_of(argv: &[String]) -> Option<PathBuf> {
+    let at = argv.iter().position(|a| a == "--data-dir")?;
+    argv.get(at + 1).map(PathBuf::from)
+}
+
+/// `hennery service status`: exit 0 when the service is installed and
+/// running, its binary exists, and no child of `up` was given up on or
+/// revoked; 1 otherwise. A binary other than this one is only named.
+pub fn status(cx: &Context, role: Option<Role>, out: &mut dyn Write) -> Result<ExitCode> {
+    let roles = match role {
+        Some(role) => vec![role],
+        None => cx.installed(),
+    };
+    if roles.is_empty() {
+        writeln!(out, "no hennery service is installed")?;
+        return Ok(ExitCode::FAILURE);
+    }
+    if roles.len() > 1 {
+        writeln!(
+            out,
+            "warning: more than one role is installed; keep one (`hennery service uninstall --role …`)"
+        )?;
+    }
+    let mut healthy = roles.len() == 1;
+    for role in roles {
+        healthy &= status_of(cx, role, out)?;
+    }
+    Ok(if healthy { ExitCode::SUCCESS } else { ExitCode::FAILURE })
+}
+
+fn status_of(cx: &Context, role: Role, out: &mut dyn Write) -> Result<bool> {
+    let file = cx.service_file(role);
+    if !file.exists() {
+        writeln!(out, "the {role} service is not installed ({})", file.display())?;
+        return Ok(false);
+    }
+    writeln!(out, "the {role} service: {}", file.display())?;
+    let mut healthy = true;
+    let argv = read_command_line(cx, role).unwrap_or_default();
+    match argv.first().map(PathBuf::from) {
+        None => {
+            writeln!(
+                out,
+                "  runs: unreadable; run `hennery service install --role {role}` again"
+            )?;
+            healthy = false;
+        }
+        Some(exe) => {
+            writeln!(out, "  runs: {}", argv.join(" "))?;
+            let canonical = |p: &Path| p.canonicalize().ok();
+            if !exe.exists() {
+                writeln!(
+                    out,
+                    "  its binary is missing; run `hennery service install --role {role}` again"
+                )?;
+                healthy = false;
+            } else if canonical(&exe) != canonical(&cx.exe) {
+                writeln!(
+                    out,
+                    "  its binary is not this one ({}); run `hennery service install --role {role}` with the one to use",
+                    cx.exe.display()
+                )?;
+            }
+        }
+    }
+    // Whether it runs, and as which process, as the service manager says.
+    let (running, pid) = match cx.platform {
+        Platform::MacOs => {
+            let ran = cx.run("launchctl", &["print", &cx.launchd_target(role)])?;
+            if !ran.ok {
+                writeln!(out, "  launchd: not loaded (it loads at your next GUI login)")?;
+                (false, None)
+            } else {
+                let field = |name: &str| {
+                    ran.stdout
+                        .lines()
+                        .find_map(|l| l.trim().strip_prefix(name)?.trim().strip_prefix('=').map(str::trim))
+                };
+                let state = field("state").unwrap_or("unknown");
+                let pid = field("pid").and_then(|pid| pid.parse::<u32>().ok());
+                match pid {
+                    Some(pid) => writeln!(out, "  launchd: {state}, pid {pid}")?,
+                    None => writeln!(out, "  launchd: {state}")?,
+                }
+                (state == "running", pid)
+            }
+        }
+        Platform::Linux => {
+            let active = cx.run("systemctl", &["--user", "is-active", role.unit()])?;
+            let enabled = cx.run("systemctl", &["--user", "is-enabled", role.unit()])?;
+            writeln!(out, "  systemd: {}, {}", active.stdout.trim(), enabled.stdout.trim())?;
+            let pid = cx
+                .run(
+                    "systemctl",
+                    &["--user", "show", "-p", "MainPID", "--value", role.unit()],
+                )?
+                .stdout
+                .trim()
+                .parse::<u32>()
+                .ok()
+                .filter(|&pid| pid != 0);
+            linger(cx, out)?;
+            (active.stdout.trim() == "active", pid)
+        }
+    };
+    healthy &= running;
+    if role == Role::Up
+        && let Some(data) = data_dir_of(&argv)
+    {
+        healthy &= children(&data, pid, out)?;
+    }
+    Ok(healthy)
+}
+
+/// Whether process `pid` exists.
+fn alive(pid: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: kill(2) with signal 0 sends nothing; it only checks.
+    unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
+}
+
+/// `up`'s report of its children (`supervisor.json`): `false` when one was
+/// given up on or revoked. A report from a process that is gone, or that
+/// is not the one the service manager runs (`pid`, when it says), is shown
+/// as stale and judged by nothing: an `up` killed outright leaves one
+/// behind, and so does an `up` run by hand on the same data directory.
+fn children(data: &Path, pid: Option<u32>, out: &mut dyn Write) -> Result<bool> {
+    let Some(state) = supervisor::read_state(data)? else {
+        writeln!(out, "  children: no report yet in {}", data.display())?;
+        return Ok(true);
+    };
+    if !alive(state.pid) || pid.is_some_and(|pid| pid != state.pid) {
+        writeln!(
+            out,
+            "  children: the last report is stale (from pid {}, which is not the service's process)",
+            state.pid
+        )?;
+        return Ok(true);
+    }
+    let mut healthy = true;
+    for (name, child) in [("collector", &state.collector), ("host", &state.host)] {
+        let last = child
+            .last_exit
+            .as_deref()
+            .map(|e| format!(", last exit: {e}"))
+            .unwrap_or_default();
+        let what = match child.state {
+            supervisor::ChildState::Running => "running".to_string(),
+            supervisor::ChildState::Restarting => "crashed; starting again".to_string(),
+            supervisor::ChildState::Stopped => "stopped".to_string(),
+            supervisor::ChildState::Revoked => {
+                healthy = false;
+                "revoked by the collector; pair it again (see `hennery up`'s log)".to_string()
+            }
+            supervisor::ChildState::GaveUp => {
+                healthy = false;
+                format!(
+                    "given up on after {} crashes; restart the service once the cause is fixed",
+                    child.crashes_in_window
+                )
+            }
+        };
+        writeln!(out, "  {name}: {what} ({} restarts{last})", child.restarts)?;
+    }
+    writeln!(out, "  (reported by pid {})", state.pid)?;
+    Ok(healthy)
 }
 
 #[cfg(test)]

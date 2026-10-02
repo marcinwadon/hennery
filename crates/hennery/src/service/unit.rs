@@ -91,6 +91,14 @@ fn xml(text: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn unxml(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
 /// The launchd user agent (distribution spec §6.2): started at login and
 /// again whenever it fails, only in a GUI login session (`Aqua`, decision
 /// 4: when the login keychain is unlocked), with the captured PATH, and its
@@ -144,6 +152,19 @@ pub fn plist(role: Role, argv: &[String], path: &str, log: &str) -> String {
     )
 }
 
+/// The `ProgramArguments` of a plist `plist` wrote.
+pub fn plist_command_line(text: &str) -> Option<Vec<String>> {
+    let (_, rest) = text.split_once("<key>ProgramArguments</key>")?;
+    let (array, _) = rest.split_once("</array>")?;
+    Some(
+        array
+            .split("<string>")
+            .skip(1)
+            .filter_map(|s| s.split_once("</string>").map(|(arg, _)| unxml(arg)))
+            .collect(),
+    )
+}
+
 /// One argument of a systemd command line: double-quoted, with `\` and `"`
 /// escaped, and `%` and `$` doubled so neither specifiers nor variables are
 /// expanded in it.
@@ -189,6 +210,37 @@ WantedBy=default.target
         exec = exec.join(" "),
         env_file = env_file.replace('%', "%%"),
     ))
+}
+
+/// The `ExecStart` of a unit `systemd_unit` wrote.
+pub fn systemd_command_line(text: &str) -> Option<Vec<String>> {
+    let line = text.lines().find_map(|l| l.strip_prefix("ExecStart="))?;
+    let mut words = Vec::new();
+    let mut chars = line.chars().peekable();
+    loop {
+        while chars.next_if_eq(&' ').is_some() {}
+        if chars.next()? != '"' {
+            return None;
+        }
+        let mut word = String::new();
+        loop {
+            match chars.next()? {
+                '"' => break,
+                '\\' => word.push(chars.next()?),
+                c @ ('%' | '$') => {
+                    if chars.next()? != c {
+                        return None;
+                    }
+                    word.push(c);
+                }
+                c => word.push(c),
+            }
+        }
+        words.push(word);
+        if chars.peek().is_none() {
+            return Some(words);
+        }
+    }
 }
 
 /// The systemd environment file: the captured PATH, double-quoted, with
@@ -351,5 +403,21 @@ mod tests {
             assert!(out.status.success(), "{role}: {stderr}");
             assert!(!stderr.contains(role.unit()), "{role}: {stderr}");
         }
+    }
+
+    /// What `status` and `uninstall` read back is what `install` wrote, for
+    /// every character the files escape.
+    #[test]
+    fn the_command_line_reads_back_from_either_file() {
+        let exe = Path::new("/home/me/.local/bin/hen nery");
+        for role in Role::ALL {
+            let argv = command_line(role, exe, &awkward()).unwrap();
+            let text = plist(role, &argv, "/usr/bin", "/tmp/a & b.log");
+            assert_eq!(plist_command_line(&text).unwrap(), argv, "{role}");
+            let text = systemd_unit(role, &argv, "/tmp/env").unwrap();
+            assert_eq!(systemd_command_line(&text).unwrap(), argv, "{role}");
+        }
+        assert_eq!(systemd_command_line("ExecStart=/bin/true"), None);
+        assert_eq!(plist_command_line("<plist/>"), None);
     }
 }

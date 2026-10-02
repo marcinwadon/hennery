@@ -344,3 +344,160 @@ fn a_failing_login_shell_fails_the_install() {
     assert!(fake.calls().is_empty());
     assert!(!cx.service_file(Role::Up).exists());
 }
+
+/// Uninstall stops and removes the unit and its environment file, and
+/// keeps the data directory.
+#[test]
+fn uninstalling_on_linux_removes_the_unit_and_keeps_the_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::new(|_, _| ok("Linger=yes"));
+    let cx = linux(dir.path(), &fake);
+    install(&cx, Role::Up, None, None, &mut Vec::new()).unwrap();
+    std::fs::create_dir_all(cx.default_data_dir()).unwrap();
+    fake.calls.borrow_mut().clear();
+    let mut out = Vec::new();
+    uninstall(&cx, None, &mut out).unwrap();
+    assert_eq!(
+        fake.calls(),
+        [
+            "systemctl --user disable --now hennery.service",
+            "systemctl --user daemon-reload"
+        ]
+    );
+    assert!(!cx.service_file(Role::Up).exists());
+    assert!(!cx.env_file().exists());
+    assert!(cx.default_data_dir().exists());
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("data directory is kept"), "{out}");
+    let mut again = Vec::new();
+    uninstall(&cx, None, &mut again).unwrap();
+    assert!(
+        String::from_utf8(again)
+            .unwrap()
+            .contains("no hennery service is installed")
+    );
+}
+
+#[test]
+fn uninstalling_on_macos_boots_out_and_removes_the_plist() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::new(|line, before| {
+        if line.contains(" print ") && before == 0 {
+            ok("state = running")
+        } else if line.contains(" print ") {
+            failed("not found")
+        } else {
+            ok("")
+        }
+    });
+    let cx = machine(dir.path(), Platform::MacOs, &fake);
+    let plist = cx.service_file(Role::Host);
+    std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    std::fs::write(&plist, unit::plist(Role::Host, &["/x".into()], "/usr/bin", "/tmp/l")).unwrap();
+    uninstall(&cx, Some(Role::Host), &mut Vec::new()).unwrap();
+    assert!(
+        fake.calls()
+            .contains(&"launchctl bootout gui/501/dev.hennery.host".to_string())
+    );
+    assert!(!plist.exists());
+}
+
+/// Status names the installed role, what it runs, what launchd says, and
+/// `up`'s children; a child given up on makes it exit 1.
+#[test]
+fn status_reports_the_service_and_ups_children() {
+    let dir = tempfile::tempdir().unwrap();
+    // This test's own process stands in for `up`, so the report is live.
+    let pid = std::process::id();
+    let fake = Fake::new(move |line, _| {
+        if line.contains(" print ") {
+            ok(&format!(
+                "gui/501/dev.hennery.up = {{\n\tstate = running\n\tpid = {pid}\n}}"
+            ))
+        } else {
+            ok("")
+        }
+    });
+    let cx = machine(dir.path(), Platform::MacOs, &fake);
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let argv = unit::command_line(Role::Up, &cx.exe, &data).unwrap();
+    let plist = cx.service_file(Role::Up);
+    std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    std::fs::write(&plist, unit::plist(Role::Up, &argv, "/usr/bin", "/tmp/l")).unwrap();
+    let report = |state| supervisor::ChildReport {
+        state,
+        crashes_in_window: 10,
+        restarts: 9,
+        last_exit: Some("exit status: 1".into()),
+    };
+    let mut state = supervisor::State {
+        pid,
+        updated_at: 0,
+        collector: report(supervisor::ChildState::Running),
+        host: report(supervisor::ChildState::Running),
+    };
+    supervisor::write_state(&data, &state).unwrap();
+    let mut out = Vec::new();
+    assert_eq!(status(&cx, None, &mut out).unwrap(), ExitCode::SUCCESS);
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains(&format!("launchd: running, pid {pid}")), "{text}");
+    assert!(text.contains(&format!("runs: {}", argv.join(" "))), "{text}");
+
+    state.host = report(supervisor::ChildState::GaveUp);
+    supervisor::write_state(&data, &state).unwrap();
+    let mut out = Vec::new();
+    assert_eq!(status(&cx, None, &mut out).unwrap(), ExitCode::FAILURE);
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("host: given up on after 10 crashes"), "{text}");
+
+    // Written by a process that is gone: stale, and judged by nothing.
+    let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+    gone.wait().unwrap();
+    state.pid = gone.id();
+    supervisor::write_state(&data, &state).unwrap();
+    let mut out = Vec::new();
+    assert_eq!(status(&cx, None, &mut out).unwrap(), ExitCode::SUCCESS);
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("the last report is stale"), "{text}");
+    assert!(!text.contains("given up on"), "{text}");
+}
+
+/// Status: nothing installed, a missing binary, a unit that is not active.
+#[test]
+fn status_fails_when_the_service_cannot_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::new(|line, _| {
+        if line.contains("is-active") {
+            ok("failed\n")
+        } else if line.contains("is-enabled") {
+            ok("enabled\n")
+        } else {
+            ok("Linger=yes")
+        }
+    });
+    let cx = linux(dir.path(), &fake);
+    let mut out = Vec::new();
+    assert_eq!(status(&cx, None, &mut out).unwrap(), ExitCode::FAILURE);
+    assert!(
+        String::from_utf8(out)
+            .unwrap()
+            .contains("no hennery service is installed")
+    );
+    assert!(fake.calls().is_empty());
+
+    let argv = unit::command_line(
+        Role::Collector,
+        Path::new("/nonexistent/hennery"),
+        &cx.default_data_dir(),
+    )
+    .unwrap();
+    let file = cx.service_file(Role::Collector);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(&file, unit::systemd_unit(Role::Collector, &argv, "/tmp/env").unwrap()).unwrap();
+    let mut out = Vec::new();
+    assert_eq!(status(&cx, None, &mut out).unwrap(), ExitCode::FAILURE);
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("its binary is missing"), "{text}");
+    assert!(text.contains("systemd: failed, enabled"), "{text}");
+}
