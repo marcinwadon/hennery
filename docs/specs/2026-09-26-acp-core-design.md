@@ -1488,10 +1488,15 @@ session that opened them ends (kernel spec §3.2).
 - `GET /api/stream/sessions/{id}` — every timeline event for one session plus
   `catalog_changed`, `pending_changed`, `turn_changed`. It resumes from
   `Last-Event-ID` **directly from the events table**; there is no catch-up
-  window.
+  window. A session the owner does not have is 404 `not_found`, like
+  another owner's. The replay is read a page (500 events) at a time, the
+  next when the stream is polled again, so at most a page and what the
+  connection buffers are held; a failed read sends `resync_required` and
+  ends the stream.
   - **Derived messages share their event's id.** `catalog_changed` (data: the
     `SessionCatalog`) follows every listed `session_started`,
-    `config_applied` or `acp_update` whose extracts carry a snapshot.
+    `config_applied` or `acp_update` whose extracts carry a snapshot; in a
+    replay, only the last such event of each page gets one.
     `pending_changed` (data: the `PendingItem` **as it stands now**) follows
     every `pending_opened`, `pending_resolved`, `pending_cancelled`,
     `answer_submitted` and `answer_result`. Both are derived from the stored

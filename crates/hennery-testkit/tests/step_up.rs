@@ -37,6 +37,11 @@ impl Collector {
         );
         // Sets the collector up.
         hennery_testkit::operator_client(&state.operator);
+        // The session `open_stream` follows: a stream is 404 for an unknown one.
+        state
+            .store
+            .create_session("s-1", "h-1", "fake", "/tmp", "hat-1", None)
+            .unwrap();
         tokio::spawn(hennery_sessions::serve(listener, state.clone()));
         Self { addr, state, _dir: dir }
     }

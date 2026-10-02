@@ -205,7 +205,20 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE pending ADD COLUMN opened_event_id INTEGER;
     CREATE INDEX events_by_kind ON events(session_id, kind, event_id);
 ",
+    // A session's events in order, from an id on: a page of a stream's
+    // replay or of the timeline reads only its own rows, with no sort
+    // (smoke test #1, F2; without it each page read every later row of the
+    // session and sorted them, under the store's lock). `IF NOT EXISTS`:
+    // the tests that roll a database back to an older version run it again.
+    "
+    CREATE INDEX IF NOT EXISTS events_by_session ON events(session_id, event_id);
+",
 ];
+
+/// `Store::events`: `?1` the session, `?2` after, `?3` the limit, `?4` the
+/// owner.
+const EVENTS_AFTER: &str = "SELECT event_id, host_seq, kind, body, ts FROM events
+     WHERE session_id = ?1 AND event_id > ?2 AND applied = 1 AND owner_id = ?4 ORDER BY event_id LIMIT ?3";
 
 /// What `Store::ingest_fact` did with one fact.
 #[derive(Debug, Clone, PartialEq)]
@@ -2578,14 +2591,12 @@ impl Store {
         Ok(out)
     }
 
-    /// Events of one session with `event_id > after`, oldest first. Host
+    /// Events of one session with `event_id > after`, oldest first: a range
+    /// of `events_by_session`. Host
     /// facts stored but not applied are left out (final review F1).
     pub fn events(&self, session_id: &str, after: i64, limit: u32) -> Result<Vec<EventDto>> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT event_id, host_seq, kind, body, ts FROM events
-             WHERE session_id = ?1 AND event_id > ?2 AND applied = 1 AND owner_id = ?4 ORDER BY event_id LIMIT ?3",
-        )?;
+        let mut stmt = conn.prepare(EVENTS_AFTER)?;
         let rows = stmt.query_map(params![session_id, after, limit, self.owner], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -2635,6 +2646,26 @@ mod tests {
     use super::*;
     use hennery_kernel::hosts::{EnrollOutcome, Enrollment, Hosts};
     use hennery_kernel::operator::{Operator, SetupOutcome};
+
+    /// A page of events reads a range of `events_by_session` in order: no
+    /// scan of the session's other rows and no sort (smoke test #1, F2).
+    #[test]
+    fn a_page_of_events_is_a_range_of_its_index() {
+        let store = Store::open_in_memory().unwrap();
+        let conn = store.conn();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {EVENTS_AFTER}"))
+            .unwrap()
+            .query_map(params!["s1", 0, 500, "owner"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(plan.len(), 1, "{plan:?}");
+        assert!(
+            plan[0].contains("USING INDEX events_by_session (session_id=? AND event_id>?)"),
+            "{plan:?}"
+        );
+    }
 
     #[test]
     fn timestamps_are_rfc3339_utc() {

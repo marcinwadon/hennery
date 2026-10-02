@@ -26,6 +26,8 @@ use hennery_proto::rest::{
 };
 use serde::Deserialize;
 use std::convert::Infallible;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 use tokio_stream::wrappers::BroadcastStream;
 
@@ -1059,15 +1061,102 @@ fn changes_catalogue(e: &EventDto) -> bool {
         .is_ok_and(|indexed| indexed.current_config().is_some() || indexed.commands.is_some())
 }
 
+/// Events one page of a stream's replay reads (smoke test #1, F2): the
+/// replay holds at most one page at a time, and reads the next only once
+/// the client has taken the last, so a session's history is never loaded
+/// whole.
+pub const REPLAY_PAGE: u32 = 500;
+
+/// A replay in pages of `REPLAY_PAGE` events, from after `cursor`, read
+/// with `fetch(after, limit)` one page per poll. `cursor` moves past each
+/// page as it is read, so it ends at the last event replayed. A short page
+/// is the last; an error is sent and ends the replay.
+fn replay_pages<E>(
+    cursor: Arc<AtomicI64>,
+    fetch: impl FnMut(i64, u32) -> Result<Vec<EventDto>, E>,
+) -> impl Stream<Item = Result<Vec<EventDto>, E>> {
+    stream::unfold(Some(fetch), move |fetch| {
+        let cursor = cursor.clone();
+        async move {
+            let mut fetch = fetch?;
+            match fetch(cursor.load(Ordering::SeqCst), REPLAY_PAGE) {
+                Ok(page) if page.is_empty() => None,
+                Ok(page) => {
+                    if let Some(last) = page.last() {
+                        cursor.store(last.event_id, Ordering::SeqCst);
+                    }
+                    let more = page.len() >= REPLAY_PAGE as usize;
+                    Some((Ok(page), more.then_some(fetch)))
+                }
+                Err(err) => Some((Err(err), None)),
+            }
+        }
+    })
+}
+
+/// The SSE messages of one replayed page. The catalogue once per page,
+/// after the last event of the page that changed it: every
+/// `catalog_changed` carries the whole catalogue as it stands, so one per
+/// event would only repeat it (the review's A6, P-23); and one held back
+/// to a later page would carry an id older than the events before it.
+fn page_messages(store: &Store, page: &[EventDto]) -> Vec<Result<Event, Infallible>> {
+    let last_catalogue = page.iter().rposition(changes_catalogue);
+    page.iter()
+        .enumerate()
+        .flat_map(|(at, e)| sse_messages(store, e, Some(at) == last_catalogue))
+        .collect()
+}
+
+fn resync_required() -> Event {
+    Event::default().event("resync_required").data("{}")
+}
+
+/// The replayed pages as SSE, `render`ed, then `follow`. A failed page
+/// sends `resync_required` and ends the stream: `follow` would skip the
+/// events after it.
+fn replay_then_follow<E: std::fmt::Display>(
+    replay: impl Stream<Item = Result<Vec<EventDto>, E>>,
+    mut render: impl FnMut(&[EventDto]) -> Vec<Result<Event, Infallible>>,
+    follow: impl Stream<Item = Result<Event, Infallible>>,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    let failed = Arc::new(AtomicBool::new(false));
+    let replay = {
+        let failed = failed.clone();
+        replay.flat_map(move |page| {
+            stream::iter(match page {
+                Ok(page) => render(&page),
+                Err(err) => {
+                    tracing::error!(error = %err, "replaying a session stream");
+                    failed.store(true, Ordering::SeqCst);
+                    vec![Ok(resync_required())]
+                }
+            })
+        })
+    };
+    // Polled only once the replay is done.
+    let follow = stream::once(async move { (!failed.load(Ordering::SeqCst)).then_some(follow) })
+        .filter_map(std::future::ready)
+        .flatten();
+    replay.chain(follow)
+}
+
 /// The session's events as SSE: replays from `Last-Event-ID`, then follows
 /// live events, until the collector shuts down or the operator's session
-/// that opened it ends (3b decision 7).
+/// that opened it ends (3b decision 7). 404 for a session the owner does
+/// not have (ACP core §9); the replay reads the events table a page at a
+/// time (`REPLAY_PAGE`), and a failed read sends `resync_required` and
+/// ends the stream.
 async fn stream_session(
     State(state): State<AppState>,
     Extension(operator_session): Extension<Authenticated>,
     Path(id): Path<String>,
     headers: HeaderMap,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+) -> Response {
+    match state.store.session(&id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) => return internal(err),
+    }
     let after: i64 = headers
         .get("last-event-id")
         .and_then(|v| v.to_str().ok())
@@ -1075,41 +1164,146 @@ async fn stream_session(
         .unwrap_or(0);
     // Subscribe before reading the backlog so nothing falls between them.
     let live = BroadcastStream::new(state.hub.subscribe());
-    let backlog = state.store.events(&id, after, u32::MAX).unwrap_or_default();
-    let last = backlog.last().map(|e| e.event_id).unwrap_or(after);
-    // The catalogue once, after the last event of the backlog that changed
-    // it: every `catalog_changed` carries the whole catalogue as it stands,
-    // so one per event would only repeat it (the review's A6, P-23).
-    let last_catalogue = backlog.iter().rposition(changes_catalogue);
-    let replay = stream::iter(
-        backlog
-            .iter()
-            .enumerate()
-            .flat_map(|(at, e)| sse_messages(&state.store, e, Some(at) == last_catalogue))
-            .collect::<Vec<_>>(),
-    );
+    // The last event sent: the replay moves it, and the live events are
+    // filtered by it only once the replay is done, so an event both read
+    // in a page and published live is sent once. Nothing is lost between
+    // them because event ids grow in commit order (`AUTOINCREMENT`, one
+    // writing connection), an event is published only once committed, and
+    // an event stored unapplied is never applied later nor published.
+    let cursor = Arc::new(AtomicI64::new(after));
+    let replay = {
+        let store = state.store.clone();
+        let session = id.clone();
+        replay_pages(cursor.clone(), move |after, limit| store.events(&session, after, limit))
+    };
     let session = id.clone();
     let store = state.store.clone();
-    let follow = live
-        .filter_map(move |item| {
+    let follow = {
+        let store = store.clone();
+        live.filter_map(move |item| {
             let session = session.clone();
             let store = store.clone();
+            let last = cursor.load(Ordering::SeqCst);
             async move {
                 match item {
                     Ok(e) if e.session_id == session && e.event_id > last => Some(sse_messages(&store, &e, true)),
                     Ok(_) => None,
                     // Lagged: tell the client to refetch instead of skipping silently.
-                    Err(_) => Some(vec![Ok(Event::default().event("resync_required").data("{}"))]),
+                    Err(_) => Some(vec![Ok(resync_required())]),
                 }
             }
         })
-        .flat_map(stream::iter);
-    let stream = replay
-        .chain(follow)
+        .flat_map(stream::iter)
+    };
+    let stream = replay_then_follow(replay, move |page| page_messages(&store, page), follow)
         .take_until(state.shutdown.clone().cancelled_owned())
         .take_until(hennery_kernel::auth::session_ended(
             state.operator.clone(),
             operator_session,
         ));
-    Sse::new(stream).keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    fn event(event_id: i64) -> EventDto {
+        EventDto {
+            event_id,
+            session_id: "s1".into(),
+            host_seq: None,
+            kind: "acp_update".into(),
+            body: serde_json::json!({}),
+            ts: String::new(),
+        }
+    }
+
+    /// Every `(after, limit)` a history was read with.
+    type Reads = Arc<Mutex<Vec<(i64, u32)>>>;
+
+    /// A history of `len` events, ids 1 to `len`, and its reads.
+    fn history(len: i64) -> (Reads, impl FnMut(i64, u32) -> Result<Vec<EventDto>, ()>) {
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let log = reads.clone();
+        let fetch = move |after: i64, limit: u32| {
+            log.lock().unwrap().push((after, limit));
+            Ok((after + 1..=len).take(limit as usize).map(event).collect())
+        };
+        (reads, fetch)
+    }
+
+    /// Smoke test #1, F2: the replay reads one page at a time, and the next
+    /// only when the client takes it, never the whole history at once.
+    #[tokio::test]
+    async fn a_replay_reads_one_bounded_page_per_poll() {
+        let page = i64::from(REPLAY_PAGE);
+        let (reads, fetch) = history(2 * page + 7);
+        let cursor = Arc::new(AtomicI64::new(0));
+        let mut pages = Box::pin(replay_pages(cursor.clone(), fetch));
+        let first = pages.next().await.unwrap().unwrap();
+        assert_eq!(first.len(), REPLAY_PAGE as usize);
+        assert_eq!(*reads.lock().unwrap(), [(0, REPLAY_PAGE)]);
+        assert_eq!(cursor.load(Ordering::SeqCst), page);
+        // Bounded: a replay that never moves on fails here instead of hanging.
+        let rest: Vec<_> = pages.take(3).map(Result::unwrap).collect().await;
+        assert_eq!(rest.iter().map(Vec::len).collect::<Vec<_>>(), [page as usize, 7]);
+        assert_eq!(
+            *reads.lock().unwrap(),
+            [(0, REPLAY_PAGE), (page, REPLAY_PAGE), (2 * page, REPLAY_PAGE)]
+        );
+        assert_eq!(cursor.load(Ordering::SeqCst), 2 * page + 7);
+    }
+
+    /// A history of exactly whole pages ends on the empty read after them.
+    #[tokio::test]
+    async fn a_replay_of_whole_pages_ends_on_an_empty_read() {
+        let page = i64::from(REPLAY_PAGE);
+        let (reads, fetch) = history(page);
+        let pages: Vec<_> = replay_pages(Arc::new(AtomicI64::new(0)), fetch).take(3).collect().await;
+        assert_eq!(pages.len(), 1);
+        assert_eq!(reads.lock().unwrap().len(), 2);
+    }
+
+    /// A failed read is sent, and nothing is read after it.
+    #[tokio::test]
+    async fn a_failed_read_ends_the_replay() {
+        let reads = Arc::new(Mutex::new(0));
+        let count = reads.clone();
+        let fetch = move |_: i64, _: u32| -> Result<Vec<EventDto>, ()> {
+            *count.lock().unwrap() += 1;
+            Err(())
+        };
+        let pages: Vec<_> = replay_pages(Arc::new(AtomicI64::new(0)), fetch).collect().await;
+        assert_eq!(pages, [Err(())]);
+        assert_eq!(*reads.lock().unwrap(), 1);
+    }
+
+    fn one_message_each(page: &[EventDto]) -> Vec<Result<Event, Infallible>> {
+        page.iter().map(|_| Ok(Event::default())).collect()
+    }
+
+    fn one_live() -> impl Stream<Item = Result<Event, Infallible>> {
+        stream::iter([Ok(Event::default())])
+    }
+
+    /// The replay, then the live events.
+    #[tokio::test]
+    async fn the_live_events_follow_the_replay() {
+        let replay = stream::iter([Ok::<_, &str>(vec![event(1), event(2)])]);
+        let sent: Vec<_> = replay_then_follow(replay, one_message_each, one_live()).collect().await;
+        assert_eq!(sent.len(), 3);
+    }
+
+    /// A failed page sends `resync_required` and ends the stream: the live
+    /// events would skip the events after it.
+    #[tokio::test]
+    async fn a_failed_page_ends_the_stream_without_the_live_events() {
+        let replay = stream::iter([Ok(vec![event(1)]), Err("disk")]);
+        let sent: Vec<_> = replay_then_follow(replay, one_message_each, one_live()).collect().await;
+        assert_eq!(sent.len(), 2);
+    }
 }
