@@ -560,6 +560,16 @@ impl Tally {
         self.left.keys().any(|(_, r)| *r == reason)
     }
 
+    /// Add what `other` counted.
+    pub(crate) fn merge(&mut self, other: Tally) {
+        for (kind, count) in other.removed {
+            *self.removed.entry(kind).or_default() += count;
+        }
+        for (key, count) in other.left {
+            *self.left.entry(key).or_default() += count;
+        }
+    }
+
     pub(crate) fn into_forgotten(self) -> Forgotten {
         Forgotten {
             removed: self

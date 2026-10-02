@@ -266,10 +266,33 @@ pub async fn forget_codex(ctx: &ForgetContext, forget: &Forget) -> Forgotten {
                 "Codex's app-server is unavailable for a forget; the fallback runs"
             );
             crate::forget::run_adapter(ctx, forget, &root, env, &strip, until).await;
+            // The archive may have created `archived_sessions/` (a home's
+            // first) and moved the rollouts there: the kind directories are
+            // opened again, with every B3 check, under the same root (the
+            // review's item 1).
+            let first = Arc::clone(&kinds);
+            let rechecked = {
+                let (ctx, root) = (ctx.clone(), root.clone());
+                tokio::task::spawn_blocking(move || check(&ctx, &root, &CODEX_KINDS)).await
+            };
+            let kinds = match rechecked {
+                Ok(Ok(kinds)) if same_dir(&first.root, &kinds.root) => kinds,
+                Ok(Ok(_)) => return whole(ForgetReason::UnsafeRoot),
+                Ok(Err(reason)) => return whole(reason),
+                Err(_) => return whole(ForgetReason::IoError),
+            };
+            drop(first);
             let hooks = ctx.hooks.clone();
             let until = until.into_std();
             let walked = tokio::task::spawn_blocking(move || {
-                let mut tally = rollouts(&kinds, &id, &hooks, true, ForgetReason::StillPresent, until);
+                let mut tally = Tally::default();
+                for (kind, _, opened) in &kinds.dirs {
+                    if let Err(reason) = opened {
+                        tally.left(*kind, *reason);
+                    }
+                }
+                tally.merge(rollouts(&kinds, &id, &hooks, true, ForgetReason::StillPresent, until));
+
                 // Decision 10: what only `thread/delete` reaches.
                 tally.left_whole(ForgetKind::CodexDatabaseCopies, ForgetReason::FallbackOnly);
                 tally
@@ -308,6 +331,15 @@ pub async fn forget_codex(ctx: &ForgetContext, forget: &Forget) -> Forgotten {
                 Err(_) => whole(ForgetReason::IoError),
             }
         }
+    }
+}
+
+/// Whether two open descriptors are the same directory (`st_dev`,
+/// `st_ino`).
+fn same_dir(a: &std::os::fd::OwnedFd, b: &std::os::fd::OwnedFd) -> bool {
+    match (walk::stat_fd(a.as_raw_fd()), walk::stat_fd(b.as_raw_fd())) {
+        (Ok(a), Ok(b)) => (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino),
+        _ => false,
     }
 }
 
