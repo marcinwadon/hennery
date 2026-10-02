@@ -366,6 +366,8 @@ fn start(request_id: &str, session_id: &str) -> CollectorFrame {
         agent: "fake".into(),
         cwd: canonical_temp_dir(),
         config: Default::default(),
+        hat_id: String::new(),
+        mcp: Default::default(),
     }
 }
 
@@ -659,6 +661,8 @@ fn resume(request_id: &str, session_id: &str, committed_seq: u64, agent_session_
         cwd: canonical_temp_dir(),
         agent_session_id: agent_session_id.into(),
         config: Default::default(),
+        hat_id: String::new(),
+        mcp: Default::default(),
     }
 }
 

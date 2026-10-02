@@ -30,7 +30,7 @@ fn started(request_id: &str) -> SessionBody {
 fn connect(hub: &Hub) -> (Registration, mpsc::UnboundedReceiver<CollectorFrame>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let registration = hub
-        .register("h", tx, Capabilities::default())
+        .register("h", tx, Capabilities::default(), Default::default())
         .expect("no live connection for h");
     hub.mark_ready("h", registration.conn_id);
     (registration, rx)
@@ -155,13 +155,16 @@ async fn capabilities_belong_to_the_hosts_current_connection() {
     let hub = Hub::new();
     assert!(!hub.has_capability("h", Capability::Park), "an unknown host has none");
     let (tx, _rx) = mpsc::unbounded_channel();
-    let first = hub.register("h", tx, Capabilities(vec![Capability::Park])).unwrap();
+    let first = hub
+        .register("h", tx, Capabilities(vec![Capability::Park]), Default::default())
+        .unwrap();
     assert!(hub.has_capability("h", Capability::Park));
     assert!(!hub.has_capability("h", Capability::Images));
     hub.unregister("h", first.conn_id);
     assert!(!hub.has_capability("h", Capability::Park), "a gone host has none");
     let (tx, _rx) = mpsc::unbounded_channel();
-    hub.register("h", tx, Capabilities::default()).unwrap();
+    hub.register("h", tx, Capabilities::default(), Default::default())
+        .unwrap();
     assert!(
         !hub.has_capability("h", Capability::Park),
         "an older build of the host that cannot park reconnected"
@@ -258,7 +261,7 @@ fn list(request_id: &str) -> CollectorFrame {
 fn connect_projects(hub: &Hub) -> (Registration, mpsc::UnboundedReceiver<CollectorFrame>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let registration = hub
-        .register("h", tx, Capabilities(vec![Capability::Projects]))
+        .register("h", tx, Capabilities(vec![Capability::Projects]), Default::default())
         .expect("no live connection for h");
     hub.mark_ready("h", registration.conn_id);
     (registration, rx)
@@ -384,7 +387,9 @@ async fn a_probe_whose_caller_is_gone_is_forgotten() {
 async fn a_probe_goes_only_to_a_reconciled_host() {
     let hub = Hub::new();
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let registration = hub.register("h", tx, Capabilities::default()).unwrap();
+    let registration = hub
+        .register("h", tx, Capabilities::default(), Default::default())
+        .unwrap();
     let answer = hub.probe("h", "p1", list("p1"), Duration::from_secs(5)).await;
     assert_eq!(answer, Err(RequestError::NotConnected));
     assert!(
