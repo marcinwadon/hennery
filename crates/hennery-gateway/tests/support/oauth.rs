@@ -201,6 +201,8 @@ pub struct Recorded {
     pub issued: Vec<String>,
     /// A client secret came in the form (`client_secret_post`).
     pub posted_secret: bool,
+    /// Every bearer token the MCP endpoint was sent, in order.
+    pub bearers: Vec<String>,
 }
 
 pub struct Inner {
@@ -308,8 +310,9 @@ impl FakeAs {
         let mut inner = self.inner.lock().unwrap();
         inner.next += 1;
         let family = inner.next;
-        let access = format!("access-{family}-0");
-        let refresh = format!("refresh-{family}-0");
+        let prefix = inner.config.prefix.clone();
+        let access = format!("{prefix}access-{family}-0");
+        let refresh = format!("{prefix}refresh-{family}-0");
         inner.access.insert(access.clone(), family);
         inner.refresh.insert(refresh.clone(), Refresh { family, used: false });
         (access, refresh)
@@ -535,7 +538,10 @@ async fn handle(State(shared): State<Shared>, request: Request) -> Response {
 
 fn mcp(shared: &Shared, config: &Config, headers: &HeaderMap, method: &str, body: &[u8], origin: &str) -> Response {
     let live = {
-        let inner = shared.inner.lock().unwrap();
+        let mut inner = shared.inner.lock().unwrap();
+        if let Some(token) = bearer(headers) {
+            inner.recorded.bearers.push(token);
+        }
         bearer(headers).is_some_and(|t| inner.access.get(&t).is_some_and(|f| !inner.revoked.contains(f)))
     };
     if !live {

@@ -20,8 +20,13 @@
 //! - **`resource`** is sent on refresh as the grant recorded it (G-10); a
 //!   server answering `invalid_target` is asked once more without it, and
 //!   that is recorded (`resource_param_accepted`).
+//! - **A token comes with where it goes** (`Fresh`): the URL and the
+//!   allowance read with it, in the same statement. The grant used may be
+//!   another than the one that failed (stored meanwhile by a Connect after
+//!   an origin edit), so a caller sends it only where it was granted for
+//!   (plan 8f decision 13).
 
-use crate::model::GrantTokens;
+use crate::model::{GrantTokens, OauthCredential};
 use crate::oauth::{self, Grant, TokenError};
 use crate::runtime::Runtime;
 use crate::store::RefreshedGrant;
@@ -33,12 +38,31 @@ use zeroize::Zeroizing;
 /// (gateway spec §4.4: 5 minutes).
 pub const PROACTIVE: i64 = 5 * 60;
 
+/// An access token with the upstream it was granted for, read together.
+/// Its `Debug` shows no token.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Fresh {
+    pub access_token: Zeroizing<String>,
+    pub url: String,
+    pub internal_network: bool,
+}
+
+impl Fresh {
+    fn of(credential: &OauthCredential, access_token: Zeroizing<String>) -> Self {
+        Self {
+            access_token,
+            url: credential.url.clone(),
+            internal_network: credential.internal_network,
+        }
+    }
+}
+
 /// What a refresh came to.
 #[derive(Clone, PartialEq, Eq)]
 pub enum Refreshed {
-    /// An access token to use: a fresh one, or one another refresh stored
-    /// meanwhile.
-    Retry(Zeroizing<String>),
+    /// An access token to use: a fresh one, or one another refresh (or a
+    /// Connect) stored meanwhile, with where it goes.
+    Retry(Fresh),
     /// Nothing to refresh: no grant, or one without a refresh token.
     NotRefreshable,
     /// The vendor refused the refresh: the connection is `needs_auth`.
@@ -96,9 +120,11 @@ async fn locked(runtime: &Runtime, id: &str, failed: Option<&str>) -> Refreshed 
     };
     match failed {
         Some(failed) if current.tokens.access_token.as_str() != failed => {
-            return Refreshed::Retry(current.tokens.access_token.clone());
+            return Refreshed::Retry(Fresh::of(&current, current.tokens.access_token.clone()));
         }
-        None if !due(current.expires_at, now) => return Refreshed::Retry(current.tokens.access_token.clone()),
+        None if !due(current.expires_at, now) => {
+            return Refreshed::Retry(Fresh::of(&current, current.tokens.access_token.clone()));
+        }
         _ => {}
     }
     let Some(refresh_token) = current.tokens.refresh_token.clone() else {
@@ -149,11 +175,11 @@ async fn locked(runtime: &Runtime, id: &str, failed: Option<&str>) -> Refreshed 
             {
                 Ok(true) => {
                     tracing::info!(connection_id = %id, "gateway: a grant was refreshed");
-                    Refreshed::Retry(tokens.access_token.clone())
+                    Refreshed::Retry(Fresh::of(&current, tokens.access_token.clone()))
                 }
                 // Changed meanwhile (an edit deleted it): use what is there.
                 Ok(false) => match runtime.store.oauth_credential(id, &runtime.key) {
-                    Ok(Some(now)) => Refreshed::Retry(now.tokens.access_token.clone()),
+                    Ok(Some(now)) => Refreshed::Retry(Fresh::of(&now, now.tokens.access_token.clone())),
                     _ => Refreshed::NotRefreshable,
                 },
                 Err(err) => {

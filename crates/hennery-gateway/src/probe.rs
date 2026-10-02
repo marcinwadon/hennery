@@ -172,7 +172,7 @@ async fn step(
                 "the authorization server could not be reached to refresh the grant".into(),
             ));
         }
-        Sent::RefreshUnsaved | Sent::Internal(_) => {
+        Sent::RefreshUnsaved | Sent::Changed | Sent::Internal(_) => {
             tracing::error!(connection_id = %connection.id, "gateway probe: the gateway failed, not the upstream");
             return Step::End(Verdict::NoChange);
         }

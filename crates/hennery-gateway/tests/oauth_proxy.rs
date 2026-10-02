@@ -508,3 +508,197 @@ async fn a_failing_token_endpoint_is_not_needs_auth() {
     assert_eq!(body["code"], "upstream_unreachable");
     assert_ne!(h.status(&id), "needs_auth");
 }
+
+/// Move `id` to fake `b`'s origin behind the API (its grant is deleted:
+/// gateway spec §4.6), and give it a grant from `b`: what an origin edit
+/// and a completed Connect leave while a refresh runs. `b`'s access token.
+fn moved_to(h: &Harness, id: &str, b: &FakeAs) -> String {
+    h.store
+        .update(
+            id,
+            &hennery_gateway::model::ConnectionPatch {
+                url: Some(b.mcp_url()),
+                ..Default::default()
+            },
+            unix_now(),
+        )
+        .unwrap();
+    let (access, refresh) = b.issue();
+    seed_grant(h, id, b, &access, Some(&refresh), None);
+    access
+}
+
+/// Gateway spec §4.5, §5.4: the retry after a 401 goes only where the
+/// token it carries was granted for. A refresh that loses its
+/// compare-and-swap reads the grant there is now; when that grant is for
+/// another URL (an origin edit and a new Connect meanwhile), its token is
+/// never sent to the old one: 502 `upstream_changed`, no `needs_auth`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_never_sends_another_url_s_token() {
+    let (h, a, id, token) = setup(
+        Config {
+            gate_token: true,
+            ..Config::default()
+        },
+        None,
+    )
+    .await;
+    // Its tokens are named apart from `a`'s.
+    let b = FakeAs::start(Config {
+        prefix: "b-".into(),
+        ..Config::default()
+    })
+    .await;
+    a.expire_access();
+    let request = tokio::spawn({
+        let client = h.client.clone();
+        let url = h.url("linear");
+        let token = token.clone();
+        async move {
+            client
+                .post(url)
+                .bearer_auth(token)
+                .header("content-type", "application/json")
+                .body(list(1).to_string())
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    // The 401's refresh is at `a`'s token endpoint, held there.
+    until(|| token_requests(&a) == 1).await;
+    let b_access = moved_to(&h, &id, &b);
+    a.open_gate();
+    let response = request.await.unwrap();
+    assert_eq!(response.status(), 502);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["code"], "upstream_changed", "{body}");
+    assert!(!a.with(|r| r.bearers.contains(&b_access)), "b's token went to a");
+    assert_ne!(h.status(&id), "needs_auth");
+}
+
+/// The same for a refresh before use (gateway spec §4.4): the request goes
+/// with the URL and the token read together after the refresh, never the
+/// URL read before it with the token read after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refresh_before_use_never_sends_another_url_s_token() {
+    let (h, a, id, token) = setup(
+        Config {
+            gate_token: true,
+            ..Config::default()
+        },
+        Some(unix_now() + 60),
+    )
+    .await;
+    // Its tokens are named apart from `a`'s.
+    let b = FakeAs::start(Config {
+        prefix: "b-".into(),
+        ..Config::default()
+    })
+    .await;
+    let request = tokio::spawn({
+        let client = h.client.clone();
+        let url = h.url("linear");
+        let token = token.clone();
+        async move {
+            client
+                .post(url)
+                .bearer_auth(token)
+                .header("content-type", "application/json")
+                .body(list(1).to_string())
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    until(|| token_requests(&a) == 1).await;
+    let b_access = moved_to(&h, &id, &b);
+    a.open_gate();
+    let response = request.await.unwrap();
+    assert!(!a.with(|r| r.bearers.contains(&b_access)), "b's token went to a");
+    // It went to `b`, with `b`'s token: what a request after the edit does.
+    assert_eq!(response.status(), 200);
+    assert_eq!(b.with(|r| r.bearers.clone()), [b_access]);
+}
+
+/// Start a request whose 401 refresh waits for the connection's lock,
+/// which the test holds; `change` runs once the upstream has answered 401.
+async fn while_a_401_waits(h: &Harness, a: &FakeAs, token: &str, change: impl FnOnce()) -> reqwest::Response {
+    let id = h.store.list().unwrap()[0].id.clone();
+    let held = h.runtime.lock(&id).await;
+    a.expire_access();
+    let request = tokio::spawn({
+        let client = h.client.clone();
+        let url = h.url("linear");
+        let token = token.to_string();
+        async move {
+            client
+                .post(url)
+                .bearer_auth(token)
+                .header("content-type", "application/json")
+                .body(list(1).to_string())
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    until(|| a.with(|r| !r.bearers.is_empty())).await;
+    change();
+    drop(held);
+    request.await.unwrap()
+}
+
+/// A grant gone by the time the refresh holds the lock: nothing to
+/// refresh, so the 401 stands: `needs_auth`, 502 `upstream_auth`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_gone_before_its_refresh_is_needs_auth() {
+    let (h, a, id, token) = setup(Config::default(), None).await;
+    let response = while_a_401_waits(&h, &a, &token, || {
+        h.raw()
+            .execute("DELETE FROM gw_credentials WHERE connection_id = ?1", [&id])
+            .unwrap();
+    })
+    .await;
+    assert_eq!(response.status(), 502);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["code"], "upstream_auth");
+    assert_eq!(a.with(|r| r.refreshes), 0);
+    assert_eq!(h.status(&id), "needs_auth");
+}
+
+/// A grant that no longer opens when the refresh reads it: the gateway's
+/// failure, not the vendor's: 502 `credential_unsaved`, no `needs_auth`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_grant_that_does_not_open_at_its_refresh_is_not_needs_auth() {
+    let (h, a, id, token) = setup(Config::default(), None).await;
+    let response = while_a_401_waits(&h, &a, &token, || {
+        h.raw()
+            .execute(
+                "UPDATE gw_credentials SET ciphertext = x'00' WHERE connection_id = ?1",
+                [&id],
+            )
+            .unwrap();
+    })
+    .await;
+    assert_eq!(response.status(), 502);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["code"], "credential_unsaved");
+    assert_eq!(a.with(|r| r.refreshes), 0);
+    assert_ne!(h.status(&id), "needs_auth");
+}
+
+/// A grant due for refresh without a refresh token is used as it is, and
+/// its requests do not queue on the connection's lock for a refresh that
+/// cannot happen (gateway spec §4.4).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unrefreshable_grant_does_not_wait_for_the_lock() {
+    let (h, a, id, token) = setup(Config::default(), None).await;
+    let (access, _) = a.issue();
+    seed_grant(&h, &id, &a, &access, None, Some(unix_now() + 60));
+    let _held = h.runtime.lock(&id).await;
+    let response = tokio::time::timeout(Duration::from_secs(5), h.post("linear", &token, &list(1)))
+        .await
+        .expect("the request waited for the lock");
+    assert_eq!(response.status(), 200);
+    assert_eq!(a.with(|r| r.refreshes), 0);
+}

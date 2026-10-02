@@ -27,7 +27,10 @@
 //!   one retry (`send_through`, plan 8f); a second 401, or nothing to
 //!   refresh, is `needs_auth` and `502 upstream_auth`; a refresh that did
 //!   not reach the vendor is `502 upstream_unreachable` and one not stored
-//!   `502 credential_unsaved`, neither `needs_auth` (gateway spec §4.5).
+//!   `502 credential_unsaved`, neither `needs_auth` (gateway spec §4.5). A
+//!   retry goes only to the URL its token was granted for: a grant for
+//!   another one, stored meanwhile, is `502 upstream_changed` (plan 8f
+//!   decision 13).
 //! - **Limits** (§5.7): per connection, the requests in flight and the open
 //!   `GET` streams; past either, 503. A request body has 30 s to arrive.
 //! - **Errors** the proxy answers itself are `ApiError` (`{code, message}`),
@@ -327,8 +330,11 @@ fn current_upstream(runtime: &Runtime, connection: &ScopedConnection) -> anyhow:
 
 /// The connection's upstream and credential for a request now: an OAuth
 /// access token within 5 minutes of its expiry is refreshed first,
-/// single-flight (gateway spec §4.4). A refresh that fails leaves the
-/// token there is: a 401 then has its own refresh and retry.
+/// single-flight (gateway spec §4.4), and then the URL and the token are
+/// read again, together: the refresh may have found another grant than the
+/// one read here (plan 8f decision 13). A refresh that fails leaves the
+/// token there is: a 401 then has its own refresh and retry. A grant
+/// without a refresh token never waits for the connection's lock.
 async fn upstream_for_request(
     runtime: &Arc<Runtime>,
     connection: &ScopedConnection,
@@ -337,13 +343,8 @@ async fn upstream_for_request(
         && let Some(credential) = runtime.store.oauth_credential(&connection.id, &runtime.key)?
         && refresh::due(credential.expires_at, unix_now())
         && credential.tokens.refresh_token.is_some()
-        && let Refreshed::Retry(fresh) = refresh::refresh(runtime.clone(), connection.id.clone(), None).await
     {
-        return Ok(Some(Upstream {
-            url: Url::parse(&credential.url)?,
-            internal_network: credential.internal_network,
-            auth: UpstreamAuth::bearer(fresh)?,
-        }));
+        refresh::refresh(runtime.clone(), connection.id.clone(), None).await;
     }
     current_upstream(runtime, connection)
 }
@@ -390,6 +391,9 @@ pub(crate) enum Sent {
     RefreshUnavailable,
     /// 401, and the refreshed grant could not be stored (no `needs_auth`).
     RefreshUnsaved,
+    /// 401, and the grant there is now is for another upstream: nothing
+    /// more was sent (no `needs_auth`).
+    Changed,
     Internal(anyhow::Error),
 }
 
@@ -447,7 +451,14 @@ pub(crate) async fn send_through(
     };
     match refresh::refresh(runtime.clone(), connection.id.clone(), Some(access.clone())).await {
         Refreshed::Retry(fresh) => {
-            let auth = match UpstreamAuth::bearer(fresh) {
+            // Only where the token was granted for (plan 8f decision 13).
+            if Url::parse(&fresh.url).ok().as_ref() != Some(&upstream.url)
+                || fresh.internal_network != upstream.internal_network
+            {
+                tracing::warn!(connection_id = %connection.id, slug = %connection.slug, "gateway proxy: the connection changed during its refresh; not retried");
+                return Sent::Changed;
+            }
+            let auth = match UpstreamAuth::bearer(fresh.access_token) {
                 Ok(auth) => auth,
                 Err(err) => return Sent::Internal(err),
             };
@@ -622,6 +633,16 @@ async fn proxy(
                 StatusCode::BAD_GATEWAY,
                 "credential_unsaved",
                 format!("connection {}'s refreshed grant could not be stored", connection.label),
+            );
+        }
+        Sent::Changed => {
+            return refuse(
+                StatusCode::BAD_GATEWAY,
+                "upstream_changed",
+                format!(
+                    "connection {} changed while its grant was refreshed: send again",
+                    connection.label
+                ),
             );
         }
         Sent::Internal(err) => return internal(err),
