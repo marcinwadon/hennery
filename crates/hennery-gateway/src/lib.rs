@@ -5,11 +5,19 @@
 //! (umbrella §9).
 
 pub mod api;
+pub mod callback;
 pub mod crypto;
+pub mod flows;
 mod jsonrpc;
 pub mod key;
 pub mod model;
+pub mod notify;
+pub mod oauth;
+mod oauth_api;
+pub mod probe;
 pub mod proxy;
+pub mod refresh;
+pub mod runtime;
 mod schema;
 pub mod scope;
 pub mod store;
@@ -30,18 +38,33 @@ use std::sync::Arc;
 #[error("the MCP gateway's master key is unavailable")]
 pub struct KeyUnavailable;
 
-/// The gateway on the collector's `hennery.db`: its store, and the master
-/// key from `keys`, made at the first start. Before serving, and after the
-/// admin socket's bind (the one-collector guard).
-pub fn open(db: &Path, keys: &key::KeySource, operator: Arc<Operator>) -> Result<api::GatewayState> {
+/// The gateway on the collector's `hennery.db`: its stores, and the master
+/// key from `keys`, made at the first start, sending through the
+/// collector's one `egress` and telling `notifier` of status transitions.
+/// Before serving, and after the admin socket's bind (the one-collector
+/// guard). The state's `runtime` is the one the proxy takes too
+/// (`proxy::ProxyState::for_sessions`).
+pub fn open(
+    db: &Path,
+    keys: &key::KeySource,
+    operator: Arc<Operator>,
+    egress: hennery_kernel::egress::Egress,
+    notifier: Arc<dyn notify::Notifier>,
+) -> Result<api::GatewayState> {
     let store = store::GatewayStore::open(db)?;
     let stored = store.has_ciphertext()?;
     let (key, origin) = key::load_or_create(keys, stored).map_err(|err| err.context(KeyUnavailable))?;
     store.check_key(&key).map_err(|err| err.context(KeyUnavailable))?;
     tracing::info!(source = ?origin, "the gateway's master key is loaded");
+    let runtime = runtime::Runtime::new(
+        Arc::new(store),
+        Arc::new(scope::ProxyStore::open(db)?),
+        Arc::new(key),
+        egress,
+        notifier,
+    );
     Ok(api::GatewayState {
-        store: Arc::new(store),
-        key: Arc::new(key),
+        runtime: Arc::new(runtime),
         operator,
     })
 }

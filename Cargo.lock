@@ -1448,6 +1448,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "chacha20poly1305",
  "ed25519-dalek",
  "futures",
@@ -1459,6 +1460,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",

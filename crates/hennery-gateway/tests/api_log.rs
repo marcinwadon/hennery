@@ -9,7 +9,11 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use hennery_gateway::api::{GatewayState, router};
 use hennery_gateway::key::MasterKey;
+use hennery_gateway::notify::Silent;
+use hennery_gateway::runtime::Runtime;
+use hennery_gateway::scope::ProxyStore;
 use hennery_gateway::store::GatewayStore;
+use hennery_kernel::egress::{Egress, Timeouts};
 use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::{Operator, SetupOutcome};
 use hennery_kernel::secret::unix_now;
@@ -40,6 +44,17 @@ fn contains(haystack: &[u8], needle: &str) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle.as_bytes())
 }
 
+/// The gateway's runtime on `db`, as the collector makes it.
+fn runtime(db: &std::path::Path, store: Arc<GatewayStore>, key: Arc<MasterKey>) -> Arc<Runtime> {
+    Arc::new(Runtime::new(
+        store,
+        Arc::new(ProxyStore::open(db).unwrap()),
+        key,
+        Egress::new(Timeouts::DEFAULT).unwrap(),
+        Arc::new(Silent),
+    ))
+}
+
 #[tokio::test]
 async fn a_static_token_is_never_logged_answered_or_stored_in_clear() {
     let captured = Captured::default();
@@ -64,8 +79,7 @@ async fn a_static_token_is_never_logged_answered_or_stored_in_clear() {
     let store = Arc::new(GatewayStore::open(&db).unwrap());
     let key = Arc::new(MasterKey::from_bytes([5; 32]));
     let app = router(GatewayState {
-        store: store.clone(),
-        key: key.clone(),
+        runtime: runtime(&db, store.clone(), key.clone()),
         operator,
     });
     let send = |method: &str, path: &str, body: String| {
@@ -186,8 +200,11 @@ async fn an_upstream_url_is_logged_and_shown_only_as_its_origin() {
     let session = operator.open_session("test", &phc, now).unwrap().unwrap();
     let hat = Hosts::open(&db).unwrap().default_hat_for_new_hosts().unwrap();
     let app = router(GatewayState {
-        store: Arc::new(GatewayStore::open(&db).unwrap()),
-        key: Arc::new(MasterKey::from_bytes([5; 32])),
+        runtime: runtime(
+            &db,
+            Arc::new(GatewayStore::open(&db).unwrap()),
+            Arc::new(MasterKey::from_bytes([5; 32])),
+        ),
         operator,
     });
     let url = format!("https://mcp.vendor.example:8443/s/{CANARY}/mcp?key={CANARY}");

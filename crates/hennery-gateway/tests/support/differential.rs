@@ -129,7 +129,7 @@ impl Decoder {
     }
 
     /// The member `name` of `node`, as this decoder finds it.
-    fn get<'a>(self, node: &'a Node, name: &str) -> Option<&'a Node> {
+    pub fn get<'a>(self, node: &'a Node, name: &str) -> Option<&'a Node> {
         let Node::Obj(entries) = node else {
             return None;
         };

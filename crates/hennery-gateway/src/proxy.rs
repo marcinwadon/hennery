@@ -22,8 +22,12 @@
 //!   answers"). An event stream is passed on event by event: a complete
 //!   event is never held, a partial one waits for its end (plan 8d decision
 //!   5).
-//! - **401** (§5.4) is never passed on: `502 upstream_auth`. The one place
-//!   an OAuth refresh and retry goes is `refreshed` (plan 8f).
+//! - **401** (§5.4) is never passed on. Static and `none`: `502
+//!   upstream_auth` and `needs_auth`. OAuth: one single-flight refresh and
+//!   one retry (`send_through`, plan 8f); a second 401, or nothing to
+//!   refresh, is `needs_auth` and `502 upstream_auth`; a refresh that did
+//!   not reach the vendor is `502 upstream_unreachable` and one not stored
+//!   `502 credential_unsaved`, neither `needs_auth` (gateway spec §4.5).
 //! - **Limits** (§5.7): per connection, the requests in flight and the open
 //!   `GET` streams; past either, 503. A request body has 30 s to arrive.
 //! - **Errors** the proxy answers itself are `ApiError` (`{code, message}`),
@@ -36,10 +40,10 @@
 //!   credential or more of the upstream URL than its origin (lane L11).
 
 use crate::jsonrpc::{self, Answered, BOM, EventOutcome, Inspected};
-use crate::key::MasterKey;
 use crate::model::{CredKind, url_for_logs};
-use crate::scope::{ClientIdentity, MountPolicy, Principal, ProxyStore, ScopedConnection};
-use crate::store::GatewayStore;
+use crate::refresh::{self, Refreshed};
+use crate::runtime::Runtime;
+use crate::scope::{ClientIdentity, MountPolicy, Principal, ScopedConnection};
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::rejection::PathRejection;
@@ -49,13 +53,14 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{any, post};
 use futures::{Stream, StreamExt};
-use hennery_kernel::egress::{Allowance, Egress, EgressClient, Limiter, Permit};
+use hennery_kernel::egress::{EgressError, Limiter, Permit};
 use hennery_kernel::secret::unix_now;
 use hennery_proto::rest::ApiError;
 use serde_json::Value;
 use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
+use zeroize::Zeroizing;
 
 /// The largest request body (gateway spec §5.1).
 pub const MAX_REQUEST_BODY: usize = 4 * 1024 * 1024;
@@ -127,32 +132,20 @@ pub struct ProxyState {
     pub identity: Arc<dyn ClientIdentity>,
     /// Principal → connections.
     pub mounts: Arc<dyn MountPolicy>,
-    /// Static credentials, with where they go (`static_credential`).
-    pub credentials: Arc<GatewayStore>,
-    /// What live traffic says of a connection's status.
-    pub statuses: Arc<ProxyStore>,
-    pub key: Arc<MasterKey>,
-    pub egress: Egress,
+    /// The stores, the key, the egress policy, the refresh locks and the
+    /// `Notifier`, shared with the API (plan 8f decision 3).
+    pub runtime: Arc<Runtime>,
     pub limits: Limits,
 }
 
 impl ProxyState {
-    /// Full mode (umbrella §10.2): session tokens and host mounts, both from
-    /// `store`.
-    pub fn full(
-        store: Arc<ProxyStore>,
-        credentials: Arc<GatewayStore>,
-        key: Arc<MasterKey>,
-        egress: Egress,
-        limits: Limits,
-    ) -> Self {
+    /// Full mode (umbrella §10.2): session tokens and host mounts, both
+    /// from the runtime's `ProxyStore`.
+    pub fn for_sessions(runtime: Arc<Runtime>, limits: Limits) -> Self {
         Self {
-            identity: store.clone(),
-            mounts: store.clone(),
-            credentials,
-            statuses: store,
-            key,
-            egress,
+            identity: runtime.statuses.clone(),
+            mounts: runtime.statuses.clone(),
+            runtime,
             limits,
         }
     }
@@ -241,11 +234,17 @@ fn bearer(headers: &HeaderMap) -> Option<&str> {
 }
 
 /// How the request authenticates upstream. Its `Debug` shows no secret.
-enum UpstreamAuth {
+pub(crate) enum UpstreamAuth {
     /// `cred_kind = none`: no credential header.
     None,
     /// `cred_kind = static`: `<header>: <prefix><token>`.
     Static { header: HeaderName, value: HeaderValue },
+    /// An OAuth kind: `Authorization: Bearer <access token>`, and the token
+    /// itself, to tell a refresh which one failed (gateway spec §4.5).
+    Oauth {
+        value: HeaderValue,
+        access: Zeroizing<String>,
+    },
 }
 
 impl std::fmt::Debug for UpstreamAuth {
@@ -253,35 +252,46 @@ impl std::fmt::Debug for UpstreamAuth {
         match self {
             Self::None => f.write_str("None"),
             Self::Static { header, .. } => write!(f, "Static({header}: <redacted>)"),
+            Self::Oauth { .. } => f.write_str("Oauth(<redacted>)"),
+        }
+    }
+}
+
+impl UpstreamAuth {
+    /// An OAuth access token as the header it goes in.
+    fn bearer(access: Zeroizing<String>) -> anyhow::Result<Self> {
+        let mut value = HeaderValue::from_str(&format!("Bearer {}", access.as_str()))?;
+        value.set_sensitive(true);
+        Ok(Self::Oauth { value, access })
+    }
+
+    /// Put the credential into `headers`; `none` puts nothing.
+    fn apply(&self, headers: &mut HeaderMap) {
+        match self {
+            Self::None => {}
+            Self::Static { header, value } => {
+                headers.insert(header.clone(), value.clone());
+            }
+            Self::Oauth { value, .. } => {
+                headers.insert(header::AUTHORIZATION, value.clone());
+            }
         }
     }
 }
 
 /// Where one request goes and how: read with the credential itself, so an
 /// edit cannot move the URL between them (plan 8a's R2).
-struct Upstream {
-    url: Url,
+pub(crate) struct Upstream {
+    pub(crate) url: Url,
     /// The connection's stored flag, as read for this request.
-    internal_network: bool,
+    pub(crate) internal_network: bool,
     auth: UpstreamAuth,
 }
 
-/// The egress client a connection's requests go through: chosen at every
-/// request from the connection's stored `internal_network` flag, never from
-/// anything in the request (plan 8d decision 9). The one place the choice
-/// is made, so a later client for the internal network swaps in here.
-fn egress_client(egress: &Egress, internal_network: bool) -> EgressClient {
-    egress.client(if internal_network {
-        Allowance::InternalNetwork
-    } else {
-        Allowance::PublicOnly
-    })
-}
-
-/// The connection's upstream and credential now. `None`: it has none it
-/// can use (a `static` connection without a token, or a kind the proxy
-/// does not take yet), so nothing is sent (plan 8d decision 3).
-fn upstream(state: &ProxyState, connection: &ScopedConnection) -> anyhow::Result<Option<Upstream>> {
+/// The connection's upstream and credential as stored now, without a
+/// refresh. `None`: it has none it can use (a `static` or OAuth connection
+/// without one), so nothing is sent (plan 8d decision 3).
+fn current_upstream(runtime: &Runtime, connection: &ScopedConnection) -> anyhow::Result<Option<Upstream>> {
     match connection.cred_kind {
         CredKind::None => Ok(Some(Upstream {
             url: Url::parse(&connection.url)?,
@@ -289,7 +299,7 @@ fn upstream(state: &ProxyState, connection: &ScopedConnection) -> anyhow::Result
             auth: UpstreamAuth::None,
         })),
         CredKind::Static => {
-            let Some(credential) = state.credentials.static_credential(&connection.id, &state.key)? else {
+            let Some(credential) = runtime.store.static_credential(&connection.id, &runtime.key)? else {
                 return Ok(None);
             };
             let header = HeaderName::from_bytes(credential.static_header.as_bytes())?;
@@ -302,18 +312,40 @@ fn upstream(state: &ProxyState, connection: &ScopedConnection) -> anyhow::Result
                 auth: UpstreamAuth::Static { header, value },
             }))
         }
-        // Plan 8f.
-        CredKind::OauthDcr | CredKind::OauthClient => Ok(None),
+        CredKind::OauthDcr | CredKind::OauthClient => {
+            let Some(credential) = runtime.store.oauth_credential(&connection.id, &runtime.key)? else {
+                return Ok(None);
+            };
+            Ok(Some(Upstream {
+                url: Url::parse(&credential.url)?,
+                internal_network: credential.internal_network,
+                auth: UpstreamAuth::bearer(credential.tokens.access_token.clone())?,
+            }))
+        }
     }
 }
 
-/// The seam for plan 8f: after an upstream 401, a fresh credential to try
-/// once more, single-flight per connection. Static and `none` credentials
-/// have nothing to refresh.
-async fn refreshed(_state: &ProxyState, _connection: &ScopedConnection, auth: &UpstreamAuth) -> Option<UpstreamAuth> {
-    match auth {
-        UpstreamAuth::None | UpstreamAuth::Static { .. } => None,
+/// The connection's upstream and credential for a request now: an OAuth
+/// access token within 5 minutes of its expiry is refreshed first,
+/// single-flight (gateway spec §4.4). A refresh that fails leaves the
+/// token there is: a 401 then has its own refresh and retry.
+async fn upstream_for_request(
+    runtime: &Arc<Runtime>,
+    connection: &ScopedConnection,
+) -> anyhow::Result<Option<Upstream>> {
+    if connection.cred_kind.is_oauth()
+        && let Some(credential) = runtime.store.oauth_credential(&connection.id, &runtime.key)?
+        && refresh::due(credential.expires_at, unix_now())
+        && credential.tokens.refresh_token.is_some()
+        && let Refreshed::Retry(fresh) = refresh::refresh(runtime.clone(), connection.id.clone(), None).await
+    {
+        return Ok(Some(Upstream {
+            url: Url::parse(&credential.url)?,
+            internal_network: credential.internal_network,
+            auth: UpstreamAuth::bearer(fresh)?,
+        }));
     }
+    current_upstream(runtime, connection)
 }
 
 /// The upstream request's headers: the allowlist, `Accept` defaulted, no
@@ -334,10 +366,116 @@ fn upstream_headers(downstream: &HeaderMap, auth: &UpstreamAuth, json_body: bool
         out.insert(header::ACCEPT, HeaderValue::from_static(DEFAULT_ACCEPT));
     }
     out.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("identity"));
-    if let UpstreamAuth::Static { header, value } = auth {
-        out.insert(header.clone(), value.clone());
-    }
+    auth.apply(&mut out);
     out
+}
+
+/// What sending a request through a connection came to (`send_through`).
+pub(crate) enum Sent {
+    /// An answer other than 401, after one refresh and retry at most.
+    Answer {
+        response: reqwest::Response,
+        upstream: Upstream,
+    },
+    /// The connection has no credential to send: nothing was sent.
+    NoCredential,
+    /// The upstream was not reached; the error carries no URL.
+    Unreachable {
+        error: EgressError,
+        upstream: Url,
+    },
+    /// 401, and no refresh helped: the connection is `needs_auth`.
+    AuthRefused,
+    /// 401, and the refresh did not reach the vendor (no `needs_auth`).
+    RefreshUnavailable,
+    /// 401, and the refreshed grant could not be stored (no `needs_auth`).
+    RefreshUnsaved,
+    Internal(anyhow::Error),
+}
+
+/// Send one request through `connection` (gateway spec §5.2, §5.4): its
+/// credential now, its egress client, the forwarded headers, and on a 401
+/// one single-flight refresh and one retry. The one forwarding path, the
+/// proxy's and the probe's (gateway spec §7). A 401 that nothing fixes sets
+/// `needs_auth`; a 2xx sets nothing here (live traffic's `ok` is the
+/// proxy's, never the probe's).
+pub(crate) async fn send_through(
+    runtime: &Arc<Runtime>,
+    connection: &ScopedConnection,
+    method: &Method,
+    downstream: &HeaderMap,
+    body: Option<Bytes>,
+    head_timeout: Duration,
+) -> Sent {
+    let upstream = match upstream_for_request(runtime, connection).await {
+        Ok(Some(upstream)) => upstream,
+        Ok(None) => return Sent::NoCredential,
+        Err(err) => return Sent::Internal(err),
+    };
+    let client = runtime.client(upstream.internal_network);
+    let send = |auth: &UpstreamAuth| {
+        let mut request = reqwest::Request::new(method.clone(), upstream.url.clone());
+        *request.headers_mut() = upstream_headers(downstream, auth, body.is_some());
+        *request.body_mut() = body.clone().map(reqwest::Body::from);
+        *request.timeout_mut() = Some(head_timeout);
+        client.send_streaming(request)
+    };
+    let refused = |note: &str| {
+        tracing::warn!(connection_id = %connection.id, slug = %connection.slug, "gateway proxy: the upstream refused the credential");
+        runtime.announce(
+            runtime
+                .statuses
+                .mark_needs_auth(&connection.id, upstream.url.as_str(), note, unix_now()),
+        );
+        Sent::AuthRefused
+    };
+    let response = match send(&upstream.auth).await {
+        Ok(response) => response,
+        Err(error) => {
+            return Sent::Unreachable {
+                error,
+                upstream: upstream.url.clone(),
+            };
+        }
+    };
+    if response.status() != StatusCode::UNAUTHORIZED {
+        return Sent::Answer { response, upstream };
+    }
+    drop(response);
+    let UpstreamAuth::Oauth { access, .. } = &upstream.auth else {
+        return refused("the upstream refused the credential (401)");
+    };
+    match refresh::refresh(runtime.clone(), connection.id.clone(), Some(access.clone())).await {
+        Refreshed::Retry(fresh) => {
+            let auth = match UpstreamAuth::bearer(fresh) {
+                Ok(auth) => auth,
+                Err(err) => return Sent::Internal(err),
+            };
+            match send(&auth).await {
+                Ok(response) if response.status() == StatusCode::UNAUTHORIZED => {
+                    drop(response);
+                    refused("the upstream refused the refreshed credential (401)")
+                }
+                Ok(response) => Sent::Answer {
+                    response,
+                    upstream: Upstream {
+                        url: upstream.url.clone(),
+                        internal_network: upstream.internal_network,
+                        auth,
+                    },
+                },
+                Err(error) => Sent::Unreachable {
+                    error,
+                    upstream: upstream.url.clone(),
+                },
+            }
+        }
+        Refreshed::NotRefreshable => refused("the upstream refused the credential (401), and it cannot be refreshed"),
+        // The refresh set `needs_auth` itself.
+        Refreshed::Refused => Sent::AuthRefused,
+        Refreshed::Unavailable => Sent::RefreshUnavailable,
+        Refreshed::Unsaved => Sent::RefreshUnsaved,
+    }
 }
 
 /// Read `body` whole, refusing past `cap` bytes.
@@ -436,36 +574,28 @@ async fn proxy(
     } else {
         None
     };
-    let upstream = match upstream(&state, &connection) {
-        Ok(Some(upstream)) => upstream,
-        Ok(None) => {
+    let runtime = &state.runtime;
+    let sent = send_through(
+        runtime,
+        &connection,
+        &method,
+        &headers,
+        body.map(Bytes::from),
+        state.limits.head_timeout,
+    )
+    .await;
+    let (response, upstream) = match sent {
+        Sent::Answer { response, upstream } => (response, upstream),
+        Sent::NoCredential => {
             tracing::info!(connection_id = %connection.id, slug = %connection.slug, "gateway proxy: the connection has no credential to send");
             return upstream_auth(&connection);
         }
-        Err(err) => return internal(err),
-    };
-    let client = egress_client(&state.egress, upstream.internal_network);
-    let send = |auth: &UpstreamAuth| {
-        let mut request = reqwest::Request::new(method.clone(), upstream.url.clone());
-        *request.headers_mut() = upstream_headers(&headers, auth, body.is_some());
-        *request.body_mut() = body.clone().map(reqwest::Body::from);
-        *request.timeout_mut() = Some(state.limits.head_timeout);
-        client.send_streaming(request)
-    };
-    let mut response = send(&upstream.auth).await;
-    if matches!(&response, Ok(r) if r.status() == StatusCode::UNAUTHORIZED)
-        && let Some(fresh) = refreshed(&state, &connection, &upstream.auth).await
-    {
-        response = send(&fresh).await;
-    }
-    let response = match response {
-        Ok(response) => response,
-        Err(err) => {
+        Sent::Unreachable { error, upstream } => {
             tracing::warn!(
                 connection_id = %connection.id,
                 slug = %connection.slug,
-                upstream = %url_for_logs(upstream.url.as_str()),
-                error = %err,
+                upstream = %url_for_logs(upstream.as_str()),
+                error = %error,
                 "gateway proxy: the upstream was not reached"
             );
             return refuse(
@@ -474,20 +604,30 @@ async fn proxy(
                 format!("connection {} could not be reached", connection.label),
             );
         }
+        Sent::AuthRefused => return upstream_auth(&connection),
+        // A refresh that did not reach the vendor, or was not stored, is
+        // no reason to sign in again (gateway spec §4.5).
+        Sent::RefreshUnavailable => {
+            return refuse(
+                StatusCode::BAD_GATEWAY,
+                "upstream_unreachable",
+                format!(
+                    "connection {}'s authorization server could not be reached to refresh its grant",
+                    connection.label
+                ),
+            );
+        }
+        Sent::RefreshUnsaved => {
+            return refuse(
+                StatusCode::BAD_GATEWAY,
+                "credential_unsaved",
+                format!("connection {}'s refreshed grant could not be stored", connection.label),
+            );
+        }
+        Sent::Internal(err) => return internal(err),
     };
     let status = response.status();
     tracing::debug!(connection_id = %connection.id, slug = %connection.slug, %method, status = status.as_u16(), "gateway proxy: upstream answered");
-    if status == StatusCode::UNAUTHORIZED {
-        drop(response);
-        tracing::warn!(connection_id = %connection.id, slug = %connection.slug, "gateway proxy: the upstream refused the credential");
-        if let Err(err) = state
-            .statuses
-            .mark_needs_auth(&connection.id, upstream.url.as_str(), now)
-        {
-            tracing::error!(connection_id = %connection.id, error = %err, "gateway proxy: status not recorded");
-        }
-        return upstream_auth(&connection);
-    }
     if status.is_redirection() {
         tracing::warn!(connection_id = %connection.id, slug = %connection.slug, status = status.as_u16(), "gateway proxy: the upstream redirected, not followed");
         return refuse(
@@ -510,12 +650,12 @@ async fn proxy(
     // A body-less 2xx proves nothing: some upstreams take a notification
     // before they check its credential (the review's O5). An empty body
     // under a type is no more (the Task 2 review).
-    if status.is_success()
-        && !matches!(kind, BodyKind::Empty)
-        && response.content_length() != Some(0)
-        && let Err(err) = state.statuses.mark_ok(&connection.id, upstream.url.as_str(), now)
-    {
-        tracing::error!(connection_id = %connection.id, error = %err, "gateway proxy: status not recorded");
+    if status.is_success() && !matches!(kind, BodyKind::Empty) && response.content_length() != Some(0) {
+        runtime.announce(
+            runtime
+                .statuses
+                .record_traffic_ok(&connection.id, upstream.url.as_str(), now),
+        );
     }
     let mut out = HeaderMap::new();
     for name in FORWARDED_RESPONSE_HEADERS {
@@ -693,7 +833,9 @@ impl Answerer {
             return;
         };
         let current = match self.state.mounts.connection(&self.principal, &self.slug) {
-            Ok(Some(connection)) if connection.id == self.connection_id => upstream(&self.state, &connection),
+            Ok(Some(connection)) if connection.id == self.connection_id => {
+                current_upstream(&self.state.runtime, &connection)
+            }
             Ok(_) => Ok(None),
             Err(err) => Err(err),
         };
@@ -718,13 +860,11 @@ impl Answerer {
         if let Some(version) = &self.protocol_version {
             headers.insert("mcp-protocol-version", version.clone());
         }
-        if let UpstreamAuth::Static { header, value } = &auth {
-            headers.insert(header.clone(), value.clone());
-        }
+        auth.apply(&mut headers);
         let mut request = reqwest::Request::new(Method::POST, self.url.clone());
         *request.headers_mut() = headers;
         *request.body_mut() = Some(serde_json::to_vec(answer).expect("a JSON value serialises").into());
-        let client = egress_client(&self.state.egress, self.internal_network);
+        let client = self.state.runtime.client(self.internal_network);
         let connection_id = self.connection_id.clone();
         tokio::spawn(async move {
             let _permit = permit;

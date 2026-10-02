@@ -84,13 +84,15 @@ const SOURCES: &[(&str, &str, usize)] = &[
     (
         "hennery-gateway/src/scope.rs",
         include_str!("../../hennery-gateway/src/scope.rs"),
-        5,
+        // Plan 8f: status writes, the probe's reads.
+        12,
     ),
 ];
 
-/// The gateway store's statements (plan 8a), apart from the list above so
-/// that other lanes' changes to it stay apart from this one.
-const GATEWAY_STATEMENTS: usize = 23;
+/// The gateway store's statements (plan 8a; plan 8f's OAuth clients and
+/// grants), apart from the list above so that other lanes' changes to it
+/// stay apart from this one.
+const GATEWAY_STATEMENTS: usize = 44;
 
 /// Files under `crates/*/src` with SQL that the audit does not read, and
 /// why (3b-iii review, A3). Any other such file fails
