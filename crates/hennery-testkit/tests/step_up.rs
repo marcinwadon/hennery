@@ -2,10 +2,10 @@
 //! minting a pairing code, changing or revoking a host, replacing its path
 //! rules, changing a hat (plan 5a decisions 7 and 8), re-assigning a
 //! session to another hat (plan 5d decision 2), subscribing a browser to
-//! push (plan 10a decision 4), deleting a session (plan 9a decision 5) and
-//! revoking a signed-in session need
-//! a password check within the last five minutes, and are refused without
-//! one, accepted within five minutes, and refused after.
+//! push (plan 10a decision 4), deleting a session (plan 9a decision 5),
+//! purging a hat (plan 9c decision 10) and revoking a signed-in session
+//! need a password check within the last five minutes, and are refused
+//! without one, accepted within five minutes, and refused after.
 
 use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::Operator;
@@ -111,6 +111,8 @@ async fn minting_changing_revoking_a_host_and_revoking_a_session_need_a_fresh_pa
             404,
         ),
         ("PATCH", "/api/hats/hat-9".to_string(), Some(r#"{"name":"x"}"#), 404),
+        // Refused before anything is read: 403, not 404, for an unknown hat.
+        ("POST", "/api/hats/hat-9/purge".to_string(), None, 404),
         (
             "PATCH",
             "/api/sessions/s-9".to_string(),
@@ -148,11 +150,14 @@ async fn minting_changing_revoking_a_host_and_revoking_a_session_need_a_fresh_pa
     assert_eq!(code_of(resp).await, (403, "step_up_required".into()));
     assert!(c.state.store.find_session("s-kept").unwrap().is_some());
     // A PATCH that names no hat needs no step-up (plan 5d decision 2), nor
-    // does a GET of the path DELETE shares (plan 9a decision 5).
+    // does a GET of the path DELETE shares (plan 9a decision 5), nor a
+    // purge's preview, which only reads (plan 9c decision 11).
     let resp = send(&stale, "PATCH", "/api/sessions/s-9", Some("{}")).await.unwrap();
     assert_eq!(resp.status(), 404);
     let resp = send(&stale, "GET", "/api/sessions/s-9", None).await.unwrap();
     assert_eq!(resp.status(), 404);
+    let resp = send(&stale, "GET", "/api/hats/hat-9/purge", None).await.unwrap();
+    assert_eq!(code_of(resp).await, (404, "not_found".into()));
     assert!(c.state.operator.authenticate(&other, unix_now()).unwrap().is_some());
     // A wrong password does not step up.
     assert_eq!(
