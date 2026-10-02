@@ -8,10 +8,13 @@
 
 let token: string | null = null
 
-if (location.pathname === '/setup' && location.hash.length > 1) {
+// `/setup/` too: the router shows it as /setup, so its fragment is the token.
+const onSetup = /^\/setup\/?$/.test(location.pathname)
+
+if (onSetup && location.hash.length > 1) {
   token = location.hash.slice(1)
 }
-if (location.pathname === '/setup' && location.hash !== '') {
+if (onSetup && location.hash !== '') {
   history.replaceState(null, '', '/setup')
 }
 

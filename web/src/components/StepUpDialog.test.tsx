@@ -87,6 +87,8 @@ describe('the step-up dialog', () => {
     expect(screen.queryByRole('dialog')).toBeNull()
     expect(screen.getByLabelText('Name')).toHaveValue('laptop')
     expect(server.sent.filter((s) => s.path === '/api/hosts/pairing-codes')).toHaveLength(1)
+    // Focus is back on what opened the dialog.
+    expect(screen.getByRole('button', { name: 'Pair' })).toHaveFocus()
   })
 
   it('closes on Escape, as a cancel', async () => {

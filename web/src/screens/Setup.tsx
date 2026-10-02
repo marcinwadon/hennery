@@ -18,7 +18,10 @@ const FINAL = ['invalid_setup_token', 'already_set_up']
 
 export default function Setup() {
   const client = useClient()
-  const [token] = useState(setupToken)
+  // Whether the form is offered: only a boolean, never a copy of the token,
+  // which lives in `setup-token` alone so that forgetting it there forgets it.
+  // A final answer withdraws the form: the token it would send is dead.
+  const [offered, setOffered] = useState(() => setupToken() !== null)
   const [password, setPassword] = useState('')
   const [confirm, setConfirm] = useState('')
   const [publicUrl, setPublicUrl] = useState(() => location.origin)
@@ -36,14 +39,23 @@ export default function Setup() {
       setError('The two passwords differ.')
       return
     }
+    // Read at the moment of sending, so a forgotten token is never sent.
+    const token = setupToken()
+    if (token === null) {
+      setOffered(false)
+      return
+    }
     setError(null)
     setBusy(true)
     try {
-      await setUp(client, { token: token ?? '', password, publicUrl, defaultHatName: hatName })
+      await setUp(client, { token, password, publicUrl, defaultHatName: hatName })
       forgetSetupToken()
       setDone(true)
     } catch (err) {
-      if (err instanceof ApiFailure && FINAL.includes(err.code)) forgetSetupToken()
+      if (err instanceof ApiFailure && FINAL.includes(err.code)) {
+        forgetSetupToken()
+        setOffered(false)
+      }
       if (err instanceof ApiFailure && err.code === 'already_set_up') setAlreadySetUp(true)
       setError(messageOf(err))
     } finally {
@@ -56,7 +68,18 @@ export default function Setup() {
       <div className="auth-card">
         <div className="brand-name">hennery</div>
         <h1>Set up hennery</h1>
-        {!token ? (
+        {!offered && error ? (
+          <>
+            <p className="form-error" role="alert">
+              <bdi>{error}</bdi>
+            </p>
+            {alreadySetUp && (
+              <p>
+                <Link to="/login">Sign in</Link>
+              </p>
+            )}
+          </>
+        ) : !offered ? (
           <p className="form-error" role="alert">
             This page needs the setup link. Run <code>hennery admin setup-url</code> on the collector and open the link
             it prints.
@@ -116,11 +139,6 @@ export default function Setup() {
             {error && (
               <p className="form-error" role="alert">
                 <bdi>{error}</bdi>
-              </p>
-            )}
-            {alreadySetUp && (
-              <p>
-                <Link to="/login">Sign in</Link>
               </p>
             )}
             <button type="submit" className="btn btn-primary" disabled={busy}>

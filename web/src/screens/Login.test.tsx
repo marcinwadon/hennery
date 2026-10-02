@@ -120,6 +120,20 @@ describe('login', () => {
     expect(screen.getByRole('button', { name: 'Sign in' })).toBeDisabled()
   })
 
+  it.each([
+    ['no Retry-After', {}],
+    ['a Retry-After that is a date', { 'Retry-After': 'Wed, 21 Oct 2026 07:28:00 GMT' }],
+  ])('waits 60 s on a 429 with %s', async (_, headers: Record<string, string>) => {
+    const server = stubServer({
+      'POST /api/auth/login': json(429, { code: 'rate_limited', message: 'm' }, headers),
+    })
+    render(<App fetchImpl={server.fetch} />)
+    await userEvent.type(screen.getByLabelText('Password'), 'not the password')
+    await userEvent.click(screen.getByRole('button', { name: 'Sign in' }))
+    expect(await screen.findByText('You can try again in 60 s.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Sign in' })).toBeDisabled()
+  })
+
   it('explains a collector that is not set up', async () => {
     withPasskeys()
     const server = stubServer({

@@ -30,6 +30,14 @@ describe('setup', () => {
     expect(history.length).toBe(before)
   })
 
+  it('takes the token from /setup/ as well, and leaves /setup', async () => {
+    const before = history.length
+    await load('/setup/#tok-456')
+    expect(location.href).toBe(`${location.origin}/setup`)
+    expect(history.length).toBe(before)
+    expect((await import('../setup-token')).setupToken()).toBe('tok-456')
+  })
+
   it('sends the token, password, this origin and the hat name, then offers a passkey', async () => {
     const App = await load('/setup#tok-123')
     const server = stubServer({ 'POST /api/setup': json(201, { public_url: location.origin }) })
@@ -92,6 +100,9 @@ describe('setup', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('hennery admin setup-url')
     expect(location.pathname).toBe('/setup')
     expect((await import('../setup-token')).setupToken()).toBeNull()
+    // The form goes with the token: a second try has nothing to send.
+    expect(screen.queryByRole('button', { name: 'Set up' })).toBeNull()
+    expect(server.sent).toHaveLength(1)
   })
 
   it('points to sign-in once set up already', async () => {
@@ -101,6 +112,10 @@ describe('setup', () => {
     await fill()
     await userEvent.click(screen.getByRole('button', { name: 'Set up' }))
     expect(await screen.findByRole('link', { name: 'Sign in' })).toHaveAttribute('href', '/login')
+    expect(screen.getByRole('alert')).toBeInTheDocument()
+    expect((await import('../setup-token')).setupToken()).toBeNull()
+    expect(screen.queryByRole('button', { name: 'Set up' })).toBeNull()
+    expect(server.sent).toHaveLength(1)
   })
 
   it('refuses two different passwords without asking the server', async () => {
