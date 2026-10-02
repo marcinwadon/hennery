@@ -4,6 +4,7 @@
 
 mod admin;
 mod config;
+mod doctor;
 mod healthcheck;
 mod inherit;
 mod lock;
@@ -47,6 +48,9 @@ enum Command {
     Admin(admin::AdminArgs),
     /// Run hennery as a per-user service (launchd, systemd).
     Service(service::ServiceArgs),
+    /// Diagnose this machine's hennery: each check ok, warn or fail, with a
+    /// fix. Reads only.
+    Doctor(doctor::DoctorArgs),
 }
 
 #[derive(Subcommand)]
@@ -322,6 +326,7 @@ async fn main() -> std::process::ExitCode {
         Command::Up(args) => run_up(args).await,
         Command::Admin(args) => admin::run(args).await.map(|()| std::process::ExitCode::SUCCESS),
         Command::Service(args) => service::run(args),
+        Command::Doctor(args) => doctor::run(args),
     };
     match result {
         Ok(code) => code,

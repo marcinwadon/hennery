@@ -522,13 +522,21 @@ pub fn hold_in_use(layout: &Layout, set: &InstalledSet) -> Result<std::fs::File>
     bail!("set {} stays locked by a collection", set.id)
 }
 
+/// glibc's dynamic loader on `platform`, which the managed Node and the
+/// Claude CLI need (distribution §1.1); `None` where there is none to need.
+pub fn glibc_loader(platform: Platform) -> Option<&'static str> {
+    match platform {
+        Platform::LinuxX64 => Some("/lib64/ld-linux-x86-64.so.2"),
+        Platform::LinuxArm64 => Some("/lib/ld-linux-aarch64.so.1"),
+        Platform::DarwinArm64 => None,
+    }
+}
+
 /// Refuse a host the managed runtime cannot run on: on Linux, one without
 /// glibc's dynamic loader (musl, or NixOS without nix-ld; distribution §1.1).
 pub fn check_host(platform: Platform) -> Result<()> {
-    let loader = match platform {
-        Platform::LinuxX64 => "/lib64/ld-linux-x86-64.so.2",
-        Platform::LinuxArm64 => "/lib/ld-linux-aarch64.so.1",
-        Platform::DarwinArm64 => return Ok(()),
+    let Some(loader) = glibc_loader(platform) else {
+        return Ok(());
     };
     if !Path::new(loader).exists() {
         bail!(

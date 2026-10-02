@@ -256,6 +256,39 @@ pub fn env_file(path: &str) -> String {
     format!("# Written by `hennery service install`: the login shell's PATH.\nPATH=\"{escaped}\"\n")
 }
 
+/// The `PATH` of a plist `plist` wrote: that one value of its
+/// `EnvironmentVariables`. Nothing else in them is read: a user may have
+/// added a secret there by hand.
+pub fn plist_path(text: &str) -> Option<String> {
+    let (_, rest) = text.split_once("<key>EnvironmentVariables</key>")?;
+    let (dict, _) = rest.split_once("</dict>")?;
+    let (_, after) = dict.split_once("<key>PATH</key>")?;
+    let (between, value) = after.split_once("<string>")?;
+    if !between.trim().is_empty() {
+        return None;
+    }
+    let (value, _) = value.split_once("</string>")?;
+    Some(unxml(value))
+}
+
+/// The `PATH` of an environment file `env_file` wrote: that line's value,
+/// unquoted and unescaped; the last such line, as systemd takes the last.
+/// No other line is read, as with the plist.
+pub fn env_file_path(text: &str) -> Option<String> {
+    let line = text.lines().rev().find_map(|l| l.strip_prefix("PATH="))?;
+    let quoted = line.trim_end().strip_prefix('"')?.strip_suffix('"')?;
+    let mut path = String::new();
+    let mut chars = quoted.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            path.push(chars.next()?);
+        } else {
+            path.push(c);
+        }
+    }
+    Some(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
