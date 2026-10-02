@@ -19,9 +19,11 @@ use hennery_proto::rest::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const MIGRATIONS: &[&str] = &[
     "
@@ -213,6 +215,62 @@ const MIGRATIONS: &[&str] = &[
     "
     CREATE INDEX IF NOT EXISTS events_by_session ON events(session_id, event_id);
 ",
+    // Session delete (ACP core §4.10; plan 9a decisions 1, 2 and 6, A5,
+    // A9). A turn's own links to the images it shows, as `event_attachments`
+    // are an event's, so an image a turn shows that never started (no
+    // `user_turn`) is still referenced; they go with the turn. Backfilled
+    // from each turn's content as `link_attachments` links an event: an
+    // image block with a hash, at its index, where the owner's row exists.
+    // A block that is no object is never read as JSON (`CASE` decides
+    // before `json_extract` runs; `AND` does not promise an order). Whether
+    // any owner still names a file (`shared_files`) walks its hash's index.
+    //
+    // A deleted session (`lifecycle = 'deleted'`) is a tombstone and never
+    // comes back: nothing is added for it, and its row is never changed
+    // again. The store's own writers check first, so a racing writer gets
+    // a typed answer; these triggers are the schema's word. A later
+    // migration that UPDATEs `sessions` must exclude tombstones
+    // (`lifecycle <> 'deleted'`), or this trigger aborts it.
+    "
+    CREATE TABLE turn_attachments (
+        turn_id TEXT NOT NULL REFERENCES turns(turn_id) ON DELETE CASCADE,
+        sha256 TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        owner_id TEXT NOT NULL REFERENCES owners(id),
+        PRIMARY KEY (turn_id, position),
+        FOREIGN KEY (owner_id, sha256) REFERENCES attachments(owner_id, sha256));
+    CREATE INDEX turn_attachments_by_image ON turn_attachments(owner_id, sha256);
+    CREATE INDEX attachments_by_hash ON attachments(sha256);
+    INSERT INTO turn_attachments(turn_id, sha256, position, owner_id)
+        SELECT turn_id, sha256, position, owner_id FROM (
+            SELECT t.turn_id, t.owner_id, b.key AS position,
+                CASE WHEN b.type = 'object' THEN
+                    CASE WHEN json_extract(b.value, '$.type') = 'image' AND json_type(b.value, '$.sha256') = 'text'
+                        THEN json_extract(b.value, '$.sha256') END
+                END AS sha256
+            FROM turns t, json_each(t.content) b
+            WHERE json_type(t.content) = 'array') linked
+        WHERE sha256 IS NOT NULL
+            AND EXISTS (SELECT 1 FROM attachments a WHERE a.owner_id = linked.owner_id AND a.sha256 = linked.sha256);
+    CREATE TRIGGER events_of_a_tombstone BEFORE INSERT ON events
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = NEW.session_id AND lifecycle = 'deleted')
+        BEGIN SELECT RAISE(ABORT, 'a deleted session gets no events'); END;
+    CREATE TRIGGER turns_of_a_tombstone BEFORE INSERT ON turns
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = NEW.session_id AND lifecycle = 'deleted')
+        BEGIN SELECT RAISE(ABORT, 'a deleted session gets no turns'); END;
+    CREATE TRIGGER pending_of_a_tombstone BEFORE INSERT ON pending
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = NEW.session_id AND lifecycle = 'deleted')
+        BEGIN SELECT RAISE(ABORT, 'a deleted session gets no questions'); END;
+    CREATE TRIGGER answers_of_a_tombstone BEFORE INSERT ON answer_queue
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = NEW.session_id AND lifecycle = 'deleted')
+        BEGIN SELECT RAISE(ABORT, 'a deleted session gets no answers'); END;
+    CREATE TRIGGER catalog_of_a_tombstone BEFORE INSERT ON session_catalog
+        WHEN EXISTS (SELECT 1 FROM sessions WHERE id = NEW.session_id AND lifecycle = 'deleted')
+        BEGIN SELECT RAISE(ABORT, 'a deleted session gets no catalogue'); END;
+    CREATE TRIGGER a_tombstone_stays BEFORE UPDATE ON sessions
+        WHEN OLD.lifecycle = 'deleted'
+        BEGIN SELECT RAISE(ABORT, 'a deleted session is never changed'); END;
+",
 ];
 
 /// `Store::events`: `?1` the session, `?2` after, `?3` the limit, `?4` the
@@ -360,6 +418,32 @@ pub enum Reassign {
     NotFound,
 }
 
+/// The state a delete's route judged to have no adapter it can reach
+/// (plan 9a decision 5): a session parked, failed, presumed parked, or
+/// `starting` or `active` on a host that is away. The store closes it
+/// collector-side first only while it is still exactly this (A4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unattached {
+    pub lifecycle: String,
+    pub presumed_parked: bool,
+}
+
+/// The outcome of `Store::delete_session` (ACP core §4.10).
+#[derive(Debug, PartialEq)]
+pub enum Deletion {
+    /// Deleted: its `session_deleted` event. `unconfirmed`: it was closed
+    /// here, collector-side, while its host may still run it (presumed
+    /// parked, or starting or active on a host away); that host closes its
+    /// adapter when it is back (plan 9a decision 4, A13). A parked or
+    /// failed session runs nowhere: its close is confirmed.
+    Done { event: EventDto, unconfirmed: bool },
+    /// Not closed, and not what the route judged unattached: this
+    /// lifecycle. Nothing changed.
+    Refused(String),
+    /// No such session, or a tombstone already.
+    NotFound,
+}
+
 /// The outcome of `Store::submit_answer` (ACP core §4.6).
 #[derive(Debug, PartialEq)]
 pub enum AnswerSubmission {
@@ -403,6 +487,9 @@ pub struct Store {
     /// Where the attachment files go: `attachments/` beside the database
     /// (kernel spec §1). An in-memory store has none.
     attachments: Option<PathBuf>,
+    /// The checkpoint a delete owes (plan 9a A8); an in-memory store has
+    /// none.
+    checkpoints: Option<Arc<Checkpoints>>,
 }
 
 /// A stored image (plan 6a), for `GET /api/attachments/{sha256}`.
@@ -435,7 +522,8 @@ fn now() -> String {
 }
 
 /// Write a collector-originated event (`host_seq` NULL, ACP core §8), for
-/// a session of `owner`'s only: for any other it fails and writes nothing.
+/// a session of `owner`'s only: for any other, or a tombstone (plan 9a
+/// A1), it fails and writes nothing.
 fn collector_event(
     tx: &Transaction<'_>,
     owner: &str,
@@ -446,7 +534,8 @@ fn collector_event(
 ) -> Result<EventDto> {
     let written = tx.execute(
         "INSERT INTO events(session_id, host_seq, kind, body, ts, owner_id)
-         SELECT ?1, NULL, ?2, ?3, ?4, ?5 WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?1 AND owner_id = ?5)",
+         SELECT ?1, NULL, ?2, ?3, ?4, ?5
+         WHERE EXISTS (SELECT 1 FROM sessions WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?5)",
         params![session_id, kind, body.to_string(), ts, owner],
     )?;
     anyhow::ensure!(written == 1, "no session {session_id}");
@@ -465,17 +554,22 @@ fn collector_event(
     })
 }
 
+/// The image blocks of a stored content that name their image, each with
+/// its index in the content. A block stored before plan 6a names no
+/// attachment (decision 9).
+fn image_hashes<'a>(blocks: impl IntoIterator<Item = &'a Value>) -> Vec<(usize, &'a str)> {
+    blocks
+        .into_iter()
+        .enumerate()
+        .filter(|(_, block)| block.get("type").and_then(Value::as_str) == Some("image"))
+        .filter_map(|(position, block)| Some((position, block.get("sha256")?.as_str()?)))
+        .collect()
+}
+
 /// Link a `user_turn` event to the images it shows (ACP core §8): one row
-/// per image block, at its index in the content. A block stored before
-/// plan 6a names no attachment, and links nothing (decision 9).
+/// per image block, at its index in the content.
 fn link_attachments(tx: &Transaction<'_>, owner: &str, event_id: i64, content: &Value) -> Result<()> {
-    for (position, block) in content.as_array().into_iter().flatten().enumerate() {
-        if block.get("type").and_then(Value::as_str) != Some("image") {
-            continue;
-        }
-        let Some(sha256) = block.get("sha256").and_then(Value::as_str) else {
-            continue;
-        };
+    for (position, sha256) in image_hashes(content.as_array().into_iter().flatten()) {
         tx.execute(
             "INSERT INTO event_attachments(event_id, sha256, position, owner_id)
              SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM attachments WHERE owner_id = ?4 AND sha256 = ?2)",
@@ -483,6 +577,39 @@ fn link_attachments(tx: &Transaction<'_>, owner: &str, event_id: i64, content: &
         )?;
     }
     Ok(())
+}
+
+/// Link a turn to the images its content shows (plan 9a decision 6), as
+/// `link_attachments` links its `user_turn`: an image a turn shows that
+/// never started is still referenced. The links go with the turn.
+fn link_turn_attachments(tx: &Transaction<'_>, owner: &str, turn_id: &str, content: &[Value]) -> Result<()> {
+    for (position, sha256) in image_hashes(content) {
+        tx.execute(
+            "INSERT INTO turn_attachments(turn_id, sha256, position, owner_id)
+             SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM attachments WHERE owner_id = ?4 AND sha256 = ?2)",
+            params![turn_id, sha256, position as i64, owner],
+        )?;
+    }
+    Ok(())
+}
+
+/// Delete the owner's rows of those of `hashes` that nothing of theirs
+/// shows any more, no turn and no event (plan 9a decision 6); the hashes
+/// whose row went. Their files go after the commit (`Store::remove_files`).
+fn drop_unreferenced(tx: &Transaction<'_>, owner: &str, hashes: &BTreeSet<String>) -> Result<Vec<String>> {
+    let mut dropped = Vec::new();
+    for sha256 in hashes {
+        let gone = tx.execute(
+            "DELETE FROM attachments WHERE owner_id = ?1 AND sha256 = ?2
+                 AND NOT EXISTS (SELECT 1 FROM turn_attachments WHERE owner_id = ?1 AND sha256 = ?2)
+                 AND NOT EXISTS (SELECT 1 FROM event_attachments WHERE owner_id = ?1 AND sha256 = ?2)",
+            [owner, sha256],
+        )?;
+        if gone == 1 {
+            dropped.push(sha256.clone());
+        }
+    }
+    Ok(dropped)
 }
 
 /// Close an open turn that the host will never end, as `interrupted`.
@@ -602,11 +729,13 @@ fn fact_applies(tx: &Transaction<'_>, owner: &str, session_id: &str, turn_id: Op
     Ok(state.as_deref() == Some("started"))
 }
 
-/// `Store::close_now`'s body, inside the caller's transaction.
+/// `Store::close_now`'s body, inside the caller's transaction. A tombstone
+/// is left alone (plan 9a A1).
 fn close_in(tx: &Transaction<'_>, owner: &str, session_id: &str) -> Result<Vec<EventDto>> {
     let row: Option<(String, bool, Option<String>)> = tx
         .query_row(
-            "SELECT lifecycle, close_requested, open_turn_id FROM sessions WHERE id = ?1 AND owner_id = ?2",
+            "SELECT lifecycle, close_requested, open_turn_id FROM sessions
+             WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2",
             [session_id, owner],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -1096,27 +1225,184 @@ fn conflict_already_recorded(
     Ok(false)
 }
 
+/// How a checkpoint after a delete is retried while a reader holds the
+/// WAL (plan 9a A8): every `retry`, `fast_retries` times, then (logged once)
+/// every `slow_retry`, until it completes. The defaults are a second, five
+/// minutes of them, then a minute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointPolicy {
+    pub retry: Duration,
+    pub fast_retries: u32,
+    pub slow_retry: Duration,
+}
+
+impl Default for CheckpointPolicy {
+    fn default() -> Self {
+        Self {
+            retry: Duration::from_secs(1),
+            fast_retries: 300,
+            slow_retry: Duration::from_secs(60),
+        }
+    }
+}
+
+/// The checkpoint a delete owes: the WAL folded back into the database and
+/// truncated, so the pages the delete wrote over leave it too (plan 9a A8).
+/// It runs on a connection of its own, so the store's lock is not held
+/// while it waits for readers. Hennery's own reads are single statements
+/// under the store's or the kernel's lock, so only a reader outside it (a
+/// `sqlite3` shell, a backup tool) can hold the WAL for long. While one
+/// does, the debt is durable: `<db>-checkpoint-owed` is written, retried by
+/// one thread until a checkpoint completes, and at the next start. A
+/// connection is opened per attempt: deletes are rare.
+struct Checkpoints {
+    path: PathBuf,
+    policy: Mutex<CheckpointPolicy>,
+    /// A retry thread is running; a new debt joins it.
+    retrying: AtomicBool,
+}
+
+/// How long one attempt waits for readers before it counts as busy.
+const CHECKPOINT_WAIT: Duration = Duration::from_secs(1);
+
+impl Checkpoints {
+    fn owed_marker(&self) -> PathBuf {
+        let mut name = self.path.as_os_str().to_os_string();
+        name.push("-checkpoint-owed");
+        PathBuf::from(name)
+    }
+
+    /// Checkpoint now; if a reader holds it up, record the debt and retry
+    /// it apart until it completes.
+    fn run(self: &Arc<Self>) {
+        if self.once() {
+            self.settle();
+            return;
+        }
+        if let Err(err) = self.owe() {
+            tracing::error!("recording a checkpoint owed failed: {err:#}");
+        }
+        if self.retrying.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let this = Arc::clone(self);
+        std::thread::spawn(move || {
+            let policy = *this.policy.lock().expect("checkpoint policy");
+            let mut attempts: u64 = 0;
+            loop {
+                let pause = if attempts < u64::from(policy.fast_retries) {
+                    policy.retry
+                } else {
+                    if attempts == u64::from(policy.fast_retries) {
+                        tracing::warn!(
+                            "a reader has held the database's WAL since a delete: the deleted pages stay in the \
+                             WAL until it is released; the checkpoint is retried every {:?}",
+                            policy.slow_retry
+                        );
+                    }
+                    policy.slow_retry
+                };
+                std::thread::sleep(pause);
+                attempts += 1;
+                if this.once() {
+                    this.retrying.store(false, Ordering::SeqCst);
+                    this.settle();
+                    tracing::info!(attempts, "the checkpoint a delete owed completed");
+                    return;
+                }
+            }
+        });
+    }
+
+    /// One `wal_checkpoint(TRUNCATE)`, waiting `CHECKPOINT_WAIT` for
+    /// readers: whether it completed. A failure to open or run it is
+    /// logged, and counts as not completed.
+    fn once(&self) -> bool {
+        let checkpointed = hennery_kernel::db::open(&self.path).and_then(|conn| {
+            conn.busy_timeout(CHECKPOINT_WAIT)?;
+            Ok(conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0))?)
+        });
+        match checkpointed {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(err) => {
+                tracing::warn!("a checkpoint after a delete failed: {err:#}");
+                false
+            }
+        }
+    }
+
+    /// Record the debt durably: the marker, synced, and its directory.
+    fn owe(&self) -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let marker = self.owed_marker();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&marker)
+            .with_context(|| format!("open {}", marker.display()))?;
+        file.sync_all()?;
+        if let Some(dir) = marker.parent() {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// The debt is paid: remove the marker, if there is one.
+    fn settle(&self) {
+        match std::fs::remove_file(self.owed_marker()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!("removing the checkpoint-owed marker failed: {err}"),
+        }
+    }
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let attachments = path.parent().map(|dir| dir.join(crate::attachments::DIR));
-        Self::init(hennery_kernel::db::open(path)?, attachments)
+        Self::init(hennery_kernel::db::open(path)?, attachments, Some(path.to_path_buf()))
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Self::init(hennery_kernel::db::open_in_memory()?, None)
+        Self::init(hennery_kernel::db::open_in_memory()?, None, None)
     }
 
     /// The kernel's tables first: they hold the owner, which this store's
     /// rows name and its last migration fills in. So the store and the
     /// kernel agree on the owner whichever opens the database first.
-    fn init(mut conn: Connection, attachments: Option<PathBuf>) -> Result<Self> {
+    fn init(mut conn: Connection, attachments: Option<PathBuf>, path: Option<PathBuf>) -> Result<Self> {
         let owner = hennery_kernel::db::kernel_owner(&mut conn)?;
         hennery_kernel::db::migrate(&mut conn, MIGRATIONS)?;
+        let checkpoints = path.map(|path| {
+            Arc::new(Checkpoints {
+                path,
+                policy: Mutex::new(CheckpointPolicy::default()),
+                retrying: AtomicBool::new(false),
+            })
+        });
+        // A checkpoint owed from before a restart is paid first (A8).
+        if let Some(checkpoints) = &checkpoints
+            && checkpoints.owed_marker().exists()
+        {
+            checkpoints.run();
+        }
         Ok(Self {
             conn: Mutex::new(conn),
             owner,
             attachments,
+            checkpoints,
         })
+    }
+
+    /// How a checkpoint a reader holds up is retried (plan 9a A8), for the
+    /// next one that is.
+    pub fn set_checkpoint_policy(&self, policy: CheckpointPolicy) {
+        if let Some(checkpoints) = &self.checkpoints {
+            *checkpoints.policy.lock().expect("checkpoint policy") = policy;
+        }
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -1149,9 +1435,11 @@ impl Store {
         Ok(())
     }
 
+    /// Fail a session's start; a tombstone is left alone (plan 9a A1).
     pub fn mark_failed(&self, id: &str, reason: &str) -> Result<()> {
         self.conn().execute(
-            "UPDATE sessions SET lifecycle = 'failed', failure_reason = ?2 WHERE id = ?1 AND owner_id = ?3",
+            "UPDATE sessions SET lifecycle = 'failed', failure_reason = ?2
+             WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?3",
             params![id, reason, self.owner],
         )?;
         Ok(())
@@ -1170,14 +1458,16 @@ impl Store {
         Ok(())
     }
 
-    pub fn session(&self, id: &str) -> Result<Option<SessionRow>> {
+    /// One session; never a tombstone (plan 9a decision 3), so every route
+    /// that reads it answers 404 for a deleted session.
+    pub fn find_session(&self, id: &str) -> Result<Option<SessionRow>> {
         let row = self
             .conn()
             .query_row(
                 "SELECT id, host_id, agent, cwd, lifecycle, activity, open_turn_id, failure_reason, close_requested,
                         presumed_parked, model, mode, config_axes, last_event_at, last_event_id, title,
                         git_worktree, base_commit, hat_id, agent_session_id
-                 FROM sessions WHERE id = ?1 AND owner_id = ?2",
+                 FROM sessions WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2",
                 [id, &self.owner],
                 |r| {
                     let config: ConfigColumns = (r.get(10)?, r.get(11)?, r.get(12)?);
@@ -1212,13 +1502,48 @@ impl Store {
         Ok(Some(row))
     }
 
-    /// One session as a list item, as stored (the detail's; the list serves
-    /// it `bounded`).
-    pub fn session_item(&self, id: &str) -> Result<Option<SessionItem>> {
+    /// Which of `ids` are tombstones of `host_id`'s (plan 9a decision 4):
+    /// what a host's connection, once ready, still has to close of the
+    /// sessions its `hello` listed, if a delete committed after its
+    /// reconciliation.
+    pub(crate) fn tombstones_of(&self, host_id: &str, ids: &[&str]) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM sessions WHERE id = ?1 AND host_id = ?2 AND lifecycle = 'deleted' AND owner_id = ?3",
+        )?;
+        let mut deleted = Vec::new();
+        for id in ids {
+            if stmt.exists(params![id, host_id, self.owner])? {
+                deleted.push(id.to_string());
+            }
+        }
+        Ok(deleted)
+    }
+
+    /// The host a session runs on, tombstones included: what a host's frame
+    /// is checked against (ACP core §3.3). A frame of this host's for its
+    /// deleted session goes on to `ingest`, which stores nothing, and is
+    /// acked, so the host prunes its outbox (plan 9a decision 4).
+    pub fn session_host(&self, id: &str) -> Result<Option<String>> {
         Ok(self
             .conn()
             .query_row(
-                &format!("SELECT {SESSION_ITEM_COLUMNS} FROM sessions WHERE id = ?1 AND owner_id = ?2"),
+                "SELECT host_id FROM sessions WHERE id = ?1 AND owner_id = ?2",
+                [id, &self.owner],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// One session as a list item, as stored (the detail's; the list serves
+    /// it `bounded`); never a tombstone (plan 9a decision 3).
+    pub fn find_session_item(&self, id: &str) -> Result<Option<SessionItem>> {
+        Ok(self
+            .conn()
+            .query_row(
+                &format!(
+                    "SELECT {SESSION_ITEM_COLUMNS} FROM sessions WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2"
+                ),
                 [id, &self.owner],
                 read_item,
             )
@@ -1278,14 +1603,15 @@ impl Store {
 
     /// The session's catalogue (ACP core §9): its config options and
     /// current values, and its slash commands; `None` for an unknown
-    /// session, an empty catalogue for one whose host has reported none.
+    /// session or a tombstone, an empty catalogue for one whose host has
+    /// reported none.
     pub fn catalog(&self, session_id: &str) -> Result<Option<SessionCatalog>> {
         let row: Option<(ConfigColumns, Option<String>, Option<String>)> = self
             .conn()
             .query_row(
                 "SELECT s.model, s.mode, s.config_axes, c.config_options, c.commands
                  FROM sessions s LEFT JOIN session_catalog c ON c.session_id = s.id AND c.owner_id = s.owner_id
-                 WHERE s.id = ?1 AND s.owner_id = ?2",
+                 WHERE s.id = ?1 AND s.lifecycle <> 'deleted' AND s.owner_id = ?2",
                 [session_id, &self.owner],
                 |r| Ok(((r.get(0)?, r.get(1)?, r.get(2)?), r.get(3)?, r.get(4)?)),
             )
@@ -1468,8 +1794,9 @@ impl Store {
     }
 
     /// Open a turn for a checked prompt (plan 6a): the turn holds the
-    /// stored blocks, and each image gets the owner's row, if it has none
-    /// yet. Its file must be saved first (`save_images`).
+    /// stored blocks and its links to the images (plan 9a decision 6), and
+    /// each image gets the owner's row, if it has none yet. Its file must
+    /// be saved first (`save_images`).
     pub fn open_prompt(&self, session_id: &str, turn_id: &str, prompt: &Checked) -> Result<bool> {
         self.open_turn_with(session_id, turn_id, &prompt.stored_json(), &prompt.images)
     }
@@ -1494,7 +1821,15 @@ impl Store {
                      ON CONFLICT(owner_id, sha256) DO NOTHING",
                     params![self.owner, image.sha256, image.mime, image.bytes.len() as i64, ts],
                 )?;
+                // A delete since `save_images` may have removed the file
+                // (plan 9a decision 6). Under the store's lock, as a delete
+                // removes files, it is written again if it is gone.
+                if let Some(dir) = self.attachments.as_deref() {
+                    crate::attachments::write(dir, &image.sha256, &image.bytes)
+                        .with_context(|| format!("store attachment {}", image.sha256))?;
+                }
             }
+            link_turn_attachments(&tx, &self.owner, turn_id, content)?;
         }
         tx.commit()?;
         Ok(changed == 1)
@@ -1557,7 +1892,10 @@ impl Store {
         })
     }
 
-    /// Undo `open_turn` after the host rejected the prompt.
+    /// Undo `open_turn` after the host rejected the prompt. The turn's
+    /// images go with it unless something else of the owner's shows them
+    /// (plan 9a decision 6): their rows in this transaction, their files
+    /// after it.
     pub fn abandon_turn(&self, session_id: &str, turn_id: &str) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
@@ -1565,12 +1903,163 @@ impl Store {
             "UPDATE sessions SET open_turn_id = NULL WHERE id = ?1 AND open_turn_id = ?2 AND owner_id = ?3",
             params![session_id, turn_id, self.owner],
         )?;
+        let hashes: BTreeSet<String> = {
+            let mut stmt = tx.prepare("SELECT sha256 FROM turn_attachments WHERE turn_id = ?1 AND owner_id = ?2")?;
+            let rows = stmt.query_map([turn_id, &self.owner], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        // Its links go with it (`ON DELETE CASCADE`).
         tx.execute(
             "DELETE FROM turns WHERE turn_id = ?1 AND owner_id = ?2",
             [turn_id, &self.owner],
         )?;
+        let dropped = drop_unreferenced(&tx, &self.owner, &hashes)?;
         tx.commit()?;
+        self.remove_files(&conn, &dropped);
         Ok(())
+    }
+
+    /// After the commit that dropped their rows, and still under the store's
+    /// lock, so no prompt records one of them meanwhile (plan 9a decision
+    /// 6): remove each image's file unless a row of any owner still names
+    /// it, since files are shared by hash. A file gone already is fine. One
+    /// that cannot be removed is logged and left: its rows are gone, and
+    /// plan 9b's sweep removes a file no row names (decision 7).
+    fn remove_files(&self, conn: &Connection, dropped: &[String]) {
+        let Some(dir) = self.attachments.as_deref() else {
+            return;
+        };
+        for sha256 in dropped {
+            let removed = crate::shared_files::hash_named_by_any_owner(conn, sha256).and_then(|named| {
+                if !named {
+                    crate::attachments::remove(dir, sha256)?;
+                }
+                Ok(())
+            });
+            if let Err(err) = removed {
+                tracing::warn!(%sha256, "an unreferenced attachment's file was left: {err:#}");
+            }
+        }
+    }
+
+    /// Delete a session (ACP core §4.10; plan 9a decisions 1, 5 and 6), in
+    /// one transaction:
+    /// - a tombstone, or no session, is `NotFound`;
+    /// - one not `closed` is refused with its lifecycle, unless it is still
+    ///   exactly what the route judged `unattached` (A4): then it is closed
+    ///   here first, as `close_now` closes, and the delete is `unconfirmed`
+    ///   if its host may still run it;
+    /// - its events, turns (their image links with them), questions,
+    ///   answers and catalogue are deleted, and the owner's images nothing
+    ///   else of theirs shows; its project recent too, unless another kept
+    ///   session of that host and hat has that cwd (R1–R4);
+    /// - `session_deleted` is written, and the row is scrubbed to a
+    ///   tombstone: `deleted`, keeping only its id, owner, host, hat,
+    ///   creation and recency.
+    ///
+    /// Then, still under the store's lock, the images' files that no owner
+    /// names any more go; once it is released, the WAL is checkpointed so
+    /// the deleted pages leave it too (A8). Both best-effort. A crash before the files go
+    /// leaves files no row names, for plan 9b's sweep (decision 7).
+    pub fn delete_session(&self, session_id: &str, unattached: Option<&Unattached>) -> Result<Deletion> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        // Its host, hat and cwd are read before the scrub clears them (R1).
+        let row: Option<(String, bool, String, String, String)> = tx
+            .query_row(
+                "SELECT lifecycle, presumed_parked, host_id, hat_id, cwd FROM sessions
+                 WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2",
+                [session_id, &self.owner],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let Some((lifecycle, presumed, host_id, hat_id, cwd)) = row else {
+            return Ok(Deletion::NotFound);
+        };
+        let mut unconfirmed = false;
+        if lifecycle != "closed" {
+            match unattached {
+                Some(judged) if judged.lifecycle == lifecycle && judged.presumed_parked == presumed => {
+                    close_in(&tx, &self.owner, session_id)?;
+                    // Only its host can still run it: presumed parked, or
+                    // starting or active on a host the route cannot reach.
+                    unconfirmed = presumed || matches!(lifecycle.as_str(), "starting" | "active");
+                }
+                _ => return Ok(Deletion::Refused(lifecycle)),
+            }
+        }
+        let hashes: BTreeSet<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT sha256 FROM turn_attachments
+                 WHERE owner_id = ?2 AND turn_id IN (SELECT turn_id FROM turns WHERE session_id = ?1 AND owner_id = ?2)
+                 UNION
+                 SELECT sha256 FROM event_attachments
+                 WHERE owner_id = ?2 AND event_id IN (SELECT event_id FROM events WHERE session_id = ?1 AND owner_id = ?2)",
+            )?;
+            let rows = stmt.query_map([session_id, &self.owner], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        // Children before their parents: an event's image links before the
+        // event, an answer before its question. A turn's links go with it
+        // (`ON DELETE CASCADE`).
+        tx.execute(
+            "DELETE FROM event_attachments WHERE owner_id = ?2
+                 AND event_id IN (SELECT event_id FROM events WHERE session_id = ?1 AND owner_id = ?2)",
+            [session_id, &self.owner],
+        )?;
+        tx.execute(
+            "DELETE FROM answer_queue WHERE session_id = ?1 AND owner_id = ?2",
+            [session_id, &self.owner],
+        )?;
+        tx.execute(
+            "DELETE FROM pending WHERE session_id = ?1 AND owner_id = ?2",
+            [session_id, &self.owner],
+        )?;
+        tx.execute(
+            "DELETE FROM session_catalog WHERE session_id = ?1 AND owner_id = ?2",
+            [session_id, &self.owner],
+        )?;
+        tx.execute(
+            "DELETE FROM turns WHERE session_id = ?1 AND owner_id = ?2",
+            [session_id, &self.owner],
+        )?;
+        tx.execute(
+            "DELETE FROM events WHERE session_id = ?1 AND owner_id = ?2",
+            [session_id, &self.owner],
+        )?;
+        // The kernel's table, on this transaction (R3). The path compares
+        // byte for byte (`=`, the column's BINARY collation; R4), and only a
+        // session kept counts (R2): this one is not yet a tombstone, so it
+        // is left out by its id. A tombstone's cwd is '' already; its filter
+        // guards a later change of the scrub.
+        tx.execute(
+            "DELETE FROM project_recents WHERE owner_id = ?1 AND host_id = ?2 AND hat_id = ?3 AND path = ?4
+                 AND NOT EXISTS (SELECT 1 FROM sessions
+                     WHERE owner_id = ?1 AND host_id = ?2 AND hat_id = ?3 AND cwd = ?4 AND id <> ?5
+                         AND lifecycle <> 'deleted')",
+            params![self.owner, host_id, hat_id, cwd, session_id],
+        )?;
+        let dropped = drop_unreferenced(&tx, &self.owner, &hashes)?;
+        let event = collector_event(&tx, &self.owner, session_id, "session_deleted", json!({}), &now())?;
+        let scrubbed = tx.execute(
+            "UPDATE sessions SET lifecycle = 'deleted', cwd = '', agent = '', title = NULL, git_branch = NULL,
+                 git_dirty = NULL, git_worktree = NULL, base_commit = NULL, model = NULL, mode = NULL,
+                 config_axes = NULL, agent_session_id = NULL, failure_reason = NULL, hat_rule_id = NULL,
+                 open_turn_id = NULL, activity = NULL, presumed_parked = 0, close_requested = 0
+             WHERE id = ?1 AND owner_id = ?2",
+            [session_id, &self.owner],
+        )?;
+        // Read in this transaction; an event without its tombstone would be
+        // worse than an error.
+        anyhow::ensure!(scrubbed == 1, "tombstoning {session_id} changed {scrubbed} rows");
+        tx.commit()?;
+        // plan 8: revoke the session's gateway tokens here
+        self.remove_files(&conn, &dropped);
+        drop(conn);
+        if let Some(checkpoints) = &self.checkpoints {
+            checkpoints.run();
+        }
+        Ok(Deletion::Done { event, unconfirmed })
     }
 
     /// Record an operator park before `park_session` is sent.
@@ -1584,12 +2073,13 @@ impl Store {
 
     /// Record an operator close of an attached session before
     /// `close_session` is sent. The intent is durable: if the host never
-    /// confirms, the next handshake sends `close_session` again.
+    /// confirms, the next handshake sends `close_session` again. For a
+    /// tombstone it fails as for an unknown session, and writes nothing.
     pub fn record_close_request(&self, session_id: &str) -> Result<EventDto> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute(
-            "UPDATE sessions SET close_requested = 1 WHERE id = ?1 AND owner_id = ?2",
+            "UPDATE sessions SET close_requested = 1 WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2",
             [session_id, &self.owner],
         )?;
         let event = collector_event(&tx, &self.owner, session_id, "operator_closed", json!({}), &now())?;
@@ -1625,8 +2115,10 @@ impl Store {
         let tx = conn.transaction()?;
         let still_requested: bool = tx
             .query_row(
+                // A tombstone's `close_requested` is 0 already; the filter
+                // guards a later edit of the predicate.
                 "SELECT close_requested = 1 AND (lifecycle = 'active' OR presumed_parked = 1)
-                 FROM sessions WHERE id = ?1 AND owner_id = ?2",
+                 FROM sessions WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2",
                 [session_id, &self.owner],
                 |r| r.get(0),
             )
@@ -1654,7 +2146,7 @@ impl Store {
         let row: Option<ResumeRow> = tx
             .query_row(
                 "SELECT lifecycle, agent_session_id, open_turn_id, model, mode, config_axes, hat_id FROM sessions
-                 WHERE id = ?1 AND owner_id = ?2",
+                 WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2",
                 [session_id, &self.owner],
                 |r| {
                     Ok((
@@ -1722,7 +2214,8 @@ impl Store {
         let tx = conn.transaction()?;
         let row: Option<(String, bool, String)> = tx
             .query_row(
-                "SELECT lifecycle, presumed_parked, hat_id FROM sessions WHERE id = ?1 AND owner_id = ?2",
+                "SELECT lifecycle, presumed_parked, hat_id FROM sessions
+                 WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2",
                 [session_id, &self.owner],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -1779,7 +2272,8 @@ impl Store {
         let ts = now();
         let ids: Vec<String> = {
             let mut stmt = tx.prepare(
-                "SELECT id FROM sessions WHERE host_id = ?1 AND lifecycle = 'active' AND owner_id = ?2 ORDER BY id",
+                "SELECT id FROM sessions
+                 WHERE host_id = ?1 AND lifecycle = 'active' AND lifecycle <> 'deleted' AND owner_id = ?2 ORDER BY id",
             )?;
             let rows = stmt.query_map([host_id, &self.owner], |r| r.get(0))?;
             rows.collect::<rusqlite::Result<_>>()?
@@ -1829,8 +2323,10 @@ impl Store {
         let tx = conn.transaction()?;
         let ts = now();
         let starting: Vec<String> = {
-            let mut stmt =
-                tx.prepare("SELECT id FROM sessions WHERE host_id = ?1 AND lifecycle = 'starting' AND owner_id = ?2")?;
+            let mut stmt = tx.prepare(
+                "SELECT id FROM sessions
+                     WHERE host_id = ?1 AND lifecycle = 'starting' AND lifecycle <> 'deleted' AND owner_id = ?2",
+            )?;
             let rows = stmt.query_map([host_id, &self.owner], |r| r.get(0))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
@@ -1855,7 +2351,9 @@ impl Store {
         let rows: Vec<(String, Option<String>, String, bool)> = {
             let mut stmt = tx.prepare(
                 "SELECT id, open_turn_id, lifecycle, presumed_parked FROM sessions
-                 WHERE host_id = ?1 AND (lifecycle = 'active' OR presumed_parked = 1) AND owner_id = ?2 ORDER BY id",
+                 WHERE host_id = ?1 AND (lifecycle = 'active' OR presumed_parked = 1) AND lifecycle <> 'deleted'
+                     AND owner_id = ?2
+                 ORDER BY id",
             )?;
             let rows = stmt.query_map([host_id, &self.owner], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
@@ -1919,7 +2417,8 @@ impl Store {
     pub fn hosts_with_active_sessions(&self) -> Result<Vec<String>> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT DISTINCT host_id FROM sessions WHERE lifecycle = 'active' AND owner_id = ?1 ORDER BY host_id",
+            "SELECT DISTINCT host_id FROM sessions
+             WHERE lifecycle = 'active' AND lifecycle <> 'deleted' AND owner_id = ?1 ORDER BY host_id",
         )?;
         let rows = stmt.query_map([&self.owner], |r| r.get(0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1948,16 +2447,28 @@ impl Store {
     /// §10; plan 10b): read in the same transaction, from what the fact
     /// changed, so a duplicate, a fact stored but not applied, and a fact
     /// for an already ended turn cross none. A frame for a session that is
-    /// not the owner's fails, and nothing is written.
+    /// not the owner's fails, and nothing is written. One for a tombstone
+    /// creates nothing and stores nothing, and is not an error (plan 9a
+    /// decision 4, A1): the host's frame is acked, so it prunes its outbox.
     pub fn ingest_fact(&self, session_id: &str, seq: u64, body: &SessionBody) -> Result<Ingested> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let owned: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1 AND owner_id = ?2)",
-            [session_id, &self.owner],
-            |r| r.get(0),
-        )?;
-        anyhow::ensure!(owned, "no session {session_id}");
+        let lifecycle: Option<String> = tx
+            .query_row(
+                "SELECT lifecycle FROM sessions WHERE id = ?1 AND owner_id = ?2",
+                [session_id, &self.owner],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(lifecycle) = lifecycle else {
+            anyhow::bail!("no session {session_id}");
+        };
+        if lifecycle == "deleted" {
+            return Ok(Ingested {
+                events: Vec::new(),
+                edge: None,
+            });
+        }
         let ts = now();
         let kind = body_kind(body);
         let received = serde_json::to_value(body)?;
@@ -2498,7 +3009,8 @@ impl Store {
     ///   parked (or closed, if the operator asked), its open turn ended;
     /// - an open turn the host does not report: `turn_not_delivered` if it
     ///   never started, `turn_ended_synthesized{interrupted}` if it did;
-    /// - attached sessions the operator closed → returned in `close`.
+    /// - attached sessions the operator closed or deleted → returned in
+    ///   `close`.
     pub fn reconcile_host(&self, host_id: &str, attached: &[AttachedSession]) -> Result<Reconciliation> {
         let listed: HashMap<&str, &AttachedSession> = attached.iter().map(|a| (a.session_id.as_str(), a)).collect();
         let mut conn = self.conn();
@@ -2507,7 +3019,7 @@ impl Store {
         let rows: Vec<(String, String, Option<String>, bool, bool)> = {
             let mut stmt = tx.prepare(
                 "SELECT id, lifecycle, open_turn_id, close_requested, presumed_parked FROM sessions
-                 WHERE host_id = ?1 AND (lifecycle IN ('starting', 'active', 'closed') OR presumed_parked = 1)
+                 WHERE host_id = ?1 AND (lifecycle IN ('starting', 'active', 'closed', 'deleted') OR presumed_parked = 1)
                      AND owner_id = ?2
                  ORDER BY id",
             )?;
@@ -2583,7 +3095,10 @@ impl Store {
                         out.close.push(id);
                     }
                 }
-                ("closed", Some(_)) => out.close.push(id),
+                // Nothing is written for a tombstone (plan 9a decision 4): its
+                // host is told to close the adapter, and its answer, a
+                // `session_closed` or `not_attached`, changes nothing.
+                ("closed" | "deleted", Some(_)) => out.close.push(id),
                 _ => {}
             }
         }
@@ -2852,6 +3367,70 @@ mod tests {
         assert_eq!(index, 1);
     }
 
+    /// Plan 9a decision 6: the turn links are backfilled from each turn's
+    /// content, as `link_attachments` links an event's: an image block with
+    /// a hash, at its index, only where the owner's row for it exists.
+    /// Anything else in the content (a block that is no object, an image
+    /// with no hash, a hash with no row) links nothing and fails nothing.
+    #[test]
+    fn the_turn_links_are_backfilled_from_the_turns_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hennery.db");
+        let (a, b, gone) = ("a".repeat(64), "b".repeat(64), "c".repeat(64));
+        {
+            let mut conn = hennery_kernel::db::open(&db).unwrap();
+            let owner = hennery_kernel::db::kernel_owner(&mut conn).unwrap();
+            // Every migration before plan 9a's, wherever later lanes put it.
+            let before = MIGRATIONS
+                .iter()
+                .position(|m| m.contains("CREATE TABLE turn_attachments"))
+                .unwrap();
+            hennery_kernel::db::migrate(&mut conn, &MIGRATIONS[..before]).unwrap();
+            let content = json!([
+                { "type": "text", "text": "x" },
+                { "type": "image", "mimeType": "image/png", "sha256": a },
+                "a string",
+                { "type": "image", "mimeType": "image/png" },
+                { "type": "image", "mimeType": "image/png", "sha256": gone },
+                { "type": "image", "mimeType": "image/png", "sha256": 7 },
+                { "type": "image", "mimeType": "image/png", "sha256": b },
+                { "type": "image", "mimeType": "image/png", "sha256": a },
+            ]);
+            conn.execute_batch(&format!(
+                "
+                INSERT INTO sessions(id, host_id, agent, cwd, lifecycle, created_at, last_event_at, owner_id)
+                    VALUES ('s1', 'h1', 'fake', '/tmp', 'active', 't', 't', '{owner}');
+                INSERT INTO attachments(owner_id, sha256, mime, size, created_at) VALUES
+                    ('{owner}', '{a}', 'image/png', 1, 't'), ('{owner}', '{b}', 'image/png', 1, 't');
+                INSERT INTO turns(turn_id, session_id, content, created_at, owner_id) VALUES
+                    ('t1', 's1', '{content}', 't', '{owner}'),
+                    ('t2', 's1', '[]', 't', '{owner}'),
+                    ('t3', 's1', '{{\"not\": \"a list\"}}', 't', '{owner}');
+                "
+            ))
+            .unwrap();
+        }
+        let store = Store::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT turn_id, sha256, position, owner_id FROM turn_attachments ORDER BY turn_id, position")
+            .unwrap();
+        let links: Vec<(String, String, i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let owner = store.owner_id().to_string();
+        assert_eq!(
+            links,
+            [
+                ("t1".into(), a.clone(), 1, owner.clone()),
+                ("t1".into(), b, 6, owner.clone()),
+                ("t1".into(), a, 7, owner),
+            ]
+        );
+    }
+
     /// The kernel's first two migrations, as 3b-ii shipped them.
     const KERNEL_3B_II: &[&str] = &[
         "
@@ -3000,7 +3579,7 @@ mod tests {
 
             let listed: Vec<String> = hosts.list().unwrap().into_iter().map(|h| h.id).collect();
             assert_eq!(listed, ["host-old"]);
-            assert!(store.session("session-old").unwrap().is_some());
+            assert!(store.find_session("session-old").unwrap().is_some());
             assert!(store.catalog("session-old").unwrap().is_some());
             assert_eq!(store.turn_state("turn-old").unwrap().as_deref(), Some("started"));
             assert_eq!(store.events("session-old", 0, 10).unwrap().len(), 1);

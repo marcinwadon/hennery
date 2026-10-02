@@ -135,6 +135,7 @@ const OPERATOR_ROUTES: &[(&str, &str)] = &[
     ("DELETE", "/api/hosts/host-9"),
     ("POST", "/api/sessions"),
     ("GET", "/api/sessions/s-1"),
+    ("DELETE", "/api/sessions/s-1"),
     ("POST", "/api/sessions/s-1/resume"),
     ("POST", "/api/sessions/s-1/prompt"),
     ("POST", "/api/sessions/s-1/cancel"),

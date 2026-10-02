@@ -2,7 +2,8 @@
 //! minting a pairing code, changing or revoking a host, replacing its path
 //! rules, changing a hat (plan 5a decisions 7 and 8), re-assigning a
 //! session to another hat (plan 5d decision 2), subscribing a browser to
-//! push (plan 10a decision 4) and revoking a session need
+//! push (plan 10a decision 4), deleting a session (plan 9a decision 5) and
+//! revoking a signed-in session need
 //! a password check within the last five minutes, and are refused without
 //! one, accepted within five minutes, and refused after.
 
@@ -118,6 +119,9 @@ async fn minting_changing_revoking_a_host_and_revoking_a_session_need_a_fresh_pa
         ),
         ("POST", "/api/push/subscriptions".to_string(), Some(SUBSCRIBE), 201),
         ("DELETE", "/api/hosts/host-9".to_string(), None, 404),
+        // Checked before anything is read: an unknown session is 403 when
+        // stale, 404 only once stepped up (plan 9a decision 5).
+        ("DELETE", "/api/sessions/s-9".to_string(), None, 404),
         ("DELETE", format!("/api/auth/sessions/{}", c.id_of(&other)), None, 204),
     ];
     let send = |session: &str, method: &str, path: &str, body: Option<&str>| {
@@ -134,8 +138,20 @@ async fn minting_changing_revoking_a_host_and_revoking_a_session_need_a_fresh_pa
         let resp = send(&stale, method, path, *body).await.unwrap();
         assert_eq!(code_of(resp).await, (403, "step_up_required".into()), "{method} {path}");
     }
-    // A PATCH that names no hat needs no step-up (plan 5d decision 2).
+    // A stale DELETE deletes nothing (plan 9a decision 5).
+    c.state
+        .store
+        .create_session("s-kept", "host-9", "fake", "/tmp", "hat-9", None)
+        .unwrap();
+    c.state.store.close_now("s-kept").unwrap();
+    let resp = send(&stale, "DELETE", "/api/sessions/s-kept", None).await.unwrap();
+    assert_eq!(code_of(resp).await, (403, "step_up_required".into()));
+    assert!(c.state.store.find_session("s-kept").unwrap().is_some());
+    // A PATCH that names no hat needs no step-up (plan 5d decision 2), nor
+    // does a GET of the path DELETE shares (plan 9a decision 5).
     let resp = send(&stale, "PATCH", "/api/sessions/s-9", Some("{}")).await.unwrap();
+    assert_eq!(resp.status(), 404);
+    let resp = send(&stale, "GET", "/api/sessions/s-9", None).await.unwrap();
     assert_eq!(resp.status(), 404);
     assert!(c.state.operator.authenticate(&other, unix_now()).unwrap().is_some());
     // A wrong password does not step up.
@@ -218,8 +234,15 @@ async fn a_locked_out_login_does_not_block_step_up() {
     assert_eq!(c.step_up(&session, OWNER_PASSWORD).await.status(), 204);
 }
 
-/// Open `GET /api/stream/sessions/s-1` with `session`.
+/// Open `GET /api/stream/sessions/s-1` with `session`; `s-1` is made if
+/// it is not there yet (A10: an unknown session's stream is 404).
 async fn open_stream(c: &Collector, session: &str) -> reqwest::Response {
+    if c.state.store.find_session("s-1").unwrap().is_none() {
+        c.state
+            .store
+            .create_session("s-1", "host-9", "fake", "/tmp", "hat-9", None)
+            .unwrap();
+    }
     let resp = c
         .request(session, "GET", "/api/stream/sessions/s-1")
         .send()

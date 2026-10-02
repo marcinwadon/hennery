@@ -95,7 +95,7 @@ impl Collector {
     }
 
     fn lifecycle(&self, session: &str) -> String {
-        self.state.store.session(session).unwrap().unwrap().lifecycle
+        self.state.store.find_session(session).unwrap().unwrap().lifecycle
     }
 
     fn event_kinds(&self, session: &str) -> Vec<String> {
@@ -110,6 +110,8 @@ type Ws = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<t
 struct ScriptedHost {
     ws: Ws,
     seq: u64,
+    /// The collector's `hello_ack`, once `hello` has had it.
+    hello_ack: Option<CollectorFrame>,
 }
 
 impl ScriptedHost {
@@ -135,7 +137,11 @@ impl ScriptedHost {
             .await
             .unwrap();
         let nonce = hex::decode(response.headers()[HELLO_NONCE_HEADER].to_str().unwrap()).unwrap();
-        let mut host = Self { ws, seq };
+        let mut host = Self {
+            ws,
+            seq,
+            hello_ack: None,
+        };
         host.send(&HostFrame::Hello {
             protocol_version: PROTOCOL_VERSION.into(),
             host_version: "test".into(),
@@ -148,6 +154,7 @@ impl ScriptedHost {
         .await;
         let ack = host.next().await;
         assert!(matches!(ack, CollectorFrame::HelloAck { .. }), "{ack:?}");
+        host.hello_ack = Some(ack);
         host
     }
 
@@ -158,7 +165,11 @@ impl ScriptedHost {
             .await
             .unwrap();
         let nonce = hex::decode(response.headers()[HELLO_NONCE_HEADER].to_str().unwrap()).unwrap();
-        let mut host = Self { ws, seq: 0 };
+        let mut host = Self {
+            ws,
+            seq: 0,
+            hello_ack: None,
+        };
         host.send(&HostFrame::Hello {
             protocol_version: PROTOCOL_VERSION.into(),
             host_version: "test".into(),
@@ -259,6 +270,21 @@ impl ScriptedHost {
                         }
                         frame => return frame,
                     },
+                    Some(Ok(_)) => {}
+                    other => panic!("collector connection ended: {other:?}"),
+                }
+            }
+        })
+        .await
+        .expect("a collector frame within 10s")
+    }
+
+    /// The next collector frame, an `ack` included.
+    async fn next_frame(&mut self) -> CollectorFrame {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match self.ws.next().await {
+                    Some(Ok(Message::Text(text))) => return serde_json::from_str(&text).unwrap(),
                     Some(Ok(_)) => {}
                     other => panic!("collector connection ended: {other:?}"),
                 }
@@ -392,7 +418,7 @@ async fn a_start_lost_in_a_drop_fails_as_not_delivered_after_the_next_handshake(
 
     // The host comes back without the session: the start never happened.
     let _host = ScriptedHost::connect(&collector, vec![], 0).await;
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!(
         (row.lifecycle.as_str(), row.failure_reason.as_deref()),
         ("failed", Some("start_not_delivered"))
@@ -621,7 +647,13 @@ async fn a_request_that_times_out_on_a_live_connection_drops_it() {
 // Plan B: host offline past the threshold (ACP core §5.3, §12 scenario 8).
 
 fn presumed(collector: &Collector, session: &str) -> bool {
-    collector.state.store.session(session).unwrap().unwrap().presumed_parked
+    collector
+        .state
+        .store
+        .find_session(session)
+        .unwrap()
+        .unwrap()
+        .presumed_parked
 }
 
 async fn presumed_parked(collector: &Collector, session: &str) {
@@ -891,7 +923,7 @@ async fn a_resume_the_agent_cannot_load_fails_with_its_reason_and_can_be_retried
     .await;
     let (status, body) = call.await.unwrap();
     assert_eq!((status, body["code"].as_str()), (502, Some("agent_has_no_record")));
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!(
         (row.lifecycle.as_str(), row.failure_reason.as_deref()),
         ("failed", Some("agent_has_no_record"))
@@ -925,7 +957,7 @@ async fn a_resume_the_host_rejects_is_a_502_with_its_code() {
         .await;
         let (status, body) = call.await.unwrap();
         assert_eq!((status, body["code"].as_str()), (502, Some(code)), "{body}");
-        let row = collector.state.store.session(&session).unwrap().unwrap();
+        let row = collector.state.store.find_session(&session).unwrap().unwrap();
         assert_eq!(
             (row.lifecycle.as_str(), row.failure_reason.as_deref()),
             ("failed", Some(code))
@@ -1021,7 +1053,7 @@ async fn a_resume_lost_in_a_drop_is_reconciled_like_a_start() {
     assert_eq!(collector.lifecycle(&session), "starting");
     // The host comes back without it: the resume never happened.
     let _host = ScriptedHost::connect(&collector, vec![], seq).await;
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!(
         (row.lifecycle.as_str(), row.failure_reason.as_deref()),
         ("failed", Some("start_not_delivered"))
@@ -1036,7 +1068,7 @@ async fn the_session_detail_shows_the_open_turn() {
     let turn = started_turn(&collector, &mut host, &session).await;
     let (status, body) = get(&client(&collector), collector.url(&format!("/api/sessions/{session}"))).await;
     assert_eq!(status, 200, "{body}");
-    let item = collector.state.store.session_item(&session).unwrap().unwrap();
+    let item = collector.state.store.find_session_item(&session).unwrap().unwrap();
     // No rule: the host's default hat (umbrella §8.2).
     let hat = collector.state.hosts.host(HOST).unwrap().unwrap().default_hat_id;
     assert_eq!(
@@ -1110,7 +1142,7 @@ async fn reject_after_the_caller_left(
 }
 
 fn failed_with(collector: &Collector, session: &str) -> Option<String> {
-    let row = collector.state.store.session(session).unwrap().unwrap();
+    let row = collector.state.store.find_session(session).unwrap().unwrap();
     (row.lifecycle == "failed").then_some(row.failure_reason).flatten()
 }
 
@@ -1161,7 +1193,7 @@ async fn a_prompt_rejected_after_its_caller_gave_up_still_frees_the_turn_slot() 
     };
     reject_after_the_caller_left(&mut host, caller, request_id).await;
     wait_for("turn slot free", || async {
-        let row = collector.state.store.session(&session).unwrap().unwrap();
+        let row = collector.state.store.find_session(&session).unwrap().unwrap();
         row.open_turn_id.is_none().then_some(())
     })
     .await;
@@ -1217,7 +1249,7 @@ async fn a_cancel_ends_the_open_turn_and_answers_with_its_outcome() {
     let (status, body) = call.await.unwrap();
     assert_eq!(status, 202, "{body}");
     assert_eq!(body, json!({ "turn_id": turn, "outcome": "cancelled" }));
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!((row.open_turn_id, row.activity.as_deref()), (None, Some("idle")));
 }
 
@@ -1975,7 +2007,7 @@ async fn a_revoke_closes_the_hosts_connection_and_parks_its_sessions_for_good() 
     assert!(body["revoked_at"].is_string(), "{body}");
     host.closed().await;
 
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!(
         (row.lifecycle.as_str(), row.presumed_parked, row.open_turn_id),
         ("parked", true, None)
@@ -2028,7 +2060,7 @@ async fn a_revoke_during_a_handshake_is_not_undone_by_its_reconciliation() {
         ))
         .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!((row.lifecycle.as_str(), row.presumed_parked), ("parked", true));
     assert!(!collector.event_kinds(&session).contains(&"reattached".to_string()));
     assert!(collector.state.hub.connected_hosts().is_empty());
@@ -2047,7 +2079,7 @@ async fn a_connection_that_ends_after_its_host_was_revoked_parks_its_sessions() 
     collector.state.hub.disconnect(HOST);
     host.closed().await;
     wait_for("the session parked", || async {
-        let row = collector.state.store.session(&session).unwrap().unwrap();
+        let row = collector.state.store.find_session(&session).unwrap().unwrap();
         (row.lifecycle == "parked" && row.presumed_parked).then_some(())
     })
     .await;
@@ -2073,7 +2105,7 @@ async fn a_registry_error_when_a_revoked_hosts_connection_ends_is_retried() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     db.execute_batch("ALTER TABLE hosts_away RENAME TO hosts").unwrap();
     wait_for("the session parked", || async {
-        let row = collector.state.store.session(&session).unwrap().unwrap();
+        let row = collector.state.store.find_session(&session).unwrap().unwrap();
         (row.lifecycle == "parked" && row.presumed_parked).then_some(())
     })
     .await;
@@ -2114,7 +2146,7 @@ async fn a_revoked_hosts_resend_complete_does_not_reattach_what_the_revoke_alrea
     collector.state.store.revoke_host(HOST).unwrap();
     host.send(&HostFrame::ResendComplete).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!((row.lifecycle.as_str(), row.presumed_parked), ("parked", true));
     assert!(!collector.event_kinds(&session).contains(&"reattached".to_string()));
     assert!(collector.state.hub.connected_hosts().is_empty(), "never marked ready");
@@ -2145,7 +2177,7 @@ async fn a_revoke_of_an_already_offline_host_still_parks_its_sessions_and_cancel
     let (status, body) = revoke(&collector, HOST).await;
     assert_eq!(status, 200, "{body}");
 
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!(
         (row.lifecycle.as_str(), row.presumed_parked, row.open_turn_id),
         ("parked", true, None)
@@ -2380,7 +2412,7 @@ async fn the_session_detail_carries_the_title_and_the_current_model_and_mode() {
         collector
             .state
             .store
-            .session(&session)
+            .find_session(&session)
             .unwrap()
             .unwrap()
             .title
@@ -2566,7 +2598,7 @@ async fn a_session_closed_and_reassigned_while_its_host_was_away_is_closed_on_it
         panic!("expected the reconcile-driven close_session");
     };
     assert_eq!(session_id, session);
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!((row.lifecycle.as_str(), row.hat_id), ("closed", acme.id));
 }
 
@@ -2814,4 +2846,339 @@ async fn a_resent_question_outside_a_turn_still_open_notifies_after_reconciliati
     host.send(&HostFrame::ResendComplete).await;
     let notices = collector.notices_until("needs your answer").await;
     assert_eq!(notices.len(), 1, "{notices:?}");
+}
+
+// Plan 9a: a deleted session on its host (ACP core §4.10; decision 4).
+
+/// A session deleted while its host was away never comes back: everything
+/// the host still sends for it is acked, so its outbox is pruned, and
+/// discarded; the reconnected host is told to close its adapter, and its
+/// `session_closed` is acked and discarded too. A frame for another host's
+/// tombstone is neither acked nor stored, as for any session not its own.
+#[tokio::test]
+async fn a_session_deleted_while_its_host_was_away_is_closed_and_never_comes_back() {
+    use hennery_sessions::store::{Deletion, ListQuery, Unattached};
+    let collector = Collector::start_in(tempfile::tempdir().unwrap(), Duration::from_millis(300)).await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let turn = started_turn(&collector, &mut host, &session).await;
+    let seq = host.seq;
+    host.drop_connection(&collector).await;
+    presumed_parked(&collector, &session).await;
+
+    // The operator deletes it, as the route will: presumed parked, so it is
+    // closed collector-side first.
+    let store = &collector.state.store;
+    let Deletion::Done { unconfirmed, .. } = store
+        .delete_session(
+            &session,
+            Some(&Unattached {
+                lifecycle: "parked".into(),
+                presumed_parked: true,
+            }),
+        )
+        .unwrap()
+    else {
+        panic!("not deleted");
+    };
+    assert!(unconfirmed);
+    // Another host's tombstone, which this host has no business writing to.
+    store
+        .create_session("s-elsewhere", "host-2", "fake", "/tmp", "hat-x", None)
+        .unwrap();
+    store.close_now("s-elsewhere").unwrap();
+    assert!(matches!(
+        store.delete_session("s-elsewhere", None).unwrap(),
+        Deletion::Done { .. }
+    ));
+    let only_tombstone = |id: &str| {
+        let kinds = collector.event_kinds(id);
+        assert_eq!(kinds, ["session_deleted"], "{id}");
+    };
+    only_tombstone(&session);
+
+    // The host comes back with the session still attached, and resends
+    // what its outbox holds for it.
+    let listed = AttachedSession {
+        open_turn_id: Some(turn.clone()),
+        ..attached(&session, seq)
+    };
+    let mut host = ScriptedHost::hello(&collector, vec![listed], seq).await;
+    let Some(CollectorFrame::HelloAck { committed, .. }) = host.hello_ack.clone() else {
+        panic!("no hello_ack");
+    };
+    assert_eq!(committed.get(&session), Some(&0), "{committed:?}");
+    host.emit(
+        &session,
+        SessionBody::AcpUpdate {
+            indexed: Default::default(),
+            payload: json!({ "update": { "sessionUpdate": "agent_message_chunk" } }),
+        },
+    )
+    .await;
+    host.emit(
+        &session,
+        turn_ended(&turn, hennery_proto::frames::TurnOutcome::Completed),
+    )
+    .await;
+    for at in [seq + 1, seq + 2] {
+        let frame = host.next_frame().await;
+        assert!(
+            matches!(&frame, CollectorFrame::Ack { session_id, ack_seq } if *session_id == session && *ack_seq == at),
+            "{frame:?}"
+        );
+    }
+    host.send(&HostFrame::ResendComplete).await;
+    let CollectorFrame::CloseSession { session_id, .. } = host.next().await else {
+        panic!("expected close_session");
+    };
+    assert_eq!(session_id, session);
+    host.emit(&session, SessionBody::SessionClosed).await;
+    let frame = host.next_frame().await;
+    assert!(
+        matches!(&frame, CollectorFrame::Ack { session_id, ack_seq } if *session_id == session && *ack_seq == seq + 3),
+        "{frame:?}"
+    );
+
+    // Another host's tombstone: not acked. Acks come in order, so the next
+    // one is the frame after it.
+    host.emit("s-elsewhere", SessionBody::SessionClosed).await;
+    host.emit(&session, SessionBody::SessionClosed).await;
+    let frame = host.next_frame().await;
+    assert!(
+        matches!(&frame, CollectorFrame::Ack { session_id, ack_seq } if *session_id == session && *ack_seq == seq + 5),
+        "{frame:?}"
+    );
+
+    only_tombstone(&session);
+    only_tombstone("s-elsewhere");
+    assert_eq!(store.committed_seq(&session).unwrap(), 0);
+    assert_eq!(store.find_session(&session).unwrap(), None);
+    assert!(store.list(&ListQuery::default()).unwrap().sessions.is_empty());
+}
+
+/// Decision 4: a host that answers the close of a deleted session
+/// `not_attached` changes nothing, and is told again on its next return.
+#[tokio::test]
+async fn a_not_attached_answer_for_a_deleted_session_changes_nothing() {
+    use hennery_sessions::store::{Deletion, Unattached};
+    let collector = Collector::start_in(tempfile::tempdir().unwrap(), Duration::from_millis(300)).await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let seq = host.seq;
+    host.drop_connection(&collector).await;
+    presumed_parked(&collector, &session).await;
+    let unattached = Unattached {
+        lifecycle: "parked".into(),
+        presumed_parked: true,
+    };
+    assert!(matches!(
+        collector
+            .state
+            .store
+            .delete_session(&session, Some(&unattached))
+            .unwrap(),
+        Deletion::Done { .. }
+    ));
+
+    for _ in 0..2 {
+        let mut host = ScriptedHost::connect(&collector, vec![attached(&session, seq)], seq).await;
+        let CollectorFrame::CloseSession { request_id, session_id } = host.next().await else {
+            panic!("expected close_session");
+        };
+        assert_eq!(session_id, session);
+        host.send(&HostFrame::Error {
+            request_id,
+            code: "not_attached".into(),
+            message: "no such session".into(),
+        })
+        .await;
+        // A frame after it, acked, shows the answer was read.
+        host.emit(&session, SessionBody::SessionClosed).await;
+        loop {
+            if let CollectorFrame::Ack { .. } = host.next_frame().await {
+                break;
+            }
+        }
+        assert_eq!(collector.event_kinds(&session), ["session_deleted"]);
+        host.drop_connection(&collector).await;
+    }
+}
+
+// Plan 9a: `DELETE /api/sessions/{id}` (decision 5, A10).
+
+async fn delete(c: &reqwest::Client, url: String) -> (u16, Value) {
+    let resp = c.delete(url).timeout(Duration::from_secs(15)).send().await.unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(Value::Null))
+}
+
+fn session_url(collector: &Collector, session: &str) -> String {
+    collector.url(&format!("/api/sessions/{session}"))
+}
+
+/// Decision 5: a parked session has no adapter: deleted at once.
+#[tokio::test]
+async fn deleting_a_parked_session_deletes_it_at_once() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = parked_session(&collector, &mut host).await;
+    let (status, body) = delete(&client(&collector), session_url(&collector, &session)).await;
+    assert_eq!(status, 204, "{body}");
+    assert_eq!(collector.state.store.find_session(&session).unwrap(), None);
+    assert_eq!(get(&client(&collector), session_url(&collector, &session)).await.0, 404);
+    // Deleted again: not found.
+    assert_eq!(
+        delete(&client(&collector), session_url(&collector, &session)).await.0,
+        404
+    );
+    assert_eq!(
+        delete(&client(&collector), session_url(&collector, "s-nope")).await.0,
+        404
+    );
+}
+
+/// Decision 5: a closed session is deleted as it is.
+#[tokio::test]
+async fn deleting_a_closed_session_deletes_it() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = parked_session(&collector, &mut host).await;
+    let close = collector.url(&format!("/api/sessions/{session}/close"));
+    assert_eq!(post(&client(&collector), close, json!({})).await.0, 202);
+    assert_eq!(collector.lifecycle(&session), "closed");
+    let (status, body) = delete(&client(&collector), session_url(&collector, &session)).await;
+    assert_eq!(status, 204, "{body}");
+    assert_eq!(collector.state.store.find_session(&session).unwrap(), None);
+    assert_eq!(get(&client(&collector), session_url(&collector, &session)).await.0, 404);
+}
+
+/// Decision 5: an active session whose host answers the close
+/// `not_attached` no longer runs there: closed collector-side, as judged
+/// (A4), and deleted.
+#[tokio::test]
+async fn a_delete_whose_close_is_answered_not_attached_deletes_it() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let c = client(&collector);
+    let url = session_url(&collector, &session);
+    let call = tokio::spawn(async move { delete(&c, url).await });
+    let CollectorFrame::CloseSession { request_id, .. } = host.next().await else {
+        panic!("expected close_session");
+    };
+    host.send(&HostFrame::Error {
+        request_id,
+        code: "not_attached".into(),
+        message: "no such session".into(),
+    })
+    .await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!(status, 204, "{body}");
+    assert_eq!(collector.state.store.find_session(&session).unwrap(), None);
+}
+
+/// Decision 5, 4: a session presumed parked while its host is away is
+/// closed collector-side and deleted; the host is told to close it on its
+/// return.
+#[tokio::test]
+async fn deleting_a_session_of_a_host_away_answers_at_once_and_its_host_closes_it_on_return() {
+    let collector = Collector::start_in(tempfile::tempdir().unwrap(), Duration::from_millis(300)).await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let seq = host.seq;
+    host.drop_connection(&collector).await;
+    presumed_parked(&collector, &session).await;
+    let (status, body) = delete(&client(&collector), session_url(&collector, &session)).await;
+    assert_eq!(status, 204, "{body}");
+    assert_eq!(collector.state.store.find_session(&session).unwrap(), None);
+    let mut host = ScriptedHost::connect(&collector, vec![attached(&session, seq)], seq).await;
+    let CollectorFrame::CloseSession { session_id, .. } = host.next().await else {
+        panic!("expected close_session");
+    };
+    assert_eq!(session_id, session);
+}
+
+/// Decision 5: a start in flight on a reachable host is refused, as close
+/// refuses it.
+#[tokio::test]
+async fn deleting_a_starting_session_on_a_reachable_host_is_refused() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let c = client(&collector);
+    let url = collector.url("/api/sessions");
+    let _start =
+        tokio::spawn(async move { post(&c, url, json!({ "host_id": HOST, "agent": "fake", "cwd": "/tmp" })).await });
+    let CollectorFrame::StartSession { session_id, .. } = host.next().await else {
+        panic!("expected start_session");
+    };
+    let (status, body) = delete(&client(&collector), session_url(&collector, &session_id)).await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("starting")), "{body}");
+    assert_eq!(collector.lifecycle(&session_id), "starting");
+}
+
+/// Decision 5: a close whose delivery is unknown (the host went away with
+/// it) answers 503 and deletes nothing; the close stays requested.
+#[tokio::test]
+async fn a_delete_whose_close_delivery_is_unknown_deletes_nothing() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let c = client(&collector);
+    let url = session_url(&collector, &session);
+    let call = tokio::spawn(async move { delete(&c, url).await });
+    let CollectorFrame::CloseSession { .. } = host.next().await else {
+        panic!("expected close_session");
+    };
+    host.drop_connection(&collector).await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (503, Some("delivery_unknown")),
+        "{body}"
+    );
+    let row = collector
+        .state
+        .store
+        .find_session(&session)
+        .unwrap()
+        .expect("not deleted");
+    assert!(row.close_requested);
+}
+
+/// A10: an open stream of the session gets its `session_deleted` and ends;
+/// afterwards the stream and the events answer 404.
+#[tokio::test]
+async fn an_open_stream_gets_session_deleted_and_ends() {
+    use futures::StreamExt;
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = parked_session(&collector, &mut host).await;
+    let resp = client(&collector)
+        .get(collector.url(&format!("/api/stream/sessions/{session}")))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let mut body = resp.bytes_stream();
+    assert_eq!(
+        delete(&client(&collector), session_url(&collector, &session)).await.0,
+        204
+    );
+    let mut buf = String::new();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(chunk) = body.next().await {
+            buf.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the stream stayed open: {buf}"));
+    assert!(buf.contains("\"kind\":\"session_deleted\""), "{buf}");
+    for path in [
+        format!("/api/stream/sessions/{session}"),
+        format!("/api/sessions/{session}/events"),
+    ] {
+        let (status, body) = get(&client(&collector), collector.url(&path)).await;
+        assert_eq!((status, body["code"].as_str()), (404, Some("not_found")), "{path}");
+    }
 }

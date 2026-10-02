@@ -119,10 +119,18 @@ fn the_owner_id_migration_gives_every_row_the_owner() {
         let conn = rusqlite::Connection::open(&db).unwrap();
         write_world(&conn, &owner, "a");
         // Back to the store's schema before this plan (version 6): plan
-        // 10b-iii's migration (version 11), 5c's (version 10) and 6b's
-        // (version 9) undone first, their indexes on `owner_id` included.
+        // 9a's migration (version 13), 10b-iii's (version 11), 5c's (version
+        // 10) and 6b's (version 9) undone first, their indexes on `owner_id`
+        // included; the events index (version 12) is made again if missing.
         conn.execute_batch(
             "
+            DROP TRIGGER events_of_a_tombstone;
+            DROP TRIGGER turns_of_a_tombstone;
+            DROP TRIGGER pending_of_a_tombstone;
+            DROP TRIGGER answers_of_a_tombstone;
+            DROP TRIGGER catalog_of_a_tombstone;
+            DROP TRIGGER a_tombstone_stays;
+            DROP TABLE turn_attachments;
             DROP INDEX events_by_kind;
             ALTER TABLE pending DROP COLUMN opened_event_id;
             DROP INDEX sessions_by_hat;
@@ -160,7 +168,7 @@ fn the_owner_id_migration_gives_every_row_the_owner() {
             .collect();
         assert_eq!(owners, vec![owner.clone()], "{table}");
     }
-    assert!(store.session("session-a").unwrap().is_some());
+    assert!(store.find_session("session-a").unwrap().is_some());
     assert_eq!(store.events("session-a", 0, 10).unwrap().len(), 1);
     assert_eq!(store.open_pending("session-a").unwrap().len(), 1);
 }
@@ -203,7 +211,7 @@ fn another_owners_sessions_are_invisible_to_the_store() {
     .unwrap();
 
     // The control: the owner's world is there.
-    assert!(store.session("session-a").unwrap().is_some());
+    assert!(store.find_session("session-a").unwrap().is_some());
     assert!(store.catalog("session-a").unwrap().is_some());
     assert_eq!(store.open_pending("session-a").unwrap().len(), 1);
     assert!(store.pending_item("pending-a").unwrap().is_some());
@@ -218,8 +226,8 @@ fn another_owners_sessions_are_invisible_to_the_store() {
     );
 
     let before = all_rows(&conn, None);
-    assert_eq!(store.session("session-b").unwrap(), None);
-    assert_eq!(store.session_item("session-b").unwrap(), None);
+    assert_eq!(store.find_session("session-b").unwrap(), None);
+    assert_eq!(store.find_session_item("session-b").unwrap(), None);
     // The list, and a search that would match only the other owner's.
     let listed: Vec<String> = store
         .list(&ListQuery::default())
@@ -300,7 +308,7 @@ fn another_owners_sessions_are_invisible_to_the_store() {
         "{reconciled:?}"
     );
     assert_eq!(all_rows(&conn, Some(OTHER)), theirs);
-    assert_eq!(store.session("session-a").unwrap().unwrap().lifecycle, "parked");
+    assert_eq!(store.find_session("session-a").unwrap().unwrap().lifecycle, "parked");
 }
 
 /// Plan 6a: an attachment is the owner's who sent it. Another owner's row,

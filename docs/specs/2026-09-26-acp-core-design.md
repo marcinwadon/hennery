@@ -1083,12 +1083,49 @@ a no-op. One transaction re-checks the lifecycle, moves the session, clears
 
 ### 4.10 Delete
 
-`DELETE /api/sessions/{id}` (step-up required, kernel spec §3.4) closes an
-attached session first, then deletes its events, turns, pending rows and
-answer queue entries; attachment files no longer referenced by any event are
-removed. A `session_deleted` tombstone event (no content) remains so the list
-stream can emit `session_removed` with an `event_id`. Per-hat purge (kernel
-spec §5.5) deletes every session of the hat the same way.
+`DELETE /api/sessions/{id}` (step-up required, kernel spec §3.4, checked
+before anything is read) closes an attached session first, then deletes its
+events, turns, pending rows, answer queue entries and catalogue; attachment
+files no longer referenced by any turn or event, of any owner, are removed. A
+`session_deleted` tombstone event (no content) remains so the list stream can
+emit `session_removed` with an `event_id`. Per-hat purge (kernel spec §5.5)
+deletes every session of the hat the same way. As built (plan 9a):
+
+- **Closing first** is `POST …/close`'s rule: `starting` on a reachable host
+  is 409 `starting`; `active` on a reachable host gets `close_session` and the
+  delete waits for it (503 `delivery_unknown`: nothing is deleted, the close
+  stays requested); anything else is closed collector-side as the route read
+  it, a compare-and-set in the delete's own transaction (409 with the
+  lifecycle as its code if it moved). 204.
+- **The tombstone** is the session's row, kept with its id, owner, host, hat
+  and times, and scrubbed: `cwd` and `agent` empty, the title, git fields,
+  model, mode, axes, agent session id, failure reason, rule, open turn and
+  activity cleared, `lifecycle = 'deleted'`. Tombstones are kept. Triggers
+  refuse any write for one, and no accessor or list returns one (404).
+- **Images:** a reference is a `turn_attachments` row (a turn holds its
+  images with or without its `user_turn` event) or an `event_attachments`
+  row. The owner's unreferenced `attachments` rows go in the transaction; each
+  file goes after commit unless another owner's row names its hash (files are
+  shared by hash). A prompt re-sending an image re-writes a file a delete
+  removed meanwhile.
+- **Its project recent** goes too, unless another kept session of that host
+  and hat has the same cwd.
+- **On its host** (§5.1): frames for a tombstone are acked and discarded;
+  reconciliation sends `close_session` for a listed tombstone, and so does a
+  delete that lands while its host is reconnecting. Its `session_closed` and
+  a `not_attached` answer change nothing.
+- **Nothing is left in the database files:** `secure_delete` is on, and the
+  WAL is checkpointed after a delete. A reader that holds the WAL (only one
+  outside hennery can, for long) makes the checkpoint owed: it is recorded
+  beside the database and retried, and at the next start, until it completes;
+  the delete itself does not wait for it. Backups taken earlier keep the data,
+  and the browser may keep a deleted image in its cache until logout clears it.
+- **The agent's own transcript on its host** (its session files) is removed
+  too, best effort, by the adapter's own call if it has one, or else only that
+  session's files inside the agent's known session directory, never through a
+  symlink; what could not be removed is reported and retried when the host
+  reconnects (operator delegated, parent decided 2026-10-02). Not built yet:
+  plan 9d.
 
 ---
 
@@ -1124,8 +1161,8 @@ spec §5.5) deletes every session of the hat the same way.
      `turn_ended_synthesized{interrupted}` if it did (reachable with a lost
      outbox, or a `turn_started` emitted between the `hello` snapshot and the
      resend; leaving it open would wedge the session at 409);
-   - attached sessions the collector has closed receive `close_session`
-     (§4.8). A session is re-assigned only once closed or truly parked (§4.9),
+   - attached sessions the collector has closed, or deleted (§4.10),
+     receive `close_session` (§4.8). A session is re-assigned only once closed or truly parked (§4.9),
      so a re-assigned session the host still has attached is one the collector
      closed;
    - the host is marked ready; then the answer queue for that host is drained
@@ -1359,6 +1396,8 @@ events(
 attachments(owner_id, sha256, mime, size, created_at, PK(owner_id, sha256))   -- file: <data>/attachments/<sha256>
 event_attachments(event_id, sha256, position, owner_id, PK(event_id, position),
   FK(owner_id, sha256) -> attachments)   -- position: the block's index in the user_turn's content
+turn_attachments(turn_id, sha256, position, owner_id, PK(turn_id, position),
+  FK(turn_id) -> turns ON DELETE CASCADE, FK(owner_id, sha256) -> attachments)   -- plan 9a
 pending(pending_id PK, session_id, owner_id, kind, turn_id NULL, option_ids JSON, payload JSON, state, reason, opened_at, resolved_at)
 answer_queue(pending_id PK, session_id, owner_id, request_id UNIQUE, answer JSON, submitted_at, delivered BOOL NULL)
 turns(turn_id PK, session_id, owner_id, request_id, state, content JSON, sent_at, started_at, ended_at, outcome, stop_reason, error)
@@ -1380,7 +1419,11 @@ shipped):
    and `answer_queue`, filled with the database's owner (kernel spec §1) —
    `owner_id` everywhere. The store runs the kernel's migrations first;
 8. `attachments` and `event_attachments`, with `owner_id` from the start —
-   images (6a).
+   images (6a);
+13. `turn_attachments` (backfilled from `turns.content`), the
+   `attachments_by_hash` index, and the triggers that refuse every write for a
+   deleted session's tombstone — delete (9a). Later migrations that update
+   `sessions` must leave tombstones alone.
 
 `sessions` has no `hat_id`, `source_kind`, `title`, git columns or
 `last_event_id` yet, `turns` keeps only `content`, `state`, `outcome` and its
@@ -1428,7 +1471,7 @@ other tables arrive with the plans that need them.
   | `session_deleted` | Tombstone after delete (§4.10). |
 
   Not written yet: `operator_started` (a start writes no collector event so
-  far), `operator_renamed`, `hat_reassigned` and `session_deleted`. A cancel writes none by design (§4.4).
+  far) and `operator_renamed`. A cancel writes none by design (§4.4).
 
 - **`sessions`, `session_catalog`, `plans` and the model/mode columns are
   filled from extracts** and from the fields of typed bodies, never by parsing
@@ -1465,7 +1508,7 @@ All endpoints require an operator session (kernel spec §3). Types come from
 | `POST /api/sessions/{id}/cancel` | Cancel the open turn → 202 `CancelResponse {turn_id, outcome}` once that turn's `turn_ended` is ingested, with its real outcome (`cancelled`; `completed` or `failed` if it ended first; `interrupted` if the session was parked or closed meanwhile, or its adapter exited); 409 `not_attached` / `no_open_turn` / `not_running` (§4.4). |
 | `POST /api/sessions/{id}/park` | Explicit park → 202 `LifecycleResponse` once `session_parked` is ingested; 409 `not_attached` (not `active`, or host not ready); 409 `park_unsupported` (host lacks the `park` capability, nothing sent). |
 | `POST /api/sessions/{id}/close` | Close → 202 `LifecycleResponse` once closed (at once when unattached, parked, presumed parked, failed or the host is offline; on `session_closed` when attached); 409 `starting` while a start is in flight on a reachable host (§4.8). |
-| `DELETE /api/sessions/{id}` | Delete (§4.10); step-up required. |
+| `DELETE /api/sessions/{id}` | Delete (§4.10) → 204; 403 `step_up_required` before anything is read; 404 (unknown or deleted); 409 `starting` on a reachable host, or the lifecycle as its code if it moved during the delete; 503 `delivery_unknown` (nothing deleted, the close stays requested). |
 | `POST /api/sessions/{id}/config` | `{config_id, value}` (a select's value id or a boolean) → 202 with the session's stored `SessionCatalog` once `config_applied` is ingested (after a read-back without options it still shows the old values, §3.2); 409 `not_attached` (not `active`, or host not ready) / `unknown_option`; 400 `invalid`; 502 `config_failed`; 422 for a value that is neither a string nor a boolean. Every viewer also gets SSE `catalog_changed`. |
 | `POST /api/sessions/{id}/pending/{pending_id}/answer` | `{option_id}` (permission) or `{action, content?}` (elicitation) → 202 `{pending_id, request_id}` once queued, whatever the lifecycle or host state; 404; 409 `not_open` / `already_answered`; 400 `invalid`; 422 for a body that is neither kind. The verdict follows as SSE `pending_changed`. |
 | `PATCH /api/sessions/{id}` | `UpdateSessionRequest {hat_id?}` → 200 `SessionDetail`; hat re-assignment (no running adapter, §4.9): 403 `step_up_required`, 400 `invalid` (not the owner's hat), 404, 409 lifecycle or `presumed_parked`. A body naming no hat needs no step-up; renaming (`title`) joins it later. |
@@ -1483,7 +1526,7 @@ reconciled; cancel, config and park answer `not_attached` then. Error bodies are
 `ApiError {code, message, session_id?}`.
 
 **Built so far:** the rows above except the session list, `events?before=`,
-`DELETE`, `PATCH`, and `GET /api/hosts/{id}/projects`, `…/browse` and
+`PATCH`, and `GET /api/hosts/{id}/projects`, `…/browse` and
 `…/agents`; a start takes no `first_prompt` yet (202 `{session_id}`). The list stream `GET /api/stream/sessions` is
 not built yet either. The host registry routes are kernel spec §8.
 
@@ -1500,6 +1543,8 @@ session that opened them ends (kernel spec §3.2).
   next when the stream is polled again, so at most a page and what the
   connection buffers are held; a failed read sends `resync_required` and
   ends the stream.
+  A deleted session's stream, and its `GET …/events`, answer 404 too; an
+  open stream ends after it sends `session_deleted` (plan 9a).
   - **Derived messages share their event's id.** `catalog_changed` (data: the
     `SessionCatalog`) follows every listed `session_started`,
     `config_applied` or `acp_update` whose extracts carry a snapshot; in a

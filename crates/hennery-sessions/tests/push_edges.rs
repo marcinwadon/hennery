@@ -100,7 +100,10 @@ fn a_question_outside_a_turn_is_an_edge_of_its_own() {
         })
     );
     // It left the activity alone.
-    assert_eq!(store.session("s1").unwrap().unwrap().activity.as_deref(), Some("idle"));
+    assert_eq!(
+        store.find_session("s1").unwrap().unwrap().activity.as_deref(),
+        Some("idle")
+    );
 }
 
 #[test]
@@ -185,7 +188,7 @@ fn a_question_asked_again_after_a_withdrawal_crosses_nothing() {
     store.ingest("s1", 4, &withdrawn).unwrap();
     assert_eq!(edge(&store, 5, &question("p2", Some("t1"), None)), None);
     assert_eq!(
-        store.session("s1").unwrap().unwrap().activity.as_deref(),
+        store.find_session("s1").unwrap().unwrap().activity.as_deref(),
         Some("blocked")
     );
 }
@@ -333,7 +336,7 @@ fn a_question_asked_again_outside_a_turn_after_a_withdrawal_waits_for_the_owners
 }
 
 fn session(store: &Store) -> EdgeSession {
-    (&store.session("s1").unwrap().unwrap()).into()
+    (&store.find_session("s1").unwrap().unwrap()).into()
 }
 
 #[test]

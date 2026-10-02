@@ -21,7 +21,8 @@ settings, storage and configuration.
 ## 1. Storage
 
 - One SQLite database, `<data>/hennery.db`, WAL mode, `rusqlite` with the
-  bundled SQLite (no system library; static builds).
+  bundled SQLite (no system library; static builds). `secure_delete` is on: a
+  deleted row's bytes are overwritten, not left in free pages (plan 9a).
 - **One writer thread** owns the write connection and receives work over a
   channel; reads use a small pool. This serialises writes by construction,
   which idempotent ingest (ACP core §8) relies on.

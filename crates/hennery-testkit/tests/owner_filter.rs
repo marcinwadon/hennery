@@ -67,7 +67,7 @@ const SOURCES: &[(&str, &str, usize)] = &[
     (
         "hennery-sessions/src/store.rs",
         include_str!("../../hennery-sessions/src/store.rs"),
-        87,
+        106,
     ),
 ];
 
@@ -78,6 +78,11 @@ const EXEMPT: &[(&str, &str)] = &[
     (
         "hennery-kernel/src/db.rs",
         "`kernel_owner`'s query finds the owner; the rest is the migrations' bookkeeping and their unit tests",
+    ),
+    (
+        "hennery-sessions/src/shared_files.rs",
+        "attachment files are shared by hash across owners: whether any owner's row still names one, before its file \
+         is removed (plan 9a A6); an existence read, no data, no write",
     ),
     (
         "hennery-host/src/outbox.rs",
