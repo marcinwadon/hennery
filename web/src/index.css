@@ -41,7 +41,7 @@ body {
   font-family:var(--font-body); font-size:15px; line-height:1.55;
   -webkit-font-smoothing:antialiased; text-rendering:optimizeLegibility;
 }
-#root { height:100vh; }
+#root { height:100dvh; }
 ::selection { background:var(--accent-soft); }
 button { font-family:inherit; cursor:pointer; }
 input,textarea { font-family:inherit; }
@@ -59,7 +59,7 @@ input,textarea { font-family:inherit; }
 /* minmax(0,1fr) (not bare 1fr, which is minmax(auto,1fr)) lets the content
    column shrink below its content's intrinsic width — without it a long
    unbreakable path keeps the track wider than the viewport. */
-.app { display:grid; grid-template-columns:300px minmax(0,1fr); grid-template-rows:100vh; height:100vh; overflow:hidden; }
+.app { display:grid; grid-template-columns:300px minmax(0,1fr); grid-template-rows:100dvh; height:100dvh; overflow:hidden; }
 .shell { display:flex; flex-direction:column; min-width:0; min-height:0; }
 
 /* Sidebar */
@@ -200,35 +200,34 @@ input,textarea { font-family:inherit; }
 @keyframes fadeUp { from{transform:translateY(8px);} to{transform:none;} }
 @media (prefers-reduced-motion: reduce) { .fade-in,.led-run,.td { animation:none; } }
 
-/* ── Mobile bar + scrim (hidden on desktop) ─────────────────
-   Both are part of the mobile layout fork; the desktop grid never shows them. */
+/* ── Mobile bar and tab bar (hidden on desktop) ─────────────
+   Both are part of the mobile layout; the desktop grid never shows them. */
 .mtopbar { display:none; }
-.scrim { display:none; }
+.tabbar { display:none; }
 
-/* ── Mobile (≤760px) ───────────────────────────────────────
-   A layout fork (not just a shrink): the sidebar becomes a slide-in drawer over
-   a single-column main view, toggled by the mobile top bar's hamburger via the
-   `nav-open` class on .app; the desktop status strip is replaced by that bar;
-   and New Session slides up as a bottom sheet. The drawer slides via `left`
-   (transform on a fixed element is brittle). */
-@media (max-width:760px) {
+/* ── Mobile (under 768px, frontend spec §2) ─────────────────
+   One column: a top bar with the view's title, the view, and a bottom tab
+   bar in place of the rail. New Session slides up as a bottom sheet. */
+@media (max-width:767px) {
   .app { grid-template-columns:minmax(0,1fr); }
+  .rail { display:none; }
 
-  /* sidebar becomes a slide-in drawer */
-  .rail {
-    position:fixed; top:0; bottom:0; left:-110%; width:86%; max-width:344px; z-index:60;
-    border-right:none; transition:left .32s var(--ease); box-shadow:var(--sh-lg);
+  /* the bottom tab bar: four targets of at least 44px, above the home
+     indicator */
+  .tabbar {
+    display:flex; flex:none; border-top:1px solid var(--border); background:var(--bg);
+    padding:4px 4px calc(4px + env(safe-area-inset-bottom));
   }
-  .nav-open .rail { left:0; }
-  .scrim {
-    display:block; position:fixed; inset:0; background:rgba(36,38,43,.42); backdrop-filter:blur(2px);
-    z-index:55; opacity:0; pointer-events:none; transition:opacity .3s var(--ease);
+  .tab {
+    flex:1; min-height:52px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:2px;
+    color:var(--fg-muted); text-decoration:none; font-size:11px; font-weight:600; border-radius:var(--r-sm);
   }
-  .nav-open .scrim { opacity:1; pointer-events:auto; }
+  .tab.on { color:var(--accent); }
 
   /* mobile top bar (replaces the desktop status strip) */
   .mtopbar {
-    display:flex; align-items:center; gap:12px; height:58px; flex:none; padding:0 12px;
+    display:flex; align-items:center; gap:12px; min-height:58px; flex:none;
+    padding:env(safe-area-inset-top) 12px 0;
     border-bottom:1px solid var(--border); background:var(--bg); position:sticky; top:0; z-index:20;
   }
   .mtb-btn { width:44px; height:44px; flex:none; border-radius:11px; border:1px solid var(--border); background:var(--surface); display:flex; align-items:center; justify-content:center; color:var(--fg-1); }
@@ -293,12 +292,12 @@ input,textarea { font-family:inherit; }
 .hat-switch { display:flex; gap:7px; }
 .topbar-div { width:1px; height:26px; background:var(--border); margin:0 4px; }
 
-/* ── Desktop (≥761px) hide the mobile-only copies ──
-   Both .view-switch-mobile and .hat-switch-mobile are shown via @media (max-width:760px).
+/* ── Desktop (768px and wider) hide the mobile-only copies ──
+   Both .view-switch-mobile and .hat-switch-mobile are shown via @media (max-width:767px).
    We hide them on desktop via a min-width query instead of unconditional display:none,
    because the unconditional rule would come later in source order and win at every width,
-   hiding the controls even at ≤760px where the max-width:760px rules should apply. */
-@media (min-width:761px) {
+   hiding the controls even under 768px where the max-width:767px rules should apply. */
+@media (min-width:768px) {
   .view-switch-mobile { display:none; }
   .hat-switch-mobile { display:none; }
 }
@@ -309,3 +308,24 @@ input,textarea { font-family:inherit; }
 .chip:hover { border-color:var(--border-strong); color:var(--fg-1); }
 .chip.on { border-color:var(--accent); background:var(--accent-wash); color:var(--accent); }
 
+
+/* ── The rail's views (desktop) ── */
+.new-btn { text-decoration:none; }
+.rail-nav { display:flex; flex-direction:column; gap:2px; padding:6px 8px; }
+.nav-item { display:flex; align-items:center; gap:10px; padding:9px 12px; border-radius:var(--r-sm); color:var(--fg-2); text-decoration:none; font-weight:600; font-size:14px; }
+.nav-item:hover { background:var(--rail-2); color:var(--fg-1); }
+.nav-item.on { background:var(--surface); color:var(--accent); box-shadow:var(--sh-sm); }
+.rail-foot { padding:12px 14px calc(12px + env(safe-area-inset-bottom)); border-top:1px solid var(--border); }
+.main { overflow-y:auto; }
+
+/* ── Sign-in screens: setup and login ── */
+.auth { min-height:100dvh; display:flex; align-items:center; justify-content:center; padding:calc(24px + env(safe-area-inset-top)) 20px calc(24px + env(safe-area-inset-bottom)); }
+.auth-card { width:100%; max-width:420px; background:var(--surface); border:1px solid var(--border); border-radius:var(--r-lg); box-shadow:var(--sh-md); padding:28px; }
+.auth-card h1 { font-family:var(--font-display); font-weight:800; font-size:24px; letter-spacing:-.01em; margin:6px 0 18px; }
+.auth-card .btn { width:100%; }
+.auth-or { text-align:center; color:var(--fg-muted); font-size:13px; margin:14px 0; }
+.field { display:block; }
+.text-input { width:100%; border:1.5px solid var(--border-strong); border-radius:var(--r-sm); padding:11px 13px; font-size:15px; color:var(--fg-1); background:var(--surface-2); outline:none; transition:border-color .15s,box-shadow .15s; }
+.text-input:focus { border-color:var(--accent); background:var(--surface); box-shadow:0 0 0 3px var(--accent-wash); }
+.form-error { color:var(--st-attn); font-size:14px; margin:0 0 14px; overflow-wrap:anywhere; }
+.dialog .modal-body p { margin:0 0 14px; }
