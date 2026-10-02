@@ -10,16 +10,26 @@ use std::time::{Duration, Instant};
 /// keeps it so.
 const OFFLINE: &str = "http://127.0.0.1:1/";
 
-/// The binary, offline.
+/// The variables that send a long-running `hennery` to a log file (plan
+/// 7c-iii): a test run from a service-run host's agent, or a shell that set
+/// them, must not log into a real log directory, nor away from the output
+/// these tests read.
+const LOG_VARS: [&str; 2] = ["HENNERY_SERVICE", "HENNERY_LOG_DIR"];
+
+/// The binary, offline and without `LOG_VARS`.
 fn hennery() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
     offline(&mut cmd);
     cmd
 }
 
+/// Offline (plan 7b), and without `LOG_VARS` (plan 7c-iii).
 fn offline(cmd: &mut Command) {
     cmd.env("HENNERY_NPM_REGISTRY", OFFLINE)
         .env("HENNERY_NODE_MIRROR", OFFLINE);
+    for var in LOG_VARS {
+        cmd.env_remove(var);
+    }
 }
 
 #[test]
@@ -1705,6 +1715,8 @@ fn the_host_fails_and_pairs_nothing_when_the_collector_dies_before_the_code() {
         .arg(&host_dir)
         .env_remove("HENNERY_HOST_DATA_DIR")
         .env_remove("HENNERY_DEV_TOKEN")
+        .env_remove(LOG_VARS[0])
+        .env_remove(LOG_VARS[1])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -3509,4 +3521,74 @@ fn a_host_without_agent_flags_runs_the_installed_set() {
     );
     let logged = std::fs::read_to_string(&log).unwrap() + &std::fs::read_to_string(log.with_extension("err")).unwrap();
     assert!(logged.contains("agents from the adapter set"), "{logged}");
+}
+
+/// `path`'s text, or nothing while it is not there.
+fn text_of(path: &std::path::Path) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+/// Plan 7c-iii: run by a service (`HENNERY_SERVICE` set, as both units set
+/// it), `up` and its two children each log to a file of their own in
+/// distribution spec §8's directory, private. Standard output, which launchd
+/// keeps as `<role>.log`, gets nothing; standard error one line from each
+/// naming its file. HOME and XDG_STATE_HOME are scratch directories: no real
+/// log directory is touched.
+#[test]
+fn a_service_run_logs_to_its_own_files_and_not_to_its_output() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch_dir("svclog");
+    let _cleanup = RemoveDir(dir.clone());
+    let (home, state) = (dir.join("home"), dir.join("state"));
+    let logs = if cfg!(target_os = "macos") {
+        home.join("Library/Logs/hennery")
+    } else {
+        state.join("hennery/log")
+    };
+    let mut command = hennery();
+    command
+        .env("HENNERY_SERVICE", "systemd")
+        .env("HOME", &home)
+        .env("XDG_STATE_HOME", &state)
+        .env("RUST_LOG", "info");
+    let log = dir.join("up.log");
+    let data = dir.join("data");
+    let mut up = up_logging_to_with(command, &data, &log, &[]);
+    let collector_log = logs.join("hennery-collector.log");
+    let host_log = logs.join("hennery-host.log");
+    up.wait_until("the collector's line in its own file", || {
+        text_of(&collector_log).contains("collector listening")
+    });
+    up.wait_until("the host's line in its own file", || {
+        text_of(&host_log).contains("connected to collector")
+    });
+    unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
+    assert!(wait_with_timeout(&mut up.up, Duration::from_secs(30)).is_some_and(|s| s.success()));
+    assert!(
+        !text_of(&host_log).contains("collector listening"),
+        "one file per process"
+    );
+    assert!(
+        !text_of(&collector_log).contains("connected to collector"),
+        "one file per process"
+    );
+    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&logs), 0o700);
+    let names = ["hennery-up.log", "hennery-collector.log", "hennery-host.log"];
+    for name in names {
+        assert_eq!(mode(&logs.join(name)), 0o600, "{name}");
+    }
+    // No colour codes in a file.
+    assert!(!text_of(&collector_log).contains('\u{1b}'));
+    let stdout = text_of(&log);
+    assert!(stdout.is_empty(), "stdout:\n{stdout}");
+    let stderr = text_of(&log.with_extension("err"));
+    let mut lines: Vec<&str> = stderr.lines().collect();
+    lines.sort_unstable();
+    let mut expected: Vec<String> = names
+        .iter()
+        .map(|name| format!("hennery: logging to {}", logs.join(name).display()))
+        .collect();
+    expected.sort_unstable();
+    assert_eq!(lines, expected, "stderr:\n{stderr}");
 }

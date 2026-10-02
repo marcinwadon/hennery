@@ -141,10 +141,12 @@ fn command(git: &Path, cwd: &Path, args: &[&str], vars: impl Iterator<Item = (Os
         .process_group(0)
         .kill_on_drop(true);
     // What an agent never inherits, git does not either: a filter it runs
-    // is the repository's code (the second review's B2).
+    // is the repository's code (the second review's B2), and the host's log
+    // variables (plan 7c-iii) are not its own.
     for var in crate::adapter::NESTING_VARS
         .iter()
         .chain(crate::adapter::HOST_SECRET_VARS)
+        .chain(crate::adapter::HOST_LOG_VARS)
     {
         cmd.env_remove(var);
     }
@@ -337,6 +339,7 @@ mod tests {
         for removed in crate::adapter::NESTING_VARS
             .iter()
             .chain(crate::adapter::HOST_SECRET_VARS)
+            .chain(crate::adapter::HOST_LOG_VARS)
         {
             assert_eq!(envs.get(OsStr::new(removed)), Some(&None), "{removed}");
         }

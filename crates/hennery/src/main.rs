@@ -7,6 +7,7 @@ mod config;
 mod healthcheck;
 mod inherit;
 mod lock;
+mod log;
 mod runtime;
 mod service;
 mod supervisor;
@@ -254,11 +255,31 @@ fn bind_all(addresses: &[String]) -> Result<Vec<std::net::TcpListener>> {
         .collect()
 }
 
+impl Command {
+    /// The name of the log this command writes when run by a service
+    /// (`log::init`): only the long-running ones have one.
+    fn log_name(&self) -> Option<&'static str> {
+        match self {
+            Self::Up(_) => Some("up"),
+            Self::Collector(CollectorCli {
+                run: Some(_),
+                command: None,
+            }) => Some("collector"),
+            Self::Host {
+                command: HostCommand::Run(_),
+            } => Some("host"),
+            _ => None,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
-        .init();
+    let cli = Cli::parse();
+    if let Err(why) = log::init(cli.command.log_name()) {
+        eprintln!("Error: {why}");
+        return std::process::ExitCode::FAILURE;
+    }
     // Every arm returns a `Result<ExitCode>` (not just `Result<()>`), and
     // nothing on this path ever calls `std::process::exit`: that call tears
     // down the whole process immediately, without unwinding this `async fn`
@@ -268,7 +289,7 @@ async fn main() -> std::process::ExitCode {
     // group. Returning an `ExitCode` here instead lets the runtime finish
     // and drop normally first, exactly like a plain `Ok(())` return always
     // did; only then does the process actually exit with that code.
-    let result = match Cli::parse().command {
+    let result = match cli.command {
         Command::Collector(CollectorCli {
             command: Some(CollectorCommand::Healthcheck(args)),
             ..
