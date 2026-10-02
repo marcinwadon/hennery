@@ -195,7 +195,10 @@ in
         nativeBuildInputs = [ hennery ];
       }
       ''
+        # Every directory doctor could default to is this check's own.
         export HOME="$TMPDIR/home" XDG_CONFIG_HOME="$TMPDIR/config"
+        export XDG_DATA_HOME="$TMPDIR/data" XDG_STATE_HOME="$TMPDIR/state"
+        unset HENNERY_DATA_DIR HENNERY_HOST_DATA_DIR
         data="$TMPDIR/a dir %h \$HOME \"quoted\" \\back"
         mkdir -p "$HOME" "$data" "$XDG_CONFIG_HOME/systemd/user" "$XDG_CONFIG_HOME/hennery"
         # A host's directory, by its names alone.
