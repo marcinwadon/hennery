@@ -48,6 +48,11 @@ pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
     preFixup = ''
       rm -rf "''${storePath:?}/v11/links"
     '';
+    # Changes with `web/pnpm-lock.yaml`. After a lock change, set it to
+    # `lib.fakeHash`, run `nix build .#web.pnpmDeps`, and copy the hash it
+    # got. A store that already holds the old output never refetches it,
+    # so the offline build is what fails there, with
+    # ERR_PNPM_NO_OFFLINE_TARBALL.
     hash = "sha256-5p7sGn/gcxYo5HKokMqyUG0Y25POOVnJiNFyi8I4vxI=";
   };
 
