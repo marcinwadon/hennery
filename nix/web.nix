@@ -59,7 +59,7 @@ pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
     # mismatch in `hennery-web-pnpm-deps`. A store that already holds the
     # old output never refetches it, so locally the build fails instead,
     # with ERR_PNPM_NO_OFFLINE_TARBALL.
-    hash = "sha256-5p7sGn/gcxYo5HKokMqyUG0Y25POOVnJiNFyi8I4vxI=";
+    hash = "sha256-iLpOElKP64wYOWB5Fvv6iUEnTZ2Z1jFbbrFHFdXfYi0=";
   };
 
   nativeBuildInputs = [

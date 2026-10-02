@@ -63,7 +63,12 @@ describe('the shell', () => {
     at('/sessions/%3Cb%3Ex%3C%2Fb%3E')
     const server = stubServer({ 'GET /api/capabilities': json(200, FULL) })
     render(<App fetchImpl={server.fetch} />)
-    expect(await screen.findByText('<b>x</b>')).toBeInTheDocument()
+    // The view shows the id while it loads, and with the deleted notice
+    // (this stub has no session): text either way.
+    await waitFor(() => expect(screen.getByText('<b>x</b>')).toBeInTheDocument())
+    expect(document.querySelector('b')).toBeNull()
+    // The session view, not a placeholder: this stub knows no session.
+    expect(await screen.findByRole('heading', { name: 'This session was deleted' })).toBeInTheDocument()
   })
 
   it('goes from / to /sessions', async () => {
