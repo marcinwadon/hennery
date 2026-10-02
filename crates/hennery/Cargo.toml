@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 publish.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Self-hosted cockpit for ACP coding agents"
 
 [features]
 # Release builds (plan 7a): build OpenSSL, which `webauthn-rs-core` links,
@@ -31,3 +34,7 @@ tracing-subscriber.workspace = true
 hennery-testkit = { path = "../hennery-testkit" }
 serde_json.workspace = true
 tempfile.workspace = true
+
+# cargo-dist (plan 7a) ships this crate's binary despite `publish = false`.
+[package.metadata.dist]
+dist = true

@@ -1,0 +1,152 @@
+# Release artifacts, built the way a release builds them (distribution spec
+# §2, plan 7a), and checked: Linux musl-static for both architectures and
+# macOS arm64, the shell installer and the Homebrew formula.
+#
+# This workflow publishes nothing. It has no tag trigger, no release, no
+# registry push, no attestation, and only `contents: read`. What it builds
+# stays a workflow artifact, kept for a week. Publishing is the operator's
+# to switch on (packaging/README.md).
+#
+# The archives hold the `hennery` binary alone, which `check-archive.sh`
+# asserts. No job here downloads, builds or uploads an adapter: the Claude CLI
+# is never redistributed (distribution spec §3.3).
+#
+# Third-party actions are pinned by commit, images by digest, cargo-dist by
+# SHA-256 (`install-dist.sh`); GitHub's own actions by major tag. Workflow
+# artifacts are never promoted to a release (packaging/README.md).
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # One archive per target, each on a native runner.
+  archive:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master @ 2026-09-12
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.target }}
+      # `musl-gcc` builds the C parts (OpenSSL, SQLite, ring) for musl.
+      - name: musl tools (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Install dist
+        run: |
+          sh packaging/install-dist.sh "$RUNNER_TEMP/dist-bin"
+          echo "$RUNNER_TEMP/dist-bin" >> "$GITHUB_PATH"
+      - name: Build the archive
+        run: |
+          dist build --artifacts=local --target=${{ matrix.target }} --print=linkage --output-format=json > dist-manifest.json
+          cp dist-manifest.json "target/distrib/${{ matrix.target }}-dist-manifest.json"
+      - name: Unpack the binary
+        run: |
+          mkdir -p unpacked
+          tar -xJf "target/distrib/hennery-${{ matrix.target }}.tar.xz" -C unpacked
+          echo "BINARY=$PWD/unpacked/hennery-${{ matrix.target }}/hennery" >> "$GITHUB_ENV"
+      - name: Holds the binary alone
+        run: sh packaging/check-archive.sh "target/distrib/hennery-${{ matrix.target }}.tar.xz" ${{ matrix.target }}
+      - name: Links nothing outside the system
+        run: sh packaging/check-linkage.sh "$BINARY"
+      - name: Runs
+        run: |
+          "$BINARY" --version
+          "$BINARY" collector --help > /dev/null
+      - name: Runs on Alpine (musl)
+        if: runner.os == 'Linux'
+        run: docker run --rm -v "$BINARY:/hennery:ro" alpine:3@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 /hennery --version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            target/distrib/hennery-${{ matrix.target }}.tar.xz
+            target/distrib/hennery-${{ matrix.target }}.tar.xz.sha256
+            target/distrib/${{ matrix.target }}-dist-manifest.json
+
+  # What spans the archives: the installer (their checksums embedded), the
+  # Homebrew formula, and `sha256.sum`.
+  installers:
+    needs: archive
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install dist
+        run: |
+          sh packaging/install-dist.sh "$RUNNER_TEMP/dist-bin"
+          echo "$RUNNER_TEMP/dist-bin" >> "$GITHUB_PATH"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: target/distrib/
+          merge-multiple: true
+      - name: Build the installers
+        run: dist build --artifacts=global
+      # cargo-dist's installer skips the check without `sha256sum`; the spec
+      # wants it to refuse (packaging/harden-installer.py).
+      - name: Harden the installer
+        run: python3 packaging/harden-installer.py target/distrib/hennery-installer.sh
+      - name: The installer installs, and refuses what it cannot check
+        run: sh packaging/test-installer.sh target/distrib
+      - name: The formula names every archive's SHA-256
+        run: sh packaging/check-formula.sh target/distrib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: installers
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            target/distrib/hennery-installer.sh
+            target/distrib/hennery.rb
+            target/distrib/sha256.sum
+
+  # The same installer, on macOS: its own `sha256sum` and `shasum`, its own
+  # archive.
+  installer-macos:
+    needs: installers
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: archive-*
+          path: target/distrib/
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: installers
+          path: target/distrib/
+      - name: The installer installs, and refuses what it cannot check
+        run: sh packaging/test-installer.sh target/distrib

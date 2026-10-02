@@ -8,6 +8,8 @@ edition = "2024"
 license = "AGPL-3.0-only"
 rust-version = "1.88"
 publish = false
+repository = "https://github.com/marcinwadon/hennery"
+homepage = "https://github.com/marcinwadon/hennery"
 
 [workspace.dependencies]
 agent-client-protocol = "=2.2.0"
@@ -66,3 +68,8 @@ opt-level = 3
 
 [profile.dev.package.sha2]
 opt-level = 3
+
+# Release archives (plan 7a): `dist build` builds with this profile.
+[profile.dist]
+inherits = "release"
+lto = "thin"
