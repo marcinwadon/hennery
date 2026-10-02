@@ -37,9 +37,33 @@ It builds on the lane's decisions L1 (mint and revoke inside the transition's tr
 - The five checks passed: 1301 tests, from 1243.
 - The 101 revert-probes of Tasks 1–3 were run, and each failed as expected (Task 1's and Task 2's Step 6, Task 3's Step 5); two more were measured inert and are kept (Task 2's Step 6).
 
-## Execution status
+## Execution status (2026-10-02)
 
-_Not executed yet._
+**Executed** on `main` at `e4e2ca3` (8a merged as `ce47137`, 8b-ii as `522e802`). The code was first built and security-reviewed on 8b merged with 8a's reviewed branch. Each task was then applied from this plan's text, step by step, and reviewed by its own opus reviewer, followed by a whole-branch review. Each fix round went into the code first, then into this plan. The plan was regenerated and replayed, and the branch rebuilt from it, as 8a, 8b-ii and later `main` moved under it. The last replay, onto `e4e2ca3`, matched the branch byte for byte.
+
+| Area | As built | Why |
+|---|---|---|
+| Task 1 review (opus): approve with fixes | `a_mint_never_takes_over_another_owner_s_token` asserts the upsert's own error, since the composite foreign keys would refuse the takeover too. A re-mint is pinned to clear `last_used_at`. The token is built at its final size. `SessionToken` lost `PartialEq`. | Two guards no test failed without; a buffer that could keep part of a token. |
+| Task 2 review (opus): approve with fixes | `HEAD` and any other method get the one 404; so does `/mcp/<slug>/`. An event whose data has a key twice is dropped. An empty body under a JSON type does not set `ok`. New tests cover the head timeout, the answerer at the request cap and its fallback to the request's `Mcp-Session-Id`. Decision 19, `Cache-Control: no-store`, answers the lane's question about caching. | axum hands `HEAD` to the `GET` handler, so a `HEAD` went upstream and its empty JSON answer marked the connection `ok`. |
+| Task 3 review (opus): approve with fixes | The proxy takes a clone of the collector's one `Egress`, the one 10b-ii builds for Web Push. | One pool per allowance, never a second `Egress`. |
+| Task 4 review (opus): approve with fixes | One false sentence about `mark_needs_auth` and five stale ones were fixed. Kernel §7.1 and umbrella §10.1 were brought in line. | The write-back must be true of the code. |
+| Plan 8b-ii's obligations | All met (decision 9). They are pinned by `tests/proxy_egress.rs`, by the upstream's `Host` check, and by the answerer re-reading the connection (decision 14). | 8b-ii merged during execution. |
+| Whole-branch review (opus): request changes | Its blocker is fixed: decision 6 now refuses a key the gateway reads when it is spelt in another case. It folds `ſ`, `_` and `-` as Go's `encoding/json` does. Also taken: the one 404 for a slug that is not UTF-8, the filter's known gaps written into §5.5, and the spec's wording. Its finding 2 is a product question ("After this plan"). | A Go upstream read `{"METHOD":"tools/call",…}` as a call that the allowlist never saw. |
+| Its scoped re-confirmation (opus): approve after one amendment | The answerer no longer keeps a client or a credential. It re-reads the connection for every answer. | Plan 8b-ii's "cache nothing across a `PATCH`". |
+| Re-confirmation of those fixes (a fresh opus): approve after amendments | F1, F2 and F3 were taken. | See "The security review's answers". |
+| Every outcome, its test and its probe (the fleet rule of 2026-10-02) | Four tests were added: a body declared over 4 MiB is 413 before it is read; a filtered `tools/list` that does not parse is 502 `upstream_invalid`; a damaged row is 500 `internal`; a batch with nothing to answer is 202. Ten `oc-*` probes were added. The table under "Review Focus" maps each outcome to its test and its probe. | Each outcome a classifier can produce needs a test of its own that fails without it. |
+
+Checks:
+- At `e4e2ca3` the five checks passed: 1301 tests, from 1243.
+- Rebased onto `main` at `68bd97d` (plan 7d-ii, which shares `Cargo.lock` with this branch) before the PR merged: the plan replayed there and matched the branch again, and the five checks passed with 1313 tests.
+- All 103 revert-probes ran (runs 9 to 11). 101 failed as expected, and the 2 measured inert are kept.
+- The proxy's test binary passed 12 of 12 runs under load: four copies at once, three times.
+- The run was on macOS only. Ubuntu CI is the Linux check.
+
+Systemic note: two classes of finding reached the whole-branch review that a per-task review missed.
+- The first is a parser differential beyond duplicate keys: case-insensitive decoders. A fuzz or differential test against a second JSON decoder would catch that class.
+- The second is a stream outliving the state it was authorised by. It is open for the maintainer.
+
 
 ## Scope
 
