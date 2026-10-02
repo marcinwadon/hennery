@@ -297,6 +297,36 @@ impl Fixture {
         fixture
     }
 
+    /// As `new`, with each agent's bundled CLI a native program: `program`'s
+    /// bytes, not a script.
+    pub fn with_native_cli(version: &str, program: &[u8]) -> Self {
+        let mut fixture = Self::new(version);
+        for agent in ["claude", "codex"] {
+            for platform in Platform::ALL {
+                let key = platform.key();
+                let file = fixture.package(
+                    &format!("node_modules/@vendor/{agent}-cli-{key}"),
+                    &format!("@vendor/{agent}-cli-{key}"),
+                    version,
+                    &[("package/cli", 0o755, program)],
+                    true,
+                );
+                let files = fixture
+                    .manifest
+                    .adapters
+                    .get_mut(agent)
+                    .unwrap()
+                    .platforms
+                    .get_mut(key)
+                    .unwrap();
+                let at = files.iter().position(|f| f.cli).unwrap();
+                files[at] = file;
+            }
+        }
+        fixture.manifest.validate().unwrap();
+        fixture
+    }
+
     fn package(&mut self, path: &str, name: &str, version: &str, files: &[(&str, u32, &[u8])], cli: bool) -> File {
         let body = tgz(files);
         let rest = format!("{name}/-/{}-{version}.tgz", name.rsplit('/').next().unwrap());
