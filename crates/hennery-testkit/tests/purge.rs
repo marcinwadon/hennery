@@ -609,6 +609,61 @@ async fn a_purge_leaves_no_trace_of_the_hat_in_the_database_files() {
     }
 }
 
+/// A logo of 8 × 8 pixels of noise from `seed`, as the kernel stores one:
+/// its image data is found nowhere else.
+fn noisy_logo(seed: u32) -> hennery_kernel::logo::Logo {
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let pixels: Vec<u8> = (0..8 * 8 * 4)
+        .map(|_| {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            (state >> 16) as u8
+        })
+        .collect();
+    let mut png = Vec::new();
+    let mut encoder = png::Encoder::new(&mut png, 8, 8);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().unwrap();
+    writer.write_image_data(&pixels).unwrap();
+    writer.finish().unwrap();
+    hennery_kernel::logo::reencode(&png, hennery_kernel::logo::MAX_STORED).unwrap()
+}
+
+/// The image data of `logo`: its bytes after the signature and `IHDR`, up
+/// to `IEND`.
+fn image_data(logo: &hennery_kernel::logo::Logo) -> &[u8] {
+    &logo.bytes[33..logo.bytes.len() - 12]
+}
+
+/// The review's A7: once its hat is purged, no logo the hat had is left in
+/// the database's files, the WAL included, the one replaced before the
+/// purge as well: the row went (`secure_delete`), and the WAL was
+/// checkpointed after it.
+#[tokio::test]
+async fn a_purge_leaves_no_trace_of_the_hats_logos() {
+    let (c, _, _) = Collector::start().await;
+    let hat = c.hat("Logos");
+    let logos = [noisy_logo(1), noisy_logo(2)];
+    for logo in &logos {
+        assert!(matches!(
+            c.state.hosts.set_hat_logo(&hat, logo).unwrap(),
+            HatChange::Done(_)
+        ));
+    }
+    let dir = c.db.parent().unwrap();
+    let files =
+        || ["hennery.db", "hennery.db-wal"].map(|file| (file, std::fs::read(dir.join(file)).unwrap_or_default()));
+    let holds = |bytes: &[u8], logo| bytes.windows(image_data(logo).len()).any(|w| w == image_data(logo));
+    // The control: the logo is in the files before the purge.
+    assert!(files().iter().any(|(_, bytes)| holds(bytes, &logos[1])));
+    c.purged(&hat).await;
+    for (file, bytes) in files() {
+        for (n, logo) in logos.iter().enumerate() {
+            assert!(!holds(&bytes, logo), "{file} still holds logo {n}");
+        }
+    }
+}
+
 /// A8, for a purge: its deletes share one checkpoint, after the last, so a
 /// reader that holds the WAL across the purge holds it up once, not once
 /// per session (a held-up checkpoint takes about 3.5 s here). Once the reader is
