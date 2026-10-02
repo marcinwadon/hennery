@@ -2,10 +2,12 @@
 //! request hennery itself sends to the network — the gateway's proxy, its
 //! OAuth calls, Web Push — goes through an [`EgressClient`].
 //!
-//! - **Built once, cloned freely.** [`Egress::new`] builds one `reqwest`
-//!   client per [`Allowance`]; [`Egress`] and [`EgressClient`] are cheap to
-//!   clone (`reqwest::Client` is an `Arc` inside) and share connection pools
-//!   with their clones. The two allowances never share a pool: a pooled
+//! - **Built once, cloned freely.** [`Egress::new`] builds its `reqwest`
+//!   clients once: one per [`Allowance`], and a second, internal-only one
+//!   for plain `http` under [`Allowance::InternalNetwork`]. [`Egress`] and
+//!   [`EgressClient`] are cheap to clone (`reqwest::Client` is an `Arc`
+//!   inside) and share connection pools with their clones. The two
+//!   allowances never share a pool: a pooled
 //!   connection skips the resolver, so a public-only request must never
 //!   ride one an internal-network request opened.
 //! - **No way around the check.** The only way to send is
@@ -15,10 +17,12 @@
 //!   `OAuthHttpClient`, `web-push-native`) converts it with
 //!   `Request::try_from` and sends it here.
 //! - **The URL check** ([`check_url`]): `https`, or plain `http` to
-//!   loopback only (a loopback literal or `localhost`), for every caller and
-//!   allowance; no credentials in the URL; an IP-literal host must be public
-//!   under [`Allowance::PublicOnly`]. reqwest never asks the resolver about a
-//!   literal, so this check is the only one a literal gets. `url::Url` has
+//!   loopback (a loopback literal or `localhost`); under
+//!   [`Allowance::InternalNetwork`] also plain `http` to an internal
+//!   address or a name (plan 8b-ii, below). No credentials in the URL; an
+//!   IP-literal host must be public under [`Allowance::PublicOnly`].
+//!   reqwest never asks the resolver about a literal, so this check is the
+//!   only one a literal gets. `url::Url` has
 //!   already normalised the odd IPv4 spellings (`2130706433`, `0x7f.1`,
 //!   `0177.0.0.1`, `127.1`) to the address they name.
 //! - **Names are resolved by hennery** (the system resolver) and, under
@@ -37,6 +41,18 @@
 //!   `::`, `::1`, IPv4-mapped `::ffff:0:0/96`, NAT64 `64:ff9b::/96` and
 //!   `64:ff9b:1::/48`, unique-local `fc00::/7`, link-local `fe80::/10` and
 //!   multicast `ff00::/8` are never public.
+//! - **Plain `http` inside the internal network** (plan 8b-ii, the
+//!   operator's decision of 2026-10-02): only under
+//!   [`Allowance::InternalNetwork`], and only to internal addresses — RFC
+//!   1918, loopback and unique-local IPv6, except AWS's metadata address
+//!   `fd00:ec2::254`. A public address stays `https` only even then, and so
+//!   do the addresses that are neither: link-local and that metadata
+//!   address (cloud metadata services answer plain `http` there), CGNAT (it
+//!   may be the carrier's network), documentation, multicast, `0.0.0.0`,
+//!   IPv4-mapped, NAT64, 6to4 and Teredo (they may lead to a public host). A
+//!   literal is checked by the URL check; a name goes through a third
+//!   client, used for nothing but plain `http` under `InternalNetwork`,
+//!   whose resolver refuses the name if **any** address is not internal.
 //! - **Never** a proxy from the environment (`HTTP_PROXY`, `HTTPS_PROXY`,
 //!   `ALL_PROXY`): it would take the checked connection elsewhere and hand
 //!   it the request. **Never** a followed redirect: a 3xx is the caller's
@@ -59,7 +75,9 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -75,8 +93,9 @@ pub enum Allowance {
     /// Public addresses only: Web Push always, and every gateway connection
     /// the operator has not marked "internal network".
     PublicOnly,
-    /// Any address: a gateway connection the operator marked "internal
-    /// network" (gateway spec §5.7), and nothing else.
+    /// Any address over `https`, and internal addresses only over plain
+    /// `http`: a gateway connection the operator marked "internal network"
+    /// (gateway spec §5.7), and nothing else.
     InternalNetwork,
 }
 
@@ -98,7 +117,8 @@ impl Timeouts {
     };
 }
 
-/// The policy's two clients, one per [`Allowance`].
+/// The policy's clients: one per [`Allowance`], and the internal-network
+/// one with a second, for plain `http`.
 #[derive(Debug, Clone)]
 pub struct Egress {
     public: EgressClient,
@@ -126,24 +146,41 @@ impl Egress {
 #[derive(Debug, Clone)]
 pub struct EgressClient {
     http: reqwest::Client,
+    /// Plain `http` under [`Allowance::InternalNetwork`]: its resolver lets
+    /// a name reach internal addresses only. `None` under `PublicOnly`.
+    plain: Option<reqwest::Client>,
     allowance: Allowance,
     timeouts: Timeouts,
 }
 
 impl EgressClient {
     fn build(allowance: Allowance, timeouts: Timeouts) -> anyhow::Result<EgressClient> {
-        let http = reqwest::Client::builder()
-            .user_agent(concat!("hennery/", env!("CARGO_PKG_VERSION")))
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .dns_resolver(Arc::new(CheckedResolver { allowance }))
-            .connect_timeout(timeouts.connect)
-            .build()?;
+        EgressClient::build_with(allowance, timeouts, system_lookup)
+    }
+
+    /// [`EgressClient::build`] with the lookup a name goes to after the
+    /// `localhost` rule: the system resolver, or a unit test's table. The
+    /// checks on its answer are the same either way.
+    fn build_with(allowance: Allowance, timeouts: Timeouts, system: SystemLookup) -> anyhow::Result<EgressClient> {
+        let (reach, plain) = match allowance {
+            Allowance::PublicOnly => (Reach::Public, None),
+            Allowance::InternalNetwork => (Reach::Any, Some(http_client(Reach::Internal, timeouts, system)?)),
+        };
         Ok(EgressClient {
-            http,
+            http: http_client(reach, timeouts, system)?,
+            plain,
             allowance,
             timeouts,
         })
+    }
+
+    /// The client a request to `url` goes through: plain `http` under
+    /// `InternalNetwork` through the internal-only one.
+    fn for_url(&self, url: &Url) -> &reqwest::Client {
+        match &self.plain {
+            Some(plain) if url.scheme() == "http" => plain,
+            _ => &self.http,
+        }
     }
 
     pub fn allowance(&self) -> Allowance {
@@ -158,7 +195,7 @@ impl EgressClient {
         if request.timeout().is_none() {
             *request.timeout_mut() = Some(self.timeouts.request);
         }
-        self.http.execute(request).await.map_err(classify)
+        self.for_url(request.url()).execute(request).await.map_err(classify)
     }
 
     /// Checks `request`'s URL and sends it; the response head must arrive
@@ -167,17 +204,29 @@ impl EgressClient {
     pub async fn send_streaming(&self, mut request: Request) -> Result<Response, EgressError> {
         check_url(request.url(), self.allowance)?;
         let head = request.timeout_mut().take().unwrap_or(self.timeouts.request);
-        match tokio::time::timeout(head, self.http.execute(request)).await {
+        let http = self.for_url(request.url());
+        match tokio::time::timeout(head, http.execute(request)).await {
             Ok(sent) => sent.map_err(classify),
             Err(_) => Err(EgressError::Timeout),
         }
     }
 }
 
+fn http_client(reach: Reach, timeouts: Timeouts, system: SystemLookup) -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent(concat!("hennery/", env!("CARGO_PKG_VERSION")))
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(Arc::new(CheckedResolver { reach, system }))
+        .connect_timeout(timeouts.connect)
+        .build()?)
+}
+
 /// Why the policy refused a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refused {
-    /// Not `https`, and not `http` to loopback.
+    /// Not `https`, and not `http` to loopback (or, under
+    /// [`Allowance::InternalNetwork`], to an internal address or a name).
     Scheme(String),
     /// The URL carries a user name or password.
     Credentials,
@@ -185,18 +234,24 @@ pub enum Refused {
     NoHost,
     /// An IP-literal host that is not public.
     Address(IpAddr),
-    /// A name that resolved to an address that is not public.
+    /// A name that resolved to an address the request may not reach: not
+    /// public, or, for plain `http` under `InternalNetwork`, not internal.
     Resolved { host: String, addr: IpAddr },
 }
 
 impl fmt::Display for Refused {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Refused::Scheme(scheme) => write!(f, "{scheme:?} URLs are refused: https only, or http to loopback"),
+            Refused::Scheme(scheme) => write!(
+                f,
+                "{scheme:?} URLs are refused: https only, or http to loopback or, on an internal network, to an internal address or a name"
+            ),
             Refused::Credentials => f.write_str("URLs with credentials are refused"),
             Refused::NoHost => f.write_str("the URL has no host"),
             Refused::Address(addr) => write!(f, "{addr} is not a public address"),
-            Refused::Resolved { host, addr } => write!(f, "{host} resolves to {addr}, not a public address"),
+            Refused::Resolved { host, addr } => {
+                write!(f, "{host} resolves to {addr}, which this request may not reach")
+            }
         }
     }
 }
@@ -262,6 +317,7 @@ pub fn check_url(url: &Url, allowance: Allowance) -> Result<(), Refused> {
     match url.scheme() {
         "https" => {}
         "http" if is_loopback_host(url) => {}
+        "http" if allowance == Allowance::InternalNetwork && may_be_internal(url) => {}
         other => return Err(Refused::Scheme(other.to_owned())),
     }
     if !url.username().is_empty() || url.password().is_some() {
@@ -285,6 +341,48 @@ fn is_loopback_host(url: &Url) -> bool {
         Some(Host::Ipv4(addr)) => addr.is_loopback(),
         Some(Host::Ipv6(addr)) => addr.is_loopback(),
         None => false,
+    }
+}
+
+/// Whether plain `http` under `InternalNetwork` may go to `url`'s host: an
+/// internal literal, or a name, which the internal-only client's resolver
+/// then checks.
+fn may_be_internal(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Domain(_)) => true,
+        Some(Host::Ipv4(addr)) => is_internal(IpAddr::V4(addr)),
+        Some(Host::Ipv6(addr)) => is_internal(IpAddr::V6(addr)),
+        None => false,
+    }
+}
+
+/// IPv4 ranges that are internal: plain `http` may reach them under
+/// `InternalNetwork` (plan 8b-ii).
+const V4_INTERNAL: &[(Ipv4Addr, u8)] = &[
+    (Ipv4Addr::new(10, 0, 0, 0), 8),     // RFC 1918
+    (Ipv4Addr::new(127, 0, 0, 0), 8),    // loopback
+    (Ipv4Addr::new(172, 16, 0, 0), 12),  // RFC 1918
+    (Ipv4Addr::new(192, 168, 0, 0), 16), // RFC 1918
+];
+
+/// IPv6 ranges that are internal; no IPv4-mapped, NAT64, 6to4 or Teredo
+/// address is, since any of them may lead to a public IPv4 host.
+const V6_INTERNAL: &[(Ipv6Addr, u8)] = &[
+    (Ipv6Addr::LOCALHOST, 128),                      // loopback
+    (Ipv6Addr::new(0xfc00, 0, 0, 0, 0, 0, 0, 0), 7), // unique-local
+];
+
+/// A cloud metadata service inside unique-local: AWS's IPv6 one. Never
+/// internal, so plain `http` never reaches it (an open question for the
+/// operator, refused until answered).
+const V6_METADATA: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0ec2, 0, 0, 0, 0, 0, 0x0254);
+
+/// Whether `addr` is internal; see the module docs. Only an allowlist, so
+/// everything else — public or neither — is not.
+fn is_internal(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(addr) => V4_INTERNAL.iter().any(|&range| in_v4(addr, range)),
+        IpAddr::V6(addr) => addr != V6_METADATA && V6_INTERNAL.iter().any(|&range| in_v6(addr, range)),
     }
 }
 
@@ -336,11 +434,25 @@ pub fn is_public(addr: IpAddr) -> bool {
     }
 }
 
-/// The addresses a name resolved to, if the allowance permits all of them.
-fn checked(host: &str, addrs: Vec<SocketAddr>, allowance: Allowance) -> Result<Vec<SocketAddr>, Refused> {
-    if allowance == Allowance::PublicOnly
-        && let Some(addr) = addrs.iter().find(|addr| !is_public(addr.ip()))
-    {
+/// Which addresses a client's resolver lets a name reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// Public only: every `PublicOnly` request.
+    Public,
+    /// Any: `https` under `InternalNetwork`.
+    Any,
+    /// Internal only: plain `http` under `InternalNetwork`.
+    Internal,
+}
+
+/// The addresses a name resolved to, if `reach` permits all of them.
+fn checked(host: &str, addrs: Vec<SocketAddr>, reach: Reach) -> Result<Vec<SocketAddr>, Refused> {
+    let permitted = |addr: &SocketAddr| match reach {
+        Reach::Public => is_public(addr.ip()),
+        Reach::Any => true,
+        Reach::Internal => is_internal(addr.ip()),
+    };
+    if let Some(addr) = addrs.iter().find(|addr| !permitted(addr)) {
         return Err(Refused::Resolved {
             host: host.to_owned(),
             addr: addr.ip(),
@@ -362,27 +474,36 @@ const LOCALHOST: [SocketAddr; 2] = [
     SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
 ];
 
+/// Where a name other than `localhost` is looked up.
+type SystemLookup = fn(String) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>>;
+
+/// The system resolver.
+fn system_lookup(host: String) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>> {
+    Box::pin(async move { Ok(tokio::net::lookup_host((host.as_str(), 0)).await?.collect()) })
+}
+
 /// The addresses `host` resolves to: [`LOCALHOST`] for `localhost`, the
 /// system resolver's answer for any other name.
-async fn lookup(host: &str) -> std::io::Result<Vec<SocketAddr>> {
+async fn lookup(host: &str, system: SystemLookup) -> std::io::Result<Vec<SocketAddr>> {
     if is_localhost(host) {
         return Ok(LOCALHOST.to_vec());
     }
-    Ok(tokio::net::lookup_host((host, 0)).await?.collect())
+    system(host.to_owned()).await
 }
 
 /// Resolves names with [`lookup`] and applies [`checked`].
 struct CheckedResolver {
-    allowance: Allowance,
+    reach: Reach,
+    system: SystemLookup,
 }
 
 impl Resolve for CheckedResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        let allowance = self.allowance;
+        let (reach, system) = (self.reach, self.system);
         Box::pin(async move {
             let host = name.as_str().to_owned();
-            let addrs = lookup(&host).await?;
-            let addrs = checked(&host, addrs, allowance)?;
+            let addrs = lookup(&host, system).await?;
+            let addrs = checked(&host, addrs, reach)?;
             Ok(Box::new(addrs.into_iter()) as Addrs)
         })
     }
