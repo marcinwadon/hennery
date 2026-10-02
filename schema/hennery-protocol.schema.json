@@ -1076,7 +1076,7 @@
       "type": "object"
     },
     "HostProjects": {
-      "description": "`GET /api/hosts/{id}/projects` (ACP core §7, §9): the git repositories\nunder the host's workspace roots.",
+      "description": "`GET /api/hosts/{id}/projects?path=` (ACP core §7, §9): the recent\nprojects of one hat, and the git repositories under the host's\nworkspace roots.",
       "properties": {
         "home": {
           "description": "The host user's home directory, for expanding `~` (frontend §7).",
@@ -1094,9 +1094,22 @@
         "partial": {
           "description": "The host cut its enumeration short: there may be more.",
           "type": "boolean"
+        },
+        "recents": {
+          "description": "Newest first: only those whose path resolves to that hat now.",
+          "items": {
+            "$ref": "#/$defs/RecentProject"
+          },
+          "type": "array"
+        },
+        "recents_hat_id": {
+          "description": "The hat `recents` belong to: the one `path` resolves to on the host,\nor the host's default hat without one (kernel spec §5.3).",
+          "type": "string"
         }
       },
       "required": [
+        "recents_hat_id",
+        "recents",
         "items",
         "partial"
       ],
@@ -1551,6 +1564,23 @@
       },
       "required": [
         "turn_id"
+      ],
+      "type": "object"
+    },
+    "RecentProject": {
+      "description": "A directory a session started or resumed in on the host (kernel spec\n§5.3).",
+      "properties": {
+        "last_used_at": {
+          "description": "RFC 3339.",
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "last_used_at"
       ],
       "type": "object"
     },

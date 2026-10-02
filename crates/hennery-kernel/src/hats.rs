@@ -150,12 +150,12 @@ pub fn is_canonical(path: &str) -> bool {
 /// Whether the rule `prefix` covers `path`: it is the path, or a parent of
 /// it by whole segments (`/p/acme` covers `/p/acme/x`, never
 /// `/p/acme-infra`). Both are canonical.
+///
+/// The one segment rule, shared with the host's browse fence
+/// (`hennery_proto::paths::is_within`, plan 6c's A9), so the fence and the
+/// hat rules cannot disagree.
 pub fn covers(prefix: &str, path: &str) -> bool {
-    match path.strip_prefix(prefix) {
-        Some("") => true,
-        Some(rest) => prefix == "/" || rest.starts_with('/'),
-        None => false,
-    }
+    hennery_proto::paths::is_within(path, prefix)
 }
 
 /// The hat `path` (canonical) resolves to among a host's `rules`, with
@@ -190,7 +190,7 @@ fn read_rule(r: &rusqlite::Row<'_>) -> rusqlite::Result<PathRule> {
 }
 
 /// A host's rules, longest prefix first, inside the caller's lock.
-fn rules_of(conn: &rusqlite::Connection, owner: &str, host_id: &str) -> Result<Vec<PathRule>> {
+pub(crate) fn rules_of(conn: &rusqlite::Connection, owner: &str, host_id: &str) -> Result<Vec<PathRule>> {
     let mut stmt = conn.prepare(
         "SELECT id, prefix, hat_id, verified FROM hat_path_rules
          WHERE host_id = ?1 AND owner_id = ?2 ORDER BY length(prefix) DESC, prefix",
@@ -482,7 +482,7 @@ fn host_exists(conn: &rusqlite::Connection, owner: &str, host_id: &str) -> Resul
     Ok(host_default_hat(conn, owner, host_id)?.is_some())
 }
 
-fn host_default_hat(conn: &rusqlite::Connection, owner: &str, host_id: &str) -> Result<Option<String>> {
+pub(crate) fn host_default_hat(conn: &rusqlite::Connection, owner: &str, host_id: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row(
             "SELECT default_hat_id FROM hosts WHERE id = ?1 AND owner_id = ?2",

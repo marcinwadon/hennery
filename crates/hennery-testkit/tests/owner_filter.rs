@@ -55,6 +55,11 @@ const SOURCES: &[(&str, &str, usize)] = &[
         16,
     ),
     (
+        "hennery-kernel/src/recents.rs",
+        include_str!("../../hennery-kernel/src/recents.rs"),
+        3,
+    ),
+    (
         "hennery-sessions/src/store.rs",
         include_str!("../../hennery-sessions/src/store.rs"),
         81,
