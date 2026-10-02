@@ -133,18 +133,47 @@ export function shownOf(state: ListState, filters: ListFilters): SessionSummary[
   return [...state.all.values()].filter((s) => isShown(state, s, filters)).sort(compareSummaries)
 }
 
-/** The sessions of the hat waiting on a question: the tab title's and the
- *  header badge's number. The server's count when it sent one
- *  (`state.waiting`, already the hat's: `state` is the hat's query's);
- *  otherwise the loaded rows'. */
-export function waitingCount(state: ListState, hat: string | null | undefined): number {
-  if (state.waiting !== undefined) return state.waiting
-  let n = 0
+/**
+ * The sessions of the hat waiting on a question (`blocked || question_waits`):
+ * the tab title's and the header badge's number, read by both through
+ * `useSessionList().counts.waiting`. It is the hat's number, never a query's:
+ * a search or a lifecycle filter leaves it as it was.
+ *
+ * The server's count (`SummaryPage.waiting`, then `waiting_changed`) is used
+ * whenever it was sent (`waitingCount`): it is the hat's whatever the query.
+ * THE FALLBACK, for a page with no `waiting`, counts the rows loaded, and
+ * the security review allowed that only with its A4: a search or a lifecycle
+ * filter starts `all` over with its own rows only, so while one is set
+ * `useSessionList` carries the ids counted from the hat's unfiltered list,
+ * brought up to date by every summary received since (`carryWaiting`). A
+ * session removed meanwhile stays counted until the filter is cleared.
+ */
+export function waitingIds(state: ListState, hat: string | null | undefined): Set<string> {
+  const ids = new Set<string>()
   for (const s of state.all.values()) {
-    if (inHat(s, hat) && (s.activity === 'blocked' || s.question_waits)) n++
+    if (inHat(s, hat) && isWaiting(s)) ids.add(s.session_id)
   }
-  return n
+  return ids
 }
+
+/** The server's count when it sent one (`state.waiting`, already the
+ *  hat's: `state` is the hat's query's); otherwise the loaded rows'. */
+export function waitingCount(state: ListState, hat: string | null | undefined): number {
+  return state.waiting ?? waitingIds(state, hat).size
+}
+
+/** `held`, the ids counted from the hat's unfiltered list, with every
+ *  summary `state` holds applied: each came after the count. */
+export function carryWaiting(held: ReadonlySet<string>, state: ListState, hat: string | null | undefined): Set<string> {
+  const ids = new Set(held)
+  for (const s of state.all.values()) {
+    if (inHat(s, hat) && isWaiting(s)) ids.add(s.session_id)
+    else ids.delete(s.session_id)
+  }
+  return ids
+}
+
+const isWaiting = (s: SessionSummary) => s.activity === 'blocked' || s.question_waits
 
 /** `held` with a page's rows: a row the stream sent later is kept. */
 function merge(held: Map<string, SessionSummary>, rows: readonly unknown[]): { all: Map<string, SessionSummary>; ids: string[] } {
