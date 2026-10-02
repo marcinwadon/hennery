@@ -25,6 +25,7 @@ hennery-host.workspace = true
 hennery-kernel.workspace = true
 hennery-sessions.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
@@ -32,8 +33,9 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 hennery-testkit = { path = "../hennery-testkit" }
-serde_json.workspace = true
 tempfile.workspace = true
+# The supervisor's tests run on a paused clock.
+tokio = { workspace = true, features = ["test-util"] }
 
 # cargo-dist (plan 7a) ships this crate's binary despite `publish = false`.
 [package.metadata.dist]

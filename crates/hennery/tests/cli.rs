@@ -344,7 +344,7 @@ impl Drop for KillTree {
         }
         for pid in std::mem::take(&mut self.children) {
             unsafe {
-                // Each child leads its own process group (`run_up` sets
+                // Each child leads its own process group (`UpChildren` sets
                 // `process_group(0)`), so kill both the pid and that group.
                 libc::kill(pid, libc::SIGKILL);
                 libc::kill(-pid, libc::SIGKILL);
@@ -359,7 +359,7 @@ impl Drop for KillTree {
 }
 
 /// A terminal's Ctrl-C delivers SIGINT to every process in the foreground
-/// process group at once. `run_up` pulls its two children out of that group
+/// process group at once. `up` pulls its two children out of that group
 /// (`process_group(0)` on both spawns) so only the supervisor is signalled
 /// and can still forward an ordered shutdown (host, then collector) instead
 /// of racing each child's own signal handler.
@@ -1433,6 +1433,19 @@ fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
     let collector = |fd: Option<&OwnedFd>, args: &[&str]| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
         cmd.arg("collector").args(args).arg("--data-dir").arg(&data);
+        if fd.is_none() {
+            // Another test's spawn can leak a descriptor into this child for
+            // a moment (macOS makes a pipe or socket close-on-exec only after
+            // it exists), and it may sit at 50: closed here, so what is
+            // tested is a closed descriptor.
+            // SAFETY: close(2) in the forked child, before exec; async-signal-safe.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::close(50);
+                    Ok(())
+                });
+            }
+        }
         if let Some(fd) = fd {
             let fd = fd.as_raw_fd();
             // SAFETY: dup2 in the forked child, before exec; async-signal-safe.
@@ -2730,4 +2743,147 @@ fn the_collector_without_a_data_dir_or_with_the_healthcheck_and_its_flags_is_ref
     assert!(String::from_utf8_lossy(&out.stderr).contains("--data-dir"));
     let out = run(&["collector", "--data-dir", "/nonexistent", "healthcheck"]);
     assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// `host.lock` (distribution spec §8): while `up`'s host child runs on
+/// `<data>/host`, a second `hennery host run` there refuses to start, names
+/// the holder's pid, and touches nothing first: not even a pairing left
+/// half-done (`host.key.pending`, `host.toml.pending`), which reading the
+/// pairing would roll forward over the first host's. The first host keeps
+/// the lock, and stays connected.
+#[test]
+fn a_second_host_on_one_data_directory_refuses_to_start() {
+    let dir = scratch_dir("hostlock");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let (mut up, listen, ids, session) = up_until_connected(&data, &dir.join("up.log"), None);
+    let lock = data.join("host").join("host.lock");
+    let holder = std::fs::read_to_string(&lock).unwrap();
+    let holder = holder.trim().to_string();
+    assert!(holder.parse::<i32>().is_ok_and(pid_alive), "{holder:?}");
+    // A pairing staged and not yet put in place, as a crash in the middle
+    // of a join leaves one: whoever reads the pairing renames both files
+    // into place. The second host must refuse before it reads it.
+    let key = hennery_host::identity::HostKey::generate();
+    let key_pending = data.join("host").join("host.key.pending");
+    key.save(&key_pending).unwrap();
+    let pending = data.join("host").join("host.toml.pending");
+    let staged = format!(
+        "collector = \"ws://127.0.0.1:9/api/hosts/ws\"\nhost_id = \"host-staged\"\npublic_key = \"{}\"\n",
+        key.public_key_hex()
+    );
+    std::fs::write(&pending, &staged).unwrap();
+
+    let mut second = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["host", "run"])
+        .arg("--data-dir")
+        .arg(data.join("host"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(dir.join("second.err")).unwrap())
+        .spawn()
+        .unwrap();
+    let status = wait_with_timeout(&mut second, Duration::from_secs(20));
+    if status.is_none() {
+        let _ = second.kill();
+        let _ = second.wait();
+    }
+    let stderr = std::fs::read_to_string(dir.join("second.err")).unwrap();
+    let status = status.unwrap_or_else(|| panic!("a second host kept running: {stderr}"));
+    assert!(!status.success(), "{stderr}");
+    assert!(
+        stderr.contains("host.lock") && stderr.contains(&format!("pid {holder}")),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&pending).unwrap(), staged);
+    assert!(key_pending.exists(), "the staged key was put in place");
+    std::fs::remove_file(&pending).unwrap();
+    std::fs::remove_file(&key_pending).unwrap();
+    up.assert_running("the first host");
+    assert_eq!(std::fs::read_to_string(&lock).unwrap().trim(), holder);
+    assert!(holder.parse::<i32>().is_ok_and(pid_alive), "{holder:?}");
+    let hosts = get_json(&listen, "/api/hosts", &session).unwrap();
+    assert_eq!(hosts[0]["host_id"], ids[0].as_str());
+    assert_eq!(hosts[0]["connected"], true, "{hosts}");
+}
+
+/// `up.lock`: a second `hennery up` on one data root refuses to start,
+/// before it starts any child, and the first keeps serving.
+#[test]
+fn a_second_up_on_one_data_root_refuses_to_start() {
+    let dir = scratch_dir("uplock");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let (mut first, listen, _, session) = up_until_connected(&data, &dir.join("first.log"), None);
+    let log = dir.join("second.log");
+    let mut second = up_logging_to(&data, &log);
+    let status = wait_with_timeout(&mut second.up, Duration::from_secs(20)).expect("the second up kept running");
+    let stderr = std::fs::read_to_string(log.with_extension("err")).unwrap();
+    assert!(!status.success(), "{stderr}");
+    assert!(
+        stderr.contains("up.lock") && stderr.contains(&format!("pid {}", first.up.id())),
+        "{stderr}"
+    );
+    first.assert_running("the first up");
+    assert!(get_json(&listen, "/api/hosts", &session).is_some());
+}
+
+/// `up`'s report of its children (`supervisor.json`), as JSON.
+fn supervisor_state(data: &std::path::Path) -> Option<serde_json::Value> {
+    serde_json::from_slice(&std::fs::read(data.join("supervisor.json")).ok()?).ok()
+}
+
+/// Distribution spec §5.2: a child killed outright, once past its start, is
+/// started again: the host reconnects with its pairing, and the collector
+/// serves on the same port, with the sessions it had.
+#[test]
+fn a_killed_child_is_started_again() {
+    let dir = scratch_dir("restart");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let (mut up, listen, ids, session) = up_until_connected(&data, &dir.join("up.log"), None);
+    let up_pid = up.up.id() as i32;
+    // Past the startup grace (5 s), counted from now, when both children
+    // run already: the kill counts as a crash, not as a failed start.
+    std::thread::sleep(Duration::from_secs(6));
+    let lock = data.join("host").join("host.lock");
+    let host = pid_from(&lock).expect("the host's pid");
+    // Both children, as `pgrep` sees them: polled, not read once.
+    let mut collector = 0;
+    up.wait_until("up's two children", || {
+        let children = children_of(up_pid);
+        collector = children.iter().copied().find(|&pid| pid != host).unwrap_or(0);
+        children.len() == 2 && children.contains(&host) && collector != 0
+    });
+    up.children = vec![host, collector];
+
+    unsafe { libc::kill(host, libc::SIGKILL) };
+    let mut again = 0;
+    up.wait_until("the host started again", || {
+        again = pid_from(&lock).unwrap_or(host);
+        again != host && pid_alive(again)
+    });
+    up.children.push(again);
+    up.wait_until("the host reported running again", || {
+        supervisor_state(&data).is_some_and(|s| s["host"]["restarts"] == 1 && s["host"]["state"] == "running")
+    });
+    up.wait_until("the host connected again", || {
+        get_json(&listen, "/api/hosts", &session).is_some_and(|hosts| {
+            hosts.as_array().is_some_and(|hosts| {
+                hosts.len() == 1 && hosts[0]["host_id"] == ids[0].as_str() && hosts[0]["connected"] == true
+            })
+        })
+    });
+
+    unsafe { libc::kill(collector, libc::SIGKILL) };
+    up.wait_until("the collector reported running again", || {
+        supervisor_state(&data).is_some_and(|s| s["collector"]["restarts"] == 1 && s["collector"]["state"] == "running")
+    });
+    up.children.extend(children_of(up_pid));
+    // The same port, and the session from before the crash.
+    up.wait_until("the collector serving again", || {
+        get_json(&listen, "/api/hosts", &session).is_some_and(|hosts| hosts[0]["connected"] == true)
+    });
+    let state = supervisor_state(&data).unwrap();
+    assert_eq!(state["pid"], up_pid, "{state}");
+    assert_eq!(state["host"]["last_exit"], "signal: 9 (SIGKILL)", "{state}");
 }
