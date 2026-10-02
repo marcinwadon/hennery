@@ -15,7 +15,7 @@ export interface Collector {
   stop(): Promise<void>
 }
 
-const BIN = process.env.HENNERY_BIN ?? resolve(process.cwd(), '../target/debug/hennery')
+export const BIN = process.env.HENNERY_BIN ?? resolve(process.cwd(), '../target/debug/hennery')
 
 export async function startCollector(): Promise<Collector> {
   const dir = mkdtempSync(join(tmpdir(), 'hennery-e2e-'))
@@ -25,6 +25,9 @@ export async function startCollector(): Promise<Collector> {
   })
   let stderr = ''
   child.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
+  // A binary that cannot start fails the test that asked for it, rather
+  // than the worker.
+  child.once('error', (err) => (stderr += `${err}`))
   // Stopped and removed on every path, a failed start included: the
   // directory holds a live setup token.
   const stop = async () => {
