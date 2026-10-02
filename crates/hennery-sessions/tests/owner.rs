@@ -131,6 +131,8 @@ fn the_owner_id_migration_gives_every_row_the_owner() {
             DROP TRIGGER catalog_of_a_tombstone;
             DROP TRIGGER a_tombstone_stays;
             DROP TABLE turn_attachments;
+            DROP TABLE host_forgets;
+            ALTER TABLE sessions DROP COLUMN agent_home;
             DROP INDEX events_by_kind;
             ALTER TABLE pending DROP COLUMN opened_event_id;
             DROP INDEX sessions_by_hat;

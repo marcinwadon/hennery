@@ -68,7 +68,7 @@ const SOURCES: &[(&str, &str, usize)] = &[
     (
         "hennery-sessions/src/store.rs",
         include_str!("../../hennery-sessions/src/store.rs"),
-        115,
+        128,
     ),
     (
         "hennery-gateway/src/store.rs",
@@ -97,6 +97,10 @@ const EXEMPT: &[(&str, &str)] = &[
     (
         "hennery-host/src/outbox.rs",
         "the host's own database, on the host's machine, not `hennery.db`",
+    ),
+    (
+        "hennery-host/src/agent_home.rs",
+        "the host's own registry of agent homes (plan 9d B1), on the host's machine, not `hennery.db`",
     ),
 ];
 

@@ -1472,6 +1472,7 @@ async fn a_resume_re_sends_the_config_its_host_last_reported() {
             request_id,
             agent_session_id: "agent-1".into(),
             indexed: catalogue("default"),
+            agent_home: None,
         },
     )
     .await;
@@ -3054,7 +3055,7 @@ async fn deleting_a_parked_session_deletes_it_at_once() {
     let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
     let session = parked_session(&collector, &mut host).await;
     let (status, body) = delete(&client(&collector), session_url(&collector, &session)).await;
-    assert_eq!(status, 204, "{body}");
+    assert_eq!(status, 200, "{body}");
     assert_eq!(collector.state.store.find_session(&session).unwrap(), None);
     assert_eq!(get(&client(&collector), session_url(&collector, &session)).await.0, 404);
     // Deleted again: not found.
@@ -3078,7 +3079,7 @@ async fn deleting_a_closed_session_deletes_it() {
     assert_eq!(post(&client(&collector), close, json!({})).await.0, 202);
     assert_eq!(collector.lifecycle(&session), "closed");
     let (status, body) = delete(&client(&collector), session_url(&collector, &session)).await;
-    assert_eq!(status, 204, "{body}");
+    assert_eq!(status, 200, "{body}");
     assert_eq!(collector.state.store.find_session(&session).unwrap(), None);
     assert_eq!(get(&client(&collector), session_url(&collector, &session)).await.0, 404);
 }
@@ -3104,7 +3105,7 @@ async fn a_delete_whose_close_is_answered_not_attached_deletes_it() {
     })
     .await;
     let (status, body) = call.await.unwrap();
-    assert_eq!(status, 204, "{body}");
+    assert_eq!(status, 200, "{body}");
     assert_eq!(collector.state.store.find_session(&session).unwrap(), None);
 }
 
@@ -3120,7 +3121,7 @@ async fn deleting_a_session_of_a_host_away_answers_at_once_and_its_host_closes_i
     host.drop_connection(&collector).await;
     presumed_parked(&collector, &session).await;
     let (status, body) = delete(&client(&collector), session_url(&collector, &session)).await;
-    assert_eq!(status, 204, "{body}");
+    assert_eq!(status, 200, "{body}");
     assert_eq!(collector.state.store.find_session(&session).unwrap(), None);
     let mut host = ScriptedHost::connect(&collector, vec![attached(&session, seq)], seq).await;
     let CollectorFrame::CloseSession { session_id, .. } = host.next().await else {
@@ -3193,7 +3194,7 @@ async fn an_open_stream_gets_session_deleted_and_ends() {
     let mut body = resp.bytes_stream();
     assert_eq!(
         delete(&client(&collector), session_url(&collector, &session)).await.0,
-        204
+        200
     );
     let mut buf = String::new();
     tokio::time::timeout(Duration::from_secs(10), async {
@@ -3211,4 +3212,252 @@ async fn an_open_stream_gets_session_deleted_and_ends() {
         let (status, body) = get(&client(&collector), collector.url(&path)).await;
         assert_eq!((status, body["code"].as_str()), (404, Some("not_found")), "{path}");
     }
+}
+
+// Plan 9d: the agent's own transcript on its host, against a scripted host.
+
+const AGENT_SESSION: &str = "0b9c1d2e-3f40-4a5b-8c6d-7e8f90a1b2c3";
+
+fn agent_home() -> hennery_proto::frames::AgentHome {
+    hennery_proto::frames::AgentHome {
+        root: "/h/.claude".into(),
+        sqlite_root: None,
+    }
+}
+
+/// A `claude` session started through the API, its `session_started`
+/// reporting `agent_home()`, then parked by the host.
+async fn parked_claude_session(collector: &Collector, host: &mut ScriptedHost) -> String {
+    let c = client(collector);
+    let url = collector.url("/api/sessions");
+    let call =
+        tokio::spawn(async move { post(&c, url, json!({ "host_id": HOST, "agent": "claude", "cwd": "/tmp" })).await });
+    let CollectorFrame::StartSession {
+        request_id, session_id, ..
+    } = host.next().await
+    else {
+        panic!("expected start_session");
+    };
+    host.emit(
+        &session_id,
+        SessionBody::SessionStarted {
+            request_id,
+            agent_session_id: AGENT_SESSION.into(),
+            indexed: Default::default(),
+            agent_home: Some(agent_home()),
+        },
+    )
+    .await;
+    assert_eq!(call.await.unwrap().0, 202);
+    host.emit(
+        &session_id,
+        SessionBody::SessionParked {
+            reason: hennery_proto::frames::ParkReason::Idle,
+        },
+    )
+    .await;
+    wait_for("parked", || async {
+        (collector.lifecycle(&session_id) == "parked").then_some(())
+    })
+    .await;
+    session_id
+}
+
+fn forgetting() -> Capabilities {
+    Capabilities(vec![
+        Capability::Park,
+        Capability::ResolvePath,
+        Capability::ForgetSession,
+    ])
+}
+
+/// The next `forget_session`: its request id, after checking it names the
+/// session's agent, id and recorded home.
+async fn expect_forget(host: &mut ScriptedHost) -> String {
+    let CollectorFrame::ForgetSession {
+        request_id,
+        agent,
+        agent_session_id,
+        agent_home: home,
+    } = host.next().await
+    else {
+        panic!("expected forget_session");
+    };
+    assert_eq!(
+        (agent.as_str(), agent_session_id.as_str(), home),
+        ("claude", AGENT_SESSION, agent_home())
+    );
+    request_id
+}
+
+fn forgotten(request_id: String, remaining: Vec<hennery_proto::frames::ForgetRemaining>) -> HostFrame {
+    use hennery_proto::frames::ForgetOutcome;
+    HostFrame::SessionForgotten {
+        request_id,
+        outcome: if remaining.is_empty() {
+            ForgetOutcome::Complete
+        } else {
+            ForgetOutcome::Partial
+        },
+        removed: vec![],
+        remaining,
+    }
+}
+
+async fn removals(collector: &Collector) -> Vec<hennery_proto::rest::HostRemovalItem> {
+    let (status, body) = get(&client(collector), collector.url("/api/settings/host-removals")).await;
+    assert_eq!(status, 200);
+    serde_json::from_value(body).unwrap()
+}
+
+/// Decisions 5–7: right after the delete, its host is asked to forget the
+/// agent's session under its recorded home; a complete answer is the
+/// delete's `removed`, and the record is gone.
+#[tokio::test]
+async fn a_delete_asks_its_host_to_forget_and_answers_removed() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect_with(&collector, vec![], 0, forgetting()).await;
+    let session = parked_claude_session(&collector, &mut host).await;
+    let c = client(&collector);
+    let url = session_url(&collector, &session);
+    let call = tokio::spawn(async move { delete(&c, url).await });
+    let request_id = expect_forget(&mut host).await;
+    host.send(&forgotten(request_id, vec![])).await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!(
+        (status, body["host_transcript"]["state"].as_str()),
+        (200, Some("removed")),
+        "{body}"
+    );
+    assert!(
+        body["host_transcript"]["notes"][0]
+            .as_str()
+            .unwrap()
+            .contains("context clear"),
+        "{body}"
+    );
+    assert!(removals(&collector).await.is_empty());
+}
+
+/// Decision 7, O10: a host still attached answers `attached`: the delete
+/// is pending for it, and once that session's `session_closed` comes the
+/// forget goes again.
+#[tokio::test]
+async fn a_forget_answered_attached_goes_again_after_the_sessions_session_closed() {
+    use hennery_proto::frames::{ForgetKind, ForgetReason, ForgetRemaining, ForgetWhat};
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect_with(&collector, vec![], 0, forgetting()).await;
+    let session = parked_claude_session(&collector, &mut host).await;
+    let c = client(&collector);
+    let url = session_url(&collector, &session);
+    let call = tokio::spawn(async move { delete(&c, url).await });
+    let request_id = expect_forget(&mut host).await;
+    let attached = ForgetRemaining {
+        what: ForgetWhat {
+            kind: ForgetKind::Session,
+            count: 0,
+        },
+        reason: ForgetReason::Attached,
+        retry: true,
+    };
+    host.send(&forgotten(request_id, vec![attached])).await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        (
+            body["host_transcript"]["state"].as_str(),
+            body["host_transcript"]["pending"].as_str()
+        ),
+        (Some("pending"), Some("attached")),
+        "{body}"
+    );
+    assert_eq!(removals(&collector).await[0].attempts, 1);
+    host.emit(&session, SessionBody::SessionClosed).await;
+    let request_id = expect_forget(&mut host).await;
+    host.send(&forgotten(request_id, vec![])).await;
+    wait_for("the record removed", || async {
+        removals(&collector).await.is_empty().then_some(())
+    })
+    .await;
+}
+
+/// Decision 4: a host that does not announce `forget_session` is never
+/// sent one: pending, `host_needs_update`.
+#[tokio::test]
+async fn a_host_without_the_capability_is_left_pending_for_an_update() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = parked_claude_session(&collector, &mut host).await;
+    let (status, body) = delete(&client(&collector), session_url(&collector, &session)).await;
+    assert_eq!(
+        (
+            status,
+            body["host_transcript"]["state"].as_str(),
+            body["host_transcript"]["pending"].as_str()
+        ),
+        (200, Some("pending"), Some("host_needs_update")),
+        "{body}"
+    );
+    let listed = removals(&collector).await;
+    assert_eq!(listed[0].attempts, 0);
+}
+
+/// B2: an answer past the size caps is not stored: the record stays
+/// pending, `no_reply`.
+#[tokio::test]
+async fn an_answer_past_the_caps_is_not_taken() {
+    use hennery_proto::frames::{ForgetKind, ForgetOutcome, ForgetWhat};
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect_with(&collector, vec![], 0, forgetting()).await;
+    let session = parked_claude_session(&collector, &mut host).await;
+    let c = client(&collector);
+    let url = session_url(&collector, &session);
+    let call = tokio::spawn(async move { delete(&c, url).await });
+    let request_id = expect_forget(&mut host).await;
+    let many = vec![
+        ForgetWhat {
+            kind: ForgetKind::Transcript,
+            count: 1
+        };
+        hennery_sessions::forget::MAX_ANSWER_ITEMS + 1
+    ];
+    host.send(&HostFrame::SessionForgotten {
+        request_id,
+        outcome: ForgetOutcome::Complete,
+        removed: many,
+        remaining: vec![],
+    })
+    .await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!(
+        (status, body["host_transcript"]["pending"].as_str()),
+        (200, Some("no_reply")),
+        "{body}"
+    );
+    assert_eq!(removals(&collector).await.len(), 1);
+}
+
+/// B7: one attempt per record at a time. A record whose attempt is held
+/// elsewhere is answered `in_progress` and nothing is sent or stored.
+#[tokio::test]
+async fn a_record_with_an_attempt_in_flight_is_not_sent_again() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect_with(&collector, vec![], 0, forgetting()).await;
+    let session = parked_claude_session(&collector, &mut host).await;
+    let c = client(&collector);
+    let url = session_url(&collector, &session);
+    let call = tokio::spawn(async move { delete(&c, url).await });
+    let first = expect_forget(&mut host).await;
+    // While the route's attempt waits for its answer, a second one for the
+    // same record (as a handshake's would) is not sent.
+    let record = collector.state.store.forgets_to_send(HOST).unwrap().remove(0);
+    let second = hennery_sessions::forget::attempt(&collector.state, &record, Duration::from_secs(5)).await;
+    assert_eq!(second.pending, Some(hennery_proto::rest::RemovalPending::InProgress));
+    host.send(&forgotten(first, vec![])).await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!(
+        (status, body["host_transcript"]["state"].as_str()),
+        (200, Some("removed")),
+        "{body}"
+    );
 }
