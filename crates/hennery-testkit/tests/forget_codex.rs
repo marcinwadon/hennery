@@ -148,6 +148,7 @@ impl Root {
                 root: root.to_str().unwrap().into(),
                 sqlite_root: sqlite_root.map(|p| p.to_str().unwrap().into()),
             },
+            fallback: false,
         }
     }
 
@@ -535,11 +536,18 @@ async fn an_app_server_that_never_answers_is_cut_at_the_deadline_and_its_group_k
             "{hang}: {:?}",
             started.elapsed()
         );
+        // Before the delete was written, the app-server's own timeout (the
+        // hybrid's count, B5 as ruled); after, the delete's.
+        let reason = if frames == 2 {
+            ForgetReason::TimedOut
+        } else {
+            ForgetReason::AppServerTimedOut
+        };
         assert_eq!(
             reasons(&forgotten),
             [
-                (ForgetKind::Session, ForgetReason::TimedOut, true),
-                (ForgetKind::Transcript, ForgetReason::TimedOut, true)
+                (ForgetKind::Session, reason, true),
+                (ForgetKind::Transcript, reason, true)
             ],
             "{hang}: {forgotten:?}"
         );
@@ -722,6 +730,37 @@ async fn a_fallback_adapter_that_never_answers_is_stopped_within_the_deadline() 
     // Cut at 4 s (6 s less the 2 s grace), not at 6 s.
     assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     assert_fell_back(&root, &forgotten, "a hung adapter");
+}
+
+/// B5 as ruled (the hybrid): a forget the collector flags `fallback`
+/// spawns no Codex at all, and goes straight to the archive and the walk
+/// under the recorded home, after every B3 check: the same result as an
+/// unavailable app-server, final. A flag only downgrades this session's
+/// own deletion: the other thread's rollouts and everything else stay,
+/// and a failed check still spawns nothing.
+#[tokio::test]
+async fn a_forget_flagged_fallback_spawns_no_codex_and_removes_only_its_own() {
+    let root = Root::new();
+    root.populate();
+    let mut flagged = root.forget_at(&root.root(), None);
+    flagged.fallback = true;
+    let forgotten = forget(&root.ctx(root.fake(FakeDelete::Delete)), &flagged).await;
+    assert_fell_back(&root, &forgotten, "flagged");
+    assert_eq!(root.spawns().len(), 0, "{:?}", root.spawns());
+    // A flagged forget whose kind directory fails its check: nothing runs.
+    let root = Root::new();
+    let target = root.outside().join("real");
+    std::fs::create_dir_all(&target).unwrap();
+    symlink(&target, root.at("sessions")).unwrap();
+    let mut flagged = root.forget_at(&root.root(), None);
+    flagged.fallback = true;
+    let forgotten = forget(&root.ctx(root.fake(FakeDelete::Delete)), &flagged).await;
+    assert_eq!(
+        reasons(&forgotten),
+        [(ForgetKind::Transcript, ForgetReason::Symlink, false)],
+        "{forgotten:?}"
+    );
+    assert_eq!((root.spawns().len(), root.archived()), (0, None));
 }
 
 /// B3, decision 12: `sessions/` or `archived_sessions/` that is a symlink

@@ -112,6 +112,7 @@ impl Root {
                 root: root.to_str().unwrap().into(),
                 sqlite_root: None,
             },
+            fallback: false,
         }
     }
 
@@ -609,4 +610,22 @@ async fn a_group_writable_root_passes_only_for_a_private_group() {
         );
         assert!(root.at(&format!("tasks/{ID}")).exists());
     }
+}
+
+/// Plan 9d-ii's hybrid: `fallback` is Codex's alone. A Claude forget that
+/// carries it (forged, say) is the same forget: the adapter's delete and
+/// the exact entries, nothing more and nothing less.
+#[tokio::test]
+async fn a_claude_forget_flagged_fallback_is_unchanged() {
+    let root = Root::new();
+    root.populate();
+    let mut flagged = root.forget_at(&root.root());
+    flagged.fallback = true;
+    let forgotten = forget(&root.ctx(Hooks::default()), &flagged).await;
+    assert_eq!(reasons(&forgotten), [], "{forgotten:?}");
+    assert!(root.adapter_ran().is_some(), "the adapter's delete ran");
+    let unflagged = Root::new();
+    unflagged.populate();
+    let same = unflagged.forget().await;
+    assert_eq!((forgotten, root.tree()), (same, unflagged.tree()));
 }

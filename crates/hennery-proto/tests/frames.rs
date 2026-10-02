@@ -841,6 +841,7 @@ fn forget_frames_use_the_spec_field_names_and_name_kinds_never_paths() {
             root: "/h/.claude".into(),
             sqlite_root: None,
         },
+        fallback: false,
     };
     let expected = json!({
         "type": "forget_session", "request_id": "r", "agent": "claude", "agent_session_id": "a1",
@@ -851,6 +852,27 @@ fn forget_frames_use_the_spec_field_names_and_name_kinds_never_paths() {
     assert_eq!(
         forget.probe_capability(),
         Ok(Some(hennery_proto::frames::Capability::ForgetSession))
+    );
+    // Plan 9d-ii's hybrid: `fallback` only when set, absent otherwise.
+    let flagged = CollectorFrame::ForgetSession {
+        request_id: "r".into(),
+        agent: "codex".into(),
+        agent_session_id: "a1".into(),
+        agent_home: AgentHome {
+            root: "/h/.codex".into(),
+            sqlite_root: None,
+        },
+        fallback: true,
+    };
+    let flagged_json = json!({
+        "type": "forget_session", "request_id": "r", "agent": "codex", "agent_session_id": "a1",
+        "agent_home": {"root": "/h/.codex"}, "fallback": true
+    });
+    assert_eq!(serde_json::to_value(&flagged).unwrap(), flagged_json);
+    assert_eq!(serde_json::from_value::<CollectorFrame>(flagged_json).unwrap(), flagged);
+    assert_eq!(
+        serde_json::to_value(ForgetReason::AppServerTimedOut).unwrap(),
+        json!("app_server_timed_out")
     );
 
     let answer = HostFrame::SessionForgotten {

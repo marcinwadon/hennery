@@ -416,6 +416,56 @@ async fn a_codex_home_mismatched_or_absent_spawns_nothing() {
     assert!(!archive_log.exists(), "an adapter's delete ran");
 }
 
+/// B5 as ruled (the hybrid) end to end: a record whose app-server timed
+/// out `APP_SERVER_TIMEOUTS_BEFORE_FALLBACK` times in a row is sent
+/// flagged `fallback` at its host's return, and the host spawns no Codex:
+/// the archive and the walk only, the session's own rollout gone, the
+/// other thread's kept, and the record final with `codex_database_copies`.
+#[tokio::test]
+async fn a_record_past_the_app_server_timeouts_is_forgotten_by_the_fallback_alone() {
+    let roots = Roots::new();
+    let db = roots.base.join("hennery.db");
+    let collector = Collector::start(&db).await;
+    let log = roots.base.join("codex.log");
+    let archive_log = roots.base.join("archive.log");
+    let script = FakeScript {
+        codex_archive_log: Some(archive_log.to_str().unwrap().into()),
+        ..answering(AGENT_SESSION)
+    };
+    let mut cfg = host_config(collector.addr, &roots, &script);
+    cfg.codex_app_server = Some(fake_codex(&log));
+    let host = start_host(cfg.clone());
+    connected(&collector, true).await;
+    let session = start_session(&collector, "codex", &roots).await;
+    let (own, other) = codex_rollouts(&roots.codex());
+    host.abort();
+    connected(&collector, false).await;
+    let (result, body) = deleted(&collector, &session).await;
+    assert_eq!(result.host_transcript.state, RemovalState::Pending, "{body}");
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "UPDATE host_forgets SET app_server_timeouts = ?1",
+            [hennery_sessions::forget::APP_SERVER_TIMEOUTS_BEFORE_FALLBACK],
+        )
+        .unwrap();
+    start_host(cfg);
+    let item = wait_for("the flagged retry at the host's return", || async {
+        let listed = removals(&collector).await;
+        (listed[0].state == HostRemovalState::Final).then(|| listed[0].clone())
+    })
+    .await;
+    let result = item.last_result.expect("a result");
+    assert_eq!(
+        result.remaining.iter().map(|r| (r.kind, r.reason)).collect::<Vec<_>>(),
+        [(ForgetKind::CodexDatabaseCopies, ForgetReason::FallbackOnly)],
+        "{result:?}"
+    );
+    assert!(!own.exists() && other.exists());
+    assert!(!log.exists(), "a Codex was spawned");
+    assert!(std::fs::read_to_string(&archive_log).unwrap().contains("CODEX_HOME="));
+}
+
 /// Decision 5: a delete while the host is away answers `pending,
 /// host_offline`; the record goes when the host is back.
 #[tokio::test]
