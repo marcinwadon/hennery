@@ -449,19 +449,22 @@ and nothing goes up.
 
 ### 5.3 Streaming
 
-- JSON responses are streamed chunk by chunk with no buffering, event
-  streams event by event (below), and there is **no compression layer on the
-  proxy route** (compression middleware delays SSE).
-- **Guarantee:** the first chunk of an upstream response reaches the client
-  before the upstream finishes writing. A test asserts it against an upstream
-  that writes one chunk and then blocks; the test must fail within seconds,
-  not hang, if the proxy buffers. For an event stream the guarantee holds
-  for every chunk that ends an event; a partial event waits for its end.
-- Exception: a `tools/list` response in JSON for a connection with an
-  allowlist is read fully (cap 8 MiB, error if exceeded — never truncated)
-  and rewritten; in an event stream, its event is. It is read as an event's
-  data is (below): JSON with a key twice, or spelling a key or method the
-  gateway reads otherwise, is 502 `upstream_invalid`.
+- Event streams are passed on event by event (below), and there is **no
+  compression layer on the proxy route** (compression middleware delays
+  SSE).
+- **Guarantee:** for an event stream, every chunk that ends an event
+  reaches the client before the upstream finishes writing; a partial event
+  waits for its end. A test asserts it against an upstream that writes one
+  event and then blocks; the test must fail within seconds, not hang, if the
+  proxy buffers.
+- **A JSON answer is read whole** (cap 8 MiB, past it 502
+  `upstream_too_large`, never truncated) before any of it goes on, with an
+  allowlist or without: a client can use none of it before its end, and it
+  may hold a server request (§5.6). It is read as an event's data is
+  (below): JSON with a key twice, or spelling a key or method the gateway
+  reads otherwise, is 502 `upstream_invalid`. It goes on as it came, or
+  rewritten when the tools filter touched it (§5.5); an empty one passes,
+  empty.
 - An event stream is passed on **event by event**: every complete event at
   once, a partial one held until its end, so an event can be rewritten or
   dropped (§5.5, §5.6). One event is at most 8 MiB; past that the stream
@@ -497,10 +500,13 @@ and nothing goes up.
 
 ### 5.5 Tool allowlist
 
-- `tools/list` responses are filtered to the allowlist, in JSON and in SSE
-  framing (per event, other events passed through byte for byte); an allowlist
-  matching nothing yields `"tools": []`, never `null`. JSON-RPC batches are
-  filtered element by element.
+- **Every `result.tools` coming down is filtered to the allowlist,
+  whatever the message's id**: in JSON and in SSE framing (per event, other
+  events passed through byte for byte), on a `POST`'s answer, a `GET`
+  stream, and a `GET` replaying one with `Last-Event-ID`. An allowlist
+  matching nothing, or a `tools` that is not an array, yields `"tools":
+  []`, never `null`. JSON-RPC batches are filtered element by element. A
+  result without `tools` is untouched.
 - **`tools/call` for a tool outside the allowlist is rejected** by the gateway
   with a JSON-RPC error (`-32602`, "tool not available through hennery") and
   never reaches the upstream. *(G-18: in the predecessor the allowlist only hid
@@ -508,37 +514,49 @@ and nothing goes up.
   string is outside it. A batch holding one is answered whole by the
   gateway and nothing in it is sent: that call `-32602`, every other request
   in it `-32600` ("batch refused"); notifications get nothing, and a body
-  with nothing to answer is 202. A response's id matches a `tools/list`
-  request's if equal or the same number however written (`1`, `1.0`); a
-  `tools/list` without an id is kept as `null`, so an answer with
-  `"id": null` is filtered too.
-- **The filter hides; the `tools/call` refusal enforces.** The filter
-  knows only the ids of the `tools/list` requests of the same exchange, so
-  an unfiltered list can still reach a client: an id answered as another
-  type (`"1"` for `1`), an interrupted `tools/list` replayed on a `GET`
-  with `Last-Event-ID`, or a response the upstream sends on another
-  stream. A tool seen that way still cannot be called. A response whose
-  `id`, `result`, `tools` or a tool's `name` is spelt otherwise or twice
-  is not passed on (§5.3).
+  with nothing to answer is 202.
+- **The filter hides; the `tools/call` refusal enforces.** Since the
+  filter reads every `result.tools`, it needs no request's id, and these
+  are accepted (the fleet parent's ruling of 2026-10-02):
+  - *An id of another type.* The gateway's own answers echo an id as the
+    client sent it, integers digit for digit and a string as a string; a
+    client that coerces ids (MCP's TypeScript SDK matches with
+    `Number(id)`) does so on its own. An upstream's answer is filtered
+    whatever its id.
+  - *An answer on another stream.* The proxy routes nothing between
+    requests: each `POST` or `GET` is its own upstream exchange, and every
+    stream is filtered alike. The upstream's `Mcp-Session-Id` is the only
+    thing that separates two sessions' streams: the gateway forwards the
+    client's, does not bind it to the token, and every token on a connection
+    uses the same upstream credential, so a token presenting another
+    session's id gets what the upstream serves for it (open for 8e).
+  - *A tool list in an error* (`error.data.tools`) is passed on: no client
+    reads tools from an error, and the refusal still enforces.
+  - A response whose `id`, `result`, `tools` or a tool's `name` is spelt
+    otherwise or twice is not passed on (§5.3).
 
 ### 5.6 Capabilities not forwarded in v1
 
 The gateway rewrites `initialize.params.capabilities` sent upstream, removing
 `sampling`, `elicitation` and `roots`. Server-to-client requests of those kinds
-arriving in a response stream are answered by the gateway with a JSON-RPC
-error. *(G-19: the predecessor's spec said these were not forwarded, but its
+arriving in any answer are refused by the gateway and never reach the
+client. *(G-19: the predecessor's spec said these were not forwarded, but its
 code passed the client's `initialize` through verbatim.)* The requests are
-`sampling/createMessage`, `elicitation/create` and `roots/list`; each is
-answered `-32601` with a `POST` on the same upstream session
+`sampling/createMessage`, `elicitation/create` and `roots/list`. In an
+event stream (a `POST`'s answer or a `GET`), each is answered `-32601` with
+a `POST` on the same upstream session
 (`Mcp-Session-Id`, the answer's or else the request's) and credential, in the
 background, and it is not passed on: its event is dropped or, in a batch, its
 element. Each answer reads the connection again, as a request does, and is
 not sent if the connection left the token's scope or changed its URL or
 internal marking since the stream opened. A notification of those names
 passes. At the connection's request cap (§5.7) the answer is skipped and
-logged. These requests are refused in
-event streams only: a JSON body answering a `POST` is that request's
-response, so inside one they pass in v1.
+logged. **In a JSON answer**, one of them (with an id) makes the
+whole answer 502 `upstream_invalid`, and nothing is answered upstream: a
+JSON body is the `POST`'s response, MCP's streamable HTTP sends server
+requests only in an event stream, and MCP's TypeScript SDK and rmcp would
+both dispatch it. Passing the rest on without it would hand the client a
+partial answer.
 
 Other methods (including ones the gateway does not know, like
 `server/discover`) are forwarded unchanged.
@@ -839,8 +857,11 @@ the boundary: the `hennery-gateway` crate does not depend on `hennery-sessions`.
 
 ## 11. Testing
 
-- **Streaming:** first chunk before upstream completion; fails fast on a
-  buffering implementation. SSE through the proxy with a long `tools/call`.
+- **Streaming:** an event stream's first event before upstream completion;
+  fails fast on a buffering implementation. SSE through the proxy with a
+  long `tools/call`. A JSON answer comes down only whole (§5.3).
+- **Differential:** every filter on parsed input, through the proxy, under
+  the decoders of `tests/support/differential.rs` (§5.2, §5.3, §5.5, §5.6).
 - **401 handling:** static token rejected → 502 `upstream_auth`, no
   `WWW-Authenticate`; OAuth refresh+retry; retry rejected → `needs_auth`;
   non-401 errors pass through.
