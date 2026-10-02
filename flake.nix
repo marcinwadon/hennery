@@ -25,7 +25,7 @@
         web = import nixpkgs-web { inherit system; };
         # The web UI (plan 7e-ii-b), built with nixpkgs-web's Node and pnpm.
         webUi = import ./nix/web.nix { pkgs = web; };
-        hennery = import ./nix/package.nix { inherit pkgs crane advisory-db; };
+        hennery = import ./nix/package.nix { inherit pkgs crane advisory-db webUi; };
         # Chromium alone (headless): what the browser checks run on.
         browsers = web.playwright-driver.browsers.override {
           withChromium = false;
