@@ -37,9 +37,9 @@ function setup(answers: (() => Response)[]) {
   const sleeps: number[] = []
   const onResync = vi.fn()
   const onError = vi.fn()
-  const open = (lastEventId?: string) =>
+  const open = (lastEventId?: string, onEvent?: (e: StreamEvent) => void) =>
     openStream(client, '/api/stream/x', {
-      onEvent: (e) => events.push(e),
+      onEvent: onEvent ?? ((e) => events.push(e)),
       onState: (s) => states.push(s),
       onResync,
       onError,
@@ -129,5 +129,226 @@ describe('openStream', () => {
     stream.close()
     await vi.waitFor(() => expect(t.states.at(-1)).toBe('closed'))
     expect(t.sent).toHaveLength(1)
+  })
+
+  it('starts each wait at 1 s again once a connection opens', async () => {
+    const t = setup([
+      () => new Response(null, { status: 503 }),
+      () => new Response(null, { status: 503 }),
+      () => sse([]),
+      () => new Response(null, { status: 503 }),
+    ])
+    const stream = t.open()
+    await vi.waitFor(() => expect(t.sleeps).toHaveLength(4))
+    expect(t.sleeps).toEqual([1000, 2000, 1000, 2000])
+    stream.close()
+  })
+
+  it('ignores an id holding NUL, keeping the last good one', async () => {
+    const t = setup([() => sse(['id: 1:2\ndata: a\n\nid: 1:3\u0000x\ndata: b\n\n'], true)])
+    const stream = t.open()
+    await vi.waitFor(() => expect(t.events).toHaveLength(2))
+    expect(t.events[1].id).toBeUndefined()
+    expect(stream.lastEventId()).toBe('1:2')
+    stream.close()
+  })
+
+  it('ends a line at a lone CR, across chunks and at the end of the stream', async () => {
+    const t = setup([() => sse(['event: item\rdata: a\r', '\rdata: b\r\r'])])
+    const stream = t.open()
+    await vi.waitFor(() => expect(t.events).toHaveLength(2))
+    expect(t.events[0]).toEqual({ event: 'item', data: 'a', id: undefined })
+    expect(t.events[1]).toEqual({ event: 'message', data: 'b', id: undefined })
+    stream.close()
+  })
+
+  it('keeps the id of a block with no data, which dispatches nothing', async () => {
+    const t = setup([() => sse(['id: 2:4\n\n', 'event: item\nid: 2:5\n\n'], true)])
+    const stream = t.open('2:1')
+    await vi.waitFor(() => expect(stream.lastEventId()).toBe('2:5'))
+    expect(t.events).toHaveLength(0)
+    stream.close()
+  })
+
+  it('an empty id clears it, so no Last-Event-ID is sent', async () => {
+    const t = setup([() => sse(['id\n\n']), () => sse([], true)])
+    const stream = t.open('2:1')
+    await vi.waitFor(() => expect(t.sent).toHaveLength(2))
+    expect(t.sent[1]['Last-Event-ID']).toBeUndefined()
+    stream.close()
+  })
+
+  it('a handler that throws stops the burst, keeps the last good id and asks for a resync', async () => {
+    const t = setup([
+      () =>
+        sse(
+          [
+            'event: item\ndata: a\nid: 1:6\n\n',
+            'event: item\ndata: b\n\nevent: item\ndata: c\n\nevent: item\ndata: d\nid: 1:9\n\n',
+          ],
+          true,
+        ),
+      () => sse([], true),
+    ])
+    const seen: string[] = []
+    const stream = t.open(undefined, (e) => {
+      seen.push(e.data)
+      if (e.data === 'b') throw new Error('boom')
+    })
+    await vi.waitFor(() => expect(t.onResync).toHaveBeenCalledTimes(1))
+    expect(seen).toEqual(['a', 'b'])
+    expect(stream.lastEventId()).toBe('1:6')
+    // Not closed by the consumer: the reconnect resumes before the event that threw.
+    await vi.waitFor(() => expect(t.sent).toHaveLength(2))
+    expect(t.sent[1]['Last-Event-ID']).toBe('1:6')
+    stream.close()
+  })
+
+  it('dispatches nothing more once closed from inside a handler', async () => {
+    const t = setup([])
+    const seen: string[] = []
+    const client = new Client({
+      fetch: (async () =>
+        sse(['event: session_removed\ndata: {}\n\nevent: item\ndata: x\nid: 1:2\n\n'], true)) as unknown as typeof fetch,
+      navigate: vi.fn(),
+      here: () => ({ pathname: '/', search: '' }),
+      stepUp: async () => {},
+    })
+    const stream: { s?: ReturnType<typeof openStream> } = {}
+    stream.s = openStream(client, '/x', {
+      lastEventId: '1:1',
+      onEvent: (e) => {
+        seen.push(e.event)
+        if (e.event === 'session_removed') stream.s?.close()
+      },
+      onState: (s) => t.states.push(s),
+    })
+    await vi.waitFor(() => expect(t.states).toContain('closed'))
+    await new Promise((r) => setTimeout(r, 10))
+    expect(seen).toEqual(['session_removed'])
+    expect(stream.s.lastEventId()).toBe('1:1')
+  })
+
+  it('reports closed at once when closed during a wait, and connects no more', async () => {
+    const answers = [() => new Response(null, { status: 503 })]
+    let calls = 0
+    const states: StreamState[] = []
+    let wake: () => void = () => {}
+    const client = new Client({
+      fetch: (async () => {
+        calls++
+        return answers.shift()?.() ?? sse([], true)
+      }) as unknown as typeof fetch,
+      navigate: vi.fn(),
+      here: () => ({ pathname: '/', search: '' }),
+      stepUp: async () => {},
+    })
+    const stream = openStream(client, '/x', {
+      onEvent: () => {},
+      onState: (s) => states.push(s),
+      sleep: () => new Promise<void>((resolve) => (wake = resolve)),
+    })
+    await vi.waitFor(() => expect(states.at(-1)).toBe('reconnecting'))
+    stream.close()
+    expect(states.at(-1)).toBe('closed')
+    wake()
+    await new Promise((r) => setTimeout(r, 10))
+    expect(calls).toBe(1)
+    expect(states).toEqual(['connecting', 'reconnecting', 'closed'])
+  })
+
+  it('the default wait ends when the stream is closed', async () => {
+    vi.useFakeTimers()
+    try {
+      const states: StreamState[] = []
+      let calls = 0
+      const client = new Client({
+        fetch: (async () => {
+          calls++
+          return new Response(null, { status: 503 })
+        }) as unknown as typeof fetch,
+        navigate: vi.fn(),
+        here: () => ({ pathname: '/', search: '' }),
+        stepUp: async () => {},
+      })
+      const stream = openStream(client, '/x', { onEvent: () => {}, onState: (s) => states.push(s) })
+      await vi.waitFor(() => expect(states.at(-1)).toBe('reconnecting'))
+      expect(vi.getTimerCount()).toBe(1)
+      stream.close()
+      // At once: no timer is left to fire.
+      expect(vi.getTimerCount()).toBe(0)
+      expect(calls).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('cancels the body of an answer it does not read', async () => {
+    const cancelled = vi.fn()
+    const failing = (status: number) =>
+      new Response(new ReadableStream({ cancel: cancelled }), { status })
+    const t = setup([() => failing(503), () => failing(404)])
+    t.open()
+    await vi.waitFor(() => expect(t.onError).toHaveBeenCalledWith(404))
+    await vi.waitFor(() => expect(cancelled).toHaveBeenCalledTimes(2))
+  })
+
+  it('removes its abort listener after each connection', async () => {
+    const added: unknown[] = []
+    const removed: unknown[] = []
+    // The prototype that owns a signal's listener methods (jsdom's or Node's).
+    let owner: object = new AbortController().signal
+    while (!Object.prototype.hasOwnProperty.call(owner, 'addEventListener')) owner = Object.getPrototypeOf(owner)
+    const target = owner as EventTarget
+    const realAdd = target.addEventListener
+    const realRemove = target.removeEventListener
+    const addSpy = vi.spyOn(target, 'addEventListener').mockImplementation(function (
+      this: EventTarget,
+      type: string,
+      listener: EventListenerOrEventListenerObject | null,
+      opts?: boolean | AddEventListenerOptions,
+    ) {
+      if (type === 'abort') added.push(listener)
+      return realAdd.call(this, type, listener, opts)
+    })
+    const removeSpy = vi.spyOn(target, 'removeEventListener').mockImplementation(function (
+      this: EventTarget,
+      type: string,
+      listener: EventListenerOrEventListenerObject | null,
+      opts?: boolean | EventListenerOptions,
+    ) {
+      if (type === 'abort') removed.push(listener)
+      return realRemove.call(this, type, listener, opts)
+    })
+    try {
+      const t = setup([() => sse(['data: a\n\n']), () => sse(['data: b\n\n']), () => sse(['data: c\n\n'])])
+      const stream = t.open()
+      await vi.waitFor(() => expect(t.sleeps).toHaveLength(3))
+      stream.close()
+      expect(added.length).toBeGreaterThanOrEqual(3)
+      expect(added.filter((l) => !removed.includes(l))).toEqual([])
+    } finally {
+      addSpy.mockRestore()
+      removeSpy.mockRestore()
+    }
+  })
+
+  it('closed while connecting: reports nothing of the answer that comes after', async () => {
+    let answer: (r: Response) => void = () => {}
+    const states: StreamState[] = []
+    const onError = vi.fn()
+    const client = new Client({
+      fetch: (() => new Promise<Response>((r) => (answer = r))) as unknown as typeof fetch,
+      navigate: vi.fn(),
+      here: () => ({ pathname: '/', search: '' }),
+      stepUp: async () => {},
+    })
+    const stream = openStream(client, '/x', { onEvent: () => {}, onState: (s) => states.push(s), onError })
+    await vi.waitFor(() => expect(states).toEqual(['connecting']))
+    stream.close()
+    answer(new Response(null, { status: 404 }))
+    await new Promise((r) => setTimeout(r, 10))
+    expect(states).toEqual(['connecting', 'closed'])
+    expect(onError).not.toHaveBeenCalled()
   })
 })
