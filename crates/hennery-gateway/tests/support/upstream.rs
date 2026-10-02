@@ -183,6 +183,24 @@ pub struct Harness {
     pub addr: SocketAddr,
     pub client: reqwest::Client,
     task: tokio::task::JoinHandle<()>,
+    limits: Limits,
+}
+
+/// The proxy over `world`, on a loopback port of its own.
+async fn serve(world: &World, limits: Limits) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let egress = Egress::new(Timeouts {
+        connect: Duration::from_secs(2),
+        request: Duration::from_secs(10),
+    })
+    .unwrap();
+    let gateway = world.gateway();
+    let app = router(ProxyState::full(world.proxy_store.clone(), &gateway, egress, limits));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, task)
 }
 
 impl std::ops::Deref for Harness {
@@ -206,29 +224,62 @@ impl Harness {
 
     pub async fn with_limits(limits: Limits) -> Self {
         let world = World::new();
-        let egress = Egress::new(Timeouts {
-            connect: Duration::from_secs(2),
-            request: Duration::from_secs(10),
-        })
-        .unwrap();
-        let gateway = world.gateway();
-        let app = router(ProxyState::full(world.proxy_store.clone(), &gateway, egress, limits));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let task = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let (addr, task) = serve(&world, limits.clone()).await;
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
         Self {
             world,
             addr,
             client,
             task,
+            limits,
         }
+    }
+
+    /// A new proxy on the same world, as after a collector restart: a new
+    /// `ProxyState`, on a new port.
+    pub async fn restart(&mut self) {
+        self.task.abort();
+        let (addr, task) = serve(&self.world, self.limits.clone()).await;
+        self.addr = addr;
+        self.task = task;
     }
 
     pub fn url(&self, slug: &str) -> String {
         format!("http://{}/mcp/{slug}", self.addr)
+    }
+
+    /// The session id the proxy gives `token` for the upstream session
+    /// `upstream_id` (plan 8e decision 13): the upstream answers a `ping`
+    /// with it, the proxy wraps it on the way down. It leaves the
+    /// upstream's handler set for that ping: a test sets its own after.
+    pub async fn session_id(
+        &self,
+        upstream: &FakeUpstream,
+        slug: &str,
+        token: &str,
+        upstream_id: &'static str,
+    ) -> String {
+        upstream.reply(move |_, _| {
+            let mut resp = json(
+                StatusCode::OK,
+                &serde_json::json!({"jsonrpc": "2.0", "id": 0, "result": {}}),
+            );
+            resp.headers_mut()
+                .insert("mcp-session-id", HeaderValue::from_static(upstream_id));
+            resp
+        });
+        let resp = self
+            .post(
+                slug,
+                token,
+                &serde_json::json!({"jsonrpc": "2.0", "id": 0, "method": "ping"}),
+            )
+            .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let wrapped = resp.headers()["mcp-session-id"].to_str().unwrap().to_owned();
+        assert!(wrapped.starts_with(&format!("{upstream_id}.")), "{wrapped}");
+        assert_ne!(wrapped, upstream_id);
+        wrapped
     }
 
     /// `POST /mcp/<slug>` with `token`, a JSON-RPC `body`.
