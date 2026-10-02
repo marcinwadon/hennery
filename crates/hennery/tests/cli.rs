@@ -3528,6 +3528,51 @@ fn text_of(path: &std::path::Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()
 }
 
+/// Plan 7c-iii, decision 2, through the binary: a relative
+/// `HENNERY_LOG_DIR` stops the start at once (exit 1, `Error:`); a log
+/// directory that cannot be made falls back to standard error, says why
+/// there, and writes nothing to standard output: the development token's
+/// warning, a `warn`, lands on standard error. `host run` on a data
+/// directory that is not there ends at once either way.
+#[test]
+fn a_bad_log_directory_refuses_or_falls_back_to_standard_error() {
+    let dir = scratch_dir("badlogdir");
+    let _cleanup = RemoveDir(dir.clone());
+    let run = |log_dir: &std::path::Path| {
+        hennery()
+            .args(["host", "run", "--data-dir"])
+            .arg(dir.join("no-such-host"))
+            .env("HENNERY_LOG_DIR", log_dir)
+            .env("HENNERY_DEV_TOKEN", "unused")
+            .env_remove("RUST_LOG")
+            .env_remove("HENNERY_HOST_DATA_DIR")
+            .output()
+            .unwrap()
+    };
+    let out = run(std::path::Path::new("relative/logs"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("Error: HENNERY_LOG_DIR is not an absolute path"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("holds no pairing"), "the start went on: {stderr}");
+
+    // A file where the directory would be: it cannot be made.
+    let blocked = dir.join("blocked");
+    std::fs::write(&blocked, "").unwrap();
+    let out = run(&blocked.join("logs"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.stdout.is_empty(), "{}", String::from_utf8_lossy(&out.stdout));
+    assert!(
+        stderr.contains("hennery: cannot write the log in")
+            && stderr.contains("logging warnings and errors to standard error"),
+        "{stderr}"
+    );
+    assert!(stderr.contains(DEV_TOKEN_WARNING), "{stderr}");
+    assert!(stderr.contains("holds no pairing"), "the start stopped: {stderr}");
+}
+
 /// Plan 7c-iii: run by a service (`HENNERY_SERVICE` set, as both units set
 /// it), `up` and its two children each log to a file of their own in
 /// distribution spec §8's directory, private. Standard output, which launchd
@@ -3547,7 +3592,14 @@ fn a_service_run_logs_to_its_own_files_and_not_to_its_output() {
     };
     let mut command = hennery();
     command
-        .env("HENNERY_SERVICE", "systemd")
+        .env(
+            "HENNERY_SERVICE",
+            if cfg!(target_os = "macos") {
+                "launchd"
+            } else {
+                "systemd"
+            },
+        )
         .env("HOME", &home)
         .env("XDG_STATE_HOME", &state)
         .env("RUST_LOG", "info");

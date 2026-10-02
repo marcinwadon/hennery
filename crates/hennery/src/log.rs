@@ -11,7 +11,10 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 
-/// Names the directory to log to, in place of the service default.
+/// Names the directory to log to, in place of the service default. Only the
+/// directory itself is checked (the user's, writable by nobody else): one
+/// inside a directory others can write to could be swapped between
+/// rotations, so give a private path.
 pub const LOG_DIR_VAR: &str = "HENNERY_LOG_DIR";
 
 /// Set by the launchd agent and the systemd unit `hennery service install`
@@ -162,8 +165,9 @@ struct Inner {
     len: u64,
     max: u64,
     files: usize,
-    /// A failed write or rotation was said once on standard error; no
-    /// other is.
+    /// The first failure, of a write or a rotation, was said on standard
+    /// error; no later one is, of either kind: under a service that is the
+    /// crash log, which must not grow with them.
     complained: bool,
 }
 
@@ -233,7 +237,9 @@ fn numbered(path: &Path, n: usize) -> PathBuf {
 }
 
 /// `buf` with every line break but a final one escaped (`\n`, `\r`), so
-/// text from an agent (an error's message, say) cannot forge a line.
+/// text from an agent (an error's message, say) cannot forge a line. A
+/// backslash is left as it is, so a message holding the two characters `\n`
+/// reads the same as an escaped break: ambiguous, never a second line.
 fn one_line(buf: &[u8]) -> std::borrow::Cow<'_, [u8]> {
     let body = buf.strip_suffix(b"\n").unwrap_or(buf);
     if !body.iter().any(|&b| b == b'\n' || b == b'\r') {
