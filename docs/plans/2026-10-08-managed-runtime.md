@@ -20,7 +20,7 @@
   - `--use-cli claude=<path>` / `codex=<path>` on `join` and `adapters update`, recorded in `host.toml`.
 - **Two hardening changes** the security review required:
   - A1: an adapter never inherits `CLAUDE_CODE_EXECUTABLE`, `CODEX_PATH`, `CODEX_CONFIG`, `DISABLE_MCP_CONFIG_FILTERING` or `APP_SERVER_LOGS`;
-  - A2: a re-pair keeps `host.toml`'s other keys.
+  - A2: a re-pair keeps `host.toml`'s `[cli]` table (`main`'s plan 6c already keeps every other key; this plan pins it for `[cli]`).
 
 **Architecture:**
 - **Data** (`adapters/`, new):
@@ -37,7 +37,7 @@
   - `runtime/install.rs`: the selection and set id, the layout, install, rollback, the in-use lock, collection;
   - `runtime/agents.rs`: `--use-cli`, the agents of a set, `prepare` for `host run`;
   - `adapter.rs`: `INHERITED_OVERRIDE_VARS` (A1);
-  - `identity.rs`: `write_config_to` keeps other keys (A2).
+  - `identity.rs`: `read_table`, and `write_config_with` crate-visible, for `[cli]` (A2).
 - **CLI** (`hennery`):
   - `src/runtime.rs` (new): `host adapters update|rollback`, `after_join`, `default_agents`;
   - `main.rs`: one `HostCommand::Adapters` variant, `join`'s flags and its install, `run_host`'s agent resolution.
@@ -57,16 +57,23 @@ Both new crates are pure Rust, which the musl-static build needs. `Cargo.lock` c
 - §13, decision 5: `--use-cli claude=<path>` (and `codex=<path>`) "records the override in `host.toml` and skips downloading that CLI".
 - ACP core §6: the overrides are `CLAUDE_CODE_EXECUTABLE` and `CODEX_PATH`, and an overridden agent "drops to the fallback, visibly".
 
-It builds on the plans executed so far, and on `main` as merged through PR #34 (hats, plan 5, and the services plan, 7c, run in parallel and are not in it). Every anchor below was taken from `main` at `6062ad0`. Where the code and a spec disagree, the code wins, and the plan says so.
+It builds on the plans executed so far, and on `main` as merged through PR #40 (7a, 7a-ii and the projects plan 6c among them) (hats, plan 5, and the services plan, 7c, run in parallel and are not in it). Every anchor below was taken from `main` at `a8469c1`. Where the code and a spec disagree, the code wins, and the plan says so.
 
 **Status:** not executed; amended after the security review. The security review of 2026-10-01 (binding on the maintainer's behalf) approved after amendments: A1–A9 required, and a scoped re-confirmation of 2026-10-02 approved the build's ten deviations, with one more amendment (the macOS barrier) and two conditions (the per-agent layout). See "Decisions" and "What the review changed".
 
-Every code block below was built and tested before the plan was written: one commit per task on a copy of `6062ad0`. Every block was generated from those commits. The plan was then replayed from its own text, task by task, onto a fresh checkout of `6062ad0`:
-- each block was applied exactly as "Reading the steps" says (80 blocks), and each "Run (regenerates …)" was run where it stands, Task 1's `lock` and `generate` against the live registry and nodejs.org;
-- after each task the tree matched the task's commit byte for byte, `Cargo.lock`, the lockfiles and `manifest.json` included;
-- each task's commit passed fmt, both clippy runs (the second on the shipped binary, test hooks off), the workspace tests and the codegen check.
+**Re-anchored on 2026-10-02** to `main` at `a8469c1`, after Tasks 1–4 had been executed on `6062ad0` and reviewed. Since then `main` had taken 7a, 7a-ii and the projects plan (6c), which moved `identity.rs`, `main.rs`, `cli.rs`, `Cargo.toml` and `ci.yml`. In this version of the plan:
+- Tasks 1–4 are the code as executed, with each review fix folded into its own task.
+- Tasks 5–7 were rebuilt on top. A2 is now mostly `main`'s own (plan 6c decision 6, decision 15), and two of `main`'s new CLI tests needed `--no-runtime` or offline mirrors.
 
-**Test counts:** 615 tests, up from 556 on `6062ad0`. Per task: 570, 570, 577, 599, 601, 609, 615.
+The first version was built and replayed on `6062ad0`, byte-identical over 80 blocks.
+
+**This version** was built as one reference commit per task on `a8469c1`, and every block was generated from those commits. It was then replayed from its own text, task by task, onto a fresh checkout of `a8469c1` plus the plan:
+- every block was applied exactly as "Reading the steps" says (88 blocks);
+- each "Run (regenerates …)" was run where it stands, Task 1's `lock` and `generate` against the live registry and nodejs.org;
+- after each task the tree matched the task's reference commit byte for byte, including `Cargo.lock`, the lockfiles and `manifest.json`;
+- each reference commit passed fmt, both clippy runs (the second on the shipped binary, test hooks off), the workspace tests and the codegen check.
+
+**Test counts:** 746 tests, up from 682 on `a8469c1`. Per task: 696, 696, 706, 730, 732, 740, 746.
 
 **Failing-test steps:** each was run on its task's parent with only the task's test files:
 - Tasks 4, 5 and 6 do not compile, for the reason given;
@@ -74,20 +81,22 @@ Every code block below was built and tested before the plan was written: one com
 
 One unrelated timing failure was seen once, in a full run under the machine's shared load: `host_session`'s `a_cancel_is_read_promptly_even_though_a_switch_deadline_fires_mid_flood`. It passed three runs out of three alone, and every later full run.
 
-**Revert-probes:** 38, each run on the built code, named in the tasks' "Revert-probes" steps. All were caught, after two tests changed:
-- `--use-cli`'s "absolute" check was not caught until its test asserted the reason, since a relative path is refused anyway when it does not exist from the test's working directory;
-- the "asked once" probe needed an assertion that the oversize download is requested once.
+**Revert-probes:** 46 in all, every one caught:
+- 38 on the first version's code;
+- 8 more for the review fixes (F1–F3 in Task 3; G1–G4 and the runtime directory in Task 4).
+
+Two tests had to change before their probes were caught:
+- `--use-cli`'s "absolute" check was not caught until its test asserted the reason. A relative path is refused anyway when it does not exist from the test's working directory.
+- The "asked once" probe needed an assertion that the oversize download is requested only once.
 
 **Not probed:**
 - the macOS `F_FULLFSYNC` barrier and the fsyncs, since no test can tell them apart (see "Not tested here");
 - the glibc-loader check, since only Linux has it.
 
-**After the plan review** the code changed (its four required findings, and most recommended ones), and the task commits, the replay, every check and every probe were run again on the changed code.
-
 **Measured outside the tests** (decisions 1 and 4):
 - one real install of the pinned set into scratch, deleted afterwards;
 - `gpgv` on Node's checksums;
-- `npm ci` with `npm audit signatures` for two of the six adapter–platform pairs;
+- `npm ci` with `npm audit signatures` for two of the six adapter–platform pairs (the Task 2 reviewer ran all six);
 - `hennery-pins extract` for every pinned package of the three platforms.
 
 ## Execution status
@@ -136,7 +145,7 @@ These were confirmed by a stronger-model security review on the maintainer's beh
 
 **What the review changed:**
 - A1: inherited override variables never reach an adapter (decision 12; Task 5).
-- A2: a re-pair keeps `host.toml`'s other keys (decision 15; Task 5).
+- A2: a re-pair keeps `host.toml`'s other keys (decision 15; Task 5). On `main` since plan 6c; Task 5 pins it for `[cli]`.
 - A3: every file has an `archive_size`, past which a download is cut off and never asked again; a digest mismatch removes the download and is never retried; connect timeout 15 s, read timeout 60 s (decisions 2, 7; Tasks 1, 4).
 - A4: sets are fsynced before their rename, and the set id hashes a layout constant, so a fixed installer never reuses a broken set (decisions 5, 6; Task 4).
 - A5: the host takes a shared lock on its set and re-checks it exists; collection takes the exclusive lock, renames the set to `.trash-*`, then removes it, all under the install lock (decision 10; Task 4).
@@ -147,7 +156,7 @@ These were confirmed by a stronger-model security review on the maintainer's beh
 - Re-confirmation, 2026-10-02:
   - one `F_FULLFSYNC` on macOS before each rename that publishes a set, a runtime or `current` (decision 7; Task 4);
   - a set's record names only agents of `[a-z0-9-]` and plain relative entries (decision 6; Task 4);
-  - optional notes taken: the `--agent` help says what is never inherited; a `host.toml` that does not parse is replaced at a re-pair; an install says its size first.
+  - optional notes taken: the `--agent` help says what is never inherited; an install says its size first. (A `host.toml` that does not parse stays an error at a re-pair: plan 6c decision 6 decided so on `main` first.)
 - The plan review (2026-10-02, "approve after amendments"), all four required findings taken:
   - a `current` or `previous` this binary cannot read never stops an install, a rollback or a collection (decision 7);
   - the test commands run integration tests unfiltered;
@@ -211,12 +220,13 @@ These were confirmed by a stronger-model security review on the maintainer's beh
    - **Every pinned package, once** (`hennery-pins extract`, from the plan review): downloaded, its bytes exactly `archive_size` and its integrity checked, and extracted under the host's rules within `unpacked_size` into a temporary directory removed at once. A pin bump that brought a link, a special file or an understated size would otherwise first fail on a host.
    - **Per adapter and platform:**
      - `npm ci --ignore-scripts --os --cpu [--libc]`;
-     - `npm audit signatures --json`, which fails on any `invalid` or `missing`;
+     - `npm audit signatures --json`, judged by `jq -e '.invalid == [] and .missing == []'`: an `invalid` or `missing` entry fails the job, and so does npm's own error object (`{"error": …}`), which has neither list (the Task 2 review's C1);
      - npm's installed tree (`node_modules/.package-lock.json`) must equal the manifest's file list;
      - `node_modules` is removed afterwards.
    - **Hardening (A8):**
      - `contents: read`;
-     - actions pinned by SHA;
+     - actions pinned by SHA (`dtolnay/rust-toolchain` at a `master` commit, with `toolchain: stable`);
+     - steps under `bash` with `pipefail`, a 60-minute timeout, and `Cargo.toml`/`Cargo.lock` in the path filter;
      - `persist-credentials: false`;
      - no `setup-node` cache, no `actions/cache`, no artifact; npm's cache in `$RUNNER_TEMP`, removed after each platform.
    - **Licensing:** the job downloads the Claude CLI, as every host does. It never keeps it.
@@ -278,7 +288,10 @@ These were confirmed by a stronger-model security review on the maintainer's beh
      - one `barrier` before each publishing rename (a set, a runtime, `current`) is `F_FULLFSYNC` on macOS and fsync elsewhere.
    - **Every directory of a staged set** is fsynced (`sync_tree`) before the barrier: a tarball's directories mostly come from its file names, not from entries of their own (plan review).
    - **A set this binary cannot read** (another layout, a record removed or torn) never stops an install, a rollback or a collection. Each reads the ids from the links, and fully checks a set only where something launches from it. A directory under the pinned id that is not a complete set of this layout is moved aside and rebuilt (plan review). Without that, a downgrade, or A4's own layout bump, would stop every update for good.
-   - **Tidying up after the switch** (downloads, collection) only warns on failure: the install has happened.
+   - **Tidying up after the switch** (downloads, then collection, each on its own) only warns on failure: the install has happened.
+   - **A set is current only with its runtime** (the Task 4 review): an install of a set whose `bin/node` is gone puts Node back before `current` names it, replacing a runtime directory left without it; collection keeps the runtime every kept or held set's record names, read leniently, so even a record of another layout keeps its Node.
+   - **The Node check** kills a `--version` that outlives its 20 s, and retries a busy text file (`ETXTBSY`, another thread's fork holding the write end for a moment).
+   - **Redirects:** to https always (at most 5); to plain http only from a loopback source to loopback.
    - **Cost if wrong:** a torn set kept as current, which A4's layout bump and `doctor`'s digest check (7d) are the way out of.
 8. **Extraction.** (amendment: stricter than §3.2)
    - **Stripped:** the first path component (npm strips one, whatever its name). Every pinned tarball's is `package/`.
@@ -288,7 +301,7 @@ These were confirmed by a stronger-model security review on the maintainer's beh
      - a file where a directory is needed;
      - two packages at one path, or one file twice (`create_new`, with `O_NOFOLLOW`).
    - **Measured:** every pinned tarball of the three platforms was listed, and none holds a link or a special file. So refusing them all needs no link resolution, and §3.2's "symlinks resolving outside" is covered by refusing every one.
-   - **Read, not refused:** pax global headers, and the pax and GNU long-name records the reader applies.
+   - **Read, not refused:** pax global headers, and the pax and GNU long-name records the reader applies. A link or a special file is refused wherever it stands, the archive's root included (the Task 3 review).
    - **Never unpacked:** xattrs (`tar` without default features).
    - **Modes:** 0755 if any exec bit was set, else 0644; directories 0755; setuid and sticky dropped.
    - **Bounds:** at most 100 000 entries, and at most `unpacked_size` + 1 MiB of bytes per package.
@@ -296,7 +309,7 @@ These were confirmed by a stronger-model security review on the maintainer's beh
    - **Choice:**
      - `current` and `previous` are relative symlinks, each replaced by a new link renamed over it.
      - An install of a new id makes the old current `previous`. The same id is "already current" and fetches nothing.
-     - **`rollback`** swaps `current` and `previous` (an error if there is no previous) and writes `adapters/hold`.
+     - **`rollback`** swaps `current` and `previous` and writes `adapters/hold`, fsynced, with a barrier before the swap. It refuses when there is no previous set, when previous is the current one, and when the previous set's Node is gone.
      - While `hold` names the current set, a host start does not install the pinned set: it warns and names `hennery host adapters update`. Every install removes `hold`. A hold left by a crash inside a rollback, naming another set, holds nothing (plan review).
    - **Why:** without the hold, the next start would "install the pinned set because it differs" (§3.2) and silently undo the rollback.
 10. **Collection.**
@@ -352,7 +365,7 @@ These were confirmed by a stronger-model security review on the maintainer's beh
 
       No spec gap.
     - **Not enforced yet:** the MCP fallback for an overridden agent (ACP core §6). Recorded for hats and the gateway.
-    - **A2:** `identity::write_config_to`, which `join` uses to stage `host.toml.pending` (PR #26), carries over the other keys of the `host.toml` beside it. One that does not parse is replaced, with a warning, since a re-pair is how a broken host recovers.
+    - **A2:** `main` already does it. Plan 6c (decision 6) made `identity::write_config_to`, which `join` uses to stage `host.toml.pending` (PR #26), keep every other key of the `host.toml` beside it, and refuse one that does not parse. This plan adds `read_table` (shared with `--use-cli`), makes `write_config_with` crate-visible, and pins that `[cli]` survives (`pairing_again_keeps_the_other_keys_of_host_toml`).
 16. **No test fetches anything.**
     - **Library tests:** fixture tarballs are built in the test and served from a loopback server, with fixture manifests passed as values under the real URLs. The loopback mirror settings route them, so the rewrite is under test too.
     - **CLI tests:**
@@ -481,16 +494,12 @@ The embedded manifest is generated by the bin the same crate graph builds, so th
 In `Cargo.toml`, replace:
 
 ```toml
-clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "=2.2.0"
 ```
 
 with:
 
 ```toml
-# SRI digests in the adapter manifest (plan 7b).
-base64 = "=0.22.1"
-clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "=2.2.0"
 # Package and Node archives (plan 7b): pure Rust, no liblzma.
 flate2 = "=1.1.10"
@@ -597,13 +606,13 @@ url.workspace = true
 In `crates/hennery-host/src/lib.rs`, replace:
 
 ```rust
-pub mod pairing;
+pub mod projects;
 ```
 
 with:
 
 ```rust
-pub mod pairing;
+pub mod projects;
 pub mod runtime;
 ```
 
@@ -2071,7 +2080,7 @@ Each of these is applied alone, the named test is run and must fail, and the cha
 
 - [ ] **Step 7: Checks and commit**
 
-Run the Global Constraints' five checks. Expected: all pass; 570 tests in the workspace.
+Run the Global Constraints' five checks. Expected: all pass; 696 tests in the workspace.
 
 ```bash
 git add Cargo.toml Cargo.lock crates/hennery-host crates/hennery-pins adapters
@@ -2115,6 +2124,8 @@ on:
       - adapters/**
       - crates/hennery-pins/**
       - crates/hennery-host/src/runtime/manifest.rs
+      - Cargo.toml
+      - Cargo.lock
       - .github/workflows/pins.yml
   push:
     branches: [main]
@@ -2122,6 +2133,8 @@ on:
       - adapters/**
       - crates/hennery-pins/**
       - crates/hennery-host/src/runtime/manifest.rs
+      - Cargo.toml
+      - Cargo.lock
       - .github/workflows/pins.yml
 
 permissions:
@@ -2130,6 +2143,11 @@ permissions:
 jobs:
   pins:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        # pipefail: a failing stage of a pipe fails the step.
+        shell: bash
     env:
       # Node's release keyring (github.com/nodejs/release-keys), pinned by
       # commit and by the digest of the keyring file.
@@ -2140,7 +2158,9 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        with:
+          toolchain: stable
       # npm 11 for `--libc`. No `cache:` input: nothing is cached.
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
@@ -2176,7 +2196,8 @@ jobs:
                 npm audit signatures --json "${npm[@]}" > "$RUNNER_TEMP/audit.json" || true
                 cat "$RUNNER_TEMP/audit.json"
                 # The JSON decides, not the exit code.
-                jq -e '(.invalid | length) == 0 and (.missing | length) == 0' "$RUNNER_TEMP/audit.json"
+                # An error object ({"error": …}) has neither list, so it fails.
+                jq -e '.invalid == [] and .missing == []' "$RUNNER_TEMP/audit.json"
                 jq -r '.packages | keys[] | select(. != "")' node_modules/.package-lock.json | sort > "$RUNNER_TEMP/installed"
                 rm -rf node_modules "$RUNNER_TEMP/npm-cache"
               )
@@ -2234,8 +2255,12 @@ The tests build raw tar headers (the name written straight into the header, so n
 In `.github/workflows/pins.yml`, replace:
 
 ```yaml
+    paths:
+      - adapters/**
       - crates/hennery-pins/**
       - crates/hennery-host/src/runtime/manifest.rs
+      - Cargo.toml
+      - Cargo.lock
       - .github/workflows/pins.yml
   push:
 ```
@@ -2243,9 +2268,13 @@ In `.github/workflows/pins.yml`, replace:
 with:
 
 ```yaml
+    paths:
+      - adapters/**
       - crates/hennery-pins/**
       - crates/hennery-host/src/runtime/manifest.rs
       - crates/hennery-host/src/runtime/extract.rs
+      - Cargo.toml
+      - Cargo.lock
       - .github/workflows/pins.yml
   push:
 ```
@@ -2254,7 +2283,7 @@ In `.github/workflows/pins.yml`, replace:
 
 ```yaml
       - crates/hennery-host/src/runtime/manifest.rs
-      - .github/workflows/pins.yml
+      - Cargo.toml
 ```
 
 with:
@@ -2262,7 +2291,7 @@ with:
 ```yaml
       - crates/hennery-host/src/runtime/manifest.rs
       - crates/hennery-host/src/runtime/extract.rs
-      - .github/workflows/pins.yml
+      - Cargo.toml
 ```
 
 In `.github/workflows/pins.yml`, replace:
@@ -2323,6 +2352,9 @@ pub fn package(tgz: &Path, dest: &Path, max_bytes: u64) -> Result<()> {
         }
         let raw = entry.path_bytes().into_owned();
         let name = std::str::from_utf8(&raw).map_err(|_| anyhow::anyhow!("an entry name is not UTF-8"))?;
+        if !kind.is_dir() && !kind.is_file() {
+            bail!("{name:?} is not a regular file or a directory ({kind:?}); links and special files are refused");
+        }
         let Some(relative) = strip_first(name)? else {
             // The root directory (`package/`) itself.
             continue;
@@ -2331,15 +2363,13 @@ pub fn package(tgz: &Path, dest: &Path, max_bytes: u64) -> Result<()> {
         if kind.is_dir() {
             create_dirs_below(dest, &target)?;
             dirs.push(target);
-        } else if kind.is_file() {
+        } else {
             let parent = target.parent().expect("a joined path has a parent");
             create_dirs_below(dest, parent)?;
             let executable = entry.header().mode()? & 0o111 != 0;
             let budget = max_bytes.saturating_sub(written);
             written +=
                 write_file(&mut entry, &target, executable, budget).with_context(|| format!("extract {relative}"))?;
-        } else {
-            bail!("{name:?} is not a regular file or a directory ({kind:?}); links and special files are refused");
         }
     }
     for dir in dirs {
@@ -2487,8 +2517,13 @@ pub fn barrier(path: &Path) -> Result<()> {
     {
         use std::os::fd::AsRawFd;
         // SAFETY: fcntl(2) F_FULLFSYNC on a descriptor this function holds.
-        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } != 0 {
-            return Err(std::io::Error::last_os_error()).with_context(|| format!("F_FULLFSYNC {}", path.display()));
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) } == -1 {
+            let err = std::io::Error::last_os_error();
+            // A filesystem without it (SMB, say): fsync is the most there is.
+            if matches!(err.raw_os_error(), Some(libc::ENOTSUP) | Some(libc::ENOTTY)) {
+                return sync(&file).with_context(|| format!("fsync {}", path.display()));
+            }
+            return Err(err).with_context(|| format!("F_FULLFSYNC {}", path.display()));
         }
         Ok(())
     }
@@ -2608,6 +2643,54 @@ mod tests {
         result.unwrap();
     }
 
+    /// The budget is the package's, across its files (review, Task 3).
+    #[test]
+    fn the_byte_budget_counts_every_file_of_the_package() {
+        let (_dir, result) = extract(
+            &[
+                ("package/a", Regular, 0o644, &[0u8; 60], ""),
+                ("package/b", Regular, 0o644, &[0u8; 60], ""),
+            ],
+            100,
+        );
+        assert!(format!("{:#}", result.unwrap_err()).contains("more bytes"));
+    }
+
+    /// A package's directory must not exist yet, as a directory or as a
+    /// link; nor may `bin/node` (review, Task 3).
+    #[test]
+    fn an_existing_destination_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let tgz = dir.path().join("p.tgz");
+        std::fs::write(&tgz, tarball(&[("package/a", Regular, 0o644, b"x", "")])).unwrap();
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        assert!(format!("{:#}", package(&tgz, &existing, 1 << 20).unwrap_err()).contains("exists already"));
+        assert!(!existing.join("a").exists());
+        let dangling = dir.path().join("dangling");
+        std::os::unix::fs::symlink(dir.path().join("nowhere"), &dangling).unwrap();
+        assert!(package(&tgz, &dangling, 1 << 20).is_err());
+        assert!(!dir.path().join("nowhere").exists());
+        let node = dir.path().join("node.tgz");
+        std::fs::write(
+            &node,
+            tarball(&[("node-v1.0.0-linux-x64/bin/node", Regular, 0o755, b"n", "")]),
+        )
+        .unwrap();
+        let bin = dir.path().join("rt/bin/node");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"old").unwrap();
+        assert!(node_binary(&node, "1.0.0", "linux-x64", &bin, 1).is_err());
+        assert_eq!(std::fs::read(&bin).unwrap(), b"old");
+    }
+
+    /// A link at the archive's root is refused too, not skipped.
+    #[test]
+    fn a_link_at_the_root_is_refused() {
+        let (_dir, result) = extract(&[("package", Symlink, 0o777, b"", "/etc")], 1 << 20);
+        assert!(format!("{:#}", result.unwrap_err()).contains("refused"));
+    }
+
     #[test]
     fn a_file_where_a_directory_is_needed_is_refused() {
         let (_dir, result) = extract(
@@ -2631,7 +2714,7 @@ mod tests {
         let record = b"18 comment=hello\n";
         global.set_entry_type(tar::EntryType::XGlobalHeader);
         global.set_size(record.len() as u64);
-        global.set_path("pax_global_header").unwrap();
+        global.set_path("package/pax_global_header").unwrap();
         global.set_cksum();
         builder.append(&global, &record[..]).unwrap();
         let mut header = tar::Header::new_gnu();
@@ -2767,7 +2850,13 @@ async fn extract_all(manifest: &Manifest) -> Result<()> {
     let mut files: BTreeMap<String, manifest::File> = BTreeMap::new();
     for adapter in manifest.adapters.values() {
         for file in adapter.platforms.values().flatten() {
-            files.entry(file.url.clone()).or_insert_with(|| file.clone());
+            let first = files.entry(file.url.clone()).or_insert_with(|| file.clone());
+            // One URL is one package: every entry naming it must agree.
+            if (&first.integrity, first.archive_size, first.unpacked_size)
+                != (&file.integrity, file.archive_size, file.unpacked_size)
+            {
+                bail!("{} is pinned twice, with different digests or sizes", file.url);
+            }
         }
     }
     let client = reqwest::Client::builder()
@@ -2812,7 +2901,7 @@ async fn extract_all(manifest: &Manifest) -> Result<()> {
 
 Run: `nix develop -c cargo test -p hennery-host --lib extract`
 
-Expected: 7 passed.
+Expected: 10 passed.
 
 Run: `nix run nixpkgs#actionlint -- .github/workflows/pins.yml`
 
@@ -2826,11 +2915,14 @@ Each is applied alone, the named test must fail, then it is reverted:
 - `strip_first`: remove `check_relative_path(rest)` → `traversal_and_absolute_names_are_refused`;
 - the `else` branch's `bail!` → `continue;` → `links_and_special_files_are_refused`;
 - `write_file`: `.create_new(true)` → `.create(true).truncate(true)` → `a_file_twice_or_more_bytes_than_pinned_is_refused`;
-- `if copied > budget` → `if false && …` → the same test.
+- `if copied > budget` → `if false && …` → the same test;
+- drop the "exists already" check → `an_existing_destination_is_refused`;
+- `let budget = max_bytes;` → `the_byte_budget_counts_every_file_of_the_package`;
+- `if false && !kind.is_dir() && !kind.is_file()` → `a_link_at_the_root_is_refused`.
 
 - [ ] **Step 4: Checks and commit**
 
-Run the five checks. Expected: all pass; 577 tests.
+Run the five checks. Expected: all pass; 706 tests.
 
 ```bash
 git add crates/hennery-host/src/runtime crates/hennery-pins .github/workflows/pins.yml
@@ -3021,6 +3113,72 @@ async fn an_interrupted_download_resumes_where_it_stopped() {
     assert_eq!(asked, [None, Some(format!("bytes={half}-"))]);
 }
 
+/// A server that ignores `Range` (a CDN, a proxy) answers 200: the download
+/// starts over and succeeds; one whose 206 starts elsewhere is started over
+/// too (review, Task 4).
+#[tokio::test]
+async fn a_source_that_does_not_resume_is_read_from_the_start() {
+    for mode in [support::RangeMode::Ignore, support::RangeMode::WrongStart] {
+        let server = Server::start().await;
+        let fixture = Fixture::new("1.0.0");
+        fixture.serve(&server);
+        server.range_mode(mode);
+        let path = fixture.server_path("claude", "node_modules/@acp/claude");
+        let half = fixture.bodies[&path].len() / 2;
+        server.cut_once(&path, half);
+        let (_dir, layout) = data_dir();
+        install::install(&layout, &selection(&fixture, &[]), &server.sources(), &quiet)
+            .await
+            .unwrap_or_else(|err| panic!("{mode:?}: {err:#}"));
+        let asked: Vec<Option<String>> = server
+            .requests()
+            .into_iter()
+            .filter(|(p, _)| *p == path)
+            .map(|(_, range)| range)
+            .collect();
+        let resumed = Some(format!("bytes={half}-"));
+        let expected = match mode {
+            // The 200 is taken as the whole file.
+            support::RangeMode::Ignore => vec![None, resumed],
+            // The wrong 206 is dropped, and the next attempt starts over.
+            _ => vec![None, resumed, None],
+        };
+        assert_eq!(asked, expected, "{mode:?}");
+    }
+}
+
+/// A set whose Node went missing gets it back from the next install of the
+/// same set; a rollback to a set without its Node is refused (review,
+/// Task 4).
+#[tokio::test]
+async fn a_set_without_its_runtime_gets_it_back() {
+    let server = Server::start().await;
+    let (one, two) = (Fixture::new("1.0.0"), Fixture::new("2.0.0"));
+    one.serve(&server);
+    two.serve(&server);
+    let (_dir, layout) = data_dir();
+    let set = install::install(&layout, &selection(&one, &[]), &server.sources(), &quiet)
+        .await
+        .unwrap()
+        .set()
+        .clone();
+    // Only `bin/node` goes: the runtime's directory stays behind, empty.
+    std::fs::remove_file(&set.node).unwrap();
+    let again = install::install(&layout, &selection(&one, &[]), &server.sources(), &quiet)
+        .await
+        .unwrap();
+    assert!(matches!(again, Installed::Switched { .. }), "{again:?}");
+    assert!(set.node.is_file(), "Node is back");
+    install::install(&layout, &selection(&two, &[]), &server.sources(), &quiet)
+        .await
+        .unwrap();
+    // Both sets share the runtime; remove it and the rollback is refused.
+    std::fs::remove_dir_all(set.node.parent().unwrap().parent().unwrap()).unwrap();
+    let err = install::rollback(&layout, &quiet).await.unwrap_err();
+    assert!(err.to_string().contains("Node"), "{err}");
+    assert!(!layout.held());
+}
+
 #[tokio::test]
 async fn a_download_left_by_an_earlier_run_resumes() {
     let server = Server::start().await;
@@ -3072,7 +3230,8 @@ async fn a_redirect_down_to_plain_http_is_refused() {
     let fixture = Fixture::new("1.0.0");
     fixture.serve(&server);
     let node = format!("/node/v24.0.0/node-v24.0.0-{}.tar.gz", here().key());
-    server.redirect(&node, "http://203.0.113.1/node.tar.gz");
+    // Unspecified, not loopback: refused before anything connects.
+    server.redirect(&node, "http://0.0.0.0:1/node.tar.gz");
     let (_dir, layout) = data_dir();
     let err = install::install(&layout, &selection(&fixture, &[]), &server.sources(), &quiet)
         .await
@@ -3255,7 +3414,11 @@ async fn too_little_free_space_is_refused_before_any_download() {
     let err = install::install(&layout, &selection(&fixture, &[]), &server.sources(), &quiet)
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("MB free"), "{err}");
+    let err = err.to_string();
+    assert!(
+        err.contains("MB free") && err.contains("and ") && err.contains(" MB are"),
+        "{err}"
+    );
     assert!(server.requests().is_empty(), "{:?}", server.requests());
 }
 
@@ -3417,6 +3580,18 @@ pub struct Server {
     state: Arc<Mutex<State>>,
 }
 
+/// How the server answers `Range: bytes=N-`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RangeMode {
+    /// 206 from byte N, as asked.
+    #[default]
+    Honour,
+    /// 200 with the whole body, as a server without range support.
+    Ignore,
+    /// 206 from byte 0, a `Content-Range` that is not the one asked for.
+    WrongStart,
+}
+
 #[derive(Default)]
 struct State {
     bodies: HashMap<String, Vec<u8>>,
@@ -3424,6 +3599,8 @@ struct State {
     cut_once: HashMap<String, usize>,
     /// Paths answered with a redirect to this location.
     redirects: HashMap<String, String>,
+    /// How a `Range` request is answered.
+    range: RangeMode,
     /// Every request: its path and its `Range` header.
     requests: Vec<(String, Option<String>)>,
 }
@@ -3451,6 +3628,10 @@ impl Server {
 
     pub fn cut_once(&self, path: &str, after: usize) {
         self.state.lock().unwrap().cut_once.insert(path.to_string(), after);
+    }
+
+    pub fn range_mode(&self, mode: RangeMode) {
+        self.state.lock().unwrap().range = mode;
     }
 
     pub fn redirect(&self, path: &str, location: &str) {
@@ -3490,7 +3671,7 @@ async fn serve(mut stream: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
         .lines()
         .find_map(|l| l.strip_prefix("range: ").or_else(|| l.strip_prefix("Range: ")))
         .map(str::to_string);
-    let (body, cut, redirect) = {
+    let (body, cut, redirect, mode) = {
         let mut state = state.lock().unwrap();
         state.requests.push((path.clone(), range.clone()));
         let cut = state.cut_once.remove(&path);
@@ -3498,6 +3679,7 @@ async fn serve(mut stream: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
             state.bodies.get(&path).cloned(),
             cut,
             state.redirects.get(&path).cloned(),
+            state.range,
         )
     };
     if let Some(location) = redirect {
@@ -3520,15 +3702,19 @@ async fn serve(mut stream: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
         .and_then(|r| r.strip_prefix("bytes="))
         .and_then(|r| r.strip_suffix('-'))
         .and_then(|n| n.parse::<usize>().ok());
-    let (status, from) = match start {
-        Some(n) if n < body.len() => ("206 Partial Content", n),
+    let (status, from) = match (start, mode) {
+        (Some(_), RangeMode::Ignore) => ("200 OK", 0),
+        (Some(n), RangeMode::WrongStart) if n < body.len() => ("206 Partial Content", 0),
+        (Some(n), RangeMode::Honour) if n < body.len() => ("206 Partial Content", n),
         _ => ("200 OK", 0),
     };
+    // A 206 always names its range, from 0 too.
+    let ranged = status.starts_with("206");
     let mut response = format!(
         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len() - from
     );
-    if from > 0 {
+    if ranged {
         response.push_str(&format!(
             "Content-Range: bytes {from}-{}/{}\r\n",
             body.len() - 1,
@@ -3815,9 +4001,12 @@ pub fn client_for(url: &str) -> Result<reqwest::Client> {
         .read_timeout(READ_TIMEOUT)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             let next = attempt.url();
+            // Plain http only from loopback to loopback: a public source
+            // never sends this host's requests to its own local services.
+            let from_loopback = attempt.previous().first().is_some_and(is_loopback);
             if attempt.previous().len() >= 5 {
                 attempt.error("too many redirects")
-            } else if next.scheme() == "https" || (next.scheme() == "http" && is_loopback(next)) {
+            } else if next.scheme() == "https" || (next.scheme() == "http" && is_loopback(next) && from_loopback) {
                 attempt.follow()
             } else {
                 attempt.error("a redirect away from https")
@@ -4159,11 +4348,15 @@ impl Selection {
                     version: &a.version,
                     entry: &a.entry,
                     cli_skipped: a.cli_skipped,
-                    files: a
-                        .files
-                        .iter()
-                        .map(|f| (f.path.as_str(), f.integrity.as_str()))
-                        .collect(),
+                    files: {
+                        let mut files: Vec<(&str, &str)> = a
+                            .files
+                            .iter()
+                            .map(|f| (f.path.as_str(), f.integrity.as_str()))
+                            .collect();
+                        files.sort();
+                        files
+                    },
                 })
                 .collect(),
         };
@@ -4422,6 +4615,7 @@ async fn install_locked(
     let previous = layout.current_id();
     if previous.as_deref() == Some(id.as_str())
         && let Ok(set) = layout.set(&id)
+        && set.node.is_file()
     {
         let _ = std::fs::remove_file(layout.hold_file());
         return Ok(Installed::AlreadyCurrent(set));
@@ -4438,6 +4632,11 @@ async fn install_locked(
         build(layout, selection, sources, progress).await?;
     }
     let set = layout.set(&id)?;
+    // A set whose runtime went (removed by hand, or by a binary that could
+    // not read this set's record) gets it back before it is current.
+    if !set.node.is_file() {
+        install_node(layout, selection, sources, progress).await?;
+    }
     // The set's rename is durable before `current` names it.
     extract::barrier(&layout.sets())?;
     if let Some(old) = previous.as_ref().filter(|old| **old != id) {
@@ -4450,8 +4649,11 @@ async fn install_locked(
     // failure is a warning, not the install's.
     // Every download belonged to this install, or to one that cannot be
     // resumed into anything now current.
-    if let Err(err) = clear_dir(&layout.downloads()).and_then(|()| collect(layout)) {
-        tracing::warn!("the adapter set is installed, but cleaning up after it failed: {err:#}");
+    if let Err(err) = clear_dir(&layout.downloads()) {
+        tracing::warn!("the adapter set is installed, but its downloads were not removed: {err:#}");
+    }
+    if let Err(err) = collect(layout) {
+        tracing::warn!("the adapter set is installed, but collecting older ones failed: {err:#}");
     }
     Ok(Installed::Switched { set, previous })
 }
@@ -4471,7 +4673,18 @@ pub async fn rollback(layout: &Layout, progress: &(dyn Fn(&str) + Sync)) -> Resu
         .previous()?
         .context("there is no previous adapter set to roll back to")?;
     let from = layout.current_id().context("there is no current adapter set")?;
-    std::fs::write(layout.hold_file(), format!("{}\n", to.id))?;
+    if from == to.id {
+        bail!("there is no previous adapter set to roll back to: previous is the current one");
+    }
+    if !to.node.is_file() {
+        bail!(
+            "the previous adapter set's Node ({}) is gone; `hennery host adapters update` installs the pinned set",
+            to.node.display()
+        );
+    }
+    // Durable before `current` names the set it holds the host on.
+    write_synced(&layout.hold_file(), format!("{}\n", to.id).as_bytes())?;
+    extract::barrier(&layout.hold_file())?;
     swap_link(layout, &layout.previous_link(), &from)?;
     swap_link(layout, &layout.current_link(), &to.id)?;
     extract::sync_dir(&layout.adapters())?;
@@ -4666,13 +4879,23 @@ async fn install_node(
     tokio::task::spawn_blocking(move || extract::node_binary(&part, &version, &platform, &target, size)).await??;
     // Before anything depends on it: a data directory mounted noexec, or a
     // Linux without the loader Node needs, fails here, not at a session.
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        tokio::process::Command::new(&binary).arg("--version").output(),
-    )
-    .await
-    .context("the downloaded Node did not answer --version within 20 s")?
-    .with_context(|| format!("run {}", binary.display()))?;
+    let mut attempts = 0;
+    let output = loop {
+        let run = tokio::process::Command::new(&binary)
+            .arg("--version")
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(std::time::Duration::from_secs(20), run)
+            .await
+            .context("the downloaded Node did not answer --version within 20 s")?
+        {
+            Err(err) if err.raw_os_error() == Some(libc::ETXTBSY) && attempts < 10 => {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            result => break result.with_context(|| format!("run {}", binary.display()))?,
+        }
+    };
     let answered = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() || answered != format!("v{}", selection.node_version) {
         bail!(
@@ -4684,6 +4907,11 @@ async fn install_node(
     extract::sync_dir(&staging)?;
     extract::barrier(&binary)?;
     let path = layout.runtimes().join(&name);
+    // A runtime directory left without its `bin/node` (by hand, by a crash)
+    // is replaced, not renamed onto.
+    if std::fs::symlink_metadata(&path).is_ok() {
+        std::fs::remove_dir_all(&path)?;
+    }
     std::fs::rename(&staging, &path)?;
     extract::sync_dir(&layout.runtimes())?;
     Ok(())
@@ -4722,9 +4950,9 @@ fn collect(layout: &Layout) -> Result<()> {
         if !is_set_id(&name) {
             continue;
         }
-        let set = layout.set(&name);
+        let runtime = runtime_named_by(&path);
         if keep.contains(&name) {
-            runtimes.extend(set.ok().map(|s| s.record.runtime));
+            runtimes.extend(runtime);
             continue;
         }
         // A host launching from it holds a shared lock: leave it.
@@ -4734,10 +4962,11 @@ fn collect(layout: &Layout) -> Result<()> {
             None => true,
         };
         if !free {
-            runtimes.extend(set.ok().map(|s| s.record.runtime));
+            runtimes.extend(runtime);
             continue;
         }
         let trash = layout.sets().join(format!(".trash-{name}"));
+        let _ = std::fs::remove_dir_all(&trash);
         std::fs::rename(&path, &trash)?;
         drop(lock);
         std::fs::remove_dir_all(&trash)?;
@@ -4754,6 +4983,16 @@ fn collect(layout: &Layout) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The runtime a set's record names, read leniently: a record of another
+/// layout still keeps its Node from being collected.
+fn runtime_named_by(set: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(set.join(RECORD)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let runtime = value.get("runtime")?.as_str()?;
+    manifest::check_relative_path(runtime).ok()?;
+    Some(runtime.to_string())
 }
 
 fn open_install_lock(layout: &Layout) -> Result<std::fs::File> {
@@ -4896,11 +5135,11 @@ pub mod install;
 
 Run: `nix develop -c cargo test -p hennery-host --test runtime --test runtime_proxy`
 
-Expected: `runtime` 16 passed, `runtime_proxy` 1.
+Expected: `runtime` 18 passed, `runtime_proxy` 1.
 
 Run: `nix develop -c cargo test -p hennery-host --lib runtime::`
 
-Expected: 17 passed (download 2, install 3, with Tasks 1 and 3's 12).
+Expected: 20 passed (download 2, install 3, with Tasks 1 and 3's 15).
 
 A test-name filter after `--test …` applies to every target, so the integration tests run unfiltered.
 
@@ -4922,11 +5161,15 @@ Each is applied alone, the named test must fail, then it is reverted:
 - `install_node`: drop the version comparison → `a_node_that_does_not_run_here_is_refused`;
 - `Layout::set`: drop the entry check → `a_record_naming_paths_outside_its_set_is_refused`;
 - `install_locked`: `layout.current()?` in place of `layout.current_id()` → `an_unreadable_current_set_does_not_stop_an_install`;
-- `Layout::held`: `self.hold_file().exists()` → `an_update_keeps_the_previous_set_and_rollback_holds_the_host_on_it`.
+- `Layout::held`: `self.hold_file().exists()` → `an_update_keeps_the_previous_set_and_rollback_holds_the_host_on_it`;
+- `install_locked`: drop `&& set.node.is_file()` → `a_set_without_its_runtime_gets_it_back`;
+- `rollback`: `if false && !to.node.is_file()` → the same test;
+- `install_node`: drop the removal of a runtime directory left behind → the same test;
+- `fetch_once`: drop the `200 => 0` arm, or accept any 206 → `a_source_that_does_not_resume_is_read_from_the_start`.
 
 - [ ] **Step 6: Checks, commit, and the 7b-i PR**
 
-Run the five checks. Expected: all pass; 599 tests.
+Run the five checks. Expected: all pass; 730 tests.
 
 ```bash
 git add crates/hennery-host
@@ -4942,13 +5185,13 @@ PR 7b-i holds Tasks 1–4.
 **PR 7b-ii.**
 
 **Files:**
-- Modify: `crates/hennery-host/src/adapter.rs` (`INHERITED_OVERRIDE_VARS`), `crates/hennery-host/src/identity.rs` (`write_config_to`, `read_table`, `write_private`)
+- Modify: `crates/hennery-host/src/adapter.rs` (`INHERITED_OVERRIDE_VARS`), `crates/hennery-host/src/identity.rs` (`read_table`; `write_config_with` and `write_private` crate-visible)
 - Test: `crates/hennery-host/tests/adapter_env.rs` (new; its own binary, since it sets this process's environment); `identity.rs`'s unit tests
 
 **Interfaces:**
 - Produces:
   - `adapter::INHERITED_OVERRIDE_VARS`;
-  - `identity::{read_table, write_private}` as `pub(crate)`.
+  - `identity::{read_table, write_config_with, write_private}` as `pub(crate)`.
 - Consumes: nothing new.
 
 - [ ] **Step 1: Write the failing test**
@@ -5044,45 +5287,41 @@ with:
 In `crates/hennery-host/src/identity.rs`, replace:
 
 ```rust
-/// `finish_interrupted_pairing`).
-pub(crate) fn write_config_to(path: &Path, collector_url: &str, host_id: &str, key: &HostKey) -> Result<()> {
-    let config = toml::to_string(&HostToml {
+/// re-pair after a revoke (plan 6c decision 6).
 ```
 
 with:
 
 ```rust
-/// `finish_interrupted_pairing`). Every key of the `host.toml` beside it
-/// that is not the pairing's (the `[cli]` overrides, plan 7b) is carried
-/// over, so a pairing again keeps them.
-pub(crate) fn write_config_to(path: &Path, collector_url: &str, host_id: &str, key: &HostKey) -> Result<()> {
-    let pairing = toml::Table::try_from(HostToml {
+/// re-pair after a revoke (plan 6c decision 6), and so do the `[cli]`
+/// overrides (plan 7b).
 ```
 
 In `crates/hennery-host/src/identity.rs`, replace:
 
 ```rust
-    write_private(path, config.as_bytes())
+fn write_config_with(path: &Path, change: impl FnOnce(&mut toml::Table)) -> Result<()> {
+    let current = path.with_file_name(CONFIG_FILE);
+    let mut table = match std::fs::read_to_string(&current) {
+        Ok(text) => toml::from_str::<toml::Table>(&text).with_context(|| format!("parse {}", current.display()))?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(err) => return Err(err).with_context(|| format!("read {}", current.display())),
+    };
+    change(&mut table);
+    write_private(path, toml::to_string(&table)?.as_bytes())
 ```
 
 with:
 
 ```rust
-    let existing = path.with_file_name(CONFIG_FILE);
-    // Pairing again is how a broken host recovers: a `host.toml` that does
-    // not parse is replaced, with a warning, not carried over.
-    let mut table = read_table(&existing).unwrap_or_else(|err| {
-        tracing::warn!("{err:#}; its other keys are not kept");
-        toml::Table::new()
-    });
-    for field in ["collector", "host_id", "public_key"] {
-        table.remove(field);
-    }
-    table.extend(pairing);
+pub(crate) fn write_config_with(path: &Path, change: impl FnOnce(&mut toml::Table)) -> Result<()> {
+    let mut table = read_table(&path.with_file_name(CONFIG_FILE))?;
+    change(&mut table);
     write_private(path, toml::to_string(&table)?.as_bytes())
 }
 
-/// `path` as a TOML table: empty if there is no file.
+/// `path` as a TOML table: empty if there is no file, an error if it does
+/// not parse.
 pub(crate) fn read_table(path: &Path) -> Result<toml::Table> {
     match std::fs::read_to_string(path) {
         Ok(text) => toml::from_str(&text).with_context(|| format!("parse {}", path.display())),
@@ -5120,8 +5359,8 @@ with:
     }
 
     /// Plan 7b, A2: a pairing written beside an existing `host.toml` (a
-    /// re-pair stages it as `host.toml.pending`) keeps that file's other
-    /// keys; a fresh one is the pairing's keys alone, as before.
+    /// re-pair stages it as `host.toml.pending`) keeps its `[cli]` table; a
+    /// fresh one is the pairing's keys alone, as before.
     #[test]
     fn pairing_again_keeps_the_other_keys_of_host_toml() {
         let dir = tempfile::tempdir().unwrap();
@@ -5143,10 +5382,6 @@ with:
         assert_eq!(table["host_id"].as_str(), Some("host-2"));
         assert_eq!(table["collector"].as_str(), Some("ws://b/api/hosts/ws"));
         assert_eq!(table["cli"]["claude"].as_str(), Some("/opt/claude"));
-        // A `host.toml` that does not parse is replaced, not a reason to fail.
-        std::fs::write(&config, "not = [toml").unwrap();
-        write_config_to(&staged, "ws://c/api/hosts/ws", "host-3", &HostKey::from_seed([3; 32])).unwrap();
-        assert_eq!(read_table(&staged).unwrap()["host_id"].as_str(), Some("host-3"));
     }
 
     #[test]
@@ -5166,12 +5401,11 @@ Expected: all pass, `pairing_again_keeps_the_other_keys_of_host_toml` among them
 - [ ] **Step 5: Revert-probes**
 
 - remove the `INHERITED_OVERRIDE_VARS` loop → `adapter_env`;
-- `write_config_to`: `table = pairing;` → `pairing_again_keeps_the_other_keys_of_host_toml`;
-- `read_table(..).expect(..)` in place of `unwrap_or_else` → the same test (a `host.toml` that does not parse).
+- `write_config_with`: `let mut table = toml::Table::new();` in place of `read_table(…)?` → `pairing_again_keeps_the_other_keys_of_host_toml`.
 
 - [ ] **Step 6: Checks and commit**
 
-Run the five checks. Expected: all pass; 601 tests.
+Run the five checks. Expected: all pass; 732 tests.
 
 ```bash
 git add crates/hennery-host
@@ -5833,7 +6067,7 @@ pub mod download;
 
 Run: `nix develop -c cargo test -p hennery-host --test runtime`
 
-Expected: 22 passed.
+Expected: 24 passed.
 
 Run: `nix develop -c cargo test -p hennery-host --lib agents`
 
@@ -5849,7 +6083,7 @@ Expected: 2 passed.
 
 - [ ] **Step 6: Checks and commit**
 
-Run the five checks. Expected: all pass; 609 tests.
+Run the five checks. Expected: all pass; 740 tests.
 
 ```bash
 git add crates/hennery-host
@@ -5980,6 +6214,20 @@ fn a_malformed_agent_flag_is_rejected() {
 In `crates/hennery/tests/cli.rs`, replace:
 
 ```rust
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+```
+
+with:
+
+```rust
+    let dir = tempfile::tempdir().unwrap();
+    let out = hennery()
+```
+
+In `crates/hennery/tests/cli.rs`, replace:
+
+```rust
     for command in ["collector", "up"] {
         let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
 ```
@@ -6084,17 +6332,21 @@ with:
 In `crates/hennery/tests/cli.rs`, replace:
 
 ```rust
+
     let log = dir.join("up.log");
     let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
     command
+        .env("HENNERY_DEV_TOKEN", TOKEN)
 ```
 
 with:
 
 ```rust
+
     let log = dir.join("up.log");
     let mut command = hennery();
     command
+        .env("HENNERY_DEV_TOKEN", TOKEN)
 ```
 
 In `crates/hennery/tests/cli.rs`, replace:
@@ -6193,6 +6445,49 @@ with:
 In `crates/hennery/tests/cli.rs`, replace:
 
 ```rust
+    let mut child = Command::new("/bin/sh")
+```
+
+with:
+
+```rust
+    let mut child = Command::new("/bin/sh")
+        // Offline, as `hennery()` is: this host may reach the managed path.
+        .env("HENNERY_NPM_REGISTRY", OFFLINE)
+        .env("HENNERY_NODE_MIRROR", OFFLINE)
+```
+
+In `crates/hennery/tests/cli.rs`, replace:
+
+```rust
+    let mut control = Command::new(env!("CARGO_BIN_EXE_hennery"))
+```
+
+with:
+
+```rust
+    let mut control = hennery()
+```
+
+In `crates/hennery/tests/cli.rs`, replace:
+
+```rust
+    let log = dir.join("up.log");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
+    command
+```
+
+with:
+
+```rust
+    let log = dir.join("up.log");
+    let mut command = hennery();
+    command
+```
+
+In `crates/hennery/tests/cli.rs`, replace:
+
+```rust
     Command::new(env!("CARGO_BIN_EXE_hennery"))
         .args(["host", "join", &format!("http://{addr}"), "--name", "laptop"])
 ```
@@ -6216,6 +6511,7 @@ In `crates/hennery/tests/cli.rs`, replace:
 ```rust
     let log = dir.join("collector.log");
     let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["collector", "--listen", "127.0.0.1:0", "--listen", "127.0.0.1:0"])
 ```
 
 with:
@@ -6223,6 +6519,7 @@ with:
 ```rust
     let log = dir.join("collector.log");
     let collector = hennery()
+        .args(["collector", "--listen", "127.0.0.1:0", "--listen", "127.0.0.1:0"])
 ```
 
 In `crates/hennery/tests/cli.rs`, replace:
@@ -6240,12 +6537,14 @@ with:
 In `crates/hennery/tests/cli.rs`, replace:
 
 ```rust
+    let log = dir.join("up.log");
     let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
 ```
 
 with:
 
 ```rust
+    let log = dir.join("up.log");
     let mut command = hennery();
 ```
 
@@ -6288,24 +6587,28 @@ with:
 In `crates/hennery/tests/cli.rs`, replace:
 
 ```rust
+fn collector_on(data: &std::path::Path, log: &std::path::Path) -> (KillTree, String) {
     let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
 ```
 
 with:
 
 ```rust
+fn collector_on(data: &std::path::Path, log: &std::path::Path) -> (KillTree, String) {
     let collector = hennery()
 ```
 
 In `crates/hennery/tests/cli.rs`, replace:
 
 ```rust
+fn admin(data: &std::path::Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_hennery"))
 ```
 
 with:
 
 ```rust
+fn admin(data: &std::path::Path, args: &[&str]) -> std::process::Output {
     hennery()
 ```
 
@@ -6378,14 +6681,50 @@ with:
 In `crates/hennery/tests/cli.rs`, replace:
 
 ```rust
-    assert!(listed.contains("\tlaptop\t") && listed.contains("\tpaired"), "{listed}");
+    let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+```
+
+with:
+
+```rust
+    let collector = hennery()
+```
+
+In `crates/hennery/tests/cli.rs`, replace:
+
+```rust
+        let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
+```
+
+with:
+
+```rust
+        let mut command = hennery();
+```
+
+In `crates/hennery/tests/cli.rs`, replace:
+
+```rust
+        Command::new(env!("CARGO_BIN_EXE_hennery"))
+```
+
+with:
+
+```rust
+        hennery()
+```
+
+In `crates/hennery/tests/cli.rs`, replace:
+
+```rust
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
 }
 ```
 
 with:
 
 ```rust
-    assert!(listed.contains("\tlaptop\t") && listed.contains("\tpaired"), "{listed}");
+    assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 /// Plan 7b: no test of this binary may reach the npm registry or nodejs.org.
@@ -6406,10 +6745,25 @@ fn every_spawn_of_the_binary_is_offline() {
         [
             format!("let mut cmd = Command::new(env!(\"{token}\"));"),
             format!("cmd.args([\"-c\", \"umask 022; exec \\\"$0\\\" \\\"$@\\\"\", env!(\"{token}\")]);"),
+            format!("env!(\"{token}\"),"),
         ],
         "spawn the binary through hennery() or under_umask_022(), which keep it offline"
     );
     assert_eq!(source.matches(concat!("offline(&mut ", "cmd)")).count(), 2);
+    // `offline` and the one spawn through a shell of its own set both
+    // mirrors.
+    assert_eq!(
+        source
+            .matches(concat!(".env(\"HENNERY_NPM_REGISTRY\", ", "OFFLINE)"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        source
+            .matches(concat!(".env(\"HENNERY_NODE_MIRROR\", ", "OFFLINE)"))
+            .count(),
+        2
+    );
 }
 
 /// A loopback mirror serving `bodies` (path → bytes), else 404: as the
@@ -6505,6 +6859,7 @@ fn paired_host(dir: &std::path::Path) {
         collector_url: "ws://127.0.0.1:1/api/hosts/ws".into(),
         host_id: "host-cli".into(),
         key: hennery_host::identity::HostKey::generate(),
+        workspace_roots: Vec::new(),
     }
     .save(dir)
     .unwrap();
@@ -6777,7 +7132,7 @@ fn a_host_without_agent_flags_runs_the_installed_set() {
 
 Run: `nix develop -c cargo test -p hennery --test cli`
 
-Expected: 33 passed, 10 failed:
+Expected: 38 passed, 10 failed:
 - five of the six new tests (`unrecognized subcommand 'adapters'`, `unexpected argument '--no-runtime'`); the audit passes;
 - five older tests that now pair with `--no-runtime` (`joining_over_http_ignores_a_configured_proxy`, `join_reads_the_code_from_standard_input_when_it_is_left_out`, `join_refuses_an_overlong_line_on_standard_input_at_once`, `the_code_descriptors_must_be_open_pipes`, `a_pairing_code_from_the_admin_socket_pairs_a_host`).
 
@@ -6857,17 +7212,23 @@ with:
 In `crates/hennery/src/main.rs`, replace:
 
 ```rust
-    collector_url: Option<String>,
+    /// `workspace_roots` in `host.toml`.
+    #[arg(long = "workspace-root")]
+    workspace_roots: Vec<String>,
+}
 ```
 
 with:
 
 ```rust
-    collector_url: Option<String>,
+    /// `workspace_roots` in `host.toml`.
+    #[arg(long = "workspace-root")]
+    workspace_roots: Vec<String>,
     /// With no `--agent`: where the pinned adapter set comes from, if it is
     /// installed at start.
     #[command(flatten)]
     mirrors: runtime::MirrorArgs,
+}
 ```
 
 In `crates/hennery/src/main.rs`, replace:
@@ -6918,14 +7279,13 @@ with:
 In `crates/hennery/src/main.rs`, replace:
 
 ```rust
-    let collector_url = args.collector_url.unwrap_or(paired.collector_url);
-    let mut cfg = HostConfig::new(collector_url, paired.host_id, paired.key, args.data_dir);
-    cfg.agents = args.agents.into_iter().collect();
+        hennery_host::projects::workspace_roots(&args.workspace_roots, &paired.workspace_roots, home.as_deref())?;
 ```
 
 with:
 
 ```rust
+        hennery_host::projects::workspace_roots(&args.workspace_roots, &paired.workspace_roots, home.as_deref())?;
     // No `--agent`: `claude` and `codex` from the installed set, the pinned
     // one installed first if it is not current (distribution spec §3.2).
     // The set stays held in use while the host runs.
@@ -6934,8 +7294,17 @@ with:
     } else {
         (args.agents.into_iter().collect(), None)
     };
-    let collector_url = args.collector_url.unwrap_or(paired.collector_url);
-    let mut cfg = HostConfig::new(collector_url, paired.host_id, paired.key, args.data_dir);
+```
+
+In `crates/hennery/src/main.rs`, replace:
+
+```rust
+    cfg.agents = args.agents.into_iter().collect();
+```
+
+with:
+
+```rust
     cfg.agents = agents;
 ```
 
@@ -7141,7 +7510,7 @@ Expected: all pass, the six new ones among them.
 
 - [ ] **Step 6: Checks, commit, and the 7b-ii PR**
 
-Run the five checks. Expected: all pass; 615 tests. `ps -ax | grep -i hennery` shows nothing of this run.
+Run the five checks. Expected: all pass; 746 tests. `ps -ax | grep -i hennery` shows nothing of this run.
 
 ```bash
 git add crates/hennery
