@@ -5,7 +5,11 @@
 //! adapter's `session/new`: tungstenite traces the frame and the ACP crate
 //! the JSON-RPC line, both with the token. The same for a `session/load`,
 //! an adapter error that quotes the servers, and a frame that does not
-//! decode, which the host logs by its error's kind and place only.
+//! decode, which the host logs by its error's kind and place only. The fake
+//! adapter also prints a stray (non-JSON-RPC) stdout line quoting the token
+//! and the URL key, which the ACP crate cannot parse and so quotes whole in
+//! a `warn` event of its own (`agent-client-protocol` 2.2.0) — the reason
+//! that target is held at `error`, not `info`.
 //! Run twice: once under a plain
 //! subscriber, which proves they do, and once under the one the process
 //! installs (`logging::capped`), which must not show it. Each run's
@@ -89,10 +93,19 @@ async fn run_sessions_with_the_token() {
         HostKey::from_seed([1; 32]),
         data.path().to_path_buf(),
     );
-    cfg.agents.insert(
-        "claude".into(),
-        hennery_host::AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap(),
-    );
+    let mut claude = hennery_host::AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    // A stray (non-JSON-RPC) line on its stdout, quoting the token and the
+    // URL key, right before it answers `session/new`: the ACP crate cannot
+    // parse it and quotes it whole in a `warn` event of its own.
+    let claude_script = hennery_testkit::FakeScript {
+        stdout_lines: vec![format!("debug: servers [{TOKEN}] {URL_KEY}")],
+        ..Default::default()
+    };
+    claude.env.push((
+        hennery_testkit::SCRIPT_ENV.into(),
+        serde_json::to_string(&claude_script).unwrap(),
+    ));
+    cfg.agents.insert("claude".into(), claude);
     let mut echo = hennery_host::AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
     let script = hennery_testkit::FakeScript {
         new_session_error: Some(-32603),
@@ -213,6 +226,14 @@ async fn a_sessions_token_is_never_logged_even_at_trace() {
             );
         }
     }
+    // The ACP crate's own `warn`, quoting the adapter's stray stdout whole:
+    // the probe for capping that target at `error`.
+    assert!(
+        control.lines().any(|line| {
+            line.contains("agent_client_protocol") && line.contains("Invalid transport input") && line.contains(TOKEN)
+        }),
+        "no agent_client_protocol warn line quoting the stray stdout's token in the plain log: {control}"
+    );
 
     // ...and the process's own subscriber, which logs, never shows it.
     let capped = Captured::default();
