@@ -190,7 +190,7 @@ function HatCard({
             <span className="field-label">Colour</span>
             <input type="color" className="colour-input" value={colour} onChange={(e) => setColour(e.target.value.toLowerCase())} />
           </label>
-          <button type="submit" className="btn btn-primary btn-sm" disabled={busy}>
+          <button type="submit" className="btn btn-primary btn-sm" disabled={busy || name.trim() === ''}>
             Save
           </button>
           <button type="button" className="btn btn-ghost btn-sm" onClick={closeForm} disabled={busy}>
@@ -392,9 +392,13 @@ function SessionIds({ ids, link }: { ids: string[]; link?: boolean }) {
 
 function PurgeOutcome({ name, result, onClose }: { name: string; result: PurgeResult; onClose: () => void }) {
   const t = result.host_transcripts
+  // The purged hat's card, and the button that opened the dialog, are
+  // gone: focus comes here.
+  const title = useRef<HTMLHeadingElement>(null)
+  useEffect(() => title.current?.focus(), [])
   return (
     <section className="card notice" aria-labelledby="purged-title" role="status">
-      <h2 className="card-title" id="purged-title">
+      <h2 className="card-title" id="purged-title" ref={title} tabIndex={-1}>
         Purged <Text>{name}</Text>
       </h2>
       <p>

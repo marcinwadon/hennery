@@ -137,6 +137,16 @@ describe('the hats', () => {
     await waitFor(() => expect(within(dayJob).getByRole('button', { name: 'Edit' })).toHaveFocus())
   })
 
+  it('cannot save a name of spaces only', async () => {
+    const server = open({})
+    const work = await screen.findByRole('listitem', { name: 'Work' })
+    await userEvent.click(within(work).getByRole('button', { name: 'Edit' }))
+    await userEvent.clear(within(work).getByRole('textbox', { name: 'Name' }))
+    await userEvent.type(within(work).getByRole('textbox', { name: 'Name' }), '   ')
+    expect(within(work).getByRole('button', { name: 'Save' })).toBeDisabled()
+    expect(sent(server, 'PATCH', '/api/hats/hat-b')).toHaveLength(0)
+  })
+
   it('puts focus on the card’s title once “Make default for new hosts” is gone', async () => {
     open({ 'PATCH /api/hats/hat-b': json(200, hat({ default_for_new_hosts: true })) })
     const work = await screen.findByRole('listitem', { name: 'Work' })
@@ -194,6 +204,18 @@ describe('purging a hat', () => {
     expect(outcome).toHaveTextContent('s-9')
     expect(outcome).toHaveTextContent('2 removed, 0 removed in part, 1 still to remove')
     expect(sent(server, 'POST', '/api/hats/hat-b/purge')).toHaveLength(2)
+  })
+
+  it('puts focus on what the purge deleted, once the dialog has gone', async () => {
+    open({
+      'GET /api/hats/hat-b/purge': json(200, preview()),
+      'POST /api/hats/hat-b/purge': json(200, result),
+    })
+    await userEvent.click(within(await screen.findByRole('listitem', { name: 'Work' })).getByRole('button', { name: 'Purge' }))
+    await userEvent.click(within(await screen.findByRole('dialog', { name: 'Purge this hat?' })).getByRole('button', { name: 'Purge' }))
+    const outcome = await screen.findByRole('status', { name: 'Purged Work' })
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    await waitFor(() => expect(within(outcome).getByRole('heading', { name: 'Purged Work' })).toHaveFocus())
   })
 
   it('cannot purge while a session runs, and names it', async () => {
