@@ -230,6 +230,28 @@ frontend), and `SetupRequest` has no default hat name; hats add it.
   either way, and every finish re-reads the relying party under the database
   lock, so a change lands wholly before or after it. Settings says so before
   saving, and the change requires step-up (§3.4).
+  - `PATCH /api/settings {public_url}` and `hennery admin reset-public-url`
+    (§4.2) run one operator function, in one transaction: the value checked
+    as setup checks it, the row and the cached origin replaced, every
+    session ended (the caller's too) and so every stream and push
+    subscription, the passkeys removed on a host-name change, every
+    ceremony ended. The same origin again is a change like any other. A
+    `contact` in the same body is set in the same transaction, or nothing
+    is.
+  - The API's write re-checks the caller's session, live and stepped up,
+    as its first statement: a session revoked or a password reset after the
+    request's checks changes nothing (401 `unauthenticated`, cookie cleared;
+    or 403 `step_up_required`).
+  - It answers 200 with the settings and `public_url_changed
+    {sessions_ended, passkeys_removed}`, and clears the session cookie as
+    the old `public_url` set it (`Secure` or not), since the answer goes to
+    the old origin. It is logged at `warn` with the old and new origins.
+  - From then on the old origin is refused (§3.3), so a wrong value locks
+    every browser out; the way back is `hennery admin reset-public-url` on
+    the collector's machine. A request already past the `Origin` check when
+    the change lands still runs (one in-flight request per session; recorded,
+    not closed). So does a password login checked before it: its session
+    outlives "every session ended", and proves the password anyway.
 
 *Deferred:* identity from a fronting proxy. A header trusted by peer address
 is forgeable by any local process when the proxy runs on loopback; a later
@@ -299,10 +321,12 @@ and stepped up, so a session revoked or a password reset mid-ceremony stores
 nothing.
 
 *Built so far:* step-up guards minting pairing codes, revoking hosts and auth
-sessions, registering and removing passkeys, and the gateway's connections
+sessions, registering and removing passkeys, the gateway's connections
 (creating, deleting, setting a static credential, and a `PATCH` naming the
-URL, kind, internal flag, header or prefix; plan 8a); the other actions get it
-with their endpoints.
+URL, kind, internal flag, header or prefix; plan 8a), and changing
+`public_url` (a `PATCH /api/settings` naming it, checked before anything is
+read and again in its write; plan 4d-B4); the other actions get it with their
+endpoints.
 
 ## 4. Host identity and pairing
 
@@ -436,7 +460,9 @@ that speaks the socket protocol directly (§10).
 - **`reset-public-url <url>`** refuses before setup, replaces the stored value
   with no restart, ends every session, and removes the passkeys only when the
   host name changes (§3.2). The CLI warns about passkeys before it asks, and
-  reports how many it removed.
+  reports how many it removed. Settings changes `public_url` the same way
+  (`PATCH /api/settings`, step-up); this reset is the way back when a wrong
+  value there locks every browser out.
 
 ### 4.3 Host lifecycle
 
@@ -598,7 +624,8 @@ purged until they are moved to another hat: 409 `hat_is_default`). As built
   - sent as `Authorization: vapid t=<token>, k=<public key>`, one token per
     (audience, subject), reused until an hour before it expires.
 - **The contact** is not asked at setup. `PATCH /api/settings {contact}` sets
-  it (no step-up), trimmed; empty clears it. It is a plain e-mail address
+  it (no step-up, unless the body names `public_url` too, §3.2), trimmed;
+  empty clears it. It is a plain e-mail address
   (ASCII letters, digits and `.+_-` before the `@`, a dotted domain after, at
   most 254 characters), so it goes into `mailto:` unescaped.
 - **Subscriptions:**
@@ -777,7 +804,7 @@ frontend spec §6.4) this makes agent output unable to run script in the UI.
 | `GET /api/auth/passkeys`, `DELETE /api/auth/passkeys/{id}` | List passkeys (label, created, last used); remove (step-up) |
 | `POST /api/auth/step-up/password`, `…/step-up/passkey/{start,finish}` | Step-up (§3.4) |
 | `GET/DELETE /api/auth/sessions[/{id}]` | Signed-in devices (revoke: step-up) |
-| `GET/PATCH /api/settings` | `{public_url, contact}`; PATCH takes `contact` only (§6) |
+| `GET/PATCH /api/settings` | `{public_url, contact}`; PATCH takes `{contact?, public_url?}`: `public_url` needs step-up and ends every session (§3.2), `contact` alone none (§6) |
 | `POST /api/hosts/pairing-codes` | Mint a pairing code (step-up) → 201 `{code, expires_at}`, or 409 `too_many_codes` (§4.1) |
 | `POST /api/hosts/enroll` | Host enrollment (code-authenticated, §4.1) → 201 `{host_id}` |
 | `GET /api/hosts`, `PATCH/DELETE /api/hosts/{id}` | List, rename/default hat, revoke (step-up) |
@@ -800,9 +827,8 @@ reconciled and not being kicked. `DELETE /api/hosts/{id}` answers 200
 `HostItem`, or 404.
 
 *Built so far:* the auth, passkey, host, push and health routes,
-`/api/settings`, `POST /api/setup` and the setup page. `public_url` changes
-only through `hennery admin reset-public-url` (§4.2): a `public_url` in
-`PATCH /api/settings` is 422 `invalid_body`. No `/api/capabilities`,
+`/api/settings` (its `PATCH` taking `public_url` since plan 4d-B4),
+`POST /api/setup` and the setup page. No `/api/capabilities`,
 `PATCH /api/hosts/{id}`, hats or path rules yet.
 
 ## 9. Backups
