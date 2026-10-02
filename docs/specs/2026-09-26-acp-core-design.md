@@ -336,7 +336,7 @@ host.)*
   | `activity` | `running` \| `idle` |
   | `title` | Session title reported by the agent |
   | `turn_id` | Turn the update or question belongs to (filled on every update) |
-  | `pending` | `{id, kind, option_ids?}` (`option_ids` for permissions, read from the raw request, §4.6) |
+  | `pending` | `{id, kind, option_ids?, title?}` (`option_ids` for permissions, read from the raw request, §4.6; `title` is a permission's `toolCall.title` or an elicitation's `message`, cut to 200 characters by the host; the collector puts it on one line, at most 120 characters; for push only, §10) |
   | `commands` | Available slash commands (full list) |
   | `config_options` | Config catalogue: the adapter's ACP option objects that hennery can parse (the crate skips one it cannot read) |
   | `current_model`, `current_mode` | Current values of the model and mode options |
@@ -1398,7 +1398,8 @@ event_attachments(event_id, sha256, position, owner_id, PK(event_id, position),
   FK(owner_id, sha256) -> attachments)   -- position: the block's index in the user_turn's content
 turn_attachments(turn_id, sha256, position, owner_id, PK(turn_id, position),
   FK(turn_id) -> turns ON DELETE CASCADE, FK(owner_id, sha256) -> attachments)   -- plan 9a
-pending(pending_id PK, session_id, owner_id, kind, turn_id NULL, option_ids JSON, payload JSON, state, reason, opened_at, resolved_at)
+pending(pending_id PK, session_id, owner_id, kind, turn_id NULL, option_ids JSON, payload JSON, state, reason, opened_at, resolved_at,
+  opened_event_id NULL)   -- the event id of its pending_opened (§10)
 answer_queue(pending_id PK, session_id, owner_id, request_id UNIQUE, answer JSON, submitted_at, delivered BOOL NULL)
 turns(turn_id PK, session_id, owner_id, request_id, state, content JSON, sent_at, started_at, ended_at, outcome, stop_reason, error)
 plans(session_id PK, entries JSON, updated_at)
@@ -1420,6 +1421,8 @@ shipped):
    `owner_id` everywhere. The store runs the kernel's migrations first;
 8. `attachments` and `event_attachments`, with `owner_id` from the start —
    images (6a);
+11. `pending.opened_event_id` and the `events_by_kind (session_id, kind,
+   event_id)` index — a question outside a turn notifies (10b-iii);
 13. `turn_attachments` (backfilled from `turns.content`), the
    `attachments_by_hash` index, and the triggers that refuse every write for a
    deleted session's tombstone — delete (9a). Later migrations that update
@@ -1569,25 +1572,60 @@ session that opened them ends (kernel spec §3.2).
 
 ## 10. Push triggers
 
-Evaluated on ingest, edge-triggered only:
+Evaluated on ingest, edge-triggered only, and read in the fact's own
+transaction from what the fact changed (plans 10b-i, 10b-iii):
 
-| Edge | Default title / body |
-|---|---|
-| activity → `blocked` | `<session title>` / "needs your answer" |
-| `turn_ended{completed}` | `<session title>` / "finished" |
-| `turn_ended{failed}` or `agent_failure` (severity ≠ warning) | `<session title>` / "failed" |
+| Edge | Default title / body | Urgency |
+|---|---|---|
+| activity `running` → `blocked` (the turn's first open question) | `<session title>` / "needs your answer" | high |
+| a question opened outside a turn (operator decision 2026-10-02) | `<session title>` / "needs your answer" | high |
+| `turn_ended{completed}` | `<session title>` / "finished" | normal |
+| `turn_ended{failed}` or `agent_failure` (severity ≠ warning) | `<session title>` / "failed" | normal |
 
-- Title is the session title, falling back to the project directory name. No
-  tool names, prompt text or transcript excerpts by default; per-hat settings
-  may opt into more (umbrella §8.3), or into a **generic title** ("Session
-  needs your answer", with no session title at all). Hats can be muted.
-- The payload carries `url: /sessions/<id>`; the service worker navigates an
-  existing window there (frontend spec).
-- Recovery and reconciliation never push, and a `turn_ended` for an already
-  ended turn never pushes. *(P-25: synthesising a turn end on reconnect would
-  have pushed once per session per reconnect.)*
+- `turn_ended{cancelled}` and `{interrupted}` do not push: the operator
+  cancelled, or the host restarted or closed it, which the session shows.
+  *Built so far:* no host fills `agent_failure` yet, so only `turn_ended`
+  gives "failed".
+- Title is the session title, falling back to the project directory name
+  (put on one line, as a title is), else "Session". No tool names, prompt
+  text or transcript excerpts by default; per-hat settings may opt into the
+  question's title as the body (`details`, umbrella §8.3), or into a
+  **generic title** ("Session needs your answer", "Session finished",
+  "Session failed", with nothing of the session's own). Hats can be muted.
+  The session's hat, title and directory are read in the same transaction as
+  the fact, so a rename or re-assignment right after cannot change them.
+- The payload carries `url: /sessions/<id>` and `tag: <session id>`, so a
+  newer notice replaces the older on a device; the service worker navigates
+  an existing window there (frontend spec).
+- **Bounded by the operator's pace.** Every edge the agent paces is bounded by
+  something the operator does:
+  - a second question in a blocked turn crosses nothing;
+  - a question asked again after the agent withdrew one in the same turn
+    crosses nothing (answered and asked again is the operator's pace, and
+    notifies);
+  - outside a turn, only the session's first open question notifies, and one
+    asked again after a withdrawal is quiet until the owner's next prompt,
+    ordered by event id (`pending.opened_event_id` against the latest
+    `user_turn`). A blocking question with no turn id gets the same bound.
+- Only the host-ingest path notifies. Recovery, reconciliation, a presumed
+  park, a revoke, the API's own writes and a synthesised turn end never push,
+  and a `turn_ended` for an already ended turn never pushes. *(P-25:
+  synthesising a turn end on reconnect would have pushed once per session per
+  reconnect.)*
+- **Facts a host resends after a reconnect** are real facts the collector may
+  not have seen. Per session the connection keeps the latest question that
+  notifies and the latest turn end that notifies (an edge that notifies
+  nothing replaces nothing), and after `resend_complete` and reconciliation
+  notifies the question if it is still open (and its turn still blocked),
+  else the turn's end. A connection that drops before `resend_complete` loses
+  them: these notices are at most once by design. With one slot, a later
+  blocking question withdrawn in the same backlog hides an outside-turn
+  question still open: the owner gets "finished" instead (accepted; only the
+  urgency is lost).
 - Codex advisory notices (`sessionFailure` with `severity: "warning"`) are
   recorded but do not push; missing or unknown severities escalate (fail-safe).
+- A notice is queued after the fact's commit into a coalescing queue that
+  never blocks ingest (kernel §6); losing one never stops a fact being acked.
 
 ---
 

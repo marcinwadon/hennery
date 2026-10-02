@@ -70,7 +70,7 @@ Checks:
 1. **One seam, and the collector's end of it is fixed.** Delivery sends through `Transport`. The collector's is the egress client, public addresses only. `spawn` takes it from the `Egress` itself, so no caller can hand delivery an `InternalNetwork` client. Tests use a fake transport, or an `InternalNetwork` client to a push service on loopback.
 2. **The policy is applied in one place** (`payload_for`), as 10b-i's `Notice` documents:
    - muted: nothing is sent;
-   - `generic_title`: the generic title, and no body;
+   - `generic_title`: the generic title, and no body unless `details` is set too (corrected in the spec write-back: `details` still puts the question's title in the body, as `the_policy_decides_what_a_payload_shows` pins; the doc comment on `payload_for` still says "no body");
    - `details`: the `detail`, when there is one, as the body.
 3. **The payload** is `{title, body, url, tag}` as JSON.
    - It is padded with trailing spaces (still valid JSON) to the next 512 bytes, at most 3993, RFC 8291's room in a 4096-byte body.

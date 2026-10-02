@@ -65,11 +65,14 @@ hosts(id TEXT PK, owner_id, name, public_key, default_hat_id, platform,
   host_version, capabilities JSON, agents JSON, workspace_roots JSON,
   last_doctor JSON, last_seen_at, created_at, revoked_at NULL)
 pairing_codes(code_hash PK, owner_id, created_at, expires_at, used_at NULL)
-settings(owner_id, key, value, PRIMARY KEY(owner_id, key))   -- public_url, contact, push defaults
+settings(owner_id, key, value, PRIMARY KEY(owner_id, key))   -- public_url, default_hat_id
 project_recents(owner_id, host_id, hat_id, path, last_used_at,
   PRIMARY KEY(host_id, hat_id, path))
-push_subscriptions(id TEXT PK, owner_id, endpoint, p256dh, auth, device_label,
-  created_at, last_success_at, last_error)
+push_subscriptions(id TEXT PK, owner_id, endpoint UNIQUE, p256dh, auth, device_label,
+  auth_session, created_at, expires_at NULL, last_success_at NULL,
+  last_error NULL)                                            -- §6
+hat_push_policies(hat_id PK, owner_id, muted, details, generic_title,
+  FK(hat_id, owner_id) -> hats ON DELETE CASCADE)             -- §6
 purged_hats(hat_id PK, owner_id, purged_at)                  -- §5.5
 ```
 
@@ -80,10 +83,14 @@ Times are integer Unix seconds; the REST API shows RFC 3339.
 `passkeys.credential_id` is unique across owners, so one credential never signs
 in to two accounts; `sign_count` is the counter last accepted (§3.2) and
 `credential` is `webauthn-rs`'s `Passkey`.
+The VAPID contact is `owners.contact` (§6). `push_subscriptions.auth_session`
+is the signed-in session that subscribed (`auth_sessions.id_hash`); a
+subscription's `endpoint` is unique across owners, like a credential id.
 
 *Built so far:* `hosts` lacks `default_hat_id` (hats), `agents`,
-`workspace_roots` (`probe_agents`) and `last_doctor`; `project_recents`,
-`push_subscriptions` and `purged_hats` do not exist yet.
+`workspace_roots` (`probe_agents`) and `last_doctor`; `purged_hats` does not
+exist yet. `push_subscriptions` and `hat_push_policies`
+are kernel migration 9 (plan 10a).
 
 ## 2. Configuration
 
@@ -457,7 +464,7 @@ that speaks the socket protocol directly (§10).
 
 ```sql
 hats(id TEXT PK, owner_id, name, colour, logo_mime NULL, logo_bytes NULL,
-  push_policy JSON, created_at)
+  created_at)                    -- push policy: hat_push_policies (§1.1, §6)
 hat_path_rules(id TEXT PK, owner_id, host_id, prefix, hat_id, verified BOOL)
 ```
 
@@ -539,20 +546,105 @@ host cannot be purged until the hosts are moved to another hat):
 
 ## 6. Push
 
-- **VAPID keys:** P-256 key pair generated on first run into `<data>/vapid.key`
-  (0600). The VAPID `sub` claim is `mailto:<owner contact>` if configured, else
-  the `public_url`; never a non-routable placeholder (iOS silently rejects
-  those). Setup does not ask for the contact; it is an optional field in
-  Settings.
-- **Delivery:** `web-push-native` builds RFC 8291 (aes128gcm) requests with
-  VAPID (RFC 8292), sent with the shared HTTP client under the egress policy
-  (§7.1; push endpoints must be public). TTL 1 hour, urgency `high` for "needs
-  your answer", `normal` otherwise. Non-2xx responses are logged with status;
-  404/410 delete the subscription.
-- **Policy** per hat: `muted`; `details` (include the agent's question title);
-  `generic_title` ("Session needs your answer", without the session title).
-  Default: not muted, no details, session title shown. Triggers are defined by
-  the modules that own them (ACP core §10, gateway §7).
+- **VAPID key:** a P-256 key in `<data>/vapid.key`: 32 raw bytes, the private
+  scalar, mode 0600. It is made once, written to a temporary name and
+  hard-linked into place, so of two starts racing the first key wins, and it
+  is **never replaced**: regenerating it would break every subscription
+  without a word. A symlink, anything but a regular file (a FIFO is refused at
+  once), a file with any group or other permission bit, another length or an
+  invalid scalar stops the start; a wrong length names the two ways out:
+  restore it, or remove it and subscribe every device again. Its bytes are zeroized; `Debug` and errors
+  show the public key or the file name only, never the private key. The data
+  directory belongs on a local filesystem (the link needs hard links).
+- **The VAPID token (RFC 8292)** is signed by the collector itself with
+  `p256::ecdsa`, not by `web-push-native` (whose `vapid` feature pulls in
+  `jwt-simple` → `superboring` → `rsa`; the maintainer agreed):
+  - ES256, deterministic (RFC 6979), as raw `r ‖ s`, 64 bytes, never DER;
+    every part base64url without padding;
+  - header `{"typ":"JWT","alg":"ES256"}`; the claims exactly `aud`, `exp`,
+    `sub`: `aud` is the endpoint's origin (`scheme://host[:port]`, the port
+    only when not the default), `exp` 12 hours ahead;
+  - `sub` is `mailto:<owner contact>` if set, else the `public_url` origin
+    when it is `https`; with neither (an `http://localhost` collector) the
+    token has **no `sub`**, never a non-routable placeholder (Apple refuses
+    any but `mailto:` or `https:`, and records that as the subscription's
+    `last_error`);
+  - sent as `Authorization: vapid t=<token>, k=<public key>`, one token per
+    (audience, subject), reused until an hour before it expires.
+- **The contact** is not asked at setup. `PATCH /api/settings {contact}` sets
+  it (no step-up), trimmed; empty clears it. It is a plain e-mail address
+  (ASCII letters, digits and `.+_-` before the `@`, a dotted domain after, at
+  most 254 characters), so it goes into `mailto:` unescaped.
+- **Subscriptions:**
+  - an endpoint is checked when subscribed: `https` only, the default port,
+    no user info or fragment, a dotted domain name (IP literals refused,
+    including the forms a URL parser normalises), none of the special-use
+    suffixes (`localhost`, `local`, `localdomain`, `lan`, `internal`,
+    `home.arpa`, `onion`, `test`, `invalid`, `example`, `alt`), at most
+    2048 bytes. It is stored and sent to as parsed. `p256dh` must be a valid
+    uncompressed P-256 point, `auth` exactly 16 bytes. No allowlist: a
+    self-hosted push service (UnifiedPush) is legitimate;
+  - the endpoint is a capability URL: never returned by the API, never
+    logged (only its host is);
+  - subscribing needs a fresh step-up (§3.4). A subscription belongs to the
+    signed-in session that made it: revoking or signing out that session
+    removes it in the same transaction, and a password or `public_url` reset
+    ends every session and so every subscription. An *expired* session keeps
+    its subscriptions (marked `signed_out` in the list);
+  - at most 32 per owner (409 `too_many_subscriptions`); the same endpoint
+    again replaces its keys, session and expiry and keeps its id (200, a new
+    one 201); another owner's endpoint is 409 `endpoint_taken`; an
+    `expirationTime` already past is refused;
+  - **rotation** (`pushsubscriptionchange`, which has no page to step up on):
+    `POST /api/push/subscriptions/rotate {old_endpoint, subscription}` needs
+    the owner's session but no step-up, and replaces only a subscription whose
+    old endpoint the owner has, keeping its id. It moves a subscription, never
+    adds one;
+  - a sign-out racing the subscribe is 401; a device label is 1–64 printable
+    characters, else the endpoint's host; the push routes read 16 KiB of body
+    at most.
+- **Policy** per hat, a `hat_push_policies` row that goes with its hat:
+  `muted` (nothing is sent); `details` (the agent's question title as the
+  body); `generic_title` ("Session needs your answer", "Session finished",
+  "Session failed": nothing of the session's own, and no body unless
+  `details` is also set, which still shows the question's title). Default, and
+  for a hat with no row or one that no longer exists: not muted, no details,
+  the session title shown. Setting it needs no step-up: the payload is
+  encrypted to the browser, so a policy changes what a lock screen shows, not
+  what leaves hennery in the clear. The question's title is agent text (a
+  command line can hold a secret): Settings says so next to `details`. Triggers are defined by the modules that
+  own them (ACP core §10, gateway §7); they queue a `Notice` in a per-tag
+  coalescing queue (256 tags, the latest notice per tag) that never blocks
+  ingest.
+- **Delivery** (plan 10b-ii), one notice after another; a notice's
+  subscriptions at most 8 at once:
+  - expired subscriptions (past `expirationTime`) are removed first and sent
+    nothing;
+  - the payload `PushPayload {title, body, url, tag}` (JSON) is padded with
+    trailing spaces to the next 512 bytes, at most 3993 (RFC 8291's room in
+    4096), and encrypted to the browser (RFC 8291, aes128gcm) with
+    `web-push-native`, default features off;
+  - headers `TTL: 3600`, `Urgency: high` for "needs your answer" and `normal`
+    otherwise, `Content-Encoding: aes128gcm`,
+    `Content-Type: application/octet-stream`, the VAPID `Authorization`;
+    never `Topic`, which the push service would see;
+  - sent through the collector's one egress client, public addresses only
+    (§7.1): a non-public address is refused before anything is sent, and DNS
+    rebinding with it. The collector builds one `Egress` before it serves; the
+    gateway will share it (agreed with plan 8);
+  - 2xx records `last_success_at` and clears `last_error`; 404 and 410 remove
+    the subscription; 429, a 5xx, a timeout or a failed connection is tried
+    again after 1 s and 4 s, or after the service's `Retry-After` (seconds
+    only) when longer, up to 10 s. Each try has 10 s and a subscription 30 s
+    in all: a retry that could not finish within it is not made. Any other
+    answer, and the egress policy's refusal, is final and keeps the
+    subscription;
+  - an outcome is recorded only on a subscription that still has the endpoint
+    pushed to, so a rotation meanwhile keeps the new one;
+  - `last_error` is a short reason of delivery's own (a status code, "could
+    not be reached"), never the endpoint or the service's answer;
+  - a slow or silent push service holds the queue up 30 s per round of 8 at
+    most; a notice whose every one of 32 services is silent, about 2 minutes.
 
 ## 7. HTTP server
 
@@ -627,8 +719,8 @@ the gateway.
 
 *Built so far:* `hennery_kernel::egress` (plans 8b and 8b-ii) — `Egress`, its
 `EgressClient::send` and `send_streaming`, `check_url`, `is_public` and
-`Limiter`. Nothing calls it yet: the gateway's proxy and OAuth and Web Push
-will.
+`Limiter`. Web Push delivery sends through its `PublicOnly` client (plan
+10b-ii); the gateway's proxy and OAuth will.
 
 ### 7.2 Content-Security-Policy
 
@@ -658,7 +750,7 @@ frontend spec §6.4) this makes agent output unable to run script in the UI.
 | `GET /api/auth/passkeys`, `DELETE /api/auth/passkeys/{id}` | List passkeys (label, created, last used); remove (step-up) |
 | `POST /api/auth/step-up/password`, `…/step-up/passkey/{start,finish}` | Step-up (§3.4) |
 | `GET/DELETE /api/auth/sessions[/{id}]` | Signed-in devices (revoke: step-up) |
-| `GET/PATCH /api/settings` | `public_url` (step-up), contact, push defaults |
+| `GET/PATCH /api/settings` | `{public_url, contact}`; PATCH takes `contact` only (§6) |
 | `POST /api/hosts/pairing-codes` | Mint a pairing code (step-up) → 201 `{code, expires_at}`, or 409 `too_many_codes` (§4.1) |
 | `POST /api/hosts/enroll` | Host enrollment (code-authenticated, §4.1) → 201 `{host_id}` |
 | `GET /api/hosts`, `PATCH/DELETE /api/hosts/{id}` | List, rename/default hat, revoke (step-up) |
@@ -668,7 +760,10 @@ frontend spec §6.4) this makes agent output unable to run script in the UI.
 | `POST /api/hats/{id}/purge` | Purge a hat (step-up, §5.5) |
 | `GET/PUT /api/hosts/{id}/path-rules` | Path rules (full set) |
 | `POST /api/hats/resolve` | `{host_id, path}` → `{canonical, exists, is_dir, hat_id, rule_id?}` |
-| `GET /api/push/vapid`, `POST/DELETE /api/push/subscriptions` | Push |
+| `GET /api/push/vapid` | The VAPID public key a browser subscribes with |
+| `GET/POST/DELETE /api/push/subscriptions` | List (no endpoints), subscribe (step-up), unsubscribe this browser `{endpoint}` |
+| `POST /api/push/subscriptions/rotate`, `DELETE /api/push/subscriptions/{id}` | Rotate (no step-up, §6); remove a device |
+| `GET /api/push/policies`, `PUT /api/push/policies/{hat_id}` | Every hat's push policy; set one (all three fields) |
 | `GET /healthz`, `GET /readyz` | Process up (200 `ok`) / the database answers within 2 s (200 `ready`, else 503 `not ready`); plain text, on every listener |
 
 `GET /api/hosts` lists every paired host, revoked ones included, oldest first,
@@ -677,10 +772,11 @@ created_at, last_seen_at?, revoked_at?}`; `connected` means connected,
 reconciled and not being kicked. `DELETE /api/hosts/{id}` answers 200
 `HostItem`, or 404.
 
-*Built so far:* the auth, passkey, host and health routes, `POST /api/setup`
-and the setup page. No `/api/capabilities`, `/api/settings` (`public_url`
-changes only through `hennery admin reset-public-url`, §4.2),
-`PATCH /api/hosts/{id}`, hats, path rules or push yet.
+*Built so far:* the auth, passkey, host, push and health routes,
+`/api/settings`, `POST /api/setup` and the setup page. `public_url` changes
+only through `hennery admin reset-public-url` (§4.2): a `public_url` in
+`PATCH /api/settings` is 422 `invalid_body`. No `/api/capabilities`,
+`PATCH /api/hosts/{id}`, hats or path rules yet.
 
 ## 9. Backups
 
@@ -793,7 +889,8 @@ Resolved by the operator on 2026-10-02:
 Resolved by the maintainer on 2026-09-27:
 
 1. **Owner contact for VAPID** — not asked at setup; derived from
-   `public_url` unless set in Settings (§6).
+   `public_url` unless set in Settings (§6). Built in plan 10a: with neither
+   a contact nor an `https` `public_url`, the token names no `sub`.
 2. **Multiple listeners** — supported in v1; browser access stays bound to
    `public_url` (§7).
 3. **`master.key` in the OS keystore** — no; a file in v1 (§10).
