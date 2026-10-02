@@ -51,6 +51,18 @@ pub struct Server {
     state: Arc<Mutex<State>>,
 }
 
+/// How the server answers `Range: bytes=N-`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RangeMode {
+    /// 206 from byte N, as asked.
+    #[default]
+    Honour,
+    /// 200 with the whole body, as a server without range support.
+    Ignore,
+    /// 206 from byte 0, a `Content-Range` that is not the one asked for.
+    WrongStart,
+}
+
 #[derive(Default)]
 struct State {
     bodies: HashMap<String, Vec<u8>>,
@@ -58,6 +70,8 @@ struct State {
     cut_once: HashMap<String, usize>,
     /// Paths answered with a redirect to this location.
     redirects: HashMap<String, String>,
+    /// How a `Range` request is answered.
+    range: RangeMode,
     /// Every request: its path and its `Range` header.
     requests: Vec<(String, Option<String>)>,
 }
@@ -85,6 +99,10 @@ impl Server {
 
     pub fn cut_once(&self, path: &str, after: usize) {
         self.state.lock().unwrap().cut_once.insert(path.to_string(), after);
+    }
+
+    pub fn range_mode(&self, mode: RangeMode) {
+        self.state.lock().unwrap().range = mode;
     }
 
     pub fn redirect(&self, path: &str, location: &str) {
@@ -124,7 +142,7 @@ async fn serve(mut stream: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
         .lines()
         .find_map(|l| l.strip_prefix("range: ").or_else(|| l.strip_prefix("Range: ")))
         .map(str::to_string);
-    let (body, cut, redirect) = {
+    let (body, cut, redirect, mode) = {
         let mut state = state.lock().unwrap();
         state.requests.push((path.clone(), range.clone()));
         let cut = state.cut_once.remove(&path);
@@ -132,6 +150,7 @@ async fn serve(mut stream: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
             state.bodies.get(&path).cloned(),
             cut,
             state.redirects.get(&path).cloned(),
+            state.range,
         )
     };
     if let Some(location) = redirect {
@@ -154,15 +173,19 @@ async fn serve(mut stream: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
         .and_then(|r| r.strip_prefix("bytes="))
         .and_then(|r| r.strip_suffix('-'))
         .and_then(|n| n.parse::<usize>().ok());
-    let (status, from) = match start {
-        Some(n) if n < body.len() => ("206 Partial Content", n),
+    let (status, from) = match (start, mode) {
+        (Some(_), RangeMode::Ignore) => ("200 OK", 0),
+        (Some(n), RangeMode::WrongStart) if n < body.len() => ("206 Partial Content", 0),
+        (Some(n), RangeMode::Honour) if n < body.len() => ("206 Partial Content", n),
         _ => ("200 OK", 0),
     };
+    // A 206 always names its range, from 0 too.
+    let ranged = status.starts_with("206");
     let mut response = format!(
         "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len() - from
     );
-    if from > 0 {
+    if ranged {
         response.push_str(&format!(
             "Content-Range: bytes {from}-{}/{}\r\n",
             body.len() - 1,

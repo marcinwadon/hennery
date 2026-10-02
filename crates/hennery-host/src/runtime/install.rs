@@ -157,11 +157,15 @@ impl Selection {
                     version: &a.version,
                     entry: &a.entry,
                     cli_skipped: a.cli_skipped,
-                    files: a
-                        .files
-                        .iter()
-                        .map(|f| (f.path.as_str(), f.integrity.as_str()))
-                        .collect(),
+                    files: {
+                        let mut files: Vec<(&str, &str)> = a
+                            .files
+                            .iter()
+                            .map(|f| (f.path.as_str(), f.integrity.as_str()))
+                            .collect();
+                        files.sort();
+                        files
+                    },
                 })
                 .collect(),
         };
@@ -420,6 +424,7 @@ async fn install_locked(
     let previous = layout.current_id();
     if previous.as_deref() == Some(id.as_str())
         && let Ok(set) = layout.set(&id)
+        && set.node.is_file()
     {
         let _ = std::fs::remove_file(layout.hold_file());
         return Ok(Installed::AlreadyCurrent(set));
@@ -436,6 +441,11 @@ async fn install_locked(
         build(layout, selection, sources, progress).await?;
     }
     let set = layout.set(&id)?;
+    // A set whose runtime went (removed by hand, or by a binary that could
+    // not read this set's record) gets it back before it is current.
+    if !set.node.is_file() {
+        install_node(layout, selection, sources, progress).await?;
+    }
     // The set's rename is durable before `current` names it.
     extract::barrier(&layout.sets())?;
     if let Some(old) = previous.as_ref().filter(|old| **old != id) {
@@ -448,8 +458,11 @@ async fn install_locked(
     // failure is a warning, not the install's.
     // Every download belonged to this install, or to one that cannot be
     // resumed into anything now current.
-    if let Err(err) = clear_dir(&layout.downloads()).and_then(|()| collect(layout)) {
-        tracing::warn!("the adapter set is installed, but cleaning up after it failed: {err:#}");
+    if let Err(err) = clear_dir(&layout.downloads()) {
+        tracing::warn!("the adapter set is installed, but its downloads were not removed: {err:#}");
+    }
+    if let Err(err) = collect(layout) {
+        tracing::warn!("the adapter set is installed, but collecting older ones failed: {err:#}");
     }
     Ok(Installed::Switched { set, previous })
 }
@@ -469,7 +482,18 @@ pub async fn rollback(layout: &Layout, progress: &(dyn Fn(&str) + Sync)) -> Resu
         .previous()?
         .context("there is no previous adapter set to roll back to")?;
     let from = layout.current_id().context("there is no current adapter set")?;
-    std::fs::write(layout.hold_file(), format!("{}\n", to.id))?;
+    if from == to.id {
+        bail!("there is no previous adapter set to roll back to: previous is the current one");
+    }
+    if !to.node.is_file() {
+        bail!(
+            "the previous adapter set's Node ({}) is gone; `hennery host adapters update` installs the pinned set",
+            to.node.display()
+        );
+    }
+    // Durable before `current` names the set it holds the host on.
+    write_synced(&layout.hold_file(), format!("{}\n", to.id).as_bytes())?;
+    extract::barrier(&layout.hold_file())?;
     swap_link(layout, &layout.previous_link(), &from)?;
     swap_link(layout, &layout.current_link(), &to.id)?;
     extract::sync_dir(&layout.adapters())?;
@@ -664,13 +688,23 @@ async fn install_node(
     tokio::task::spawn_blocking(move || extract::node_binary(&part, &version, &platform, &target, size)).await??;
     // Before anything depends on it: a data directory mounted noexec, or a
     // Linux without the loader Node needs, fails here, not at a session.
-    let output = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        tokio::process::Command::new(&binary).arg("--version").output(),
-    )
-    .await
-    .context("the downloaded Node did not answer --version within 20 s")?
-    .with_context(|| format!("run {}", binary.display()))?;
+    let mut attempts = 0;
+    let output = loop {
+        let run = tokio::process::Command::new(&binary)
+            .arg("--version")
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(std::time::Duration::from_secs(20), run)
+            .await
+            .context("the downloaded Node did not answer --version within 20 s")?
+        {
+            Err(err) if err.raw_os_error() == Some(libc::ETXTBSY) && attempts < 10 => {
+                attempts += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            result => break result.with_context(|| format!("run {}", binary.display()))?,
+        }
+    };
     let answered = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if !output.status.success() || answered != format!("v{}", selection.node_version) {
         bail!(
@@ -720,9 +754,9 @@ fn collect(layout: &Layout) -> Result<()> {
         if !is_set_id(&name) {
             continue;
         }
-        let set = layout.set(&name);
+        let runtime = runtime_named_by(&path);
         if keep.contains(&name) {
-            runtimes.extend(set.ok().map(|s| s.record.runtime));
+            runtimes.extend(runtime);
             continue;
         }
         // A host launching from it holds a shared lock: leave it.
@@ -732,10 +766,11 @@ fn collect(layout: &Layout) -> Result<()> {
             None => true,
         };
         if !free {
-            runtimes.extend(set.ok().map(|s| s.record.runtime));
+            runtimes.extend(runtime);
             continue;
         }
         let trash = layout.sets().join(format!(".trash-{name}"));
+        let _ = std::fs::remove_dir_all(&trash);
         std::fs::rename(&path, &trash)?;
         drop(lock);
         std::fs::remove_dir_all(&trash)?;
@@ -752,6 +787,16 @@ fn collect(layout: &Layout) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The runtime a set's record names, read leniently: a record of another
+/// layout still keeps its Node from being collected.
+fn runtime_named_by(set: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(set.join(RECORD)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let runtime = value.get("runtime")?.as_str()?;
+    manifest::check_relative_path(runtime).ok()?;
+    Some(runtime.to_string())
 }
 
 fn open_install_lock(layout: &Layout) -> Result<std::fs::File> {

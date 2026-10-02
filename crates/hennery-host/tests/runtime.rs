@@ -157,6 +157,59 @@ async fn an_interrupted_download_resumes_where_it_stopped() {
     assert_eq!(asked, [None, Some(format!("bytes={half}-"))]);
 }
 
+/// A server that ignores `Range` (a CDN, a proxy) answers 200: the download
+/// starts over and succeeds; one whose 206 starts elsewhere is started over
+/// too (review, Task 4).
+#[tokio::test]
+async fn a_source_that_does_not_resume_is_read_from_the_start() {
+    for mode in [support::RangeMode::Ignore, support::RangeMode::WrongStart] {
+        let server = Server::start().await;
+        let fixture = Fixture::new("1.0.0");
+        fixture.serve(&server);
+        server.range_mode(mode);
+        let path = fixture.server_path("claude", "node_modules/@acp/claude");
+        let half = fixture.bodies[&path].len() / 2;
+        server.cut_once(&path, half);
+        let (_dir, layout) = data_dir();
+        install::install(&layout, &selection(&fixture, &[]), &server.sources(), &quiet)
+            .await
+            .unwrap_or_else(|err| panic!("{mode:?}: {err:#}"));
+        let asked = server.requests().iter().filter(|(p, _)| *p == path).count();
+        assert!(asked >= 2, "{mode:?}: asked {asked} times");
+    }
+}
+
+/// A set whose Node went missing gets it back from the next install of the
+/// same set; a rollback to a set without its Node is refused (review,
+/// Task 4).
+#[tokio::test]
+async fn a_set_without_its_runtime_gets_it_back() {
+    let server = Server::start().await;
+    let (one, two) = (Fixture::new("1.0.0"), Fixture::new("2.0.0"));
+    one.serve(&server);
+    two.serve(&server);
+    let (_dir, layout) = data_dir();
+    let set = install::install(&layout, &selection(&one, &[]), &server.sources(), &quiet)
+        .await
+        .unwrap()
+        .set()
+        .clone();
+    std::fs::remove_dir_all(set.node.parent().unwrap().parent().unwrap()).unwrap();
+    let again = install::install(&layout, &selection(&one, &[]), &server.sources(), &quiet)
+        .await
+        .unwrap();
+    assert!(matches!(again, Installed::Switched { .. }), "{again:?}");
+    assert!(set.node.is_file(), "Node is back");
+    install::install(&layout, &selection(&two, &[]), &server.sources(), &quiet)
+        .await
+        .unwrap();
+    // Both sets share the runtime; remove it and the rollback is refused.
+    std::fs::remove_dir_all(set.node.parent().unwrap().parent().unwrap()).unwrap();
+    let err = install::rollback(&layout, &quiet).await.unwrap_err();
+    assert!(err.to_string().contains("Node"), "{err}");
+    assert!(!layout.held());
+}
+
 #[tokio::test]
 async fn a_download_left_by_an_earlier_run_resumes() {
     let server = Server::start().await;
@@ -208,7 +261,8 @@ async fn a_redirect_down_to_plain_http_is_refused() {
     let fixture = Fixture::new("1.0.0");
     fixture.serve(&server);
     let node = format!("/node/v24.0.0/node-v24.0.0-{}.tar.gz", here().key());
-    server.redirect(&node, "http://203.0.113.1/node.tar.gz");
+    // Unspecified, not loopback: refused before anything connects.
+    server.redirect(&node, "http://0.0.0.0:1/node.tar.gz");
     let (_dir, layout) = data_dir();
     let err = install::install(&layout, &selection(&fixture, &[]), &server.sources(), &quiet)
         .await
@@ -391,7 +445,11 @@ async fn too_little_free_space_is_refused_before_any_download() {
     let err = install::install(&layout, &selection(&fixture, &[]), &server.sources(), &quiet)
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("MB free"), "{err}");
+    let err = err.to_string();
+    assert!(
+        err.contains("MB free") && err.contains("and ") && err.contains(" MB are"),
+        "{err}"
+    );
     assert!(server.requests().is_empty(), "{:?}", server.requests());
 }
 

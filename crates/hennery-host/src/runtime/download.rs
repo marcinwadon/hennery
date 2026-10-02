@@ -106,9 +106,12 @@ pub fn client_for(url: &str) -> Result<reqwest::Client> {
         .read_timeout(READ_TIMEOUT)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             let next = attempt.url();
+            // Plain http only from loopback to loopback: a public source
+            // never sends this host's requests to its own local services.
+            let from_loopback = attempt.previous().first().is_some_and(is_loopback);
             if attempt.previous().len() >= 5 {
                 attempt.error("too many redirects")
-            } else if next.scheme() == "https" || (next.scheme() == "http" && is_loopback(next)) {
+            } else if next.scheme() == "https" || (next.scheme() == "http" && is_loopback(next) && from_loopback) {
                 attempt.follow()
             } else {
                 attempt.error("a redirect away from https")
