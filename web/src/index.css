@@ -587,6 +587,7 @@ h2.grp-head { margin:0; font-size:inherit; font-weight:inherit; }
 .stream-state:empty { display:none; }
 .stream-state { flex:none; padding:6px 20px; font-size:12.5px; font-weight:600; color:var(--st-wait); background:var(--surface-2); border-bottom:1px solid var(--border); }
 .session-error { padding:8px 20px 0; margin:0; }
+.start-notice { padding:8px 20px; margin:0; font-size:14px; color:var(--st-attn); overflow-wrap:anywhere; }
 .transcript-empty { color:var(--fg-quiet); padding:20px 0; }
 .load-earlier { display:flex; justify-content:center; margin:0 0 18px; }
 .item-note { font-size:12.5px; color:var(--fg-muted); margin:6px 0 0; }
