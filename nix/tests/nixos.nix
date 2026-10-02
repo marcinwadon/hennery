@@ -80,7 +80,9 @@ pkgs.testers.runNixOSTest {
                 " 'runuser -u hennery -- hennery admin --data-dir /var/lib/hennery pairing-code' /dev/null",
                 timeout=60,
             )
-            code = re.search(r"\b[A-Za-z0-9]{4}-[A-Za-z0-9]{4}\b", said).group(0)
+            found = re.search(r"\b[A-Za-z0-9]{4}-[A-Za-z0-9]{4}\b", said)
+            assert found, said
+            code = found.group(0)
             machine.succeed(
                 f"runuser -u alice -- hennery host join http://127.0.0.1:7117 {code} --no-runtime"
                 " --data-dir /var/lib/hennery-host < /dev/null",

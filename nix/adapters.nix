@@ -44,9 +44,9 @@ let
     }:
     let
       # A CLI built against glibc needs NixOS' loader and libraries put in;
-      # one that is musl-static (Codex's) runs as it is. Codex's bundled
-      # musl voice libraries stay as they are: at worst its voice feature
-      # does not load.
+      # one that is musl-static (Codex's) runs as it is. Codex's voice host
+      # and its libraries are glibc builds left as they are (patching them
+      # failed on Linux CI), so on NixOS its voice feature does not load.
       patchElf = glibc && stdenv.hostPlatform.isElf;
       pinned = manifest.adapters.${name};
       files = pinned.platforms.${platform};

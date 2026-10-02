@@ -31,8 +31,8 @@ runCommand "${adapter.pname}-runs"
     programs=0
     for dir in ${lib.concatMapStringsSep " " (path: "${adapter}/${path}") adapter.cliPaths}; do
       # The native programs, as the host's installer finds them: executable
-      # files that are neither scripts nor libraries, outside nested
-      # `node_modules`.
+      # files that are neither scripts nor libraries (`.so.<n>` included),
+      # outside nested `node_modules`.
       while IFS= read -r program; do
         # Native code only: ELF, or Mach-O (thin or universal).
         case "$(head -c 4 "$program" | od -An -tx1 | tr -d ' \n')" in
@@ -63,7 +63,7 @@ runCommand "${adapter.pname}-runs"
         esac
         programs=$((programs + 1))
       done < <(find "$dir" -name node_modules -prune -o -type f -perm -u+x \
-        ! -name '*.node' ! -name '*.so' ! -name '*.dylib' -print | sort)
+        ! -name '*.node' ! -name '*.so' ! -name '*.so.*' ! -name '*.dylib' -print | sort)
     done
     if [ "$programs" -eq 0 ]; then
       echo "no native program found in ${adapter.pname}'s CLI" >&2
@@ -87,6 +87,9 @@ runCommand "${adapter.pname}-runs"
     wait "$adapter" || true
     head -c 2000 "$TMPDIR/answer"
     echo
-    grep '"result"' "$TMPDIR/answer" | grep -q '"id":0'
+    if ! grep '"result"' "$TMPDIR/answer" | grep -q '"id":0'; then
+      echo "${adapter.pname} did not answer initialize" >&2
+      exit 1
+    fi
     touch "$out"
   ''

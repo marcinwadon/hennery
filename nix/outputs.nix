@@ -36,6 +36,7 @@ in
   checks = {
     codex-acp-runs = adapterCheck adapters.codex;
     unpack-refuses = pkgs.callPackage ./unpack-check.nix { };
+    adapter-check-cases = pkgs.callPackage ./adapter-check-cases.nix { inherit adapterCheck; };
   }
   // lib.optionalAttrs linux {
     inherit (modules) nixos-eval home-manager-doctor;

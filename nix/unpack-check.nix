@@ -42,9 +42,9 @@ runCommand "hennery-unpack-refuses" { nativeBuildInputs = [ python3 ]; } ''
     grep -q "$2" "$1.err" || { echo "FAIL: $1: $(cat "$1.err")" >&2; exit 1; }
     echo "ok: $1 refused: $(cat "$1.err")"
   }
-  refused symlink "neither a file nor a directory"
-  refused hardlink "neither a file nor a directory"
-  refused fifo "neither a file nor a directory"
+  refused symlink "neither a file nor a directory (a link, or a special file)"
+  refused hardlink "neither a file nor a directory (a link, or a special file)"
+  refused fifo "neither a file nor a directory (a link, or a special file)"
   refused twice "appears twice"
   refused dotdot "has a '.', '..'"
   refused absolute "is absolute"
