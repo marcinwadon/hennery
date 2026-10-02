@@ -5,9 +5,10 @@
 // - 401 `unauthenticated`: to the login screen, which returns here.
 // - 403 `step_up_required`: the step-up dialog, then the request once more.
 //   Safe to send again: every step-up check runs before its handler does
-//   anything (`require_step_up` is a route layer; the one handler that
-//   checks for itself checks before it writes), so the refused attempt
-//   changed nothing. Never a third time, never another dialog.
+//   anything (`require_step_up` is a route or handler layer; the handlers
+//   that check for themselves check before they read or write), so the
+//   refused attempt changed nothing. Never a third time, never another
+//   dialog.
 // - Anything else not 2xx: an `ApiFailure` with the server's code.
 //
 // `mode` is left at fetch's default, `cors`: with it a same-origin `POST`
