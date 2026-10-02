@@ -45,15 +45,39 @@ pub enum CryptoError {
     Refused,
 }
 
+/// The AAD's field for a stdio server's environment values (plan 8e): one
+/// sealed JSON object per `gw_stdio_servers` row.
+pub const STDIO_ENV: &str = "gw_stdio_servers.env";
+
 fn aad(connection_id: &str, field: &str, key_version: u32) -> Vec<u8> {
-    let version = key_version.to_be_bytes();
-    let mut out = Vec::with_capacity(12 + connection_id.len() + field.len() + version.len());
-    for part in [connection_id.as_bytes(), field.as_bytes(), &version] {
+    aad_of(&[connection_id.as_bytes(), field.as_bytes(), &key_version.to_be_bytes()])
+}
+
+/// Each part preceded by its length as 4 bytes, big-endian. `aad`'s three
+/// parts are plan 8a's encoding, unchanged; a stdio server's (plan 8e, the
+/// API review's R5) are its row id, its host, its hat, the field and the
+/// version: five parts, so no stdio AAD reads as a connection's.
+fn aad_of(parts: &[&[u8]]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(parts.iter().map(|part| 4 + part.len()).sum());
+    for part in parts {
         let len = u32::try_from(part.len()).expect("an AAD part under 4 GiB");
         out.extend_from_slice(&len.to_be_bytes());
         out.extend_from_slice(part);
     }
     out
+}
+
+/// A stdio server row's AAD: bound to the row, its host and its hat (R5),
+/// so no `PUT` can move one hat's values into another hat or onto another
+/// host.
+fn stdio_aad(row_id: &str, host_id: &str, hat_id: &str, key_version: u32) -> Vec<u8> {
+    aad_of(&[
+        row_id.as_bytes(),
+        host_id.as_bytes(),
+        hat_id.as_bytes(),
+        STDIO_ENV.as_bytes(),
+        &key_version.to_be_bytes(),
+    ])
 }
 
 fn cipher(key: &MasterKey) -> XChaCha20Poly1305 {
@@ -63,11 +87,31 @@ fn cipher(key: &MasterKey) -> XChaCha20Poly1305 {
 /// Seal `plaintext` for `connection_id`'s `field` under `key`, with a fresh
 /// nonce from the operating system's generator.
 pub fn seal(key: &MasterKey, connection_id: &str, field: &str, plaintext: &[u8]) -> Vec<u8> {
+    seal_with(key, &aad(connection_id, field, key.version()), plaintext)
+}
+
+/// Seal a stdio server row's environment values (`STDIO_ENV`).
+pub fn seal_stdio(key: &MasterKey, row_id: &str, host_id: &str, hat_id: &str, plaintext: &[u8]) -> Vec<u8> {
+    seal_with(key, &stdio_aad(row_id, host_id, hat_id, key.version()), plaintext)
+}
+
+/// Open what `seal_stdio` stored for that row, host and hat.
+pub fn open_stdio(
+    key: &MasterKey,
+    row_id: &str,
+    host_id: &str,
+    hat_id: &str,
+    key_version: u32,
+    blob: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    open_with(key, key_version, blob, |version| {
+        stdio_aad(row_id, host_id, hat_id, version)
+    })
+}
+
+fn seal_with(key: &MasterKey, aad: &[u8], plaintext: &[u8]) -> Vec<u8> {
     let nonce = hennery_kernel::secret::random_bytes::<NONCE_LEN>();
-    let payload = Payload {
-        msg: plaintext,
-        aad: &aad(connection_id, field, key.version()),
-    };
+    let payload = Payload { msg: plaintext, aad };
     let sealed = cipher(key)
         .encrypt(&XNonce::from(nonce), payload)
         .expect("XChaCha20-Poly1305 seals any message under 256 GiB");
@@ -88,6 +132,15 @@ pub fn open(
     key_version: u32,
     blob: &[u8],
 ) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
+    open_with(key, key_version, blob, |version| aad(connection_id, field, version))
+}
+
+fn open_with(
+    key: &MasterKey,
+    key_version: u32,
+    blob: &[u8],
+    aad: impl FnOnce(u32) -> Vec<u8>,
+) -> Result<Zeroizing<Vec<u8>>, CryptoError> {
     if blob.len() < VERSION_LEN + NONCE_LEN + TAG_LEN {
         return Err(CryptoError::Malformed);
     }
@@ -103,7 +156,7 @@ pub fn open(
     let nonce: [u8; NONCE_LEN] = nonce.try_into().expect("24 bytes");
     let payload = Payload {
         msg: sealed,
-        aad: &aad(connection_id, field, key_version),
+        aad: &aad(key_version),
     };
     cipher(key)
         .decrypt(&XNonce::from(nonce), payload)
@@ -143,5 +196,41 @@ mod tests {
         };
         assert_eq!(reopened(1).unwrap(), b"secret");
         assert!(reopened(2).is_err());
+    }
+
+    /// Plan 8e: generalising the AAD left plan 8a's encoding byte for byte.
+    #[test]
+    fn a_connections_aad_is_plan_8as_encoding() {
+        let mut expected = Vec::new();
+        for part in [b"conn-1".as_slice(), STATIC_TOKEN.as_bytes(), &1u32.to_be_bytes()] {
+            expected.extend_from_slice(&(part.len() as u32).to_be_bytes());
+            expected.extend_from_slice(part);
+        }
+        assert_eq!(aad("conn-1", STATIC_TOKEN, 1), expected);
+    }
+
+    /// The API review's R5: a stdio row's values are bound to its row, its
+    /// host and its hat; another of any does not open them, nor does a
+    /// connection's field.
+    #[test]
+    fn a_stdio_blob_opens_only_for_its_row_host_and_hat() {
+        let key = MasterKey::from_bytes([5; 32]);
+        let blob = seal_stdio(&key, "stdio-1", "host-a", "hat-a", b"{}");
+        assert_eq!(&*open_stdio(&key, "stdio-1", "host-a", "hat-a", 1, &blob).unwrap(), b"{}");
+        for (row, host, hat) in [
+            ("stdio-2", "host-a", "hat-a"),
+            ("stdio-1", "host-b", "hat-a"),
+            ("stdio-1", "host-a", "hat-b"),
+        ] {
+            assert_eq!(
+                open_stdio(&key, row, host, hat, 1, &blob).unwrap_err(),
+                CryptoError::Refused,
+                "{row} {host} {hat}"
+            );
+        }
+        assert_eq!(
+            open(&key, "stdio-1", STATIC_TOKEN, 1, &blob).unwrap_err(),
+            CryptoError::Refused
+        );
     }
 }

@@ -15,7 +15,9 @@ use crate::model::{
     MAX_CONNECTIONS, MAX_HOST_ID, MAX_MOUNTS, NewConnection, StaticCredential, header_problem, label_problem,
     parse_url, prefix_problem, slug_problem, token_problem, tools,
 };
+use crate::revocation::Cut;
 use crate::schema::{COMPONENT, MIGRATIONS};
+use crate::tokens;
 use anyhow::{Context, Result, anyhow};
 use hennery_kernel::db;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -66,7 +68,9 @@ impl GatewayStore {
         })
     }
 
-    fn conn(&self) -> MutexGuard<'_, Connection> {
+    /// The store's connection: `stdio.rs` and `session.rs` hold their
+    /// statements on it, which the owner audit reads too.
+    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn.lock().expect("gateway store lock")
     }
 
@@ -117,9 +121,12 @@ impl GatewayStore {
         if hat.is_none() {
             return Ok(Change::Invalid(format!("no hat {:?}", new.hat_id)));
         }
+        // A stdio server's name too (plan 8e decision E2): both are
+        // `hennery-<name>` to an agent. In this transaction, as the insert.
         let taken = tx
             .query_row(
-                "SELECT 1 FROM gw_connections WHERE slug = ?1 AND owner_id = ?2",
+                "SELECT 1 FROM gw_connections WHERE slug = ?1 AND owner_id = ?2
+                 UNION ALL SELECT 1 FROM gw_stdio_servers WHERE name = ?1 AND owner_id = ?2",
                 [&new.slug, &self.owner],
                 |_| Ok(()),
             )
@@ -392,8 +399,10 @@ impl GatewayStore {
     /// Whether any credential is stored: then a missing master key is an
     /// error, never a new key (`key::load_or_create`).
     pub fn has_ciphertext(&self) -> Result<bool> {
+        // A stdio server's sealed values too (plan 8a's hand-off to 8e).
         Ok(self.conn().query_row(
-            "SELECT EXISTS (SELECT 1 FROM gw_credentials WHERE owner_id = ?1)",
+            "SELECT EXISTS (SELECT 1 FROM gw_credentials WHERE owner_id = ?1)
+                 OR EXISTS (SELECT 1 FROM gw_stdio_servers WHERE owner_id = ?1 AND env_ciphertext IS NOT NULL)",
             [&self.owner],
             |r| r.get(0),
         )?)
@@ -415,18 +424,40 @@ impl GatewayStore {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let Some((id, version, blob, kind)) = row else {
+        if let Some((id, version, blob, kind)) = row {
+            anyhow::ensure!(
+                kind == CredKind::Static.as_str(),
+                "connection {id} has a credential of kind {kind}"
+            );
+            crypto::open(key, &id, STATIC_TOKEN, version, &blob)
+                .map(drop)
+                .with_context(|| {
+                    format!(
+                        "the master key does not open the stored credential of connection {id}: restore the key it \
+                         was sealed with. {}",
+                        crate::key::GIVE_UP
+                    )
+                })?;
+        }
+        // And the newest stdio server's values (plan 8e), likewise.
+        let row: Option<(String, String, String, u32, Vec<u8>)> = self
+            .conn()
+            .query_row(
+                "SELECT id, host_id, hat_id, key_version, env_ciphertext FROM gw_stdio_servers
+                 WHERE owner_id = ?1 AND env_ciphertext IS NOT NULL
+                 ORDER BY updated_at DESC, id LIMIT 1",
+                [&self.owner],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let Some((id, host_id, hat_id, version, blob)) = row else {
             return Ok(());
         };
-        anyhow::ensure!(
-            kind == CredKind::Static.as_str(),
-            "connection {id} has a credential of kind {kind}"
-        );
-        crypto::open(key, &id, STATIC_TOKEN, version, &blob)
+        crypto::open_stdio(key, &id, &host_id, &hat_id, version, &blob)
             .map(drop)
             .with_context(|| {
                 format!(
-                    "the master key does not open the stored credential of connection {id}: restore the key it was \
+                    "the master key does not open the stored values of stdio server {id}: restore the key they were \
                      sealed with. {}",
                     crate::key::GIVE_UP
                 )
@@ -434,11 +465,20 @@ impl GatewayStore {
     }
 
     /// The gateway's part of purging a hat (kernel spec §5.5, lane L6): the
-    /// hat's connections, with their credentials and mounts, in one
-    /// transaction. Idempotent: a hat with nothing left, or gone, is done.
-    pub fn purge_hat(&self, hat_id: &str) -> Result<()> {
+    /// hat's session tokens (`tokens::purge_hat_in`, plan 8d's hand-off),
+    /// its stdio servers (plan 8e), and its connections with their
+    /// credentials and mounts, in one transaction. Idempotent: a hat with
+    /// nothing left, or gone, is done. The tokens it deleted are to be cut
+    /// once it returns (`Revocations::cut`).
+    pub fn purge_hat(&self, hat_id: &str) -> Result<Cut> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
+        let cut = Cut(tokens::hat_hashes_in(&tx, &self.owner, hat_id)?);
+        tokens::purge_hat_in(&tx, &self.owner, hat_id)?;
+        tx.execute(
+            "DELETE FROM gw_stdio_servers WHERE hat_id = ?1 AND owner_id = ?2",
+            [hat_id, &self.owner],
+        )?;
         tx.execute(
             "DELETE FROM gw_credentials WHERE owner_id = ?2
                  AND connection_id IN (SELECT id FROM gw_connections WHERE hat_id = ?1 AND owner_id = ?2)",
@@ -454,7 +494,7 @@ impl GatewayStore {
             [hat_id, &self.owner],
         )?;
         tx.commit()?;
-        Ok(())
+        Ok(cut)
     }
 }
 

@@ -9,8 +9,10 @@ use crate::key::MasterKey;
 use crate::model::{
     Change, ConnectionPatch, ConnectionRecord, CredKind, CredentialChange, NewConnection, url_for_logs,
 };
+use crate::stdio::{self, StdioChange, StdioInput};
 use crate::store::GatewayStore;
-use axum::extract::{DefaultBodyLimit, Extension, Path, State};
+use axum::extract::rejection::QueryRejection;
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::handler::Handler;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -22,7 +24,8 @@ use hennery_kernel::operator::{Authenticated, Operator};
 use hennery_kernel::secret::{rfc3339, unix_now};
 use hennery_proto::rest::{
     ApiError, CreateMcpConnectionRequest, McpConnectionItem, McpConnectionStatus, McpCredKind, McpCredentialRequest,
-    McpMountsRequest, UpdateMcpConnectionRequest,
+    McpMountsRequest, McpStdioEnvItem, McpStdioServerItem, McpStdioServerSet, McpStdioServersRequest,
+    UpdateMcpConnectionRequest,
 };
 use std::sync::Arc;
 
@@ -37,6 +40,10 @@ pub struct GatewayState {
     pub key: Arc<MasterKey>,
     /// The owner and their sessions (kernel spec §3).
     pub operator: Arc<Operator>,
+    /// What a revoke cuts (plan 8e decision 12): one per collector, shared
+    /// by the proxy (`ProxyState::full`) and the sessions' side
+    /// (`session::GatewayMcp`).
+    pub revocations: crate::revocation::Revocations,
 }
 
 /// The routes, behind the operator's session. Step-up is layered on each
@@ -57,6 +64,12 @@ pub fn router(state: GatewayState) -> Router {
         .route(
             "/api/mcp/connections/{id}/credential",
             put(credential.layer(middleware::from_fn(require_step_up))),
+        )
+        // Plan 8e: a stdio server is a command the host runs, so a `PUT`
+        // needs step-up (kernel spec §3.4); a `GET` does not.
+        .route(
+            "/api/mcp/stdio-servers",
+            get(stdio_set).put(replace_stdio_set.layer(middleware::from_fn(require_step_up))),
         )
         .layer(DefaultBodyLimit::max(BODY_LIMIT));
     operator_only(routes, state.operator.clone())
@@ -296,6 +309,123 @@ async fn credential(
             format!("a {} connection takes no static token", kind.as_str()),
         ),
         Ok(CredentialChange::Invalid(why)) => error(StatusCode::BAD_REQUEST, "invalid", why),
+        Err(err) => internal(err),
+    }
+}
+
+/// `?host_id=&hat_id=` of the stdio routes. Read as text: a missing or
+/// malformed one is an `ApiError`.
+#[derive(serde::Deserialize)]
+struct StdioQuery {
+    host_id: Option<String>,
+    hat_id: Option<String>,
+}
+
+/// Both ids, each 1 to 64 bytes; neither is quoted back when refused.
+fn stdio_place(query: Result<Query<StdioQuery>, QueryRejection>) -> Result<(String, String), Response> {
+    let refused = || {
+        error(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            format!("host_id and hat_id are each 1 to {} bytes", stdio::MAX_ID),
+        )
+    };
+    let Ok(Query(query)) = query else {
+        return Err(refused());
+    };
+    match (query.host_id, query.hat_id) {
+        (Some(host), Some(hat))
+            if (1..=stdio::MAX_ID).contains(&host.len()) && (1..=stdio::MAX_ID).contains(&hat.len()) =>
+        {
+            Ok((host, hat))
+        }
+        _ => Err(refused()),
+    }
+}
+
+fn stdio_answer(host_id: String, hat_id: String, change: StdioChange) -> Response {
+    match change {
+        StdioChange::Done(servers) => Json(McpStdioServerSet {
+            host_id,
+            hat_id,
+            servers: servers
+                .into_iter()
+                .map(|server| McpStdioServerItem {
+                    name: server.name,
+                    command: server.command,
+                    args: server.args,
+                    // Every name stored has its value stored (`""` too).
+                    env: server
+                        .env
+                        .into_iter()
+                        .map(|name| McpStdioEnvItem { name, has_value: true })
+                        .collect(),
+                    created_at: rfc3339(server.created_at),
+                    updated_at: rfc3339(server.updated_at),
+                })
+                .collect(),
+        })
+        .into_response(),
+        StdioChange::NotFound => error(StatusCode::NOT_FOUND, "not_found", "no such host or hat"),
+        StdioChange::HostRevoked => error(
+            StatusCode::CONFLICT,
+            "host_revoked",
+            "the host is revoked: its stdio servers can be read, not changed",
+        ),
+        StdioChange::Invalid(why) => error(StatusCode::BAD_REQUEST, "invalid", why),
+        StdioChange::EnvValueMissing(why) => error(StatusCode::BAD_REQUEST, "env_value_missing", why),
+        StdioChange::SlugTaken(why) => error(StatusCode::CONFLICT, "slug_taken", why),
+        StdioChange::TooMany(why) => error(StatusCode::CONFLICT, "too_many_stdio_servers", why),
+    }
+}
+
+/// `GET /api/mcp/stdio-servers?host_id=&hat_id=`: the set, without a value.
+async fn stdio_set(
+    State(state): State<GatewayState>,
+    query: Result<Query<StdioQuery>, QueryRejection>,
+) -> Response {
+    let (host_id, hat_id) = match stdio_place(query) {
+        Ok(place) => place,
+        Err(refused) => return refused,
+    };
+    match state.store.stdio_set(&host_id, &hat_id) {
+        Ok(change) => stdio_answer(host_id, hat_id, change),
+        Err(err) => internal(err),
+    }
+}
+
+/// `PUT /api/mcp/stdio-servers?host_id=&hat_id=` (step-up): the whole set,
+/// replaced. Logged by its host, hat and size only: a command's arguments
+/// and its values are the operator's secrets.
+async fn replace_stdio_set(
+    State(state): State<GatewayState>,
+    query: Result<Query<StdioQuery>, QueryRejection>,
+    ApiJson(req): ApiJson<McpStdioServersRequest>,
+) -> Response {
+    let (host_id, hat_id) = match stdio_place(query) {
+        Ok(place) => place,
+        Err(refused) => return refused,
+    };
+    let servers: Vec<StdioInput> = req
+        .servers
+        .into_iter()
+        .map(|server| StdioInput {
+            name: server.name,
+            command: server.command,
+            args: server.args,
+            env: server.env.into_iter().map(|var| (var.name, var.value)).collect(),
+        })
+        .collect();
+    match state
+        .store
+        .replace_stdio_set(&host_id, &hat_id, &servers, &state.key, unix_now())
+    {
+        Ok(change) => {
+            if let StdioChange::Done(stored) = &change {
+                tracing::info!(%host_id, %hat_id, servers = stored.len(), "gateway stdio servers replaced");
+            }
+            stdio_answer(host_id, hat_id, change)
+        }
         Err(err) => internal(err),
     }
 }

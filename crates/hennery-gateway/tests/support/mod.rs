@@ -8,13 +8,16 @@
 pub mod upstream;
 
 use ed25519_dalek::SigningKey;
+use hennery_gateway::api::GatewayState;
 use hennery_gateway::key::MasterKey;
+use hennery_gateway::revocation::Revocations;
 use hennery_gateway::model::{Change, CredKind, CredentialChange, NewConnection};
 use hennery_gateway::scope::ProxyStore;
 use hennery_gateway::store::GatewayStore;
 use hennery_gateway::tokens;
 use hennery_kernel::hats::HatChange;
 use hennery_kernel::hosts::{Enrollment, Hosts};
+use hennery_kernel::operator::Operator;
 use hennery_kernel::secret::unix_now;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +29,8 @@ pub struct World {
     pub proxy_store: Arc<ProxyStore>,
     pub key: Arc<MasterKey>,
     pub hosts: Hosts,
+    /// Shared by the proxy (`Harness`) and `gateway()` (plan 8e).
+    pub revocations: Revocations,
 }
 
 impl World {
@@ -42,6 +47,7 @@ impl World {
             proxy_store,
             key: Arc::new(MasterKey::from_bytes([7; 32])),
             hosts,
+            revocations: Revocations::new(),
         }
     }
 
@@ -149,5 +155,16 @@ impl World {
 
     pub fn status(&self, id: &str) -> String {
         self.store.connection(id).unwrap().unwrap().status
+    }
+
+    /// The gateway on this database, as the collector builds it: its
+    /// store, key and `revocations`, the owner opened on the same file.
+    pub fn gateway(&self) -> GatewayState {
+        GatewayState {
+            store: self.store.clone(),
+            key: self.key.clone(),
+            operator: Arc::new(Operator::open(&self.db).unwrap()),
+            revocations: self.revocations.clone(),
+        }
     }
 }

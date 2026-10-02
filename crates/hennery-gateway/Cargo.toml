@@ -28,6 +28,8 @@ serde_json.workspace = true
 thiserror.workspace = true
 # The proxy answers refused server requests in the background (plan 8d).
 tokio.workspace = true
+# A revoke ends the token's open streams (plan 8e decision 12).
+tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true
 zeroize.workspace = true

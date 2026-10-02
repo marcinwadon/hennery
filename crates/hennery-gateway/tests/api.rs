@@ -46,6 +46,7 @@ impl Api {
             store: store.clone(),
             key: key.clone(),
             operator: operator.clone(),
+            revocations: Default::default(),
         });
         Self {
             _dir: dir,
