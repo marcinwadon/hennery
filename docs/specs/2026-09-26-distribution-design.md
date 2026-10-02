@@ -431,6 +431,7 @@ are never printed (only "logged in" and the method).
 | 15 | Collector isolation: gateway credentials for more than one hat while the collector shares its OS user with agents (warn, kernel spec §10) |
 | 16 | Collector listeners: every configured address bound; `public_url` reaches one of them or a reverse proxy (warn, kernel spec §7) |
 | 17 | CLI overrides (`--use-cli`): the operator's CLI version against the pinned one (warn on a gap, §13) |
+| 18 | The collector's secret files, `vapid.key` and `master.key`, judged by their metadata alone, never read, as the collector takes them and in its order: a regular file, not a symlink; no group or other bits; owned by the collector directory's owner and readable by it; for `master.key`, one name only; 32 bytes. Each way the collector would refuse one fails, with its fix. A file not made yet is fine, but once `hennery.db` exists a missing one warns: a new `vapid.key` breaks every push subscription, and a missing `master.key` stops a collector with stored gateway credentials. One that can't be looked at warns (run doctor as the collector's user). `hennery backup` carries both (kernel §9) |
 
 The host runs checks 3–4, 9, 12 and 13 on demand (`probe_agents`) and reports
 them to the collector, so the Hosts view shows them without a terminal.

@@ -16,6 +16,7 @@ mod env;
 mod platform;
 mod process;
 mod runtime;
+mod secrets;
 mod service;
 mod spawn;
 
@@ -202,6 +203,7 @@ pub fn checks(doctor: &Doctor) -> Vec<Finding> {
         service::host_directory(doctor),
         collector::listeners(doctor),
         runtime::cli_overrides(doctor),
+        secrets::secret_files(doctor),
     ]
 }
 

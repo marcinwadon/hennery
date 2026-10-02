@@ -2468,3 +2468,219 @@ fn every_listener_and_public_url_is_tried() {
     assert_eq!(sixteen.status, Status::Warn, "{sixteen:?}");
     assert!(sixteen.summary.contains("reaches no listener or proxy"), "{sixteen:?}");
 }
+
+/// Check 18: each secret file is judged by its metadata alone, in the
+/// collector's order, every way the collector would refuse it a failure
+/// with its fix; a file not made yet is fine, but one missing once the
+/// collector has run warns; one that cannot be looked at warns.
+#[test]
+fn the_collectors_secret_files_are_judged_as_the_collector_takes_them() {
+    use super::secrets::{KEY_BYTES, Secret, judge, secret_files};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let me = std::fs::metadata(dir.path()).unwrap().uid();
+    let key = |name: &str, bytes: usize, mode: u32| {
+        let path = dir.path().join(name);
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, vec![7u8; bytes]).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+        path
+    };
+    assert_eq!(judge(&dir.path().join("none"), me, true), Secret::Absent);
+    assert_eq!(judge(&key("fine", 32, 0o600), me, true), Secret::Fine);
+    assert_eq!(judge(&key("owner-read", 32, 0o400), me, true), Secret::Fine);
+    assert_eq!(judge(&key("shared", 32, 0o640), me, true), Secret::Shared);
+    assert_eq!(judge(&key("world", 32, 0o604), me, true), Secret::Shared);
+    assert_eq!(judge(&key("unreadable", 32, 0o200), me, true), Secret::Unreadable);
+    assert_eq!(judge(&key("theirs", 32, 0o600), me + 1, true), Secret::OtherOwner(me));
+    assert_eq!(judge(&key("short", 31, 0o600), me, true), Secret::WrongSize(31));
+    assert_eq!(judge(&key("long", 33, 0o600), me, true), Secret::WrongSize(33));
+    assert_eq!(judge(&key("hex", 64, 0o600), me, true), Secret::WrongSize(64));
+    let linked = key("linked", 32, 0o600);
+    std::fs::hard_link(&linked, dir.path().join("second-name")).unwrap();
+    assert_eq!(judge(&linked, me, true), Secret::HardLinked);
+    assert_eq!(
+        judge(&linked, me, false),
+        Secret::Fine,
+        "vapid.key's names do not matter"
+    );
+    // The gateway looks at the names before the size.
+    let both = key("both", 31, 0o600);
+    std::fs::hard_link(&both, dir.path().join("both-again")).unwrap();
+    assert_eq!(judge(&both, me, true), Secret::HardLinked);
+    let target = key("target", 32, 0o600);
+    std::os::unix::fs::symlink(&target, dir.path().join("link")).unwrap();
+    assert_eq!(judge(&dir.path().join("link"), me, true), Secret::Link);
+    std::fs::create_dir(dir.path().join("a-dir")).unwrap();
+    assert_eq!(judge(&dir.path().join("a-dir"), me, true), Secret::NotAFile);
+    let fifo = dir.path().join("fifo");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: mkfifo(3) on a path in the test's own directory.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    assert_eq!(judge(&fifo, me, true), Secret::NotAFile);
+    // A directory that cannot be searched: what is in it cannot be looked at
+    // (root searches anything, so not there).
+    let closed = dir.path().join("closed");
+    std::fs::create_dir(&closed).unwrap();
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // SAFETY: geteuid(2) only reads.
+    if unsafe { libc::geteuid() } != 0 {
+        assert!(matches!(
+            judge(&closed.join("vapid.key"), me, false),
+            Secret::Unknown(_)
+        ));
+    }
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(KEY_BYTES, 32);
+
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let collector = dir.path().join("collector");
+    std::fs::create_dir_all(&collector).unwrap();
+    let dirs = Dirs {
+        root: collector.clone(),
+        from: Found::Given,
+        host: None,
+        collector: Some(collector.clone()),
+        notes: Vec::new(),
+    };
+    let check18 = |dirs: &Dirs| {
+        let doctor = Doctor {
+            cx: &cx,
+            dirs: dirs.clone(),
+            run: &nothing,
+        };
+        match secret_files(&doctor) {
+            Finding::Checked(check) => check,
+            other => panic!("{other:?}"),
+        }
+    };
+    let check = check18(&dirs);
+    assert_eq!((check.number, check.status), (18, Status::Ok), "{check:?}");
+    assert!(check.summary.contains("no vapid.key yet"), "{check:?}");
+    assert!(check.summary.contains("HENNERY_MASTER_KEY"), "{check:?}");
+
+    // Once the collector has run, a missing key was lost.
+    std::fs::write(collector.join("hennery.db"), "").unwrap();
+    let check = check18(&dirs);
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(
+        check
+            .summary
+            .contains("every push subscription made with the old one stops working"),
+        "{check:?}"
+    );
+    assert!(
+        check
+            .summary
+            .contains("the collector refuses to start until it is restored"),
+        "{check:?}"
+    );
+    assert!(check.fix.contains("restore vapid.key from a backup"), "{check:?}");
+    assert!(check.fix.contains("gw_credentials"), "{check:?}");
+
+    let vapid = collector.join("vapid.key");
+    let master = collector.join("master.key");
+    let write = |path: &Path, bytes: usize, mode: u32| {
+        let _ = std::fs::remove_file(path);
+        std::fs::write(path, vec![7u8; bytes]).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    write(&vapid, 32, 0o600);
+    write(&master, 32, 0o600);
+    let check = check18(&dirs);
+    assert_eq!(check.status, Status::Ok, "{check:?}");
+    assert!(
+        check.summary.contains("vapid.key is private; master.key is private"),
+        "{check:?}"
+    );
+
+    let cases: [(&dyn Fn(), &str, &str); 8] = [
+        (
+            &|| write(&vapid, 32, 0o644),
+            "vapid.key can be read or changed by other users",
+            "subscribe every device again",
+        ),
+        (
+            &|| write(&master, 32, 0o640),
+            "master.key can be read or changed",
+            "gw_credentials",
+        ),
+        (
+            &|| write(&vapid, 31, 0o600),
+            "vapid.key holds 31 bytes, not 32",
+            "subscribe every device again",
+        ),
+        (
+            &|| write(&master, 31, 0o600),
+            "master.key holds 31 bytes, not 32",
+            "this file is unused",
+        ),
+        (
+            &|| write(&master, 64, 0o600),
+            "master.key holds 64 bytes, not 32",
+            "written as hex",
+        ),
+        (
+            &|| write(&master, 32, 0o200),
+            "master.key cannot be read by its owner",
+            "chmod 600",
+        ),
+        (
+            &|| {
+                write(&master, 32, 0o600);
+                std::fs::hard_link(&master, collector.join("copy")).unwrap();
+            },
+            "master.key has other hard links",
+            "-samefile",
+        ),
+        (
+            &|| {
+                let _ = std::fs::remove_file(&vapid);
+                std::os::unix::fs::symlink(&target, &vapid).unwrap();
+            },
+            "vapid.key is a symbolic link",
+            "put the file itself",
+        ),
+    ];
+    for (break_it, why, fix) in cases {
+        write(&vapid, 32, 0o600);
+        write(&master, 32, 0o600);
+        let _ = std::fs::remove_file(collector.join("copy"));
+        break_it();
+        let check = check18(&dirs);
+        assert_eq!(check.status, Status::Fail, "{why}: {check:?}");
+        assert!(check.summary.contains(why) && check.fix.contains(fix), "{check:?}");
+    }
+    let _ = std::fs::remove_file(&vapid);
+    std::fs::create_dir(&vapid).unwrap();
+    let check = check18(&dirs);
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    assert!(check.summary.contains("vapid.key is not a regular file"), "{check:?}");
+    assert!(check.fix.contains("put the key file itself"), "{check:?}");
+
+    // In doctor's list too: a whole run reports it, last, and changes
+    // nothing it looked at.
+    std::fs::remove_dir(&vapid).unwrap();
+    write(&vapid, 31, 0o600);
+    let findings = checked(&cx, dirs.clone(), &nothing, &collector);
+    let check = line(&findings, 18);
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    assert!(check.summary.contains("vapid.key holds 31 bytes"), "{check:?}");
+    let last = match findings.last().unwrap() {
+        Finding::Checked(check) => check.number,
+        Finding::NotRun { number, .. } => *number,
+    };
+    assert_eq!(last, 18);
+
+    let no_collector = Dirs {
+        collector: None,
+        ..dirs
+    };
+    let doctor = Doctor {
+        cx: &cx,
+        dirs: no_collector,
+        run: &nothing,
+    };
+    assert!(matches!(secret_files(&doctor), Finding::NotRun { number: 18, .. }));
+}
