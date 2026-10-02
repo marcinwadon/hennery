@@ -32,6 +32,12 @@ pub enum Stop {
     TooDeep,
     /// A system call failed with this errno.
     Io(i32),
+    /// The forget's deadline passed (B6; the review's item 3).
+    Deadline,
+    /// The named entry was a directory when it was looked at and is not
+    /// one by the time it is opened (a symlink swapped in): left alone
+    /// (the review's item 8).
+    Swapped,
 }
 
 /// Seams for tests (the host crate's `test-hooks` feature): nothing in a
@@ -44,7 +50,21 @@ pub struct Hooks {
     #[cfg(feature = "test-hooks")]
     #[allow(clippy::type_complexity)]
     pub listed: Option<std::sync::Arc<dyn Fn(&Path, &[std::ffi::OsString]) + Send + Sync>>,
+    /// Called once a named entry has been found to be a directory, before
+    /// it is opened, with its path.
+    #[cfg(feature = "test-hooks")]
+    pub stated: Option<PathHook>,
+    /// Asked before a project directory is listed, with its path: `true`
+    /// makes the listing fail (`EIO`).
+    #[cfg(feature = "test-hooks")]
+    pub fail_listing: Option<PathTest>,
 }
+
+/// A test hook given a path (`Hooks::stated`).
+pub type PathHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
+/// A test hook asked about a path (`Hooks::fail_listing`).
+pub type PathTest = std::sync::Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 
 impl std::fmt::Debug for Hooks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -63,6 +83,24 @@ impl Hooks {
                 .collect();
             hook(_path, &names);
         }
+    }
+
+    fn stated(&self, _path: &Path) {
+        #[cfg(feature = "test-hooks")]
+        if let Some(hook) = &self.stated {
+            hook(_path);
+        }
+    }
+
+    /// `list`, unless a test makes the listing of `_path` fail.
+    pub fn list(&self, dir: RawFd, _path: &Path) -> Result<Vec<CString>, i32> {
+        #[cfg(feature = "test-hooks")]
+        if let Some(hook) = &self.fail_listing
+            && hook(_path)
+        {
+            return Err(libc::EIO);
+        }
+        list(dir)
     }
 }
 
@@ -241,27 +279,36 @@ struct Frame {
 }
 
 /// Remove the directory `name` in `parent` and everything in it (R1, R2),
-/// on the file system `dev`. An entry that turns out not to be a directory
-/// (a symlink swapped in included) is unlinked as an entry.
-pub fn remove_tree(parent: RawFd, name: &CStr, dev: libc::dev_t, path: &Path, hooks: &Hooks) -> Result<(), Stop> {
+/// on the file system `dev`, before `until`. Below the top, an entry that
+/// turns out not to be a directory (a symlink swapped in included) is
+/// unlinked as an entry; the top itself is left (`Stop::Swapped`).
+pub fn remove_tree(
+    parent: RawFd,
+    name: &CStr,
+    dev: libc::dev_t,
+    path: &Path,
+    hooks: &Hooks,
+    until: std::time::Instant,
+) -> Result<(), Stop> {
+    if std::time::Instant::now() >= until {
+        return Err(Stop::Deadline);
+    }
     let mut stack: Vec<Frame> = Vec::new();
-    match descend(parent, name, dev, path, hooks)? {
+    match descend(parent, name, dev, 1, path, hooks)? {
         Some(frame) => stack.push(frame),
         None => return Ok(()),
     }
     while let Some(top) = stack.last_mut() {
+        if std::time::Instant::now() >= until {
+            return Err(Stop::Deadline);
+        }
         if top.next < top.entries.len() {
             let child = top.entries[top.next].clone();
             top.next += 1;
             let child_path = top.path.join(std::ffi::OsStr::from_bytes(child.as_bytes()));
             let fd = top.fd.as_raw_fd();
-            if stack.len() >= MAX_DEPTH {
-                // Only a directory makes it deeper.
-                if matches!(stat_at(fd, &child), Ok(Some(st)) if is_dir(&st)) {
-                    return Err(Stop::TooDeep);
-                }
-            }
-            if let Some(frame) = descend(fd, &child, dev, &child_path, hooks)? {
+            let depth = stack.len() + 1;
+            if let Some(frame) = descend(fd, &child, dev, depth, &child_path, hooks)? {
                 stack.push(frame);
             }
         } else {
@@ -274,12 +321,23 @@ pub fn remove_tree(parent: RawFd, name: &CStr, dev: libc::dev_t, path: &Path, ho
     Ok(())
 }
 
-/// Open `name` in `dir` to remove what it holds: its frame, listed, if it
-/// is a directory on `dev`; `None` once it is unlinked (no directory) or
-/// gone.
-fn descend(dir: RawFd, name: &CStr, dev: libc::dev_t, path: &Path, hooks: &Hooks) -> Result<Option<Frame>, Stop> {
+/// Open `name` in `dir`, `depth` levels down (1: the named entry itself),
+/// to remove what it holds: its frame, listed, if it is a directory on
+/// `dev`; `None` once it is unlinked (no directory) or gone. Its depth is
+/// judged on the descriptor it opened, so a directory swapped in after
+/// its parent was listed counts too (the review's item 2).
+fn descend(
+    dir: RawFd,
+    name: &CStr,
+    dev: libc::dev_t,
+    depth: usize,
+    path: &Path,
+    hooks: &Hooks,
+) -> Result<Option<Frame>, Stop> {
     let fd = match open_dir_at(dir, name) {
         Ok(fd) => fd,
+        // The named entry is no directory any more: never unlinked here.
+        Err(libc::ELOOP | libc::ENOTDIR) if depth == 1 => return Err(Stop::Swapped),
         Err(libc::ELOOP | libc::ENOTDIR) => {
             unlink_at(dir, name, 0).map_err(Stop::Io)?;
             return Ok(None);
@@ -287,6 +345,9 @@ fn descend(dir: RawFd, name: &CStr, dev: libc::dev_t, path: &Path, hooks: &Hooks
         Err(libc::ENOENT) => return Ok(None),
         Err(e) => return Err(Stop::Io(e)),
     };
+    if depth > MAX_DEPTH {
+        return Err(Stop::TooDeep);
+    }
     let st = stat_fd(fd.as_raw_fd()).map_err(Stop::Io)?;
     if st.st_dev != dev {
         return Err(Stop::MountPoint);
@@ -313,21 +374,92 @@ pub enum Removal {
     Stopped(Stop),
 }
 
-/// Remove the entry `name` in `dir`, which the forget names exactly (B9):
-/// a symlink is left and reported; a directory goes with its contents; any
-/// other entry is unlinked.
-pub fn remove_entry(dir: RawFd, name: &CStr, dev: libc::dev_t, path: &Path, hooks: &Hooks) -> Removal {
+/// Remove the entry `name` in `dir`, which the forget names exactly (B9),
+/// before `until`: a symlink is left and reported, one swapped in for a
+/// directory too; a directory goes with its contents; any other entry is
+/// unlinked.
+pub fn remove_entry(
+    dir: RawFd,
+    name: &CStr,
+    dev: libc::dev_t,
+    path: &Path,
+    hooks: &Hooks,
+    until: std::time::Instant,
+) -> Removal {
     match stat_at(dir, name) {
         Ok(None) => Removal::Absent,
         Ok(Some(st)) if is_link(&st) => Removal::Symlink,
-        Ok(Some(st)) if is_dir(&st) => match remove_tree(dir, name, dev, path, hooks) {
-            Ok(()) => Removal::Removed,
-            Err(stop) => Removal::Stopped(stop),
-        },
+        Ok(Some(st)) if is_dir(&st) => {
+            hooks.stated(path);
+            match remove_tree(dir, name, dev, path, hooks, until) {
+                Ok(()) => Removal::Removed,
+                Err(Stop::Swapped) => match stat_at(dir, name) {
+                    Ok(Some(st)) if is_link(&st) => Removal::Symlink,
+                    Ok(None) => Removal::Absent,
+                    _ => Removal::Stopped(Stop::Io(libc::EAGAIN)),
+                },
+                Err(stop) => Removal::Stopped(stop),
+            }
+        }
         Ok(Some(_)) => match unlink_at(dir, name, 0) {
             Ok(()) => Removal::Removed,
             Err(e) => Removal::Stopped(Stop::Io(e)),
         },
         Err(e) => Removal::Stopped(Stop::Io(e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tree() -> (tempfile::TempDir, OwnedFd, libc::dev_t) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("t/a/b")).unwrap();
+        std::fs::write(dir.path().join("t/a/b/f"), "x").unwrap();
+        let fd = open_root(dir.path()).unwrap();
+        let dev = stat_fd(fd.as_raw_fd()).unwrap().st_dev;
+        (dir, fd, dev)
+    }
+
+    fn later() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(60)
+    }
+
+    /// R2, the review's item 7: a directory on another device stops the
+    /// removal, and nothing of it goes.
+    #[test]
+    fn another_file_system_stops_the_removal() {
+        let (dir, fd, dev) = tree();
+        let t = c_name(b"t");
+        assert_eq!(
+            remove_tree(fd.as_raw_fd(), &t, dev ^ 1, Path::new("t"), &Hooks::default(), later()),
+            Err(Stop::MountPoint)
+        );
+        assert!(dir.path().join("t/a/b/f").exists());
+        assert_eq!(
+            remove_tree(fd.as_raw_fd(), &t, dev, Path::new("t"), &Hooks::default(), later()),
+            Ok(())
+        );
+        assert!(!dir.path().join("t").exists());
+    }
+
+    /// B6, the review's item 3: past its deadline, a removal stops.
+    #[test]
+    fn a_removal_past_its_deadline_stops() {
+        let (dir, fd, dev) = tree();
+        let past = std::time::Instant::now();
+        assert_eq!(
+            remove_tree(
+                fd.as_raw_fd(),
+                &c_name(b"t"),
+                dev,
+                Path::new("t"),
+                &Hooks::default(),
+                past
+            ),
+            Err(Stop::Deadline)
+        );
+        assert!(dir.path().join("t/a/b/f").exists());
     }
 }

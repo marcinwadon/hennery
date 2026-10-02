@@ -40,6 +40,8 @@ pub struct ForgetContext {
     /// Test seams of the removal (the `test-hooks` feature): none in a
     /// real build.
     pub hooks: crate::walk::Hooks,
+    /// The host user (`account`), for the ownership checks (B3).
+    pub account: Account,
 }
 
 /// One forget, as the collector asked for it, checked against the
@@ -151,11 +153,18 @@ async fn forget_claude(ctx: &ForgetContext, forget: &Forget) -> Forgotten {
             };
         }
     };
-    if kinds.dirs[0].2.is_ok() {
+    // Not with a `projects/` that failed its check: the adapter would
+    // follow it (B3).
+    let projects_ok = kinds
+        .dirs
+        .iter()
+        .any(|(kind, _, opened)| *kind == ForgetKind::Transcript && opened.is_ok());
+    if projects_ok {
         run_adapter(ctx, forget, &root, until).await;
     }
     let (id, hooks) = (forget.agent_session_id.clone(), ctx.hooks.clone());
-    match tokio::task::spawn_blocking(move || remove_and_verify(&kinds, &root, &id, &hooks)).await {
+    let until = until.into_std();
+    match tokio::task::spawn_blocking(move || remove_and_verify(&kinds, &root, &id, &hooks, until)).await {
         Ok(forgotten) => forgotten,
         Err(_) => Forgotten {
             removed: Vec::new(),
@@ -281,10 +290,139 @@ fn kind_entry(kind: ForgetKind, id: &str) -> String {
     }
 }
 
-/// The host user's own, and not writable by group or others (B3).
-fn safely_owned(st: &libc::stat) -> bool {
+/// The host user, as the safety checks need them (B3): the effective uid,
+/// and its account's primary gid and name (`getpwuid_r`). With no account
+/// the name is empty and the gid matches nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Account {
+    pub uid: libc::uid_t,
+    pub gid: libc::gid_t,
+    pub name: Vec<u8>,
+}
+
+/// A group, as `getgrgid_r` gives it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Group {
+    pub gid: libc::gid_t,
+    pub name: Vec<u8>,
+    pub members: Vec<Vec<u8>>,
+}
+
+/// Whether a root or kind directory with `st` is safe to remove from (B3;
+/// the review's item 5): the host user's, never writable by others, and
+/// writable by its group only when that group is the user's own private
+/// one: the account's primary group, named as the user, with no member
+/// but the user (a umask of 002 makes every directory so). A shared group
+/// (`staff`) does not count.
+pub fn safe_mode(st: &libc::stat, account: &Account, group: Option<&Group>) -> bool {
+    if st.st_uid != account.uid || st.st_mode & 0o002 != 0 {
+        return false;
+    }
+    if st.st_mode & 0o020 == 0 {
+        return true;
+    }
+    let Some(group) = group else {
+        return false;
+    };
+    !account.name.is_empty()
+        && st.st_gid == account.gid
+        && group.gid == st.st_gid
+        && group.name == account.name
+        && (group.members.is_empty() || group.members == [account.name.clone()])
+}
+
+/// The size of a buffer for `getpwuid_r` / `getgrgid_r`, and its growth.
+const LOOKUP_BUFFER: usize = 1024;
+const LOOKUP_BUFFER_MAX: usize = 1 << 20;
+
+/// The host user's account (`getpwuid_r` of the effective uid), only the
+/// reentrant call.
+pub fn account() -> Account {
     // SAFETY: geteuid(2) cannot fail.
-    st.st_uid == unsafe { libc::geteuid() } && st.st_mode & 0o022 == 0
+    let uid = unsafe { libc::geteuid() };
+    let mut size = LOOKUP_BUFFER;
+    while size <= LOOKUP_BUFFER_MAX {
+        let mut buf = vec![0 as libc::c_char; size];
+        // SAFETY: an all-zero `passwd` is a valid value for the call to fill.
+        let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        // SAFETY: getpwuid_r(3) into local storage of the given size.
+        let rc = unsafe { libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr(), buf.len(), &mut found) };
+        match rc {
+            0 if !found.is_null() => {
+                // SAFETY: `pw_name` points into `buf`, NUL-terminated.
+                let name = unsafe { std::ffi::CStr::from_ptr(pwd.pw_name) }.to_bytes().to_vec();
+                return Account {
+                    uid,
+                    gid: pwd.pw_gid,
+                    name,
+                };
+            }
+            libc::ERANGE => size *= 2,
+            libc::EINTR => {}
+            _ => break,
+        }
+    }
+    Account {
+        uid,
+        gid: libc::gid_t::MAX,
+        name: Vec::new(),
+    }
+}
+
+/// The group `gid` (`getgrgid_r`), if there is one.
+pub fn group(gid: libc::gid_t) -> Option<Group> {
+    let mut size = LOOKUP_BUFFER;
+    while size <= LOOKUP_BUFFER_MAX {
+        let mut buf = vec![0 as libc::c_char; size];
+        // SAFETY: as in `account`.
+        let mut grp: libc::group = unsafe { std::mem::zeroed() };
+        let mut found: *mut libc::group = std::ptr::null_mut();
+        // SAFETY: getgrgid_r(3) into local storage of the given size.
+        let rc = unsafe { libc::getgrgid_r(gid, &mut grp, buf.as_mut_ptr(), buf.len(), &mut found) };
+        match rc {
+            0 if !found.is_null() => {
+                // SAFETY: the name and the NULL-terminated member list point
+                // into `buf`.
+                let name = unsafe { std::ffi::CStr::from_ptr(grp.gr_name) }.to_bytes().to_vec();
+                let mut members = Vec::new();
+                let mut at = grp.gr_mem;
+                // SAFETY: as above; the list ends with a NULL pointer.
+                unsafe {
+                    while !at.is_null() && !(*at).is_null() {
+                        members.push(std::ffi::CStr::from_ptr(*at).to_bytes().to_vec());
+                        at = at.add(1);
+                    }
+                }
+                return Some(Group {
+                    gid: grp.gr_gid,
+                    name,
+                    members,
+                });
+            }
+            0 => return None,
+            libc::ERANGE => size *= 2,
+            libc::EINTR => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// `safe_mode` for `st`, looking its group up only if it matters.
+fn safely_owned(st: &libc::stat, account: &Account) -> bool {
+    let group = if st.st_mode & 0o020 != 0 {
+        group(st.st_gid)
+    } else {
+        None
+    };
+    safe_mode(st, account, group.as_ref())
+}
+
+/// `(st_dev, st_ino)` of `path`, following links.
+fn identity(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
 }
 
 /// The root, checked (decision 8, B3), open: absolute and canonical, still
@@ -301,19 +439,28 @@ fn open_checked_root(ctx: &ForgetContext, root: &Path) -> Result<(OwnedFd, libc:
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Err(ForgetReason::RootMissing),
         Err(_) => return Err(ForgetReason::UnsafeRoot),
     }
+    let fd = walk::open_root(root).map_err(|_| ForgetReason::UnsafeRoot)?;
+    let st = walk::stat_fd(fd.as_raw_fd()).map_err(|_| ForgetReason::UnsafeRoot)?;
+    // The field types differ by platform (`st_dev` is `i32` on macOS).
+    #[allow(clippy::unnecessary_cast)]
+    let opened = (st.st_dev as u64, st.st_ino as u64);
+    // The directory opened is the one the path names now (the review's
+    // item 9): nothing was swapped in between the checks and the open.
+    if identity(root) != Some(opened) {
+        return Err(ForgetReason::UnsafeRoot);
+    }
+    // Not the host's data directory, nor the user's home, nor one of
+    // their ancestors (`/` too), compared by device and inode.
     let mut guarded: Vec<PathBuf> = vec![ctx.data_dir.clone()];
     guarded.extend(ctx.home.clone());
     guarded.extend(std::env::var_os("HOME").map(PathBuf::from));
     for guarded in guarded {
         let guarded = std::fs::canonicalize(&guarded).unwrap_or(guarded);
-        // `root` is that directory, or one of its ancestors (`/` too).
-        if guarded.starts_with(root) {
+        if guarded.ancestors().any(|dir| identity(dir) == Some(opened)) {
             return Err(ForgetReason::UnsafeRoot);
         }
     }
-    let fd = walk::open_root(root).map_err(|_| ForgetReason::UnsafeRoot)?;
-    let st = walk::stat_fd(fd.as_raw_fd()).map_err(|_| ForgetReason::UnsafeRoot)?;
-    if !walk::is_dir(&st) || !safely_owned(&st) {
+    if !walk::is_dir(&st) || !safely_owned(&st, &ctx.account) {
         return Err(ForgetReason::UnsafeRoot);
     }
     Ok((fd, st.st_dev))
@@ -322,7 +469,7 @@ fn open_checked_root(ctx: &ForgetContext, root: &Path) -> Result<(OwnedFd, libc:
 /// A kind directory, checked before anything runs (B3): open through no
 /// symlink, the host user's, not writable by others, on the root's file
 /// system. `Ok(None)` if there is none.
-fn open_kind(root: RawFd, name: &str, dev: libc::dev_t) -> Result<Option<OwnedFd>, ForgetReason> {
+fn open_kind(root: RawFd, name: &str, dev: libc::dev_t, account: &Account) -> Result<Option<OwnedFd>, ForgetReason> {
     let c_name = walk::c_name(name.as_bytes());
     let fd = match walk::open_dir_at(root, &c_name) {
         Ok(fd) => fd,
@@ -341,7 +488,7 @@ fn open_kind(root: RawFd, name: &str, dev: libc::dev_t) -> Result<Option<OwnedFd
     if st.st_dev != dev {
         return Err(ForgetReason::MountPoint);
     }
-    if !safely_owned(&st) {
+    if !safely_owned(&st, account) {
         return Err(ForgetReason::UnsafeDirectory);
     }
     Ok(Some(fd))
@@ -351,7 +498,10 @@ fn open_kind(root: RawFd, name: &str, dev: libc::dev_t) -> Result<Option<OwnedFd
 /// still there, or a removal that failed midway (B3). A symlink, a mount
 /// point, an unsafe directory stay as they are.
 fn retryable(reason: ForgetReason) -> bool {
-    matches!(reason, ForgetReason::StillPresent | ForgetReason::IoError)
+    matches!(
+        reason,
+        ForgetReason::StillPresent | ForgetReason::IoError | ForgetReason::TimedOut | ForgetReason::InProgress
+    )
 }
 
 /// What is counted per kind.
@@ -386,7 +536,8 @@ fn stop_reason(stop: walk::Stop) -> ForgetReason {
     match stop {
         walk::Stop::MountPoint => ForgetReason::MountPoint,
         walk::Stop::TooDeep => ForgetReason::TooDeep,
-        walk::Stop::Io(_) => ForgetReason::IoError,
+        walk::Stop::Io(_) | walk::Stop::Swapped => ForgetReason::IoError,
+        walk::Stop::Deadline => ForgetReason::TimedOut,
     }
 }
 
@@ -406,7 +557,7 @@ fn check(ctx: &ForgetContext, root: &Path) -> Result<Kinds, ForgetReason> {
     let (root_fd, dev) = open_checked_root(ctx, root)?;
     let dirs = CLAUDE_KINDS
         .iter()
-        .map(|&(kind, name)| (kind, name, open_kind(root_fd.as_raw_fd(), name, dev)))
+        .map(|&(kind, name)| (kind, name, open_kind(root_fd.as_raw_fd(), name, dev, &ctx.account)))
         .collect();
     Ok(Kinds {
         root: root_fd,
@@ -416,8 +567,9 @@ fn check(ctx: &ForgetContext, root: &Path) -> Result<Kinds, ForgetReason> {
 }
 
 /// The project directories under `projects` that are real directories on
-/// `dev`, each open, with its name; a symlinked one is skipped, never
-/// followed (decision 8); one on another file system is counted.
+/// `dev`, each open, with its name; a symlinked one is counted and never
+/// followed (decision 8; the review's item 4); one on another file system
+/// is counted; a file there is no project directory.
 /// `base` is the directory's path, for the logs only: nothing is looked up
 /// by it.
 fn project_dirs(
@@ -442,7 +594,12 @@ fn project_dirs(
                 Ok(_) => tally.left(ForgetKind::Transcript, ForgetReason::MountPoint),
                 Err(_) => tally.left(ForgetKind::Transcript, ForgetReason::IoError),
             },
-            Err(libc::ELOOP | libc::ENOTDIR | libc::ENOENT) => {}
+            Err(libc::ELOOP | libc::ENOTDIR) => {
+                if matches!(walk::stat_at(projects, &name), Ok(Some(st)) if walk::is_link(&st)) {
+                    tally.left(ForgetKind::Transcript, ForgetReason::Symlink);
+                }
+            }
+            Err(libc::ENOENT) => {}
             Err(_) => tally.left(ForgetKind::Transcript, ForgetReason::IoError),
         }
     }
@@ -452,13 +609,22 @@ fn project_dirs(
 /// The exact entries of `kinds` (B9), each through descriptors (R1, R2),
 /// then the check afterwards (B4): what is still there is what is left,
 /// whatever the removal reported.
-fn remove_and_verify(kinds: &Kinds, root: &Path, id: &str, hooks: &walk::Hooks) -> Forgotten {
+fn remove_and_verify(
+    kinds: &Kinds,
+    root: &Path,
+    id: &str,
+    hooks: &walk::Hooks,
+    until: std::time::Instant,
+) -> Forgotten {
     let mut tally = Tally::default();
+    // Project directories whose listing failed, in either pass: each counts
+    // once, as left for a retry (the review's item 1).
+    let mut unlisted: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
     // Why an entry was not removed, by kind and name, for the check after.
     let mut why: BTreeMap<(ForgetKind, Vec<u8>), ForgetReason> = BTreeMap::new();
     let mut each = |kind: ForgetKind, dir: RawFd, path: PathBuf, name: &[u8], tally: &mut Tally| {
         let c = walk::c_name(name);
-        match walk::remove_entry(dir, &c, kinds.dev, &path, hooks) {
+        match walk::remove_entry(dir, &c, kinds.dev, &path, hooks, until) {
             walk::Removal::Absent => {}
             walk::Removal::Removed => *tally.removed.entry(kind).or_default() += 1,
             walk::Removal::Symlink => {
@@ -480,9 +646,20 @@ fn remove_and_verify(kinds: &Kinds, root: &Path, id: &str, hooks: &walk::Hooks) 
         };
         let base = root.join(dir_name);
         if *kind == ForgetKind::Transcript {
-            for (project, project_name) in project_dirs(dir, &base, kinds.dev, &mut tally) {
+            // What the first pass finds of the project directories is found
+            // again, and counted, by the check after.
+            let mut scratch = Tally::default();
+            for (project, project_name) in project_dirs(dir, &base, kinds.dev, &mut scratch) {
                 let project_path = base.join(std::ffi::OsStr::from_bytes(project_name.as_bytes()));
-                let names = walk::list(project.as_raw_fd()).unwrap_or_default();
+                let names = match hooks.list(project.as_raw_fd(), &project_path) {
+                    Ok(names) => names,
+                    Err(_) => {
+                        if unlisted.insert(project_name.as_bytes().to_vec()) {
+                            tally.left(ForgetKind::Transcript, ForgetReason::IoError);
+                        }
+                        continue;
+                    }
+                };
                 for name in names.iter().filter(|n| in_transcript_family(n.as_bytes(), id)) {
                     let path = project_path.join(std::ffi::OsStr::from_bytes(name.as_bytes()));
                     each(*kind, project.as_raw_fd(), path, name.as_bytes(), &mut tally);
@@ -507,14 +684,23 @@ fn remove_and_verify(kinds: &Kinds, root: &Path, id: &str, hooks: &walk::Hooks) 
             }
             Err(_) => tally.left(kind, ForgetReason::IoError),
         };
-    for (kind, _, opened) in &kinds.dirs {
+    for (kind, dir_name, opened) in &kinds.dirs {
         let Ok(Some(fd)) = opened else {
             continue;
         };
         if *kind == ForgetKind::Transcript {
-            let mut scratch = Tally::default();
-            for (project, _) in project_dirs(fd.as_raw_fd(), Path::new(""), kinds.dev, &mut scratch) {
-                let names = walk::list(project.as_raw_fd()).unwrap_or_default();
+            let base = root.join(dir_name);
+            for (project, project_name) in project_dirs(fd.as_raw_fd(), &base, kinds.dev, &mut tally) {
+                let project_path = base.join(std::ffi::OsStr::from_bytes(project_name.as_bytes()));
+                let names = match hooks.list(project.as_raw_fd(), &project_path) {
+                    Ok(names) => names,
+                    Err(_) => {
+                        if unlisted.insert(project_name.as_bytes().to_vec()) {
+                            tally.left(ForgetKind::Transcript, ForgetReason::IoError);
+                        }
+                        continue;
+                    }
+                };
                 for name in names.iter().filter(|n| in_transcript_family(n.as_bytes(), id)) {
                     verify(*kind, project.as_raw_fd(), name.as_bytes(), &mut tally);
                 }
@@ -530,6 +716,104 @@ fn remove_and_verify(kinds: &Kinds, root: &Path, id: &str, hooks: &walk::Hooks) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn me() -> Account {
+        Account {
+            uid: 501,
+            gid: 501,
+            name: b"me".to_vec(),
+        }
+    }
+
+    fn dir(uid: libc::uid_t, gid: libc::gid_t, mode: libc::mode_t) -> libc::stat {
+        // SAFETY: an all-zero `stat` is a valid value.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        st.st_uid = uid;
+        st.st_gid = gid;
+        st.st_mode = libc::S_IFDIR | mode;
+        st
+    }
+
+    fn grp(gid: libc::gid_t, name: &str, members: &[&str]) -> Group {
+        Group {
+            gid,
+            name: name.as_bytes().to_vec(),
+            members: members.iter().map(|m| m.as_bytes().to_vec()).collect(),
+        }
+    }
+
+    /// The review's item 5.
+    #[test]
+    fn only_the_users_private_group_may_write_a_directory_besides_the_user() {
+        let me = me();
+        // Not group-writable: only the owner counts.
+        assert!(safe_mode(&dir(501, 20, 0o755), &me, None));
+        assert!(!safe_mode(&dir(502, 501, 0o755), &me, None));
+        // A private group (umask 002): the user's own, empty or just them.
+        let private = grp(501, "me", &[]);
+        assert!(safe_mode(&dir(501, 501, 0o775), &me, Some(&private)));
+        assert!(safe_mode(&dir(501, 501, 0o775), &me, Some(&grp(501, "me", &["me"]))));
+        // A shared group, `staff` (gid 20).
+        assert!(!safe_mode(
+            &dir(501, 20, 0o775),
+            &me,
+            Some(&grp(20, "staff", &["me", "you"]))
+        ));
+        // A group named as the user and only theirs, but not their
+        // primary one.
+        assert!(!safe_mode(&dir(501, 600, 0o775), &me, Some(&grp(600, "me", &[]))));
+        // The primary gid, but named otherwise, or with another member.
+        assert!(!safe_mode(&dir(501, 501, 0o775), &me, Some(&grp(501, "dev", &[]))));
+        assert!(!safe_mode(&dir(501, 501, 0o775), &me, Some(&grp(501, "me", &["you"]))));
+        assert!(!safe_mode(
+            &dir(501, 501, 0o775),
+            &me,
+            Some(&grp(501, "me", &["me", "you"]))
+        ));
+        // A group it could not look up, or an account with no name.
+        assert!(!safe_mode(&dir(501, 501, 0o775), &me, None));
+        let nameless = Account {
+            name: Vec::new(),
+            ..me.clone()
+        };
+        assert!(!safe_mode(&dir(501, 501, 0o775), &nameless, Some(&grp(501, "", &[]))));
+        // Writable by others: never.
+        assert!(!safe_mode(&dir(501, 501, 0o777), &me, Some(&private)));
+        assert!(!safe_mode(&dir(501, 501, 0o757), &me, Some(&private)));
+    }
+
+    /// `account` and `group` find the host user (the reentrant calls).
+    #[test]
+    fn the_host_user_and_their_group_are_found() {
+        let account = account();
+        // SAFETY: geteuid(2) cannot fail.
+        assert_eq!(account.uid, unsafe { libc::geteuid() });
+        assert!(!account.name.is_empty());
+        assert_eq!(super::group(account.gid).map(|g| g.gid), Some(account.gid));
+    }
+
+    /// The review's item 7: a kind directory on another device is refused.
+    #[test]
+    fn a_kind_directory_on_another_file_system_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("tasks")).unwrap();
+        let fd = walk::open_root(root.path()).unwrap();
+        let dev = walk::stat_fd(fd.as_raw_fd()).unwrap().st_dev;
+        let me = account();
+        assert!(matches!(open_kind(fd.as_raw_fd(), "tasks", dev, &me), Ok(Some(_))));
+        assert_eq!(
+            open_kind(fd.as_raw_fd(), "tasks", dev ^ 1, &me).err(),
+            Some(ForgetReason::MountPoint)
+        );
+    }
+
+    /// The review's item 3: what the deadline left, a retry may finish.
+    #[test]
+    fn a_removal_cut_by_its_deadline_is_retried() {
+        assert_eq!(stop_reason(walk::Stop::Deadline), ForgetReason::TimedOut);
+        assert!(retryable(ForgetReason::TimedOut));
+        assert!(!retryable(ForgetReason::Symlink));
+    }
 
     #[test]
     fn only_the_transcripts_own_names_are_its_family() {
