@@ -364,8 +364,11 @@ One form, one request (`POST /api/sessions`):
   default-hat mounts; per (host, hat), the local stdio servers (command, args,
   env; step-up); a persistent note that changes apply to new and resumed
   sessions. Vendor error text renders as text.
-- **Hats:** create, rename, theme (colour; logo uploaded as SVG or PNG,
-  sanitised by the server and always rendered as `<img>`), default hat per
+- **Hats:** create, rename, theme (one colour, the second accent derived
+  from it; a logo, uploaded as a PNG: an SVG, WebP or JPEG the operator picks
+  is drawn onto a canvas in the browser and uploaded as a PNG, which the
+  server re-encodes (kernel spec §5.1); always rendered as `<img>` from
+  `/api/hats/{id}/logo?v=<HatItem.logo>`), default hat per
   host, path rules per host with a live "this path resolves to" tester, and
   "Purge hat" (lists what will be deleted; confirmation plus step-up).
 - **Settings:** account and passkeys (label, created, last used; registering

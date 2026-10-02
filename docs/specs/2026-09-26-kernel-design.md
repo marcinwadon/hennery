@@ -76,7 +76,8 @@ hat_push_policies(hat_id PK, owner_id, muted, details, generic_title,
 purged_hats(hat_id PK, owner_id, purged_at)                  -- §5.5
 ```
 
-`hats` and `hat_path_rules` are in §5.1.
+`hats` and `hat_path_rules` are in §5.1; a hat's logo is three columns of
+`hats` there (plan 4d-B2).
 
 Times are integer Unix seconds; the REST API shows RFC 3339.
 `hosts.public_key` (lowercase hex) is unique, across owners too.
@@ -284,6 +285,8 @@ minutes** (`auth_sessions.last_step_up_at`), even inside a valid session:
 - local stdio server configuration;
 - registering or revoking passkeys; revoking hosts or auth sessions;
 - deleting sessions, re-assigning a session to another hat, and purging hats;
+- changing a hat (name, colour, the default for new hosts) or its logo
+  (setting or removing it; plan 4d-B2), and replacing a host's path rules;
 - changing `public_url`.
 
 Without a fresh check the endpoint answers 403 `step_up_required`; the
@@ -466,8 +469,8 @@ that speaks the socket protocol directly (§10).
 ### 5.1 Model
 
 ```sql
-hats(id TEXT PK, owner_id, name, colour, logo_mime NULL, logo_bytes NULL,
-  created_at)                    -- push policy: hat_push_policies (§1.1, §6)
+hats(id TEXT PK, owner_id, name, colour, created_at,
+  logo_mime NULL, logo_bytes NULL, logo_etag NULL)  -- all three or none; push policy: hat_push_policies (§1.1, §6)
 hat_path_rules(id TEXT PK, owner_id, host_id, prefix, hat_id, verified BOOL)
 ```
 
@@ -475,11 +478,29 @@ hat_path_rules(id TEXT PK, owner_id, host_id, prefix, hat_id, verified BOOL)
 is the default for new hosts until changed. A hat referenced by a host default
 cannot be deleted; otherwise hats are removed by purge (§5.5).
 
-**Logos** are uploaded as SVG or PNG (≤ 64 KiB), **sanitised server-side**
-(SVG: scripts, event handlers, `foreignObject`, external references and
-non-`data:` URLs removed; PNG: decoded and re-encoded) and served from
-`GET /api/hats/{id}/logo` with `nosniff` and a `default-src 'none'`
-policy. The frontend renders them only as `<img>`, never inline.
+**Logos** are uploaded as a **PNG only** (≤ 64 KiB decoded, as standard
+base64 in a JSON body of at most 96 KiB), and **re-encoded server-side**: the
+header alone is read first and an image over 1024 pixels either way refused
+before any pixel buffer exists; the first frame is decoded to 8-bit pixels
+(palettes and transparency expanded, 16-bit cut) and written afresh as `IHDR`,
+`IDAT` and `IEND` only, so no text, metadata, profile, animation or trailing
+bytes of the upload survive; the result is at most 256 KiB. SVG is not taken:
+a document format served from this origin could run script if its URL were
+opened directly, and Rust has no maintained SVG sanitiser; WebP is not taken
+either (`image-webp` 0.2.4 sizes a VP8 frame's buffers from the inner header
+before the canvas check). The web UI turns an SVG, WebP or JPEG into a PNG in
+the browser before it uploads (plan 4d-B2, its security review's ruling B).
+They are served from `GET /api/hats/{id}/logo` (a browser `GET`, §3.3) as
+`image/png`, chosen by the kind stored, with `nosniff`,
+`Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'`,
+`Content-Disposition: inline; filename="logo.png"`,
+`Cross-Origin-Resource-Policy: same-origin`, and `Cache-Control: private,
+no-cache` with a strong `ETag` (304 when `If-None-Match` names it), so the
+URL opened as a page is still an inert image. `HatItem.logo` is that `ETag`,
+absent without a logo. `PUT` and `DELETE` need step-up (§3.4); a hat frozen
+for its purge takes no new logo (409 `hat_purging`) but can lose its own; the
+purge takes the logo with the hat's row. The frontend renders them only as
+`<img>`, never inline.
 
 ### 5.2 Resolution
 
@@ -783,7 +804,7 @@ frontend spec §6.4) this makes agent output unable to run script in the UI.
 | `GET /api/hosts`, `PATCH/DELETE /api/hosts/{id}` | List, rename/default hat, revoke (step-up) |
 | `GET /api/hosts/ws` | Host WebSocket (ACP core) |
 | `GET/POST /api/hats`, `PATCH /api/hats/{id}` | Hats |
-| `GET/PUT /api/hats/{id}/logo` | Sanitised logo (§5.1) |
+| `GET/PUT/DELETE /api/hats/{id}/logo` | The hat's logo: served as a re-encoded PNG; set from a PNG `{data}` in base64; removed (§5.1; PUT and DELETE: step-up) |
 | `POST /api/hats/{id}/purge` | Purge a hat (step-up, §5.5) |
 | `GET/PUT /api/hosts/{id}/path-rules` | Path rules (full set) |
 | `POST /api/hats/resolve` | `{host_id, path}` → `{canonical, exists, is_dir, hat_id, rule_id?}` |
@@ -886,7 +907,11 @@ an existing data directory without `--force`.
   code is spent.
 - Hat resolution table tests: segment match, longest prefix, default fallback,
   symlinked paths (canonical on host), unverified rules.
-- Logo sanitisation: scripts, event handlers and external references removed.
+- Logo re-encoding: only `IHDR`/`IDAT`/`IEND` come out, with the pixels the
+  upload decoded to; text, metadata, profiles, private chunks and a document
+  after `IEND` do not survive; SVG, WebP, JPEG and GIF refused; the size
+  checked from the header before anything is decoded; the logo URL fetched
+  directly carries its sandbox policy, `nosniff` and its fixed type.
 - Purge: sessions, gateway rows and rules removed; `forget_hat` sent after
   handshakes.
 - Push: 410 removes the subscription; non-2xx logged; generic title honoured.
