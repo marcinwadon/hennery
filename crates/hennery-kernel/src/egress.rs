@@ -46,7 +46,10 @@
 //!   request's own timeout or else [`Timeouts::request`].
 //!   [`EgressClient::send_streaming`] bounds only the wait for the response
 //!   head the same way; the caller reads the body for as long as it wants
-//!   and decides for itself when a stream has been idle too long.
+//!   and decides for itself when a stream has been idle too long. A body
+//!   that fails while it is read (`send`'s deadline included) fails with a
+//!   `reqwest::Error` from [`Response`], not an [`EgressError`]: strip its
+//!   URL with `without_url()` before logging it.
 //! - **Errors** ([`EgressError`]) never carry the URL (its path or query can
 //!   hold a secret), so they are safe to log.
 //! - **Per-caller limits** ([`Limiter`]): a counter of permits per caller
@@ -63,7 +66,7 @@ use std::time::Duration;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 /// What a caller needs to build a request and read its answer, so it
 /// depends on the kernel, not on reqwest.
-pub use reqwest::{Method, Request, Response, Url, header};
+pub use reqwest::{Method, Request, Response, StatusCode, Url, header};
 use url::Host;
 
 /// Whether a request may reach non-public addresses.
@@ -543,6 +546,9 @@ mod tests {
         );
     }
 
+    /// Well-known public resolvers' addresses: only parsed and classified,
+    /// never connected to. The documentation ranges cannot stand in for
+    /// them, since they are rightly not public.
     #[test]
     fn public_literals_and_names_pass() {
         for url in [
