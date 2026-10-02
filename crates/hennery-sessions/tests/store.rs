@@ -376,7 +376,9 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
-            "DROP INDEX sessions_by_hat;
+            "DROP INDEX events_by_kind;
+             ALTER TABLE pending DROP COLUMN opened_event_id;
+             DROP INDEX sessions_by_hat;
              ALTER TABLE sessions DROP COLUMN hat_id;
              ALTER TABLE sessions DROP COLUMN hat_rule_id;
              DROP INDEX sessions_by_recency;
@@ -2439,10 +2441,13 @@ fn the_hat_migration_gives_each_session_its_hosts_default_hat() {
             .create_session("s-gone", "h-gone", "fake", "/tmp", "x", None)
             .unwrap();
     }
-    // Back to the store's schema before hats (version 9).
+    // Back to the store's schema before hats (version 9): plan 10b-iii's
+    // migration (version 11) undone too.
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.execute_batch(
-        "DROP INDEX sessions_by_hat;
+        "DROP INDEX events_by_kind;
+         ALTER TABLE pending DROP COLUMN opened_event_id;
+         DROP INDEX sessions_by_hat;
          ALTER TABLE sessions DROP COLUMN hat_id;
          ALTER TABLE sessions DROP COLUMN hat_rule_id;
          PRAGMA user_version = 9;",

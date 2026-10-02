@@ -119,10 +119,12 @@ fn the_owner_id_migration_gives_every_row_the_owner() {
         let conn = rusqlite::Connection::open(&db).unwrap();
         write_world(&conn, &owner, "a");
         // Back to the store's schema before this plan (version 6): plan
-        // 5c's migration (version 10) and 6b's (version 9) undone first,
-        // their indexes on `owner_id` included.
+        // 10b-iii's migration (version 11), 5c's (version 10) and 6b's
+        // (version 9) undone first, their indexes on `owner_id` included.
         conn.execute_batch(
             "
+            DROP INDEX events_by_kind;
+            ALTER TABLE pending DROP COLUMN opened_event_id;
             DROP INDEX sessions_by_hat;
             ALTER TABLE sessions DROP COLUMN hat_id;
             ALTER TABLE sessions DROP COLUMN hat_rule_id;
