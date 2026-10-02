@@ -35,13 +35,16 @@
 //! - **Logs** name the connection and its slug, never the token, the
 //!   credential or more of the upstream URL than its origin (lane L11).
 
+use crate::api::GatewayState;
 use crate::jsonrpc::{self, Answered, BOM, EventOutcome, Inspected};
 use crate::key::MasterKey;
 use crate::model::{CredKind, url_for_logs};
+use crate::revocation::{Revocations, Watch};
 use crate::scope::{ClientIdentity, MountPolicy, Principal, ProxyStore, ScopedConnection};
 use crate::store::GatewayStore;
+use crate::tokens::{is_session_token, token_hash};
 use axum::Router;
-use axum::body::{Body, Bytes};
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
@@ -134,26 +137,25 @@ pub struct ProxyState {
     pub key: Arc<MasterKey>,
     pub egress: Egress,
     pub limits: Limits,
+    /// What a revoke cuts (plan 8e decision 12): the same one the sessions'
+    /// side revokes through (`session::GatewayMcp`).
+    pub revocations: Revocations,
 }
 
 impl ProxyState {
     /// Full mode (umbrella §10.2): session tokens and host mounts, both from
-    /// `store`.
-    pub fn full(
-        store: Arc<ProxyStore>,
-        credentials: Arc<GatewayStore>,
-        key: Arc<MasterKey>,
-        egress: Egress,
-        limits: Limits,
-    ) -> Self {
+    /// `store`; requests watched in `gateway`'s `Revocations`, with its
+    /// store and key.
+    pub fn full(store: Arc<ProxyStore>, gateway: &GatewayState, egress: Egress, limits: Limits) -> Self {
         Self {
             identity: store.clone(),
             mounts: store.clone(),
-            credentials,
+            credentials: gateway.store.clone(),
             statuses: store,
-            key,
+            key: gateway.key.clone(),
             egress,
             limits,
+            revocations: gateway.revocations.clone(),
         }
     }
 }
@@ -361,9 +363,72 @@ enum ReadError {
     Failed,
 }
 
-/// `POST|GET|DELETE /mcp/{slug}`.
+/// `POST|GET|DELETE /mcp/{slug}`. A session token is watched from before
+/// it is resolved until the answer's body ends (plan 8e decision 12): a
+/// revoke that commits meanwhile ends the request, a 404 if no answer has
+/// begun, else its body cut short with an error. Bodies already whole in
+/// memory are left as they are.
 async fn proxy(
     State(state): State<ProxyState>,
+    slug: Result<Path<String>, PathRejection>,
+    method: Method,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let watch = bearer(&headers)
+        .filter(|token| is_session_token(token))
+        .map(|token| state.revocations.watch(&token_hash(token)));
+    let Some(watch) = watch else {
+        // Never resolves: answered as for any unknown token.
+        return forward(state, slug, method, headers, body).await;
+    };
+    let revoked = watch.token();
+    let answer = tokio::select! {
+        biased;
+        () = revoked.cancelled() => {
+            tracing::info!("gateway proxy: the session token was revoked before the answer");
+            return not_found();
+        }
+        answer = forward(state, slug, method, headers, body) => answer,
+    };
+    if answer.body().size_hint().exact().is_some() {
+        return answer;
+    }
+    let (parts, body) = answer.into_parts();
+    Response::from_parts(parts, Body::from_stream(cut_off(body.into_data_stream(), watch)))
+}
+
+/// `body` until its token is cut, then an error, which ends the response
+/// mid-body (the client sees a broken stream, never a complete one), and
+/// drops the upstream's.
+fn cut_off<S>(body: S, watch: Watch) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, axum::Error>> + Send + 'static,
+{
+    let revoked = watch.token();
+    futures::stream::unfold(
+        (Box::pin(body), Some(watch), revoked),
+        |(mut body, watch, revoked)| async move {
+            let watch = watch?;
+            tokio::select! {
+                biased;
+                () = revoked.cancelled() => {
+                    tracing::info!("gateway proxy: the session token was revoked, its stream cut");
+                    Some((Err(std::io::Error::other("the session token was revoked")), (body, None, revoked)))
+                }
+                next = body.next() => match next {
+                    Some(Ok(bytes)) => Some((Ok(bytes), (body, Some(watch), revoked))),
+                    Some(Err(err)) => Some((Err(std::io::Error::other(err)), (body, None, revoked))),
+                    None => None,
+                },
+            }
+        },
+    )
+}
+
+/// The proxy's work for one request, once its token is watched.
+async fn forward(
+    state: ProxyState,
     slug: Result<Path<String>, PathRejection>,
     method: Method,
     headers: HeaderMap,

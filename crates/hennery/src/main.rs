@@ -442,8 +442,7 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     // above, shared with Web Push.
     let proxy = hennery_gateway::proxy::ProxyState::full(
         std::sync::Arc::new(hennery_gateway::scope::ProxyStore::open(&db)?),
-        gateway.store.clone(),
-        gateway.key.clone(),
+        &gateway,
         egress.clone(),
         hennery_gateway::proxy::Limits::default(),
     );

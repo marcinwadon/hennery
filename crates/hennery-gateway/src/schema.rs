@@ -80,4 +80,33 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     CREATE INDEX gw_session_tokens_by_host ON gw_session_tokens(owner_id, host_id);
     CREATE INDEX gw_session_tokens_by_hat ON gw_session_tokens(owner_id, hat_id);
     ",
+    // Plan 8e: local stdio servers (gateway spec §3.4), one set per (host,
+    // hat), replaced whole. A server keeps its row while its name stays
+    // (decision E1). Only the environment's values are sealed (§2), as one
+    // JSON object per row, bound to the row, its host and its hat
+    // (`crypto::seal_stdio`, R5); their names are kept beside, in order.
+    // A hat's sets go with its purge (`GatewayStore::purge_hat`), before
+    // the hat row can be deleted; a revoked host's stay (decision E5).
+    "
+    CREATE TABLE gw_stdio_servers (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL REFERENCES owners(id),
+        host_id TEXT NOT NULL,
+        hat_id TEXT NOT NULL,
+        name TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        command TEXT NOT NULL,
+        args TEXT NOT NULL,
+        env_names TEXT NOT NULL,
+        key_version INTEGER,
+        env_ciphertext BLOB,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        UNIQUE (owner_id, host_id, hat_id, name),
+        CHECK ((key_version IS NULL) = (env_ciphertext IS NULL)),
+        FOREIGN KEY (host_id, owner_id) REFERENCES hosts(id, owner_id),
+        FOREIGN KEY (hat_id, owner_id) REFERENCES hats(id, owner_id));
+    CREATE INDEX gw_stdio_servers_by_hat ON gw_stdio_servers(owner_id, hat_id);
+    CREATE INDEX gw_stdio_servers_by_name ON gw_stdio_servers(owner_id, name);
+    ",
 ];
