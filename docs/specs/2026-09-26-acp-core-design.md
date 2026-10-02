@@ -1065,6 +1065,15 @@ the agent's stored history came from the old hat; the change writes a
 `hat_reassigned{from, to}` event. The next resume re-resolves the path and must
 agree with the new hat, or the operator must also change the path rules.
 
+`PATCH /api/sessions/{id} {hat_id}` needs step-up (kernel spec §3.4), checked
+before anything is read. A presumed-parked session is refused (409
+`presumed_parked`): its host is away and may still run it, with the old hat's
+MCP servers, so it is closed first. `starting` and `active` are 409 with their
+lifecycle. The hat must be one of the owner's (400 `invalid`); the same hat is
+a no-op. One transaction re-checks the lifecycle, moves the session, clears
+`hat_rule_id` (that rule no longer decided its hat) and writes the event
+(plan 5d).
+
 ### 4.10 Delete
 
 `DELETE /api/sessions/{id}` (step-up required, kernel spec §3.4) closes an
@@ -1108,8 +1117,10 @@ spec §5.5) deletes every session of the hat the same way.
      `turn_ended_synthesized{interrupted}` if it did (reachable with a lost
      outbox, or a `turn_started` emitted between the `hello` snapshot and the
      resend; leaving it open would wedge the session at 409);
-   - attached sessions the collector has closed, or whose hat was re-assigned,
-     receive `close_session` (§4.8);
+   - attached sessions the collector has closed receive `close_session`
+     (§4.8). A session is re-assigned only once closed or truly parked (§4.9),
+     so a re-assigned session the host still has attached is one the collector
+     closed;
    - the host is marked ready; then the answer queue for that host is drained
      (§4.6).
 
@@ -1450,7 +1461,7 @@ All endpoints require an operator session (kernel spec §3). Types come from
 | `DELETE /api/sessions/{id}` | Delete (§4.10); step-up required. |
 | `POST /api/sessions/{id}/config` | `{config_id, value}` (a select's value id or a boolean) → 202 with the session's stored `SessionCatalog` once `config_applied` is ingested (after a read-back without options it still shows the old values, §3.2); 409 `not_attached` (not `active`, or host not ready) / `unknown_option`; 400 `invalid`; 502 `config_failed`; 422 for a value that is neither a string nor a boolean. Every viewer also gets SSE `catalog_changed`. |
 | `POST /api/sessions/{id}/pending/{pending_id}/answer` | `{option_id}` (permission) or `{action, content?}` (elicitation) → 202 `{pending_id, request_id}` once queued, whatever the lifecycle or host state; 404; 409 `not_open` / `already_answered`; 400 `invalid`; 422 for a body that is neither kind. The verdict follows as SSE `pending_changed`. |
-| `PATCH /api/sessions/{id}` | Rename; hat re-assignment (no running adapter, §4.9). |
+| `PATCH /api/sessions/{id}` | `UpdateSessionRequest {hat_id?}` → 200 `SessionDetail`; hat re-assignment (no running adapter, §4.9): 403 `step_up_required`, 400 `invalid` (not the owner's hat), 404, 409 lifecycle or `presumed_parked`. A body naming no hat needs no step-up; renaming (`title`) joins it later. |
 | `GET /api/attachments/{sha256}` | Image bytes of the owner's, as their stored type, with `nosniff`, `Content-Security-Policy: default-src 'none'`, `Cross-Origin-Resource-Policy: same-origin` and `Cache-Control: private, max-age=31536000, immutable`; 404 for any name that is not one of the owner's images. |
 | `GET /api/settings/attachments` | `AttachmentUsage {count, bytes}`: the owner's stored images, each once, for Settings (§15). |
 | `GET /api/hosts/{id}/projects` / `…/browse?path=` | Project picker. |
