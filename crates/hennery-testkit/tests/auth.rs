@@ -109,6 +109,7 @@ async fn hello(ws: &mut Ws, host_id: &str, proof: String) -> CollectorFrame {
             capabilities: Default::default(),
             workspace_roots: vec![],
             attached_sessions: vec![],
+            mcp_isolation: Default::default(),
         })
         .unwrap(),
     ))

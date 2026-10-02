@@ -1,6 +1,6 @@
 //! Connected hosts and in-flight collector→host requests.
 
-use hennery_proto::frames::{Capabilities, Capability, CollectorFrame, HostFrame, SessionBody};
+use hennery_proto::frames::{AgentIsolation, Capabilities, Capability, CollectorFrame, HostFrame, SessionBody};
 use hennery_proto::rest::EventDto;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +22,11 @@ pub enum RequestError {
     /// The host's connection lacks the capability the probe needs (ACP core
     /// §3.3); nothing was sent.
     Unsupported,
+    /// The host's connection cannot take the MCP servers a start or resume
+    /// carries (`HostConn::takes`, plan 8c): it did not announce
+    /// `mcp_servers`, or does not isolate the agent and isolation was not
+    /// waived. Nothing was sent.
+    McpUndeliverable,
     /// The connection has `MAX_PROBES` probes in flight already; nothing
     /// was sent.
     Busy,
@@ -91,6 +96,25 @@ struct HostConn {
     ended: CancellationToken,
     /// From this connection's `hello` (ACP core §3.3).
     capabilities: Capabilities,
+    /// From the same `hello`: per agent, how it isolates MCP servers.
+    mcp_isolation: AgentIsolation,
+}
+
+impl HostConn {
+    /// Whether `frame` may go out on this connection (plan 8c, the lane's
+    /// L3): MCP servers only to a host that announced `mcp_servers`, which
+    /// would otherwise ignore them unseen, and only for an agent it
+    /// isolates, unless the collector waived that. Checked under the hosts
+    /// lock, against the very connection the frame goes out on, so a host
+    /// that reconnects on an older build cannot slip in between.
+    fn takes(&self, frame: &CollectorFrame) -> bool {
+        let Some(mcp) = frame.mcp_delivery() else {
+            return true;
+        };
+        mcp.mcp_servers.is_empty()
+            || (self.capabilities.has(Capability::McpServers)
+                && (mcp.isolation_waived || frame.agent().is_some_and(|agent| self.mcp_isolation.isolates(agent))))
+    }
 }
 
 impl HostConn {
@@ -144,14 +168,16 @@ impl Hub {
         }
     }
 
-    /// Register a host connection (not yet ready) with the capabilities its
-    /// `hello` announced. A second live connection for the same host id is
-    /// refused, never allowed to supersede the first silently.
+    /// Register a host connection (not yet ready) with the capabilities and
+    /// the MCP isolation its `hello` announced. A second live connection for
+    /// the same host id is refused, never allowed to supersede the first
+    /// silently.
     pub fn register(
         &self,
         host_id: &str,
         tx: mpsc::UnboundedSender<CollectorFrame>,
         capabilities: Capabilities,
+        mcp_isolation: AgentIsolation,
     ) -> Option<Registration> {
         let mut hosts = self.hosts.lock().expect("hosts lock");
         if hosts.get(host_id).is_some_and(|h| !h.tx.is_closed()) {
@@ -168,6 +194,7 @@ impl Hub {
                 kicked: kicked.clone(),
                 ended: CancellationToken::new(),
                 capabilities,
+                mcp_isolation,
             },
         );
         if let Some(old) = replaced {
@@ -304,6 +331,23 @@ impl Hub {
             .is_some_and(|h| h.capabilities.has(capability))
     }
 
+    /// How the host's current connection isolates `agent`'s MCP servers
+    /// (`hello.mcp_isolation`), with whether it announced `mcp_servers` at
+    /// all; `None` if it is not connected. For plan 8e's delivery decision.
+    /// A connection without `mcp_servers` isolates nothing, whatever its
+    /// `hello` said: it would take no servers.
+    pub fn mcp_isolation(&self, host_id: &str, agent: &str) -> Option<(bool, hennery_proto::frames::McpIsolation)> {
+        self.hosts.lock().expect("hosts lock").get(host_id).map(|h| {
+            let announced = h.capabilities.has(Capability::McpServers);
+            let isolation = if announced {
+                h.mcp_isolation.get(agent)
+            } else {
+                hennery_proto::frames::McpIsolation::None
+            };
+            (announced, isolation)
+        })
+    }
+
     /// Send a frame nobody waits for (an answer: its verdict arrives as a
     /// fact, ACP core §4.6) to a host that is connected and reconciled.
     /// `false` if it is not: the frame then goes after its next handshake.
@@ -312,7 +356,8 @@ impl Hub {
             .lock()
             .expect("hosts lock")
             .get(host_id)
-            .filter(|h| h.routable())
+            // Nothing that carries servers goes out unchecked, here either.
+            .filter(|h| h.routable() && h.takes(&frame))
             .is_some_and(|h| h.tx.send(frame).is_ok())
     }
 
@@ -395,6 +440,9 @@ impl Hub {
             let Some(host) = hosts.get(host_id).filter(|h| h.routable()) else {
                 return Err(RequestError::NotConnected);
             };
+            if !host.takes(&frame) {
+                return Err(RequestError::McpUndeliverable);
+            }
             self.waiters.lock().expect("waiters lock").insert(
                 request_id.to_string(),
                 Waiter {

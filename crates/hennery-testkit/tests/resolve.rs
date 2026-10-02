@@ -85,6 +85,15 @@ impl ScriptedHost {
 
     /// `connect` announcing `capabilities`.
     async fn connect_with(collector: &Collector, capabilities: Capabilities) -> Self {
+        Self::connect_announcing(collector, capabilities, Default::default()).await
+    }
+
+    /// `connect_with`, announcing `mcp_isolation` too (plan 8c).
+    async fn connect_announcing(
+        collector: &Collector,
+        capabilities: Capabilities,
+        mcp_isolation: hennery_proto::frames::AgentIsolation,
+    ) -> Self {
         let (ws, response) = tokio_tungstenite::connect_async(format!("ws://{}/api/hosts/ws", collector.addr))
             .await
             .unwrap();
@@ -101,6 +110,7 @@ impl ScriptedHost {
             capabilities,
             workspace_roots: vec![],
             attached_sessions: vec![],
+            mcp_isolation,
         })
         .await;
         assert!(matches!(host.next().await, CollectorFrame::HelloAck { .. }));
@@ -922,5 +932,67 @@ async fn a_reassigned_session_resumes_in_its_new_hat_once_the_rules_agree() {
     let call = resume();
     host.answer("/home/me/acme", true).await;
     host.started().await;
+    assert_eq!(call.await.unwrap().0, 202);
+}
+
+/// Plan 8c: a start and a resume carry the session's hat, and no servers
+/// yet (minting is plan 8e's); the per-agent isolation a `hello` announces
+/// reaches the hub, from the live connection.
+#[tokio::test]
+async fn starts_and_resumes_carry_the_sessions_hat_and_no_servers() {
+    use hennery_proto::frames::{AgentIsolation, McpDelivery, McpIsolation, SessionBody};
+    let collector = Collector::start().await;
+    let acme = collector.hat("Acme");
+    rule(&collector, "/home/me/acme", &acme, true);
+    let isolation = AgentIsolation([("fake".to_string(), McpIsolation::ClaudeStrict)].into_iter().collect());
+    let capabilities = Capabilities(vec![Capability::ResolvePath, Capability::McpServers]);
+    let mut host = ScriptedHost::connect_announcing(&collector, capabilities, isolation).await;
+    assert_eq!(
+        collector.state.hub.mcp_isolation(HOST, "fake"),
+        Some((true, McpIsolation::ClaudeStrict))
+    );
+
+    let call = start(&collector, "/home/me/acme");
+    host.answer("/home/me/acme", true).await;
+    let CollectorFrame::StartSession {
+        request_id,
+        session_id,
+        hat_id,
+        mcp,
+        ..
+    } = host.next().await
+    else {
+        panic!("expected a start");
+    };
+    assert_eq!((hat_id.as_str(), &mcp), (acme.as_str(), &McpDelivery::default()));
+    host.emit(&session_id, SessionBody::session_started(request_id, "agent-1"))
+        .await;
+    assert_eq!(call.await.unwrap().0, 202);
+    host.parked(&session_id).await;
+    wait_for("parked", || async {
+        let row = collector.state.store.find_session(&session_id).unwrap().unwrap();
+        (row.lifecycle == "parked").then_some(())
+    })
+    .await;
+
+    let call = send(
+        &collector,
+        "POST",
+        &format!("/api/sessions/{session_id}/resume"),
+        json!({}),
+    );
+    host.answer("/home/me/acme", true).await;
+    let CollectorFrame::ResumeSession {
+        request_id,
+        hat_id,
+        mcp,
+        ..
+    } = host.next().await
+    else {
+        panic!("expected a resume");
+    };
+    assert_eq!((hat_id.as_str(), &mcp), (acme.as_str(), &McpDelivery::default()));
+    host.emit(&session_id, SessionBody::session_started(request_id, "agent-1"))
+        .await;
     assert_eq!(call.await.unwrap().0, 202);
 }
