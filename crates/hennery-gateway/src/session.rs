@@ -142,7 +142,7 @@ fn mounted_slugs_in(tx: &Transaction<'_>, owner: &str, host_id: &str, hat_id: &s
              AND EXISTS (SELECT 1 FROM gw_mounts m JOIN hosts h ON h.id = m.host_id AND h.owner_id = ?1
                          WHERE m.connection_id = c.id AND m.owner_id = ?1 AND m.host_id = ?3
                              AND h.revoked_at IS NULL)
-         ORDER BY c.created_at, c.id",
+         ORDER BY c.slug",
     )?;
     let rows = stmt.query_map(params![owner, hat_id, host_id], |r| r.get(0))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)

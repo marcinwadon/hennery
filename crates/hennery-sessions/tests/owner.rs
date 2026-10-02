@@ -143,6 +143,9 @@ fn the_owner_id_migration_gives_every_row_the_owner() {
             ALTER TABLE sessions DROP COLUMN git_worktree;
             ALTER TABLE sessions DROP COLUMN base_commit;
             ALTER TABLE sessions DROP COLUMN last_event_id;
+            ALTER TABLE sessions DROP COLUMN mcp_delivery_mode;
+            ALTER TABLE sessions DROP COLUMN mcp_delivery_servers;
+            ALTER TABLE sessions DROP COLUMN mcp_delivery_at;
             ALTER TABLE session_catalog DROP COLUMN commands;
             ",
         )
