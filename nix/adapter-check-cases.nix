@@ -1,10 +1,11 @@
 # `adapter-check.nix` judges each outcome as it says (plan 7e-ii-a): fake
-# adapters, made of programs compiled here (one exits 0, one 1) and a shell
-# script as the adapter, each built through the check. A good one passes, and so does one whose helper's
-# loader this system lacks (Linux), by name. One whose CLI fails, one whose
-# helper cannot start (Linux), one with no native program, and one that
-# does not answer `initialize` each fail with their reason
-# (`testers.testBuildFailure`).
+# adapters, made of native programs compiled here and a shell script as
+# the adapter, each built through the check.
+# - Passes: a good one; one whose helper's loader this system lacks
+#   (Linux), passed over by name.
+# - Fails, each with its reason (`testers.testBuildFailure`): a CLI that
+#   fails; a CLI whose `--version` does not name it; a helper that cannot
+#   start (Linux); no native program; no answer to `initialize`.
 {
   lib,
   stdenv,
@@ -25,8 +26,8 @@ let
   silent = writeShellScript "silent" ''
     read -r _
   '';
-  # A fake adapter: `programs` (name = command to make it) in its CLI's
-  # package, and `adapter` as its wrapper.
+  # A fake adapter: `programs` (name = how to make it) in its CLI's package,
+  # and `adapter` as its wrapper.
   fake =
     name:
     {
@@ -48,38 +49,46 @@ let
       passthru.cliPaths = [ "lib/cli" ];
       meta.mainProgram = "fake-acp";
     };
-  # A native program that exits with `code`, whatever its arguments.
-  exits = code: target: "echo 'int main(void) { return ${toString code}; }' | $CC -x c -o ${target} -";
+  # A native program that prints `text` and exits with `code`, whatever its
+  # arguments.
+  says =
+    text: code: target:
+    "printf '%s\\n' '#include <stdio.h>' 'int main(void) { puts(\"${text}\"); return ${toString code}; }'"
+    + " | $CC -x c -o ${target} -";
+  claude = says "2.1.0 (Claude Code)" 0;
   # An ELF whose loader is somewhere else: missing, or not a loader at all.
-  loader = path: target: "${exits 0 target}; patchelf --set-interpreter ${path} ${target}";
+  loader = path: target: "${says "" 0 target}; patchelf --set-interpreter ${path} ${target}";
   passes = name: drv: (adapterCheck drv).overrideAttrs { name = "adapter-check-passes-${name}"; };
   fails =
     name: drv: reason:
     runCommand "adapter-check-fails-${name}" { failed = testers.testBuildFailure (adapterCheck drv); } ''
-      grep -q ${lib.escapeShellArg reason} "$failed/testBuildFailure.log" || {
+      grep -qF ${lib.escapeShellArg reason} "$failed/testBuildFailure.log" || {
         echo "${name}: expected ${lib.escapeShellArg reason}, got:"; cat "$failed/testBuildFailure.log"; exit 1;
       }
       touch "$out"
     '';
   cases = {
-    good = passes "good" (fake "good" { programs.claude = exits 0; });
-    cli-fails = fails "cli-fails" (fake "cli-fails" { programs.codex = exits 1; }) "failed: 1";
+    good = passes "good" (fake "good" { programs.claude = claude; });
+    cli-fails = fails "cli-fails" (fake "cli-fails" { programs.codex = says "codex-cli 1.0" 1; }) "failed: 1";
+    cli-unnamed = fails "cli-unnamed" (fake "cli-unnamed" {
+      programs.claude = says "1.3.0" 0;
+    }) "does not say (Claude Code)";
     no-program = fails "no-program" (fake "no-program" { programs = { }; }) "no native program found";
     no-answer = fails "no-answer" (fake "no-answer" {
-      programs.rg = exits 0;
+      programs.rg = says "ripgrep 15.2.0" 0;
       adapter = silent;
     }) "did not answer initialize";
   }
   // lib.optionalAttrs linux {
     loader-missing = passes "loader-missing" (fake "loader-missing" {
       programs = {
-        claude = exits 0;
+        inherit claude;
         helper = loader "/nonexistent/ld-musl-x86_64.so.1";
       };
     });
     helper-cannot-start = fails "helper-cannot-start" (fake "helper-cannot-start" {
       programs = {
-        claude = exits 0;
+        inherit claude;
         helper = loader "${coreutils}/bin/true";
       };
     }) "did not run";

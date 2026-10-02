@@ -41,7 +41,20 @@ runCommand "${adapter.pname}-runs"
         esac
         echo "running $program --version"
         status=0
-        timeout 120 "$program" --version < /dev/null || status=$?
+        said=$(timeout 120 "$program" --version < /dev/null 2>&1) || status=$?
+        echo "$said"
+        # Each CLI must name itself: a bun-compiled one that lost its
+        # program (stripped) answers with bun's version instead.
+        case "$(basename "$program")" in
+          claude) name="(Claude Code)" ;;
+          codex) name="codex-cli" ;;
+          rg) name="ripgrep" ;;
+          *) name="" ;;
+        esac
+        if [ "$status" -eq 0 ] && [ -n "$name" ] && ! grep -qF "$name" <<< "$said"; then
+          echo "$program --version does not say $name" >&2
+          exit 1
+        fi
         # The CLIs themselves must answer; a helper that takes no
         # `--version` must still have started (not 126 or 127, the loader's
         # failures, nor a signal or the timeout's 124). A helper whose
