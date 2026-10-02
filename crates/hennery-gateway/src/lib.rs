@@ -1,13 +1,19 @@
 //! The MCP gateway (gateway spec): connections, their credentials at rest,
-//! and the hosts they are mounted on. Depends on `hennery-kernel` and
-//! `hennery-proto`, never on `hennery-sessions` (umbrella §9).
+//! the hosts they are mounted on, session tokens, and the proxy that
+//! forwards a token's requests to its connections. Depends on
+//! `hennery-kernel` and `hennery-proto`, never on `hennery-sessions`
+//! (umbrella §9).
 
 pub mod api;
 pub mod crypto;
+mod jsonrpc;
 pub mod key;
 pub mod model;
+pub mod proxy;
 mod schema;
+pub mod scope;
 pub mod store;
+pub mod tokens;
 
 use anyhow::Result;
 use hennery_kernel::operator::Operator;

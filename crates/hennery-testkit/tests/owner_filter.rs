@@ -75,6 +75,17 @@ const SOURCES: &[(&str, &str, usize)] = &[
         include_str!("../../hennery-gateway/src/store.rs"),
         GATEWAY_STATEMENTS,
     ),
+    // Plan 8d: session tokens, and the proxy's reads and writes.
+    (
+        "hennery-gateway/src/tokens.rs",
+        include_str!("../../hennery-gateway/src/tokens.rs"),
+        4,
+    ),
+    (
+        "hennery-gateway/src/scope.rs",
+        include_str!("../../hennery-gateway/src/scope.rs"),
+        5,
+    ),
 ];
 
 /// The gateway store's statements (plan 8a), apart from the list above so

@@ -12,13 +12,22 @@ publish.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 chacha20poly1305.workspace = true
+# The proxy (plan 8d): its bodies are streams.
+futures.workspace = true
 hennery-kernel.workspace = true
 hennery-proto.workspace = true
 hex.workspace = true
 libc = "0.2"
+# The proxy's upstream requests (plan 8d), sent through the kernel's egress
+# clients (`hennery_kernel::egress`), never a client of its own.
+reqwest.workspace = true
 rusqlite.workspace = true
+# What the proxy reads of JSON-RPC (plan 8d): duplicate keys refused.
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# The proxy answers refused server requests in the background (plan 8d).
+tokio.workspace = true
 tracing.workspace = true
 url.workspace = true
 zeroize.workspace = true

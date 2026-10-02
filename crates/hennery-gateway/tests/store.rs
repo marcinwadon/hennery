@@ -633,7 +633,8 @@ fn the_store_and_the_kernel_agree_on_the_owner_whichever_opens_first() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(version, 1);
+    // Plan 8a's tables, then plan 8d's session tokens.
+    assert_eq!(version, 2);
 }
 
 /// Plan 8a decision 19 (lane L11): a connection's `Debug` shows only its

@@ -433,6 +433,17 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     // (plan 8a decision 8; `KeyUnavailable` tells that case apart).
     let keys = hennery_gateway::key::KeySource::from_env(&args.data_dir)?;
     let gateway = hennery_gateway::open(&db, &keys, state.operator.clone())?;
+    // The gateway's proxy (plan 8d), `/mcp/<slug>`: bearer tokens, beside
+    // the operator's routes and outside them (lane L8), sending only
+    // through the kernel's egress policy, the collector's one `Egress`
+    // above, shared with Web Push.
+    let proxy = hennery_gateway::proxy::ProxyState::full(
+        std::sync::Arc::new(hennery_gateway::scope::ProxyStore::open(&db)?),
+        gateway.store.clone(),
+        gateway.key.clone(),
+        egress.clone(),
+        hennery_gateway::proxy::Limits::default(),
+    );
     state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
     hennery_sessions::offline::after_startup(&state);
     hennery_sessions::sweep::after_startup(&state);
@@ -498,7 +509,9 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     });
     let served = hennery_sessions::serve_all(
         listeners,
-        hennery_sessions::router(state.clone()).merge(hennery_gateway::api::router(gateway)),
+        hennery_sessions::router(state.clone())
+            .merge(hennery_gateway::api::router(gateway))
+            .merge(hennery_gateway::proxy::router(proxy)),
         state.shutdown.clone(),
     )
     .await;
