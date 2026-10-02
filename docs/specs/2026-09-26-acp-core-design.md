@@ -418,6 +418,9 @@ host.)*
   offered no `promptCapabilities.image` in `initialize` (plan 6a). Both are
   refused before `turn_started`, so the turn never starts.
 - `start_session`: `unknown_agent` — the agent is not configured on the host.
+- `start_session`, `resume_session`: `cwd_not_canonical` — the cwd does not
+  resolve on the host to itself as a directory (a symlink swapped in since the
+  collector resolved it); nothing is spawned (plan 5c).
 - Answers to a session with no live actor are refused `not_attached`. The
   collector logs that refusal; it is no verdict (§4.6).
 - A command queued behind an ending actor is answered `not_attached` at once,
@@ -604,7 +607,6 @@ ingest in `seq` order (host facts) or when the collector writes its own event
 | `starting` | `session_started` | `active/idle` (or `active/running` once a first prompt's `turn_started` arrives); clears any `failure_reason` |
 | `starting` | `start_failed` | `failed` (reason stored) |
 | `starting` | host rejects the start/resume | `failed` (the host's code) |
-| `starting` | start with the host offline | `failed` (`host_offline`) |
 | `starting` | reconciliation finds no trace of the start | `failed` (`start_not_delivered`) |
 | `starting` | host revoked (kernel spec §4.3) | `failed` (`host_revoked`), with a `start_not_delivered` event |
 | `failed` | a late `session_started` | `active` (the real fact wins, e.g. over a `start_not_delivered` guess) |
@@ -673,7 +675,14 @@ reconciled, gets 409 `host_offline` (§9).
 **Hat resolution comes first.** `POST /api/sessions` → `resolve_path` on the
 host (canonical cwd) → path-rule match (kernel spec §5.2) → the hat is stored
 with the canonical cwd → `start_session`. A host that is offline cannot start
-a session.
+a session, and no session is created: with no resolution there is no hat
+(409 `host_offline`, plan 5c). The deciding rule is stored too
+(`sessions.hat_rule_id`, audit only). A cwd that is not a directory on the host
+is 400 `invalid_cwd`. A rule that would cover the canonical cwd but for case,
+would win, and names another hat makes the hat doubtful: 409 `hat_ambiguous`,
+naming the rule's prefix, until the host's rules are saved again (plan 5c;
+verified rules count, since the case on disk can change after a rule is
+saved).
 
 **One request starts a session.** `start_session` carries agent, cwd, model,
 mode, other config axes, the MCP servers for the session (from
@@ -699,7 +708,11 @@ last.)*
 (§4.5), and step 4 re-applies the stored model/axes/mode. If the re-resolved
 hat differs from the stored one, the resume is refused (409 `hat_mismatch`)
 with a message naming both hats; the operator must re-assign explicitly
-(§4.9). Every resume mints a fresh gateway token, superseding the previous
+(§4.9). Before that, the stored cwd is resolved again: a canonical form other
+than the stored one (a symlink swapped in, or a session from before plan 5c
+whose cwd was stored as typed) is 409 `cwd_moved`, and the near miss is
+refused as at a start (`hat_ambiguous`). A session that got no hat (`''`,
+stored before hats) always meets `hat_mismatch` until re-assigned. Every resume mints a fresh gateway token, superseding the previous
 one. The catalogue announced is the post-switch one. *(P-13: announcing the
 pre-switch catalogue made the collector overwrite a stored mode with the
 adapter default, and the next resume applied the default for real.)*
@@ -1313,7 +1326,7 @@ store's own connection, kernel spec §1). Every table carries `owner_id`.
 
 ```sql
 sessions(
-  id TEXT PK, owner_id, host_id, hat_id, source_kind, agent, cwd,
+  id TEXT PK, owner_id, host_id, hat_id, hat_rule_id NULL, source_kind, agent, cwd,
   agent_session_id, title, lifecycle, activity, presumed_parked BOOL, close_requested BOOL,
   failure_reason, model, mode, config_axes JSON,
   git_branch, git_dirty, git_worktree, base_commit,
@@ -1423,13 +1436,13 @@ All endpoints require an operator session (kernel spec §3). Types come from
 
 | Method & path | Purpose |
 |---|---|
-| `GET /api/sessions?cursor&limit&q&hat&lifecycle` | Paginated list, newest `last_event_at` first. `q` searches title, cwd, branch, id across all sessions regardless of filters except hat. |
-| `POST /api/sessions` | Start: `{host_id, agent, cwd, model?, mode?, axes?, first_prompt?{content[]}}` → 202 `{session_id, turn_id?}` once `session_started` is ingested; 409 `host_offline` (the session is created and marked `failed{host_offline}`); 502 with the host's code (`start_failed`, `unknown_agent`, …); 503 `delivery_unknown` **with `session_id`** (the session exists and may still start; the caller has no other way to learn its id). |
+| `GET /api/sessions?cursor&limit&q&hat&lifecycle` | Paginated list, newest `last_event_at` first. `q` searches title, cwd, branch, id across all sessions regardless of filters except hat. Each item carries `hat_id` (`''`: a session from before hats that got none). `hat=<id>` lists that hat's sessions (an unknown hat lists none); an empty `hat=` is 400 `invalid` (plan 5c). |
+| `POST /api/sessions` | Start: `{host_id, agent, cwd, model?, mode?, axes?, first_prompt?{content[]}}` → 202 `{session_id, turn_id?}` once `session_started` is ingested; 400 `unknown_host`; 400 `invalid_cwd`; 409 `hat_ambiguous`; 409 `host_offline` (no session is created, plan 5c); 502 with the host's code (`start_failed`, `unknown_agent`, …); 503 `delivery_unknown` **with `session_id`** (the session exists and may still start; the caller has no other way to learn its id). |
 | `GET /api/sessions/{id}` | Session detail `SessionDetail`: the list item (lifecycle, activity, failure reason, `presumed_parked`), the open turn `{turn_id, state: sent \| started}`, and `pending[]`: the open questions as `PendingItem {pending_id, session_id, kind, state, reason?, turn_id?, option_ids?, payload, answered, delivered?}`, oldest first (`answered`: an answer is queued; `delivered`: its verdict, absent until one comes). |
 | `GET /api/sessions/{id}/events?before=<event_id>&limit` | Timeline page ending before an event; without `before`, the tail. The frontend opens at the tail. |
 | `GET /api/sessions/{id}/events?after=<event_id>&limit` | Timeline page after an event (applied rows only, §8). |
 | `GET /api/sessions/{id}/catalog` | `SessionCatalog {session_id, config_options[], model?, mode?, axes{}}`; commands, plan and usage join it with the plans that produce them. |
-| `POST /api/sessions/{id}/resume` | 202 `LifecycleResponse {session_id, lifecycle}` once `session_started` is ingested; 409 `starting` / `active` (its lifecycle); 409 `agent_has_no_record` (no agent session id, host not contacted); 409 `host_offline` (nothing changes); 409 `hat_mismatch` (§4.3); 502 with the host's code for any rejection or `start_failed` (the session becomes `failed` with it); 503 `delivery_unknown` (stays `starting`, reconciled like a start). |
+| `POST /api/sessions/{id}/resume` | 202 `LifecycleResponse {session_id, lifecycle}` once `session_started` is ingested; 409 `starting` / `active` (its lifecycle); 409 `agent_has_no_record` (no agent session id, host not contacted); 409 `host_offline` (nothing changes); 409 `hat_mismatch`, `cwd_moved`, `hat_ambiguous` (§4.3); 400 `invalid_cwd`; 502 with the host's code for any rejection or `start_failed` (the session becomes `failed` with it); 503 `delivery_unknown` (stays `starting`, reconciled like a start). |
 | `POST /api/sessions/{id}/prompt` | `{content[]}` → 202 `{turn_id}` once `turn_started` is ingested; 409 `not_attached` (not `active`) / `host_offline` (host not ready) / `turn_in_progress` / `images_unsupported` (the host lacks `images`, nothing sent; or its agent takes none); 400 `empty_prompt`, 400 `invalid_content` (a block other than text or image, an image of another type, or bytes that are not the type they claim), 400 `invalid` (host); 413 `content_too_large` (§11's image and text limits; a body over 24 MiB gets 413 `body_too_large`); 503 `delivery_unknown` (the turn stays open until reconciled). Everything the collector refuses is checked before a turn opens or a file is written, except the host's per-agent refusal, a failed send and a turn that opens between the files and the turn row, which leave the prompt's images stored but unreferenced. |
 | `POST /api/sessions/{id}/cancel` | Cancel the open turn → 202 `CancelResponse {turn_id, outcome}` once that turn's `turn_ended` is ingested, with its real outcome (`cancelled`; `completed` or `failed` if it ended first; `interrupted` if the session was parked or closed meanwhile, or its adapter exited); 409 `not_attached` / `no_open_turn` / `not_running` (§4.4). |
 | `POST /api/sessions/{id}/park` | Explicit park → 202 `LifecycleResponse` once `session_parked` is ingested; 409 `not_attached` (not `active`, or host not ready); 409 `park_unsupported` (host lacks the `park` capability, nothing sent). |
@@ -1453,8 +1466,7 @@ reconciled; cancel, config and park answer `not_attached` then. Error bodies are
 
 **Built so far:** the rows above except the session list, `events?before=`,
 `DELETE`, `PATCH`, and `GET /api/hosts/{id}/projects`, `…/browse` and
-`…/agents`; a start takes no `first_prompt` yet (202 `{session_id}`), and
-`hat_mismatch` comes with hats. The list stream `GET /api/stream/sessions` is
+`…/agents`; a start takes no `first_prompt` yet (202 `{session_id}`). The list stream `GET /api/stream/sessions` is
 not built yet either. The host registry routes are kernel spec §8.
 
 **SSE** (umbrella §11.2). **Every state change first writes an events row, and
