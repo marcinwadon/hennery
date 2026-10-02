@@ -5,14 +5,16 @@ use crate::content::{self, Refusal};
 use crate::hub::{RequestError, Undo};
 use crate::resolve::{NotResolved, OnHost, resolve_on_host};
 use crate::store::{
-    AnswerSubmission, Cursor, LIFECYCLES, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT, ListQuery, Reassign, ResumeRequest, Store,
+    AnswerSubmission, Cursor, Deletion, LIFECYCLES, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT, ListQuery, Reassign,
+    ResumeRequest, SessionRow, Store, Unattached,
 };
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
+use axum::handler::Handler;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Json, Router, middleware};
 use futures::stream::{self, Stream, StreamExt};
 use hennery_kernel::hats::{Resolution, SessionHat};
 use hennery_kernel::json::ApiJson;
@@ -68,7 +70,15 @@ const _: () = assert!(
 pub fn router(state: AppState) -> Router {
     let routes = Router::new()
         .route("/api/sessions", post(start_session).get(list_sessions))
-        .route("/api/sessions/{id}", get(session_detail).patch(update_session))
+        // Step-up is layered on `delete` alone (`Handler::layer`, as in
+        // hats.rs), so GET and PATCH are as they were; PATCH checks it
+        // itself when it names a hat (plan 5d decision 2).
+        .route(
+            "/api/sessions/{id}",
+            get(session_detail)
+                .patch(update_session)
+                .delete(delete_session.layer(middleware::from_fn(hennery_kernel::auth::require_step_up))),
+        )
         .route("/api/sessions/{id}/resume", post(resume))
         // The one route that reads more than axum's default 2 MB (plan 6a).
         .route(
@@ -935,31 +945,46 @@ async fn park(State(state): State<AppState>, Path(id): Path<String>) -> Response
     }
 }
 
-/// Close: attached sessions are closed by their host (`session_closed`);
-/// anything else is closed immediately. A close whose delivery is unknown
-/// stays requested and is re-sent after the host's next handshake.
-async fn close(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let session = match state.store.find_session(&id) {
-        Ok(Some(s)) => s,
-        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
-        Err(err) => return internal(err),
+/// Where closing a session stands (ACP core §4.8), for `close` and
+/// `delete` (plan 9a decision 5).
+enum Closing {
+    /// Closed: by its host just now, or already.
+    Closed,
+    /// It has no adapter the collector can reach, as read: to be closed
+    /// collector-side, while it is still this (A4).
+    Unattached(Unattached),
+    /// Refused, or the host's answer is not known: this response.
+    Answer(Response),
+}
+
+/// Close `session` through its host if it is attached there: a start in
+/// flight on a reachable host is refused; an active session on a reachable
+/// host gets a durable close request and `close_session`, waiting for its
+/// end. A host that answers `not_attached` no longer has it: it is closed
+/// collector-side here. A close whose delivery is unknown stays requested
+/// and is re-sent after the host's next handshake.
+async fn close_through_host(state: &AppState, session: &SessionRow) -> Closing {
+    let judged = Unattached {
+        lifecycle: session.lifecycle.clone(),
+        presumed_parked: session.presumed_parked,
     };
     let reachable = state.hub.is_ready(&session.host_id);
     match session.lifecycle.as_str() {
-        "closed" => return lifecycle_response(&state, &id),
+        "closed" => return Closing::Closed,
         "starting" if reachable => {
-            return error(
+            return Closing::Answer(error(
                 StatusCode::CONFLICT,
                 "starting",
                 "the session is starting; close it once the start settles",
-            );
+            ));
         }
         "active" if reachable => {}
-        _ => return close_unattached(&state, &id),
+        _ => return Closing::Unattached(judged),
     }
-    match state.store.record_close_request(&id) {
+    let id = &session.id;
+    match state.store.record_close_request(id) {
         Ok(event) => state.hub.publish(event),
-        Err(err) => return internal(err),
+        Err(err) => return Closing::Answer(internal(err)),
     }
     let request_id = uuid::Uuid::now_v7().to_string();
     let frame = CollectorFrame::CloseSession {
@@ -968,16 +993,73 @@ async fn close(State(state): State<AppState>, Path(id): Path<String>) -> Respons
     };
     match state
         .hub
-        .request_for_session(&session.host_id, &request_id, &id, frame, TEARDOWN_TIMEOUT)
+        .request_for_session(&session.host_id, &request_id, id, frame, TEARDOWN_TIMEOUT)
         .await
     {
         // `session_closed`, or a `session_parked` that overtook the close
         // (ingest turns that into `closed`, since a close was requested).
-        Ok(_) => lifecycle_response(&state, &id),
-        // The host no longer has it (or went away): nothing left to stop.
-        Err(RequestError::Rejected { code, .. }) if code == "not_attached" => close_unattached(&state, &id),
-        Err(RequestError::NotConnected) => close_unattached(&state, &id),
-        Err(err) => request_failed(err),
+        Ok(_) => Closing::Closed,
+        // The host no longer has it (or went away before the close was
+        // sent): nothing left to stop, so closed collector-side, while it
+        // is still as read (A4; a close request changes neither).
+        Err(RequestError::Rejected { code, .. }) if code == "not_attached" => Closing::Unattached(judged),
+        Err(RequestError::NotConnected) => Closing::Unattached(judged),
+        Err(err) => Closing::Answer(request_failed(err)),
+    }
+}
+
+/// Close: attached sessions are closed by their host (`session_closed`);
+/// anything else is closed immediately.
+async fn close(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let session = match state.store.find_session(&id) {
+        Ok(Some(s)) => s,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) => return internal(err),
+    };
+    match close_through_host(&state, &session).await {
+        Closing::Closed => lifecycle_response(&state, &id),
+        Closing::Unattached(_) => close_unattached(&state, &id),
+        Closing::Answer(response) => response,
+    }
+}
+
+/// Delete (ACP core §4.10; plan 9a decision 5), behind step-up, which the
+/// route checks before this reads anything. Closed as `close` closes it,
+/// then deleted in one transaction that requires it closed, or closes it
+/// there while it is still as judged unattached (A4): 409 with the
+/// lifecycle if something moved it on meanwhile (a resume). 204.
+///
+/// A session closed without its host (`unconfirmed`) is closed by that
+/// host when it reconciles next (decision 4). No `close_session` is sent
+/// here even if the host is back meanwhile: a host that reconciled before
+/// the delete reattached the session, so the delete was refused; one that
+/// reconciles after it finds the tombstone.
+async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    let session = match state.store.find_session(&id) {
+        Ok(Some(s)) => s,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) => return internal(err),
+    };
+    let unattached = match close_through_host(&state, &session).await {
+        Closing::Closed => None,
+        Closing::Unattached(judged) => Some(judged),
+        Closing::Answer(response) => return response,
+    };
+    match state.store.delete_session(&id, unattached.as_ref()) {
+        // Only `session_deleted`: what a collector-side close wrote went
+        // with the session, in the same transaction.
+        Ok(Deletion::Done { event, unconfirmed }) => {
+            tracing::info!(session_id = %id, unconfirmed, "session deleted");
+            state.hub.publish(event);
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(Deletion::Refused(lifecycle)) => error(
+            StatusCode::CONFLICT,
+            &lifecycle,
+            format!("the session is {lifecycle} now; delete it again once that settles"),
+        ),
+        Ok(Deletion::NotFound) => error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) => internal(err),
     }
 }
 
@@ -993,7 +1075,14 @@ fn default_limit() -> u32 {
     500
 }
 
+/// The session's timeline; 404 for an unknown or deleted session (plan 9a
+/// A10).
 async fn events(State(state): State<AppState>, Path(id): Path<String>, Query(q): Query<EventsQuery>) -> Response {
+    match state.store.find_session(&id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) => return internal(err),
+    }
     match state.store.events(&id, q.after, q.limit.min(5000)) {
         Ok(list) => Json(list).into_response(),
         Err(err) => internal(err),
@@ -1113,12 +1202,13 @@ fn resync_required() -> Event {
 
 /// The replayed pages as SSE, `render`ed, then `follow`. A failed page
 /// sends `resync_required` and ends the stream: `follow` would skip the
-/// events after it.
-fn replay_then_follow<E: std::fmt::Display>(
+/// events after it. The items are SSE messages, or anything a message
+/// converts into (the stream's end mark, plan 9a A10).
+fn replay_then_follow<E: std::fmt::Display, M: From<Result<Event, Infallible>>>(
     replay: impl Stream<Item = Result<Vec<EventDto>, E>>,
-    mut render: impl FnMut(&[EventDto]) -> Vec<Result<Event, Infallible>>,
-    follow: impl Stream<Item = Result<Event, Infallible>>,
-) -> impl Stream<Item = Result<Event, Infallible>> {
+    mut render: impl FnMut(&[EventDto]) -> Vec<M>,
+    follow: impl Stream<Item = M>,
+) -> impl Stream<Item = M> {
     let failed = Arc::new(AtomicBool::new(false));
     let replay = {
         let failed = failed.clone();
@@ -1128,7 +1218,7 @@ fn replay_then_follow<E: std::fmt::Display>(
                 Err(err) => {
                     tracing::error!(error = %err, "replaying a session stream");
                     failed.store(true, Ordering::SeqCst);
-                    vec![Ok(resync_required())]
+                    vec![M::from(Ok(resync_required()))]
                 }
             })
         })
@@ -1141,18 +1231,19 @@ fn replay_then_follow<E: std::fmt::Display>(
 }
 
 /// The session's events as SSE: replays from `Last-Event-ID`, then follows
-/// live events, until the collector shuts down or the operator's session
-/// that opened it ends (3b decision 7). 404 for a session the owner does
-/// not have (ACP core §9); the replay reads the events table a page at a
-/// time (`REPLAY_PAGE`), and a failed read sends `resync_required` and
-/// ends the stream.
+/// live events, until the collector shuts down, the operator's session
+/// that opened it ends (3b decision 7), or it sends the session's
+/// `session_deleted` (plan 9a A10). 404 for an unknown or deleted session
+/// (ACP core §9); the replay reads the events table a page at a time
+/// (`REPLAY_PAGE`), and a failed read sends `resync_required` and ends the
+/// stream.
 async fn stream_session(
     State(state): State<AppState>,
     Extension(operator_session): Extension<Authenticated>,
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
-    match state.store.session(&id) {
+    match state.store.find_session(&id) {
         Ok(Some(_)) => {}
         Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
         Err(err) => return internal(err),
@@ -1186,16 +1277,28 @@ async fn stream_session(
             let last = cursor.load(Ordering::SeqCst);
             async move {
                 match item {
-                    Ok(e) if e.session_id == session && e.event_id > last => Some(sse_messages(&store, &e, true)),
+                    Ok(e) if e.session_id == session && e.event_id > last => {
+                        Some(with_end_mark(sse_messages(&store, &e, true), ends_stream(&e)))
+                    }
                     Ok(_) => None,
                     // Lagged: tell the client to refetch instead of skipping silently.
-                    Err(_) => Some(vec![Ok(resync_required())]),
+                    Err(_) => Some(vec![Some(Ok(resync_required()))]),
                 }
             }
         })
         .flat_map(stream::iter)
     };
-    let stream = replay_then_follow(replay, move |page| page_messages(&store, page), follow)
+    // The replay up to the event that ends the stream, if a page holds it,
+    // and an end mark after it, which ends the stream at once, not at the
+    // next message.
+    let render = move |page: &[EventDto]| {
+        let end = page.iter().position(ends_stream);
+        let page = end.map_or(page, |end| &page[..=end]);
+        with_end_mark(page_messages(&store, page), end.is_some())
+    };
+    let stream = replay_then_follow(replay, render, follow)
+        .take_while(|message| std::future::ready(message.is_some()))
+        .filter_map(std::future::ready)
         .take_until(state.shutdown.clone().cancelled_owned())
         .take_until(hennery_kernel::auth::session_ended(
             state.operator.clone(),
@@ -1204,6 +1307,18 @@ async fn stream_session(
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
+}
+
+/// The event after which a session's stream ends: its tombstone (plan 9a
+/// A10), after which nothing of it is written again.
+fn ends_stream(e: &EventDto) -> bool {
+    e.kind == "session_deleted"
+}
+
+/// `messages` as a stream's items, with the end mark (`None`) after them
+/// if `ends`.
+fn with_end_mark(messages: Vec<Result<Event, Infallible>>, ends: bool) -> Vec<Option<Result<Event, Infallible>>> {
+    messages.into_iter().map(Some).chain(ends.then_some(None)).collect()
 }
 
 #[cfg(test)]
