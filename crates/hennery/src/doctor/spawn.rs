@@ -223,6 +223,25 @@ pub enum Started {
 const INITIALIZE: &str =
     r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{}}}"#;
 
+/// How `Started::Failed` begins when the adapter said nothing in time.
+pub const NO_ANSWER: &str = "it did not answer `initialize`";
+
+/// The most of a version an adapter or a CLI gives that the report shows.
+const MAX_VERSION: usize = 64;
+
+/// `version` as the report may show it: at most 64 of `[0-9A-Za-z.+-]`,
+/// else "an unreadable version" (it comes from the adapter).
+pub fn readable_version(version: &str) -> String {
+    let readable = !version.is_empty()
+        && version.len() <= MAX_VERSION
+        && version.chars().all(|c| c.is_ascii_alphanumeric() || ".+-".contains(c));
+    if readable {
+        version.to_string()
+    } else {
+        "an unreadable version".to_string()
+    }
+}
+
 /// The most lines read waiting for `initialize`'s answer.
 const MAX_LINES: usize = 1000;
 
@@ -275,13 +294,13 @@ pub fn initialize(agent: &AgentCommand, env: &[(String, String)], timeout: Durat
                             result
                                 .pointer("/agentInfo/version")
                                 .and_then(|v| v.as_str())
-                                .map(str::to_string),
+                                .map(readable_version),
                         ),
                         None => Started::Failed("it answered `initialize` with an error".to_string()),
                     };
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    break Started::Failed(format!("it did not answer `initialize` within {timeout:?}"));
+                    break Started::Failed(format!("{NO_ANSWER} within {timeout:?}"));
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     break Started::Failed("it exited without answering `initialize`".to_string());

@@ -179,46 +179,50 @@ fn an_interrupted_doctor_leaves_no_adapter_running() {
         std::fs::write(stubs.join(name), "#!/bin/sh\nexit 1\n").unwrap();
         std::fs::set_permissions(stubs.join(name), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    let mut doctor = Command::new(env!("CARGO_BIN_EXE_hennery"))
-        .args(["doctor", "--data-dir"])
-        .arg(&host)
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", &config)
-        .env("XDG_DATA_HOME", dir.path().join("data"))
-        .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
-        .env("HENNERY_NPM_REGISTRY", OFFLINE)
-        .env("HENNERY_NODE_MIRROR", OFFLINE)
-        .env_remove("HENNERY_DATA_DIR")
-        .env_remove("HENNERY_HOST_DATA_DIR")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .unwrap();
-    // Generous: doctor's own first run can wait on the same scan.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    let adapter_pid: i32 = loop {
-        if let Ok(text) = std::fs::read_to_string(&pid_file) {
-            break text.trim().parse().unwrap();
+    // Ctrl-C, and a dropped SSH session's hangup.
+    for signal in [libc::SIGINT, libc::SIGHUP] {
+        let _ = std::fs::remove_file(&pid_file);
+        let mut doctor = Command::new(env!("CARGO_BIN_EXE_hennery"))
+            .args(["doctor", "--data-dir"])
+            .arg(&host)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_DATA_HOME", dir.path().join("data"))
+            .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
+            .env("HENNERY_NPM_REGISTRY", OFFLINE)
+            .env("HENNERY_NODE_MIRROR", OFFLINE)
+            .env_remove("HENNERY_DATA_DIR")
+            .env_remove("HENNERY_HOST_DATA_DIR")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // Generous: doctor's own first run can wait on the same scan.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let adapter_pid: i32 = loop {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                break text.trim().parse().unwrap();
+            }
+            assert!(std::time::Instant::now() < deadline, "the adapter never started");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        // SAFETY: kill(2) of the doctor process this test started.
+        unsafe { libc::kill(doctor.id() as i32, signal) };
+        let status = loop {
+            if let Some(status) = doctor.try_wait().unwrap() {
+                break status;
+            }
+            assert!(std::time::Instant::now() < deadline, "doctor did not stop");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        assert_eq!(status.code(), Some(130));
+        // SAFETY: kill(2) with signal 0 only checks.
+        while unsafe { libc::kill(adapter_pid, 0) } == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the adapter {adapter_pid} is still running"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        assert!(std::time::Instant::now() < deadline, "the adapter never started");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
-    // SAFETY: kill(2) of the doctor process this test started.
-    unsafe { libc::kill(doctor.id() as i32, libc::SIGINT) };
-    let status = loop {
-        if let Some(status) = doctor.try_wait().unwrap() {
-            break status;
-        }
-        assert!(std::time::Instant::now() < deadline, "doctor did not stop");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
-    assert_eq!(status.code(), Some(130));
-    // SAFETY: kill(2) with signal 0 only checks.
-    while unsafe { libc::kill(adapter_pid, 0) } == 0 {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "the adapter {adapter_pid} is still running"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(20));
     }
 }

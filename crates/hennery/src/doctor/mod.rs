@@ -26,10 +26,10 @@ use crate::service::{Context, Ran, System};
 use anyhow::Result;
 use clap::Args;
 use dirs::Dirs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Args)]
 pub struct DoctorArgs {
@@ -208,49 +208,14 @@ pub fn checks(doctor: &Doctor) -> Vec<Finding> {
 /// How long a program run for a check may take.
 pub const RUN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The most output read from a program run for a check.
-const MAX_OUTPUT: u64 = 4096;
-
 /// Run `program` for a check: no standard input, an environment of the base
-/// system's PATH alone (nothing of the shell doctor runs in), at most
-/// `MAX_OUTPUT` bytes of each output read, killed after `RUN_TIMEOUT`. What
-/// it prints is parsed by the check, never printed or logged. The output is
-/// read once the program exits: one that fills a pipe is killed at the
-/// timeout and gives `None`, and one that leaves a child holding its pipes
-/// would hold the read. The programs run (glibc's loader, `getconf`) do
-/// neither.
+/// system's PATH alone (nothing of the shell doctor runs in), in `/`, at
+/// most `spawn::MAX_OUTPUT` bytes of each output read, killed with its
+/// group after `RUN_TIMEOUT`, and by `spawn::kill_all` when doctor is
+/// stopped. What it prints is parsed by the check, never printed or logged.
 pub fn run_bounded(program: &Path, args: &[&str]) -> Option<Ran> {
-    use std::process::{Command, Stdio};
-    let mut child = Command::new(program)
-        .args(args)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + RUN_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    };
-    let mut stdout = Vec::new();
-    child.stdout.take()?.take(MAX_OUTPUT).read_to_end(&mut stdout).ok()?;
-    let mut stderr = Vec::new();
-    child.stderr.take()?.take(MAX_OUTPUT).read_to_end(&mut stderr).ok()?;
-    Some(Ran {
-        ok: status.success(),
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-    })
+    let env = [("PATH".to_string(), "/usr/bin:/bin".to_string())];
+    spawn::run(program, args, &env, RUN_TIMEOUT, true)
 }
 
 /// `hennery doctor`.
@@ -278,10 +243,13 @@ fn stop_children_on_signals() -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut interrupt = signal(SignalKind::interrupt())?;
     let mut terminate = signal(SignalKind::terminate())?;
+    // A dropped SSH session's hangup reaches doctor, not its groups.
+    let mut hangup = signal(SignalKind::hangup())?;
     tokio::spawn(async move {
         tokio::select! {
             _ = interrupt.recv() => {}
             _ = terminate.recv() => {}
+            _ = hangup.recv() => {}
         }
         spawn::kill_all();
         std::process::exit(130);

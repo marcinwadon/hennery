@@ -1618,11 +1618,17 @@ fn adapters_start_as_the_host_starts_them_and_are_all_stopped() {
     assert_eq!(check.status, Status::Warn, "{check:?}");
     assert!(check.summary.contains("not the pinned 0.81.0"), "{check:?}");
 
+    // Silent, on a Mac: the failure says what a first run there can be.
     std::fs::write(agents.entry("claude"), "silent").unwrap();
+    let mac = machine(dir.path(), Platform::MacOs, &fake);
     let started = std::time::Instant::now();
-    let check = check3();
+    let check = line(&checked(&mac, dirs.clone(), &nothing, &agents.host), 3).clone();
     assert_eq!(check.status, Status::Fail, "{check:?}");
     assert!(check.summary.contains("did not answer `initialize`"), "{check:?}");
+    assert!(
+        check.summary.contains("macOS checks a newly written program"),
+        "{check:?}"
+    );
     assert!(
         started.elapsed() < std::time::Duration::from_secs(40),
         "{:?}",
@@ -1660,6 +1666,12 @@ fn initialize_reads_its_answer_and_nothing_else() {
         answer(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#),
         spawn::Started::Answered(None)
     );
+    assert_eq!(
+        answer(r#"{"jsonrpc":"2.0","id":0,"result":{"agentInfo":{"version":"1.2.3 canary-7d see https://x"}}}"#),
+        spawn::Started::Answered(Some("an unreadable version".into()))
+    );
+    assert_eq!(spawn::readable_version(&"9".repeat(65)), "an unreadable version");
+    assert_eq!(spawn::readable_version("0.81.0-beta+1"), "0.81.0-beta+1");
     assert!(matches!(
         answer(r#"{"jsonrpc":"2.0","id":0,"error":{"code":-1,"message":"canary-7d"}}"#),
         spawn::Started::Failed(why) if !why.contains("canary")
@@ -1801,6 +1813,10 @@ fn logged_in_is_the_clis_exit_code_alone() {
         "{check:?}"
     );
     assert!(check.fix.contains("doctor never logs in"), "{check:?}");
+    assert!(
+        check.fix.contains("does not read a login given by a variable"),
+        "{check:?}"
+    );
     for agent in ["claude", "codex"] {
         std::fs::write(agents.dir.join(format!("{agent}-logged-in")), "").unwrap();
     }
@@ -1866,12 +1882,37 @@ fn bundled_and_terminal_clis_are_compared() {
         "{seventeen:?}"
     );
     script(&terminal.join("claude"), "#!/bin/sh\necho '3.0.0 (Claude Code)'\n");
-    let seventeen = line(&checked(&cx, dirs, &nothing, &agents.host), 17).clone();
+    let seventeen = line(&checked(&cx, dirs.clone(), &nothing, &agents.host), 17).clone();
     assert_eq!(seventeen.status, Status::Warn, "{seventeen:?}");
     assert!(
         seventeen.summary.contains("your CLI is 3.0.0, the pinned one 2.1.3"),
         "{seventeen:?}"
     );
+
+    // Other users can write to its directory: doctor runs it for no check.
+    let ran = dir.path().join("terminal-ran");
+    script(
+        &terminal.join("claude"),
+        &format!("#!/bin/sh\ntouch \"{}\"\necho '2.1.3 (Claude Code)'\n", ran.display()),
+    );
+    std::fs::set_permissions(&terminal, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let findings = checked(&cx, dirs, &nothing, &agents.host);
+    std::fs::set_permissions(&terminal, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!ran.exists(), "{findings:?}");
+    let four = line(&findings, 4);
+    assert!(
+        four.summary
+            .contains("claude's CLI is not run: other users can write to"),
+        "{four:?}"
+    );
+    let thirteen = line(&findings, 13);
+    assert_eq!(thirteen.status, Status::Warn, "{thirteen:?}");
+    assert!(
+        thirteen.summary.contains("is not run: other users can write to"),
+        "{thirteen:?}"
+    );
+    let seventeen = line(&findings, 17);
+    assert!(seventeen.summary.contains("its version is not read"), "{seventeen:?}");
 }
 
 /// The service's `--agent` commands are started in place of a set, with
@@ -2040,7 +2081,7 @@ fn the_collector_is_reached_step_by_step_and_its_hello_judged() {
     assert!(
         seven
             .summary
-            .contains("another connection with this host's key is live"),
+            .contains("this host's key is in use by another live connection"),
         "{seven:?}"
     );
     let _ = stop.send(());
@@ -2090,8 +2131,10 @@ fn each_step_to_the_collector_fails_on_its_own() {
     let dirs = Dirs::by_contents(host.clone(), Found::Given);
     let run = || checked(&cx, dirs.clone(), &nothing, &host);
 
-    point_at(&host, "ws://192.0.2.7:7117/api/hosts/ws");
-    let seven = line(&run(), 7).clone();
+    point_at(&host, "ws://doctor:canary-7d-secret@192.0.2.7:7117/api/hosts/ws");
+    let findings = run();
+    assert!(!report(&dirs, &findings).contains("canary-7d"), "{findings:?}");
+    let seven = line(&findings, 7).clone();
     assert_eq!(seven.status, Status::Fail, "{seven:?}");
     assert!(
         seven.summary.contains("only allowed to a loopback address"),
@@ -2111,11 +2154,36 @@ fn each_step_to_the_collector_fails_on_its_own() {
     assert!(not_run(&findings, 8));
 
     let unavailable = answering("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".into());
-    point_at(&host, &format!("ws://{unavailable}/api/hosts/ws"));
-    assert!(
-        line(&run(), 7).summary.contains("answered 503"),
-        "{:?}",
-        line(&run(), 7)
+    point_at(
+        &host,
+        &format!("ws://doctor:canary-7d-secret@{unavailable}/api/hosts/ws"),
+    );
+    let findings = run();
+    let seven = line(&findings, 7);
+    assert!(seven.summary.contains("answered 503"), "{seven:?}");
+    assert!(seven.summary.contains(&format!("http://{unavailable}/")), "{seven:?}");
+    assert!(!report(&dirs, &findings).contains("canary-7d"), "{findings:?}");
+
+    // A connection closed without an answer, over plain http: not a TLS
+    // failure, whatever the URL's words (the error is judged without it).
+    let closing = answering(String::new());
+    point_at(&host, &format!("ws://tls:certificate@{closing}/api/hosts/ws"));
+    let seven = line(&run(), 7).clone();
+    assert_eq!(seven.status, Status::Fail, "{seven:?}");
+    assert!(!seven.summary.contains("TLS failed"), "{seven:?}");
+
+    // https to a server that speaks no TLS: check 7 fails, and check 8
+    // does not run on what it said.
+    let plain = answering("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".into());
+    point_at(&host, &format!("wss://doctor:canary-7d-secret@{plain}/api/hosts/ws"));
+    let findings = run();
+    let seven = line(&findings, 7);
+    assert_eq!(seven.status, Status::Fail, "{seven:?}");
+    assert!(not_run(&findings, 8), "{findings:?}");
+    assert!(!report(&dirs, &findings).contains("canary-7d"), "{findings:?}");
+    assert_eq!(
+        collector::shown_url("https://doctor:canary-7d-secret@127.0.0.1:9/"),
+        "https://127.0.0.1:9/"
     );
 
     let old =

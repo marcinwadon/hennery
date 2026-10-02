@@ -39,6 +39,23 @@ fn quoted(text: &str) -> String {
     out
 }
 
+/// `url` as the report may show it: without a user name or password, which
+/// `parse_public_url` accepts in a URL (`https://user:secret@host`).
+pub fn shown_url(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(mut parsed) if !parsed.username().is_empty() || parsed.password().is_some() => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.to_string()
+        }
+        _ => url.to_string(),
+    }
+}
+
+/// How long the whole `hello` may take: the probe bounds its handshake and
+/// its answer (15 s each), not its close.
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(35);
+
 /// `future` run to its end on a runtime of its own, on a thread of its own:
 /// doctor runs inside `main`'s runtime, which cannot be blocked on.
 fn block_on<T: Send + 'static>(future: impl std::future::Future<Output = T> + Send + 'static) -> T {
@@ -70,7 +87,7 @@ pub enum Health {
 /// `STEP_TIMEOUT`; only its status and `Date` are read.
 pub fn healthz(base: &Url) -> Health {
     let Ok(url) = base.join("/healthz") else {
-        return Health::Failed(format!("{base} cannot take a path"));
+        return Health::Failed(format!("{} cannot take a path", shown_url(base.as_str())));
     };
     block_on(async move {
         let client = match reqwest::Client::builder()
@@ -92,6 +109,9 @@ pub fn healthz(base: &Url) -> Health {
                     .and_then(http_date),
             },
             Err(err) => {
+                // Without the URL: a name with "tls" in it is not a TLS
+                // failure, and a URL's credentials are not printed.
+                let err = err.without_url();
                 let chain = format!("{err:#}");
                 let why = std::error::Error::source(&err)
                     .map(|s| s.to_string())
@@ -162,7 +182,7 @@ fn collector_of(doctor: &Doctor, paired: &Paired) -> Result<(String, String), St
         return Ok((base, ws));
     }
     let ws = paired.collector_url.clone();
-    let mut url = Url::parse(&ws).map_err(|_| format!("host.toml's collector {ws} is not a URL"))?;
+    let mut url = Url::parse(&ws).map_err(|_| "host.toml's collector is not a URL".to_string())?;
     let scheme = match url.scheme() {
         "wss" => "https",
         "ws" => "http",
@@ -230,10 +250,12 @@ fn reach(doctor: &Doctor, host: &std::path::Path, paired: &Paired, verdict: &mut
         }
     };
     let rejoin = "pair this host again: `hennery host join <the collector's URL>`";
+    let shown = shown_url(&base);
     let url = match hennery_host::pairing::parse_public_url(&base) {
         Ok(url) => url,
         Err(err) => {
-            verdict.fail(format!("{err}"), rejoin);
+            // Its words quote the URL: shown without credentials.
+            verdict.fail(format!("{err}").replace(&base, &shown), rejoin);
             return None;
         }
     };
@@ -266,25 +288,25 @@ fn reach(doctor: &Doctor, host: &std::path::Path, paired: &Paired, verdict: &mut
     let date = match healthz(&url) {
         Health::Tls(why) => {
             verdict.fail(
-                format!("{base}: TLS failed: {why}"),
+                format!("{shown}: TLS failed: {why}"),
                 "give the collector a certificate for its name (and check this machine's clock: an expired-looking certificate can be the clock)",
             );
             return None;
         }
         Health::Failed(why) => {
-            verdict.fail(format!("{base}/healthz: {why}"), "check the collector's log");
+            verdict.fail(format!("{shown}healthz: {why}"), "check the collector's log");
             return None;
         }
         Health::Answered { status, .. } if status != 200 => {
             verdict.fail(
-                format!("{base}/healthz answered {status}"),
+                format!("{shown}healthz answered {status}"),
                 "check that this URL is the collector's, and its log",
             );
             return None;
         }
         Health::Answered { date, .. } => date,
     };
-    verdict.ok(format!("{base} answers"));
+    verdict.ok(format!("{shown} answers"));
     hello(doctor, host, paired, &ws, verdict);
     Some(date)
 }
@@ -334,20 +356,29 @@ fn hello(doctor: &Doctor, host: &std::path::Path, paired: &Paired, ws: &str, ver
         return;
     }
     let (ws, id, key) = (ws.to_string(), paired.host_id.clone(), paired.key.clone());
-    let standing = block_on(async move { hennery_host::connection::probe(&ws, &id, &key).await });
+    let standing =
+        block_on(
+            async move { tokio::time::timeout(HELLO_TIMEOUT, hennery_host::connection::probe(&ws, &id, &key)).await },
+        );
     let rejoin = "pair it again: remove host.key and host.toml, then `hennery host join <url>`";
     match standing {
-        Ok(Standing::Accepted) => verdict.ok("its hello is accepted (the collector now shows this host as seen)"),
-        Ok(Standing::Connected) => verdict.warn(
-            "another connection with this host's key is live, and no host here holds host.lock: a copied data directory, or a host that died moments ago",
-            "run doctor again in a minute; if it stays, give the other copy a pairing of its own (`hennery host join`)",
+        Err(_) => verdict.fail(
+            format!("its hello did not finish within {HELLO_TIMEOUT:?}"),
+            "check the collector's log",
         ),
-        Ok(Standing::Revoked) => verdict.fail(
+        Ok(Ok(Standing::Accepted)) => verdict.ok(
+            "its hello is accepted (the collector records this host as seen now, with this binary's version)",
+        ),
+        Ok(Ok(Standing::Connected)) => verdict.warn(
+            "this host's key is in use by another live connection, and no host here holds host.lock",
+            "run doctor again in a minute; if it stays and no other copy of this directory is yours, revoke the host in the Hosts view and pair again (`hennery host join`)",
+        ),
+        Ok(Ok(Standing::Revoked)) => verdict.fail(
             "the collector revoked this host",
             "re-pair it with `hennery host join <url>` (it gets a new key and id)",
         ),
-        Ok(Standing::Unknown) => verdict.fail("the collector does not know this host or its key", rejoin),
-        Err(err) => verdict.fail(
+        Ok(Ok(Standing::Unknown)) => verdict.fail("the collector does not know this host or its key", rejoin),
+        Ok(Err(err)) => verdict.fail(
             format!("its hello failed: {}", quoted(&err.to_string())),
             "check the collector's log",
         ),
@@ -446,15 +477,20 @@ pub fn listeners(doctor: &Doctor) -> Finding {
     match file.public_url(None) {
         None => verdict.ok("no public_url in config.toml (the one stored at setup is not read)"),
         Some(public) => match hennery_host::pairing::parse_public_url(&public) {
-            Err(err) => verdict.warn(format!("{err}"), "fix public_url in config.toml"),
+            Err(err) => verdict.warn(
+                format!("{err}").replace(&public, &shown_url(&public)),
+                "fix public_url in config.toml",
+            ),
             Ok(url) => match healthz(&url) {
-                Health::Answered { status: 200, .. } => verdict.ok(format!("public_url {public} answers /healthz")),
+                Health::Answered { status: 200, .. } => {
+                    verdict.ok(format!("public_url {} answers /healthz", shown_url(&public)))
+                }
                 Health::Answered { status, .. } => verdict.warn(
-                    format!("public_url {public} answers /healthz with {status}"),
+                    format!("public_url {} answers /healthz with {status}", shown_url(&public)),
                     "point public_url, or the proxy in front, at this collector",
                 ),
                 Health::Tls(why) | Health::Failed(why) => verdict.warn(
-                    format!("public_url {public} reaches no listener or proxy: {why}"),
+                    format!("public_url {} reaches no listener or proxy: {why}", shown_url(&public)),
                     "point public_url, or the proxy in front, at this collector",
                 ),
             },

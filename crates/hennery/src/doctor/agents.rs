@@ -6,6 +6,7 @@
 //! Nothing is ever logged in, and nothing a CLI prints reaches the report.
 
 use super::dirs::NO_HOST;
+use super::runtime::writable_by_others;
 use super::spawn::{self, Cli, Started};
 use super::{Doctor, Finding, Verdict};
 use hennery_host::AgentCommand;
@@ -16,6 +17,26 @@ use std::path::{Path, PathBuf};
 
 /// Why the agent checks did not run.
 const NO_AGENTS: &str = "no adapter set installed and no --agent";
+
+/// What a timeout on macOS may be: the first run of a program written
+/// since, which macOS checks online and waits for (decision 14).
+fn first_run_note(doctor: &Doctor) -> &'static str {
+    if doctor.cx.platform == crate::service::Platform::MacOs {
+        " (macOS checks a newly written program online on its first run, and a network problem can delay that: run doctor again)"
+    } else {
+        ""
+    }
+}
+
+/// Whether other users can change what `cli` runs: its program, or the
+/// directory it is in, writable by them. Doctor does not run such a CLI.
+fn others_can_change(doctor: &Doctor, cli: &Cli) -> Option<PathBuf> {
+    let program = cli.program.as_path();
+    [program, program.parent().unwrap_or(program)]
+        .into_iter()
+        .find(|p| writable_by_others(p, doctor.cx.uid))
+        .map(Path::to_path_buf)
+}
 
 /// What an agent's checks need: how a host would start it, the version
 /// its set pins (none for an `--agent` command), and its CLI.
@@ -112,7 +133,11 @@ pub fn adapters_start(doctor: &Doctor) -> Finding {
         let name = &agent.name;
         match (spawn::initialize(&agent.command, &env, spawn::INITIALIZE_TIMEOUT), &agent.pinned) {
             (Started::Failed(why), _) => verdict.fail(
-                format!("{name} does not start: {why}"),
+                if why.starts_with(spawn::NO_ANSWER) {
+                    format!("{name} does not start: {why}{}", first_run_note(doctor))
+                } else {
+                    format!("{name} does not start: {why}")
+                },
                 "run `hennery host adapters update`, then `hennery doctor` again; the host's log has the adapter's own output",
             ),
             (Started::Answered(Some(version)), Some(pinned)) if version == *pinned => {
@@ -145,11 +170,11 @@ fn status_of(agent: &str) -> Option<(&'static [&'static str], &'static str)> {
     match agent {
         "claude" => Some((
             &["auth", "status"],
-            "run `claude` in a terminal and sign in (`/login`); doctor never logs in",
+            "run `claude` in a terminal and sign in (`/login`); doctor never logs in, and does not read a login given by a variable in the service's environment file or plist",
         )),
         "codex" => Some((
             &["login", "status"],
-            "run `codex login` in a terminal; doctor never logs in",
+            "run `codex login` in a terminal; doctor never logs in, and does not read a login given by a variable in the service's environment file or plist",
         )),
         _ => None,
     }
@@ -173,6 +198,16 @@ pub fn logged_in(doctor: &Doctor) -> Finding {
             ));
             continue;
         };
+        if let Some(writable) = others_can_change(doctor, cli) {
+            verdict.warn(
+                format!(
+                    "{name}'s CLI is not run: other users can write to {}",
+                    writable.display()
+                ),
+                format!("run `chmod go-w {}`", writable.display()),
+            );
+            continue;
+        }
         match cli.run(args, &env, false) {
             Some(ran) if ran.ok => verdict.ok(format!("{name} is logged in")),
             Some(_) => verdict.warn(format!("{name} is not logged in"), fix),
@@ -183,7 +218,10 @@ pub fn logged_in(doctor: &Doctor) -> Finding {
                     ""
                 };
                 verdict.warn(
-                    format!("{name}'s CLI did not say whether it is logged in{keychain}"),
+                    format!(
+                        "{name}'s CLI did not say whether it is logged in{keychain}{}",
+                        first_run_note(doctor)
+                    ),
                     format!("run `{} {}` in a terminal", cli.shown(), args.join(" ")),
                 )
             }
@@ -240,7 +278,10 @@ pub fn bundled_and_terminal(doctor: &Doctor) -> Finding {
         };
         let Some(ours) = spawn::cli_version(&bundled, &env) else {
             verdict.warn(
-                format!("{name}'s bundled CLI does not say its version"),
+                format!(
+                    "{name}'s bundled CLI does not say its version{}",
+                    first_run_note(doctor)
+                ),
                 "run `hennery host adapters update`",
             );
             continue;
@@ -252,9 +293,20 @@ pub fn bundled_and_terminal(doctor: &Doctor) -> Finding {
             ));
             continue;
         };
+        if let Some(writable) = others_can_change(doctor, &theirs_cli) {
+            verdict.warn(
+                format!(
+                    "{} is not run: other users can write to {}",
+                    theirs_cli.shown(),
+                    writable.display()
+                ),
+                format!("run `chmod go-w {}`", writable.display()),
+            );
+            continue;
+        }
         match spawn::cli_version(&theirs_cli, &terminal_env) {
             None => verdict.warn(
-                format!("{} does not say its version", theirs_cli.shown()),
+                format!("{} does not say its version{}", theirs_cli.shown(), first_run_note(doctor)),
                 format!("run `{} --version` in a terminal", theirs_cli.shown()),
             ),
             Some(theirs) if spawn::far_apart(ours, theirs) => verdict.warn(
@@ -288,6 +340,13 @@ pub fn override_gap(doctor: &Doctor, host: &Path, agent: &str, cli: &Path, verdi
         verdict.ok(format!("{agent}: the pinned CLI is not installed here to compare with"));
         return;
     };
+    if others_can_change(doctor, &Cli::plain(cli)).is_some() {
+        // The warning that says so, with its fix, is check 17's own.
+        verdict.ok(format!(
+            "{agent}: its version is not read (other users can write to it)"
+        ));
+        return;
+    }
     let env = spawn::agent_env(doctor);
     match (
         spawn::cli_version(&Cli::plain(cli), &env),
@@ -308,7 +367,7 @@ pub fn override_gap(doctor: &Doctor, host: &Path, agent: &str, cli: &Path, verdi
             theirs.0, theirs.1, theirs.2, ours.0, ours.1, ours.2
         )),
         _ => verdict.warn(
-            format!("{agent}: a CLI's version cannot be read"),
+            format!("{agent}: a CLI's version cannot be read{}", first_run_note(doctor)),
             format!("run `{} --version` in a terminal", cli.display()),
         ),
     }
