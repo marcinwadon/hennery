@@ -31,7 +31,7 @@ export function ItemView({ item, env }: { item: Item; env: ItemEnv }) {
     case 'plan':
       return <PlanItem item={item} env={env} />
     case 'question':
-      return <QuestionCard item={item} agent={env.agent} actions={env.questionActions?.(item)} />
+      return <QuestionCard item={item} env={env} />
     case 'marker':
       return <Marker item={item} env={env} />
     case 'unrecognised':

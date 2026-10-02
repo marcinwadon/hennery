@@ -1,117 +1,146 @@
-// A question the agent asked (frontend spec §6.3), read-only here: the
-// request, its options or fields, and where it stands, in words. The
-// answering controls come in through `actions`; without them the card only
-// shows. Options are styled by their kind, never by their agent-chosen names.
-import type { ReactNode } from 'react'
-import type { PendingReason } from '../../generated/protocol'
-import type { Field } from '../../generated/view'
-import type { ItemOf } from './types'
+// A question the agent asked (frontend spec §6.3): the request, its options
+// or form, and where it stands, in words (lib/delivery.ts).
+//
+// - Only an item the server holds `answerable` can be answered (F-15), and
+//   only through the session's answer book (`env.answers`); without one the
+//   card only shows.
+// - A permission's options are buttons in the adapter's order, styled by
+//   their kind, never by their agent-chosen names. Keys 1–9 pick one, but
+//   only while the card itself has the focus, never from a text field, and
+//   only on a desktop (F-16): the listener is on the card, not the window.
+// - A newly opened question takes the focus only when the composer is empty
+//   (§10).
+// - A question the agent stopped waiting on offers "Answer as a new
+//   message": the question's text goes to `env.onAnswerAsMessage`, and the
+//   view words the composer's draft around it.
+// - A form's draft lives in the answer book, by question: the card can be
+//   mounted again without losing it.
+import { useEffect, useRef, type KeyboardEvent } from 'react'
+import type { AnswerRequest } from '../../generated/protocol'
+import { useMediaQuery } from '../../hooks/useMediaQuery'
+import { deliveryOf, digitIndex, optionTone, questionText, type OptionTone } from '../../lib/delivery'
+import { useAnswerState, useFormDraft } from '../../store/useAnswer'
+import Elicitation from './Elicitation'
+import type { ItemEnv, ItemOf } from './types'
 
 type Question = ItemOf<'question'>
 
-export const REASON_WORDS: Record<PendingReason, string> = {
-  turn_cancelled: 'the turn was stopped',
-  session_closed: 'the session was closed',
-  session_parked: 'the session was parked',
-  adapter_lost: 'the agent’s process was lost',
-  host_restarted: 'the host restarted',
-  agent_withdrew: 'the agent withdrew the question',
-  host_revoked: 'the host was revoked',
-}
+/** Where the digit shortcuts work: a wide screen with a fine pointer. */
+export const DESKTOP = '(min-width: 768px) and (pointer: fine)'
 
-/** Where a question stands, from the item alone (the table in §6.3 without
- *  its local states: an answer in flight, an answer refused). */
-export function questionStateText(q: Question): string {
-  if (q.delivered === true) return 'Answered'
-  if (q.state === 'cancelled') {
-    const why = q.reason ? (REASON_WORDS[q.reason] ?? q.reason) : undefined
-    return why ? `The agent stopped waiting (${why})` : 'The agent stopped waiting'
-  }
-  if (q.delivered === false) return 'Sent, but the agent was no longer waiting'
-  if (q.state === 'delivered') return 'Answered'
-  if (q.answered) return 'Sent'
-  if (q.answerable) return 'Needs your answer'
-  return 'Open'
-}
-
-/** A permission option's style, from its kind alone. */
-export function optionClass(kind: string): string {
-  if (kind.startsWith('reject')) return 'q-opt q-opt-reject'
-  if (kind === 'allow_always') return 'q-opt q-opt-always'
-  return 'q-opt q-opt-allow'
-}
-
-function FieldView({ field }: { field: Field }) {
-  return (
-    <div className="elic-field">
-      <span className="elic-label">{field.label || field.key}</span>
-      {field.hint && <span className="elic-hint">{field.hint}</span>}
-      {field.options && field.options.length > 0 && (
-        <ul className="elic-opts">
-          {field.options.map((option, i) => (
-            <li key={i} className="elic-opt">
-              <span className="elic-opt-value">{option.label || option.value}</span>
-              {option.description && <span className="elic-opt-desc">{option.description}</span>}
-            </li>
-          ))}
-        </ul>
-      )}
-      {field.field_kind === 'unsupported' && <span className="elic-unsupported-msg">This field cannot be filled in here.</span>}
-    </div>
-  )
+const BUTTON_TONE: Record<OptionTone, string> = {
+  allow: 'btn-primary',
+  always: 'btn-ghost',
+  reject: 'btn-danger',
 }
 
 interface Props {
   item: Question
-  /** The agent's label: who is asking. */
-  agent: string
-  /** Controls that answer it; absent, the card is read-only. */
-  actions?: ReactNode
+  env: ItemEnv
 }
 
-export default function QuestionCard({ item, agent, actions }: Props) {
+export default function QuestionCard({ item, env }: Props) {
   const { request } = item
-  const state = questionStateText(item)
-  const live = item.answerable
+  const book = env.answers
+  const { local, hostAway } = useAnswerState(book, item.id)
+  const [draft, onDraft] = useFormDraft(book, item.id)
+  const d = deliveryOf(item, book ? local : undefined, hostAway)
+  // Live: this card can answer now.
+  const live = book !== undefined && d.controls
+  const desktop = useMediaQuery(DESKTOP)
+  const ref = useRef<HTMLElement>(null)
+  const { composerEmpty } = env
+
+  useEffect(() => {
+    if (!live || !book) return
+    // Claimed once, whatever the composer holds: a question opened while
+    // the operator typed never takes the focus later.
+    if (!book.claimFocus(item.id)) return
+    if (composerEmpty?.() === true) ref.current?.focus({ preventScroll: true })
+  }, [live, book, item.id, composerEmpty])
+
+  const answer = (body: AnswerRequest) => {
+    if (book && !d.busy) void book.answer(item, body)
+  }
+
+  const onKeyDown = (e: KeyboardEvent<HTMLElement>) => {
+    if (!live || !desktop || d.busy || request.type !== 'permission') return
+    const at = digitIndex(e)
+    if (at === undefined || at >= request.options.length) return
+    e.preventDefault()
+    answer({ option_id: request.options[at].option_id })
+  }
+
+  const agent = env.agent
   return (
-    <section className={'ask fade-in' + (live ? '' : ' stale')} aria-label={`Question from ${agent}`}>
+    <section
+      ref={ref}
+      className={'ask fade-in' + (live ? '' : ' stale')}
+      aria-label={`Question from ${agent}`}
+      tabIndex={live ? 0 : undefined}
+      onKeyDown={live ? onKeyDown : undefined}
+    >
       <div className="ask-eyebrow">
-        <span className="e-tag">
-          {request.type === 'permission' ? `${agent} asks for permission` : `${agent} asks`}
-        </span>
+        <span className="e-tag">{request.type === 'permission' ? `${agent} asks for permission` : `${agent} asks`}</span>
       </div>
       {request.type === 'permission' ? (
         <>
           <p className="ask-q">{request.title || 'Permission'}</p>
-          {request.options.length === 0 ? (
-            <p className="item-note">This question cannot be answered here: stop, park or close the session.</p>
-          ) : (
-            <ul className="q-opts">
-              {request.options.map((option) => (
-                <li key={option.option_id} className={optionClass(option.option_kind)}>
-                  {option.name}
-                </li>
-              ))}
-            </ul>
-          )}
+          {request.options.length > 0 &&
+            (live ? (
+              <div className="q-opts" role="group" aria-label="Options">
+                {request.options.map((option, i) => {
+                  const tone = optionTone(option.option_kind)
+                  return (
+                    <button
+                      key={option.option_id}
+                      type="button"
+                      className={`btn btn-sm ${BUTTON_TONE[tone]} q-opt q-opt-${tone}`}
+                      disabled={d.busy}
+                      onClick={() => answer({ option_id: option.option_id })}
+                    >
+                      {option.name}
+                      {desktop && i < 9 && (
+                        <kbd className="q-key" aria-hidden="true">
+                          {i + 1}
+                        </kbd>
+                      )}
+                    </button>
+                  )
+                })}
+              </div>
+            ) : (
+              <ul className="q-opts">
+                {request.options.map((option) => (
+                  <li key={option.option_id} className={`q-opt q-opt-${optionTone(option.option_kind)}`}>
+                    {option.name}
+                  </li>
+                ))}
+              </ul>
+            ))}
         </>
       ) : (
         <>
           <p className="ask-q">{request.message}</p>
-          {request.fields.length > 0 && (
-            <div className="elic-fields">
-              {request.fields.map((field) => (
-                <FieldView key={field.key} field={field} />
-              ))}
-            </div>
-          )}
-          {!request.form_supported && (
-            <p className="item-note">This form cannot be filled in here: it can only be declined or cancelled.</p>
-          )}
+          <Elicitation request={request} live={live} busy={d.busy} draft={draft} onDraft={onDraft} onAnswer={answer} />
         </>
       )}
-      <p className="q-state">{state}</p>
-      {actions && <div className="ask-actions">{actions}</div>}
+      <p className="q-state">
+        <span>{d.text}</span>
+        {d.note && <span className="q-note">{d.note}</span>}
+      </p>
+      {d.error && (
+        <p className="form-error q-error" role="alert">
+          <bdi>{d.error}</bdi>
+        </p>
+      )}
+      {d.answerAsMessage && env.onAnswerAsMessage && (
+        <div className="ask-actions">
+          <button type="button" className="btn btn-ghost btn-sm" onClick={() => env.onAnswerAsMessage?.(questionText(request))}>
+            Answer as a new message
+          </button>
+        </div>
+      )}
     </section>
   )
 }

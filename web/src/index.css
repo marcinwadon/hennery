@@ -606,11 +606,21 @@ h2.grp-head { margin:0; font-size:inherit; font-weight:inherit; }
 .unrec { margin:0 0 22px; }
 .ask { margin:0 0 22px; }
 .q-opts { display:flex; flex-wrap:wrap; gap:8px; margin:0; padding:0; list-style:none; }
-.q-opt { border-radius:var(--r-full); padding:6px 14px; font-size:13px; font-weight:600; border:1.5px solid var(--border-strong); background:var(--surface); }
-.q-opt-allow { border-color:var(--accent); color:var(--accent); }
-.q-opt-always { border-style:dashed; color:var(--fg-2); }
-.q-opt-reject { border-color:var(--st-attn); color:var(--st-attn); }
-.q-state { margin:12px 0 0; font-size:13px; font-weight:700; color:var(--fg-2); }
+li.q-opt { border-radius:var(--r-full); padding:6px 14px; font-size:13px; font-weight:600; border:1.5px solid var(--border-strong); background:var(--surface); }
+li.q-opt-allow { border-color:var(--accent); color:var(--accent); }
+li.q-opt-always { border-style:dashed; color:var(--fg-2); }
+li.q-opt-reject { border-color:var(--st-attn); color:var(--st-attn); }
+.q-key { font-family:var(--font-mono); font-size:11px; font-weight:500; opacity:.65; }
+.q-state { margin:12px 0 0; font-size:13px; font-weight:700; color:var(--fg-2); display:flex; flex-wrap:wrap; gap:0 8px; }
+.q-note { font-weight:500; color:var(--fg-muted); }
+.q-error { margin:10px 0 0; font-size:13px; }
+.ask:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+.elic-field { border:0; margin:0; padding:0; min-width:0; }
+.elic-field > legend { padding:0; margin-bottom:7px; }
+.elic-opt { flex-direction:row; align-items:flex-start; gap:9px; }
+.elic-opt input { margin:3px 0 0; accent-color:var(--accent); flex:none; }
+.elic-opt > .elic-opt-desc { flex-basis:100%; margin-left:22px; }
+.elic-opts .elic-opt { flex-wrap:wrap; }
 .elic-opts { list-style:none; margin:0; padding:0; }
 .steps-item { border:1px solid var(--border); border-radius:var(--r-sm); }
 .meta-dirty { color:var(--st-wait); font-weight:600; }
@@ -620,4 +630,5 @@ h2.grp-head { margin:0; font-size:inherit; font-weight:inherit; }
   .back-btn { display:flex; align-items:center; justify-content:center; width:44px; height:44px; flex:none; border-radius:11px; border:1px solid var(--border); background:var(--surface); color:var(--fg-1); }
   .session-head .conv-name { display:block; font-size:16px; }
   .q-opts { flex-direction:column; }
+  .q-opts .btn, .ask-actions .btn, .elic-opt { min-height:44px; }
 }

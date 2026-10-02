@@ -71,9 +71,12 @@ export function configRefusal(err: unknown): string {
 
 /** The draft a question the agent stopped waiting on is answered in, as a
  *  new message (frontend spec §6.3, "Answer as a new message"): the operator
- *  writes the answer after it. */
+ *  writes the answer after it. A question that ends its own sentence (`?`,
+ *  `.`, `!`) gets no second stop. */
 export function answerAsMessage(question: string): string {
-  return `You asked: ${question}. My answer: `
+  const q = question.trimEnd()
+  const stop = /[?.!]$/.test(q) ? '' : '.'
+  return `You asked: ${q}${stop} My answer: `
 }
 
 /** The labels a draft put in for the operator carries until it is sent. */

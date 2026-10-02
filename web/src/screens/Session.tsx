@@ -1,4 +1,5 @@
-// One session (frontend spec §6): its header and its transcript, read-only.
+// One session (frontend spec §6): its header, its transcript, whose question
+// cards answer, and its composer.
 //
 // - The items come from the item store (`useSessionItems`): the first page,
 //   then the stream. The header reads the list's summary when the caller has
@@ -12,11 +13,17 @@
 // - The window's first row is pinned by item id: an upsert, or an item
 //   joining a turn above it or at the end, never moves it. A resync (the
 //   items replaced) goes back to the tail, and to the end.
+// - A question the operator can answer is never held above the window: the
+//   window starts at it when it is older than the tail, and stays there
+//   once it is answered. Being answerable, it is pending in the open turn,
+//   so this grows the window only as far as that turn reaches back.
 // - The stream's state shows as "Reconnecting…", and "Resynced" for a moment
 //   after the items were replaced.
 // - The composer sits under the transcript: the session's own (F-17), fed
 //   the header's session, the item store's catalogue and the capabilities
-//   of the session's host. Through it, a turn that was not delivered comes
+//   of the session's host. The hosts are fetched once per view: the header
+//   names the host, the composer reads its capabilities, and the question
+//   cards whether it is connected. Through it, a turn that was not delivered comes
 //   back as a draft ("Send again"), and a question the agent stopped
 //   waiting on is answered as a new message; neither sends on its own.
 // - A deleted session says so, nothing more is fetched, and its draft and
@@ -39,6 +46,7 @@ import { forgetAttachments } from '../lib/attachments'
 import { saveDraft } from '../lib/drafts'
 import { Icon } from '../lib/ui'
 import { Link } from '../router'
+import { useAnswering } from '../store/useAnswer'
 import { useSessionItems, type Timing } from '../store/useSessionItems'
 
 /** Within this many pixels of the end, the reader is at the end. */
@@ -61,8 +69,6 @@ interface Props {
   tail?: number
   /** The item store's timing (tests). */
   timing?: Partial<Timing>
-  /** The seam for the cards: question actions. */
-  env?: Pick<ItemEnv, 'questionActions'>
 }
 
 /** The newest plan among the loaded items. */
@@ -129,13 +135,29 @@ function capabilitiesOf(hosts: unknown, hostId: string | undefined): Capabilitie
   return null
 }
 
+/** Whether `connected` is what `GET /api/hosts` reports for host `hostId`;
+ *  undefined while unknown. */
+function connectedOf(hosts: unknown, hostId: string | undefined): boolean | undefined {
+  if (hostId === undefined || !Array.isArray(hosts)) return undefined
+  for (const entry of hosts as unknown[]) {
+    if (!entry || typeof entry !== 'object') continue
+    const host = entry as Record<string, unknown>
+    if (host.host_id === hostId) return typeof host.connected === 'boolean' ? host.connected : undefined
+  }
+  return undefined
+}
+
 /** Where the transcript's window starts: the pinned item's index, or the
- *  newest `size` items when nothing is pinned for these `loads`. */
+ *  newest `size` items when nothing is pinned for these `loads`; earlier
+ *  when a question that can be answered is held above it. Decided while
+ *  rendering, never after: a card that left the window for one render
+ *  would be mounted again. */
 function windowStart(items: readonly Item[], pin: string | null, size: number): number {
   const tail = Math.max(0, items.length - size)
-  if (pin === null) return tail
-  const at = items.findIndex((item) => item.id === pin)
-  return at < 0 ? tail : at
+  const at = pin === null ? -1 : items.findIndex((item) => item.id === pin)
+  const start = at < 0 ? tail : at
+  const open = items.findIndex((item) => item.kind === 'question' && item.answerable)
+  return open >= 0 && open < start ? open : start
 }
 
 /** The transcript's window over `items`: its first row pinned by id, `TAIL`
@@ -168,7 +190,7 @@ function useTailWindow(items: Item[], loads: number, size: number) {
   return { visible, held: start, reveal }
 }
 
-export default function SessionView({ id, summary, awaitSummary = false, tail = TAIL, timing, env: seams }: Props) {
+export default function SessionView({ id, summary, awaitSummary = false, tail = TAIL, timing }: Props) {
   const s = useSessionItems(id, timing)
   const info = useHeaderInfo(id, summary, awaitSummary)
   const win = useTailWindow(s.items, s.loads, tail)
@@ -179,6 +201,7 @@ export default function SessionView({ id, summary, awaitSummary = false, tail = 
   const hatItems = useList('hats', wantsHats)
   const hats = useMemo(() => namesOf(hatItems, 'id'), [hatItems])
   const plan = useMemo(() => latestPlan(s.items), [s.items])
+  const answers = useAnswering(id, info, s.items, s.loading, connectedOf(hostItems, info?.host_id))
 
   // The composer's handle: the item seams reach the draft through it, and
   // stay the same functions for as long as the view is shown.
@@ -197,12 +220,12 @@ export default function SessionView({ id, summary, awaitSummary = false, tail = 
       sessionId: id,
       agent: agentLabel(info?.agent),
       hatName: (hat: string) => hats.get(hat),
+      answers,
       onSendAgain,
       onAnswerAsMessage,
       composerEmpty,
-      ...seams,
     }),
-    [id, info?.agent, hats, onSendAgain, onAnswerAsMessage, composerEmpty, seams],
+    [id, info?.agent, hats, answers, onSendAgain, onAnswerAsMessage, composerEmpty],
   )
 
   // A deleted session's draft and images can never be sent: drop them.

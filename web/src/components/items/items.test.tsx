@@ -279,11 +279,6 @@ describe('question', () => {
     expect(screen.getByText('Needs your answer')).toBeInTheDocument()
   })
 
-  it('renders the actions it is given (the seam for answering)', () => {
-    show(item('question', permission), { ...env, questionActions: (q) => <button type="button">answer {q.pending_id}</button> })
-    expect(screen.getByRole('button', { name: 'answer p1' })).toBeInTheDocument()
-  })
-
   it('says a permission with no options cannot be answered here', () => {
     show(item('question', { ...permission, request: { type: 'permission', options: [] } }))
     expect(screen.getByText(/cannot be answered here: stop, park or close the session/)).toBeInTheDocument()
