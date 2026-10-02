@@ -3,7 +3,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import type { SessionDetail } from '../generated/protocol'
 import type { Item, ItemPage, SessionSummary } from '../generated/view'
 import { json, liveStream, routed, type Call, type LiveStream } from '../test-stream'
-import SessionView from './Session'
+import SessionView, { TAIL } from './Session'
 
 const ID = 's1'
 const PAGE = '/api/view/sessions/s1'
@@ -359,5 +359,121 @@ describe('SessionView', () => {
     await screen.findAllByText('a')
     expect((container.querySelector('.session > .steps') as HTMLDetailsElement).open).toBe(false)
     expect((container.querySelector('.transcript .steps') as HTMLDetailsElement).open).toBe(true)
+  })
+})
+
+/** The transcript's rows, by the text of each message (its id). */
+const shown = () => Array.from(document.querySelectorAll('.transcript .bubble')).map((b) => b.textContent)
+
+describe('the tail window', () => {
+  it(`renders at most the newest ${TAIL} items on open`, async () => {
+    // The windowing measurement's threshold under load.
+    expect(TAIL).toBe(200)
+    // Markers: a cheap row, so the real window size stays quick under load.
+    const markers = Array.from(
+      { length: TAIL + 30 },
+      (_, i) => ({ id: `m${i}`, version: 1, ts: '2026-10-02T10:00:00.000Z', turn_id: 't5', kind: 'marker', marker: 'host_back' }) as Item,
+    )
+    const s = server({ pages: [() => json(page(markers))] })
+    const { container } = render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+    await waitFor(() => expect(container.querySelectorAll('.marker')).toHaveLength(TAIL))
+    // Nothing older on the server, but rows are held: the way up stays.
+    expect(screen.getByRole('button', { name: /Load earlier/ })).toBeInTheDocument()
+    expect(scroller().scrollTop).toBe(TAIL * ROW - VIEW)
+  })
+
+  it('reveals held rows before fetching, and fetches only once none is held', async () => {
+    const s = server({
+      pages: [() => json(page(rows(11, 't5'), true))],
+      older: { t5: () => json(page(rows(6, 't4'), false)) },
+    })
+    render(<SessionView id={ID} tail={4} timing={FAST} />, { wrapper: s.wrapper })
+    await screen.findByText('t5-10')
+    expect(shown()).toEqual(['t5-7', 't5-8', 't5-9', 't5-10'])
+    const earlier = () => fireEvent.click(screen.getByRole('button', { name: /Load earlier/ }))
+    earlier()
+    await screen.findByText('t5-3')
+    expect(shown()).toHaveLength(8)
+    earlier()
+    await screen.findByText('t5-0')
+    expect(shown()).toHaveLength(11)
+    // Two reveals, no fetch.
+    expect(s.of(PAGE)).toHaveLength(1)
+    earlier()
+    // Nothing held: now the turns before, and up to a window of them shown.
+    await screen.findByText('t4-2')
+    expect(s.of(PAGE).map((c) => new URL(c.path, 'http://h').searchParams.get('before_turn'))).toEqual([null, 't5'])
+    expect(shown().slice(0, 5)).toEqual(['t4-2', 't4-3', 't4-4', 't4-5', 't5-0'])
+    expect(screen.queryByText('t4-1')).toBeNull()
+  })
+
+  it('keeps the reader’s place when held rows are revealed, from the button or the top', async () => {
+    const s = server({ pages: [() => json(page(rows(15, 't5')))] })
+    render(<SessionView id={ID} tail={6} timing={FAST} />, { wrapper: s.wrapper })
+    await screen.findByText('t5-14')
+    // Below the top: scrolling there reveals nothing by itself.
+    scrollTo(200)
+    expect(shown()).toHaveLength(6)
+    fireEvent.click(screen.getByRole('button', { name: /Load earlier/ }))
+    await screen.findByText('t5-3')
+    expect(scroller().scrollTop).toBe(200 + 6 * ROW)
+    scrollTo(0)
+    await screen.findByText('t5-0')
+    expect(scroller().scrollTop).toBe(3 * ROW)
+    expect(s.of(PAGE)).toHaveLength(1)
+  })
+
+  it('pins its first row by id: a new item at the end leaves it, and shows while at the end', async () => {
+    const s = server({ pages: [() => json(page(rows(6, 't5')))] })
+    render(<SessionView id={ID} tail={4} timing={FAST} />, { wrapper: s.wrapper })
+    await screen.findByText('t5-5')
+    await waitFor(() => expect(s.streams).toHaveLength(1))
+    expect(shown()).toEqual(['t5-2', 't5-3', 't5-4', 't5-5'])
+    act(() => s.streams[0].event('item', message('t5-new', 't5')))
+    await screen.findByText('t5-new')
+    expect(shown()).toEqual(['t5-2', 't5-3', 't5-4', 't5-5', 't5-new'])
+    expect(scroller().scrollTop).toBe(5 * ROW - VIEW)
+  })
+
+  it('shows nothing new for an upsert of a held row, or a new row of a held turn', async () => {
+    const s = server({ pages: [() => json(page([...rows(3, 't4'), ...rows(4, 't5')]))] })
+    render(<SessionView id={ID} tail={4} timing={FAST} />, { wrapper: s.wrapper })
+    await screen.findByText('t5-3')
+    await waitFor(() => expect(s.streams).toHaveLength(1))
+    act(() => s.streams[0].event('item', { ...message('t4-0', 't4', 'changed'), version: 2 }))
+    act(() => s.streams[0].event('item', message('t4-new', 't4')))
+    act(() => s.streams[0].event('item', message('t5-new', 't5')))
+    await screen.findByText('t5-new')
+    expect(shown()).toEqual(['t5-0', 't5-1', 't5-2', 't5-3', 't5-new'])
+    expect(screen.queryByText('changed')).toBeNull()
+    expect(screen.queryByText('t4-new')).toBeNull()
+  })
+
+  it('goes back to the tail, and to the end, on a resync', async () => {
+    // The same ids come back: the resync itself, not a missing row, resets.
+    const s = server({ pages: [() => json(page(rows(10, 't5'))), () => json(page(rows(10, 't5'), false, 20))] })
+    render(<SessionView id={ID} tail={5} timing={FAST} />, { wrapper: s.wrapper })
+    await screen.findByText('t5-9')
+    await waitFor(() => expect(s.streams).toHaveLength(1))
+    fireEvent.click(screen.getByRole('button', { name: /Load earlier/ }))
+    await screen.findByText('t5-0')
+    scrollTo(150)
+    act(() => s.streams[0].event('resync_required', {}))
+    await waitFor(() => expect(s.streams).toHaveLength(2))
+    await waitFor(() => expect(shown()).toEqual(['t5-5', 't5-6', 't5-7', 't5-8', 't5-9']))
+    expect(scroller().scrollTop).toBe(5 * ROW - VIEW)
+  })
+
+  it('goes to the end on a resync even when the new rows hold the old first one', async () => {
+    const again = [...rows(2, 't4'), message('t5-5', 't5'), message('t5-6', 't5')]
+    const s = server({ pages: [() => json(page(rows(10, 't5'))), () => json(page(again, false, 20))] })
+    render(<SessionView id={ID} tail={5} timing={FAST} />, { wrapper: s.wrapper })
+    await screen.findByText('t5-9')
+    await waitFor(() => expect(s.streams).toHaveLength(1))
+    scrollTo(150)
+    act(() => s.streams[0].event('resync_required', {}))
+    await waitFor(() => expect(shown()).toEqual(['t4-0', 't4-1', 't5-5', 't5-6']))
+    // Not rows prepended above the reader: the end.
+    expect(scroller().scrollTop).toBe(4 * ROW - VIEW)
   })
 })

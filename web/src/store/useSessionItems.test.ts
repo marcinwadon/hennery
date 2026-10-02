@@ -118,11 +118,16 @@ describe('useSessionItems', () => {
     })
     const { result } = renderHook(() => useSessionItems(ID, FAST), { wrapper: s.wrapper })
     await waitFor(() => expect(result.current.stream).toBe('open'))
+    expect(result.current.loads).toBe(1)
     await act(() => result.current.loadOlder())
     expect(s.of(PAGE_PATH)[1].path).toBe(`${PAGE_PATH}?before_turn=t3`)
     expect(result.current.items.map((i) => i.id)).toEqual(['a', 'c'])
+    // An older page is not a first page.
+    expect(result.current.loads).toBe(1)
     act(() => s.streams[0].send('event: resync_required\ndata: {}\n\n'))
     await waitFor(() => expect(result.current.items.map((i) => i.id)).toEqual(['x']))
+    // The items were replaced: the view's window goes back to the tail.
+    expect(result.current.loads).toBe(2)
     expect(result.current.older).toBe(true)
     expect(result.current.resynced).toBe(true)
     await waitFor(() => expect(result.current.stream).toBe('open'))
