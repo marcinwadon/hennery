@@ -1575,6 +1575,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "futures",
+ "hennery-gateway",
  "hennery-kernel",
  "hennery-proto",
  "hex",

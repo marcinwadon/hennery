@@ -15,7 +15,10 @@ use hennery_kernel::hosts::{EnrollOutcome, Enrollment, HostRecord, Revoke, TooMa
 use hennery_kernel::json::ApiJson;
 use hennery_kernel::lifecycle::LifecycleHooks;
 use hennery_kernel::secret::{rfc3339, unix_now};
-use hennery_proto::rest::{EnrollRequest, EnrollResponse, HostItem, PairingCodeResponse, UpdateHostRequest};
+use hennery_proto::frames::Capability;
+use hennery_proto::rest::{
+    EnrollRequest, EnrollResponse, HostItem, McpAgentDelivery, PairingCodeResponse, UpdateHostRequest,
+};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -167,7 +170,21 @@ async fn update_host(
 
 /// A registry entry as the API shows it, with whether it is connected.
 pub(crate) fn host_item(state: &AppState, record: HostRecord) -> HostItem {
+    // Plan 8e decision E7: per agent, from the latest accepted `hello`, and
+    // only for a host that takes servers at all (one without says so by
+    // its capabilities). The one mapping, `McpAgentDelivery::of`.
+    let mcp_delivery = record
+        .mcp_isolation
+        .filter(|_| record.capabilities.has(Capability::McpServers))
+        .map(|isolation| {
+            isolation
+                .0
+                .into_iter()
+                .map(|(agent, how)| (agent, McpAgentDelivery::of(how)))
+                .collect()
+        });
     HostItem {
+        mcp_delivery,
         connected: state.hub.is_ready(&record.id),
         host_id: record.id,
         name: record.name,

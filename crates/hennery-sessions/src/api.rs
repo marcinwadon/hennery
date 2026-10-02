@@ -5,7 +5,7 @@ use crate::content::{self, Refusal};
 use crate::hub::{RequestError, Undo};
 use crate::resolve::{NotResolved, OnHost, resolve_on_host};
 use crate::store::{
-    AnswerSubmission, Cursor, Deletion, LIFECYCLES, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT, ListQuery, Reassign,
+    AnswerSubmission, Cursor, Deletion, LIFECYCLES, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT, ListQuery, McpContext, Reassign,
     ResumeRequest, SessionRow, Store, Unattached,
 };
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
@@ -143,7 +143,9 @@ fn request_failed(err: RequestError) -> Response {
                 "invalid" => StatusCode::BAD_REQUEST,
                 _ => StatusCode::BAD_GATEWAY,
             };
-            error(status, &code, message)
+            // The host's words, which can quote what the agent printed
+            // (plan 8e decision 11).
+            error(status, &code, crate::redact::shown(&message))
         }
         RequestError::DeliveryUnknown => error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -170,7 +172,9 @@ fn request_failed(err: RequestError) -> Response {
 /// host and an unknown delivery answer as for any other request.
 fn resume_failed(err: RequestError) -> Response {
     match err {
-        RequestError::Rejected { code, message } => error(StatusCode::BAD_GATEWAY, &code, message),
+        RequestError::Rejected { code, message } => {
+            error(StatusCode::BAD_GATEWAY, &code, crate::redact::shown(&message))
+        }
         other => request_failed(other),
     }
 }
@@ -289,20 +293,25 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
         }
         Err(why) => return why.into_response(),
     };
+    let mcp_context = match mcp_context(&state, &req.host_id, &req.agent) {
+        Ok(context) => context,
+        Err(err) => return internal(err),
+    };
     let session_id = uuid::Uuid::now_v7().to_string();
-    match state.store.create_session(
+    let mcp = match state.store.create_session_with_mcp(
         &session_id,
         &req.host_id,
         &req.agent,
         &cwd,
         &hat.hat_id,
         hat.rule_id.as_deref(),
+        mcp_context,
     ) {
-        Ok(true) => {}
+        Ok(Some(mcp)) => mcp,
         // The hat resolved before its purge froze it (plan 9c decision 10c).
-        Ok(false) => return hat_purging(&state, &hat.hat_id),
+        Ok(None) => return hat_purging(&state, &hat.hat_id),
         Err(err) => return internal(err),
-    }
+    };
     let request_id = uuid::Uuid::now_v7().to_string();
     let frame = CollectorFrame::StartSession {
         request_id: request_id.clone(),
@@ -312,10 +321,9 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
         agent: req.agent,
         cwd,
         config: req.config,
-        // The hat just stored. No servers yet: minting and the delivery
-        // decision are plan 8e's.
+        // The hat just stored, and what it was given (plan 8e).
         hat_id: hat.hat_id.clone(),
-        mcp: Default::default(),
+        mcp: mcp.frame(),
     };
     let undo = Undo::Start {
         session_id: session_id.clone(),
@@ -341,12 +349,38 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
             }
             request_failed(RequestError::NotConnected)
         }
+        // Never sent: the host's connection withdrew what the decision
+        // read (a reconnect in between). Failed with that code, its token
+        // revoked (api-8e-8f A2).
+        Err(RequestError::McpUndeliverable) => {
+            if let Err(e) = state.store.mark_failed(&session_id, MCP_UNDELIVERABLE) {
+                return internal(e);
+            }
+            request_failed(RequestError::McpUndeliverable)
+        }
         // The socket task has already failed the session with the host's
-        // code (`Undo::Start`); not for `McpUndeliverable`, which the hub
-        // refused before sending: that leaves the session `starting`, and
-        // plan 8e fails it (unreachable in 8c, which sends no servers).
+        // code (`Undo::Start`).
         Err(err) => request_failed(err),
     }
+}
+
+/// The code a start or resume the hub refused for its MCP servers fails
+/// with (plan 8c's `mcp_isolation_unavailable`).
+const MCP_UNDELIVERABLE: &str = "mcp_isolation_unavailable";
+
+/// What the delivery decision reads of `host_id` outside the store (lane
+/// L2): its live connection's capability and `agent`'s isolation, from the
+/// hub, and whether its rules name another hat, from the kernel. A host not
+/// connected takes nothing.
+fn mcp_context(state: &AppState, host_id: &str, agent: &str) -> anyhow::Result<McpContext> {
+    let Some((capable, isolation)) = state.hub.mcp_isolation(host_id, agent) else {
+        return Ok(McpContext::NONE);
+    };
+    Ok(McpContext {
+        capable,
+        isolation,
+        rules_name_other_hats: state.hosts.rules_name_other_hats(host_id)?,
+    })
 }
 
 /// The longest search the list takes, in characters (plan 6b decision 8).
@@ -459,10 +493,15 @@ async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -
         Ok(pending) => pending,
         Err(err) => return internal(err),
     };
+    let mcp_delivery = match state.store.mcp_delivery(&id) {
+        Ok(delivery) => delivery,
+        Err(err) => return internal(err),
+    };
     Json(SessionDetail {
         session: item,
         open_turn,
         pending,
+        mcp_delivery,
     })
     .into_response()
 }
@@ -586,17 +625,23 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         Ok(hat) => hat,
         Err(why) => return why.into_response(),
     };
-    let (agent_session_id, committed_seq, config) = match state.store.request_resume(&id, &hat.hat_id) {
+    let mcp_context = match mcp_context(&state, &session.host_id, &session.agent) {
+        Ok(context) => context,
+        Err(err) => return internal(err),
+    };
+    let (agent_session_id, committed_seq, config, mcp) = match state.store.request_resume_with_mcp(&id, &hat.hat_id, mcp_context)
+    {
         Ok(ResumeRequest::Starting {
             events,
             agent_session_id,
             committed_seq,
             config,
+            mcp,
         }) => {
             for event in events {
                 state.hub.publish(event);
             }
-            (agent_session_id, committed_seq, config)
+            (agent_session_id, committed_seq, config, mcp)
         }
         // A concurrent resume got there first (ACP core §12 scenario 11).
         Ok(ResumeRequest::Busy(lifecycle)) => return busy(&lifecycle),
@@ -626,9 +671,10 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         agent_session_id,
         // Re-applied after the load (ACP core §4.3).
         config,
-        // The hat the resume just re-resolved, equal to the stored one.
+        // The hat the resume just re-resolved, equal to the stored one, and
+        // what it was given, with a fresh token (plan 8e).
         hat_id: hat.hat_id.clone(),
-        mcp: Default::default(),
+        mcp: mcp.frame(),
     };
     let undo = Undo::Start { session_id: id.clone() };
     match state
@@ -646,10 +692,15 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
             }
             resume_failed(RequestError::NotConnected)
         }
+        // Never sent, as for a start.
+        Err(RequestError::McpUndeliverable) => {
+            if let Err(e) = state.store.mark_failed_if_starting(&id, MCP_UNDELIVERABLE) {
+                return internal(e);
+            }
+            resume_failed(RequestError::McpUndeliverable)
+        }
         // The socket task has already failed the session with the host's
-        // code (`Undo::Start`); not for `McpUndeliverable`, which the hub
-        // refused before sending: that leaves the session `starting`, and
-        // plan 8e fails it (unreachable in 8c, which sends no servers).
+        // code (`Undo::Start`).
         Err(err) => resume_failed(err),
     }
 }
