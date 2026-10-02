@@ -1240,6 +1240,13 @@
         "id": {
           "type": "string"
         },
+        "logo": {
+          "description": "The hat's logo's `ETag`, without its quotes, when it has a logo\n(plan 4d-B2); absent when it has none. `GET /api/hats/{id}/logo`\nserves it; a client may add `?v=<logo>` to that URL so a new logo is\na new URL to its cache.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "name": {
           "type": "string"
         },
@@ -3569,6 +3576,19 @@
       },
       "required": [
         "sessions"
+      ],
+      "type": "object"
+    },
+    "SetHatLogoRequest": {
+      "additionalProperties": false,
+      "description": "`PUT /api/hats/{id}/logo` (kernel spec §5.1, §8; plan 4d-B2): a PNG, at\nmost 64 KiB, as standard base64 with its padding and nothing around it\n(no `data:` prefix, no whitespace). The body is at most 96 KiB. Step-up.\nThe collector decodes it and writes it afresh, so what is served is\nnever the upload's bytes. 200 with the `HatItem`.\n\nIts own codes: 400 `invalid_logo` (not base64; not a readable PNG; over\n1024 pixels either way); 413 `logo_too_large` (over 64 KiB, or over 256\nKiB once re-encoded); 413 `body_too_large`; 415 `unsupported_logo` (not\na PNG: the web UI turns an SVG, a WebP or a JPEG into one first); 404\n`not_found`; 409 `hat_purging` (a hat frozen for its purge takes no new\nlogo). `DELETE /api/hats/{id}/logo` (step-up) removes it: 200 with the\n`HatItem`, a frozen hat's too, or 404.",
+      "properties": {
+        "data": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "data"
       ],
       "type": "object"
     },
