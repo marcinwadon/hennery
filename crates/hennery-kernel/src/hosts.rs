@@ -45,6 +45,12 @@ const ALPHABET: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 /// Longest accepted host name, version and platform string.
 const MAX_FIELD: usize = 64;
 
+/// The most workspace roots stored per host (decision 7).
+pub const MAX_ROOTS: usize = 32;
+
+/// The longest path the collector stores or shows from a host, in bytes.
+pub const MAX_PATH: usize = 4096;
+
 /// A freshly minted pairing code, shown once.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PairingCode {
@@ -146,9 +152,24 @@ pub struct HostRecord {
     pub capabilities: Capabilities,
     /// The hat of its sessions that no path rule claims (kernel spec §5.1).
     pub default_hat_id: String,
+    /// From its latest reconciled connection (decision 7).
+    pub workspace_roots: Vec<String>,
     pub created_at: i64,
     pub last_seen_at: Option<i64>,
     pub revoked_at: Option<i64>,
+}
+
+/// Whether text a host sent can be shown (the review's A6): at most `max`
+/// bytes, with no control or invisible format character.
+pub fn is_displayable_text(text: &str, max: usize) -> bool {
+    text.len() <= max && !text.chars().any(|c| c.is_control() || is_format_char(c))
+}
+
+/// Whether a path a host reported can be stored and shown (decision 7, the
+/// review's A6): absolute and `is_displayable_text` within `MAX_PATH`. It
+/// is shown, never trusted: the host enforces its own fence.
+pub fn is_displayable_path(path: &str) -> bool {
+    path.starts_with('/') && is_displayable_text(path, MAX_PATH)
 }
 
 /// Invisible Unicode format characters (bidi overrides and isolates,
@@ -432,6 +453,31 @@ impl Hosts {
         Ok(())
     }
 
+    /// Store the workspace roots a reconciled connection of `host_id`
+    /// reported (decision 7): the first `MAX_ROOTS` that
+    /// `is_displayable_path` accepts. Only a reconciled connection's count:
+    /// `hennery host join`'s probe sends a `hello` that knows nothing of
+    /// `host run`'s flags.
+    pub fn record_workspace_roots(&self, host_id: &str, reported: &[String]) -> Result<()> {
+        let kept: Vec<&String> = reported
+            .iter()
+            .filter(|root| is_displayable_path(root))
+            .take(MAX_ROOTS)
+            .collect();
+        if kept.len() != reported.len() {
+            tracing::warn!(
+                %host_id,
+                dropped = reported.len() - kept.len(),
+                "dropped workspace roots that are not absolute, too long, too many or hold hidden characters"
+            );
+        }
+        self.conn().execute(
+            "UPDATE hosts SET workspace_roots = ?2 WHERE id = ?1 AND owner_id = ?3",
+            params![host_id, serde_json::to_string(&kept)?, self.owner],
+        )?;
+        Ok(())
+    }
+
     pub fn is_revoked(&self, host_id: &str) -> Result<bool> {
         let revoked: Option<Option<i64>> = self
             .conn()
@@ -496,11 +542,11 @@ impl Hosts {
     }
 }
 
-const HOST_COLUMNS: &str =
-    "id, name, platform, host_version, capabilities, default_hat_id, created_at, last_seen_at, revoked_at";
+const HOST_COLUMNS: &str = "id, name, platform, host_version, capabilities, default_hat_id, created_at, last_seen_at, revoked_at, workspace_roots";
 
 fn read_host(r: &rusqlite::Row<'_>) -> rusqlite::Result<HostRecord> {
     let capabilities: String = r.get(4)?;
+    let workspace_roots: String = r.get(9)?;
     Ok(HostRecord {
         id: r.get(0)?,
         name: r.get(1)?,
@@ -511,6 +557,7 @@ fn read_host(r: &rusqlite::Row<'_>) -> rusqlite::Result<HostRecord> {
         created_at: r.get(6)?,
         last_seen_at: r.get(7)?,
         revoked_at: r.get(8)?,
+        workspace_roots: serde_json::from_str(&workspace_roots).unwrap_or_default(),
     })
 }
 

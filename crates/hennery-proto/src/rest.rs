@@ -285,6 +285,10 @@ pub struct HostItem {
     pub capabilities: crate::frames::Capabilities,
     /// The hat of its sessions that no path rule claims (kernel spec §5.1).
     pub default_hat_id: String,
+    /// From its latest reconciled connection, as configured on the host
+    /// (ACP core §7): where its projects are, and where browsing may start.
+    #[serde(default)]
+    pub workspace_roots: Vec<String>,
     /// Connected and reconciled: requests reach it now.
     pub connected: bool,
     /// RFC 3339.

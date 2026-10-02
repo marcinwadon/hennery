@@ -84,6 +84,38 @@ impl ScriptedHost {
         host
     }
 
+    /// `hello` with `workspace_roots` and nothing attached, and its
+    /// `hello_ack`, but no `resend_complete`: what `hennery host join`'s
+    /// probe sends. Then the connection is closed.
+    async fn hello_only(collector: &Collector, workspace_roots: Vec<String>) {
+        let (ws, response) = tokio_tungstenite::connect_async(format!("ws://{}/api/hosts/ws", collector.addr))
+            .await
+            .unwrap();
+        let nonce = hex::decode(response.headers()[HELLO_NONCE_HEADER].to_str().unwrap()).unwrap();
+        let mut host = Self { ws };
+        host.send(&HostFrame::Hello {
+            protocol_version: PROTOCOL_VERSION.into(),
+            host_version: "test".into(),
+            host_id: HOST.into(),
+            proof: host_key().sign_hello(&nonce, HOST, PROTOCOL_VERSION),
+            capabilities: Capabilities(vec![Capability::Projects]),
+            workspace_roots,
+            attached_sessions: vec![],
+        })
+        .await;
+        assert!(matches!(host.next().await, CollectorFrame::HelloAck { .. }));
+        host.ws.close(None).await.unwrap();
+    }
+
+    /// Drop the connection and wait until the collector has noticed.
+    async fn drop_connection(self, collector: &Collector) {
+        drop(self.ws);
+        wait_for("host gone", || async {
+            (!collector.state.hub.is_ready(HOST)).then_some(())
+        })
+        .await;
+    }
+
     /// `connect` announcing the `projects` capability and no roots.
     async fn with_projects(collector: &Collector) -> Self {
         Self::connect(collector, Capabilities(vec![Capability::Projects]), vec![]).await
@@ -273,4 +305,44 @@ async fn a_late_probe_reply_is_dropped_and_the_connection_kept() {
     let request_id = listed(&mut host).await;
     host.send(&projects(request_id, &["/p/b"])).await;
     assert_eq!(call.await.unwrap(), Ok(projects("p2".into(), &["/p/b"])));
+}
+
+fn client(collector: &Collector) -> reqwest::Client {
+    hennery_testkit::operator_client(&collector.state.operator)
+}
+
+/// `GET path` on the collector: the status and the JSON body.
+async fn get(collector: &Collector, path: &str) -> (u16, serde_json::Value) {
+    let resp = client(collector)
+        .get(format!("http://{}{path}", collector.addr))
+        .timeout(Duration::from_secs(20))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(serde_json::Value::Null))
+}
+
+async fn listed_roots(collector: &Collector) -> serde_json::Value {
+    let (status, hosts) = get(collector, "/api/hosts").await;
+    assert_eq!(status, 200, "{hosts}");
+    hosts[0]["workspace_roots"].clone()
+}
+
+// Task 4: the roots a reconciled connection reported (decision 7).
+
+#[tokio::test]
+async fn a_reconciled_connections_roots_are_stored_and_listed() {
+    let collector = Collector::start().await;
+    assert_eq!(listed_roots(&collector).await, serde_json::json!([]));
+    let roots = vec!["/srv/projects".to_string(), "relative".into(), "/lap\u{202E}top".into()];
+    let host = ScriptedHost::connect(&collector, Capabilities(vec![Capability::Projects]), roots).await;
+    assert_eq!(listed_roots(&collector).await, serde_json::json!(["/srv/projects"]));
+    host.drop_connection(&collector).await;
+    // `host join`'s probe: a hello that is never reconciled changes nothing.
+    ScriptedHost::hello_only(&collector, vec![]).await;
+    assert_eq!(listed_roots(&collector).await, serde_json::json!(["/srv/projects"]));
+    // The next reconciled connection's report replaces them.
+    let _host = ScriptedHost::connect(&collector, Capabilities(vec![Capability::Projects]), vec!["/p".into()]).await;
+    assert_eq!(listed_roots(&collector).await, serde_json::json!(["/p"]));
 }

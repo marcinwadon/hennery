@@ -1021,6 +1021,14 @@
             "string",
             "null"
           ]
+        },
+        "workspace_roots": {
+          "default": [],
+          "description": "From its latest reconciled connection, as configured on the host\n(ACP core §7): where its projects are, and where browsing may start.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
         }
       },
       "required": [

@@ -175,6 +175,7 @@ pub(crate) fn host_item(state: &AppState, record: HostRecord) -> HostItem {
         host_version: record.host_version,
         capabilities: record.capabilities,
         default_hat_id: record.default_hat_id,
+        workspace_roots: record.workspace_roots,
         created_at: rfc3339(record.created_at),
         last_seen_at: record.last_seen_at.map(rfc3339),
         revoked_at: record.revoked_at.map(rfc3339),

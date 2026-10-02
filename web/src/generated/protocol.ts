@@ -268,6 +268,11 @@ capabilities: Capabilities,
  */
 default_hat_id: string, 
 /**
+ * From its latest reconciled connection, as configured on the host
+ * (ACP core §7): where its projects are, and where browsing may start.
+ */
+workspace_roots: Array<string>, 
+/**
  * Connected and reconciled: requests reach it now.
  */
 connected: boolean, 

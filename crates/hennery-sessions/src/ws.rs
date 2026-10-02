@@ -62,7 +62,7 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
         host_id,
         proof,
         capabilities,
-        workspace_roots: _,
+        workspace_roots,
         attached_sessions,
     }) = hello
     else {
@@ -348,6 +348,12 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                     Ok(done) => {
                         for event in done.events {
                             state.hub.publish(event);
+                        }
+                        // Only a reconciled connection's roots are stored
+                        // (decision 7), before the host is listed as
+                        // connected with them.
+                        if let Err(err) = state.hosts.record_workspace_roots(&host_id, &workspace_roots) {
+                            tracing::warn!(%host_id, error = %err, "recording the host's workspace roots failed");
                         }
                         for session_id in done.close {
                             let request_id = uuid::Uuid::now_v7().to_string();
