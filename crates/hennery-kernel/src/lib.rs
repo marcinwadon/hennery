@@ -5,6 +5,7 @@
 pub mod admin;
 pub mod auth;
 pub mod auth_api;
+pub mod capabilities;
 pub mod csp;
 pub mod db;
 pub mod delivery;
@@ -22,4 +23,4 @@ pub mod ratelimit;
 pub mod recents;
 mod schema;
 pub mod secret;
-mod setup_page;
+pub mod web;

@@ -189,6 +189,25 @@
       },
       "type": "array"
     },
+    "CapabilitiesResponse": {
+      "description": "`GET /api/capabilities` (kernel spec §8): the mode, which decides the\nviews the web UI shows, and the features this collector has switched\non. `features` is an open list: a client ignores a name it does not\nknow.",
+      "properties": {
+        "features": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "mode": {
+          "$ref": "#/$defs/DeploymentMode"
+        }
+      },
+      "required": [
+        "mode",
+        "features"
+      ],
+      "type": "object"
+    },
     "Capability": {
       "description": "A feature a host implements, announced in `hello` (ACP core §3.3). The\ncollector never sends a frame that needs a capability to a host that\nlacks it.",
       "oneOf": [
@@ -818,6 +837,14 @@
         "host_transcript"
       ],
       "type": "object"
+    },
+    "DeploymentMode": {
+      "description": "How this collector is deployed (kernel spec §8, frontend spec §2): the\nwhole cockpit, or the MCP gateway alone.",
+      "enum": [
+        "full",
+        "gateway"
+      ],
+      "type": "string"
     },
     "DirEntry": {
       "description": "One subdirectory in a `browse_directory` answer (ACP core §7).",

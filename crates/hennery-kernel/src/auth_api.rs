@@ -63,15 +63,24 @@ pub fn router(operator: Arc<Operator>) -> Router {
             ),
         operator.clone(),
     );
-    let private = || middleware::map_response(crate::setup_page::private_headers);
     Router::new()
-        .route("/api/setup", post(setup).layer(private()))
-        .route("/setup", get(crate::setup_page::page).layer(private()))
-        .route("/setup.js", get(crate::setup_page::script).layer(private()))
+        .route(
+            "/api/setup",
+            post(setup).layer(middleware::map_response(private_headers)),
+        )
         .merge(browser)
         .merge(signed_in)
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         .with_state(operator)
+}
+
+/// Every `POST /api/setup` answer: never cached, and never a `Referer`
+/// onwards (kernel spec §3.1). The page itself is the web UI's (`web.rs`).
+async fn private_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 pub(crate) fn error(status: StatusCode, code: &str, message: impl Into<String>) -> Response {

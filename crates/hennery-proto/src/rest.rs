@@ -1343,3 +1343,22 @@ pub struct HostRemovalItem {
     pub last_result: Option<TranscriptRemoval>,
     pub created_at: String,
 }
+
+/// How this collector is deployed (kernel spec §8, frontend spec §2): the
+/// whole cockpit, or the MCP gateway alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentMode {
+    Full,
+    Gateway,
+}
+
+/// `GET /api/capabilities` (kernel spec §8): the mode, which decides the
+/// views the web UI shows, and the features this collector has switched
+/// on. `features` is an open list: a client ignores a name it does not
+/// know.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct CapabilitiesResponse {
+    pub mode: DeploymentMode,
+    pub features: Vec<String>,
+}

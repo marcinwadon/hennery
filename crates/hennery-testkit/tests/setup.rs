@@ -168,40 +168,6 @@ async fn setup_responses_are_never_cached_nor_referred() {
     assert_private(&done);
 }
 
-/// 3b decision 16: the link is `/setup#<token>`. The page and its script
-/// are static; the script reads the token from the fragment and sends it
-/// only in the `POST /api/setup` body. The page runs no inline script.
-#[tokio::test]
-async fn the_setup_page_is_static_and_reads_the_token_from_the_fragment() {
-    let c = Collector::start().await;
-    let page = reqwest::get(format!("http://{}/setup", c.addr)).await.unwrap();
-    assert_eq!(page.status(), 200);
-    assert_private(&page);
-    let csp = page.headers()["content-security-policy"].to_str().unwrap().to_string();
-    assert!(
-        csp.starts_with("script-src 'self';") && csp.contains("frame-ancestors 'none'"),
-        "{csp}"
-    );
-    let html = page.text().await.unwrap();
-    assert!(html.contains(r#"<script src="/setup.js" defer></script>"#), "{html}");
-    assert_eq!(html.matches("<script").count(), 1, "an inline script: {html}");
-
-    let script = reqwest::get(format!("http://{}/setup.js", c.addr)).await.unwrap();
-    assert_eq!(script.status(), 200);
-    assert_private(&script);
-    assert!(
-        script.headers()["content-type"]
-            .to_str()
-            .unwrap()
-            .starts_with("text/javascript")
-    );
-    let js = script.text().await.unwrap();
-    assert!(
-        js.contains("location.hash") && js.contains(r#"fetch("/api/setup""#) && js.contains("default_hat_name"),
-        "{js}"
-    );
-}
-
 /// A logged request must never show the password.
 #[test]
 fn a_setup_request_does_not_show_its_password_in_debug() {

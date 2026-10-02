@@ -5,11 +5,12 @@
 use axum::http::{HeaderValue, header};
 use axum::response::Response;
 
-/// Kernel spec §7.2's policy, without the theme bootstrap's hash: no page
-/// served today has an inline script (the setup page's script is a file of
-/// its own).
-pub const POLICY: &str =
-    "script-src 'self'; img-src 'self' data: blob:; object-src 'none'; frame-ancestors 'none'; base-uri 'none'";
+/// Kernel spec §7.2's policy. No page has an inline script, so it names no
+/// hash: the web UI's theme bootstrap is a file of its own (`/theme.js`).
+/// Everything else comes from this origin: scripts, styles, fonts, API
+/// calls and form targets (plan 4b).
+pub const POLICY: &str = "script-src 'self'; default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; \
+     object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
 /// Set `POLICY` on a `text/html` response. Use as
 /// `axum::middleware::map_response(csp::on_html)`, outermost.
