@@ -137,6 +137,8 @@ fn installing_on_macos_writes_and_bootstraps_the_agent() {
         assert!(path.split(':').any(|e| e == dir), "{dir} not in {path}");
     }
     assert!(text.contains("<string>Aqua</string>"), "{text}");
+    assert_eq!(unit::plist_shell(&text).as_deref(), Some("/bin/sh"), "{text}");
+    assert!(out.contains("from the login shell: /bin/sh"), "{out}");
     let logs = cx.home.join("Library/Logs/hennery");
     assert_eq!(mode(&logs), 0o700);
     assert_eq!(mode(&logs.join("up.log")), 0o600);
@@ -246,8 +248,51 @@ fn installing_on_linux_writes_enables_and_starts_the_unit() {
     assert!(line.starts_with("PATH=\"/") && line.ends_with('"'), "{env}");
     assert!(line.split([':', '"']).any(|e| e == "/usr/bin"), "{env}");
     assert!(!env.contains("CLAUDE"), "{env}");
+    assert_eq!(unit::env_file_shell(&env).as_deref(), Some("/bin/sh"), "{env}");
     assert!(out.contains("loginctl enable-linger hennery-test"), "{out}");
     assert!(out.contains(&format!("PATH (in {})", env_file.display())), "{out}");
+}
+
+/// `--shell` is the shell the PATH is captured from, and the one recorded;
+/// one that is not an absolute path is refused before it is run.
+#[test]
+fn the_shell_given_is_recorded_and_must_be_absolute() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::new(|line, _| {
+        if line.contains(" print ") {
+            failed("not found")
+        } else {
+            ok("")
+        }
+    });
+    let cx = machine(dir.path(), Platform::MacOs, &fake);
+    let shell = crate::service::path::marker_shell(dir.path());
+    let mut out = Vec::new();
+    install(&cx, Role::Up, None, Some(&shell), &mut out).unwrap();
+    let plist = std::fs::read_to_string(cx.service_file(Role::Up)).unwrap();
+    assert_eq!(unit::plist_shell(&plist).as_deref(), shell.to_str(), "{plist}");
+    let marker = dir.path().join("marker-bin");
+    let path = unit::plist_path(&plist).unwrap();
+    assert!(path.split(':').any(|e| Path::new(e) == marker), "{plist}");
+    let out = String::from_utf8(out).unwrap();
+    assert!(
+        out.contains(&format!("from the login shell: {}", shell.display())),
+        "{out}"
+    );
+
+    // The same script, named relative to this process's directory: it would
+    // run if it were tried.
+    let ran = dir.path().join("marker-ran");
+    std::fs::remove_file(&ran).unwrap();
+    let cwd = std::env::current_dir().unwrap();
+    let up = "../".repeat(cwd.components().count() - 1);
+    let relative = Path::new(&up).join(shell.strip_prefix("/").unwrap());
+    assert!(relative.is_relative() && relative.is_file(), "{}", relative.display());
+    let before = fake.calls().len();
+    let err = install(&cx, Role::Up, None, Some(&relative), &mut Vec::new()).unwrap_err();
+    assert!(format!("{err:#}").contains("--shell"), "{err:#}");
+    assert!(!ran.exists(), "the relative shell was run");
+    assert_eq!(fake.calls().len(), before, "nothing runs for a relative shell");
 }
 
 /// Linger on: nothing to advise.
@@ -393,7 +438,11 @@ fn uninstalling_on_macos_boots_out_and_removes_the_plist() {
     let cx = machine(dir.path(), Platform::MacOs, &fake);
     let plist = cx.service_file(Role::Host);
     std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-    std::fs::write(&plist, unit::plist(Role::Host, &["/x".into()], "/usr/bin", "/tmp/l")).unwrap();
+    std::fs::write(
+        &plist,
+        unit::plist(Role::Host, &["/x".into()], "/usr/bin", "/bin/sh", "/tmp/l"),
+    )
+    .unwrap();
     let mut out = Vec::new();
     uninstall(&cx, Some(Role::Host), &mut out).unwrap();
     assert!(
@@ -443,7 +492,7 @@ fn status_reports_the_service_and_ups_children() {
     let argv = unit::command_line(Role::Up, &cx.exe, &data).unwrap();
     let plist = cx.service_file(Role::Up);
     std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-    std::fs::write(&plist, unit::plist(Role::Up, &argv, "/usr/bin", "/tmp/l")).unwrap();
+    std::fs::write(&plist, unit::plist(Role::Up, &argv, "/usr/bin", "/bin/sh", "/tmp/l")).unwrap();
     let report = |state| supervisor::ChildReport {
         state,
         crashes_in_window: 10,
@@ -506,7 +555,7 @@ fn a_report_is_stale_by_either_condition_and_an_unreadable_one_fails() {
     let argv = unit::command_line(Role::Up, &cx.exe, &data).unwrap();
     let plist = cx.service_file(Role::Up);
     std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-    std::fs::write(&plist, unit::plist(Role::Up, &argv, "/usr/bin", "/tmp/l")).unwrap();
+    std::fs::write(&plist, unit::plist(Role::Up, &argv, "/usr/bin", "/bin/sh", "/tmp/l")).unwrap();
     let gave_up = supervisor::ChildReport {
         state: supervisor::ChildState::GaveUp,
         crashes_in_window: 10,

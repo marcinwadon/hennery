@@ -83,7 +83,7 @@ pub fn plain(path: &Path) -> Result<String> {
     Ok(text.to_string())
 }
 
-fn xml(text: &str) -> String {
+pub(crate) fn xml(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -101,10 +101,11 @@ fn unxml(text: &str) -> String {
 
 /// The launchd user agent (distribution spec §6.2): started at login and
 /// again whenever it fails, only in a GUI login session (`Aqua`, decision
-/// 4: when the login keychain is unlocked), with the captured PATH, and its
-/// output in `log`. `ExitTimeOut` gives `up` the time it takes to stop both
-/// children (10 s each) before launchd kills it.
-pub fn plist(role: Role, argv: &[String], path: &str, log: &str) -> String {
+/// 4: when the login keychain is unlocked), with the captured PATH and the
+/// login shell it was captured from (`SHELL`), and its output in `log`.
+/// `ExitTimeOut` gives `up` the time it takes to stop both children (10 s
+/// each) before launchd kills it.
+pub fn plist(role: Role, argv: &[String], path: &str, shell: &str, log: &str) -> String {
     let args: String = argv
         .iter()
         .map(|a| format!("\t\t<string>{}</string>\n", xml(a)))
@@ -123,6 +124,8 @@ pub fn plist(role: Role, argv: &[String], path: &str, log: &str) -> String {
 	<dict>
 		<key>PATH</key>
 		<string>{path}</string>
+		<key>SHELL</key>
+		<string>{shell}</string>
 		<key>HENNERY_SERVICE</key>
 		<string>launchd</string>
 	</dict>
@@ -148,6 +151,7 @@ pub fn plist(role: Role, argv: &[String], path: &str, log: &str) -> String {
 "#,
         label = xml(&role.label()),
         path = xml(path),
+        shell = xml(shell),
         log = xml(log),
     )
 }
@@ -243,26 +247,46 @@ pub fn systemd_command_line(text: &str) -> Option<Vec<String>> {
     }
 }
 
-/// The systemd environment file: the captured PATH, double-quoted, with
-/// `\`, `"`, `$` and `` ` `` escaped.
-pub fn env_file(path: &str) -> String {
+/// The systemd environment file: the captured PATH, and the login shell it
+/// was captured from (`SHELL`), each double-quoted, with `\`, `"`, `$` and
+/// `` ` `` escaped.
+pub fn env_file(path: &str, shell: &str) -> String {
+    format!(
+        "# Written by `hennery service install`: the login shell and its PATH.\nSHELL={}\nPATH={}\n",
+        env_quoted(shell),
+        env_quoted(path)
+    )
+}
+
+fn env_quoted(value: &str) -> String {
     let mut escaped = String::new();
-    for c in path.chars() {
+    for c in value.chars() {
         if matches!(c, '\\' | '"' | '$' | '`') {
             escaped.push('\\');
         }
         escaped.push(c);
     }
-    format!("# Written by `hennery service install`: the login shell's PATH.\nPATH=\"{escaped}\"\n")
+    format!("\"{escaped}\"")
 }
 
 /// The `PATH` of a plist `plist` wrote: that one value of its
 /// `EnvironmentVariables`. Nothing else in them is read: a user may have
 /// added a secret there by hand.
 pub fn plist_path(text: &str) -> Option<String> {
+    plist_env(text, "PATH")
+}
+
+/// The `SHELL` of a plist `plist` wrote, read as its `PATH` is; `None` in
+/// one written before the shell was recorded.
+pub fn plist_shell(text: &str) -> Option<String> {
+    plist_env(text, "SHELL")
+}
+
+/// The value of `name` in a plist's `EnvironmentVariables`.
+fn plist_env(text: &str, name: &str) -> Option<String> {
     let (_, rest) = text.split_once("<key>EnvironmentVariables</key>")?;
     let (dict, _) = rest.split_once("</dict>")?;
-    let (_, after) = dict.split_once("<key>PATH</key>")?;
+    let (_, after) = dict.split_once(&format!("<key>{name}</key>"))?;
     let (between, value) = after.split_once("<string>")?;
     if !between.trim().is_empty() {
         return None;
@@ -275,18 +299,30 @@ pub fn plist_path(text: &str) -> Option<String> {
 /// unquoted and unescaped; the last such line, as systemd takes the last.
 /// No other line is read, as with the plist.
 pub fn env_file_path(text: &str) -> Option<String> {
-    let line = text.lines().rev().find_map(|l| l.strip_prefix("PATH="))?;
+    env_file_value(text, "PATH")
+}
+
+/// The `SHELL` of an environment file `env_file` wrote, read as its `PATH`
+/// is; `None` in one written before the shell was recorded.
+pub fn env_file_shell(text: &str) -> Option<String> {
+    env_file_value(text, "SHELL")
+}
+
+/// The value of the last `name=` line of an environment file.
+fn env_file_value(text: &str, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    let line = text.lines().rev().find_map(|l| l.strip_prefix(prefix.as_str()))?;
     let quoted = line.trim_end().strip_prefix('"')?.strip_suffix('"')?;
-    let mut path = String::new();
+    let mut value = String::new();
     let mut chars = quoted.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
-            path.push(chars.next()?);
+            value.push(chars.next()?);
         } else {
-            path.push(c);
+            value.push(c);
         }
     }
-    Some(path)
+    Some(value)
 }
 
 #[cfg(test)]
@@ -337,6 +373,7 @@ mod tests {
             Role::Up,
             &argv,
             "/opt/x & y/bin:/usr/bin",
+            "/opt/my & shell/bin/fish",
             "/Users/me/Library/Logs/hennery/up.log",
         );
         for wanted in [
@@ -346,7 +383,8 @@ mod tests {
             "<key>ThrottleInterval</key>\n\t<integer>10</integer>",
             "<key>ExitTimeOut</key>\n\t<integer>30</integer>",
             "<key>LimitLoadToSessionType</key>\n\t<string>Aqua</string>",
-            "<string>/opt/x &amp; y/bin:/usr/bin</string>",
+            "<key>PATH</key>\n\t\t<string>/opt/x &amp; y/bin:/usr/bin</string>",
+            "<key>SHELL</key>\n\t\t<string>/opt/my &amp; shell/bin/fish</string>",
             "<key>HENNERY_SERVICE</key>\n\t\t<string>launchd</string>",
             "<key>StandardErrorPath</key>\n\t<string>/Users/me/Library/Logs/hennery/up.log</string>",
         ] {
@@ -382,13 +420,14 @@ mod tests {
     }
 
     #[test]
-    fn the_env_file_holds_the_path_alone_quoted() {
-        let text = env_file("/opt/a b/bin:/opt/$x/`y`/\"z\"\\:/usr/bin");
+    fn the_env_file_holds_the_shell_and_the_path_alone_quoted() {
+        let text = env_file("/opt/a b/bin:/opt/$x/`y`/\"z\"\\:/usr/bin", "/opt/$s/fish");
         assert_eq!(
             text.lines().last().unwrap(),
             "PATH=\"/opt/a b/bin:/opt/\\$x/\\`y\\`/\\\"z\\\"\\\\:/usr/bin\""
         );
-        assert_eq!(text.lines().filter(|l| !l.starts_with('#')).count(), 1);
+        assert!(text.contains("\nSHELL=\"/opt/\\$s/fish\"\n"), "{text}");
+        assert_eq!(text.lines().filter(|l| !l.starts_with('#')).count(), 2);
     }
 
     /// `plutil -lint` accepts the plist (macOS; it ships with the system).
@@ -398,7 +437,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let argv = command_line(Role::Up, &std::env::current_exe().unwrap(), &awkward()).unwrap();
         let file = dir.path().join("dev.hennery.up.plist");
-        std::fs::write(&file, plist(Role::Up, &argv, "/usr/bin:/bin", "/tmp/a & b/up.log")).unwrap();
+        std::fs::write(
+            &file,
+            plist(Role::Up, &argv, "/usr/bin:/bin", "/bin/zsh", "/tmp/a & b/up.log"),
+        )
+        .unwrap();
         let out = std::process::Command::new("/usr/bin/plutil")
             .arg("-lint")
             .arg(&file)
@@ -422,7 +465,7 @@ mod tests {
         assert!(version.status.success());
         let dir = tempfile::tempdir().unwrap();
         let env = dir.path().join("service 100%.env");
-        std::fs::write(&env, env_file("/usr/bin:/bin")).unwrap();
+        std::fs::write(&env, env_file("/usr/bin:/bin", "/bin/bash")).unwrap();
         for role in Role::ALL {
             let argv = command_line(role, &std::env::current_exe().unwrap(), &awkward()).unwrap();
             let file = dir.path().join(role.unit());
@@ -445,7 +488,7 @@ mod tests {
         let exe = Path::new("/home/me/.local/bin/hen nery");
         for role in Role::ALL {
             let argv = command_line(role, exe, &awkward()).unwrap();
-            let text = plist(role, &argv, "/usr/bin", "/tmp/a & b.log");
+            let text = plist(role, &argv, "/usr/bin", "/bin/sh", "/tmp/a & b.log");
             assert_eq!(plist_command_line(&text).unwrap(), argv, "{role}");
             let text = systemd_unit(role, &argv, "/tmp/env").unwrap();
             assert_eq!(systemd_command_line(&text).unwrap(), argv, "{role}");

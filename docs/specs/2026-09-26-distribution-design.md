@@ -326,6 +326,19 @@ looked like the agent silently ignoring tools.)*
 - `/usr/bin:/bin` (and `/usr/sbin:/sbin` on macOS) are always appended.
 - The result is written to an env file (systemd) or the plist (launchd) and the
   location is printed. `doctor` re-captures and warns on drift.
+- **The shell is recorded beside the PATH, as `SHELL`.** It is recorded on
+  every install: the account's login shell, or the one `--shell` names, which
+  must be an absolute path and is refused before it is run.
+  - `doctor` runs that same shell again. When it is not the account's, its fix
+    names both, since either `--shell` or a `chsh` since may be the cause.
+  - The host's agents get it as `SHELL`, as launchd and systemd would give the
+    account's. Agents that honour `$SHELL` run the shell their PATH came from
+    (Claude Code uses it when it is bash or zsh).
+  - A `chsh` reaches the service, and its agents, only when the service is
+    installed again.
+  - A service file written before the shell was recorded falls back to the
+    account's shell; one whose `SHELL` is not an absolute path is passed on
+    as it stands, but `doctor` does not run it.
 
 The agent nesting variables (`CLAUDECODE`, `CLAUDE_CODE_ENTRYPOINT`,
 `CLAUDE_CODE_SSE_PORT`) are never written to the service environment, and the
@@ -335,7 +348,7 @@ host strips them at every adapter spawn regardless.
 
 `~/Library/LaunchAgents/dev.hennery.<role>.plist`: `RunAtLoad`,
 `KeepAlive = {SuccessfulExit = false}`, `ThrottleInterval = 10`,
-`LimitLoadToSessionType = Aqua`, `EnvironmentVariables.PATH` from §6.1,
+`LimitLoadToSessionType = Aqua`, `EnvironmentVariables.PATH` and `SHELL` from §6.1,
 stdout/stderr to `~/Library/Logs/hennery/<role>.log` (crash output only; hennery
 writes its own size-capped rotating log, `hennery-<process>.log` beside it, §8).
 Loaded with `launchctl bootstrap

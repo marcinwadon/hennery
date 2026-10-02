@@ -194,16 +194,23 @@ fn paired(dir: &Path) -> PathBuf {
 }
 
 /// `role`'s service installed on `cx`, running `exe` on `data`, with
-/// `path` as its PATH.
+/// `path` as its PATH, captured from `/bin/sh`.
 fn install(cx: &Context, role: Role, exe: &Path, data: &Path, path: &str) {
+    install_with_shell(cx, role, exe, data, path, "/bin/sh");
+}
+
+/// `install`, the PATH captured from `shell` (`--shell`).
+fn install_with_shell(cx: &Context, role: Role, exe: &Path, data: &Path, path: &str, shell: &str) {
     let argv = unit::command_line(role, exe, data).unwrap();
     let file = cx.service_file(role);
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     match cx.platform {
-        Platform::MacOs => std::fs::write(&file, unit::plist(role, &argv, path, "/tmp/hennery-test.log")).unwrap(),
+        Platform::MacOs => {
+            std::fs::write(&file, unit::plist(role, &argv, path, shell, "/tmp/hennery-test.log")).unwrap()
+        }
         Platform::Linux => {
             std::fs::create_dir_all(cx.env_file().parent().unwrap()).unwrap();
-            std::fs::write(cx.env_file(), unit::env_file(path)).unwrap();
+            std::fs::write(cx.env_file(), unit::env_file(path, shell)).unwrap();
             std::fs::write(&file, unit::systemd_unit(role, &argv, "/tmp/service.env").unwrap()).unwrap();
         }
     }
@@ -527,7 +534,7 @@ fn install_with_agents(cx: &Context, role: Role, data: &Path) {
     let file = cx.service_file(role);
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     std::fs::create_dir_all(cx.env_file().parent().unwrap()).unwrap();
-    std::fs::write(cx.env_file(), unit::env_file("/usr/bin:/bin")).unwrap();
+    std::fs::write(cx.env_file(), unit::env_file("/usr/bin:/bin", "/bin/sh")).unwrap();
     std::fs::write(&file, unit::systemd_unit(role, &argv, "/tmp/service.env").unwrap()).unwrap();
 }
 
@@ -1094,10 +1101,21 @@ fn a_replaced_binary_asks_for_a_restart() {
 fn the_service_path_is_read_back_alone() {
     let awkward = "/a dir/with \"quotes\" & <tags> $HOME `tick` \\back:/usr/bin";
     let argv = vec!["/bin/hennery".to_string(), "up".to_string()];
-    let plist = unit::plist(Role::Up, &argv, awkward, "/tmp/l");
+    let shell = "/opt/a \"shell\" & <$x> `y` \\/fish";
+    let plist = unit::plist(Role::Up, &argv, awkward, shell, "/tmp/l");
     assert_eq!(unit::plist_path(&plist).as_deref(), Some(awkward));
-    let env = unit::env_file(awkward);
+    assert_eq!(unit::plist_shell(&plist).as_deref(), Some(shell));
+    let env = unit::env_file(awkward, shell);
     assert_eq!(unit::env_file_path(&env).as_deref(), Some(awkward));
+    assert_eq!(unit::env_file_shell(&env).as_deref(), Some(shell));
+    // A file written before the shell was recorded has none.
+    let old = plist.replace(
+        &format!("\t\t<key>SHELL</key>\n\t\t<string>{}</string>\n", unit::xml(shell)),
+        "",
+    );
+    assert_eq!(unit::plist_shell(&old), None);
+    assert_eq!(unit::plist_path(&old).as_deref(), Some(awkward));
+    assert_eq!(unit::env_file_shell(&format!("PATH=\"{awkward}\"\n")), None);
 
     let extra = plist.replace(
         "<key>EnvironmentVariables</key>\n\t<dict>\n",
@@ -1166,7 +1184,8 @@ fn a_service_path_without_sh_or_git_fails_and_drift_warns() {
             .contains("your login shell (/bin/sh) now gives another PATH"),
         "{check:?}"
     );
-    assert!(check.fix.contains("--shell"), "{check:?}");
+    // The service recorded the account's shell: no `--shell` to name.
+    assert!(!check.fix.contains("--shell"), "{check:?}");
 
     // What this machine's login shell gives may lack git, or name a
     // directory the scratch home lacks: only the drift is pinned here.
@@ -1193,6 +1212,97 @@ fn a_service_path_without_sh_or_git_fails_and_drift_warns() {
         "{check:?}"
     );
     assert!(check.summary.contains("Nix store"), "{check:?}");
+}
+
+/// The environment doctor gives the adapters on `cx`.
+fn agent_env_of(cx: &Context, dirs: &Dirs) -> Vec<(String, String)> {
+    let doctor = Doctor {
+        cx,
+        dirs: dirs.clone(),
+        run: &nothing,
+    };
+    spawn::agent_env(&doctor)
+}
+
+/// Check 5 runs again the login shell the service recorded, not the
+/// account's: with the PATH that shell gives recorded, there is no drift,
+/// and on a drift the fix names both shells (`--shell`, or a `chsh` since).
+/// A service older than the record falls back to the account's shell; a
+/// recorded shell that is not an absolute path is not run, and said. The
+/// adapters get the recorded `SHELL` as it stands, as the service gives it.
+#[test]
+fn check_5_and_the_adapters_use_the_shell_the_service_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let fake = systemd("active", std::process::id(), "yes");
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    assert_eq!(cx.shell, Path::new("/bin/sh"));
+    let shell = crate::service::path::marker_shell(dir.path());
+    let shell_text = shell.display().to_string();
+    let macos = cx.platform == Platform::MacOs;
+    let env = crate::service::path::shell_environment(&cx.env, &shell, macos);
+    let captured =
+        crate::service::path::login_environment(&shell, &env, crate::service::path::CAPTURE_TIMEOUT).unwrap();
+    let theirs = crate::service::path::service_path(&captured, &cx.home, macos)
+        .unwrap()
+        .path;
+    assert_ne!(theirs, captured_path(&cx), "the marker shell gives a PATH of its own");
+    let dirs = Dirs::by_contents(data.clone(), Found::Given);
+    let check5 = || line(&checked(&cx, dirs.clone(), &nothing, &data), 5).clone();
+
+    install_with_shell(&cx, Role::Up, &cx.exe, &data, &theirs, &shell_text);
+    let check = check5();
+    assert!(
+        check
+            .summary
+            .contains(&format!("your login shell ({shell_text}) gives the same PATH")),
+        "{check:?}"
+    );
+    assert!(env_has(&agent_env_of(&cx, &dirs), "SHELL", &shell_text));
+
+    let both = tools(dir.path(), "both", &["sh", "git"]);
+    let drifted = format!("{}:{theirs}", both.display());
+    install_with_shell(&cx, Role::Up, &cx.exe, &data, &drifted, &shell_text);
+    let check = check5();
+    assert!(check.summary.contains("now gives another PATH"), "{check:?}");
+    assert!(check.fix.contains(&format!("--shell {shell_text}` again")), "{check:?}");
+    assert!(check.fix.contains("your account's shell is /bin/sh"), "{check:?}");
+
+    // The shell recorded is the account's: the plain reinstall is the fix.
+    install(&cx, Role::Up, &cx.exe, &data, &drifted);
+    let check = check5();
+    assert!(check.summary.contains("(/bin/sh) now gives another PATH"), "{check:?}");
+    assert!(!check.fix.contains("--shell"), "{check:?}");
+
+    // Older than the record: the account's shell, and the hint.
+    let text = std::fs::read_to_string(cx.env_file()).unwrap();
+    let old: String = text
+        .lines()
+        .filter(|l| !l.starts_with("SHELL="))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    std::fs::write(cx.env_file(), old).unwrap();
+    let check = check5();
+    assert!(check.summary.contains("(/bin/sh) now gives another PATH"), "{check:?}");
+    assert!(check.fix.contains("`--shell` if it was installed"), "{check:?}");
+    assert!(env_has(&agent_env_of(&cx, &dirs), "SHELL", "/bin/sh"));
+
+    // Not an absolute path: said, never run; the adapters get it as is.
+    std::fs::write(cx.env_file(), unit::env_file(&drifted, "bash")).unwrap();
+    let check = check5();
+    assert!(
+        check
+            .summary
+            .contains("the service's SHELL (bash) is not an absolute path"),
+        "{check:?}"
+    );
+    assert!(check.summary.contains("(/bin/sh)"), "{check:?}");
+    assert!(env_has(&agent_env_of(&cx, &dirs), "SHELL", "bash"));
+}
+
+fn env_has(env: &[(String, String)], name: &str, value: &str) -> bool {
+    env.iter().any(|(n, v)| n == name && v == value)
 }
 
 /// Check 14 under `hennery up` run by hand, with no service installed
@@ -2006,7 +2116,7 @@ fn a_services_agents_and_path_are_the_ones_used() {
     let file = cx.service_file(Role::Host);
     std::fs::create_dir_all(file.parent().unwrap()).unwrap();
     std::fs::create_dir_all(cx.env_file().parent().unwrap()).unwrap();
-    std::fs::write(cx.env_file(), unit::env_file("/service/bin:/usr/bin:/bin")).unwrap();
+    std::fs::write(cx.env_file(), unit::env_file("/service/bin:/usr/bin:/bin", "/bin/sh")).unwrap();
     std::fs::write(
         &file,
         unit::systemd_unit(Role::Host, &argv, "/tmp/service.env").unwrap(),

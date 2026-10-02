@@ -365,6 +365,43 @@ fn nvm_default(nvm: &Path) -> Option<String> {
         .map(|(_, name)| name)
 }
 
+/// A login shell of its own for tests, in `dir`: it runs `-c` as `/bin/sh`
+/// does, with `<dir>/marker-bin` (a real directory) first on its PATH, and
+/// each run appends a line to `<dir>/marker-ran`. So a captured PATH shows
+/// it was this shell that ran, and the file whether it ran at all. Warmed
+/// up once: on Linux a fork elsewhere can hold a file just written open
+/// for writing (ETXTBSY) for a moment.
+#[cfg(test)]
+pub(crate) fn marker_shell(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("marker-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let ran = dir.join("marker-ran");
+    let shell = dir.join("marker-shell");
+    std::fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\n[ \"$3\" = warm-up ] && exit 0\necho ran >> '{}'\nPATH='{}':$PATH; export PATH; shift 2; exec /bin/sh \"$@\"\n",
+            ran.display(),
+            bin.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let warm = Instant::now() + Duration::from_secs(60);
+    while let Err(err) = std::process::Command::new(&shell)
+        .args(["-l", "-i", "warm-up"])
+        .status()
+    {
+        assert!(
+            err.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < warm,
+            "{err}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    shell
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

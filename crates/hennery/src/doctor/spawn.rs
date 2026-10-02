@@ -33,9 +33,9 @@ const DRAIN: Duration = Duration::from_secs(5);
 /// (decision 14): what launchd and systemd give a user service (`HOME`,
 /// `USER`, `LOGNAME`, `SHELL`), on Linux the user manager's
 /// `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` (a keyring-backed
-/// login needs them), and the service's PATH (or with no service doctor's
-/// own). Built, not inherited; and `command` drops what the host's spawn
-/// drops (`stripped`).
+/// login needs them), and the service's PATH and `SHELL` (with no service,
+/// doctor's own PATH and the account's shell). Built, not inherited; and
+/// `command` drops what the host's spawn drops (`stripped`).
 pub fn agent_env(doctor: &Doctor) -> Vec<(String, String)> {
     let cx = doctor.cx;
     let linux = cx.platform == crate::service::Platform::Linux;
@@ -48,7 +48,8 @@ pub fn agent_env(doctor: &Doctor) -> Vec<(String, String)> {
         .iter()
         .filter_map(|name| cx.env.get(*name).map(|v| (name.to_string(), v.clone())))
         .collect();
-    env.push(("SHELL".to_string(), cx.shell.display().to_string()));
+    let shell = super::service::service_shell_of(doctor).unwrap_or_else(|| cx.shell.display().to_string());
+    env.push(("SHELL".to_string(), shell));
     let path = super::service::service_path_of(doctor)
         .or_else(|| cx.env.get("PATH").cloned())
         .unwrap_or_else(|| "/usr/bin:/bin".to_string());

@@ -195,6 +195,26 @@ pub fn service_path_of(doctor: &Doctor) -> Option<String> {
     }
 }
 
+/// The login shell the installed service's PATH was captured from, its
+/// `SHELL`, read back as its PATH is, as it stands: `None` when the file is
+/// older than the record.
+fn installed_shell(doctor: &Doctor, role: Role) -> Option<String> {
+    let cx = doctor.cx;
+    match cx.platform {
+        Platform::MacOs => unit::plist_shell(&std::fs::read_to_string(cx.service_file(role)).ok()?),
+        Platform::Linux => unit::env_file_shell(&std::fs::read_to_string(cx.env_file()).ok()?),
+    }
+}
+
+/// The `SHELL` the one installed service gives the host, as it stands, if
+/// there is one and it recorded one.
+pub fn service_shell_of(doctor: &Doctor) -> Option<String> {
+    match doctor.cx.installed()[..] {
+        [role] => installed_shell(doctor, role),
+        _ => None,
+    }
+}
+
 /// Whether an executable `name` is in one of `entries`.
 fn on_path(entries: &[&str], name: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -206,7 +226,8 @@ fn on_path(entries: &[&str], name: &str) -> bool {
 /// Check 5 (distribution spec §6.1): the service's PATH has `sh` and `git`
 /// (`rg` is optional), no entry that is gone or short-lived, and has not
 /// drifted from the login shell's. The login shell is run again, exactly
-/// as `service install` runs it, and only the PATH is kept of what it gives.
+/// as `service install` runs it, and only the PATH is kept of what it gives:
+/// the one the service recorded (`--shell`), else the account's.
 pub fn service_path(doctor: &Doctor) -> Finding {
     let cx = doctor.cx;
     let role = match cx.installed()[..] {
@@ -265,21 +286,48 @@ pub fn service_path(doctor: &Doctor) -> Finding {
             verdict.warn(format!("the service's PATH: {note}"), shaky);
         }
     }
-    let shell = cx.shell.display();
-    let env = path::shell_environment(&cx.env, &cx.shell, macos);
+    // The shell recorded is run again; one that is not an absolute path
+    // never is, and the account's stands in for it.
+    let recorded = installed_shell(doctor, role);
+    let runnable = recorded
+        .as_deref()
+        .map(PathBuf::from)
+        .filter(|shell| shell.is_absolute());
+    if let Some(relative) = recorded.as_deref().filter(|_| runnable.is_none()) {
+        verdict.warn(
+            format!("the service's SHELL ({relative}) is not an absolute path"),
+            reinstall.clone(),
+        );
+    }
+    let login = runnable.clone().unwrap_or_else(|| cx.shell.clone());
+    let shell = login.display();
+    // The same shell again. One other than the account's was given with
+    // `--shell`, or the account's shell has changed since (`chsh`): both
+    // are named, as either may be meant.
+    let again = match &runnable {
+        Some(runnable) if *runnable != cx.shell => format!(
+            "the service's PATH came from {}, and your account's shell is {}: run `hennery service install --role {role} --shell {}` again to keep the first, or without `--shell` for the second",
+            runnable.display(),
+            cx.shell.display(),
+            runnable.display()
+        ),
+        Some(_) => reinstall.clone(),
+        None => format!("{reinstall} (with `--shell` if it was installed with another shell)"),
+    };
+    let env = path::shell_environment(&cx.env, &login, macos);
     // Only the PATH is kept: the rest of the login environment is dropped
     // here, never printed or logged.
-    let now = path::login_environment(&cx.shell, &env, path::CAPTURE_TIMEOUT)
+    let now = path::login_environment(&login, &env, path::CAPTURE_TIMEOUT)
         .and_then(|captured| path::service_path(&captured, &cx.home, macos));
     match now {
         Ok(now) if now.path != installed => verdict.warn(
             format!("your login shell ({shell}) now gives another PATH than the service has"),
-            format!("{reinstall} (with `--shell` if it was installed with another shell)"),
+            again,
         ),
         Ok(_) => verdict.ok(format!("your login shell ({shell}) gives the same PATH")),
         Err(err) => verdict.warn(
             format!("your login shell's ({shell}) PATH could not be captured: {err:#}"),
-            format!("check that `{shell} -l -i -c env` runs, or {reinstall} with `--shell`"),
+            format!("check that `{shell} -l -i -c env` runs, or {reinstall} with another `--shell`"),
         ),
     }
     Finding::Checked(verdict.check(5, "service PATH"))
