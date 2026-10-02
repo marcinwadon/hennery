@@ -224,7 +224,9 @@ pub fn service_path(doctor: &Doctor) -> Finding {
     };
     let entries: Vec<&str> = installed.split(':').filter(|e| !e.is_empty()).collect();
     let mut missing = false;
-    for tool in ["sh", "git"] {
+    // Agents run `sh` and `git` (distribution §6.1); a collector runs none.
+    let needed: &[&str] = if role == Role::Collector { &[] } else { &["sh", "git"] };
+    for &tool in needed {
         if !on_path(&entries, tool) {
             missing = true;
             verdict.fail(
@@ -310,9 +312,13 @@ fn holder(doctor: &Doctor, lock: &Path) -> Holder {
     };
     let mut text = String::new();
     let _ = (&mut file).take(MAX_LOCK_TEXT).read_to_string(&mut text);
-    let Some(pid) = text.trim().parse::<u32>().ok().filter(|&pid| service::alive(pid)) else {
+    // A pid of a process that is gone: its lock went with it. No pid at all
+    // is a host between taking the lock and writing its pid (or none ever
+    // ran here): the probe tells.
+    let pid = text.trim().parse::<u32>().ok();
+    if pid.is_some_and(|pid| !service::alive(pid)) {
         return Holder::Nobody;
-    };
+    }
     use std::os::fd::AsRawFd;
     // SAFETY: flock(2) on a descriptor this function owns; dropping the
     // file releases the shared lock if it was taken.
@@ -320,7 +326,13 @@ fn holder(doctor: &Doctor, lock: &Path) -> Holder {
         return Holder::Nobody;
     }
     match std::io::Error::last_os_error() {
-        err if err.raw_os_error() == Some(libc::EWOULDBLOCK) => Holder::Pid(pid),
+        err if err.raw_os_error() == Some(libc::EWOULDBLOCK) => match pid {
+            Some(pid) => Holder::Pid(pid),
+            None => Holder::Unknown(format!(
+                "{} is held by a process that has not written its pid",
+                lock.display()
+            )),
+        },
         err => Holder::Unknown(format!("{}: {err}", lock.display())),
     }
 }
@@ -404,6 +416,17 @@ pub fn host_directory(doctor: &Doctor) -> Finding {
             Ok(Some((Role::Up, Some(up)))) if process::parent(doctor.cx, pid) == Some(up) => {
                 verdict.ok(format!("up's host (pid {pid}) serves it"))
             }
+            // Which process the service runs, or whose child the holder is,
+            // cannot be read (no user bus, `/proc` mounted `hidepid`): never
+            // tell the operator to stop what may be the service's own host.
+            Ok(Some((role, None))) => verdict.warn(
+                format!("pid {pid} serves it; whether it is the {role} service's host is unknown"),
+                "see check 10: the service manager could not say which process it runs",
+            ),
+            Ok(Some((Role::Up, Some(_)))) if process::parent(doctor.cx, pid).is_none() => verdict.warn(
+                format!("pid {pid} serves it; whether it is up's host is unknown: its parent cannot be read"),
+                "check by hand that its parent is the up service's process",
+            ),
             Ok(Some((role, _))) => verdict.warn(
                 format!("pid {pid}, not the {role} service's host, serves it: the service's host cannot start"),
                 format!("stop pid {pid} (`kill {pid}`), and let the service run its host"),

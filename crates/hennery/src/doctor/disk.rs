@@ -74,11 +74,15 @@ pub fn space(verdict: &mut Verdict, host: &Path, free: anyhow::Result<u64>, need
 }
 
 /// What installing this binary's pinned set would need now, the runtime
-/// included if it is not there: the set beside the current one.
-fn next_set(host: &Path) -> Option<u64> {
+/// included if it is not there: the set beside the current one. Nothing
+/// when it is current already: an update installs nothing then.
+pub fn next_set(host: &Path) -> Option<u64> {
     let overrides = hennery_host::runtime::agents::cli_overrides(host).ok()?;
     let selection = install::Selection::pinned(&hennery_host::runtime::agents::skipped(&overrides)).ok()?;
     let layout = Layout::new(host).ok()?;
+    if layout.current_id() == Some(selection.set_id()) {
+        return None;
+    }
     let with_node = !layout
         .runtimes()
         .join(selection.runtime_name())

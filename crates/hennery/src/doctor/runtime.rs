@@ -143,10 +143,7 @@ pub fn adapter_set(doctor: &Doctor) -> Finding {
     let (layout, selection) = match Layout::new(host).and_then(|layout| Ok((layout, pinned(host)?))) {
         Ok(both) => both,
         Err(err) => {
-            verdict.fail(
-                format!("cannot tell: {err:#}"),
-                "fix host.toml, or pair this host again",
-            );
+            verdict.fail(format!("cannot tell: {err}"), "fix host.toml, or pair this host again");
             return Finding::Checked(verdict.check(12, "adapter set"));
         }
     };
@@ -184,7 +181,8 @@ pub fn cli_overrides(doctor: &Doctor) -> Finding {
     };
     let mut verdict = Verdict::default();
     match agents::cli_overrides(host) {
-        Err(err) => verdict.fail(format!("{err:#}"), "fix host.toml's [cli] table"),
+        // `{err}`, not `{err:#}`: a parse error's detail quotes the file.
+        Err(err) => verdict.fail(format!("{err}"), "fix host.toml's [cli] table"),
         Ok(overrides) if overrides.is_empty() => verdict.ok("every agent runs its bundled CLI"),
         Ok(overrides) => {
             for (agent, path) in overrides {

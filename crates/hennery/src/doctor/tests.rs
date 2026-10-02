@@ -565,8 +565,11 @@ fn a_set_other_than_the_pin_or_none_or_a_hold_warns() {
     assert_eq!(check12().unwrap().status, Status::Warn);
     std::fs::remove_file(cx.service_file(Role::Host)).unwrap();
 
+    assert!(disk::next_set(&host).is_some());
     let (id, _) = pinned_set(&host).unwrap();
     assert_eq!(check12().unwrap().status, Status::Ok);
+    // Current already: the next update installs nothing, so needs no room.
+    assert_eq!(disk::next_set(&host), None);
     let current = host.join("adapters/current");
     std::fs::remove_file(&current).unwrap();
     std::os::unix::fs::symlink(Path::new("sets").join("0".repeat(32)), &current).unwrap();
@@ -1174,6 +1177,14 @@ fn a_service_path_without_sh_or_git_fails_and_drift_warns() {
     );
     assert!(!check.summary.contains("another PATH"), "{check:?}");
 
+    // A collector runs no agents: it needs neither sh nor git.
+    std::fs::remove_file(cx.service_file(Role::Up)).unwrap();
+    install(&cx, Role::Collector, &cx.exe, &data, &no_git.display().to_string());
+    let dirs = Dirs::by_contents(data.clone(), Found::Given);
+    let check = line(&checked(&cx, dirs, &nothing, &data), 5).clone();
+    assert!(!check.summary.contains("not on the service's PATH"), "{check:?}");
+    std::fs::remove_file(cx.service_file(Role::Collector)).unwrap();
+
     let check = check5(&format!("{now}:/nonexistent-7d:/nix/store/abc-tools/bin"));
     assert!(
         check
@@ -1213,6 +1224,12 @@ fn host_lock_is_judged_by_who_holds_it() {
         check14(&cx).summary,
         format!("pid {me} serves it: a host started by hand")
     );
+    // Held, before its holder wrote its pid: not "no host".
+    std::fs::write(host.join("host.lock"), "").unwrap();
+    let check = check14(&cx);
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("has not written its pid"), "{check:?}");
+    std::fs::write(host.join("host.lock"), format!("{me}\n")).unwrap();
 
     let fake = systemd("active", me, "yes");
     let cx = machine(dir.path(), Platform::Linux, &fake);
@@ -1229,6 +1246,18 @@ fn host_lock_is_judged_by_who_holds_it() {
     assert_eq!(check.status, Status::Warn, "{check:?}");
     assert!(check.summary.contains("which service should is unknown"), "{check:?}");
     std::fs::remove_file(cx.service_file(Role::Collector)).unwrap();
+    // The manager names no process: unknown, and never `kill`.
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let check = check14(&cx);
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(
+        check
+            .summary
+            .contains("whether it is the host service's host is unknown"),
+        "{check:?}"
+    );
+    assert!(!check.fix.contains("kill"), "{check:?}");
     std::fs::remove_file(cx.service_file(Role::Host)).unwrap();
 
     let fake = systemd("active", 77, "yes");
@@ -1240,6 +1269,11 @@ fn host_lock_is_judged_by_who_holds_it() {
     assert_eq!(check14(&cx).summary, format!("up's host (pid {me}) serves it"));
     std::fs::write(proc.join("stat"), format!("{me} (hennery) S 78 1 1 0\n")).unwrap();
     assert_eq!(check14(&cx).status, Status::Warn);
+    // Its parent cannot be read (`hidepid`): unknown, and never `kill`.
+    std::fs::remove_file(proc.join("stat")).unwrap();
+    let check = check14(&cx);
+    assert!(check.summary.contains("its parent cannot be read"), "{check:?}");
+    assert!(!check.fix.contains("kill"), "{check:?}");
     std::fs::remove_file(cx.service_file(Role::Up)).unwrap();
 
     // `/proc/locks` says who holds it, whatever the file says.
@@ -1383,4 +1417,22 @@ fn no_secret_reaches_the_report() {
         assert!(!text.contains("canary-7d"), "{platform:?}: {text}");
         std::fs::remove_file(cx.service_file(Role::Up)).unwrap();
     }
+}
+
+/// On Linux, `/proc/locks` names this process as the holder of a lock it
+/// really holds, at the real root: the device it prints matches `stat`'s on
+/// CI's filesystem.
+#[cfg(target_os = "linux")]
+#[test]
+fn proc_locks_names_the_real_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let mut cx = machine(dir.path(), Platform::Linux, &fake);
+    cx.root = PathBuf::from("/");
+    let lock = crate::lock::acquire(dir.path(), crate::lock::HOST_LOCK, "hennery host run").unwrap();
+    assert_eq!(
+        process::flock_holder(&cx, &dir.path().join(crate::lock::HOST_LOCK)),
+        Some(std::process::id())
+    );
+    drop(lock);
 }
