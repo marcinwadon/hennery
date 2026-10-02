@@ -2298,6 +2298,49 @@ fn a_git_state_fills_the_git_columns_and_records_the_base_commit_once() {
     assert_eq!(store.session_item("s1").unwrap().unwrap().git_branch, None);
 }
 
+/// The task review's gap: a state that differs only in `worktree`, or only
+/// by a first base commit, changes a column, so it applies; the same state
+/// again does not.
+#[test]
+fn a_git_state_that_changes_only_the_worktree_or_the_first_base_applies() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.ingest("s1", 2, &git(Some("main"), false, None)).unwrap();
+    let linked = SessionBody::GitState {
+        branch: Some("main".into()),
+        dirty: false,
+        worktree: true,
+        head: Some("c0ffee".into()),
+        base_commit: None,
+    };
+    assert_eq!(kinds(&store.ingest("s1", 3, &linked).unwrap()), ["git_state"]);
+    assert_eq!(store.session("s1").unwrap().unwrap().git_worktree, Some(true));
+    assert!(store.ingest("s1", 4, &linked).unwrap().is_empty());
+    let SessionBody::GitState {
+        branch,
+        dirty,
+        worktree,
+        head,
+        ..
+    } = linked
+    else {
+        unreachable!()
+    };
+    let based = SessionBody::GitState {
+        branch,
+        dirty,
+        worktree,
+        head,
+        base_commit: Some("c0ffee".into()),
+    };
+    assert_eq!(kinds(&store.ingest("s1", 5, &based).unwrap()), ["git_state"]);
+    assert_eq!(
+        store.session("s1").unwrap().unwrap().base_commit.as_deref(),
+        Some("c0ffee")
+    );
+    assert!(store.ingest("s1", 6, &based).unwrap().is_empty());
+}
+
 /// A git state for a closed session changes nothing; a base commit that is
 /// not a commit id is not recorded.
 #[test]
