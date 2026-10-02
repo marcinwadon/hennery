@@ -71,7 +71,7 @@ The operator answered this plan's four questions through the fleet parent:
 
 1. **The adapters come from the binary's own manifest, unpacked as the host installs them** (§3.1, §3.2, D-2).
    - Each tarball is a fixed-output `fetchurl` whose hash is the manifest's `integrity`. No hash is kept by hand, and a manifest bump changes the packages with no edit under `nix/`.
-   - `nix/unpack.sh` judges the listing before it writes anything, under the rules of `crates/hennery-host/src/runtime/extract.rs`: regular files and directories only; no absolute name, no `.`, `..` or empty component; no name twice; a destination that exists is refused. It then strips the first component (`package/`), with no owner and no permissions taken from the archive. After extracting, anything but files and directories fails, as a backstop. (The security review's A1: the first draft piped `tar -t` into `grep -q`, where under `pipefail` a SIGPIPE could turn a refusal into a pass; the listings are now read whole.)
+   - `nix/unpack.sh` judges the listing before it writes anything, under the rules of `crates/hennery-host/src/runtime/extract.rs`: regular files and directories only; no absolute name, no `.`, `..` or empty component; no name twice; a destination that exists is refused. It then strips the first component (`package/`), with no owner and no permissions taken from the archive. After extracting, anything but files and directories fails, as a backstop: with the listing's rule removed, the backstop alone refuses a link (probed). The listings are read whole and judged from here-strings, never piped into `grep -q`, whose early exit under `pipefail` could turn a refusal into a pass. (The first security review's A1: stricter unpacking.)
    - No npm and no install script runs. The packages are unpacked in the manifest's order, a package before the ones nested in it.
    - nixpkgs' `nodejs_24` runs the entry, and evaluation fails if its major is not the manifest's Node major.
 2. **The Claude adapter is unfree, and is no `packages` output** (§3.3; Q3).
@@ -84,10 +84,10 @@ The operator answered this plan's four questions through the fleet parent:
    - Codex's voice host and its libraries are glibc builds left unpatched (patching them failed on Linux CI). On NixOS its voice feature does not load; the run check names it and passes over it.
 4. **What the run check judges** (`nix/adapter-check.nix`).
    - Every native program of the bundled CLI's packages (executable ELF or Mach-O files that are not libraries, outside nested `node_modules`) runs `--version`. `claude`, `codex` and `rg` must exit 0 and name themselves (`(Claude Code)`, `codex-cli`, `ripgrep`): a stripped bun CLI answers with bun's version. Any other helper must have started: not 124 (the timeout), 126 to 255 (the loader's failures and signals).
-   - Exit 127 is passed over only when the program's ELF interpreter does not exist on this system (Codex's voice host). A 127 with the loader present, a library missing, fails.
+   - Exit 127 is passed over only when the program's ELF interpreter does not exist on this system (Codex's voice host), and only in an adapter that is not patched: in one `autoPatchelfHook` patches (Claude's on Linux, `passthru.patched`), a missing loader means the hook missed that program, and fails (the second review's O2). A 127 with the loader present, a library missing, fails.
    - The adapter must answer ACP `initialize` (`"result"` with `"id":0`) within 120 seconds, on a pipe held open until then.
    - No program found fails.
-   - Each outcome has its own fake adapter in `adapter-check-cases.nix`, compiled in the build: passes (good; a helper whose loader is missing, Linux) and fails, each with its reason (a CLI that fails; a CLI that does not name itself; a helper that cannot start, Linux; a helper missing a library, Linux; no program; no answer).
+   - Each outcome has its own fake adapter in `adapter-check-cases.nix`, compiled in the build: passes (good; a helper whose loader is missing, Linux) and fails, each with its reason (a CLI that fails; a CLI that does not name itself; a helper that cannot start, Linux; a helper missing a library, Linux; a helper whose loader is missing in a patched adapter, Linux; no program; no answer).
    - On macOS the check runs unsandboxed (`__noChroot`): the macOS sandbox refuses the CLIs what they need at their first run, as for nixpkgs' `claude-code`. A Mac with `sandbox = true` cannot build it.
 5. **One set of options and command lines for both modules** (`common.nix`).
    - Every word of `ExecStart=` is quoted as `service/unit.rs`'s `systemd_word` quotes it: double-quoted, `\` and `"` escaped, `%` and `$` doubled. Doctor's `systemd_command_line` reads only words written that way, so it reads the module's units as it reads `service install`'s.
@@ -109,14 +109,16 @@ The operator answered this plan's four questions through the fleet parent:
 10. **Doctor reads the NixOS host unit for its `--agent` words, and nothing else** (the security review's A4).
     - `service::read_system_command_line(cx, Role::Host)` reads `/etc/systemd/system/hennery-host.service` (under the context's root), on Linux only, with `unit::systemd_command_line`. Drop-ins (`hennery-host.service.d/`) are not read.
     - `Doctor::given` looks at the user services first, then that unit; the first whose `--data-dir` is the directory checked and that gives an agent wins. `given_agents` keeps its meaning (the agents given, by whichever); `agents_given_by_system_unit` says whether a system unit gave them.
-    - Check 1 then names the unit: "the system unit /etc/systemd/system/hennery-host.service gives its agents with --agent", as check 10 finds no user service to explain it. Check 3 starts those agents. No other check judges a system unit.
+    - Its `--agent` words count as a user service's do, for every check that reads them: check 1 names the unit ("the system unit /etc/systemd/system/hennery-host.service gives its agents with --agent", as check 10 finds no user service to explain it); check 2 does not ask for nix-ld; checks 3 and 4 start those agents; check 9 needs room for no next set; check 12 says no managed set is needed. Nothing else of the unit is read, and no other check judges it (the second review's A1).
+    - Check 3 starts them with doctor's own PATH, not the unit's: with no user service there is no service PATH to read. Their commands are absolute store paths; tools they look up (`sh`, `git`) may differ from the unit's (the second review's O1, under "After this plan").
+    - Only root writes `/etc/systemd/system`, the unit counts only for the directory its `--data-dir` names, and user services are tried first, so it gives doctor nothing to run that root did not choose.
 11. **Where each check runs.**
     - Everywhere: `codex-acp-runs`, `unpack-refuses`, `adapter-check-cases` (its loader cases on Linux only).
     - Linux: `modules-eval` (its results are computed at evaluation, so it also evaluates on a Mac: `nix eval --raw .#checks.x86_64-linux.modules-eval.buildCommand`), and `home-manager-doctor`, which needs a Linux `hennery`. Gated on the system's name, never on `pkgs.stdenv` (a module's structure gated on `stdenv` recurses).
     - x86_64-linux: `nixos`, the virtual machine, which needs KVM; only the x86_64 runner has it.
     - The home-manager module is evaluated against stand-ins for home-manager's own options: the flake takes no home-manager input.
 12. **Tests never touch the building machine's services or data** (fleet rule).
-    - `home-manager-doctor` runs the binary as `offline()` in `crates/hennery/tests/cli.rs` does (PR #102): `HOME` and `XDG_{CONFIG,DATA,STATE}_HOME` in the build's own directory, `HENNERY_DATA_DIR`, `HENNERY_HOST_DATA_DIR`, `HENNERY_MASTER_KEY`, `CREDENTIALS_DIRECTORY`, `HENNERY_SERVICE` and `HENNERY_LOG_DIR` unset, the npm registry and Node mirror a port nothing listens on. The build sandbox has no network on Linux either.
+    - `home-manager-doctor` runs the binary as `offline()` in `crates/hennery/tests/cli.rs` does (PR #102): `HOME` and `XDG_{CONFIG,DATA,STATE,CACHE}_HOME` in the build's own directory; `HENNERY_DATA_DIR`, `HENNERY_HOST_DATA_DIR`, `HENNERY_MASTER_KEY`, `CREDENTIALS_DIRECTORY`, `HENNERY_DEV_TOKEN`, `HENNERY_SERVICE`, `HENNERY_LOG_DIR`, `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `CODEX_SQLITE_HOME` unset; the npm registry and Node mirror a port nothing listens on (the second review's N1). The build sandbox starts from a clean environment and has no network on Linux either.
     - The virtual machine's service manager, users and data directories are its own.
     - The Rust tests write only under their temporary roots.
 13. **CI** (`nix.yml`).
@@ -221,7 +223,7 @@ All commands run from the repository root. `<system>` is this machine's Nix syst
   nix flake check --all-systems --no-build
   ```
 
-  Expected: both exit 0. `unpack-refuses` prints `ok: <name> refused: …` for each of the eight bad tarballs, then `ok: good unpacked without its first component` and `ok: an existing destination refused`. `codex-acp-runs` prints each native program it runs and the adapter's answer, `{"jsonrpc":"2.0","id":0,"result":{…"agentInfo":{"name":"@agentclientprotocol/codex-acp"…`. On Linux (CI), `adapter-check-cases` builds its three Linux cases too, and `NIXPKGS_ALLOW_UNFREE=1 nix build --impure --no-link -L .#claude-acp-runs` prints `2.1.280 (Claude Code)` and the adapter's answer.
+  Expected: both exit 0. `unpack-refuses` prints `ok: <name> refused: …` for each of the eight bad tarballs, then `ok: good unpacked without its first component` and `ok: an existing destination refused`. `codex-acp-runs` prints each native program it runs and the adapter's answer, `{"jsonrpc":"2.0","id":0,"result":{…"agentInfo":{"name":"@agentclientprotocol/codex-acp"…`. On Linux (CI), `adapter-check-cases` builds its four Linux cases too, and `NIXPKGS_ALLOW_UNFREE=1 nix build --impure --no-link -L .#claude-acp-runs` prints `2.1.280 (Claude Code)` and the adapter's answer.
 
 - [ ] **Step 6: The revert-probes**
 
@@ -416,7 +418,7 @@ All commands run from the repository root. `<system>` is this machine's Nix syst
   - `pub fn Doctor::agents_given_by_system_unit(&self) -> bool` is new: whether those came from `/etc/systemd/system/hennery-host.service`;
   - `pub(crate) fn service::read_system_command_line(cx, role)` is new, Linux only.
 - **7c's own unit and launchd agent** (the parent's PR, Q4): `RestartPreventExitStatus=78`, and launchd's equivalent, for `service install`. This plan's units already have it; `unit.rs` is untouched.
-- **Doctor and the system unit:** check 10 still looks for user services only, so on a NixOS host it says no service is installed; check 5 does not read the system unit's PATH. Teaching check 10 about system units (active, pointing at this binary) is a follow-up. Drop-ins (`hennery-host.service.d/`) are not read.
+- **Doctor and the system unit:** check 10 still looks for user services only, so on a NixOS host it says no service is installed; check 5 does not read the system unit's PATH, and check 3 starts the unit's agents with doctor's own PATH (the second review's O1). Reading the unit's `Environment="PATH=…"`, and teaching check 10 about system units (active, pointing at this binary), are follow-ups. Drop-ins (`hennery-host.service.d/`) are not read.
 - **aarch64-linux** is evaluated in CI, never built: no runner has it.
 - **The macOS sandbox:** `adapter-check` runs unsandboxed on macOS; a Mac with `sandbox = true` cannot build `codex-acp-runs`.
 - **Codex's voice host** stays unpatched on Linux, so its voice feature does not load on NixOS.

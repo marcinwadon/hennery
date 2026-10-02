@@ -78,6 +78,7 @@ for name, old, new, case in [
 for name, old, new, case, expect in [
     ("check-loader-missing", "echo \"passed over: $program needs the loader $interpreter, which this system does not have\"\n              continue", "exit 1", "loader-missing", r"adapter-check-passes-loader-missing"),
     ("check-cannot-start", "*:124 | *:12[6-9] | *:1[3-9]? | *:2??) echo \"$program did not run: $status\" >&2; exit 1 ;;", "*:124) exit 1 ;;", "helper-cannot-start", NOT_FAILED),
+    ("check-patched-loader", "              if ${lib.boolToString (adapter.patched or false)}; then\n                echo \"$program needs the loader $interpreter, which this system does not have: autoPatchelfHook left it unpatched\" >&2\n                exit 1\n              fi\n", "", "loader-missing-patched", NOT_FAILED),
     ("check-library-missing", "echo \"$program did not run: $status (loader: ''${interpreter:-none})\" >&2\n            exit 1", "continue", "library-missing", NOT_FAILED),
 ]:
     probe(name, "linux", A, old, new, build(LINUX, f"adapter-check-cases.{case}"), "fail", expect)
@@ -102,7 +103,7 @@ probe("rust-linux-only", "mac", S, "if cx.platform != Platform::Linux {\n       
       "let text", rust(SYSTEM_UNIT_TEST), "fail", re.escape(SYSTEM_UNIT_TEST) + r" \.\.\. FAILED")
 probe("rust-named", "mac", R, "Ok(None) if doctor.agents_given_by_system_unit() =>", "Ok(None) if false =>",
       rust(SYSTEM_UNIT_TEST), "fail", re.escape(SYSTEM_UNIT_TEST) + r" \.\.\. FAILED")
-probe("rust-user-first", "mac", M, "user.chain(system).find_map", "system.chain(user).find_map",
+probe("rust-user-first", "mac", M, "user.chain(system).find_map", "system.into_iter().chain(user).find_map",
       rust(USER_SERVICE_TEST), "fail", re.escape(USER_SERVICE_TEST) + r" \.\.\. FAILED")
 probe("rust-no-agent", "mac", M, "(!given.is_empty()).then_some((system, given))", "Some((system, given))",
       rust(SYSTEM_UNIT_TEST), "fail", re.escape(SYSTEM_UNIT_TEST) + r" \.\.\. FAILED")
@@ -117,7 +118,10 @@ N = "nix/modules/nixos.nix"
 H = "nix/modules/home-manager.nix"
 O = "nix/outputs.nix"
 evalfail("eval-agent", C, '"--agent"\n        "${name}=', '"--agen"\n        "${name}=', "nix: the agents given with --agent")
-evalfail("eval-managed", C, 'lib.optionals (cfg.adapters.source == "nix") (', 'lib.optionals true (', "managed: no --agent")
+# With `managed` given the Nix adapters, its default agents need the
+# Claude licence: the evaluation itself fails.
+probe("eval-managed", "mac", C, 'lib.optionals (cfg.adapters.source == "nix") (', 'lib.optionals true (', EVAL, "fail",
+      r"Refusing to evaluate package 'hennery-claude-acp-[0-9.]+' .* because it has an unfree license")
 evalfail("eval-percent", C, '[ "\\\\\\\\" "\\\\\\"" "%%" "$$" ]', '[ "\\\\\\\\" "\\\\\\"" "%" "$$" ]', "home-manager: every word quoted as unit.rs quotes it")
 evalfail("eval-dollar", C, '[ "\\\\\\\\" "\\\\\\"" "%%" "$$" ]', '[ "\\\\\\\\" "\\\\\\"" "%%" "$" ]', "home-manager: every word quoted as unit.rs quotes it")
 evalfail("eval-listen", C, '"--listen"\n      address', '"--listn"\n      address', "collector: its command line")
