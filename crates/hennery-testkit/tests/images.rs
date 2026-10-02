@@ -557,3 +557,73 @@ async fn attachments_are_served_only_to_the_operator() {
     let resp = reqwest::get(collector.url("/api/settings/attachments")).await.unwrap();
     assert_eq!(resp.status(), 401);
 }
+
+/// Plan 9a decision 5: deleting an active session on a connected host
+/// closes it there first, then deletes it: 204, 404 after, off the list, its
+/// image no longer served, its file gone and the usage down.
+#[tokio::test]
+async fn deleting_an_active_session_closes_it_on_its_host_then_removes_it_and_its_images() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, Capabilities(vec![Capability::Park, Capability::Images])).await;
+    let session = started_session(&collector, &mut host).await;
+    let bytes = png(9, 4096);
+    let c = client(&collector);
+    let c2 = c.clone();
+    let url = prompt_url(&collector, &session);
+    let body = json!({ "content": [{ "type": "text", "text": "look" }, image("image/png", &bytes)] });
+    let call = tokio::spawn(async move { post(&c2, url, &body).await });
+    accept_prompt(&mut host, &session).await;
+    assert_eq!(call.await.unwrap().0, 202);
+    assert_eq!(collector.files(), [sha(&bytes)]);
+    let served = collector.url(&format!("/api/attachments/{}", sha(&bytes)));
+    assert_eq!(c.get(&served).send().await.unwrap().status(), 200);
+    assert_eq!(
+        usage(&c, &collector).await,
+        AttachmentUsage {
+            count: 1,
+            bytes: bytes.len() as u64
+        }
+    );
+
+    let c2 = c.clone();
+    let url = collector.url(&format!("/api/sessions/{session}"));
+    let call = tokio::spawn(async move { c2.delete(url).timeout(Duration::from_secs(60)).send().await.unwrap() });
+    let CollectorFrame::CloseSession { session_id, .. } = host.next().await else {
+        panic!("expected close_session");
+    };
+    assert_eq!(session_id, session);
+    host.emit(&session, SessionBody::SessionClosed).await;
+    assert_eq!(call.await.unwrap().status(), 204);
+
+    for path in [
+        format!("/api/sessions/{session}"),
+        format!("/api/sessions/{session}/events"),
+        format!("/api/stream/sessions/{session}"),
+    ] {
+        let status = c.get(collector.url(&path)).send().await.unwrap().status();
+        assert_eq!(status, 404, "{path}");
+    }
+    let list: Value = c
+        .get(collector.url("/api/sessions"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list["sessions"], json!([]), "{list}");
+    assert!(collector.files().is_empty(), "{:?}", collector.files());
+    assert_eq!(c.get(&served).send().await.unwrap().status(), 404);
+    assert_eq!(usage(&c, &collector).await, AttachmentUsage { count: 0, bytes: 0 });
+}
+
+/// `GET /api/settings/attachments`.
+async fn usage(c: &reqwest::Client, collector: &Collector) -> AttachmentUsage {
+    c.get(collector.url("/api/settings/attachments"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
