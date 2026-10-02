@@ -33,6 +33,8 @@ tokio-tungstenite.workspace = true
 tokio-util.workspace = true
 toml.workspace = true
 tracing.workspace = true
+# The process's log output, with the message-tracing targets capped (plan 8c).
+tracing-subscriber.workspace = true
 url.workspace = true
 uuid.workspace = true
 

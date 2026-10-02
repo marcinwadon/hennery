@@ -7,6 +7,7 @@ pub mod connection;
 pub mod forget;
 pub mod git;
 pub mod identity;
+pub mod logging;
 pub mod outbox;
 pub mod pairing;
 pub mod paths;
