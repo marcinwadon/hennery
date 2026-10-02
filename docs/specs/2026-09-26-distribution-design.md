@@ -23,7 +23,7 @@ One binary, `hennery`:
 | `hennery collector` | Collector only (full mode) |
 | `hennery gateway` | Collector in gateway-only mode |
 | `hennery host join <url> [<code>]` | Pair this machine (the code from stdin when left out) and install its runtime (§3) |
-| `hennery host run` | Run a paired host; exits 78 (`EX_CONFIG`) once it is revoked |
+| `hennery host run` | Run a paired host; exits 78 (`EX_CONFIG`) once it is revoked, but 0 when launchd runs it as the host service (§5.2); either way it records the revoke |
 | `hennery host adapters update` / `rollback` | Switch to the adapter set pinned by this binary / back to the previous one |
 | `hennery mcp apply --client claude\|codex` | Render a standalone client's gateway manifest into agent config; token from `--token-file`, `HENNERY_MCP_TOKEN` or stdin, never a flag (gateway spec §3.3) |
 | `hennery service install\|uninstall\|status [--role up\|host\|collector]` | launchd / systemd user service, one per role (§6) |
@@ -289,10 +289,18 @@ unit's remaining processes anyway; the pipe matters most under launchd.
 - A host child that exits 78 (revoked) is not restarted: `up` logs which files
   to remove to pair it again, and keeps the collector serving the operator and
   remote hosts.
-- A host run by its own service is not restarted after a revoke either. On
-  systemd its unit carries `RestartPreventExitStatus=78` (§6.3). launchd has no
-  per-exit-code switch, so the host service's own handling of a revoke is a
-  follow-up.
+- **A host run by its own service is not restarted after a revoke either:**
+  - **systemd:** the host unit carries `RestartPreventExitStatus=78` (§6.3).
+  - **launchd** has no per-exit-code switch: `KeepAlive = {SuccessfulExit =
+    false}` restarts any non-zero exit. So a revoked host that launchd runs as
+    the host service exits 0 instead. `up`'s child keeps 78 under a launchd
+    `up` too.
+  - **The record:** every revoked host also writes `revoked` in its data
+    directory, holding the host id, the collector and the time.
+    `hennery service status` and doctor's check 10 read it, and say to pair
+    again with `hennery host join <public URL>`, then start the service.
+  - **Staleness:** the record counts only while its host id is the pairing's.
+    A re-pair stores another id, which retires it.
 - Both children run in their own process groups, so a terminal's Ctrl-C
   reaches only the supervisor. The supervisor handles SIGINT like SIGTERM and
   forwards it: host first (it flushes its outbox, closes adapters; sessions
@@ -368,6 +376,10 @@ writes its own size-capped rotating log, `hennery-<process>.log` beside it, §8)
 Loaded with `launchctl bootstrap
 gui/$UID`, restarted with `launchctl kickstart -k`.
 
+A revoked host service makes one start per login, refused by the collector. It
+then exits 0 and stays down (§5.2): the plist keeps restarting after a failure
+(a network down at start), so it cannot be told to stop on the revoke's code.
+
 `Aqua` means the host runs only while the user has a GUI login session, which
 is also when the login keychain (where Claude keeps its credentials) is
 unlocked. A headless Mac therefore needs a logged-in user; `doctor` checks
@@ -438,7 +450,7 @@ are never printed (only "logged in" and the method).
 | 7 | Collector: DNS, TCP, TLS, certificate matches `public_url`; `http://` only on loopback; WebSocket `hello` accepted (revoked → "re-pair with `hennery host join`"; `bad_proof`, an unknown host → "remove `host.key` and `host.toml`, then `hennery host join`") |
 | 8 | Clock skew against the collector's `Date` header (warn > 30 s, fail > 5 min) |
 | 9 | Disk: free space for two adapter sets and the outbox; current outbox size; recent transcript gaps; `outbox.db.orphaned-*` kept from earlier identities |
-| 10 | Service: installed, active, pointing at this binary; linger on Linux; only one role installed per machine; restart needed after an upgrade (running version ≠ binary on disk) |
+| 10 | Service: installed, active, pointing at this binary; linger on Linux; only one role installed per machine; restart needed after an upgrade (running version ≠ binary on disk); a host service whose host was revoked fails, from its `revoked` record (§5.2), with the re-pair as the fix |
 | 11 | Another `hennery` earlier on PATH (name collision, §11) |
 | 12 | Adapter set: installed set differs from the one pinned by this binary (warn, with `hennery host adapters update`) |
 | 13 | Bundled vs terminal CLI: the pinned bundled `claude`/`codex` version compared with the one on the user's PATH; warn on a large gap (sessions resumed from the terminal may meet an unexpected format) |

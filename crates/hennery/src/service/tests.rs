@@ -641,3 +641,60 @@ fn status_fails_when_the_service_cannot_run() {
     assert!(text.contains("its binary is missing"), "{text}");
     assert!(text.contains("systemd: failed, enabled"), "{text}");
 }
+
+/// `service status` for a host service whose host was revoked: launchd's
+/// revoked host exits 0 and is not loaded or running, so the record says
+/// why, with the re-pair and how to start it, and the status fails; a
+/// record a re-pair retired says nothing.
+#[test]
+fn status_says_a_host_service_was_revoked_from_its_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::new(|line, _| {
+        if line.contains(" print ") {
+            failed("Could not find service")
+        } else {
+            ok("")
+        }
+    });
+    let cx = machine(dir.path(), Platform::MacOs, &fake);
+    let data = paired(dir.path());
+    let plist = cx.service_file(Role::Host);
+    std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+    let argv = unit::command_line(Role::Host, &cx.exe, &data).unwrap();
+    std::fs::write(&plist, unit::plist(Role::Host, &argv, "/usr/bin", "/bin/sh", "/tmp/l")).unwrap();
+    // The plist keeps restarting on a failure: a revoke exits 0 to stop it,
+    // rather than restarting only on a crash, which would also stop the
+    // restart after a network failure at start.
+    assert!(
+        std::fs::read_to_string(&plist)
+            .unwrap()
+            .contains("<key>SuccessfulExit</key>\n\t\t<false/>")
+    );
+    let record = |host_id: &str| {
+        crate::revoked::record(
+            &data,
+            &crate::revoked::Revoked {
+                host_id: host_id.into(),
+                collector_url: "ws://127.0.0.1:7117/api/hosts/ws".into(),
+                at: 1,
+            },
+        )
+        .unwrap()
+    };
+    record("host-test");
+    let mut out = Vec::new();
+    assert_eq!(status(&cx, Some(Role::Host), &mut out).unwrap(), ExitCode::FAILURE);
+    let text = String::from_utf8(out).unwrap();
+    assert!(text.contains("revoked by the collector"), "{text}");
+    assert!(text.contains("hennery host join http://127.0.0.1:7117"), "{text}");
+    assert!(
+        text.contains("launchctl kickstart -k gui/501/dev.hennery.host"),
+        "{text}"
+    );
+
+    record("an-earlier-host");
+    let mut out = Vec::new();
+    status(&cx, Some(Role::Host), &mut out).unwrap();
+    let text = String::from_utf8(out).unwrap();
+    assert!(!text.contains("revoked by the collector"), "{text}");
+}

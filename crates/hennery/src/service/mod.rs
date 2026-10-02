@@ -655,6 +655,25 @@ fn status_of(cx: &Context, role: Role, out: &mut dyn Write) -> Result<bool> {
             }
         }
     }
+    // A revoked host stays down (spec §5.2): under launchd its exit code no
+    // longer says why, so its record does; said first, as the manager may
+    // not even be reachable.
+    if role == Role::Host
+        && let Some(data) = data_dir_of(&argv)
+    {
+        match crate::revoked::current(&data) {
+            Ok(Some(revoked)) => {
+                let (why, fix) = revoked.said(&start_command(cx, role));
+                writeln!(out, "  {why}; {fix}")?;
+                healthy = false;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                writeln!(out, "  whether it was revoked is unknown: {err:#}")?;
+                healthy = false;
+            }
+        }
+    }
     // Whether it runs, and as which process, as the service manager says.
     let Some(managed) = managed(cx, role)? else {
         writeln!(out, "  systemd: unavailable (`systemctl --user` cannot be run)")?;
@@ -671,6 +690,14 @@ fn status_of(cx: &Context, role: Role, out: &mut dyn Write) -> Result<bool> {
         healthy &= children(&data, managed.pid, out)?;
     }
     Ok(healthy)
+}
+
+/// How `role`'s service is started (again) by hand.
+pub(crate) fn start_command(cx: &Context, role: Role) -> String {
+    match cx.platform {
+        Platform::MacOs => format!("launchctl kickstart -k gui/{}/{}", cx.uid, role.label()),
+        Platform::Linux => format!("systemctl --user restart {}", role.unit()),
+    }
 }
 
 /// What the service manager says of a service: parsed fields only, never

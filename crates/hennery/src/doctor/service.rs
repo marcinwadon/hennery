@@ -19,10 +19,7 @@ const SEVERAL: &str = "more than one service installed";
 
 /// How `role`'s service is restarted.
 fn restart(doctor: &Doctor, role: Role) -> String {
-    match doctor.cx.platform {
-        Platform::MacOs => format!("launchctl kickstart -k gui/{}/{}", doctor.cx.uid, role.label()),
-        Platform::Linux => format!("systemctl --user restart {}", role.unit()),
-    }
+    service::start_command(doctor.cx, role)
 }
 
 fn canonical(path: &Path) -> PathBuf {
@@ -85,6 +82,27 @@ fn one_service(doctor: &Doctor, role: Role, verdict: &mut Verdict) {
             ),
             format!("run `hennery service install --role {role}` with the binary to use"),
         );
+    }
+    // A revoked host stays down (spec §5.2), whatever its service manager
+    // says: pairing it again is the fix, not installing the service again.
+    if role == Role::Host
+        && let Some(data) = service::data_dir_of(&argv)
+    {
+        match crate::revoked::current(&data) {
+            Ok(Some(revoked)) => {
+                let (why, fix) = revoked.said(&restart(doctor, role));
+                verdict.fail(format!("the {role} service's host was {why}"), fix);
+                return;
+            }
+            Ok(None) => {}
+            Err(err) => verdict.warn(
+                format!("whether the {role} service's host was revoked is unknown: {err:#}"),
+                format!(
+                    "remove {} if it is not hennery's",
+                    data.join(crate::revoked::FILE).display()
+                ),
+            ),
+        }
     }
     let managed = match service::managed(cx, role) {
         Ok(Some(managed)) => managed,
