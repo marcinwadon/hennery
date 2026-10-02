@@ -1,0 +1,58 @@
+/* The management screens (plan 4d): Hosts, Hats and Settings. Their own
+   file, so the shell's index.css stays the shell's. Mobile-first: one
+   column, every target at least 44 px under 768 px. */
+
+.manage { width:100%; max-width:860px; margin:0 auto; padding:24px 20px calc(32px + env(safe-area-inset-bottom)); display:flex; flex-direction:column; gap:16px; }
+.manage-head { display:flex; align-items:center; gap:12px; }
+.manage-head h1 { font-family:var(--font-display); font-weight:800; font-size:26px; letter-spacing:-.01em; margin:0; flex:1; }
+.cards { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:12px; }
+.card { background:var(--surface); border:1px solid var(--border); border-radius:var(--r-md); box-shadow:var(--sh-sm); padding:16px 18px; min-width:0; }
+.card-head { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:10px; }
+.card-title { font-family:var(--font-display); font-weight:700; font-size:16px; margin:0; min-width:0; overflow-wrap:anywhere; flex:1; }
+.card-actions { display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-top:12px; }
+.card-actions .spacer { flex:1; }
+.card p { margin:0 0 10px; overflow-wrap:anywhere; }
+.notice { border-color:var(--accent); }
+
+.facts { display:grid; grid-template-columns:max-content minmax(0,1fr); gap:4px 14px; margin:0; font-size:14px; }
+.facts dt { color:var(--fg-muted); }
+.facts dd { margin:0; min-width:0; overflow-wrap:anywhere; }
+
+.state, .tag { font-size:11px; font-weight:700; letter-spacing:.06em; text-transform:uppercase; border-radius:var(--r-full); padding:3px 9px; white-space:nowrap; }
+.state-online { background:rgba(47,158,68,.13); color:#247A33; }
+.state-offline { background:var(--surface-3); color:var(--fg-muted); }
+.state-revoked { background:rgba(229,72,77,.12); color:var(--st-attn); }
+.host-revoked .card-title { color:var(--fg-muted); }
+.tag { background:var(--accent-wash); color:var(--accent); }
+.tag-warn { background:rgba(232,145,12,.14); color:#B26A00; }
+
+.swatch { width:18px; height:18px; border-radius:6px; flex:none; background:var(--fg-quiet); border:1px solid var(--border-strong); }
+.colour-input { width:52px; height:40px; padding:2px; border:1.5px solid var(--border-strong); border-radius:var(--r-sm); background:var(--surface-2); }
+
+.inline-form { display:flex; align-items:flex-end; gap:10px; flex-wrap:wrap; margin-top:8px; }
+.inline-form .field { margin:0; flex:1; min-width:180px; }
+.select-field { display:inline-flex; flex-direction:column; gap:4px; }
+.select-field .field-label { margin:0; font-size:12px; }
+.select-field select { min-height:36px; border:1.5px solid var(--border-strong); border-radius:var(--r-sm); background:var(--surface-2); color:var(--fg-1); padding:6px 8px; font:inherit; max-width:100%; }
+
+.command { background:var(--ink); color:#fff; border-radius:var(--r-sm); padding:12px 14px; margin:0 0 10px; overflow-x:auto; font-family:var(--font-mono); font-size:13px; }
+.pairing-code code { font-family:var(--font-mono); font-weight:700; }
+.hint { color:var(--fg-muted); font-size:13px; }
+.empty { color:var(--fg-muted); }
+.sign-out-error { margin-top:8px; font-size:13px; }
+
+.rules { margin-top:12px; }
+.rule-list { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:10px; }
+.rule { display:flex; align-items:flex-end; gap:10px; flex-wrap:wrap; }
+.rule .field { margin:0; }
+.rule-prefix { flex:1; min-width:200px; }
+.tester { margin-top:16px; border-top:1px solid var(--border); padding-top:14px; }
+.tester .field { margin:0 0 6px; }
+.purge-list { margin:0 0 12px; padding-left:20px; overflow-wrap:anywhere; }
+
+@media (max-width:767px) {
+  .manage { padding:16px 14px calc(24px + env(safe-area-inset-bottom)); }
+  .manage-head h1 { font-size:22px; }
+  .card-actions .btn, .inline-form .btn, .rule .btn { min-height:44px; }
+  .select-field select { min-height:44px; }
+}

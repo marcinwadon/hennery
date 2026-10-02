@@ -10,6 +10,7 @@ import type { CapabilitiesResponse } from '../generated/protocol'
 import { LABEL, PATH, tabsOf, viewOf, viewsOf, type View } from '../lib/views'
 import { Icon } from '../lib/ui'
 import { Link, type Route } from '../router'
+import Hosts from '../screens/Hosts'
 import Placeholder from '../screens/Placeholder'
 import SignOut from './SignOut'
 
@@ -114,6 +115,8 @@ export default function Shell({ route }: { route: Route }) {
             <Placeholder title="Not found" text="No page lives at this address." />
           ) : !shown ? (
             <Placeholder title={title} text="This view is not part of this deployment." />
+          ) : route.name === 'hosts' ? (
+            <Hosts />
           ) : route.name === 'session' ? (
             <Placeholder title="Session" detail={route.id} text="The session view arrives with the transcript." />
           ) : (
