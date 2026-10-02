@@ -26,19 +26,54 @@ The collector sends no servers yet: minting and the delivery decision are plan 8
 - Umbrella §8.5: "Fallback: on a mixed host, sessions in the host's default hat get the default hat's mounts; sessions in other hats run without gateway MCP servers … Isolation is never silently weakened to make a feature work."
 - The spike: "It is not persisted across resume … hennery must send the same `_meta` (and the same `mcpServers`) on every `session/new` **and** every `session/load`."
 
-It builds on plan 5c's `sessions.hat_id` and plan 7b's installed set and `--use-cli`. Every anchor was taken from `main` at `fc00485`.
+It builds on plan 5c's `sessions.hat_id` and plan 7b's installed set and `--use-cli`. Every anchor was taken from `main` at `27fa020`.
 
 **Status:** written 2026-10-02; reviewed on the maintainer's behalf, approved after amendments and re-confirmed (see "The security review's answers"). One product question is with the maintainer: decision 8's ACP payloads (Q2), needed before 8e. Decision 4's window between 8c and 8e (Q1) was decided by the lane parent from umbrella §8.5 and the spike: proceed; release sequencing flagged to the fleet parent (see "After this plan").
 
 **How the code blocks were made and checked:**
 - Every block below was generated from the built code, on a scratch branch, task by task.
-- The plan was replayed from its own text onto `fc00485`. The tree matched each tests-only and task commit, byte for byte.
-- After every task the five checks passed: 1044, 1058 and 1060 tests, from 1032.
+- The plan was replayed from its own text onto `27fa020`. The tree matched each tests-only and task commit, byte for byte.
+- After every task the five checks passed: 1409, 1424 and 1426 tests, from 1394.
 - Every side-effect line was revert-probed (each task's Step 5).
 
-## Execution status
+## Execution status (2026-10-02)
 
-Not executed yet.
+**Executed** with subagent-driven development: one implementer per task, an opus reviewer per task (Task 4's a sonnet one), a whole-branch opus review. It ran on `fc00485`, where each task's tests-only and task commits matched the plan's replayed trees byte for byte. Main then moved twice, and the branch was rebased each time, every fix folded into the commit that needs it:
+- onto `e4e2ca3` (8a, the purge plans, push delivery and others): `mcp_delivery()` names plan 9c's new `ForgetHat` (its exhaustive match refused to compile without it), the hub's `register` in a new `api.rs` test gets the isolation, the `resolve` test reads the renamed `find_session`, and plan 9c's `purge` test sends `mcp_isolation` in its `hello`;
+- onto `befa372` (8d, plan 9d's forget): `Capability` gains `mcp_servers` after 9d's `forget_session` (the host announces both); the host's `attach` keeps 9d's agent-home recorder and passes the profile; the actor keeps 9d's `agent_session_id` and 8c's `secrets`; the fake answers with 9d's scripted session id and logs and echoes 8c's servers; `mcp_delivery()` names `ForgetSession`; the forget's probe match folds `McpUndeliverable` into `Unsupported` (a probe carries no servers), as the other probes do; 9d's `forget_host` frames carry the hat and no servers.
+- onto `27fa020` (frontend 4b, a flake fix, a service fix): no conflict; the generated files regenerated unchanged.
+- onto `ecc50cd` (the gateway's differential fix): docs only, no conflict. The plan's anchors and replay stay on `27fa020`. The reviews' amendments came as follow-up commits, and the plan was amended to match (its blocks are the final code), so the history is:
+
+| Commit | What |
+|---|---|
+| `6fd4318` | the plan |
+| `a0196af`, `efc002c` | Task 1's tests, then the wire and the hub's gate |
+| `923c4a9`, `a96a4db` | Task 2's tests, then the host |
+| `f8ddce0` | Task 2's review: the test value `scrub` cuts in part used `:`, which `Secrets` also cuts at, so the redact-before-`scrub` order was untested (four probes passed: the stderr tail, `redact_with`, the config note, the replay note); it now uses `,` and all four fail their test |
+| `35431cf`, `ff7d327` | Task 3's tests, then the cap |
+| `e7f36a6`, `ef7100a` | Task 3's review (important): at `warn` the ACP crate quotes an adapter's stdout line that is not JSON-RPC (`Invalid transport input`), so a token printed there reached the log at the default `RUST_LOG`; the fake's `stdout_lines`, a test that shows it uncapped, and the ACP crate held at `error` (tungstenite stays at `info`) |
+| `11a04e9` | the plan amended with both |
+| `218e32b` | Task 4, the spec write-back |
+| `46e260d` | the whole-branch review's minors: the start's and resume's catch-all comments say a refused delivery leaves the session `starting`; the `hello` test's accept is bounded; ACP core §3.3 lists every capability the host announces |
+| `99ac971` | the fleet's rule that every outcome a classifier or verdict can give has a test and a probe of its own: an audit (opus) found a resume's servers never checked through the hub, the 409 mapping untested and the host's delivered path untested; four tests, and probes P46–P80 |
+
+| Area | As built | Why |
+|---|---|---|
+| The security review (opus, on the maintainer's behalf) and its re-confirmation | As recorded in "The security review's answers". | |
+| Q1, decision 4's window | Decided by the lane parent: proceed; the release blocker below. | |
+| Q2, decision 8's ACP payloads | Open, with the maintainer, before 8e. | |
+| Task 1's review (opus) | Approved; minors recorded (two `impl HostConn` blocks, the generated TS's required lists, as elsewhere in the protocol). | |
+| Task 2's review (opus) | One important finding, plan-mandated: the test value above. Fixed, re-reviewed: addressed. | |
+| Task 3's review (opus) | One important finding, plan-mandated: the ACP crate's `warn`. Fixed, re-reviewed: addressed, and none of the crate's `error` events quotes a message. Its comments were made descriptive in a second round. | |
+| Task 4's review (sonnet) | Approved. | |
+| The whole-branch review (opus) | Ready to merge; six minors: three fixed (`46e260d`), three added to "After this plan" (an agent's HTTP MCP capability, 8e's waived-flag test, a held rollback set's isolation). | |
+| The outcome audit (opus) and its tests' review (sonnet) | Four tests (`99ac971`), approved; the 409-versus-502 status of `mcp_isolation_unavailable` left to 8e ("After this plan"). | The fleet rule of 2026-10-02. |
+
+Checks:
+- The five checks passed after every task: 1409, 1424 and 1426 tests, from 1394; at the branch's tip, 1426.
+- Every revert-probe was run on the built code (P1–P45 on `fc00485`, P46–P80 on `e4e2ca3`, all again on `befa372`): P1–P79 each failed its test (P18 by the compiler; P38 with its line as P43 left it; P13 with the capability list 9d extended). The first full run found the four the test value hid; earlier results had predated the `:@` cut that hid them. P80 (`tokio_tungstenite` held at `info`) is caught by nothing: that crate traces no message at its target, so its cap is defence in depth.
+- The four test binaries this plan adds or extends (`hub_mcp`, `host_connection`, `session_mcp`, `session_mcp_log`), four copies of each in parallel, three rounds, on `fc00485`, `e4e2ca3` and `befa372`, while the other lanes built: 48 runs each time, no failure.
+- macOS only; ubuntu CI is the Linux check. No test reads another process's state.
 
 ## Scope
 
@@ -175,7 +210,7 @@ Found while fixing the L11 canary: one segment of a URL's path echoed alone was 
 - "Create `path`:" makes a new file with the block.
 - "In `path`, replace:" is followed by a block that occurs **exactly once** in the file at that point, as whole lines (earlier blocks of the same task already applied, in order), then "with:" and its replacement.
 
-"Run:" lines only check or regenerate: `cargo run -p hennery-proto --bin gen` rewrites the generated files and changes no other file. The plan was replayed exactly this way, from its own text, onto `fc00485`.
+"Run:" lines only check or regenerate: `cargo run -p hennery-proto --bin gen` rewrites the generated files and changes no other file. The plan was replayed exactly this way, from its own text, onto `27fa020`.
 
 ---
 
@@ -784,6 +819,75 @@ fn notify_sends_no_servers_a_connection_cannot_take() {
     assert!(rx.try_recv().is_err(), "sent anyway");
     assert!(hub.notify("h", start("claude", false, false)));
 }
+
+/// `start(agent, true, waived)` as a resume.
+fn resume(agent: &str, waived: bool) -> CollectorFrame {
+    let CollectorFrame::StartSession {
+        request_id,
+        session_id,
+        committed_seq,
+        agent,
+        cwd,
+        config,
+        hat_id,
+        mcp,
+    } = start(agent, true, waived)
+    else {
+        unreachable!()
+    };
+    CollectorFrame::ResumeSession {
+        request_id,
+        session_id,
+        committed_seq,
+        agent,
+        cwd,
+        agent_session_id: "a1".into(),
+        config,
+        hat_id,
+        mcp,
+    }
+}
+
+/// A resume carries servers as a start does (an agent keeps none across
+/// `session/load`), and the hub checks it the same way: by the agent it
+/// names, on the connection it would go out on.
+#[tokio::test]
+async fn a_resume_with_servers_is_checked_as_a_start_is() {
+    let with = Capabilities(vec![Capability::McpServers]);
+    for (capabilities, agent, waived, delivered) in [
+        // (capabilities, agent, waived, delivered)
+        (with.clone(), "claude", false, true),
+        (with.clone(), "codex", false, false),
+        (with, "codex", true, true),
+        (Capabilities::default(), "claude", true, false),
+    ] {
+        let hub = Hub::new();
+        let mut rx = connect(&hub, capabilities.clone());
+        let result = send(&hub, &mut rx, resume(agent, waived)).await;
+        let case = format!("{capabilities:?} {agent} waived={waived}");
+        if delivered {
+            assert_eq!(result, Ok(()), "{case}");
+        } else {
+            assert_eq!(result, Err(RequestError::McpUndeliverable), "{case}");
+            assert!(rx.try_recv().is_err(), "sent anyway: {case}");
+        }
+    }
+}
+
+/// A frame that carries no delivery (a prompt) is not the guard's to
+/// refuse: it goes out on any connection, one that announced nothing too.
+#[tokio::test]
+async fn a_frame_without_a_delivery_goes_out_on_any_connection() {
+    let hub = Hub::new();
+    let mut rx = connect(&hub, Capabilities::default());
+    let prompt = CollectorFrame::Prompt {
+        request_id: "r1".into(),
+        session_id: "s1".into(),
+        turn_id: "t1".into(),
+        content: vec![],
+    };
+    assert_eq!(send(&hub, &mut rx, prompt).await, Ok(()));
+}
 ```
 
 In `crates/hennery-testkit/tests/auth.rs`, replace:
@@ -814,6 +918,52 @@ with:
             Capabilities(vec![Capability::ResolvePath]),
             Default::default(),
         )
+```
+
+In `crates/hennery-testkit/tests/forget_host.rs`, replace:
+
+```rust
+            config: Default::default(),
+        }
+```
+
+with:
+
+```rust
+            config: Default::default(),
+            hat_id: String::new(),
+            mcp: Default::default(),
+        }
+```
+
+In `crates/hennery-testkit/tests/forget_host.rs`, replace:
+
+```rust
+            config: Default::default(),
+        })
+```
+
+with:
+
+```rust
+            config: Default::default(),
+            hat_id: String::new(),
+            mcp: Default::default(),
+        })
+```
+
+In `crates/hennery-testkit/tests/forget_host.rs`, replace:
+
+```rust
+        config: Default::default(),
+```
+
+with:
+
+```rust
+        config: Default::default(),
+        hat_id: String::new(),
+        mcp: Default::default(),
 ```
 
 In `crates/hennery-testkit/tests/host_connection.rs`, replace:
@@ -897,6 +1047,19 @@ with:
             attached_sessions: vec![],
             mcp_isolation: Default::default(),
         })
+```
+
+In `crates/hennery-testkit/tests/purge.rs`, replace:
+
+```rust
+            attached_sessions: attached,
+```
+
+with:
+
+```rust
+            attached_sessions: attached,
+            mcp_isolation: Default::default(),
 ```
 
 In `crates/hennery-testkit/tests/reconcile.rs`, replace:
@@ -1022,7 +1185,7 @@ async fn starts_and_resumes_carry_the_sessions_hat_and_no_servers() {
     assert_eq!(call.await.unwrap().0, 202);
     host.parked(&session_id).await;
     wait_for("parked", || async {
-        let row = collector.state.store.session(&session_id).unwrap().unwrap();
+        let row = collector.state.store.find_session(&session_id).unwrap().unwrap();
         (row.lifecycle == "parked").then_some(())
     })
     .await;
@@ -1106,15 +1269,13 @@ git commit -m "test(gateway): MCP servers and the hat on start and resume, and t
 In `crates/hennery-host/src/connection.rs`, replace:
 
 ```rust
-use hennery_proto::frames::{AttachedSession, Capabilities, Capability, CollectorFrame, HostFrame, SessionConfig};
+    AttachedSession, Capabilities, Capability, CollectorFrame, ForgetReason, HostFrame, SessionConfig,
 ```
 
 with:
 
 ```rust
-use hennery_proto::frames::{
-    AgentIsolation, AttachedSession, Capabilities, Capability, CollectorFrame, HostFrame, SessionConfig,
-};
+    AgentIsolation, AttachedSession, Capabilities, Capability, CollectorFrame, ForgetReason, HostFrame, SessionConfig,
 ```
 
 In `crates/hennery-host/src/connection.rs`, replace:
@@ -1186,13 +1347,13 @@ with:
 In `crates/hennery-proto/src/frames.rs`, replace:
 
 ```rust
-    ResolvePath,
+    ForgetSession,
 ```
 
 with:
 
 ```rust
-    ResolvePath,
+    ForgetSession,
     /// A session's MCP servers (plan 8c): the host passes a start's or
     /// resume's `mcp_servers` into `session/new` / `session/load` with the
     /// agent's isolation, as `hello.mcp_isolation` reports it, and refuses
@@ -1467,7 +1628,7 @@ with:
 In `crates/hennery-proto/src/frames.rs`, replace:
 
 ```rust
-            | Self::CloseSession { .. } => Err(NotAProbe),
+            | Self::ForgetHat { .. } => Err(NotAProbe),
         }
     }
 }
@@ -1477,7 +1638,7 @@ In `crates/hennery-proto/src/frames.rs`, replace:
 with:
 
 ```rust
-            | Self::CloseSession { .. } => Err(NotAProbe),
+            | Self::ForgetHat { .. } => Err(NotAProbe),
         }
     }
 
@@ -1500,7 +1661,9 @@ with:
             | Self::ParkSession { .. }
             | Self::CloseSession { .. }
             | Self::ListProjects { .. }
-            | Self::BrowseDirectory { .. } => None,
+            | Self::BrowseDirectory { .. }
+            | Self::ForgetHat { .. }
+            | Self::ForgetSession { .. } => None,
         }
     }
 
@@ -1598,6 +1761,24 @@ with:
 In `crates/hennery-sessions/src/api.rs`, replace:
 
 ```rust
+        // The socket task has already failed the session with the host's
+        // code (`Undo::Start`).
+        Err(err) => request_failed(err),
+```
+
+with:
+
+```rust
+        // The socket task has already failed the session with the host's
+        // code (`Undo::Start`); not for `McpUndeliverable`, which the hub
+        // refused before sending: that leaves the session `starting`, and
+        // plan 8e fails it (unreachable in 8c, which sends no servers).
+        Err(err) => request_failed(err),
+```
+
+In `crates/hennery-sessions/src/api.rs`, replace:
+
+```rust
         config,
 ```
 
@@ -1608,6 +1789,78 @@ with:
         // The hat the resume just re-resolved, equal to the stored one.
         hat_id: hat.hat_id.clone(),
         mcp: Default::default(),
+```
+
+In `crates/hennery-sessions/src/api.rs`, replace:
+
+```rust
+        // code (`Undo::Start`).
+```
+
+with:
+
+```rust
+        // code (`Undo::Start`); not for `McpUndeliverable`, which the hub
+        // refused before sending: that leaves the session `starting`, and
+        // plan 8e fails it (unreachable in 8c, which sends no servers).
+```
+
+In `crates/hennery-sessions/src/api.rs`, replace:
+
+```rust
+        assert_eq!(sent.len(), 2);
+    }
+}
+```
+
+with:
+
+```rust
+        assert_eq!(sent.len(), 2);
+    }
+
+    /// Plan 8c: the hub's refusal to send servers answers 409
+    /// `mcp_isolation_unavailable`, on a start and on a resume alike.
+    #[tokio::test]
+    async fn an_undeliverable_mcp_delivery_answers_409_mcp_isolation_unavailable() {
+        for response in [
+            request_failed(RequestError::McpUndeliverable),
+            resume_failed(RequestError::McpUndeliverable),
+        ] {
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["code"], "mcp_isolation_unavailable", "{body}");
+        }
+    }
+}
+```
+
+In `crates/hennery-sessions/src/api.rs`, replace:
+
+```rust
+            .register(HOST, tx.clone(), Capabilities::default())
+```
+
+with:
+
+```rust
+            .register(HOST, tx.clone(), Capabilities::default(), Default::default())
+```
+
+In `crates/hennery-sessions/src/forget.rs`, replace:
+
+```rust
+        Err(RequestError::Unsupported) => (pending(RemovalPending::HostNeedsUpdate), false, false),
+```
+
+with:
+
+```rust
+        // A probe carries no servers: `McpUndeliverable` cannot happen.
+        Err(RequestError::Unsupported | RequestError::McpUndeliverable) => {
+            (pending(RemovalPending::HostNeedsUpdate), false, false)
+        }
 ```
 
 In `crates/hennery-sessions/src/hub.rs`, replace:
@@ -1850,10 +2103,11 @@ Each is run on the task's code, then restored.
 - In `Hub::mcp_isolation`, report the `hello`'s isolation without the capability. `a_reconnect_without_the_capability_takes_no_servers` fails.
 - In `ws.rs`, register the connection with `Default::default()` in place of the `hello`'s `mcp_isolation`. `starts_and_resumes_carry_the_sessions_hat_and_no_servers` fails on the hub's isolation.
 - In `api.rs`, send `hat_id: String::new()` on the start, then on the resume. That test fails on each.
+- Every outcome on its own (P46–P63): in `mcp_delivery()`, give a resume `None`; in `agent()`, drop the resume; `a_resume_with_servers_is_checked_as_a_start_is` fails on each. In `request_failed`, answer `McpUndeliverable` with another code, then another status; `an_undeliverable_mcp_delivery_answers_409_mcp_isolation_unavailable` fails on each. In `HostConn::takes`, drop each of its conditions in turn (no servers pass; servers need the capability; a waiver delivers; an isolated agent delivers; a frame without a delivery passes); `servers_go_only_where_they_are_announced_and_isolated_or_waived`, `a_reconnect_without_the_capability_takes_no_servers` or `a_frame_without_a_delivery_goes_out_on_any_connection` fails on each. Read an unknown isolation value, then an absent agent, as `claude_strict`; require `mcp_isolation` in a `hello`; `a_hello_announces_per_agent_isolation_read_leniently` fails on each. Show a parsed URL as `<redacted>`; give an unparsed URL no secret value; the URL tests fail.
 
 - [ ] **Step 6: The full checks**
 
-Expected: all pass; **1044 tests**.
+Expected: all pass; **1409 tests**.
 
 - [ ] **Step 7: Commit**
 
@@ -1943,18 +2197,10 @@ tracing-subscriber.workspace = true
 In `crates/hennery-testkit/src/bin/hennery-fake-acp.rs`, replace:
 
 ```rust
-                async move |_req: NewSessionRequest, responder, cx| match script.new_session_error {
-                    Some(code) => responder.respond_with_error(agent_client_protocol::Error::new(code, "scripted")),
-                    None if script.config_in_update_only => {
-                        if let Some(options) = announced() {
-                            cx.send_notification(SessionNotification::new(
-                                "fake-session-1",
-                                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
-                            ))?;
-                        }
-                        responder.respond(NewSessionResponse::new("fake-session-1"))
-                    }
-                    None => responder.respond(NewSessionResponse::new("fake-session-1").config_options(announced())),
+                async move |_req: NewSessionRequest, responder, cx| {
+                    let id = script.session_id.clone().unwrap_or_else(|| "fake-session-1".into());
+                    match script.new_session_error {
+                        Some(code) => responder.respond_with_error(agent_client_protocol::Error::new(code, "scripted")),
 ```
 
 with:
@@ -1965,6 +2211,7 @@ with:
                     for line in &script.stdout_lines {
                         write_stdout_line(line);
                     }
+                    let id = script.session_id.clone().unwrap_or_else(|| "fake-session-1".into());
                     match script.new_session_error {
                         Some(code) => {
                             let message = if script.new_session_error_echoes {
@@ -1974,19 +2221,6 @@ with:
                             };
                             responder.respond_with_error(agent_client_protocol::Error::new(code, message))
                         }
-                        None if script.config_in_update_only => {
-                            if let Some(options) = announced() {
-                                cx.send_notification(SessionNotification::new(
-                                    "fake-session-1",
-                                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
-                                ))?;
-                            }
-                            responder.respond(NewSessionResponse::new("fake-session-1"))
-                        }
-                        None => {
-                            responder.respond(NewSessionResponse::new("fake-session-1").config_options(announced()))
-                        }
-                    }
 ```
 
 In `crates/hennery-testkit/src/bin/hennery-fake-acp.rs`, replace:
@@ -2185,14 +2419,14 @@ with:
 In `crates/hennery-testkit/tests/host_connection.rs`, replace:
 
 ```rust
-            Capability::ResolvePath
+            Capability::ForgetSession,
 ```
 
 with:
 
 ```rust
-            Capability::ResolvePath,
-            Capability::McpServers
+            Capability::ForgetSession,
+            Capability::McpServers,
 ```
 
 In `crates/hennery-testkit/tests/host_connection.rs`, replace:
@@ -2244,7 +2478,10 @@ async fn hello_announces_mcp_servers_and_how_each_agent_is_isolated() {
     cfg.profiles.insert("claude".into(), Profile::Claude);
     cfg.profiles.insert("own-cli".into(), Profile::ClaudeOwnCli);
     tokio::spawn(run(cfg));
-    let (tcp, _) = listener.accept().await.unwrap();
+    let (tcp, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("host connects")
+        .unwrap();
     let ws = accept(tcp).await.unwrap();
     let (_sink, mut stream) = ws.split();
     let HostFrame::Hello {
@@ -2307,6 +2544,81 @@ async fn servers_an_agent_cannot_be_kept_to_are_refused_before_any_spawn() {
     send_frame(&mut sink, &with_servers(start("r4", "s3"), "claude", false)).await;
     read_until(&mut stream, body_is("s3", "session_started")).await;
     assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 2);
+}
+
+/// The fake adapter appending each `session/new` and `session/load` it
+/// parses to `log`.
+fn logging_fake(log: &std::path::Path) -> hennery_host::AgentCommand {
+    let mut fake = hennery_host::AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    let script = hennery_testkit::FakeScript {
+        session_log: Some(log.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    fake.env.push((
+        hennery_testkit::SCRIPT_ENV.into(),
+        serde_json::to_string(&script).unwrap(),
+    ));
+    fake
+}
+
+/// A delivered start or resume reaches the adapter through the connection
+/// with its servers, and with its agent's profile's `_meta`: strict for
+/// Claude, on `session/new` and on `session/load` alike, none for a
+/// generic agent.
+#[tokio::test]
+async fn a_delivered_start_reaches_the_adapter_with_its_servers_and_profile() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("sessions.jsonl");
+    let mut cfg = host_with_fake(addr, "mcp-deliver", logging_fake(&log));
+    cfg.agents.insert("claude".into(), logging_fake(&log));
+    cfg.profiles
+        .insert("claude".into(), hennery_host::profile::Profile::Claude);
+    tokio::spawn(run(cfg));
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+
+    send_frame(&mut sink, &with_servers(start("r1", "s1"), "claude", false)).await;
+    read_until(&mut stream, body_is("s1", "session_started")).await;
+    send_frame(&mut sink, &with_servers(start("r2", "s2"), "fake", true)).await;
+    read_until(&mut stream, body_is("s2", "session_started")).await;
+    // A fresh session id: a resume of a live one restarts it, no load.
+    send_frame(
+        &mut sink,
+        &with_servers(resume("r3", "s3", 0, "agent-3"), "claude", false),
+    )
+    .await;
+    read_until(&mut stream, body_is("s3", "session_started")).await;
+
+    // Each line is written before its request is answered, so before the
+    // `session_started` read above.
+    let logged: Vec<(String, serde_json::Value)> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let line: serde_json::Value = serde_json::from_str(line).unwrap();
+            (line["method"].as_str().unwrap().to_string(), line["params"].clone())
+        })
+        .collect();
+    let methods: Vec<&str> = logged.iter().map(|(m, _)| m.as_str()).collect();
+    assert_eq!(methods, ["session/new", "session/new", "session/load"], "{logged:?}");
+    let servers = serde_json::json!([{
+        "type": "http",
+        "name": "hennery-notes",
+        "url": "https://hennery.example/mcp/notes",
+        "headers": [{"name": "Authorization", "value": "Bearer hst_0123456789abcdef"}],
+    }]);
+    let strict = serde_json::json!({"claudeCode": {"options": {"extraArgs": {"strict-mcp-config": ""}}}});
+    for (method, params) in &logged {
+        assert_eq!(params["mcpServers"], servers, "{method}: {params}");
+    }
+    assert_eq!(logged[0].1["_meta"], strict, "{}", logged[0].1);
+    assert!(
+        logged[1].1.get("_meta").is_none_or(serde_json::Value::is_null),
+        "{}",
+        logged[1].1
+    );
+    assert_eq!(logged[2].1["_meta"], strict, "{}", logged[2].1);
 }
 
 ```
@@ -2821,26 +3133,27 @@ pub const REDACTED: &str = "[redacted]";
 In `crates/hennery-host/src/connection.rs`, replace:
 
 ```rust
-use crate::projects::Probes;
-use crate::session::{self, AgentCommand, Answer, Attach, Launch, SessionCmd, SessionHandle, SessionOptions};
-use crate::uplink::Uplink;
-use anyhow::{Context, Result, bail};
-use futures::{SinkExt, StreamExt};
-use hennery_proto::frames::{
-    AgentIsolation, AttachedSession, Capabilities, Capability, CollectorFrame, HostFrame, SessionConfig,
+use crate::outbox::Outbox;
 ```
 
 with:
 
 ```rust
+use crate::outbox::Outbox;
 use crate::profile::Profile;
-use crate::projects::Probes;
-use crate::session::{self, AgentCommand, Answer, Attach, Launch, SessionCmd, SessionHandle, SessionOptions};
-use crate::uplink::Uplink;
-use anyhow::{Context, Result, bail};
-use futures::{SinkExt, StreamExt};
-use hennery_proto::frames::{
-    AgentIsolation, AttachedSession, Capabilities, Capability, CollectorFrame, HostFrame, McpDelivery, SessionConfig,
+```
+
+In `crates/hennery-host/src/connection.rs`, replace:
+
+```rust
+    AgentIsolation, AttachedSession, Capabilities, Capability, CollectorFrame, ForgetReason, HostFrame, SessionConfig,
+```
+
+with:
+
+```rust
+    AgentIsolation, AttachedSession, Capabilities, Capability, CollectorFrame, ForgetReason, HostFrame, McpDelivery,
+    SessionConfig,
 ```
 
 In `crates/hennery-host/src/connection.rs`, replace:
@@ -2947,6 +3260,7 @@ In `crates/hennery-host/src/connection.rs`, replace:
                 Capability::Images,
                 Capability::Projects,
                 Capability::ResolvePath,
+                Capability::ForgetSession,
             ]),
             // Nothing isolated yet: the host takes no servers until it
             // announces `mcp_servers` (plan 8c, Task 2).
@@ -2965,6 +3279,7 @@ with:
                 Capability::Images,
                 Capability::Projects,
                 Capability::ResolvePath,
+                Capability::ForgetSession,
                 Capability::McpServers,
             ]),
             mcp_isolation: announce.mcp_isolation,
@@ -3021,17 +3336,14 @@ with:
 In `crates/hennery-host/src/connection.rs`, replace:
 
 ```rust
+    }
     // Before anything can be enqueued for this session: continue from the
-    // larger of this host's counter and the collector's (ACP core §5.1), so
-    // a session resumed after the outbox was lost never reuses a seq.
-    uplink.fast_forward(&req.session_id, req.committed_seq)?;
-    let options = cfg.session_options();
-    spawn_or_restart(uplink, sessions, req, command, options);
 ```
 
 with:
 
 ```rust
+    }
     // Servers this host cannot keep the agent to, unless the collector
     // waived that, are refused before anything is spawned: never dropped,
     // never passed (plan 8c, the lane's L3).
@@ -3047,10 +3359,17 @@ with:
         return Ok(());
     }
     // Before anything can be enqueued for this session: continue from the
-    // larger of this host's counter and the collector's (ACP core §5.1), so
-    // a session resumed after the outbox was lost never reuses a seq.
-    uplink.fast_forward(&req.session_id, req.committed_seq)?;
-    let options = cfg.session_options();
+```
+
+In `crates/hennery-host/src/connection.rs`, replace:
+
+```rust
+    spawn_or_restart(uplink, sessions, req, command, options);
+```
+
+with:
+
+```rust
     spawn_or_restart(uplink, sessions, req, command, profile, options);
 ```
 
@@ -3736,16 +4055,16 @@ with:
 In `crates/hennery-host/src/session.rs`, replace:
 
 ```rust
-    /// Shared with the handle (`SessionHandle::is_ending`).
-    ending: Arc<AtomicBool>,
+    /// Shared with the handle (`SessionHandle::agent_session_id`).
+    agent_session_id: Arc<Mutex<Option<String>>>,
 }
 ```
 
 with:
 
 ```rust
-    /// Shared with the handle (`SessionHandle::is_ending`).
-    ending: Arc<AtomicBool>,
+    /// Shared with the handle (`SessionHandle::agent_session_id`).
+    agent_session_id: Arc<Mutex<Option<String>>>,
     /// The secret values of the session's MCP servers (ACP core §8).
     secrets: Secrets,
 }
@@ -4140,6 +4459,7 @@ Each is run on the task's code, then restored.
 - In `Secrets::redact_body`, leave the `TurnEnded` error as it is; in the start's config note, scrub without redacting first; in `reject`, send the message as it is. `an_adapters_errors_quoting_its_secrets_are_redacted_in_every_answer_and_fact` fails on each.
 - In `Replay::note`, scrub without redacting first. `a_replay_note_quoting_a_secret_is_redacted_before_scrub` fails.
 - In `Secrets::of`, cut values at whitespace only; then leave `:@` out of `SEPARATORS`. `secrets_are_redacted_whole_and_by_part_but_not_short_values` fails on each.
+- Every outcome on its own (P50, P51, P64–P78): in `spawn_or_restart`, pass no servers, then the default profile; `a_delivered_start_reaches_the_adapter_with_its_servers_and_profile` fails on each. In `Profile::of_installed`, `mcp_isolation`, `session_meta` and `mcp_refusal`, change each arm in turn (claude, claude with its own CLI, any other; strict, none; no servers, waived, isolated); the profile tests, `claude_is_strict_without_servers_too_and_its_own_cli_as_well` or `a_generic_agent_gets_its_servers_and_no_meta` fail on each. Keep short values in `Secrets`; send the host's refusal with another code; give an unlisted agent another profile; report each agent's isolation from one fixed profile; their tests fail on each.
 - In `Actor::start`, drop `adapter.redact_with(self.secrets.clone())`; then, in `Adapter::stderr_tail`, `scrub` before redacting. `the_sessions_secret_values_never_reach_what_it_reports` fails on each.
 - In `McpServer::secret_values`, drop `.chain(args.iter().map(String::as_str))`, then `.chain(url_secrets(url))`. `the_sessions_secret_values_never_reach_what_it_reports` fails on each (the stdio key; the URL's key, L11), and `a_start_failure_quoting_the_servers_is_redacted_in_the_fact_and_the_log` on the second.
 - In `Secrets::of`, leave out the JSON-escaped form; then give `Secrets` a `Debug` that shows its values. `secrets_are_redacted_whole_and_by_part_but_not_short_values` fails on each.
@@ -4150,7 +4470,7 @@ Each is run on the task's code, then restored.
 
 - [ ] **Step 6: The full checks**
 
-Expected: all pass; **1058 tests**.
+Expected: all pass; **1424 tests**.
 
 - [ ] **Step 7: Commit**
 
@@ -4665,11 +4985,12 @@ Expected: PASS. The test's plain run shows the token on a `tungstenite` line, on
 - In `capped`, put a `Targets` that lets everything through in place of `secret_cap()`. `a_sessions_token_is_never_logged_even_at_trace` fails.
 - In `connect_once`, log an undecodable frame with `error = %err` again. `a_sessions_token_is_never_logged_even_at_trace` fails.
 - In `MESSAGE_TRACING_TARGETS`, hold `agent_client_protocol` at `INFO`. `a_sessions_token_is_never_logged_even_at_trace` fails (the ACP crate's warning quotes the stray stdout line).
+- Hold `tungstenite` at `TRACE`: the same test fails. `tokio_tungstenite` at `TRACE` is caught by nothing: `tokio-tungstenite` 0.29 traces no message at that target, so its cap is defence in depth, unproven.
 - In `log::install`, install the subscriber uncapped; then, at one of `log::init`'s three sites, install one with `.init()` directly. `every_subscriber_is_installed_capped` fails on each.
 
 - [ ] **Step 6: The full checks**
 
-Expected: all pass; **1060 tests**.
+Expected: all pass; **1426 tests**.
 
 - [ ] **Step 7: Commit**
 
@@ -4741,13 +5062,18 @@ with:
 In `docs/specs/2026-09-26-acp-core-design.md`, replace:
 
 ```markdown
+  spec §8). The hennery host announces `park` and `images`: `images` says the
+  host carries image blocks, and each session still refuses them when its
   agent takes none (`images_unsupported`, above).
 ```
 
 with:
 
 ```markdown
-  agent takes none (`images_unsupported`, above). `mcp_servers` (plan 8c):
+  spec §8). The hennery host announces `park`, `images`, `projects`,
+  `resolve_path` and `mcp_servers`: `images` says the host carries image
+  blocks, and each session still refuses them when its agent takes none
+  (`images_unsupported`, above). `mcp_servers` (plan 8c):
   the host passes a start's or resume's servers into `session/new` /
   `session/load` with each agent's isolation, and refuses those it cannot
   isolate unless waived (`mcp_isolation_unavailable`). `mcp_servers[]`,
@@ -4868,13 +5194,16 @@ git commit -m "docs(spec): write back plan 8c's per-session MCP servers on the h
 - **The operator's opt-in to unverified isolation** for an override (ACP core §6), in `host.toml`, reported in `mcp_isolation` (decision 7).
 - **Server names** `hennery-<slug>` (ACP core §6) are the gateway's to set. The host passes names as given.
 - **The host registry** may record `mcp_isolation` for display (decision 2), with a kernel migration.
+- **One status for `mcp_isolation_unavailable`:** the hub's refusal answers 409; a host's refusal reaches the collector as `Rejected` and answers 502. Settle one before 8e makes either reachable.
+- **Test that `isolation_waived` is never set** for a session in a hat other than the host's default on a mixed host (the security review's answer D).
+- **An agent's HTTP MCP support:** the host passes servers without reading the agent's `initialize` answer (`mcpCapabilities.http`). The pinned Claude takes them; before a waived delivery to another agent (8e) or Codex (8h), refuse or record what happens to an agent that did not announce it.
 
 **What plan 8h inherits:**
 - `hat_id` arrives on every start and resume (empty for a session from before hats).
 - A Codex profile: `Profile::of_installed("codex", false)` gives `Generic` today. 8h adds the composed `CODEX_HOME`, a new `McpIsolation` value (an older collector reads it as `none`), and that value in `hello.mcp_isolation`.
 
 **Operator items** (live gates, the lane's L10: never run by a lane):
-- On every adapter pin bump (ACP core §12): while a Claude session runs with a gateway server, search the process list for its token, and record the result per pin; and with the strict flag, a global MCP probe server receives nothing (the spike's harness, automated).
+- On every adapter pin bump (ACP core §12), and for every set a host can run (a held rollback set too, which still reports `claude_strict`): while a Claude session runs with a gateway server, search the process list for its token, and record the result per pin; and with the strict flag, a global MCP probe server receives nothing (the spike's harness, automated).
 - Plugin-provided MCP servers under strict mode are unmeasured (ACP core §6).
 - **Release note** (for the release that carries 8c and 8e): Claude sessions started through hennery no longer see the user's own MCP servers or claude.ai connectors; MCP servers are managed in hennery's gateway (decision 4).
 
