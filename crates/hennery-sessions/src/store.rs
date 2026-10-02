@@ -14,8 +14,8 @@ use hennery_proto::frames::{
     PendingResolution, SessionBody, SessionConfig, TurnOutcome,
 };
 use hennery_proto::rest::{
-    AnswerRequest, AttachmentUsage, EventDto, PendingItem, PendingState, SessionCatalog, SessionItem, TITLE_MAX_CHARS,
-    TITLE_MAX_JSON_BYTES, json_char_width,
+    AnswerRequest, AttachmentUsage, EventDto, PendingItem, PendingState, SessionCatalog, SessionItem, SessionPage,
+    TITLE_MAX_CHARS, TITLE_MAX_JSON_BYTES, json_char_width,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
@@ -631,6 +631,100 @@ fn read_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionItem> {
     })
 }
 
+/// Every lifecycle a session can be in (ACP core §4.2).
+pub const LIFECYCLES: [&str; 5] = ["starting", "active", "parked", "closed", "failed"];
+
+/// The session list's page size when none is asked for, and the largest
+/// it serves (plan 6b decision 8).
+pub const LIST_DEFAULT_LIMIT: u32 = 50;
+pub const LIST_MAX_LIMIT: u32 = 200;
+
+/// A position in the session list: the last item of a page, by its sort
+/// key (decision 8). It goes out opaque, as hex, and is a position only, so
+/// a cursor from another query is harmless.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cursor {
+    pub last_event_at: String,
+    pub session_id: String,
+}
+
+impl Cursor {
+    pub fn encode(&self) -> String {
+        hex::encode(format!("{}\n{}", self.last_event_at, self.session_id))
+    }
+
+    /// `None` for anything `encode` did not make: not hex, not UTF-8, no
+    /// separator, a part empty or longer than 64 bytes, or more than 256
+    /// characters in all (the review's O4).
+    pub fn decode(cursor: &str) -> Option<Self> {
+        if cursor.len() > 256 {
+            return None;
+        }
+        let text = String::from_utf8(hex::decode(cursor).ok()?).ok()?;
+        let (at, id) = text.split_once('\n')?;
+        let fits = |part: &str| (1..=64).contains(&part.len());
+        (fits(at) && fits(id)).then(|| Self {
+            last_event_at: at.to_string(),
+            session_id: id.to_string(),
+        })
+    }
+}
+
+/// What a page of the session list holds (ACP core §9; plan 6b decision 8).
+#[derive(Debug, Clone, Copy)]
+pub struct ListQuery<'a> {
+    /// Start after this position (the previous page's `next_cursor`).
+    pub after: Option<&'a Cursor>,
+    /// At most this many sessions, clamped to 1..=`LIST_MAX_LIMIT`.
+    pub limit: u32,
+    /// Only sessions in one of these lifecycles (names from `LIFECYCLES`);
+    /// all when `None`. Ignored while `search` is set (frontend §5).
+    pub lifecycles: Option<&'a [&'a str]>,
+    /// Only sessions whose title, cwd, branch or id holds this text.
+    pub search: Option<&'a str>,
+}
+
+impl Default for ListQuery<'_> {
+    fn default() -> Self {
+        Self {
+            after: None,
+            limit: LIST_DEFAULT_LIMIT,
+            lifecycles: None,
+            search: None,
+        }
+    }
+}
+
+/// `search` as a `LIKE` pattern that matches it anywhere, its `%`, `_` and
+/// `\` taken literally (`ESCAPE '\'`). SQLite's `LIKE` ignores case for
+/// ASCII letters only.
+fn like_pattern(search: &str) -> String {
+    let mut pattern = String::from("%");
+    for c in search.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    pattern.push('%');
+    pattern
+}
+
+/// The session list's one statement (decision 8): the owner's sessions
+/// after the cursor `(?2, ?3)`, in one of the lifecycles `?4`…`?8` (a NULL
+/// slot matches nothing), matching the pattern `?9` unless it is NULL, the
+/// newest `last_event_at` first and the id breaking ties, at most `?10`. It
+/// walks `sessions_by_recency` and sorts nothing (the review's A11).
+fn list_statement() -> String {
+    format!(
+        "SELECT {SESSION_ITEM_COLUMNS} FROM sessions
+         WHERE owner_id = ?1 AND (last_event_at, id) < (?2, ?3) AND lifecycle IN (?4, ?5, ?6, ?7, ?8)
+             AND (?9 IS NULL OR title LIKE ?9 ESCAPE '\\' OR cwd LIKE ?9 ESCAPE '\\'
+                  OR git_branch LIKE ?9 ESCAPE '\\' OR id LIKE ?9 ESCAPE '\\')
+         ORDER BY last_event_at DESC, id DESC LIMIT ?10"
+    )
+}
+
 /// A session's `model`, `mode` and `config_axes` columns.
 type ConfigColumns = (Option<String>, Option<String>, Option<String>);
 
@@ -964,6 +1058,56 @@ impl Store {
                 read_item,
             )
             .optional()?)
+    }
+
+    /// One page of the session list (ACP core §9; decision 8), each item
+    /// `bounded`, with where the next page starts if there is one.
+    pub fn list(&self, query: &ListQuery<'_>) -> Result<SessionPage> {
+        let limit = query.limit.clamp(1, LIST_MAX_LIMIT);
+        // A page with no cursor starts above every stamp.
+        let (at, id) = match query.after {
+            Some(cursor) => (cursor.last_event_at.as_str(), cursor.session_id.as_str()),
+            None => ("\u{10FFFF}", ""),
+        };
+        let pattern = query.search.map(like_pattern);
+        let slots: [Option<&str>; 5] = match query.lifecycles.filter(|_| pattern.is_none()) {
+            Some(named) => std::array::from_fn(|i| named.get(i).copied()),
+            None => LIFECYCLES.map(Some),
+        };
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&list_statement())?;
+        let rows = stmt.query_map(
+            params![
+                self.owner,
+                at,
+                id,
+                slots[0],
+                slots[1],
+                slots[2],
+                slots[3],
+                slots[4],
+                pattern,
+                limit + 1
+            ],
+            read_item,
+        )?;
+        let mut sessions = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let next_cursor = if sessions.len() > limit as usize {
+            sessions.truncate(limit as usize);
+            sessions.last().map(|last| {
+                Cursor {
+                    last_event_at: last.last_event_at.clone(),
+                    session_id: last.session_id.clone(),
+                }
+                .encode()
+            })
+        } else {
+            None
+        };
+        Ok(SessionPage {
+            sessions: sessions.into_iter().map(SessionItem::bounded).collect(),
+            next_cursor,
+        })
     }
 
     /// The session's catalogue (ACP core §9): its config options and
@@ -2128,6 +2272,74 @@ mod tests {
             one_line("a\u{202E}b\u{200B}c\u{FEFF}d\u{061C}e\u{2066}f\u{200F}", 100, 100).as_deref(),
             Some("abcdef")
         );
+    }
+
+    /// The review's A11: the list's one statement walks the recency index,
+    /// with no sort of its own, with or without a search.
+    #[test]
+    fn the_list_walks_the_recency_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hennery.db");
+        Store::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", list_statement()))
+            .unwrap()
+            .query_map(
+                params![
+                    "o",
+                    "~",
+                    "",
+                    "active",
+                    "parked",
+                    None::<String>,
+                    None::<String>,
+                    None::<String>,
+                    "%x%",
+                    50
+                ],
+                |r| r.get(3),
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let plan = plan.join("\n");
+        assert!(plan.contains("USING INDEX sessions_by_recency"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    }
+
+    /// Decision 8, the review's O4: a cursor goes out opaque and comes back
+    /// the same; anything else is refused.
+    #[test]
+    fn a_cursor_round_trips_and_a_malformed_one_is_refused() {
+        let cursor = Cursor {
+            last_event_at: "2026-10-07T12:00:00.000Z".into(),
+            session_id: "0199a4c2-7e1f-7c3a-9b2d-4f6e8a0c1d2e".into(),
+        };
+        let encoded = cursor.encode();
+        assert!(encoded.chars().all(|c| c.is_ascii_hexdigit()), "{encoded}");
+        assert_eq!(Cursor::decode(&encoded), Some(cursor));
+        for bad in [
+            "",
+            "zz",
+            "abc",
+            &hex::encode("no separator"),
+            &hex::encode("\nid"),
+            &hex::encode("at\n"),
+            &hex::encode([0xff, b'\n', b'a']),
+            &hex::encode(format!("at\n{}", "x".repeat(65))),
+            // Well formed, each part within 64 bytes, but past 256 characters.
+            &hex::encode(format!("{}\n{}", "a".repeat(64), "b".repeat(64))),
+        ] {
+            assert_eq!(Cursor::decode(bad), None, "{bad}");
+        }
+    }
+
+    /// `%`, `_` and `\` in a search are literal (decision 8).
+    #[test]
+    fn a_search_escapes_like_wildcards() {
+        assert_eq!(like_pattern("100%_a\\b"), "%100\\%\\_a\\\\b%");
+        assert_eq!(like_pattern("plain"), "%plain%");
     }
 
     /// Plan 6b decision 5: every stamp has the same width, so comparing

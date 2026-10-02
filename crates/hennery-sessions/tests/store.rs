@@ -2065,3 +2065,174 @@ fn a_session_item_is_the_row_with_its_title_and_current_model_and_mode() {
     assert_eq!(item.created_at.len(), 24);
     assert!(store.session_item("nope").unwrap().is_none());
 }
+
+// Plan 6b: the session list (ACP core §9; frontend §5).
+
+use hennery_sessions::store::{Cursor, ListQuery};
+
+/// A store over a file, with a session per `(id, last_event_at, title,
+/// cwd)`, its recency set by hand so the order is known.
+fn listed_store(dir: &std::path::Path, sessions: &[(&str, &str, Option<&str>, &str)]) -> Store {
+    let db = dir.join("hennery.db");
+    let store = Store::open(&db).unwrap();
+    for (id, _, _, cwd) in sessions {
+        store.create_session(id, "h1", "fake", cwd).unwrap();
+    }
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    for (id, at, title, _) in sessions {
+        conn.execute(
+            "UPDATE sessions SET last_event_at = ?2, title = ?3 WHERE id = ?1",
+            rusqlite::params![id, at, title],
+        )
+        .unwrap();
+    }
+    store
+}
+
+fn ids(page: &hennery_proto::rest::SessionPage) -> Vec<&str> {
+    page.sessions.iter().map(|s| s.session_id.as_str()).collect()
+}
+
+/// Stamps from before any real clock this test runs on.
+const T: &str = "2020-01-07T12:00:0";
+
+/// One sort key, newest `last_event_at` first, the id breaking ties
+/// (decision 8); pages follow an opaque cursor, and a session that moves to
+/// the top meanwhile does not shift the next page.
+#[test]
+fn the_list_is_newest_first_and_pages_by_keyset() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = |s: u8| format!("{T}{s}.000Z");
+    let (a1, a2, a3, a5) = (at(1), at(2), at(3), at(5));
+    let store = listed_store(
+        dir.path(),
+        &[
+            ("s1", &a1, None, "/tmp"),
+            ("s2", &a3, None, "/tmp"),
+            ("s3", &a3, None, "/tmp"),
+            ("s4", &a2, None, "/tmp"),
+            ("s5", &a5, None, "/tmp"),
+        ],
+    );
+    assert_eq!(
+        ids(&store.list(&ListQuery::default()).unwrap()),
+        ["s5", "s3", "s2", "s4", "s1"]
+    );
+    let first = store
+        .list(&ListQuery {
+            limit: 2,
+            ..ListQuery::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&first), ["s5", "s3"]);
+    let cursor = Cursor::decode(first.next_cursor.as_deref().unwrap()).unwrap();
+    // s1 moves to the top: the next page is still the one after s3.
+    store.ingest("s1", 1, &SessionBody::session_started("r", "a")).unwrap();
+    let second = store
+        .list(&ListQuery {
+            after: Some(&cursor),
+            limit: 2,
+            ..ListQuery::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&second), ["s2", "s4"]);
+    // s1 now sorts first, so nothing follows s4: no further page.
+    assert_eq!(second.next_cursor, None);
+    let all = store
+        .list(&ListQuery {
+            limit: 6,
+            ..ListQuery::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&all), ["s1", "s5", "s3", "s2", "s4"]);
+    assert_eq!(all.next_cursor, None);
+}
+
+/// Decision 8: `q` matches a substring of the title, cwd, branch or id, with
+/// `%`, `_` and `\` taken literally and ASCII case ignored; while it is set,
+/// the lifecycle filter is bypassed (frontend §5, F-10).
+#[test]
+fn search_matches_title_cwd_branch_and_id_literally_across_every_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = format!("{T}1.000Z");
+    let store = listed_store(
+        dir.path(),
+        &[
+            ("percent", &at, Some("100% done"), "/tmp"),
+            ("plain", &at, Some("1000 done"), "/tmp"),
+            ("under", &at, None, "/src/my_app"),
+            ("nounder", &at, None, "/src/myXapp"),
+            ("slash", &at, Some("a\\b"), "/tmp"),
+            ("branchy", &at, None, "/tmp"),
+        ],
+    );
+    rusqlite::Connection::open(dir.path().join("hennery.db"))
+        .unwrap()
+        .execute(
+            "UPDATE sessions SET git_branch = 'feat/list-search' WHERE id = 'branchy'",
+            [],
+        )
+        .unwrap();
+    store.close_now("percent").unwrap();
+    let found = |q: &str| {
+        let active = ["starting"];
+        let mut found = ids(&store
+            .list(&ListQuery {
+                search: Some(q),
+                lifecycles: Some(&active),
+                ..ListQuery::default()
+            })
+            .unwrap())
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        found.sort();
+        found
+    };
+    assert_eq!(found("100%"), ["percent"]);
+    assert_eq!(found("DONE"), ["percent", "plain"]);
+    assert_eq!(found("my_app"), ["under"]);
+    assert_eq!(found("a\\b"), ["slash"]);
+    assert_eq!(found("LIST-SEARCH"), ["branchy"]);
+    assert_eq!(found("nounde"), ["nounder"]);
+    assert_eq!(found("%"), ["percent"]);
+}
+
+/// Without `q`, only the named lifecycles are listed ("Hide closed" names
+/// all but `closed`); a presumed park is `parked`.
+#[test]
+fn the_lifecycle_filter_keeps_only_the_named_lifecycles() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = format!("{T}1.000Z");
+    let store = listed_store(dir.path(), &[("open", &at, None, "/tmp"), ("shut", &at, None, "/tmp")]);
+    store.close_now("shut").unwrap();
+    let only = |lifecycles: &[&str]| {
+        ids(&store
+            .list(&ListQuery {
+                lifecycles: Some(lifecycles),
+                ..ListQuery::default()
+            })
+            .unwrap())
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(only(&["starting", "active", "parked", "failed"]), ["open"]);
+    assert_eq!(only(&["closed"]), ["shut"]);
+}
+
+/// The list serves each item bounded (the review's A1); the detail's is as
+/// stored.
+#[test]
+fn the_list_serves_items_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = format!("/home/someone/{}webapp", "deep/".repeat(40));
+    let store = listed_store(dir.path(), &[("s1", &format!("{T}1.000Z"), None, &cwd)]);
+    let listed = store.list(&ListQuery::default()).unwrap().sessions.remove(0);
+    assert!(
+        listed.cwd.starts_with('…') && listed.cwd.ends_with("deep/webapp"),
+        "{}",
+        listed.cwd
+    );
+    assert_eq!(store.session_item("s1").unwrap().unwrap().cwd, cwd);
+}

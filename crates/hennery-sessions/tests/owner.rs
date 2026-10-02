@@ -5,7 +5,7 @@ use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::Operator;
 use hennery_proto::frames::{AttachedSession, SessionBody};
 use hennery_proto::rest::AnswerRequest;
-use hennery_sessions::store::{AnswerSubmission, Reconciliation, ResumeRequest, Store};
+use hennery_sessions::store::{AnswerSubmission, ListQuery, Reconciliation, ResumeRequest, Store};
 use rusqlite::types::Value;
 use serde_json::json;
 
@@ -207,6 +207,21 @@ fn another_owners_sessions_are_invisible_to_the_store() {
 
     let before = all_rows(&conn, None);
     assert_eq!(store.session("session-b").unwrap(), None);
+    assert_eq!(store.session_item("session-b").unwrap(), None);
+    // The list, and a search that would match only the other owner's.
+    let listed: Vec<String> = store
+        .list(&ListQuery::default())
+        .unwrap()
+        .sessions
+        .into_iter()
+        .map(|s| s.session_id)
+        .collect();
+    assert_eq!(listed, ["session-a"]);
+    let search = ListQuery {
+        search: Some("session-b"),
+        ..ListQuery::default()
+    };
+    assert!(store.list(&search).unwrap().sessions.is_empty());
     assert_eq!(store.catalog("session-b").unwrap(), None);
     assert!(store.open_pending("session-b").unwrap().is_empty());
     assert_eq!(store.pending_item("pending-b").unwrap(), None);

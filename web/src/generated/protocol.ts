@@ -234,6 +234,13 @@ created_at: string,
  */
 last_event_at: string, };
 
+export type SessionPage = { sessions: Array<SessionItem>, 
+/**
+ * Where the next page starts, for `cursor` (opaque); absent on the last
+ * page.
+ */
+next_cursor?: string | undefined, };
+
 export type SessionDetail = { open_turn?: OpenTurn | undefined, 
 /**
  * Open pending requests, oldest first: what the operator can answer.

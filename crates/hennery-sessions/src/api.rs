@@ -3,7 +3,9 @@
 use crate::AppState;
 use crate::content::{self, Refusal};
 use crate::hub::{RequestError, Undo};
-use crate::store::{AnswerSubmission, ResumeRequest, Store};
+use crate::store::{
+    AnswerSubmission, Cursor, LIFECYCLES, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT, ListQuery, ResumeRequest, Store,
+};
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -60,7 +62,7 @@ const _: () = assert!(
 /// Every route here is an operator's (kernel spec §3.3).
 pub fn router(state: AppState) -> Router {
     let routes = Router::new()
-        .route("/api/sessions", post(start_session))
+        .route("/api/sessions", post(start_session).get(list_sessions))
         .route("/api/sessions/{id}", get(session_detail))
         .route("/api/sessions/{id}/resume", post(resume))
         // The one route that reads more than axum's default 2 MB (plan 6a).
@@ -216,6 +218,93 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
         // The socket task has already failed the session with the host's
         // code (`Undo::Start`).
         Err(err) => request_failed(err),
+    }
+}
+
+/// The longest search the list takes, in characters (plan 6b decision 8).
+const SEARCH_MAX_CHARS: usize = 200;
+
+/// `GET /api/sessions`' query (ACP core §9). Every value is read as text,
+/// so a malformed one gets an `ApiError`.
+#[derive(Deserialize)]
+struct ListParams {
+    cursor: Option<String>,
+    limit: Option<String>,
+    q: Option<String>,
+    hat: Option<String>,
+    lifecycle: Option<String>,
+}
+
+/// The session list (ACP core §9; plan 6b decision 8): newest
+/// `last_event_at` first, in pages of `limit` (50 by default, clamped to
+/// 1..=200) after `cursor`; only the comma-separated `lifecycle`s, unless
+/// `q` searches the title, cwd, branch and id of every session.
+async fn list_sessions(State(state): State<AppState>, Query(params): Query<ListParams>) -> Response {
+    // Sessions have no hat until hats (plan 5) gives them `hat_id`; a
+    // filter that cannot be honoured is refused, never ignored. The seam
+    // hats fills.
+    if params.hat.is_some() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "hat_filter_unavailable",
+            "sessions have no hat yet, so the list cannot be filtered by one",
+        );
+    }
+    let limit = match params.limit.as_deref().map(str::parse::<u32>) {
+        None => LIST_DEFAULT_LIMIT,
+        Some(Ok(limit)) => limit.clamp(1, LIST_MAX_LIMIT),
+        Some(Err(_)) => return error(StatusCode::BAD_REQUEST, "invalid", "limit must be a whole number"),
+    };
+    let cursor = match params.cursor.as_deref().map(Cursor::decode) {
+        None => None,
+        Some(Some(cursor)) => Some(cursor),
+        Some(None) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_cursor",
+                "not a cursor this list gave out",
+            );
+        }
+    };
+    let search = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
+    // A control character would cut the pattern short (a NUL ends it: the
+    // second review's P4).
+    if search.is_some_and(|q| q.chars().count() > SEARCH_MAX_CHARS || q.chars().any(char::is_control)) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            format!("a search is at most {SEARCH_MAX_CHARS} characters, with no control characters"),
+        );
+    }
+    let mut lifecycles: Vec<&str> = Vec::new();
+    for name in params
+        .lifecycle
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+    {
+        if name.is_empty() || lifecycles.contains(&name) {
+            continue;
+        }
+        if !LIFECYCLES.contains(&name) {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid",
+                format!("lifecycle is a list of {}", LIFECYCLES.join(", ")),
+            );
+        }
+        lifecycles.push(name);
+    }
+    let query = ListQuery {
+        after: cursor.as_ref(),
+        limit,
+        lifecycles: (!lifecycles.is_empty()).then_some(lifecycles.as_slice()),
+        search,
+    };
+    match state.store.list(&query) {
+        Ok(page) => Json(page).into_response(),
+        Err(err) => internal(err),
     }
 }
 

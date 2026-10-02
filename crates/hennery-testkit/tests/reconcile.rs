@@ -2379,3 +2379,70 @@ async fn a_start_names_a_paired_host_and_an_agent_of_at_most_32_bytes() {
     .await;
     assert_eq!((status, body["code"].as_str()), (409, Some("host_offline")), "{body}");
 }
+
+// Plan 6b: `GET /api/sessions` (ACP core §9).
+
+/// Pages, searches and filters; every parameter it cannot honour is
+/// refused, never ignored: `hat` until sessions have hats (plan 5).
+#[tokio::test]
+async fn the_session_list_pages_searches_filters_and_refuses_what_it_cannot_honour() {
+    let collector = Collector::start().await;
+    let store = &collector.state.store;
+    for (id, cwd) in [("a", "/src/alpha"), ("b", "/src/beta"), ("c", "/src/gamma")] {
+        store.create_session(id, HOST, "fake", cwd).unwrap();
+        // One millisecond apart at least, so the order is known.
+        tokio::time::sleep(Duration::from_millis(3)).await;
+    }
+    store.close_now("a").unwrap();
+    let c = client(&collector);
+    let list = async |query: &str| get(&c, collector.url(&format!("/api/sessions{query}"))).await;
+    let ids = |page: &Value| -> Vec<String> {
+        page["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["session_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let (status, page) = list("").await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(ids(&page), ["a", "c", "b"]);
+    assert_eq!(page.get("next_cursor"), None);
+    assert_eq!(page["sessions"][0]["lifecycle"], "closed");
+
+    let (_, first) = list("?limit=2").await;
+    assert_eq!(ids(&first), ["a", "c"]);
+    let cursor = first["next_cursor"].as_str().unwrap().to_string();
+    let (_, rest) = list(&format!("?limit=2&cursor={cursor}")).await;
+    assert_eq!(ids(&rest), ["b"]);
+    assert_eq!(rest.get("next_cursor"), None);
+    // Clamped to at least one.
+    assert_eq!(ids(&list("?limit=0").await.1), ["a"]);
+
+    let (_, open) = list("?lifecycle=starting,active,parked,failed").await;
+    assert_eq!(ids(&open), ["c", "b"]);
+    // A search bypasses the lifecycle filter.
+    let (_, found) = list("?lifecycle=starting&q=ALPHA").await;
+    assert_eq!(ids(&found), ["a"]);
+    let (_, blank) = list("?q=%20%20").await;
+    assert_eq!(ids(&blank), ["a", "c", "b"]);
+
+    for (query, code) in [
+        ("?hat=work", "hat_filter_unavailable"),
+        ("?hat=", "hat_filter_unavailable"),
+        ("?cursor=zz", "invalid_cursor"),
+        ("?limit=x", "invalid"),
+        ("?limit=-1", "invalid"),
+        ("?lifecycle=active,bogus", "invalid"),
+    ] {
+        let (status, body) = list(query).await;
+        assert_eq!((status, body["code"].as_str()), (400, Some(code)), "{query}: {body}");
+    }
+    let (status, body) = list(&format!("?q={}", "q".repeat(201))).await;
+    assert_eq!((status, body["code"].as_str()), (400, Some("invalid")), "{body}");
+    // A control character would cut the pattern short (a NUL ends it).
+    let (status, body) = list("?q=a%00b").await;
+    assert_eq!((status, body["code"].as_str()), (400, Some("invalid")), "{body}");
+    assert_eq!(list(&format!("?q={}", "q".repeat(200))).await.0, 200);
+}

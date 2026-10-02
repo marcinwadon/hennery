@@ -252,6 +252,18 @@ impl SessionItem {
     }
 }
 
+/// `GET /api/sessions` (ACP core §9): one page of the session list, newest
+/// `last_event_at` first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SessionPage {
+    pub sessions: Vec<SessionItem>,
+    /// Where the next page starts, for `cursor` (opaque); absent on the last
+    /// page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub next_cursor: Option<String>,
+}
+
 /// `GET /api/sessions/{id}` (ACP core §9): the list item, as stored, the
 /// open turn and the pending requests still open.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]

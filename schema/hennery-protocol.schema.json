@@ -2144,6 +2144,28 @@
       ],
       "type": "object"
     },
+    "SessionPage": {
+      "description": "`GET /api/sessions` (ACP core §9): one page of the session list, newest\n`last_event_at` first.",
+      "properties": {
+        "next_cursor": {
+          "description": "Where the next page starts, for `cursor` (opaque); absent on the last\npage.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessions": {
+          "items": {
+            "$ref": "#/$defs/SessionItem"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "sessions"
+      ],
+      "type": "object"
+    },
     "SetupRequest": {
       "description": "`POST /api/setup` (kernel spec §3.1): the one-time owner setup, with the\ntoken from the setup link. `Debug` leaves the password out.",
       "properties": {
