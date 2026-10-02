@@ -220,7 +220,8 @@ const MIGRATIONS: &[&str] = &[
     // from each turn's content as `link_attachments` links an event: an
     // image block with a hash, at its index, where the owner's row exists.
     // A block that is no object is never read as JSON (`CASE` decides
-    // before `json_extract` runs; `AND` does not promise an order).
+    // before `json_extract` runs; `AND` does not promise an order). Whether
+    // any owner still names a file (`shared_files`) walks its hash's index.
     //
     // A deleted session (`lifecycle = 'deleted'`) is a tombstone and never
     // comes back: nothing is added for it, and its row is never changed
@@ -237,6 +238,7 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (turn_id, position),
         FOREIGN KEY (owner_id, sha256) REFERENCES attachments(owner_id, sha256));
     CREATE INDEX turn_attachments_by_image ON turn_attachments(owner_id, sha256);
+    CREATE INDEX attachments_by_hash ON attachments(sha256);
     INSERT INTO turn_attachments(turn_id, sha256, position, owner_id)
         SELECT turn_id, sha256, position, owner_id FROM (
             SELECT t.turn_id, t.owner_id, b.key AS position,
@@ -427,10 +429,11 @@ pub struct Unattached {
 /// The outcome of `Store::delete_session` (ACP core §4.10).
 #[derive(Debug, PartialEq)]
 pub enum Deletion {
-    /// Deleted: its `session_deleted` event. `unconfirmed`: it was not
-    /// closed yet and was closed here, collector-side, with no word from
-    /// its host, which closes its adapter, if any, when it is back (plan 9a
-    /// decision 4, A13).
+    /// Deleted: its `session_deleted` event. `unconfirmed`: it was closed
+    /// here, collector-side, while its host may still run it (presumed
+    /// parked, or starting or active on a host away); that host closes its
+    /// adapter when it is back (plan 9a decision 4, A13). A parked or
+    /// failed session runs nowhere: its close is confirmed.
     Done { event: EventDto, unconfirmed: bool },
     /// Not closed, and not what the route judged unattached: this
     /// lifecycle. Nothing changed.
@@ -482,6 +485,9 @@ pub struct Store {
     /// Where the attachment files go: `attachments/` beside the database
     /// (kernel spec §1). An in-memory store has none.
     attachments: Option<PathBuf>,
+    /// The database file, for the checkpoint after a delete, which runs on
+    /// a connection of its own; an in-memory store has none.
+    path: Option<PathBuf>,
 }
 
 /// A stored image (plan 6a), for `GET /api/attachments/{sha256}`.
@@ -1217,11 +1223,15 @@ fn conflict_already_recorded(
     Ok(false)
 }
 
-/// Fold the WAL back into the database and truncate it, so the pages a
-/// delete wrote leave it too (plan 9a A8): best-effort, logged. Busy while
-/// another connection reads; then the next checkpoint does it.
-fn checkpoint(conn: &Connection) {
-    match conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0)) {
+/// Fold the WAL of the database at `path` back into it and truncate it, so
+/// the pages a delete wrote leave it too (plan 9a A8): best-effort, logged.
+/// On a connection of its own, so the store's lock is not held while it
+/// waits for readers; busy if one stays, and then the next checkpoint does
+/// it.
+fn checkpoint(path: &Path) {
+    let checkpointed = hennery_kernel::db::open(path)
+        .and_then(|conn| Ok(conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0))?));
+    match checkpointed {
         Ok(0) => {}
         Ok(_) => tracing::warn!("the checkpoint after a delete was busy: the WAL keeps its pages until the next"),
         Err(err) => tracing::warn!("the checkpoint after a delete failed: {err:#}"),
@@ -1231,23 +1241,24 @@ fn checkpoint(conn: &Connection) {
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let attachments = path.parent().map(|dir| dir.join(crate::attachments::DIR));
-        Self::init(hennery_kernel::db::open(path)?, attachments)
+        Self::init(hennery_kernel::db::open(path)?, attachments, Some(path.to_path_buf()))
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Self::init(hennery_kernel::db::open_in_memory()?, None)
+        Self::init(hennery_kernel::db::open_in_memory()?, None, None)
     }
 
     /// The kernel's tables first: they hold the owner, which this store's
     /// rows name and its last migration fills in. So the store and the
     /// kernel agree on the owner whichever opens the database first.
-    fn init(mut conn: Connection, attachments: Option<PathBuf>) -> Result<Self> {
+    fn init(mut conn: Connection, attachments: Option<PathBuf>, path: Option<PathBuf>) -> Result<Self> {
         let owner = hennery_kernel::db::kernel_owner(&mut conn)?;
         hennery_kernel::db::migrate(&mut conn, MIGRATIONS)?;
         Ok(Self {
             conn: Mutex::new(conn),
             owner,
             attachments,
+            path,
         })
     }
 
@@ -1298,7 +1309,7 @@ impl Store {
     pub fn mark_failed_if_starting(&self, id: &str, reason: &str) -> Result<()> {
         self.conn().execute(
             "UPDATE sessions SET lifecycle = 'failed', failure_reason = ?2
-             WHERE id = ?1 AND lifecycle = 'starting' AND lifecycle <> 'deleted' AND owner_id = ?3",
+             WHERE id = ?1 AND lifecycle = 'starting' AND owner_id = ?3",
             params![id, reason, self.owner],
         )?;
         Ok(())
@@ -1346,6 +1357,21 @@ impl Store {
         };
         row.config = stored_config(config)?;
         Ok(Some(row))
+    }
+
+    /// The host a session runs on, tombstones included: what a host's frame
+    /// is checked against (ACP core §3.3). A frame of this host's for its
+    /// deleted session goes on to `ingest`, which stores nothing, and is
+    /// acked, so the host prunes its outbox (plan 9a decision 4).
+    pub fn session_host(&self, id: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT host_id FROM sessions WHERE id = ?1 AND owner_id = ?2",
+                [id, &self.owner],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// One session as a list item, as stored (the detail's; the list serves
@@ -1416,14 +1442,15 @@ impl Store {
 
     /// The session's catalogue (ACP core §9): its config options and
     /// current values, and its slash commands; `None` for an unknown
-    /// session, an empty catalogue for one whose host has reported none.
+    /// session or a tombstone, an empty catalogue for one whose host has
+    /// reported none.
     pub fn catalog(&self, session_id: &str) -> Result<Option<SessionCatalog>> {
         let row: Option<(ConfigColumns, Option<String>, Option<String>)> = self
             .conn()
             .query_row(
                 "SELECT s.model, s.mode, s.config_axes, c.config_options, c.commands
                  FROM sessions s LEFT JOIN session_catalog c ON c.session_id = s.id AND c.owner_id = s.owner_id
-                 WHERE s.id = ?1 AND s.owner_id = ?2",
+                 WHERE s.id = ?1 AND s.lifecycle <> 'deleted' AND s.owner_id = ?2",
                 [session_id, &self.owner],
                 |r| Ok(((r.get(0)?, r.get(1)?, r.get(2)?), r.get(3)?, r.get(4)?)),
             )
@@ -1759,7 +1786,8 @@ impl Store {
     /// - a tombstone, or no session, is `NotFound`;
     /// - one not `closed` is refused with its lifecycle, unless it is still
     ///   exactly what the route judged `unattached` (A4): then it is closed
-    ///   here first, as `close_now` closes, and the delete is `unconfirmed`;
+    ///   here first, as `close_now` closes, and the delete is `unconfirmed`
+    ///   if its host may still run it;
     /// - its events, turns (their image links with them), questions,
     ///   answers and catalogue are deleted, and the owner's images nothing
     ///   else of theirs shows; its project recent too, unless another kept
@@ -1769,8 +1797,8 @@ impl Store {
     ///   creation and recency.
     ///
     /// Then, still under the store's lock, the images' files that no owner
-    /// names any more go, and the WAL is checkpointed so the deleted pages
-    /// leave it too (A8): both best-effort. A crash before the files go
+    /// names any more go; once it is released, the WAL is checkpointed so
+    /// the deleted pages leave it too (A8). Both best-effort. A crash before the files go
     /// leaves files no row names, for plan 9b's sweep (decision 7).
     pub fn delete_session(&self, session_id: &str, unattached: Option<&Unattached>) -> Result<Deletion> {
         let mut conn = self.conn();
@@ -1792,7 +1820,9 @@ impl Store {
             match unattached {
                 Some(judged) if judged.lifecycle == lifecycle && judged.presumed_parked == presumed => {
                     close_in(&tx, &self.owner, session_id)?;
-                    unconfirmed = true;
+                    // Only its host can still run it: presumed parked, or
+                    // starting or active on a host the route cannot reach.
+                    unconfirmed = presumed || matches!(lifecycle.as_str(), "starting" | "active");
                 }
                 _ => return Ok(Deletion::Refused(lifecycle)),
             }
@@ -1839,7 +1869,8 @@ impl Store {
         // The kernel's table, on this transaction (R3). The path compares
         // byte for byte (`=`, the column's BINARY collation; R4), and only a
         // session kept counts (R2): this one is not yet a tombstone, so it
-        // is left out by its id.
+        // is left out by its id. A tombstone's cwd is '' already; its filter
+        // guards a later change of the scrub.
         tx.execute(
             "DELETE FROM project_recents WHERE owner_id = ?1 AND host_id = ?2 AND hat_id = ?3 AND path = ?4
                  AND NOT EXISTS (SELECT 1 FROM sessions
@@ -1863,7 +1894,10 @@ impl Store {
         tx.commit()?;
         // plan 8: revoke the session's gateway tokens here
         self.remove_files(&conn, &dropped);
-        checkpoint(&conn);
+        drop(conn);
+        if let Some(path) = self.path.as_deref() {
+            checkpoint(path);
+        }
         Ok(Deletion::Done { event, unconfirmed })
     }
 
@@ -1878,12 +1912,13 @@ impl Store {
 
     /// Record an operator close of an attached session before
     /// `close_session` is sent. The intent is durable: if the host never
-    /// confirms, the next handshake sends `close_session` again.
+    /// confirms, the next handshake sends `close_session` again. For a
+    /// tombstone it fails as for an unknown session, and writes nothing.
     pub fn record_close_request(&self, session_id: &str) -> Result<EventDto> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         tx.execute(
-            "UPDATE sessions SET close_requested = 1 WHERE id = ?1 AND owner_id = ?2",
+            "UPDATE sessions SET close_requested = 1 WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2",
             [session_id, &self.owner],
         )?;
         let event = collector_event(&tx, &self.owner, session_id, "operator_closed", json!({}), &now())?;
@@ -1919,6 +1954,8 @@ impl Store {
         let tx = conn.transaction()?;
         let still_requested: bool = tx
             .query_row(
+                // A tombstone's `close_requested` is 0 already; the filter
+                // guards a later edit of the predicate.
                 "SELECT close_requested = 1 AND (lifecycle = 'active' OR presumed_parked = 1)
                  FROM sessions WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2",
                 [session_id, &self.owner],
@@ -1948,7 +1985,7 @@ impl Store {
         let row: Option<ResumeRow> = tx
             .query_row(
                 "SELECT lifecycle, agent_session_id, open_turn_id, model, mode, config_axes, hat_id FROM sessions
-                 WHERE id = ?1 AND owner_id = ?2",
+                 WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2",
                 [session_id, &self.owner],
                 |r| {
                     Ok((
@@ -2016,7 +2053,8 @@ impl Store {
         let tx = conn.transaction()?;
         let row: Option<(String, bool, String)> = tx
             .query_row(
-                "SELECT lifecycle, presumed_parked, hat_id FROM sessions WHERE id = ?1 AND owner_id = ?2",
+                "SELECT lifecycle, presumed_parked, hat_id FROM sessions
+                 WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2",
                 [session_id, &self.owner],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
@@ -2810,7 +2848,8 @@ impl Store {
     ///   parked (or closed, if the operator asked), its open turn ended;
     /// - an open turn the host does not report: `turn_not_delivered` if it
     ///   never started, `turn_ended_synthesized{interrupted}` if it did;
-    /// - attached sessions the operator closed → returned in `close`.
+    /// - attached sessions the operator closed or deleted → returned in
+    ///   `close`.
     pub fn reconcile_host(&self, host_id: &str, attached: &[AttachedSession]) -> Result<Reconciliation> {
         let listed: HashMap<&str, &AttachedSession> = attached.iter().map(|a| (a.session_id.as_str(), a)).collect();
         let mut conn = self.conn();
@@ -2819,8 +2858,8 @@ impl Store {
         let rows: Vec<(String, String, Option<String>, bool, bool)> = {
             let mut stmt = tx.prepare(
                 "SELECT id, lifecycle, open_turn_id, close_requested, presumed_parked FROM sessions
-                 WHERE host_id = ?1 AND (lifecycle IN ('starting', 'active', 'closed') OR presumed_parked = 1)
-                     AND lifecycle <> 'deleted' AND owner_id = ?2
+                 WHERE host_id = ?1 AND (lifecycle IN ('starting', 'active', 'closed', 'deleted') OR presumed_parked = 1)
+                     AND owner_id = ?2
                  ORDER BY id",
             )?;
             let rows = stmt.query_map([host_id, &self.owner], |r| {
@@ -2895,7 +2934,10 @@ impl Store {
                         out.close.push(id);
                     }
                 }
-                ("closed", Some(_)) => out.close.push(id),
+                // Nothing is written for a tombstone (plan 9a decision 4): its
+                // host is told to close the adapter, and its answer, a
+                // `session_closed` or `not_attached`, changes nothing.
+                ("closed" | "deleted", Some(_)) => out.close.push(id),
                 _ => {}
             }
         }

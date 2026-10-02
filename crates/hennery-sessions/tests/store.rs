@@ -2459,6 +2459,7 @@ fn the_hat_migration_gives_each_session_its_hosts_default_hat() {
          DROP TRIGGER catalog_of_a_tombstone;
          DROP TRIGGER a_tombstone_stays;
          DROP TABLE turn_attachments;
+         DROP INDEX attachments_by_hash;
          DROP INDEX events_by_kind;
          ALTER TABLE pending DROP COLUMN opened_event_id;
          DROP INDEX sessions_by_hat;
@@ -2602,7 +2603,7 @@ fn a_session_with_no_running_adapter_is_reassigned_to_another_hat() {
 use base64::Engine;
 use hennery_proto::rest::{AttachmentUsage, EventDto};
 use hennery_sessions::content;
-use hennery_sessions::store::{Deletion, Unattached};
+use hennery_sessions::store::{Deletion, Reassign, Unattached};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
@@ -3160,21 +3161,23 @@ fn a_session_not_closed_is_deleted_only_as_the_route_judged_it() {
         }
         assert_eq!((raw_row(&conn, id), event_kinds(&conn, id)), (row, kinds));
     };
-    let deleted = |id: &str, unattached: &Unattached| match store.delete_session(id, Some(unattached)).unwrap() {
-        Deletion::Done { event, unconfirmed } => {
-            assert!(unconfirmed);
-            assert_eq!(event.kind, "session_deleted");
-            assert_eq!(event_kinds(&conn, id), ["session_deleted"]);
-        }
-        other => panic!("not deleted: {other:?}"),
-    };
+    // `unconfirmed`: its host may still run it (A13).
+    let deleted =
+        |id: &str, unattached: &Unattached, may_run: bool| match store.delete_session(id, Some(unattached)).unwrap() {
+            Deletion::Done { event, unconfirmed } => {
+                assert_eq!(unconfirmed, may_run, "{id}");
+                assert_eq!(event.kind, "session_deleted");
+                assert_eq!(event_kinds(&conn, id), ["session_deleted"]);
+            }
+            other => panic!("not deleted: {other:?}"),
+        };
 
     store
         .create_session("s1", "h1", "fake", "/srv/a", "hat-1", None)
         .unwrap();
     refused("s1", None, "starting");
     refused("s1", Some(&judged("active", false)), "starting");
-    deleted("s1", &judged("starting", false));
+    deleted("s1", &judged("starting", false), true);
 
     active(&store, "s2", "/srv/b");
     store.open_turn("s2", "t2", &prompt_text()).unwrap();
@@ -3183,7 +3186,7 @@ fn a_session_not_closed_is_deleted_only_as_the_route_judged_it() {
     store.presume_parked("h1").unwrap();
     // The route saw it active on an offline host; it is presumed parked by now.
     refused("s2", Some(&judged("active", false)), "parked");
-    deleted("s2", &judged("parked", true));
+    deleted("s2", &judged("parked", true), true);
 
     active(&store, "s3", "/srv/c");
     store
@@ -3197,7 +3200,18 @@ fn a_session_not_closed_is_deleted_only_as_the_route_judged_it() {
         .unwrap();
     refused("s3", None, "parked");
     refused("s3", Some(&judged("parked", true)), "parked");
-    deleted("s3", &judged("parked", false));
+    deleted("s3", &judged("parked", false), false);
+
+    active(&store, "s4", "/srv/d");
+    refused("s4", Some(&judged("active", true)), "active");
+    deleted("s4", &judged("active", false), true);
+
+    store
+        .create_session("s5", "h1", "fake", "/srv/e", "hat-1", None)
+        .unwrap();
+    store.mark_failed("s5", "spawn").unwrap();
+    refused("s5", None, "failed");
+    deleted("s5", &judged("failed", false), false);
 }
 
 /// Decision 2, A9: the schema itself refuses anything new for a tombstone,
@@ -3253,8 +3267,22 @@ fn the_stores_writers_leave_a_tombstone_alone() {
     store.mark_failed("s1", "late").unwrap();
     store.mark_failed_if_starting("s1", "late").unwrap();
     assert!(!store.open_turn("s1", "t1", &prompt_text()).unwrap());
-    let err = store.record_park_request("s1").unwrap_err().to_string();
-    assert!(err.contains("no session s1"), "{err}");
+    for err in [
+        store.record_park_request("s1").unwrap_err().to_string(),
+        store.record_close_request("s1").unwrap_err().to_string(),
+    ] {
+        assert!(err.contains("no session s1"), "{err}");
+    }
+    assert_eq!(store.request_resume("s1", "hat-1").unwrap(), ResumeRequest::NotFound);
+    assert_eq!(store.reassign_hat("s1", "hat-1").unwrap(), Reassign::NotFound);
+    assert_eq!(store.catalog("s1").unwrap(), None);
+    assert!(matches!(
+        store.submit_answer("s1", "p1", &choose("allow")).unwrap(),
+        AnswerSubmission::NotFound
+    ));
+    // Its host's frames still find it, to ack and discard them (decision 4).
+    assert_eq!(store.session_host("s1").unwrap().as_deref(), Some("h1"));
+    assert_eq!(store.session_host("s-nope").unwrap(), None);
     assert_eq!(raw_row(&conn, "s1"), row);
     assert_eq!(event_kinds(&conn, "s1"), ["session_deleted"]);
 }
@@ -3278,11 +3306,17 @@ fn a_tombstone_goes_through_the_bulk_functions_untouched() {
         };
         assert_eq!(store.hosts_with_active_sessions().unwrap(), ["h1"]);
         store.presume_parked("h1").unwrap();
+        // Decision 4: listed, its host is told to close its adapter; its
+        // answer, either way, changes nothing.
         let reconciled = store.reconcile_host("h1", &attached).unwrap();
         assert!(reconciled.events.iter().all(|e| e.session_id != "s1"), "{reconciled:?}");
+        assert_eq!(reconciled.close.contains(&"s1".to_string()), listed, "{reconciled:?}");
+        assert!(store.ingest("s1", 2, &SessionBody::SessionClosed).unwrap().is_empty());
+        assert!(store.close_after_rejected_reconcile_close("s1").unwrap().is_empty());
         store.revoke_host("h1").unwrap();
         assert!(store.hosts_with_active_sessions().unwrap().is_empty());
-        store.reconcile_host("h1", &attached).unwrap();
+        let again = store.reconcile_host("h1", &attached).unwrap();
+        assert_eq!(again.close.contains(&"s1".to_string()), listed, "{again:?}");
         assert_eq!(raw_row(&conn, "s1"), row, "listed: {listed}");
         assert_eq!(event_kinds(&conn, "s1"), ["session_deleted"], "listed: {listed}");
     }
