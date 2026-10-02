@@ -41,6 +41,9 @@ pub fn binary_and_set(doctor: &Doctor) -> Finding {
     ));
     if let Some(host) = &doctor.dirs.host {
         match Layout::new(host).and_then(|layout| layout.current()) {
+            Ok(None) if doctor.agents_given_by_system_unit() => {
+                verdict.ok("the system unit /etc/systemd/system/hennery-host.service gives its agents with --agent")
+            }
             Ok(None) if doctor.agents_given() => verdict.ok("the service gives its agents with --agent"),
             Ok(None) => verdict.ok("no adapter set is installed (see check 12)"),
             Ok(Some(set)) => {

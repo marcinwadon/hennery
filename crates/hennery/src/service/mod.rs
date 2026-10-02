@@ -590,6 +590,18 @@ pub(crate) fn read_command_line(cx: &Context, role: Role) -> Option<Vec<String>>
     }
 }
 
+/// The command line of `role`'s systemd *system* unit, as the NixOS module
+/// writes it (plan 7e-ii-a): `/etc/systemd/system/<unit>`, under `root`.
+/// Linux only. Read for its `--agent` words and nothing else: no check
+/// judges a system unit otherwise.
+pub(crate) fn read_system_command_line(cx: &Context, role: Role) -> Option<Vec<String>> {
+    if cx.platform != Platform::Linux {
+        return None;
+    }
+    let text = std::fs::read_to_string(cx.root.join("etc/systemd/system").join(role.unit())).ok()?;
+    unit::systemd_command_line(&text)
+}
+
 pub(crate) fn data_dir_of(argv: &[String]) -> Option<PathBuf> {
     let at = argv.iter().position(|a| a == "--data-dir")?;
     argv.get(at + 1).map(PathBuf::from)
