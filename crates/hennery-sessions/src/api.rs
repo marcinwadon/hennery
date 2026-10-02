@@ -15,8 +15,9 @@ use hennery_kernel::json::ApiJson;
 use hennery_kernel::operator::Authenticated;
 use hennery_proto::frames::{Capability, CollectorFrame, Indexed, SessionBody};
 use hennery_proto::rest::{
-    AnswerRequest, AnswerResponse, ApiError, CancelResponse, ConfigRequest, EventDto, LifecycleResponse, OpenTurn,
-    PendingItem, PromptRequest, PromptResponse, SessionDetail, StartSessionRequest, StartSessionResponse,
+    AGENT_MAX_JSON_BYTES, AnswerRequest, AnswerResponse, ApiError, CancelResponse, ConfigRequest, EventDto,
+    LifecycleResponse, OpenTurn, PendingItem, PromptRequest, PromptResponse, SessionDetail, StartSessionRequest,
+    StartSessionResponse, json_width,
 };
 use serde::Deserialize;
 use std::convert::Infallible;
@@ -150,6 +151,27 @@ fn resume_failed(err: RequestError) -> Response {
 }
 
 async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<StartSessionRequest>) -> Response {
+    // What a list item shows must be bounded (plan 6b, the review's A1): a
+    // paired host's id, and an agent's name within its cap. Refused before
+    // any session exists.
+    if json_width(&req.agent) > AGENT_MAX_JSON_BYTES {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            format!("an agent's name is at most {AGENT_MAX_JSON_BYTES} bytes"),
+        );
+    }
+    match state.hosts.host(&req.host_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "unknown_host",
+                "no host is paired with that id",
+            );
+        }
+        Err(err) => return internal(err),
+    }
     let session_id = uuid::Uuid::now_v7().to_string();
     if let Err(err) = state
         .store
@@ -197,12 +219,13 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
     }
 }
 
-/// Session detail (ACP core §9): the list item plus the open turn.
+/// Session detail (ACP core §9): the list item, as stored, plus the open
+/// turn and the open questions.
 async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let session = match state.store.session(&id) {
-        Ok(Some(s)) => s,
-        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
-        Err(err) => return internal(err),
+    let (session, item) = match (state.store.session(&id), state.store.session_item(&id)) {
+        (Ok(Some(s)), Ok(Some(item))) => (s, item),
+        (Ok(None), _) | (_, Ok(None)) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        (Err(err), _) | (_, Err(err)) => return internal(err),
     };
     let open_turn = match session.open_turn_id {
         Some(turn_id) => match state.store.turn_state(&turn_id) {
@@ -220,14 +243,7 @@ async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -
         Err(err) => return internal(err),
     };
     Json(SessionDetail {
-        session_id: session.id,
-        host_id: session.host_id,
-        agent: session.agent,
-        cwd: session.cwd,
-        lifecycle: session.lifecycle,
-        activity: session.activity,
-        failure_reason: session.failure_reason,
-        presumed_parked: session.presumed_parked,
+        session: item,
         open_turn,
         pending,
     })

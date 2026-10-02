@@ -192,18 +192,32 @@ fn resume_frames_and_host_notes_use_the_spec_field_names() {
     assert_eq!(serde_json::from_value::<SessionBody>(expected).unwrap(), note);
 }
 
-#[test]
-fn session_detail_leaves_out_absent_optionals() {
-    use hennery_proto::rest::{OpenTurn, SessionDetail};
-    let detail = SessionDetail {
+/// A list item with only what every session has.
+fn bare_item() -> hennery_proto::rest::SessionItem {
+    hennery_proto::rest::SessionItem {
         session_id: "s".into(),
         host_id: "h".into(),
         agent: "claude".into(),
         cwd: "/tmp".into(),
+        title: None,
         lifecycle: "active".into(),
         activity: Some("running".into()),
         failure_reason: None,
         presumed_parked: false,
+        git_branch: None,
+        git_dirty: None,
+        model: None,
+        mode: None,
+        created_at: "2026-10-07T12:00:00.000Z".into(),
+        last_event_at: "2026-10-07T12:00:01.000Z".into(),
+    }
+}
+
+#[test]
+fn session_detail_leaves_out_absent_optionals() {
+    use hennery_proto::rest::{OpenTurn, SessionDetail};
+    let detail = SessionDetail {
+        session: bare_item(),
         open_turn: Some(OpenTurn {
             turn_id: "t".into(),
             state: "started".into(),
@@ -215,9 +229,113 @@ fn session_detail_leaves_out_absent_optionals() {
         json!({
             "session_id": "s", "host_id": "h", "agent": "claude", "cwd": "/tmp",
             "lifecycle": "active", "activity": "running", "presumed_parked": false,
+            "created_at": "2026-10-07T12:00:00.000Z", "last_event_at": "2026-10-07T12:00:01.000Z",
             "open_turn": {"turn_id": "t", "state": "started"}, "pending": []
         })
     );
+}
+
+/// Plan 6b, the review's A1: as the list serves it, a model, mode or
+/// failure reason past its cap is left out (the stored value is kept for a
+/// resume), a title or branch past its cap is cut, and a long cwd keeps
+/// its end, after `…`; within the caps nothing changes.
+#[test]
+fn a_listed_item_is_bounded_field_by_field() {
+    use hennery_proto::rest::{
+        AGENT_MAX_JSON_BYTES, CWD_MAX_JSON_BYTES, FAILURE_REASON_MAX_JSON_BYTES, HOST_ID_MAX_JSON_BYTES,
+        MODE_MAX_JSON_BYTES, MODEL_MAX_JSON_BYTES,
+    };
+    let within = hennery_proto::rest::SessionItem {
+        title: Some("Fix the login bug".into()),
+        git_branch: Some("fix/login".into()),
+        model: Some("m".repeat(MODEL_MAX_JSON_BYTES)),
+        mode: Some("\"".repeat(MODE_MAX_JSON_BYTES / 2)),
+        failure_reason: Some("f".repeat(FAILURE_REASON_MAX_JSON_BYTES)),
+        cwd: "c".repeat(CWD_MAX_JSON_BYTES),
+        ..bare_item()
+    };
+    assert_eq!(within.clone().bounded(), within);
+    assert_eq!(AGENT_MAX_JSON_BYTES, 32);
+
+    let past = hennery_proto::rest::SessionItem {
+        title: Some("t".repeat(500)),
+        git_branch: Some("b".repeat(500)),
+        model: Some("m".repeat(MODEL_MAX_JSON_BYTES + 1)),
+        mode: Some("\"".repeat(MODE_MAX_JSON_BYTES / 2 + 1)),
+        failure_reason: Some("f".repeat(FAILURE_REASON_MAX_JSON_BYTES + 1)),
+        cwd: format!("/home/someone/{}webapp", "deep/".repeat(40)),
+        ..bare_item()
+    }
+    .bounded();
+    assert_eq!(past.title, Some("t".repeat(120)));
+    assert_eq!(past.git_branch, Some("b".repeat(120)));
+    assert_eq!((past.model, past.mode, past.failure_reason), (None, None, None));
+    // The second review's P1: within its cap, but with a control or hidden
+    // character, a model, mode or failure reason is left out too; an agent
+    // or host id from before the start checked them is cut.
+    let odd = hennery_proto::rest::SessionItem {
+        model: Some("op\u{202E}us".into()),
+        mode: Some("pl\u{200B}an".into()),
+        failure_reason: Some("bad\nreason".into()),
+        agent: "a".repeat(40),
+        host_id: "h".repeat(100),
+        ..bare_item()
+    }
+    .bounded();
+    assert_eq!((odd.model, odd.mode, odd.failure_reason), (None, None, None));
+    assert_eq!(
+        (odd.agent, odd.host_id),
+        ("a".repeat(AGENT_MAX_JSON_BYTES), "h".repeat(HOST_ID_MAX_JSON_BYTES))
+    );
+    assert!(
+        past.cwd.starts_with('…') && past.cwd.ends_with("/deep/webapp"),
+        "{}",
+        past.cwd
+    );
+    assert!(serde_json::to_string(&past.cwd).unwrap().len() - 2 <= CWD_MAX_JSON_BYTES);
+    // Never inside a character: four bytes each.
+    let emoji = hennery_proto::rest::SessionItem {
+        cwd: "😀".repeat(100),
+        ..bare_item()
+    }
+    .bounded();
+    assert_eq!(emoji.cwd, format!("…{}", "😀".repeat((CWD_MAX_JSON_BYTES - 3) / 4)));
+}
+
+/// P-23 (ACP core §8): a list item stays under 1 KiB, here with every field
+/// at its cap or past it, the worst content for each (quotes, backslashes,
+/// control and four-byte characters), a cwd of exactly its cap (kept
+/// whole), a 30-character `created_at` from before stamps had one width,
+/// and room left for the `hat_id` hats add (plan 6b decision 10, the
+/// reviews' A1 and P2).
+#[test]
+fn a_listed_item_stays_under_1_kib_with_every_field_at_its_worst() {
+    let item = hennery_proto::rest::SessionItem {
+        session_id: "0199a4c2-7e1f-7c3a-9b2d-4f6e8a0c1d2e".into(),
+        // Past their caps (an older row's): cut to 32 bytes each.
+        host_id: "\"".repeat(40),
+        agent: "\"".repeat(40),
+        // Exactly 128 bytes as JSON writes it: kept whole.
+        cwd: format!("/{}", "\"\\😀".repeat(15)) + &"x".repeat(7),
+        title: Some("\"".repeat(500)),
+        lifecycle: "starting".into(),
+        activity: Some("blocked".into()),
+        failure_reason: Some("\\".repeat(16)),
+        presumed_parked: false,
+        git_branch: Some("\\😀".repeat(200)),
+        git_dirty: Some(false),
+        model: Some("\"".repeat(24)),
+        mode: Some("\\".repeat(24)),
+        created_at: "2026-10-07T12:34:56.123456789Z".into(),
+        last_event_at: "2026-10-07T12:34:56.789Z".into(),
+    }
+    .bounded();
+    assert!(!item.cwd.starts_with('…'), "{}", item.cwd);
+    assert_eq!(serde_json::to_string(&item.cwd).unwrap().len() - 2, 128);
+    let json = serde_json::to_string(&item).unwrap();
+    // `,"hat_id":"…"` with a 36-character id is 48 bytes; 64 are kept.
+    assert!(json.len() <= 1024 - 64, "{} bytes: {json}", json.len());
+    assert!(item.model.is_some() && item.mode.is_some() && item.failure_reason.is_some());
 }
 
 #[test]

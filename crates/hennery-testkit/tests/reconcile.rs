@@ -981,11 +981,13 @@ async fn the_session_detail_shows_the_open_turn() {
     let turn = started_turn(&collector, &mut host, &session).await;
     let (status, body) = get(&client(&collector), collector.url(&format!("/api/sessions/{session}"))).await;
     assert_eq!(status, 200, "{body}");
+    let item = collector.state.store.session_item(&session).unwrap().unwrap();
     assert_eq!(
         body,
         json!({
             "session_id": session, "host_id": HOST, "agent": "fake", "cwd": "/tmp",
             "lifecycle": "active", "activity": "running", "presumed_parked": false,
+            "created_at": item.created_at, "last_event_at": item.last_event_at,
             "open_turn": { "turn_id": turn, "state": "started" }, "pending": []
         })
     );
@@ -2241,4 +2243,89 @@ async fn a_replay_sends_the_catalogue_once_after_the_last_event_that_changed_it(
         json!([{"name": "review", "description": "review"}]),
         "{data}"
     );
+}
+
+// Plan 6b: the list item in the detail; what a start may name (the review's
+// A1).
+
+/// The detail is the list item (with the title and the current model and
+/// mode), the open turn and the open questions.
+#[tokio::test]
+async fn the_session_detail_carries_the_title_and_the_current_model_and_mode() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    host.emit(&session, mode_update("plan")).await;
+    host.emit(
+        &session,
+        SessionBody::AcpUpdate {
+            indexed: hennery_proto::frames::Indexed {
+                title: Some("Fix the login bug".into()),
+                ..Default::default()
+            },
+            payload: json!({"update": {"sessionUpdate": "session_info_update"}}),
+        },
+    )
+    .await;
+    wait_for("the title", || async {
+        collector
+            .state
+            .store
+            .session(&session)
+            .unwrap()
+            .unwrap()
+            .title
+            .map(|_| ())
+    })
+    .await;
+    let (status, detail) = get(&client(&collector), collector.url(&format!("/api/sessions/{session}"))).await;
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(detail["title"], "Fix the login bug");
+    assert_eq!(detail["mode"], "plan");
+    assert_eq!(detail["lifecycle"], "active");
+    assert_eq!(detail["pending"], json!([]));
+    assert_eq!(detail["last_event_at"].as_str().unwrap().len(), 24);
+}
+
+/// A start names a paired host (an unknown one is refused before any
+/// session exists), and an agent of at most 32 bytes as JSON writes them,
+/// so every field of the list item is bounded.
+#[tokio::test]
+async fn a_start_names_a_paired_host_and_an_agent_of_at_most_32_bytes() {
+    let collector = Collector::start().await;
+    let c = client(&collector);
+    let (status, body) = post(
+        &c,
+        collector.url("/api/sessions"),
+        json!({ "host_id": "host-unknown", "agent": "fake", "cwd": "/tmp" }),
+    )
+    .await;
+    assert_eq!((status, body["code"].as_str()), (400, Some("unknown_host")), "{body}");
+    let (status, body) = post(
+        &c,
+        collector.url("/api/sessions"),
+        json!({ "host_id": HOST, "agent": "a".repeat(33), "cwd": "/tmp" }),
+    )
+    .await;
+    assert_eq!((status, body["code"].as_str()), (400, Some("invalid")), "{body}");
+    let (status, body) = post(
+        &c,
+        collector.url("/api/sessions"),
+        json!({ "host_id": HOST, "agent": "\"".repeat(17), "cwd": "/tmp" }),
+    )
+    .await;
+    assert_eq!((status, body["code"].as_str()), (400, Some("invalid")), "{body}");
+    let sessions: i64 = rusqlite::Connection::open(collector._dir.path().join("hennery.db"))
+        .unwrap()
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(sessions, 0);
+    // A paired host that is offline still gets a session, failed as before.
+    let (status, body) = post(
+        &c,
+        collector.url("/api/sessions"),
+        json!({ "host_id": HOST, "agent": "a".repeat(32), "cwd": "/tmp" }),
+    )
+    .await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("host_offline")), "{body}");
 }

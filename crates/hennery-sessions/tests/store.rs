@@ -2010,3 +2010,58 @@ fn commands_reported_before_any_config_are_served_with_an_empty_catalogue() {
     assert_eq!(catalog.commands, [json!({"name": "review", "description": "review"})]);
     assert!(catalog.config_options.is_empty() && catalog.current.is_empty());
 }
+
+// Plan 6b: the list item (ACP core §8, §9).
+
+/// Decision 9: the item is the row, read from `sessions` alone, with the
+/// title and the current model and mode (B2b's "model / mode in the list
+/// and detail items"), unbounded: the detail serves it as it is.
+#[test]
+fn a_session_item_is_the_row_with_its_title_and_current_model_and_mode() {
+    let store = Store::open_in_memory().unwrap();
+    let cwd = format!("/home/someone/{}", "deep/".repeat(40));
+    store.create_session("s1", "h1", "fake", &cwd).unwrap();
+    let snapshot = Indexed {
+        config_options: Some(vec![json!({"id": "model"}), json!({"id": "mode"})]),
+        current_model: Some("opus".into()),
+        current_mode: Some("plan".into()),
+        current_axes: Some(Default::default()),
+        ..Indexed::default()
+    };
+    store
+        .ingest(
+            "s1",
+            1,
+            &SessionBody::SessionStarted {
+                request_id: "r0".into(),
+                agent_session_id: "a1".into(),
+                indexed: snapshot,
+            },
+        )
+        .unwrap();
+    store.ingest("s1", 2, &titled("Fix the login bug")).unwrap();
+    let row = store.session("s1").unwrap().unwrap();
+    let item = store.session_item("s1").unwrap().unwrap();
+    assert_eq!(
+        item,
+        hennery_proto::rest::SessionItem {
+            session_id: "s1".into(),
+            host_id: "h1".into(),
+            agent: "fake".into(),
+            cwd,
+            title: Some("Fix the login bug".into()),
+            lifecycle: "active".into(),
+            activity: Some("idle".into()),
+            failure_reason: None,
+            presumed_parked: false,
+            git_branch: None,
+            git_dirty: None,
+            model: Some("opus".into()),
+            mode: Some("plan".into()),
+            created_at: item.created_at.clone(),
+            last_event_at: row.last_event_at,
+        }
+    );
+    assert_eq!(item.created_at.len(), 24);
+    assert!(store.session_item("nope").unwrap().is_none());
+}

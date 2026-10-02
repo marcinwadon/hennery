@@ -1949,7 +1949,7 @@
       "type": "object"
     },
     "SessionDetail": {
-      "description": "`GET /api/sessions/{id}` (ACP core §9): the list item, the open turn and\nthe pending requests still open.",
+      "description": "`GET /api/sessions/{id}` (ACP core §9): the list item, as stored, the\nopen turn and the pending requests still open.",
       "properties": {
         "activity": {
           "type": [
@@ -1958,6 +1958,10 @@
           ]
         },
         "agent": {
+          "type": "string"
+        },
+        "created_at": {
+          "description": "RFC 3339, UTC.",
           "type": "string"
         },
         "cwd": {
@@ -1969,11 +1973,42 @@
             "null"
           ]
         },
+        "git_branch": {
+          "description": "The branch checked out in `cwd`, as the host last reported it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_dirty": {
+          "description": "Whether `cwd`'s work tree had changes, as the host last reported.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "host_id": {
+          "type": "string"
+        },
+        "last_event_at": {
+          "description": "When its last listed event was written (RFC 3339, UTC, three\nfractional digits): the list's sort key, newest first.",
           "type": "string"
         },
         "lifecycle": {
           "type": "string"
+        },
+        "mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "The current model and mode, as the host last reported them.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "open_turn": {
           "anyOf": [
@@ -1999,6 +2034,13 @@
         },
         "session_id": {
           "type": "string"
+        },
+        "title": {
+          "description": "The title the agent reported, on one line and capped.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -2007,7 +2049,98 @@
         "agent",
         "cwd",
         "lifecycle",
-        "presumed_parked"
+        "presumed_parked",
+        "created_at",
+        "last_event_at"
+      ],
+      "type": "object"
+    },
+    "SessionItem": {
+      "description": "One session as the session list shows it (ACP core §8, §9; frontend\n§5), read from `sessions` alone: never the catalogue, commands or plan\n(P-23). The detail serves it as stored; the list, `bounded`.",
+      "properties": {
+        "activity": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent": {
+          "type": "string"
+        },
+        "created_at": {
+          "description": "RFC 3339, UTC.",
+          "type": "string"
+        },
+        "cwd": {
+          "type": "string"
+        },
+        "failure_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_branch": {
+          "description": "The branch checked out in `cwd`, as the host last reported it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_dirty": {
+          "description": "Whether `cwd`'s work tree had changes, as the host last reported.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "host_id": {
+          "type": "string"
+        },
+        "last_event_at": {
+          "description": "When its last listed event was written (RFC 3339, UTC, three\nfractional digits): the list's sort key, newest first.",
+          "type": "string"
+        },
+        "lifecycle": {
+          "type": "string"
+        },
+        "mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "The current model and mode, as the host last reported them.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "presumed_parked": {
+          "description": "Parked only because its host has been offline past the threshold\n(ACP core §5.3); the host may still be running it.",
+          "type": "boolean"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "title": {
+          "description": "The title the agent reported, on one line and capped.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "session_id",
+        "host_id",
+        "agent",
+        "cwd",
+        "lifecycle",
+        "presumed_parked",
+        "created_at",
+        "last_event_at"
       ],
       "type": "object"
     },

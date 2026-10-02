@@ -13,7 +13,10 @@ use hennery_proto::frames::{
     AttachedSession, CollectorFrame, ConfigValue, ElicitationAction, Indexed, ParkReason, PendingKind, PendingReason,
     PendingResolution, SessionBody, SessionConfig, TurnOutcome,
 };
-use hennery_proto::rest::{AnswerRequest, AttachmentUsage, EventDto, PendingItem, PendingState, SessionCatalog};
+use hennery_proto::rest::{
+    AnswerRequest, AttachmentUsage, EventDto, PendingItem, PendingState, SessionCatalog, SessionItem, TITLE_MAX_CHARS,
+    TITLE_MAX_JSON_BYTES, json_char_width,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -542,22 +545,6 @@ fn store_catalogue(tx: &Transaction<'_>, owner: &str, session_id: &str, indexed:
     Ok(())
 }
 
-/// The caps on a title in the session list (plan 6b decision 1, the
-/// review's A1): with every field of a list item at its cap, the item stays
-/// under 1 KiB (P-23).
-const TITLE_MAX_CHARS: usize = 120;
-const TITLE_MAX_JSON_BYTES: usize = 160;
-
-/// Bidi controls and zero-width characters: dropped from what the list
-/// shows, since they could make a row read as something else (the review's
-/// A2). Every other control character is a space by then.
-fn is_hidden_format(c: char) -> bool {
-    matches!(
-        c,
-        '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
-    )
-}
-
 /// `raw` as one line for the session list (plan 6b decision 1): bidi and
 /// zero-width characters dropped, every other control character a space,
 /// runs of whitespace one space and the ends trimmed; then cut, never
@@ -568,16 +555,13 @@ fn is_hidden_format(c: char) -> bool {
 fn one_line(raw: &str, max_chars: usize, max_json_bytes: usize) -> Option<String> {
     let spaced: String = raw
         .chars()
-        .filter(|c| !is_hidden_format(*c))
+        .filter(|c| !hennery_proto::rest::is_hidden_format(*c))
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let mut out = String::new();
     let (mut chars, mut bytes) = (0, 0);
     for c in spaced.split_whitespace().collect::<Vec<_>>().join(" ").chars() {
-        let width = match c {
-            '"' | '\\' => 2,
-            c => c.len_utf8(),
-        };
+        let width = json_char_width(c);
         if chars == max_chars || bytes + width > max_json_bytes {
             break;
         }
@@ -620,6 +604,31 @@ fn store_state(tx: &Transaction<'_>, owner: &str, session_id: &str, indexed: &In
         )?;
     }
     Ok(())
+}
+
+/// The columns of a list item, in `read_item`'s order.
+const SESSION_ITEM_COLUMNS: &str = "id, host_id, agent, cwd, title, lifecycle, activity, failure_reason,
+     presumed_parked, git_branch, git_dirty, model, mode, created_at, last_event_at";
+
+/// A row of `SESSION_ITEM_COLUMNS` as a list item, as stored.
+fn read_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionItem> {
+    Ok(SessionItem {
+        session_id: r.get(0)?,
+        host_id: r.get(1)?,
+        agent: r.get(2)?,
+        cwd: r.get(3)?,
+        title: r.get(4)?,
+        lifecycle: r.get(5)?,
+        activity: r.get(6)?,
+        failure_reason: r.get(7)?,
+        presumed_parked: r.get(8)?,
+        git_branch: r.get(9)?,
+        git_dirty: r.get(10)?,
+        model: r.get(11)?,
+        mode: r.get(12)?,
+        created_at: r.get(13)?,
+        last_event_at: r.get(14)?,
+    })
 }
 
 /// A session's `model`, `mode` and `config_axes` columns.
@@ -942,6 +951,19 @@ impl Store {
         };
         row.config = stored_config(config)?;
         Ok(Some(row))
+    }
+
+    /// One session as a list item, as stored (the detail's; the list serves
+    /// it `bounded`).
+    pub fn session_item(&self, id: &str) -> Result<Option<SessionItem>> {
+        Ok(self
+            .conn()
+            .query_row(
+                &format!("SELECT {SESSION_ITEM_COLUMNS} FROM sessions WHERE id = ?1 AND owner_id = ?2"),
+                [id, &self.owner],
+                read_item,
+            )
+            .optional()?)
     }
 
     /// The session's catalogue (ACP core §9): its config options and

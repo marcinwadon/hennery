@@ -202,16 +202,73 @@ export type OpenTurn = { turn_id: string,
  */
 state: string, };
 
-export type SessionDetail = { session_id: string, host_id: string, agent: string, cwd: string, lifecycle: string, activity?: string | undefined, failure_reason?: string | undefined, 
+export type SessionItem = { session_id: string, host_id: string, agent: string, cwd: string, 
+/**
+ * The title the agent reported, on one line and capped.
+ */
+title?: string | undefined, lifecycle: string, activity?: string | undefined, failure_reason?: string | undefined, 
 /**
  * Parked only because its host has been offline past the threshold
  * (ACP core §5.3); the host may still be running it.
  */
-presumed_parked: boolean, open_turn?: OpenTurn | undefined, 
+presumed_parked: boolean, 
+/**
+ * The branch checked out in `cwd`, as the host last reported it.
+ */
+git_branch?: string | undefined, 
+/**
+ * Whether `cwd`'s work tree had changes, as the host last reported.
+ */
+git_dirty?: boolean | undefined, 
+/**
+ * The current model and mode, as the host last reported them.
+ */
+model?: string | undefined, mode?: string | undefined, 
+/**
+ * RFC 3339, UTC.
+ */
+created_at: string, 
+/**
+ * When its last listed event was written (RFC 3339, UTC, three
+ * fractional digits): the list's sort key, newest first.
+ */
+last_event_at: string, };
+
+export type SessionDetail = { open_turn?: OpenTurn | undefined, 
 /**
  * Open pending requests, oldest first: what the operator can answer.
  */
-pending: Array<PendingItem>, };
+pending: Array<PendingItem>, session_id: string, host_id: string, agent: string, cwd: string, 
+/**
+ * The title the agent reported, on one line and capped.
+ */
+title?: string | undefined, lifecycle: string, activity?: string | undefined, failure_reason?: string | undefined, 
+/**
+ * Parked only because its host has been offline past the threshold
+ * (ACP core §5.3); the host may still be running it.
+ */
+presumed_parked: boolean, 
+/**
+ * The branch checked out in `cwd`, as the host last reported it.
+ */
+git_branch?: string | undefined, 
+/**
+ * Whether `cwd`'s work tree had changes, as the host last reported.
+ */
+git_dirty?: boolean | undefined, 
+/**
+ * The current model and mode, as the host last reported them.
+ */
+model?: string | undefined, mode?: string | undefined, 
+/**
+ * RFC 3339, UTC.
+ */
+created_at: string, 
+/**
+ * When its last listed event was written (RFC 3339, UTC, three
+ * fractional digits): the list's sort key, newest first.
+ */
+last_event_at: string, };
 
 export type CancelResponse = { turn_id: string, outcome: TurnOutcome, };
 
