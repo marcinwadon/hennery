@@ -10,5 +10,7 @@
 
 pub mod cap;
 pub mod item;
+pub mod question;
+pub mod tool;
 
 pub use item::*;
