@@ -2112,6 +2112,7 @@ fn the_collector_is_reached_step_by_step_and_its_hello_judged() {
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
     };
+    assert_eq!(seven.status, Status::Fail, "{seven:?}");
     assert!(seven.summary.contains("revoked"), "{seven:?}");
     assert!(seven.fix.contains("hennery host join"), "{seven:?}");
 
