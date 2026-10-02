@@ -72,7 +72,10 @@ struct ScriptedHost {
 }
 
 impl ScriptedHost {
-    async fn connect(collector: &Collector, capabilities: Capabilities) -> Self {
+    /// A host announcing `capabilities`, and `resolve_path`, which a start
+    /// needs (plan 5c).
+    async fn connect(collector: &Collector, mut capabilities: Capabilities) -> Self {
+        capabilities.0.push(Capability::ResolvePath);
         let config = WebSocketConfig::default()
             .max_message_size(Some(32 << 20))
             .max_frame_size(Some(32 << 20));
@@ -122,13 +125,24 @@ impl ScriptedHost {
         self.send(&frame).await;
     }
 
-    /// The next collector frame that is not an `ack`.
+    /// The next collector frame that is not an `ack`, or a `resolve_path`:
+    /// this host resolves every path to itself (plan 5c), as a host with no
+    /// symlinks would.
     async fn next(&mut self) -> CollectorFrame {
         tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 match self.ws.next().await {
                     Some(Ok(Message::Text(text))) => match serde_json::from_str(&text).unwrap() {
                         CollectorFrame::Ack { .. } => {}
+                        CollectorFrame::ResolvePath { request_id, path } => {
+                            let answer = HostFrame::ResolvedPath {
+                                request_id,
+                                canonical: path,
+                                exists: true,
+                                is_dir: true,
+                            };
+                            self.send(&answer).await;
+                        }
                         frame => return frame,
                     },
                     Some(Ok(_)) => {}

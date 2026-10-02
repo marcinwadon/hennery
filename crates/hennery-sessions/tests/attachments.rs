@@ -29,7 +29,7 @@ fn sha(bytes: &[u8]) -> String {
 }
 
 fn started(store: &Store) {
-    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store
         .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
         .unwrap();

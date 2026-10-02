@@ -119,10 +119,13 @@ fn the_owner_id_migration_gives_every_row_the_owner() {
         let conn = rusqlite::Connection::open(&db).unwrap();
         write_world(&conn, &owner, "a");
         // Back to the store's schema before this plan (version 6): plan
-        // 6b's migration (version 9) undone first, its index on `owner_id`
-        // included.
+        // 5c's migration (version 10) and 6b's (version 9) undone first,
+        // their indexes on `owner_id` included.
         conn.execute_batch(
             "
+            DROP INDEX sessions_by_hat;
+            ALTER TABLE sessions DROP COLUMN hat_id;
+            ALTER TABLE sessions DROP COLUMN hat_rule_id;
             DROP INDEX sessions_by_recency;
             ALTER TABLE sessions DROP COLUMN title;
             ALTER TABLE sessions DROP COLUMN git_branch;
@@ -190,6 +193,13 @@ fn another_owners_sessions_are_invisible_to_the_store() {
     )
     .unwrap();
 
+    // Both owners' sessions in one hat, for the hat filter.
+    conn.execute(
+        "UPDATE sessions SET hat_id = 'hat-x' WHERE id IN ('session-a', 'session-b')",
+        [],
+    )
+    .unwrap();
+
     // The control: the owner's world is there.
     assert!(store.session("session-a").unwrap().is_some());
     assert!(store.catalog("session-a").unwrap().is_some());
@@ -222,6 +232,19 @@ fn another_owners_sessions_are_invisible_to_the_store() {
         ..ListQuery::default()
     };
     assert!(store.list(&search).unwrap().sessions.is_empty());
+    // And a hat filter naming a hat both owners' sessions carry.
+    let by_hat = ListQuery {
+        hat: Some("hat-x"),
+        ..ListQuery::default()
+    };
+    let listed: Vec<String> = store
+        .list(&by_hat)
+        .unwrap()
+        .sessions
+        .into_iter()
+        .map(|s| s.session_id)
+        .collect();
+    assert_eq!(listed, ["session-a"]);
     assert_eq!(store.catalog("session-b").unwrap(), None);
     assert!(store.open_pending("session-b").unwrap().is_empty());
     assert_eq!(store.pending_item("pending-b").unwrap(), None);
@@ -247,7 +270,10 @@ fn another_owners_sessions_are_invisible_to_the_store() {
             .unwrap()
             .is_empty()
     );
-    assert_eq!(store.request_resume("session-b").unwrap(), ResumeRequest::NotFound);
+    assert_eq!(
+        store.request_resume("session-b", "hat-1").unwrap(),
+        ResumeRequest::NotFound
+    );
     assert!(store.presume_parked("host-b").unwrap().is_empty());
     assert!(store.revoke_host("host-b").unwrap().is_empty());
     assert_eq!(store.reconcile_host("host-b", &[]).unwrap(), Reconciliation::default());
@@ -307,7 +333,7 @@ fn another_owners_attachment_is_neither_served_nor_counted() {
     assert_eq!(store.attachment_usage().unwrap().count, 0);
 
     // The owner sends the same image: a row of their own, and it is served.
-    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store
         .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
         .unwrap();

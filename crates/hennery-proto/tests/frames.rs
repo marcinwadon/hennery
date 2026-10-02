@@ -203,6 +203,7 @@ fn bare_item() -> hennery_proto::rest::SessionItem {
         host_id: "h".into(),
         agent: "claude".into(),
         cwd: "/tmp".into(),
+        hat_id: "hat-1".into(),
         title: None,
         lifecycle: "active".into(),
         activity: Some("running".into()),
@@ -231,7 +232,7 @@ fn session_detail_leaves_out_absent_optionals() {
     assert_eq!(
         serde_json::to_value(&detail).unwrap(),
         json!({
-            "session_id": "s", "host_id": "h", "agent": "claude", "cwd": "/tmp",
+            "session_id": "s", "host_id": "h", "agent": "claude", "cwd": "/tmp", "hat_id": "hat-1",
             "lifecycle": "active", "activity": "running", "presumed_parked": false,
             "created_at": "2026-10-07T12:00:00.000Z", "last_event_at": "2026-10-07T12:00:01.000Z",
             "open_turn": {"turn_id": "t", "state": "started"}, "pending": []
@@ -310,8 +311,8 @@ fn a_listed_item_is_bounded_field_by_field() {
 /// at its cap or past it, the worst content for each (quotes, backslashes,
 /// control and four-byte characters), a cwd of exactly its cap (kept
 /// whole), a 30-character `created_at` from before stamps had one width,
-/// and room left for the `hat_id` hats add (plan 6b decision 10, the
-/// reviews' A1 and P2).
+/// and the `hat_id` hats added: `hat-` and 16 hex digits, as the kernel
+/// mints them (plan 6b decision 10, the reviews' A1 and P2; plan 5c).
 #[test]
 fn a_listed_item_stays_under_1_kib_with_every_field_at_its_worst() {
     let item = hennery_proto::rest::SessionItem {
@@ -321,6 +322,7 @@ fn a_listed_item_stays_under_1_kib_with_every_field_at_its_worst() {
         agent: "\"".repeat(40),
         // Exactly 128 bytes as JSON writes it: kept whole.
         cwd: format!("/{}", "\"\\😀".repeat(15)) + &"x".repeat(7),
+        hat_id: "hat-0123456789abcdef".into(),
         title: Some("\"".repeat(500)),
         lifecycle: "starting".into(),
         activity: Some("blocked".into()),
@@ -337,8 +339,7 @@ fn a_listed_item_stays_under_1_kib_with_every_field_at_its_worst() {
     assert!(!item.cwd.starts_with('…'), "{}", item.cwd);
     assert_eq!(serde_json::to_string(&item.cwd).unwrap().len() - 2, 128);
     let json = serde_json::to_string(&item).unwrap();
-    // `,"hat_id":"…"` with a 36-character id is 48 bytes; 64 are kept.
-    assert!(json.len() <= 1024 - 64, "{} bytes: {json}", json.len());
+    assert!(json.len() <= 1024, "{} bytes: {json}", json.len());
     assert!(item.model.is_some() && item.mode.is_some() && item.failure_reason.is_some());
 }
 
