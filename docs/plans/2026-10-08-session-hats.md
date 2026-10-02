@@ -48,7 +48,7 @@ Re-assignment is plan 5d.
 
 It builds on the executed plans [5a](2026-10-06-hats.md) and [5b](2026-10-07-resolve-path.md), and on plan 6's session list (6b) and recent projects (6c). Read their "After this plan" first. Every anchor below was taken from the tree 5b leaves on today's `main`. Where the code and a spec disagree, the code wins, and the plan says so.
 
-**Status:** not executed; amended after the security review.
+**Status:** executed 2026-10-02 (see "Execution status"); amended after the security review.
 
 The security review of 2026-10-02, binding on the maintainer's behalf, covered 5b, 5c and 5d. It approved after amendments: B1–B3 required; P1 and P4–P7 taken; P2 and P3 recorded. It then re-confirmed the amended code: "confirmed with notes".
 
@@ -57,6 +57,28 @@ The security review of 2026-10-02, binding on the maintainer's behalf, covered 5
 - The plan was then replayed from its own text onto `6d72a03` (`main` with 5b merged). After each task's Step 1 the tree matched the tests-only commit, and after each task the task commit, byte for byte, the generated files included.
 - After every task the five checks passed: 853, 860 and 861 tests, from 852.
 - The guards were revert-probed.
+
+## Execution status (2026-10-02)
+
+**Executed** on `main` at `6d72a03` (5b merged). The code was first built and reviewed on an older base, before plan 6's session list (6b) and recent projects (6c) merged. The stronger-model security review of 5b–5d covered that code. Then one opus implementer ported it onto `main`, an opus review checked the port against the reviewed code, and the review's fixes were made in the same task. The task commits here were then staged file by file from the port, and the plan replayed onto `6d72a03`.
+
+| Area | As built | Why |
+|---|---|---|
+| Migration number | Sessions migration 10, not 8 as first written. It also adds `sessions_by_hat`, and an `EXPLAIN QUERY PLAN` test pins that the list uses it. | 6b and 6c took 8 and 9. A filter on `hat_id` without the index would scan every session of the owner. |
+| `SessionItem.hat_id` (6b) | `hat_id` moved from `SessionDetail` to the list item, which the detail embeds. It is a required string, and `''` means no hat. The worst-case list item is 961 bytes, under 6b's 1 KiB. | 6b's list item came first. `''` is the contract the security review approved; with 5a's default hats it never occurs for a new session. |
+| `?hat=` (6b) | Wired by this plan, replacing 6b's `hat_filter_unavailable`. It has its own statement, so the index serves it. An empty `hat=` is 400 `invalid`. | 6b landed first, so the filter came to the second to land. The port review ruled on the empty value: refused, never answered with an empty list (6b's own principle). |
+| Recents (6c) | `remember_project` files a project under the session's stored hat, and skips a session with no hat. A test changes the rules between the start and `session_started`. | The rules' current answer could name a hat the session is not in. That would show a hat's recent projects to another hat. |
+| The port review (opus): approve with fixes | Four fixes: the empty `?hat=` above; a host unpaired between 6b's check and the hat decision answers 400 `unknown_host`, not 404; `hat_mismatch` names a session with no hat as "no hat"; and a runtime test that another owner's session never shows under a hat filter. | The review found no security issue: the order of the checks probes only the owner's own routable host, and owner filtering holds on every new statement. |
+| Test harness | The scripted hosts in `images.rs` and `projects.rs` answer `resolve_path` too. `resolve.rs` gains `next_any`, since the old acks-skipping `next` broke a 5b test that expects an `Ack`. The offline-start test in `reconcile.rs` asserts that no session row exists. | Every start now resolves its cwd through the host first. |
+
+Checks:
+- After every task the five checks passed (853, 860, 861 tests, from 852). The 9 revert-probes of the tasks' "Revert-probes" steps each failed as expected.
+- The run was macOS only; ubuntu CI is the Linux check (`canonical_temp_dir`, and the e2e canonicalising `/tmp`).
+
+Deferred, not blocking (the port review):
+- `remember_project`'s `is_canonical` and empty-hat guards can no longer be reached. They are kept as defensive guards, untested.
+- The list item's 64-byte reserve is spent (63 bytes left). The next field on it must account for that.
+- P2, P3 and P5 for `request_failed` stay recorded (see "After this plan").
 
 ## Scope
 
