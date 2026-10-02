@@ -1,6 +1,8 @@
-export function relTime(iso: string): string {
+/** How long before `now` `iso` was, in words. A list passes its own ticking
+ *  `now` (`useNow`), so its rows move on while nothing else renders. */
+export function relTime(iso: string, now: number = Date.now()): string {
   if (!iso) return ''
-  const s = Math.floor((Date.now() - new Date(iso).getTime()) / 1000)
+  const s = Math.floor((now - new Date(iso).getTime()) / 1000)
   if (isNaN(s)) return ''
   if (s < 5) return 'just now'
   if (s < 60) return `${s}s ago`

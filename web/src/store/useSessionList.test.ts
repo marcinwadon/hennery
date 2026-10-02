@@ -392,4 +392,145 @@ describe('useSessionList', () => {
     await waitFor(() => expect(ids(result.current.shown)).toEqual(['b']))
     expect(retryMs.mock.calls).toEqual([[0], [0]])
   })
+
+  it('keeps the hat’s waiting count through a search and while the hat’s list loads again', async () => {
+    let held: ((r: Response) => void) | null = null
+    let unfilteredPages = 0
+    const t = routed((call) => {
+      if (call.path.startsWith(STREAM)) return liveStream().response
+      if (call.path.includes('q=')) return json(page([], 30))
+      unfilteredPages++
+      const first = page([summary('asks', { activity: 'blocked' }), summary('calm')], 10)
+      return unfilteredPages === 1 ? json(first) : new Promise<Response>((r) => (held = r))
+    })
+    const { result, rerender } = renderHook((f: ListFilters) => useSessionList(f, FAST), {
+      wrapper: t.wrapper,
+      initialProps: { hideClosed: false } as ListFilters,
+    })
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    expect(result.current.counts.waiting).toBe(1)
+    rerender({ hideClosed: false, q: 'zz' })
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    expect(result.current.shown).toEqual([])
+    expect(result.current.counts.waiting).toBe(1)
+    rerender({ hideClosed: false })
+    await waitFor(() => expect(held).not.toBeNull())
+    expect(result.current.loading).toBe(true)
+    expect(result.current.counts.waiting).toBe(1)
+    await act(async () => held!(json(page([summary('asks'), summary('calm')], 40))))
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    expect(result.current.counts.waiting).toBe(0)
+  })
+
+  // The server's count: rows that disagree with it show which one is read.
+  it('the server’s count holds through a search and while the hat’s list loads again', async () => {
+    let held: ((r: Response) => void) | null = null
+    let unfilteredPages = 0
+    const t = routed((call) => {
+      if (call.path.startsWith(STREAM)) return liveStream().response
+      // The search finds nothing; the hat's count went up to 5 meanwhile.
+      if (call.path.includes('q=')) return json(page([], 30, undefined, 5))
+      unfilteredPages++
+      const first = page([summary('asks', { activity: 'blocked' }), summary('calm')], 10, undefined, 4)
+      return unfilteredPages === 1 ? json(first) : new Promise<Response>((r) => (held = r))
+    })
+    const { result, rerender } = renderHook((f: ListFilters) => useSessionList(f, FAST), {
+      wrapper: t.wrapper,
+      initialProps: { hat: 'hat-a', hideClosed: false } as ListFilters,
+    })
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    expect(result.current.counts.waiting).toBe(4)
+    rerender({ hat: 'hat-a', hideClosed: false, q: 'zz' })
+    expect(result.current.loading).toBe(true)
+    expect(result.current.counts.waiting).toBe(4)
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    expect(result.current.counts.waiting).toBe(5)
+    rerender({ hat: 'hat-a', hideClosed: false })
+    await waitFor(() => expect(held).not.toBeNull())
+    expect(result.current.loading).toBe(true)
+    expect(result.current.counts.waiting).toBe(5)
+    await act(async () => held!(json(page([summary('asks', { activity: 'blocked' })], 40, undefined, 0))))
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    expect(result.current.counts.waiting).toBe(0)
+  })
+
+  it('the server’s count of one hat is never shown for another while its list loads', async () => {
+    let held: ((r: Response) => void) | null = null
+    const t = routed((call) => {
+      if (call.path.startsWith(STREAM)) return liveStream().response
+      if (call.path.includes('hat=hat-b')) return new Promise<Response>((r) => (held = r))
+      return json(page([summary('asks', { activity: 'blocked' })], 10, undefined, 4))
+    })
+    const { result, rerender } = renderHook((f: ListFilters) => useSessionList(f, FAST), {
+      wrapper: t.wrapper,
+      initialProps: { hat: 'hat-a', hideClosed: false } as ListFilters,
+    })
+    await waitFor(() => expect(result.current.counts.waiting).toBe(4))
+    rerender({ hat: 'hat-b', hideClosed: false })
+    await waitFor(() => expect(held).not.toBeNull())
+    expect(result.current.loading).toBe(true)
+    expect(result.current.counts.waiting).toBe(0)
+    await act(async () => held!(json(page([], 20, undefined, 2))))
+    await waitFor(() => expect(result.current.counts.waiting).toBe(2))
+    rerender({ hat: 'hat-a', hideClosed: false })
+    await waitFor(() => expect(result.current.loading).toBe(false))
+    expect(result.current.counts.waiting).toBe(4)
+  })
+
+  // A refused first page (4xx) never loads: the count it would replace holds.
+  const REFUSED = json({ code: 'invalid', message: 'a search is at most 200 characters, with no control characters' }, 400)
+
+  it('a search the server refuses (over 200 characters) keeps the server’s count', async () => {
+    const long = 'q'.repeat(201)
+    const t = routed((call) => {
+      if (call.path.startsWith(STREAM)) return liveStream().response
+      if (call.path.includes('q=')) return REFUSED.clone()
+      return json(page([summary('asks', { activity: 'blocked' })], 10, undefined, 4))
+    })
+    const { result, rerender } = renderHook((f: ListFilters) => useSessionList(f, FAST), {
+      wrapper: t.wrapper,
+      initialProps: { hat: 'hat-a', hideClosed: false } as ListFilters,
+    })
+    await waitFor(() => expect(result.current.counts.waiting).toBe(4))
+    rerender({ hat: 'hat-a', hideClosed: false, q: long })
+    await waitFor(() => expect(result.current.error).not.toBeNull())
+    expect(new URL(t.calls.at(-1)!.path, 'http://h').searchParams.get('q')).toBe(long)
+    expect(result.current.loading).toBe(false)
+    expect(result.current.stream).toBe('closed')
+    expect(result.current.counts.waiting).toBe(4)
+  })
+
+  it('an unfiltered first page the server refuses keeps the server’s count', async () => {
+    const t = routed((call) => {
+      if (call.path.startsWith(STREAM)) return liveStream().response
+      if (call.path.includes('lifecycle=')) return REFUSED.clone()
+      return json(page([summary('asks', { activity: 'blocked' })], 10, undefined, 4))
+    })
+    const { result, rerender } = renderHook((f: ListFilters) => useSessionList(f, FAST), {
+      wrapper: t.wrapper,
+      initialProps: { hat: 'hat-a', hideClosed: false } as ListFilters,
+    })
+    await waitFor(() => expect(result.current.counts.waiting).toBe(4))
+    rerender({ hat: 'hat-a', hideClosed: true })
+    await waitFor(() => expect(result.current.error).not.toBeNull())
+    expect(result.current.loading).toBe(false)
+    expect(result.current.counts.waiting).toBe(4)
+  })
+
+  it('with no server count, an unfiltered first page the server refuses keeps the rows counted before', async () => {
+    const t = routed((call) => {
+      if (call.path.startsWith(STREAM)) return liveStream().response
+      if (call.path.includes('lifecycle=')) return REFUSED.clone()
+      return json(page([summary('asks', { activity: 'blocked' }), summary('calm')], 10))
+    })
+    const { result, rerender } = renderHook((f: ListFilters) => useSessionList(f, FAST), {
+      wrapper: t.wrapper,
+      initialProps: { hat: 'hat-a', hideClosed: false } as ListFilters,
+    })
+    await waitFor(() => expect(result.current.counts.waiting).toBe(1))
+    rerender({ hat: 'hat-a', hideClosed: true })
+    await waitFor(() => expect(result.current.error).not.toBeNull())
+    expect(result.current.loading).toBe(false)
+    expect(result.current.counts.waiting).toBe(1)
+  })
 })
