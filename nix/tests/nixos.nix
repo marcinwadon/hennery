@@ -61,20 +61,38 @@ pkgs.testers.runNixOSTest {
         machine.succeed("[ \"$(systemctl show -P KillMode hennery-host.service)\" = mixed ]")
         machine.succeed("[ \"$(systemctl show -P User hennery-host.service)\" = alice ]")
 
+    def dump():
+        # What a failure needs to be read from CI's log alone.
+        print(machine.execute(
+            "systemctl status hennery-host.service hennery-collector.service --no-pager -l; "
+            "journalctl -u hennery-host -u hennery-collector --no-pager | tail -n 80; "
+            "tail -n 40 /var/log/hennery-host/hennery-host.log; ls -la /var/lib/hennery-host"
+        )[1])
+
     with subtest("paired, the host runs and connects"):
-        code = machine.succeed("runuser -u hennery -- hennery admin --data-dir /var/lib/hennery pairing-code").strip()
-        machine.succeed(
-            f"runuser -u alice -- hennery host join http://127.0.0.1:7117 {code} --no-runtime --data-dir /var/lib/hennery-host"
-        )
-        machine.succeed("systemctl start hennery-host.service")
-        machine.wait_for_unit("hennery-host.service")
-        machine.wait_until_succeeds("grep -q 'connected to collector' /var/log/hennery-host/hennery-host.log", timeout=60)
-        hosts = machine.succeed("runuser -u hennery -- hennery admin --data-dir /var/lib/hennery hosts")
-        assert "paired" in hosts, hosts
+        try:
+            code = machine.succeed(
+                "runuser -u hennery -- hennery admin --data-dir /var/lib/hennery pairing-code", timeout=30
+            ).strip()
+            machine.succeed(
+                f"runuser -u alice -- hennery host join http://127.0.0.1:7117 {code} --no-runtime"
+                " --data-dir /var/lib/hennery-host < /dev/null",
+                timeout=60,
+            )
+            machine.succeed("systemctl start hennery-host.service", timeout=30)
+            machine.wait_for_unit("hennery-host.service", timeout=60)
+            machine.wait_until_succeeds(
+                "grep -q 'connected to collector' /var/log/hennery-host/hennery-host.log", timeout=60
+            )
+            hosts = machine.succeed("runuser -u hennery -- hennery admin --data-dir /var/lib/hennery hosts", timeout=30)
+            assert "paired" in hosts, hosts
+        except Exception:
+            dump()
+            raise
 
     with subtest("doctor sees the system unit's --agent"):
         report = machine.succeed(
-            "runuser -u alice -- hennery doctor --data-dir /var/lib/hennery-host || true"
+            "runuser -u alice -- hennery doctor --data-dir /var/lib/hennery-host < /dev/null || true", timeout=180
         )
         print(report)
         import re

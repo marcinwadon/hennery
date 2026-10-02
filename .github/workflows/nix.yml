@@ -34,7 +34,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     # A cold build takes about 9 minutes, and on ubuntu the NixOS test and
     # the adapters add more; a hung one should not run for hours.
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
