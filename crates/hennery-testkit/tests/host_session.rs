@@ -1626,7 +1626,15 @@ async fn options_announced_in_an_update_before_the_answer_are_the_ones_switched(
         else {
             panic!("{frames:?}");
         };
-        assert_eq!(*indexed, Indexed::default(), "{attach:?}");
+        // Marked early (plan 6b decision 2), and no catalogue.
+        assert_eq!(
+            *indexed,
+            Indexed {
+                early: true,
+                ..Indexed::default()
+            },
+            "{attach:?}"
+        );
     }
 }
 
@@ -1828,7 +1836,15 @@ async fn only_a_live_config_option_update_carries_the_catalogue() {
         } => indexed.clone(),
         other => panic!("{other:?}"),
     };
-    assert_eq!(replayed, Indexed::default(), "a replayed update carried a catalogue");
+    // Marked early (plan 6b decision 2), and nothing else.
+    assert_eq!(
+        replayed,
+        Indexed {
+            early: true,
+            ..Indexed::default()
+        },
+        "a replayed update carried a catalogue"
+    );
 
     assert!(handle.send(prompt("r1", "t1")));
     let frames = wait_until(&uplink, has("turn_ended")).await;
@@ -3311,4 +3327,138 @@ async fn a_question_the_agent_withdraws_closes_and_an_answer_reaches_nobody() {
     assert!(handle.send(choose("ra", &pending, "allow")));
     let frames = wait_until(&uplink, |f| !verdicts(f).is_empty()).await;
     assert_eq!(verdicts(&frames), [("ra".to_string(), pending, false)]);
+}
+
+// Plan 6b: the `title` and `commands` extracts (ACP core §3.2, §7).
+
+/// What one `acp_update` frame's extracts say of the adapter's state.
+type StateExtracts = (Option<String>, Option<Vec<serde_json::Value>>, Option<String>, bool);
+
+/// The `title`, `commands`, `turn_id` and `early` extracts of every
+/// `acp_update` frame of one `sessionUpdate` kind.
+fn state_extracts(frames: &[HostFrame], kind: &str) -> Vec<StateExtracts> {
+    frames
+        .iter()
+        .filter_map(|f| match f {
+            HostFrame::Session {
+                body: SessionBody::AcpUpdate { indexed, payload },
+                ..
+            } if payload["update"]["sessionUpdate"] == kind => Some((
+                indexed.title.clone(),
+                indexed.commands.clone(),
+                indexed.turn_id.clone(),
+                indexed.early,
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A live `session_info_update` carries its title (`null` clears it: an
+/// empty title; no title at all: no extract), and a live
+/// `available_commands_update` the full list of the commands the crate
+/// can read, but only when the adapter sent a list: one that is missing or
+/// not an array, or whose every entry is unreadable, carries none (the
+/// crate would read each as an empty list, which would wipe the stored
+/// commands). Neither carries the other's extract or the catalogue's.
+#[tokio::test]
+async fn live_state_updates_carry_the_title_and_the_commands() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        prompt_updates: vec![
+            json!({"sessionUpdate": "session_info_update", "title": "Fix the login bug"}),
+            json!({"sessionUpdate": "available_commands_update", "availableCommands": [
+                {"name": "review", "description": "Review the diff"},
+                {"name": 7, "description": "not a command"},
+                {"name": "plan", "description": "Plan it", "input": {"hint": "what to plan"}}
+            ]}),
+            json!({"sessionUpdate": "session_info_update", "title": null}),
+            json!({"sessionUpdate": "session_info_update", "updatedAt": "2026-10-07T12:00:00Z"}),
+            json!({"sessionUpdate": "available_commands_update", "availableCommands": []}),
+            json!({"sessionUpdate": "available_commands_update"}),
+            json!({"sessionUpdate": "available_commands_update", "availableCommands": "review"}),
+            json!({"sessionUpdate": "available_commands_update", "availableCommands": [{"name": 7}]}),
+        ],
+        ..FakeScript::default()
+    };
+    let handle = session::start(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        fake_with(&script),
+        std::env::temp_dir(),
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    let t1 = Some("t1".to_string());
+    assert_eq!(
+        state_extracts(&frames, "session_info_update"),
+        [
+            (Some("Fix the login bug".into()), None, t1.clone(), false),
+            (Some(String::new()), None, t1.clone(), false),
+            (None, None, t1.clone(), false),
+        ]
+    );
+    assert_eq!(
+        state_extracts(&frames, "available_commands_update"),
+        [
+            (
+                None,
+                Some(vec![
+                    json!({"name": "review", "description": "Review the diff"}),
+                    json!({"name": "plan", "description": "Plan it", "input": {"hint": "what to plan"}}),
+                ]),
+                t1.clone(),
+                false
+            ),
+            (None, Some(vec![]), t1.clone(), false),
+            (None, None, t1.clone(), false),
+            (None, None, t1.clone(), false),
+            (None, None, t1.clone(), false),
+        ]
+    );
+    for frame in &frames {
+        if let HostFrame::Session {
+            body: SessionBody::AcpUpdate { indexed, .. },
+            ..
+        } = frame
+        {
+            assert!(indexed.current_config().is_none(), "{indexed:?}");
+        }
+    }
+}
+
+/// Plan 6b decision 2: a title and commands replayed by `session/load` are
+/// passed through with their extracts, outside any turn, unlike the
+/// catalogue (P-13), and marked `early`: the collector lets such a title
+/// only fill an empty one.
+#[tokio::test]
+async fn a_resume_passes_the_replayed_title_and_commands_through_with_their_extracts() {
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let script = FakeScript {
+        replay: vec![
+            json!({"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "old answer"}}),
+            json!({"sessionUpdate": "session_info_update", "title": "Old title"}),
+            json!({"sessionUpdate": "available_commands_update", "availableCommands": [
+                {"name": "review", "description": "Review the diff"}
+            ]}),
+        ],
+        ..FakeScript::default()
+    };
+    let _handle = resuming(&uplink, &script);
+    let frames = wait_until(&uplink, |frames| updates_of(frames).len() == 2).await;
+    assert_eq!(
+        state_extracts(&frames, "session_info_update"),
+        [(Some("Old title".into()), None, None, true)]
+    );
+    assert_eq!(
+        state_extracts(&frames, "available_commands_update"),
+        [(
+            None,
+            Some(vec![json!({"name": "review", "description": "Review the diff"})]),
+            None,
+            true
+        )]
+    );
 }

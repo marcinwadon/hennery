@@ -10,7 +10,6 @@
 use crate::adapter::{Adapter, ExitInfo, KILL_GRACE, scrub};
 pub use crate::adapter::{AgentCommand, NESTING_VARS};
 use crate::uplink::Uplink;
-use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     BooleanConfigOptionCapabilities, CancelNotification, ClientCapabilities, ClientSessionCapabilities, ContentBlock,
     ElicitationCapabilities, ElicitationFormCapabilities, InitializeRequest, LoadSessionRequest, NewSessionRequest,
@@ -18,6 +17,7 @@ use agent_client_protocol::schema::v1::{
     SessionConfigOptionValue, SessionConfigOptionsCapabilities, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, SetSessionConfigOptionResponse, StopReason,
 };
+use agent_client_protocol::schema::{MaybeUndefined, ProtocolVersion};
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, ErrorCode, Responder, UntypedMessage};
 use hennery_proto::frames::{
     ConfigValue, ElicitationAction, HostFrame, Indexed, ParkReason, PendingExtract, PendingKind, PendingReason,
@@ -935,7 +935,7 @@ impl Actor {
         }
         for early in early {
             match early {
-                Early::Update(payload) => self.emit(update(payload, None)),
+                Early::Update(payload) => self.emit(early_update(payload)),
                 Early::Question(question) => self.open_question(question, None),
             }
         }
@@ -2198,13 +2198,73 @@ fn catalogue_extracts(options: &[SessionConfigOption]) -> Indexed {
 
 /// An adapter notification as a session frame; `turn` is the turn in flight
 /// when it arrived (the `turn_id` extract, ACP core §3.2).
+///
+/// A `session_info_update`'s title and an `available_commands_update`'s
+/// commands are extracted here, wherever the update comes from: live, sent
+/// before the start was announced, or replayed by `session/load`. Unlike
+/// the catalogue (P-13), they are the adapter's current state, and they are
+/// emitted in wire order, so the latest wins (plan 6b decision 2).
 fn update(payload: Value, turn: Option<&str>) -> SessionBody {
+    let (title, commands) = state_extracts(&payload);
     SessionBody::AcpUpdate {
         indexed: Indexed {
             turn_id: turn.map(str::to_string),
+            title,
+            commands,
             ..Indexed::default()
         },
         payload,
+    }
+}
+
+/// An update the adapter sent before `session_started`, emitted after it:
+/// replayed by a load, or sent while the start ran. Marked `early`, so the
+/// collector lets its title only fill an empty one (plan 6b decision 2).
+fn early_update(payload: Value) -> SessionBody {
+    let mut body = update(payload, None);
+    if let SessionBody::AcpUpdate { indexed, .. } = &mut body {
+        indexed.early = true;
+    }
+    body
+}
+
+/// The `title` and `commands` extracts (ACP core §3.2) of a
+/// `session_info_update` or an `available_commands_update`. A title of
+/// `null` clears it, and is sent as an empty title; an update without one
+/// changes nothing. Commands are extracted only from a list the adapter
+/// sent: the crate reads a missing or malformed one, and one whose every
+/// entry it skips, as an empty list, which would wipe the stored commands.
+fn state_extracts(payload: &Value) -> (Option<String>, Option<Vec<Value>>) {
+    if !matches!(
+        payload["update"]["sessionUpdate"].as_str(),
+        Some("session_info_update" | "available_commands_update")
+    ) {
+        return (None, None);
+    }
+    let Ok(notification) = serde_json::from_value::<SessionNotification>(payload.clone()) else {
+        return (None, None);
+    };
+    match notification.update {
+        SessionUpdate::SessionInfoUpdate(info) => match info.title {
+            MaybeUndefined::Value(title) => (Some(title), None),
+            MaybeUndefined::Null => (Some(String::new()), None),
+            MaybeUndefined::Undefined => (None, None),
+        },
+        SessionUpdate::AvailableCommandsUpdate(update) => {
+            let Some(sent) = payload["update"]["availableCommands"].as_array() else {
+                return (None, None);
+            };
+            let commands: Vec<Value> = update
+                .available_commands
+                .iter()
+                .filter_map(|command| serde_json::to_value(command).ok())
+                .collect();
+            if commands.is_empty() && !sent.is_empty() {
+                return (None, None);
+            }
+            (None, Some(commands))
+        }
+        _ => (None, None),
     }
 }
 

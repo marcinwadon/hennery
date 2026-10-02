@@ -172,6 +172,11 @@ pub struct FakeScript {
     /// `image:<mimeType>:<SHA-256 of the decoded bytes>\n`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_images: bool,
+    /// Raw ACP `update` objects streamed as `session/update` at the start of
+    /// every prompt, in order, before its asks and chunks. Sent untyped,
+    /// like `replay`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prompt_updates: Vec<serde_json::Value>,
 }
 
 /// One question the fake asks its client during a prompt, and the chunk it
@@ -235,6 +240,7 @@ impl Default for FakeScript {
             ask_on_load_waits: false,
             withdraw_asks: false,
             no_images: false,
+            prompt_updates: Vec::new(),
         }
     }
 }

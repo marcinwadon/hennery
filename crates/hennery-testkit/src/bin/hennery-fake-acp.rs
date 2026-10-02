@@ -361,6 +361,12 @@ async fn main() -> agent_client_protocol::Result<()> {
                     let cx2 = cx.clone();
                     cancel.send_replace(false);
                     let mut cancelled = cancel.subscribe();
+                    for update in &script.prompt_updates {
+                        cx.send_notification(UntypedMessage::new(
+                            "session/update",
+                            serde_json::json!({ "sessionId": req.session_id, "update": update }),
+                        )?)?;
+                    }
                     if let Some(mode) = &script.prompt_sets_mode {
                         let options = {
                             let mut options = catalogue.lock().unwrap();

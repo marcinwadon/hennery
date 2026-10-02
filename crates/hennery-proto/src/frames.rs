@@ -172,8 +172,25 @@ impl SessionConfig {
 pub struct Indexed {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    /// On a `session_info_update` that names a title: the title the agent
+    /// reported, as it sent it; empty when it cleared it (ACP `null`). The
+    /// collector normalises and caps it for the session list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// On an `available_commands_update`: the adapter's slash commands, the
+    /// full list (ACP `AvailableCommand` objects, those hennery can parse).
+    /// An empty list means the adapter has none, unlike an empty
+    /// `config_options`. Never part of the catalogue snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "unknown[] | undefined", optional)]
+    pub commands: Option<Vec<Value>>,
+    /// On an update the adapter sent before the session was announced:
+    /// replayed by `session/load`, or sent while the start ran (ACP core
+    /// §4.5). What it says may be older than what the collector holds, so
+    /// its title only fills an empty one (plan 6b decision 2).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[ts(as = "Option<bool>", optional)]
+    pub early: bool,
     /// The full config catalogue: the adapter's ACP `SessionConfigOption`
     /// objects, for the UI. The collector stores it and never reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]

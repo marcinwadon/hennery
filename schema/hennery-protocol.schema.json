@@ -1118,6 +1118,14 @@
     "Indexed": {
       "description": "Fields the collector may read from a session event. Closed set (ACP core §3.2).\n\nThe catalogue extracts (`config_options`, `current_model`,\n`current_mode`, `current_axes`) travel together: when `config_options`\nis present and not empty, the four are one snapshot of the adapter's\nconfig. An absent or empty `config_options` means \"no read-back\", never\n\"the adapter has no config\" (a response that failed to parse looks\nempty).",
       "properties": {
+        "commands": {
+          "description": "On an `available_commands_update`: the adapter's slash commands, the\nfull list (ACP `AvailableCommand` objects, those hennery can parse).\nAn empty list means the adapter has none, unlike an empty\n`config_options`. Never part of the catalogue snapshot.",
+          "items": true,
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "config_options": {
           "description": "The full config catalogue: the adapter's ACP `SessionConfigOption`\nobjects, for the UI. The collector stores it and never reads it.",
           "items": true,
@@ -1150,6 +1158,10 @@
             "null"
           ]
         },
+        "early": {
+          "description": "On an update the adapter sent before the session was announced:\nreplayed by `session/load`, or sent while the start ran (ACP core\n§4.5). What it says may be older than what the collector holds, so\nits title only fills an empty one (plan 6b decision 2).",
+          "type": "boolean"
+        },
         "pending": {
           "anyOf": [
             {
@@ -1162,6 +1174,7 @@
           "description": "On `pending_opened`: the request's id, kind and option ids."
         },
         "title": {
+          "description": "On a `session_info_update` that names a title: the title the agent\nreported, as it sent it; empty when it cleared it (ACP `null`). The\ncollector normalises and caps it for the session list.",
           "type": [
             "string",
             "null"

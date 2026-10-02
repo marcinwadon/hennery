@@ -29,7 +29,27 @@ export type PendingExtract = { id: string, kind: PendingKind,
  */
 option_ids?: Array<string> | null, };
 
-export type Indexed = { turn_id?: string | null, title?: string | null, 
+export type Indexed = { turn_id?: string | null, 
+/**
+ * On a `session_info_update` that names a title: the title the agent
+ * reported, as it sent it; empty when it cleared it (ACP `null`). The
+ * collector normalises and caps it for the session list.
+ */
+title?: string | null, 
+/**
+ * On an `available_commands_update`: the adapter's slash commands, the
+ * full list (ACP `AvailableCommand` objects, those hennery can parse).
+ * An empty list means the adapter has none, unlike an empty
+ * `config_options`. Never part of the catalogue snapshot.
+ */
+commands?: unknown[] | undefined, 
+/**
+ * On an update the adapter sent before the session was announced:
+ * replayed by `session/load`, or sent while the start ran (ACP core
+ * §4.5). What it says may be older than what the collector holds, so
+ * its title only fills an empty one (plan 6b decision 2).
+ */
+early?: boolean, 
 /**
  * The full config catalogue: the adapter's ACP `SessionConfigOption`
  * objects, for the UI. The collector stores it and never reads it.
