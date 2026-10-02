@@ -129,6 +129,10 @@ fn every_collector_frame_round_trips() {
             action: hennery_proto::frames::ElicitationAction::Cancel,
             content: None,
         },
+        CollectorFrame::ResolvePath {
+            request_id: "r".into(),
+            path: "~/Projects".into(),
+        },
     ];
     for f in frames {
         let back: CollectorFrame = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
@@ -771,4 +775,28 @@ fn git_state_round_trips_and_leaves_out_absent_optionals() {
     });
     let body: SessionBody = serde_json::from_value(full.clone()).unwrap();
     assert_eq!(serde_json::to_value(&body).unwrap(), full);
+}
+
+/// Kernel spec §5.4: `resolve_path{path}` → `resolved_path{canonical,
+/// exists, is_dir}`, each with its request id.
+#[test]
+fn resolve_path_and_its_answer_use_the_spec_field_names() {
+    let request = CollectorFrame::ResolvePath {
+        request_id: "r".into(),
+        path: "~/p".into(),
+    };
+    let wire = json!({"type": "resolve_path", "request_id": "r", "path": "~/p"});
+    assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+    assert_eq!(serde_json::from_value::<CollectorFrame>(wire).unwrap(), request);
+    let answer = HostFrame::ResolvedPath {
+        request_id: "r".into(),
+        canonical: "/home/me/p".into(),
+        exists: true,
+        is_dir: false,
+    };
+    let wire = json!({
+        "type": "resolved_path", "request_id": "r", "canonical": "/home/me/p", "exists": true, "is_dir": false
+    });
+    assert_eq!(serde_json::to_value(&answer).unwrap(), wire);
+    assert_eq!(serde_json::from_value::<HostFrame>(wire).unwrap(), answer);
 }

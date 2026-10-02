@@ -8,6 +8,7 @@ pub mod hosts;
 pub mod hub;
 pub mod offline;
 pub mod projects;
+mod resolve;
 pub mod store;
 pub mod ws;
 

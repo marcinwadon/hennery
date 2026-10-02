@@ -26,6 +26,8 @@ pub enum Capability {
     Images,
     /// Explicit park (`park_session`).
     Park,
+    /// Resolving typed paths (`resolve_path`, kernel spec §5.4).
+    ResolvePath,
 }
 
 /// `hello.capabilities`. Deserialized leniently: a capability this build
@@ -410,6 +412,17 @@ pub enum HostFrame {
         code: String,
         message: String,
     },
+    /// The answer to `resolve_path` (kernel spec §5.4). Not outboxed: a
+    /// probe changes nothing, so a lost answer costs only a retry.
+    /// `canonical` is absolute, symlinks resolved, with no `.`, `..` or
+    /// trailing slash; for a path that does not exist, its deepest existing
+    /// ancestor is resolved and the rest normalised by its text.
+    ResolvedPath {
+        request_id: String,
+        canonical: String,
+        exists: bool,
+        is_dir: bool,
+    },
     /// Sent once per connection after the unacked outbox has been resent.
     /// The collector reconciles `hello.attached_sessions` only after this
     /// frame, so a resent `turn_ended` is never duplicated by a synthesised
@@ -456,6 +469,7 @@ impl CollectorFrame {
     pub fn probe_capability(&self) -> Result<Option<Capability>, NotAProbe> {
         match self {
             Self::ListProjects { .. } | Self::BrowseDirectory { .. } => Ok(Some(Capability::Projects)),
+            Self::ResolvePath { .. } => Ok(Some(Capability::ResolvePath)),
             Self::HelloAck { .. }
             | Self::HelloError { .. }
             | Self::StartSession { .. }
@@ -478,7 +492,9 @@ impl HostFrame {
     /// or this does not compile (umbrella §5.4).
     pub fn probe_request_id(&self) -> Option<&str> {
         match self {
-            Self::Projects { request_id, .. } | Self::Directory { request_id, .. } => Some(request_id),
+            Self::Projects { request_id, .. }
+            | Self::Directory { request_id, .. }
+            | Self::ResolvedPath { request_id, .. } => Some(request_id),
             Self::Hello { .. } | Self::Session { .. } | Self::Error { .. } | Self::ResendComplete => None,
         }
     }
@@ -583,6 +599,13 @@ pub enum CollectorFrame {
         session_id: String,
         #[ts(type = "number")]
         ack_seq: u64,
+    },
+    /// Resolve a typed path on the host, where the filesystem is (kernel
+    /// spec §5.2, §5.4): absolute, or `~` / `~/…` for the host user's home.
+    /// Completed by `resolved_path` | `error{invalid}`.
+    ResolvePath {
+        request_id: String,
+        path: String,
     },
     /// Completed by `session_parked{operator}` (ACP core §4.8).
     ParkSession {

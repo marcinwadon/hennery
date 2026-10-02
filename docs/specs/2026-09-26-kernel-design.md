@@ -477,9 +477,13 @@ Given `(host_id, path)`:
 1. The path is **canonical**: absolute, symlinks resolved, no `.`/`..`, no
    trailing slash. Canonicalisation happens **on the host**, which is where the
    filesystem is (`resolve_path` request, §5.4). Rule prefixes are stored
-   canonicalised the same way (resolved through the host when the rule is
-   saved; a rule for a path that does not exist is stored as typed, normalised
-   lexically, and marked unverified).
+   canonicalised the same way: resolved through the host when the rule is
+   saved, so rules are saved only while their host is connected (409
+   `host_offline` otherwise; plan 5b, the security review's B1). A rule for a
+   path that does not exist keeps its deepest existing ancestor resolved, the
+   rest applied by its text, and is marked unverified; a `..` after the part
+   that exists, a dangling symlink there, and a canonical form that is not
+   UTF-8 are refused. `~` and `~/…` are the host user's home.
 2. Candidate rules are those of that host whose prefix equals the path or is a
    **path-segment prefix** of it (`/p/acme` matches `/p/acme` and `/p/acme/x`,
    never `/p/acme-infra`).
@@ -506,7 +510,10 @@ running adapter (parked, closed or failed), with a warning, and writes a `hat_re
 `resolve_path{path}` → `resolved_path{canonical, exists, is_dir}` (or `error`)
 is part of the frame catalogue (ACP core §3.3). It is used for typed paths in
 New session, for session start and resume, for rule saving, and by the hat
-tester.
+tester. It goes only to a host that announces the `resolve_path` capability
+(409 `resolve_unsupported` otherwise). The collector accepts an answer only in
+canonical form (502 `bad_host_answer`); a refusal coded `invalid` is 400, any
+other code 502 `host_refused` (plan 5b).
 
 ### 5.5 Lifecycle hooks and purge
 
@@ -626,7 +633,7 @@ frontend spec §6.4) this makes agent output unable to run script in the UI.
 | `GET/PUT /api/hats/{id}/logo` | Sanitised logo (§5.1) |
 | `POST /api/hats/{id}/purge` | Purge a hat (step-up, §5.5) |
 | `GET/PUT /api/hosts/{id}/path-rules` | Path rules (full set) |
-| `POST /api/hats/resolve` | `{host_id, path}` → `{canonical, hat_id, rule_id?}` |
+| `POST /api/hats/resolve` | `{host_id, path}` → `{canonical, exists, is_dir, hat_id, rule_id?}` |
 | `GET /api/push/vapid`, `POST/DELETE /api/push/subscriptions` | Push |
 | `GET /healthz`, `GET /readyz` | Process up (200 `ok`) / the database answers within 2 s (200 `ready`, else 503 `not ready`); plain text, on every listener |
 

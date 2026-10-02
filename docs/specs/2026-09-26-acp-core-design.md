@@ -425,13 +425,15 @@ host.)*
 
 **Not on the wire yet** (they arrive with their subsystems): `first_prompt`,
 `mcp_servers[]` and `hat` on start/resume (gateway, hats); `hello_ack.server_time`;
-`hello.agents[]` and `workspace_roots[]`; the probes and their responses;
-`forget_hat`.
+`hello.agents[]` and `workspace_roots[]`; the projects probes and their
+responses; `forget_hat`. `resolve_path` / `resolved_path` are on the wire
+since plan 5b: probes, answered only by the connection they went out on.
 
 `hello` fields:
 
 - `capabilities`: `projects` (project enumeration and browsing), `images`
-  (image content blocks in prompts), `park` (explicit park). The collector
+  (image content blocks in prompts), `park` (explicit park), `resolve_path`
+  (resolving typed paths, kernel spec §5.4). The collector
   never sends a frame, or a prompt containing images, to a host that lacks the
   capability, as the host's current connection announces it (a host that
   reconnects on an older build between the check and the send is the one

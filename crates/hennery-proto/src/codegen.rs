@@ -75,6 +75,8 @@ pub fn render_schema() -> String {
         rest::PathRuleItem,
         rest::PathRuleInput,
         rest::PathRulesRequest,
+        rest::HatResolveRequest,
+        rest::HatResolution,
     );
     // `serde_json::Map` is a `BTreeMap` (always iterates sorted) by default,
     // or an `IndexMap` (iterates in insertion order) when serde_json's
@@ -192,6 +194,8 @@ pub fn render_ts() -> String {
         rest::PathRuleItem,
         rest::PathRuleInput,
         rest::PathRulesRequest,
+        rest::HatResolveRequest,
+        rest::HatResolution,
     );
     out
 }

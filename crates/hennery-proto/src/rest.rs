@@ -689,3 +689,26 @@ pub struct PathRuleInput {
 pub struct PathRulesRequest {
     pub rules: Vec<PathRuleInput>,
 }
+
+/// `POST /api/hats/resolve` (kernel spec §8): which hat `path` resolves to
+/// on `host_id`, as a session started there would get. The host resolves
+/// the path; `~` and `~/…` are its user's home.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HatResolveRequest {
+    pub host_id: String,
+    pub path: String,
+}
+
+/// 200 to `POST /api/hats/resolve`: the canonical path, whether it exists
+/// and is a directory there, and its hat, with the rule that decided it
+/// (absent: the host's default hat).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HatResolution {
+    pub canonical: String,
+    pub exists: bool,
+    pub is_dir: bool,
+    pub hat_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub rule_id: Option<String>,
+}
