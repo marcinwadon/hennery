@@ -1132,6 +1132,69 @@ async fn run_up(args: UpArgs) -> Result<std::process::ExitCode> {
 mod tests {
     use super::*;
 
+    /// Plan 10b-ii: the collector's notices reach delivery, and delivery is
+    /// public only. A subscription at a loopback address gets a notice
+    /// refused, recorded on it; nothing is sent.
+    #[tokio::test]
+    async fn the_collectors_notices_go_to_a_public_only_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hennery.db");
+        let mut state = AppState::new(
+            Store::open(&db).unwrap(),
+            Hosts::open(&db).unwrap(),
+            Operator::open(&db).unwrap(),
+        );
+        let now = hennery_kernel::secret::unix_now();
+        let token = state.operator.issue_setup_token(now).unwrap().unwrap();
+        state
+            .operator
+            .set_up(&token, "correct horse battery", "https://hennery.example", now)
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO push_subscriptions(id, owner_id, endpoint, p256dh, auth, device_label, auth_session, created_at)
+                 VALUES ('push-a', ?1, ?2,
+                     'BLn9b-VR0ca83knDNZ32dCHGyjJp-1riX9ZTN40MqV8K_LpQmLqxC_DoHvqvFXO_nGdAB4W9dogZb_sM-uV4JbY',
+                     '_ordMnz7uTCmrpBTeUV4Bw', 'test', 's', ?3)",
+                rusqlite::params![
+                    state.hosts.owner_id(),
+                    format!("http://{}/push", listener.local_addr().unwrap()),
+                    now
+                ],
+            )
+            .unwrap();
+        start_push(
+            &mut state,
+            &hennery_kernel::egress::Egress::new(hennery_kernel::egress::Timeouts::DEFAULT).unwrap(),
+        );
+        state.push.notify(hennery_kernel::push::Notice {
+            hat_id: state.hosts.default_hat_for_new_hosts().unwrap(),
+            urgency: hennery_kernel::push::Urgency::Normal,
+            title: "t".into(),
+            generic_title: "g".into(),
+            body: "finished".into(),
+            detail: None,
+            url: "/sessions/s1".into(),
+            tag: "s1".into(),
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let error = loop {
+            if let Some(error) = state.hosts.subscriptions().unwrap()[0].last_error.clone() {
+                break error;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the notice never reached delivery"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert!(error.contains("public address"), "{error}");
+        listener.set_nonblocking(true).unwrap();
+        assert!(listener.accept().is_err(), "nothing connected");
+    }
+
     /// Final review I1: `up` may itself have the old operator bearer in its
     /// environment (`HENNERY_DEV_TOKEN`, left in a shell from before 3b);
     /// its host child must not inherit it, so neither can any agent that
