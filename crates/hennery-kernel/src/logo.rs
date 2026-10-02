@@ -9,7 +9,11 @@
 //! header alone is read first, and an image over `MAX_SIDE` pixels either way
 //! is refused there (the review's A2).
 
+use crate::hats::HatChange;
+use crate::hosts::Hosts;
+use anyhow::Result;
 use base64::Engine;
+use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::io::Cursor;
 
@@ -38,6 +42,16 @@ pub struct Logo {
     pub bytes: Vec<u8>,
     /// What `GET /api/hats/{id}/logo` answers as its `ETag` (without the
     /// quotes): the first 128 bits of the bytes' SHA-256, in hex.
+    pub etag: String,
+}
+
+/// A stored logo, as the logo route serves it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredLogo {
+    /// Always `MIME_PNG` (the schema's check); the route still answers
+    /// only a kind it knows.
+    pub mime: String,
+    pub bytes: Vec<u8>,
     pub etag: String,
 }
 
@@ -112,6 +126,67 @@ pub fn reencode(input: &[u8], max_stored: usize) -> Result<Logo, Refusal> {
     }
     let etag = hex::encode(&Sha256::digest(&bytes)[..16]);
     Ok(Logo { bytes, etag })
+}
+
+impl Hosts {
+    /// `hat_id`'s logo, if the owner has that hat and it has one.
+    pub fn hat_logo(&self, hat_id: &str) -> Result<Option<StoredLogo>> {
+        Ok(self
+            .conn()
+            .query_row(
+                "SELECT logo_mime, logo_bytes, logo_etag FROM hats
+                 WHERE id = ?1 AND owner_id = ?2 AND logo_bytes IS NOT NULL",
+                [hat_id, self.owner_id()],
+                |r| {
+                    Ok(StoredLogo {
+                        mime: r.get(0)?,
+                        bytes: r.get(1)?,
+                        etag: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Give `hat_id` `logo`, replacing any it had: `Done` with the hat as it
+    /// is now; `NotFound`; or `Purging` for a hat frozen for its purge,
+    /// which keeps the logo it had. The freeze is checked in the statement
+    /// that would set it (plan 9c decision 10c).
+    pub fn set_hat_logo(&self, hat_id: &str, logo: &Logo) -> Result<HatChange> {
+        let owner = self.owner_id();
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let set = tx.execute(
+            "UPDATE hats SET logo_mime = ?3, logo_bytes = ?4, logo_etag = ?5
+             WHERE id = ?1 AND owner_id = ?2
+                 AND NOT EXISTS (SELECT 1 FROM purged_hats p WHERE p.hat_id = hats.id AND p.owner_id = ?2)",
+            params![hat_id, owner, MIME_PNG, logo.bytes, logo.etag],
+        )?;
+        let hat = crate::hats::hat_in(&tx, owner, hat_id)?;
+        tx.commit()?;
+        Ok(match hat {
+            Some(hat) if set == 1 => HatChange::Done(hat),
+            Some(_) => HatChange::Purging,
+            None => HatChange::NotFound,
+        })
+    }
+
+    /// Take `hat_id`'s logo away, if it has one: `Done` with the hat as it
+    /// is now, or `NotFound`. A frozen hat's logo goes too: that is the
+    /// purge's own direction (the review's A6).
+    pub fn clear_hat_logo(&self, hat_id: &str) -> Result<HatChange> {
+        let owner = self.owner_id();
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE hats SET logo_mime = NULL, logo_bytes = NULL, logo_etag = NULL
+             WHERE id = ?1 AND owner_id = ?2",
+            [hat_id, owner],
+        )?;
+        let hat = crate::hats::hat_in(&tx, owner, hat_id)?;
+        tx.commit()?;
+        Ok(hat.map_or(HatChange::NotFound, HatChange::Done))
+    }
 }
 
 #[cfg(test)]
