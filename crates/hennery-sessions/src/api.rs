@@ -1550,6 +1550,21 @@ mod tests {
         let sent: Vec<_> = replay_then_follow(replay, one_message_each, one_live()).collect().await;
         assert_eq!(sent.len(), 2);
     }
+
+    /// Plan 8c: the hub's refusal to send servers answers 409
+    /// `mcp_isolation_unavailable`, on a start and on a resume alike.
+    #[tokio::test]
+    async fn an_undeliverable_mcp_delivery_answers_409_mcp_isolation_unavailable() {
+        for response in [
+            request_failed(RequestError::McpUndeliverable),
+            resume_failed(RequestError::McpUndeliverable),
+        ] {
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["code"], "mcp_isolation_unavailable", "{body}");
+        }
+    }
 }
 
 /// A delete against a host's reconciliation (plan 9a, the whole-branch
