@@ -693,7 +693,7 @@
           "type": "boolean"
         },
         "label": {
-          "description": "1 to 64 printable characters.",
+          "description": "1 to 64 bytes of UTF-8 once trimmed (stored trimmed), with no\ncontrol or invisible format character.",
           "type": "string"
         },
         "slug": {
@@ -1416,7 +1416,7 @@
           "type": "boolean"
         },
         "label": {
-          "description": "The operator's name for it: 1 to 64 printable characters.",
+          "description": "The operator's name for it: 1 to 64 bytes of UTF-8 once trimmed\n(stored trimmed), with no control or invisible format character.",
           "type": "string"
         },
         "mounts": {
@@ -1468,7 +1468,7 @@
           "type": "string"
         },
         "url": {
-          "description": "The upstream MCP endpoint, as stored (parsed and serialised). Only\nthis list shows it whole: logs and errors show only its origin.",
+          "description": "The upstream MCP endpoint, as stored (parsed and serialised). Only\nthe API's answers show it whole: logs and errors show only its origin.",
           "type": "string"
         }
       },
@@ -1557,7 +1557,7 @@
     },
     "McpMountsRequest": {
       "additionalProperties": false,
-      "description": "`PUT /api/mcp/connections/{id}/mounts`: the whole set of hosts the\nconnection is mounted on, replacing the one before, never a delta\n(gateway spec §9). No step-up: a mount reaches only a host the owner\npaired. 200 with the `McpConnectionItem`.\n\nIts own codes, beyond every route's (see `McpConnectionItem`): 404\n`not_found`; 400 `invalid` (a host that is not one of the owner's\npaired, unrevoked hosts; more than 1024 hosts; an id over 64 bytes,\nwhich is not quoted back). A refused set changes nothing.",
+      "description": "`PUT /api/mcp/connections/{id}/mounts`: the whole set of hosts the\nconnection is mounted on, replacing the one before, never a delta\n(gateway spec §9). No step-up: a mount reaches only a host the owner\npaired. 200 with the `McpConnectionItem`.\n\nIts own codes, beyond every route's (see `McpConnectionItem`): 404\n`not_found`; 400 `invalid` (a host that is not one of the owner's\npaired, unrevoked hosts; more than 1024 hosts; an id over 64 bytes,\nwhich is not quoted back). The limits count the ids as sent, and are\nchecked before the connection is looked up. A refused set changes\nnothing.",
       "properties": {
         "host_ids": {
           "description": "Host ids; `[]` unmounts it everywhere. A repeated id counts once.",
@@ -3036,7 +3036,7 @@
           ]
         },
         "label": {
-          "description": "1 to 64 printable characters.",
+          "description": "1 to 64 bytes of UTF-8 once trimmed (stored trimmed), with no\ncontrol or invisible format character.",
           "type": [
             "string",
             "null"

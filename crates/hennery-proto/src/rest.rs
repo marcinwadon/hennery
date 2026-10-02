@@ -935,10 +935,11 @@ pub struct McpConnectionItem {
     /// `^[a-z0-9][a-z0-9-]{0,47}$`, unique per owner; fixed once created.
     /// Agents see the server as `hennery-<slug>`.
     pub slug: String,
-    /// The operator's name for it: 1 to 64 printable characters.
+    /// The operator's name for it: 1 to 64 bytes of UTF-8 once trimmed
+    /// (stored trimmed), with no control or invisible format character.
     pub label: String,
     /// The upstream MCP endpoint, as stored (parsed and serialised). Only
-    /// this list shows it whole: logs and errors show only its origin.
+    /// the API's answers show it whole: logs and errors show only its origin.
     pub url: String,
     /// The hat whose sessions may use it. Fixed once created: a grant stays
     /// in its hat.
@@ -998,7 +999,8 @@ pub struct McpConnectionItem {
 pub struct CreateMcpConnectionRequest {
     /// `^[a-z0-9][a-z0-9-]{0,47}$`, unique per owner; fixed once created.
     pub slug: String,
-    /// 1 to 64 printable characters.
+    /// 1 to 64 bytes of UTF-8 once trimmed (stored trimmed), with no
+    /// control or invisible format character.
     pub label: String,
     /// Absolute `https`, or `http` only with `internal_network`; with a
     /// host, without a user name, password or fragment; at most 2048 bytes.
@@ -1047,7 +1049,8 @@ pub struct CreateMcpConnectionRequest {
 #[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateMcpConnectionRequest {
-    /// 1 to 64 printable characters.
+    /// 1 to 64 bytes of UTF-8 once trimmed (stored trimmed), with no
+    /// control or invisible format character.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "string | undefined", optional)]
     pub label: Option<String>,
@@ -1103,7 +1106,9 @@ mod present {
 /// Its own codes, beyond every route's (see `McpConnectionItem`): 404
 /// `not_found`; 400 `invalid` (a host that is not one of the owner's
 /// paired, unrevoked hosts; more than 1024 hosts; an id over 64 bytes,
-/// which is not quoted back). A refused set changes nothing.
+/// which is not quoted back). The limits count the ids as sent, and are
+/// checked before the connection is looked up. A refused set changes
+/// nothing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]
 pub struct McpMountsRequest {

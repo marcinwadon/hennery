@@ -990,12 +990,13 @@ id: string,
  */
 slug: string, 
 /**
- * The operator's name for it: 1 to 64 printable characters.
+ * The operator's name for it: 1 to 64 bytes of UTF-8 once trimmed
+ * (stored trimmed), with no control or invisible format character.
  */
 label: string, 
 /**
  * The upstream MCP endpoint, as stored (parsed and serialised). Only
- * this list shows it whole: logs and errors show only its origin.
+ * the API's answers show it whole: logs and errors show only its origin.
  */
 url: string, 
 /**
@@ -1081,7 +1082,8 @@ export type CreateMcpConnectionRequest = {
  */
 slug: string, 
 /**
- * 1 to 64 printable characters.
+ * 1 to 64 bytes of UTF-8 once trimmed (stored trimmed), with no
+ * control or invisible format character.
  */
 label: string, 
 /**
@@ -1137,7 +1139,8 @@ internal_network?: boolean | undefined, };
  */
 export type UpdateMcpConnectionRequest = { 
 /**
- * 1 to 64 printable characters.
+ * 1 to 64 bytes of UTF-8 once trimmed (stored trimmed), with no
+ * control or invisible format character.
  */
 label?: string | undefined, 
 /**
@@ -1175,7 +1178,9 @@ internal_network?: boolean | undefined, };
  * Its own codes, beyond every route's (see `McpConnectionItem`): 404
  * `not_found`; 400 `invalid` (a host that is not one of the owner's
  * paired, unrevoked hosts; more than 1024 hosts; an id over 64 bytes,
- * which is not quoted back). A refused set changes nothing.
+ * which is not quoted back). The limits count the ids as sent, and are
+ * checked before the connection is looked up. A refused set changes
+ * nothing.
  */
 export type McpMountsRequest = { 
 /**
