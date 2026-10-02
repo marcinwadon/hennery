@@ -6,6 +6,7 @@
 use ed25519_dalek::SigningKey;
 use hennery_kernel::hats::{HatChange, HostChange, NewRule, PurgeStart, RulesChange};
 use hennery_kernel::hosts::{Enrollment, Hosts, Registered, Revoke};
+use hennery_kernel::push::PushPolicy;
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 
@@ -231,6 +232,31 @@ fn the_last_step_deletes_a_frozen_hat_and_keeps_its_purged_row() {
     assert!(!hosts.finish_purge(&acme).unwrap());
     assert_eq!(hosts.begin_purge(&acme, NOW).unwrap(), PurgeStart::NotFound);
     assert_eq!(hosts.purge_counts(&acme).unwrap(), (0, 0));
+}
+
+/// Decision 10e: the hat's push policy (plan 10a decision 6) goes with
+/// its row. Not the default, so a row left behind could not pass for none.
+#[test]
+fn the_last_step_takes_the_hats_push_policy_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (hosts, db) = file_hosts(dir.path());
+    let acme = new_hat(&hosts, "Acme");
+    let muted = PushPolicy {
+        muted: true,
+        ..PushPolicy::default()
+    };
+    assert!(hosts.set_push_policy(&acme, muted).unwrap());
+    let conn = Connection::open(&db).unwrap();
+    let policies = |hat: &str| count(&conn, "SELECT count(*) FROM hat_push_policies WHERE hat_id = ?1", hat);
+    assert_eq!(policies(&acme), 1);
+
+    assert!(matches!(
+        hosts.begin_purge(&acme, NOW).unwrap(),
+        PurgeStart::Frozen { .. }
+    ));
+    assert_eq!(policies(&acme), 1, "the freeze keeps it");
+    assert!(hosts.finish_purge(&acme).unwrap());
+    assert_eq!(policies(&acme), 0);
 }
 
 /// Another owner's `purged_hats` row, written straight into the database,

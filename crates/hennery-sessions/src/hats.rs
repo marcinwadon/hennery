@@ -6,7 +6,7 @@
 
 use crate::AppState;
 use crate::api::Unplaceable;
-use crate::api::{error, internal};
+use crate::api::{close_deleted_on_host, error, internal};
 use crate::resolve::{NotResolved, resolve_on_host};
 use crate::store::{Deletion, HatSession, Unattached};
 use axum::extract::{Path, State};
@@ -301,30 +301,43 @@ pub fn purge_sessions(state: &AppState, hat_id: &str) -> anyhow::Result<PurgedSe
     for session in sessions {
         // Its host may have come back since the read above, with hundreds
         // of deletes in between: asked again, just before its own. Defence
-        // in depth: a host that returns between this and the delete still
-        // finds it closed only at its next handshake (decision 4).
+        // in depth: one that returns between this and the delete is closed
+        // by `delete_as_read`, or by its connection (decision 4).
         if running(state, &session) {
             return Err(SessionsRunning(vec![session.id]).into());
         }
-        let unattached = (session.lifecycle != "closed").then(|| Unattached {
-            lifecycle: session.lifecycle.clone(),
-            presumed_parked: session.presumed_parked,
-        });
-        match state.store.delete_session(&session.id, unattached.as_ref())? {
-            Deletion::Done { event, unconfirmed } => {
-                state.hub.publish(event);
-                purged.deleted += 1;
-                if unconfirmed {
-                    purged.unconfirmed.push(session.id);
-                }
-            }
-            // A resume, or its host back with it, since it was read.
-            Deletion::Refused(_) => return Err(SessionsRunning(vec![session.id]).into()),
-            // Deleted meanwhile, by a delete of its own.
-            Deletion::NotFound => {}
-        }
+        delete_as_read(state, session, &mut purged)?;
     }
     Ok(purged)
+}
+
+/// Delete one session of a purge, as `session` was read and judged not
+/// running (plan 9c decision 10d; plan 9a decision 5, A4), counting it in
+/// `purged`. Its host may have reconciled after that judgement and be
+/// ready by the commit, as a delete's may: one deleted `unconfirmed` is
+/// then sent `close_session` here, as `api::finish_delete` sends it; if the
+/// commit came before its host was ready, its connection finds the
+/// tombstone once it is (`ws::ready`, after `mark_ready`).
+pub(crate) fn delete_as_read(state: &AppState, session: HatSession, purged: &mut PurgedSessions) -> anyhow::Result<()> {
+    let unattached = (session.lifecycle != "closed").then(|| Unattached {
+        lifecycle: session.lifecycle.clone(),
+        presumed_parked: session.presumed_parked,
+    });
+    match state.store.delete_session(&session.id, unattached.as_ref())? {
+        Deletion::Done { event, unconfirmed } => {
+            state.hub.publish(event);
+            purged.deleted += 1;
+            if unconfirmed {
+                close_deleted_on_host(state, &session.host_id, &session.id);
+                purged.unconfirmed.push(session.id);
+            }
+        }
+        // A resume, or its host back with it, since it was read.
+        Deletion::Refused(_) => return Err(SessionsRunning(vec![session.id]).into()),
+        // Deleted meanwhile, by a delete of its own.
+        Deletion::NotFound => {}
+    }
+    Ok(())
 }
 
 fn sessions_running(ids: Vec<String>) -> Response {
