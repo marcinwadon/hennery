@@ -328,7 +328,7 @@ pub(crate) fn delete_as_read(state: &AppState, session: HatSession, purged: &mut
         .store
         .delete_session_owing_checkpoint(&session.id, unattached.as_ref())?
     {
-        Deletion::Done { event, unconfirmed } => {
+        Deletion::Done { event, unconfirmed, .. } => {
             state.hub.publish(event);
             purged.deleted += 1;
             if unconfirmed {

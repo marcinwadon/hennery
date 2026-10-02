@@ -194,9 +194,21 @@ pub struct SessionOptions {
     /// `git` for the git probe (ACP core §7), found once when the host
     /// starts (`git::find_git`); `None`: no probe, no `git_state`.
     pub git: Option<PathBuf>,
+    /// Where the agent's data is registered before each `session_started`
+    /// (plan 9d decision 1, B1); `None`: nothing is recorded.
+    pub home: Option<HomeRecorder>,
     /// Test seams (see `test_hooks`).
     #[cfg(feature = "test-hooks")]
     pub test_hooks: Option<test_hooks::TestHooks>,
+}
+
+/// What a session actor needs to record its agent's home (plan 9d
+/// decision 1): the agent's name, as the collector sends it, and the
+/// host's registry.
+#[derive(Debug, Clone)]
+pub struct HomeRecorder {
+    pub agent: String,
+    pub registry: Arc<crate::agent_home::Registry>,
 }
 
 impl Default for SessionOptions {
@@ -208,6 +220,7 @@ impl Default for SessionOptions {
             cancel_grace: CANCEL_GRACE,
             config_timeout: CONFIG_TIMEOUT,
             git: None,
+            home: None,
             #[cfg(feature = "test-hooks")]
             test_hooks: None,
         }
@@ -237,9 +250,18 @@ pub struct SessionHandle {
     /// has been queued (even before the actor has read it), or the actor
     /// has begun ending by itself.
     ending: Arc<AtomicBool>,
+    /// The agent's own session id, once known: at launch for a load, once
+    /// `session/new` answered for a new session (plan 9d B7).
+    agent_session_id: Arc<Mutex<Option<String>>>,
 }
 
 impl SessionHandle {
+    /// The agent's own session id, if known yet (plan 9d B7): a forget for
+    /// it is refused while this actor has not ended.
+    pub fn agent_session_id(&self) -> Option<String> {
+        self.agent_session_id.lock().expect("agent session id lock").clone()
+    }
+
     /// Queue a command. `false` if the actor has ended.
     pub fn send(&self, cmd: SessionCmd) -> bool {
         let ends = matches!(cmd, SessionCmd::Park { .. } | SessionCmd::Close { .. });
@@ -343,7 +365,12 @@ pub fn launch(uplink: Uplink, launch: Launch, options: SessionOptions) -> Sessio
     let (tx, rx) = mpsc::unbounded_channel();
     let open_turn = Arc::new(Mutex::new(None));
     let ending = Arc::new(AtomicBool::new(false));
+    let agent_session_id = Arc::new(Mutex::new(match &launch.attach {
+        Attach::Load { agent_session_id } => Some(agent_session_id.clone()),
+        Attach::New => None,
+    }));
     let actor = Actor {
+        agent_session_id: agent_session_id.clone(),
         uplink,
         session_id: launch.session_id.clone(),
         open_turn: open_turn.clone(),
@@ -366,6 +393,7 @@ pub fn launch(uplink: Uplink, launch: Launch, options: SessionOptions) -> Sessio
         open_turn,
         done,
         ending,
+        agent_session_id,
     }
 }
 
@@ -734,6 +762,8 @@ struct Actor {
     base_probe: Mutex<Option<(Watcher, watch::Receiver<bool>)>>,
     /// Shared with the handle (`SessionHandle::is_ending`).
     ending: Arc<AtomicBool>,
+    /// Shared with the handle (`SessionHandle::agent_session_id`).
+    agent_session_id: Arc<Mutex<Option<String>>>,
 }
 
 /// What the actor knows of its adapter's config options.
@@ -767,6 +797,42 @@ impl Actor {
     fn emit(&self, body: SessionBody) {
         if let Err(err) = self.uplink.emit(&self.session_id, body) {
             tracing::error!(session_id = %self.session_id, error = %err, "failed to persist a session frame");
+        }
+    }
+
+    /// Emit `session_started` for `request_id`, after registering where the
+    /// agent keeps this session's data (plan 9d decision 1, B1): durably,
+    /// before the frame, so a forget can always match it. A home that
+    /// cannot be resolved or registered is left out, and the session
+    /// records none. A load whose agent session was registered with other
+    /// roots before gets a `host_note` after it: both stay registered (B8).
+    fn announce(&self, request_id: String, agent_session: &str, env: &[(String, String)], loaded: bool) {
+        *self.agent_session_id.lock().expect("agent session id lock") = Some(agent_session.to_string());
+        let mut moved = false;
+        let agent_home = self.options.home.as_ref().and_then(|recorder| {
+            let home = crate::agent_home::resolve(&recorder.agent, env)?;
+            match recorder.registry.record(&recorder.agent, agent_session, &home) {
+                Ok(was_elsewhere) => {
+                    moved = was_elsewhere;
+                    Some(home)
+                }
+                Err(err) => {
+                    tracing::error!(session_id = %self.session_id, error = %err, "registering the agent's home failed; not reported");
+                    None
+                }
+            }
+        });
+        self.emit(SessionBody::SessionStarted {
+            request_id,
+            agent_session_id: agent_session.to_string(),
+            indexed: self.catalogue_extracts(),
+            agent_home,
+        });
+        if moved && loaded {
+            self.emit(SessionBody::HostNote {
+                note: "agent_home_moved".into(),
+                text: "the agent's data directory is not the one this session used before; both are recorded".into(),
+            });
         }
     }
 
@@ -833,6 +899,9 @@ impl Actor {
         } = launch;
         // For the git probe: `cwd` goes to the adapter's start.
         let probe_cwd = cwd.clone();
+        // Where the agent's data is resolved from (plan 9d decision 1).
+        let agent_env = agent.env.clone();
+        let loaded = matches!(attach, Attach::Load { .. });
         let (mut adapter, io) = match Adapter::spawn(&agent, &cwd) {
             Ok(spawned) => spawned,
             Err(err) => {
@@ -958,11 +1027,7 @@ impl Actor {
             current: applied.current,
         };
         // The catalogue after the switches, never the one before (P-13).
-        self.emit(SessionBody::SessionStarted {
-            request_id,
-            agent_session_id: agent_session.to_string(),
-            indexed: self.catalogue_extracts(),
-        });
+        self.announce(request_id, &agent_session.to_string(), &agent_env, loaded);
         // A load's state updates follow the start they belong to, and so do
         // updates the adapter sent while the start's switches ran. They are
         // older than the catalogue just announced, so they carry no
@@ -1128,11 +1193,9 @@ impl Actor {
                         // any) is in the outbox ahead of this answer.
                         _ => self.reject(request_id, "not_running", "that turn is not running".into()),
                     },
-                    Some(SessionCmd::Restart { request_id }) => self.emit(SessionBody::SessionStarted {
-                        request_id,
-                        agent_session_id: agent_session.to_string(),
-                        indexed: self.catalogue_extracts(),
-                    }),
+                    Some(SessionCmd::Restart { request_id }) => {
+                        self.announce(request_id, &agent_session.to_string(), &agent_env, loaded)
+                    }
                     // A switch may run during a turn; it is answered in order.
                     Some(SessionCmd::SetConfig { request_id, config_id, value }) => {
                         idle_since = Instant::now();

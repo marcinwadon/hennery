@@ -10,12 +10,13 @@
 use crate::content::{Checked, Image};
 use anyhow::{Context, Result};
 use hennery_proto::frames::{
-    AttachedSession, CollectorFrame, ConfigValue, ElicitationAction, Indexed, ParkReason, PendingKind, PendingReason,
-    PendingResolution, SessionBody, SessionConfig, TurnOutcome,
+    AgentHome, AttachedSession, CollectorFrame, ConfigValue, ElicitationAction, ForgetKind, ForgetReason, Indexed,
+    ParkReason, PendingKind, PendingReason, PendingResolution, SessionBody, SessionConfig, TurnOutcome,
 };
 use hennery_proto::rest::{
-    AnswerRequest, AttachmentUsage, BRANCH_MAX_CHARS, BRANCH_MAX_JSON_BYTES, EventDto, PendingItem, PendingState,
-    SessionCatalog, SessionItem, SessionPage, TITLE_MAX_CHARS, TITLE_MAX_JSON_BYTES, json_char_width,
+    AnswerRequest, AttachmentUsage, BRANCH_MAX_CHARS, BRANCH_MAX_JSON_BYTES, EventDto, HostRemovalState, PendingItem,
+    PendingState, RemovalItem, RemovalState, SessionCatalog, SessionItem, SessionPage, TITLE_MAX_CHARS,
+    TITLE_MAX_JSON_BYTES, TranscriptRemoval, json_char_width,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
@@ -271,7 +272,169 @@ const MIGRATIONS: &[&str] = &[
         WHEN OLD.lifecycle = 'deleted'
         BEGIN SELECT RAISE(ABORT, 'a deleted session is never changed'); END;
 ",
+    // The agent's own transcript on its host (plan 9d decisions 1–3, B8).
+    // `sessions.agent_home`: every distinct (agent session id, roots) the
+    // session's host reported in a `session_started`, at most
+    // `MAX_AGENT_HOMES`, as a JSON array; NULL before 9d, and on a
+    // tombstone. `host_forgets`: what a delete left to remove on a host,
+    // one row per pair, written in the delete's own transaction. It keeps
+    // the agent's ids and roots, never a cwd, a title or any content, and
+    // nothing reads it as a session (decision 3). `state` is `pending`
+    // (retried at the host's next handshake) or `final` (something is
+    // left that no retry changes; listed until dismissed, O10); a removal
+    // the host reports complete deletes its row. No backfill: a session
+    // from before has no home (decision 11).
+    "
+    ALTER TABLE sessions ADD COLUMN agent_home TEXT;
+    CREATE TABLE host_forgets (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL REFERENCES owners(id),
+        host_id TEXT NOT NULL,
+        session_id TEXT NOT NULL REFERENCES sessions(id),
+        hat_id TEXT NOT NULL,
+        agent TEXT NOT NULL,
+        agent_session_id TEXT NOT NULL,
+        agent_home TEXT,
+        created_at TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
+        last_result TEXT,
+        state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending', 'final')));
+    CREATE INDEX host_forgets_by_host ON host_forgets(owner_id, host_id, state);
+    CREATE INDEX host_forgets_by_session ON host_forgets(owner_id, session_id);
+",
 ];
+
+/// The most distinct (agent session id, roots) pairs a session records
+/// (plan 9d B8). A pair past it is not recorded, and so not forgotten.
+pub const MAX_AGENT_HOMES: usize = 8;
+
+/// One (agent session id, roots) a session used (plan 9d B8), as
+/// `sessions.agent_home` keeps it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecordedHome {
+    pub agent_session_id: String,
+    #[serde(flatten)]
+    pub home: AgentHome,
+}
+
+/// A removal still to make, or made with something left, on a host (plan
+/// 9d decisions 2 and 6): one `host_forgets` row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForgetRecord {
+    pub id: String,
+    pub host_id: String,
+    pub session_id: String,
+    pub agent: String,
+    pub agent_session_id: String,
+    /// `None`: the session recorded none (decision 11), and the record is
+    /// final from the start.
+    pub agent_home: Option<AgentHome>,
+    pub state: HostRemovalState,
+    pub attempts: u32,
+    pub last_result: Option<TranscriptRemoval>,
+    pub created_at: String,
+}
+
+/// What a delete left for the session's host (plan 9d decision 2, B8).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HostForgets {
+    /// The session's agent, as it was.
+    pub agent: String,
+    /// It had an agent session id: there is something on the host.
+    pub had_agent_record: bool,
+    /// One per recorded pair, as written.
+    pub records: Vec<ForgetRecord>,
+    /// Pairs another kept session still refers to: not forgotten (B8).
+    pub shared: u32,
+}
+
+const FORGET_COLUMNS: &str =
+    "id, host_id, session_id, agent, agent_session_id, agent_home, state, attempts, last_result, created_at";
+
+fn read_forget(r: &rusqlite::Row<'_>) -> rusqlite::Result<(ForgetRecord, Option<String>, String, Option<String>)> {
+    Ok((
+        ForgetRecord {
+            id: r.get(0)?,
+            host_id: r.get(1)?,
+            session_id: r.get(2)?,
+            agent: r.get(3)?,
+            agent_session_id: r.get(4)?,
+            agent_home: None,
+            state: HostRemovalState::Pending,
+            attempts: r.get(7)?,
+            last_result: None,
+            created_at: r.get(9)?,
+        },
+        r.get(5)?,
+        r.get(6)?,
+        r.get(8)?,
+    ))
+}
+
+/// A `read_forget` row with its JSON and state decoded.
+fn decode_forget(
+    (mut record, home, state, result): (ForgetRecord, Option<String>, String, Option<String>),
+) -> Result<ForgetRecord> {
+    record.agent_home = home.map(|h| serde_json::from_str(&h)).transpose()?;
+    record.state = if state == "final" {
+        HostRemovalState::Final
+    } else {
+        HostRemovalState::Pending
+    };
+    record.last_result = result.map(|r| serde_json::from_str(&r)).transpose()?;
+    Ok(record)
+}
+
+/// The pairs `sessions.agent_home` holds; an unreadable value counts as
+/// none, logged (it is only ever written by `record_home`).
+fn recorded_homes(raw: Option<&str>) -> Vec<RecordedHome> {
+    raw.map(|raw| {
+        serde_json::from_str(raw).unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "a session's recorded agent homes do not parse");
+            Vec::new()
+        })
+    })
+    .unwrap_or_default()
+}
+
+/// Add the (agent session id, home) a `session_started` reported to the
+/// session's recorded pairs (plan 9d B8): only a well-formed home (the
+/// shape check), only a pair not there yet, at most `MAX_AGENT_HOMES`.
+fn record_home(
+    tx: &Transaction<'_>,
+    owner: &str,
+    session_id: &str,
+    agent_session_id: &str,
+    home: &AgentHome,
+) -> Result<()> {
+    if !home.is_well_formed() {
+        tracing::warn!(%session_id, "not recording an agent home that is not absolute, bounded and free of NUL");
+        return Ok(());
+    }
+    let raw: Option<String> = tx.query_row(
+        "SELECT agent_home FROM sessions WHERE id = ?1 AND owner_id = ?2",
+        [session_id, owner],
+        |r| r.get(0),
+    )?;
+    let mut homes = recorded_homes(raw.as_deref());
+    let pair = RecordedHome {
+        agent_session_id: agent_session_id.to_string(),
+        home: home.clone(),
+    };
+    if homes.contains(&pair) {
+        return Ok(());
+    }
+    if homes.len() >= MAX_AGENT_HOMES {
+        tracing::warn!(%session_id, "a session reported more agent homes than are recorded; this one is not");
+        return Ok(());
+    }
+    homes.push(pair);
+    tx.execute(
+        "UPDATE sessions SET agent_home = ?2 WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?3",
+        params![session_id, serde_json::to_string(&homes)?, owner],
+    )?;
+    Ok(())
+}
 
 /// `Store::events`: `?1` the session, `?2` after, `?3` the limit, `?4` the
 /// owner.
@@ -452,7 +615,12 @@ pub enum Deletion {
     /// parked, or starting or active on a host away); that host closes its
     /// adapter when it is back (plan 9a decision 4, A13). A parked or
     /// failed session runs nowhere: its close is confirmed.
-    Done { event: EventDto, unconfirmed: bool },
+    Done {
+        event: EventDto,
+        unconfirmed: bool,
+        /// What is left to remove on its host (plan 9d decision 2).
+        forgets: Box<HostForgets>,
+    },
     /// Not closed, and not what the route judged unattached: this
     /// lifecycle. Nothing changed.
     Refused(String),
@@ -1401,6 +1569,139 @@ impl Checkpoints {
     }
 }
 
+/// The deleted session, as `write_forgets` reads it.
+struct ForgetSource<'a> {
+    session_id: &'a str,
+    host_id: &'a str,
+    hat_id: &'a str,
+    agent: &'a str,
+    agent_session_id: Option<&'a str>,
+    agent_home: Option<&'a str>,
+}
+
+/// A record's result when the collector knows it without asking the host:
+/// final, with `reason` for the whole session (plan 9d decision 11, O10).
+pub fn final_result(reason: ForgetReason) -> TranscriptRemoval {
+    TranscriptRemoval {
+        state: RemovalState::Partial,
+        pending: None,
+        remaining: vec![RemovalItem {
+            kind: ForgetKind::Session,
+            count: 0,
+            reason,
+        }],
+        notes: Vec::new(),
+    }
+}
+
+/// In the delete's transaction, before the scrub (plan 9d decision 2):
+/// one `host_forgets` row per (agent session id, roots) the session used
+/// (B8), and one with no home for an agent session id it recorded none
+/// for (a session from before 9d: final, decision 11). None for a pair
+/// another kept session of that host and agent still refers to, by its
+/// agent session id or among its recorded pairs (B8, `shared`). A record
+/// for a revoked host is final (O10): it never connects again.
+fn write_forgets(tx: &Transaction<'_>, owner: &str, deleted: ForgetSource<'_>) -> Result<HostForgets> {
+    let mut pairs: Vec<(String, Option<AgentHome>)> = recorded_homes(deleted.agent_home)
+        .into_iter()
+        .map(|recorded| (recorded.agent_session_id, Some(recorded.home)))
+        .collect();
+    if let Some(id) = deleted.agent_session_id
+        && !pairs.iter().any(|(recorded, _)| recorded == id)
+    {
+        pairs.push((id.to_string(), None));
+    }
+    let mut out = HostForgets {
+        agent: deleted.agent.to_string(),
+        had_agent_record: !pairs.is_empty(),
+        ..HostForgets::default()
+    };
+    let revoked: bool = tx
+        .query_row(
+            "SELECT revoked_at IS NOT NULL FROM hosts WHERE id = ?1 AND owner_id = ?2",
+            [deleted.host_id, owner],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    // The agent sessions the other kept sessions of this host and agent
+    // refer to: by their id, and among their recorded pairs.
+    let in_use: BTreeSet<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT agent_session_id, agent_home FROM sessions
+             WHERE host_id = ?2 AND agent = ?3 AND id <> ?4 AND lifecycle <> 'deleted' AND owner_id = ?1
+                 AND (agent_session_id IS NOT NULL OR agent_home IS NOT NULL)",
+        )?;
+        let rows = stmt.query_map(
+            params![owner, deleted.host_id, deleted.agent, deleted.session_id],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+        )?;
+        let mut ids = BTreeSet::new();
+        for row in rows {
+            let (id, homes) = row?;
+            ids.extend(id);
+            ids.extend(recorded_homes(homes.as_deref()).into_iter().map(|h| h.agent_session_id));
+        }
+        ids
+    };
+    let ts = now();
+    for (agent_session_id, home) in pairs {
+        if in_use.contains(&agent_session_id) {
+            out.shared += 1;
+            continue;
+        }
+        let known = match (&home, revoked) {
+            (None, _) => Some(final_result(ForgetReason::NoRecordedHome)),
+            (Some(_), true) => Some(final_result(ForgetReason::HostRevoked)),
+            (Some(_), false) => None,
+        };
+        let state = if known.is_some() {
+            HostRemovalState::Final
+        } else {
+            HostRemovalState::Pending
+        };
+        let record = ForgetRecord {
+            id: uuid::Uuid::now_v7().to_string(),
+            host_id: deleted.host_id.to_string(),
+            session_id: deleted.session_id.to_string(),
+            agent: deleted.agent.to_string(),
+            agent_session_id,
+            agent_home: home,
+            state,
+            attempts: 0,
+            last_result: known,
+            created_at: ts.clone(),
+        };
+        tx.execute(
+            "INSERT INTO host_forgets(id, owner_id, host_id, session_id, hat_id, agent, agent_session_id, agent_home,
+                                      created_at, last_result, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                record.id,
+                owner,
+                record.host_id,
+                record.session_id,
+                deleted.hat_id,
+                record.agent,
+                record.agent_session_id,
+                record.agent_home.as_ref().map(serde_json::to_string).transpose()?,
+                record.created_at,
+                record.last_result.as_ref().map(serde_json::to_string).transpose()?,
+                state_name(state),
+            ],
+        )?;
+        out.records.push(record);
+    }
+    Ok(out)
+}
+
+fn state_name(state: HostRemovalState) -> &'static str {
+    match state {
+        HostRemovalState::Pending => "pending",
+        HostRemovalState::Final => "final",
+    }
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
         let attachments = path.parent().map(|dir| dir.join(crate::attachments::DIR));
@@ -2183,16 +2484,39 @@ impl Store {
     fn delete_rows(&self, session_id: &str, unattached: Option<&Unattached>) -> Result<Deletion> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        // Its host, hat and cwd are read before the scrub clears them (R1).
-        let row: Option<(String, bool, String, String, String)> = tx
+        // Its host, hat and cwd are read before the scrub clears them (R1),
+        // and so are its agent and what it recorded of the agent's data
+        // (plan 9d decision 2, B8).
+        type DeletedRow = (
+            String,
+            bool,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        );
+        let row: Option<DeletedRow> = tx
             .query_row(
-                "SELECT lifecycle, presumed_parked, host_id, hat_id, cwd FROM sessions
-                 WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2",
+                "SELECT lifecycle, presumed_parked, host_id, hat_id, cwd, agent, agent_session_id, agent_home
+                 FROM sessions WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2",
                 [session_id, &self.owner],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some((lifecycle, presumed, host_id, hat_id, cwd)) = row else {
+        let Some((lifecycle, presumed, host_id, hat_id, cwd, agent, agent_session_id, agent_home)) = row else {
             return Ok(Deletion::NotFound);
         };
         let mut unconfirmed = false;
@@ -2259,12 +2583,26 @@ impl Store {
             params![self.owner, host_id, hat_id, cwd, session_id],
         )?;
         let dropped = drop_unreferenced(&tx, &self.owner, &hashes)?;
+        // What is left to remove on the host, before the scrub (plan 9d
+        // decision 2): one record per pair the session used.
+        let forgets = write_forgets(
+            &tx,
+            &self.owner,
+            ForgetSource {
+                session_id,
+                host_id: &host_id,
+                hat_id: &hat_id,
+                agent: &agent,
+                agent_session_id: agent_session_id.as_deref(),
+                agent_home: agent_home.as_deref(),
+            },
+        )?;
         let event = collector_event(&tx, &self.owner, session_id, "session_deleted", json!({}), &now())?;
         let scrubbed = tx.execute(
             "UPDATE sessions SET lifecycle = 'deleted', cwd = '', agent = '', title = NULL, git_branch = NULL,
                  git_dirty = NULL, git_worktree = NULL, base_commit = NULL, model = NULL, mode = NULL,
                  config_axes = NULL, agent_session_id = NULL, failure_reason = NULL, hat_rule_id = NULL,
-                 open_turn_id = NULL, activity = NULL, presumed_parked = 0, close_requested = 0
+                 open_turn_id = NULL, activity = NULL, presumed_parked = 0, close_requested = 0, agent_home = NULL
              WHERE id = ?1 AND owner_id = ?2",
             [session_id, &self.owner],
         )?;
@@ -2274,7 +2612,83 @@ impl Store {
         tx.commit()?;
         // plan 8: revoke the session's gateway tokens here
         self.remove_files(&conn, &dropped);
-        Ok(Deletion::Done { event, unconfirmed })
+        Ok(Deletion::Done {
+            event,
+            unconfirmed,
+            forgets: Box::new(forgets),
+        })
+    }
+
+    /// A host's records still to send, oldest first (plan 9d decision 5):
+    /// pending, with a home.
+    pub fn forgets_to_send(&self, host_id: &str) -> Result<Vec<ForgetRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {FORGET_COLUMNS} FROM host_forgets
+             WHERE host_id = ?1 AND state = 'pending' AND agent_home IS NOT NULL AND owner_id = ?2
+             ORDER BY created_at, id"
+        ))?;
+        let rows = stmt.query_map([host_id, &self.owner], read_forget)?;
+        rows.map(|row| decode_forget(row?)).collect()
+    }
+
+    /// A deleted session's records still to send (plan 9d O10: a retry
+    /// follows its `session_closed`).
+    pub fn forgets_of_session(&self, session_id: &str) -> Result<Vec<ForgetRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {FORGET_COLUMNS} FROM host_forgets
+             WHERE session_id = ?1 AND state = 'pending' AND agent_home IS NOT NULL AND owner_id = ?2
+             ORDER BY created_at, id"
+        ))?;
+        let rows = stmt.query_map([session_id, &self.owner], read_forget)?;
+        rows.map(|row| decode_forget(row?)).collect()
+    }
+
+    /// Every record, oldest first (`GET /api/settings/host-removals`).
+    pub fn host_removals(&self) -> Result<Vec<ForgetRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {FORGET_COLUMNS} FROM host_forgets WHERE owner_id = ?1 ORDER BY created_at, id"
+        ))?;
+        let rows = stmt.query_map([&self.owner], read_forget)?;
+        rows.map(|row| decode_forget(row?)).collect()
+    }
+
+    /// What one attempt at a record came to (plan 9d decision 6): a
+    /// complete removal deletes the record; otherwise its result is kept,
+    /// `sent` attempts are counted, and `final` stops the retries. Only a
+    /// record still pending changes: a dismissed or final one is left.
+    pub fn forget_attempted(&self, id: &str, result: &TranscriptRemoval, sent: bool, done: bool) -> Result<()> {
+        let conn = self.conn();
+        if result.state == RemovalState::Removed {
+            conn.execute(
+                "DELETE FROM host_forgets WHERE id = ?1 AND state = 'pending' AND owner_id = ?2",
+                [id, &self.owner],
+            )?;
+            return Ok(());
+        }
+        conn.execute(
+            "UPDATE host_forgets SET attempts = attempts + ?2, last_result = ?3, state = ?4
+             WHERE id = ?1 AND state = 'pending' AND owner_id = ?5",
+            params![
+                id,
+                i64::from(sent),
+                serde_json::to_string(result)?,
+                if done { "final" } else { "pending" },
+                self.owner
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Dismiss a record (plan 9d O10): it is no longer retried or listed.
+    /// `false` if there is none.
+    pub fn dismiss_forget(&self, id: &str) -> Result<bool> {
+        Ok(self.conn().execute(
+            "DELETE FROM host_forgets WHERE id = ?1 AND owner_id = ?2",
+            [id, &self.owner],
+        )? > 0)
     }
 
     /// Record an operator park before `park_session` is sent.
@@ -2632,6 +3046,17 @@ impl Store {
                 [&id, &self.owner],
             )?;
         }
+        // A revoked host never connects again: what it was left to remove
+        // stays listed, final (plan 9d O10).
+        tx.execute(
+            "UPDATE host_forgets SET state = 'final', last_result = ?2
+             WHERE host_id = ?1 AND state = 'pending' AND owner_id = ?3",
+            params![
+                host_id,
+                serde_json::to_string(&final_result(ForgetReason::HostRevoked))?,
+                self.owner
+            ],
+        )?;
         tx.commit()?;
         Ok(events)
     }
@@ -2743,6 +3168,7 @@ impl Store {
             SessionBody::SessionStarted {
                 agent_session_id,
                 indexed,
+                agent_home,
                 ..
             } => {
                 // A re-emitted `session_started` for a session already
@@ -2762,6 +3188,11 @@ impl Store {
                 } else {
                     // The catalogue after the start's switches (P-13).
                     store_catalogue(&tx, &self.owner, session_id, indexed, &ts)?;
+                    // Where the agent keeps this session's data (plan 9d
+                    // decision 1, B8).
+                    if let Some(home) = agent_home {
+                        record_home(&tx, &self.owner, session_id, agent_session_id, home)?;
+                    }
                 }
             }
             SessionBody::StartFailed { code, .. } => {

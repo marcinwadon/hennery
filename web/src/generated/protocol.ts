@@ -20,7 +20,7 @@ export type SessionConfig = { model?: string | null, mode?: string | null, axes?
  * collector never sends a frame that needs a capability to a host that
  * lacks it.
  */
-export type Capability = "projects" | "images" | "park" | "resolve_path";
+export type Capability = "projects" | "images" | "park" | "resolve_path" | "forget_session";
 
 /**
  * `hello.capabilities`. Deserialized leniently: a capability this build
@@ -142,7 +142,14 @@ pending?: PendingExtract | null, };
 /**
  * The body of a sequenced, outboxed session frame.
  */
-export type SessionBody = { "kind": "session_started", request_id: string, agent_session_id: string, indexed: Indexed, } | { "kind": "start_failed", request_id: string, code: string, message: string, } | { "kind": "turn_started", request_id: string, turn_id: string, } | { "kind": "acp_update", indexed: Indexed, payload: unknown, } | { "kind": "turn_ended", turn_id: string, outcome: TurnOutcome, stop_reason?: string | null, error?: string | null, } | { "kind": "session_parked", reason: ParkReason, } | { "kind": "session_closed" } | { "kind": "adapter_exited", code?: number | null, signal?: number | null, stderr_tail: string, } | { "kind": "host_note", note: string, text: string, } | { "kind": "config_applied", request_id: string, indexed: Indexed, } | { "kind": "pending_opened", pending_id: string, indexed: Indexed, payload: unknown, } | { "kind": "pending_resolved", pending_id: string, resolution: PendingResolution, reason?: PendingReason | null, } | { "kind": "answer_result", pending_id: string, request_id: string, delivered: boolean, } | { "kind": "git_state", 
+export type SessionBody = { "kind": "session_started", request_id: string, agent_session_id: string, indexed: Indexed, 
+/**
+ * Where the agent keeps its data for this session (plan 9d
+ * decision 1), registered on the host before this was sent (B1).
+ * Absent from an older host, for an agent hennery cannot forget
+ * for, or when the host could not resolve or register it.
+ */
+agent_home?: AgentHome | undefined, } | { "kind": "start_failed", request_id: string, code: string, message: string, } | { "kind": "turn_started", request_id: string, turn_id: string, } | { "kind": "acp_update", indexed: Indexed, payload: unknown, } | { "kind": "turn_ended", turn_id: string, outcome: TurnOutcome, stop_reason?: string | null, error?: string | null, } | { "kind": "session_parked", reason: ParkReason, } | { "kind": "session_closed" } | { "kind": "adapter_exited", code?: number | null, signal?: number | null, stderr_tail: string, } | { "kind": "host_note", note: string, text: string, } | { "kind": "config_applied", request_id: string, indexed: Indexed, } | { "kind": "pending_opened", pending_id: string, indexed: Indexed, payload: unknown, } | { "kind": "pending_resolved", pending_id: string, resolution: PendingResolution, reason?: PendingReason | null, } | { "kind": "answer_result", pending_id: string, request_id: string, delivered: boolean, } | { "kind": "git_state", 
 /**
  * The branch checked out; absent when detached.
  */
@@ -190,6 +197,45 @@ name: string,
 git: boolean, };
 
 /**
+ * Where an agent keeps its own data for a session, as its host resolved
+ * it from the adapter's environment (plan 9d decision 1): `root` is
+ * Claude's `CLAUDE_CONFIG_DIR` or `~/.claude`, Codex's `CODEX_HOME` or
+ * `~/.codex`; `sqlite_root` is Codex's `CODEX_SQLITE_HOME` if set.
+ * Canonical, its bytes as the filesystem gave them (O11). A host's report
+ * is not verified by the collector beyond its shape (`is_well_formed`).
+ */
+export type AgentHome = { root: string, sqlite_root?: string | undefined, };
+
+/**
+ * What a forget names on the host (plan 9d decision 4, B2): a kind of
+ * entry, never a path. The masked path each stands for is `masked`.
+ */
+export type ForgetKind = "session" | "transcript" | "file_history" | "session_env" | "tasks" | "debug" | "codex_database_copies";
+
+/**
+ * Why something named was not removed: a fixed code the host chooses
+ * (plan 9d B2), never free text.
+ */
+export type ForgetReason = "attached" | "unsupported_agent" | "no_recorded_home" | "unknown_to_host" | "shared" | "unsafe_root" | "root_missing" | "symlink" | "not_a_directory" | "unsafe_directory" | "mount_point" | "too_deep" | "still_present" | "io_error" | "invalid_id" | "host_revoked";
+
+/**
+ * One kind of entry and how many of them (plan 9d B2).
+ */
+export type ForgetWhat = { kind: ForgetKind, count: number, };
+
+/**
+ * Something a forget left (plan 9d decision 4). `retry: false` marks what
+ * a retry cannot change.
+ */
+export type ForgetRemaining = { what: ForgetWhat, reason: ForgetReason, retry: boolean, };
+
+/**
+ * How a forget ended (plan 9d decision 4): `complete` when the check
+ * afterwards found nothing named left (B4).
+ */
+export type ForgetOutcome = "complete" | "partial";
+
+/**
  * Host -> collector.
  */
 export type HostFrame = { "type": "hello", protocol_version: string, host_version: string, host_id: string, 
@@ -219,7 +265,7 @@ partial: boolean,
  * The host user's home directory, canonical, so the picker can
  * expand `~` (frontend §7). Absent if the host has none.
  */
-home?: string | null, } | { "type": "directory", request_id: string, 
+home?: string | null, } | { "type": "session_forgotten", request_id: string, outcome: ForgetOutcome, removed: Array<ForgetWhat>, remaining: Array<ForgetRemaining>, } | { "type": "directory", request_id: string, 
 /**
  * The browsed directory, canonical.
  */
@@ -259,7 +305,7 @@ agent_session_id: string, model?: string | null, mode?: string | null, axes?: { 
 /**
  * ACP ContentBlocks, built by the frontend.
  */
-content: unknown[], } | { "type": "cancel_turn", request_id: string, session_id: string, turn_id: string, } | { "type": "set_config", request_id: string, session_id: string, config_id: string, value: ConfigValue, } | { "type": "answer_permission", request_id: string, session_id: string, pending_id: string, option_id: string, } | { "type": "answer_elicitation", request_id: string, session_id: string, pending_id: string, action: ElicitationAction, content?: unknown, } | { "type": "ack", session_id: string, ack_seq: number, } | { "type": "resolve_path", request_id: string, path: string, } | { "type": "park_session", request_id: string, session_id: string, } | { "type": "close_session", request_id: string, session_id: string, } | { "type": "list_projects", request_id: string, } | { "type": "browse_directory", request_id: string, path: string, } | { "type": "forget_hat", hat_id: string, };
+content: unknown[], } | { "type": "cancel_turn", request_id: string, session_id: string, turn_id: string, } | { "type": "set_config", request_id: string, session_id: string, config_id: string, value: ConfigValue, } | { "type": "answer_permission", request_id: string, session_id: string, pending_id: string, option_id: string, } | { "type": "answer_elicitation", request_id: string, session_id: string, pending_id: string, action: ElicitationAction, content?: unknown, } | { "type": "ack", session_id: string, ack_seq: number, } | { "type": "resolve_path", request_id: string, path: string, } | { "type": "park_session", request_id: string, session_id: string, } | { "type": "close_session", request_id: string, session_id: string, } | { "type": "list_projects", request_id: string, } | { "type": "browse_directory", request_id: string, path: string, } | { "type": "forget_hat", hat_id: string, } | { "type": "forget_session", request_id: string, agent: string, agent_session_id: string, agent_home: AgentHome, };
 
 /**
  * `POST /api/sessions` (ACP core §9): `{host_id, agent, cwd, model?, mode?, axes?}`.
@@ -1263,3 +1309,46 @@ export type McpCredentialRequest = {
  * The token, as the upstream takes it after `static_prefix`.
  */
 token: string, };
+
+/**
+ * Where removing the agent's own transcript of a deleted session stands
+ * (plan 9d decision 7).
+ */
+export type RemovalState = "removed" | "partial" | "pending" | "none";
+
+/**
+ * Why a removal is still pending (plan 9d decision 7).
+ */
+export type RemovalPending = "host_offline" | "host_needs_update" | "no_reply" | "attached" | "in_progress";
+
+/**
+ * One kind of entry left on the host, how many, and why (plan 9d B2). Its
+ * path is `kind`'s masked one (`ForgetKind::masked`).
+ */
+export type RemovalItem = { kind: ForgetKind, count: number, reason: ForgetReason, };
+
+/**
+ * The agent's own transcript of a deleted session on its host (plan 9d
+ * decision 7): best effort. `notes` name what is never removed, whatever
+ * the state.
+ */
+export type TranscriptRemoval = { state: RemovalState, pending?: RemovalPending | undefined, remaining: Array<RemovalItem>, notes: Array<string>, };
+
+/**
+ * `DELETE /api/sessions/{id}` (ACP core §4.10; plan 9d decision 7).
+ */
+export type DeleteResult = { host_transcript: TranscriptRemoval, };
+
+/**
+ * Whether a host removal is still retried (plan 9d decision 6, O10).
+ */
+export type HostRemovalState = "pending" | "final";
+
+/**
+ * One entry of `GET /api/settings/host-removals` (plan 9d decision 7).
+ */
+export type HostRemovalItem = { id: string, host_id: string, 
+/**
+ * The deleted session (a tombstone).
+ */
+session_id: string, agent: string, state: HostRemovalState, attempts: number, last_result?: TranscriptRemoval | undefined, created_at: string, };

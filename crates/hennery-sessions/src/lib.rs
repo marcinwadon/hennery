@@ -3,6 +3,7 @@
 pub mod api;
 pub mod attachments;
 pub mod content;
+pub mod forget;
 pub mod hats;
 pub mod hosts;
 pub mod hub;
@@ -55,6 +56,8 @@ pub struct AppState {
     /// How often the attachments are swept after the sweep at startup
     /// (plan 9b decision 9).
     pub sweep_interval: Duration,
+    /// The host removals with an attempt in flight (plan 9d B7).
+    pub forgets: Arc<forget::InFlight>,
 }
 
 impl AppState {
@@ -72,6 +75,7 @@ impl AppState {
             vapid: Arc::new(VapidKey::generate()),
             push: Push::detached(),
             sweep_interval: sweep::INTERVAL,
+            forgets: Arc::new(forget::InFlight::default()),
         }
     }
 }
