@@ -26,6 +26,8 @@ struct Collector {
     addr: SocketAddr,
     state: AppState,
     _dir: tempfile::TempDir,
+    /// What the push triggers queued (plan 10b), unread by any delivery.
+    notices: std::sync::Mutex<hennery_kernel::push::Notices>,
 }
 
 impl Collector {
@@ -57,8 +59,35 @@ impl Collector {
             Operator::open(&dir.path().join("hennery.db")).unwrap(),
         );
         state.offline_threshold = offline;
+        let (push, notices) = hennery_kernel::push::Push::new();
+        state.push = push;
         tokio::spawn(hennery_sessions::serve(listener, state.clone()));
-        Self { addr, state, _dir: dir }
+        Self {
+            addr,
+            state,
+            _dir: dir,
+            notices: std::sync::Mutex::new(notices),
+        }
+    }
+
+    /// Every notice queued since the last call.
+    fn notices(&self) -> Vec<hennery_kernel::push::Notice> {
+        let mut queue = self.notices.lock().unwrap();
+        std::iter::from_fn(|| queue.try_recv()).collect()
+    }
+
+    /// The notices queued from now until one has `body`, that one last: a
+    /// notice is queued after its fact's commit, so the store showing the
+    /// fact does not mean the notice is there yet.
+    async fn notices_until(&self, body: &str) -> Vec<hennery_kernel::push::Notice> {
+        let mut seen = Vec::new();
+        wait_for(body, || {
+            seen.extend(self.notices());
+            let done = seen.iter().any(|n| n.body == body);
+            async move { done.then_some(()) }
+        })
+        .await;
+        seen
     }
 
     fn url(&self, path: &str) -> String {
@@ -2539,4 +2568,188 @@ async fn a_session_closed_and_reassigned_while_its_host_was_away_is_closed_on_it
     assert_eq!(session_id, session);
     let row = collector.state.store.session(&session).unwrap().unwrap();
     assert_eq!((row.lifecycle.as_str(), row.hat_id), ("closed", acme.id));
+}
+
+// Plan 10b: push triggers, from the host's facts only (ACP core §10).
+
+/// A question blocks the turn: one urgent notice; a second question, none;
+/// the turn's end: "finished".
+#[tokio::test]
+async fn a_blocked_turn_and_its_end_each_queue_one_notice() {
+    use hennery_kernel::push::Urgency;
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let (session, turn) = asking_session(&collector, &mut host).await;
+    let notices = collector.notices_until("needs your answer").await;
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(
+        (notices[0].urgency, notices[0].body.as_str(), notices[0].tag.as_str()),
+        (Urgency::High, "needs your answer", session.as_str())
+    );
+    assert_eq!(notices[0].url, format!("/sessions/{session}"));
+    host.emit(&session, opened("p2", &turn)).await;
+    host.emit(
+        &session,
+        turn_ended(&turn, hennery_proto::frames::TurnOutcome::Completed),
+    )
+    .await;
+    // One socket's frames are handled in order: by the end's notice, `p2`
+    // was handled, and queued none.
+    let notices = collector.notices_until("finished").await;
+    assert_eq!(
+        notices.iter().map(|n| n.body.as_str()).collect::<Vec<_>>(),
+        ["finished"]
+    );
+}
+
+/// A host that restarted mid-turn: reconciliation ends the turn, and
+/// nothing is pushed for it (P-25). Then a question in another session's
+/// turn, on the same socket: its notice, queued after everything before
+/// it, is the only one.
+#[tokio::test]
+async fn a_turn_ended_by_reconciliation_queues_no_notice() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    started_turn(&collector, &mut host, &session).await;
+    host.drop_connection(&collector).await;
+    let mut host = ScriptedHost::hello(&collector, vec![], 0).await;
+    host.send(&HostFrame::ResendComplete).await;
+    wait_for("parked", || async {
+        (collector.lifecycle(&session) == "parked").then_some(())
+    })
+    .await;
+    assert!(
+        collector
+            .event_kinds(&session)
+            .contains(&"turn_ended_synthesized".to_string())
+    );
+    let (other, _) = asking_session(&collector, &mut host).await;
+    let notices = collector.notices_until("needs your answer").await;
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(notices[0].tag, other);
+}
+
+/// 10b-i's review, A1: facts the host resends after a reconnect notify
+/// only once reconciliation is done, and only what still holds. A
+/// question asked, withdrawn and then the turn finished, all in the
+/// backlog: one "finished", no "needs your answer".
+#[tokio::test]
+async fn a_resent_backlog_notifies_only_what_still_holds() {
+    use hennery_proto::frames::{PendingReason, PendingResolution, TurnOutcome};
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let turn = started_turn(&collector, &mut host, &session).await;
+    let seq = host.seq;
+    host.drop_connection(&collector).await;
+    let mut host = ScriptedHost::hello(&collector, vec![attached(&session, seq)], seq).await;
+    host.emit(&session, opened("p1", &turn)).await;
+    host.emit(
+        &session,
+        SessionBody::PendingResolved {
+            pending_id: "p1".into(),
+            resolution: PendingResolution::Cancelled,
+            reason: Some(PendingReason::AgentWithdrew),
+        },
+    )
+    .await;
+    host.emit(&session, turn_ended(&turn, TurnOutcome::Completed)).await;
+    // A6: a later edge that notifies nothing (a question outside any turn)
+    // must not hide the "finished".
+    host.emit(&session, outside("p2")).await;
+    wait_for("the backlog", || async {
+        (!collector.state.store.open_pending(&session).unwrap().is_empty()).then_some(())
+    })
+    .await;
+    // Ingested, and nothing queued while the resend runs.
+    assert!(collector.notices().is_empty());
+    host.send(&HostFrame::ResendComplete).await;
+    let notices = collector.notices_until("finished").await;
+    assert_eq!(
+        notices.iter().map(|n| n.body.as_str()).collect::<Vec<_>>(),
+        ["finished"]
+    );
+}
+
+/// A1, the other way: a question in the backlog still open once the host
+/// is reconciled does ask the owner, then.
+#[tokio::test]
+async fn a_resent_question_still_open_notifies_after_reconciliation() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let turn = started_turn(&collector, &mut host, &session).await;
+    let seq = host.seq;
+    host.drop_connection(&collector).await;
+    let mut host = ScriptedHost::hello(
+        &collector,
+        vec![AttachedSession {
+            session_id: session.clone(),
+            last_seq: seq,
+            open_turn_id: Some(turn.clone()),
+        }],
+        seq,
+    )
+    .await;
+    host.emit(&session, opened("p1", &turn)).await;
+    wait_for("the question", || async {
+        (!collector.state.store.open_pending(&session).unwrap().is_empty()).then_some(())
+    })
+    .await;
+    // Ingested, but not notified while the resend runs.
+    assert!(collector.notices().is_empty());
+    host.send(&HostFrame::ResendComplete).await;
+    let notices = collector.notices_until("needs your answer").await;
+    assert_eq!(notices.len(), 1, "{notices:?}");
+}
+
+/// 10b-i's review, A2: a question asked again after the agent withdrew one
+/// in the same turn does not notify; it is the agent's pace, not the
+/// owner's.
+#[tokio::test]
+async fn a_question_asked_again_after_a_withdrawal_does_not_notify() {
+    use hennery_proto::frames::{PendingReason, PendingResolution};
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let (session, turn) = asking_session(&collector, &mut host).await;
+    collector.notices_until("needs your answer").await;
+    host.emit(
+        &session,
+        SessionBody::PendingResolved {
+            pending_id: "p1".into(),
+            resolution: PendingResolution::Cancelled,
+            reason: Some(PendingReason::AgentWithdrew),
+        },
+    )
+    .await;
+    host.emit(&session, opened("p2", &turn)).await;
+    host.emit(
+        &session,
+        turn_ended(&turn, hennery_proto::frames::TurnOutcome::Completed),
+    )
+    .await;
+    let notices = collector.notices_until("finished").await;
+    assert_eq!(
+        notices.iter().map(|n| n.body.as_str()).collect::<Vec<_>>(),
+        ["finished"]
+    );
+}
+
+/// A question asked outside any turn.
+fn outside(pending_id: &str) -> SessionBody {
+    let SessionBody::PendingOpened {
+        pending_id,
+        mut indexed,
+        payload,
+    } = opened(pending_id, "unused")
+    else {
+        unreachable!("`opened` makes a question");
+    };
+    indexed.turn_id = None;
+    SessionBody::PendingOpened {
+        pending_id,
+        indexed,
+        payload,
+    }
 }

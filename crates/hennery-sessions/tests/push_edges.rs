@@ -1,8 +1,11 @@
 //! Push triggers (ACP core §10; plan 10b): the edges a host fact crosses,
-//! read by the store in the fact's own transaction. Edge-triggered only: a duplicate, a fact not applied, an already
+//! read by the store in the fact's own transaction, and which of them
+//! notify. Edge-triggered only: a duplicate, a fact not applied, an already
 //! ended turn and a second question cross nothing.
 
+use hennery_kernel::push::Urgency;
 use hennery_proto::frames::{Indexed, PendingExtract, PendingKind, SessionBody, TurnOutcome};
+use hennery_sessions::notify::notice_for;
 use hennery_sessions::store::{EdgeSession, PushEdge, Store};
 use serde_json::json;
 
@@ -227,4 +230,102 @@ fn a_close_mid_turn_ends_it_without_an_edge() {
     let closed = store.ingest_fact("s1", 3, &SessionBody::SessionClosed).unwrap();
     assert!(closed.events.iter().any(|e| e.kind == "turn_ended_synthesized"));
     assert_eq!(closed.edge, None);
+}
+
+fn session(store: &Store) -> EdgeSession {
+    (&store.session("s1").unwrap().unwrap()).into()
+}
+
+#[test]
+fn only_blocked_finished_and_failed_notify() {
+    let store = Store::open_in_memory().unwrap();
+    running(&store);
+    let s = session(&store);
+    let blocked = notice_for(
+        &PushEdge::Blocked {
+            pending_id: "p1".into(),
+            title: Some("Run cargo test".into()),
+        },
+        &s,
+    )
+    .unwrap();
+    assert_eq!(
+        (blocked.urgency, blocked.title.as_str(), blocked.body.as_str()),
+        (Urgency::High, "project", "needs your answer")
+    );
+    assert_eq!(blocked.generic_title, "Session needs your answer");
+    assert_eq!(blocked.detail.as_deref(), Some("Run cargo test"));
+    assert_eq!(
+        (blocked.url.as_str(), blocked.tag.as_str(), blocked.hat_id.as_str()),
+        ("/sessions/s1", "s1", "hat-1")
+    );
+
+    let finished = notice_for(&PushEdge::TurnEnded(TurnOutcome::Completed), &s).unwrap();
+    assert_eq!(
+        (finished.urgency, finished.body.as_str(), finished.detail),
+        (Urgency::Normal, "finished", None)
+    );
+    let failed = notice_for(&PushEdge::TurnEnded(TurnOutcome::Failed), &s).unwrap();
+    assert_eq!(
+        (failed.body.as_str(), failed.generic_title.as_str()),
+        ("failed", "Session failed")
+    );
+    for quiet in [TurnOutcome::Cancelled, TurnOutcome::Interrupted] {
+        assert_eq!(notice_for(&PushEdge::TurnEnded(quiet), &s), None);
+    }
+}
+
+/// The maintainer's open question (plan 10b): until it is answered, a
+/// question asked outside a turn does not notify. Answering it changes
+/// `notice_for` and this test.
+#[test]
+fn a_question_outside_a_turn_does_not_notify_yet() {
+    let store = Store::open_in_memory().unwrap();
+    running(&store);
+    let edge = PushEdge::QuestionOutsideTurn {
+        pending_id: "p1".into(),
+        title: None,
+    };
+    assert_eq!(notice_for(&edge, &session(&store)), None);
+}
+
+#[test]
+fn the_title_is_the_sessions_else_its_directorys() {
+    let store = Store::open_in_memory().unwrap();
+    running(&store);
+    store
+        .ingest(
+            "s1",
+            3,
+            &SessionBody::AcpUpdate {
+                indexed: Indexed {
+                    title: Some("Fix the flaky test".into()),
+                    ..Indexed::default()
+                },
+                payload: json!({"sessionUpdate": "session_info_update"}),
+            },
+        )
+        .unwrap();
+    let notice = notice_for(&PushEdge::TurnEnded(TurnOutcome::Completed), &session(&store)).unwrap();
+    assert_eq!(notice.title, "Fix the flaky test");
+}
+
+/// 10b-i's review, A4: a directory's name reaches a lock screen like a
+/// title does, on one line, with no invisible or control characters.
+#[test]
+fn a_directorys_name_is_put_on_one_line() {
+    let at = |cwd: &str| EdgeSession {
+        id: "s1".into(),
+        hat_id: "hat-1".into(),
+        title: None,
+        cwd: cwd.into(),
+    };
+    let ended = PushEdge::TurnEnded(TurnOutcome::Completed);
+    assert_eq!(
+        notice_for(&ended, &at("/home/me/evil\u{202e}txt.exe\nname"))
+            .unwrap()
+            .title,
+        "eviltxt.exe name"
+    );
+    assert_eq!(notice_for(&ended, &at("/")).unwrap().title, "Session");
 }
