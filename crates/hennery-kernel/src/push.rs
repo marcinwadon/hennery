@@ -719,11 +719,243 @@ impl Hosts {
     }
 }
 
+/// How soon a push service should deliver a notification (RFC 8030 §5.3):
+/// `high` for "needs your answer", `normal` otherwise (kernel spec §6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Urgency {
+    High,
+    Normal,
+}
+
+/// A notification for the owner's devices, before the hat's policy is
+/// applied (kernel spec §6; plan 10b decision 1). The modules that own a
+/// trigger fill it in (ACP core §10, gateway §7); delivery applies the
+/// policy, so no caller re-implements it:
+/// - a muted hat: nothing is sent;
+/// - `generic_title`: `generic_title` replaces `title`, and `body` is
+///   dropped;
+/// - `details`: `detail`, when there is one, replaces `body`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    /// The hat whose policy applies; `''` (a session from before hats) has
+    /// the default.
+    pub hat_id: String,
+    pub urgency: Urgency,
+    /// The session title, or the connection's label.
+    pub title: String,
+    /// The title with nothing of the session's own: "Session needs your
+    /// answer".
+    pub generic_title: String,
+    pub body: String,
+    /// More than the default shows (the agent's question title), only
+    /// under a hat with `details`.
+    pub detail: Option<String>,
+    /// The same-origin path the notification opens: `/sessions/<id>`, or
+    /// `/mcp` for the gateway's. Never a URL.
+    pub url: String,
+    /// One notification per tag on a device: a newer one replaces it.
+    pub tag: String,
+}
+
+/// The tags waiting to be delivered, at most (plan 10b-i decision 5). A
+/// tag holds one notice, its latest, so one session cannot fill the queue
+/// for the others (10b-i's review, A2).
+pub const NOTICE_QUEUE: usize = 256;
+
+#[derive(Default)]
+struct Queue {
+    /// Tags in the order they were first queued.
+    order: std::collections::VecDeque<String>,
+    /// Each queued tag's latest notice.
+    latest: std::collections::HashMap<String, Notice>,
+    /// Notices dropped because `NOTICE_QUEUE` tags were waiting.
+    dropped: u64,
+    /// Whether a reader is there; without one, every notice is dropped.
+    read: bool,
+}
+
+struct Shared {
+    queue: std::sync::Mutex<Queue>,
+    ready: tokio::sync::Notify,
+}
+
+/// Where notices go to be delivered (kernel spec §6): a queue that
+/// delivery (plan 10b-ii) drains. Cheap to clone; `notify` never waits and
+/// never fails, so a trigger can call it from any thread, async or not.
+#[derive(Clone)]
+pub struct Push {
+    shared: std::sync::Arc<Shared>,
+}
+
+/// The queue's reading end, for delivery. Dropping it makes `notify` drop
+/// everything.
+pub struct Notices {
+    shared: std::sync::Arc<Shared>,
+}
+
+impl Push {
+    /// A queue of `NOTICE_QUEUE` tags and its reading end.
+    pub fn new() -> (Push, Notices) {
+        let shared = std::sync::Arc::new(Shared {
+            queue: std::sync::Mutex::new(Queue {
+                read: true,
+                ..Queue::default()
+            }),
+            ready: tokio::sync::Notify::new(),
+        });
+        (Push { shared: shared.clone() }, Notices { shared })
+    }
+
+    /// A queue nobody reads: every notice is dropped. What a collector has
+    /// until delivery runs, and tests that do not look.
+    pub fn detached() -> Push {
+        Push::new().0
+    }
+
+    /// Queue `notice` for delivery. Never waits. A notice for a tag already
+    /// waiting replaces it there, keeping its place: a device shows one
+    /// notification per tag anyway. A new tag when `NOTICE_QUEUE` are
+    /// waiting is dropped and counted, with a warning at the first drop and
+    /// every power of two after. The log names no notice's text.
+    pub fn notify(&self, notice: Notice) {
+        let mut queue = self
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !queue.read {
+            return;
+        }
+        if let Some(waiting) = queue.latest.get_mut(&notice.tag) {
+            *waiting = notice;
+        } else if queue.order.len() >= NOTICE_QUEUE {
+            queue.dropped += 1;
+            if queue.dropped.is_power_of_two() {
+                tracing::warn!(dropped = queue.dropped, "push queue full; notifications dropped");
+            }
+            return;
+        } else {
+            queue.order.push_back(notice.tag.clone());
+            queue.latest.insert(notice.tag.clone(), notice);
+        }
+        drop(queue);
+        self.shared.ready.notify_one();
+    }
+}
+
+impl Notices {
+    /// The next notice, oldest tag first; waits for one.
+    pub async fn recv(&mut self) -> Notice {
+        let shared = self.shared.clone();
+        loop {
+            let ready = shared.ready.notified();
+            if let Some(notice) = self.try_recv() {
+                return notice;
+            }
+            ready.await;
+        }
+    }
+
+    /// The next notice, if one is waiting.
+    pub fn try_recv(&mut self) -> Option<Notice> {
+        let mut queue = self
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tag = queue.order.pop_front()?;
+        queue.latest.remove(&tag)
+    }
+
+    /// Notices dropped so far because the queue was full.
+    pub fn dropped(&self) -> u64 {
+        self.shared
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .dropped
+    }
+}
+
+impl Drop for Notices {
+    fn drop(&mut self) {
+        let mut queue = self
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue.read = false;
+        queue.order.clear();
+        queue.latest.clear();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use p256::ecdsa::signature::Verifier;
     use serde_json::{Value, json};
+
+    fn notice(tag: &str, body: &str) -> Notice {
+        Notice {
+            hat_id: "hat-1".into(),
+            urgency: Urgency::Normal,
+            title: "t".into(),
+            generic_title: "g".into(),
+            body: body.into(),
+            detail: None,
+            url: format!("/sessions/{tag}"),
+            tag: tag.into(),
+        }
+    }
+
+    /// 10b-i's review, A2: a tag holds its latest notice, in its first
+    /// place, so one session's burst is one notice.
+    #[test]
+    fn a_tag_waiting_keeps_its_place_and_takes_the_latest_notice() {
+        let (push, mut notices) = Push::new();
+        push.notify(notice("s1", "needs your answer"));
+        push.notify(notice("s2", "finished"));
+        push.notify(notice("s1", "failed"));
+        assert_eq!(
+            notices.try_recv().map(|n| (n.tag, n.body)),
+            Some(("s1".into(), "failed".into()))
+        );
+        assert_eq!(notices.try_recv().map(|n| n.tag), Some("s2".into()));
+        assert_eq!(notices.try_recv(), None);
+    }
+
+    #[test]
+    fn a_full_queue_drops_new_tags_and_counts_them() {
+        let (push, mut notices) = Push::new();
+        for n in 0..NOTICE_QUEUE + 3 {
+            push.notify(notice(&format!("s{n}"), "finished"));
+        }
+        assert_eq!(notices.dropped(), 3);
+        // A waiting tag is still replaced.
+        push.notify(notice("s0", "failed"));
+        assert_eq!(notices.try_recv().map(|n| n.body), Some("failed".into()));
+        assert_eq!(std::iter::from_fn(|| notices.try_recv()).count(), NOTICE_QUEUE - 1);
+    }
+
+    #[test]
+    fn without_a_reader_every_notice_is_dropped() {
+        let push = Push::detached();
+        push.notify(notice("s1", "finished"));
+        let (push, notices) = Push::new();
+        drop(notices);
+        push.notify(notice("s1", "finished"));
+        assert!(push.shared.queue.lock().unwrap().latest.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reader_waits_for_the_next_notice() {
+        let (push, mut notices) = Push::new();
+        let reader = tokio::spawn(async move { notices.recv().await });
+        tokio::task::yield_now().await;
+        push.notify(notice("s1", "finished"));
+        assert_eq!(reader.await.unwrap().tag, "s1");
+    }
 
     /// A real browser's keys (web-push-native's example subscription).
     const P256DH: &str = "BLn9b-VR0ca83knDNZ32dCHGyjJp-1riX9ZTN40MqV8K_LpQmLqxC_DoHvqvFXO_nGdAB4W9dogZb_sM-uV4JbY";

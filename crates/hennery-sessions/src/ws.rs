@@ -2,7 +2,7 @@
 
 use crate::AppState;
 use crate::hub::Undo;
-use crate::store::Store;
+use crate::store::{Edge, Ingested, PushEdge, Store};
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -175,6 +175,13 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
     // 3. reader. Requests reach this host only once its resend is complete
     // and reconciled (`mark_ready`).
     let mut reconciled = false;
+    // The push edges of facts the host resent before its resend completed:
+    // notified once reconciliation is done, if they still hold (10b-i's
+    // review, A1). A resent question already withdrawn or answered must not
+    // ask the owner. Per session, the latest of each kind that would notify
+    // (A6): a later edge that notifies nothing must not hide a "finished".
+    // Lost if the connection drops first: a push is not state.
+    let mut deferred: HashMap<String, Deferred> = HashMap::new();
     // `close_session` frames the reconciliation loop re-sends by itself
     // (below), outside `Hub::request_for_session`: no waiter is registered
     // for them, so their `request_id` is tracked here instead. A `not_attached`
@@ -230,13 +237,22 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                         break;
                     }
                 }
-                match state.store.ingest(&session_id, seq, &body) {
-                    Ok(created) => {
+                match state.store.ingest_fact(&session_id, seq, &body) {
+                    Ok(Ingested { events: created, edge }) => {
                         // An applied `session_started`, of a start or a
                         // resume: a duplicate or a stale one creates none.
                         let started = created.iter().any(|event| event.kind == "session_started");
                         for event in created {
                             state.hub.publish(event);
+                        }
+                        // After the commit, and only from here: recovery
+                        // and reconciliation never push (ACP core §10).
+                        if let Some(edge) = edge {
+                            if reconciled {
+                                notify(&state, &edge);
+                            } else {
+                                deferred.entry(session_id.clone()).or_default().keep(edge);
+                            }
                         }
                         if started {
                             remember_project(&state, &host_id, &session_id);
@@ -386,6 +402,11 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                                 break;
                             }
                         }
+                        for (_, held) in deferred.drain() {
+                            if let Some(edge) = held.into_edge(&state) {
+                                notify(&state, &edge);
+                            }
+                        }
                         tracing::info!(%host_id, "host reconciled");
                     }
                     Err(err) => {
@@ -456,6 +477,62 @@ async fn retry_repark(state: AppState, host_id: String) {
     );
 }
 
+/// Notify the owner of `edge`, which a host fact crossed, if it notifies
+/// (`notify::notice_for`). Queued, never waited on.
+fn notify(state: &AppState, edge: &Edge) {
+    if let Some(notice) = crate::notify::notice_for(&edge.kind, &edge.session) {
+        state.push.notify(notice);
+    }
+}
+
+/// A session's edges deferred during a resend (A1, A6): its latest
+/// question that blocked a turn, and its latest turn end that notifies.
+#[derive(Default)]
+struct Deferred {
+    blocked: Option<Edge>,
+    ended: Option<Edge>,
+}
+
+impl Deferred {
+    /// Keep `edge` if it would notify; an edge that notifies nothing
+    /// replaces nothing.
+    fn keep(&mut self, edge: Edge) {
+        if crate::notify::notice_for(&edge.kind, &edge.session).is_none() {
+            return;
+        }
+        match edge.kind {
+            PushEdge::Blocked { .. } => self.blocked = Some(edge),
+            PushEdge::TurnEnded(_) => self.ended = Some(edge),
+            // Notifies nothing yet (the maintainer's open question): if it
+            // ever does, it needs a slot and a check of its own here.
+            PushEdge::QuestionOutsideTurn { .. } => {}
+        }
+    }
+
+    /// What to notify once reconciled: the question if it is still open and
+    /// its turn still blocked (`Store::still_blocked_on`), else the turn's
+    /// end. A failed read is logged and counts as not holding: a push is not
+    /// state.
+    fn into_edge(self, state: &AppState) -> Option<Edge> {
+        if let Some(edge) = self.blocked {
+            let PushEdge::Blocked { pending_id, .. } = &edge.kind else {
+                unreachable!("`keep` files only `Blocked` here");
+            };
+            let holds = state
+                .store
+                .still_blocked_on(&edge.session.id, pending_id)
+                .unwrap_or_else(|err| {
+                    tracing::warn!(session_id = %edge.session.id, error = %err, "deferred push dropped: store unreadable");
+                    false
+                });
+            if holds {
+                return Some(edge);
+            }
+        }
+        self.ended
+    }
+}
+
 /// Remember the cwd of a session that just started or resumed as one of its
 /// host's recent projects, under the session's hat (kernel spec §5.3; plan
 /// 6c decision 11). Only a canonical cwd: a start stores the cwd as its
@@ -496,5 +573,38 @@ fn undo_rejected(store: &Store, undo: &Undo, code: &str) -> anyhow::Result<()> {
     match undo {
         Undo::Start { session_id } => store.mark_failed_if_starting(session_id, code),
         Undo::Prompt { session_id, turn_id } => store.abandon_turn(session_id, turn_id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::EdgeSession;
+    use hennery_proto::frames::TurnOutcome;
+
+    fn ended(outcome: TurnOutcome) -> Edge {
+        Edge {
+            kind: PushEdge::TurnEnded(outcome),
+            session: EdgeSession {
+                id: "s1".into(),
+                hat_id: "hat-1".into(),
+                title: None,
+                cwd: "/p".into(),
+            },
+        }
+    }
+
+    /// A6: a later turn end that notifies nothing (cancelled, interrupted)
+    /// does not replace one that does.
+    #[test]
+    fn a_quiet_turn_end_does_not_replace_a_finished_one() {
+        let mut held = Deferred::default();
+        held.keep(ended(TurnOutcome::Completed));
+        held.keep(ended(TurnOutcome::Cancelled));
+        held.keep(ended(TurnOutcome::Interrupted));
+        assert_eq!(
+            held.ended.map(|e| e.kind),
+            Some(PushEdge::TurnEnded(TurnOutcome::Completed))
+        );
     }
 }
