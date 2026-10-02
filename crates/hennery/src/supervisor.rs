@@ -21,8 +21,7 @@ pub const STATE_FILE: &str = "supervisor.json";
 /// How long `up` waits for a child it asked to stop.
 const STOP_GRACE: Duration = Duration::from_secs(10);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Which {
     Collector,
     Host,
@@ -363,6 +362,11 @@ fn exited<S: Children>(
         return None;
     }
     tracing::warn!(child = %child.which, status = %shown, "exited");
+    if first && now.duration_since(since) < policy.startup_grace {
+        child.slot = Slot::Down;
+        child.report.state = ChildState::Stopped;
+        return Some(format!("the {} failed to start ({shown})", child.which));
+    }
     if !children.host_paired() {
         child.slot = Slot::Down;
         child.report.state = ChildState::Stopped;
@@ -370,11 +374,6 @@ fn exited<S: Children>(
             "the {} exited ({shown}) before the all-in-one host was paired; start `hennery up` again to pair it",
             child.which
         ));
-    }
-    if first && now.duration_since(since) < policy.startup_grace {
-        child.slot = Slot::Down;
-        child.report.state = ChildState::Stopped;
-        return Some(format!("the {} failed to start ({shown})", child.which));
     }
     after_crash(child, now, policy)
 }

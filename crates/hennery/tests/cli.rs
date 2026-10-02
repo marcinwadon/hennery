@@ -344,7 +344,7 @@ impl Drop for KillTree {
         }
         for pid in std::mem::take(&mut self.children) {
             unsafe {
-                // Each child leads its own process group (`run_up` sets
+                // Each child leads its own process group (`UpChildren` sets
                 // `process_group(0)`), so kill both the pid and that group.
                 libc::kill(pid, libc::SIGKILL);
                 libc::kill(-pid, libc::SIGKILL);
@@ -359,7 +359,7 @@ impl Drop for KillTree {
 }
 
 /// A terminal's Ctrl-C delivers SIGINT to every process in the foreground
-/// process group at once. `run_up` pulls its two children out of that group
+/// process group at once. `up` pulls its two children out of that group
 /// (`process_group(0)` on both spawns) so only the supervisor is signalled
 /// and can still forward an ordered shutdown (host, then collector) instead
 /// of racing each child's own signal handler.

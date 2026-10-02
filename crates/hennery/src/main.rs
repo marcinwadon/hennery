@@ -753,7 +753,8 @@ fn loopback_url(listen: &str) -> String {
     }
 }
 
-/// `up`'s host child, but for the pairing descriptor (`run_up` adds it).
+/// `up`'s host child, but for the pairing descriptor (`UpChildren::host`
+/// adds it).
 fn host_command(
     exe: &std::path::Path,
     host_dir: &std::path::Path,
@@ -790,6 +791,31 @@ fn host_command(
         host_cmd.arg("--agent").arg(spec);
     }
     host_cmd
+}
+
+/// What a host data directory holds of a pairing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pairing {
+    None,
+    /// `host.key` and `host.toml`.
+    Whole,
+    /// Staged by a join and not yet put in place (`host.toml.pending`).
+    Interrupted,
+}
+
+/// What `dir` holds of a host's pairing, from the files alone. Not
+/// `Paired::load`, which rolls an interrupted pairing forward (renames, the
+/// outbox moved aside): only the host may do that, under `host.lock`
+/// (decision 8 of plan 7c).
+fn pairing_in(dir: &std::path::Path) -> Pairing {
+    use hennery_host::identity::{CONFIG_FILE, KEY_FILE};
+    if dir.join(format!("{CONFIG_FILE}.pending")).exists() {
+        Pairing::Interrupted
+    } else if dir.join(KEY_FILE).is_file() && dir.join(CONFIG_FILE).is_file() {
+        Pairing::Whole
+    } else {
+        Pairing::None
+    }
 }
 
 /// What `up` starts its children from, again after a crash.
@@ -868,7 +894,7 @@ impl supervisor::Children for UpChildren<'_> {
     }
 
     fn host_paired(&self) -> bool {
-        matches!(Paired::load(&self.host_dir), Ok(Some(_)))
+        pairing_in(&self.host_dir) == Pairing::Whole
     }
 
     fn revoked(&self) {
@@ -886,7 +912,8 @@ impl supervisor::Children for UpChildren<'_> {
 /// a signal stopped it, and 1 when it could not go on.
 async fn run_up(args: UpArgs) -> Result<std::process::ExitCode> {
     // First, before any child exists: from here on a SIGINT or SIGTERM is
-    // caught and waits for the loop below, which stops both children. Caught
+    // caught and waits for `supervisor::supervise`, which stops both
+    // children. Caught
     // only once the loop first ran, one sent just after the collector's
     // spawn killed `up` by the default action and left that collector
     // running with nobody to stop it.
@@ -920,10 +947,11 @@ async fn run_up(args: UpArgs) -> Result<std::process::ExitCode> {
     // where the collector's admin socket cannot tell (its path too long).
     let _lock = lock::acquire(&args.data_dir, lock::UP_LOCK, "hennery up")?;
     // The host pairs itself on first start only; a pairing that was revoked
-    // is not replaced (kernel spec §4.2).
-    let pairing = match Paired::load(&host_dir)? {
-        Some(_) => None,
-        None => Some(std::io::pipe()?),
+    // is not replaced (kernel spec §4.2). One left half-done needs no code:
+    // the host child finishes it, under its lock.
+    let pairing = match pairing_in(&host_dir) {
+        Pairing::Whole | Pairing::Interrupted => None,
+        Pairing::None => Some(std::io::pipe()?),
     };
     let mut children = UpChildren {
         exe,
@@ -1033,5 +1061,25 @@ mod tests {
             .map(|w| w[1].as_str())
             .collect();
         assert_eq!(roots, ["/srv/projects", "~/src"]);
+    }
+
+    /// Plan 7c, decision 8: `up` judges its host's pairing from the files,
+    /// never by `Paired::load`, which would put a staged pairing in place
+    /// without the host's lock. A staged one is neither whole nor touched.
+    #[test]
+    fn the_pairing_is_judged_from_the_files_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(pairing_in(dir.path()), Pairing::None);
+        std::fs::write(dir.path().join("host.key"), "k").unwrap();
+        assert_eq!(pairing_in(dir.path()), Pairing::None);
+        std::fs::write(dir.path().join("host.toml"), "t").unwrap();
+        assert_eq!(pairing_in(dir.path()), Pairing::Whole);
+        std::fs::write(dir.path().join("host.toml.pending"), "staged").unwrap();
+        assert_eq!(pairing_in(dir.path()), Pairing::Interrupted);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("host.toml.pending")).unwrap(),
+            "staged"
+        );
+        assert_eq!(pairing_in(&dir.path().join("missing")), Pairing::None);
     }
 }
