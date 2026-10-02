@@ -153,6 +153,7 @@ const OPERATOR_ROUTES: &[(&str, &str)] = &[
     ("POST", "/api/auth/step-up/password"),
     ("GET", "/api/auth/sessions"),
     ("DELETE", "/api/auth/sessions/0000"),
+    ("GET", "/api/capabilities"),
 ];
 
 /// Every route outside the operator's session, as a method and a path:

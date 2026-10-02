@@ -156,6 +156,7 @@ pub fn router(state: AppState) -> Router {
         .merge(projects::router(state.clone()))
         .merge(push::router(state.clone()))
         .merge(hennery_kernel::auth_api::router(state.operator.clone()))
+        .merge(hennery_kernel::capabilities::router(state.operator.clone()))
         .merge(hennery_kernel::health::router(state.operator.clone()))
         .merge(ws::router(state))
         .route("/", axum::routing::get(|| async { axum::response::Html(PLACEHOLDER) }))

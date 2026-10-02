@@ -100,6 +100,8 @@ pub fn render_schema() -> String {
         rest::McpCredentialRequest,
         rest::DeleteResult,
         rest::HostRemovalItem,
+        rest::DeploymentMode,
+        rest::CapabilitiesResponse,
     );
     // `serde_json::Map` is a `BTreeMap` (always iterates sorted) by default,
     // or an `IndexMap` (iterates in insertion order) when serde_json's
@@ -259,6 +261,8 @@ pub fn render_ts() -> String {
         rest::HostRemovalState,
         rest::HostRemovalItem,
         rest::HostTranscripts,
+        rest::DeploymentMode,
+        rest::CapabilitiesResponse,
     );
     out
 }

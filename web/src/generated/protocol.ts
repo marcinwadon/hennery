@@ -1365,3 +1365,17 @@ session_id: string, agent: string, state: HostRemovalState, attempts: number, la
  * none. The pending ones are retried at their host's next handshake.
  */
 export type HostTranscripts = { removed: number, partial: number, pending: number, pending_sessions: Array<string>, };
+
+/**
+ * How this collector is deployed (kernel spec §8, frontend spec §2): the
+ * whole cockpit, or the MCP gateway alone.
+ */
+export type DeploymentMode = "full" | "gateway";
+
+/**
+ * `GET /api/capabilities` (kernel spec §8): the mode, which decides the
+ * views the web UI shows, and the features this collector has switched
+ * on. `features` is an open list: a client ignores a name it does not
+ * know.
+ */
+export type CapabilitiesResponse = { mode: DeploymentMode, features: Array<string>, };
