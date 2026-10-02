@@ -241,6 +241,9 @@ describe('filters', () => {
     const region = await list()
     await userEvent.selectOptions(within(region).getByRole('combobox', { name: 'Lifecycle' }), 'active')
     await userEvent.type(within(region).getByRole('searchbox', { name: 'Search sessions' }), 'fix')
+    // A loaded machine may pause past the debounce mid-word: a search for
+    // `f` can go first, with the same rows. Wait for the whole word's.
+    await waitFor(() => expect(s.of(LIST).at(-1)!.searchParams.get('q')).toBe('fix'))
     await waitFor(() => expect(names(region)).toEqual(['found-closed']))
     const sent = s.of(LIST).at(-1)!.searchParams
     expect(sent.get('q')).toBe('fix')
