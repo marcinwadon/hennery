@@ -15,8 +15,11 @@ slice); everything else is design. The maintainer's decisions are recorded below
      auth, pairing, hats, push, HTTP security.
    - [MCP gateway](specs/2026-09-26-mcp-gateway-design.md) — connections,
      OAuth, per-session tokens, streaming proxy, renderers.
+   - [Client view](specs/2026-10-02-client-view-design.md) — the display fold
+     on the collector (`hennery-view`), the view API every client uses, and the
+     web UI reused from the predecessor frontend.
    - [Frontend](specs/2026-09-26-frontend-design.md) — views, data layer,
-     transcript fold, cards, PWA.
+     transcript fold rules, cards, PWA.
    - [Distribution](specs/2026-09-26-distribution-design.md) — binary,
      managed runtime and adapter manifest, release pipeline, services, doctor.
 3. Evidence:
