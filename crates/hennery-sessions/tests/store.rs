@@ -370,7 +370,14 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
-            "DROP TABLE event_attachments;
+            "DROP INDEX sessions_by_recency;
+             ALTER TABLE sessions DROP COLUMN title;
+             ALTER TABLE sessions DROP COLUMN git_branch;
+             ALTER TABLE sessions DROP COLUMN git_dirty;
+             ALTER TABLE sessions DROP COLUMN git_worktree;
+             ALTER TABLE sessions DROP COLUMN base_commit;
+             ALTER TABLE sessions DROP COLUMN last_event_id;
+             DROP TABLE event_attachments;
              DROP TABLE attachments;
              ALTER TABLE turns DROP COLUMN state;
              ALTER TABLE sessions DROP COLUMN owner_id;
@@ -1810,4 +1817,56 @@ fn a_revoke_converges_even_after_its_wait_timed_out_and_reconciliation_reattache
         (PendingState::Cancelled, Some(PendingReason::HostRevoked))
     );
     assert_eq!(store.pending_item("p1").unwrap().unwrap().delivered, Some(false));
+}
+
+// Plan 6b: a session's recency (the list's sort key, ACP core §9) moves
+// only with an event the timeline lists (decision 6).
+
+fn recency(store: &Store) -> (String, Option<i64>) {
+    let s = store.session("s1").unwrap().unwrap();
+    (s.last_event_at, s.last_event_id)
+}
+
+#[test]
+fn recency_moves_only_with_a_listed_event() {
+    let store = Store::open_in_memory().unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    let (created_at, none) = recency(&store);
+    assert_eq!(none, None);
+    let first = store
+        .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
+        .unwrap();
+    let after_start = recency(&store);
+    assert_eq!(after_start, (first[0].ts.clone(), Some(first[0].event_id)));
+    assert!(after_start.0 >= created_at);
+    // Later than any stamp so far, so a wrongly moved recency would show.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    // An exact duplicate, and a fact that does not apply (an end for a turn
+    // that is not open), move neither.
+    assert!(
+        store
+            .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(store.ingest("s1", 2, &ended("t-none")).unwrap().is_empty());
+    assert_eq!(recency(&store), after_start);
+    // A listed update moves both.
+    let listed = store.ingest("s1", 3, &update(1)).unwrap();
+    assert_eq!(recency(&store), (listed[0].ts.clone(), Some(listed[0].event_id)));
+    assert!(listed[0].ts > after_start.0);
+}
+
+#[test]
+fn a_fact_that_writes_collector_events_leaves_recency_at_the_last_of_them() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    let created = store.ingest("s1", 2, &turn_started("t1")).unwrap();
+    assert_eq!(kinds(&created), ["turn_started", "user_turn"]);
+    assert!(created[1].event_id > created[0].event_id);
+    assert_eq!(recency(&store).1, Some(created[1].event_id));
+    // A collector event of its own moves it too.
+    let parked = store.record_park_request("s1").unwrap();
+    assert_eq!(recency(&store), (parked.ts.clone(), Some(parked.event_id)));
 }

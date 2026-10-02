@@ -156,6 +156,27 @@ const MIGRATIONS: &[&str] = &[
         FOREIGN KEY (owner_id, sha256) REFERENCES attachments(owner_id, sha256));
     CREATE INDEX event_attachments_by_image ON event_attachments(owner_id, sha256);
 ",
+    // The session list and its extracts (plan 6b, ACP core §8): the title
+    // and the git state the host reports, the session's recency (the list's
+    // sort key: the time and id of its last listed event), and the latest
+    // slash commands, off the list (P-23). Recency is rewritten to one
+    // fixed width, so text order is time order (decision 5); a value that
+    // is not a time is left as it is. The git columns are filled from
+    // `git_state` (6b-ii).
+    "
+    ALTER TABLE sessions ADD COLUMN title TEXT;
+    ALTER TABLE sessions ADD COLUMN git_branch TEXT;
+    ALTER TABLE sessions ADD COLUMN git_dirty INTEGER;
+    ALTER TABLE sessions ADD COLUMN git_worktree INTEGER;
+    ALTER TABLE sessions ADD COLUMN base_commit TEXT;
+    ALTER TABLE sessions ADD COLUMN last_event_id INTEGER;
+    ALTER TABLE session_catalog ADD COLUMN commands TEXT;
+    UPDATE sessions SET last_event_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', last_event_at), last_event_at);
+    UPDATE sessions SET last_event_id = (
+        SELECT MAX(e.event_id) FROM events e
+        WHERE e.session_id = sessions.id AND e.applied = 1 AND e.owner_id = sessions.owner_id);
+    CREATE INDEX sessions_by_recency ON sessions(owner_id, last_event_at DESC, id DESC);
+",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -177,6 +198,11 @@ pub struct SessionRow {
     /// The model, mode and other axes the host last reported as current;
     /// a resume re-applies them (ACP core §4.3).
     pub config: SessionConfig,
+    /// When the session's last listed event was written (`stamp`), or its
+    /// creation; the session list's sort key.
+    pub last_event_at: String,
+    /// That event's id; `None` until the session has one.
+    pub last_event_id: Option<i64>,
 }
 
 /// The outcome of `Store::request_resume`.
@@ -250,10 +276,26 @@ pub struct Attachment {
     pub bytes: Vec<u8>,
 }
 
+/// `at` as RFC 3339 UTC with exactly three fractional digits
+/// (`2026-10-07T12:34:56.789Z`, truncated to the millisecond). Every stamp
+/// has the same width, so comparing two as text compares the times: the
+/// session list sorts on them (plan 6b decision 5). `time`'s own RFC 3339
+/// output trims trailing zeros, so `…:05.1Z` would sort after `…:05.12Z`.
+fn stamp(at: time::OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second(),
+        at.millisecond()
+    )
+}
+
 fn now() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .expect("RFC 3339 formatting of the current time")
+    stamp(time::OffsetDateTime::now_utc())
 }
 
 /// Write a collector-originated event (`host_seq` NULL, ACP core §8), for
@@ -272,12 +314,13 @@ fn collector_event(
         params![session_id, kind, body.to_string(), ts, owner],
     )?;
     anyhow::ensure!(written == 1, "no session {session_id}");
+    let event_id = tx.last_insert_rowid();
     tx.execute(
-        "UPDATE sessions SET last_event_at = ?2 WHERE id = ?1 AND owner_id = ?3",
-        params![session_id, ts, owner],
+        "UPDATE sessions SET last_event_at = ?2, last_event_id = ?3 WHERE id = ?1 AND owner_id = ?4",
+        params![session_id, ts, event_id, owner],
     )?;
     Ok(EventDto {
-        event_id: tx.last_insert_rowid(),
+        event_id,
         session_id: session_id.to_string(),
         host_seq: None,
         kind: kind.to_string(),
@@ -786,7 +829,7 @@ impl Store {
             .conn()
             .query_row(
                 "SELECT id, host_id, agent, cwd, lifecycle, activity, open_turn_id, failure_reason, close_requested,
-                        presumed_parked, model, mode, config_axes
+                        presumed_parked, model, mode, config_axes, last_event_at, last_event_id
                  FROM sessions WHERE id = ?1 AND owner_id = ?2",
                 [id, &self.owner],
                 |r| {
@@ -803,6 +846,8 @@ impl Store {
                         close_requested: r.get(8)?,
                         presumed_parked: r.get(9)?,
                         config: SessionConfig::default(),
+                        last_event_at: r.get(13)?,
+                        last_event_id: r.get(14)?,
                     };
                     Ok((row, config))
                 },
@@ -1770,10 +1815,17 @@ impl Store {
                 }
             }
         }
-        tx.execute(
-            "UPDATE sessions SET last_event_at = ?2 WHERE id = ?1 AND owner_id = ?3",
-            params![session_id, ts, self.owner],
-        )?;
+        // Only a listed event moves the session's recency (plan 6b decision
+        // 6): a fact kept just as the idempotency key is hidden from the
+        // timeline, so it must not move the session up the list either.
+        // The fact's collector events come after it, so the last of them
+        // is the session's last event.
+        if let Some(last) = created.iter().map(|e| e.event_id).max() {
+            tx.execute(
+                "UPDATE sessions SET last_event_at = ?2, last_event_id = ?3 WHERE id = ?1 AND owner_id = ?4",
+                params![session_id, ts, last, self.owner],
+            )?;
+        }
         tx.commit()?;
         Ok(created)
     }
@@ -1941,6 +1993,83 @@ mod tests {
     fn timestamps_are_rfc3339_utc() {
         let ts = super::now();
         assert!(ts.ends_with('Z') && ts.as_bytes()[10] == b'T', "{ts}");
+    }
+
+    /// Plan 6b decision 5: every stamp has the same width, so comparing
+    /// them as text compares the times, within a second too.
+    #[test]
+    fn stamps_have_one_width_so_text_order_is_time_order() {
+        let at = |nanos: i64| {
+            super::stamp(
+                time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap() + time::Duration::nanoseconds(nanos),
+            )
+        };
+        let stamps = [
+            at(0),
+            at(100_000_000),
+            at(120_000_000),
+            at(999_999_999),
+            at(1_000_000_000),
+        ];
+        assert_eq!(stamps[0], "2027-01-15T08:00:00.000Z");
+        assert_eq!(stamps[1], "2027-01-15T08:00:00.100Z");
+        assert_eq!(stamps[3], "2027-01-15T08:00:00.999Z");
+        assert!(stamps.iter().all(|s| s.len() == 24), "{stamps:?}");
+        assert!(stamps.windows(2).all(|w| w[0] < w[1]), "{stamps:?}");
+    }
+
+    /// Plan 6b's migration on a database from before it: `last_event_at`
+    /// rewritten to the fixed width (an unreadable value left alone),
+    /// `last_event_id` from the session's last listed event, and the list's
+    /// index in place.
+    #[test]
+    fn the_session_list_migration_normalises_recency_on_an_older_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hennery.db");
+        {
+            let mut conn = hennery_kernel::db::open(&db).unwrap();
+            let owner = hennery_kernel::db::kernel_owner(&mut conn).unwrap();
+            hennery_kernel::db::migrate(&mut conn, &MIGRATIONS[..8]).unwrap();
+            conn.execute_batch(&format!(
+                "
+                INSERT INTO sessions(id, host_id, agent, cwd, lifecycle, created_at, last_event_at, owner_id) VALUES
+                    ('s1', 'h1', 'fake', '/tmp', 'active', 't', '2026-10-01T10:00:05.12Z', '{owner}'),
+                    ('s2', 'h1', 'fake', '/tmp', 'active', 't', '2026-10-01T10:00:05Z', '{owner}'),
+                    ('s3', 'h1', 'fake', '/tmp', 'active', 't', 't', '{owner}');
+                INSERT INTO events(session_id, host_seq, kind, body, ts, applied, owner_id) VALUES
+                    ('s1', 1, 'session_started', '{{}}', 't', 1, '{owner}'),
+                    ('s1', 2, 'acp_update', '{{}}', 't', 1, '{owner}'),
+                    ('s1', 3, 'turn_ended', '{{}}', 't', 0, '{owner}');
+                "
+            ))
+            .unwrap();
+        }
+        Store::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, last_event_at, last_event_id FROM sessions ORDER BY id")
+            .unwrap();
+        let rows: Vec<(String, String, Option<i64>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("s1".into(), "2026-10-01T10:00:05.120Z".into(), Some(2)),
+                ("s2".into(), "2026-10-01T10:00:05.000Z".into(), None),
+                ("s3".into(), "t".into(), None),
+            ]
+        );
+        let index: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'sessions_by_recency'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
     }
 
     /// The kernel's first two migrations, as 3b-ii shipped them.
