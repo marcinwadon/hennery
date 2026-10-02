@@ -557,7 +557,7 @@ purged until they are moved to another hat: 409 `hat_is_default`). As built
 - **`GET /api/hats/{id}/purge`** previews it (no step-up): the counts of
   sessions, rules and recents, the sessions that would refuse it, and the
   sessions with no hat (`hat_id = ''`), which no purge deletes.
-- 200 `PurgeResult {sessions, rules, unconfirmed}`.
+- 200 `PurgeResult {sessions, rules, unconfirmed, host_transcripts}`: the last counts the sessions' agent transcripts on their hosts removed, partly removed and pending, with the pending ids (ACP core §4.10, plan 9d-i).
 
 - sessions: every session of the hat is deleted as in ACP core §4.10;
 - gateway: its connections with their grants, mounts, session tokens,

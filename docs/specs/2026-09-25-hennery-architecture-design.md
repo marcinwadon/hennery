@@ -516,7 +516,8 @@ step-up authentication (§7.3):
   requests and queued answers (ACP core §4.10). A tombstone with no content
   remains, so a host that still runs the session is told to close it. Backups
   taken before the delete keep its data. The agent's own transcript on its
-  host is removed too, best effort (ACP core §4.10).
+  host is removed too, best effort, and what could not be is reported and
+  retried (ACP core §4.10).
 - **Purge a hat** removes all of its sessions, its gateway connections with
   their grants, and its path rules; hosts delete their composed agent homes for
   that hat on their next connection (kernel §5.5).
