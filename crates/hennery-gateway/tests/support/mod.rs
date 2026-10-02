@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+pub mod upstream;
+
 use ed25519_dalek::SigningKey;
 use hennery_gateway::key::MasterKey;
 use hennery_gateway::model::{Change, CredKind, CredentialChange, NewConnection};
