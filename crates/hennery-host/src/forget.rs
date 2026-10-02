@@ -764,6 +764,8 @@ mod tests {
             &me,
             Some(&grp(20, "staff", &["me", "you"]))
         ));
+        // A looked-up group that is not the directory's.
+        assert!(!safe_mode(&dir(501, 501, 0o775), &me, Some(&grp(600, "me", &[]))));
         // A group named as the user and only theirs, but not their
         // primary one.
         assert!(!safe_mode(&dir(501, 600, 0o775), &me, Some(&grp(600, "me", &[]))));
@@ -818,6 +820,59 @@ mod tests {
         assert_eq!(stop_reason(walk::Stop::Deadline), ForgetReason::TimedOut);
         assert!(retryable(ForgetReason::TimedOut));
         assert!(!retryable(ForgetReason::Symlink));
+    }
+
+    /// Every way the walk stops has its reason (the fleet's per-outcome
+    /// rule), and only those a retry can change are retried.
+    #[test]
+    fn each_stop_of_the_walk_has_its_reason() {
+        assert_eq!(stop_reason(walk::Stop::MountPoint), ForgetReason::MountPoint);
+        assert_eq!(stop_reason(walk::Stop::TooDeep), ForgetReason::TooDeep);
+        assert_eq!(stop_reason(walk::Stop::Io(libc::EIO)), ForgetReason::IoError);
+        assert_eq!(stop_reason(walk::Stop::Swapped), ForgetReason::IoError);
+        for (reason, retried) in [
+            (ForgetReason::StillPresent, true),
+            (ForgetReason::IoError, true),
+            (ForgetReason::InProgress, true),
+            (ForgetReason::TimedOut, true),
+            (ForgetReason::MountPoint, false),
+            (ForgetReason::TooDeep, false),
+            (ForgetReason::UnsafeDirectory, false),
+            (ForgetReason::NotADirectory, false),
+            (ForgetReason::UnsafeRoot, false),
+            (ForgetReason::RootMissing, false),
+        ] {
+            assert_eq!(retryable(reason), retried, "{reason:?}");
+        }
+    }
+
+    /// A forget the connection did not check never builds a path from an
+    /// id the agent never writes.
+    #[tokio::test]
+    async fn an_unchecked_invalid_id_is_refused_by_the_forget_itself() {
+        let ctx = ForgetContext {
+            agents: HashMap::new(),
+            data_dir: PathBuf::from("/nonexistent-data"),
+            home: None,
+            hooks: walk::Hooks::default(),
+            account: None,
+        };
+        let forgotten = forget(
+            &ctx,
+            &Forget {
+                agent: "claude".into(),
+                agent_session_id: "../escape".into(),
+                agent_home: hennery_proto::frames::AgentHome {
+                    root: "/tmp".into(),
+                    sqlite_root: None,
+                },
+            },
+        )
+        .await;
+        assert_eq!(
+            forgotten.remaining,
+            [left(ForgetKind::Session, 0, ForgetReason::InvalidId, false)]
+        );
     }
 
     #[test]
