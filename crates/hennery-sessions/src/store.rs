@@ -1227,7 +1227,8 @@ fn conflict_already_recorded(
 /// the pages a delete wrote leave it too (plan 9a A8): best-effort, logged.
 /// On a connection of its own, so the store's lock is not held while it
 /// waits for readers; busy if one stays, and then the next checkpoint does
-/// it.
+/// it. A connection is opened per delete: deletes are rare. Plan 9b's
+/// sweep, which checkpoints too, could keep one connection for both.
 fn checkpoint(path: &Path) {
     let checkpointed = hennery_kernel::db::open(path)
         .and_then(|conn| Ok(conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0))?));
@@ -1357,6 +1358,24 @@ impl Store {
         };
         row.config = stored_config(config)?;
         Ok(Some(row))
+    }
+
+    /// Which of `ids` are tombstones of `host_id`'s (plan 9a decision 4):
+    /// what a host's connection, once ready, still has to close of the
+    /// sessions its `hello` listed, if a delete committed after its
+    /// reconciliation.
+    pub(crate) fn tombstones_of(&self, host_id: &str, ids: &[&str]) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT 1 FROM sessions WHERE id = ?1 AND host_id = ?2 AND lifecycle = 'deleted' AND owner_id = ?3",
+        )?;
+        let mut deleted = Vec::new();
+        for id in ids {
+            if stmt.exists(params![id, host_id, self.owner])? {
+                deleted.push(id.to_string());
+            }
+        }
+        Ok(deleted)
     }
 
     /// The host a session runs on, tombstones included: what a host's frame

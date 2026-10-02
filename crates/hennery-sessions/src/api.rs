@@ -947,7 +947,7 @@ async fn park(State(state): State<AppState>, Path(id): Path<String>) -> Response
 
 /// Where closing a session stands (ACP core §4.8), for `close` and
 /// `delete` (plan 9a decision 5).
-enum Closing {
+pub(crate) enum Closing {
     /// Closed: by its host just now, or already.
     Closed,
     /// It has no adapter the collector can reach, as read: to be closed
@@ -963,7 +963,7 @@ enum Closing {
 /// end. A host that answers `not_attached` no longer has it: it is closed
 /// collector-side here. A close whose delivery is unknown stays requested
 /// and is re-sent after the host's next handshake.
-async fn close_through_host(state: &AppState, session: &SessionRow) -> Closing {
+pub(crate) async fn close_through_host(state: &AppState, session: &SessionRow) -> Closing {
     let judged = Unattached {
         lifecycle: session.lifecycle.clone(),
         presumed_parked: session.presumed_parked,
@@ -1030,10 +1030,16 @@ async fn close(State(state): State<AppState>, Path(id): Path<String>) -> Respons
 /// lifecycle if something moved it on meanwhile (a resume). 204.
 ///
 /// A session closed without its host (`unconfirmed`) is closed by that
-/// host when it reconciles next (decision 4). No `close_session` is sent
-/// here even if the host is back meanwhile: a host that reconciled before
-/// the delete reattached the session, so the delete was refused; one that
-/// reconciles after it finds the tombstone.
+/// host when it reconciles next (decision 4). Its host may be back by the
+/// time the delete commits: a reconciliation that ran between this read and
+/// the commit left a listed active session as it was, so the judgement
+/// still held, and the delete went ahead. If the host is ready now, it is
+/// sent `close_session` here (`finish_delete`), with nobody waiting for the
+/// answer; if the commit came before it was ready, its connection finds the
+/// tombstone once it is (`ws::ready`, after `mark_ready`). A `not_attached`
+/// answer is only logged: a tombstone has nothing left to close. A
+/// connection kicked between the two sends neither; its next reconcile
+/// closes the session.
 async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let session = match state.store.find_session(&id) {
         Ok(Some(s)) => s,
@@ -1045,12 +1051,31 @@ async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -
         Closing::Unattached(judged) => Some(judged),
         Closing::Answer(response) => return response,
     };
-    match state.store.delete_session(&id, unattached.as_ref()) {
+    finish_delete(&state, &session, unattached.as_ref())
+}
+
+/// The delete itself, once `close_through_host` has judged `session`.
+pub(crate) fn finish_delete(state: &AppState, session: &SessionRow, unattached: Option<&Unattached>) -> Response {
+    let id = &session.id;
+    match state.store.delete_session(id, unattached) {
         // Only `session_deleted`: what a collector-side close wrote went
         // with the session, in the same transaction.
         Ok(Deletion::Done { event, unconfirmed }) => {
             tracing::info!(session_id = %id, unconfirmed, "session deleted");
             state.hub.publish(event);
+            if unconfirmed {
+                // Its host may be ready by now (it reconciled after the
+                // judgement): nobody waits for the answer, which changes
+                // nothing on a tombstone. `notify` sends only to a host that
+                // is ready.
+                state.hub.notify(
+                    &session.host_id,
+                    CollectorFrame::CloseSession {
+                        request_id: uuid::Uuid::now_v7().to_string(),
+                        session_id: id.clone(),
+                    },
+                );
+            }
             StatusCode::NO_CONTENT.into_response()
         }
         Ok(Deletion::Refused(lifecycle)) => error(
@@ -1420,5 +1445,206 @@ mod tests {
         let replay = stream::iter([Ok(vec![event(1)]), Err("disk")]);
         let sent: Vec<_> = replay_then_follow(replay, one_message_each, one_live()).collect().await;
         assert_eq!(sent.len(), 2);
+    }
+}
+
+/// A delete against a host's reconciliation (plan 9a, the whole-branch
+/// review's race). Its window, between `reconcile_host`'s commit and
+/// `mark_ready`, has no await point, so these tests do not race it: they
+/// call the steps the route and the host's connection run, in each order
+/// the window allows, over a connection registered with a channel of
+/// their own.
+#[cfg(test)]
+mod delete_race_tests {
+    use super::*;
+    use crate::ws::{after_reconcile, ready};
+    use hennery_kernel::hosts::Hosts;
+    use hennery_kernel::operator::Operator;
+    use hennery_proto::frames::{AttachedSession, Capabilities, SessionBody};
+    use std::collections::{HashMap, HashSet};
+    use tokio::sync::mpsc;
+
+    const HOST: &str = "host-1";
+
+    struct Fixture {
+        state: AppState,
+        rx: mpsc::UnboundedReceiver<CollectorFrame>,
+        tx: mpsc::UnboundedSender<CollectorFrame>,
+        conn_id: u64,
+        _dir: tempfile::TempDir,
+    }
+
+    /// A collector's state, and `HOST` connected but not yet reconciled.
+    fn fixture() -> Fixture {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hennery.db");
+        let state = AppState::new(
+            Store::open(&db).unwrap(),
+            Hosts::open(&db).unwrap(),
+            Operator::open(&db).unwrap(),
+        );
+        let (tx, rx) = mpsc::unbounded_channel();
+        let conn_id = state
+            .hub
+            .register(HOST, tx.clone(), Capabilities::default())
+            .unwrap()
+            .conn_id;
+        Fixture {
+            state,
+            rx,
+            tx,
+            conn_id,
+            _dir: dir,
+        }
+    }
+
+    fn session(f: &Fixture, id: &str, started: bool) -> SessionRow {
+        f.state
+            .store
+            .create_session(id, HOST, "fake", "/tmp", "hat-1", None)
+            .unwrap();
+        if started {
+            f.state
+                .store
+                .ingest(id, 1, &SessionBody::session_started("r0", "a1"))
+                .unwrap();
+        }
+        f.state.store.find_session(id).unwrap().unwrap()
+    }
+
+    fn listed(id: &str) -> Vec<AttachedSession> {
+        vec![AttachedSession {
+            session_id: id.into(),
+            last_seq: 1,
+            open_turn_id: None,
+        }]
+    }
+
+    /// The route's judgement while the host is not ready: unattached, as
+    /// read.
+    async fn judged_unattached(f: &Fixture, session: &SessionRow) -> Unattached {
+        match close_through_host(&f.state, session).await {
+            Closing::Unattached(judged) => judged,
+            _ => panic!("expected the session judged unattached"),
+        }
+    }
+
+    /// The `close_session` frames sent to the host so far.
+    fn closes(f: &mut Fixture) -> Vec<String> {
+        let mut ids = Vec::new();
+        while let Ok(frame) = f.rx.try_recv() {
+            if let CollectorFrame::CloseSession { session_id, .. } = frame {
+                ids.push(session_id);
+            }
+        }
+        ids
+    }
+
+    /// The delete commits after the reconciliation and before the host is
+    /// ready: the route cannot reach the host, so its connection, once
+    /// ready, finds the tombstone and closes it.
+    #[tokio::test]
+    async fn a_delete_committed_before_the_host_is_ready_is_closed_by_its_connection() {
+        let mut f = fixture();
+        let s = session(&f, "s1", true);
+        let attached = listed("s1");
+        let mut reconcile_closes = HashMap::new();
+        let done = f.state.store.reconcile_host(HOST, &attached).unwrap();
+        let closed = after_reconcile(&f.state, HOST, &[], done, &f.tx, &mut reconcile_closes);
+        assert!(closed.is_empty());
+        let judged = judged_unattached(&f, &s).await;
+        let response = finish_delete(&f.state, &s, Some(&judged));
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(
+            closes(&mut f).is_empty(),
+            "the host is not ready: the route sends nothing"
+        );
+        ready(
+            &f.state,
+            HOST,
+            f.conn_id,
+            &attached,
+            &closed,
+            &f.tx,
+            &mut reconcile_closes,
+        )
+        .unwrap();
+        assert_eq!(closes(&mut f), ["s1"]);
+        // Tracked, so a `not_attached` answer finds its session.
+        assert_eq!(reconcile_closes.values().filter(|s| *s == "s1").count(), 1);
+    }
+
+    /// The route judged the session while its host was not ready, and the
+    /// delete commits once it is: the connection's check came too early,
+    /// so the route closes it.
+    #[tokio::test]
+    async fn a_delete_committed_after_the_host_is_ready_is_closed_by_the_route() {
+        let mut f = fixture();
+        let s = session(&f, "s1", true);
+        let attached = listed("s1");
+        let mut reconcile_closes = HashMap::new();
+        let done = f.state.store.reconcile_host(HOST, &attached).unwrap();
+        let closed = after_reconcile(&f.state, HOST, &[], done, &f.tx, &mut reconcile_closes);
+        let judged = judged_unattached(&f, &s).await;
+        ready(
+            &f.state,
+            HOST,
+            f.conn_id,
+            &attached,
+            &closed,
+            &f.tx,
+            &mut reconcile_closes,
+        )
+        .unwrap();
+        assert!(closes(&mut f).is_empty(), "nothing is deleted yet");
+        let response = finish_delete(&f.state, &s, Some(&judged));
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(closes(&mut f), ["s1"]);
+    }
+
+    /// A tombstone the reconciliation itself closes gets one
+    /// `close_session`, not a second from the check after `mark_ready`.
+    #[tokio::test]
+    async fn a_delete_committed_before_the_reconciliation_is_closed_once() {
+        let mut f = fixture();
+        let s = session(&f, "s1", true);
+        let attached = listed("s1");
+        let judged = judged_unattached(&f, &s).await;
+        assert_eq!(
+            finish_delete(&f.state, &s, Some(&judged)).status(),
+            StatusCode::NO_CONTENT
+        );
+        let mut reconcile_closes = HashMap::new();
+        let done = f.state.store.reconcile_host(HOST, &attached).unwrap();
+        let closed = after_reconcile(&f.state, HOST, &[], done, &f.tx, &mut reconcile_closes);
+        assert_eq!(closed, HashSet::from(["s1".to_string()]));
+        ready(
+            &f.state,
+            HOST,
+            f.conn_id,
+            &attached,
+            &closed,
+            &f.tx,
+            &mut reconcile_closes,
+        )
+        .unwrap();
+        assert_eq!(closes(&mut f), ["s1"]);
+    }
+
+    /// The route's own `starting` arm (plan 9a decision 5): refused before
+    /// the store is asked, which would refuse it too.
+    #[tokio::test]
+    async fn a_starting_session_on_a_ready_host_is_refused_by_the_route() {
+        let f = fixture();
+        let s = session(&f, "s1", false);
+        f.state.hub.mark_ready(HOST, f.conn_id);
+        let Closing::Answer(response) = close_through_host(&f.state, &s).await else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["code"], "starting", "{body}");
+        assert_eq!(f.state.store.find_session("s1").unwrap().unwrap().lifecycle, "starting");
     }
 }

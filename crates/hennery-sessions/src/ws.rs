@@ -2,7 +2,7 @@
 
 use crate::AppState;
 use crate::hub::Undo;
-use crate::store::{Edge, Ingested, PushEdge, Store};
+use crate::store::{Edge, Ingested, PushEdge, Reconciliation, Store};
 use axum::Router;
 use axum::extract::State;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
@@ -13,9 +13,9 @@ use futures::{SinkExt, StreamExt};
 use hennery_kernel::hosts::HelloCheck;
 use hennery_kernel::lifecycle::LifecycleHooks;
 use hennery_kernel::secret::{random_bytes, unix_now};
-use hennery_proto::frames::{CollectorFrame, HostFrame, SessionBody};
+use hennery_proto::frames::{AttachedSession, CollectorFrame, HostFrame, SessionBody};
 use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION, protocol_major};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -373,37 +373,20 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                 // §5.1 step 4).
                 match state.store.reconcile_host(&host_id, &attached_sessions) {
                     Ok(done) => {
-                        for event in done.events {
-                            state.hub.publish(event);
-                        }
-                        // Only a reconciled connection's roots are stored
-                        // (decision 7), before the host is listed as
-                        // connected with them.
-                        if let Err(err) = state.hosts.record_workspace_roots(&host_id, &workspace_roots) {
-                            tracing::warn!(%host_id, error = %err, "recording the host's workspace roots failed");
-                        }
-                        for session_id in done.close {
-                            let request_id = uuid::Uuid::now_v7().to_string();
-                            reconcile_closes.insert(request_id.clone(), session_id.clone());
-                            let _ = tx.send(CollectorFrame::CloseSession { request_id, session_id });
-                        }
+                        let closed =
+                            after_reconcile(&state, &host_id, &workspace_roots, done, &tx, &mut reconcile_closes);
                         reconciled = true;
-                        state.hub.mark_ready(&host_id, conn_id);
-                        // The answer queue (ACP core §5.1 step 4), after the
-                        // reconciliation cancelled what a restart lost, and
-                        // after `mark_ready`: an answer submitted meanwhile
-                        // is either read here or sent by its own handler
-                        // (or both; the host dedupes by pending id).
-                        match state.store.answers_to_send(&host_id) {
-                            Ok(answers) => {
-                                for frame in answers {
-                                    let _ = tx.send(frame);
-                                }
-                            }
-                            Err(err) => {
-                                tracing::error!(%host_id, error = %err, "reading the answer queue failed; dropping connection");
-                                break;
-                            }
+                        if let Err(err) = ready(
+                            &state,
+                            &host_id,
+                            conn_id,
+                            &attached_sessions,
+                            &closed,
+                            &tx,
+                            &mut reconcile_closes,
+                        ) {
+                            tracing::error!(%host_id, error = %err, "reading the answer queue failed; dropping connection");
+                            break;
                         }
                         for (_, held) in deferred.drain() {
                             if let Some(edge) = held.into_edge(&state) {
@@ -439,6 +422,97 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
         tokio::spawn(retry_repark(state.clone(), host_id.clone()));
     }
     crate::offline::after_disconnect(&state, host_id, conn_id);
+}
+
+/// What a committed reconciliation (ACP core §5.1 step 4) sends and records
+/// before the host is ready: its events, the host's workspace roots, and a
+/// `close_session` for each attached session the operator closed or
+/// deleted. The sessions sent one.
+pub(crate) fn after_reconcile(
+    state: &AppState,
+    host_id: &str,
+    workspace_roots: &[String],
+    done: Reconciliation,
+    tx: &mpsc::UnboundedSender<CollectorFrame>,
+    reconcile_closes: &mut HashMap<String, String>,
+) -> HashSet<String> {
+    for event in done.events {
+        state.hub.publish(event);
+    }
+    // Only a reconciled connection's roots are stored (decision 7), before
+    // the host is listed as connected with them.
+    if let Err(err) = state.hosts.record_workspace_roots(host_id, workspace_roots) {
+        tracing::warn!(%host_id, error = %err, "recording the host's workspace roots failed");
+    }
+    let mut closed = HashSet::new();
+    for session_id in done.close {
+        send_reconcile_close(tx, reconcile_closes, &session_id);
+        closed.insert(session_id);
+    }
+    closed
+}
+
+/// Mark the host ready, then send what waited for that. An error means
+/// the answer queue could not be read: the caller drops the connection.
+pub(crate) fn ready(
+    state: &AppState,
+    host_id: &str,
+    conn_id: u64,
+    attached: &[AttachedSession],
+    closed: &HashSet<String>,
+    tx: &mpsc::UnboundedSender<CollectorFrame>,
+    reconcile_closes: &mut HashMap<String, String>,
+) -> anyhow::Result<()> {
+    // The read below must stay after `mark_ready`: moved before it, a
+    // delete committed between the two is closed by neither side, and no
+    // test would notice (plan 9a's whole-branch review).
+    state.hub.mark_ready(host_id, conn_id);
+    // A delete that judged a listed session unattached (this host not ready
+    // yet) and committed after the reconciliation: nothing above closed its
+    // adapter. Read after `mark_ready`, so a delete committed before this
+    // read is found here, and one committed after it finds the host ready
+    // and sends the close itself (`api::finish_delete`). Both may: the
+    // second is answered `not_attached`, which changes nothing on a
+    // tombstone (plan 9a decision 4). If the read fails, the next
+    // reconnect's reconciliation closes it.
+    let listed: Vec<&str> = attached
+        .iter()
+        .map(|a| a.session_id.as_str())
+        .filter(|id| !closed.contains(*id))
+        .collect();
+    match state.store.tombstones_of(host_id, &listed) {
+        Ok(deleted) => {
+            for session_id in deleted {
+                send_reconcile_close(tx, reconcile_closes, &session_id);
+            }
+        }
+        Err(err) => {
+            tracing::warn!(%host_id, error = %err, "checking for sessions deleted during reconciliation failed");
+        }
+    }
+    // The answer queue (ACP core §5.1 step 4), after the reconciliation
+    // cancelled what a restart lost, and after `mark_ready`: an answer
+    // submitted meanwhile is either read here or sent by its own handler
+    // (or both; the host dedupes by pending id).
+    for frame in state.store.answers_to_send(host_id)? {
+        let _ = tx.send(frame);
+    }
+    Ok(())
+}
+
+/// A `close_session` the connection itself sends, tracked by its request
+/// id (see `reconcile_closes` in `serve`).
+fn send_reconcile_close(
+    tx: &mpsc::UnboundedSender<CollectorFrame>,
+    reconcile_closes: &mut HashMap<String, String>,
+    session_id: &str,
+) {
+    let request_id = uuid::Uuid::now_v7().to_string();
+    reconcile_closes.insert(request_id.clone(), session_id.to_string());
+    let _ = tx.send(CollectorFrame::CloseSession {
+        request_id,
+        session_id: session_id.to_string(),
+    });
 }
 
 /// The pauses before each retry of a re-park whose check or park failed.
