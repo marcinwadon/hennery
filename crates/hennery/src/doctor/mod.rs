@@ -7,9 +7,12 @@
 //! tests replace.
 
 mod dirs;
+mod disk;
 mod env;
 mod platform;
+mod process;
 mod runtime;
+mod service;
 
 #[cfg(test)]
 mod tests;
@@ -163,6 +166,8 @@ pub fn checks(doctor: &Doctor) -> Vec<Finding> {
         runtime::binary_and_set(doctor),
         platform::platform(doctor),
         env::environment(doctor),
+        disk::disk(doctor),
+        service::service(doctor),
         env::hennery_on_path(doctor),
         runtime::adapter_set(doctor),
         runtime::cli_overrides(doctor),

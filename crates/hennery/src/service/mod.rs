@@ -510,15 +510,18 @@ fn install_systemd(cx: &Context, role: Role, argv: &[String], path: &str, file: 
     Ok(restarted)
 }
 
+/// Whether `loginctl` says linger is on for this user.
+pub(crate) fn linger_on(cx: &Context) -> bool {
+    let uid = cx.uid.to_string();
+    cx.run("loginctl", &["show-user", &uid, "-p", "Linger"])
+        .is_ok_and(|ran| ran.ok && ran.stdout.trim() == "Linger=yes")
+}
+
 /// Distribution spec §6.3: without linger the service stops at logout and
 /// does not start at boot. Said, never changed: enabling it may need
 /// privileges.
 fn linger(cx: &Context, out: &mut dyn Write) -> Result<()> {
-    let uid = cx.uid.to_string();
-    let on = cx
-        .run("loginctl", &["show-user", &uid, "-p", "Linger"])
-        .is_ok_and(|ran| ran.ok && ran.stdout.trim() == "Linger=yes");
-    if !on {
+    if !linger_on(cx) {
         writeln!(
             out,
             "  linger is off: the service stops when you log out and does not start at boot. To keep it running, run:\n    loginctl enable-linger {}",
@@ -649,36 +652,71 @@ fn status_of(cx: &Context, role: Role, out: &mut dyn Write) -> Result<bool> {
         }
     }
     // Whether it runs, and as which process, as the service manager says.
-    let (running, pid) = match cx.platform {
+    let Some(managed) = managed(cx, role)? else {
+        writeln!(out, "  systemd: unavailable (`systemctl --user` cannot be run)")?;
+        return Ok(false);
+    };
+    writeln!(out, "  {}", managed.said)?;
+    if cx.platform == Platform::Linux {
+        linger(cx, out)?;
+    }
+    healthy &= managed.running;
+    if role == Role::Up
+        && let Some(data) = data_dir_of(&argv)
+    {
+        healthy &= children(&data, managed.pid, out)?;
+    }
+    Ok(healthy)
+}
+
+/// What the service manager says of a service: parsed fields only, never
+/// its raw output (`launchctl print` lists the job's environment).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Managed {
+    /// As `status` prints it, e.g. `launchd: running, pid 42`.
+    pub said: String,
+    pub running: bool,
+    /// Its process, when the manager names one.
+    pub pid: Option<u32>,
+}
+
+/// Ask the service manager about `role`'s service: `None` when `systemctl
+/// --user` cannot be run at all.
+pub(crate) fn managed(cx: &Context, role: Role) -> Result<Option<Managed>> {
+    match cx.platform {
         Platform::MacOs => {
             let ran = cx.run("launchctl", &["print", &cx.launchd_target(role)])?;
             if !ran.ok {
-                writeln!(out, "  launchd: not loaded (it loads at your next GUI login)")?;
-                (false, None)
-            } else {
-                let field = |name: &str| {
-                    ran.stdout
-                        .lines()
-                        .find_map(|l| l.trim().strip_prefix(name)?.trim().strip_prefix('=').map(str::trim))
-                };
-                let state = field("state").unwrap_or("unknown");
-                let pid = field("pid").and_then(|pid| pid.parse::<u32>().ok());
-                match pid {
-                    Some(pid) => writeln!(out, "  launchd: {state}, pid {pid}")?,
-                    None => writeln!(out, "  launchd: {state}")?,
-                }
-                (state == "running", pid)
+                return Ok(Some(Managed {
+                    said: "launchd: not loaded (it loads at your next GUI login)".to_string(),
+                    running: false,
+                    pid: None,
+                }));
             }
+            let field = |name: &str| {
+                ran.stdout
+                    .lines()
+                    .find_map(|l| l.trim().strip_prefix(name)?.trim().strip_prefix('=').map(str::trim))
+            };
+            let state = field("state").unwrap_or("unknown");
+            let pid = field("pid").and_then(|pid| pid.parse::<u32>().ok());
+            let said = match pid {
+                Some(pid) => format!("launchd: {state}, pid {pid}"),
+                None => format!("launchd: {state}"),
+            };
+            Ok(Some(Managed {
+                said,
+                running: state == "running",
+                pid,
+            }))
         }
         Platform::Linux => {
             let (Ok(active), Ok(enabled)) = (
                 cx.run("systemctl", &["--user", "is-active", role.unit()]),
                 cx.run("systemctl", &["--user", "is-enabled", role.unit()]),
             ) else {
-                writeln!(out, "  systemd: unavailable (`systemctl --user` cannot be run)")?;
-                return Ok(false);
+                return Ok(None);
             };
-            writeln!(out, "  systemd: {}, {}", active.stdout.trim(), enabled.stdout.trim())?;
             let pid = cx
                 .run(
                     "systemctl",
@@ -689,21 +727,17 @@ fn status_of(cx: &Context, role: Role, out: &mut dyn Write) -> Result<bool> {
                 .parse::<u32>()
                 .ok()
                 .filter(|&pid| pid != 0);
-            linger(cx, out)?;
-            (active.stdout.trim() == "active", pid)
+            Ok(Some(Managed {
+                said: format!("systemd: {}, {}", active.stdout.trim(), enabled.stdout.trim()),
+                running: active.stdout.trim() == "active",
+                pid,
+            }))
         }
-    };
-    healthy &= running;
-    if role == Role::Up
-        && let Some(data) = data_dir_of(&argv)
-    {
-        healthy &= children(&data, pid, out)?;
     }
-    Ok(healthy)
 }
 
 /// Whether process `pid` exists.
-fn alive(pid: u32) -> bool {
+pub(crate) fn alive(pid: u32) -> bool {
     let Ok(pid) = libc::pid_t::try_from(pid) else {
         return false;
     };
@@ -711,31 +745,75 @@ fn alive(pid: u32) -> bool {
     unsafe { libc::kill(pid, 0) == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) }
 }
 
-/// `up`'s report of its children (`supervisor.json`): `false` when one was
-/// given up on or revoked. A report from a process that is gone, or that
-/// is not the one the service manager runs (`pid`, when it says), is shown
-/// as stale and judged by nothing: an `up` killed outright leaves one
-/// behind, and so does an `up` run by hand on the same data directory.
+/// `up`'s report of its children (`supervisor.json`), as `status` and
+/// `doctor` both judge it.
+#[derive(Debug)]
+pub(crate) enum Report {
+    /// `up` has written none yet.
+    None,
+    /// It cannot be read: why.
+    Unreadable(String),
+    /// From a process that is gone, or that is not the one the service
+    /// manager runs: that process's pid.
+    Stale(u32),
+    Current(supervisor::State),
+}
+
+/// `up`'s report in `data`. A report from a process that is gone, or that
+/// is not the one the service manager runs (`pid`, when it says), is stale
+/// and judged by nothing: an `up` killed outright leaves one behind, and so
+/// does an `up` run by hand on the same data directory.
+pub(crate) fn report(data: &Path, pid: Option<u32>) -> Report {
+    match supervisor::read_state(data) {
+        Ok(None) => Report::None,
+        Err(err) => Report::Unreadable(format!("{err:#}")),
+        Ok(Some(state)) if !alive(state.pid) || pid.is_some_and(|pid| pid != state.pid) => Report::Stale(state.pid),
+        Ok(Some(state)) => Report::Current(state),
+    }
+}
+
+/// One child's state in words, and whether it is healthy: one given up on,
+/// or revoked, is not.
+pub(crate) fn child_state(child: &supervisor::ChildReport) -> (String, bool) {
+    match child.state {
+        supervisor::ChildState::Running => ("running".to_string(), true),
+        supervisor::ChildState::Restarting => ("crashed; starting again".to_string(), true),
+        supervisor::ChildState::Stopped => ("stopped".to_string(), true),
+        supervisor::ChildState::Revoked => (
+            "revoked by the collector; pair it again (see `hennery up`'s log)".to_string(),
+            false,
+        ),
+        supervisor::ChildState::GaveUp => (
+            format!(
+                "given up on after {} crashes; restart the service once the cause is fixed",
+                child.crashes_in_window
+            ),
+            false,
+        ),
+    }
+}
+
+/// `up`'s report of its children, printed: `false` when one was given up
+/// on or revoked, or the report cannot be read.
 fn children(data: &Path, pid: Option<u32>, out: &mut dyn Write) -> Result<bool> {
-    let state = match supervisor::read_state(data) {
-        Ok(Some(state)) => state,
-        Ok(None) => {
+    let state = match report(data, pid) {
+        Report::None => {
             writeln!(out, "  children: no report yet in {}", data.display())?;
             return Ok(true);
         }
-        Err(err) => {
-            writeln!(out, "  children: the report cannot be read ({err:#})")?;
+        Report::Unreadable(err) => {
+            writeln!(out, "  children: the report cannot be read ({err})")?;
             return Ok(false);
         }
+        Report::Stale(pid) => {
+            writeln!(
+                out,
+                "  children: the last report is stale (from pid {pid}, which is not the service's process)"
+            )?;
+            return Ok(true);
+        }
+        Report::Current(state) => state,
     };
-    if !alive(state.pid) || pid.is_some_and(|pid| pid != state.pid) {
-        writeln!(
-            out,
-            "  children: the last report is stale (from pid {}, which is not the service's process)",
-            state.pid
-        )?;
-        return Ok(true);
-    }
     let mut healthy = true;
     for (name, child) in [("collector", &state.collector), ("host", &state.host)] {
         let last = child
@@ -743,22 +821,8 @@ fn children(data: &Path, pid: Option<u32>, out: &mut dyn Write) -> Result<bool> 
             .as_deref()
             .map(|e| format!(", last exit: {e}"))
             .unwrap_or_default();
-        let what = match child.state {
-            supervisor::ChildState::Running => "running".to_string(),
-            supervisor::ChildState::Restarting => "crashed; starting again".to_string(),
-            supervisor::ChildState::Stopped => "stopped".to_string(),
-            supervisor::ChildState::Revoked => {
-                healthy = false;
-                "revoked by the collector; pair it again (see `hennery up`'s log)".to_string()
-            }
-            supervisor::ChildState::GaveUp => {
-                healthy = false;
-                format!(
-                    "given up on after {} crashes; restart the service once the cause is fixed",
-                    child.crashes_in_window
-                )
-            }
-        };
+        let (what, ok) = child_state(child);
+        healthy &= ok;
         writeln!(out, "  {name}: {what} ({} restarts{last})", child.restarts)?;
     }
     writeln!(out, "  (reported by pid {})", state.pid)?;

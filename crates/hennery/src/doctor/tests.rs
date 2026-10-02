@@ -767,3 +767,304 @@ fn a_machine_that_cannot_run_the_runtime_fails_only_where_a_host_needs_it() {
     };
     assert_eq!(judge(&mac, true).summary, "macOS on Apple silicon");
 }
+
+/// Check 9: no room for the outbox fails; no room for the next set warns;
+/// a large outbox and orphaned outboxes warn, by name.
+#[test]
+fn the_disk_fails_without_room_for_the_outbox_and_warns_without_room_for_a_set() {
+    use hennery_host::runtime::install::SPACE_MARGIN;
+    let host = Path::new("/srv/hennery/host");
+    let space = |free: anyhow::Result<u64>, needed: Option<u64>| {
+        let mut verdict = Verdict::default();
+        disk::space(&mut verdict, host, free, needed);
+        verdict.check(9, "disk")
+    };
+    let check = space(Ok(SPACE_MARGIN - 1), Some(1 << 30));
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    assert!(check.fix.contains("/srv/hennery/host"), "{check:?}");
+    let check = space(Ok(SPACE_MARGIN + 1), Some(SPACE_MARGIN + 2));
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("the next adapter set needs"), "{check:?}");
+    assert_eq!(space(Ok(1 << 40), Some(1 << 30)).status, Status::Ok);
+    assert_eq!(space(Ok(SPACE_MARGIN + 1), None).status, Status::Ok);
+    assert_eq!(space(Err(anyhow::anyhow!("statvfs")), None).status, Status::Warn);
+
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let host = paired(&dir.path().join("host"));
+    let dirs = Dirs::by_contents(host.clone(), Found::Given);
+    let check9 = || line(&checked(&cx, dirs.clone(), &nothing, &host), 9).clone();
+    assert!(check9().summary.contains("outbox 0 KB"), "{:?}", check9());
+
+    // Sparse: no disk is spent on it.
+    let outbox = std::fs::File::create(host.join("outbox.db")).unwrap();
+    outbox.set_len(disk::LARGE_OUTBOX + 1).unwrap();
+    let check = check9();
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("the outbox holds 1024 MB"), "{check:?}");
+    std::fs::remove_file(host.join("outbox.db")).unwrap();
+
+    for name in [
+        "outbox.db.orphaned-host-1",
+        "outbox.db.orphaned-host-1-wal",
+        "outbox.db.orphaned-unpaired.1",
+    ] {
+        std::fs::write(host.join(name), "").unwrap();
+    }
+    let check = check9();
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(
+        check
+            .summary
+            .contains("never read again: outbox.db.orphaned-host-1, outbox.db.orphaned-unpaired.1"),
+        "{check:?}"
+    );
+}
+
+/// launchd's answer for a job that runs as `pid`, with what `launchctl
+/// print` also lists: the job's environment.
+fn launchd_running(pid: u32) -> Fake {
+    Fake::new(move |line| {
+        if line.starts_with("launchctl print") {
+            said(&format!(
+                "gui/501/dev.hennery.up = {{\n\tstate = running\n\tpid = {pid}\n\tenvironment = {{\n\t\tTOKEN => canary-7d-launchctl\n\t}}\n}}\n"
+            ))
+        } else {
+            said("")
+        }
+    })
+}
+
+/// systemd's answers for a unit that is `active` as `pid`, with linger
+/// `linger`.
+fn systemd(active: &'static str, pid: u32, linger: &'static str) -> Fake {
+    Fake::new(move |line| {
+        if line.contains(" is-active ") {
+            said(&format!("{active}\n"))
+        } else if line.contains(" is-enabled ") {
+            said("enabled\n")
+        } else if line.contains("MainPID") {
+            said(&format!("{pid}\n"))
+        } else if line.starts_with("loginctl") {
+            said(&format!("Linger={linger}\n"))
+        } else {
+            failed()
+        }
+    })
+}
+
+/// Check 10's line on `cx`, with `dirs` and `watched` as for `checked`.
+fn check10(cx: &Context, data: &Path) -> Check {
+    let dirs = Dirs::by_contents(data.to_path_buf(), Found::Given);
+    line(&checked(cx, dirs, &nothing, data), 10).clone()
+}
+
+/// Check 10: none installed warns; two roles fail.
+#[test]
+fn no_service_warns_and_two_roles_fail() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let check = check10(&cx, &data);
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.fix.contains("hennery service install"), "{check:?}");
+
+    install(&cx, Role::Up, &cx.exe, &data, "/usr/bin:/bin");
+    install(&cx, Role::Collector, &cx.exe, &data, "/usr/bin:/bin");
+    let check = check10(&cx, &data);
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    assert!(
+        check.summary.contains("2 roles are installed: up, collector"),
+        "{check:?}"
+    );
+}
+
+/// Check 10: running is ok, as launchd or systemd says; not running fails;
+/// linger off warns; a user manager that cannot be asked is a warning, not
+/// "not running".
+#[test]
+fn a_running_service_is_ok_and_one_not_running_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let me = std::process::id();
+
+    let fake = launchd_running(me);
+    let cx = machine(dir.path(), Platform::MacOs, &fake);
+    install(&cx, Role::Up, &cx.exe, &data, "/usr/bin:/bin");
+    let check = check10(&cx, &data);
+    assert_eq!(check.status, Status::Ok, "{check:?}");
+    assert!(
+        check.summary.contains(&format!("launchd: running, pid {me}")),
+        "{check:?}"
+    );
+    std::fs::remove_file(cx.service_file(Role::Up)).unwrap();
+
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::MacOs, &fake);
+    install(&cx, Role::Up, &cx.exe, &data, "/usr/bin:/bin");
+    let check = check10(&cx, &data);
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    assert!(check.summary.contains("not running (launchd: not loaded"), "{check:?}");
+    std::fs::remove_file(cx.service_file(Role::Up)).unwrap();
+
+    for (active, linger, status) in [
+        ("active", "yes", Status::Ok),
+        ("active", "no", Status::Warn),
+        ("failed", "yes", Status::Fail),
+    ] {
+        let fake = systemd(active, me, linger);
+        let cx = machine(dir.path(), Platform::Linux, &fake);
+        install(&cx, Role::Host, &cx.exe, &data, "/usr/bin:/bin");
+        let check = check10(&cx, &data);
+        assert_eq!(check.status, status, "{active} {linger}: {check:?}");
+        if linger == "no" {
+            assert!(check.fix.contains("loginctl enable-linger hennery-test"), "{check:?}");
+        }
+    }
+
+    let mut fake = Fake::none();
+    fake.unreachable = true;
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let check = check10(&cx, &data);
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("`systemctl --user` cannot be run"), "{check:?}");
+}
+
+/// Check 10: a service whose binary is gone fails; one that runs another
+/// binary than this one warns.
+#[test]
+fn a_missing_or_other_binary_is_named() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let fake = systemd("active", std::process::id(), "yes");
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let gone = dir.path().join("gone/hennery");
+    install(&cx, Role::Up, &gone, &data, "/usr/bin:/bin");
+    let check = check10(&cx, &data);
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    assert!(check.summary.contains("which is missing"), "{check:?}");
+
+    let other = dir.path().join("other-hennery");
+    std::fs::write(&other, "#!/bin/sh\n").unwrap();
+    install(&cx, Role::Up, &other, &data, "/usr/bin:/bin");
+    let check = check10(&cx, &data);
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("not this binary"), "{check:?}");
+}
+
+/// Check 10: `up`'s children judged as `service status` judges them: given
+/// up on or revoked fails, each with its own fix; an unreadable report
+/// fails; a stale one is judged by nothing.
+#[test]
+fn ups_children_given_up_on_or_revoked_fail() {
+    use crate::supervisor::{self, ChildReport, ChildState, State};
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let me = std::process::id();
+    let fake = launchd_running(me);
+    let cx = machine(dir.path(), Platform::MacOs, &fake);
+    install(&cx, Role::Up, &cx.exe, &data, "/usr/bin:/bin");
+    let child = |state| ChildReport {
+        state,
+        crashes_in_window: 10,
+        restarts: 9,
+        last_exit: Some("exit status: 1".into()),
+    };
+    let write = |pid, host| {
+        supervisor::write_state(
+            &data,
+            &State {
+                pid,
+                updated_at: 0,
+                collector: child(ChildState::Running),
+                host: child(host),
+            },
+        )
+        .unwrap()
+    };
+    write(me, ChildState::Running);
+    assert_eq!(check10(&cx, &data).status, Status::Ok);
+
+    write(me, ChildState::GaveUp);
+    let check = check10(&cx, &data);
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    assert!(
+        check.summary.contains("up's host: given up on after 10 crashes"),
+        "{check:?}"
+    );
+    let restart = format!("launchctl kickstart -k gui/{}/dev.hennery.up", uid());
+    assert!(check.fix.contains(&restart), "{check:?}");
+
+    write(me, ChildState::Revoked);
+    let check = check10(&cx, &data);
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    assert!(
+        check.fix.contains(&data.join("host/host.key").display().to_string()),
+        "{check:?}"
+    );
+
+    let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+    gone.wait().unwrap();
+    write(gone.id(), ChildState::GaveUp);
+    assert_eq!(check10(&cx, &data).status, Status::Ok);
+
+    std::fs::write(data.join(supervisor::STATE_FILE), "{not json").unwrap();
+    let check = check10(&cx, &data);
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    assert!(check.summary.contains("cannot be read"), "{check:?}");
+}
+
+/// Check 10: a binary replaced since the service started asks for a
+/// restart. On Linux `/proc/<pid>/exe` decides (here a made-up `/proc`);
+/// on macOS the process's path and the binary's ctime.
+#[test]
+fn a_replaced_binary_asks_for_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let fake = systemd("active", 4242, "yes");
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let exe = dir.path().join("bin/hennery");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::write(&exe, "new\n").unwrap();
+    let old = dir.path().join("old-hennery");
+    std::fs::write(&old, "old\n").unwrap();
+    install(&cx, Role::Host, &exe, &data, "/usr/bin:/bin");
+    let proc = cx.root.join("proc/4242");
+    std::fs::create_dir_all(&proc).unwrap();
+    let restart = "systemctl --user restart hennery-host.service";
+
+    std::os::unix::fs::symlink(&old, proc.join("exe")).unwrap();
+    let check = check10(&cx, &data);
+    assert!(
+        check.summary.contains("pid 4242 still runs the old binary"),
+        "{check:?}"
+    );
+    assert!(check.fix.contains(restart), "{check:?}");
+
+    std::fs::remove_file(proc.join("exe")).unwrap();
+    std::os::unix::fs::symlink(&exe, proc.join("exe")).unwrap();
+    let check = check10(&cx, &data);
+    assert!(!check.summary.contains("old binary"), "{check:?}");
+    assert_eq!(process::runs(&cx, 4242, &exe), Some(true));
+
+    std::fs::remove_file(proc.join("exe")).unwrap();
+    std::os::unix::fs::symlink(format!("{} (deleted)", exe.display()), proc.join("exe")).unwrap();
+    assert_eq!(process::runs(&cx, 4242, &exe), Some(false));
+
+    if cfg!(target_os = "macos") {
+        let fake = Fake::none();
+        let mac = machine(dir.path(), Platform::MacOs, &fake);
+        let me = std::process::id();
+        let this = std::env::current_exe().unwrap();
+        assert_eq!(process::runs(&mac, me, &this), Some(true));
+        // Another file than the one this process runs.
+        assert_eq!(process::runs(&mac, me, &exe), Some(false));
+    }
+}
