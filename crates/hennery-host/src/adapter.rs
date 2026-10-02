@@ -22,8 +22,10 @@ pub const NESTING_VARS: &[&str] = &["CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLA
 /// bearer an agent could answer its own permission questions, mint a
 /// pairing code and enroll again after a revoke. Named one by one, not by
 /// the `HENNERY_` prefix: other `HENNERY_` variables (the fake adapter's
-/// script, say) are an agent's to read.
-pub const HOST_SECRET_VARS: &[&str] = &["HENNERY_DEV_TOKEN"];
+/// script, say) are an agent's to read. `HENNERY_MASTER_KEY` opens every
+/// credential the gateway holds (plan 8a): `up` passes it to its collector,
+/// never to its host.
+pub const HOST_SECRET_VARS: &[&str] = &["HENNERY_DEV_TOKEN", "HENNERY_MASTER_KEY"];
 
 /// Variables that point an adapter at another agent CLI or configuration
 /// (plan 7b, A1): `CLAUDE_CODE_EXECUTABLE` and `CODEX_PATH` replace the

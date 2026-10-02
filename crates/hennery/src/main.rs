@@ -426,6 +426,13 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     // reads (plan 10b-ii).
     let egress = hennery_kernel::egress::Egress::new(hennery_kernel::egress::Timeouts::DEFAULT)?;
     start_push(&mut state, &egress);
+    // Before serving: the gateway's store, and the master key that opens
+    // what it holds (plan 8a), from `HENNERY_MASTER_KEY`, a systemd
+    // credential or `<data>/master.key`. A key that is missing while
+    // credentials are stored, or that does not open them, stops the start
+    // (plan 8a decision 8; `KeyUnavailable` tells that case apart).
+    let keys = hennery_gateway::key::KeySource::from_env(&args.data_dir)?;
+    let gateway = hennery_gateway::open(&db, &keys, state.operator.clone())?;
     state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
     hennery_sessions::offline::after_startup(&state);
     let listeners = listeners
@@ -490,7 +497,7 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     });
     let served = hennery_sessions::serve_all(
         listeners,
-        hennery_sessions::router(state.clone()),
+        hennery_sessions::router(state.clone()).merge(hennery_gateway::api::router(gateway)),
         state.shutdown.clone(),
     )
     .await;
