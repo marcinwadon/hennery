@@ -2,6 +2,7 @@
 //! and the hosts they are mounted on. Depends on `hennery-kernel` and
 //! `hennery-proto`, never on `hennery-sessions` (umbrella §9).
 
+pub mod api;
 pub mod crypto;
 pub mod key;
 pub mod model;

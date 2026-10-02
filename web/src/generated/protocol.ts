@@ -616,3 +616,45 @@ export type PushPayload = { title: string, body: string,
  * `/sessions/<id>`, or `/mcp`: always a path, never a URL.
  */
 url: string, tag: string, };
+
+export type McpCredKind = "none" | "static" | "oauth_dcr" | "oauth_client";
+
+export type McpConnectionStatus = "not_connected" | "ok" | "needs_auth" | "error";
+
+export type McpConnectionItem = { id: string, 
+/**
+ * `^[a-z0-9][a-z0-9-]{0,47}$`, unique per owner; fixed once created.
+ */
+slug: string, label: string, url: string, 
+/**
+ * Fixed once created: a grant stays in its hat.
+ */
+hat_id: string, cred_kind: McpCredKind, 
+/**
+ * The header a static token is sent in, and what goes before it.
+ */
+static_header: string, static_prefix: string, 
+/**
+ * `null`: every tool.
+ */
+tool_allowlist: string[] | null, internal_network: boolean, status: McpConnectionStatus, status_note?: string | undefined, account_label?: string | undefined, 
+/**
+ * RFC 3339, as the other stamps.
+ */
+status_at: string, created_at: string, updated_at: string, has_credential: boolean, 
+/**
+ * The hosts it is mounted on, by id; revoked hosts are left out.
+ */
+mounts: Array<string>, };
+
+export type CreateMcpConnectionRequest = { slug: string, label: string, url: string, hat_id: string, cred_kind: McpCredKind, static_header?: string | undefined, static_prefix?: string | undefined, tool_allowlist?: string[] | null | undefined, internal_network?: boolean | undefined, };
+
+export type UpdateMcpConnectionRequest = { label?: string | undefined, url?: string | undefined, cred_kind?: McpCredKind | undefined, static_header?: string | undefined, static_prefix?: string | undefined, 
+/**
+ * Absent: kept. `null`: cleared. A list: set.
+ */
+tool_allowlist?: string[] | null | undefined, internal_network?: boolean | undefined, };
+
+export type McpMountsRequest = { host_ids: Array<string>, };
+
+export type McpCredentialRequest = { token: string, };

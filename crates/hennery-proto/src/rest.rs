@@ -864,3 +864,208 @@ pub struct PushPayload {
     pub url: String,
     pub tag: String,
 }
+
+/// How an MCP gateway connection authenticates to its upstream (gateway
+/// spec §2). Plan 8a takes `none` and `static`; the OAuth kinds come with
+/// plan 8f.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum McpCredKind {
+    None,
+    Static,
+    OauthDcr,
+    OauthClient,
+}
+
+/// A connection's health (gateway spec §7). Plan 8a only ever reports
+/// `not_connected`; the probe (plan 8f) sets the others.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum McpConnectionStatus {
+    NotConnected,
+    Ok,
+    NeedsAuth,
+    Error,
+}
+
+/// One MCP gateway connection (gateway spec §2, §9): an entry of
+/// `GET /api/mcp/connections`, and the answer to its creation and changes.
+/// Never its secret: `has_credential` says whether one is stored.
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct McpConnectionItem {
+    pub id: String,
+    /// `^[a-z0-9][a-z0-9-]{0,47}$`, unique per owner; fixed once created.
+    pub slug: String,
+    pub label: String,
+    pub url: String,
+    /// Fixed once created: a grant stays in its hat.
+    pub hat_id: String,
+    pub cred_kind: McpCredKind,
+    /// The header a static token is sent in, and what goes before it.
+    pub static_header: String,
+    pub static_prefix: String,
+    /// `null`: every tool.
+    #[ts(type = "string[] | null")]
+    pub tool_allowlist: Option<Vec<String>>,
+    pub internal_network: bool,
+    pub status: McpConnectionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub status_note: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub account_label: Option<String>,
+    /// RFC 3339, as the other stamps.
+    pub status_at: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub has_credential: bool,
+    /// The hosts it is mounted on, by id; revoked hosts are left out.
+    pub mounts: Vec<String>,
+}
+
+/// `POST /api/mcp/connections` (step-up). Absent: the `Authorization`
+/// header with `Bearer `, every tool, a public upstream.
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct CreateMcpConnectionRequest {
+    pub slug: String,
+    pub label: String,
+    pub url: String,
+    pub hat_id: String,
+    pub cred_kind: McpCredKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub static_header: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub static_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string[] | null | undefined", optional)]
+    pub tool_allowlist: Option<Vec<String>>,
+    #[serde(default)]
+    #[ts(type = "boolean | undefined", optional)]
+    pub internal_network: bool,
+}
+
+/// `PATCH /api/mcp/connections/{id}`: an absent field keeps its value; a
+/// `null` allowlist clears it (every tool), `""` clears the prefix (gateway
+/// spec §4.6). Naming `url`, `cred_kind`, `internal_network`,
+/// `static_header` or `static_prefix` needs step-up. Another origin or
+/// kind deletes the stored credential. The slug and the hat cannot change.
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateMcpConnectionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "McpCredKind | undefined", optional)]
+    pub cred_kind: Option<McpCredKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub static_header: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub static_prefix: Option<String>,
+    /// Absent: kept. `null`: cleared. A list: set.
+    #[serde(default, with = "present", skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<Vec<String>>")]
+    #[ts(type = "string[] | null | undefined", optional)]
+    pub tool_allowlist: Option<Option<Vec<String>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "boolean | undefined", optional)]
+    pub internal_network: Option<bool>,
+}
+
+/// A field that may be absent, `null` or a value, kept apart: absent is
+/// `None` (`#[serde(default)]`), `null` is `Some(None)`.
+mod present {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer, T: Serialize>(value: &Option<Option<T>>, serializer: S) -> Result<S::Ok, S::Error> {
+        value.as_ref().and_then(Option::as_ref).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Option<T>>, D::Error> {
+        Option::<T>::deserialize(deserializer).map(Some)
+    }
+}
+
+/// `PUT /api/mcp/connections/{id}/mounts`: the whole set of hosts the
+/// connection is mounted on, replacing the one before (gateway spec §9).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct McpMountsRequest {
+    pub host_ids: Vec<String>,
+}
+
+/// `PUT /api/mcp/connections/{id}/credential` (step-up): a static token,
+/// write-only (204). Its `Debug` never shows the token.
+#[derive(Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct McpCredentialRequest {
+    pub token: String,
+}
+
+impl std::fmt::Debug for McpCredentialRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpCredentialRequest")
+            .field("token", &"<redacted>")
+            .finish()
+    }
+}
+
+/// What of an upstream URL a `Debug` may show (plan 8a decision 19):
+/// `scheme://host[:port]`, without a user name, path, query or fragment,
+/// any of which may hold a secret. Parsed as the gateway parses a URL
+/// (`url::Url`), so raw input, before any check, fails closed: what does
+/// not parse shows as `<not a url>`, a scheme without an origin as `null`
+/// (the re-confirmation's finding 1).
+pub fn url_origin(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(url) => url.origin().ascii_serialization(),
+        Err(_) => "<not a url>".into(),
+    }
+}
+
+impl std::fmt::Debug for McpConnectionItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpConnectionItem")
+            .field("id", &self.id)
+            .field("slug", &self.slug)
+            .field("url", &url_origin(&self.url))
+            .field("hat_id", &self.hat_id)
+            .field("cred_kind", &self.cred_kind)
+            .field("status", &self.status)
+            .field("has_credential", &self.has_credential)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for CreateMcpConnectionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateMcpConnectionRequest")
+            .field("slug", &self.slug)
+            .field("url", &url_origin(&self.url))
+            .field("hat_id", &self.hat_id)
+            .field("cred_kind", &self.cred_kind)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for UpdateMcpConnectionRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpdateMcpConnectionRequest")
+            .field("label", &self.label)
+            .field("url", &self.url.as_deref().map(url_origin))
+            .field("cred_kind", &self.cred_kind)
+            .field("internal_network", &self.internal_network)
+            .finish_non_exhaustive()
+    }
+}
