@@ -1,0 +1,752 @@
+//! Doctor's checks on made-up machines: temporary homes, data directories
+//! and roots (for `/proc` and `/etc`), a fake service manager that answers
+//! only questions, and a fake runner. No test runs `launchctl`, `systemctl`
+//! or `loginctl`, reaches the network, or touches a real data directory;
+//! every one checks that doctor changed nothing it looked at, and that each
+//! warning and failure says what to do.
+
+use super::dirs::{Found, HOST_DIR_VAR};
+use super::*;
+use crate::service::unit::{self, Role};
+use crate::service::{Manager, Platform};
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+/// The service manager's verbs doctor may use: it asks, it never changes.
+const READ_ONLY_VERBS: &[&str] = &["print", "is-active", "is-enabled", "show", "show-user"];
+
+/// Answers each command line with `answer`, and fails the test on any verb
+/// that is not a question.
+struct Fake {
+    calls: RefCell<Vec<String>>,
+    answer: Box<dyn Fn(&str) -> Ran>,
+    /// Every command fails to run, as without a user bus.
+    unreachable: bool,
+}
+
+impl Fake {
+    fn new(answer: impl Fn(&str) -> Ran + 'static) -> Self {
+        Self {
+            calls: RefCell::default(),
+            answer: Box::new(answer),
+            unreachable: false,
+        }
+    }
+
+    /// Knows no service: `launchctl print` fails, `systemctl` says inactive.
+    fn none() -> Self {
+        Self::new(|line| {
+            if line.starts_with("launchctl") {
+                failed()
+            } else {
+                said("inactive")
+            }
+        })
+    }
+}
+
+impl Manager for Fake {
+    fn run(&self, program: &str, args: &[&str]) -> anyhow::Result<Ran> {
+        let verb = args.iter().copied().find(|a| !a.starts_with('-')).unwrap_or_default();
+        assert!(
+            READ_ONLY_VERBS.contains(&verb),
+            "doctor ran `{program} {}`, which is not a question",
+            args.join(" ")
+        );
+        let line = std::iter::once(program)
+            .chain(args.iter().copied())
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.calls.borrow_mut().push(line.clone());
+        if self.unreachable {
+            anyhow::bail!("run {program}: no user bus");
+        }
+        Ok((self.answer)(&line))
+    }
+}
+
+fn said(stdout: &str) -> Ran {
+    Ran {
+        ok: true,
+        stdout: stdout.into(),
+        stderr: String::new(),
+    }
+}
+
+fn failed() -> Ran {
+    Ran {
+        ok: false,
+        stdout: String::new(),
+        stderr: "not found".into(),
+    }
+}
+
+/// This test process's user, so the files it makes count as the user's own.
+fn uid() -> u32 {
+    // SAFETY: getuid(2) cannot fail.
+    unsafe { libc::getuid() }
+}
+
+/// A machine in `dir`: its home, its `/` (for `/proc` and `/etc`), this test
+/// binary as the one doctor runs as, `/bin/sh` as the login shell, and a
+/// PATH of the base system only.
+fn machine<'a>(dir: &Path, platform: Platform, manager: &'a Fake) -> Context<'a> {
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    Context {
+        platform,
+        env: BTreeMap::from([
+            ("HOME".to_string(), home.display().to_string()),
+            ("PATH".to_string(), "/usr/bin:/bin".to_string()),
+        ]),
+        home,
+        uid: uid(),
+        user: "hennery-test".into(),
+        shell: PathBuf::from("/bin/sh"),
+        exe: std::env::current_exe().unwrap(),
+        root,
+        manager,
+    }
+}
+
+/// A runner that runs nothing.
+fn nothing(_: &Path, _: &[&str]) -> Option<Ran> {
+    None
+}
+
+/// Every file and directory under `dir`: its kind, size, mode and mtime.
+fn snapshot(dir: &Path) -> BTreeMap<PathBuf, (bool, u64, u32, i64, i64)> {
+    let mut seen = BTreeMap::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(path) = todo.pop() {
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            todo.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+        }
+        seen.insert(
+            path,
+            (meta.is_dir(), meta.len(), meta.mode(), meta.mtime(), meta.mtime_nsec()),
+        );
+    }
+    seen
+}
+
+/// Run every check over `dirs` on `cx`, and check what holds for every
+/// run: nothing under `watched` changed, and every warning and failure has
+/// a fix.
+fn checked(cx: &Context, dirs: Dirs, run: Runner, watched: &Path) -> Vec<Finding> {
+    let before = snapshot(watched);
+    let doctor = Doctor { cx, dirs, run };
+    let findings = checks(&doctor);
+    assert_eq!(snapshot(watched), before, "doctor changed what it looked at");
+    for finding in &findings {
+        if let Finding::Checked(check) = finding {
+            assert!(!check.summary.is_empty(), "{check:?}");
+            if check.status != Status::Ok {
+                assert!(!check.fix.is_empty(), "a {:?} without a fix: {check:?}", check.status);
+            }
+        }
+    }
+    findings
+}
+
+/// Check `number`'s line.
+fn line(findings: &[Finding], number: u8) -> &Check {
+    findings
+        .iter()
+        .find_map(|f| match f {
+            Finding::Checked(c) if c.number == number => Some(c),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("check {number} did not run: {findings:?}"))
+}
+
+/// Whether check `number` was not run.
+fn not_run(findings: &[Finding], number: u8) -> bool {
+    findings
+        .iter()
+        .any(|f| matches!(f, Finding::NotRun { number: n, .. } if *n == number))
+}
+
+/// The report as text.
+fn report(dirs: &Dirs, findings: &[Finding]) -> String {
+    let mut out = Vec::new();
+    render(dirs, findings, &mut out).unwrap();
+    String::from_utf8(out).unwrap()
+}
+
+/// A host data directory with a pairing in it.
+fn paired(dir: &Path) -> PathBuf {
+    hennery_host::identity::Paired {
+        collector_url: "ws://127.0.0.1:1/api/hosts/ws".into(),
+        host_id: "host-test".into(),
+        key: hennery_host::identity::HostKey::generate(),
+        workspace_roots: Vec::new(),
+    }
+    .save(dir)
+    .unwrap();
+    dir.to_path_buf()
+}
+
+/// `role`'s service installed on `cx`, running `exe` on `data`, with
+/// `path` as its PATH.
+fn install(cx: &Context, role: Role, exe: &Path, data: &Path, path: &str) {
+    let argv = unit::command_line(role, exe, data).unwrap();
+    let file = cx.service_file(role);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    match cx.platform {
+        Platform::MacOs => std::fs::write(&file, unit::plist(role, &argv, path, "/tmp/hennery-test.log")).unwrap(),
+        Platform::Linux => {
+            std::fs::create_dir_all(cx.env_file().parent().unwrap()).unwrap();
+            std::fs::write(cx.env_file(), unit::env_file(path)).unwrap();
+            std::fs::write(&file, unit::systemd_unit(role, &argv, "/tmp/service.env").unwrap()).unwrap();
+        }
+    }
+}
+
+/// The directory: given, else `HENNERY_HOST_DATA_DIR`'s host, else the one
+/// service's, else the default. A disagreeing host variable is said.
+#[test]
+fn the_directory_is_the_one_given_then_the_host_variables_then_the_services_then_the_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let mut cx = machine(dir.path(), Platform::Linux, &fake);
+    let given = dir.path().join("given");
+    assert_eq!(Dirs::discover(&cx, Some(&given)).unwrap().from, Found::Given);
+
+    let host = paired(&dir.path().join("host-var"));
+    cx.env.insert(HOST_DIR_VAR.into(), host.display().to_string());
+    let dirs = Dirs::discover(&cx, None).unwrap();
+    assert_eq!((dirs.from, dirs.host.as_ref()), (Found::HostVariable, Some(&host)));
+    let dirs = Dirs::discover(&cx, Some(&given)).unwrap();
+    assert_eq!(dirs.from, Found::Given);
+    assert!(
+        dirs.notes[0].contains("HENNERY_HOST_DATA_DIR names another host directory"),
+        "{dirs:?}"
+    );
+    cx.env.remove(HOST_DIR_VAR);
+
+    let data = dir.path().join("up-data");
+    std::fs::create_dir_all(data.join("host")).unwrap();
+    install(&cx, Role::Up, &cx.exe, &data, "/usr/bin:/bin");
+    let dirs = Dirs::discover(&cx, None).unwrap();
+    assert_eq!(dirs.from, Found::Service(Role::Up));
+    assert_eq!(dirs.host, Some(data.join("host")));
+    assert_eq!(dirs.collector, None);
+
+    std::fs::remove_file(cx.service_file(Role::Up)).unwrap();
+    let dirs = Dirs::discover(&cx, None).unwrap();
+    assert_eq!(dirs.from, Found::Default);
+    assert_eq!(dirs.root, dir.path().join("home/.local/share/hennery"));
+}
+
+/// What a directory holds is told by the names in it; an interrupted
+/// pairing is left exactly as it is.
+#[test]
+fn what_a_directory_holds_is_told_by_its_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let host = paired(&dir.path().join("host"));
+    let dirs = Dirs::by_contents(host.clone(), Found::Given);
+    assert_eq!(
+        (dirs.host.as_ref(), dirs.describe().as_str()),
+        (Some(&host), "a host's")
+    );
+
+    let up = dir.path().join("up");
+    paired(&up.join("host"));
+    std::fs::create_dir_all(up.join("collector")).unwrap();
+    let dirs = Dirs::by_contents(up.clone(), Found::Given);
+    assert_eq!(dirs.host, Some(up.join("host")));
+    assert_eq!(dirs.collector, Some(up.join("collector")));
+
+    let collector = dir.path().join("collector");
+    std::fs::create_dir_all(&collector).unwrap();
+    std::fs::write(collector.join("hennery.db"), "").unwrap();
+    let dirs = Dirs::by_contents(collector.clone(), Found::Given);
+    assert_eq!((dirs.host, dirs.collector.as_ref()), (None, Some(&collector)));
+
+    let empty = dir.path().join("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    assert_eq!(
+        Dirs::by_contents(empty, Found::Given).describe(),
+        "nothing of hennery's is in it"
+    );
+    assert_eq!(
+        Dirs::by_contents(dir.path().join("missing"), Found::Given).describe(),
+        "it does not exist"
+    );
+
+    // Staged by a join that did not finish: a host's, and left staged.
+    let staged = dir.path().join("staged");
+    std::fs::create_dir_all(&staged).unwrap();
+    std::fs::write(staged.join("host.toml.pending"), "collector = \"x\"\n").unwrap();
+    std::fs::write(staged.join("host.key.pending"), "00\n").unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let dirs = Dirs::by_contents(staged.clone(), Found::Given);
+    assert_eq!(dirs.host, Some(staged.clone()));
+    checked(&cx, dirs, &nothing, &staged);
+    assert!(staged.join("host.toml.pending").exists());
+    assert!(!staged.join("host.toml").exists());
+}
+
+/// Check 6: the nesting variables by name, never by value; and root.
+#[test]
+fn nesting_variables_and_root_warn_by_name_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let mut cx = machine(dir.path(), Platform::Linux, &fake);
+    let dirs = Dirs::by_contents(dir.path().join("none"), Found::Given);
+    let findings = checked(&cx, dirs.clone(), &nothing, dir.path());
+    assert_eq!(line(&findings, 6).status, Status::Ok);
+
+    cx.env.insert("CLAUDECODE".into(), "canary-7d-nesting".into());
+    let findings = checked(&cx, dirs.clone(), &nothing, dir.path());
+    let check = line(&findings, 6);
+    assert_eq!(check.status, Status::Warn);
+    assert!(check.summary.contains("CLAUDECODE"), "{check:?}");
+    assert!(!report(&dirs, &findings).contains("canary-7d-nesting"));
+
+    cx.env.remove("CLAUDECODE");
+    cx.uid = 0;
+    let findings = checked(&cx, dirs, &nothing, dir.path());
+    assert!(line(&findings, 6).summary.contains("run as root"), "{findings:?}");
+}
+
+/// Check 11: the `hennery` PATH finds first must be this binary; one only
+/// later on PATH is named; none at all warns; a relative entry is skipped.
+#[test]
+fn the_hennery_path_finds_first_must_be_this_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let mut cx = machine(dir.path(), Platform::Linux, &fake);
+    let dirs = Dirs::by_contents(dir.path().join("none"), Found::Given);
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("hennery"), "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(other.join("hennery"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let this = dir.path().join("this");
+    std::fs::create_dir_all(&this).unwrap();
+    std::os::unix::fs::symlink(&cx.exe, this.join("hennery")).unwrap();
+
+    let path = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap().into_string().unwrap();
+    cx.env.insert("PATH".into(), path(&[&other, &this]));
+    let findings = checked(&cx, dirs.clone(), &nothing, dir.path());
+    let check = line(&findings, 11);
+    assert_eq!(check.status, Status::Warn);
+    assert!(check.summary.contains("another install"), "{check:?}");
+
+    cx.env.insert("PATH".into(), path(&[&this, &other]));
+    let findings = checked(&cx, dirs.clone(), &nothing, dir.path());
+    let check = line(&findings, 11);
+    assert_eq!(check.status, Status::Ok);
+    assert!(check.summary.contains("later on PATH"), "{check:?}");
+
+    cx.env.insert("PATH".into(), "/usr/bin:/bin".into());
+    let findings = checked(&cx, dirs.clone(), &nothing, dir.path());
+    assert!(line(&findings, 11).summary.contains("no hennery is on PATH"));
+
+    // `other` as a relative entry is not searched.
+    cx.env.insert("PATH".into(), format!("other:{}", this.display()));
+    let findings = checked(&cx, dirs, &nothing, dir.path());
+    assert_eq!(line(&findings, 11).status, Status::Ok);
+}
+
+/// The report names its directory, prints one line per check and a fix
+/// under each warning and failure, groups the checks it did not run, exits
+/// 1 only on a failure, and escapes control characters.
+#[test]
+fn the_report_fails_only_on_a_failure_and_escapes_control_characters() {
+    let dirs = Dirs::by_contents(PathBuf::from("/nowhere/a\nb"), Found::Default);
+    let mut warned = Verdict::default();
+    warned.ok("fine");
+    warned.warn("odd\u{1b}[31m", "do this");
+    let findings = vec![
+        Finding::Checked(warned.check(6, "environment")),
+        Finding::NotRun {
+            number: 9,
+            why: dirs::NO_HOST,
+        },
+        Finding::NotRun {
+            number: 12,
+            why: dirs::NO_HOST,
+        },
+    ];
+    let text = report(&dirs, &findings);
+    assert!(
+        text.starts_with("hennery doctor: /nowhere/a\\nb (the default)\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("warn  6 environment: fine; odd\\u{1b}[31m\n        fix: do this\n"),
+        "{text}"
+    );
+    assert!(text.contains("not run here: 9, 12 (no host data directory)"), "{text}");
+    assert_eq!(exit_code(&findings), ExitCode::SUCCESS);
+
+    let mut failed = Verdict::default();
+    failed.warn("a", "fix a");
+    failed.fail("b", "fix b");
+    let check = failed.check(2, "platform");
+    assert_eq!((check.status, check.fix.as_str()), (Status::Fail, "fix b"));
+    assert_eq!(exit_code(&[Finding::Checked(check)]), ExitCode::FAILURE);
+}
+
+/// The set this binary pins, laid out in `host` as an install leaves it,
+/// without downloading anything: each file's directory, each entry, the
+/// record, Node (a script) and `current`. `None` where there is no managed
+/// runtime.
+fn pinned_set(host: &Path) -> Option<(String, PathBuf)> {
+    use hennery_host::runtime::install::{LAYOUT, RecordAdapter, Selection, SetRecord};
+    let selection = Selection::pinned(&Default::default()).ok()?;
+    let id = selection.set_id();
+    let set = host.join("adapters/sets").join(&id);
+    let mut adapters = BTreeMap::new();
+    for adapter in &selection.adapters {
+        for file in &adapter.files {
+            std::fs::create_dir_all(set.join(&adapter.name).join(&file.path)).unwrap();
+        }
+        let entry = set.join(&adapter.name).join(&adapter.entry);
+        std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
+        std::fs::write(&entry, "// entry\n").unwrap();
+        adapters.insert(
+            adapter.name.clone(),
+            RecordAdapter {
+                version: adapter.version.clone(),
+                entry: adapter.entry.clone(),
+                cli_skipped: adapter.cli_skipped,
+            },
+        );
+    }
+    let record = SetRecord {
+        layout: LAYOUT,
+        id: id.clone(),
+        manifest_hash: selection.manifest_hash.clone(),
+        platform: selection.platform.key().to_string(),
+        runtime: selection.runtime_name(),
+        adapters,
+    };
+    std::fs::write(set.join("hennery-set.json"), serde_json::to_string(&record).unwrap()).unwrap();
+    let bin = host.join("runtimes").join(selection.runtime_name()).join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("node"), "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(bin.join("node"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::os::unix::fs::symlink(Path::new("sets").join(&id), host.join("adapters/current")).unwrap();
+    Some((id, set))
+}
+
+/// Check 1: this binary and its manifest; the pinned set with all its
+/// packages is ok; a package or Node gone, or a record that cannot be
+/// read, fails; a set others can write to warns. No host: 12 and 17 do not
+/// run, and 1 still names the binary.
+#[test]
+fn the_pinned_set_present_is_ok_and_a_missing_part_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let none = Dirs::by_contents(dir.path().join("none"), Found::Given);
+    let findings = checked(&cx, none, &nothing, dir.path());
+    assert!(line(&findings, 1).summary.starts_with("hennery "), "{findings:?}");
+    assert!(not_run(&findings, 12) && not_run(&findings, 17), "{findings:?}");
+
+    let host = paired(&dir.path().join("host"));
+    let Some((id, set)) = pinned_set(&host) else {
+        return;
+    };
+    let dirs = Dirs::by_contents(host.clone(), Found::Given);
+    let check1 = |what: &str| {
+        let findings = checked(&cx, dirs.clone(), &nothing, &host);
+        let check = line(&findings, 1).clone();
+        assert!(check.summary.contains(what), "{what}: {check:?}");
+        check
+    };
+    let check = check1("every pinned package are present");
+    assert_eq!(check.status, Status::Ok, "{check:?}");
+    assert!(check.summary.contains(&id), "{check:?}");
+
+    std::fs::set_permissions(&set, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let check = check1("can be written by other users");
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    std::fs::set_permissions(&set, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let package = std::fs::read_dir(set.join("claude/node_modules"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::rename(&package, dir.path().join("aside")).unwrap();
+    let check = check1("is missing");
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    assert!(check.fix.contains("remove"), "{check:?}");
+    std::fs::rename(dir.path().join("aside"), &package).unwrap();
+
+    let record = set.join("hennery-set.json");
+    let node = std::fs::read_dir(host.join("runtimes"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::rename(node.join("bin/node"), dir.path().join("node")).unwrap();
+    let check = check1("its Node");
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    std::fs::rename(dir.path().join("node"), node.join("bin/node")).unwrap();
+
+    std::fs::write(&record, "{not json").unwrap();
+    let check = check1("cannot be read");
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+}
+
+/// The command line a service of `role` would have with `--agent` added,
+/// written as its unit or plist.
+fn install_with_agents(cx: &Context, role: Role, data: &Path) {
+    let mut argv = unit::command_line(role, &cx.exe, data).unwrap();
+    argv.extend([
+        "--agent".to_string(),
+        "claude=/nix/store/x-claude/bin/claude-acp".to_string(),
+    ]);
+    let file = cx.service_file(role);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(cx.env_file().parent().unwrap()).unwrap();
+    std::fs::write(cx.env_file(), unit::env_file("/usr/bin:/bin")).unwrap();
+    std::fs::write(&file, unit::systemd_unit(role, &argv, "/tmp/service.env").unwrap()).unwrap();
+}
+
+/// Check 12: no set, another set than the pin, or a hold warns; a service
+/// that gives its agents with `--agent` needs no set.
+#[test]
+fn a_set_other_than_the_pin_or_none_or_a_hold_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let host = paired(&dir.path().join("host"));
+    let dirs = Dirs::by_contents(host.clone(), Found::Given);
+    let check12 = || {
+        let findings = checked(&cx, dirs.clone(), &nothing, &host);
+        if hennery_host::runtime::manifest::Platform::current().is_none() {
+            assert!(not_run(&findings, 12));
+            return None;
+        }
+        Some(line(&findings, 12).clone())
+    };
+    let Some(check) = check12() else {
+        return;
+    };
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("no adapter set is installed"), "{check:?}");
+    assert!(check.fix.contains("hennery host adapters update"), "{check:?}");
+
+    install_with_agents(&cx, Role::Host, &host);
+    let check = check12().unwrap();
+    assert_eq!(check.status, Status::Ok, "{check:?}");
+    assert!(check.summary.contains("--agent"), "{check:?}");
+    std::fs::remove_file(cx.service_file(Role::Host)).unwrap();
+
+    let (id, _) = pinned_set(&host).unwrap();
+    assert_eq!(check12().unwrap().status, Status::Ok);
+    let current = host.join("adapters/current");
+    std::fs::remove_file(&current).unwrap();
+    std::os::unix::fs::symlink(Path::new("sets").join("0".repeat(32)), &current).unwrap();
+    let check = check12().unwrap();
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains(&format!("this binary pins {id}")), "{check:?}");
+
+    std::fs::remove_file(&current).unwrap();
+    std::os::unix::fs::symlink(Path::new("sets").join(&id), &current).unwrap();
+    std::fs::write(host.join("adapters/hold"), format!("{id}\n")).unwrap();
+    let check = check12().unwrap();
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("a rollback holds this host"), "{check:?}");
+}
+
+/// Check 17: no override is ok; one that runs is named; one that cannot
+/// run fails; one for an agent that takes none warns; one others can write
+/// warns.
+#[test]
+fn cli_overrides_are_named_and_one_that_cannot_run_fails() {
+    use hennery_host::runtime::agents::{UseCli, set_cli_override};
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let host = paired(&dir.path().join("host"));
+    let dirs = Dirs::by_contents(host.clone(), Found::Given);
+    let check17 = || line(&checked(&cx, dirs.clone(), &nothing, &host), 17).clone();
+    assert_eq!(check17().summary, "every agent runs its bundled CLI");
+
+    let bin = dir.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cli = bin.join("claude");
+    std::fs::write(&cli, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let cli = cli.canonicalize().unwrap();
+    let choice = |agent: &str| UseCli {
+        agent: agent.into(),
+        path: Some(cli.clone()),
+    };
+    set_cli_override(&host, &choice("claude")).unwrap();
+    let check = check17();
+    assert_eq!(check.status, Status::Ok, "{check:?}");
+    assert!(check.summary.contains("your own CLI"), "{check:?}");
+
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert_eq!(check17().status, Status::Warn);
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    set_cli_override(&host, &choice("gemini")).unwrap();
+    let check = check17();
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("gemini, which takes none"), "{check:?}");
+
+    std::fs::remove_file(&cli).unwrap();
+    let check = check17();
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    assert!(check.fix.contains("--use-cli claude=bundled"), "{check:?}");
+}
+
+/// What glibc's loader path answers, told from its banner alone.
+#[test]
+fn glibc_is_told_from_its_loaders_banner() {
+    use platform::{Libc, major_minor, parse_getconf, parse_loader};
+    let ubuntu = "ld.so (Ubuntu GLIBC 2.35-0ubuntu3.8) stable release version 2.35.\nCopyright (C) 2022 Free Software Foundation, Inc.\n";
+    assert_eq!(parse_loader(ubuntu), Libc::Glibc(2, 35));
+    let fedora = "ld.so (GNU libc) stable release version 2.39.\n";
+    assert_eq!(parse_loader(fedora), Libc::Glibc(2, 39));
+    let el7 = "ld.so (GNU libc) stable release version 2.17, by Roland McGrath et al.\n";
+    assert_eq!(parse_loader(el7), Libc::Glibc(2, 17));
+    let musl = "\nmusl libc (x86_64)\nVersion 1.2.4\nDynamic Program Loader\n";
+    assert_eq!(parse_loader(musl), Libc::Musl);
+    let stub = "NixOS cannot run dynamically linked executables intended for generic\nlinux environments out of the box. For more information, see:\nhttps://nix.dev/permalink/stub-ld\n";
+    assert_eq!(parse_loader(stub), Libc::NixStub);
+    // A version without glibc's name is not taken for glibc's.
+    assert_eq!(parse_loader("some loader, version 2.40\n"), Libc::Unknown);
+    assert_eq!(parse_loader(""), Libc::Unknown);
+    assert_eq!(parse_getconf("glibc 2.28\n"), Some((2, 28)));
+    assert_eq!(parse_getconf("2.28"), None);
+    assert_eq!(major_minor("5.15.0-91-generic"), Some((5, 15)));
+    assert_eq!(major_minor("4.18.0-553.el8_10.x86_64"), Some((4, 18)));
+    assert_eq!(major_minor("garbage"), None);
+}
+
+/// The loader is asked first; `/usr/bin/getconf` only when it says
+/// nothing, and never on NixOS; both by absolute path under the root.
+#[test]
+fn the_loader_is_asked_first_and_getconf_never_on_nixos() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let dirs = Dirs::by_contents(dir.path().join("none"), Found::Given);
+    let asked = RefCell::new(Vec::new());
+    let answers = |banner: Option<&'static str>| {
+        let asked = &asked;
+        move |program: &Path, _: &[&str]| -> Option<Ran> {
+            asked.borrow_mut().push(program.to_path_buf());
+            if program.ends_with("getconf") {
+                Some(said("glibc 2.31\n"))
+            } else {
+                banner.map(said)
+            }
+        }
+    };
+    let loader = "/lib64/ld-linux-x86-64.so.2";
+    let behind = |run: Runner, nixos| {
+        let doctor = Doctor {
+            cx: &cx,
+            dirs: dirs.clone(),
+            run,
+        };
+        platform::libc_behind(&doctor, loader, nixos)
+    };
+    let banner = answers(Some("ld.so (GNU libc) stable release version 2.39.\n"));
+    assert_eq!(behind(&banner, false), platform::Libc::Glibc(2, 39));
+    assert_eq!(*asked.borrow(), [cx.root.join("lib64/ld-linux-x86-64.so.2")]);
+
+    asked.borrow_mut().clear();
+    let silent = answers(None);
+    assert_eq!(behind(&silent, false), platform::Libc::Glibc(2, 31));
+    assert_eq!(asked.borrow()[1], cx.root.join("usr/bin/getconf"));
+
+    asked.borrow_mut().clear();
+    assert_eq!(behind(&silent, true), platform::Libc::Unknown);
+    assert_eq!(asked.borrow().len(), 1, "getconf asked on NixOS");
+}
+
+/// Check 2's verdicts: each reason a host cannot run fails where a host
+/// needs the managed runtime, and is a warning elsewhere.
+#[test]
+fn a_machine_that_cannot_run_the_runtime_fails_only_where_a_host_needs_it() {
+    use hennery_host::runtime::manifest::Platform as Runtime;
+    use platform::{Facts, Libc, judge};
+    let linux = |loader: bool, nixos: bool, libc: Libc, kernel: &str| Facts {
+        name: "linux-x86_64".into(),
+        platform: Some(Runtime::LinuxX64),
+        loader: Some(("/lib64/ld-linux-x86-64.so.2", loader)),
+        nixos,
+        libc,
+        kernel: Some(kernel.into()),
+    };
+    let fine = judge(&linux(true, false, Libc::Glibc(2, 35), "6.8.0-45-generic"), true);
+    assert_eq!(fine.status, Status::Ok, "{fine:?}");
+    assert_eq!(fine.summary, "linux-x64 with glibc 2.35; Linux 6.8.0-45-generic");
+    let cases = [
+        (
+            linux(false, true, Libc::Unknown, "6.6.0"),
+            "NixOS without nix-ld",
+            "programs.nix-ld",
+        ),
+        (
+            linux(false, false, Libc::Unknown, "6.6.0"),
+            "no glibc loader",
+            "only the collector",
+        ),
+        (
+            linux(true, true, Libc::NixStub, "6.6.0"),
+            "NixOS's stub",
+            "programs.nix-ld",
+        ),
+        (linux(true, false, Libc::Musl, "6.6.0"), "musl's", "only the collector"),
+        (
+            linux(true, false, Libc::Glibc(2, 27), "6.6.0"),
+            "glibc 2.27 is older than 2.28",
+            "glibc 2.28",
+        ),
+        (
+            linux(true, false, Libc::Glibc(2, 35), "4.14.0"),
+            "Linux 4.14.0 is older than 4.18",
+            "kernel",
+        ),
+    ];
+    for (facts, why, fix) in cases {
+        let strict = judge(&facts, true);
+        assert_eq!(strict.status, Status::Fail, "{strict:?}");
+        assert!(strict.summary.contains(why) && strict.fix.contains(fix), "{strict:?}");
+        let lenient = judge(&facts, false);
+        assert_eq!(lenient.status, Status::Warn, "{lenient:?}");
+        assert!(
+            lenient.summary.contains("no managed runtime can run here"),
+            "{lenient:?}"
+        );
+    }
+    let unknown = judge(&linux(true, false, Libc::Unknown, "weird"), true);
+    assert_eq!(unknown.status, Status::Warn, "{unknown:?}");
+    let intel_mac = Facts {
+        name: "macos-x86_64".into(),
+        platform: None,
+        loader: None,
+        nixos: false,
+        libc: Libc::Unknown,
+        kernel: None,
+    };
+    assert_eq!(judge(&intel_mac, true).status, Status::Fail);
+    let mac = Facts {
+        platform: Some(Runtime::DarwinArm64),
+        ..intel_mac
+    };
+    assert_eq!(judge(&mac, true).summary, "macOS on Apple silicon");
+}

@@ -89,7 +89,7 @@ pub trait Manager {
 }
 
 /// The machine's own service manager.
-struct System;
+pub(crate) struct System;
 
 impl Manager for System {
     fn run(&self, program: &str, args: &[&str]) -> Result<Ran> {
@@ -130,7 +130,7 @@ pub struct Context<'a> {
 }
 
 impl<'a> Context<'a> {
-    fn from_process(manager: &'a dyn Manager) -> Result<Self> {
+    pub(crate) fn from_process(manager: &'a dyn Manager) -> Result<Self> {
         let platform = if cfg!(target_os = "macos") {
             Platform::MacOs
         } else if cfg!(target_os = "linux") {
@@ -201,7 +201,7 @@ impl<'a> Context<'a> {
     }
 
     /// The systemd unit's environment file (distribution spec §8).
-    fn env_file(&self) -> PathBuf {
+    pub(crate) fn env_file(&self) -> PathBuf {
         self.xdg("CONFIG", ".config").join("hennery/service.env")
     }
 
@@ -213,7 +213,7 @@ impl<'a> Context<'a> {
     }
 
     /// The roles whose service file is there.
-    fn installed(&self) -> Vec<Role> {
+    pub(crate) fn installed(&self) -> Vec<Role> {
         Role::ALL
             .into_iter()
             .filter(|&role| self.service_file(role).exists())
@@ -575,7 +575,7 @@ pub fn uninstall(cx: &Context, role: Option<Role>, out: &mut dyn Write) -> Resul
     Ok(())
 }
 
-fn read_command_line(cx: &Context, role: Role) -> Option<Vec<String>> {
+pub(crate) fn read_command_line(cx: &Context, role: Role) -> Option<Vec<String>> {
     let text = std::fs::read_to_string(cx.service_file(role)).ok()?;
     match cx.platform {
         Platform::MacOs => unit::plist_command_line(&text),
@@ -583,7 +583,7 @@ fn read_command_line(cx: &Context, role: Role) -> Option<Vec<String>> {
     }
 }
 
-fn data_dir_of(argv: &[String]) -> Option<PathBuf> {
+pub(crate) fn data_dir_of(argv: &[String]) -> Option<PathBuf> {
     let at = argv.iter().position(|a| a == "--data-dir")?;
     argv.get(at + 1).map(PathBuf::from)
 }
