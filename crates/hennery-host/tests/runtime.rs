@@ -756,15 +756,24 @@ async fn a_start_waits_out_a_lock_only_a_forked_child_still_shares() {
         .clone();
     std::fs::remove_file(&set.node).unwrap();
     let lock = std::fs::File::open(layout.install_lock()).unwrap();
-    // SAFETY: flock(2) and fcntl(2) on a descriptor this test holds.
-    let shared = unsafe {
-        assert_eq!(libc::flock(lock.as_raw_fd(), libc::LOCK_EX), 0);
-        libc::fcntl(lock.as_raw_fd(), libc::F_DUPFD, 3)
-    };
-    assert!(shared >= 3, "{}", std::io::Error::last_os_error());
-    let mut child = std::process::Command::new("sleep").arg("1").spawn().unwrap();
-    // SAFETY: close(2) on the copy this test made.
-    unsafe { libc::close(shared) };
+    // SAFETY: flock(2) on a descriptor this test holds.
+    assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+    // The copy without close-on-exec is made in the child alone, before its
+    // exec: a copy in this process would reach every child another test
+    // forks meanwhile, and stay held past their exec.
+    let fd = lock.as_raw_fd();
+    let mut sleep = std::process::Command::new("sleep");
+    sleep.arg("1");
+    // SAFETY: dup(2) in the forked child, before exec; nothing is allocated.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut sleep, move || {
+            if libc::dup(fd) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = sleep.spawn().unwrap();
     drop(lock);
     // Only the child holds the lock now.
     let probe = std::fs::File::open(layout.install_lock()).unwrap();
@@ -817,4 +826,111 @@ async fn a_start_does_not_wait_on_another_install() {
         "{:?}",
         prepared.agents.notes
     );
+}
+
+/// A script at `dir/name`: one that sleeps `secs` and then answers as Node,
+/// or, with `answers` false, one that only sleeps, as the sleep itself
+/// (`exec`), so the deadline's kill ends it and nothing is left running.
+fn slow_node(dir: &std::path::Path, name: &str, secs: u32, answers: bool) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    let body = if answers {
+        format!("#!/bin/sh\nsleep {secs}\necho v24.0.0\n")
+    } else {
+        format!("#!/bin/sh\nexec sleep {secs}\n")
+    };
+    std::fs::write(&path, body).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    path
+}
+
+/// A first run that is slow but answers is waited for, and the progress
+/// lines say why while it waits (on macOS, Gatekeeper's online check).
+#[tokio::test]
+async fn a_slow_first_run_is_waited_for_and_said_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = slow_node(dir.path(), "node", 1, true);
+    let notes = std::sync::Mutex::new(Vec::new());
+    let note = |line: &str| notes.lock().unwrap().push(line.to_string());
+    let output = install::first_run_version(
+        &node,
+        // The script is a newly written program too: on macOS it waits in
+        // the same scan queue, so the bound is generous.
+        std::time::Duration::from_secs(120),
+        std::time::Duration::from_millis(200),
+        &note,
+    )
+    .await
+    .unwrap();
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "v24.0.0");
+    let notes = notes.into_inner().unwrap().join("\n");
+    assert!(notes.contains("has not answered yet"), "{notes}");
+    if cfg!(target_os = "macos") {
+        assert!(notes.contains("checks a newly written program online"), "{notes}");
+    }
+}
+
+/// A first run that never answers fails at the deadline, naming what a
+/// slow first run waits for; it does not hang the install.
+#[tokio::test]
+async fn a_first_run_that_never_answers_fails_at_the_deadline_saying_why() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = slow_node(dir.path(), "node", 60, false);
+    let started = std::time::Instant::now();
+    let err = install::first_run_version(
+        &node,
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(10),
+        &quiet,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    let err = format!("{err:#}");
+    assert!(err.contains("did not answer --version within 1 s"), "{err}");
+    if cfg!(target_os = "macos") {
+        assert!(err.contains("checks a newly written program online"), "{err}");
+        assert!(err.contains("once the network answers"), "{err}");
+    } else {
+        assert!(err.contains("not mounted noexec") && !err.contains("network"), "{err}");
+    }
+}
+
+/// What cannot run at all fails at once, not at the deadline.
+#[tokio::test]
+async fn a_node_that_cannot_run_fails_at_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let node = dir.path().join("node");
+    std::fs::write(&node, "not a program").unwrap();
+    let started = std::time::Instant::now();
+    let err = install::first_run_version(
+        &node,
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(10),
+        &quiet,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(30),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(format!("{err:#}").contains("run "), "{err:#}");
+}
+
+/// The deadline a real install gives Node's first run: more on macOS,
+/// whose first runs wait on Gatekeeper's online check.
+#[test]
+fn macos_gives_a_first_run_more_time() {
+    let deadline = install::FIRST_RUN_DEADLINE.as_secs();
+    if cfg!(target_os = "macos") {
+        assert!(deadline >= 60, "{deadline}");
+    } else {
+        assert_eq!(deadline, 20);
+    }
 }
