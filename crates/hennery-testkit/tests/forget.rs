@@ -56,6 +56,14 @@ impl Collector {
     }
 }
 
+/// The umask these tests assume: the root and kind directories must not be
+/// writable by group or others (B3), and a 002 umask would make every one
+/// so. Set for the whole test binary; every test here wants the same.
+fn usual_umask() {
+    // SAFETY: umask(2) cannot fail.
+    unsafe { libc::umask(0o022) };
+}
+
 /// The test's own data roots, canonical (`/var` is a link on macOS).
 struct Roots {
     _dir: tempfile::TempDir,
@@ -64,6 +72,7 @@ struct Roots {
 
 impl Roots {
     fn new() -> Self {
+        usual_umask();
         let dir = tempfile::tempdir().unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
         for sub in ["claude", "codex", "host", "work"] {

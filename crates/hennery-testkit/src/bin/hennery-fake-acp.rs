@@ -337,9 +337,22 @@ async fn main() -> agent_client_protocol::Result<()> {
         .on_receive_request(
             {
                 let script = script.clone();
-                async move |req: DeleteSessionRequest, responder, _cx| match delete_session(&script, &req.session_id) {
-                    Ok(()) => responder.respond(DeleteSessionResponse::new()),
-                    Err(message) => responder.respond_with_error(agent_client_protocol::Error::new(-32603, message)),
+                async move |req: DeleteSessionRequest, responder, cx| {
+                    let script = script.clone();
+                    cx.spawn(async move {
+                        let deleted = delete_session(&script, &req.session_id);
+                        if let Some(gate) = &script.delete_waits_for_file {
+                            while !std::path::Path::new(gate).exists() {
+                                tokio::time::sleep(Duration::from_millis(10)).await;
+                            }
+                        }
+                        match deleted {
+                            Ok(()) => responder.respond(DeleteSessionResponse::new()),
+                            Err(message) => {
+                                responder.respond_with_error(agent_client_protocol::Error::new(-32603, message))
+                            }
+                        }
+                    })
                 }
             },
             agent_client_protocol::on_receive_request!(),
