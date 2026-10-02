@@ -229,13 +229,21 @@ commands, config catalogue, plan, …). The collector never parses the ACP
 payload itself.
 
 Only two components understand ACP shapes: the **host**, which runs ACP, and the
-**frontend**, which renders it using the official ACP SDK types.
+**view layer** (`hennery-view`), which folds stored ACP into display items for
+every client ([client view spec](2026-10-02-client-view-design.md)). The view
+layer only reads: ingest, storage and the raw events routes never parse the
+ACP payload, and raw events stay stored and served verbatim.
 
-*Rejected:* a collector that interprets ACP updates. In the predecessor the
-collector decoded ACP updates into its own event types; every adapter bump risked
-a middle layer silently dropping something new. A whole update kind (the
-agent's plan/step list) was dropped for months before anyone noticed, because
-nothing failed — it simply never arrived.
+*Rejected, then amended (2026-10-02):* this section first rejected any
+collector-side interpretation of ACP. In the predecessor the collector decoded
+ACP updates into its own event types, and a whole update kind (the agent's
+plan/step list) was dropped for months before anyone noticed, because nothing
+failed — it simply never arrived. With three clients planned (web, a Rust
+terminal UI, a Swift app), the fold moved to one place on the collector. The
+predecessor's failure is answered by two rules that hold wherever the fold
+runs: an update the fold does not recognise becomes a visible `unrecognised`
+item carrying its raw JSON, and golden tests over recorded real adapter output
+fail on any shape change.
 
 ### 5.3 Hello and versioning
 

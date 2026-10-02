@@ -3,6 +3,9 @@
 - **Date:** 2026-09-26
 - **Status:** Draft. Amended 2026-10-01 where the APIs it consumes changed as
   built (plans A to 3c); rendering is still the design, untouched by any plan.
+  Amended 2026-10-02 by the [client view spec](2026-10-02-client-view-design.md):
+  the display fold (§6.1) runs on the collector, the data layer (§4) consumes
+  display items, and the stack (§1) is the predecessor frontend's, reused.
 - **Refines:** [architecture spec](2026-09-25-hennery-architecture-design.md) §13;
   consumes the APIs of the [ACP core](2026-09-26-acp-core-design.md) and
   [MCP gateway](2026-09-26-mcp-gateway-design.md) specs.
@@ -11,7 +14,9 @@
   catalogue found only by reading code, never reproduced, are marked "(read)".
 
 The frontend is a single React application embedded in the `hennery` binary. It
-is mobile-first, installable as a PWA, and is the only place that renders ACP.
+is mobile-first and installable as a PWA. It renders display items that the
+collector's view layer folds from ACP (client view spec); it is one of several
+clients of that view API.
 
 ---
 
@@ -19,19 +24,20 @@ is mobile-first, installable as a PWA, and is the only place that renders ACP.
 
 | Concern | Choice | Why |
 |---|---|---|
-| Language / build | TypeScript (strict), Vite | Umbrella §13. |
-| UI | React | Umbrella §13. |
-| Routing | TanStack Router | Typed routes and search params (filters live in the URL, so a push link or a reload restores the view). |
-| Server state | TanStack Query for snapshots; an SSE-fed keyed store for live data (§4) | Snapshots and deltas are different problems; one tool for each. |
-| Styling | CSS Modules + design tokens as CSS custom properties | Component-scoped styles cannot be overridden by an unrelated unconditional rule. *(F-1: a bare `display:none` after a media query hid a mobile control for a month; F-2: a CSS reset silently removed markdown list markers.)* |
-| hennery types | TypeScript generated from `hennery-proto` (`ts-rs`) | Umbrella §5.4. |
-| ACP types | `@agentclientprotocol/sdk`, pinned to the version the pinned adapters bundle | The frontend is the only other place that understands ACP. |
+| Language / build | TypeScript (strict), Vite, pnpm | Umbrella §13; the predecessor frontend's build, reused (client view spec D4). |
+| UI | React 19 | The predecessor frontend, reused. |
+| Routing | A small router for real links (`/sessions/<id>` and the routes of §2) | A push link or a reload restores the view (F-19). |
+| Server state | A typed client for the view API: snapshot pages plus SSE upserts into a keyed store (§4) | Items arrive folded; no component parses event JSON. |
+| Styling | Tailwind v4 plus the predecessor's CSS custom properties, with the guards of client view spec §5.3 | Reuse of the predecessor's look. F-1 and F-2 are guarded by a scoped markdown container and Playwright computed-style checks. |
+| hennery types | TypeScript generated from Rust (`ts-rs`), including the view items | Umbrella §5.4. |
+| ACP types | Not needed for rendering: the view layer folds ACP | Client view spec D1. |
 | Markdown | `react-markdown` + `remark-gfm` → `remark-breaks` → `rehype-sanitize` → `rehype-highlight {ignoreMissing}` | Order is load-bearing; raw HTML is not parsed (§6.4). |
 | Tests | Vitest + Testing Library; Playwright (desktop and mobile viewports) | §12. |
 
-*Rejected:* a utility-CSS framework with a global reset. The predecessor's two
-worst styling bugs (F-1, F-2) were both cascade effects of global rules that no
-test saw.
+*Amended 2026-10-02:* this table first chose CSS Modules and rejected a
+utility-CSS framework with a global reset, after F-1 and F-2. The maintainer
+chose to reuse the predecessor frontend (client view spec D4); those two
+failures are now guarded directly (client view spec §5.3).
 
 ---
 
@@ -70,7 +76,8 @@ test saw.
   `POST /api/setup` body. It then offers to register a passkey: setup's
   session counts as stepped up, so registration needs no second password
   within 5 minutes.
-- **Login:** passkey first (conditional UI where supported), password second.
+- **Login:** a "Sign in with passkey" button first, password second. Browser
+  autofill (conditional UI) is deferred (client view spec D6).
   The passkey button is hidden on 409 `no_passkeys` or `passkeys_unavailable`
   (a `public_url` at an IP address); a 429 honours `Retry-After`.
 - A 401 from any API call routes to `/login` with the current URL as the return
@@ -91,11 +98,11 @@ test saw.
   refetched the full list on every SSE event, including every streamed message
   chunk, from every open tab; with ~600 sessions the list payload reached
   5.6 MB before catalogues were moved out.)*
-- **Session:** opening a session fetches its detail and the **tail** of its
-  timeline (`events` without `before`), then opens the session SSE stream from
-  the last `event_id` and **appends** events, folding incrementally (§6.1).
-  Scrolling up loads older pages with `before=<oldest event_id>`. No
-  per-event timeline refetch.
+- **Session:** opening a session fetches its detail and the first page of its
+  **items** (`GET /api/view/sessions/{id}`, the newest turns), then opens the
+  item stream from that page's `revision` and applies upserts by item id
+  (client view spec §4.1). Scrolling up loads older pages with `before_turn`.
+  No per-event refetch, and no fold in the browser.
 - **Catalogue** (config options, commands, plan): fetched on open, refreshed on
   `catalog_changed`. Never shown for the wrong session while loading.
 - **Resume:** both streams reconnect with `Last-Event-ID`. The UI shows a
@@ -158,9 +165,11 @@ index, so card-local state (a half-filled form) cannot move to another item.
 
 ### 6.1 Display fold
 
-A pure module, `fold(events) → items`, over ACP payloads from the session
-stream. It is the riskiest code in the frontend and is specified and tested as
-such:
+A pure function, `fold(events) → items`, over ACP payloads from the session
+stream. *Amended 2026-10-02:* it lives in the collector's view layer
+(`hennery-view`, client view spec §3), not in the frontend; the rules below
+move there unchanged. It is the riskiest code in the product and is specified
+and tested as such:
 
 - Consecutive `agent_message_chunk` / `agent_thought_chunk` of the same kind
   merge into one turn, keeping the first chunk's timestamp; any other item
@@ -190,8 +199,8 @@ such:
   `<tool_use_error>` does not trip it) gets a visible warning. *(F-13: a
   sub-agent without tools role-played tool calls and invented results,
   including fake commits.)*
-- Unknown update kinds render as a neutral "unsupported update" divider, never
-  disappear.
+- Unknown update kinds become `unrecognised` items carrying their raw JSON,
+  rendered as a collapsed "unsupported update" block; they never disappear.
 - Fixtures: captured adapter output for every pinned adapter version (Claude
   and Codex), table-driven. A pin bump that changes shapes fails these tests.
 
