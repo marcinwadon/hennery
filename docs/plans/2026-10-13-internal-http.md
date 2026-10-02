@@ -30,9 +30,32 @@ It builds on plan 8b (merged as #63, `ef75d4f`) and on the gateway lane's L7 (no
 - The five checks passed: 1022 tests, from 1019.
 - All 74 revert-probes were run, and each failed its test: Task 1's new ones, and plan 8b's, with their anchors moved.
 
-## Execution status
+## Execution status (2026-10-02)
 
-_Not executed yet._
+**Executed** on `1ab10ab` (main after #68), not on `ef75d4f`: the plan's anchors were taken at `ef75d4f`, and its text replays onto both (24 blocks, 3 commits each); on `1ab10ab` the replayed tree is byte for byte this branch's, the plan file aside. The first execution (on `4f71aed`) was rebuilt twice, once after Task 1's review and once after Task 2's, by regenerating the plan from `scratch/gateway-8b-ii-tasks` and replaying it, so the history is one commit per step:
+
+| Commit | What |
+|---|---|
+| `cc62771` | the plan |
+| `34cc7fd`, `7119fa6` | Task 1's tests, then the code, with both task reviews' changes folded in |
+| `5a43d7c` | Task 2, the write-back |
+
+| Area | As built | Why |
+|---|---|---|
+| The security review (opus, on the maintainer's behalf) | Approve after amendments: decision 1 narrowed (link-local and CGNAT out), O1–O8 taken; Q1–Q3 recorded as product questions. | See "The security review's answers". |
+| The re-confirmation (fresh opus) | "Confirmed with notes"; notes 1–5 taken. | |
+| Task 1's review (opus) | Approve with minors: the module doc's "one client per allowance", `Scheme`'s doc and `Display` text ("or a name"), one rewrapped line; all taken. | |
+| Task 2's review (opus) | Approve with minors: kernel §12's Q1 to name `fd00:ec2::254`; §7.1's intro to count the internal-only client; "without the allowance" in §7.1's address bullet; all taken. Gateway §5.7's wording and the README table's heading (optional) left. | |
+| Q1's default made restrictive (after Task 2's review) | `fd00:ec2::254` is refused for plain `http` under the marking (`V6_METADATA`, checked before the allowlist), where the first execution left it reachable as a known limit (decision 1). Two tests extended, two revert-probes. | The gateway lane asked for the restrictive default on every open question; the reviews had left this one open. |
+| The whole-branch review (opus, 2026-10-02) | Approve with minors, and the scoped re-confirmation of the `fd00:ec2::254` amendment, the doc minors and the open questions: **confirmed**. Its nit 1 taken (kernel §12 lists Q1, Q2 and Q3 separately, "for the maintainer"); nit 2 is this section; its note 3 (the private lookup seam is not a bypass) needs nothing. | |
+
+Checks:
+- The five checks passed on the branch: **1039 tests, from 1036** on `1ab10ab` (1022, from 1019, on `ef75d4f`).
+- The 74 revert-probes each failed their test as a test (`probe.py`: 74 probes, 0 bad), on the replayed tree.
+- The `egress` binary and the kernel's `egress::` unit tests, six copies each in parallel, three rounds: 36 runs, no failure.
+- The run was macOS only; ubuntu CI is the Linux check. No test needs DNS or a network: literals, `localhost` (answered by rule) and the unit test's private table.
+
+Open for the maintainer, not blocking: Q1–Q3 ("After this plan"), each with its restrictive default.
 
 ## Scope
 
