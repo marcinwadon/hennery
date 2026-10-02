@@ -59,9 +59,9 @@ export function summaries(client: Client, q: SummaryQuery = {}): Promise<Summary
 }
 
 /** `GET /api/view/sessions/{id}/turns/{turn_id}`: a prompt that was not
- *  delivered, whole, to send again. */
-export function undeliveredTurn(client: Client, id: string, turnId: string): Promise<TurnContent> {
-  return client.request<TurnContent>('GET', `/api/view/sessions/${enc(id)}/turns/${enc(turnId)}`)
+ *  delivered, whole, to send again. `signal` aborts the request. */
+export function undeliveredTurn(client: Client, id: string, turnId: string, signal?: AbortSignal): Promise<TurnContent> {
+  return client.request<TurnContent>('GET', `/api/view/sessions/${enc(id)}/turns/${enc(turnId)}`, undefined, { signal })
 }
 
 /** `GET /api/sessions/{id}/catalog`: the config options and slash commands. */

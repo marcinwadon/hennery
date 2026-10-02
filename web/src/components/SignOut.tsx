@@ -8,6 +8,8 @@ import { logOut } from '../api/auth'
 import { messageOf } from '../api/errors'
 import { Text } from '../lib/text'
 import { useClient } from '../app-client'
+import { forgetAllAttachments } from '../lib/attachments'
+import { forgetAllDrafts } from '../lib/drafts'
 import { navigate } from '../router'
 
 export default function SignOut({ className = 'btn btn-ghost btn-sm' }: { className?: string }) {
@@ -25,6 +27,12 @@ export default function SignOut({ className = 'btn btn-ghost btn-sm' }: { classN
       setBusy(false)
       return
     }
+    // Signed out: the drafts go with the session, their text in
+    // sessionStorage and their images in memory. Only here: a failed
+    // sign-out keeps them (still signed in), and so does a 401's redirect to
+    // the login screen, so work survives an expired session.
+    forgetAllDrafts()
+    forgetAllAttachments()
     navigate('/login')
   }
 

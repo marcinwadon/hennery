@@ -1,9 +1,9 @@
 export const MAX_IMAGE_BYTES = 5 * 1024 * 1024 // 5 MiB, matches the collector cap
-const ALLOWED = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
+export const ALLOWED_IMAGE_TYPES: ReadonlySet<string> = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
 
 /** Returns an error string if the file isn't an allowed image, else null. */
 export function isAllowedImage(file: File): string | null {
-  if (!ALLOWED.has(file.type)) return `unsupported image type: ${file.type || 'unknown'}`
+  if (!ALLOWED_IMAGE_TYPES.has(file.type)) return `unsupported image type: ${file.type || 'unknown'}`
   if (file.size > MAX_IMAGE_BYTES) return `image too large (max 5 MiB): ${file.name}`
   return null
 }
