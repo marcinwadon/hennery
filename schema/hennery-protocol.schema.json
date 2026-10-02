@@ -1704,6 +1704,31 @@
       ],
       "type": "object"
     },
+    "PushPayload": {
+      "description": "What a push carries to the browser's service worker (kernel spec §6;\nplan 10b-ii), encrypted to the browser (RFC 8291): the push service sees\nits size only, and that is padded. The service worker shows `title` and\n`body` as text, tags the notification `tag`, and on a click opens `url`,\na path of this origin.",
+      "properties": {
+        "body": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "url": {
+          "description": "`/sessions/<id>`, or `/mcp`: always a path, never a URL.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "body",
+        "url",
+        "tag"
+      ],
+      "type": "object"
+    },
     "PushPolicyItem": {
       "description": "One hat's push policy: an entry of `GET /api/push/policies`, one per hat,\noldest hat first, and the answer to `PUT /api/push/policies/{hat_id}`.",
       "properties": {
