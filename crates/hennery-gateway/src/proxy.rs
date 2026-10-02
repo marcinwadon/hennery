@@ -16,11 +16,12 @@
 //!   `Content-Type` is the gateway's both ways: a `POST` goes up as
 //!   `application/json`, which it checked, and an answer comes down as the
 //!   one type the gateway judged it by (the review's B1).
-//! - **Streaming** (§5.3): every body is passed on chunk by chunk, except a
-//!   `tools/list` answer in JSON under an allowlist, which is read whole
-//!   (8 MiB at most) and filtered. An event stream is passed on event by
-//!   event: a complete event is never held, a partial one waits for its end
-//!   (plan 8d decision 5).
+//! - **Streaming** (§5.3): a JSON answer is read whole (8 MiB at most) and
+//!   judged before any of it goes on: a client can use none of it before its
+//!   end, and a server request may be in it (plan 2026-10-15 "gateway JSON
+//!   answers"). An event stream is passed on event by event: a complete
+//!   event is never held, a partial one waits for its end (plan 8d decision
+//!   5).
 //! - **401** (§5.4) is never passed on: `502 upstream_auth`. The one place
 //!   an OAuth refresh and retry goes is `refreshed` (plan 8f).
 //! - **Limits** (§5.7): per connection, the requests in flight and the open
@@ -34,7 +35,7 @@
 //! - **Logs** name the connection and its slug, never the token, the
 //!   credential or more of the upstream URL than its origin (lane L11).
 
-use crate::jsonrpc::{self, BOM, EventOutcome, Inspected};
+use crate::jsonrpc::{self, Answered, BOM, EventOutcome, Inspected};
 use crate::key::MasterKey;
 use crate::model::{CredKind, url_for_logs};
 use crate::scope::{ClientIdentity, MountPolicy, Principal, ProxyStore, ScopedConnection};
@@ -400,7 +401,7 @@ async fn proxy(
             "too many requests or streams to this MCP server",
         );
     };
-    let (body, tools_list) = if method == Method::POST {
+    let body = if method == Method::POST {
         let declared = headers
             .get(header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
@@ -424,7 +425,7 @@ async fn proxy(
             }
         };
         match jsonrpc::inspect_request(&bytes, connection.tool_allowlist.as_deref()) {
-            Inspected::Forward { body, tools_list } => (Some(body), tools_list),
+            Inspected::Forward(body) => Some(body),
             Inspected::Answer(Some(answer)) => {
                 tracing::info!(connection_id = %connection.id, slug = %connection.slug, "gateway proxy: a tools/call outside the allowlist refused");
                 return axum::Json(answer).into_response();
@@ -433,7 +434,7 @@ async fn proxy(
             Inspected::Invalid(why) => return refuse(StatusCode::BAD_REQUEST, "invalid_request", why),
         }
     } else {
-        (None, Vec::new())
+        None
     };
     let upstream = match upstream(&state, &connection) {
         Ok(Some(upstream)) => upstream,
@@ -543,7 +544,7 @@ async fn proxy(
             drop(permits);
             Body::empty()
         }
-        BodyKind::Json if allowlist.is_some() && !tools_list.is_empty() => {
+        BodyKind::Json => {
             let read = read_capped(response.bytes_stream(), MAX_FILTERED_BODY).await;
             drop(permits);
             let bytes = match read {
@@ -556,6 +557,7 @@ async fn proxy(
                     );
                 }
                 Err(ReadError::Failed) => {
+                    tracing::debug!(connection_id = %connection.id, "gateway proxy: the upstream body failed");
                     return refuse(
                         StatusCode::BAD_GATEWAY,
                         "upstream_unreachable",
@@ -563,24 +565,37 @@ async fn proxy(
                     );
                 }
             };
-            // Read as an event's data is (plan 2026-10-15): the filter
-            // re-serialises what it read, so a key twice is resolved for
-            // the client, but a key spelt otherwise goes on, and a client
-            // that ignores case or cuts at a NUL reads it.
-            let Some(mut value) = jsonrpc::read(&bytes) else {
-                return refuse(
-                    StatusCode::BAD_GATEWAY,
-                    "upstream_invalid",
-                    format!(
-                        "connection {} answered with JSON the gateway cannot read",
-                        connection.label
-                    ),
-                );
-            };
-            jsonrpc::filter_tools_lists(&mut value, &tools_list, allowlist.as_deref().unwrap_or_default());
-            Body::from(serde_json::to_vec(&value).expect("a JSON value serialises"))
+            // Read as an event's data is (plan 2026-10-15 "gateway
+            // differential"), and judged as one: no server request the
+            // gateway refuses, every tools list filtered ("gateway JSON
+            // answers").
+            match jsonrpc::inspect_answer(&bytes, allowlist.as_deref()) {
+                Answered::Unchanged => Body::from(bytes),
+                Answered::Rewritten(bytes) => Body::from(bytes),
+                Answered::Unreadable => {
+                    tracing::warn!(connection_id = %connection.id, slug = %connection.slug, "gateway proxy: a JSON answer the gateway cannot read refused");
+                    return refuse(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_invalid",
+                        format!(
+                            "connection {} answered with JSON the gateway cannot read",
+                            connection.label
+                        ),
+                    );
+                }
+                Answered::ServerRequest => {
+                    tracing::warn!(connection_id = %connection.id, slug = %connection.slug, "gateway proxy: a JSON answer holding a server request refused");
+                    return refuse(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_invalid",
+                        format!(
+                            "connection {} answered with a server request inside a JSON answer",
+                            connection.label
+                        ),
+                    );
+                }
+            }
         }
-        BodyKind::Json => Body::from_stream(passthrough(response, permits, connection.id.clone())),
         BodyKind::EventStream => {
             let answerer = Answerer {
                 state: state.clone(),
@@ -592,7 +607,7 @@ async fn proxy(
                 protocol_version: headers.get("mcp-protocol-version").cloned(),
                 connection_id: connection.id.clone(),
             };
-            Body::from_stream(events(response, permits, allowlist, tools_list, answerer))
+            Body::from_stream(events(response, permits, allowlist, answerer))
         }
     };
     let mut answer = Response::new(body);
@@ -649,23 +664,6 @@ fn body_kind(response: &reqwest::Response) -> Result<BodyKind, &'static str> {
         None => Err("a body of no content type"),
         Some(_) => Err("a content type other than JSON or an event stream"),
     }
-}
-
-/// The upstream's body as it comes, chunk by chunk, holding `permits`. A
-/// failure mid-body ends it; its error carries no URL.
-fn passthrough(
-    response: reqwest::Response,
-    permits: Permits,
-    connection_id: String,
-) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
-    response.bytes_stream().map(move |chunk| {
-        let _held = &permits;
-        chunk.map_err(|err| {
-            let err = err.without_url();
-            tracing::debug!(connection_id = %connection_id, error = %err, "gateway proxy: the upstream body failed");
-            std::io::Error::other(err)
-        })
-    })
 }
 
 /// Answers server-to-client requests the gateway refuses (gateway spec
@@ -754,7 +752,6 @@ fn events(
     response: reqwest::Response,
     permits: Permits,
     allowlist: Option<Vec<String>>,
-    ids: Vec<Value>,
     answerer: Answerer,
 ) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static {
     struct State<S> {
@@ -768,7 +765,6 @@ fn events(
         done: bool,
         _permits: Permits,
         allowlist: Option<Vec<String>>,
-        ids: Vec<Value>,
         answerer: Answerer,
     }
     let state = State {
@@ -779,7 +775,6 @@ fn events(
         done: false,
         _permits: permits,
         allowlist,
-        ids,
         answerer,
     };
     futures::stream::unfold(state, |mut state| async move {
@@ -826,7 +821,7 @@ fn events(
                         };
                         state.resume = 0;
                         let event = &state.pending[start..start + end];
-                        match jsonrpc::rewrite_event(event, &state.ids, state.allowlist.as_deref(), &mut answers) {
+                        match jsonrpc::rewrite_event(event, state.allowlist.as_deref(), &mut answers) {
                             EventOutcome::Unchanged => out.extend_from_slice(event),
                             EventOutcome::Rewritten(bytes) => out.extend_from_slice(&bytes),
                             EventOutcome::Dropped => {}
