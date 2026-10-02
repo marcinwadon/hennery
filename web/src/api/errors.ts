@@ -49,6 +49,7 @@ export class ApiFailure extends Error {
   constructor(status: number, body: Partial<ApiError> | undefined, retryAfter?: number) {
     const code = body?.code ?? `http_${status}`
     const serverMessage = body?.message ?? `The request failed (${status}).`
+    // Own keys only: a code like `constructor` is the server's, not Object's.
     super(Object.hasOwn(MESSAGES, code) ? MESSAGES[code] : serverMessage)
     this.name = 'ApiFailure'
     this.status = status
