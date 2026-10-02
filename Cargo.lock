@@ -1320,6 +1320,7 @@ dependencies = [
  "libc",
  "p256",
  "password-auth",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

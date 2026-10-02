@@ -582,19 +582,41 @@ host cannot be purged until the hosts are moved to another hat):
 
 ### 7.1 Outbound HTTP (egress policy)
 
-One shared `reqwest` client for every outbound call — gateway proxy, OAuth
-discovery/registration/token calls, Web Push:
+One shared policy for every outbound call — gateway proxy, OAuth
+discovery/registration/token calls, Web Push — with one `reqwest` client per
+allowance, so a public-only request never rides a pooled connection that an
+internal-network request opened:
 
-- redirects are never followed;
+- redirects are never followed (a 3xx is the caller's answer), and no proxy
+  from the environment is ever used;
+- `https`, or plain `http` to loopback only (a loopback literal or
+  `localhost`, which always resolves to loopback, without a lookup), for
+  every caller and allowance; a URL with credentials in it is refused;
 - DNS is resolved by hennery and each address is checked before connecting:
   loopback, link-local (including `169.254.169.254`), RFC 1918, unique-local
   IPv6, CGNAT and other non-public ranges are refused, unless the caller passes
   an explicit "internal network" allowance (a gateway connection the operator
-  marked so; never Web Push);
-- per-caller limits on concurrent requests and idle streams (gateway §5.7).
+  marked so; never Web Push). A name with **any** non-public address is
+  refused, not filtered. An IP-literal host never reaches the resolver, so the
+  URL check applies the same rule to it. IPv6 is public only inside
+  `2000::/3`, outside Teredo and benchmarking `2001::/23`, 6to4 `2002::/16`
+  and the documentation ranges; so IPv4-mapped and NAT64 addresses are never
+  public either;
+- a connect timeout (10 s) and a default deadline (30 s): for the whole
+  exchange, or, for a streaming response, for its head only — the caller
+  decides when a stream has been idle too long;
+- errors never carry the URL, so they can be logged;
+- per-caller limits on concurrent requests and on open streams, idle or not
+  (stricter than gateway §5.7's idle streams): a count of permits per caller
+  key, refused at once past its cap (the proxy's 503).
 
 It lives in the kernel so that push delivery can use it without depending on
 the gateway.
+
+*Built so far:* `hennery_kernel::egress` (plan 8b) — `Egress`, its
+`EgressClient::send` and `send_streaming`, `check_url`, `is_public` and
+`Limiter`. Nothing calls it yet: the gateway's proxy and OAuth and Web Push
+will.
 
 ### 7.2 Content-Security-Policy
 
@@ -737,7 +759,13 @@ an existing data directory without `--force`.
 
 ## 12. Open questions
 
-None open. Resolved by the maintainer on 2026-09-27:
+Open:
+
+- **Plain `http` to a LAN address for an "internal network" connection** —
+  refused until the maintainer decides (§7.1; plan 8b, decision 6); widening
+  it later breaks nothing.
+
+Resolved by the maintainer on 2026-09-27:
 
 1. **Owner contact for VAPID** — not asked at setup; derived from
    `public_url` unless set in Settings (§6).
