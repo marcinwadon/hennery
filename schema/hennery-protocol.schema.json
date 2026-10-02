@@ -1275,6 +1275,16 @@
             "null"
           ]
         },
+        "mcp_delivery": {
+          "additionalProperties": {
+            "$ref": "#/$defs/McpAgentDelivery"
+          },
+          "description": "Per agent id, which hats' sessions get gateway MCP servers, from the\n`mcp_isolation` of its latest accepted `hello` (plan 8e). Absent: no\nsuch `hello` was recorded yet. Only for a host whose `capabilities`\ninclude `mcp_servers`; one without receives no servers at all.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
         "name": {
           "type": "string"
         },
@@ -1449,6 +1459,21 @@
         "password"
       ],
       "type": "object"
+    },
+    "McpAgentDelivery": {
+      "description": "Which hats' sessions on a host get gateway MCP servers for one agent\n(umbrella §8.5, plan 8e), from the agent's isolation as the host last\nannounced it. Read leniently by the UI: a value it does not know is to be\nshown as `default_hat_only`.",
+      "oneOf": [
+        {
+          "const": "isolated",
+          "description": "The host keeps the agent's sessions to the servers hennery passes:\nevery hat's sessions get their own hat's servers.",
+          "type": "string"
+        },
+        {
+          "const": "default_hat_only",
+          "description": "The host cannot isolate this agent: sessions in the host's default hat\nget the default hat's servers (and also load the user's own MCP\nconfiguration); sessions in any other hat get none (the fallback).",
+          "type": "string"
+        }
+      ]
     },
     "McpConnectionItem": {
       "description": "One MCP gateway connection (gateway spec §2, §9): an entry of\n`GET /api/mcp/connections` (200, an array, oldest first), and the answer\nto `POST` (201), `PATCH` (200) and `PUT …/{id}/mounts` (200). Never its\nsecret: `has_credential` says whether one is stored.\n\nEvery `/api/mcp/*` route is the operator's and answers\n`Cache-Control: no-store`. An error is an `ApiError`; the codes every\nroute may answer:\n- 401 `unauthenticated`: no live session: sign in.\n- 403 `setup_required`, `origin_mismatch` or `cross_site`: the browser\n  rules refused the request (kernel spec §3.2).\n- 415 `unsupported_media_type`: a body that is not `application/json`.\n- 400 `invalid_body`: a body that is not JSON; 422 `invalid_body`: one\n  that is not the route's shape, an unknown field included. The body is\n  never quoted back.\n- 413 `body_too_large`: a body over 256 KiB.\n- 405, with no body: a method the path does not take.\n- 500 `internal`.\n\nEach request type names the codes of its own route. A 403\n`step_up_required` asks for a password or passkey check\n(`POST /api/auth/step-up/…`); retry after it.\n\n`DELETE /api/mcp/connections/{id}` (step-up) takes no body: 204, its\nmounts and credential deleted with it; 403 `step_up_required`, 404\n`not_found`.",
@@ -1723,6 +1748,217 @@
           "type": "object"
         }
       ]
+    },
+    "McpSessionDelivery": {
+      "description": "On `SessionDetail` (plan 8e decision E10): never a server, a header or a\ntoken, only the mode and a count.",
+      "properties": {
+        "at": {
+          "description": "RFC 3339: the start or resume it describes.",
+          "type": "string"
+        },
+        "mode": {
+          "$ref": "#/$defs/McpSessionDeliveryMode",
+          "description": "What it was given."
+        },
+        "servers": {
+          "description": "How many servers it was given (connections plus stdio servers): `0`\nwith `isolated` means its hat has none on this host.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "mode",
+        "servers",
+        "at"
+      ],
+      "type": "object"
+    },
+    "McpSessionDeliveryMode": {
+      "description": "What a session's latest start or resume was given (plan 8e decision\nE10).",
+      "oneOf": [
+        {
+          "const": "isolated",
+          "description": "Its hat's servers, the agent kept to them.",
+          "type": "string"
+        },
+        {
+          "const": "unisolated",
+          "description": "Its hat's servers, isolation waived: the host's default hat on a host\nthat cannot isolate the agent. It also loads the user's own MCP\nconfiguration.",
+          "type": "string"
+        },
+        {
+          "const": "fallback",
+          "description": "None: another hat than the host's default, on a host that cannot\nisolate the agent (umbrella §8.5).",
+          "type": "string"
+        },
+        {
+          "const": "unsupported",
+          "description": "None: the host cannot receive MCP servers (no `mcp_servers`\ncapability).",
+          "type": "string"
+        }
+      ]
+    },
+    "McpStdioEnvInput": {
+      "additionalProperties": false,
+      "description": "One environment variable in a `PUT`: `value` absent (or `null`) keeps\nthe value stored for this server name and variable name in the same\n(host, hat), and only while the server's `command` is unchanged; a\nstring sets it. A variable left out of the list is deleted. Its `Debug`\nnever shows the value.",
+      "properties": {
+        "name": {
+          "description": "`^[A-Za-z_][A-Za-z0-9_]{0,127}$`, unique per server.",
+          "type": "string"
+        },
+        "value": {
+          "description": "Absent or `null`: kept. A string (`\"\"` too): set; at most 8192\nbytes, no NUL.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
+    "McpStdioEnvItem": {
+      "description": "One environment variable of a stdio server, as `GET` answers it: its\nname and whether a value is stored. The value is sealed at rest\n(gateway spec §6) and no route answers it.",
+      "properties": {
+        "has_value": {
+          "description": "A value is stored (possibly `\"\"`).",
+          "type": "boolean"
+        },
+        "name": {
+          "description": "`^[A-Za-z_][A-Za-z0-9_]{0,127}$`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "has_value"
+      ],
+      "type": "object"
+    },
+    "McpStdioServerInput": {
+      "additionalProperties": false,
+      "description": "One server in a `PUT`. Its `Debug` shows the name and the command only.",
+      "properties": {
+        "args": {
+          "default": [],
+          "description": "Absent: none. At most 64, each at most 4096 bytes without NUL, 16\nKiB in all.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "description": "1 to 1024 bytes, no control characters.",
+          "type": "string"
+        },
+        "env": {
+          "default": [],
+          "description": "Absent: none. At most 64.",
+          "items": {
+            "$ref": "#/$defs/McpStdioEnvInput"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "`^[a-z0-9][a-z0-9-]{0,47}$`, unique in the set, and not one of the\nowner's connection slugs.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "command"
+      ],
+      "type": "object"
+    },
+    "McpStdioServerItem": {
+      "description": "One local stdio server of a (host, hat) (gateway spec §3.4): passed to\nthat hat's sessions on that host as an ACP stdio `mcpServers` entry\nnamed `hennery-<name>`. The agent runs it on the host; the gateway does\nnot proxy it. Its `Debug` shows the name, the command and how many\nargs, never the args.",
+      "properties": {
+        "args": {
+          "description": "As stored. Not sealed: a secret belongs in `env`.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "command": {
+          "description": "As stored: run by the agent, found on its `PATH` unless absolute.",
+          "type": "string"
+        },
+        "created_at": {
+          "description": "RFC 3339.",
+          "type": "string"
+        },
+        "env": {
+          "description": "Names only, in the order given.",
+          "items": {
+            "$ref": "#/$defs/McpStdioEnvItem"
+          },
+          "type": "array"
+        },
+        "name": {
+          "description": "`^[a-z0-9][a-z0-9-]{0,47}$`, unique in its set, and never one of the\nowner's connection slugs.",
+          "type": "string"
+        },
+        "updated_at": {
+          "description": "RFC 3339: the `PUT` that last changed it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "command",
+        "args",
+        "env",
+        "created_at",
+        "updated_at"
+      ],
+      "type": "object"
+    },
+    "McpStdioServerSet": {
+      "description": "`GET /api/mcp/stdio-servers?host_id=&hat_id=` (200), and the answer to\nits `PUT` (200): one (host, hat)'s whole set, oldest first. A host or\nhat with none answers `servers: []`.\n\nIts own codes, beyond every route's (see `McpConnectionItem`): 400\n`invalid` (`host_id` or `hat_id` missing or over 64 bytes, never quoted\nback); 404 `not_found` (not one of the owner's hosts or hats; a revoked\nhost is found).",
+      "properties": {
+        "hat_id": {
+          "description": "The hat whose sessions get them.",
+          "type": "string"
+        },
+        "host_id": {
+          "description": "The host whose agents run them.",
+          "type": "string"
+        },
+        "servers": {
+          "description": "Oldest first.",
+          "items": {
+            "$ref": "#/$defs/McpStdioServerItem"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "host_id",
+        "hat_id",
+        "servers"
+      ],
+      "type": "object"
+    },
+    "McpStdioServersRequest": {
+      "additionalProperties": false,
+      "description": "`PUT /api/mcp/stdio-servers?host_id=&hat_id=` (step-up): the (host,\nhat)'s whole set, replacing the one before, never a delta. `[]` deletes\nthem all. 200 with the stored `McpStdioServerSet`. Applies to the next\nstart or resume of a session of that hat on that host.\n\nIts own codes, beyond every route's (see `McpConnectionItem`): 403\n`step_up_required`; 404 `not_found` (host or hat); 409 `host_revoked`;\n400 `invalid` (`message` names the server and the field; a value is\nnever quoted back); 400 `env_value_missing` (a kept value that is not\nstored, or whose server's `command` changed); 409 `slug_taken` (a name\none of the owner's connections has); 409 `too_many_stdio_servers` (more\nthan 32 in the set, or 1024 for the owner). A refused set changes\nnothing.",
+      "properties": {
+        "servers": {
+          "description": "The whole set, in the order to keep for new servers.",
+          "items": {
+            "$ref": "#/$defs/McpStdioServerInput"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "servers"
+      ],
+      "type": "object"
     },
     "NameValue": {
       "description": "A name and a value: an HTTP header of an MCP server, or an environment\nvariable of a stdio one. The value can be a secret (a gateway session\ntoken, a stdio server's key), so `Debug` never shows it (ACP core §8).",
@@ -2859,6 +3095,17 @@
         },
         "lifecycle": {
           "type": "string"
+        },
+        "mcp_delivery": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpSessionDelivery"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What its latest start or resume was given (plan 8e decision E10);\nabsent for a session not started or resumed since plan 8e."
         },
         "mode": {
           "type": [

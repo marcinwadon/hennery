@@ -98,6 +98,15 @@ pub fn render_schema() -> String {
         rest::UpdateMcpConnectionRequest,
         rest::McpMountsRequest,
         rest::McpCredentialRequest,
+        rest::McpAgentDelivery,
+        rest::McpSessionDeliveryMode,
+        rest::McpSessionDelivery,
+        rest::McpStdioEnvItem,
+        rest::McpStdioServerItem,
+        rest::McpStdioServerSet,
+        rest::McpStdioEnvInput,
+        rest::McpStdioServerInput,
+        rest::McpStdioServersRequest,
     );
     // `serde_json::Map` is a `BTreeMap` (always iterates sorted) by default,
     // or an `IndexMap` (iterates in insertion order) when serde_json's
@@ -248,6 +257,15 @@ pub fn render_ts() -> String {
         rest::UpdateMcpConnectionRequest,
         rest::McpMountsRequest,
         rest::McpCredentialRequest,
+        rest::McpAgentDelivery,
+        rest::McpSessionDeliveryMode,
+        rest::McpSessionDelivery,
+        rest::McpStdioEnvItem,
+        rest::McpStdioServerItem,
+        rest::McpStdioServerSet,
+        rest::McpStdioEnvInput,
+        rest::McpStdioServerInput,
+        rest::McpStdioServersRequest,
     );
     out
 }
