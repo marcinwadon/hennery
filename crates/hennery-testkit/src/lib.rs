@@ -122,6 +122,11 @@ pub struct FakeScript {
     /// until the prompt is cancelled (an adapter flooding the host).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub flood: bool,
+    /// With `flood`, sleep this long between chunks instead: still endless,
+    /// but the host's connection task is idle between them, as it is for
+    /// an agent that streams no faster than the host reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flood_interval_ms: Option<u64>,
     /// Before answering a switch of the model option, send this many
     /// `agent_message_chunk` notifications with no sleep between them, then
     /// answer. Sent inline (not from a spawned task), so they land on the
@@ -231,6 +236,7 @@ impl Default for FakeScript {
             announce_after_switch: false,
             announce_before_switch: false,
             flood: false,
+            flood_interval_ms: None,
             model_switch_chunks_first: None,
             model_switch_answer_on_file: None,
             asks: Vec::new(),

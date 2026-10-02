@@ -833,6 +833,8 @@ impl Actor {
         let (_stop_tx, stop_rx) = oneshot::channel::<()>();
         let transport = ByteStreams::new(io.stdin.compat_write(), io.stdout.compat());
         let session_id = self.session_id.clone();
+        #[cfg(feature = "test-hooks")]
+        let hooks = self.options.test_hooks.clone();
         let _acp = AcpTask(tokio::spawn(async move {
             let result = Client
                 .builder()
@@ -842,7 +844,13 @@ impl Actor {
                 .on_receive_notification(
                     async move |msg: UntypedMessage, _cx| {
                         if msg.method == "session/update" {
-                            let _ = updates_tx.send(Inbound::Update(msg.params));
+                            let _sent = updates_tx.send(Inbound::Update(msg.params));
+                            #[cfg(feature = "test-hooks")]
+                            if _sent.is_ok()
+                                && let Some(hooks) = &hooks
+                            {
+                                hooks.update_queued();
+                            }
                         }
                         Ok(())
                     },
@@ -1085,6 +1093,10 @@ impl Actor {
                             // A repeated cancel changes nothing: the one
                             // already sent is still being honoured.
                             if running.cancel_deadline.is_none() {
+                                #[cfg(feature = "test-hooks")]
+                                if let Some(hooks) = &self.options.test_hooks {
+                                    hooks.cancel_read();
+                                }
                                 if let Err(err) = conn.send_notification(CancelNotification::new(agent_session.clone())) {
                                     tracing::warn!(session_id = %self.session_id, error = %err, "session/cancel not sent");
                                 }
@@ -1184,6 +1196,10 @@ impl Actor {
                     }
                 }
                 _ = out_deadline(out_at) => {
+                    #[cfg(feature = "test-hooks")]
+                    if let Some(hooks) = &self.options.test_hooks {
+                        hooks.hold_if_armed(test_hooks::HoldAt::SwitchDeadline).await;
+                    }
                     // Never drains: an adapter's own flood backlog must
                     // never hold up this arm either, or it becomes just
                     // another way to hold off a cancel sitting behind it in
@@ -1237,8 +1253,17 @@ impl Actor {
                     self.teardown(&mut adapter, &mut updates, None, &mut configs, PendingReason::SessionParked).await;
                     return self.emit(SessionBody::SessionParked { reason: ParkReason::Idle });
                 }
-                // A burst is over and nothing else was ready: back to the updates.
-                _ = std::future::ready(()), if burst >= UPDATE_BURST => burst = 0,
+                // A burst is over and nothing else was ready: back to the
+                // updates, but only after giving this worker up once. What
+                // the arms above send the adapter (`session/cancel` above
+                // all) is only queued for the ACP task, and an idle ACP task
+                // woken from here waits in this worker's LIFO slot, which no
+                // other worker can steal from, until the actor's poll ends.
+                // Every update is a synchronous outbox commit: without this
+                // yield that poll runs on for over a burst of them, and on a
+                // slow disk a cancel read promptly still went out seconds
+                // later.
+                _ = tokio::task::yield_now(), if burst >= UPDATE_BURST => burst = 0,
             }
         }
     }
@@ -1447,6 +1472,10 @@ impl Actor {
     /// cleared, or the adapter withdrew one of its own questions (ACP core
     /// §4.7) — either is activity, not just an orphan clearing.
     fn handle_inbound(&self, inbound: Inbound, turn: Option<&str>, configs: &mut PendingConfigs) -> bool {
+        #[cfg(feature = "test-hooks")]
+        if let Some(hooks) = &self.options.test_hooks {
+            hooks.inbound_handled();
+        }
         match inbound {
             Inbound::Update(payload) => {
                 self.emit(self.live_update(payload, turn));

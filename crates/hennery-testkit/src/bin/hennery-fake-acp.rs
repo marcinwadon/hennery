@@ -404,7 +404,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                         }
                         if script.flood {
                             // Back to back until cancelled, yielding (never
-                            // sleeping) so the cancel can land.
+                            // sleeping, unless paced) so the cancel can land.
                             for chunk in script.chunks.iter().cycle() {
                                 if *cancelled.borrow() {
                                     return responder.respond(PromptResponse::new(StopReason::Cancelled));
@@ -415,7 +415,10 @@ async fn main() -> agent_client_protocol::Result<()> {
                                         TextContent::new(chunk.clone()),
                                     ))),
                                 ))?;
-                                tokio::task::yield_now().await;
+                                match script.flood_interval_ms {
+                                    Some(ms) => tokio::time::sleep(Duration::from_millis(ms)).await,
+                                    None => tokio::task::yield_now().await,
+                                }
                             }
                         }
                         for (sent, chunk) in script.chunks.into_iter().enumerate() {
