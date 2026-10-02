@@ -1195,6 +1195,52 @@ fn a_service_path_without_sh_or_git_fails_and_drift_warns() {
     assert!(check.summary.contains("Nix store"), "{check:?}");
 }
 
+/// Check 14 under `hennery up` run by hand, with no service installed
+/// (smoke test #1, F6): a holder whose parent is the `up` that reports in
+/// the data directory is up's host, not "a host started by hand".
+#[test]
+fn ups_host_is_named_when_up_runs_by_hand() {
+    use crate::supervisor::{self, ChildReport, ChildState, State};
+    let dir = tempfile::tempdir().unwrap();
+    let me = std::process::id();
+    let up = dir.path().join("up");
+    let host = paired(&up.join("host"));
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let check14 = |cx: &Context| {
+        let dirs = Dirs::by_contents(host.clone(), Found::Given);
+        line(&checked(cx, dirs, &nothing, &host), 14).clone()
+    };
+    let _lock = crate::lock::acquire(&host, crate::lock::HOST_LOCK, "hennery host run").unwrap();
+    let child = ChildReport {
+        state: ChildState::Running,
+        crashes_in_window: 0,
+        restarts: 0,
+        last_exit: None,
+    };
+    // `up` is this live process too; its host's parent is read from `/proc`.
+    supervisor::write_state(
+        &up,
+        &State {
+            pid: me,
+            updated_at: 0,
+            collector: child.clone(),
+            host: child,
+        },
+    )
+    .unwrap();
+    let proc = cx.root.join(format!("proc/{me}"));
+    std::fs::create_dir_all(&proc).unwrap();
+    std::fs::write(proc.join("stat"), format!("{me} (hennery) S {me} 1 1 0\n")).unwrap();
+    assert_eq!(check14(&cx).summary, format!("up's host (pid {me}) serves it"));
+    // Its parent is some other process: started by hand after all.
+    std::fs::write(proc.join("stat"), format!("{me} (hennery) S 1 1 1 0\n")).unwrap();
+    assert_eq!(
+        check14(&cx).summary,
+        format!("pid {me} serves it: a host started by hand")
+    );
+}
+
 /// Check 14: who holds `host.lock`. Nobody, or a dead pid's file, is no
 /// host; this process holding it is a host started by hand, the host
 /// service's own process, or not the service's; under `up`, its host is

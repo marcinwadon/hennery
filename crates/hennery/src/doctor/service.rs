@@ -369,6 +369,16 @@ fn service_of(doctor: &Doctor, host: &Path) -> Result<Option<(Role, Option<u32>)
     Ok(Some((role, pid)))
 }
 
+/// The pid of a `hennery up` that no service runs and whose host
+/// directory `host` is: the `up` reporting live in its parent directory
+/// (smoke test #1, F6).
+fn up_by_hand(host: &Path) -> Option<u32> {
+    match service::report(host.parent()?, None) {
+        Report::Current(state) => Some(state.pid),
+        _ => None,
+    }
+}
+
 /// Check 14 (distribution spec §8): one host on the directory, and that
 /// one the service's; and the directory and its key private (by their
 /// modes; the key is never read).
@@ -409,6 +419,9 @@ pub fn host_directory(doctor: &Doctor) -> Finding {
                 format!("pid {pid} serves it, and which service should is unknown: {why}"),
                 "see check 10, and keep one service with a command line hennery wrote",
             ),
+            Ok(None) if up_by_hand(host).is_some_and(|up| process::parent(doctor.cx, pid) == Some(up)) => {
+                verdict.ok(format!("up's host (pid {pid}) serves it"))
+            }
             Ok(None) => verdict.ok(format!("pid {pid} serves it: a host started by hand")),
             Ok(Some((Role::Host, Some(service)))) if service == pid => {
                 verdict.ok(format!("the host service (pid {pid}) serves it"))
