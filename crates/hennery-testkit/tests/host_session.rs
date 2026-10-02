@@ -3463,3 +3463,263 @@ async fn a_resume_passes_the_replayed_title_and_commands_through_with_their_extr
         )]
     );
 }
+
+// Plan 6b-ii: the git probe (ACP core §3.2, §7).
+
+/// `(branch, dirty, worktree, head, base_commit)` of every `git_state`.
+type GitFields = (Option<String>, bool, bool, Option<String>, Option<String>);
+
+fn git_states(frames: &[HostFrame]) -> Vec<GitFields> {
+    frames
+        .iter()
+        .filter_map(|f| match f {
+            HostFrame::Session {
+                body:
+                    SessionBody::GitState {
+                        branch,
+                        dirty,
+                        worktree,
+                        head,
+                        base_commit,
+                    },
+                ..
+            } => Some((branch.clone(), *dirty, *worktree, head.clone(), base_commit.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn probing(git: Option<std::path::PathBuf>) -> SessionOptions {
+    SessionOptions {
+        git,
+        ..SessionOptions::default()
+    }
+}
+
+fn setup_git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(["-c", "user.name=test", "-c", "user.email=test@example.invalid"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_string()
+}
+
+/// Decision 11: a `git_state` follows the start (with the commit a new
+/// session started from) and each turn's end, never ahead of it.
+#[tokio::test]
+async fn the_git_state_follows_the_start_and_every_turn_end() {
+    let Some(git) = hennery_host::git::find_git() else {
+        eprintln!("no git on PATH: skipped");
+        return;
+    };
+    let repo = tempfile::tempdir().unwrap();
+    setup_git(repo.path(), &["init", "-q", "-b", "main"]);
+    setup_git(repo.path(), &["commit", "-q", "--allow-empty", "-m", "first"]);
+    let head = Some(setup_git(repo.path(), &["rev-parse", "HEAD"]));
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let handle = session::spawn(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        fake_with(&FakeScript::default()),
+        repo.path().to_path_buf(),
+        probing(Some(git)),
+    );
+    let frames = wait_until(&uplink, has("git_state")).await;
+    assert_eq!(kinds(&frames), ["session_started", "git_state"]);
+    let main = Some("main".to_string());
+    assert_eq!(
+        git_states(&frames),
+        [(main.clone(), false, false, head.clone(), head.clone())]
+    );
+    std::fs::write(repo.path().join("new.txt"), "x").unwrap();
+    assert!(handle.send(prompt("r1", "t1")));
+    let frames = wait_until(&uplink, |f| git_states(f).len() == 2).await;
+    let kinds = kinds(&frames);
+    let ended = kinds.iter().position(|k| k == "turn_ended").unwrap();
+    assert_eq!(kinds[ended + 1..], ["git_state"]);
+    assert_eq!(git_states(&frames)[1], (main, true, false, head, None));
+}
+
+/// The pids `pids` holds, one per line.
+fn pids_in(pids: &Path) -> Vec<i32> {
+    std::fs::read_to_string(pids)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.parse().unwrap())
+        .collect()
+}
+
+/// Wait until `pids` holds at least `n` pids, and return them.
+async fn wait_for_pids(pids: &Path, n: usize) -> Vec<i32> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let found = pids_in(pids);
+        if found.len() >= n {
+            return found;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "only {found:?}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Whether `pid` is gone: no such process, or a zombie (killed, but not
+/// reaped yet by its parent, which on Linux may take a while: fleet rule,
+/// poll for a positive signal and never trust one read).
+fn gone(pid: i32) -> bool {
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .unwrap();
+    let stat = String::from_utf8_lossy(&out.stdout);
+    stat.trim().is_empty() || stat.trim_start().starts_with('Z')
+}
+
+/// Wait until none of `pids` runs, at most `within`.
+async fn wait_dead_all(pids: &[i32], within: Duration) {
+    let deadline = tokio::time::Instant::now() + within;
+    while !pids.iter().all(|pid| gone(*pid)) {
+        assert!(tokio::time::Instant::now() < deadline, "{pids:?} still run");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// An executable script at `path`, ready to run: until every descriptor a
+/// concurrent fork inherited while it was written is gone, running it fails
+/// (`ETXTBSY`). Run with no arguments, the script must only exit.
+fn write_script(path: &Path, body: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::write(path, body).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for attempt in 0.. {
+        match Command::new(path).status() {
+            Ok(status) => {
+                assert!(status.success());
+                return;
+            }
+            Err(err) if err.raw_os_error() == Some(libc::ETXTBSY) && attempt < 100 => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(err) => panic!("{err}"),
+        }
+    }
+}
+
+/// The second review's B1: a first turn that ends while the start's probe
+/// still runs does not cost the base commit. The start's probe is awaited,
+/// not aborted, and the states still arrive in order.
+#[tokio::test]
+async fn a_quick_first_turn_still_gets_the_base_commit() {
+    let Some(real) = hennery_host::git::find_git() else {
+        eprintln!("no git on PATH: skipped");
+        return;
+    };
+    let repo = tempfile::tempdir().unwrap();
+    setup_git(repo.path(), &["init", "-q", "-b", "main"]);
+    setup_git(repo.path(), &["commit", "-q", "--allow-empty", "-m", "first"]);
+    let head = Some(setup_git(repo.path(), &["rev-parse", "HEAD"]));
+    let dir = tempfile::tempdir().unwrap();
+    let git = dir.path().join("git");
+    let release = dir.path().join("release");
+    // The first call (the start's probe) waits until the test releases it,
+    // at most ten seconds; every other call is the real git.
+    write_script(
+        &git,
+        &format!(
+            "#!/bin/sh\n[ $# -eq 0 ] && exit 0\nif [ ! -e {mark} ]; then : > {mark}\n  n=0; while [ ! -e {release} ] && [ $n -lt 1000 ]; do sleep 0.01; n=$((n+1)); done\nfi\nexec {real} \"$@\"\n",
+            mark = dir.path().join("mark").display(),
+            release = release.display(),
+            real = real.display()
+        ),
+    );
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let handle = session::spawn(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        fake_with(&FakeScript::default()),
+        repo.path().to_path_buf(),
+        probing(Some(git)),
+    );
+    wait_until(&uplink, has("session_started")).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    let frames = wait_until(&uplink, has("turn_ended")).await;
+    assert!(git_states(&frames).is_empty(), "the start's probe is still held");
+    std::fs::write(&release, "").unwrap();
+    let frames = wait_until(&uplink, |f| git_states(f).len() == 2).await;
+    let main = Some("main".to_string());
+    assert_eq!(
+        git_states(&frames),
+        [
+            (main.clone(), false, false, head.clone(), head.clone()),
+            (main, false, false, head, None)
+        ]
+    );
+}
+
+/// Decision 11: a `git` that hangs never delays a turn's end. A probe that
+/// a newer one replaces is killed with whatever it started (its process
+/// group), and so is one past its 3 s bound; neither reports a state.
+#[tokio::test]
+async fn a_hung_git_never_delays_a_turn_end_and_is_killed_with_its_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let pids = dir.path().join("pids");
+    let git = dir.path().join("git");
+    write_script(
+        &git,
+        &format!(
+            "#!/bin/sh\n[ $# -eq 0 ] && exit 0\necho $$ >> {0}\nsleep 30 &\necho $! >> {0}\nwait\n",
+            pids.display()
+        ),
+    );
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let handle = session::spawn(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        fake_with(&FakeScript::default()),
+        std::env::temp_dir(),
+        probing(Some(git)),
+    );
+    // The start's probe hangs: its git and git's child run.
+    let after_start = wait_for_pids(&pids, 2).await;
+    let asked = tokio::time::Instant::now();
+    assert!(handle.send(prompt("r1", "t1")));
+    wait_until(&uplink, has("turn_ended")).await;
+    assert!(asked.elapsed() < Duration::from_secs(2), "{:?}", asked.elapsed());
+    // The turn's probe replaced it, killing its whole group.
+    wait_dead_all(&after_start, Duration::from_secs(5)).await;
+    // The turn's probe hangs too, and is killed past its bound.
+    let after_turn = wait_for_pids(&pids, 4).await;
+    wait_dead_all(
+        &after_turn[2..],
+        hennery_host::git::PROBE_TIMEOUT + Duration::from_secs(3),
+    )
+    .await;
+    assert!(git_states(&uplink.pending().unwrap()).is_empty());
+}
+
+/// Outside a work tree, or with no `git` at all, nothing is reported.
+#[tokio::test]
+async fn no_git_state_is_reported_outside_a_work_tree_or_without_git() {
+    let outside = tempfile::tempdir().unwrap();
+    for git in [hennery_host::git::find_git(), None] {
+        let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+        let handle = session::spawn(
+            uplink.clone(),
+            "r0".into(),
+            "s1".into(),
+            fake_with(&FakeScript::default()),
+            outside.path().to_path_buf(),
+            probing(git),
+        );
+        wait_until(&uplink, has("session_started")).await;
+        assert!(handle.send(prompt("r1", "t1")));
+        wait_until(&uplink, has("turn_ended")).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(git_states(&uplink.pending().unwrap()).is_empty());
+    }
+}

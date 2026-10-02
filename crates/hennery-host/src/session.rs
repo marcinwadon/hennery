@@ -191,6 +191,9 @@ pub struct SessionOptions {
     pub cancel_grace: Duration,
     /// How long one config switch may take.
     pub config_timeout: Duration,
+    /// `git` for the git probe (ACP core §7), found once when the host
+    /// starts (`git::find_git`); `None`: no probe, no `git_state`.
+    pub git: Option<PathBuf>,
     /// Test seams (see `test_hooks`).
     #[cfg(feature = "test-hooks")]
     pub test_hooks: Option<test_hooks::TestHooks>,
@@ -204,6 +207,7 @@ impl Default for SessionOptions {
             idle_timeout: Some(IDLE_TIMEOUT),
             cancel_grace: CANCEL_GRACE,
             config_timeout: CONFIG_TIMEOUT,
+            git: None,
             #[cfg(feature = "test-hooks")]
             test_hooks: None,
         }
@@ -347,6 +351,7 @@ pub fn launch(uplink: Uplink, launch: Launch, options: SessionOptions) -> Sessio
         catalogue: Mutex::new(Catalogue::default()),
         questions: Mutex::new(Questions::default()),
         inbound: OnceLock::new(),
+        probe: Mutex::new(None),
         ending: ending.clone(),
     };
     let done = CancellationToken::new();
@@ -386,6 +391,12 @@ enum Inbound {
     /// The adapter withdrew question `pending_id` (`$/cancel_request`).
     QuestionWithdrawn {
         pending_id: String,
+    },
+    /// What a git probe found (ACP core §7); `base`: the first after a new
+    /// session's start, so `head` is the commit it started from.
+    Git {
+        state: crate::git::GitState,
+        base: bool,
     },
 }
 
@@ -452,11 +463,13 @@ struct OpenQuestion {
 }
 
 /// A task that is aborted when its owner is dropped.
-struct Watcher(tokio::task::JoinHandle<()>);
+struct Watcher(Option<tokio::task::JoinHandle<()>>);
 
 impl Drop for Watcher {
     fn drop(&mut self) {
-        self.0.abort();
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
     }
 }
 
@@ -641,9 +654,9 @@ impl Replay {
         match inbound {
             Inbound::Update(payload) => self.observe(payload),
             Inbound::Question(question) => self.kept.push(Early::Question(question)),
-            // No switch is sent, and no question is open, before the
-            // actor's main loop starts.
-            Inbound::SwitchAnswer { .. } | Inbound::QuestionWithdrawn { .. } => {}
+            // No switch is sent, no question is open and no probe runs
+            // before the actor's main loop starts.
+            Inbound::SwitchAnswer { .. } | Inbound::QuestionWithdrawn { .. } | Inbound::Git { .. } => {}
         }
     }
 
@@ -690,8 +703,13 @@ struct Actor {
     catalogue: Mutex<Catalogue>,
     /// The adapter's questions waiting for the operator.
     questions: Mutex<Questions>,
-    /// The inbound channel, for the questions' withdrawal watchers.
+    /// The inbound channel, for the questions' withdrawal watchers and the
+    /// git probe.
     inbound: OnceLock<mpsc::UnboundedSender<Inbound>>,
+    /// The git probe running, if one is, and whether it (or one it waits
+    /// for) records the base commit: a newer probe replaces it, which aborts
+    /// it unless it does, and the actor's end aborts it.
+    probe: Mutex<Option<(Watcher, bool)>>,
     /// Shared with the handle (`SessionHandle::is_ending`).
     ending: Arc<AtomicBool>,
 }
@@ -791,6 +809,8 @@ impl Actor {
             cwd,
             ..
         } = launch;
+        // For the git probe: `cwd` goes to the adapter's start.
+        let probe_cwd = cwd.clone();
         let (mut adapter, io) = match Adapter::spawn(&agent, &cwd) {
             Ok(spawned) => spawned,
             Err(err) => {
@@ -929,7 +949,7 @@ impl Actor {
             match updates.try_recv() {
                 Ok(Inbound::Update(payload)) => early.push(Early::Update(payload)),
                 Ok(Inbound::Question(question)) => early.push(Early::Question(question)),
-                Ok(Inbound::SwitchAnswer { .. } | Inbound::QuestionWithdrawn { .. }) => {}
+                Ok(Inbound::SwitchAnswer { .. } | Inbound::QuestionWithdrawn { .. } | Inbound::Git { .. }) => {}
                 Err(_) => break,
             }
         }
@@ -952,6 +972,10 @@ impl Actor {
                 text: scrub(&format!("{what}: {}", applied.failures.join("; "))),
             });
         }
+        // The git state after the start; a new session's names the commit
+        // it started from (the review's O3: a resume's would name a later
+        // one).
+        self.probe_git(&probe_cwd, matches!(attach, Attach::New));
 
         // Prompts are deduplicated by turn_id: a retried delivery after a
         // lost acknowledgement must never run the same turn twice. Only a
@@ -1131,6 +1155,7 @@ impl Actor {
                                 TurnOutcome::Completed
                             };
                             self.end_turn(ended.id, outcome, stop_reason(&response), None);
+                            self.probe_git(&probe_cwd, false);
                         }
                         Err(err) => {
                             #[cfg(feature = "test-hooks")]
@@ -1149,6 +1174,7 @@ impl Actor {
                             // error instead of `cancelled`.
                             let outcome = if cancelling { TurnOutcome::Cancelled } else { TurnOutcome::Failed };
                             self.end_turn(ended.id, outcome, None, Some(err.to_string()));
+                            self.probe_git(&probe_cwd, false);
                         }
                     }
                 }
@@ -1431,7 +1457,51 @@ impl Actor {
                 self.withdraw_question(pending_id);
                 true
             }
+            Inbound::Git { state, base } => {
+                self.emit(SessionBody::GitState {
+                    base_commit: state.head.clone().filter(|_| base),
+                    branch: state.branch,
+                    dirty: state.dirty,
+                    worktree: state.worktree,
+                    head: state.head,
+                });
+                false
+            }
         }
+    }
+
+    /// Probe `cwd`'s git state on a task of its own (ACP core §7; plan
+    /// 6b-ii decision 11): it never holds the actor, so it never delays or
+    /// reorders a turn's end. Its result, if any, comes back on the ordered
+    /// inbound channel as `Inbound::Git`. A newer probe aborts this one, and
+    /// so does the actor's end; either kills git's process group. Only the
+    /// probe that records the base commit is not aborted by a newer one (the
+    /// second review's B1): the newer waits for it (it is bounded too), so a
+    /// quick first turn cannot cost the base, and the states stay in order.
+    fn probe_git(&self, cwd: &std::path::Path, base: bool) {
+        let (Some(git), Some(inbound)) = (self.options.git.clone(), self.inbound.get().cloned()) else {
+            return;
+        };
+        let mut slot = self.probe.lock().expect("probe lock");
+        let earlier = match slot.as_mut() {
+            Some((watcher, true)) if watcher.0.as_ref().is_some_and(|task| !task.is_finished()) => watcher.0.take(),
+            _ => None,
+        };
+        let carries_base = base || earlier.is_some();
+        let cwd = cwd.to_path_buf();
+        let task = tokio::spawn(async move {
+            if let Some(earlier) = earlier {
+                // Aborted with this task, if it is.
+                let mut earlier = Watcher(Some(earlier));
+                if let Some(task) = earlier.0.as_mut() {
+                    let _ = task.await;
+                }
+            }
+            if let Some(state) = crate::git::probe(&git, &cwd).await {
+                let _ = inbound.send(Inbound::Git { state, base });
+            }
+        });
+        *slot = Some((Watcher(Some(task)), carries_base));
     }
 
     /// Announce an adapter's question as `pending_opened` and keep its
@@ -1468,10 +1538,10 @@ impl Actor {
         let cancellation = responder.cancellation();
         let withdrawal = self.inbound.get().cloned().map(|inbound| {
             let pending_id = pending_id.clone();
-            Watcher(tokio::spawn(async move {
+            Watcher(Some(tokio::spawn(async move {
                 cancellation.cancelled().await;
                 let _ = inbound.send(Inbound::QuestionWithdrawn { pending_id });
-            }))
+            })))
         });
         let question = OpenQuestion {
             pending_id,
@@ -1836,7 +1906,7 @@ async fn negotiate(
                 match updates.try_recv() {
                     Ok(Inbound::Update(payload)) => replay.kept.push(Early::Update(payload)),
                     Ok(Inbound::Question(question)) => replay.kept.push(Early::Question(question)),
-                    Ok(Inbound::SwitchAnswer { .. } | Inbound::QuestionWithdrawn { .. }) => {}
+                    Ok(Inbound::SwitchAnswer { .. } | Inbound::QuestionWithdrawn { .. } | Inbound::Git { .. }) => {}
                     Err(_) => break,
                 }
             }
