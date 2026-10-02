@@ -2419,6 +2419,38 @@ fn parse_prompt(content: Vec<Value>) -> Result<Vec<ContentBlock>, String> {
 mod tests {
     use super::*;
 
+    /// Plan 10b: what a question is about, for a push under `details`.
+    #[test]
+    fn a_questions_title_is_its_tool_call_title_or_its_message() {
+        let permission = serde_json::json!({"toolCall": {"toolCallId": "c1", "title": "Run cargo test"}});
+        assert_eq!(
+            question_title(PendingKind::Permission, &permission).as_deref(),
+            Some("Run cargo test")
+        );
+        let elicitation = serde_json::json!({"message": "Which branch?", "requestedSchema": {}});
+        assert_eq!(
+            question_title(PendingKind::Elicitation, &elicitation).as_deref(),
+            Some("Which branch?")
+        );
+        // None where the agent gave none, or gave only blanks.
+        assert_eq!(
+            question_title(PendingKind::Permission, &serde_json::json!({"toolCall": {}})),
+            None
+        );
+        assert_eq!(
+            question_title(PendingKind::Elicitation, &serde_json::json!({"message": "  "})),
+            None
+        );
+        assert_eq!(
+            question_title(PendingKind::Elicitation, &serde_json::json!({"message": 7})),
+            None
+        );
+        // Cut to MAX_QUESTION_TITLE characters, on a character boundary.
+        let long = serde_json::json!({"message": "\u{e9}".repeat(MAX_QUESTION_TITLE + 5)});
+        let cut = question_title(PendingKind::Elicitation, &long).unwrap();
+        assert_eq!(cut.chars().count(), MAX_QUESTION_TITLE);
+    }
+
     /// A boolean would be discarded by the adapter's schema validator,
     /// which looks exactly like not advertising it (P-19).
     #[test]
