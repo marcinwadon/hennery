@@ -52,6 +52,23 @@ pub const SILENT_EVENTS: [&str; 6] = [
     "operator_parked",
 ];
 
+/// The key of the group a `user_turn` event starts, which its items carry
+/// as `turn_id`: its turn id, or `event-<event_id>` when that is missing,
+/// empty or past `ID_MAX_BYTES`. The view API places a question built from
+/// the store's record by it.
+pub fn group_key(event_id: i64, turn_id: Option<&str>) -> String {
+    match turn_id.filter(|t| !t.is_empty() && t.len() <= ID_MAX_BYTES) {
+        Some(turn) => turn.to_string(),
+        None => format!("event-{event_id}"),
+    }
+}
+
+/// The id of a question's item: pending ids are host-minted and unique
+/// (plan 4a-i decision 3).
+pub fn question_id(pending_id: &str) -> String {
+    format!("question:{pending_id}")
+}
+
 /// Who may answer a question now: the server's pending set (F-15).
 pub trait Answerable {
     /// Open, with no answer queued.
@@ -287,10 +304,7 @@ impl Fold {
             }
         }
         self.dirty_set.clear();
-        let turn = str_at(&event.body, "turn_id")
-            .filter(|t| !t.is_empty() && t.len() <= ID_MAX_BYTES)
-            .map(str::to_string);
-        self.group = turn.clone().unwrap_or_else(|| format!("event-{}", event.event_id));
+        self.group = group_key(event.event_id, str_at(&event.body, "turn_id"));
         self.turn = Some(self.group.clone());
         self.ordinal = 0;
         self.items = Items::default();
@@ -529,7 +543,7 @@ impl Fold {
             }
             return;
         };
-        let id = format!("question:{pending_id}");
+        let id = question_id(pending_id);
         // Asked again in its group (a resent fact): nothing changes, so the
         // verdict never goes back to open (the re-confirmation's N-2).
         if self.items.get(&id).is_some() {
@@ -573,7 +587,7 @@ impl Fold {
             _ => (PendingState::Cancelled, false, None),
         };
         let now = answerable.answerable(pending_id);
-        self.change(event, &format!("question:{pending_id}"), |body| match body {
+        self.change(event, &question_id(pending_id), |body| match body {
             Body::Question(question) => {
                 let mut changed = question.absorb(state, reason, answered, delivered);
                 changed |= question.answerable != now;

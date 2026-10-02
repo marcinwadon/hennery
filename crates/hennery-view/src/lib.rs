@@ -8,13 +8,15 @@
 //! an update the fold cannot place becomes an `unrecognised` item and is
 //! never dropped (D3).
 
+pub mod api;
 pub mod cap;
+pub mod codegen;
 pub mod fold;
 pub mod item;
 pub mod question;
 pub mod tool;
 
-pub use fold::{Answerable, Fold, Items, fold};
+pub use fold::{Answerable, Fold, Items, fold, group_key, question_id};
 pub use item::*;
 
 /// The fold's rules' version. Ordinal ids and versions follow the rules:
