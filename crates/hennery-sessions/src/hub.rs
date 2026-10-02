@@ -32,14 +32,6 @@ pub enum RequestError {
 /// on it.
 pub const MAX_PROBES: usize = 8;
 
-/// The capability a probe needs from its host (ACP core §3.3), if any.
-fn probe_capability(frame: &CollectorFrame) -> Option<Capability> {
-    match frame {
-        CollectorFrame::ListProjects { .. } | CollectorFrame::BrowseDirectory { .. } => Some(Capability::Projects),
-        _ => None,
-    }
-}
-
 /// The fact that completes a request, besides a rejection of its
 /// `request_id` (ACP core §3.2, §3.3).
 enum CompletedBy {
@@ -467,10 +459,23 @@ impl Hub {
             let Some(host) = hosts.get(host_id).filter(|h| h.routable()) else {
                 return Err(RequestError::NotConnected);
             };
-            if probe_capability(&frame).is_some_and(|needed| !host.capabilities.has(needed)) {
+            // A frame that is not a probe has no reply to wait for here: it
+            // is a caller's bug, refused before anything is sent.
+            let Ok(needed) = frame.probe_capability() else {
+                tracing::error!(%host_id, %request_id, "Hub::probe given a frame that is not a probe");
+                return Err(RequestError::Rejected {
+                    code: "not_a_probe".into(),
+                    message: "not a probe".into(),
+                });
+            };
+            if needed.is_some_and(|needed| !host.capabilities.has(needed)) {
                 return Err(RequestError::Unsupported);
             }
             let mut probes = self.probes.lock().expect("probes lock");
+            // A request id in use would hand its reply to the wrong caller.
+            if probes.contains_key(request_id) {
+                return Err(RequestError::Busy);
+            }
             if probes.values().filter(|p| p.conn_id == host.conn_id).count() >= MAX_PROBES {
                 return Err(RequestError::Busy);
             }

@@ -411,6 +411,30 @@ async fn a_probe_goes_only_to_a_connection_with_its_capability() {
     assert_eq!(hub.pending_probes(), 0);
 }
 
+/// Task 1's review: only a probe goes through `Hub::probe`, and a request
+/// id in flight is not reused.
+#[tokio::test]
+async fn a_frame_that_is_not_a_probe_or_an_id_in_use_is_refused() {
+    let hub = Arc::new(Hub::new());
+    let (_registration, mut rx) = connect_projects(&hub);
+    let answer = hub.probe("h", "r1", prompt("r1"), Duration::from_secs(5)).await;
+    assert!(
+        matches!(answer, Err(RequestError::Rejected { ref code, .. }) if code == "not_a_probe"),
+        "{answer:?}"
+    );
+    assert!(rx.try_recv().is_err(), "a frame that is not a probe was sent");
+    let call = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.probe("h", "p1", list("p1"), Duration::from_secs(5)).await }
+    });
+    assert_eq!(rx.recv().await, Some(list("p1")));
+    let again = hub.probe("h", "p1", list("p1"), Duration::from_secs(5)).await;
+    assert_eq!(again, Err(RequestError::Busy));
+    assert!(rx.try_recv().is_err());
+    assert_eq!(hub.pending_probes(), 1, "the reused id displaced the first probe");
+    call.abort();
+}
+
 /// The review's O3: a connection has at most `MAX_PROBES` probes in flight.
 #[tokio::test]
 async fn a_connection_has_a_bounded_number_of_probes_in_flight() {

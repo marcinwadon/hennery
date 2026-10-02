@@ -204,6 +204,55 @@ async fn a_host_error_answers_its_probe_and_keeps_the_connection() {
     assert!(collector.state.hub.is_ready(HOST));
 }
 
+/// Task 1's review: probe routing leaves the session waiters' rejections
+/// alone, and a waiter's rejection leaves a probe alone.
+#[tokio::test]
+async fn a_host_error_answers_only_the_request_it_names() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::with_projects(&collector).await;
+    let hub = collector.state.hub.clone();
+    let waiter = tokio::spawn(async move {
+        let frame = CollectorFrame::Prompt {
+            request_id: "w1".into(),
+            session_id: "s1".into(),
+            turn_id: "t1".into(),
+            content: vec![serde_json::json!({"type": "text", "text": "hi"})],
+        };
+        hub.request(HOST, "w1", frame, Duration::from_secs(10)).await
+    });
+    assert!(matches!(host.next().await, CollectorFrame::Prompt { .. }));
+    let call = probe(&collector, "p1", Duration::from_secs(10));
+    let request_id = listed(&mut host).await;
+    host.send(&HostFrame::Error {
+        request_id: "w1".into(),
+        code: "not_attached".into(),
+        message: "no".into(),
+    })
+    .await;
+    let answered = waiter.await.unwrap();
+    assert!(
+        matches!(answered, Err(RequestError::Rejected { ref code, .. }) if code == "not_attached"),
+        "{answered:?}"
+    );
+    assert_eq!(
+        collector.state.hub.pending_probes(),
+        1,
+        "the waiter's rejection answered the probe"
+    );
+    host.send(&HostFrame::Error {
+        request_id,
+        code: "invalid".into(),
+        message: "no".into(),
+    })
+    .await;
+    let answered = call.await.unwrap();
+    assert!(
+        matches!(answered, Err(RequestError::Rejected { ref code, .. }) if code == "invalid"),
+        "{answered:?}"
+    );
+    assert_eq!(collector.state.hub.pending_requests(), 0);
+}
+
 #[tokio::test]
 async fn a_late_probe_reply_is_dropped_and_the_connection_kept() {
     let collector = Collector::start().await;
@@ -212,7 +261,10 @@ async fn a_late_probe_reply_is_dropped_and_the_connection_kept() {
     let late = listed(&mut host).await;
     assert_eq!(call.await.unwrap(), Err(RequestError::DeliveryUnknown));
     host.send(&projects(late, &["/late"])).await;
+    // Time for the socket to read it: it answers nothing, and waits on
+    // nothing.
     host.hears_nothing(Duration::from_millis(200)).await;
+    assert_eq!(collector.state.hub.pending_probes(), 0);
     assert!(
         collector.state.hub.is_ready(HOST),
         "a probe timeout dropped the connection"

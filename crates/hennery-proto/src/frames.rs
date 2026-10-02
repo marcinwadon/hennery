@@ -402,6 +402,35 @@ pub enum HostFrame {
     },
 }
 
+/// A collector frame that is not a probe (`CollectorFrame::probe_capability`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NotAProbe;
+
+impl CollectorFrame {
+    /// If this frame is a probe (ACP core §3.3): the capability its host
+    /// must have announced, if any. Exhaustive on purpose, like
+    /// `HostFrame::probe_request_id`: a new collector frame must say whether
+    /// it is a probe and what it needs, or this does not compile (umbrella
+    /// §5.4).
+    pub fn probe_capability(&self) -> Result<Option<Capability>, NotAProbe> {
+        match self {
+            Self::ListProjects { .. } | Self::BrowseDirectory { .. } => Ok(Some(Capability::Projects)),
+            Self::HelloAck { .. }
+            | Self::HelloError { .. }
+            | Self::StartSession { .. }
+            | Self::ResumeSession { .. }
+            | Self::Prompt { .. }
+            | Self::CancelTurn { .. }
+            | Self::SetConfig { .. }
+            | Self::AnswerPermission { .. }
+            | Self::AnswerElicitation { .. }
+            | Self::Ack { .. }
+            | Self::ParkSession { .. }
+            | Self::CloseSession { .. } => Err(NotAProbe),
+        }
+    }
+}
+
 impl HostFrame {
     /// The probe this frame answers, if it is a probe reply (ACP core §3.3).
     /// Exhaustive on purpose: a new host frame must say whether it is one,
