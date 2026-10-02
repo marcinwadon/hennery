@@ -9,7 +9,8 @@
 //! the setup false, not the code.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::sync::watch;
 
 /// How many updates the actor handles in a row before its other arms get a
@@ -25,6 +26,8 @@ pub const ORPHAN_GRACE: u32 = super::ORPHAN_GRACE;
 pub(super) enum HoldAt {
     /// Right after a `set_config` sent a switch.
     SwitchSent,
+    /// Right as a switch's deadline fires, before the arm does anything.
+    SwitchDeadline,
     /// Right after a switch's deadline orphaned it.
     Orphaned,
     /// Right after a turn's reply errored, before `exited_within` checks
@@ -50,7 +53,23 @@ struct Inner {
     /// Set once the actor is actually parked at its armed hold point,
     /// waiting for `released`.
     holding: watch::Sender<bool>,
+    /// Live updates pushed onto the actor's inbound channel so far.
+    updates_queued: watch::Sender<u64>,
+    /// Inbound items the actor has handled so far, by any path.
+    handled: AtomicU64,
+    /// `handled` when the actor went on from its hold (`NOT_YET` before).
+    handled_at_release: AtomicU64,
+    /// `handled` when the actor read the first `Cancel` it acted on
+    /// (`NOT_YET` before).
+    handled_at_cancel: AtomicU64,
+    /// Each inbound item handled after that `Cancel`, up to `slow_count`
+    /// of them, keeps the actor's thread busy this long first: a stand-in
+    /// for an outbox commit on a slow disk.
+    slow_commit: Duration,
+    slow_count: u64,
 }
+
+const NOT_YET: u64 = u64::MAX;
 
 impl TestHooks {
     /// Hold the actor right after the first `set_config` it sends to the
@@ -59,6 +78,12 @@ impl TestHooks {
     /// adapter sends.
     pub fn hold_after_first_switch() -> Self {
         Self::holding_at(HoldAt::SwitchSent)
+    }
+
+    /// Hold the actor right as the first switch deadline fires, before
+    /// that arm decides anything (or drains anything), until `release`.
+    pub fn hold_when_first_switch_deadline_fires() -> Self {
+        Self::holding_at(HoldAt::SwitchDeadline)
     }
 
     /// Hold the actor right after the first switch its deadline orphans
@@ -83,8 +108,24 @@ impl TestHooks {
                 released: watch::Sender::new(false),
                 answers_queued: watch::Sender::new(0),
                 holding: watch::Sender::new(false),
+                updates_queued: watch::Sender::new(0),
+                handled: AtomicU64::new(0),
+                handled_at_release: AtomicU64::new(NOT_YET),
+                handled_at_cancel: AtomicU64::new(NOT_YET),
+                slow_commit: Duration::ZERO,
+                slow_count: 0,
             }),
         }
+    }
+
+    /// Make each of the first `count` inbound items the actor handles after
+    /// reading a `Cancel` keep its thread busy for `commit` first, as a slow
+    /// disk's outbox commit would. Set before the hooks are shared.
+    pub fn slow_commits_after_cancel(mut self, commit: Duration, count: u64) -> Self {
+        let inner = Arc::get_mut(&mut self.inner).expect("configured before it is shared");
+        inner.slow_commit = commit;
+        inner.slow_count = count;
+        self
     }
 
     /// Let a held actor go on (and never hold it again).
@@ -107,6 +148,63 @@ impl TestHooks {
         self.inner.answers_queued.send_modify(|count| *count += 1);
     }
 
+    /// Live updates pushed onto the actor's inbound channel so far (queued,
+    /// not necessarily handled).
+    pub fn updates_queued_now(&self) -> u64 {
+        *self.inner.updates_queued.borrow()
+    }
+
+    /// Resolves once at least `n` live updates have been pushed onto the
+    /// actor's inbound channel.
+    pub async fn updates_queued(&self, n: u64) {
+        let mut queued = self.inner.updates_queued.subscribe();
+        let _ = queued.wait_for(|count| *count >= n).await;
+    }
+
+    /// Called by the connection's notification handler, right after a live
+    /// update is pushed onto the inbound channel.
+    pub(super) fn update_queued(&self) {
+        self.inner.updates_queued.send_modify(|count| *count += 1);
+    }
+
+    /// How many inbound items the actor handled between going on from its
+    /// hold and reading its first `Cancel`; `None` until both happened.
+    pub fn handled_from_release_to_cancel(&self) -> Option<u64> {
+        let released = self.inner.handled_at_release.load(Ordering::SeqCst);
+        let cancelled = self.inner.handled_at_cancel.load(Ordering::SeqCst);
+        if released == NOT_YET || cancelled == NOT_YET {
+            return None;
+        }
+        cancelled.checked_sub(released)
+    }
+
+    /// Called by the actor as it handles any inbound item.
+    pub(super) fn inbound_handled(&self) {
+        let handled = self.inner.handled.fetch_add(1, Ordering::SeqCst);
+        let cancelled = self.inner.handled_at_cancel.load(Ordering::SeqCst);
+        if cancelled != NOT_YET
+            && handled
+                .checked_sub(cancelled)
+                .is_some_and(|after| after < self.inner.slow_count)
+        {
+            // Spun, not slept: a sleep's wake-up can be late by far more
+            // than the commit is long, and a commit holds the thread busy.
+            let started = std::time::Instant::now();
+            while started.elapsed() < self.inner.slow_commit {
+                std::hint::spin_loop();
+            }
+        }
+    }
+
+    /// Called by the actor when a `Cancel` makes it send `session/cancel`.
+    pub(super) fn cancel_read(&self) {
+        let handled = self.inner.handled.load(Ordering::SeqCst);
+        let _ = self
+            .inner
+            .handled_at_cancel
+            .compare_exchange(NOT_YET, handled, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
     /// Resolves once the actor has reached its armed hold point and is
     /// actually waiting there for `release` — as opposed to a test assuming
     /// so from timing alone.
@@ -121,6 +219,8 @@ impl TestHooks {
             self.inner.holding.send_replace(true);
             let mut released = self.inner.released.subscribe();
             let _ = released.wait_for(|released| *released).await;
+            let handled = self.inner.handled.load(Ordering::SeqCst);
+            self.inner.handled_at_release.store(handled, Ordering::SeqCst);
         }
     }
 }
