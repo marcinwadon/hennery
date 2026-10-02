@@ -3,7 +3,7 @@
 //! first. They share the host registry's connection and owner, and every
 //! query names the owner (kernel spec §1).
 
-use crate::hats::{is_canonical, resolve};
+use crate::hats::{host_default_hat, is_canonical, resolve, rules_of};
 use crate::hosts::{Hosts, is_displayable_path};
 use anyhow::Result;
 use rusqlite::{TransactionBehavior, params};
@@ -38,7 +38,7 @@ impl Hosts {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO project_recents(owner_id, host_id, hat_id, path, last_used_at) VALUES (?1, ?2, ?3, ?4, ?5)
-             ON CONFLICT(host_id, hat_id, path) DO UPDATE SET last_used_at = excluded.last_used_at
+             ON CONFLICT(host_id, hat_id, path) DO UPDATE SET last_used_at = max(last_used_at, excluded.last_used_at)
                  WHERE project_recents.owner_id = ?1",
             params![owner, host_id, hat_id, path, now],
         )?;
@@ -58,10 +58,13 @@ impl Hosts {
     /// each was remembered, which a rule or a default changed since leaves
     /// stale. Empty for an unknown host.
     pub fn recents(&self, host_id: &str, hat_id: &str, limit: usize) -> Result<Vec<Recent>> {
-        let (Some(rules), Some(host)) = (self.path_rules(host_id)?, self.host(host_id)?) else {
+        // One read of the rules, the default hat and the recents, under one
+        // lock, as `resolve_hat` reads (Task 6's review).
+        let conn = self.conn();
+        let Some(default_hat) = host_default_hat(&conn, self.owner_id(), host_id)? else {
             return Ok(Vec::new());
         };
-        let conn = self.conn();
+        let rules = rules_of(&conn, self.owner_id(), host_id)?;
         let mut stmt = conn.prepare(
             "SELECT path, last_used_at FROM project_recents WHERE owner_id = ?1 AND host_id = ?2
              ORDER BY last_used_at DESC, path",
@@ -78,8 +81,7 @@ impl Hosts {
             let recent = recent?;
             // Newest first, so a path stored under two hats is shown once,
             // with its latest use.
-            if resolve(&rules, &host.default_hat_id, &recent.path).hat_id == hat_id && seen.insert(recent.path.clone())
-            {
+            if resolve(&rules, &default_hat, &recent.path).hat_id == hat_id && seen.insert(recent.path.clone()) {
                 shown.push(recent);
                 if shown.len() == limit {
                     break;

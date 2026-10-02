@@ -124,6 +124,64 @@ fn recents_follow_the_hat_their_path_resolves_to_now() {
     );
 }
 
+/// Task 6's review: a change of the host's default hat moves the recents
+/// no rule claims, at once; and a use that reads earlier (a clock stepped
+/// back) never makes a recent older.
+#[test]
+fn a_new_default_hat_takes_the_recents_no_rule_claims() {
+    let (hosts, old_default) = registry();
+    let HatChange::Done(work) = hosts.create_hat("Work", None, NOW).unwrap() else {
+        panic!("a hat");
+    };
+    hosts.remember("host-1", &old_default, "/p/a", NOW + 5).unwrap();
+    hosts.remember("host-1", &old_default, "/p/a", NOW).unwrap();
+    assert_eq!(
+        hosts.recents("host-1", &old_default, 10).unwrap()[0].last_used_at,
+        NOW + 5
+    );
+    hosts.update_host("host-1", None, Some(&work.id)).unwrap();
+    assert!(hosts.recents("host-1", &old_default, 10).unwrap().is_empty());
+    assert_eq!(paths(&hosts.recents("host-1", &work.id, 10).unwrap()), ["/p/a"]);
+}
+
+/// Migration 8's cascade: recents go with their hat and their host.
+#[test]
+fn recents_go_with_their_hat_and_their_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("hennery.db");
+    let hosts = Hosts::open(&path).unwrap();
+    let default_hat = {
+        let enrollment = Enrollment {
+            public_key: hex::encode(
+                ed25519_dalek::SigningKey::from_bytes(&[1; 32])
+                    .verifying_key()
+                    .as_bytes(),
+            ),
+            name: "test".into(),
+            host_version: "0".into(),
+            platform: "test".into(),
+        };
+        hosts.register("host-1", &enrollment, NOW).unwrap();
+        hosts.host("host-1").unwrap().unwrap().default_hat_id
+    };
+    let HatChange::Done(work) = hosts.create_hat("Work", None, NOW).unwrap() else {
+        panic!("a hat");
+    };
+    hosts.remember("host-1", &default_hat, "/p/a", NOW).unwrap();
+    hosts.remember("host-1", &work.id, "/p/b", NOW).unwrap();
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    let count = |conn: &rusqlite::Connection| -> i64 {
+        conn.query_row("SELECT count(*) FROM project_recents", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count(&conn), 2);
+    conn.execute("DELETE FROM hats WHERE id = ?1", [&work.id]).unwrap();
+    assert_eq!(count(&conn), 1);
+    conn.execute("DELETE FROM hosts WHERE id = 'host-1'", []).unwrap();
+    assert_eq!(count(&conn), 0);
+}
+
 /// Another owner's recents, written straight into the file with that
 /// owner's host and hat, are neither listed nor pruned.
 #[test]
