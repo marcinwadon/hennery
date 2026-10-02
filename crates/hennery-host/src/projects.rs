@@ -77,6 +77,8 @@ pub const MAX_PATH: usize = 4096;
 /// A4). One more is answered `busy`.
 pub const MAX_LISTS: usize = 1;
 pub const MAX_BROWSES: usize = 4;
+/// Path resolutions (`resolve_path`, plan 5b) a host runs at once.
+pub const MAX_RESOLVES: usize = 4;
 
 /// The bounds of an enumeration and a listing (decisions 4 and 5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -406,14 +408,15 @@ fn refusal_below(fence: &Fence, path: &Path, err: &std::io::Error) -> BrowseErro
 }
 
 /// Runs the host's probe work (the review's A4): on blocking threads, never
-/// in the connection loop, at most `MAX_LISTS` enumerations and
-/// `MAX_BROWSES` listings at once. One more is answered `busy`; the
-/// collector says so. The reply goes out on whatever connection is up when
+/// in the connection loop, at most `MAX_LISTS` enumerations, `MAX_BROWSES`
+/// listings and `MAX_RESOLVES` path resolutions (plan 5b) at once. One more
+/// is answered `busy`; the collector says so. The reply goes out on whatever connection is up when
 /// it is ready; another connection's reply is dropped by the collector.
 #[derive(Clone)]
 pub struct Probes {
     lists: Arc<Semaphore>,
     browses: Arc<Semaphore>,
+    resolves: Arc<Semaphore>,
     limits: Limits,
 }
 
@@ -428,6 +431,7 @@ impl Probes {
         Self {
             lists: Arc::new(Semaphore::new(lists)),
             browses: Arc::new(Semaphore::new(browses)),
+            resolves: Arc::new(Semaphore::new(MAX_RESOLVES)),
             limits,
         }
     }
@@ -487,6 +491,57 @@ impl Probes {
                 Err(refused) => refusal(request_id, refused),
             });
         });
+    }
+}
+
+impl Probes {
+    /// Answer `resolve_path` (kernel spec §5.4): `path` resolved where the
+    /// filesystem is (`crate::paths::resolve`), `~` being `home`. A refusal
+    /// is `invalid` with its reason; a panic is answered `internal` with a
+    /// fixed message instead, not left to the collector's timeout (the
+    /// review's Important 1): the operator's bad input and a bug in this
+    /// host must not look alike.
+    pub fn resolve(&self, uplink: &Uplink, request_id: String, path: String, home: Option<PathBuf>) {
+        let Ok(permit) = self.resolves.clone().try_acquire_owned() else {
+            uplink.reply(busy(request_id));
+            return;
+        };
+        let uplink = uplink.clone();
+        tokio::task::spawn_blocking(move || {
+            let outcome = std::panic::catch_unwind(|| crate::paths::resolve(&path, home.as_deref()));
+            // Released before the reply goes out, so a caller's next probe
+            // never finds this slot still held (the review's Minor 1).
+            drop(permit);
+            uplink.reply(resolved_reply(request_id, outcome));
+        });
+    }
+}
+
+/// The reply for a `resolve_path`'s outcome: resolved, the function's own
+/// refusal (`invalid`, its reason), or a panic caught instead of crashing
+/// the blocking thread (`internal`, a fixed message: the caller's input is
+/// never blamed for this host's bug).
+fn resolved_reply(
+    request_id: String,
+    outcome: std::thread::Result<Result<crate::paths::Resolved, String>>,
+) -> HostFrame {
+    match outcome {
+        Ok(Ok(resolved)) => HostFrame::ResolvedPath {
+            request_id,
+            canonical: resolved.canonical,
+            exists: resolved.exists,
+            is_dir: resolved.is_dir,
+        },
+        Ok(Err(message)) => HostFrame::Error {
+            request_id,
+            code: "invalid".into(),
+            message,
+        },
+        Err(_) => HostFrame::Error {
+            request_id,
+            code: "internal".into(),
+            message: "resolving the path failed on this host".into(),
+        },
     }
 }
 
@@ -587,5 +642,43 @@ mod tests {
         let odd = Path::new(std::ffi::OsStr::from_bytes(b"/h\xff"));
         let err = workspace_roots(&strings(&["~/src"]), &[], Some(odd)).unwrap_err();
         assert!(err.to_string().contains("UTF-8"), "{err}");
+    }
+
+    /// The review's Important 1: a panic resolving a path is answered
+    /// `internal`, not `invalid` as the function's own refusal is.
+    #[test]
+    fn a_panic_resolving_is_answered_internal_not_invalid() {
+        let outcome: std::thread::Result<Result<crate::paths::Resolved, String>> = Err(Box::new("boom"));
+        match resolved_reply("r1".into(), outcome) {
+            HostFrame::Error {
+                request_id,
+                code,
+                message,
+            } => {
+                assert_eq!(request_id, "r1");
+                assert_eq!(code, "internal");
+                assert_eq!(message, "resolving the path failed on this host");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The function's own refusal, unlike a panic, is answered `invalid`
+    /// with its reason.
+    #[test]
+    fn the_functions_own_refusal_is_answered_invalid() {
+        let outcome: std::thread::Result<Result<crate::paths::Resolved, String>> = Ok(Err("x".into()));
+        match resolved_reply("r2".into(), outcome) {
+            HostFrame::Error {
+                request_id,
+                code,
+                message,
+            } => {
+                assert_eq!(request_id, "r2");
+                assert_eq!(code, "invalid");
+                assert_eq!(message, "x");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

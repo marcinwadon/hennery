@@ -397,7 +397,7 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
             HostFrame::ResendComplete => tracing::warn!(%host_id, "ignoring repeated resend_complete"),
             // Probe replies answer the probe of this connection that they
             // name, if it still waits (ACP core §3.3).
-            frame @ (HostFrame::Projects { .. } | HostFrame::Directory { .. }) => {
+            frame @ (HostFrame::Projects { .. } | HostFrame::Directory { .. } | HostFrame::ResolvedPath { .. }) => {
                 state.hub.probe_reply(&host_id, conn_id, frame);
             }
             HostFrame::Hello { .. } => tracing::warn!(%host_id, "ignoring repeated hello"),

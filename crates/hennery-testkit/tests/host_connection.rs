@@ -791,7 +791,12 @@ async fn a_host_announces_that_it_can_park_take_images_and_serve_projects() {
     use hennery_proto::frames::{Capabilities, Capability};
     assert_eq!(
         capabilities,
-        Capabilities(vec![Capability::Park, Capability::Images, Capability::Projects])
+        Capabilities(vec![
+            Capability::Park,
+            Capability::Images,
+            Capability::Projects,
+            Capability::ResolvePath
+        ])
     );
 }
 

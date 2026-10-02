@@ -4,7 +4,7 @@ export type ConfigValue = boolean | string;
 
 export type SessionConfig = { model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, };
 
-export type Capability = "projects" | "images" | "park";
+export type Capability = "projects" | "images" | "park" | "resolve_path";
 
 export type Capabilities = Array<Capability>;
 
@@ -130,7 +130,7 @@ capabilities: Capabilities,
  * The workspace roots from the host's config (ACP core §7), as
  * configured. Absent means none (an older host).
  */
-workspace_roots: Array<string>, attached_sessions: Array<AttachedSession>, } | { "type": "session", session_id: string, seq: number, body: SessionBody, } | { "type": "error", request_id: string, code: string, message: string, } | { "type": "resend_complete" } | { "type": "projects", request_id: string, items: Array<Project>, 
+workspace_roots: Array<string>, attached_sessions: Array<AttachedSession>, } | { "type": "session", session_id: string, seq: number, body: SessionBody, } | { "type": "error", request_id: string, code: string, message: string, } | { "type": "resolved_path", request_id: string, canonical: string, exists: boolean, is_dir: boolean, } | { "type": "resend_complete" } | { "type": "projects", request_id: string, items: Array<Project>, 
 /**
  * A bound cut the enumeration short: there may be more.
  */
@@ -176,7 +176,7 @@ agent_session_id: string, model?: string | null, mode?: string | null, axes?: { 
 /**
  * ACP ContentBlocks, built by the frontend.
  */
-content: unknown[], } | { "type": "cancel_turn", request_id: string, session_id: string, turn_id: string, } | { "type": "set_config", request_id: string, session_id: string, config_id: string, value: ConfigValue, } | { "type": "answer_permission", request_id: string, session_id: string, pending_id: string, option_id: string, } | { "type": "answer_elicitation", request_id: string, session_id: string, pending_id: string, action: ElicitationAction, content?: unknown, } | { "type": "ack", session_id: string, ack_seq: number, } | { "type": "park_session", request_id: string, session_id: string, } | { "type": "close_session", request_id: string, session_id: string, } | { "type": "list_projects", request_id: string, } | { "type": "browse_directory", request_id: string, path: string, };
+content: unknown[], } | { "type": "cancel_turn", request_id: string, session_id: string, turn_id: string, } | { "type": "set_config", request_id: string, session_id: string, config_id: string, value: ConfigValue, } | { "type": "answer_permission", request_id: string, session_id: string, pending_id: string, option_id: string, } | { "type": "answer_elicitation", request_id: string, session_id: string, pending_id: string, action: ElicitationAction, content?: unknown, } | { "type": "ack", session_id: string, ack_seq: number, } | { "type": "resolve_path", request_id: string, path: string, } | { "type": "park_session", request_id: string, session_id: string, } | { "type": "close_session", request_id: string, session_id: string, } | { "type": "list_projects", request_id: string, } | { "type": "browse_directory", request_id: string, path: string, };
 
 export type StartSessionRequest = { host_id: string, agent: string, cwd: string, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, };
 

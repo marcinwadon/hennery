@@ -281,7 +281,12 @@ async fn handshake(
             // Every hennery host can park, take images (a session whose
             // agent offers none refuses them, plan 6a decision 2) and serve
             // the project picker (browsing under home works without roots).
-            capabilities: Capabilities(vec![Capability::Park, Capability::Images, Capability::Projects]),
+            capabilities: Capabilities(vec![
+                Capability::Park,
+                Capability::Images,
+                Capability::Projects,
+                Capability::ResolvePath,
+            ]),
             workspace_roots,
             attached_sessions: attached()?,
         },
@@ -684,6 +689,7 @@ fn handle(
         CollectorFrame::BrowseDirectory { request_id, path } => {
             probes.browse(uplink, request_id, path, cfg.workspace_roots.clone(), cfg.home.clone())
         }
+        CollectorFrame::ResolvePath { request_id, path } => probes.resolve(uplink, request_id, path, cfg.home.clone()),
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }
     Ok(())
