@@ -1167,8 +1167,8 @@ fn collector_under_umask_022(data: &std::path::Path, log: &std::path::Path) -> (
 
 /// Final review I2: pairing-code hashes (decision 5) and everything else in
 /// `hennery.db` rely on nobody but the collector's user reading it. Its data
-/// directory is created 0700 (every missing parent too) and the database
-/// and its WAL files 0600, whatever the umask.
+/// directory is created 0700 (every missing parent too) and the database,
+/// its WAL files and the VAPID key (plan 10a) 0600, whatever the umask.
 #[test]
 fn the_collectors_data_is_private_to_its_user() {
     let dir = scratch_dir("private");
@@ -1180,7 +1180,13 @@ fn the_collectors_data_is_private_to_its_user() {
     // removes the `-wal` and `-shm`.
     assert_eq!(mode_of(&dir.join("root")), 0o700);
     assert_eq!(mode_of(&data), 0o700);
-    for file in ["hennery.db", "hennery.db-wal", "hennery.db-shm", "admin.sock"] {
+    for file in [
+        "hennery.db",
+        "hennery.db-wal",
+        "hennery.db-shm",
+        "admin.sock",
+        "vapid.key",
+    ] {
         assert_eq!(mode_of(&data.join(file)), 0o600, "{file}");
     }
     unsafe { libc::kill(collector.up.id() as i32, libc::SIGTERM) };
@@ -3828,4 +3834,55 @@ fn ups_children_stop_when_up_is_killed() {
         get_json(&listen, "/api/hosts", &session)
             .is_some_and(|hosts| hosts[0]["host_id"] == host_id.as_str() && hosts[0]["connected"] == true)
     });
+}
+
+/// Plan 10a (the review's A4): the collector serves the VAPID key of its
+/// `vapid.key`, not the in-memory one `AppState::new` starts with, and a
+/// restart keeps it: every subscription is bound to it.
+#[test]
+fn the_collector_serves_the_vapid_key_of_its_file_across_restarts() {
+    let dir = scratch_dir("vapid");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("collector");
+    let (mut collector, listen) = collector_on(&data, &dir.join("collector.log"));
+    let session = sign_in(&mut collector, &listen, &data);
+    let served = get_json(&listen, "/api/push/vapid", &session).expect("the VAPID key");
+    let file = hennery_kernel::push::VapidKey::load_or_create(&data).unwrap();
+    assert_eq!(served["public_key"], file.public_key());
+    unsafe { libc::kill(collector.up.id() as i32, libc::SIGTERM) };
+    assert!(wait_with_timeout(&mut collector.up, Duration::from_secs(15)).is_some());
+
+    // Restarted on another port: signed in from the `public_url` setup
+    // stored, the first port's origin.
+    let origin = format!("http://{listen}");
+    let (mut again, listen) = collector_on(&data, &dir.join("again.log"));
+    let session = password_session(&listen, &origin);
+    let served = get_json(&listen, "/api/push/vapid", &session).expect("the VAPID key");
+    assert_eq!(served["public_key"], file.public_key());
+    unsafe { libc::kill(again.up.id() as i32, libc::SIGTERM) };
+    assert!(wait_with_timeout(&mut again.up, Duration::from_secs(15)).is_some());
+}
+
+/// `POST /api/auth/login` with the owner's password from `origin`: the
+/// session token its cookie carries.
+fn password_session(listen: &str, origin: &str) -> String {
+    let body = serde_json::json!({ "password": PASSWORD }).to_string();
+    let mut stream = TcpStream::connect(listen).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(15))).unwrap();
+    let request = format!(
+        "POST /api/auth/login HTTP/1.1\r\nHost: {listen}\r\nOrigin: {origin}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            let value = value.trim().strip_prefix("hennery_session=")?;
+            name.eq_ignore_ascii_case("set-cookie")
+                .then(|| value.split(';').next().unwrap().to_string())
+        })
+        .unwrap_or_else(|| panic!("no session cookie: {response}"))
 }

@@ -1,7 +1,8 @@
 //! Step-up (kernel spec §3.4, §11) and the signed-in sessions (§3.2):
 //! minting a pairing code, changing or revoking a host, replacing its path
 //! rules, changing a hat (plan 5a decisions 7 and 8), re-assigning a
-//! session to another hat (plan 5d decision 2) and revoking a session need
+//! session to another hat (plan 5d decision 2), subscribing a browser to
+//! push (plan 10a decision 4) and revoking a session need
 //! a password check within the last five minutes, and are refused without
 //! one, accepted within five minutes, and refused after.
 
@@ -18,21 +19,26 @@ use std::time::Duration;
 struct Collector {
     addr: SocketAddr,
     state: AppState,
+    _dir: tempfile::TempDir,
 }
 
 impl Collector {
+    /// On one database file, as the collector runs: a push subscription is
+    /// stored only for a session the registry sees signed in (plan 10a).
     async fn start() -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hennery.db");
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let state = AppState::new(
-            Store::open_in_memory().unwrap(),
-            Hosts::open_in_memory().unwrap(),
-            Operator::open_in_memory().unwrap(),
+            Store::open(&db).unwrap(),
+            Hosts::open(&db).unwrap(),
+            Operator::open(&db).unwrap(),
         );
         // Sets the collector up.
         hennery_testkit::operator_client(&state.operator);
         tokio::spawn(hennery_sessions::serve(listener, state.clone()));
-        Self { addr, state }
+        Self { addr, state, _dir: dir }
     }
 
     /// A session whose last password check was `age` seconds ago.
@@ -80,6 +86,9 @@ async fn code_of(resp: reqwest::Response) -> (u16, String) {
     )
 }
 
+/// A browser's subscription (web-push-native's example keys).
+const SUBSCRIBE: &str = r#"{"endpoint":"https://fcm.googleapis.com/fcm/send/x","keys":{"p256dh":"BLn9b-VR0ca83knDNZ32dCHGyjJp-1riX9ZTN40MqV8K_LpQmLqxC_DoHvqvFXO_nGdAB4W9dogZb_sM-uV4JbY","auth":"_ordMnz7uTCmrpBTeUV4Bw"}}"#;
+
 /// Kernel spec §3.4 and §11: every listed action refused without a fresh
 /// check, accepted within five minutes, and refused after.
 #[tokio::test]
@@ -102,6 +111,7 @@ async fn minting_changing_revoking_a_host_and_revoking_a_session_need_a_fresh_pa
             Some(r#"{"hat_id":"hat-9"}"#),
             404,
         ),
+        ("POST", "/api/push/subscriptions".to_string(), Some(SUBSCRIBE), 201),
         ("DELETE", "/api/hosts/host-9".to_string(), None, 404),
         ("DELETE", format!("/api/auth/sessions/{}", c.id_of(&other)), None, 204),
     ];
