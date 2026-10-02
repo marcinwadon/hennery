@@ -87,8 +87,14 @@ fn doctor_reports_on_a_host_directory_and_changes_nothing() {
         stdout.contains("not run here: 3, 4, 13 (no adapter set installed and no --agent); 5 (no service installed)"),
         "{stdout}"
     );
-    // Warnings (no service, no adapter set) exit 0; no check fails here.
-    assert!(out.status.success(), "{stdout}{stderr}");
+    // The pairing names a collector on loopback port 1, where nothing
+    // listens: check 7 fails, and doctor exits 1; nothing else fails.
+    assert!(
+        stdout.contains("fail  7 collector: nothing answers on 127.0.0.1:1"),
+        "{stdout}"
+    );
+    assert_eq!(stdout.matches("\nfail ").count(), 1, "{stdout}");
+    assert_eq!(out.status.code(), Some(1), "{stdout}{stderr}");
     assert!(
         !dir.path().join("ran").exists(),
         "{:?}",
