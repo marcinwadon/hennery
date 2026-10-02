@@ -2748,8 +2748,9 @@ fn the_collector_without_a_data_dir_or_with_the_healthcheck_and_its_flags_is_ref
 /// `host.lock` (distribution spec §8): while `up`'s host child runs on
 /// `<data>/host`, a second `hennery host run` there refuses to start, names
 /// the holder's pid, and touches nothing first: not even a pairing left
-/// half-done (`host.toml.pending`), which reading the pairing would roll
-/// forward. The first host keeps the lock, and stays connected.
+/// half-done (`host.key.pending`, `host.toml.pending`), which reading the
+/// pairing would roll forward over the first host's. The first host keeps
+/// the lock, and stays connected.
 #[test]
 fn a_second_host_on_one_data_directory_refuses_to_start() {
     let dir = scratch_dir("hostlock");
@@ -2760,10 +2761,18 @@ fn a_second_host_on_one_data_directory_refuses_to_start() {
     let holder = std::fs::read_to_string(&lock).unwrap();
     let holder = holder.trim().to_string();
     assert!(holder.parse::<i32>().is_ok_and(pid_alive), "{holder:?}");
-    // Read only once the lock is ours, a stale stage like this one would be
-    // refused ("without the key it was paired with") before any lock.
+    // A pairing staged and not yet put in place, as a crash in the middle
+    // of a join leaves one: whoever reads the pairing renames both files
+    // into place. The second host must refuse before it reads it.
+    let key = hennery_host::identity::HostKey::generate();
+    let key_pending = data.join("host").join("host.key.pending");
+    key.save(&key_pending).unwrap();
     let pending = data.join("host").join("host.toml.pending");
-    std::fs::write(&pending, "not a pairing").unwrap();
+    let staged = format!(
+        "collector = \"ws://127.0.0.1:9/api/hosts/ws\"\nhost_id = \"host-staged\"\npublic_key = \"{}\"\n",
+        key.public_key_hex()
+    );
+    std::fs::write(&pending, &staged).unwrap();
 
     let mut second = Command::new(env!("CARGO_BIN_EXE_hennery"))
         .args(["host", "run"])
@@ -2785,8 +2794,10 @@ fn a_second_host_on_one_data_directory_refuses_to_start() {
         stderr.contains("host.lock") && stderr.contains(&format!("pid {holder}")),
         "{stderr}"
     );
-    assert_eq!(std::fs::read_to_string(&pending).unwrap(), "not a pairing");
+    assert_eq!(std::fs::read_to_string(&pending).unwrap(), staged);
+    assert!(key_pending.exists(), "the staged key was put in place");
     std::fs::remove_file(&pending).unwrap();
+    std::fs::remove_file(&key_pending).unwrap();
     up.assert_running("the first host");
     assert_eq!(std::fs::read_to_string(&lock).unwrap().trim(), holder);
     assert!(holder.parse::<i32>().is_ok_and(pid_alive), "{holder:?}");
