@@ -198,6 +198,66 @@ const MIGRATIONS: &[&str] = &[
 ",
 ];
 
+/// What `Store::ingest_fact` did with one fact.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Ingested {
+    /// The events it created, in order: none for a duplicate or a fact not
+    /// applied.
+    pub events: Vec<EventDto>,
+    /// The push edge it crossed, if any.
+    pub edge: Option<Edge>,
+}
+
+/// A push edge, with the session as the fact left it: read in the fact's
+/// transaction, so a re-assignment or rename after it cannot change which
+/// hat's policy applies (10b-i's review, A3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Edge {
+    pub kind: PushEdge,
+    pub session: EdgeSession,
+}
+
+/// What a notice needs of its session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EdgeSession {
+    pub id: String,
+    pub hat_id: String,
+    /// On one line and capped, as stored.
+    pub title: Option<String>,
+    pub cwd: String,
+}
+
+/// The edge's session from a row read later: for tests, and for any caller
+/// that holds a row rather than an edge.
+impl From<&SessionRow> for EdgeSession {
+    fn from(row: &SessionRow) -> Self {
+        Self {
+            id: row.id.clone(),
+            hat_id: row.hat_id.clone(),
+            title: row.title.clone(),
+            cwd: row.cwd.clone(),
+        }
+    }
+}
+
+/// A change a host fact made that may notify the owner (ACP core §10).
+/// Only an applied fact, ingested from its host, crosses one: recovery and
+/// reconciliation write no facts, and never push. Which edges notify is
+/// decided in one place (`notify::notice_for`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushEdge {
+    /// The session's activity went from `running` to `blocked`: the first
+    /// open question of the turn. `title` is the question's, from the host
+    /// (`PendingExtract::title`), on one line.
+    Blocked { pending_id: String, title: Option<String> },
+    /// A question the agent asked outside a turn: it leaves the activity
+    /// alone (ACP core §4.2), so it is not `Blocked`.
+    QuestionOutsideTurn { pending_id: String, title: Option<String> },
+    /// The open turn ended with this outcome (a real `turn_ended`; a
+    /// synthesised one is never a fact).
+    TurnEnded(TurnOutcome),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct SessionRow {
     pub id: String,
@@ -600,7 +660,7 @@ fn store_catalogue(tx: &Transaction<'_>, owner: &str, session_id: &str, indexed:
 /// as JSON writes it. With control characters gone, only `"` and `\` are
 /// escaped, as two bytes each; a cap on the raw bytes would not hold, since
 /// JSON writes a control character as six. `None` when nothing is left.
-fn one_line(raw: &str, max_chars: usize, max_json_bytes: usize) -> Option<String> {
+pub(crate) fn one_line(raw: &str, max_chars: usize, max_json_bytes: usize) -> Option<String> {
     let spaced: String = raw
         .chars()
         .filter(|c| !hennery_proto::rest::is_hidden_format(*c))
@@ -1853,12 +1913,21 @@ impl Store {
         Ok(v.unwrap_or(0) as u64)
     }
 
+    /// Ingest one sequenced host frame (`ingest_fact`): the events it
+    /// created, in order.
+    pub fn ingest(&self, session_id: &str, seq: u64, body: &SessionBody) -> Result<Vec<EventDto>> {
+        Ok(self.ingest_fact(session_id, seq, body)?.events)
+    }
+
     /// Ingest one sequenced host frame. Idempotent on (session_id, seq): a
     /// duplicate with the same body is discarded; one with a different body
     /// is kept as a `conflict` event (ACP core §3.6). Returns the events it
-    /// created, in order. A frame for a session that is not the owner's
-    /// fails, and nothing is written.
-    pub fn ingest(&self, session_id: &str, seq: u64, body: &SessionBody) -> Result<Vec<EventDto>> {
+    /// created, in order, and the push edge it crossed, if any (ACP core
+    /// §10; plan 10b): read in the same transaction, from what the fact
+    /// changed, so a duplicate, a fact stored but not applied, and a fact
+    /// for an already ended turn cross none. A frame for a session that is
+    /// not the owner's fails, and nothing is written.
+    pub fn ingest_fact(&self, session_id: &str, seq: u64, body: &SessionBody) -> Result<Ingested> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let owned: bool = tx.query_row(
@@ -1899,9 +1968,13 @@ impl Store {
                 )?]
             };
             tx.commit()?;
-            return Ok(created);
+            return Ok(Ingested {
+                events: created,
+                edge: None,
+            });
         }
         let fact_id = tx.last_insert_rowid();
+        let mut edge = None;
         let mut created = vec![EventDto {
             event_id: fact_id,
             session_id: session_id.to_string(),
@@ -2060,6 +2133,8 @@ impl Store {
                 if applied == 0 {
                     created.clear();
                     mark_unapplied(&tx, &self.owner, fact_id)?;
+                } else {
+                    edge = Some(PushEdge::TurnEnded(*outcome));
                 }
             }
             SessionBody::SessionParked { reason } => {
@@ -2174,10 +2249,47 @@ impl Store {
                     created.clear();
                     mark_unapplied(&tx, &self.owner, fact_id)?;
                 } else {
-                    tx.execute(
+                    let blocked = tx.execute(
                         "UPDATE sessions SET activity = 'blocked' WHERE id = ?1 AND activity = 'running' AND owner_id = ?2",
                         [session_id, &self.owner],
                     )?;
+                    // Edge-triggered: only the question that blocks the
+                    // turn; a second one finds it blocked already. The
+                    // activity decides, not the turn id: a question with
+                    // none that blocks a running turn is `Blocked`. One that
+                    // leaves the activity alone (ACP core §4.2), asked
+                    // outside a turn, is an edge of its own.
+                    let title = extract
+                        .and_then(|e| e.title.as_deref())
+                        .and_then(|t| one_line(t, TITLE_MAX_CHARS, TITLE_MAX_JSON_BYTES));
+                    // A question asked again after the agent withdrew one
+                    // in the same turn notifies nothing: an agent could
+                    // otherwise ask and withdraw in a loop, each one an
+                    // urgent push, with no one but it pacing them
+                    // (10b-i's review, A2). Answered and asked again is
+                    // the operator's pace, and still notifies.
+                    let rewithdrawn = blocked > 0
+                        && tx.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM pending WHERE session_id = ?1 AND turn_id = ?2
+                                 AND pending_id <> ?3 AND reason = 'agent_withdrew' AND owner_id = ?4)",
+                            params![session_id, indexed.turn_id, pending_id, self.owner],
+                            |r| r.get::<_, bool>(0),
+                        )?;
+                    edge = if rewithdrawn {
+                        None
+                    } else if blocked > 0 {
+                        Some(PushEdge::Blocked {
+                            pending_id: pending_id.clone(),
+                            title,
+                        })
+                    } else if indexed.turn_id.is_none() {
+                        Some(PushEdge::QuestionOutsideTurn {
+                            pending_id: pending_id.clone(),
+                            title,
+                        })
+                    } else {
+                        None
+                    };
                 }
             }
             SessionBody::PendingResolved {
@@ -2273,8 +2385,41 @@ impl Store {
                 params![session_id, ts, last, self.owner],
             )?;
         }
+        // The session as this fact left it, for the notice (A3).
+        let edge = match edge {
+            Some(kind) => Some(Edge {
+                kind,
+                session: tx.query_row(
+                    "SELECT id, hat_id, title, cwd FROM sessions WHERE id = ?1 AND owner_id = ?2",
+                    [session_id, &self.owner],
+                    |r| {
+                        Ok(EdgeSession {
+                            id: r.get(0)?,
+                            hat_id: r.get(1)?,
+                            title: r.get(2)?,
+                            cwd: r.get(3)?,
+                        })
+                    },
+                )?,
+            }),
+            None => None,
+        };
         tx.commit()?;
-        Ok(created)
+        Ok(Ingested { events: created, edge })
+    }
+
+    /// Whether `pending_id` is still open in `session_id`, and the session
+    /// still blocked: a `Blocked` edge the host resent before reconnecting
+    /// is notified only if it still holds once the resend is complete
+    /// (10b-i's review, A1).
+    pub fn still_blocked_on(&self, session_id: &str, pending_id: &str) -> Result<bool> {
+        Ok(self.conn().query_row(
+            "SELECT EXISTS(SELECT 1 FROM pending p JOIN sessions s ON s.id = p.session_id AND s.owner_id = p.owner_id
+                 WHERE p.pending_id = ?1 AND p.session_id = ?2 AND p.state = 'open' AND s.activity = 'blocked'
+                     AND p.owner_id = ?3)",
+            [pending_id, session_id, &self.owner],
+            |r| r.get(0),
+        )?)
     }
 
     /// Reconcile a host's sessions after its `resend_complete` (ACP core

@@ -538,11 +538,12 @@ fn pending_bodies_use_the_spec_field_names() {
         pending_id: "p1".into(),
         indexed: Indexed {
             turn_id: Some("t1".into()),
-            pending: Some(PendingExtract {
+            pending: Some(Box::new(PendingExtract {
                 id: "p1".into(),
                 kind: PendingKind::Permission,
                 option_ids: Some(vec!["allow".into(), "reject".into()]),
-            }),
+                title: None,
+            })),
             ..Indexed::default()
         },
         payload: json!({"sessionId": "a1", "options": [], "_meta": {"x": 1}}),

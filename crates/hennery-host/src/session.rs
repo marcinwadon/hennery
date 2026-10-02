@@ -436,6 +436,23 @@ fn option_ids(params: &Value) -> Option<Vec<String>> {
     )
 }
 
+/// The most a question's title carries to the collector, in characters.
+const MAX_QUESTION_TITLE: usize = 200;
+
+/// What a question is about, as the agent put it (plan 10b): a permission's
+/// tool call title, an elicitation's message, cut to
+/// `MAX_QUESTION_TITLE` characters. Read from the raw request, as its
+/// option ids are; the collector puts it on one line.
+fn question_title(kind: PendingKind, params: &Value) -> Option<String> {
+    let title = match kind {
+        PendingKind::Permission => params.pointer("/toolCall/title"),
+        PendingKind::Elicitation => params.get("message"),
+    }?
+    .as_str()?;
+    let title: String = title.chars().take(MAX_QUESTION_TITLE).collect();
+    (!title.trim().is_empty()).then_some(title)
+}
+
 /// The adapter's questions waiting for the operator (ACP core §4.6), oldest
 /// first. No timeout: each waits until it is answered or cancelled.
 #[derive(Default)]
@@ -1566,15 +1583,17 @@ impl Actor {
             PendingKind::Permission => option_ids(&params),
             PendingKind::Elicitation => None,
         };
+        let title = question_title(kind, &params);
         self.emit(SessionBody::PendingOpened {
             pending_id: pending_id.clone(),
             indexed: Indexed {
                 turn_id: turn.map(str::to_string),
-                pending: Some(PendingExtract {
+                pending: Some(Box::new(PendingExtract {
                     id: pending_id.clone(),
                     kind,
                     option_ids,
-                }),
+                    title,
+                })),
                 ..Indexed::default()
             },
             payload: params,
@@ -2418,6 +2437,38 @@ fn parse_prompt(content: Vec<Value>) -> Result<Vec<ContentBlock>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan 10b: what a question is about, for a push under `details`.
+    #[test]
+    fn a_questions_title_is_its_tool_call_title_or_its_message() {
+        let permission = serde_json::json!({"toolCall": {"toolCallId": "c1", "title": "Run cargo test"}});
+        assert_eq!(
+            question_title(PendingKind::Permission, &permission).as_deref(),
+            Some("Run cargo test")
+        );
+        let elicitation = serde_json::json!({"message": "Which branch?", "requestedSchema": {}});
+        assert_eq!(
+            question_title(PendingKind::Elicitation, &elicitation).as_deref(),
+            Some("Which branch?")
+        );
+        // None where the agent gave none, or gave only blanks.
+        assert_eq!(
+            question_title(PendingKind::Permission, &serde_json::json!({"toolCall": {}})),
+            None
+        );
+        assert_eq!(
+            question_title(PendingKind::Elicitation, &serde_json::json!({"message": "  "})),
+            None
+        );
+        assert_eq!(
+            question_title(PendingKind::Elicitation, &serde_json::json!({"message": 7})),
+            None
+        );
+        // Cut to MAX_QUESTION_TITLE characters, on a character boundary.
+        let long = serde_json::json!({"message": "\u{e9}".repeat(MAX_QUESTION_TITLE + 5)});
+        let cut = question_title(PendingKind::Elicitation, &long).unwrap();
+        assert_eq!(cut.chars().count(), MAX_QUESTION_TITLE);
+    }
 
     /// A boolean would be discarded by the adapter's schema validator,
     /// which looks exactly like not advertising it (P-19).

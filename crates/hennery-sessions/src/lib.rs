@@ -6,6 +6,7 @@ pub mod content;
 pub mod hats;
 pub mod hosts;
 pub mod hub;
+pub mod notify;
 pub mod offline;
 pub mod projects;
 pub mod push;
@@ -16,7 +17,7 @@ pub mod ws;
 use axum::Router;
 use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::Operator;
-use hennery_kernel::push::VapidKey;
+use hennery_kernel::push::{Push, VapidKey};
 use hennery_kernel::ratelimit::{Limiter, Policy};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -45,6 +46,10 @@ pub struct AppState {
     /// The VAPID key pair (kernel spec §6). `new` makes one in memory; the
     /// collector replaces it with `<data>/vapid.key` before it serves.
     pub vapid: Arc<VapidKey>,
+    /// Where push triggers send their notices (ACP core §10). `new` gives
+    /// a queue nobody reads; the collector replaces it with one delivery
+    /// drains.
+    pub push: Push,
 }
 
 impl AppState {
@@ -60,6 +65,7 @@ impl AppState {
             projects: Arc::new(projects::ProjectsCache::new(projects::CACHE_TTL)),
             probe_timeout: projects::PROBE_TIMEOUT,
             vapid: Arc::new(VapidKey::generate()),
+            push: Push::detached(),
         }
     }
 }

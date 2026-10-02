@@ -1272,7 +1272,7 @@
               "type": "null"
             }
           ],
-          "description": "On `pending_opened`: the request's id, kind and option ids."
+          "description": "On `pending_opened`: the request's id, kind, option ids and title."
         },
         "title": {
           "description": "On a `session_info_update` that names a title: the title the agent\nreported, as it sent it; empty when it cleared it (ACP `null`). The\ncollector normalises and caps it for the session list.",
@@ -1503,6 +1503,13 @@
           },
           "type": [
             "array",
+            "null"
+          ]
+        },
+        "title": {
+          "description": "What the question is about, as the agent put it: a permission's tool\ncall title, an elicitation's message (plan 10b). A push shows it\nonly under a hat with `details` (kernel spec §6).",
+          "type": [
+            "string",
             "null"
           ]
         }

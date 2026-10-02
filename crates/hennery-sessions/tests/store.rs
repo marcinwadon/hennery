@@ -1328,11 +1328,12 @@ fn permission(pending_id: &str) -> SessionBody {
         pending_id: pending_id.into(),
         indexed: Indexed {
             turn_id: Some("t1".into()),
-            pending: Some(PendingExtract {
+            pending: Some(Box::new(PendingExtract {
                 id: pending_id.into(),
                 kind: PendingKind::Permission,
                 option_ids: Some(vec!["allow".into(), "reject".into()]),
-            }),
+                title: None,
+            })),
             ..Indexed::default()
         },
         payload: json!({"toolCall": {"toolCallId": "call-1"}}),
@@ -1344,11 +1345,12 @@ fn elicitation(pending_id: &str) -> SessionBody {
         pending_id: pending_id.into(),
         indexed: Indexed {
             turn_id: Some("t1".into()),
-            pending: Some(PendingExtract {
+            pending: Some(Box::new(PendingExtract {
                 id: pending_id.into(),
                 kind: PendingKind::Elicitation,
                 option_ids: None,
-            }),
+                title: None,
+            })),
             ..Indexed::default()
         },
         payload: json!({"mode": "form"}),
@@ -1508,11 +1510,12 @@ fn an_empty_option_ids_is_treated_like_no_option_ids() {
         pending_id: "p1".into(),
         indexed: Indexed {
             turn_id: Some("t1".into()),
-            pending: Some(PendingExtract {
+            pending: Some(Box::new(PendingExtract {
                 id: "p1".into(),
                 kind: PendingKind::Permission,
                 option_ids: Some(vec![]),
-            }),
+                title: None,
+            })),
             ..Indexed::default()
         },
         payload: json!({"toolCall": {"toolCallId": "call-1"}}),
@@ -1781,11 +1784,12 @@ fn turnless_permission(pending_id: &str) -> SessionBody {
         pending_id: pending_id.into(),
         indexed: Indexed {
             turn_id: None,
-            pending: Some(PendingExtract {
+            pending: Some(Box::new(PendingExtract {
                 id: pending_id.into(),
                 kind: PendingKind::Permission,
                 option_ids: Some(vec!["allow".into(), "reject".into()]),
-            }),
+                title: None,
+            })),
             ..Indexed::default()
         },
         payload: json!({"toolCall": {"toolCallId": "call-1"}}),

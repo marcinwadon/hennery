@@ -130,6 +130,11 @@ pub struct PendingExtract {
     /// permission request whose options hennery could not parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub option_ids: Option<Vec<String>>,
+    /// What the question is about, as the agent put it: a permission's tool
+    /// call title, an elicitation's message (plan 10b). A push shows it
+    /// only under a hat with `details` (kernel spec §6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// The value of one config option (ACP `session/set_config_option`): a
@@ -207,9 +212,11 @@ pub struct Indexed {
     /// The current value of every other option, by config id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_axes: Option<BTreeMap<String, ConfigValue>>,
-    /// On `pending_opened`: the request's id, kind and option ids.
+    /// On `pending_opened`: the request's id, kind, option ids and title.
+    // Boxed: it is on one fact in many, and inline it made every host frame
+    // larger (plan 10b-i decision 7).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pending: Option<PendingExtract>,
+    pub pending: Option<Box<PendingExtract>>,
 }
 
 impl Indexed {
