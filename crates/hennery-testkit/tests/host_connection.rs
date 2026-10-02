@@ -1460,3 +1460,78 @@ async fn servers_an_agent_cannot_be_kept_to_are_refused_before_any_spawn() {
     read_until(&mut stream, body_is("s3", "session_started")).await;
     assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 2);
 }
+
+/// The fake adapter appending each `session/new` and `session/load` it
+/// parses to `log`.
+fn logging_fake(log: &std::path::Path) -> hennery_host::AgentCommand {
+    let mut fake = hennery_host::AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    let script = hennery_testkit::FakeScript {
+        session_log: Some(log.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    fake.env.push((
+        hennery_testkit::SCRIPT_ENV.into(),
+        serde_json::to_string(&script).unwrap(),
+    ));
+    fake
+}
+
+/// A delivered start or resume reaches the adapter through the connection
+/// with its servers, and with its agent's profile's `_meta`: strict for
+/// Claude, on `session/new` and on `session/load` alike, none for a
+/// generic agent.
+#[tokio::test]
+async fn a_delivered_start_reaches_the_adapter_with_its_servers_and_profile() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("sessions.jsonl");
+    let mut cfg = host_with_fake(addr, "mcp-deliver", logging_fake(&log));
+    cfg.agents.insert("claude".into(), logging_fake(&log));
+    cfg.profiles
+        .insert("claude".into(), hennery_host::profile::Profile::Claude);
+    tokio::spawn(run(cfg));
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+
+    send_frame(&mut sink, &with_servers(start("r1", "s1"), "claude", false)).await;
+    read_until(&mut stream, body_is("s1", "session_started")).await;
+    send_frame(&mut sink, &with_servers(start("r2", "s2"), "fake", true)).await;
+    read_until(&mut stream, body_is("s2", "session_started")).await;
+    // A fresh session id: a resume of a live one restarts it, no load.
+    send_frame(
+        &mut sink,
+        &with_servers(resume("r3", "s3", 0, "agent-3"), "claude", false),
+    )
+    .await;
+    read_until(&mut stream, body_is("s3", "session_started")).await;
+
+    // Each line is written before its request is answered, so before the
+    // `session_started` read above.
+    let logged: Vec<(String, serde_json::Value)> = std::fs::read_to_string(&log)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let line: serde_json::Value = serde_json::from_str(line).unwrap();
+            (line["method"].as_str().unwrap().to_string(), line["params"].clone())
+        })
+        .collect();
+    let methods: Vec<&str> = logged.iter().map(|(m, _)| m.as_str()).collect();
+    assert_eq!(methods, ["session/new", "session/new", "session/load"], "{logged:?}");
+    let servers = serde_json::json!([{
+        "type": "http",
+        "name": "hennery-notes",
+        "url": "https://hennery.example/mcp/notes",
+        "headers": [{"name": "Authorization", "value": "Bearer hst_0123456789abcdef"}],
+    }]);
+    let strict = serde_json::json!({"claudeCode": {"options": {"extraArgs": {"strict-mcp-config": ""}}}});
+    for (method, params) in &logged {
+        assert_eq!(params["mcpServers"], servers, "{method}: {params}");
+    }
+    assert_eq!(logged[0].1["_meta"], strict, "{}", logged[0].1);
+    assert!(
+        logged[1].1.get("_meta").is_none_or(serde_json::Value::is_null),
+        "{}",
+        logged[1].1
+    );
+    assert_eq!(logged[2].1["_meta"], strict, "{}", logged[2].1);
+}
