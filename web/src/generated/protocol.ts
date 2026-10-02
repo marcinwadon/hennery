@@ -72,7 +72,29 @@ current_axes?: { [key in string]: ConfigValue } | null,
  */
 pending?: PendingExtract | null, };
 
-export type SessionBody = { "kind": "session_started", request_id: string, agent_session_id: string, indexed: Indexed, } | { "kind": "start_failed", request_id: string, code: string, message: string, } | { "kind": "turn_started", request_id: string, turn_id: string, } | { "kind": "acp_update", indexed: Indexed, payload: unknown, } | { "kind": "turn_ended", turn_id: string, outcome: TurnOutcome, stop_reason?: string | null, error?: string | null, } | { "kind": "session_parked", reason: ParkReason, } | { "kind": "session_closed" } | { "kind": "adapter_exited", code?: number | null, signal?: number | null, stderr_tail: string, } | { "kind": "host_note", note: string, text: string, } | { "kind": "config_applied", request_id: string, indexed: Indexed, } | { "kind": "pending_opened", pending_id: string, indexed: Indexed, payload: unknown, } | { "kind": "pending_resolved", pending_id: string, resolution: PendingResolution, reason?: PendingReason | null, } | { "kind": "answer_result", pending_id: string, request_id: string, delivered: boolean, };
+export type SessionBody = { "kind": "session_started", request_id: string, agent_session_id: string, indexed: Indexed, } | { "kind": "start_failed", request_id: string, code: string, message: string, } | { "kind": "turn_started", request_id: string, turn_id: string, } | { "kind": "acp_update", indexed: Indexed, payload: unknown, } | { "kind": "turn_ended", turn_id: string, outcome: TurnOutcome, stop_reason?: string | null, error?: string | null, } | { "kind": "session_parked", reason: ParkReason, } | { "kind": "session_closed" } | { "kind": "adapter_exited", code?: number | null, signal?: number | null, stderr_tail: string, } | { "kind": "host_note", note: string, text: string, } | { "kind": "config_applied", request_id: string, indexed: Indexed, } | { "kind": "pending_opened", pending_id: string, indexed: Indexed, payload: unknown, } | { "kind": "pending_resolved", pending_id: string, resolution: PendingResolution, reason?: PendingReason | null, } | { "kind": "answer_result", pending_id: string, request_id: string, delivered: boolean, } | { "kind": "git_state", 
+/**
+ * The branch checked out; absent when detached.
+ */
+branch?: string | undefined, 
+/**
+ * Any staged, unstaged or untracked change.
+ */
+dirty: boolean, 
+/**
+ * `cwd` is in a linked work tree (`git worktree add`), not the
+ * repository's main one.
+ */
+worktree: boolean, 
+/**
+ * The commit checked out; absent on a branch with no commit yet.
+ */
+head?: string | undefined, 
+/**
+ * On the first state after a new session's start: the commit it
+ * started from. The collector records it once.
+ */
+base_commit?: string | undefined, };
 
 export type Project = { 
 /**

@@ -751,3 +751,24 @@ fn a_hello_without_workspace_roots_has_none() {
     assert!(hello(json!({})).is_empty());
     assert_eq!(hello(json!({"workspace_roots": ["/p", "~/src"]})), ["/p", "~/src"]);
 }
+
+/// Plan 6b-ii: `git_state` on the wire, with its optionals left out.
+#[test]
+fn git_state_round_trips_and_leaves_out_absent_optionals() {
+    let detached = SessionBody::GitState {
+        branch: None,
+        dirty: true,
+        worktree: false,
+        head: None,
+        base_commit: None,
+    };
+    let expected = json!({"kind": "git_state", "dirty": true, "worktree": false});
+    assert_eq!(serde_json::to_value(&detached).unwrap(), expected);
+    assert_eq!(serde_json::from_value::<SessionBody>(expected).unwrap(), detached);
+    let full = json!({
+        "kind": "git_state", "branch": "main", "dirty": false, "worktree": true,
+        "head": "c0ffee", "base_commit": "c0ffee"
+    });
+    let body: SessionBody = serde_json::from_value(full.clone()).unwrap();
+    assert_eq!(serde_json::to_value(&body).unwrap(), full);
+}

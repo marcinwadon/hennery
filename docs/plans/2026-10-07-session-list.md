@@ -42,7 +42,7 @@
 
 It builds on the executed [passkeys plan 3c](2026-10-05-passkeys.md), [`owner_id` everywhere 3b-iii](2026-10-04-owner-id.md), [session config B2b](2026-09-30-session-config.md) and [permissions (2)](2026-10-01-permissions.md). From B2b's and (2)'s "After this plan" it takes "the rest of the catalogue" (commands; plan and usage stay out) and "`model` / `mode` in the list and detail items". Every anchor below was taken from `main` at `7f779e4`, which merged PR #18. Where the code and a spec disagree, the code wins, and the plan says so.
 
-**Status:** 6b-i executed 2026-10-02 as PR #46 (see "Execution status"); 6b-ii (Tasks 6–7) executed on its branch, to ship as PR 2. Amended after two security reviews (2026-10-02). The first, on the decisions, approved after amendments A1–A11 (O1, O3, O4, O6 taken); the second, on the written plan, approved after amendments B1–B4 (P1–P5 taken, P6 and P7 recorded) and re-confirmed the amended code at its final commit (see "Decisions", "What the reviews changed"). Both reviews were by a stronger model (Claude Opus) on the maintainer's behalf.
+**Status:** executed 2026-10-02 as PR #46 (6b-i, merged as `b2aee2e`) and PR #48 (6b-ii; see "Execution status"). Amended after two security reviews (2026-10-02). The first, on the decisions, approved after amendments A1–A11 (O1, O3, O4, O6 taken); the second, on the written plan, approved after amendments B1–B4 (P1–P5 taken, P6 and P7 recorded) and re-confirmed the amended code at its final commit (see "Decisions", "What the reviews changed"). Both reviews were by a stronger model (Claude Opus) on the maintainer's behalf.
 
 Every code block below was built and tested in a scratch copy of `7f779e4`, two commits per task (the task's tests alone, then the whole task), and generated from those commits. The plan was then replayed from its own text, task by task, onto a fresh copy of `7f779e4`: after each task's Step 1 the tree matched the scratch's tests-only commit, and after the task its task commit, byte for byte, the generated files included (114 blocks; after every task the replay ran fmt, both clippy runs, the codegen check and the workspace tests: 537, 539, 546, 551, 559, 562 and 571 tests, up from 533). The revert-probes (each task's Step 5) were run: 43 probes, every one caught. The timing-sensitive test binaries (`host_session`, `reconcile`) ran with four copies at once, three rounds: one pre-existing test failed once under that load and passed alone 15 times of 15 (see "Not tested here").
 
@@ -101,7 +101,23 @@ Deferred minors (from the task reviews):
   - the query-plan test does not assert a SEARCH, nor run without a pattern;
   - no HTTP case for duplicate or empty lifecycle names.
 
-**6b-ii** (Tasks 6–7) is recorded when PR 2 merges.
+**6b-ii executed** (Tasks 6–7) on branch `plan/session-list-git`, the same way: one implementer and one opus review per task. Every task's code was identical on disk to its scratch commit. PR 2 was then rebased onto `main` after PR #46 merged. Each task review had one Important finding, both fixed:
+
+| Area | As built | Why |
+|---|---|---|
+| `git_state`'s "changes nothing" rule (Task 6 review, Important) | `a_git_state_that_changes_only_the_worktree_or_the_first_base_applies`: a state that differs only in `worktree`, or only by a first base commit, applies; the same state again does not. Both clauses revert-probed | Every earlier test state that filled the base also changed the branch or dirtiness, and `worktree` was always false, so either clause could be deleted unnoticed |
+| The base probe (Task 7 review, Important) | The probe after a new session's start has a slot of its own (`base_probe`) and a `watch` that turns true when it is over; a turn's probe waits on that, then runs, and turns' probes replace (and abort) each other. `after_the_base_a_turns_probe_replaces_the_previous_turns` pins it, and `a_hung_git_never_delays_a_turn_end_and_is_killed_with_its_group` now runs on a resumed session, so a replaced probe's group is killed well inside the 3 s bound. Both revert-probed (a turn's probe that awaits the previous one fails both) | B1's chaining kept the "carries the base" mark after the base was over: every later probe queued behind the earlier ones. And the hung test's replaced probe died by its timeout, not by its replacement, so abort-and-kill was untested |
+| The probe's minors (Task 7 review) | The status reader is closed before `wait` (a git past the 64 KiB cap fails at once); `version_of` runs git in a process group of its own, killed whole past 3 s; the tests' own `git` calls drop every inherited `GIT_*` | The review's minors 3–5 |
+| The audit's floor (rebase) | 87 for `store.rs` (86 + 1) | |
+
+Deferred minors:
+- Task 6: an uppercase base commit is stored as sent; the base's length bounds are untested; the branch's byte cap is never what cuts it in a test.
+- Task 7:
+  - `version_of` runs on the caller's thread;
+  - the B1 test's held base probe still runs under its 3 s bound while the test waits for the turn's end;
+  - `no_git_state_is_reported_outside_a_work_tree_or_without_git` asserts absence after a fixed 500 ms.
+
+Tests: 783 in the workspace (769 on `main` after PR #46, plus 14). `host_session` ran with four copies at once, three rounds: all passed.
 
 ## Scope
 

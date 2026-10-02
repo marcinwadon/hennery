@@ -316,6 +316,30 @@ pub enum SessionBody {
         request_id: String,
         delivered: bool,
     },
+    /// The git state of the session's cwd (ACP core §3.2, §7): after the
+    /// start and after each turn, when `cwd` is in a work tree and `git`
+    /// answered within 3 s (plan 6b-ii decision 11). Never in place of, or
+    /// ahead of, the `turn_ended` it follows.
+    GitState {
+        /// The branch checked out; absent when detached.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "string | undefined", optional)]
+        branch: Option<String>,
+        /// Any staged, unstaged or untracked change.
+        dirty: bool,
+        /// `cwd` is in a linked work tree (`git worktree add`), not the
+        /// repository's main one.
+        worktree: bool,
+        /// The commit checked out; absent on a branch with no commit yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "string | undefined", optional)]
+        head: Option<String>,
+        /// On the first state after a new session's start: the commit it
+        /// started from. The collector records it once.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[ts(type = "string | undefined", optional)]
+        base_commit: Option<String>,
+    },
 }
 
 impl SessionBody {

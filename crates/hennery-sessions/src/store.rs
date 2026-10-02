@@ -14,8 +14,8 @@ use hennery_proto::frames::{
     PendingResolution, SessionBody, SessionConfig, TurnOutcome,
 };
 use hennery_proto::rest::{
-    AnswerRequest, AttachmentUsage, EventDto, PendingItem, PendingState, SessionCatalog, SessionItem, SessionPage,
-    TITLE_MAX_CHARS, TITLE_MAX_JSON_BYTES, json_char_width,
+    AnswerRequest, AttachmentUsage, BRANCH_MAX_CHARS, BRANCH_MAX_JSON_BYTES, EventDto, PendingItem, PendingState,
+    SessionCatalog, SessionItem, SessionPage, TITLE_MAX_CHARS, TITLE_MAX_JSON_BYTES, json_char_width,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
@@ -209,6 +209,10 @@ pub struct SessionRow {
     /// The title the agent last reported, on one line and capped (plan 6b
     /// decision 1); `None` until it reports one, or once it clears it.
     pub title: Option<String>,
+    /// Whether `cwd` was in a linked work tree, as the host last reported.
+    pub git_worktree: Option<bool>,
+    /// The commit a new session started from, recorded once (ACP core §7).
+    pub base_commit: Option<String>,
 }
 
 /// The outcome of `Store::request_resume`.
@@ -1015,7 +1019,8 @@ impl Store {
             .conn()
             .query_row(
                 "SELECT id, host_id, agent, cwd, lifecycle, activity, open_turn_id, failure_reason, close_requested,
-                        presumed_parked, model, mode, config_axes, last_event_at, last_event_id, title
+                        presumed_parked, model, mode, config_axes, last_event_at, last_event_id, title,
+                        git_worktree, base_commit
                  FROM sessions WHERE id = ?1 AND owner_id = ?2",
                 [id, &self.owner],
                 |r| {
@@ -1035,6 +1040,8 @@ impl Store {
                         last_event_at: r.get(13)?,
                         last_event_id: r.get(14)?,
                         title: r.get(15)?,
+                        git_worktree: r.get(16)?,
+                        base_commit: r.get(17)?,
                     };
                     Ok((row, config))
                 },
@@ -2059,6 +2066,42 @@ impl Store {
                     mark_unapplied(&tx, &self.owner, fact_id)?;
                 }
             }
+            SessionBody::GitState {
+                branch,
+                dirty,
+                worktree,
+                base_commit,
+                ..
+            } => {
+                // The branch on one line and capped, like the title; the
+                // base commit once, and only a commit id (plan 6b-ii
+                // decision 11). A state that changes nothing is kept as the
+                // idempotency key only, like a verdict that changes nothing
+                // (the review's O1): not listed, and the session does not
+                // move up the list.
+                let branch = branch
+                    .as_deref()
+                    .and_then(|b| one_line(b, BRANCH_MAX_CHARS, BRANCH_MAX_JSON_BYTES));
+                let base = base_commit
+                    .as_deref()
+                    .filter(|c| (4..=64).contains(&c.len()) && c.chars().all(|c| c.is_ascii_hexdigit()));
+                let changed = if fact_applies(&tx, &self.owner, session_id, None)? {
+                    tx.execute(
+                        "UPDATE sessions SET git_branch = ?2, git_dirty = ?3, git_worktree = ?4,
+                             base_commit = COALESCE(base_commit, ?5)
+                         WHERE id = ?1 AND owner_id = ?6
+                             AND (git_branch IS NOT ?2 OR git_dirty IS NOT ?3 OR git_worktree IS NOT ?4
+                                  OR (base_commit IS NULL AND ?5 IS NOT NULL))",
+                        params![session_id, branch, dirty, worktree, base, self.owner],
+                    )?
+                } else {
+                    0
+                };
+                if changed == 0 {
+                    created.clear();
+                    mark_unapplied(&tx, &self.owner, fact_id)?;
+                }
+            }
             // Diagnostics only, with no transition of their own: an
             // `adapter_exited` is followed by the `session_parked` that
             // detaches; a `host_note` (e.g. `replay_unknown_dropped` after a
@@ -2235,6 +2278,7 @@ fn body_kind(body: &SessionBody) -> &'static str {
         SessionBody::PendingOpened { .. } => "pending_opened",
         SessionBody::PendingResolved { .. } => "pending_resolved",
         SessionBody::AnswerResult { .. } => "answer_result",
+        SessionBody::GitState { .. } => "git_state",
     }
 }
 

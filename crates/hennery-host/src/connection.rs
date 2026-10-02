@@ -55,6 +55,9 @@ pub struct HostConfig {
     /// allowed under it too. None unless set, so no test reads the real one;
     /// `hennery host run` sets it.
     pub home: Option<PathBuf>,
+    /// `git` for the sessions' git probe (ACP core §7), found on `PATH` once,
+    /// when the host starts; `None`: no `git_state`.
+    pub git: Option<PathBuf>,
 }
 
 impl HostConfig {
@@ -74,6 +77,7 @@ impl HostConfig {
             healthy_after: Duration::from_secs(60),
             workspace_roots: Vec::new(),
             home: None,
+            git: crate::git::find_git(),
         }
     }
 
@@ -89,6 +93,7 @@ impl HostConfig {
     pub fn session_options(&self) -> SessionOptions {
         SessionOptions {
             idle_timeout: (!self.idle_timeout.is_zero()).then_some(self.idle_timeout),
+            git: self.git.clone(),
             ..SessionOptions::default()
         }
     }

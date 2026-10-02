@@ -3,6 +3,7 @@
 
 pub mod adapter;
 pub mod connection;
+pub mod git;
 pub mod identity;
 pub mod outbox;
 pub mod pairing;
