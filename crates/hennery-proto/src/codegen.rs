@@ -132,7 +132,8 @@ pub fn render_schema() -> String {
 /// iterates in when it is backed by an `IndexMap` (the `preserve_order`
 /// feature); a plain `BTreeMap`-backed `Map` already iterates sorted, so
 /// this is a no-op change in output for that build either way.
-fn sort_keys(value: serde_json::Value) -> serde_json::Value {
+/// `hennery-view`'s generator sorts its schema with it too.
+pub fn sort_keys(value: serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => {
             // A `BTreeMap` always iterates in sorted key order regardless of

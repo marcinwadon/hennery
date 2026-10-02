@@ -70,6 +70,7 @@ hennery-kernel = { path = "crates/hennery-kernel" }
 hennery-sessions = { path = "crates/hennery-sessions" }
 hennery-host = { path = "crates/hennery-host" }
 hennery-gateway = { path = "crates/hennery-gateway" }
+hennery-view = { path = "crates/hennery-view" }
 
 # Argon2 is unusably slow unoptimised; every test that logs in pays for it.
 [profile.dev.package.argon2]
