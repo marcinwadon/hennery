@@ -316,7 +316,9 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
             request_failed(RequestError::NotConnected)
         }
         // The socket task has already failed the session with the host's
-        // code (`Undo::Start`).
+        // code (`Undo::Start`); not for `McpUndeliverable`, which the hub
+        // refused before sending: that leaves the session `starting`, and
+        // plan 8e fails it (unreachable in 8c, which sends no servers).
         Err(err) => request_failed(err),
     }
 }
@@ -601,7 +603,9 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
             resume_failed(RequestError::NotConnected)
         }
         // The socket task has already failed the session with the host's
-        // code (`Undo::Start`).
+        // code (`Undo::Start`); not for `McpUndeliverable`, which the hub
+        // refused before sending: that leaves the session `starting`, and
+        // plan 8e fails it (unreachable in 8c, which sends no servers).
         Err(err) => resume_failed(err),
     }
 }

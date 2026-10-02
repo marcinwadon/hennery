@@ -1382,7 +1382,10 @@ async fn hello_announces_mcp_servers_and_how_each_agent_is_isolated() {
     cfg.profiles.insert("claude".into(), Profile::Claude);
     cfg.profiles.insert("own-cli".into(), Profile::ClaudeOwnCli);
     tokio::spawn(run(cfg));
-    let (tcp, _) = listener.accept().await.unwrap();
+    let (tcp, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("host connects")
+        .unwrap();
     let ws = accept(tcp).await.unwrap();
     let (_sink, mut stream) = ws.split();
     let HostFrame::Hello {
