@@ -33,9 +33,17 @@
           withFfmpeg = false;
         };
         webTools = [ web.nodejs_24 web.pnpm ];
+        # The pinned adapters and their checks (plan 7e-ii-a).
+        nixOutputs = import ./nix/outputs.nix { inherit pkgs nixpkgs; };
       in {
         packages.default = hennery.package;
-        checks = hennery.checks;
+        # The free adapter. The Claude adapter is unfree (distribution spec
+        # §3.3), so it is no package of the flake's, which `nix flake check`
+        # would evaluate: `nix build .#claude-acp` builds it once the
+        # operator accepts its licence (`NIXPKGS_ALLOW_UNFREE=1 --impure`).
+        packages.codex-acp = nixOutputs.codex-acp;
+        legacyPackages = nixOutputs.legacyPackages;
+        checks = hennery.checks // nixOutputs.checks;
         # Building the web UI only (CI's Rust and release jobs): no browsers.
         devShells.web = pkgs.mkShell { packages = webTools; };
         devShells.default = pkgs.mkShell {
