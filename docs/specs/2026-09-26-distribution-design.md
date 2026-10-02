@@ -248,6 +248,16 @@ At start `hennery up` checks whether gateway credentials exist for more than one
 hat while the collector shares its OS user with the host child, and warns if so
 (kernel spec §10).
 
+Before its first child, `hennery up` makes one more pipe, the parent pipe, and
+holds its write end for as long as it runs; every child it starts, restarts
+included, inherits the read end (descriptor 12, `--parent-fd`). However `up`
+dies (SIGKILL, OOM, a panic), each child reads end-of-file and stops as on
+SIGTERM: the host stops its adapters and parks its sessions, the collector
+closes its listeners and admin socket. A child still running 20 s later exits
+outright. So a killed `up` leaves no child holding the port or `host.lock`
+against its relaunch (plan 7c-iii). Under systemd, `KillMode=mixed` stops the
+unit's remaining processes anyway; the pipe matters most under launchd.
+
 ### 5.2 Restart policy
 
 - A crashed child is restarted with exponential backoff (1 s → 60 s); ten
@@ -314,7 +324,8 @@ host strips them at every adapter spawn regardless.
 `KeepAlive = {SuccessfulExit = false}`, `ThrottleInterval = 10`,
 `LimitLoadToSessionType = Aqua`, `EnvironmentVariables.PATH` from §6.1,
 stdout/stderr to `~/Library/Logs/hennery/<role>.log` (crash output only; hennery
-writes its own size-capped rotating log). Loaded with `launchctl bootstrap
+writes its own size-capped rotating log, `hennery-<process>.log` beside it, §8).
+Loaded with `launchctl bootstrap
 gui/$UID`, restarted with `launchctl kickstart -k`.
 
 `Aqua` means the host runs only while the user has a GUI login session, which
@@ -409,7 +420,15 @@ them to the collector, so the Hosts view shows them without a terminal.
 | Service env | `~/.config/hennery/service.env` | in the plist |
 
 `HENNERY_DATA_DIR` overrides the data directory (containers, tests). Logs rotate
-at 10 MiB × 5 files. A collector and a host on the same machine (`hennery up`)
+at 10 MiB × 5 files: the file being written and four rotated ones (`.1` to
+`.4`). Only a run by a service (`HENNERY_SERVICE`, which both units set) logs to
+these files, one per process: `hennery-up.log`, `hennery-collector.log`,
+`hennery-host.log` (0600, in a 0700 directory of the user's own), beside
+launchd's `<role>.log`, which then gets crash output only; under systemd the
+journal does too. `HENNERY_LOG_DIR` names another directory (absolute; a
+relative one refuses the start). A directory that cannot be used falls back to
+standard error at `warn`, saying why there. A terminal run, a container and the
+other commands log to standard output (plan 7c-iii). A collector and a host on the same machine (`hennery up`)
 share the data directory, in two subdirectories: `<data>/collector` and
 `<data>/host`.
 
