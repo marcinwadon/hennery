@@ -1,0 +1,27 @@
+[package]
+name = "hennery-pins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The adapter manifest's generator (plan 7b): run by hand on a pin bump and
+# by the pin-bump CI job, never by the binary or its tests.
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+clap.workspace = true
+flate2.workspace = true
+futures.workspace = true
+hennery-host.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+toml.workspace = true
