@@ -43,14 +43,29 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy on the shipped binary (test-hooks off)
         run: cargo clippy -p hennery --locked -- -D warnings
-      # On Linux, a hard RLIMIT_NOFILE above the adapter's closing loop's cap
-      # (`MAX_CLOSED_FD`, 65536, the runner's own hard limit), so the test of
-      # `close_range` can hold a descriptor past it, as a container's
-      # million-descriptor limit would (it asserts it ran, under `CI`).
+      # On Linux the tests run with no network but loopback: built first,
+      # while the network is there, then run in a network namespace of their
+      # own whose only link is `lo`. A test that reaches a registry, or any
+      # host but 127.0.0.1 and ::1, fails here instead of passing on whatever
+      # answers (plan 7b's review found one that reached npm). They run as the
+      # runner's own user again (`setpriv`), so permission checks still bite,
+      # with the environment kept and the hard RLIMIT_NOFILE raised past the
+      # adapter's closing loop's cap (`MAX_CLOSED_FD`, 65536, the runner's own
+      # hard limit), so the test of `close_range` can hold a descriptor past
+      # it (it asserts it ran, under `CI`).
+      # macOS has no network namespaces (`sandbox-exec` is deprecated), so its
+      # tests run with the network: ubuntu is where a leak is caught.
       - name: Tests
         run: |
-          if [ "$RUNNER_OS" = Linux ]; then sudo prlimit --pid $$ --nofile=65536:1048576; fi
-          cargo test --workspace --locked
+          if [ "$RUNNER_OS" != Linux ]; then
+            cargo test --workspace --locked
+            exit 0
+          fi
+          cargo test --workspace --locked --no-run
+          sudo --preserve-env env "PATH=$PATH" "HOME=$HOME" unshare --net -- sh -c '
+            ip link set lo up
+            exec prlimit --nofile=65536:1048576 -- setpriv --reuid="$SUDO_UID" --regid="$SUDO_GID" --init-groups -- cargo test --workspace --locked --offline
+          '
         env:
           # On ubuntu the PATH-capture and unit-lint tests fail rather than
           # skip when a shell or `systemd-analyze` is missing.
