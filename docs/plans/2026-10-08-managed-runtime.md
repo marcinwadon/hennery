@@ -59,7 +59,7 @@ Both new crates are pure Rust, which the musl-static build needs. `Cargo.lock` c
 
 It builds on the plans executed so far, and on `main` as merged through PR #40 (7a, 7a-ii and the projects plan 6c among them) (hats, plan 5, and the services plan, 7c, run in parallel and are not in it). Every anchor below was taken from `main` at `a8469c1`. Where the code and a spec disagree, the code wins, and the plan says so.
 
-**Status:** not executed; amended after the security review. The security review of 2026-10-01 (binding on the maintainer's behalf) approved after amendments: A1–A9 required, and a scoped re-confirmation of 2026-10-02 approved the build's ten deviations, with one more amendment (the macOS barrier) and two conditions (the per-agent layout). See "Decisions" and "What the review changed".
+**Status:** executed 2026-10-02 (see "Execution status"); amended after the security review. The security review of 2026-10-01 (binding on the maintainer's behalf) approved after amendments: A1–A9 required, and a scoped re-confirmation of 2026-10-02 approved the build's ten deviations, with one more amendment (the macOS barrier) and two conditions (the per-agent layout). See "Decisions" and "What the review changed".
 
 **Re-anchored on 2026-10-02** to `main` at `a8469c1`, after Tasks 1–4 had been executed on `6062ad0` and reviewed. Since then `main` had taken 7a, 7a-ii and the projects plan (6c), which moved `identity.rs`, `main.rs`, `cli.rs`, `Cargo.toml` and `ci.yml`. In this version of the plan:
 - Tasks 1–4 are the code as executed, with each review fix folded into its own task.
@@ -99,9 +99,67 @@ Two tests had to change before their probes were caught:
 - `npm ci` with `npm audit signatures` for two of the six adapter–platform pairs (the Task 2 reviewer ran all six);
 - `hennery-pins extract` for every pinned package of the three platforms.
 
-## Execution status
+## Execution status (2026-10-02)
 
-Not executed yet.
+**Executed** in two PRs:
+- **7b-i** (Tasks 1–4): branch `feat/managed-runtime`, PR #51, merged as `3117743`.
+- **7b-ii** (Tasks 5–7): branch `feat/managed-runtime-cli`, PR #52, rebased onto `6d72a03`.
+
+How it was run:
+- **Per task:** one implementer (sonnet) applied the blocks as written, and the tree matched the task's reference commit before the commit was kept. A review (opus) followed.
+- **Review fixes:** every required finding was fixed in its own commit, revert-probed and re-checked by the same reviewer.
+- **Whole-branch reviews:** one per PR. 7b-i was "ready". 7b-ii was "not ready" once: `adapters update` and `rollback` acted on any directory, including `hennery up`'s own root. That was fixed in its own commit, and the re-check said "ready".
+
+Re-anchoring:
+- **7b-i** was executed on `6062ad0`, then rebased twice: onto `a8469c1`, where this plan was re-anchored with its Task 1–4 review fixes folded in (88 blocks, replayed byte-identically), and onto `82222d0`, where 7c and 7e-i had landed.
+- **Tasks 5–7** were executed on the re-anchored plan, then rebased with 7b-i.
+- **Commits:** one rebase signed them with the operator's key (it carries an employer UID). They were made again, unsigned, before anything was pushed.
+
+The plan's code blocks for Tasks 5–7 are as planned. **Where the branch differs, the branch's code wins:**
+
+| Area | As built | Why |
+|---|---|---|
+| T2 `pins.yml` (review C1) | `jq -e '.invalid == [] and .missing == []'`; steps under `bash` with `pipefail`; a 60-minute timeout; `Cargo.toml`/`Cargo.lock` in the paths; `rust-toolchain` pinned as `ci.yml` pins it; `node_modules` and the npm cache removed by a `trap` (folded into the re-anchored Task 2, except the last two, made after it) | `(.invalid \| length) == 0` was true for npm's error object (`{"error": …}`), so a failed audit, such as a failed key fetch, passed the job. It was proven both ways before the fix. |
+| T3 extraction (review) | A link at the archive's root is refused, not skipped. `barrier` checks for `-1` and falls back to fsync on `ENOTSUP`/`ENOTTY`. `hennery-pins extract` refuses a URL pinned twice with different digests or sizes. New tests: an existing destination, and the budget across a package's files. | Two refusals had no test (probes F1–F3). The rest are minors taken. |
+| T4 installer (review) | A set is current only with its `bin/node`, and a missing one is installed again. A runtime directory left behind is replaced. Collection keeps the runtime every kept or held record names, read leniently. `rollback` refuses `previous == current` and a target whose Node is gone, and writes the hold fsynced, behind a barrier. `node --version` is killed on timeout and retried on `ETXTBSY`. A plain-http redirect is allowed only from loopback to loopback. Set ids hash files in path order. Cleanup after a switch only warns. New tests: a source that does not resume, and the resume sequences pinned. | A future layout's binary could delete a set's Node, and this binary would then call the set "already current" forever. The resume paths had no test. Probes G1–G4 and one more. |
+| T5 A2 | `main` already keeps `host.toml`'s other keys (plan 6c decision 6). It refuses one that does not parse, rather than replacing it as this plan's first version did. Task 5 adds only `read_table` and pins `[cli]`. | The re-anchor; plan 6c decided first. |
+| T6 `prepare` (review) | A current set without its Node is installed again at start. Offline, it runs no agents, with a note. An override next to a bundled CLI is tested. `--use-cli` refuses a `.` inside a path (`Path`'s `==` ignores it, so the bytes are compared). `skipped` keeps only agents that have a CLI variable. | The start ran agents whose `node` did not exist, with no note. A hand-written `[cli] gemini = …` turned off every start-time install. Probes H1–H5. |
+| T7 CLI (review) | A test that cleared its environment (`env_clear`) went on to reach the real registry through `up`'s host child. It now sets both mirrors again, and the audit requires every `.env_clear()` to be followed by both offline mirrors. `--use-cli`'s warning says the MCP fallback is not enforced yet. `rollback` says a running host keeps its set until it restarts. `update` and `join` refuse a bad mirror before recording anything or spending the code. The `--agent` help gives a concrete `env` example. | **Critical:** decision 16's audit checked how the binary was spawned, not what the test then did to its environment. Probes K1–K3. |
+| 7b-ii whole-branch review (I-1) | `host adapters update` and `rollback` act only on a paired host's data directory. `up`'s root is refused with a pointer to `<data-dir>/host`, and both `--data-dir` helps say so. `up --agent` has help. "A running host keeps…" is printed only when the set changed. | Given `up`'s root or a mistyped path, they downloaded a set no host would ever run, and said it was current. Probes L1–L2. |
+| T7 on 7c | `mod lock/service/supervisor/runtime`. `run_up` returns its own exit code. 7c's new raw spawns are `hennery()`. In `run_host`, `lock::acquire` comes first, then the pairing, then `default_agents`. `_set_in_use` lives across the run. | The rebase onto `82222d0`. |
+
+**How could we have caught the T7 Critical systemically?** Decision 16's audit looked at spawns, not at the environment a spawned process ends up with.
+- What it has now: a rule for every `.env_clear()`.
+- What would catch the whole class: one helper owning every test spawn's environment, with the audit refusing environment changes made outside it. Or test runs with outbound network denied (macOS `sandbox-exec`, a Linux network namespace), which the 7b-i whole-branch review did by hand. CI could do the same for the test step.
+
+**CI on #51:**
+- `pins` passed on its first live run: signature, `check`, `extract` over 125 packages, and `audit signatures` with npm's tree equal to the manifest for all 6 agent/platform pairs.
+- `rust (ubuntu-latest)` failed once in `host_session`'s `a_cancel_is_read_promptly_even_though_a_switch_deadline_fires_mid_flood`. That is an existing timing test this plan does not touch, and it failed here once under load too.
+
+**Deferred minors:**
+- the inode-level A5 re-check, since the set is checked by path;
+- the runtime directory is keyed by Node version, not digest;
+- free space counts `.part` bytes still to fetch, and the leftover staging;
+- a start-time install that times out releases the install lock while a blocking extraction may still write into its staging directory. A racing update fails once; the content cannot be corrupted (`create_new`);
+- `hold_in_use` sleeps on a runtime thread, at start only;
+- the generator's `allows` lacks npm's `["any"]`;
+- `libc` is ignored off Linux;
+- CLI packages are marked by prefix;
+- some generator rules have no fixture test;
+- `refuse_npmrc` checks one level deep;
+- `lock` uses whichever `npm` is first on PATH;
+- a 416 shares the wrong-206 path, untested;
+- `--no-runtime` silently accepts the mirror flags (a conflict would refuse a join that has only `HENNERY_NPM_REGISTRY` set);
+- an Intel Mac, which has no pinned set, is told to run `adapters update`, which fails there too;
+- a directory holding only `host.toml.pending` (an interrupted join) is refused as unpaired by `adapters update`, though `host run` would roll it forward;
+- `rollback` on `up`'s root has no test of its own (it uses the same check as `update`).
+
+**Tests:** 870 in the workspace on `feat/managed-runtime-cli` rebased onto `6d72a03` (849 before #50 landed), 831 on `feat/managed-runtime`.
+- New in 7b: 48 in 7b-i, 18 in 7b-ii.
+- Revert-probes:
+  - 46 at planning, all caught;
+  - the implementers ran each task's probes again on the executed code: 4, 4, 16, 2, 5 and 6, all caught;
+  - the review fixes added 18 more (F1–F3, G1–G4, the runtime directory, H1–H5, K1–K3, L1–L2), all caught.
 
 ## Scope
 
@@ -7544,10 +7602,11 @@ PR 7b-ii holds Tasks 5–7, stacked on 7b-i.
   - Unpack each file at `<agent>/<path>`, one tree per agent (decision 6), and run `<node> <agent>/<entry>`.
   - The `cli` files are the agent CLIs; the Claude adapter's derivation must be `unfree`.
   - No entry has `install_script`.
-  - crane's source filter must keep `adapters/manifest.json` (the host crate `include_str!`s it).
+  - crane's source filter keeps `adapters/manifest.json` (the host crate `include_str!`s it): 7e-i lists it with `maybeMissing`, so this is done.
   - A Nix-provided-adapters host runs `host run --agent claude=… --agent codex=…` and pairs with `join --no-runtime`.
   - `check_host` fails inside a Linux build sandbox (no `/lib64/ld-linux-x86-64.so.2`), so every `install()` test, `this_host_can_run_the_runtime` and the CLI's install tests fail in crane's checkPhase: skip them there (a feature or an environment variable for the check). `an_update_refuses_bytes_that_do_not_match_and_keeps_the_current_set` also needs about 1.2 GB free, for the real manifest's space check.
-- **7c (services):**
+- **The mirrors for a service host** (the 7b-ii review's I-2): a service's environment carries only PATH, so a host run as a service never sees `HENNERY_NPM_REGISTRY` or `HENNERY_NODE_MIRROR`. A mirror-only operator's service host installs from the public registry at its first start after an upgrade. Record the mirrors at `join` or `adapters update` (in `host.toml`), or let `service install` carry them: for whichever later plan touches services or `host.toml` first.
+- **7c (services, merged before this plan's 7b-ii):**
   - `host.lock` belongs in `host run` before `default_agents`: two hosts on one data directory would each install.
   - The service environment may carry `HENNERY_NPM_REGISTRY` / `HENNERY_NODE_MIRROR`. It must never carry the override variables (A1 strips them anyway).
   - The data-dir defaults, when they land, apply to `host adapters update|rollback` as to `join` and `run`.
