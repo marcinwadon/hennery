@@ -271,10 +271,13 @@ async fn a_codex_sessions_removal_is_left_pending_for_a_later_host() {
     let [item] = listed.as_slice() else {
         panic!("{listed:?}");
     };
+    // The delete's own attempt; the close's `session_closed` may ask for
+    // one more (the review's item 11). One or two, never a runaway loop.
     assert_eq!(
-        (item.session_id.as_str(), item.agent.as_str(), item.state, item.attempts),
-        (session.as_str(), "codex", HostRemovalState::Pending, 1)
+        (item.session_id.as_str(), item.agent.as_str(), item.state),
+        (session.as_str(), "codex", HostRemovalState::Pending)
     );
+    assert!((1..=2).contains(&item.attempts), "{item:?}");
 }
 
 /// Decision 5: a delete while the host is away answers `pending,
