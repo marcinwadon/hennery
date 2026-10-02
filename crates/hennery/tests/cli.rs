@@ -4,12 +4,27 @@ use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+/// Where the managed runtime would fetch from, in every test: a loopback
+/// port nothing listens on (plan 7b). No test reaches the npm registry or
+/// nodejs.org, whatever it starts; `every_spawn_of_the_binary_is_offline`
+/// keeps it so.
+const OFFLINE: &str = "http://127.0.0.1:1/";
+
+/// The binary, offline.
+fn hennery() -> Command {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
+    offline(&mut cmd);
+    cmd
+}
+
+fn offline(cmd: &mut Command) {
+    cmd.env("HENNERY_NPM_REGISTRY", OFFLINE)
+        .env("HENNERY_NODE_MIRROR", OFFLINE);
+}
+
 #[test]
 fn help_lists_the_skeleton_commands() {
-    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
-        .arg("--help")
-        .output()
-        .unwrap();
+    let out = hennery().arg("--help").output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     for cmd in ["collector", "host", "up", "admin"] {
         assert!(text.contains(cmd), "missing {cmd} in help:\n{text}");
@@ -18,10 +33,7 @@ fn help_lists_the_skeleton_commands() {
 
 #[test]
 fn host_help_lists_join_and_run() {
-    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
-        .args(["host", "--help"])
-        .output()
-        .unwrap();
+    let out = hennery().args(["host", "--help"]).output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     for cmd in ["join", "run"] {
         assert!(text.contains(cmd), "missing {cmd} in help:\n{text}");
@@ -71,8 +83,16 @@ fn joining_over_http_ignores_a_configured_proxy() {
     let host_dir = std::env::temp_dir().join(format!("hennery-cli-noproxy-host-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&host_dir);
 
-    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
-        .args(["host", "join", &format!("http://{addr}"), &code, "--name", "laptop"])
+    let out = hennery()
+        .args([
+            "host",
+            "join",
+            &format!("http://{addr}"),
+            &code,
+            "--name",
+            "laptop",
+            "--no-runtime",
+        ])
         .arg("--data-dir")
         .arg(&host_dir)
         // A bogus proxy nobody listens on.
@@ -101,7 +121,7 @@ fn joining_over_http_ignores_a_configured_proxy() {
 
 #[test]
 fn a_malformed_agent_flag_is_rejected() {
-    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let out = hennery()
         .args(["host", "run", "--data-dir", "/tmp/x", "--agent", "noequals"])
         .output()
         .unwrap();
@@ -114,7 +134,7 @@ fn a_malformed_agent_flag_is_rejected() {
 #[test]
 fn a_bad_workspace_root_fails_before_pairing() {
     let dir = tempfile::tempdir().unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let out = hennery()
         .args(["host", "run", "--data-dir"])
         .arg(dir.path())
         .args(["--workspace-root", "relative/dir"])
@@ -131,7 +151,7 @@ fn a_bad_workspace_root_fails_before_pairing() {
 #[test]
 fn the_development_token_flag_is_gone() {
     for command in ["collector", "up"] {
-        let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        let out = hennery()
             .args([command, "--dev-token", "dev-token-for-tests"])
             .args(["--data-dir", "/nonexistent/hennery-cli-dev-token"])
             .output()
@@ -188,7 +208,7 @@ fn the_development_token_in_the_environment_is_warned_about_and_never_printed() 
         ),
     ];
     for (name, args) in runs {
-        let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        let out = hennery()
             .args(args)
             .env("HENNERY_DEV_TOKEN", TOKEN)
             .env("RUST_LOG", "info")
@@ -380,7 +400,7 @@ fn sigint_to_ups_process_group_still_shuts_down_cleanly() {
     let dir = scratch_dir("pgtest");
     let log = dir.join("up.log");
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
+    let mut command = hennery();
     command
         .args(["up", "--listen", "127.0.0.1:0"])
         .arg("--data-dir")
@@ -632,7 +652,7 @@ fn delete(listen: &str, path: &str, session: &str) -> Option<u16> {
 
 /// Start `up` on port 0 with its log in `log`.
 fn up_logging_to(dir: &std::path::Path, log: &std::path::Path) -> KillTree {
-    up_logging_to_with(Command::new(env!("CARGO_BIN_EXE_hennery")), dir, log, &[])
+    up_logging_to_with(hennery(), dir, log, &[])
 }
 
 /// Like `up_logging_to`, from `command` (`hennery` itself, or a shell in
@@ -736,7 +756,7 @@ fn a_non_loopback_listen_is_refused_and_touches_neither_data_dir() {
     // TEST-NET-3 (RFC 5737): never routable, and not loopback either, so
     // `collector_ws_url` refuses it (plain http off loopback) before `up`
     // spawns anything that could bind or listen on it.
-    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let out = hennery()
         .args(["up", "--listen", "203.0.113.5:7117"])
         .arg("--data-dir")
         .arg(&dir)
@@ -768,7 +788,7 @@ fn a_failed_pairing_code_write_is_logged_without_the_code_and_does_not_kill_the_
     let _cleanup = RemoveDir(dir.clone());
     let log = dir.join("collector.log");
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
+    let mut cmd = hennery();
     cmd.args(["collector", "--listen", "127.0.0.1:0"])
         .arg("--data-dir")
         .arg(dir.join("data"))
@@ -883,7 +903,7 @@ fn a_revoked_hosts_still_starting_adapter_is_reaped_past_shut_downs_bound() {
 
     let log = dir.join("up.log");
     let mut up = up_logging_to_with(
-        Command::new(env!("CARGO_BIN_EXE_hennery")),
+        hennery(),
         &dir.join("data"),
         &log,
         &["--agent", &format!("slow=/bin/sh {}", script.display())],
@@ -1007,7 +1027,7 @@ fn ups_agents_never_see_the_operator_token_or_the_pairing_pipe() {
     std::fs::remove_file(report("env.txt")).unwrap();
 
     let log = dir.join("up.log");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
+    let mut command = hennery();
     command
         .env("HENNERY_DEV_TOKEN", TOKEN)
         .env("HENNERY_AGENT_MAY_SEE", "yes")
@@ -1096,6 +1116,7 @@ fn close_leaked_descriptors() {
 fn under_umask_022() -> Command {
     let mut cmd = Command::new("/bin/sh");
     cmd.args(["-c", "umask 022; exec \"$0\" \"$@\"", env!("CARGO_BIN_EXE_hennery")]);
+    offline(&mut cmd);
     cmd
 }
 
@@ -1170,7 +1191,7 @@ fn a_sigterm_during_the_start_leaves_no_admin_socket() {
     let data = dir.join("data");
     let log = dir.join("collector.log");
 
-    let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let collector = hennery()
         .args(["collector", "--listen", "127.0.0.1:0"])
         .arg("--data-dir")
         .arg(&data)
@@ -1440,7 +1461,7 @@ fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
     let unix: OwnedFd = std::os::unix::net::UnixListener::bind(dir.join("s")).unwrap().into();
     let listening: OwnedFd = std::net::TcpListener::bind("127.0.0.1:0").unwrap().into();
     let collector = |fd: Option<&OwnedFd>, args: &[&str]| {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
+        let mut cmd = hennery();
         cmd.arg("collector").args(args).arg("--data-dir").arg(&data);
         if fd.is_none() {
             // Another test's spawn can leak a descriptor into this child for
@@ -1536,14 +1557,14 @@ fn the_code_descriptors_must_be_open_pipes() {
     // `--listen 127.0.0.1:0`: should a check let it through, this collector
     // must not take a port another one may be serving.
     let collector = |data: &std::path::Path, fd: &str| -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
+        let mut cmd = hennery();
         cmd.args(["collector", "--listen", "127.0.0.1:0", "--pairing-code-fd", fd])
             .arg("--data-dir")
             .arg(data);
         cmd
     };
     let host = |data: &std::path::Path, fd: &str| -> Command {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
+        let mut cmd = hennery();
         cmd.args(["host", "run", "--join-url", "http://127.0.0.1:1", "--join-code-fd", fd])
             .arg("--data-dir")
             .arg(data);
@@ -1616,8 +1637,16 @@ fn the_code_descriptors_must_be_open_pipes() {
     // descriptor rather than closing whatever is at that number.
     let (_rt, addr, code) = collector_with_a_pairing_code(&dir);
     let paired = dir.join("paired");
-    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
-        .args(["host", "join", &format!("http://{addr}"), &code, "--name", "laptop"])
+    let out = hennery()
+        .args([
+            "host",
+            "join",
+            &format!("http://{addr}"),
+            &code,
+            "--name",
+            "laptop",
+            "--no-runtime",
+        ])
         .arg("--data-dir")
         .arg(&paired)
         .env_remove("HENNERY_HOST_DATA_DIR")
@@ -1656,6 +1685,9 @@ fn the_host_fails_and_pairs_nothing_when_the_collector_dies_before_the_code() {
     let (_rt, addr, _code) = collector_with_a_pairing_code(&dir);
     let host_dir = dir.join("host");
     let mut child = Command::new("/bin/sh")
+        // Offline, as `hennery()` is: this host may reach the managed path.
+        .env("HENNERY_NPM_REGISTRY", OFFLINE)
+        .env("HENNERY_NODE_MIRROR", OFFLINE)
         .args([
             "-c",
             ": | exec \"$0\" \"$@\" 3<&0 </dev/null",
@@ -1743,7 +1775,7 @@ fn the_pairing_code_never_reaches_ups_childrens_argv_or_environment() {
     // `hennery` itself, not a shell: macOS shows no platform binary's
     // environment (`/bin/sh`'s, say) to `ps -E`. `host join` with the code
     // left out waits on standard input, and gives up once that closes.
-    let mut control = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let mut control = hennery()
         .args(["host", "join", "http://127.0.0.1:1", "--name", "ABCD-EFGH"])
         .arg("--data-dir")
         .arg(dir.join("control"))
@@ -1776,7 +1808,7 @@ fn the_pairing_code_never_reaches_ups_childrens_argv_or_environment() {
 
     let data = dir.join("data");
     let log = dir.join("up.log");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
+    let mut command = hennery();
     command
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -1873,8 +1905,15 @@ fn collector_with_a_pairing_code(dir: &std::path::Path) -> (tokio::runtime::Runt
 /// `hennery host join` to the collector at `addr`, into `host`, with the
 /// code left out (so read from standard input) and every stream piped.
 fn join_from_stdin(addr: std::net::SocketAddr, host: &std::path::Path) -> std::process::Child {
-    Command::new(env!("CARGO_BIN_EXE_hennery"))
-        .args(["host", "join", &format!("http://{addr}"), "--name", "laptop"])
+    hennery()
+        .args([
+            "host",
+            "join",
+            &format!("http://{addr}"),
+            "--name",
+            "laptop",
+            "--no-runtime",
+        ])
         .arg("--data-dir")
         .arg(host)
         .env_remove("HENNERY_HOST_DATA_DIR")
@@ -2004,7 +2043,7 @@ fn every_listen_address_serves_the_same_collector() {
     let _cleanup = RemoveDir(dir.clone());
     let data = dir.join("collector");
     let log = dir.join("collector.log");
-    let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let collector = hennery()
         .args(["collector", "--listen", "127.0.0.1:0", "--listen", "127.0.0.1:0"])
         .arg("--data-dir")
         .arg(&data)
@@ -2046,7 +2085,7 @@ fn a_taken_listen_address_fails_the_start_before_the_data_dir_is_touched() {
     let taken = taken.local_addr().unwrap().to_string();
     for command in ["collector", "up"] {
         let data = dir.join(command);
-        let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        let out = hennery()
             .args([command, "--listen", "127.0.0.1:0", "--listen", &taken])
             .arg("--data-dir")
             .arg(&data)
@@ -2070,7 +2109,7 @@ fn up_hands_every_listen_address_to_its_collector() {
     let _cleanup = RemoveDir(dir.clone());
     let data = dir.join("data");
     let log = dir.join("up.log");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
+    let mut command = hennery();
     command.env("HENNERY_LISTEN", "127.0.0.1:0");
     let mut up = up_logging_to_with(command, &data, &log, &["--listen", "127.0.0.1:0"]);
     let addresses = up.listening_on(2);
@@ -2107,7 +2146,7 @@ fn config_toml_yields_to_the_environment_and_the_environment_to_flags() {
     .unwrap();
     let run = |env: &[(&str, &str)], args: &[&str], name: &str| {
         let log = dir.join(format!("{name}.log"));
-        let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        let collector = hennery()
             .arg("collector")
             .args(args)
             .arg("--data-dir")
@@ -2169,7 +2208,7 @@ fn a_bad_config_toml_stops_the_start() {
         std::fs::set_permissions(data.join("config.toml"), std::fs::Permissions::from_mode(mode)).unwrap();
         // On port 0, and bounded: a collector that ignored the file would
         // serve rather than stop, and never on the default port.
-        let mut child = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        let mut child = hennery()
             .args(["collector", "--listen", "127.0.0.1:0", "--data-dir"])
             .arg(&data)
             .stdout(std::process::Stdio::null())
@@ -2196,7 +2235,7 @@ fn up_hands_its_public_url_to_its_collector() {
     let _cleanup = RemoveDir(dir.clone());
     let data = dir.join("data");
     let mut up = up_logging_to_with(
-        Command::new(env!("CARGO_BIN_EXE_hennery")),
+        hennery(),
         &data,
         &dir.join("up.log"),
         &["--public-url", "https://up.example"],
@@ -2210,7 +2249,7 @@ fn up_hands_its_public_url_to_its_collector() {
 /// A collector on port 0 in `data`, logging to `log`, once it serves: the
 /// guard, and the address it listens on.
 fn collector_on(data: &std::path::Path, log: &std::path::Path) -> (KillTree, String) {
-    let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let collector = hennery()
         .args(["collector", "--listen", "127.0.0.1:0"])
         .arg("--data-dir")
         .arg(data)
@@ -2227,7 +2266,7 @@ fn collector_on(data: &std::path::Path, log: &std::path::Path) -> (KillTree, Str
 /// `hennery admin --data-dir <data> <args…>` with no terminal: standard
 /// input is empty.
 fn admin(data: &std::path::Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_hennery"))
+    hennery()
         .arg("admin")
         .arg("--data-dir")
         .arg(data)
@@ -2243,7 +2282,7 @@ fn admin(data: &std::path::Path, args: &[&str]) -> std::process::Output {
 /// killed and fails the test.
 fn admin_on_a_terminal(data: &std::path::Path, args: &[&str], typed: &str) -> std::process::Output {
     let (master, slave) = open_pty();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let mut child = hennery()
         .arg("admin")
         .arg("--data-dir")
         .arg(data)
@@ -2273,7 +2312,7 @@ fn admin_on_a_terminal(data: &std::path::Path, args: &[&str], typed: &str) -> st
 fn admin_conversation(data: &std::path::Path, args: &[&str], steps: &[(&str, &str)]) -> (std::process::Output, String) {
     use std::sync::{Arc, Mutex};
     let (master, slave) = open_pty();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let mut child = hennery()
         .arg("admin")
         .arg("--data-dir")
         .arg(data)
@@ -2565,7 +2604,7 @@ fn admin_gives_up_on_a_collector_that_never_answers() {
         let _ = wait.recv();
         drop(held);
     });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let mut child = hennery()
         .arg("admin")
         .arg("--data-dir")
         .arg(&dir)
@@ -2655,8 +2694,16 @@ fn a_pairing_code_from_the_admin_socket_pairs_a_host() {
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let code = String::from_utf8_lossy(&out.stdout).trim().to_string();
     assert!(contains_a_pairing_code_shape(&code), "{code}");
-    let join = Command::new(env!("CARGO_BIN_EXE_hennery"))
-        .args(["host", "join", &format!("http://{listen}"), &code, "--name", "laptop"])
+    let join = hennery()
+        .args([
+            "host",
+            "join",
+            &format!("http://{listen}"),
+            &code,
+            "--name",
+            "laptop",
+            "--no-runtime",
+        ])
         .arg("--data-dir")
         .arg(dir.join("host"))
         .output()
@@ -2678,7 +2725,7 @@ fn the_healthcheck_passes_while_the_collector_serves_and_fails_once_it_stops() {
     let _cleanup = RemoveDir(dir.clone());
     let data = dir.join("collector");
     let log = dir.join("collector.log");
-    let collector = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let collector = hennery()
         .args(["collector", "--listen", "127.0.0.1:0"])
         .arg("--data-dir")
         .arg(&data)
@@ -2689,7 +2736,7 @@ fn the_healthcheck_passes_while_the_collector_serves_and_fails_once_it_stops() {
     let mut collector = KillTree::new(collector, &log);
     let address = collector.listening();
     let healthcheck = |how: &dyn Fn(&mut Command)| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_hennery"));
+        let mut command = hennery();
         command
             .args(["collector", "healthcheck"])
             .env_remove("HENNERY_LISTEN")
@@ -2740,7 +2787,7 @@ fn the_healthcheck_passes_while_the_collector_serves_and_fails_once_it_stops() {
 #[test]
 fn the_collector_without_a_data_dir_or_with_the_healthcheck_and_its_flags_is_refused() {
     let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_hennery"))
+        hennery()
             .args(args)
             .env_remove("HENNERY_DATA_DIR")
             .env_remove("HENNERY_LISTEN")
@@ -2783,7 +2830,7 @@ fn a_second_host_on_one_data_directory_refuses_to_start() {
     );
     std::fs::write(&pending, &staged).unwrap();
 
-    let mut second = Command::new(env!("CARGO_BIN_EXE_hennery"))
+    let mut second = hennery()
         .args(["host", "run"])
         .arg("--data-dir")
         .arg(data.join("host"))
@@ -2918,7 +2965,7 @@ fn service(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
         .unwrap();
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    Command::new(env!("CARGO_BIN_EXE_hennery"))
+    hennery()
         .arg("service")
         .args(args)
         .env("HOME", dir.join("home"))
@@ -2974,10 +3021,7 @@ fn service_install_refuses_an_unpaired_host_and_a_second_role() {
 
 #[test]
 fn service_help_lists_install_uninstall_and_status() {
-    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
-        .args(["service", "--help"])
-        .output()
-        .unwrap();
+    let out = hennery().args(["service", "--help"]).output().unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     for command in ["install", "uninstall", "status"] {
         assert!(text.contains(command), "{text}");
@@ -3000,4 +3044,404 @@ fn service_status_with_nothing_installed_fails_without_asking_the_manager() {
         "{:?}",
         std::fs::read_to_string(dir.join("ran"))
     );
+}
+
+/// Plan 7b: no test of this binary may reach the npm registry or nodejs.org.
+/// Every spawn of `hennery` goes through `hennery()` or `under_umask_022()`,
+/// which point both mirrors at a loopback port nothing answers on.
+#[test]
+fn every_spawn_of_the_binary_is_offline() {
+    // Spelt in pieces, so these lines are not counted themselves.
+    let token = concat!("CARGO_BIN_", "EXE_hennery");
+    let source = include_str!("cli.rs");
+    let spawns: Vec<&str> = source
+        .lines()
+        .filter(|line| line.contains(token))
+        .map(str::trim)
+        .collect();
+    assert_eq!(
+        spawns,
+        [
+            format!("let mut cmd = Command::new(env!(\"{token}\"));"),
+            format!("cmd.args([\"-c\", \"umask 022; exec \\\"$0\\\" \\\"$@\\\"\", env!(\"{token}\")]);"),
+            format!("env!(\"{token}\"),"),
+        ],
+        "spawn the binary through hennery() or under_umask_022(), which keep it offline"
+    );
+    assert_eq!(source.matches(concat!("offline(&mut ", "cmd)")).count(), 2);
+    // `offline` and the one spawn through a shell of its own set both
+    // mirrors.
+    assert_eq!(
+        source
+            .matches(concat!(".env(\"HENNERY_NPM_REGISTRY\", ", "OFFLINE)"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        source
+            .matches(concat!(".env(\"HENNERY_NODE_MIRROR\", ", "OFFLINE)"))
+            .count(),
+        2
+    );
+}
+
+/// A loopback mirror serving `bodies` (path → bytes), else 404: as the
+/// registry or nodejs.org would, but with whatever bytes a test wants.
+fn mirror(bodies: std::collections::HashMap<String, Vec<u8>>) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
+                head.push(byte[0]);
+            }
+            let head = String::from_utf8_lossy(&head);
+            let path = head.split_whitespace().nth(1).unwrap_or("/");
+            let _ = match bodies.get(path) {
+                Some(body) => stream
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .and_then(|()| stream.write_all(body)),
+                None => stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+            };
+        }
+    });
+    base
+}
+
+/// A complete set, as an install leaves one, without downloading it: its
+/// record, `.in-use`, each agent's `entry` and the runtime's `bin/node`
+/// (a shell script). Returns the set's directory.
+fn fabricate_set(
+    host_dir: &std::path::Path,
+    id: &str,
+    runtime: &str,
+    node: &str,
+    adapters: &[(&str, &str)],
+) -> std::path::PathBuf {
+    use hennery_host::runtime::install::{RecordAdapter, SetRecord};
+    use std::os::unix::fs::PermissionsExt;
+    let set = host_dir.join("adapters/sets").join(id);
+    let record = SetRecord {
+        layout: hennery_host::runtime::install::LAYOUT,
+        id: id.to_string(),
+        manifest_hash: "0".repeat(64),
+        platform: hennery_host::runtime::manifest::Platform::current()
+            .unwrap()
+            .key()
+            .to_string(),
+        runtime: runtime.to_string(),
+        adapters: adapters
+            .iter()
+            .map(|(name, entry)| {
+                let file = set.join(name).join(entry);
+                std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+                std::fs::write(&file, "// entry\n").unwrap();
+                (
+                    name.to_string(),
+                    RecordAdapter {
+                        version: "9.9.9".into(),
+                        entry: entry.to_string(),
+                        cli_skipped: false,
+                    },
+                )
+            })
+            .collect(),
+    };
+    std::fs::write(set.join("hennery-set.json"), serde_json::to_string(&record).unwrap()).unwrap();
+    std::fs::write(set.join(".in-use"), "").unwrap();
+    let bin = host_dir.join("runtimes").join(runtime).join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::write(bin.join("node"), format!("#!/bin/sh\n{node}\n")).unwrap();
+    std::fs::set_permissions(bin.join("node"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    set
+}
+
+/// Point `adapters/<link>` at set `id`, as an install does.
+fn link_set(host_dir: &std::path::Path, link: &str, id: &str) {
+    let path = host_dir.join("adapters").join(link);
+    let _ = std::fs::remove_file(&path);
+    std::os::unix::fs::symlink(std::path::Path::new("sets").join(id), path).unwrap();
+}
+
+/// A paired host's data directory, without a collector.
+fn paired_host(dir: &std::path::Path) {
+    hennery_host::identity::Paired {
+        collector_url: "ws://127.0.0.1:1/api/hosts/ws".into(),
+        host_id: "host-cli".into(),
+        key: hennery_host::identity::HostKey::generate(),
+        workspace_roots: Vec::new(),
+    }
+    .save(dir)
+    .unwrap();
+}
+
+/// `host join` pairs, then installs the runtime (distribution §3.2). An
+/// install that fails (here: offline) exits non-zero but keeps the pairing,
+/// and says how to retry.
+#[test]
+fn join_installs_the_runtime_and_keeps_the_pairing_when_that_fails() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let dir = scratch_dir("join-runtime");
+    let _cleanup = RemoveDir(dir.clone());
+    let (addr, code) = rt.block_on(async {
+        let db = dir.join("hennery.db");
+        let state = hennery_sessions::AppState::new(
+            hennery_sessions::store::Store::open(&db).unwrap(),
+            hennery_kernel::hosts::Hosts::open(&db).unwrap(),
+            hennery_kernel::operator::Operator::open(&db).unwrap(),
+        );
+        let code = state
+            .hosts
+            .mint_pairing_code(hennery_kernel::secret::unix_now())
+            .unwrap()
+            .code;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(hennery_sessions::serve(listener, state));
+        (addr, code)
+    });
+    let host = dir.join("host");
+    let out = hennery()
+        .args(["host", "join", &format!("http://{addr}"), &code, "--name", "laptop"])
+        .arg("--data-dir")
+        .arg(&host)
+        .output()
+        .unwrap();
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    assert!(!out.status.success(), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("paired as host-"), "{stdout}");
+    assert!(
+        stderr.contains("the adapter runtime was not installed") && stderr.contains("hennery host adapters update"),
+        "{stderr}"
+    );
+    assert!(host.join("host.key").exists() && host.join("host.toml").exists());
+    assert!(!host.join("adapters/current").exists());
+}
+
+/// A mirror answering other bytes than pinned: the update aborts naming
+/// it, nothing is installed, and the current set stays current.
+#[test]
+fn an_update_refuses_bytes_that_do_not_match_and_keeps_the_current_set() {
+    let dir = scratch_dir("update-mismatch");
+    let _cleanup = RemoveDir(dir.clone());
+    let host = dir.join("host");
+    let old = "0123456789abcdef0123456789abcdef";
+    fabricate_set(&host, old, "node-0-test", "exit 0", &[("claude", "e.js")]);
+    link_set(&host, "current", old);
+    // Node comes first; the mirror serves zeros of exactly its pinned size.
+    let manifest = hennery_host::runtime::manifest::Manifest::embedded();
+    let platform = hennery_host::runtime::manifest::Platform::current().unwrap();
+    let node = &manifest.node.platforms[platform.key()];
+    let path = node.url.strip_prefix("https://nodejs.org/dist/").unwrap();
+    let base = mirror([(format!("/node/{path}"), vec![0u8; node.archive_size as usize])].into());
+    let out = hennery()
+        .args(["host", "adapters", "update", "--data-dir"])
+        .arg(&host)
+        .args([
+            "--npm-registry",
+            &format!("{base}/npm/"),
+            "--node-mirror",
+            &format!("{base}/node/"),
+        ])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        stderr.contains("does not match the digest") && stderr.contains(&base),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read_link(host.join("adapters/current")).unwrap(),
+        std::path::Path::new("sets").join(old)
+    );
+    assert!(!host.join("adapters/previous").exists());
+    assert_eq!(std::fs::read_dir(host.join("adapters/downloads")).unwrap().count(), 0);
+}
+
+/// `--use-cli` records the operator's CLI in `host.toml`, keeping the
+/// pairing, and says what that costs; `=bundled` removes it; a relative
+/// path, an unknown agent or an unpaired host are refused.
+#[test]
+fn use_cli_is_recorded_in_host_toml_and_bundled_removes_it() {
+    let dir = scratch_dir("use-cli");
+    let _cleanup = RemoveDir(dir.clone());
+    let host = dir.join("host");
+    let update = |extra: &[&str]| {
+        hennery()
+            .args(["host", "adapters", "update", "--data-dir"])
+            .arg(&host)
+            .args(extra)
+            .output()
+            .unwrap()
+    };
+    let unpaired = update(&["--use-cli", "claude=/bin/sh"]);
+    assert!(!unpaired.status.success());
+    assert!(String::from_utf8_lossy(&unpaired.stderr).contains("pair this host first"));
+
+    paired_host(&host);
+    // Recorded before the install, which fails here (offline).
+    let out = update(&["--use-cli", "claude=/bin/sh"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("loses the pin's guarantee") && stderr.contains("MCP fallback"),
+        "{stderr}"
+    );
+    let toml = std::fs::read_to_string(host.join("host.toml")).unwrap();
+    assert!(
+        toml.contains("[cli]") && toml.contains("claude = \"/bin/sh\""),
+        "{toml}"
+    );
+    assert!(toml.contains("host_id = \"host-cli\""), "{toml}");
+    let out = update(&["--use-cli", "claude=bundled"]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains("back to its bundled CLI"));
+    let toml = std::fs::read_to_string(host.join("host.toml")).unwrap();
+    assert!(!toml.contains("[cli]"), "{toml}");
+
+    for bad in ["claude=sh", "gemini=/bin/sh", "claude=/nonexistent/claude"] {
+        let out = update(&["--use-cli", bad]);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{bad}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // A mirror must be https (or loopback http): an update refuses one.
+    let out = update(&["--npm-registry", "http://npm.example/"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("must be https://"));
+    let both = hennery()
+        .args([
+            "host",
+            "join",
+            "http://127.0.0.1:1",
+            "AAAA-AAAA",
+            "--no-runtime",
+            "--use-cli",
+            "claude=/bin/sh",
+        ])
+        .arg("--data-dir")
+        .arg(dir.join("other"))
+        .output()
+        .unwrap();
+    assert_eq!(both.status.code(), Some(2), "--no-runtime with --use-cli");
+}
+
+/// `rollback` makes the previous set current, keeps the other as previous,
+/// and holds the host on it.
+#[test]
+fn rollback_swaps_to_the_previous_set_and_holds_the_host() {
+    let dir = scratch_dir("rollback");
+    let _cleanup = RemoveDir(dir.clone());
+    let host = dir.join("host");
+    let (new, old) = ("11111111111111111111111111111111", "22222222222222222222222222222222");
+    fabricate_set(&host, new, "node-0-test", "exit 0", &[("claude", "e.js")]);
+    fabricate_set(&host, old, "node-0-test", "exit 0", &[("claude", "e.js")]);
+    link_set(&host, "current", new);
+    link_set(&host, "previous", old);
+    let out = hennery()
+        .args(["host", "adapters", "rollback", "--data-dir"])
+        .arg(&host)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(stdout.contains(&format!("from adapter set {new} to {old}")), "{stdout}");
+    let target = |link: &str| std::fs::read_link(host.join("adapters").join(link)).unwrap();
+    assert_eq!(target("current"), std::path::Path::new("sets").join(old));
+    assert_eq!(target("previous"), std::path::Path::new("sets").join(new));
+    assert!(host.join("adapters/hold").exists());
+}
+
+/// `hennery up` with no `--agent` runs `claude` from the installed set:
+/// the runtime's node, the entry by its absolute path inside the set (never
+/// through `current`), and none of the override variables `up` inherited
+/// (A1). The set is the one this binary pins, so nothing is downloaded.
+#[test]
+fn a_host_without_agent_flags_runs_the_installed_set() {
+    let dir = scratch_dir("managed");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let host = data.join("host");
+    let report = dir.join("report.txt");
+    let selection = hennery_host::runtime::install::Selection::pinned(&Default::default()).unwrap();
+    let entries: Vec<(&str, &str)> = selection
+        .adapters
+        .iter()
+        .map(|a| (a.name.as_str(), a.entry.as_str()))
+        .collect();
+    let set = fabricate_set(
+        &host,
+        &selection.set_id(),
+        &selection.runtime_name(),
+        &format!(
+            "printf '%s\\n' \"$@\" > {r}.tmp; env >> {r}.tmp; mv {r}.tmp {r}",
+            r = report.display()
+        ),
+        &entries,
+    );
+    link_set(&host, "current", &selection.set_id());
+
+    let log = dir.join("up.log");
+    let mut command = hennery();
+    command
+        .env("CLAUDE_CODE_EXECUTABLE", "/inherited/claude")
+        .env("CODEX_PATH", "/inherited/codex")
+        .env("RUST_LOG", "info");
+    let mut up = up_logging_to_with(command, &data, &log, &[]);
+    let listen = up.listening();
+    let session = sign_in(&mut up, &listen, &data.join("collector"));
+    let mut host_id = String::new();
+    up.wait_until("the host connected", || {
+        let Some(serde_json::Value::Array(hosts)) = get_json(&listen, "/api/hosts", &session) else {
+            return false;
+        };
+        match hosts.first() {
+            Some(h) if h["connected"] == true => {
+                host_id = h["host_id"].as_str().unwrap().to_string();
+                true
+            }
+            _ => false,
+        }
+    });
+    post_json(
+        &listen,
+        "/api/sessions",
+        &session,
+        &serde_json::json!({ "host_id": host_id, "agent": "claude", "cwd": dir }).to_string(),
+    );
+    up.wait_until("the adapter's report", || report.exists());
+    let text = std::fs::read_to_string(&report).unwrap();
+    let claude_entry = selection
+        .adapters
+        .iter()
+        .find(|a| a.name == "claude")
+        .unwrap()
+        .entry
+        .clone();
+    assert_eq!(
+        text.lines().next().unwrap(),
+        set.join("claude").join(claude_entry).to_string_lossy(),
+        "{text}"
+    );
+    assert!(!text.contains("/adapters/current/"), "{text}");
+    assert!(
+        !text.contains("/inherited/"),
+        "an inherited override reached the adapter: {text}"
+    );
+    let logged = std::fs::read_to_string(&log).unwrap() + &std::fs::read_to_string(log.with_extension("err")).unwrap();
+    assert!(logged.contains("agents from the adapter set"), "{logged}");
 }
