@@ -19,6 +19,8 @@ base64 = "=0.22.1"
 axum = { version = "0.8.9", features = ["ws"] }
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "=2.2.0"
+# Package and Node archives (plan 7b): pure Rust, no liblzma.
+flate2 = "=1.1.10"
 futures = "0.3"
 getrandom = "=0.3.4"
 hex = "=0.4.3"
@@ -29,6 +31,8 @@ schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "=0.10.9"
+# Default features off: never unpack extended attributes (plan 7b).
+tar = { version = "=0.4.46", default-features = false }
 tempfile = "3"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting"] }

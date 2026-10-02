@@ -1,0 +1,38 @@
+# The adapter pins (umbrella spec §12.3, distribution spec §3.1). A release
+# IS a tested adapter set, and the pin decides what model aliases resolve
+# to: a product decision, not a detail. After changing a pin:
+#
+#   cargo run -p hennery-pins -- lock      # package.json + package-lock.json
+#   cargo run -p hennery-pins -- generate  # adapters/manifest.json
+#
+# The pin-bump CI job (`.github/workflows/pins.yml`) then checks the
+# manifest, the registry signatures and Node's signed checksums. The live
+# e2e gate (umbrella §14) is the operator's to run, with logged-in agents.
+
+# npm resolves the lockfiles as of this instant, so `lock` is reproducible.
+npm_before = "2026-10-01T00:00:00Z"
+
+[node]
+# Proposed, operator to confirm (plan 7b): the newest Node 24 LTS.
+version = "24.21.0"
+
+[adapters.claude]
+# Proposed, operator to confirm (plan 7b): the version the per-session MCP
+# spike measured (docs/spikes/2026-09-25-per-session-mcp.md).
+package = "@agentclientprotocol/claude-agent-acp"
+version = "0.81.0"
+entry = "dist/index.js"
+# The bundled Claude CLI: the SDK's platform packages. Proprietary, so never
+# redistributed (distribution §3.3); skipped by `--use-cli claude=…`.
+cli = ["node_modules/@anthropic-ai/claude-agent-sdk-"]
+
+[adapters.codex]
+# Proposed, operator to confirm (plan 7b): the version the spike measured.
+# `@zed-industries/codex-acp` is deprecated in its favour; the unscoped
+# `codex-acp` is an unrelated third party.
+package = "@agentclientprotocol/codex-acp"
+version = "1.13.0"
+entry = "dist/index.js"
+# The bundled Codex CLI: `@openai/codex`'s platform packages (npm aliases of
+# `@openai/codex@<version>-<platform>`); skipped by `--use-cli codex=…`.
+cli = ["node_modules/@openai/codex-"]

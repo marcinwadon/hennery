@@ -1,0 +1,106 @@
+# The pin-bump job (distribution spec §3.1, plan 7b): runs only when the
+# adapter pins, their lockfiles, the manifest or its generator change.
+#
+# Licensing (distribution §3.3): this job downloads the Claude CLI from the
+# npm registry, as every host does, and must never keep it. No artifact is
+# uploaded, nothing is cached (no `actions/cache`, no `setup-node` cache),
+# and `node_modules` is removed after each platform.
+#
+# Not run here: the live e2e gate (umbrella §14), which needs logged-in
+# agents. The operator runs it on every pin bump.
+name: pins
+
+on:
+  pull_request:
+    paths:
+      - adapters/**
+      - crates/hennery-pins/**
+      - crates/hennery-host/src/runtime/manifest.rs
+      - crates/hennery-host/src/runtime/extract.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/pins.yml
+  push:
+    branches: [main]
+    paths:
+      - adapters/**
+      - crates/hennery-pins/**
+      - crates/hennery-host/src/runtime/manifest.rs
+      - crates/hennery-host/src/runtime/extract.rs
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/pins.yml
+
+permissions:
+  contents: read
+
+jobs:
+  pins:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        # pipefail: a failing stage of a pipe fails the step.
+        shell: bash
+    env:
+      # Node's release keyring (github.com/nodejs/release-keys), pinned by
+      # commit and by the digest of the keyring file.
+      RELEASE_KEYS_COMMIT: 481637f813e912c4aa3622d7964ab426c97b8e8d
+      RELEASE_KEYS_SHA256: 610b8d249da3d5733f5a128def2dd0294dbbf5b5713e6ca2529db8db419dee00
+      REGISTRY: https://registry.npmjs.org/
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master @ 2026-09-12
+        with:
+          toolchain: stable
+      # npm 11 for `--libc`. No `cache:` input: nothing is cached.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "24"
+      - name: Node's checksums carry a release key's signature
+        run: |
+          version=$(jq -r .node.version adapters/manifest.json)
+          curl -fsSLo pubring.kbx \
+            "https://raw.githubusercontent.com/nodejs/release-keys/$RELEASE_KEYS_COMMIT/gpg/pubring.kbx"
+          echo "$RELEASE_KEYS_SHA256  pubring.kbx" | sha256sum -c -
+          curl -fsSLO "https://nodejs.org/dist/v$version/SHASUMS256.txt"
+          curl -fsSLO "https://nodejs.org/dist/v$version/SHASUMS256.txt.sig"
+          gpgv --keyring ./pubring.kbx SHASUMS256.txt.sig SHASUMS256.txt
+      - name: The manifest is what the pins, the lockfiles and the signed checksums give
+        run: cargo run -p hennery-pins --locked -- check --node-shasums SHASUMS256.txt
+      - name: Every pinned package is its pinned size and digest, and extracts as a host extracts it
+        run: cargo run -p hennery-pins --locked -- extract
+      - name: Registry signatures, and npm installs exactly the manifest's files, per platform
+        run: |
+          : > "$RUNNER_TEMP/npmrc-user"
+          : > "$RUNNER_TEMP/npmrc-global"
+          for agent in $(jq -r '.adapters | keys[]' adapters/manifest.json); do
+            for platform in darwin-arm64 linux-arm64 linux-x64; do
+              case $platform in
+                darwin-arm64) flags=(--os=darwin --cpu=arm64) ;;
+                linux-arm64) flags=(--os=linux --cpu=arm64 --libc=glibc) ;;
+                linux-x64) flags=(--os=linux --cpu=x64 --libc=glibc) ;;
+              esac
+              echo "::group::$agent on $platform"
+              (
+                cd "adapters/$agent"
+                # Gone whatever happens below: nothing downloaded is kept.
+                trap 'rm -rf node_modules "$RUNNER_TEMP/npm-cache"' EXIT
+                npm=(--userconfig="$RUNNER_TEMP/npmrc-user" --globalconfig="$RUNNER_TEMP/npmrc-global"
+                     --registry="$REGISTRY" --cache="$RUNNER_TEMP/npm-cache")
+                npm ci "${npm[@]}" --ignore-scripts --no-audit --no-fund "${flags[@]}"
+                npm audit signatures --json "${npm[@]}" > "$RUNNER_TEMP/audit.json" || true
+                cat "$RUNNER_TEMP/audit.json"
+                # The JSON decides, not the exit code.
+                # An error object ({"error": …}) has neither list, so it fails.
+                jq -e '.invalid == [] and .missing == []' "$RUNNER_TEMP/audit.json"
+                jq -r '.packages | keys[] | select(. != "")' node_modules/.package-lock.json | sort > "$RUNNER_TEMP/installed"
+              )
+              jq -r --arg agent "$agent" --arg platform "$platform" \
+                '.adapters[$agent].platforms[$platform][].path' adapters/manifest.json | sort > "$RUNNER_TEMP/pinned"
+              diff -u "$RUNNER_TEMP/pinned" "$RUNNER_TEMP/installed"
+              echo "::endgroup::"
+            done
+          done
