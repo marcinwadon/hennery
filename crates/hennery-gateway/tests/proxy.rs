@@ -494,13 +494,20 @@ async fn only_json_and_event_streams_pass() {
 /// proxy fails this within seconds, it does not hang.
 #[tokio::test]
 async fn the_first_chunk_arrives_before_the_upstream_finishes() {
-    for (content_type, first) in [
-        ("application/json", r#"{"jsonrpc":"2.0","#.to_string()),
-        (
-            "text/event-stream",
-            event(&json!({"jsonrpc": "2.0", "method": "notifications/progress"})),
-        ),
-    ] {
+    // JSON is read whole (plan 2026-10-15 "gateway JSON answers"): a client
+    // can use none of it before its end, and a server request may be in it.
+    // While the upstream blocks, nothing of it comes down.
+    {
+        let s = setup(CredKind::None, None).await;
+        s.upstream
+            .reply(|_, hold| first_then_block("application/json", r#"{"jsonrpc":"2.0","#, hold));
+        let held = tokio::time::timeout(Duration::from_secs(1), s.h.post("linear", &s.token, &ping(1))).await;
+        assert!(held.is_err(), "a JSON answer came down before its end");
+    }
+    for (content_type, first) in [(
+        "text/event-stream",
+        event(&json!({"jsonrpc": "2.0", "method": "notifications/progress"})),
+    )] {
         let s = setup(CredKind::None, None).await;
         let chunk = first.clone();
         s.upstream
@@ -579,7 +586,7 @@ async fn requests_past_the_cap_are_503() {
     )
     .await;
     s.upstream
-        .reply(|_, hold| first_then_block("application/json", "{", hold));
+        .reply(|_, hold| first_then_block("text/event-stream", ": open\n\n", hold));
     let first = s.h.post("linear", &s.token, &ping(1)).await;
     assert_eq!(first.status(), StatusCode::OK);
     let second = s.h.post("linear", &s.token, &ping(2)).await;

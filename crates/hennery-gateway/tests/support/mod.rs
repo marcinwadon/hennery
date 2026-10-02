@@ -5,6 +5,7 @@
 
 #![allow(dead_code)]
 
+pub mod differential;
 pub mod upstream;
 
 use ed25519_dalek::SigningKey;

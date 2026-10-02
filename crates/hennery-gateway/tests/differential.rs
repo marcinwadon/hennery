@@ -10,20 +10,11 @@
 //!   allowlist, an `initialize` with a capability not forwarded, or a
 //!   method the gateway reads that the gateway did not read there.
 //! - **Down:** no decoder reads in what the client received a refused
-//!   server request, or a tool outside the allowlist in an answer to the
-//!   client's `tools/list`.
+//!   server request, in JSON or an event stream, or a tool outside the
+//!   allowlist in any `result.tools`, whatever its id.
 //!
-//! The decoders, as measured (plan 2026-10-15 "gateway differential"):
-//! - `Exact`: last of two keys wins, names compared exactly (serde_json,
-//!   JavaScript's `JSON.parse`, Python's `json`).
-//! - `First`: first wins, exactly (RapidJSON's `FindMember`, simdjson).
-//! - `GoV1`: last wins, names matched ignoring case with `ſ` as `s` and the
-//!   Kelvin sign as `k` (Go's `encoding/json`).
-//! - `GoV2Fold`: as `GoV1`, also ignoring `_` and `-` (Go's
-//!   `encoding/json/v2` asked to match case-insensitively).
-//! - `JsonC`: last wins, keys and strings cut at the first NUL (json-c 0.18).
-//! - `CJson`: first wins, names matched ignoring ASCII case, keys and
-//!   strings cut at the first NUL (cJSON 1.7.19's `cJSON_GetObjectItem`).
+//! The decoders are `support::differential`'s, each measured against a
+//! real one (Go, json-c, cJSON).
 //!
 //! What no decoder conflates (a key with a trailing space, a zero-width
 //! character, a fullwidth letter, NFD against NFC) is forwarded, and the
@@ -38,269 +29,11 @@ use axum::body::Body;
 use axum::http::{StatusCode, header};
 use axum::response::Response;
 use hennery_gateway::model::CredKind;
-use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Value, json};
+use support::differential::{forwarded_is_safe, received, received_is_safe};
 use support::upstream::{FakeUpstream, Harness};
 
 const ALLOWED: &str = "search";
-const READ_METHODS: &[&str] = &["tools/call", "tools/list", "initialize"];
-const STRIPPED: &[&str] = &["sampling", "elicitation", "roots"];
-const REFUSED: &[&str] = &["sampling/createMessage", "elicitation/create", "roots/list"];
-
-// --- A JSON tree that keeps every key, in order, twice if twice -----------
-
-#[derive(Debug, Clone)]
-enum Node {
-    Null,
-    Bool,
-    Num(f64),
-    Str(String),
-    Arr(Vec<Node>),
-    Obj(Vec<(String, Node)>),
-}
-
-impl<'de> Deserialize<'de> for Node {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(NodeVisitor)
-    }
-}
-
-struct NodeVisitor;
-
-impl<'de> Visitor<'de> for NodeVisitor {
-    type Value = Node;
-
-    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("JSON")
-    }
-    fn visit_unit<E>(self) -> Result<Node, E> {
-        Ok(Node::Null)
-    }
-    fn visit_bool<E>(self, _: bool) -> Result<Node, E> {
-        Ok(Node::Bool)
-    }
-    fn visit_i64<E>(self, v: i64) -> Result<Node, E> {
-        Ok(Node::Num(v as f64))
-    }
-    fn visit_u64<E>(self, v: u64) -> Result<Node, E> {
-        Ok(Node::Num(v as f64))
-    }
-    fn visit_f64<E>(self, v: f64) -> Result<Node, E> {
-        Ok(Node::Num(v))
-    }
-    fn visit_str<E>(self, v: &str) -> Result<Node, E> {
-        Ok(Node::Str(v.to_owned()))
-    }
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Node, A::Error> {
-        let mut items = Vec::new();
-        while let Some(item) = seq.next_element()? {
-            items.push(item);
-        }
-        Ok(Node::Arr(items))
-    }
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Node, A::Error> {
-        let mut entries = Vec::new();
-        while let Some((key, value)) = map.next_entry::<String, Node>()? {
-            entries.push((key, value));
-        }
-        Ok(Node::Obj(entries))
-    }
-}
-
-// --- The decoders ---------------------------------------------------------
-
-#[derive(Debug, Clone, Copy)]
-enum Decoder {
-    Exact,
-    First,
-    GoV1,
-    GoV2Fold,
-    JsonC,
-    CJson,
-}
-
-const DECODERS: &[Decoder] = &[
-    Decoder::Exact,
-    Decoder::First,
-    Decoder::GoV1,
-    Decoder::GoV2Fold,
-    Decoder::JsonC,
-    Decoder::CJson,
-];
-
-fn cut_at_nul(s: &str) -> &str {
-    s.split('\0').next().unwrap_or_default()
-}
-
-impl Decoder {
-    /// A key as this decoder compares it with a name.
-    fn key(self, key: &str) -> String {
-        match self {
-            Decoder::Exact | Decoder::First => key.to_owned(),
-            Decoder::GoV1 => key.chars().map(go_fold).collect(),
-            Decoder::GoV2Fold => key.chars().filter(|c| !matches!(c, '_' | '-')).map(go_fold).collect(),
-            Decoder::JsonC => cut_at_nul(key).to_owned(),
-            Decoder::CJson => cut_at_nul(key).to_ascii_lowercase(),
-        }
-    }
-
-    fn first_wins(self) -> bool {
-        matches!(self, Decoder::First | Decoder::CJson)
-    }
-
-    /// The member `name` of `node`, as this decoder finds it.
-    fn get<'a>(self, node: &'a Node, name: &str) -> Option<&'a Node> {
-        let Node::Obj(entries) = node else {
-            return None;
-        };
-        let want = self.key(name);
-        let mut found = entries.iter().filter(|(k, _)| self.key(k) == want).map(|(_, v)| v);
-        if self.first_wins() {
-            found.next()
-        } else {
-            found.next_back()
-        }
-    }
-
-    /// A string as this decoder hands it on.
-    fn str(self, node: Option<&Node>) -> Option<String> {
-        match node? {
-            Node::Str(s) => Some(match self {
-                Decoder::JsonC | Decoder::CJson => cut_at_nul(s).to_owned(),
-                _ => s.clone(),
-            }),
-            _ => None,
-        }
-    }
-}
-
-/// Go's case folding of a rune, as far as it reaches ASCII.
-fn go_fold(c: char) -> char {
-    match c {
-        '\u{17f}' => 's',
-        '\u{212a}' => 'k',
-        c => c.to_ascii_lowercase(),
-    }
-}
-
-fn messages(root: &Node) -> Vec<&Node> {
-    match root {
-        Node::Arr(items) => items.iter().collect(),
-        other => vec![other],
-    }
-}
-
-/// What no decoder may read in a body the gateway forwarded.
-fn forwarded_is_safe(body: &[u8]) -> Result<(), String> {
-    let root: Node = serde_json::from_slice(body)
-        .map_err(|e| format!("forwarded bytes no strict decoder reads ({e}); a lenient one might"))?;
-    for (i, message) in messages(&root).into_iter().enumerate() {
-        let gateway = Decoder::Exact.str(Decoder::Exact.get(message, "method"));
-        for &d in DECODERS {
-            let method = d.str(d.get(message, "method"));
-            if let Some(m) = method.as_deref()
-                && READ_METHODS.contains(&m)
-                && gateway.as_deref() != Some(m)
-            {
-                return Err(format!(
-                    "{d:?} reads method {m:?} in message {i}; the gateway read {gateway:?}"
-                ));
-            }
-            match method.as_deref() {
-                Some("tools/call") => {
-                    let name = d.str(d.get(message, "params").and_then(|p| d.get(p, "name")));
-                    if name.as_deref() != Some(ALLOWED) {
-                        return Err(format!("{d:?} reads a tools/call of {name:?} in message {i}"));
-                    }
-                }
-                Some("initialize") => {
-                    let caps = d.get(message, "params").and_then(|p| d.get(p, "capabilities"));
-                    for cap in STRIPPED {
-                        if caps.and_then(|c| d.get(c, cap)).is_some() {
-                            return Err(format!("{d:?} reads capability {cap} in message {i}"));
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    Ok(())
-}
-
-/// What no decoder may read in a message the client received, answering a
-/// `tools/list` of id `asked`: a refused request, and, with `allowlist`, a
-/// tool outside it.
-fn received_is_safe(root: &Node, asked: f64, allowlist: bool) -> Result<(), String> {
-    for (i, message) in messages(root).into_iter().enumerate() {
-        for &d in DECODERS {
-            let method = d.str(d.get(message, "method"));
-            if let Some(m) = method.as_deref()
-                && REFUSED.contains(&m)
-                && d.get(message, "id").is_some()
-            {
-                return Err(format!("{d:?} reads a {m} request in message {i}"));
-            }
-            let answers = matches!(d.get(message, "id"), Some(Node::Num(id)) if *id == asked);
-            let tools = d.get(message, "result").and_then(|r| d.get(r, "tools"));
-            if allowlist
-                && answers
-                && let Some(Node::Arr(tools)) = tools
-            {
-                for tool in tools {
-                    let name = d.str(d.get(tool, "name"));
-                    if name.as_deref() != Some(ALLOWED) {
-                        return Err(format!("{d:?} reads tool {name:?} in message {i}"));
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// A client's event-stream parser (WHATWG's rules, as `eventsource-parser`
-/// in MCP's TypeScript SDK): one leading byte-order mark stripped, lines
-/// ended by CRLF, LF or CR, comments ignored, data lines joined by LF, an
-/// event dispatched at an empty line, an unended last one dropped.
-fn client_events(text: &[u8]) -> Vec<String> {
-    let text = text.strip_prefix(b"\xef\xbb\xbf").unwrap_or(text);
-    let text = String::from_utf8_lossy(text);
-    let mut lines = Vec::new();
-    let mut rest = &text[..];
-    while let Some(at) = rest.find(['\r', '\n']) {
-        lines.push(&rest[..at]);
-        let skip = if rest[at..].starts_with("\r\n") { 2 } else { 1 };
-        rest = &rest[at + skip..];
-    }
-    let mut out = Vec::new();
-    let mut data: Option<String> = None;
-    for line in lines {
-        if line.is_empty() {
-            if let Some(d) = data.take() {
-                out.push(d);
-            }
-            continue;
-        }
-        if line.starts_with(':') {
-            continue;
-        }
-        let (field, value) = match line.split_once(':') {
-            Some((f, v)) => (f, v.strip_prefix(' ').unwrap_or(v)),
-            None => (line, ""),
-        };
-        if field == "data" {
-            match &mut data {
-                Some(d) => {
-                    d.push('\n');
-                    d.push_str(value);
-                }
-                None => data = Some(value.to_owned()),
-            }
-        }
-    }
-    out
-}
 
 // --- The proxy, the upstream, one vector at a time ------------------------
 
@@ -460,7 +193,7 @@ async fn no_decoder_reads_past_the_request_filter() {
             failures.push(format!("{what}: 400, yet sent"));
         }
         for up in sent {
-            if let Err(why) = forwarded_is_safe(&up.body) {
+            if let Err(why) = forwarded_is_safe(&up.body, &[ALLOWED]) {
                 failures.push(format!("{what}: {why}"));
             }
         }
@@ -537,6 +270,18 @@ const RESPONSES: &[(&str, Kind, &str, Expect)] = &[
     // 7. The envelope.
     ("sse array method", Kind::Sse, "data: {\"jsonrpc\":\"2.0\",\"id\":\"s\",\"method\":[\"roots/list\"]}\n\n", Safe),
     ("sse batch in a batch", Kind::Sse, "data: [[{\"jsonrpc\":\"2.0\",\"id\":\"s\",\"method\":\"roots/list\"}]]\n\n", Safe),
+    ("json sampling", Kind::Json, r#"{"jsonrpc":"2.0","id":"s","method":"sampling/createMessage","params":{}}"#, Safe),
+    ("json refused in a batch", Kind::Json, r#"[{"jsonrpc":"2.0","id":1,"result":{}},{"jsonrpc":"2.0","id":"s","method":"roots/list"}]"#, Safe),
+    ("json tools and a refused request", Kind::Json, r#"[{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"search"}]}},{"jsonrpc":"2.0","id":"s","method":"roots/list"}]"#, Safe),
+    ("json METHOD", Kind::Json, r#"{"jsonrpc":"2.0","id":"s","METHOD":"elicitation/create"}"#, Safe),
+    ("json NUL method value", Kind::Json, r#"{"jsonrpc":"2.0","id":"s","method":"roots/list\u0000x"}"#, Safe),
+    ("json method twice", Kind::Json, r#"{"jsonrpc":"2.0","id":"s","method":"roots/list","method":"ping"}"#, Safe),
+    // Ids: the filter reads every result.tools, whatever its id.
+    ("json id of another type", Kind::Json, r#"{"jsonrpc":"2.0","id":"1","result":{"tools":[{"name":"delete"}]}}"#, Safe),
+    ("json another id", Kind::Json, r#"{"jsonrpc":"2.0","id":7,"result":{"tools":[{"name":"search"},{"name":"delete"}]}}"#, Forwarded),
+    ("json no id", Kind::Json, r#"{"jsonrpc":"2.0","result":{"tools":[{"name":"delete"}]}}"#, Safe),
+    ("sse id of another type", Kind::Sse, "data: {\"jsonrpc\":\"2.0\",\"id\":\"1\",\"result\":{\"tools\":[{\"name\":\"delete\"}]}}\n\n", Safe),
+    ("sse another id", Kind::Sse, "data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"tools\":[{\"name\":\"search\"},{\"name\":\"delete\"}]}}\n\n", Forwarded),
     ("sse refused in a batch", Kind::Sse, "data: [{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"delete\"}]}},{\"jsonrpc\":\"2.0\",\"id\":\"s\",\"method\":\"roots/list\"}]\n\n", Forwarded),
 ];
 
@@ -549,22 +294,6 @@ const RAW_EVENTS: &[(&str, &[u8])] = &[
     ("sse invalid byte in a method", b"data: {\"jsonrpc\":\"2.0\",\"id\":\"s\",\"method\":\"roots/list\xff\"}\n\n"),
     ("sse overlong quotes", b"data: {\"id\":\"s\",\"x\":\"\xc0\xa2,\xc0\xa2method\xc0\xa2:\xc0\xa2roots/list\xc0\xa2,\xc0\xa2y\xc0\xa2:\xc0\xa2\",\"jsonrpc\":\"2.0\"}\n\n"),
 ];
-
-/// What the client received, as messages, for a body of `content_type`.
-/// Bytes that are not UTF-8 are a failure: a client may decode them
-/// otherwise than any model here.
-fn received(content_type: &str, body: &[u8]) -> Result<Vec<Node>, String> {
-    std::str::from_utf8(body).map_err(|e| format!("received bytes that are not UTF-8 ({e})"))?;
-    let datas = if content_type == "text/event-stream" {
-        client_events(body)
-    } else {
-        vec![String::from_utf8_lossy(body).into_owned()]
-    };
-    datas
-        .iter()
-        .map(|d| serde_json::from_str(d).map_err(|e| format!("received data no strict decoder reads ({e}): {d:?}")))
-        .collect()
-}
 
 /// One response vector through the proxy: the failures it shows, if any.
 async fn answer_vector(
@@ -616,7 +345,7 @@ async fn answer_vector(
                 failures.push(format!("{what}: nothing delivered"));
             }
             for message in &messages {
-                if let Err(why) = received_is_safe(message, 1.0, allowlist) {
+                if let Err(why) = received_is_safe(message, allowlist.then_some(&[ALLOWED][..])) {
                     failures.push(format!("{what}: {why}"));
                 }
             }
@@ -639,16 +368,14 @@ async fn no_decoder_reads_past_the_response_filters() {
 }
 
 /// The refusal of server requests does not depend on an allowlist: every
-/// event-stream vector again, on a connection without one. (Without one, a
-/// JSON answer is passed on unread, as 8d's Q1 ruling has it.)
+/// vector again, in JSON and event streams, on a connection without one
+/// (gateway spec §5.6: in any answer).
 #[tokio::test]
 async fn no_decoder_reads_a_refused_request_without_an_allowlist() {
     let s = setup_with(None).await;
     let mut failures = Vec::new();
     for &(what, kind, body, expect) in RESPONSES {
-        if matches!(kind, Kind::Sse) {
-            failures.extend(answer_vector(&s, what, kind, body.as_bytes(), expect, false).await);
-        }
+        failures.extend(answer_vector(&s, what, kind, body.as_bytes(), expect, false).await);
     }
     for &(what, body) in RAW_EVENTS {
         failures.extend(answer_vector(&s, what, Kind::Sse, body, Safe, false).await);
@@ -669,6 +396,15 @@ async fn ids_are_echoed_exactly_and_still_filtered() {
         let text = s.post(body).await.text().await.unwrap();
         assert!(text.contains(&format!(r#""id":{id}"#)), "{id}: {text}");
     }
+    // A string id stays a string: a client that coerces it (`Number("1")`)
+    // does so on its own (gateway spec §5.5).
+    let answer: Value = s
+        .post(r#"{"jsonrpc":"2.0","id":"1","method":"tools/call","params":{"name":"delete"}}"#)
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(answer["id"], json!("1"));
     for (id, value) in [("-0", 0.0), ("1e0", 1.0)] {
         let body = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"tools/call","params":{{"name":"delete"}}}}"#);
         let answer: Value = s.post(body).await.json().await.unwrap();
@@ -713,4 +449,182 @@ async fn a_tools_list_without_an_id_is_filtered_as_null() {
         .await
         .unwrap();
     assert_eq!(answer["result"]["tools"], json!([{"name": "search"}]));
+}
+
+/// A `GET` stream, and a `GET` replaying one with `Last-Event-ID`, are
+/// filtered as a live answer is: they carry no `tools/list` id of their
+/// own (gateway spec §5.5).
+#[tokio::test]
+async fn a_get_stream_and_its_replay_are_filtered() {
+    let s = setup().await;
+    let replayed = "id: 9\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"search\"},{\"name\":\"delete\"}]}}\n\n";
+    s.upstream.reply(move |_, _| {
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(replayed))
+            .unwrap()
+    });
+    for last_event_id in [None, Some("8")] {
+        let mut get =
+            s.h.client
+                .get(s.h.url("linear"))
+                .bearer_auth(&s.token)
+                .header(header::ACCEPT, "text/event-stream");
+        if let Some(id) = last_event_id {
+            get = get.header("last-event-id", id);
+        }
+        let text = get.send().await.unwrap().text().await.unwrap();
+        let events = support::differential::client_events(text.as_bytes());
+        assert_eq!(events.len(), 1, "{last_event_id:?}: {text}");
+        let answer: Value = serde_json::from_str(&events[0]).unwrap();
+        assert_eq!(
+            answer["result"]["tools"],
+            json!([{"name": "search"}]),
+            "{last_event_id:?}"
+        );
+    }
+    let seen = s.upstream.seen();
+    assert_eq!(seen[1].header("last-event-id"), Some("8"));
+}
+
+/// An answer on another stream (accepted, gateway spec §5.5): the proxy
+/// keeps nothing between requests, so one session's upstream stream never
+/// reaches another's. Two sessions on one connection, each with its own
+/// upstream session, open their streams at once; each sees only its own.
+#[tokio::test]
+async fn each_session_sees_only_its_own_upstream_stream() {
+    let s = setup().await;
+    let hat = s.h.hat();
+    let other = s.h.mint("s2", "host-a", &hat);
+    // Each event its own chunk, a pause between them, so the two streams
+    // interleave inside the proxy; the answer's session id is the
+    // upstream's own (`srv-…`), not the one the client sent.
+    s.upstream.reply(|seen, _| {
+        let who = seen.header("mcp-session-id").unwrap_or("none").to_owned();
+        let header = format!("srv-{who}");
+        let events = futures::stream::unfold(0, move |n| {
+            let who = who.clone();
+            async move {
+                if n == 20 {
+                    return None;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                let event = format!(
+                    "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{{\"for\":\"{who}\",\"n\":{n}}}}}\n\n"
+                );
+                Some((Ok::<_, std::io::Error>(axum::body::Bytes::from(event)), n + 1))
+            }
+        });
+        Response::builder()
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header("mcp-session-id", header)
+            .body(Body::from_stream(events))
+            .unwrap()
+    });
+    let open = |token: String, upstream_session: &'static str| {
+        let client = s.h.client.clone();
+        let url = s.h.url("linear");
+        async move {
+            let resp = client
+                .get(url)
+                .bearer_auth(token)
+                .header(header::ACCEPT, "text/event-stream")
+                .header("mcp-session-id", upstream_session)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.headers()["mcp-session-id"],
+                format!("srv-{upstream_session}").as_str()
+            );
+            resp.text().await.unwrap()
+        }
+    };
+    let (one, two) = tokio::join!(open(s.token.clone(), "up-1"), open(other, "up-2"));
+    for (text, mine) in [(one, "up-1"), (two, "up-2")] {
+        let events = support::differential::client_events(text.as_bytes());
+        assert_eq!(events.len(), 20, "{mine}: {text}");
+        for event in events {
+            let message: Value = serde_json::from_str(&event).unwrap();
+            assert_eq!(message["params"]["for"], mine, "{event}");
+        }
+    }
+}
+
+/// A server request inside a JSON answer (gateway spec §5.6, plan
+/// 2026-10-15 "gateway JSON answers" decision 2): the whole answer is 502
+/// `upstream_invalid`, nothing of it reaches the client, and nothing is
+/// answered upstream. With an allowlist or without.
+#[tokio::test]
+async fn a_server_request_in_a_json_answer_is_502() {
+    for allowlist in [Some(&[ALLOWED][..]), None] {
+        let s = setup_with(allowlist).await;
+        // Whatever the status: a JSON body is judged on a 4xx or 5xx too.
+        for status in [
+            StatusCode::OK,
+            StatusCode::ACCEPTED,
+            StatusCode::BAD_REQUEST,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let before = s.upstream.seen().len();
+            s.upstream.reply(move |_, _| {
+                Response::builder()
+                    .status(status)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"[{"jsonrpc":"2.0","id":1,"result":{}},{"jsonrpc":"2.0","id":"s","method":"sampling/createMessage","params":{}}]"#,
+                    ))
+                    .unwrap()
+            });
+            let resp = s.post(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{allowlist:?} {status}");
+            let body: Value = resp.json().await.unwrap();
+            assert_eq!(body["code"], "upstream_invalid", "{allowlist:?} {status}");
+            assert!(!body["message"].as_str().unwrap().contains("sampling/createMessage"));
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert_eq!(
+                s.upstream.seen().len(),
+                before + 1,
+                "{allowlist:?} {status}: something was answered upstream"
+            );
+        }
+    }
+}
+
+/// Every JSON answer is read whole (gateway spec §5.3): one over 8 MiB is
+/// 502 `upstream_too_large`, never truncated, with an allowlist or not; an
+/// empty one passes, empty.
+#[tokio::test]
+async fn a_json_answer_is_read_whole_and_capped() {
+    for allowlist in [Some(&[ALLOWED][..]), None] {
+        let s = setup_with(allowlist).await;
+        s.upstream.reply(|_, _| {
+            let pad = "x".repeat(8 * 1024 * 1024);
+            Response::builder()
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"result":{{"pad":"{pad}"}}}}"#
+                )))
+                .unwrap()
+        });
+        let resp = s.post(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{allowlist:?}");
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["code"], "upstream_too_large");
+        // A 202 typed JSON, with a body that is empty but not declared so.
+        s.upstream.reply(|_, _| {
+            Response::builder()
+                .status(StatusCode::ACCEPTED)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from_stream(futures::stream::iter(Vec::<
+                    Result<axum::body::Bytes, std::io::Error>,
+                >::new())))
+                .unwrap()
+        });
+        let resp = s
+            .post(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+            .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED, "{allowlist:?}");
+        assert_eq!(resp.text().await.unwrap(), "");
+    }
 }
