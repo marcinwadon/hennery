@@ -5,6 +5,7 @@
 use crate::AppState;
 use crate::api::{error, internal};
 use crate::hub::RequestError;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -261,9 +262,15 @@ fn is_askable(path: &str) -> bool {
 async fn browse(
     State(state): State<AppState>,
     Path(host_id): Path<String>,
-    Query(query): Query<BrowseQuery>,
+    query: Result<Query<BrowseQuery>, QueryRejection>,
 ) -> Response {
-    let Some(path) = query.path.filter(|path| is_askable(path)) else {
+    // A query that does not parse (`path` given twice) is as invalid as a
+    // missing one, and answered the same way (Task 5's review).
+    let Some(path) = query
+        .ok()
+        .and_then(|Query(query)| query.path)
+        .filter(|path| is_askable(path))
+    else {
         return error(
             StatusCode::BAD_REQUEST,
             "invalid",

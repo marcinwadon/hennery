@@ -472,7 +472,7 @@ impl Hosts {
             );
         }
         self.conn().execute(
-            "UPDATE hosts SET workspace_roots = ?2 WHERE id = ?1 AND owner_id = ?3",
+            "UPDATE hosts SET workspace_roots = ?2 WHERE id = ?1 AND revoked_at IS NULL AND owner_id = ?3",
             params![host_id, serde_json::to_string(&kept)?, self.owner],
         )?;
         Ok(())

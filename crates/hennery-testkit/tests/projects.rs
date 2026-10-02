@@ -380,7 +380,9 @@ async fn listed_projects(collector: &Collector, host: &mut ScriptedHost, paths: 
 #[tokio::test]
 async fn projects_come_from_the_host_and_are_cached_for_its_connection() {
     let collector = Collector::start_with(|state| {
-        state.projects = Arc::new(ProjectsCache::new(Duration::from_millis(500)));
+        // Long enough for the cached request to land in time on a loaded
+        // machine (Task 5's review); expiry is pinned by the unit test too.
+        state.projects = Arc::new(ProjectsCache::new(Duration::from_secs(2)));
     })
     .await;
     let mut host = ScriptedHost::with_projects(&collector).await;
@@ -394,7 +396,7 @@ async fn projects_come_from_the_host_and_are_cached_for_its_connection() {
     assert_eq!((status, &body["items"]), (200, &json!([{"path": "/p/a"}])));
     host.hears_nothing(Duration::from_millis(100)).await;
     // Past its lifetime it is asked again.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(2100)).await;
     let (_, body) = listed_projects(&collector, &mut host, &["/p/b"]).await;
     assert_eq!(body["items"], json!([{"path": "/p/b"}]));
     // A new connection is asked again, at once.
@@ -484,7 +486,14 @@ async fn browse_checks_the_path_before_asking() {
     let collector = Collector::start().await;
     let mut host = ScriptedHost::with_projects(&collector).await;
     let long = format!("/{}", "x".repeat(4096));
-    for query in ["", "?path=", "?path=relative", "?path=/a%0Ab", &format!("?path={long}")] {
+    for query in [
+        "",
+        "?path=",
+        "?path=relative",
+        "?path=/a%0Ab",
+        &format!("?path={long}"),
+        "?path=/a&path=/b",
+    ] {
         let (status, body) = get(&collector, &format!("/api/hosts/{HOST}/browse{query}")).await;
         assert_eq!((status, body["code"].as_str()), (400, Some("invalid")), "{query:?}");
     }
@@ -602,7 +611,9 @@ async fn a_hosts_reply_is_checked_before_it_is_shown() {
 
 #[tokio::test]
 async fn a_host_that_does_not_answer_is_no_answer_and_keeps_its_connection() {
-    let collector = Collector::start_with(|state| state.probe_timeout = Duration::from_millis(300)).await;
+    // Long enough for the follow-up probe's round trip on a loaded machine
+    // (Task 5's review).
+    let collector = Collector::start_with(|state| state.probe_timeout = Duration::from_secs(2)).await;
     let mut host = ScriptedHost::with_projects(&collector).await;
     let call = get_later(&collector, &format!("/api/hosts/{HOST}/projects"));
     let late = listed(&mut host).await;
@@ -613,4 +624,51 @@ async fn a_host_that_does_not_answer_is_no_answer_and_keeps_its_connection() {
     host.send(&projects(late, &["/late"])).await;
     let (_, body) = listed_projects(&collector, &mut host, &["/p/a"]).await;
     assert_eq!(body["items"], json!([{"path": "/p/a"}]));
+}
+
+/// Task 5's review: past the collector's own bounds, an answer is marked
+/// partial or truncated, and a home that can be shown is kept.
+#[tokio::test]
+async fn an_answer_past_the_collectors_bounds_is_partial_or_truncated() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::with_projects(&collector).await;
+    let call = get_later(&collector, &format!("/api/hosts/{HOST}/projects"));
+    let request_id = listed(&mut host).await;
+    host.send(&HostFrame::Projects {
+        request_id,
+        items: (0..16_001)
+            .map(|n| Project {
+                path: format!("/p/{n}"),
+            })
+            .collect(),
+        partial: false,
+        home: Some("/home/u".into()),
+    })
+    .await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(body["items"].as_array().unwrap().len(), 16_000);
+    assert_eq!((&body["partial"], &body["home"]), (&json!(true), &json!("/home/u")));
+
+    let call = get_later(&collector, &format!("/api/hosts/{HOST}/browse?path=/p"));
+    let CollectorFrame::BrowseDirectory { request_id, .. } = host.next().await else {
+        panic!("expected browse_directory");
+    };
+    host.send(&HostFrame::Directory {
+        request_id,
+        path: "/p".into(),
+        parent: None,
+        entries: (0..1001)
+            .map(|n| DirEntry {
+                name: format!("d{n}"),
+                git: false,
+            })
+            .collect(),
+        truncated: false,
+    })
+    .await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!(status, 200);
+    assert_eq!(body["entries"].as_array().unwrap().len(), 1000);
+    assert_eq!(body["truncated"], json!(true));
 }
