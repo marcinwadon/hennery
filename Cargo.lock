@@ -1445,13 +1445,19 @@ name = "hennery-gateway"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "axum",
  "chacha20poly1305",
+ "ed25519-dalek",
  "hennery-kernel",
  "hex",
  "libc",
+ "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "toml",
  "tracing",
+ "url",
  "zeroize",
 ]
 
@@ -1581,6 +1587,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "futures",
+ "hennery-gateway",
  "hennery-host",
  "hennery-kernel",
  "hennery-proto",
