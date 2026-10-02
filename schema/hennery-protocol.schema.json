@@ -2524,6 +2524,18 @@
         }
       },
       "type": "object"
+    },
+    "UpdateSessionRequest": {
+      "description": "`PATCH /api/sessions/{id}` (ACP core §9): absent fields stay as they are.\n`hat_id` re-assigns the session (ACP core §4.9): only with no running\nadapter, and with a fresh step-up.",
+      "properties": {
+        "hat_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",

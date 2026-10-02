@@ -717,3 +717,13 @@ pub struct HatResolution {
     #[ts(type = "string | undefined", optional)]
     pub rule_id: Option<String>,
 }
+
+/// `PATCH /api/sessions/{id}` (ACP core §9): absent fields stay as they are.
+/// `hat_id` re-assigns the session (ACP core §4.9): only with no running
+/// adapter, and with a fresh step-up.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct UpdateSessionRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub hat_id: Option<String>,
+}

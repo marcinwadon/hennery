@@ -5,7 +5,7 @@ use crate::content::{self, Refusal};
 use crate::hub::{RequestError, Undo};
 use crate::resolve::{NotResolved, OnHost, resolve_on_host};
 use crate::store::{
-    AnswerSubmission, Cursor, LIFECYCLES, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT, ListQuery, ResumeRequest, Store,
+    AnswerSubmission, Cursor, LIFECYCLES, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT, ListQuery, Reassign, ResumeRequest, Store,
 };
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
@@ -17,11 +17,12 @@ use futures::stream::{self, Stream, StreamExt};
 use hennery_kernel::hats::{Resolution, SessionHat};
 use hennery_kernel::json::ApiJson;
 use hennery_kernel::operator::Authenticated;
+use hennery_kernel::secret::unix_now;
 use hennery_proto::frames::{Capability, CollectorFrame, Indexed, SessionBody};
 use hennery_proto::rest::{
     AGENT_MAX_JSON_BYTES, AnswerRequest, AnswerResponse, ApiError, CancelResponse, ConfigRequest, EventDto,
     LifecycleResponse, OpenTurn, PendingItem, PromptRequest, PromptResponse, SessionDetail, StartSessionRequest,
-    StartSessionResponse, json_width,
+    StartSessionResponse, UpdateSessionRequest, json_width,
 };
 use serde::Deserialize;
 use std::convert::Infallible;
@@ -65,7 +66,7 @@ const _: () = assert!(
 pub fn router(state: AppState) -> Router {
     let routes = Router::new()
         .route("/api/sessions", post(start_session).get(list_sessions))
-        .route("/api/sessions/{id}", get(session_detail))
+        .route("/api/sessions/{id}", get(session_detail).patch(update_session))
         .route("/api/sessions/{id}/resume", post(resume))
         // The one route that reads more than axum's default 2 MB (plan 6a).
         .route(
@@ -435,6 +436,47 @@ fn hat_name(state: &AppState, hat_id: &str) -> String {
         Ok(Some(hat)) => format!("hat {:?}", hat.name),
         _ => format!("hat {hat_id}"),
     }
+}
+
+/// `PATCH /api/sessions/{id}` (ACP core §9): re-assign the session to another
+/// hat (ACP core §4.9), 200 with its detail. Only with no running adapter,
+/// and only from a session stepped up within five minutes (plan 5d decision
+/// 2): it moves the session's history into another hat's reach.
+async fn update_session(
+    State(state): State<AppState>,
+    Extension(operator_session): Extension<Authenticated>,
+    Path(id): Path<String>,
+    ApiJson(req): ApiJson<UpdateSessionRequest>,
+) -> Response {
+    let Some(hat_id) = req.hat_id else {
+        return session_detail(State(state), Path(id)).await;
+    };
+    if !operator_session.stepped_up(unix_now()) {
+        return hennery_kernel::auth::step_up_required();
+    }
+    match state.store.reassign_hat(&id, &hat_id) {
+        Ok(Reassign::Done(event)) => {
+            tracing::info!(session_id = %id, %hat_id, "session re-assigned");
+            state.hub.publish(event);
+        }
+        Ok(Reassign::Unchanged) => {}
+        Ok(Reassign::Attached(lifecycle)) => {
+            return error(
+                StatusCode::CONFLICT,
+                &lifecycle,
+                match lifecycle.as_str() {
+                    "presumed_parked" => {
+                        "its host has been away and may still run it: close the session first".to_string()
+                    }
+                    other => format!("the session is {other}: park or close it first"),
+                },
+            );
+        }
+        Ok(Reassign::UnknownHat) => return error(StatusCode::BAD_REQUEST, "invalid", "no such hat"),
+        Ok(Reassign::NotFound) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) => return internal(err),
+    }
+    session_detail(State(state), Path(id)).await
 }
 
 /// Resume a parked, closed or failed session (ACP core §4.3): 202 with the
