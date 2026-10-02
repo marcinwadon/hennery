@@ -50,6 +50,7 @@ fn kinds(frames: &[HostFrame]) -> Vec<String> {
                     None => format!("pending_resolved:{}", tag(resolution)),
                 },
                 SessionBody::AnswerResult { delivered, .. } => format!("answer_result:{delivered}"),
+                SessionBody::GitState { .. } => "git_state".to_string(),
             },
             other => format!("{other:?}"),
         })

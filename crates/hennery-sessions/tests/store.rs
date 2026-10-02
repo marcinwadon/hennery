@@ -2236,3 +2236,88 @@ fn the_list_serves_items_bounded() {
     );
     assert_eq!(store.session_item("s1").unwrap().unwrap().cwd, cwd);
 }
+
+// Plan 6b-ii: the git state (ACP core §3.2, §7, §8).
+
+fn git(branch: Option<&str>, dirty: bool, base: Option<&str>) -> SessionBody {
+    SessionBody::GitState {
+        branch: branch.map(str::to_string),
+        dirty,
+        worktree: false,
+        head: Some("c0ffee".into()),
+        base_commit: base.map(str::to_string),
+    }
+}
+
+/// Decision 11: a `git_state` fills the git columns, the branch on one
+/// line and capped like the title; `base_commit` is recorded once; one
+/// that changes nothing is stored but not listed (the review's O1), and
+/// does not move the session up the list.
+#[test]
+fn a_git_state_fills_the_git_columns_and_records_the_base_commit_once() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    let created = store.ingest("s1", 2, &git(Some("main"), true, Some("c0ffee"))).unwrap();
+    assert_eq!(kinds(&created), ["git_state"]);
+    let row = store.session("s1").unwrap().unwrap();
+    assert_eq!(
+        (row.git_worktree, row.base_commit.as_deref()),
+        (Some(false), Some("c0ffee"))
+    );
+    let item = store.session_item("s1").unwrap().unwrap();
+    assert_eq!((item.git_branch.as_deref(), item.git_dirty), (Some("main"), Some(true)));
+
+    let recency = store.session("s1").unwrap().unwrap().last_event_id;
+    assert!(
+        store
+            .ingest("s1", 3, &git(Some("main"), true, Some("decade")))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(store.session("s1").unwrap().unwrap().last_event_id, recency);
+    assert_eq!(listed(&store, "s1"), ["session_started", "git_state"]);
+
+    store
+        .ingest(
+            "s1",
+            4,
+            &git(
+                Some(&format!("feat/\u{202E}{}", "x".repeat(200))),
+                false,
+                Some("decade"),
+            ),
+        )
+        .unwrap();
+    let row = store.session("s1").unwrap().unwrap();
+    assert_eq!(row.base_commit.as_deref(), Some("c0ffee"));
+    let item = store.session_item("s1").unwrap().unwrap();
+    assert_eq!(item.git_branch, Some(format!("feat/{}", "x".repeat(115))));
+    assert_eq!(item.git_dirty, Some(false));
+    // Detached: no branch.
+    store.ingest("s1", 5, &git(None, false, None)).unwrap();
+    assert_eq!(store.session_item("s1").unwrap().unwrap().git_branch, None);
+}
+
+/// A git state for a closed session changes nothing; a base commit that is
+/// not a commit id is not recorded.
+#[test]
+fn a_git_state_for_a_closed_session_or_with_a_strange_base_changes_nothing() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store
+        .ingest("s1", 2, &git(Some("main"), false, Some("not a commit")))
+        .unwrap();
+    assert_eq!(store.session("s1").unwrap().unwrap().base_commit, None);
+    store.close_now("s1").unwrap();
+    assert!(
+        store
+            .ingest("s1", 3, &git(Some("other"), true, Some("c0ffee")))
+            .unwrap()
+            .is_empty()
+    );
+    let item = store.session_item("s1").unwrap().unwrap();
+    assert_eq!(
+        (item.git_branch.as_deref(), item.git_dirty),
+        (Some("main"), Some(false))
+    );
+}
