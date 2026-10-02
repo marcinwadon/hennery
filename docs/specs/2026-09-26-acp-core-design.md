@@ -383,6 +383,7 @@ host.)*
 | `browse_directory` | path | `directory{entries[]}` \| `error` |
 | `resolve_path` | path | `resolved_path{canonical, exists, is_dir}` \| `error` (kernel spec §5.4) |
 | `probe_agents` | — | `agents{…}` (same shape as in `hello`) |
+| `forget_session` | agent, agent_session_id, agent_home | `session_forgotten{outcome: complete \| partial, removed[{what, count}], remaining[{what, count, reason, retry}]}` \| `error`. Only to a host with the `forget_session` capability; kinds and reason codes are fixed, never paths (§4.10, plan 9d-i). |
 
 **Collector → host, not requests:**
 
@@ -1126,8 +1127,29 @@ deletes every session of the hat the same way. As built (plan 9a):
   too, best effort, by the adapter's own call if it has one, or else only that
   session's files inside the agent's known session directory, never through a
   symlink; what could not be removed is reported and retried when the host
-  reconnects (operator delegated, parent decided 2026-10-02). Not built yet:
-  plan 9d.
+  reconnects (operator delegated, parent decided 2026-10-02). As built for
+  Claude (plan 9d-i):
+  - the host records each session's agent home at start (from the adapter's
+    environment: `CLAUDE_CONFIG_DIR` or `~/.claude`; `CODEX_HOME` or
+    `~/.codex`) in a registry of its own, synced before `session_started`, and
+    reports it; the delete writes a `host_forgets` record for each, before
+    the scrub, unless another kept session uses that agent session;
+  - the collector sends `forget_session` (§3.3) at once if the host is ready,
+    and after every reconciled handshake and the session's `session_closed`;
+    the host acts only for a home it registered, never while an adapter of
+    that agent session runs;
+  - for Claude: the adapter's `session/delete` (outside the no-follow
+    guarantee), then, through directory descriptors and never through a
+    link, `projects/*/<id>.jsonl`, `<id>/` and the transcript's sidecars, and
+    `file-history/<id>/`, `session-env/<id>/`, `tasks/<id>/`,
+    `debug/<id>.txt`; checked afterwards. A root or directory another user,
+    or a group other than the user's own private one, may write is refused;
+  - the delete's answer and the purge's carry what was removed, what was left
+    and why (kinds and counts, never paths); `GET /api/settings/host-removals`
+    lists what is left;
+  - **not removed:** transcripts started after a context clear inside the
+    agent (a session id hennery never learns), and a session from before 9d
+    (no recorded home). Codex: plan 9d-ii.
 
 ---
 
@@ -1434,7 +1456,10 @@ shipped):
 13. `turn_attachments` (backfilled from `turns.content`), the
    `attachments_by_hash` index, and the triggers that refuse every write for a
    deleted session's tombstone — delete (9a). Later migrations that update
-   `sessions` must leave tombstones alone.
+   `sessions` must leave tombstones alone;
+14. `sessions.agent_home` and `host_forgets` (owner, host, session, hat,
+   agent, agent session id, home, state, attempts, last result) — the
+   agent's transcript on its host (9d-i).
 
 `sessions` has no `hat_id`, `source_kind`, `title`, git columns or
 `last_event_id` yet, `turns` keeps only `content`, `state`, `outcome` and its
@@ -1519,11 +1544,12 @@ All endpoints require an operator session (kernel spec §3). Types come from
 | `POST /api/sessions/{id}/cancel` | Cancel the open turn → 202 `CancelResponse {turn_id, outcome}` once that turn's `turn_ended` is ingested, with its real outcome (`cancelled`; `completed` or `failed` if it ended first; `interrupted` if the session was parked or closed meanwhile, or its adapter exited); 409 `not_attached` / `no_open_turn` / `not_running` (§4.4). |
 | `POST /api/sessions/{id}/park` | Explicit park → 202 `LifecycleResponse` once `session_parked` is ingested; 409 `not_attached` (not `active`, or host not ready); 409 `park_unsupported` (host lacks the `park` capability, nothing sent). |
 | `POST /api/sessions/{id}/close` | Close → 202 `LifecycleResponse` once closed (at once when unattached, parked, presumed parked, failed or the host is offline; on `session_closed` when attached); 409 `starting` while a start is in flight on a reachable host (§4.8). |
-| `DELETE /api/sessions/{id}` | Delete (§4.10) → 204; 403 `step_up_required` before anything is read; 404 (unknown or deleted); 409 `starting` on a reachable host, or the lifecycle as its code if it moved during the delete; 503 `delivery_unknown` (nothing deleted, the close stays requested). |
+| `DELETE /api/sessions/{id}` | Delete (§4.10) → 200 `DeleteResult {host_transcript: {state: removed \| partial \| pending \| none, remaining[], notes[]}}` (plan 9d-i; 204 before it); 403 `step_up_required` before anything is read; 404 (unknown or deleted); 409 `starting` on a reachable host, or the lifecycle as its code if it moved during the delete; 503 `delivery_unknown` (nothing deleted, the close stays requested). |
 | `POST /api/sessions/{id}/config` | `{config_id, value}` (a select's value id or a boolean) → 202 with the session's stored `SessionCatalog` once `config_applied` is ingested (after a read-back without options it still shows the old values, §3.2); 409 `not_attached` (not `active`, or host not ready) / `unknown_option`; 400 `invalid`; 502 `config_failed`; 422 for a value that is neither a string nor a boolean. Every viewer also gets SSE `catalog_changed`. |
 | `POST /api/sessions/{id}/pending/{pending_id}/answer` | `{option_id}` (permission) or `{action, content?}` (elicitation) → 202 `{pending_id, request_id}` once queued, whatever the lifecycle or host state; 404; 409 `not_open` / `already_answered`; 400 `invalid`; 422 for a body that is neither kind. The verdict follows as SSE `pending_changed`. |
 | `PATCH /api/sessions/{id}` | `UpdateSessionRequest {hat_id?}` → 200 `SessionDetail`; hat re-assignment (no running adapter, §4.9): 403 `step_up_required`, 400 `invalid` (not the owner's hat), 404, 409 lifecycle or `presumed_parked`. A body naming no hat needs no step-up; renaming (`title`) joins it later. |
 | `GET /api/attachments/{sha256}` | Image bytes of the owner's, as their stored type, with `nosniff`, `Content-Security-Policy: default-src 'none'`, `Cross-Origin-Resource-Policy: same-origin` and `Cache-Control: private, max-age=31536000, immutable`; 404 for any name that is not one of the owner's images. |
+| `GET /api/settings/host-removals`, `DELETE …/{id}` | What is left to remove on hosts (host, agent, state, last result, attempts); dismiss one (step-up) (plan 9d-i). |
 | `GET /api/settings/attachments` | `AttachmentUsage {count, bytes}`: the owner's stored images, each once, for Settings (§15). |
 | `GET /api/hosts/{id}/projects` / `…/browse?path=` | Project picker. |
 | `GET /api/hosts/{id}/agents` | Agents, availability, auth and catalogues for that host. |
