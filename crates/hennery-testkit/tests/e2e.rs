@@ -376,7 +376,12 @@ async fn a_start_with_unknown_delivery_reports_503_with_the_session_id() {
     let conn_id = collector
         .state
         .hub
-        .register("host-1", tx, Capabilities(vec![Capability::ResolvePath]))
+        .register(
+            "host-1",
+            tx,
+            Capabilities(vec![Capability::ResolvePath]),
+            Default::default(),
+        )
         .expect("register fake host")
         .conn_id;
     collector.state.hub.mark_ready("host-1", conn_id);

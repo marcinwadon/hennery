@@ -144,6 +144,7 @@ impl ScriptedHost {
             capabilities,
             workspace_roots: vec![],
             attached_sessions: attached,
+            mcp_isolation: Default::default(),
         })
         .await;
         let ack = host.next().await;
@@ -167,6 +168,7 @@ impl ScriptedHost {
             capabilities: Capabilities::default(),
             workspace_roots: vec![],
             attached_sessions: vec![],
+            mcp_isolation: Default::default(),
         })
         .await;
         host.next().await
@@ -605,6 +607,8 @@ async fn a_request_that_times_out_on_a_live_connection_drops_it() {
         agent: "fake".into(),
         cwd: "/tmp".into(),
         config: Default::default(),
+        hat_id: String::new(),
+        mcp: Default::default(),
     };
     let outcome = collector
         .state
