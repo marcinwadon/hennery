@@ -42,13 +42,66 @@
 
 It builds on the executed [passkeys plan 3c](2026-10-05-passkeys.md), [`owner_id` everywhere 3b-iii](2026-10-04-owner-id.md), [session config B2b](2026-09-30-session-config.md) and [permissions (2)](2026-10-01-permissions.md). From B2b's and (2)'s "After this plan" it takes "the rest of the catalogue" (commands; plan and usage stay out) and "`model` / `mode` in the list and detail items". Every anchor below was taken from `main` at `7f779e4`, which merged PR #18. Where the code and a spec disagree, the code wins, and the plan says so.
 
-**Status:** not executed; amended after two security reviews (2026-10-02). The first, on the decisions, approved after amendments A1–A11 (O1, O3, O4, O6 taken); the second, on the written plan, approved after amendments B1–B4 (P1–P5 taken, P6 and P7 recorded) and re-confirmed the amended code at its final commit (see "Decisions", "What the reviews changed"). Both reviews were by a stronger model (Claude Opus) on the maintainer's behalf.
+**Status:** 6b-i executed 2026-10-02 as PR #46 (see "Execution status"); 6b-ii (Tasks 6–7) executed on its branch, to ship as PR 2. Amended after two security reviews (2026-10-02). The first, on the decisions, approved after amendments A1–A11 (O1, O3, O4, O6 taken); the second, on the written plan, approved after amendments B1–B4 (P1–P5 taken, P6 and P7 recorded) and re-confirmed the amended code at its final commit (see "Decisions", "What the reviews changed"). Both reviews were by a stronger model (Claude Opus) on the maintainer's behalf.
 
 Every code block below was built and tested in a scratch copy of `7f779e4`, two commits per task (the task's tests alone, then the whole task), and generated from those commits. The plan was then replayed from its own text, task by task, onto a fresh copy of `7f779e4`: after each task's Step 1 the tree matched the scratch's tests-only commit, and after the task its task commit, byte for byte, the generated files included (114 blocks; after every task the replay ran fmt, both clippy runs, the codegen check and the workspace tests: 537, 539, 546, 551, 559, 562 and 571 tests, up from 533). The revert-probes (each task's Step 5) were run: 43 probes, every one caught. The timing-sensitive test binaries (`host_session`, `reconcile`) ran with four copies at once, three rounds: one pre-existing test failed once under that load and passed alone 15 times of 15 (see "Not tested here").
 
-## Execution status
+## Execution status (2026-10-02)
 
-Not executed yet.
+**6b-i executed** (Tasks 1–5) on branch `plan/session-list`, as PR #46.
+- **How:** each task was done by one implementer, then reviewed by an opus reviewer; a whole-branch review covered both PRs.
+- **Verified on disk:** every task's code was identical to the scratch commit the plan was replayed from.
+- **Review findings:**
+  - two Important findings, both fixed (see the table);
+  - every other finding was Minor, and they are deferred (see below).
+- **The whole-branch review:**
+  - its Critical finding was the rebase, done below;
+  - its Important findings: this record (I1), and the corrections under "After this plan" (I2).
+- **Tests:** 769 in the workspace after the rebase onto `main` at `5504cbd` (743 there, plus 26).
+
+| Area | As built | Why |
+|---|---|---|
+| The catalogue's replay test (Task 3 review, Important) | `a_replay_sends_the_catalogue_once_after_the_last_event_that_changed_it` waits until every event is stored before it opens the stream, and also reads from `Last-Event-ID` (once, after `bypass`, from the commands event; none past `bypass`) | `ScriptedHost::emit` does not wait for the collector, so an event stored late arrived live and the count could fail; the test's name promised a `Last-Event-ID` replay it never made |
+| Migration number (rebase) | Migration 9, after 6a's attachments (8). `the_session_list_migration_normalises_recency_on_an_older_database` builds a version-8 database (`MIGRATIONS[..8]`); the rollback tests also drop 6a's two tables | 6a merged its migration first; a merged migration is never edited |
+| The audit's floor (rebase) | 86 for `store.rs` (`main`'s 81, plus this PR's 5) | 6a added four statements |
+| `start_session` (rebase) | Takes `main`'s `ApiJson` extractor; the checks are unchanged | `main` answers refused JSON bodies with a fixed `ApiError` |
+| Decision 12 (rebase) | No `#[expect(clippy::large_enum_variant)]` on `HostFrame` | On `main`'s frames the lint no longer fires, and an unfulfilled `expect` fails `-D warnings` |
+| `SessionCatalog.commands` (whole-branch review, M3) | Always sent: no `#[serde(default)]` | With it, the schema made the field optional while the TypeScript type required it |
+
+Deferred minors (from the task reviews):
+- Task 1:
+  - recency's id never goes back, but its time follows the wall clock (decision 6's "never back" is the id);
+  - the migration rounds old fractions, while `stamp` truncates;
+  - a leftover value that is not a time sorts first;
+  - three more migration-test rows (another owner's event, a collector event, an offset stamp).
+- Task 2:
+  - an `expect` `reason`;
+  - a clone of each payload in `state_extracts`;
+  - a stricter "no catalogue" assertion;
+  - three more inputs (a numeric title, `availableCommands: null`, an entry the crate drops);
+  - an early title on a new session's start, and a replayed `null` title;
+  - an exact count in the resume test.
+- Task 3:
+  - a stale comment in `ingest` ("never sends a replayed one with extracts");
+  - no collector-side guard against an early config snapshot;
+  - no test of early commands;
+  - a `catalog_changed` silently skipped on a store error;
+  - an early update with config extracts triggering a `catalog_changed` that changes nothing.
+- Task 4:
+  - the detail answers 404 rather than 500 when one of its two reads fails and the other finds nothing;
+  - the 1 KiB test has no control character;
+  - the start's revoked-host and other-owner cases are untested;
+  - the operator's cwd and agent may hold bidi characters;
+  - the detail's model is untested;
+  - a `created_at` compared with itself.
+- Task 5:
+  - repeated query keys (`?lifecycle=a&lifecycle=b`) get axum's plain-text 400, not an `ApiError`;
+  - a `limit` past `u32` is refused rather than clamped;
+  - `ListQuery` accepts `Some(&[])` and more than five names;
+  - the query-plan test does not assert a SEARCH, nor run without a pattern;
+  - no HTTP case for duplicate or empty lifecycle names.
+
+**6b-ii** (Tasks 6–7) is recorded when PR 2 merges.
 
 ## Scope
 
@@ -149,7 +202,7 @@ The second (2026-10-02, on the written plan; it found A1–A11, O1, O3, O4 and O
    - **Choice:** `last_event_at` and the new `last_event_id` are set by every collector event and by every host fact that applies, to the stamp and the highest event id written. A fact kept only as the idempotency key (unapplied) and an exact duplicate move neither. A fact's own collector events (`user_turn`, `turn_not_delivered`, `pending_cancelled`) come after it, so the highest id is the last of them. The migration backfills `last_event_id` from the highest applied event.
    - **Was:** every stored fact bumped `last_event_at`, unapplied ones too, so a hidden event moved a session up the list.
    - **Not changed:** `mark_failed` and `mark_failed_if_starting` change a session without an event, so without recency (recorded for the list stream). `presume_parked` writes an event per session, so a host gone to sleep moves its sessions up the list, as the spec has it.
-7. **One migration for every column of this plan.** Migration 8 adds `sessions.title`, `git_branch`, `git_dirty`, `git_worktree`, `base_commit`, `last_event_id` and `session_catalog.commands`, normalises recency (decision 5), backfills `last_event_id` (decision 6, correlating `owner_id` by hand: migrations start with `ALTER`, and the audit reads only statements that start with a verb), and adds `sessions_by_recency(owner_id, last_event_at DESC, id DESC)`. The git columns stay `NULL` until 6b-ii.
+7. **One migration for every column of this plan.** Migration 8 as written, 9 as merged (6a took 8; see "Execution status"), adds `sessions.title`, `git_branch`, `git_dirty`, `git_worktree`, `base_commit`, `last_event_id` and `session_catalog.commands`, normalises recency (decision 5), backfills `last_event_id` (decision 6, correlating `owner_id` by hand: migrations start with `ALTER`, and the audit reads only statements that start with a verb), and adds `sessions_by_recency(owner_id, last_event_at DESC, id DESC)`. The git columns stay `NULL` until 6b-ii.
 8. **`GET /api/sessions`.** It answers `SessionPage { sessions: SessionItem[], next_cursor? }`.
    - **Order:** `last_event_at DESC, id DESC`.
    - **Keyset:** one static statement, `(last_event_at, id) < (?2, ?3)`, walking `sessions_by_recency` with no sort of its own (pinned by a query-plan test, A11). With no cursor the bound is a sentinel above every stamp. `next_cursor` is set exactly when a further row exists (`limit + 1` fetched).
@@ -194,7 +247,7 @@ The second (2026-10-02, on the written plan; it found A1–A11, O1, O3, O4 and O
 - decision 8: ACP core §9: the list's cursor, `limit`, `lifecycle` and `q` rules, and `hat`'s 400 until hats;
 - decision 9: ACP core §8, §9: the item's fields and caps; `POST /api/sessions`' 400 `unknown_host` and agent cap; the detail as the item plus the open turn and questions;
 - decision 11: ACP core §3.2, §7: `git_state`'s fields, when it is sent, its failure semantics, and the probe's isolation and residual risk;
-- ACP core §8's "Built so far": migrations 7 (`owner_id`, 3b-iii) and 8 (this plan).
+- ACP core §8's "Built so far": migrations 7 (`owner_id`, 3b-iii), 8 (attachments, 6a) and 9 (this plan).
 
 ## Global Constraints
 
@@ -5183,6 +5236,8 @@ Each probe below was applied to the task's commit, its test run, and the change 
 - a title from before this plan, or of an agent that never reports one, is absent: fall back to the cwd's last component (frontend §5).
 
 **Recorded, not done:**
+- `git_worktree`, `base_commit` and `head` are stored (or ride the event) but no REST type serves them: a later diff or Changes view reads them (the whole-branch review's I2);
+- `find_git` runs `git --version` inside `HostConfig::new`, on the caller's thread, for up to 3 s (the whole-branch review's M2);
 - the `text_projection`, `usage` and `plan` extracts; `GET …/catalog` gains plan and usage with them;
 - transcript full-text search (out of v1);
 - `LIKE` ignores case for ASCII letters only (decision 8);
