@@ -52,7 +52,7 @@ gw_credentials(
   expires_at, updated_at)
 gw_mounts(connection_id, host_id, owner_id, PRIMARY KEY(connection_id, host_id))
 gw_session_tokens(                  -- one per session, minted at every start/resume
-  session_id PK, owner_id, host_id, hat_id, token_hash,
+  session_id PK, owner_id, host_id, hat_id, token_hash UNIQUE,
   created_at, last_used_at, revoked_at)
 gw_clients(                         -- standalone clients only
   id TEXT PK, owner_id, hat_id, label,
@@ -153,6 +153,15 @@ included, since a table with children cannot be rebuilt later to widen one
 - Tokens are 32 random bytes, stored only as SHA-256 hashes. A standalone
   token is shown once; a session token exists in plaintext only inside the
   `start_session` / `resume_session` frame for that session's host.
+- A session token is `hnry_session_` and 64 lowercase hexadecimal digits, a
+  prefix a secret scanner can match; anything else is not looked up (plan
+  8d). Standalone tokens get a prefix of their own (plan 8g).
+- The gateway mints and revokes inside the sessions store's own
+  transactions (`tokens::mint_in`, `revoke_in`, `revoke_host_in`, each
+  taking the caller's `rusqlite::Transaction`), so a transition that rolls
+  back leaves no token minted or revoked. A mint replaces the session's
+  row: the previous token no longer resolves. A hat purge deletes its
+  tokens, revoked ones too (`purge_hat_in`).
 - **One token per session.** It is revoked on park, close, adapter exit and
   host revoke (`SessionMcp::revoke`), and superseded by the token minted at the
   next resume. A presumed park while the host is merely offline does not revoke
@@ -160,7 +169,11 @@ included, since a table with children cannot be rebuilt later to widen one
 - **Scope is checked at request time** from the token's (host, hat) and the
   mounts as they are now, never from anything the request claims. An unknown
   token, a revoked token, an unmounted connection, or a connection of another
-  hat all return **404** (not 403: do not confirm existence).
+  hat all return **404** (not 403: do not confirm existence). So do a
+  missing, malformed or repeated `Authorization`, a superseded token, a
+  token of a revoked host and an unknown slug: one body for all of them, and
+  never 401 (G-17). A revoked host's tokens and mounts are out of scope
+  whether or not its tokens were revoked.
 - Tokens are never logged, and the `headers` of `mcp_servers` entries never
   appear in timeline events or SSE (ACP core §8).
 
@@ -367,6 +380,17 @@ Resolve token → principal → the connection with that slug, which must be in
 the principal's scope (§3.1). Otherwise 404. The request body is capped at
 4 MiB (413 only for the size limit).
 
+Every answer the proxy makes itself is an `ApiError`, `{code, message}`, as
+every other route's: 404 `not_found`, 400 `invalid_request`, 408
+`request_timeout` (a body has 30 s to arrive), 413 `body_too_large`, 503
+`busy`, 502 `upstream_auth`, `upstream_unreachable`, `upstream_redirect`,
+`upstream_content_type`, `upstream_too_large` or `upstream_invalid`, 500
+`internal`. None names more of the upstream URL than its connection's label.
+A JSON-RPC error inside an MCP answer (§5.5, §5.6) stays JSON-RPC. Anything
+deeper under a slug (`/mcp/<slug>/…`, a bare trailing slash too), a slug
+that is not UTF-8, and any other method (`HEAD` included) is the same 404,
+and nothing goes up.
+
 ### 5.2 Forwarding
 
 - Hand-written on `axum` + `reqwest` streaming. Not built on an MCP library:
@@ -376,13 +400,39 @@ the principal's scope (§3.1). Otherwise 404. The request body is capped at
   `application/json, text/event-stream`), `Mcp-Session-Id`,
   `Mcp-Protocol-Version`, `Last-Event-ID`. `Authorization` is replaced by the
   upstream credential (or removed for `none`). Everything else is dropped.
-- **Response headers forwarded:** `Content-Type`, `Mcp-Session-Id`,
-  `Cache-Control`. Everything else is dropped, including `Set-Cookie` and
-  `WWW-Authenticate`. *(G-15: the predecessor passed `Set-Cookie` through.)*
+  `Content-Type: application/json` goes up with a `POST` (the gateway checked
+  the body is JSON), `Accept-Encoding: identity` is sent, and the upstream
+  URL is the connection's as stored: the client's path beyond the slug and
+  its query are not forwarded. A static credential is read in one statement
+  with the URL, header and prefix it goes with.
+- **A `POST` body must be JSON with no key twice in any object**, or it is
+  400 `invalid_request` and nothing is sent: a parser upstream that keeps
+  the first of two `"method"`s or `"name"`s would otherwise run what the
+  allowlist never saw. Nor may it spell a key the gateway reads otherwise
+  than exactly, folding ASCII case and `ſ` to `s` and ignoring `_` and `-`,
+  as Go's `encoding/json` (v1 and v2) can match names: a message's
+  `jsonrpc`, `id`, `method` and `params`, a `tools/call`'s `name`, an
+  `initialize`'s `capabilities` and the capabilities not forwarded.
+  `METHOD` or `Name` would be read upstream as what the allowlist never
+  saw. The bytes go up as they came, except an
+  `initialize` rewritten (§5.6). `GET` and `DELETE` bodies are neither read
+  nor sent.
+- **Response headers forwarded:** `Mcp-Session-Id`; `Content-Type` is the
+  gateway's (below). `Cache-Control` is always `no-store`, the proxy's own
+  answers' too: an answer to a request that carries a token is no shared
+  cache's to keep, whatever the upstream says. Everything else is dropped,
+  including `Set-Cookie` and `WWW-Authenticate`. *(G-15: the predecessor
+  passed `Set-Cookie` through.)*
   The gateway always adds `X-Content-Type-Options: nosniff`, and forwards only
   `application/json` and `text/event-stream` bodies; any other upstream content
-  type becomes a 502.
-- Upstream redirects are never followed (§5.7).
+  type becomes a 502. So does a body without a content type, more than one
+  `Content-Type`, and any `Content-Encoding` but `identity`. A body-less
+  answer (202, 204, or `Content-Length: 0`) without a type passes, empty. The
+  `Content-Type` sent down is the gateway's, the one type it judged the body
+  by, without parameters: a parameter or a second header cannot make a
+  client read as an event stream what the gateway passed as JSON.
+- Upstream redirects are never followed (§5.7): a 3xx is 502
+  `upstream_redirect`, its `Location` never forwarded.
 - **Sessions:** `Mcp-Session-Id` passes through in both directions, so each
   downstream client session maps to its own upstream session and the gateway
   holds no session table. `DELETE` is forwarded so client terminations reach
@@ -392,20 +442,37 @@ the principal's scope (§3.1). Otherwise 404. The request body is capped at
 
 ### 5.3 Streaming
 
-- Responses are streamed chunk by chunk with no buffering and **no compression
-  layer on the proxy route** (compression middleware delays SSE).
+- JSON responses are streamed chunk by chunk with no buffering, event
+  streams event by event (below), and there is **no compression layer on the
+  proxy route** (compression middleware delays SSE).
 - **Guarantee:** the first chunk of an upstream response reaches the client
   before the upstream finishes writing. A test asserts it against an upstream
   that writes one chunk and then blocks; the test must fail within seconds,
-  not hang, if the proxy buffers.
-- Exception: a `tools/list` response for a connection with an allowlist is
-  read fully (cap 8 MiB, error if exceeded — never truncated) and rewritten.
+  not hang, if the proxy buffers. For an event stream the guarantee holds
+  for every chunk that ends an event; a partial event waits for its end.
+- Exception: a `tools/list` response in JSON for a connection with an
+  allowlist is read fully (cap 8 MiB, error if exceeded — never truncated)
+  and rewritten; in an event stream, its event is.
+- An event stream is passed on **event by event**: every complete event at
+  once, a partial one held until its end, so an event can be rewritten or
+  dropped (§5.5, §5.6). One event is at most 8 MiB; past that the stream
+  ends. It fails closed: a byte-order mark at its start is dropped, as a
+  client's parser would; an event whose data is not JSON (to serde_json: a
+  lone surrogate, say), has a key twice in an object, spells a key the
+  gateway reads otherwise (§5.2), or has a line that starts with a
+  byte-order mark, is dropped, since a client's parser might read what the
+  gateway cannot; a last event the stream never ends is
+  dropped (a final lone `\r` included). A rewritten event keeps its other
+  fields (`id:`, `event:`) and gets one `data:` line.
+  Events without data (comments, pings) pass byte for byte, and invalid
+  UTF-8 in an event no rule touches goes on as it came, as clients decode
+  it with replacement characters.
 
 ### 5.4 Upstream 401
 
 - Every response status other than 401 is committed and streamed immediately.
 - A 401 is held: static or `none` credential, or OAuth without a refresh
-  token → **502** `{"error": "upstream_auth", "message": "connection <label>
+  token → **502** `{"code": "upstream_auth", "message": "connection <label>
   needs re-authorization in hennery"}`; OAuth → single-flight refresh and one
   retry, and a second 401 → `needs_auth` + 502 `upstream_auth`.
 - **A 401 is never passed to the client and `WWW-Authenticate` is never
@@ -414,6 +481,9 @@ the principal's scope (§3.1). Otherwise 404. The request body is capped at
   prevent.)*
 - A failure before the response is committed is a clean 502 with no stray
   upstream headers.
+- A `static` connection without a token, or of a kind the proxy does not take
+  yet, sends nothing: 502 `upstream_auth`.
+- A 401 for a static or `none` connection sets it `needs_auth` (§7).
 
 ### 5.5 Tool allowlist
 
@@ -424,7 +494,20 @@ the principal's scope (§3.1). Otherwise 404. The request body is capped at
 - **`tools/call` for a tool outside the allowlist is rejected** by the gateway
   with a JSON-RPC error (`-32602`, "tool not available through hennery") and
   never reaches the upstream. *(G-18: in the predecessor the allowlist only hid
-  tools; a direct call still executed.)*
+  tools; a direct call still executed.)* A call whose `params.name` is not a
+  string is outside it. A batch holding one is answered whole by the
+  gateway and nothing in it is sent: that call `-32602`, every other request
+  in it `-32600` ("batch refused"); notifications get nothing, and a body
+  with nothing to answer is 202. A response's id matches a `tools/list`
+  request's if equal or the same number however written (`1`, `1.0`).
+- **The filter hides; the `tools/call` refusal enforces.** The filter
+  knows only the ids of the `tools/list` requests of the same exchange, so
+  an unfiltered list can still reach a client: an id answered as another
+  type (`"1"` for `1`), an interrupted `tools/list` replayed on a `GET`
+  with `Last-Event-ID`, a response the upstream sends on another stream,
+  or one whose `result`, `tools` or a tool's `name` is spelt otherwise or
+  twice, for a client that reads it so. A tool seen that way still cannot
+  be called.
 
 ### 5.6 Capabilities not forwarded in v1
 
@@ -432,7 +515,18 @@ The gateway rewrites `initialize.params.capabilities` sent upstream, removing
 `sampling`, `elicitation` and `roots`. Server-to-client requests of those kinds
 arriving in a response stream are answered by the gateway with a JSON-RPC
 error. *(G-19: the predecessor's spec said these were not forwarded, but its
-code passed the client's `initialize` through verbatim.)*
+code passed the client's `initialize` through verbatim.)* The requests are
+`sampling/createMessage`, `elicitation/create` and `roots/list`; each is
+answered `-32601` with a `POST` on the same upstream session
+(`Mcp-Session-Id`, the answer's or else the request's) and credential, in the
+background, and it is not passed on: its event is dropped or, in a batch, its
+element. Each answer reads the connection again, as a request does, and is
+not sent if the connection left the token's scope or changed its URL or
+internal marking since the stream opened. A notification of those names
+passes. At the connection's request cap (§5.7) the answer is skipped and
+logged. These requests are refused in
+event streams only: a JSON body answering a `POST` is that request's
+response, so inside one they pass in v1.
 
 Other methods (including ones the gateway does not know, like
 `server/discover`) are forwarded unchanged.
@@ -454,8 +548,21 @@ use it without depending on the gateway:
   (RFC 1918, loopback, unique-local IPv6 except `fd00:ec2::254`), never to a
   public one (the operator's decision of 2026-10-02; kernel §7.1). §4's OAuth
   URLs stay `https` (loopback `http` allowed) even then.
-- Per connection, a cap on concurrent upstream requests and on idle streaming
-  responses; beyond it the proxy answers 503.
+- Per connection, a cap on concurrent upstream requests and on open streaming
+  responses, idle or not; beyond it the proxy answers 503.
+  - `POST` and `DELETE` requests in flight: 64, each held from before its
+    body is read until its answer's body ends or the client goes, a `POST`
+    answered with an event stream included. A body has 30 s to arrive.
+  - Open `GET` streams, the server-to-client channel: 32, counted whether
+    idle or not (kernel §7.1's limiter); no idle timeout. A `GET` takes no
+    request permit.
+  - The response head must arrive within 300 s (a long `tools/call` may
+    answer in JSON only when done).
+- The egress client is chosen at every request from the connection's
+  stored `internal_network` flag, read with its URL from the same row, never
+  from anything in the request; it applies the rules above (kernel §7.1).
+  The stored scheme and authority are sent verbatim, and the client's `Host`
+  is never forwarded.
 
 **Connection URLs** (plan 8a, at save time): `http` or `https`, absolute,
 with a host, no user name or password, no fragment, at most 2048 bytes; a
@@ -465,10 +572,11 @@ serialises it. **`http` is saved only on a connection marked
 unmarked plain `http` is refused (400 `invalid`), loopback included, and
 clearing the mark while the URL is `http` is refused and changes nothing
 (move the URL to `https` in the same `PATCH`). This is stricter than the
-egress policy's scheme rule (kernel §7.1: `https`, or `http` to loopback);
-which of the two holds is settled by the proxy plan (8d). Under a connection's
-`internal_network` mark, egress sends plain `http` to internal addresses only
-(kernel §7.1, plan 8b-ii). Non-public addresses
+egress policy's scheme rule (§5.7, kernel §7.1) for an unmarked connection;
+for a marked one the policy is the stricter, sending plain `http` to
+internal addresses only (plan 8b-ii). Neither implies the other, and both
+apply: the proxy sends every request through the egress policy (plan 8d),
+so a saved URL the policy refuses is refused when used. Non-public addresses
 are not refused when saving: the egress policy refuses them at request time
 unless the connection is internal.
 
@@ -599,7 +707,13 @@ Docker image); `hennery up` warns in that situation (kernel §10). In v1
   - 2xx → `ok`; 401 after one single-flight refresh → `needs_auth`; 5xx or
     transport failure → `error`; any other 4xx → **no change**.
 - **Live traffic** also updates status: a 2xx through a connection marked
-  `needs_auth`/`error` sets `ok`.
+  `needs_auth`/`error` sets `ok` (and `not_connected`: a 2xx proves the
+  upstream takes what was sent), if it has a JSON or event-stream body: a
+  body-less 202, or an empty body under a type (`Content-Length: 0`),
+  proves nothing. A 401 sets a
+  static or `none` connection `needs_auth`. Either only if the connection
+  still has the URL the request went to, and `ok` on a static one only if it
+  still has a token; no other status changes it.
 - A `needs_auth` connection stays mounted (unmounting on a possibly transient
   failure would churn every session's configuration).
 - **Notifier** (`Notifier` interface, umbrella §10.2): fires on **transitions**

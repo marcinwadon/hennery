@@ -737,8 +737,8 @@ opened:
   decides when a stream has been idle too long;
 - errors never carry the URL, so they can be logged;
 - per-caller limits on concurrent requests and on open streams, idle or not
-  (stricter than gateway §5.7's idle streams): a count of permits per caller
-  key, refused at once past its cap (the proxy's 503).
+  (gateway §5.7): a count of permits per caller key, refused at once past
+  its cap (the proxy's 503).
 
 It lives in the kernel so that push delivery can use it without depending on
 the gateway.
@@ -746,7 +746,8 @@ the gateway.
 *Built so far:* `hennery_kernel::egress` (plans 8b and 8b-ii) — `Egress`, its
 `EgressClient::send` and `send_streaming`, `check_url`, `is_public` and
 `Limiter`. Web Push delivery sends through its `PublicOnly` client (plan
-10b-ii); the gateway's proxy and OAuth will.
+10b-ii), and the gateway's proxy through the client its connection's marking
+chooses (plan 8d), both from the collector's one `Egress`; OAuth will.
 
 ### 7.2 Content-Security-Policy
 

@@ -828,7 +828,8 @@ hand.
   - One upstream session per downstream MCP session (`Mcp-Session-Id` passes
     through; the gateway keeps no session table).
   - Streaming responses (SSE) are forwarded incrementally: the first chunk must
-    reach the client before the upstream finishes writing. A buffering proxy
+    reach the client before the upstream finishes writing (for an event
+    stream, every chunk that ends an event; gateway §5.3). A buffering proxy
     works on every short response and fails on the first long one.
   - An upstream `401` becomes `502 upstream_auth`. A `401` is never passed
     through, and `WWW-Authenticate` is stripped; otherwise the agent's MCP
