@@ -727,7 +727,58 @@ async fn a_start_puts_a_missing_node_back_or_says_it_is_missing() {
     assert!(notes.contains("Node") && notes.contains("is missing"), "{notes}");
     drop(prepared);
     let prepared = agents::prepare(&host_dir(&layout), Some(&selection), Some(&server.sources()), &quiet).await;
-    assert!(set.node.is_file(), "the start put Node back");
+    assert!(
+        set.node.is_file(),
+        "the start put Node back: {:?}",
+        prepared.agents.notes
+    );
+    assert_eq!(prepared.agents.agents.len(), 2, "{:?}", prepared.agents.notes);
+}
+
+/// A lock no install holds any more, but a child this process forked still
+/// shares, does not turn a start away: it waits that out, within the grace.
+/// Here the child is `sleep`, given a copy of the locked descriptor without
+/// close-on-exec, so it shares the lock until it exits, a second on; a fork
+/// shares it the same way until it execs. Without the grace the start gives
+/// up at once, saying another install is running.
+#[tokio::test]
+async fn a_start_waits_out_a_lock_only_a_forked_child_still_shares() {
+    use std::os::fd::AsRawFd;
+    let server = Server::start().await;
+    let fixture = Fixture::new("1.0.0");
+    fixture.serve(&server);
+    let (_dir, layout) = data_dir();
+    let selection = selection(&fixture, &[]);
+    let set = install::install(&layout, &selection, &server.sources(), &quiet)
+        .await
+        .unwrap()
+        .set()
+        .clone();
+    std::fs::remove_file(&set.node).unwrap();
+    let lock = std::fs::File::open(layout.install_lock()).unwrap();
+    // SAFETY: flock(2) and fcntl(2) on a descriptor this test holds.
+    let shared = unsafe {
+        assert_eq!(libc::flock(lock.as_raw_fd(), libc::LOCK_EX), 0);
+        libc::fcntl(lock.as_raw_fd(), libc::F_DUPFD, 3)
+    };
+    assert!(shared >= 3, "{}", std::io::Error::last_os_error());
+    let mut child = std::process::Command::new("sleep").arg("1").spawn().unwrap();
+    // SAFETY: close(2) on the copy this test made.
+    unsafe { libc::close(shared) };
+    drop(lock);
+    // Only the child holds the lock now.
+    let probe = std::fs::File::open(layout.install_lock()).unwrap();
+    // SAFETY: flock(2) on a descriptor this test holds.
+    let free = unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    drop(probe);
+    assert!(!free, "the child does not hold the lock");
+    let prepared = agents::prepare(&host_dir(&layout), Some(&selection), Some(&server.sources()), &quiet).await;
+    child.wait().unwrap();
+    assert!(
+        set.node.is_file(),
+        "the start put Node back: {:?}",
+        prepared.agents.notes
+    );
     assert_eq!(prepared.agents.agents.len(), 2, "{:?}", prepared.agents.notes);
 }
 
