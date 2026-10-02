@@ -155,7 +155,9 @@ is serialised through it. Consequences:
   close-on-exec is closed, up to the hard `RLIMIT_NOFILE` (at most 65 536), so
   an agent gets only its stdio: never the pairing pipe (kernel spec §4.2) or
   whatever the host inherited from `hennery up`, a service manager or a shell.
-  One numbered above that cap survives; Linux `close_range` is the follow-up.
+  On Linux 5.11 and later one `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)` marks
+  every descriptor from 3 up close-on-exec instead, past that cap too (plan
+  7a-ii); elsewhere one numbered above the cap survives.
 - **Exit watcher:** the supervisor awaits the child. On exit (any cause other
   than a requested close or park) it:
   1. fails every outstanding JSON-RPC call to that adapter;
