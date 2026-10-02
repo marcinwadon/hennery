@@ -6,13 +6,14 @@
 
 use crate::identity::HostKey;
 use crate::outbox::Outbox;
+use crate::profile::Profile;
 use crate::projects::Probes;
 use crate::session::{self, AgentCommand, Answer, Attach, Launch, SessionCmd, SessionHandle, SessionOptions};
 use crate::uplink::Uplink;
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
 use hennery_proto::frames::{
-    AgentIsolation, AttachedSession, Capabilities, Capability, CollectorFrame, HostFrame, SessionConfig,
+    AgentIsolation, AttachedSession, Capabilities, Capability, CollectorFrame, HostFrame, McpDelivery, SessionConfig,
 };
 use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION};
 use std::collections::HashMap;
@@ -38,6 +39,10 @@ pub struct HostConfig {
     pub key: HostKey,
     pub data_dir: PathBuf,
     pub agents: HashMap<String, AgentCommand>,
+    /// Each agent's profile (ACP core §6), from where it came: the
+    /// installed set's `claude` is `Claude` (`ClaudeOwnCli` with
+    /// `--use-cli`); an agent not listed, a `--agent` command, is `Generic`.
+    pub profiles: HashMap<String, Profile>,
     pub reconnect_min: Duration,
     pub reconnect_max: Duration,
     pub ping_interval: Duration,
@@ -70,6 +75,7 @@ impl HostConfig {
             key,
             data_dir,
             agents: HashMap::new(),
+            profiles: HashMap::new(),
             reconnect_min: Duration::from_millis(500),
             reconnect_max: Duration::from_secs(30),
             ping_interval: Duration::from_secs(15),
@@ -89,6 +95,21 @@ impl HostConfig {
             .iter()
             .filter_map(|root| root.to_str().map(str::to_string))
             .collect()
+    }
+
+    /// The profile of `agent` (`Generic` unless listed).
+    pub fn profile(&self, agent: &str) -> Profile {
+        self.profiles.get(agent).copied().unwrap_or_default()
+    }
+
+    /// `hello.mcp_isolation`: every configured agent, isolated or not.
+    pub fn mcp_isolation(&self) -> AgentIsolation {
+        AgentIsolation(
+            self.agents
+                .keys()
+                .map(|agent| (agent.clone(), self.profile(agent).mcp_isolation()))
+                .collect(),
+        )
     }
 
     /// Options for every session actor this host spawns.
@@ -217,7 +238,7 @@ pub async fn probe(collector_url: &str, host_id: &str, key: &HostKey) -> Result<
         collector_url,
         host_id,
         key,
-        Vec::new(),
+        Announce::default(),
         || Ok(Vec::new()),
         PROBE_TIMEOUT,
         PROBE_TIMEOUT,
@@ -246,11 +267,19 @@ type WsStream = futures::stream::SplitStream<
 /// Connect, send a `hello` signed over this connection's nonce (ACP core
 /// §3.5), and read the collector's answer. `attached` is read once the
 /// socket is up, right before the `hello` goes out.
+/// What a `hello` reports of the host's configuration: nothing for a
+/// probe.
+#[derive(Default)]
+struct Announce {
+    workspace_roots: Vec<String>,
+    mcp_isolation: AgentIsolation,
+}
+
 async fn handshake(
     collector_url: &str,
     host_id: &str,
     key: &HostKey,
-    workspace_roots: Vec<String>,
+    announce: Announce,
     attached: impl FnOnce() -> Result<Vec<AttachedSession>>,
     connect_timeout: Duration,
     read_timeout: Duration,
@@ -283,16 +312,18 @@ async fn handshake(
             // Every hennery host can park, take images (a session whose
             // agent offers none refuses them, plan 6a decision 2) and serve
             // the project picker (browsing under home works without roots).
+            // `mcp_servers`: it passes a session's servers, isolated as
+            // `mcp_isolation` says, and refuses those it cannot isolate
+            // (plan 8c).
             capabilities: Capabilities(vec![
                 Capability::Park,
                 Capability::Images,
                 Capability::Projects,
                 Capability::ResolvePath,
+                Capability::McpServers,
             ]),
-            // Nothing isolated yet: the host takes no servers until it
-            // announces `mcp_servers` (plan 8c, Task 2).
-            mcp_isolation: AgentIsolation::default(),
-            workspace_roots,
+            mcp_isolation: announce.mcp_isolation,
+            workspace_roots: announce.workspace_roots,
             attached_sessions: attached()?,
         },
     )
@@ -337,7 +368,10 @@ async fn connect_once(
         &cfg.collector_url,
         &cfg.host_id,
         &cfg.key,
-        cfg.reported_roots(),
+        Announce {
+            workspace_roots: cfg.reported_roots(),
+            mcp_isolation: cfg.mcp_isolation(),
+        },
         || attached_sessions(uplink, sessions),
         cfg.connect_timeout,
         cfg.read_timeout,
@@ -408,7 +442,14 @@ async fn connect_once(
                             }
                             handle(cfg, uplink, sessions, probes, frame)?
                         }
-                        Err(err) => tracing::warn!(error = %err, "ignoring unknown or invalid frame"),
+                        // By the error's kind and place only: its text can
+                        // quote a string of the frame, a header value say.
+                        Err(err) => tracing::warn!(
+                            kind = ?err.classify(),
+                            line = err.line(),
+                            column = err.column(),
+                            "ignoring unknown or invalid frame"
+                        ),
                     },
                     Some(Ok(Message::Close(_))) => bail!("collector closed the connection"),
                     Some(Ok(_)) => {} // ping/pong/binary: liveness only
@@ -466,6 +507,7 @@ struct AttachRequest {
     cwd: String,
     attach: Attach,
     config: SessionConfig,
+    mcp: McpDelivery,
 }
 
 /// Start or resume a session (ACP core §4.3), idempotently (§2.2).
@@ -489,12 +531,26 @@ fn attach(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, req: AttachReq
         });
         return Ok(());
     }
+    // Servers this host cannot keep the agent to, unless the collector
+    // waived that, are refused before anything is spawned: never dropped,
+    // never passed (plan 8c, the lane's L3).
+    let profile = cfg.profile(&req.agent);
+    if let Some(problem) =
+        crate::profile::mcp_refusal(&req.agent, profile, &req.mcp.mcp_servers, req.mcp.isolation_waived)
+    {
+        uplink.reply(HostFrame::Error {
+            request_id: req.request_id,
+            code: "mcp_isolation_unavailable".into(),
+            message: problem,
+        });
+        return Ok(());
+    }
     // Before anything can be enqueued for this session: continue from the
     // larger of this host's counter and the collector's (ACP core §5.1), so
     // a session resumed after the outbox was lost never reuses a seq.
     uplink.fast_forward(&req.session_id, req.committed_seq)?;
     let options = cfg.session_options();
-    spawn_or_restart(uplink, sessions, req, command, options);
+    spawn_or_restart(uplink, sessions, req, command, profile, options);
     Ok(())
 }
 
@@ -527,6 +583,7 @@ fn spawn_or_restart(
     sessions: &Sessions,
     req: AttachRequest,
     command: AgentCommand,
+    profile: Profile,
     options: SessionOptions,
 ) {
     let mut map = sessions.lock().expect("sessions lock");
@@ -553,7 +610,7 @@ fn spawn_or_restart(
         let (uplink, sessions) = (uplink.clone(), sessions.clone());
         tokio::spawn(async move {
             old.finished().await;
-            spawn_or_restart(&uplink, &sessions, req, command, options);
+            spawn_or_restart(&uplink, &sessions, req, command, profile, options);
         });
         return;
     }
@@ -571,6 +628,8 @@ fn spawn_or_restart(
         config: req.config,
         agent: command,
         cwd: PathBuf::from(req.cwd),
+        profile,
+        mcp_servers: req.mcp.mcp_servers,
     };
     map.handles
         .insert(req.session_id, session::launch(uplink.clone(), launch, options));
@@ -591,8 +650,9 @@ fn handle(
             agent,
             cwd,
             config,
+            // Carried for plan 8h's composed `CODEX_HOME`; unused here.
             hat_id: _,
-            mcp: _,
+            mcp,
         } => attach(
             cfg,
             uplink,
@@ -605,6 +665,7 @@ fn handle(
                 cwd,
                 attach: Attach::New,
                 config,
+                mcp,
             },
         )?,
         CollectorFrame::ResumeSession {
@@ -616,7 +677,7 @@ fn handle(
             agent_session_id,
             config,
             hat_id: _,
-            mcp: _,
+            mcp,
         } => attach(
             cfg,
             uplink,
@@ -629,6 +690,7 @@ fn handle(
                 cwd,
                 attach: Attach::Load { agent_session_id },
                 config,
+                mcp,
             },
         )?,
         CollectorFrame::Prompt {

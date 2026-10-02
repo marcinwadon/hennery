@@ -98,6 +98,10 @@ pub struct Adapter {
     /// watcher already did) a group SIGKILL; `kill_group`/`Drop` then do
     /// nothing further.
     group_killed: bool,
+    /// Its session's secret values (`redact_with`), redacted from the
+    /// stderr tail before `scrub`: a value `scrub` cuts in part would no
+    /// longer match whole.
+    secrets: crate::profile::Secrets,
 }
 
 /// The bounded stderr buffer, plus whether it has ever dropped bytes from
@@ -201,6 +205,7 @@ impl Adapter {
                 stderr,
                 stderr_done,
                 group_killed: false,
+                secrets: Default::default(),
             },
             io,
         ))
@@ -260,8 +265,14 @@ impl Adapter {
         self.group_killed = true;
     }
 
-    /// The last `STDERR_TAIL_BYTES` of stderr, scrubbed of token-like
-    /// strings. Waits briefly for the pipe to drain if the adapter exited.
+    /// Redact `secrets` from the stderr tail.
+    pub fn redact_with(&mut self, secrets: crate::profile::Secrets) {
+        self.secrets = secrets;
+    }
+
+    /// The last `STDERR_TAIL_BYTES` of stderr, its session's secret values
+    /// redacted (`redact_with`), then scrubbed of token-like strings.
+    /// Waits briefly for the pipe to drain if the adapter exited.
     ///
     /// Once the buffer has ever been truncated, its front byte is an
     /// arbitrary offset into the original stream, not necessarily the start
@@ -276,11 +287,12 @@ impl Adapter {
         let bytes: Vec<u8> = ring.buf.iter().copied().collect();
         let truncated = ring.truncated;
         drop(ring);
+        let clean = |bytes: &[u8]| scrub(&self.secrets.redact(&String::from_utf8_lossy(bytes)));
         if !truncated {
-            return scrub(&String::from_utf8_lossy(&bytes));
+            return clean(&bytes);
         }
         match bytes.iter().position(|&b| b == b'\n') {
-            Some(idx) => scrub(&String::from_utf8_lossy(&bytes[idx + 1..])),
+            Some(idx) => clean(&bytes[idx + 1..]),
             None => "[stderr truncated]".to_string(),
         }
     }
@@ -381,7 +393,8 @@ const TOKEN_PREFIXES: &[&str] = &[
     "xoxr-",
     "xoxs-",
 ];
-const REDACTED: &str = "[redacted]";
+/// What a redacted secret reads as.
+pub const REDACTED: &str = "[redacted]";
 
 /// Replace token-like strings (`Bearer …`, `sk-…`, `ghp_…`, `github_pat_…`,
 /// `xox?-…`) with `[redacted]`, keeping the prefix so the kind of secret is
