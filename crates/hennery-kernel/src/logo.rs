@@ -66,7 +66,8 @@ pub enum Refusal {
     TooLarge,
     /// Not a PNG by its signature: SVG, WebP, JPEG, GIF, anything else.
     Unsupported,
-    /// A side of 0, or over `MAX_SIDE`.
+    /// Over `MAX_SIDE` either way (a side of 0 is refused by the decoder
+    /// first, as `Damaged`).
     Dimensions,
     /// The decoder refused it.
     Damaged,
@@ -111,8 +112,8 @@ pub fn reencode(input: &[u8], max_stored: usize) -> Result<Logo, Refusal> {
     let mut reader = decoder.read_info().map_err(|_| Refusal::Damaged)?;
     let size = reader.output_buffer_size().ok_or(Refusal::Damaged)?;
     let mut pixels = vec![0; size];
-    // The first frame, sized by what the decoder says it wrote (the
-    // review's A3), never by the header.
+    // The first frame; the encoder refuses pixels of any other length
+    // than the frame it is given (the review's A3).
     let frame = reader.next_frame(&mut pixels).map_err(|_| Refusal::Damaged)?;
     let mut bytes = Vec::new();
     let mut encoder = png::Encoder::new(&mut bytes, frame.width, frame.height);
@@ -526,7 +527,8 @@ mod tests {
 
     /// The size is checked from the header alone, before anything else is
     /// read (the review's A2): a header claiming 2³¹ pixels, with nothing
-    /// after it, is `Dimensions`, not `Damaged`. 1024 either way is taken.
+    /// after it, is `Dimensions`, not `Damaged`. 1024 either way is taken,
+    /// grey or RGBA as a canvas exports it.
     #[test]
     fn a_side_over_1024_is_refused_from_the_header_alone() {
         for (w, h) in [(1025, 1), (1, 1025), (0x7fff_ffff, 0x7fff_ffff), (1 << 20, 16)] {
@@ -539,6 +541,19 @@ mod tests {
         let (w, h, colour, data) = pixels(&logo.bytes);
         assert_eq!((w, h, colour), (1024, 1024, ColorType::Grayscale));
         assert!(data.iter().all(|&p| p == 7));
+
+        let rgba = encode(
+            1024,
+            1024,
+            ColorType::Rgba,
+            BitDepth::Eight,
+            &[1, 2, 3, 4].repeat(1024 * 1024),
+        );
+        assert!(rgba.len() < MAX_UPLOAD, "{}", rgba.len());
+        let logo = reencoded(&rgba);
+        let (w, h, colour, data) = pixels(&logo.bytes);
+        assert_eq!((w, h, colour), (1024, 1024, ColorType::Rgba));
+        assert!(data.chunks(4).all(|p| p == [1, 2, 3, 4]));
     }
 
     /// What the decoder refuses is `Damaged`: a zero side, a truncated

@@ -114,7 +114,7 @@ async fn minting_changing_revoking_a_host_and_revoking_a_session_need_a_fresh_pa
         // Refused before anything is read: 403, not 404, for an unknown hat.
         ("POST", "/api/hats/hat-9/purge".to_string(), None, 404),
         // A hat's logo (plan 4d-B2): an unknown hat is 404 before the
-        // upload is read, so this body, which is no image, never is.
+        // upload is decoded, so this body, which is no image, never is.
         ("PUT", "/api/hats/hat-9/logo".to_string(), Some(r#"{"data":""}"#), 404),
         ("DELETE", "/api/hats/hat-9/logo".to_string(), None, 404),
         (

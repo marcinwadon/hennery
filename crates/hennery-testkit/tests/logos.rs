@@ -161,6 +161,17 @@ async fn a_logo_is_uploaded_served_replaced_and_removed() {
     assert_eq!(header(&resp, "etag"), Some(format!("\"{}\"", expected.etag).as_str()));
     assert_eq!(resp.bytes().await.unwrap().as_ref(), &expected.bytes[..]);
 
+    // The query is ignored: a client may add `?v=` so that a new logo is a
+    // new URL, but the same logo is served either way.
+    let versioned = c
+        .client()
+        .get(format!("{}?v={}", c.logo_url(&acme), expected.etag))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(versioned.status(), 200);
+    assert_eq!(versioned.bytes().await.unwrap().as_ref(), &expected.bytes[..]);
+
     let other = reencode(&png_of(3, 1, 200), MAX_STORED).unwrap();
     let hat = hat_item(c.put(&acme, &png_of(3, 1, 200)).await).await;
     assert_eq!(hat.logo.as_deref(), Some(other.etag.as_str()));
@@ -375,7 +386,8 @@ async fn each_refusal_is_a_fixed_answer() {
 /// Kernel spec §3.3 and the review's ruling on the body: JSON only, at most
 /// 96 KiB however it is sent (the review's O4: chunked, with no length),
 /// one `data` field. The same field spelt with a `\u` escape is the same
-/// field (the fleet's differential rule); twice, or beside another, it is
+/// field (the fleet's differential rule); twice, even once escaped, beside
+/// another, spelt in another case, or after a byte-order mark, it is
 /// refused.
 #[tokio::test]
 async fn the_body_is_one_json_field_of_at_most_96_kib() {
@@ -388,7 +400,8 @@ async fn the_body_is_one_json_field_of_at_most_96_kib() {
         code_of(c.put_body(&acme, over.clone()).await).await,
         (413, "body_too_large".into())
     );
-    let chunks: Vec<Result<Vec<u8>, std::io::Error>> = over.into_bytes().chunks(8192).map(|c| Ok(c.to_vec())).collect();
+    let chunks: Vec<Result<Vec<u8>, std::io::Error>> =
+        over.into_bytes().chunks(8192).map(|chunk| Ok(chunk.to_vec())).collect();
     let chunked = reqwest::Body::wrap_stream(futures::stream::iter(chunks));
     assert_eq!(
         code_of(c.put_body(&acme, chunked).await).await,
@@ -407,7 +420,10 @@ async fn the_body_is_one_json_field_of_at_most_96_kib() {
 
     let twice = format!("{{\"data\":\"{data}\",\"data\":\"{data}\"}}");
     let beside = format!("{{\"data\":\"{data}\",\"mime\":\"image/svg+xml\"}}");
-    for body in [twice, beside, "{}".to_string()] {
+    let escaped_twice = format!("{{\"data\":\"{data}\",\"\\u0064ata\":\"{data}\"}}");
+    let other_case = format!("{{\"Data\":\"{data}\"}}");
+    let bom = format!("\u{feff}{{\"data\":\"{data}\"}}");
+    for body in [twice, beside, escaped_twice, other_case, bom, "{}".to_string()] {
         let (status, code) = code_of(c.put_body(&acme, body.clone()).await).await;
         assert_eq!((status / 100, code.as_str()), (4, "invalid_body"), "{body}");
     }

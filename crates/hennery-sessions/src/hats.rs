@@ -43,7 +43,8 @@ pub const LOGO_BODY_LIMIT: usize = 96 * 1024;
 /// default for new hosts that of every later host, and a swapped name or
 /// colour would point the next stepped-up change at the wrong hat. So does
 /// a purge (plan 9c decision 10), which deletes what it cannot give back;
-/// its preview only reads.
+/// its preview only reads. A hat's logo needs step-up to be set or
+/// removed, but not to be served.
 pub fn router(state: AppState) -> Router {
     let routes = Router::new()
         .route("/api/hats", get(list_hats).post(create_hat))
@@ -178,7 +179,7 @@ fn logo_refused(refusal: Refusal) -> Response {
 
 /// `PUT /api/hats/{id}/logo` (kernel spec §5.1): the upload re-encoded
 /// (`logo::from_upload`) and stored; 200 with the hat as it is now. An
-/// unknown hat is 404 before the upload is read. A hat frozen for its purge
+/// unknown hat is 404 before the upload is decoded. A hat frozen for its purge
 /// is 409 `hat_purging`, checked as the logo is stored.
 async fn put_logo(
     State(state): State<AppState>,
