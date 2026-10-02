@@ -424,6 +424,26 @@ describe('SessionView: a question that opens without the focus is said', () => {
     expect(anySaid()).toEqual([])
   })
 
+  it('never takes the focus for, or says, a question that came with a resync', async () => {
+    const items = [message('m1', 't1')]
+    const s = server(items)
+    await shown(s)
+    // Where a question opened at the tail would take the focus.
+    expect(document.activeElement).toBe(document.body)
+    expect(textarea().value).toBe('')
+    // The resync's page keeps m1, the last item seen, with a question after it.
+    items.push(question(), message('m2', 't1'))
+    act(() => s.streams[0].event('resync_required', {}))
+    await screen.findByText('Run it?', {}, WAIT)
+    await waitFor(() => expect(s.streams).toHaveLength(2), WAIT)
+    // A later event: once it shows, the card's effects have run.
+    act(() => s.streams[1].event('item', message('m3', 't1')))
+    await screen.findByText('m3')
+    expect(card()).not.toHaveFocus()
+    expect(document.activeElement).toBe(document.body)
+    expect(anySaid()).toEqual([])
+  })
+
   it('says nothing of a question that was open when the session opened', async () => {
     sessionStorage.setItem('hennery.draft.s1', 'half a thought')
     const s = server([message('m1', 't1'), question()])
