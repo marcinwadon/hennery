@@ -4,9 +4,31 @@ export type ConfigValue = boolean | string;
 
 export type SessionConfig = { model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, };
 
-export type Capability = "projects" | "images" | "park" | "resolve_path";
+export type Capability = "projects" | "images" | "park" | "resolve_path" | "mcp_servers";
 
 export type Capabilities = Array<Capability>;
+
+export type NameValue = { name: string, value: string, };
+
+export type McpServer = { "type": "http", name: string, url: string, headers: Array<NameValue>, } | { "type": "stdio", name: string, command: string, args: Array<string>, env: Array<NameValue>, };
+
+export type McpDelivery = { 
+/**
+ * Passed in `session/new` / `session/load`. Only to a host that
+ * announced `mcp_servers`.
+ */
+mcp_servers?: Array<McpServer>, 
+/**
+ * The collector knowingly delivers to an agent the host cannot isolate
+ * (the mixed-host fallback's default hat, or a single-hat host,
+ * umbrella §8.5). Absent, the host refuses servers for such an agent
+ * (`mcp_isolation_unavailable`): isolation is never lost by omission.
+ */
+isolation_waived?: boolean, };
+
+export type McpIsolation = "claude_strict" | "none";
+
+export type AgentIsolation = { [key in string]: McpIsolation };
 
 export type AttachedSession = { session_id: string, last_seq: number, open_turn_id?: string | null, };
 
@@ -133,6 +155,11 @@ proof: string,
  */
 capabilities: Capabilities, 
 /**
+ * Per agent, how this host isolates its MCP servers (plan 8c).
+ * Absent means none is isolated (an older host).
+ */
+mcp_isolation: AgentIsolation, 
+/**
  * The workspace roots from the host's config (ACP core §7), as
  * configured. Absent means none (an older host).
  */
@@ -169,7 +196,24 @@ committed: Record<string, number>, } | { "type": "hello_error", code: string, me
  * The collector's highest committed seq for this session; the host
  * continues from the larger of this and its own counter (§5.1).
  */
-committed_seq: number, agent: string, cwd: string, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, } | { "type": "resume_session", request_id: string, session_id: string, 
+committed_seq: number, agent: string, cwd: string, 
+/**
+ * The session's hat (`sessions.hat_id`); empty for a session from
+ * before hats. Carried, not yet used by the host (plan 8c).
+ */
+hat_id?: string, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, 
+/**
+ * Passed in `session/new` / `session/load`. Only to a host that
+ * announced `mcp_servers`.
+ */
+mcp_servers?: Array<McpServer>, 
+/**
+ * The collector knowingly delivers to an agent the host cannot isolate
+ * (the mixed-host fallback's default hat, or a single-hat host,
+ * umbrella §8.5). Absent, the host refuses servers for such an agent
+ * (`mcp_isolation_unavailable`): isolation is never lost by omission.
+ */
+isolation_waived?: boolean, } | { "type": "resume_session", request_id: string, session_id: string, 
 /**
  * Fast-forward the host's counter before the first frame (§5.1).
  */
@@ -178,7 +222,23 @@ committed_seq: number, agent: string, cwd: string,
  * The adapter's own session id, from the stored `session_started`:
  * the host keeps no copy across restarts.
  */
-agent_session_id: string, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, } | { "type": "prompt", request_id: string, session_id: string, turn_id: string, 
+agent_session_id: string, 
+/**
+ * As on `start_session`.
+ */
+hat_id?: string, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, 
+/**
+ * Passed in `session/new` / `session/load`. Only to a host that
+ * announced `mcp_servers`.
+ */
+mcp_servers?: Array<McpServer>, 
+/**
+ * The collector knowingly delivers to an agent the host cannot isolate
+ * (the mixed-host fallback's default hat, or a single-hat host,
+ * umbrella §8.5). Absent, the host refuses servers for such an agent
+ * (`mcp_isolation_unavailable`): isolation is never lost by omission.
+ */
+isolation_waived?: boolean, } | { "type": "prompt", request_id: string, session_id: string, turn_id: string, 
 /**
  * ACP ContentBlocks, built by the frontend.
  */
