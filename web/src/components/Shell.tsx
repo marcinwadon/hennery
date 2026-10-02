@@ -14,6 +14,12 @@ import Hats from '../screens/Hats'
 import Hosts from '../screens/Hosts'
 import Placeholder from '../screens/Placeholder'
 import SignOut from './SignOut'
+import { useMediaQuery } from '../hooks/useMediaQuery'
+import SessionList from './SessionList'
+import SessionScope, { WaitingBadge } from './SessionScope'
+
+/** The rail's width and up (frontend spec §2). */
+export const DESKTOP = '(min-width: 768px)'
 
 const ICON: Record<View, (p: { size?: number }) => React.JSX.Element> = {
   sessions: Icon.List,
@@ -29,6 +35,7 @@ export default function Shell({ route }: { route: Route }) {
   const [caps, setCaps] = useState<CapabilitiesResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [attempt, setAttempt] = useState(0)
+  const desktop = useMediaQuery(DESKTOP)
 
   useEffect(() => {
     let live = true
@@ -71,11 +78,12 @@ export default function Shell({ route }: { route: Route }) {
   const shown = current !== null && views.includes(current)
   const title = route.name === 'not_found' ? 'Not found' : current ? LABEL[current] : 'hennery'
 
-  return (
+  const frame = (
     <div className="app">
       <aside className="rail" aria-label="Views">
         <div className="rail-head">
           <span className="brand-name">hennery</span>
+          <WaitingBadge />
         </div>
         {views.includes('new') && (
           <Link to={PATH.new} className="new-btn">
@@ -99,7 +107,7 @@ export default function Shell({ route }: { route: Route }) {
               )
             })}
         </nav>
-        <div className="rail-scroll" />
+        <div className="rail-scroll">{desktop && <SessionList />}</div>
         <div className="rail-foot">
           <SignOut />
         </div>
@@ -110,6 +118,7 @@ export default function Shell({ route }: { route: Route }) {
             <div className="mtb-eyebrow">hennery</div>
             <div className="mtb-title">{title}</div>
           </div>
+          <WaitingBadge />
         </header>
         <main className="main">
           {route.name === 'not_found' ? (
@@ -120,6 +129,8 @@ export default function Shell({ route }: { route: Route }) {
             <Hosts />
           ) : route.name === 'hats' ? (
             <Hats />
+          ) : route.name === 'sessions' && !desktop ? (
+            <SessionList screen />
           ) : route.name === 'session' ? (
             <Placeholder title="Session" detail={route.id} text="The session view arrives with the transcript." />
           ) : (
@@ -144,5 +155,12 @@ export default function Shell({ route }: { route: Route }) {
         </nav>
       </div>
     </div>
+  )
+  return views.includes('sessions') ? (
+    <SessionScope route={route} desktop={desktop}>
+      {frame}
+    </SessionScope>
+  ) : (
+    frame
   )
 }

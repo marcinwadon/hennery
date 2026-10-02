@@ -9,6 +9,8 @@ describe('relTime', () => {
   it('minutes', () => expect(relTime('2026-06-09T11:45:00Z')).toBe('15m ago'))
   it('hours', () => expect(relTime('2026-06-09T09:00:00Z')).toBe('3h ago'))
   it('empty -> empty', () => expect(relTime('')).toBe(''))
+  it('counts from the `now` it is given', () =>
+    expect(relTime('2026-06-09T11:45:00Z', Date.parse('2026-06-09T13:45:00Z'))).toBe('2h ago'))
 })
 describe('clockTime', () => {
   it('empty -> empty', () => expect(clockTime('')).toBe(''))
