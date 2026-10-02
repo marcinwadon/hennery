@@ -1290,6 +1290,8 @@ fn launching(
         config,
         agent: fake_with(script),
         cwd: std::env::temp_dir(),
+        profile: Default::default(),
+        mcp_servers: Vec::new(),
     };
     session::launch(uplink.clone(), launch, options)
 }
