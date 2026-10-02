@@ -13,6 +13,7 @@ pub mod push;
 mod resolve;
 mod shared_files;
 pub mod store;
+pub mod sweep;
 pub mod ws;
 
 use axum::Router;
@@ -51,6 +52,9 @@ pub struct AppState {
     /// a queue nobody reads; the collector replaces it with one delivery
     /// drains.
     pub push: Push,
+    /// How often the attachments are swept after the sweep at startup
+    /// (plan 9b decision 9).
+    pub sweep_interval: Duration,
 }
 
 impl AppState {
@@ -67,6 +71,7 @@ impl AppState {
             probe_timeout: projects::PROBE_TIMEOUT,
             vapid: Arc::new(VapidKey::generate()),
             push: Push::detached(),
+            sweep_interval: sweep::INTERVAL,
         }
     }
 }

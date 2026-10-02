@@ -492,6 +492,16 @@ pub struct Store {
     checkpoints: Option<Arc<Checkpoints>>,
 }
 
+/// What one sweep removed (plan 9b): the owner's rows nothing of theirs
+/// showed, the image files no row of any owner named, and the leftover
+/// temporary files.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SweepReport {
+    pub rows: u64,
+    pub files: u64,
+    pub temps: u64,
+}
+
 /// A stored image (plan 6a), for `GET /api/attachments/{sha256}`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Attachment {
@@ -1940,6 +1950,11 @@ impl Store {
                 tracing::warn!(%sha256, "an unreferenced attachment's file was left: {err:#}");
             }
         }
+    }
+
+    /// Sweep the attachments (plan 9b). Not yet: sweeps nothing.
+    pub fn sweep_attachments(&self, _now: std::time::SystemTime) -> Result<SweepReport> {
+        Ok(SweepReport::default())
     }
 
     /// Delete a session (ACP core §4.10; plan 9a decisions 1, 5 and 6), in

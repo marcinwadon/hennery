@@ -27,6 +27,18 @@ pub fn is_sha256(name: &str) -> bool {
     name.len() == 64 && name.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// The temporary file `write` writes `sha256` to before its rename:
+/// `.<sha256>.<16 hex digits>.tmp`, hidden, and unique per write.
+fn temp_name(sha256: &str, random: [u8; 8]) -> String {
+    format!(".{sha256}.{}.tmp", hex::encode(random))
+}
+
+/// `name` is a temporary file as `write` names one, which a crash may
+/// leave (plan 9b): the only other name the sweep removes.
+pub fn is_temp(_name: &str) -> bool {
+    false
+}
+
 fn path(dir: &Path, sha256: &str) -> std::io::Result<PathBuf> {
     if !is_sha256(sha256) {
         return Err(std::io::Error::new(
@@ -50,10 +62,7 @@ pub fn write(dir: &Path, sha256: &str, bytes: &[u8]) -> std::io::Result<()> {
     if target.exists() {
         return Ok(());
     }
-    let temp = dir.join(format!(
-        ".{sha256}.{}.tmp",
-        hex::encode(hennery_kernel::secret::random_bytes::<8>())
-    ));
+    let temp = dir.join(temp_name(sha256, hennery_kernel::secret::random_bytes::<8>()));
     let written = (|| {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
@@ -116,6 +125,31 @@ mod tests {
             assert!(!is_sha256(name), "{name}");
             assert!(read(Path::new("/"), name).is_err(), "{name}");
             assert!(write(Path::new("/nonexistent"), name, b"x").is_err(), "{name}");
+        }
+    }
+
+    /// Plan 9b: the sweep removes a leftover temporary file by its name,
+    /// so the name `write` makes is the only one it matches.
+    #[test]
+    fn only_the_names_write_makes_are_temporary_files() {
+        let random = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+        let name = temp_name(SHA, random);
+        assert_eq!(name, format!(".{SHA}.0123456789abcdef.tmp"));
+        assert!(is_temp(&name));
+        for other in [
+            SHA.to_string(),
+            name[1..].to_string(),
+            format!("{name}.bak"),
+            format!(".{SHA}.tmp"),
+            format!(".{SHA}.0123456789abcde.tmp"),
+            format!(".{SHA}.0123456789abcdef0.tmp"),
+            format!(".{SHA}.0123456789ABCDEF.tmp"),
+            format!(".{}.0123456789abcdef.tmp", SHA.to_uppercase()),
+            format!(".{}.0123456789abcdef.tmp", &SHA[1..]),
+            format!(".{SHA}.0123456789abcdef.tmq"),
+            format!(".{SHA}/0123456789abcdef.tmp"),
+        ] {
+            assert!(!is_temp(&other), "{other}");
         }
     }
 
