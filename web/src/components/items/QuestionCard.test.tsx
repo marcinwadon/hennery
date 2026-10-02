@@ -383,16 +383,16 @@ describe('focus on a newly opened question', () => {
 
   it('moves to an answerable card opened at the tail when the composer is empty', () => {
     const t = setup()
-    t.book.observe(items())
-    t.book.observe(items(permission()))
+    t.book.observe(items(), 1)
+    t.book.observe(items(permission()), 1)
     show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book, composerEmpty: () => true })
     expect(card()).toHaveFocus()
   })
 
   it('stays put while the composer holds text, and does not come back later', () => {
     const t = setup()
-    t.book.observe(items())
-    t.book.observe(items(permission()))
+    t.book.observe(items(), 1)
+    t.book.observe(items(permission()), 1)
     const v = show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book, composerEmpty: () => false })
     expect(card()).not.toHaveFocus()
     v.again(permission({ version: 2 }), { sessionId: SESSION, agent: 'Codex', answers: t.book, composerEmpty: () => true })
@@ -401,16 +401,16 @@ describe('focus on a newly opened question', () => {
 
   it('never moves without the composer’s seam', () => {
     const t = setup()
-    t.book.observe(items())
-    t.book.observe(items(permission()))
+    t.book.observe(items(), 1)
+    t.book.observe(items(permission()), 1)
     show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
     expect(card()).not.toHaveFocus()
   })
 
   it('stays in a field inside the transcript that no open card holds, and says the card instead', () => {
     const t = setup()
-    t.book.observe(items())
-    t.book.observe(items(permission()))
+    t.book.observe(items(), 1)
+    t.book.observe(items(permission()), 1)
     const v = render(
       <div className="transcript">
         <input aria-label="Note" />
@@ -430,7 +430,7 @@ describe('focus on a newly opened question', () => {
 
   it('never moves to a card that was there on the first page', () => {
     const t = setup()
-    t.book.observe(items(permission()))
+    t.book.observe(items(permission()), 1)
     show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book, composerEmpty: () => true })
     expect(card()).not.toHaveFocus()
   })

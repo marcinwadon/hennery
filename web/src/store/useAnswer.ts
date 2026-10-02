@@ -6,15 +6,16 @@
 // - Each answer's outcome (202, 409, 404, another refusal) is held with the
 //   item's version when it was sent; the card shows it until the item's
 //   next upsert (lib/delivery.ts).
-// - Whether the host is away: the session is presumed parked, or its host
-//   is not connected (the view's one `GET /api/hosts`, read when it opens).
+// - Whether the host is away (lib/hostAway.ts): the session is presumed
+//   parked; else the newest host marker since the first page; else the
+//   view's one `GET /api/hosts`, read when it opens. No event fetches.
 // - Each form's draft, by question: a card mounted again (the window moved,
 //   the transcript was rendered anew) finds what the operator had filled in.
 // - Which questions opened at the tail since the first page: the one card
 //   that may take the focus (§10), once.
 // - What the view's one live region says last: a question that opened
 //   without taking the focus.
-import { useEffect, useLayoutEffect, useMemo, useSyncExternalStore } from 'react'
+import { useLayoutEffect, useMemo, useSyncExternalStore } from 'react'
 import { answerQuestion } from '../api/answer'
 import type { Client } from '../api/client'
 import { ApiFailure, messageOf } from '../api/errors'
@@ -22,6 +23,7 @@ import { useClient } from '../app-client'
 import type { AnswerRequest, SessionItem } from '../generated/protocol'
 import type { Item } from '../generated/view'
 import { freshQuestions, type LocalAnswer } from '../lib/delivery'
+import { hostAway, newestTs } from '../lib/hostAway'
 import type { Draft } from '../lib/elicitation'
 
 /** No draft: one object, so a card's snapshot stays the same. */
@@ -36,6 +38,8 @@ export class AnswerBook {
   private away = false
   private known: Set<string> | null = null
   private lastId: string | undefined
+  private loads: number | undefined
+  private since: number | undefined
   private readonly fresh = new Set<string>()
   private readonly drafts = new Map<string, Draft>()
   private said = ''
@@ -85,6 +89,11 @@ export class AnswerBook {
     return this.away
   }
 
+  /** The newest time the first page held (ms), once it is observed. */
+  get baseline(): number | undefined {
+    return this.since
+  }
+
   setHostAway(away: boolean) {
     if (away === this.away) return
     this.away = away
@@ -108,12 +117,19 @@ export class AnswerBook {
   }
 
   /** Take in the session's items once its first page is loaded: the
-   *  questions that opened at the tail since the last look are fresh. */
-  observe(items: readonly Item[]) {
-    for (const id of freshQuestions(items, this.known, this.lastId)) this.fresh.add(id)
-    const known = this.known ?? new Set<string>()
-    for (const item of items) if (item.kind === 'question') known.add(item.id)
-    this.known = known
+   *  questions that opened at the tail since the last look are fresh.
+   *  `loads` counts the pages that replaced the items (the first, and each
+   *  resync's): a new one is a new baseline, so a question that came with a
+   *  resync is never fresh, wherever it sits. */
+  observe(items: readonly Item[], loads: number) {
+    // The first page's newest time, once: host markers after it count.
+    if (this.since === undefined) this.since = newestTs(items)
+    const known = loads === this.loads ? this.known : null
+    this.loads = loads
+    for (const id of freshQuestions(items, known, this.lastId)) this.fresh.add(id)
+    const held = known ?? new Set<string>()
+    for (const item of items) if (item.kind === 'question') held.add(item.id)
+    this.known = held
     this.lastId = items.length > 0 ? items[items.length - 1].id : undefined
   }
 
@@ -168,13 +184,17 @@ export function useFormDraft(book: AnswerBook | undefined, id: string): [Draft, 
 }
 
 /** The session view's book: one per session, fed its items once the first
- *  page is in, and told whether the host is away. `connected`: what the
- *  view's hosts list says of the session's host (undefined: unknown). */
+ *  page is in, and told whether the host is away. `loads`: the item store's
+ *  count of pages that replaced the items (a resync's included).
+ *  `connected`: what the view's hosts list said of the session's host when
+ *  it opened (undefined: unknown), the seed the host markers since then
+ *  overrule. */
 export function useAnswering(
   sessionId: string,
   info: Pick<SessionItem, 'presumed_parked'> | undefined,
   items: readonly Item[],
   loading: boolean,
+  loads: number,
   connected: boolean | undefined,
 ): AnswerBook {
   const client = useClient()
@@ -182,9 +202,13 @@ export function useAnswering(
   // Before the cards' effects (a layout effect runs first): a fresh card
   // finds itself fresh when it mounts.
   useLayoutEffect(() => {
-    if (!loading) book.observe(items)
-  }, [book, items, loading])
-  const away = Boolean(info?.presumed_parked) || connected === false
-  useEffect(() => book.setHostAway(away), [book, away])
+    if (!loading) book.observe(items, loads)
+  }, [book, items, loading, loads])
+  // After `observe`: the first page's time is known before its markers
+  // are read (before it, the store holds no items).
+  const presumedParked = Boolean(info?.presumed_parked)
+  useLayoutEffect(() => {
+    book.setHostAway(hostAway({ presumedParked, seed: connected, items, since: book.baseline ?? -Infinity }))
+  }, [book, items, loading, presumedParked, connected])
   return book
 }
