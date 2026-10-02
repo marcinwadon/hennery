@@ -80,7 +80,14 @@ These need the operator's decision, credentials, or both. None is set up:
   (`-p 127.0.0.1:8080:8080`); read the setup link with
   `docker exec … hennery admin setup-url`, not from `docker logs` (with
   `docker run -t` the link itself is logged); a bind mount keeps the host's
-  owner, so it must belong to 65532.
+  owner, so it must belong to 65532; change the port with `HENNERY_LISTEN`,
+  not `--listen` on the command, because the `HEALTHCHECK` reads
+  `HENNERY_LISTEN`.
+- **Third-party licence notices:** the archives carry only hennery's
+  `LICENSE`, and the image none. Before the first release, generate the
+  notices for the Rust crates and the vendored OpenSSL (Apache-2.0), e.g.
+  with `cargo-about`; ship them in each archive and in the image; and
+  update `check-archive.sh`'s exact list and the `.dockerignore`.
 - **Dependency updates** (Dependabot, or another bot): for `openssl-src`
   above all, the pinned actions and the image digests. It opens pull
   requests on its own schedule, so it is the operator's to switch on.

@@ -1,7 +1,7 @@
 #!/bin/sh
 # The hardened shell installer (distribution spec §2, §9), run against the
 # archives of this build, served from a directory (`file://`):
-#   - every archive's SHA-256 is embedded in it, and is the archive's;
+#   - each archive of the build is offered, with its SHA-256 embedded;
 #   - it installs a binary that runs, with `sha256sum` or with `shasum`;
 #   - a checksum mismatch aborts, and installs nothing;
 #   - no SHA-256 tool, an empty checksum, no checksum at all, or a checksum
@@ -12,6 +12,9 @@
 # Usage: test-installer.sh <directory holding hennery-installer.sh and every
 # archive with its .sha256>
 set -eu
+# Either would install outside the scratch directory and make the "left a
+# binary" checks vacuous.
+unset HENNERY_INSTALL_DIR CARGO_DIST_FORCE_INSTALL_DIR
 
 dist=$(cd "$1" && pwd)
 installer="$dist/hennery-installer.sh"
@@ -44,6 +47,11 @@ for archive in $arms; do
         fail "the installer's checksum for $archive is not the archive's"
     count=$((count + 1))
 done
+built=0
+for archive in "$dist"/*.tar.xz; do
+    built=$((built + 1))
+done
+[ "$count" = "$built" ] || fail "the installer offers $count archives, this build made $built"
 echo "ok: the installer embeds each of its $count archives' SHA-256"
 
 # run_installer <download dir> <install dir> <log>: the installer's exit status.

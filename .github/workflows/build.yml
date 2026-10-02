@@ -8,9 +8,10 @@
 # stays a workflow artifact, kept for a week. Publishing is the operator's
 # to switch on (packaging/README.md).
 #
-# The archives hold the `hennery` binary alone, which `check-archive.sh`
-# asserts. No job here downloads, builds or uploads an adapter: the Claude CLI
-# is never redistributed (distribution spec §3.3).
+# The archives hold the `hennery` binary, its licence and its README, nothing
+# else, which `check-archive.sh` asserts. No job here downloads, builds or
+# uploads an adapter: the Claude CLI is never redistributed (distribution spec
+# §3.3).
 #
 # Third-party actions are pinned by commit, images by digest, cargo-dist by
 # SHA-256 (`install-dist.sh`); GitHub's own actions by major tag. Workflow
@@ -74,7 +75,7 @@ jobs:
           mkdir -p unpacked
           tar -xJf "target/distrib/hennery-${{ matrix.target }}.tar.xz" -C unpacked
           echo "BINARY=$PWD/unpacked/hennery-${{ matrix.target }}/hennery" >> "$GITHUB_ENV"
-      - name: Holds the binary alone
+      - name: Holds the binary, its licence and README only
         run: sh packaging/check-archive.sh "target/distrib/hennery-${{ matrix.target }}.tar.xz" ${{ matrix.target }}
       - name: Links nothing outside the system
         run: sh packaging/check-linkage.sh "$BINARY"
