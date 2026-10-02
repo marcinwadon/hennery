@@ -727,3 +727,126 @@ pub struct UpdateSessionRequest {
     #[ts(type = "string | undefined", optional)]
     pub hat_id: Option<String>,
 }
+
+/// `GET /api/push/vapid` (kernel spec §6): the collector's VAPID public key,
+/// the uncompressed P-256 point in base64url, which a browser's
+/// `pushManager.subscribe` takes as `applicationServerKey`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct VapidKeyResponse {
+    pub public_key: String,
+}
+
+/// A subscription's keys, as `PushSubscription.toJSON()` gives them
+/// (base64url).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PushKeys {
+    pub p256dh: String,
+    pub auth: String,
+}
+
+/// `POST /api/push/subscriptions` (kernel spec §6, §8): the browser's
+/// `PushSubscription.toJSON()`, and optionally what Settings should list it
+/// as (1 to 64 printable characters; the endpoint's host name when absent).
+/// The endpoint must be `https` on a public domain name at the default
+/// port. Needs a fresh step-up (plan 10a decision 4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PushSubscribeRequest {
+    pub endpoint: String,
+    /// Milliseconds since the epoch, as the browser reports it.
+    #[serde(default, rename = "expirationTime", skip_serializing_if = "Option::is_none")]
+    #[ts(type = "number | null | undefined", optional)]
+    pub expiration_time: Option<i64>,
+    pub keys: PushKeys,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub device_label: Option<String>,
+}
+
+/// `POST /api/push/subscriptions/rotate`: the push service replaced this
+/// browser's subscription, and its service worker reports the new one
+/// (`pushsubscriptionchange`). No step-up: there is no page to ask on. Only
+/// a subscription whose `old_endpoint` the owner has is replaced, keeping its
+/// id and the session that made it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PushRotateRequest {
+    pub old_endpoint: String,
+    pub subscription: PushSubscribeRequest,
+}
+
+/// `DELETE /api/push/subscriptions`: this browser unsubscribing, by the
+/// endpoint it knows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PushUnsubscribeRequest {
+    pub endpoint: String,
+}
+
+/// One push subscription: an entry of `GET /api/push/subscriptions`, and
+/// the answer to `POST` (201 new, 200 the endpoint's earlier one replaced).
+/// The endpoint itself is never shown, only its host.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PushSubscriptionItem {
+    /// What `DELETE /api/push/subscriptions/{id}` takes.
+    pub id: String,
+    pub endpoint_host: String,
+    pub device_label: String,
+    /// RFC 3339.
+    pub created_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub last_success_at: Option<String>,
+    /// Why the last delivery failed, when it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub last_error: Option<String>,
+    /// Subscribed by the session asking: this browser.
+    pub this_device: bool,
+    /// The session that subscribed it has ended or expired: it is no longer
+    /// in the signed-in devices, but still receives notifications until it
+    /// is removed here.
+    pub signed_out: bool,
+}
+
+/// A hat's push policy (kernel spec §6): the body of
+/// `PUT /api/push/policies/{hat_id}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PushPolicyRequest {
+    /// No notification for the hat's sessions.
+    pub muted: bool,
+    /// Include the agent's question title.
+    pub details: bool,
+    /// "Session needs your answer", without the session title.
+    pub generic_title: bool,
+}
+
+/// One hat's push policy: an entry of `GET /api/push/policies`, one per hat,
+/// oldest hat first, and the answer to `PUT /api/push/policies/{hat_id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PushPolicyItem {
+    pub hat_id: String,
+    pub muted: bool,
+    pub details: bool,
+    pub generic_title: bool,
+}
+
+/// `GET /api/settings` (kernel spec §8), and the answer to its `PATCH`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SettingsResponse {
+    pub public_url: String,
+    /// The owner's push contact (kernel spec §6): an e-mail address the
+    /// push services may write to. Absent: they are given an `https`
+    /// `public_url`, and nothing for an `http` one, which Apple refuses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub contact: Option<String>,
+}
+
+/// `PATCH /api/settings`: absent fields stay as they are. `contact` is an
+/// e-mail address, trimmed, or empty (or blank) to clear it. `public_url` is not changed here
+/// yet: `hennery admin reset-public-url` does that (kernel spec §4.2).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct SettingsUpdateRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub contact: Option<String>,
+}

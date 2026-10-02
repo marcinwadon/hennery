@@ -540,3 +540,67 @@ export type HatResolveRequest = { host_id: string, path: string, };
 export type HatResolution = { canonical: string, exists: boolean, is_dir: boolean, hat_id: string, rule_id?: string | undefined, };
 
 export type UpdateSessionRequest = { hat_id?: string | undefined, };
+
+export type VapidKeyResponse = { public_key: string, };
+
+export type PushKeys = { p256dh: string, auth: string, };
+
+export type PushSubscribeRequest = { endpoint: string, 
+/**
+ * Milliseconds since the epoch, as the browser reports it.
+ */
+expirationTime?: number | null | undefined, keys: PushKeys, device_label?: string | undefined, };
+
+export type PushRotateRequest = { old_endpoint: string, subscription: PushSubscribeRequest, };
+
+export type PushUnsubscribeRequest = { endpoint: string, };
+
+export type PushSubscriptionItem = { 
+/**
+ * What `DELETE /api/push/subscriptions/{id}` takes.
+ */
+id: string, endpoint_host: string, device_label: string, 
+/**
+ * RFC 3339.
+ */
+created_at: string, last_success_at?: string | undefined, 
+/**
+ * Why the last delivery failed, when it did.
+ */
+last_error?: string | undefined, 
+/**
+ * Subscribed by the session asking: this browser.
+ */
+this_device: boolean, 
+/**
+ * The session that subscribed it has ended or expired: it is no longer
+ * in the signed-in devices, but still receives notifications until it
+ * is removed here.
+ */
+signed_out: boolean, };
+
+export type PushPolicyRequest = { 
+/**
+ * No notification for the hat's sessions.
+ */
+muted: boolean, 
+/**
+ * Include the agent's question title.
+ */
+details: boolean, 
+/**
+ * "Session needs your answer", without the session title.
+ */
+generic_title: boolean, };
+
+export type PushPolicyItem = { hat_id: string, muted: boolean, details: boolean, generic_title: boolean, };
+
+export type SettingsResponse = { public_url: string, 
+/**
+ * The owner's push contact (kernel spec §6): an e-mail address the
+ * push services may write to. Absent: they are given an `https`
+ * `public_url`, and nothing for an `http` one, which Apple refuses.
+ */
+contact?: string | undefined, };
+
+export type SettingsUpdateRequest = { contact?: string | undefined, };
