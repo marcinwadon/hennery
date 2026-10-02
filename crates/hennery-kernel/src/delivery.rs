@@ -4,9 +4,12 @@
 //! signed with the collector's VAPID key (RFC 8292).
 //!
 //! Requests go out through a `Transport`. The collector's is the shared
-//! egress client, public addresses only (kernel spec §7.1, plan 8b); tests
-//! use a fake one. Nothing here opens a connection itself.
+//! egress client, public addresses only (kernel spec §7.1, plan 8b): `spawn`
+//! takes it from an `Egress` itself, so no caller can hand delivery another.
+//! Tests use a fake one, or an `InternalNetwork` client to a push service on
+//! loopback.
 
+use crate::egress::{Allowance, Egress, EgressClient, EgressError, Method, Request, header};
 use crate::hosts::Hosts;
 use crate::operator::Operator;
 use crate::push::{
@@ -79,6 +82,65 @@ pub enum Sent {
 /// (`PublicOnly`); never one that reaches a private address.
 pub trait Transport: Send + Sync + 'static {
     fn send(&self, request: PushRequest) -> Pin<Box<dyn Future<Output = Sent> + Send + '_>>;
+}
+
+/// The egress client sends a push as any other request (kernel spec §7.1):
+/// its policy refuses a non-public address before anything is sent, and an
+/// error never carries the endpoint.
+impl Transport for EgressClient {
+    fn send(&self, push: PushRequest) -> Pin<Box<dyn Future<Output = Sent> + Send + '_>> {
+        Box::pin(async move {
+            let mut request = Request::new(Method::POST, push.endpoint);
+            for (name, value) in &push.headers {
+                let (Ok(name), Ok(value)) = (
+                    header::HeaderName::from_bytes(name.as_bytes()),
+                    header::HeaderValue::from_str(value),
+                ) else {
+                    return Sent::Failed;
+                };
+                request.headers_mut().insert(name, value);
+            }
+            *request.body_mut() = Some(push.body.into());
+            match EgressClient::send(self, request).await {
+                Ok(response) => Sent::Status {
+                    code: response.status().as_u16(),
+                    retry_after: retry_after(response.headers()),
+                },
+                Err(EgressError::Refused(_)) => Sent::Refused,
+                Err(EgressError::Timeout) => Sent::Timeout,
+                Err(EgressError::Http(_)) => Sent::Failed,
+            }
+        })
+    }
+}
+
+/// `Retry-After` in seconds (RFC 9110 §10.2.3); an HTTP date, or anything
+/// else, is no hint.
+fn retry_after(headers: &header::HeaderMap) -> Option<Duration> {
+    let secs = headers
+        .get(header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(Duration::from_secs(secs))
+}
+
+/// Start the collector's delivery: a queue, and a task draining it through
+/// `egress`'s public-only client (kernel spec §6, §7.1: Web Push never
+/// reaches a private address). The queue's sending end is `AppState::push`.
+pub fn spawn(hosts: Arc<Hosts>, operator: Arc<Operator>, vapid: Arc<VapidKey>, egress: &Egress) -> crate::push::Push {
+    let (push, notices) = crate::push::Push::new();
+    let delivery = Delivery::new(
+        hosts,
+        operator,
+        vapid,
+        egress.client(Allowance::PublicOnly),
+        RetryPolicy::default(),
+    );
+    tokio::spawn(delivery.run(notices));
+    push
 }
 
 /// When to try again, and how long to wait.
@@ -413,6 +475,21 @@ mod tests {
         let other = url::Url::parse("https://web.push.apple.com/b").unwrap();
         tokens.authorization(&vapid, &other, None, made + 3 * VAPID_TOKEN_SECS);
         assert_eq!(tokens.0.len(), 1);
+    }
+
+    #[test]
+    fn retry_after_is_read_in_seconds_only() {
+        let mut headers = header::HeaderMap::new();
+        assert_eq!(retry_after(&headers), None);
+        headers.insert(header::RETRY_AFTER, header::HeaderValue::from_static(" 30 "));
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(30)));
+        headers.insert(
+            header::RETRY_AFTER,
+            header::HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(retry_after(&headers), None);
+        headers.insert(header::RETRY_AFTER, header::HeaderValue::from_static("-1"));
+        assert_eq!(retry_after(&headers), None);
     }
 
     #[test]

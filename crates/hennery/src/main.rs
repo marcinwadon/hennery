@@ -419,6 +419,13 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     // Before anything serves: every push subscription is bound to this key
     // (kernel spec §6).
     state.vapid = std::sync::Arc::new(hennery_kernel::push::VapidKey::load_or_create(&args.data_dir)?);
+    // The collector's one outbound HTTP policy (kernel spec §7.1), built
+    // once: Web Push takes it here, and the gateway shares this same one
+    // (agreed with plan 8), never a second. Delivery starts before anything
+    // serves, so a notice queued meanwhile reaches it, not the queue nobody
+    // reads (plan 10b-ii).
+    let egress = hennery_kernel::egress::Egress::new(hennery_kernel::egress::Timeouts::DEFAULT)?;
+    start_push(&mut state, &egress);
     state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
     hennery_sessions::offline::after_startup(&state);
     let listeners = listeners
@@ -1123,6 +1130,13 @@ async fn run_up(args: UpArgs) -> Result<std::process::ExitCode> {
             Ok(std::process::ExitCode::FAILURE)
         }
     }
+}
+
+/// Web Push delivery (plan 10b-ii): the state's notices go to a task that
+/// sends them through `egress`, public addresses only.
+fn start_push(state: &mut AppState, egress: &hennery_kernel::egress::Egress) {
+    state.push =
+        hennery_kernel::delivery::spawn(state.hosts.clone(), state.operator.clone(), state.vapid.clone(), egress);
 }
 
 #[cfg(test)]
