@@ -274,6 +274,11 @@ async fn a_symlink_at_a_named_entry_is_reported_and_never_followed() {
         ]
     );
     assert!(std::fs::symlink_metadata(root.at(&format!("file-history/{ID}"))).is_ok());
+    // Something left: a partial outcome.
+    let HostFrame::SessionForgotten { outcome, .. } = forgotten.clone().into_frame("r".into()) else {
+        unreachable!()
+    };
+    assert_eq!(outcome, ForgetOutcome::Partial);
     assert!(std::fs::symlink_metadata(root.at(&format!("projects/-p/{ID}.cast"))).is_ok());
 }
 
@@ -402,7 +407,10 @@ async fn unsafe_roots_are_refused_before_anything_runs() {
             path.display()
         );
     }
-    std::fs::set_permissions(root.root(), std::fs::Permissions::from_mode(0o775)).unwrap();
+    // Writable by others: refused on every platform. (Group-writable passes
+    // for the user's private group, as on ubuntu's runners, and fails for a
+    // shared one, as macOS's `staff`: its own test covers both.)
+    std::fs::set_permissions(root.root(), std::fs::Permissions::from_mode(0o757)).unwrap();
     let forgotten = root.forget().await;
     assert_eq!(
         reasons(&forgotten),
