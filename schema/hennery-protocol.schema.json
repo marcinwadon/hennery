@@ -2357,6 +2357,26 @@
       ],
       "type": "object"
     },
+    "PublicUrlChanged": {
+      "description": "What a `public_url` change ended, as `hennery admin reset-public-url`\nreports it: every signed-in session (the caller's own among them), and\nthe passkeys of a host name `public_url` no longer has.",
+      "properties": {
+        "passkeys_removed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sessions_ended": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sessions_ended",
+        "passkeys_removed"
+      ],
+      "type": "object"
+    },
     "PurgePreview": {
       "description": "`GET /api/hats/{id}/purge` (kernel spec §5.5; plan 9c decision 11, A13):\nwhat a purge of the hat would delete, read only. Tombstones are not\ncounted.",
       "properties": {
@@ -3378,7 +3398,7 @@
       "type": "object"
     },
     "SettingsResponse": {
-      "description": "`GET /api/settings` (kernel spec §8), and the answer to its `PATCH`.",
+      "description": "`GET /api/settings` (kernel spec §8).",
       "properties": {
         "contact": {
           "description": "The owner's push contact (kernel spec §6): an e-mail address the\npush services may write to. Absent: they are given an `https`\n`public_url`, and nothing for an `http` one, which Apple refuses.",
@@ -3398,15 +3418,49 @@
     },
     "SettingsUpdateRequest": {
       "additionalProperties": false,
-      "description": "`PATCH /api/settings`: absent fields stay as they are. `contact` is an\ne-mail address, trimmed, or empty (or blank) to clear it. `public_url` is not changed here\nyet: `hennery admin reset-public-url` does that (kernel spec §4.2).",
+      "description": "`PATCH /api/settings`: absent fields stay as they are, and so does a\n`null` one. `contact` is an e-mail address, trimmed, or empty (or blank)\nto clear it.\n\n`public_url` moves the collector (kernel spec §3.2), as\n`hennery admin reset-public-url` does (§4.2), and needs a fresh step-up\n(§3.4). It ends every signed-in session, this one included (its cookie\nis cleared), and so every stream and push subscription; it removes\nevery passkey when the host name changes. The browser must then sign in\nat the new origin: requests from the old one are refused. A typo is\nrecovered on the collector's machine, with `hennery admin\nreset-public-url`. A body with both fields changes both or neither.",
       "properties": {
         "contact": {
           "type": [
             "string",
             "null"
           ]
+        },
+        "public_url": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
+      "type": "object"
+    },
+    "SettingsUpdateResponse": {
+      "description": "The answer to `PATCH /api/settings`: the settings as they are now and,\nwhen `public_url` was changed, what the change ended. Without\n`public_url_changed` it is exactly `SettingsResponse`.",
+      "properties": {
+        "contact": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "public_url": {
+          "type": "string"
+        },
+        "public_url_changed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicUrlChanged"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "public_url"
+      ],
       "type": "object"
     },
     "SetupRequest": {

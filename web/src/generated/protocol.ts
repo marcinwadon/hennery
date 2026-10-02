@@ -1012,7 +1012,7 @@ generic_title: boolean, };
 export type PushPolicyItem = { hat_id: string, muted: boolean, details: boolean, generic_title: boolean, };
 
 /**
- * `GET /api/settings` (kernel spec §8), and the answer to its `PATCH`.
+ * `GET /api/settings` (kernel spec §8).
  */
 export type SettingsResponse = { public_url: string, 
 /**
@@ -1023,11 +1023,34 @@ export type SettingsResponse = { public_url: string,
 contact?: string | undefined, };
 
 /**
- * `PATCH /api/settings`: absent fields stay as they are. `contact` is an
- * e-mail address, trimmed, or empty (or blank) to clear it. `public_url` is not changed here
- * yet: `hennery admin reset-public-url` does that (kernel spec §4.2).
+ * `PATCH /api/settings`: absent fields stay as they are, and so does a
+ * `null` one. `contact` is an e-mail address, trimmed, or empty (or blank)
+ * to clear it.
+ *
+ * `public_url` moves the collector (kernel spec §3.2), as
+ * `hennery admin reset-public-url` does (§4.2), and needs a fresh step-up
+ * (§3.4). It ends every signed-in session, this one included (its cookie
+ * is cleared), and so every stream and push subscription; it removes
+ * every passkey when the host name changes. The browser must then sign in
+ * at the new origin: requests from the old one are refused. A typo is
+ * recovered on the collector's machine, with `hennery admin
+ * reset-public-url`. A body with both fields changes both or neither.
  */
-export type SettingsUpdateRequest = { contact?: string | undefined, };
+export type SettingsUpdateRequest = { contact?: string | undefined, public_url?: string | undefined, };
+
+/**
+ * The answer to `PATCH /api/settings`: the settings as they are now and,
+ * when `public_url` was changed, what the change ended. Without
+ * `public_url_changed` it is exactly `SettingsResponse`.
+ */
+export type SettingsUpdateResponse = { public_url: string, contact?: string | undefined, public_url_changed?: PublicUrlChanged | undefined, };
+
+/**
+ * What a `public_url` change ended, as `hennery admin reset-public-url`
+ * reports it: every signed-in session (the caller's own among them), and
+ * the passkeys of a host name `public_url` no longer has.
+ */
+export type PublicUrlChanged = { sessions_ended: number, passkeys_removed: number, };
 
 /**
  * What a push carries to the browser's service worker (kernel spec §6;

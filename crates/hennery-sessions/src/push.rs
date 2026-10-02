@@ -7,17 +7,17 @@ use crate::AppState;
 use crate::api::{error, internal};
 use axum::extract::{DefaultBodyLimit, Extension, Path, State};
 use axum::handler::Handler;
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router, middleware};
 use hennery_kernel::json::ApiJson;
-use hennery_kernel::operator::Authenticated;
+use hennery_kernel::operator::{Authenticated, PublicUrl, PublicUrlChange, cleared_cookie};
 use hennery_kernel::push::{NewSubscription, PushPolicy, Subscribed, Subscription};
 use hennery_kernel::secret::{rfc3339, unix_now};
 use hennery_proto::rest::{
-    PushPolicyItem, PushPolicyRequest, PushRotateRequest, PushSubscribeRequest, PushSubscriptionItem,
-    PushUnsubscribeRequest, SettingsResponse, SettingsUpdateRequest, VapidKeyResponse,
+    PublicUrlChanged, PushPolicyItem, PushPolicyRequest, PushRotateRequest, PushSubscribeRequest, PushSubscriptionItem,
+    PushUnsubscribeRequest, SettingsResponse, SettingsUpdateRequest, SettingsUpdateResponse, VapidKeyResponse,
 };
 
 /// Every route needs the operator's session. Subscribing a browser needs a
@@ -225,31 +225,127 @@ async fn set_policy(
 
 /// `GET /api/settings`: `public_url` and the push contact.
 async fn settings(State(state): State<AppState>) -> Response {
-    settings_now(&state)
+    match settings_now(&state) {
+        Ok(settings) => Json(settings).into_response(),
+        Err(err) => internal(err),
+    }
 }
 
 /// `PATCH /api/settings`: 200 with the settings as they are now. An empty
-/// `contact` clears it.
-async fn update_settings(State(state): State<AppState>, ApiJson(req): ApiJson<SettingsUpdateRequest>) -> Response {
-    if let Some(contact) = req.contact {
-        let contact = contact.trim();
-        match state.operator.set_contact((!contact.is_empty()).then_some(contact)) {
+/// `contact` clears it. A `public_url` needs a fresh step-up, checked
+/// before anything is read or written (plan 4d-B4 decision 2), and moves
+/// the collector as `hennery admin reset-public-url` does (decision 1).
+/// A body without one needs none (kernel spec §6).
+async fn update_settings(
+    State(state): State<AppState>,
+    Extension(session): Extension<Authenticated>,
+    ApiJson(req): ApiJson<SettingsUpdateRequest>,
+) -> Response {
+    let contact = req
+        .contact
+        .as_deref()
+        .map(str::trim)
+        .map(|contact| (!contact.is_empty()).then_some(contact));
+    if let Some(public_url) = req.public_url.as_deref() {
+        if !session.stepped_up(unix_now()) {
+            return hennery_kernel::auth::step_up_required();
+        }
+        return change_public_url(&state, &session, public_url, contact);
+    }
+    if let Some(contact) = contact {
+        match state.operator.set_contact(contact) {
             Ok(Ok(())) => {}
             Ok(Err(why)) => return error(StatusCode::BAD_REQUEST, "invalid", why),
             Err(err) => return internal(err),
         }
     }
-    settings_now(&state)
+    match settings_now(&state) {
+        Ok(settings) => Json(SettingsUpdateResponse {
+            public_url: settings.public_url,
+            contact: settings.contact,
+            public_url_changed: None,
+        })
+        .into_response(),
+        Err(err) => internal(err),
+    }
 }
 
-fn settings_now(state: &AppState) -> Response {
+/// `public_url` moved, and with it the contact when the body names one
+/// (decision 1). The operator re-checks the caller's session in its write
+/// (the review's A1). Every session ended, the caller's too, so the cookie
+/// is cleared, as the old `public_url` set it (decision 4): this answer
+/// goes to the old origin. The move is logged as soon as it is made (A2).
+fn change_public_url(
+    state: &AppState,
+    session: &Authenticated,
+    input: &str,
+    contact: Option<Option<&str>>,
+) -> Response {
+    let caller = Some((session.session_id.as_str(), unix_now()));
+    let (from, to, sessions_ended, passkeys_removed) = match state.operator.change_public_url(input, contact, caller) {
+        Ok(PublicUrlChange::Done {
+            from,
+            to,
+            sessions_ended,
+            passkeys_removed,
+        }) => {
+            tracing::warn!(
+                from = from.as_ref().map(PublicUrl::origin).unwrap_or_default(),
+                to = to.origin(),
+                sessions_ended,
+                passkeys_removed,
+                "public_url changed over the API"
+            );
+            (from, to, sessions_ended, passkeys_removed)
+        }
+        Ok(PublicUrlChange::Invalid(why)) => return error(StatusCode::BAD_REQUEST, "invalid", why),
+        // The session ended after the request's checks (a revoke, a reset):
+        // as if it had not been signed in, and its cookie is dead.
+        Ok(PublicUrlChange::SignedOut) => {
+            let secure = state.operator.public_url().is_none_or(|url| url.is_https());
+            return with_cleared_cookie(
+                error(StatusCode::UNAUTHORIZED, "unauthenticated", "sign in first"),
+                secure,
+            );
+        }
+        Ok(PublicUrlChange::StepUpRequired) => return hennery_kernel::auth::step_up_required(),
+        // Unreachable here: the browser rules refuse every state-changing
+        // request before setup.
+        Ok(PublicUrlChange::NotSetUp) => {
+            return error(StatusCode::FORBIDDEN, "setup_required", "hennery is not set up yet");
+        }
+        Err(err) => return internal(err),
+    };
+    let response = match state.operator.contact() {
+        Ok(contact) => Json(SettingsUpdateResponse {
+            public_url: to.origin().to_string(),
+            contact,
+            public_url_changed: Some(PublicUrlChanged {
+                sessions_ended: sessions_ended as u64,
+                passkeys_removed: passkeys_removed as u64,
+            }),
+        })
+        .into_response(),
+        Err(err) => internal(err),
+    };
+    with_cleared_cookie(response, from.as_ref().is_none_or(PublicUrl::is_https))
+}
+
+/// `response` with the session cookie cleared: whatever it answers, the
+/// session has ended.
+fn with_cleared_cookie(mut response: Response, secure: bool) -> Response {
+    if let Ok(cookie) = HeaderValue::from_str(&cleared_cookie(secure)) {
+        response.headers_mut().append(header::SET_COOKIE, cookie);
+    }
+    response
+}
+
+fn settings_now(state: &AppState) -> anyhow::Result<SettingsResponse> {
     let public_url = state
         .operator
         .public_url()
         .map(|url| url.origin().to_string())
         .unwrap_or_default();
-    match state.operator.contact() {
-        Ok(contact) => Json(SettingsResponse { public_url, contact }).into_response(),
-        Err(err) => internal(err),
-    }
+    let contact = state.operator.contact()?;
+    Ok(SettingsResponse { public_url, contact })
 }
