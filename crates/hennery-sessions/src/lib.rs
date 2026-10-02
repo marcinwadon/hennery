@@ -8,6 +8,7 @@ pub mod hosts;
 pub mod hub;
 pub mod offline;
 pub mod projects;
+pub mod push;
 mod resolve;
 pub mod store;
 pub mod ws;
@@ -15,6 +16,7 @@ pub mod ws;
 use axum::Router;
 use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::Operator;
+use hennery_kernel::push::VapidKey;
 use hennery_kernel::ratelimit::{Limiter, Policy};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -40,6 +42,9 @@ pub struct AppState {
     pub projects: Arc<projects::ProjectsCache>,
     /// How long a probe waits for its reply (ACP core §3.4).
     pub probe_timeout: Duration,
+    /// The VAPID key pair (kernel spec §6). `new` makes one in memory; the
+    /// collector replaces it with `<data>/vapid.key` before it serves.
+    pub vapid: Arc<VapidKey>,
 }
 
 impl AppState {
@@ -54,6 +59,7 @@ impl AppState {
             offline_threshold: offline::OFFLINE_THRESHOLD,
             projects: Arc::new(projects::ProjectsCache::new(projects::CACHE_TTL)),
             probe_timeout: projects::PROBE_TIMEOUT,
+            vapid: Arc::new(VapidKey::generate()),
         }
     }
 }
@@ -121,6 +127,7 @@ pub fn router(state: AppState) -> Router {
         .merge(hosts::router(state.clone()))
         .merge(hats::router(state.clone()))
         .merge(projects::router(state.clone()))
+        .merge(push::router(state.clone()))
         .merge(hennery_kernel::auth_api::router(state.operator.clone()))
         .merge(hennery_kernel::health::router(state.operator.clone()))
         .merge(ws::router(state))

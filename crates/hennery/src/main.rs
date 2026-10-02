@@ -416,6 +416,9 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     let hosts = Hosts::open(&db)?;
     let operator = Operator::open(&db)?;
     let mut state = AppState::new(store, hosts, operator);
+    // Before anything serves: every push subscription is bound to this key
+    // (kernel spec §6).
+    state.vapid = std::sync::Arc::new(hennery_kernel::push::VapidKey::load_or_create(&args.data_dir)?);
     state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
     hennery_sessions::offline::after_startup(&state);
     let listeners = listeners

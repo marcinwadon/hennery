@@ -535,6 +535,10 @@ impl Operator {
             // Otherwise the transaction rolls back: no session ends.
             anyhow::ensure!(replaced == 1, "the owner has no password to reset");
             let ended = tx.execute("DELETE FROM auth_sessions WHERE owner_id = ?1", [&self.owner])?;
+            // Each went with the session that subscribed it (plan 10a
+            // decision 4): a device subscribed with a stolen session must
+            // not survive the recovery either.
+            tx.execute("DELETE FROM push_subscriptions WHERE owner_id = ?1", [&self.owner])?;
             let passkeys_removed = tx.execute("DELETE FROM passkeys WHERE owner_id = ?1", [&self.owner])?;
             tx.commit()?;
             // Still under the connection's lock, which every finish holds
@@ -578,6 +582,9 @@ impl Operator {
                 params![self.owner, PUBLIC_URL_KEY, public_url.origin()],
             )?;
             let ended = tx.execute("DELETE FROM auth_sessions WHERE owner_id = ?1", [&self.owner])?;
+            // Every subscription goes with its session (plan 10a decision
+            // 4), and each was made by a service worker of the old origin.
+            tx.execute("DELETE FROM push_subscriptions WHERE owner_id = ?1", [&self.owner])?;
             let same_host = self.public_url().as_ref().and_then(PublicUrl::rp_id) == public_url.rp_id();
             let passkeys_removed = if same_host {
                 0
@@ -596,6 +603,28 @@ impl Operator {
             sessions_ended: ended,
             passkeys_removed,
         })
+    }
+
+    /// The owner's push contact (kernel spec §6): an e-mail address, or
+    /// `None` when they gave none and the VAPID token names `public_url`.
+    pub fn contact(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn()
+            .query_row("SELECT contact FROM owners WHERE id = ?1", [&self.owner], |r| r.get(0))?)
+    }
+
+    /// Set the owner's push contact, or clear it with `None` (plan 10a
+    /// decision 7). `Err` with the reason, and nothing stored, for one that
+    /// is not a plain e-mail address.
+    pub fn set_contact(&self, contact: Option<&str>) -> Result<Result<(), String>> {
+        if let Some(problem) = contact.and_then(crate::push::contact_problem) {
+            return Ok(Err(problem));
+        }
+        self.conn().execute(
+            "UPDATE owners SET contact = ?2 WHERE id = ?1",
+            params![self.owner, contact],
+        )?;
+        Ok(Ok(()))
     }
 
     /// Wake every stream held open by a session: some have ended.
@@ -815,13 +844,25 @@ impl Operator {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// End a live session. Whether there was one: an expired session is
-    /// not listed by `sessions`, so it is not there to revoke either.
+    /// End a live session, and the push subscriptions it made (plan 10a
+    /// decision 4): a device signed out, or revoked as lost, gets no more
+    /// notifications. Whether there was one: an expired session is not
+    /// listed by `sessions`, so it is not there to revoke either.
     pub fn revoke_session(&self, session_id: &str, now: i64) -> Result<bool> {
-        let changed = self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let changed = tx.execute(
             "DELETE FROM auth_sessions WHERE id_hash = ?1 AND expires_at > ?2 AND owner_id = ?3",
             params![session_id, now, self.owner],
         )?;
+        if changed > 0 {
+            tx.execute(
+                "DELETE FROM push_subscriptions WHERE auth_session = ?1 AND owner_id = ?2",
+                params![session_id, self.owner],
+            )?;
+        }
+        tx.commit()?;
+        drop(conn);
         if changed > 0 {
             self.sessions_ended();
         }

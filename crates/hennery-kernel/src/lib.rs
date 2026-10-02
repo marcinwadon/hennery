@@ -15,6 +15,7 @@ pub mod lifecycle;
 pub mod operator;
 pub mod origin;
 pub mod passkeys;
+pub mod push;
 pub mod ratelimit;
 pub mod recents;
 mod schema;

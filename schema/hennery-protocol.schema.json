@@ -1681,6 +1681,176 @@
       ],
       "type": "object"
     },
+    "PushKeys": {
+      "description": "A subscription's keys, as `PushSubscription.toJSON()` gives them\n(base64url).",
+      "properties": {
+        "auth": {
+          "type": "string"
+        },
+        "p256dh": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "p256dh",
+        "auth"
+      ],
+      "type": "object"
+    },
+    "PushPolicyItem": {
+      "description": "One hat's push policy: an entry of `GET /api/push/policies`, one per hat,\noldest hat first, and the answer to `PUT /api/push/policies/{hat_id}`.",
+      "properties": {
+        "details": {
+          "type": "boolean"
+        },
+        "generic_title": {
+          "type": "boolean"
+        },
+        "hat_id": {
+          "type": "string"
+        },
+        "muted": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "hat_id",
+        "muted",
+        "details",
+        "generic_title"
+      ],
+      "type": "object"
+    },
+    "PushPolicyRequest": {
+      "description": "A hat's push policy (kernel spec §6): the body of\n`PUT /api/push/policies/{hat_id}`.",
+      "properties": {
+        "details": {
+          "description": "Include the agent's question title.",
+          "type": "boolean"
+        },
+        "generic_title": {
+          "description": "\"Session needs your answer\", without the session title.",
+          "type": "boolean"
+        },
+        "muted": {
+          "description": "No notification for the hat's sessions.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "muted",
+        "details",
+        "generic_title"
+      ],
+      "type": "object"
+    },
+    "PushRotateRequest": {
+      "description": "`POST /api/push/subscriptions/rotate`: the push service replaced this\nbrowser's subscription, and its service worker reports the new one\n(`pushsubscriptionchange`). No step-up: there is no page to ask on. Only\na subscription whose `old_endpoint` the owner has is replaced, keeping its\nid and the session that made it.",
+      "properties": {
+        "old_endpoint": {
+          "type": "string"
+        },
+        "subscription": {
+          "$ref": "#/$defs/PushSubscribeRequest"
+        }
+      },
+      "required": [
+        "old_endpoint",
+        "subscription"
+      ],
+      "type": "object"
+    },
+    "PushSubscribeRequest": {
+      "description": "`POST /api/push/subscriptions` (kernel spec §6, §8): the browser's\n`PushSubscription.toJSON()`, and optionally what Settings should list it\nas (1 to 64 printable characters; the endpoint's host name when absent).\nThe endpoint must be `https` on a public domain name at the default\nport. Needs a fresh step-up (plan 10a decision 4).",
+      "properties": {
+        "device_label": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "endpoint": {
+          "type": "string"
+        },
+        "expirationTime": {
+          "description": "Milliseconds since the epoch, as the browser reports it.",
+          "format": "int64",
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "keys": {
+          "$ref": "#/$defs/PushKeys"
+        }
+      },
+      "required": [
+        "endpoint",
+        "keys"
+      ],
+      "type": "object"
+    },
+    "PushSubscriptionItem": {
+      "description": "One push subscription: an entry of `GET /api/push/subscriptions`, and\nthe answer to `POST` (201 new, 200 the endpoint's earlier one replaced).\nThe endpoint itself is never shown, only its host.",
+      "properties": {
+        "created_at": {
+          "description": "RFC 3339.",
+          "type": "string"
+        },
+        "device_label": {
+          "type": "string"
+        },
+        "endpoint_host": {
+          "type": "string"
+        },
+        "id": {
+          "description": "What `DELETE /api/push/subscriptions/{id}` takes.",
+          "type": "string"
+        },
+        "last_error": {
+          "description": "Why the last delivery failed, when it did.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_success_at": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "signed_out": {
+          "description": "The session that subscribed it has ended or expired: it is no longer\nin the signed-in devices, but still receives notifications until it\nis removed here.",
+          "type": "boolean"
+        },
+        "this_device": {
+          "description": "Subscribed by the session asking: this browser.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "endpoint_host",
+        "device_label",
+        "created_at",
+        "this_device",
+        "signed_out"
+      ],
+      "type": "object"
+    },
+    "PushUnsubscribeRequest": {
+      "description": "`DELETE /api/push/subscriptions`: this browser unsubscribing, by the\nendpoint it knows.",
+      "properties": {
+        "endpoint": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "endpoint"
+      ],
+      "type": "object"
+    },
     "RecentProject": {
       "description": "A directory a session started or resumed in on the host (kernel spec\n§5.3).",
       "properties": {
@@ -2323,6 +2493,38 @@
       ],
       "type": "object"
     },
+    "SettingsResponse": {
+      "description": "`GET /api/settings` (kernel spec §8), and the answer to its `PATCH`.",
+      "properties": {
+        "contact": {
+          "description": "The owner's push contact (kernel spec §6): an e-mail address the\npush services may write to. Absent: they are given an `https`\n`public_url`, and nothing for an `http` one, which Apple refuses.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "public_url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "public_url"
+      ],
+      "type": "object"
+    },
+    "SettingsUpdateRequest": {
+      "additionalProperties": false,
+      "description": "`PATCH /api/settings`: absent fields stay as they are. `contact` is an\ne-mail address, trimmed, or empty (or blank) to clear it. `public_url` is not changed here\nyet: `hennery admin reset-public-url` does that (kernel spec §4.2).",
+      "properties": {
+        "contact": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
     "SetupRequest": {
       "description": "`POST /api/setup` (kernel spec §3.1): the one-time owner setup, with the\ntoken from the setup link. `Debug` leaves the password out.",
       "properties": {
@@ -2535,6 +2737,18 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "VapidKeyResponse": {
+      "description": "`GET /api/push/vapid` (kernel spec §6): the collector's VAPID public key,\nthe uncompressed P-256 point in base64url, which a browser's\n`pushManager.subscribe` takes as `applicationServerKey`.",
+      "properties": {
+        "public_key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "public_key"
+      ],
       "type": "object"
     }
   },

@@ -78,6 +78,16 @@ pub fn render_schema() -> String {
         rest::HatResolveRequest,
         rest::HatResolution,
         rest::UpdateSessionRequest,
+        rest::VapidKeyResponse,
+        rest::PushKeys,
+        rest::PushSubscribeRequest,
+        rest::PushRotateRequest,
+        rest::PushUnsubscribeRequest,
+        rest::PushSubscriptionItem,
+        rest::PushPolicyRequest,
+        rest::PushPolicyItem,
+        rest::SettingsResponse,
+        rest::SettingsUpdateRequest,
     );
     // `serde_json::Map` is a `BTreeMap` (always iterates sorted) by default,
     // or an `IndexMap` (iterates in insertion order) when serde_json's
@@ -198,6 +208,16 @@ pub fn render_ts() -> String {
         rest::HatResolveRequest,
         rest::HatResolution,
         rest::UpdateSessionRequest,
+        rest::VapidKeyResponse,
+        rest::PushKeys,
+        rest::PushSubscribeRequest,
+        rest::PushRotateRequest,
+        rest::PushUnsubscribeRequest,
+        rest::PushSubscriptionItem,
+        rest::PushPolicyRequest,
+        rest::PushPolicyItem,
+        rest::SettingsResponse,
+        rest::SettingsUpdateRequest,
     );
     out
 }
