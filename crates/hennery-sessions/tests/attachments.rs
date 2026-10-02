@@ -213,3 +213,36 @@ fn content_stored_before_attachments_links_nothing() {
         .unwrap();
     assert_eq!(links, 0);
 }
+
+/// A stored block naming an image of no row of the owner's (written by
+/// hand, or by a client before 6a) links nothing, and the `user_turn` is
+/// still written: without the link's guard, the foreign key would fail the
+/// whole ingest of `turn_started`.
+#[test]
+fn a_block_naming_an_unknown_attachment_links_nothing() {
+    let data = tempfile::tempdir().unwrap();
+    let db = data.path().join("hennery.db");
+    let store = Store::open(&db).unwrap();
+    started(&store);
+    let stray = json!({ "type": "image", "mimeType": "image/png", "sha256": "0".repeat(64), "size": 1 });
+    assert!(store.open_turn("s1", "t1", std::slice::from_ref(&stray)).unwrap());
+    let created = turn_started(&store, 2, "t1");
+    assert_eq!(created.last().unwrap().kind, "user_turn");
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let links: i64 = conn
+        .query_row("SELECT count(*) FROM event_attachments", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(links, 0);
+}
+
+/// An image whose file is gone is not found, rather than served empty.
+#[test]
+fn a_recorded_image_whose_file_is_gone_is_not_found() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Store::open(&data.path().join("hennery.db")).unwrap();
+    started(&store);
+    let a = png(1, 64);
+    prompt(&store, "t1", vec![image(&a)]);
+    std::fs::remove_file(data.path().join("attachments").join(sha(&a))).unwrap();
+    assert!(store.attachment(&sha(&a)).unwrap().is_none());
+}

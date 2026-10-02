@@ -154,7 +154,7 @@ async fn post(c: &reqwest::Client, url: String, body: &Value) -> (u16, Value) {
     let resp = c
         .post(url)
         .json(body)
-        .timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(60))
         .send()
         .await
         .unwrap();

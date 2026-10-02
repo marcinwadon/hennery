@@ -371,6 +371,8 @@ mod tests {
             json!({ "type": "image", "mimeType": "image/png", "data": "not base64!" }),
             // Base64 with line breaks, as some encoders write it.
             json!({ "type": "image", "mimeType": "image/png", "data": "iVBORw0K\nGgo=" }),
+            // Without its padding: the engine is strict.
+            json!({ "type": "image", "mimeType": "image/png", "data": "iVBORw0KGgo" }),
         ] {
             assert!(matches!(refusal(json!([block])), Refusal::Invalid(_)));
         }
