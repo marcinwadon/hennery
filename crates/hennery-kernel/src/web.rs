@@ -88,6 +88,7 @@ fn file(asset: &'static Asset, cache: &'static str, request: &HeaderMap) -> Resp
             .get(header::IF_NONE_MATCH)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|tags| tags.split(',').any(|t| t.trim() == asset.etag || t.trim() == "*"));
+    // A 304 names no type: the cached copy keeps its own.
     let mut response = if fresh {
         StatusCode::NOT_MODIFIED.into_response()
     } else {
@@ -99,10 +100,6 @@ fn file(asset: &'static Asset, cache: &'static str, request: &HeaderMap) -> Resp
     headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
     if cache != "no-store" {
         headers.insert(header::ETAG, HeaderValue::from_static(asset.etag));
-    }
-    if fresh {
-        // A 304 names no type: the cached copy keeps its own.
-        headers.remove(header::CONTENT_TYPE);
     }
     response
 }

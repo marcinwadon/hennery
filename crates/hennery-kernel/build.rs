@@ -163,8 +163,10 @@ fn placeholder() -> String {
 <ol>
 <li>Print the one-time setup link: <code>hennery admin setup-url</code>. The token is the part after <code>#</code>.</li>
 <li>Send it with the owner's password and this page's address as the public URL:
-<pre>curl -X POST "$PUBLIC_URL/api/setup" -H "Origin: $PUBLIC_URL" -H "Content-Type: application/json" \
-  -d '{{"token": "…", "password": "…", "public_url": "'"$PUBLIC_URL"'", "default_hat_name": "Personal"}}'</pre></li>
+The JSON goes on stdin, so the password stays out of <code>ps</code>, and the quoted <code>'EOF'</code> keeps the shell from expanding it. Write the public URL into it yourself, and escape <code>"</code> and <code>\</code> as JSON does:
+<pre>curl -X POST "$PUBLIC_URL/api/setup" -H "Origin: $PUBLIC_URL" -H "Content-Type: application/json" -d @- &lt;&lt;'EOF'
+{{"token": "…", "password": "…", "public_url": "https://…", "default_hat_name": "Personal"}}
+EOF</pre></li>
 </ol>
 <p>For the web UI, build it (<code>pnpm install &amp;&amp; pnpm build</code> in <code>web/</code>) and rebuild hennery.</p>
 </html>

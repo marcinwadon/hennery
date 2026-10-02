@@ -175,23 +175,25 @@ async fn the_setup_page_is_never_cached_nor_referred() {
     }
 }
 
-/// `index.html` revalidates: its ETag answers 304, with no body.
+/// `index.html` revalidates: its ETag, or `*`, answers 304, with no body
+/// and no content type (the cached copy keeps its own).
 #[tokio::test]
 async fn the_page_revalidates_with_its_etag() {
     let addr = start().await;
     let first = get(addr, "/hosts").await;
     let etag = header(&first, "etag").unwrap();
     let client = reqwest::Client::new();
-    for tags in [etag.clone(), format!("\"0000\", {etag}")] {
+    for tags in [etag.clone(), format!("\"0000\", {etag}"), "*".to_string()] {
         let again = client
             .get(format!("http://{addr}/sessions"))
-            .header("if-none-match", tags)
+            .header("if-none-match", &tags)
             .send()
             .await
             .unwrap();
-        assert_eq!(again.status(), 304);
-        assert_eq!(header(&again, "etag").as_deref(), Some(etag.as_str()));
-        assert!(again.bytes().await.unwrap().is_empty());
+        assert_eq!(again.status(), 304, "{tags}");
+        assert_eq!(header(&again, "etag").as_deref(), Some(etag.as_str()), "{tags}");
+        assert_eq!(header(&again, "content-type"), None, "{tags}");
+        assert!(again.bytes().await.unwrap().is_empty(), "{tags}");
     }
     let stale = client
         .get(format!("http://{addr}/sessions"))
@@ -200,6 +202,44 @@ async fn the_page_revalidates_with_its_etag() {
         .await
         .unwrap();
     assert_eq!(stale.status(), 200);
+}
+
+/// The setup page is never revalidated: a cached copy would outlive the
+/// token, so even its own ETag or `*` gets the whole page, with no ETag.
+#[tokio::test]
+async fn the_setup_page_is_never_revalidated() {
+    let addr = start().await;
+    let etag = header(&get(addr, "/hosts").await, "etag").unwrap();
+    let client = reqwest::Client::new();
+    for tags in [etag, "*".to_string()] {
+        let resp = client
+            .get(format!("http://{addr}/setup"))
+            .header("if-none-match", &tags)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{tags}");
+        assert_eq!(header(&resp, "etag"), None, "{tags}");
+        assert!(!resp.bytes().await.unwrap().is_empty(), "{tags}");
+    }
+}
+
+/// `/theme.js` (the real UI only) is not hashed, so it revalidates rather
+/// than being cached for good: a new build's theme reaches the browser.
+#[tokio::test]
+async fn the_theme_script_revalidates() {
+    if !hennery_kernel::web::ui_embedded() {
+        return;
+    }
+    let addr = start().await;
+    let resp = get(addr, "/theme.js").await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header(&resp, "cache-control").as_deref(), Some("no-cache"));
+    assert!(header(&resp, "etag").is_some());
+    assert_eq!(
+        header(&resp, "content-type").as_deref(),
+        Some("text/javascript; charset=utf-8")
+    );
 }
 
 /// A missing hashed file is a plain 404, never the page: a browser that
