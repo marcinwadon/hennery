@@ -39,7 +39,7 @@ in
     adapter-check-cases = pkgs.callPackage ./adapter-check-cases.nix { inherit adapterCheck; };
   }
   // lib.optionalAttrs linux {
-    inherit (modules) nixos-eval home-manager-doctor;
+    inherit (modules) modules-eval home-manager-doctor;
   }
   // lib.optionalAttrs (system == "x86_64-linux") {
     # Virtual machines need KVM, which only the x86_64 runner has.
