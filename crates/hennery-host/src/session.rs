@@ -31,7 +31,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
@@ -352,6 +352,7 @@ pub fn launch(uplink: Uplink, launch: Launch, options: SessionOptions) -> Sessio
         questions: Mutex::new(Questions::default()),
         inbound: OnceLock::new(),
         probe: Mutex::new(None),
+        base_probe: Mutex::new(None),
         ending: ending.clone(),
     };
     let done = CancellationToken::new();
@@ -706,10 +707,14 @@ struct Actor {
     /// The inbound channel, for the questions' withdrawal watchers and the
     /// git probe.
     inbound: OnceLock<mpsc::UnboundedSender<Inbound>>,
-    /// The git probe running, if one is, and whether it (or one it waits
-    /// for) records the base commit: a newer probe replaces it, which aborts
-    /// it unless it does, and the actor's end aborts it.
-    probe: Mutex<Option<(Watcher, bool)>>,
+    /// The git probe of the last turn's end, if it still runs: a newer one
+    /// replaces it, which aborts it, and so does the actor's end.
+    probe: Mutex<Option<Watcher>>,
+    /// The probe after a new session's start, which records the base
+    /// commit, with what says it is over (`true`, or the sender gone). A
+    /// turn's probe waits for it rather than aborting it (the second
+    /// review's B1), so the states stay in order; the actor's end aborts it.
+    base_probe: Mutex<Option<(Watcher, watch::Receiver<bool>)>>,
     /// Shared with the handle (`SessionHandle::is_ending`).
     ending: Arc<AtomicBool>,
 }
@@ -1474,34 +1479,47 @@ impl Actor {
     /// 6b-ii decision 11): it never holds the actor, so it never delays or
     /// reorders a turn's end. Its result, if any, comes back on the ordered
     /// inbound channel as `Inbound::Git`. A newer probe aborts this one, and
-    /// so does the actor's end; either kills git's process group. Only the
-    /// probe that records the base commit is not aborted by a newer one (the
-    /// second review's B1): the newer waits for it (it is bounded too), so a
-    /// quick first turn cannot cost the base, and the states stay in order.
+    /// so does the actor's end; either kills git's process group. The probe
+    /// that records the base commit is never replaced (the second review's
+    /// B1): it has a slot of its own, and a turn's probe first waits for it
+    /// to be over (it is bounded too), so a quick first turn cannot cost the
+    /// base and the states stay in order. Turns' probes replace each other.
     fn probe_git(&self, cwd: &std::path::Path, base: bool) {
         let (Some(git), Some(inbound)) = (self.options.git.clone(), self.inbound.get().cloned()) else {
             return;
         };
-        let mut slot = self.probe.lock().expect("probe lock");
-        let earlier = match slot.as_mut() {
-            Some((watcher, true)) if watcher.0.as_ref().is_some_and(|task| !task.is_finished()) => watcher.0.take(),
-            _ => None,
-        };
-        let carries_base = base || earlier.is_some();
         let cwd = cwd.to_path_buf();
+        if base {
+            let (over, over_rx) = watch::channel(false);
+            let task = tokio::spawn(async move {
+                if let Some(state) = crate::git::probe(&git, &cwd).await {
+                    let _ = inbound.send(Inbound::Git { state, base: true });
+                }
+                let _ = over.send(true);
+            });
+            *self.base_probe.lock().expect("probe lock") = Some((Watcher(Some(task)), over_rx));
+            return;
+        }
+        let base_over = self
+            .base_probe
+            .lock()
+            .expect("probe lock")
+            .as_ref()
+            .map(|(_, over)| over.clone());
         let task = tokio::spawn(async move {
-            if let Some(earlier) = earlier {
-                // Aborted with this task, if it is.
-                let mut earlier = Watcher(Some(earlier));
-                if let Some(task) = earlier.0.as_mut() {
-                    let _ = task.await;
+            if let Some(mut over) = base_over {
+                // Done, or aborted (its sender gone): either way, over.
+                while !*over.borrow_and_update() {
+                    if over.changed().await.is_err() {
+                        break;
+                    }
                 }
             }
             if let Some(state) = crate::git::probe(&git, &cwd).await {
-                let _ = inbound.send(Inbound::Git { state, base });
+                let _ = inbound.send(Inbound::Git { state, base: false });
             }
         });
-        *slot = Some((Watcher(Some(task)), carries_base));
+        *self.probe.lock().expect("probe lock") = Some(Watcher(Some(task)));
     }
 
     /// Announce an adapter's question as `pending_opened` and keep its

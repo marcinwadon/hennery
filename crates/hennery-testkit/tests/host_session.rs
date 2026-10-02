@@ -3497,7 +3497,14 @@ fn probing(git: Option<std::path::PathBuf>) -> SessionOptions {
 }
 
 fn setup_git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let mut cmd = Command::new("git");
+    // Never the repository a git hook of the runner's names.
+    for (name, _) in std::env::vars_os() {
+        if name.to_string_lossy().starts_with("GIT_") {
+            cmd.env_remove(name);
+        }
+    }
+    let out = cmd
         .current_dir(dir)
         .args(["-c", "user.name=test", "-c", "user.email=test@example.invalid"])
         .args(args)
@@ -3662,7 +3669,9 @@ async fn a_quick_first_turn_still_gets_the_base_commit() {
 
 /// Decision 11: a `git` that hangs never delays a turn's end. A probe that
 /// a newer one replaces is killed with whatever it started (its process
-/// group), and so is one past its 3 s bound; neither reports a state.
+/// group), at once, and so is one past its 3 s bound; neither reports a
+/// state. A resumed session, so the start's probe records no base and is
+/// replaced like any other (the task review's second finding).
 #[tokio::test]
 async fn a_hung_git_never_delays_a_turn_end_and_is_killed_with_its_group() {
     let dir = tempfile::tempdir().unwrap();
@@ -3676,10 +3685,11 @@ async fn a_hung_git_never_delays_a_turn_end_and_is_killed_with_its_group() {
         ),
     );
     let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
-    let handle = session::spawn(
+    let handle = session::resume(
         uplink.clone(),
         "r0".into(),
         "s1".into(),
+        "agent-7".into(),
         fake_with(&FakeScript::default()),
         std::env::temp_dir(),
         probing(Some(git)),
@@ -3690,8 +3700,9 @@ async fn a_hung_git_never_delays_a_turn_end_and_is_killed_with_its_group() {
     assert!(handle.send(prompt("r1", "t1")));
     wait_until(&uplink, has("turn_ended")).await;
     assert!(asked.elapsed() < Duration::from_secs(2), "{:?}", asked.elapsed());
-    // The turn's probe replaced it, killing its whole group.
-    wait_dead_all(&after_start, Duration::from_secs(5)).await;
+    // The turn's probe replaced it, killing its whole group at once: well
+    // before the 3 s bound would have.
+    wait_dead_all(&after_start, Duration::from_millis(2000)).await;
     // The turn's probe hangs too, and is killed past its bound.
     let after_turn = wait_for_pids(&pids, 4).await;
     wait_dead_all(
@@ -3700,6 +3711,53 @@ async fn a_hung_git_never_delays_a_turn_end_and_is_killed_with_its_group() {
     )
     .await;
     assert!(git_states(&uplink.pending().unwrap()).is_empty());
+}
+
+/// The task review's first finding: once the base probe is over, a turn's
+/// probe replaces the previous turn's at once, rather than queueing behind
+/// it.
+#[tokio::test]
+async fn after_the_base_a_turns_probe_replaces_the_previous_turns() {
+    let Some(real) = hennery_host::git::find_git() else {
+        eprintln!("no git on PATH: skipped");
+        return;
+    };
+    let repo = tempfile::tempdir().unwrap();
+    setup_git(repo.path(), &["init", "-q", "-b", "main"]);
+    setup_git(repo.path(), &["commit", "-q", "--allow-empty", "-m", "first"]);
+    let dir = tempfile::tempdir().unwrap();
+    let (git, pids, count) = (
+        dir.path().join("git"),
+        dir.path().join("pids"),
+        dir.path().join("count"),
+    );
+    // The base probe's two calls are the real git; every later one hangs.
+    write_script(
+        &git,
+        &format!(
+            "#!/bin/sh\n[ $# -eq 0 ] && exit 0\nn=$(cat {count} 2>/dev/null || echo 0); n=$((n+1)); echo $n > {count}\n\
+             if [ $n -le 2 ]; then exec {real} \"$@\"; fi\necho $$ >> {pids}\nsleep 30 &\necho $! >> {pids}\nwait\n",
+            count = count.display(),
+            pids = pids.display(),
+            real = real.display()
+        ),
+    );
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let handle = session::spawn(
+        uplink.clone(),
+        "r0".into(),
+        "s1".into(),
+        fake_with(&FakeScript::default()),
+        repo.path().to_path_buf(),
+        probing(Some(git)),
+    );
+    wait_until(&uplink, |f| git_states(f).len() == 1).await;
+    assert!(handle.send(prompt("r1", "t1")));
+    wait_until(&uplink, has("turn_ended")).await;
+    let first = wait_for_pids(&pids, 2).await;
+    assert!(handle.send(prompt("r2", "t2")));
+    wait_until(&uplink, |f| turn_ends(f).len() == 2).await;
+    wait_dead_all(&first, Duration::from_millis(2000)).await;
 }
 
 /// Outside a work tree, or with no `git` at all, nothing is reported.

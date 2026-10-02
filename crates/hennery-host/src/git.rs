@@ -73,11 +73,13 @@ pub fn find_git() -> Option<PathBuf> {
 /// must not hold the host's start (the second review, after B1–B4).
 fn version_of(git: &Path) -> Option<(u32, u32)> {
     use std::io::Read;
+    use std::os::unix::process::CommandExt;
     let mut child = std::process::Command::new(git)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .ok()?;
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
@@ -86,7 +88,14 @@ fn version_of(git: &Path) -> Option<(u32, u32)> {
             Ok(Some(status)) => break status,
             Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             _ => {
-                let _ = child.kill();
+                // Whatever it started too (an `xcrun`, say).
+                if let Ok(pgid) = i32::try_from(child.id()) {
+                    // SAFETY: killpg(2) on the group of a child not yet
+                    // reaped, so its id is not reused.
+                    unsafe {
+                        libc::killpg(pgid, libc::SIGKILL);
+                    }
+                }
                 let _ = child.wait();
                 return None;
             }
@@ -240,6 +249,9 @@ async fn probe_unbounded(git: &Path, cwd: &Path) -> Option<GitState> {
         }
     }
     if !dirty {
+        // Closed first: a git still writing (past the cap) fails at once
+        // rather than at the probe's bound.
+        drop(status);
         let finished = child.wait().await.ok()?;
         group.0 = None;
         if !finished.success() {
@@ -271,7 +283,14 @@ mod tests {
 
     /// `git` run by a test to set a repository up, not by the probe.
     fn sh_git(dir: &Path, args: &[&str]) -> String {
-        let out = std::process::Command::new(find_git().unwrap())
+        let mut cmd = std::process::Command::new(find_git().unwrap());
+        // Never the repository a git hook of the runner's names.
+        for (name, _) in std::env::vars_os() {
+            if name.to_string_lossy().starts_with("GIT_") {
+                cmd.env_remove(name);
+            }
+        }
+        let out = cmd
             .current_dir(dir)
             .args(["-c", "user.name=test", "-c", "user.email=test@example.invalid"])
             .args(args)
