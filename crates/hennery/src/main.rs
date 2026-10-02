@@ -6,6 +6,7 @@ mod admin;
 mod config;
 mod healthcheck;
 mod inherit;
+mod lock;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -640,6 +641,21 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
     if !args.workspace_roots.is_empty() {
         hennery_host::projects::workspace_roots(&args.workspace_roots, &[], home.as_deref())?;
     }
+    // Held until this returns (distribution spec §8): a second host on this
+    // data directory stops here, before anything reads its pairing.
+    // `Paired::load` is not only a read: it rolls an interrupted pairing
+    // forward (renames, and moves the outbox aside). A directory that is not
+    // there yet is made, 0700, only by `up`'s first start, which pairs in it.
+    if !args.data_dir.exists() && args.join_url.is_some() {
+        hennery_host::identity::create_private_dir(&args.data_dir)?;
+    }
+    if !args.data_dir.is_dir() {
+        bail!(
+            "{} holds no pairing; run `hennery host join <url> <code>` first",
+            args.data_dir.display()
+        );
+    }
+    let _lock = lock::acquire(&args.data_dir, lock::HOST_LOCK, "hennery host run")?;
     let paired = match Paired::load(&args.data_dir)? {
         Some(paired) => {
             // Paired already (kernel spec §4.2): the code is not needed.
@@ -826,6 +842,10 @@ async fn run_up(args: UpArgs) -> Result<()> {
     let collector_ws_url = hennery_host::pairing::collector_ws_url(&collector_url)?;
     // Before either child creates its own directory in it.
     private_data_dir(&args.data_dir)?;
+    // Held until `up` returns, before either child starts: a second `up` on
+    // this data root would run a second collector on its database, also
+    // where the collector's admin socket cannot tell (its path too long).
+    let _lock = lock::acquire(&args.data_dir, lock::UP_LOCK, "hennery up")?;
     // The host pairs itself on first start only; a pairing that was revoked
     // is not replaced (kernel spec §4.2).
     let pairing = match Paired::load(&host_dir)? {

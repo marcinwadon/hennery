@@ -1433,6 +1433,19 @@ fn the_collector_refuses_a_listen_fd_that_is_not_a_listening_socket() {
     let collector = |fd: Option<&OwnedFd>, args: &[&str]| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_hennery"));
         cmd.arg("collector").args(args).arg("--data-dir").arg(&data);
+        if fd.is_none() {
+            // Another test's spawn can leak a descriptor into this child for
+            // a moment (macOS makes a pipe or socket close-on-exec only after
+            // it exists), and it may sit at 50: closed here, so what is
+            // tested is a closed descriptor.
+            // SAFETY: close(2) in the forked child, before exec; async-signal-safe.
+            unsafe {
+                cmd.pre_exec(|| {
+                    libc::close(50);
+                    Ok(())
+                });
+            }
+        }
         if let Some(fd) = fd {
             let fd = fd.as_raw_fd();
             // SAFETY: dup2 in the forked child, before exec; async-signal-safe.
@@ -2730,4 +2743,75 @@ fn the_collector_without_a_data_dir_or_with_the_healthcheck_and_its_flags_is_ref
     assert!(String::from_utf8_lossy(&out.stderr).contains("--data-dir"));
     let out = run(&["collector", "--data-dir", "/nonexistent", "healthcheck"]);
     assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// `host.lock` (distribution spec §8): while `up`'s host child runs on
+/// `<data>/host`, a second `hennery host run` there refuses to start, names
+/// the holder's pid, and touches nothing first: not even a pairing left
+/// half-done (`host.toml.pending`), which reading the pairing would roll
+/// forward. The first host keeps the lock, and stays connected.
+#[test]
+fn a_second_host_on_one_data_directory_refuses_to_start() {
+    let dir = scratch_dir("hostlock");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let (mut up, listen, ids, session) = up_until_connected(&data, &dir.join("up.log"), None);
+    let lock = data.join("host").join("host.lock");
+    let holder = std::fs::read_to_string(&lock).unwrap();
+    let holder = holder.trim().to_string();
+    assert!(holder.parse::<i32>().is_ok_and(pid_alive), "{holder:?}");
+    // Read only once the lock is ours, a stale stage like this one would be
+    // refused ("without the key it was paired with") before any lock.
+    let pending = data.join("host").join("host.toml.pending");
+    std::fs::write(&pending, "not a pairing").unwrap();
+
+    let mut second = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["host", "run"])
+        .arg("--data-dir")
+        .arg(data.join("host"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::fs::File::create(dir.join("second.err")).unwrap())
+        .spawn()
+        .unwrap();
+    let status = wait_with_timeout(&mut second, Duration::from_secs(20));
+    if status.is_none() {
+        let _ = second.kill();
+        let _ = second.wait();
+    }
+    let stderr = std::fs::read_to_string(dir.join("second.err")).unwrap();
+    let status = status.unwrap_or_else(|| panic!("a second host kept running: {stderr}"));
+    assert!(!status.success(), "{stderr}");
+    assert!(
+        stderr.contains("host.lock") && stderr.contains(&format!("pid {holder}")),
+        "{stderr}"
+    );
+    assert_eq!(std::fs::read_to_string(&pending).unwrap(), "not a pairing");
+    std::fs::remove_file(&pending).unwrap();
+    up.assert_running("the first host");
+    assert_eq!(std::fs::read_to_string(&lock).unwrap().trim(), holder);
+    assert!(holder.parse::<i32>().is_ok_and(pid_alive), "{holder:?}");
+    let hosts = get_json(&listen, "/api/hosts", &session).unwrap();
+    assert_eq!(hosts[0]["host_id"], ids[0].as_str());
+    assert_eq!(hosts[0]["connected"], true, "{hosts}");
+}
+
+/// `up.lock`: a second `hennery up` on one data root refuses to start,
+/// before it starts any child, and the first keeps serving.
+#[test]
+fn a_second_up_on_one_data_root_refuses_to_start() {
+    let dir = scratch_dir("uplock");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let (mut first, listen, _, session) = up_until_connected(&data, &dir.join("first.log"), None);
+    let log = dir.join("second.log");
+    let mut second = up_logging_to(&data, &log);
+    let status = wait_with_timeout(&mut second.up, Duration::from_secs(20)).expect("the second up kept running");
+    let stderr = std::fs::read_to_string(log.with_extension("err")).unwrap();
+    assert!(!status.success(), "{stderr}");
+    assert!(
+        stderr.contains("up.lock") && stderr.contains(&format!("pid {}", first.up.id())),
+        "{stderr}"
+    );
+    first.assert_running("the first up");
+    assert!(get_json(&listen, "/api/hosts", &session).is_some());
 }
