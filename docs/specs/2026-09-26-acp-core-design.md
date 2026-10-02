@@ -361,7 +361,7 @@ host.)*
 |---|---|---|
 | `start_session` | session_id (collector-minted), committed_seq, agent, cwd (canonical), model?, mode?, axes{}, first_prompt?{turn_id, content[]}, mcp_servers[], hat | `session_started` \| `start_failed` \| `error{unknown_agent}` |
 | `resume_session` | session_id, committed_seq, agent, cwd, agent_session_id, model?, mode?, axes{}, mcp_servers[], hat | `session_started` \| `start_failed` \| `error` (as a start) |
-| `prompt` | session_id, turn_id, content[] (ACP ContentBlocks) | `turn_started` \| `error{turn_in_progress \| not_attached \| invalid}` |
+| `prompt` | session_id, turn_id, content[] (ACP ContentBlocks) | `turn_started` \| `error{turn_in_progress \| not_attached \| invalid \| images_unsupported}` |
 | `cancel_turn` | session_id, turn_id | That turn's `turn_ended`, **whatever its outcome** \| `error{not_running \| not_attached}` |
 | `park_session` | session_id | `session_parked{reason: operator}` \| `error{not_attached}` (only to hosts with the `park` capability) |
 | `close_session` | session_id | `session_closed` \| `error{not_attached}` |
@@ -411,7 +411,10 @@ host.)*
   catalogue; `invalid` — the value is of the wrong kind for it;
   `config_failed` — the adapter refused it, did not answer within 15 s, or an
   earlier switch is still out (§4.3).
-- `prompt`: `invalid` — the content is not ACP ContentBlocks.
+- `prompt`: `invalid` — the content is not ACP ContentBlocks;
+  `images_unsupported` — it has an image block, and the session's agent
+  offered no `promptCapabilities.image` in `initialize` (plan 6a). Both are
+  refused before `turn_started`, so the turn never starts.
 - `start_session`: `unknown_agent` — the agent is not configured on the host.
 - Answers to a session with no live actor are refused `not_attached`. The
   collector logs that refusal; it is no verdict (§4.6).
@@ -428,7 +431,9 @@ host.)*
 - `capabilities`: `projects` (project enumeration and browsing), `images`
   (image content blocks in prompts), `park` (explicit park). The collector
   never sends a frame, or a prompt containing images, to a host that lacks the
-  capability; the UI hides the feature for that host. **Deserialized
+  capability, as the host's current connection announces it (a host that
+  reconnects on an older build between the check and the send is the one
+  gap, recorded by plan 6a); the UI hides the feature for that host. **Deserialized
   leniently:** an entry this build does not know (a newer host) is skipped,
   never a reason to refuse the `hello`; an absent field means none. The
   generated JSON Schema still lists the known values as a closed set, but that
@@ -437,8 +442,9 @@ host.)*
   capabilities of the live connection (in the hub), so a host that reconnects
   on an older build loses them at once; the host registry also records the
   latest accepted `hello`'s list for display (`HostItem.capabilities`, kernel
-  spec §8). The hennery host
-  announces only `park` so far.
+  spec §8). The hennery host announces `park` and `images`: `images` says the
+  host carries image blocks, and each session still refuses them when its
+  agent takes none (`images_unsupported`, above).
 - `agents[]`: per agent `{id, version, available, auth, catalog}` where
   `catalog` is the profile's **static default catalogue** (§6), so the
   New-session pickers work before the first session on a host exists.
@@ -802,7 +808,8 @@ leaves the session `failed` like a failed start, and `failed` is resumable.
   *(P-15: the predecessor allowed overlapping prompts; the first to finish
   cleared the "running" flag while the second was in flight, and the reaper
   could then reap mid-turn.)*
-- **Empty prompts are rejected at the API** (400): no text and no image.
+- **Empty prompts are rejected at the API** (400): no image, and no text
+  but whitespace.
   *(P-16: an empty prompt reached the adapter and produced a `-32602 Invalid
   params` error on the session.)*
 - **Every started turn ends with exactly one `turn_ended`**, outcome one of:
@@ -1264,12 +1271,19 @@ therefore decides the CLI version.
 - **Prompt content** is an array of ACP ContentBlocks built by the frontend
   (text and image blocks, in order). The collector validates: image MIME in
   {png, jpeg, gif, webp}, ≤ 5 MiB decoded each, ≤ 20 images, **≤ 16 MiB
-  decoded in total** per prompt.
+  decoded in total** per prompt. It accepts only text and image blocks, and
+  an image only if its bytes begin like the type it claims (plan 6a). It
+  keeps of each block only its text, or its `mimeType` and `data`: that is
+  what the host is sent, so a `uri`, `annotations` or `_meta` never reach
+  the agent.
 - **Images are stored** in the collector as content-addressed files in the
-  data directory (named by SHA-256) and referenced from the user-turn event,
-  so the transcript can show them later (retention follows the session).
-  *(P-22: the predecessor never stored sent images; transcripts kept orphaned
-  "[Image #N]" markers.)*
+  data directory (`attachments/<sha256>`, written to a temporary file,
+  synced and renamed, 0600 in a 0700 directory), before the turn opens, and
+  referenced from the turn and the user-turn event as `{type: "image",
+  mimeType, sha256, size}`, so the transcript can show them later
+  (retention follows the session). Neither holds the image's bytes, so no
+  replay carries them. *(P-22: the predecessor never stored sent images;
+  transcripts kept orphaned "[Image #N]" markers.)*
 - **Slash commands** arrive as `available_commands_update` (passed through,
   with a `commands` extract); the collector keeps the latest list per session
   and serves it from the catalogue endpoint, never in the session list.
@@ -1307,15 +1321,16 @@ events(
   session_id, owner_id, host_seq NULL, kind, body JSON, ts,
   applied BOOL,                        -- 0: stored host fact that did not apply
   UNIQUE(session_id, host_seq))
-attachments(sha256 PK, owner_id, mime, size, created_at)   -- file: <data>/attachments/<sha256>
-event_attachments(event_id, sha256, position)
+attachments(owner_id, sha256, mime, size, created_at, PK(owner_id, sha256))   -- file: <data>/attachments/<sha256>
+event_attachments(event_id, sha256, position, owner_id, PK(event_id, position),
+  FK(owner_id, sha256) -> attachments)   -- position: the block's index in the user_turn's content
 pending(pending_id PK, session_id, owner_id, kind, turn_id NULL, option_ids JSON, payload JSON, state, reason, opened_at, resolved_at)
 answer_queue(pending_id PK, session_id, owner_id, request_id UNIQUE, answer JSON, submitted_at, delivered BOOL NULL)
 turns(turn_id PK, session_id, owner_id, request_id, state, content JSON, sent_at, started_at, ended_at, outcome, stop_reason, error)
 plans(session_id PK, entries JSON, updated_at)
 ```
 
-**Built so far** (migrations 1–7, applied in order, never edited once
+**Built so far** (migrations 1–8, applied in order, never edited once
 shipped):
 
 1. `sessions`, `turns`, `events` — the walking skeleton;
@@ -1328,7 +1343,9 @@ shipped):
 6. `pending` (with `turn_id`) and `answer_queue` — permission and elicitation;
 7. `owner_id` on `sessions`, `turns`, `events`, `session_catalog`, `pending`
    and `answer_queue`, filled with the database's owner (kernel spec §1) —
-   `owner_id` everywhere. The store runs the kernel's migrations first.
+   `owner_id` everywhere. The store runs the kernel's migrations first;
+8. `attachments` and `event_attachments`, with `owner_id` from the start —
+   images (6a).
 
 `sessions` has no `hat_id`, `source_kind`, `title`, git columns or
 `last_event_id` yet, `turns` keeps only `content`, `state`, `outcome` and its
@@ -1409,7 +1426,7 @@ All endpoints require an operator session (kernel spec §3). Types come from
 | `GET /api/sessions/{id}/events?after=<event_id>&limit` | Timeline page after an event (applied rows only, §8). |
 | `GET /api/sessions/{id}/catalog` | `SessionCatalog {session_id, config_options[], model?, mode?, axes{}}`; commands, plan and usage join it with the plans that produce them. |
 | `POST /api/sessions/{id}/resume` | 202 `LifecycleResponse {session_id, lifecycle}` once `session_started` is ingested; 409 `starting` / `active` (its lifecycle); 409 `agent_has_no_record` (no agent session id, host not contacted); 409 `host_offline` (nothing changes); 409 `hat_mismatch` (§4.3); 502 with the host's code for any rejection or `start_failed` (the session becomes `failed` with it); 503 `delivery_unknown` (stays `starting`, reconciled like a start). |
-| `POST /api/sessions/{id}/prompt` | `{content[]}` → 202 `{turn_id}` once `turn_started` is ingested; 409 `not_attached` (not `active`) / `host_offline` (host not ready) / `turn_in_progress`; 400 `empty_prompt`, 400 `invalid` (host); 503 `delivery_unknown` (the turn stays open until reconciled). |
+| `POST /api/sessions/{id}/prompt` | `{content[]}` → 202 `{turn_id}` once `turn_started` is ingested; 409 `not_attached` (not `active`) / `host_offline` (host not ready) / `turn_in_progress` / `images_unsupported` (the host lacks `images`, nothing sent; or its agent takes none); 400 `empty_prompt`, 400 `invalid_content` (a block other than text or image, an image of another type, or bytes that are not the type they claim), 400 `invalid` (host); 413 `content_too_large` (§11's image and text limits; a body over 24 MiB gets 413 `body_too_large`); 503 `delivery_unknown` (the turn stays open until reconciled). Everything the collector refuses is checked before a turn opens or a file is written, except the host's per-agent refusal, a failed send and a turn that opens between the files and the turn row, which leave the prompt's images stored but unreferenced. |
 | `POST /api/sessions/{id}/cancel` | Cancel the open turn → 202 `CancelResponse {turn_id, outcome}` once that turn's `turn_ended` is ingested, with its real outcome (`cancelled`; `completed` or `failed` if it ended first; `interrupted` if the session was parked or closed meanwhile, or its adapter exited); 409 `not_attached` / `no_open_turn` / `not_running` (§4.4). |
 | `POST /api/sessions/{id}/park` | Explicit park → 202 `LifecycleResponse` once `session_parked` is ingested; 409 `not_attached` (not `active`, or host not ready); 409 `park_unsupported` (host lacks the `park` capability, nothing sent). |
 | `POST /api/sessions/{id}/close` | Close → 202 `LifecycleResponse` once closed (at once when unattached, parked, presumed parked, failed or the host is offline; on `session_closed` when attached); 409 `starting` while a start is in flight on a reachable host (§4.8). |
@@ -1417,7 +1434,8 @@ All endpoints require an operator session (kernel spec §3). Types come from
 | `POST /api/sessions/{id}/config` | `{config_id, value}` (a select's value id or a boolean) → 202 with the session's stored `SessionCatalog` once `config_applied` is ingested (after a read-back without options it still shows the old values, §3.2); 409 `not_attached` (not `active`, or host not ready) / `unknown_option`; 400 `invalid`; 502 `config_failed`; 422 for a value that is neither a string nor a boolean. Every viewer also gets SSE `catalog_changed`. |
 | `POST /api/sessions/{id}/pending/{pending_id}/answer` | `{option_id}` (permission) or `{action, content?}` (elicitation) → 202 `{pending_id, request_id}` once queued, whatever the lifecycle or host state; 404; 409 `not_open` / `already_answered`; 400 `invalid`; 422 for a body that is neither kind. The verdict follows as SSE `pending_changed`. |
 | `PATCH /api/sessions/{id}` | Rename; hat re-assignment (no running adapter, §4.9). |
-| `GET /api/attachments/{sha256}` | Image bytes, cache-immutable. |
+| `GET /api/attachments/{sha256}` | Image bytes of the owner's, as their stored type, with `nosniff`, `Content-Security-Policy: default-src 'none'`, `Cross-Origin-Resource-Policy: same-origin` and `Cache-Control: private, max-age=31536000, immutable`; 404 for any name that is not one of the owner's images. |
+| `GET /api/settings/attachments` | `AttachmentUsage {count, bytes}`: the owner's stored images, each once, for Settings (§15). |
 | `GET /api/hosts/{id}/projects` / `…/browse?path=` | Project picker. |
 | `GET /api/hosts/{id}/agents` | Agents, availability, auth and catalogues for that host. |
 
@@ -1430,8 +1448,8 @@ reconciled; cancel, config and park answer `not_attached` then. Error bodies are
 `ApiError {code, message, session_id?}`.
 
 **Built so far:** the rows above except the session list, `events?before=`,
-`DELETE`, `PATCH`, attachments, and `GET /api/hosts/{id}/projects`, `…/browse`
-and `…/agents`; a start takes no `first_prompt` yet (202 `{session_id}`), and
+`DELETE`, `PATCH`, and `GET /api/hosts/{id}/projects`, `…/browse` and
+`…/agents`; a start takes no `first_prompt` yet (202 `{session_id}`), and
 `hat_mismatch` comes with hats. The list stream `GET /api/stream/sessions` is
 not built yet either. The host registry routes are kernel spec §8.
 
@@ -1495,6 +1513,8 @@ Evaluated on ingest, edge-triggered only:
 |---|---|
 | WebSocket frame | 32 MiB |
 | Prompt images | 20 × ≤ 5 MiB, ≤ 16 MiB decoded in total |
+| Prompt text | ≤ 2 MiB in total (6a) |
+| Prompt request body | 24 MiB; every other route 2 MB (6a) |
 | Terminal output buffer | 1 MiB per terminal (or `outputByteLimit`) |
 | Adapter stderr tail | 64 KiB |
 | Outbox | 64 MiB (state-bearing frames kept beyond it, reported) |
@@ -1628,7 +1648,8 @@ session, Changes tab, config explorer, auto-naming, memory. Gateway internals
 Resolved by the maintainer on 2026-09-27:
 
 1. **Attachment retention** — no size cap in v1. Images live as long as their
-   session; Settings shows the attachment store's disk usage (frontend §8).
+   session; Settings shows the attachment store's disk usage (frontend §8),
+   from `GET /api/settings/attachments` (§9).
 2. **Per-hat "isolate agent user config"** — not in v1, documentation only.
    The docs next to the hat settings say that each session still loads the
    user's own agent configuration (umbrella §8.4) and that a hat needing this
@@ -1658,6 +1679,11 @@ the plans' "Decisions" lists hold the reasoning:
    the reaper away (§4.2, §4.6, §4.7); a turn cancel cancels them too.
 9. **A host's refusal of an answer is no verdict** (§4.6).
 10. **Duplicate detection is structural**, not by hash (§3.6).
+11. **Images** (plan 6a, by a stronger-model review on the maintainer's
+    behalf): checked before anything is written; only text and image
+    blocks; stored and sent as checked, the turn and the `user_turn` event
+    holding references, never bytes; attachments keyed by owner and hash;
+    refused per agent (§3.3, §7, §8, §9).
 
 ---
 

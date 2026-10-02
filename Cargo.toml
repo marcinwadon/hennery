@@ -12,6 +12,8 @@ publish = false
 [workspace.dependencies]
 agent-client-protocol = "=2.2.0"
 anyhow = "1"
+# Images in prompts (plan 6a): decoded at the collector.
+base64 = "=0.22.1"
 axum = { version = "0.8.9", features = ["ws"] }
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "=2.2.0"
@@ -52,4 +54,12 @@ hennery-host = { path = "crates/hennery-host" }
 opt-level = 3
 
 [profile.dev.package.blake2]
+opt-level = 3
+
+# Image prompts (plan 6a) decode and hash up to 16 MiB each; the tests do
+# that many times over.
+[profile.dev.package.base64]
+opt-level = 3
+
+[profile.dev.package.sha2]
 opt-level = 3

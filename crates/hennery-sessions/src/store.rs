@@ -7,16 +7,17 @@
 //! this store: it reads none of them, changes none, and writes nothing
 //! for them.
 
-use anyhow::Result;
+use crate::content::{Checked, Image};
+use anyhow::{Context, Result};
 use hennery_proto::frames::{
     AttachedSession, CollectorFrame, ConfigValue, ElicitationAction, Indexed, ParkReason, PendingKind, PendingReason,
     PendingResolution, SessionBody, SessionConfig, TurnOutcome,
 };
-use hennery_proto::rest::{AnswerRequest, EventDto, PendingItem, PendingState, SessionCatalog};
+use hennery_proto::rest::{AnswerRequest, AttachmentUsage, EventDto, PendingItem, PendingState, SessionCatalog};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 const MIGRATIONS: &[&str] = &[
@@ -133,6 +134,28 @@ const MIGRATIONS: &[&str] = &[
     UPDATE pending SET owner_id = (SELECT id FROM owners ORDER BY created_at, id LIMIT 1);
     UPDATE answer_queue SET owner_id = (SELECT id FROM owners ORDER BY created_at, id LIMIT 1);
 ",
+    // Image attachments (ACP core §7, §8; plan 6a): one row per owner and
+    // image, whose bytes are the file `attachments/<sha256>` beside the
+    // database, and one row per image block of a `user_turn` event, at the
+    // block's index in its content. Keyed by owner and hash (decision 5),
+    // so another owner's copy of an image is a row of its own.
+    "
+    CREATE TABLE attachments (
+        owner_id TEXT NOT NULL REFERENCES owners(id),
+        sha256 TEXT NOT NULL,
+        mime TEXT NOT NULL,
+        size INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (owner_id, sha256));
+    CREATE TABLE event_attachments (
+        event_id INTEGER NOT NULL REFERENCES events(event_id),
+        sha256 TEXT NOT NULL,
+        position INTEGER NOT NULL,
+        owner_id TEXT NOT NULL REFERENCES owners(id),
+        PRIMARY KEY (event_id, position),
+        FOREIGN KEY (owner_id, sha256) REFERENCES attachments(owner_id, sha256));
+    CREATE INDEX event_attachments_by_image ON event_attachments(owner_id, sha256);
+",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -215,6 +238,16 @@ pub struct Store {
     /// The database's owner (`hennery_kernel::db::kernel_owner`), whom
     /// every query names.
     owner: String,
+    /// Where the attachment files go: `attachments/` beside the database
+    /// (kernel spec §1). An in-memory store has none.
+    attachments: Option<PathBuf>,
+}
+
+/// A stored image (plan 6a), for `GET /api/attachments/{sha256}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub mime: String,
+    pub bytes: Vec<u8>,
 }
 
 fn now() -> String {
@@ -251,6 +284,26 @@ fn collector_event(
         body,
         ts: ts.to_string(),
     })
+}
+
+/// Link a `user_turn` event to the images it shows (ACP core §8): one row
+/// per image block, at its index in the content. A block stored before
+/// plan 6a names no attachment, and links nothing (decision 9).
+fn link_attachments(tx: &Transaction<'_>, owner: &str, event_id: i64, content: &Value) -> Result<()> {
+    for (position, block) in content.as_array().into_iter().flatten().enumerate() {
+        if block.get("type").and_then(Value::as_str) != Some("image") {
+            continue;
+        }
+        let Some(sha256) = block.get("sha256").and_then(Value::as_str) else {
+            continue;
+        };
+        tx.execute(
+            "INSERT INTO event_attachments(event_id, sha256, position, owner_id)
+             SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM attachments WHERE owner_id = ?4 AND sha256 = ?2)",
+            params![event_id, sha256, position as i64, owner],
+        )?;
+    }
+    Ok(())
 }
 
 /// Close an open turn that the host will never end, as `interrupted`.
@@ -667,22 +720,24 @@ fn conflict_already_recorded(
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self> {
-        Self::init(hennery_kernel::db::open(path)?)
+        let attachments = path.parent().map(|dir| dir.join(crate::attachments::DIR));
+        Self::init(hennery_kernel::db::open(path)?, attachments)
     }
 
     pub fn open_in_memory() -> Result<Self> {
-        Self::init(hennery_kernel::db::open_in_memory()?)
+        Self::init(hennery_kernel::db::open_in_memory()?, None)
     }
 
     /// The kernel's tables first: they hold the owner, which this store's
     /// rows name and its last migration fills in. So the store and the
     /// kernel agree on the owner whichever opens the database first.
-    fn init(mut conn: Connection) -> Result<Self> {
+    fn init(mut conn: Connection, attachments: Option<PathBuf>) -> Result<Self> {
         let owner = hennery_kernel::db::kernel_owner(&mut conn)?;
         hennery_kernel::db::migrate(&mut conn, MIGRATIONS)?;
         Ok(Self {
             conn: Mutex::new(conn),
             owner,
+            attachments,
         })
     }
 
@@ -944,6 +999,17 @@ impl Store {
     /// Open a turn if the session is active and has none open. Returns false
     /// when a turn is already in flight (ACP core §4.4: one turn at a time).
     pub fn open_turn(&self, session_id: &str, turn_id: &str, content: &[Value]) -> Result<bool> {
+        self.open_turn_with(session_id, turn_id, content, &[])
+    }
+
+    /// Open a turn for a checked prompt (plan 6a): the turn holds the
+    /// stored blocks, and each image gets the owner's row, if it has none
+    /// yet. Its file must be saved first (`save_images`).
+    pub fn open_prompt(&self, session_id: &str, turn_id: &str, prompt: &Checked) -> Result<bool> {
+        self.open_turn_with(session_id, turn_id, &prompt.stored_json(), &prompt.images)
+    }
+
+    fn open_turn_with(&self, session_id: &str, turn_id: &str, content: &[Value], images: &[Image]) -> Result<bool> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let changed = tx.execute(
@@ -952,13 +1018,78 @@ impl Store {
             params![session_id, turn_id, self.owner],
         )?;
         if changed == 1 {
+            let ts = now();
             tx.execute(
                 "INSERT INTO turns(turn_id, session_id, content, created_at, owner_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![turn_id, session_id, serde_json::to_string(content)?, now(), self.owner],
+                params![turn_id, session_id, serde_json::to_string(content)?, ts, self.owner],
             )?;
+            for image in images {
+                tx.execute(
+                    "INSERT INTO attachments(owner_id, sha256, mime, size, created_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT(owner_id, sha256) DO NOTHING",
+                    params![self.owner, image.sha256, image.mime, image.bytes.len() as i64, ts],
+                )?;
+            }
         }
         tx.commit()?;
         Ok(changed == 1)
+    }
+
+    /// Save each image's file (plan 6a), before `open_prompt` records it.
+    /// An image already stored is kept as it is.
+    pub fn save_images(&self, images: &[Image]) -> Result<()> {
+        if images.is_empty() {
+            return Ok(());
+        }
+        let dir = self
+            .attachments
+            .as_deref()
+            .context("an in-memory store keeps no attachment files")?;
+        for image in images {
+            crate::attachments::write(dir, &image.sha256, &image.bytes)
+                .with_context(|| format!("store attachment {}", image.sha256))?;
+        }
+        Ok(())
+    }
+
+    /// One of the owner's images, by its hash: `None` for a name that is
+    /// not a hash, an image of no row of the owner's, or one whose file is
+    /// gone.
+    pub fn attachment(&self, sha256: &str) -> Result<Option<Attachment>> {
+        if !crate::attachments::is_sha256(sha256) {
+            return Ok(None);
+        }
+        let mime: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT mime FROM attachments WHERE owner_id = ?1 AND sha256 = ?2",
+                [&self.owner, sha256],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let (Some(mime), Some(dir)) = (mime, self.attachments.as_deref()) else {
+            return Ok(None);
+        };
+        match crate::attachments::read(dir, sha256)? {
+            Some(bytes) => Ok(Some(Attachment { mime, bytes })),
+            None => {
+                tracing::warn!(%sha256, "an attachment's file is missing");
+                Ok(None)
+            }
+        }
+    }
+
+    /// The owner's images, each counted once, and their size (plan 6a).
+    pub fn attachment_usage(&self) -> Result<AttachmentUsage> {
+        let (count, bytes): (i64, i64) = self.conn().query_row(
+            "SELECT count(*), coalesce(sum(size), 0) FROM attachments WHERE owner_id = ?1",
+            [&self.owner],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(AttachmentUsage {
+            count: count as u64,
+            bytes: bytes as u64,
+        })
     }
 
     /// Undo `open_turn` after the host rejected the prompt.
@@ -1441,7 +1572,9 @@ impl Store {
                         .optional()?;
                     if let Some(content) = content {
                         let body = json!({ "turn_id": turn_id, "content": serde_json::from_str::<Value>(&content)? });
-                        created.push(collector_event(&tx, &self.owner, session_id, "user_turn", body, &ts)?);
+                        let user_turn = collector_event(&tx, &self.owner, session_id, "user_turn", body, &ts)?;
+                        link_attachments(&tx, &self.owner, user_turn.event_id, &user_turn.body["content"])?;
+                        created.push(user_turn);
                     }
                 } else {
                     created.clear();

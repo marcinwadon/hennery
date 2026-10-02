@@ -875,7 +875,7 @@ impl Actor {
         let mut replay = Replay::default();
         let started = tokio::select! {
             result = async {
-                let (session, catalogue) =
+                let (session, catalogue, images) =
                     match tokio::time::timeout_at(deadline, negotiate(&conn, cwd, &attach, &mut updates, &mut replay)).await {
                         Ok(result) => result?,
                         Err(_) => {
@@ -887,14 +887,14 @@ impl Actor {
                         }
                     };
                 let applied = apply_config(&conn, &session, catalogue, &config, self.options.config_timeout, deadline).await;
-                Ok((session, applied))
+                Ok((session, applied, images))
             } => result,
             info = adapter.exited() => {
                 let tail = adapter.stderr_tail().await;
                 Err(StartError::other(format!("adapter exited during start ({}): {}", describe(info), last_lines(&tail, 5))))
             }
         };
-        let (agent_session, applied) = match started {
+        let (agent_session, applied, images) = match started {
             Ok(started) => started,
             Err(error) => {
                 self.begin_ending();
@@ -1024,6 +1024,12 @@ impl Actor {
                                 continue;
                             }
                         };
+                        // ACP: images only to an agent whose `initialize`
+                        // offered them (plan 6a, decision 2).
+                        if !images && blocks.iter().any(|block| matches!(block, ContentBlock::Image(_))) {
+                            self.reject(request_id, "images_unsupported", "this agent does not take images".into());
+                            continue;
+                        }
                         if seen_turns.contains(&turn_id) {
                             tracing::info!(%turn_id, "ignoring duplicate prompt delivery");
                             continue;
@@ -1798,7 +1804,8 @@ async fn next_reply(turn: &mut Option<Turn>) -> agent_client_protocol::Result<Pr
 /// `initialize`, then `session/new` or `session/load`. While a load is
 /// outstanding its replay is classified, never emitted (ACP core §4.5).
 /// Returns the config options the adapter announced (none if it announced
-/// none, or they did not parse). What the adapter sends meanwhile goes into
+/// none, or they did not parse), and whether its `initialize` offered
+/// images in prompts (plan 6a). What the adapter sends meanwhile goes into
 /// `replay`.
 async fn negotiate(
     conn: &ConnectionTo<Agent>,
@@ -1806,12 +1813,13 @@ async fn negotiate(
     attach: &Attach,
     updates: &mut mpsc::UnboundedReceiver<Inbound>,
     replay: &mut Replay,
-) -> Result<(SessionId, Announced), StartError> {
+) -> Result<(SessionId, Announced, bool), StartError> {
     let init = conn
         .send_request(InitializeRequest::new(ProtocolVersion::V1).client_capabilities(client_capabilities()))
         .block_task()
         .await
         .map_err(|err| StartError::acp(err, false))?;
+    let images = init.agent_capabilities.prompt_capabilities.image;
     let agent_session_id = match attach {
         Attach::New => {
             let created = conn
@@ -1833,7 +1841,7 @@ async fn negotiate(
                 }
             }
             let catalogue = announced_options(created.config_options, replay.updates());
-            return Ok((created.session_id, catalogue));
+            return Ok((created.session_id, catalogue, images));
         }
         Attach::Load { agent_session_id } => agent_session_id,
     };
@@ -1864,7 +1872,7 @@ async fn negotiate(
                 }
                 let loaded = result.map_err(|err| StartError::acp(err, true))?;
                 let catalogue = announced_options(loaded.config_options, replay.updates());
-                return Ok((id, catalogue));
+                return Ok((id, catalogue, images));
             }
         }
     }

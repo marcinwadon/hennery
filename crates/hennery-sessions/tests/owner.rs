@@ -123,6 +123,9 @@ fn the_owner_id_migration_gives_every_row_the_owner() {
             conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN owner_id;"))
                 .unwrap();
         }
+        // And without the tables of the migrations after it.
+        conn.execute_batch("DROP TABLE event_attachments; DROP TABLE attachments;")
+            .unwrap();
         conn.execute_batch("PRAGMA user_version = 6;").unwrap();
     }
     let store = Store::open(&db).unwrap();
@@ -240,4 +243,54 @@ fn another_owners_sessions_are_invisible_to_the_store() {
     );
     assert_eq!(all_rows(&conn, Some(OTHER)), theirs);
     assert_eq!(store.session("session-a").unwrap().unwrap().lifecycle, "parked");
+}
+
+/// Plan 6a: an attachment is the owner's who sent it. Another owner's row,
+/// its file on disk under the same name, is neither served nor counted;
+/// the owner's own copy of the same image is a row of its own.
+#[test]
+fn another_owners_attachment_is_neither_served_nor_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    let store = Store::open(&db).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO owners(id, created_at, set_up_at) VALUES (?1, ?2, ?2)",
+        rusqlite::params![OTHER, OTHER_CREATED_AT],
+    )
+    .unwrap();
+    let bytes = b"GIF89a, another owner's".to_vec();
+    let image = json!({
+        "type": "image", "mimeType": "image/gif",
+        "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &bytes),
+    });
+    let checked = hennery_sessions::content::check(vec![image]).unwrap();
+    let sha = checked.images[0].sha256.clone();
+    conn.execute(
+        "INSERT INTO attachments(owner_id, sha256, mime, size, created_at) VALUES (?1, ?2, 'image/gif', ?3, ?4)",
+        rusqlite::params![OTHER, sha, bytes.len() as i64, "2026-10-01T00:00:00Z"],
+    )
+    .unwrap();
+    std::fs::create_dir(dir.path().join("attachments")).unwrap();
+    std::fs::write(dir.path().join("attachments").join(&sha), &bytes).unwrap();
+    assert!(store.attachment(&sha).unwrap().is_none());
+    assert_eq!(store.attachment_usage().unwrap().count, 0);
+
+    // The owner sends the same image: a row of their own, and it is served.
+    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    store
+        .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
+        .unwrap();
+    store.save_images(&checked.images).unwrap();
+    assert!(store.open_prompt("s1", "t1", &checked).unwrap());
+    assert_eq!(store.attachment(&sha).unwrap().unwrap().bytes, bytes);
+    assert_eq!(store.attachment_usage().unwrap().count, 1);
+    let owners: Vec<String> = conn
+        .prepare("SELECT owner_id FROM attachments ORDER BY owner_id = ?1")
+        .unwrap()
+        .query_map([OTHER], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(owners, [store.owner_id(), OTHER]);
 }

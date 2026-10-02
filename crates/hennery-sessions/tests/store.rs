@@ -370,7 +370,9 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
-            "ALTER TABLE turns DROP COLUMN state;
+            "DROP TABLE event_attachments;
+             DROP TABLE attachments;
+             ALTER TABLE turns DROP COLUMN state;
              ALTER TABLE sessions DROP COLUMN owner_id;
              ALTER TABLE turns DROP COLUMN owner_id;
              ALTER TABLE events DROP COLUMN owner_id;
