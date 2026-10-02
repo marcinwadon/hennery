@@ -144,6 +144,9 @@ fn an_interrupted_doctor_leaves_no_adapter_running() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     let home = dir.path().join("home");
+    // Doctor starts the adapters in the home directory (decision 14): on
+    // Linux nothing below would create it.
+    std::fs::create_dir_all(&home).unwrap();
     let config = dir.path().join("config");
     let argv = [
         "/usr/bin/true".to_string(),
