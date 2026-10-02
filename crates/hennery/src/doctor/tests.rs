@@ -2185,6 +2185,10 @@ fn each_step_to_the_collector_fails_on_its_own() {
         collector::shown_url("https://doctor:canary-7d-secret@127.0.0.1:9/"),
         "https://127.0.0.1:9/"
     );
+    assert_eq!(
+        collector::shown_url("https://doctor:canary-7d-secret@[127.0.0.1"),
+        "an unreadable URL"
+    );
 
     let old =
         "HTTP/1.1 200 OK\r\nDate: Thu, 01 Oct 2026 00:00:00 GMT\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";

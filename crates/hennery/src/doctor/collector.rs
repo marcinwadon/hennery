@@ -48,7 +48,9 @@ pub fn shown_url(url: &str) -> String {
             let _ = parsed.set_password(None);
             parsed.to_string()
         }
-        _ => url.to_string(),
+        Ok(_) => url.to_string(),
+        // It could still hold `user:pass@` before what broke it.
+        Err(_) => "an unreadable URL".to_string(),
     }
 }
 
