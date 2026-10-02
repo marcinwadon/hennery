@@ -69,7 +69,9 @@ pub fn target(var: impl Fn(&str) -> Option<OsString>, macos: bool) -> Result<Tar
 
 /// Set up logging for `process` (`up`, `collector`, `host`), or for a
 /// command that always logs to standard output (`None`). `RUST_LOG`
-/// filters, `info` by default.
+/// filters, `info` by default; the targets that trace whole messages stay
+/// at `info` whatever it says, since they would show a session's gateway
+/// token (`hennery_host::logging::capped`, plan 8c).
 ///
 /// A file that cannot be used (the directory not creatable, not private,
 /// the disk full) falls back to standard error, saying why there, at `warn`
@@ -83,7 +85,7 @@ pub fn init(process: Option<&str>) -> Result<(), String> {
     };
     let why = match process.map(|_| target(|name| std::env::var_os(name), cfg!(target_os = "macos"))) {
         None | Some(Ok(Target::Stdout)) => {
-            tracing_subscriber::fmt().with_env_filter(filter("info")).init();
+            install(tracing_subscriber::fmt().with_env_filter(filter("info")).finish());
             return Ok(());
         }
         Some(Err(why)) => return Err(why),
@@ -96,14 +98,16 @@ pub fn init(process: Option<&str>) -> Result<(), String> {
                     // One line where the service manager keeps output, so
                     // its log points at this one.
                     say(&format!("logging to {}", dir.join(&name).display()));
-                    tracing_subscriber::fmt()
-                        .with_env_filter(filter("info"))
-                        .with_ansi(false)
-                        // A failed write is said once by the writer, not
-                        // once per event on standard error.
-                        .log_internal_errors(false)
-                        .with_writer(log)
-                        .init();
+                    install(
+                        tracing_subscriber::fmt()
+                            .with_env_filter(filter("info"))
+                            .with_ansi(false)
+                            // A failed write is said once by the writer, not
+                            // once per event on standard error.
+                            .log_internal_errors(false)
+                            .with_writer(log)
+                            .finish(),
+                    );
                     return Ok(());
                 }
                 Err(err) => format!("cannot write the log in {}: {err}", dir.display()),
@@ -112,12 +116,25 @@ pub fn init(process: Option<&str>) -> Result<(), String> {
     };
     say(&format!("{why}; logging warnings and errors to standard error"));
     // Colour only on a terminal: under a service this is the crash log.
-    tracing_subscriber::fmt()
-        .with_env_filter(filter("warn"))
-        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
-        .with_writer(std::io::stderr)
-        .init();
+    install(
+        tracing_subscriber::fmt()
+            .with_env_filter(filter("warn"))
+            .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+            .with_writer(std::io::stderr)
+            .finish(),
+    );
     Ok(())
+}
+
+/// Install `subscriber` as the process's, `log` records bridged in, with
+/// the targets that trace whole messages capped (plan 8c): the one place
+/// this file installs one (`every_subscriber_is_installed_capped`).
+fn install<S>(subscriber: S)
+where
+    S: tracing::Subscriber + Send + Sync + 'static,
+{
+    use tracing_subscriber::util::SubscriberInitExt;
+    hennery_host::logging::capped(subscriber).init();
 }
 
 /// `line` on standard error, prefixed, in one `write`: `up` and its
@@ -347,6 +364,21 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Rotating {
 
 #[cfg(test)]
 mod tests {
+    /// Plan 8c: every subscriber is installed through `install`, which
+    /// caps the targets that trace whole messages. Read from the source:
+    /// an installed subscriber cannot be inspected.
+    #[test]
+    fn every_subscriber_is_installed_capped() {
+        let source = include_str!("log.rs");
+        let init = concat!(".", "init()");
+        assert_eq!(
+            source.matches(init).count(),
+            1,
+            "a subscriber installed outside `install`"
+        );
+        assert!(source.contains(concat!("hennery_host::logging::capped(subscriber)", ".", "init();")));
+    }
+
     use super::*;
     use std::collections::BTreeMap;
     use tracing_subscriber::fmt::MakeWriter;
