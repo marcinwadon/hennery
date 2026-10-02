@@ -1525,7 +1525,10 @@ All endpoints require an operator session (kernel spec §3). Types come from
 connection dropped or the request timed out after it was sent (§3.4); the
 fact, if it happened, still arrives and applies. 409 `host_offline` to a start,
 resume or prompt when the host is not connected, or connected but not yet
-reconciled; cancel, config and park answer `not_attached` then. Error bodies are
+reconciled; cancel, config and park answer `not_attached` then. A start
+on a host that has not connected since it was paired says so in the
+`host_offline` message: its first start installs the agents before it
+connects (distribution §3.2), which can take minutes. Error bodies are
 `ApiError {code, message, session_id?}`.
 
 **Built so far:** the rows above except the session list, `events?before=`,

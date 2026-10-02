@@ -368,6 +368,36 @@ fn prompt_body() -> Value {
     json!({ "content": [{ "type": "text", "text": "hi" }] })
 }
 
+/// Smoke test #1, F1: a host paired but never connected is most likely
+/// installing its agents on its first start, which can take minutes; a
+/// start says so instead of a bare "not connected". Once it has connected,
+/// an offline host gets the plain answer again.
+#[tokio::test]
+async fn a_start_on_a_host_that_never_connected_says_why() {
+    let collector = Collector::start().await;
+    let start = async || {
+        post(
+            &client(&collector),
+            collector.url("/api/sessions"),
+            json!({ "host_id": HOST, "agent": "fake", "cwd": "/tmp" }),
+        )
+        .await
+    };
+    let (status, body) = start().await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("host_offline")), "{body}");
+    let message = body["message"].as_str().unwrap();
+    assert!(message.contains("has not connected since it was paired"), "{message}");
+    assert!(message.contains("installs its agents"), "{message}");
+
+    ScriptedHost::connect(&collector, vec![], 0)
+        .await
+        .drop_connection(&collector)
+        .await;
+    let (status, body) = start().await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("host_offline")), "{body}");
+    assert_eq!(body["message"], "the host is not connected", "{body}");
+}
+
 #[tokio::test]
 async fn nothing_is_sent_to_a_host_before_its_reconciliation() {
     let collector = Collector::start().await;

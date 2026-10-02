@@ -231,6 +231,12 @@ async fn session_cwd(state: &AppState, host_id: &str, cwd: &str) -> Result<OnHos
 /// asked to start anything (umbrella §8.2). The client never names a hat.
 /// A host that is not connected and reconciled gets no session at all
 /// (plan 5c decision 2).
+/// The `host_offline` answer to a start on a host that has not connected
+/// since it was paired.
+const NEVER_CONNECTED: &str = "the host has not connected since it was paired; on its first start a host installs its \
+     agents (a few hundred MB) before it connects, which can take minutes, so try again once the Hosts view shows it \
+     connected";
+
 async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<StartSessionRequest>) -> Response {
     // What a list item shows must be bounded (plan 6b, the review's A1): a
     // paired host's id, and an agent's name within its cap. Refused before
@@ -243,6 +249,12 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
         );
     }
     match state.hosts.host(&req.host_id) {
+        // Never connected, no `hello` on record and not connected now
+        // (smoke test #1, F1): a host's first start installs its agents
+        // before it connects, so say that rather than only "not connected".
+        Ok(Some(host)) if host.last_seen_at.is_none() && !state.hub.is_ready(&req.host_id) => {
+            return error(StatusCode::CONFLICT, "host_offline", NEVER_CONNECTED);
+        }
         Ok(Some(_)) => {}
         Ok(None) => {
             return error(
