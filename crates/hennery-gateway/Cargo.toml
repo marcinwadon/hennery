@@ -1,0 +1,22 @@
+[package]
+name = "hennery-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# Never `hennery-sessions`, in any table (umbrella §9, gateway spec §10):
+# `tests/boundary.rs` reads the manifests and fails if it appears.
+[dependencies]
+anyhow.workspace = true
+chacha20poly1305.workspace = true
+hennery-kernel.workspace = true
+hex.workspace = true
+libc = "0.2"
+thiserror.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
