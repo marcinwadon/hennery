@@ -1497,6 +1497,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
 ]
@@ -1612,6 +1613,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
  "webauthn-authenticator-rs",
  "webauthn-rs",
 ]

@@ -190,6 +190,7 @@ impl ScriptedHost {
             capabilities: Capabilities(vec![Capability::Park, Capability::ResolvePath]),
             workspace_roots: vec![],
             attached_sessions: attached,
+            mcp_isolation: Default::default(),
         })
         .await;
         let ack = host.next().await;
