@@ -326,3 +326,48 @@ fn a_revoked_hosts_records_are_final() {
     );
     assert!(store.forgets_to_send("h1").unwrap().is_empty());
 }
+
+fn stored_home(db: &Path, id: &str) -> Option<String> {
+    Connection::open(db)
+        .unwrap()
+        .query_row("SELECT agent_home FROM host_forgets WHERE id = ?1", [id], |r| r.get(0))
+        .unwrap()
+}
+
+/// The review's item 12: a record keeps its roots only while it may still
+/// be sent: a final one, by an attempt, a revoke or at its writing, has
+/// none.
+#[test]
+fn a_final_record_keeps_no_roots() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    for (id, a) in [("s1", "a1"), ("s2", "a2"), ("s3", "a3")] {
+        started(&store, id, "claude", a, Some("/h/.claude"));
+    }
+    delete(&store, "s1");
+    delete(&store, "s2");
+    let records = store.forgets_to_send("h1").unwrap();
+    let (r1, r2) = (&records[0].id, &records[1].id);
+    assert!(stored_home(&db, r1).is_some());
+    let left = hennery_sessions::store::final_result(ForgetReason::Symlink);
+    store.forget_attempted(r1, &left, true, true).unwrap();
+    assert_eq!(stored_home(&db, r1), None);
+    store
+        .forget_attempted(r2, &pending_result(RemovalPending::NoReply), true, false)
+        .unwrap();
+    assert!(stored_home(&db, r2).is_some());
+    let hosts = hennery_kernel::hosts::Hosts::open(&db).unwrap();
+    let enrollment = hennery_kernel::hosts::Enrollment {
+        public_key: "aa".repeat(32),
+        name: "h".into(),
+        host_version: "t".into(),
+        platform: "t".into(),
+    };
+    hosts.register("h1", &enrollment, 0).unwrap();
+    hosts.revoke("h1", 1).unwrap();
+    store.revoke_host("h1").unwrap();
+    assert_eq!(stored_home(&db, r2), None);
+    let written = delete(&store, "s3");
+    assert_eq!(written.records[0].agent_home, None);
+    assert_eq!(stored_home(&db, &written.records[0].id), None);
+}

@@ -3438,7 +3438,8 @@ async fn an_answer_past_the_caps_is_not_taken() {
 }
 
 /// B7: one attempt per record at a time. A record whose attempt is held
-/// elsewhere is answered `in_progress` and nothing is sent or stored.
+/// elsewhere is answered `in_progress` and nothing is sent or stored; the
+/// holder goes again once its own answer is in (the review's item 11).
 #[tokio::test]
 async fn a_record_with_an_attempt_in_flight_is_not_sent_again() {
     let collector = Collector::start().await;
@@ -3453,11 +3454,52 @@ async fn a_record_with_an_attempt_in_flight_is_not_sent_again() {
     let record = collector.state.store.forgets_to_send(HOST).unwrap().remove(0);
     let second = hennery_sessions::forget::attempt(&collector.state, &record, Duration::from_secs(5)).await;
     assert_eq!(second.pending, Some(hennery_proto::rest::RemovalPending::InProgress));
+    // The first is answered `attached`: asked again meanwhile, it goes
+    // again at once.
+    use hennery_proto::frames::{ForgetKind, ForgetReason, ForgetRemaining, ForgetWhat};
+    let attached = ForgetRemaining {
+        what: ForgetWhat {
+            kind: ForgetKind::Session,
+            count: 0,
+        },
+        reason: ForgetReason::Attached,
+        retry: true,
+    };
+    host.send(&forgotten(first, vec![attached])).await;
+    let first = expect_forget(&mut host).await;
     host.send(&forgotten(first, vec![])).await;
     let (status, body) = call.await.unwrap();
     assert_eq!(
         (status, body["host_transcript"]["state"].as_str()),
         (200, Some("removed")),
         "{body}"
+    );
+}
+
+/// B8, the review's item 13: a record whose agent session another kept
+/// session took up since the delete is not sent: final, `shared`.
+#[tokio::test]
+async fn a_record_whose_agent_session_is_in_use_again_is_not_sent() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = parked_claude_session(&collector, &mut host).await;
+    // No capability: the delete leaves the record pending.
+    let (status, body) = delete(&client(&collector), session_url(&collector, &session)).await;
+    assert_eq!(
+        (status, body["host_transcript"]["state"].as_str()),
+        (200, Some("pending")),
+        "{body}"
+    );
+    let _again = parked_claude_session(&collector, &mut host).await;
+    let record = collector.state.store.forgets_to_send(HOST).unwrap().remove(0);
+    let result = hennery_sessions::forget::attempt(&collector.state, &record, Duration::from_secs(5)).await;
+    assert_eq!(
+        result.remaining.iter().map(|r| r.reason).collect::<Vec<_>>(),
+        [hennery_proto::frames::ForgetReason::Shared]
+    );
+    let listed = removals(&collector).await;
+    assert_eq!(
+        (listed[0].state, listed[0].attempts),
+        (hennery_proto::rest::HostRemovalState::Final, 0)
     );
 }
