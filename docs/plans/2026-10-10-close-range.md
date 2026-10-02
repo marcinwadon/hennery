@@ -10,11 +10,17 @@
 
 **Spec:** the kernel spec and ACP core §2.3 say an agent gets its stdio and nothing else of the host's; plan 3b-ii's "After this plan" carries the follow-up: "`close_range(3, ~0, CLOSE_RANGE_CLOEXEC)` would reach every descriptor, past `MAX_CLOSED_FD` and the hard limit's cap, once Linux-only code can be tested". The debt lane handed it to the distribution lane on 2026-10-02, the first lane whose CI checks Linux behaviour (plan 7a). Anchors are `main` at `2d9d3b3` (PR #41).
 
-**Status:** not executed; amended after the security review. The security review of 2026-10-02 (binding on the maintainer's behalf) approved with one amendment, A1: the `pre_exec` SAFETY comment names the new system call. Taken, with O2 (the loop's docs say it is the fallback on Linux 5.11 and later); O1 and O3 recorded under "After this plan"; decisions 1–5 confirmed. The code was built on `feat/close-range`, CI-proven and revert-probed there (runs below); the plan was replayed from its own text onto `2d9d3b3`, and the tree matched the branch byte for byte. The checks passed on macOS: fmt, both clippy runs, the workspace tests and the codegen check.
+**Status:** executed 2026-10-02 (see "Execution status"); amended after the security review. The security review of 2026-10-02 (binding on the maintainer's behalf) approved with one amendment, A1: the `pre_exec` SAFETY comment names the new system call. Taken, with O2 (the loop's docs say it is the fallback on Linux 5.11 and later); O1 and O3 recorded under "After this plan"; decisions 1–5 confirmed. The code was built on `feat/close-range`, CI-proven and revert-probed there (runs below); the plan was replayed from its own text onto `2d9d3b3`, and the tree matched the branch byte for byte. The checks passed on macOS: fmt, both clippy runs, the workspace tests and the codegen check.
 
-## Execution status
+## Execution status (2026-10-02)
 
-Not executed yet.
+**Executed** on branch `exec/close-range`, pushed as `feat/close-range` (PR #40), on `main` at `2d9d3b3`. One implementer applied the task; the opus task review, which is also this one-task plan's whole-branch review, approved it ("ready to merge"), with no Critical or Important finding. The code is byte-identical to the CI-proven and revert-probed branch. The CI revert-probes (Step 6) were not repeated: runs 36949287213 and 36949540092 ran them on this code.
+
+As built beyond the task: the ACP core spec's §2.3 "Descriptors" line is amended here rather than later (the review's Minor 1), since this plan closes the gap it named.
+
+Deferred minors: on Linux the fallback loop is tested by nothing (O1); the `close_inherited` doc's "close-on-exec descriptors are left alone" now describes the loop only (the `close_range` path re-marks them, harmlessly).
+
+Tests: 682 in the workspace on macOS (one more than `2d9d3b3`); on Linux, two more.
 
 ## Scope
 
@@ -312,7 +318,7 @@ One task: the system call, its two tests, and the CI step.
 
 - **Not tested here:** a kernel older than 5.11 (the fallback); `close_range` on aarch64 Linux (the musl build compiles it; no arm64 test job runs the tests). On Linux the fallback loop is now tested by nothing: the two older descriptor tests go through `close_range` too. Its code is the one macOS runs and tests. A test-only switch forcing the fallback would close the gap (the review's O1).
 - **A seccomp filter that kills on unknown system calls** (the review's O3): the child then dies by `SIGSYS` before `exec`, std's pipe closes empty, the spawn reports success, and the agent exits at once by signal. It fails closed, visibly. Filters that answer `EPERM`, Docker's default among them, fall back to the loop.
-- **Spec amendment:** ACP core §2.3: on Linux 5.11 and later, every descriptor from 3 up is marked close-on-exec with one `close_range`; elsewhere the loop up to the hard limit, at most 65536.
+- **Spec amendment:** ACP core §2.3, applied in this PR.
 
 ---
 
