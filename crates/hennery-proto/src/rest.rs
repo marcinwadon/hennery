@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-use crate::frames::{ConfigValue, ElicitationAction, PendingKind, PendingReason, SessionConfig};
+use crate::frames::{
+    ConfigValue, ElicitationAction, ForgetKind, ForgetReason, PendingKind, PendingReason, SessionConfig,
+};
 
 /// `POST /api/sessions` (ACP core §9): `{host_id, agent, cwd, model?, mode?, axes?}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -1237,4 +1239,89 @@ impl std::fmt::Debug for UpdateMcpConnectionRequest {
             .field("internal_network", &self.internal_network)
             .finish_non_exhaustive()
     }
+}
+
+/// Where removing the agent's own transcript of a deleted session stands
+/// (plan 9d decision 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum RemovalState {
+    /// Its host removed everything it names.
+    Removed,
+    /// Something is left (`remaining`), or could not be looked for.
+    Partial,
+    /// Not done yet (`pending`): retried when the host reconnects.
+    Pending,
+    /// The session had no agent record: nothing on the host.
+    None,
+}
+
+/// Why a removal is still pending (plan 9d decision 7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum RemovalPending {
+    HostOffline,
+    /// The host does not announce `forget_session`.
+    HostNeedsUpdate,
+    /// No answer within the wait (30 s).
+    NoReply,
+    /// The host still has the agent's session attached.
+    Attached,
+    /// Another attempt is running right now.
+    InProgress,
+}
+
+/// One kind of entry left on the host, how many, and why (plan 9d B2). Its
+/// path is `kind`'s masked one (`ForgetKind::masked`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct RemovalItem {
+    pub kind: ForgetKind,
+    pub count: u32,
+    pub reason: ForgetReason,
+}
+
+/// The agent's own transcript of a deleted session on its host (plan 9d
+/// decision 7): best effort. `notes` name what is never removed, whatever
+/// the state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct TranscriptRemoval {
+    pub state: RemovalState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "RemovalPending | undefined", optional)]
+    pub pending: Option<RemovalPending>,
+    pub remaining: Vec<RemovalItem>,
+    pub notes: Vec<String>,
+}
+
+/// `DELETE /api/sessions/{id}` (ACP core §4.10; plan 9d decision 7).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct DeleteResult {
+    pub host_transcript: TranscriptRemoval,
+}
+
+/// Whether a host removal is still retried (plan 9d decision 6, O10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum HostRemovalState {
+    /// Retried at the host's next handshake.
+    Pending,
+    /// Done with something left that no retry changes: listed until it is
+    /// dismissed.
+    Final,
+}
+
+/// One entry of `GET /api/settings/host-removals` (plan 9d decision 7).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HostRemovalItem {
+    pub id: String,
+    pub host_id: String,
+    /// The deleted session (a tombstone).
+    pub session_id: String,
+    pub agent: String,
+    pub state: HostRemovalState,
+    pub attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "TranscriptRemoval | undefined", optional)]
+    pub last_result: Option<TranscriptRemoval>,
+    pub created_at: String,
 }

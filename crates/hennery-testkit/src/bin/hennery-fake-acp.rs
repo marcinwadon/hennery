@@ -112,18 +112,21 @@ async fn main() -> agent_client_protocol::Result<()> {
             {
                 let script = script.clone();
                 let announced = announced.clone();
-                async move |_req: NewSessionRequest, responder, cx| match script.new_session_error {
-                    Some(code) => responder.respond_with_error(agent_client_protocol::Error::new(code, "scripted")),
-                    None if script.config_in_update_only => {
-                        if let Some(options) = announced() {
-                            cx.send_notification(SessionNotification::new(
-                                "fake-session-1",
-                                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
-                            ))?;
+                async move |_req: NewSessionRequest, responder, cx| {
+                    let id = script.session_id.clone().unwrap_or_else(|| "fake-session-1".into());
+                    match script.new_session_error {
+                        Some(code) => responder.respond_with_error(agent_client_protocol::Error::new(code, "scripted")),
+                        None if script.config_in_update_only => {
+                            if let Some(options) = announced() {
+                                cx.send_notification(SessionNotification::new(
+                                    id.clone(),
+                                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
+                                ))?;
+                            }
+                            responder.respond(NewSessionResponse::new(id))
                         }
-                        responder.respond(NewSessionResponse::new("fake-session-1"))
+                        None => responder.respond(NewSessionResponse::new(id).config_options(announced())),
                     }
-                    None => responder.respond(NewSessionResponse::new("fake-session-1").config_options(announced())),
                 }
             },
             agent_client_protocol::on_receive_request!(),

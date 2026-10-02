@@ -4,14 +4,20 @@
 //! socket only ends `connect_once`; session actors keep running and keep
 //! writing to the outbox, which is resent on the next connection.
 
+use crate::agent_home::Registry;
+use crate::forget::{Forget, ForgetContext};
 use crate::identity::HostKey;
 use crate::outbox::Outbox;
 use crate::projects::Probes;
-use crate::session::{self, AgentCommand, Answer, Attach, Launch, SessionCmd, SessionHandle, SessionOptions};
+use crate::session::{
+    self, AgentCommand, Answer, Attach, HomeRecorder, Launch, SessionCmd, SessionHandle, SessionOptions,
+};
 use crate::uplink::Uplink;
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
-use hennery_proto::frames::{AttachedSession, Capabilities, Capability, CollectorFrame, HostFrame, SessionConfig};
+use hennery_proto::frames::{
+    AttachedSession, Capabilities, Capability, CollectorFrame, ForgetReason, HostFrame, SessionConfig,
+};
 use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -108,6 +114,9 @@ struct SessionMap {
     /// would otherwise attach an adapter that shutdown never sees, and that
     /// the runtime then SIGKILLs without its grace.
     closing: bool,
+    /// Agent session ids a forget is removing right now, and how many
+    /// forgets each (plan 9d B7): no actor attaches one meanwhile.
+    forgetting: HashMap<String, usize>,
 }
 
 type Sessions = Arc<Mutex<SessionMap>>;
@@ -126,6 +135,10 @@ pub async fn run_until(cfg: HostConfig, shutdown: impl Future<Output = ()>) -> R
     std::fs::create_dir_all(&cfg.data_dir)?;
     let outbox = Outbox::open(&cfg.data_dir.join(crate::outbox::FILE))?;
     let (uplink, mut replies) = Uplink::new(outbox);
+    // Where each session's agent keeps its data (plan 9d B1).
+    let homes = Arc::new(crate::agent_home::Registry::open(
+        &cfg.data_dir.join(crate::agent_home::FILE),
+    )?);
     let sessions: Sessions = Arc::new(Mutex::new(SessionMap::default()));
     // Outlives each connection, so its bounds hold across reconnects.
     let probes = Probes::default();
@@ -133,7 +146,8 @@ pub async fn run_until(cfg: HostConfig, shutdown: impl Future<Output = ()>) -> R
     let serve = async {
         let mut backoff = cfg.reconnect_min;
         loop {
-            if let Err(err) = connect_once(&cfg, &uplink, &sessions, &probes, &mut replies, &mut backoff).await {
+            if let Err(err) = connect_once(&cfg, &uplink, &sessions, &probes, &homes, &mut replies, &mut backoff).await
+            {
                 if revoked(&err) {
                     return err;
                 }
@@ -288,6 +302,7 @@ async fn handshake(
                 Capability::Images,
                 Capability::Projects,
                 Capability::ResolvePath,
+                Capability::ForgetSession,
             ]),
             workspace_roots,
             attached_sessions: attached()?,
@@ -327,6 +342,7 @@ async fn connect_once(
     uplink: &Uplink,
     sessions: &Sessions,
     probes: &Probes,
+    homes: &Arc<Registry>,
     replies: &mut mpsc::UnboundedReceiver<HostFrame>,
     backoff: &mut Duration,
 ) -> Result<()> {
@@ -403,7 +419,7 @@ async fn connect_once(
                                 // accumulated from earlier failed attempts.
                                 *backoff = cfg.reconnect_min;
                             }
-                            handle(cfg, uplink, sessions, probes, frame)?
+                            handle(cfg, uplink, sessions, probes, homes, frame)?
                         }
                         Err(err) => tracing::warn!(error = %err, "ignoring unknown or invalid frame"),
                     },
@@ -466,7 +482,13 @@ struct AttachRequest {
 }
 
 /// Start or resume a session (ACP core §4.3), idempotently (§2.2).
-fn attach(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, req: AttachRequest) -> Result<()> {
+fn attach(
+    cfg: &HostConfig,
+    uplink: &Uplink,
+    sessions: &Sessions,
+    homes: &Arc<Registry>,
+    req: AttachRequest,
+) -> Result<()> {
     let Some(command) = cfg.agents.get(&req.agent).cloned() else {
         uplink.reply(HostFrame::Error {
             request_id: req.request_id,
@@ -490,7 +512,12 @@ fn attach(cfg: &HostConfig, uplink: &Uplink, sessions: &Sessions, req: AttachReq
     // larger of this host's counter and the collector's (ACP core §5.1), so
     // a session resumed after the outbox was lost never reuses a seq.
     uplink.fast_forward(&req.session_id, req.committed_seq)?;
-    let options = cfg.session_options();
+    let mut options = cfg.session_options();
+    // Registered before each `session_started` (plan 9d decision 1).
+    options.home = Some(HomeRecorder {
+        agent: req.agent.clone(),
+        registry: homes.clone(),
+    });
     spawn_or_restart(uplink, sessions, req, command, options);
     Ok(())
 }
@@ -531,6 +558,18 @@ fn spawn_or_restart(
         // Host shutdown: the collector sees this connection end and
         // reconciles the start after the next handshake (ACP core §5.1).
         tracing::info!(session_id = %req.session_id, "host shutting down; not attaching");
+        return;
+    }
+    // A forget is removing this agent session's data (plan 9d B7): it is
+    // not loaded meanwhile. Checked on every re-decide too.
+    if let Attach::Load { agent_session_id } = &req.attach
+        && map.forgetting.contains_key(agent_session_id)
+    {
+        uplink.reply(HostFrame::Error {
+            request_id: req.request_id,
+            code: "forgetting".into(),
+            message: "the agent's data for this session is being removed".into(),
+        });
         return;
     }
     // The old actor is ending — a park or close is queued ahead of this
@@ -578,6 +617,7 @@ fn handle(
     uplink: &Uplink,
     sessions: &Sessions,
     probes: &Probes,
+    homes: &Arc<Registry>,
     frame: CollectorFrame,
 ) -> Result<()> {
     match frame {
@@ -592,6 +632,7 @@ fn handle(
             cfg,
             uplink,
             sessions,
+            homes,
             AttachRequest {
                 request_id,
                 session_id,
@@ -614,6 +655,7 @@ fn handle(
             cfg,
             uplink,
             sessions,
+            homes,
             AttachRequest {
                 request_id,
                 session_id,
@@ -724,9 +766,91 @@ fn handle(
         // anything else, and only once no adapter of that hat runs; until
         // then, deferred. Idempotent: it comes after every handshake.
         CollectorFrame::ForgetHat { hat_id } => tracing::info!(%hat_id, "the collector purged a hat"),
+        CollectorFrame::ForgetSession {
+            request_id,
+            agent,
+            agent_session_id,
+            agent_home,
+        } => forget(
+            cfg,
+            uplink,
+            sessions,
+            homes,
+            request_id,
+            Forget {
+                agent,
+                agent_session_id,
+                agent_home,
+            },
+        ),
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }
     Ok(())
+}
+
+/// `forget_session` (plan 9d decision 8): the id first, then the registry
+/// (B1), then, under the sessions lock, that no live actor has the agent's
+/// session (decision 13, B7: an actor still ending counts, it may still
+/// write). Then the forget runs in a task of its own, its marker refusing
+/// any attach of that agent session until it is done, and answers on this
+/// connection's reply channel.
+fn forget(
+    cfg: &HostConfig,
+    uplink: &Uplink,
+    sessions: &Sessions,
+    homes: &Arc<Registry>,
+    request_id: String,
+    f: Forget,
+) {
+    if !crate::forget::valid_id(&f.agent_session_id) {
+        uplink.reply(HostFrame::Error {
+            request_id,
+            code: "invalid".into(),
+            message: "not an agent session id".into(),
+        });
+        return;
+    }
+    match homes.contains(&f.agent, &f.agent_session_id, &f.agent_home) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(agent = %f.agent, "a forget for an agent home this host never registered; refused");
+            return uplink.reply(crate::forget::refused(request_id, ForgetReason::UnknownToHost, false));
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "reading the agent-home registry failed");
+            return uplink.reply(crate::forget::refused(request_id, ForgetReason::IoError, true));
+        }
+    }
+    {
+        let mut map = sessions.lock().expect("sessions lock");
+        let attached = map
+            .handles
+            .values()
+            .any(|h| !h.is_ended() && h.agent_session_id().as_deref() == Some(f.agent_session_id.as_str()));
+        if attached {
+            return uplink.reply(crate::forget::refused(request_id, ForgetReason::Attached, true));
+        }
+        *map.forgetting.entry(f.agent_session_id.clone()).or_default() += 1;
+    }
+    let ctx = ForgetContext {
+        agents: cfg.agents.clone(),
+        data_dir: cfg.data_dir.clone(),
+        home: cfg.home.clone(),
+    };
+    let (uplink, sessions) = (uplink.clone(), sessions.clone());
+    tokio::spawn(async move {
+        let done = crate::forget::forget(&ctx, &f).await;
+        {
+            let mut map = sessions.lock().expect("sessions lock");
+            if let Some(n) = map.forgetting.get_mut(&f.agent_session_id) {
+                *n -= 1;
+                if *n == 0 {
+                    map.forgetting.remove(&f.agent_session_id);
+                }
+            }
+        }
+        uplink.reply(done.into_frame(request_id));
+    });
 }
 
 /// An operator's answer goes to the session's live actor, which reports
