@@ -29,7 +29,7 @@ fn ended(turn: &str) -> SessionBody {
 fn session_started_activates_the_session() {
     let store = Store::open_in_memory().unwrap();
     started(&store);
-    let s = store.session("s1").unwrap().unwrap();
+    let s = store.find_session("s1").unwrap().unwrap();
     assert_eq!((s.lifecycle.as_str(), s.activity.as_deref()), ("active", Some("idle")));
 }
 
@@ -119,7 +119,7 @@ fn turn_ended_closes_only_the_open_turn_and_a_late_duplicate_changes_nothing() {
     // and per ACP core §4.4 must not be pushed since it was not applied.
     let late = store.ingest("s1", 4, &ended("t1")).unwrap();
     assert!(late.is_empty());
-    let s = store.session("s1").unwrap().unwrap();
+    let s = store.find_session("s1").unwrap().unwrap();
     assert_eq!(s.open_turn_id.as_deref(), Some("t2"));
     assert_eq!(s.activity.as_deref(), Some("running"));
 }
@@ -196,13 +196,13 @@ fn session_parked_and_session_closed_detach_an_active_session() {
             },
         )
         .unwrap();
-    let s = store.session("s1").unwrap().unwrap();
+    let s = store.find_session("s1").unwrap().unwrap();
     assert_eq!((s.lifecycle.as_str(), s.activity.as_deref()), ("parked", None));
 
     store.create_session("s2", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store.ingest("s2", 1, &SessionBody::session_started("r", "a")).unwrap();
     store.ingest("s2", 2, &SessionBody::SessionClosed).unwrap();
-    assert_eq!(store.session("s2").unwrap().unwrap().lifecycle, "closed");
+    assert_eq!(store.find_session("s2").unwrap().unwrap().lifecycle, "closed");
 }
 
 #[test]
@@ -219,7 +219,7 @@ fn a_park_that_overtakes_an_operator_close_closes_the_session() {
             },
         )
         .unwrap();
-    let s = store.session("s1").unwrap().unwrap();
+    let s = store.find_session("s1").unwrap().unwrap();
     assert_eq!((s.lifecycle.as_str(), s.close_requested), ("closed", false));
 }
 
@@ -237,7 +237,7 @@ fn close_now_closes_an_unattached_session_once() {
         )
         .unwrap();
     assert_eq!(kinds(&store.close_now("s1").unwrap()), ["operator_closed"]);
-    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "closed");
+    assert_eq!(store.find_session("s1").unwrap().unwrap().lifecycle, "closed");
     assert!(store.close_now("s1").unwrap().is_empty());
 }
 
@@ -255,13 +255,13 @@ fn reconcile_fails_a_start_the_host_never_received_and_leaves_a_running_start_al
         .unwrap();
     let r = store.reconcile_host("h1", &[attached("pending", None)]).unwrap();
     assert_eq!(kinds(&r.events), ["start_not_delivered"]);
-    let lost = store.session("lost").unwrap().unwrap();
+    let lost = store.find_session("lost").unwrap().unwrap();
     assert_eq!(
         (lost.lifecycle.as_str(), lost.failure_reason.as_deref()),
         ("failed", Some("start_not_delivered"))
     );
-    assert_eq!(store.session("pending").unwrap().unwrap().lifecycle, "starting");
-    assert_eq!(store.session("other-host").unwrap().unwrap().lifecycle, "starting");
+    assert_eq!(store.find_session("pending").unwrap().unwrap().lifecycle, "starting");
+    assert_eq!(store.find_session("other-host").unwrap().unwrap().lifecycle, "starting");
 }
 
 #[test]
@@ -273,7 +273,7 @@ fn reconcile_parks_sessions_a_restarted_host_lost_and_interrupts_their_turn() {
     let r = store.reconcile_host("h1", &[]).unwrap();
     assert_eq!(kinds(&r.events), ["host_restarted", "turn_ended_synthesized"]);
     assert_eq!(r.events[1].body, json!({"turn_id": "t1", "outcome": "interrupted"}));
-    let s = store.session("s1").unwrap().unwrap();
+    let s = store.find_session("s1").unwrap().unwrap();
     assert_eq!((s.lifecycle.as_str(), s.open_turn_id.as_deref()), ("parked", None));
     assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("ended"));
     // Reconciling again changes nothing.
@@ -292,7 +292,7 @@ fn reconcile_releases_a_prompt_that_never_reached_the_adapter() {
     let r = store.reconcile_host("h1", &[attached("s1", None)]).unwrap();
     assert_eq!(kinds(&r.events), ["turn_not_delivered"]);
     assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("not_delivered"));
-    let s = store.session("s1").unwrap().unwrap();
+    let s = store.find_session("s1").unwrap().unwrap();
     assert_eq!((s.lifecycle.as_str(), s.activity.as_deref()), ("active", Some("idle")));
     assert!(
         store.open_turn("s1", "t2", &prompt_text()).unwrap(),
@@ -308,7 +308,7 @@ fn reconcile_keeps_a_turn_the_host_reports_open() {
     let r = store.reconcile_host("h1", &[attached("s1", Some("t1"))]).unwrap();
     assert!(r.events.is_empty());
     assert_eq!(
-        store.session("s1").unwrap().unwrap().open_turn_id.as_deref(),
+        store.find_session("s1").unwrap().unwrap().open_turn_id.as_deref(),
         Some("t1")
     );
 }
@@ -321,7 +321,7 @@ fn reconcile_interrupts_a_started_turn_the_host_no_longer_reports() {
     store.ingest("s1", 2, &turn_started("t1")).unwrap();
     let r = store.reconcile_host("h1", &[attached("s1", None)]).unwrap();
     assert_eq!(kinds(&r.events), ["turn_ended_synthesized"]);
-    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "active");
+    assert_eq!(store.find_session("s1").unwrap().unwrap().lifecycle, "active");
 }
 
 #[test]
@@ -332,7 +332,7 @@ fn a_late_turn_started_reopens_a_turn_marked_not_delivered() {
     store.reconcile_host("h1", &[attached("s1", None)]).unwrap();
     let created = store.ingest("s1", 2, &turn_started("t1")).unwrap();
     assert_eq!(kinds(&created), ["turn_started", "user_turn"]);
-    let s = store.session("s1").unwrap().unwrap();
+    let s = store.find_session("s1").unwrap().unwrap();
     assert_eq!(
         (s.open_turn_id.as_deref(), s.activity.as_deref()),
         (Some("t1"), Some("running"))
@@ -359,7 +359,7 @@ fn reconcile_asks_to_close_attached_sessions_the_operator_closed() {
         .reconcile_host("h1", &[attached("s1", None), attached("s2", None)])
         .unwrap();
     assert_eq!(r.close, ["s1", "s2"]);
-    assert_eq!(store.session("s3").unwrap().unwrap().lifecycle, "closed");
+    assert_eq!(store.find_session("s3").unwrap().unwrap().lifecycle, "closed");
 }
 
 #[test]
@@ -376,7 +376,14 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
-            "DROP INDEX events_by_kind;
+            "DROP TRIGGER events_of_a_tombstone;
+             DROP TRIGGER turns_of_a_tombstone;
+             DROP TRIGGER pending_of_a_tombstone;
+             DROP TRIGGER answers_of_a_tombstone;
+             DROP TRIGGER catalog_of_a_tombstone;
+             DROP TRIGGER a_tombstone_stays;
+             DROP TABLE turn_attachments;
+             DROP INDEX events_by_kind;
              ALTER TABLE pending DROP COLUMN opened_event_id;
              DROP INDEX sessions_by_hat;
              ALTER TABLE sessions DROP COLUMN hat_id;
@@ -409,8 +416,8 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
     }
     let store = Store::open(&db).unwrap();
     assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("started"));
-    assert!(!store.session("s1").unwrap().unwrap().close_requested);
-    assert!(store.session("s1").unwrap().unwrap().config.is_empty());
+    assert!(!store.find_session("s1").unwrap().unwrap().close_requested);
+    assert!(store.find_session("s1").unwrap().unwrap().config.is_empty());
     // Rows written before migration 3 count as applied.
     assert_eq!(
         kinds(&store.events("s1", 0, 100).unwrap()),
@@ -436,14 +443,14 @@ fn a_late_turn_started_takes_the_slot_back_from_a_turn_that_never_started() {
     assert_eq!(store.turn_state("t2").unwrap().as_deref(), Some("not_delivered"));
     assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("started"));
     assert_eq!(
-        store.session("s1").unwrap().unwrap().open_turn_id.as_deref(),
+        store.find_session("s1").unwrap().unwrap().open_turn_id.as_deref(),
         Some("t1")
     );
 
     // The host rejecting t2 (it lost the slot) leaves t1's slot alone.
     store.abandon_turn("s1", "t2").unwrap();
     assert_eq!(
-        store.session("s1").unwrap().unwrap().open_turn_id.as_deref(),
+        store.find_session("s1").unwrap().unwrap().open_turn_id.as_deref(),
         Some("t1")
     );
 }
@@ -477,7 +484,7 @@ fn a_late_turn_started_for_an_already_ended_turn_changes_nothing() {
 
     let created = store.ingest("s1", 4, &turn_started("t1")).unwrap();
     assert!(created.is_empty());
-    let s = store.session("s1").unwrap().unwrap();
+    let s = store.find_session("s1").unwrap().unwrap();
     assert_eq!(s.open_turn_id.as_deref(), Some("t2"));
     assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("ended"));
 }
@@ -629,12 +636,12 @@ fn a_resume_moves_a_parked_session_to_starting_with_what_the_host_needs() {
     };
     assert_eq!(kinds(&events), ["operator_resumed"]);
     assert_eq!((agent_session_id.as_str(), committed_seq), ("a1", 3));
-    let s = store.session("s1").unwrap().unwrap();
+    let s = store.find_session("s1").unwrap().unwrap();
     assert_eq!((s.lifecycle.as_str(), s.activity.as_deref()), ("starting", None));
     store
         .ingest("s1", 4, &SessionBody::session_started("r9", "a1"))
         .unwrap();
-    let s = store.session("s1").unwrap().unwrap();
+    let s = store.find_session("s1").unwrap().unwrap();
     assert_eq!((s.lifecycle.as_str(), s.activity.as_deref()), ("active", Some("idle")));
 }
 
@@ -680,7 +687,7 @@ fn a_resume_of_a_failed_or_closed_session_clears_what_stopped_it() {
         )
         .unwrap();
     // Not applied: the session is active, not starting.
-    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "active");
+    assert_eq!(store.find_session("s1").unwrap().unwrap().lifecycle, "active");
     store.close_now("s1").unwrap();
     assert!(matches!(
         store.request_resume("s1", "hat-1").unwrap(),
@@ -697,7 +704,7 @@ fn a_resume_of_a_failed_or_closed_session_clears_what_stopped_it() {
             },
         )
         .unwrap();
-    let s = store.session("s1").unwrap().unwrap();
+    let s = store.find_session("s1").unwrap().unwrap();
     assert_eq!(
         (s.lifecycle.as_str(), s.failure_reason.as_deref()),
         ("failed", Some("agent_has_no_record"))
@@ -706,7 +713,7 @@ fn a_resume_of_a_failed_or_closed_session_clears_what_stopped_it() {
         store.request_resume("s1", "hat-1").unwrap(),
         ResumeRequest::Starting { .. }
     ));
-    assert_eq!(store.session("s1").unwrap().unwrap().failure_reason, None);
+    assert_eq!(store.find_session("s1").unwrap().unwrap().failure_reason, None);
 }
 
 #[test]
@@ -715,7 +722,7 @@ fn a_session_the_agent_never_created_cannot_be_resumed() {
     store.create_session("s1", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store.mark_failed("s1", "start_not_delivered").unwrap();
     assert_eq!(store.request_resume("s1", "hat-1").unwrap(), ResumeRequest::NoRecord);
-    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "failed");
+    assert_eq!(store.find_session("s1").unwrap().unwrap().lifecycle, "failed");
     assert_eq!(store.request_resume("nope", "hat-1").unwrap(), ResumeRequest::NotFound);
 }
 
@@ -736,14 +743,14 @@ fn detaching_releases_a_prompt_the_host_never_acknowledged() {
         .unwrap();
     assert_eq!(kinds(&created), ["session_parked", "turn_not_delivered"]);
     assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("not_delivered"));
-    assert_eq!(store.session("s1").unwrap().unwrap().open_turn_id, None);
+    assert_eq!(store.find_session("s1").unwrap().unwrap().open_turn_id, None);
 
     store.create_session("s2", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store.ingest("s2", 1, &SessionBody::session_started("r", "a2")).unwrap();
     assert!(store.open_turn("s2", "t2", &prompt_text()).unwrap());
     let created = store.ingest("s2", 2, &SessionBody::SessionClosed).unwrap();
     assert_eq!(kinds(&created), ["session_closed", "turn_not_delivered"]);
-    assert_eq!(store.session("s2").unwrap().unwrap().open_turn_id, None);
+    assert_eq!(store.find_session("s2").unwrap().unwrap().open_turn_id, None);
 }
 
 #[test]
@@ -765,7 +772,7 @@ fn a_resume_releases_a_turn_an_older_database_left_open() {
         panic!("not resumable");
     };
     assert_eq!(kinds(&events), ["turn_not_delivered", "operator_resumed"]);
-    assert_eq!(store.session("s1").unwrap().unwrap().open_turn_id, None);
+    assert_eq!(store.find_session("s1").unwrap().unwrap().open_turn_id, None);
 }
 
 // Plan B: one rule for every stored-but-unapplied host fact (decision 7).
@@ -812,7 +819,7 @@ fn a_start_failed_that_changes_nothing_is_not_listed() {
     };
     assert!(store.ingest("s1", 2, &failed).unwrap().is_empty());
     assert_eq!(listed(&store, "s1"), ["session_started"]);
-    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "active");
+    assert_eq!(store.find_session("s1").unwrap().unwrap().lifecycle, "active");
 }
 
 #[test]
@@ -884,14 +891,14 @@ fn a_start_that_ran_after_all_revives_the_session_without_its_failure_reason() {
     store.create_session("s1", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store.reconcile_host("h1", &[]).unwrap();
     assert_eq!(
-        store.session("s1").unwrap().unwrap().failure_reason.as_deref(),
+        store.find_session("s1").unwrap().unwrap().failure_reason.as_deref(),
         Some("start_not_delivered")
     );
     let created = store
         .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
         .unwrap();
     assert_eq!(kinds(&created), ["session_started"]);
-    let s = store.session("s1").unwrap().unwrap();
+    let s = store.find_session("s1").unwrap().unwrap();
     assert_eq!((s.lifecycle.as_str(), s.failure_reason), ("active", None));
 }
 
@@ -906,7 +913,7 @@ fn a_start_failed_replaces_a_reconciled_guess_of_start_not_delivered() {
     store.create_session("s1", "h1", "fake", "/tmp", "hat-1", None).unwrap();
     store.reconcile_host("h1", &[]).unwrap();
     assert_eq!(
-        store.session("s1").unwrap().unwrap().failure_reason.as_deref(),
+        store.find_session("s1").unwrap().unwrap().failure_reason.as_deref(),
         Some("start_not_delivered")
     );
     let created = store
@@ -921,7 +928,7 @@ fn a_start_failed_replaces_a_reconciled_guess_of_start_not_delivered() {
         )
         .unwrap();
     assert_eq!(kinds(&created), ["start_failed"]);
-    let s = store.session("s1").unwrap().unwrap();
+    let s = store.find_session("s1").unwrap().unwrap();
     assert_eq!(
         (s.lifecycle.as_str(), s.failure_reason.as_deref()),
         ("failed", Some("agent_not_logged_in"))
@@ -947,13 +954,13 @@ fn presume_parked_parks_the_hosts_active_sessions_and_keeps_their_open_turn() {
     let events = store.presume_parked("h1").unwrap();
     assert_eq!(kinds(&events), ["presumed_parked"]);
     assert_eq!(events[0].body["reason"], "host_offline");
-    let s1 = store.session("s1").unwrap().unwrap();
+    let s1 = store.find_session("s1").unwrap().unwrap();
     assert_eq!(
         (s1.lifecycle.as_str(), s1.presumed_parked, s1.open_turn_id.as_deref()),
         ("parked", true, Some("t1"))
     );
     assert_eq!(store.turn_state("t1").unwrap().as_deref(), Some("started"));
-    assert_eq!(store.session("s2").unwrap().unwrap().lifecycle, "active");
+    assert_eq!(store.find_session("s2").unwrap().unwrap().lifecycle, "active");
     // Idempotent: nothing is active on h1 any more.
     assert!(store.presume_parked("h1").unwrap().is_empty());
     assert_eq!(store.hosts_with_active_sessions().unwrap(), ["h2"]);
@@ -966,7 +973,7 @@ fn reconcile_reattaches_a_presumed_session_the_host_still_has() {
     store.presume_parked("h1").unwrap();
     let done = store.reconcile_host("h1", &[attached("s1", Some("t1"))]).unwrap();
     assert_eq!(kinds(&done.events), ["reattached"]);
-    let s1 = store.session("s1").unwrap().unwrap();
+    let s1 = store.find_session("s1").unwrap().unwrap();
     assert_eq!(
         (s1.lifecycle.as_str(), s1.presumed_parked, s1.open_turn_id.as_deref()),
         ("active", false, Some("t1"))
@@ -982,7 +989,7 @@ fn reconcile_of_a_presumed_session_the_host_lost_is_a_host_restart() {
     store.presume_parked("h1").unwrap();
     let done = store.reconcile_host("h1", &[]).unwrap();
     assert_eq!(kinds(&done.events), ["host_restarted", "turn_ended_synthesized"]);
-    let s1 = store.session("s1").unwrap().unwrap();
+    let s1 = store.find_session("s1").unwrap().unwrap();
     assert_eq!(
         (s1.lifecycle.as_str(), s1.presumed_parked, s1.open_turn_id),
         ("parked", false, None)
@@ -1013,7 +1020,7 @@ fn facts_a_returning_host_resends_still_apply_to_a_presumed_session() {
         )
         .unwrap();
     assert_eq!(kinds(&parked), ["session_parked"]);
-    let s1 = store.session("s1").unwrap().unwrap();
+    let s1 = store.find_session("s1").unwrap().unwrap();
     assert_eq!((s1.lifecycle.as_str(), s1.presumed_parked), ("parked", false));
     // Reconciliation leaves a real park alone.
     assert!(store.reconcile_host("h1", &[]).unwrap().events.is_empty());
@@ -1028,11 +1035,11 @@ fn closing_or_resuming_a_presumed_session_ends_the_presumption() {
         store.request_resume("s1", "hat-1").unwrap(),
         ResumeRequest::Starting { .. }
     ));
-    assert!(!store.session("s1").unwrap().unwrap().presumed_parked);
+    assert!(!store.find_session("s1").unwrap().unwrap().presumed_parked);
 
     store.presume_parked("h2").unwrap();
     store.close_now("s2").unwrap();
-    let s2 = store.session("s2").unwrap().unwrap();
+    let s2 = store.find_session("s2").unwrap().unwrap();
     assert_eq!((s2.lifecycle.as_str(), s2.presumed_parked), ("closed", false));
 }
 
@@ -1064,7 +1071,7 @@ fn a_real_session_parked_fact_still_releases_a_presumed_sessions_open_turn() {
         )
         .unwrap();
     assert_eq!(kinds(&events), ["session_parked", "turn_ended_synthesized"]);
-    let s1 = store.session("s1").unwrap().unwrap();
+    let s1 = store.find_session("s1").unwrap().unwrap();
     assert_eq!(
         (s1.lifecycle.as_str(), s1.presumed_parked, s1.open_turn_id),
         ("parked", false, None)
@@ -1079,7 +1086,7 @@ fn a_real_session_closed_fact_still_applies_to_a_presumed_session() {
     store.presume_parked("h2").unwrap();
     let events = store.ingest("s2", 2, &SessionBody::SessionClosed).unwrap();
     assert_eq!(kinds(&events), ["session_closed"]);
-    let s2 = store.session("s2").unwrap().unwrap();
+    let s2 = store.find_session("s2").unwrap().unwrap();
     assert_eq!((s2.lifecycle.as_str(), s2.presumed_parked), ("closed", false));
 }
 
@@ -1106,7 +1113,7 @@ fn a_rejected_reconcile_close_closes_only_a_session_still_waiting_on_that_close(
         Vec::<&str>::new(),
         "operator_closed is already recorded"
     );
-    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "closed");
+    assert_eq!(store.find_session("s1").unwrap().unwrap().lifecycle, "closed");
 
     // Closed, then resumed: the late rejection must leave the start alone.
     assert!(matches!(
@@ -1115,7 +1122,7 @@ fn a_rejected_reconcile_close_closes_only_a_session_still_waiting_on_that_close(
     ));
     let before = store.events("s1", 0, 100).unwrap();
     assert!(store.close_after_rejected_reconcile_close("s1").unwrap().is_empty());
-    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "starting");
+    assert_eq!(store.find_session("s1").unwrap().unwrap().lifecycle, "starting");
     assert_eq!(store.events("s1", 0, 100).unwrap(), before);
 }
 
@@ -1124,7 +1131,7 @@ fn a_failed_resume_fails_only_a_session_still_starting() {
     let store = Store::open_in_memory().unwrap();
     started(&store);
     store.mark_failed_if_starting("s1", "not_attached").unwrap();
-    let s = store.session("s1").unwrap().unwrap();
+    let s = store.find_session("s1").unwrap().unwrap();
     assert_eq!(
         (s.lifecycle.as_str(), s.failure_reason.as_deref()),
         ("active", None),
@@ -1133,7 +1140,7 @@ fn a_failed_resume_fails_only_a_session_still_starting() {
     parked(&store, 2);
     store.request_resume("s1", "hat-1").unwrap();
     store.mark_failed_if_starting("s1", "not_attached").unwrap();
-    let s = store.session("s1").unwrap().unwrap();
+    let s = store.find_session("s1").unwrap().unwrap();
     assert_eq!(
         (s.lifecycle.as_str(), s.failure_reason.as_deref()),
         ("failed", Some("not_attached"))
@@ -1167,11 +1174,11 @@ fn an_old_actors_detach_after_a_resume_began_changes_nothing() {
             .is_empty()
     );
     assert_eq!(store.events("s1", 0, 100).unwrap(), before);
-    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "starting");
+    assert_eq!(store.find_session("s1").unwrap().unwrap().lifecycle, "starting");
     store
         .ingest("s1", 5, &SessionBody::session_started("r9", "a1"))
         .unwrap();
-    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "active");
+    assert_eq!(store.find_session("s1").unwrap().unwrap().lifecycle, "active");
 }
 
 // Plan B2b: the catalogue and the stored config (ACP core §3.2, §8).
@@ -1223,7 +1230,7 @@ fn applied(indexed: Indexed) -> SessionBody {
 }
 
 fn stored(store: &Store) -> SessionConfig {
-    store.session("s1").unwrap().unwrap().config
+    store.find_session("s1").unwrap().unwrap().config
 }
 
 #[test]
@@ -1386,7 +1393,7 @@ fn choose(option_id: &str) -> AnswerRequest {
 }
 
 fn activity(store: &Store) -> Option<String> {
-    store.session("s1").unwrap().unwrap().activity
+    store.find_session("s1").unwrap().unwrap().activity
 }
 
 fn state_of(store: &Store, pending_id: &str) -> (PendingState, Option<PendingReason>) {
@@ -1687,7 +1694,7 @@ fn the_session_store_and_the_host_registry_share_one_database_in_either_order() 
         // Reopened, each finds its own tables and migrates nothing twice.
         let store = Store::open(&db).unwrap();
         let hosts = Hosts::open(&db).unwrap();
-        assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "active");
+        assert_eq!(store.find_session("s1").unwrap().unwrap().lifecycle, "active");
         assert!(hosts.list().unwrap().is_empty());
     }
 }
@@ -1743,7 +1750,7 @@ fn a_revoked_hosts_sessions_are_parked_for_good_and_what_they_held_is_cancelled(
     );
     assert_eq!(events[1].body, json!({ "reason": "host_revoked" }));
     for id in ["s1", "s3"] {
-        let row = store.session(id).unwrap().unwrap();
+        let row = store.find_session(id).unwrap().unwrap();
         assert_eq!(
             (
                 row.lifecycle.as_str(),
@@ -1760,14 +1767,14 @@ fn a_revoked_hosts_sessions_are_parked_for_good_and_what_they_held_is_cancelled(
         (PendingState::Cancelled, Some(PendingReason::HostRevoked))
     );
     assert_eq!(store.pending_item("p1").unwrap().unwrap().delivered, Some(false));
-    let s2 = store.session("s2").unwrap().unwrap();
+    let s2 = store.find_session("s2").unwrap().unwrap();
     assert_eq!(
         (s2.lifecycle.as_str(), s2.failure_reason.as_deref()),
         ("failed", Some("host_revoked"))
     );
-    let s5 = store.session("s5").unwrap().unwrap();
+    let s5 = store.find_session("s5").unwrap().unwrap();
     assert_eq!((s5.lifecycle.as_str(), s5.presumed_parked), ("closed", false));
-    assert_eq!(store.session("s4").unwrap().unwrap().lifecycle, "active");
+    assert_eq!(store.find_session("s4").unwrap().unwrap().lifecycle, "active");
 
     // A repeated revoke finds nothing left to do.
     assert!(store.revoke_host("h1").unwrap().is_empty());
@@ -1809,7 +1816,7 @@ fn a_revoke_converges_even_after_its_wait_timed_out_and_reconciliation_reattache
     // its resend_complete reconciles the session back as the active one it
     // once was.
     store.reconcile_host("h1", &[attached("s1", None)]).unwrap();
-    assert_eq!(store.session("s1").unwrap().unwrap().lifecycle, "active");
+    assert_eq!(store.find_session("s1").unwrap().unwrap().lifecycle, "active");
 
     // The zombie connection keeps talking: a turnless question opens.
     store.ingest("s1", 3, &turnless_permission("p1")).unwrap();
@@ -1822,7 +1829,7 @@ fn a_revoke_converges_even_after_its_wait_timed_out_and_reconciliation_reattache
     // question cancelled and its queued answer given up as undelivered.
     let events = store.revoke_host("h1").unwrap();
     assert!(kinds(&events).contains(&"pending_cancelled"), "{:?}", kinds(&events));
-    let row = store.session("s1").unwrap().unwrap();
+    let row = store.find_session("s1").unwrap().unwrap();
     assert_eq!(
         (row.lifecycle.as_str(), row.presumed_parked, row.open_turn_id),
         ("parked", true, None)
@@ -1838,7 +1845,7 @@ fn a_revoke_converges_even_after_its_wait_timed_out_and_reconciliation_reattache
 // only with an event the timeline lists (decision 6).
 
 fn recency(store: &Store) -> (String, Option<i64>) {
-    let s = store.session("s1").unwrap().unwrap();
+    let s = store.find_session("s1").unwrap().unwrap();
     (s.last_event_at, s.last_event_id)
 }
 
@@ -1911,7 +1918,7 @@ fn commands(names: &[&str]) -> SessionBody {
 }
 
 fn title_of(store: &Store) -> Option<String> {
-    store.session("s1").unwrap().unwrap().title
+    store.find_session("s1").unwrap().unwrap().title
 }
 
 /// Decision 1: the title is kept on one line and capped, for the list; an
@@ -2007,7 +2014,7 @@ fn commands_replace_the_stored_list_and_never_touch_the_config() {
         (&after.config_options, &after.current),
         (&before.config_options, &before.current)
     );
-    assert_eq!(store.session("s1").unwrap().unwrap().config, before.current);
+    assert_eq!(store.find_session("s1").unwrap().unwrap().config, before.current);
     store.ingest("s1", 3, &commands(&[])).unwrap();
     let emptied = store.catalog("s1").unwrap().unwrap();
     assert!(emptied.commands.is_empty());
@@ -2055,8 +2062,8 @@ fn a_session_item_is_the_row_with_its_title_and_current_model_and_mode() {
         )
         .unwrap();
     store.ingest("s1", 2, &titled("Fix the login bug")).unwrap();
-    let row = store.session("s1").unwrap().unwrap();
-    let item = store.session_item("s1").unwrap().unwrap();
+    let row = store.find_session("s1").unwrap().unwrap();
+    let item = store.find_session_item("s1").unwrap().unwrap();
     assert_eq!(
         item,
         hennery_proto::rest::SessionItem {
@@ -2079,7 +2086,7 @@ fn a_session_item_is_the_row_with_its_title_and_current_model_and_mode() {
         }
     );
     assert_eq!(item.created_at.len(), 24);
-    assert!(store.session_item("nope").unwrap().is_none());
+    assert!(store.find_session_item("nope").unwrap().is_none());
 }
 
 // Plan 6b: the session list (ACP core §9; frontend §5).
@@ -2250,7 +2257,7 @@ fn the_list_serves_items_bounded() {
         "{}",
         listed.cwd
     );
-    assert_eq!(store.session_item("s1").unwrap().unwrap().cwd, cwd);
+    assert_eq!(store.find_session_item("s1").unwrap().unwrap().cwd, cwd);
 }
 
 // Plan 6b-ii: the git state (ACP core §3.2, §7, §8).
@@ -2275,22 +2282,22 @@ fn a_git_state_fills_the_git_columns_and_records_the_base_commit_once() {
     started(&store);
     let created = store.ingest("s1", 2, &git(Some("main"), true, Some("c0ffee"))).unwrap();
     assert_eq!(kinds(&created), ["git_state"]);
-    let row = store.session("s1").unwrap().unwrap();
+    let row = store.find_session("s1").unwrap().unwrap();
     assert_eq!(
         (row.git_worktree, row.base_commit.as_deref()),
         (Some(false), Some("c0ffee"))
     );
-    let item = store.session_item("s1").unwrap().unwrap();
+    let item = store.find_session_item("s1").unwrap().unwrap();
     assert_eq!((item.git_branch.as_deref(), item.git_dirty), (Some("main"), Some(true)));
 
-    let recency = store.session("s1").unwrap().unwrap().last_event_id;
+    let recency = store.find_session("s1").unwrap().unwrap().last_event_id;
     assert!(
         store
             .ingest("s1", 3, &git(Some("main"), true, Some("decade")))
             .unwrap()
             .is_empty()
     );
-    assert_eq!(store.session("s1").unwrap().unwrap().last_event_id, recency);
+    assert_eq!(store.find_session("s1").unwrap().unwrap().last_event_id, recency);
     assert_eq!(listed(&store, "s1"), ["session_started", "git_state"]);
 
     store
@@ -2304,14 +2311,14 @@ fn a_git_state_fills_the_git_columns_and_records_the_base_commit_once() {
             ),
         )
         .unwrap();
-    let row = store.session("s1").unwrap().unwrap();
+    let row = store.find_session("s1").unwrap().unwrap();
     assert_eq!(row.base_commit.as_deref(), Some("c0ffee"));
-    let item = store.session_item("s1").unwrap().unwrap();
+    let item = store.find_session_item("s1").unwrap().unwrap();
     assert_eq!(item.git_branch, Some(format!("feat/{}", "x".repeat(115))));
     assert_eq!(item.git_dirty, Some(false));
     // Detached: no branch.
     store.ingest("s1", 5, &git(None, false, None)).unwrap();
-    assert_eq!(store.session_item("s1").unwrap().unwrap().git_branch, None);
+    assert_eq!(store.find_session_item("s1").unwrap().unwrap().git_branch, None);
 }
 
 /// The task review's gap: a state that differs only in `worktree`, or only
@@ -2330,7 +2337,7 @@ fn a_git_state_that_changes_only_the_worktree_or_the_first_base_applies() {
         base_commit: None,
     };
     assert_eq!(kinds(&store.ingest("s1", 3, &linked).unwrap()), ["git_state"]);
-    assert_eq!(store.session("s1").unwrap().unwrap().git_worktree, Some(true));
+    assert_eq!(store.find_session("s1").unwrap().unwrap().git_worktree, Some(true));
     assert!(store.ingest("s1", 4, &linked).unwrap().is_empty());
     let SessionBody::GitState {
         branch,
@@ -2351,7 +2358,7 @@ fn a_git_state_that_changes_only_the_worktree_or_the_first_base_applies() {
     };
     assert_eq!(kinds(&store.ingest("s1", 5, &based).unwrap()), ["git_state"]);
     assert_eq!(
-        store.session("s1").unwrap().unwrap().base_commit.as_deref(),
+        store.find_session("s1").unwrap().unwrap().base_commit.as_deref(),
         Some("c0ffee")
     );
     assert!(store.ingest("s1", 6, &based).unwrap().is_empty());
@@ -2366,7 +2373,7 @@ fn a_git_state_for_a_closed_session_or_with_a_strange_base_changes_nothing() {
     store
         .ingest("s1", 2, &git(Some("main"), false, Some("not a commit")))
         .unwrap();
-    assert_eq!(store.session("s1").unwrap().unwrap().base_commit, None);
+    assert_eq!(store.find_session("s1").unwrap().unwrap().base_commit, None);
     store.close_now("s1").unwrap();
     assert!(
         store
@@ -2374,7 +2381,7 @@ fn a_git_state_for_a_closed_session_or_with_a_strange_base_changes_nothing() {
             .unwrap()
             .is_empty()
     );
-    let item = store.session_item("s1").unwrap().unwrap();
+    let item = store.find_session_item("s1").unwrap().unwrap();
     assert_eq!(
         (item.git_branch.as_deref(), item.git_dirty),
         (Some("main"), Some(false))
@@ -2403,7 +2410,7 @@ fn a_resume_in_another_hat_than_the_sessions_is_refused_and_changes_nothing() {
         store.request_resume("s1", "hat-b").unwrap(),
         ResumeRequest::HatMismatch("hat-a".into())
     );
-    let row = store.session("s1").unwrap().unwrap();
+    let row = store.find_session("s1").unwrap().unwrap();
     assert_eq!((row.lifecycle.as_str(), row.hat_id.as_str()), ("parked", "hat-a"));
     assert!(matches!(
         store.request_resume("s1", "hat-a").unwrap(),
@@ -2442,10 +2449,17 @@ fn the_hat_migration_gives_each_session_its_hosts_default_hat() {
             .unwrap();
     }
     // Back to the store's schema before hats (version 9): plan 10b-iii's
-    // migration (version 11) undone too.
+    // migration (version 11) and plan 9a's (version 13) undone too.
     let conn = rusqlite::Connection::open(&db).unwrap();
     conn.execute_batch(
-        "DROP INDEX events_by_kind;
+        "DROP TRIGGER events_of_a_tombstone;
+         DROP TRIGGER turns_of_a_tombstone;
+         DROP TRIGGER pending_of_a_tombstone;
+         DROP TRIGGER answers_of_a_tombstone;
+         DROP TRIGGER catalog_of_a_tombstone;
+         DROP TRIGGER a_tombstone_stays;
+         DROP TABLE turn_attachments;
+         DROP INDEX events_by_kind;
          ALTER TABLE pending DROP COLUMN opened_event_id;
          DROP INDEX sessions_by_hat;
          ALTER TABLE sessions DROP COLUMN hat_id;
@@ -2454,8 +2468,8 @@ fn the_hat_migration_gives_each_session_its_hosts_default_hat() {
     )
     .unwrap();
     let store = Store::open(&db).unwrap();
-    assert_eq!(store.session("s-on-h1").unwrap().unwrap().hat_id, acme.id);
-    assert_eq!(store.session("s-gone").unwrap().unwrap().hat_id, personal);
+    assert_eq!(store.find_session("s-on-h1").unwrap().unwrap().hat_id, acme.id);
+    assert_eq!(store.find_session("s-gone").unwrap().unwrap().hat_id, personal);
 }
 
 /// Plan 5c (plan 6b's "After this plan"): the list is filtered by the hat
@@ -2573,10 +2587,788 @@ fn a_session_with_no_running_adapter_is_reassigned_to_another_hat() {
         (event.kind.as_str(), event.body.clone()),
         ("hat_reassigned", json!({ "from": personal, "to": acme.id }))
     );
-    assert_eq!(store.session("s1").unwrap().unwrap().hat_id, acme.id);
+    assert_eq!(store.find_session("s1").unwrap().unwrap().hat_id, acme.id);
     let rule: Option<String> = conn
         .query_row("SELECT hat_rule_id FROM sessions WHERE id = 's1'", [], |r| r.get(0))
         .unwrap();
     assert_eq!(rule, None, "the rule that decided the old hat no longer does");
     assert_eq!(store.reassign_hat("s-nope", &acme.id).unwrap(), Reassign::NotFound);
+}
+
+// Plan 9a: session delete (ACP core §4.10). What is left of a deleted
+// session is its row, scrubbed, as a tombstone (decision 1), and one
+// `session_deleted` event; nothing writes to it again (decision 2, A1).
+
+use base64::Engine;
+use hennery_proto::rest::{AttachmentUsage, EventDto};
+use hennery_sessions::content;
+use hennery_sessions::store::{Deletion, Unattached};
+use rusqlite::Connection;
+use std::path::{Path, PathBuf};
+
+/// A store over `hennery.db` in `dir`, and that path.
+fn file_store(dir: &Path) -> (Store, PathBuf) {
+    let db = dir.join("hennery.db");
+    (Store::open(&db).unwrap(), db)
+}
+
+/// Delete `id`, which is closed: its `session_deleted` event.
+fn delete(store: &Store, id: &str) -> EventDto {
+    match store.delete_session(id, None).unwrap() {
+        Deletion::Done {
+            event,
+            unconfirmed: false,
+        } => event,
+        other => panic!("not deleted: {other:?}"),
+    }
+}
+
+/// `id` on `host`, started, closed and deleted: a tombstone.
+fn tombstone(store: &Store, id: &str, host: &str) {
+    store.create_session(id, host, "fake", "/tmp", "hat-1", None).unwrap();
+    store.ingest(id, 1, &SessionBody::session_started("r0", "a0")).unwrap();
+    store.close_now(id).unwrap();
+    delete(store, id);
+}
+
+/// Every column of a session's row, as stored.
+fn raw_row(conn: &Connection, id: &str) -> Vec<rusqlite::types::Value> {
+    let mut stmt = conn.prepare("SELECT * FROM sessions WHERE id = ?1").unwrap();
+    let width = stmt.column_count();
+    stmt.query_row([id], |r| (0..width).map(|i| r.get(i)).collect())
+        .unwrap()
+}
+
+fn event_kinds(conn: &Connection, id: &str) -> Vec<String> {
+    let mut stmt = conn
+        .prepare("SELECT kind FROM events WHERE session_id = ?1 ORDER BY event_id")
+        .unwrap();
+    stmt.query_map([id], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// `len` bytes of a PNG, different for each `seed`.
+fn png(seed: u8, len: usize) -> Vec<u8> {
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.extend((0..len - 8).map(|i| seed.wrapping_add(i as u8)));
+    bytes
+}
+
+fn image(bytes: &[u8]) -> serde_json::Value {
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    json!({ "type": "image", "mimeType": "image/png", "data": data })
+}
+
+fn sha(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// Check `content`, save its images and open `turn` of `session` with it,
+/// as the prompt route does.
+fn prompt_in(store: &Store, session: &str, turn: &str, content: Vec<serde_json::Value>) {
+    let checked = content::check(content).unwrap();
+    store.save_images(&checked.images).unwrap();
+    assert!(store.open_prompt(session, turn, &checked).unwrap());
+}
+
+/// `id` on `h1`, active, in `cwd`.
+fn active(store: &Store, id: &str, cwd: &str) {
+    store.create_session(id, "h1", "fake", cwd, "hat-1", None).unwrap();
+    store.ingest(id, 1, &SessionBody::session_started("r0", "a0")).unwrap();
+}
+
+fn has_file(db: &Path, sha256: &str) -> bool {
+    db.parent().unwrap().join("attachments").join(sha256).exists()
+}
+
+/// The tables that hold something of a session (a `session_id` column or
+/// a foreign key to `sessions`), plus the image tables, each with how many
+/// rows of it they hold: the session's own row, its events, turns and
+/// images by the ids and hashes it had.
+fn rows_of(conn: &Connection, id: &str, events: &[i64], turns: &[String], hashes: &[String]) -> Vec<(String, i64)> {
+    let tables: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let list = |items: Vec<String>| items.join(", ");
+    let quoted = |items: &[String]| list(items.iter().map(|s| format!("'{s}'")).collect());
+    let mut out = Vec::new();
+    for table in tables {
+        let columns: Vec<String> = conn
+            .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let refers: bool = conn
+            .query_row(
+                &format!(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_foreign_key_list('{table}') WHERE \"table\" = 'sessions')"
+                ),
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let filter = match table.as_str() {
+            "sessions" => format!("id = '{id}'"),
+            "event_attachments" => format!("event_id IN ({})", list(events.iter().map(i64::to_string).collect())),
+            "turn_attachments" => format!("turn_id IN ({})", quoted(turns)),
+            "attachments" => format!("sha256 IN ({})", quoted(hashes)),
+            _ if columns.iter().any(|c| c == "session_id") => format!("session_id = '{id}'"),
+            _ => {
+                assert!(!refers, "{table} refers to sessions with no session_id: walk it here");
+                continue;
+            }
+        };
+        let count: i64 = conn
+            .query_row(&format!("SELECT count(*) FROM {table} WHERE {filter}"), [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        out.push((table, count));
+    }
+    out
+}
+
+/// Decision 1: everything of the session goes but its row and one
+/// `session_deleted` event, walked over the schema, so a table added later
+/// with a `session_id` is walked too. Another session keeps all of its own.
+#[test]
+fn a_deleted_session_leaves_only_its_tombstone_row_and_one_event() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    let (a, b, kept) = (png(1, 300), png(2, 300), png(3, 300));
+    for id in ["s1", "s2"] {
+        active(&store, id, "/srv/app");
+        store.ingest(id, 2, &titled("a title")).unwrap();
+        store.ingest(id, 3, &commands(&["build"])).unwrap();
+        store.ingest(id, 4, &git(Some("main"), true, Some("c0ffee"))).unwrap();
+    }
+    // s1: a started turn with an image (its event links it), a question
+    // with an answer queued; then a second turn that never started, with
+    // another image (only the turn links it).
+    prompt_in(
+        &store,
+        "s1",
+        "t1",
+        vec![json!({"type": "text", "text": "see"}), image(&a)],
+    );
+    store.ingest("s1", 5, &turn_started("t1")).unwrap();
+    store.ingest("s1", 6, &permission("p1")).unwrap();
+    assert!(matches!(
+        store.submit_answer("s1", "p1", &choose("allow")).unwrap(),
+        AnswerSubmission::Queued(_)
+    ));
+    store.ingest("s1", 7, &ended("t1")).unwrap();
+    prompt_in(&store, "s1", "t2", vec![image(&b)]);
+    prompt_in(&store, "s2", "t9", vec![image(&kept)]);
+    store.ingest("s2", 5, &turn_started("t9")).unwrap();
+    store.close_now("s1").unwrap();
+
+    let conn = Connection::open(&db).unwrap();
+    let ids = |sql: &str, id: &str| -> Vec<String> {
+        conn.prepare(sql)
+            .unwrap()
+            .query_map([id], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let events: Vec<i64> = conn
+        .prepare("SELECT event_id FROM events WHERE session_id = 's1'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let turns = ids("SELECT turn_id FROM turns WHERE session_id = ?1", "s1");
+    let hashes = vec![sha(&a), sha(&b)];
+    let before = rows_of(&conn, "s1", &events, &turns, &hashes);
+    let walked: Vec<&str> = before.iter().map(|(t, _)| t.as_str()).collect();
+    for table in [
+        "answer_queue",
+        "attachments",
+        "event_attachments",
+        "events",
+        "pending",
+        "session_catalog",
+        "sessions",
+        "turn_attachments",
+        "turns",
+    ] {
+        assert!(walked.contains(&table), "{table} not walked: {walked:?}");
+    }
+    assert!(
+        before.iter().all(|(_, n)| *n > 0),
+        "nothing to delete somewhere: {before:?}"
+    );
+    let s2_before = {
+        let s2_events: Vec<i64> = conn
+            .prepare("SELECT event_id FROM events WHERE session_id = 's2'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let s2_turns = ids("SELECT turn_id FROM turns WHERE session_id = ?1", "s2");
+        (
+            s2_events.clone(),
+            s2_turns.clone(),
+            rows_of(&conn, "s2", &s2_events, &s2_turns, &[sha(&kept)]),
+        )
+    };
+
+    let event = delete(&store, "s1");
+    assert_eq!((event.kind.as_str(), &event.body), ("session_deleted", &json!({})));
+    let after = rows_of(&conn, "s1", &events, &turns, &hashes);
+    for (table, n) in &after {
+        let left = match table.as_str() {
+            "sessions" | "events" => 1,
+            _ => 0,
+        };
+        assert_eq!(*n, left, "{table}: {after:?}");
+    }
+    assert_eq!(event_kinds(&conn, "s1"), ["session_deleted"]);
+    assert!(!has_file(&db, &sha(&a)) && !has_file(&db, &sha(&b)));
+    let (s2_events, s2_turns, s2_rows) = s2_before;
+    assert_eq!(rows_of(&conn, "s2", &s2_events, &s2_turns, &[sha(&kept)]), s2_rows);
+    assert!(has_file(&db, &sha(&kept)));
+    // A tombstone is no session: deleted again, it is not found.
+    assert!(matches!(store.delete_session("s1", None).unwrap(), Deletion::NotFound));
+    assert!(matches!(
+        store.delete_session("s-nope", None).unwrap(),
+        Deletion::NotFound
+    ));
+}
+
+/// Decision 1: the tombstone keeps its id, owner, host, hat, creation and
+/// recency (its `session_deleted` event); every column that could hold
+/// client data is cleared. Decision 3: no accessor and no list finds it.
+#[test]
+fn a_tombstone_is_scrubbed_and_found_by_no_accessor_or_list() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    store
+        .create_session("s1", "h1", "fake", "/srv/app", "hat-1", Some("rule-1"))
+        .unwrap();
+    store
+        .ingest(
+            "s1",
+            1,
+            &SessionBody::SessionStarted {
+                request_id: "r0".into(),
+                agent_session_id: "agent-1".into(),
+                indexed: catalogue("opus", "plan"),
+            },
+        )
+        .unwrap();
+    store.ingest("s1", 2, &titled("a title")).unwrap();
+    store.ingest("s1", 3, &git(Some("main"), true, Some("c0ffee"))).unwrap();
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    store.presume_parked("h1").unwrap();
+    // Every column that can hold client data holds some.
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("UPDATE sessions SET failure_reason = 'x' WHERE id = 's1'", [])
+        .unwrap();
+    let created_at: String = conn
+        .query_row("SELECT created_at FROM sessions WHERE id = 's1'", [], |r| r.get(0))
+        .unwrap();
+    let Deletion::Done { event, unconfirmed } = store
+        .delete_session(
+            "s1",
+            Some(&Unattached {
+                lifecycle: "parked".into(),
+                presumed_parked: true,
+            }),
+        )
+        .unwrap()
+    else {
+        panic!("not deleted");
+    };
+    assert!(unconfirmed);
+
+    type Scrubbed = (
+        (String, String, String, String, String, String),
+        (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<bool>,
+            Option<bool>,
+            Option<String>,
+        ),
+        (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ),
+        (Option<String>, bool, bool),
+        (String, Option<i64>, bool),
+    );
+    let row: Scrubbed = conn
+        .query_row(
+            "SELECT host_id, hat_id, agent, cwd, lifecycle, created_at,
+                    title, git_branch, base_commit, git_dirty, git_worktree, model,
+                    mode, config_axes, agent_session_id, failure_reason, hat_rule_id, open_turn_id,
+                    activity, presumed_parked, close_requested,
+                    last_event_at, last_event_id, owner_id = ?1
+             FROM sessions WHERE id = 's1'",
+            [store.owner_id()],
+            |r| {
+                Ok((
+                    (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?),
+                    (r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?),
+                    (r.get(12)?, r.get(13)?, r.get(14)?, r.get(15)?, r.get(16)?, r.get(17)?),
+                    (r.get(18)?, r.get(19)?, r.get(20)?),
+                    (r.get(21)?, r.get(22)?, r.get(23)?),
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        row,
+        (
+            (
+                "h1".into(),
+                "hat-1".into(),
+                String::new(),
+                String::new(),
+                "deleted".into(),
+                created_at
+            ),
+            (None, None, None, None, None, None),
+            (None, None, None, None, None, None),
+            (None, false, false),
+            (event.ts.clone(), Some(event.event_id), true),
+        )
+    );
+
+    // The columns no closed session holds set are cleared too.
+    store
+        .create_session("s2", "h1", "fake", "/srv/b", "hat-1", None)
+        .unwrap();
+    store.close_now("s2").unwrap();
+    conn.execute(
+        "UPDATE sessions SET open_turn_id = 't9', activity = 'idle', presumed_parked = 1, close_requested = 1
+         WHERE id = 's2'",
+        [],
+    )
+    .unwrap();
+    delete(&store, "s2");
+    let flags: (Option<String>, Option<String>, bool, bool) = conn
+        .query_row(
+            "SELECT open_turn_id, activity, presumed_parked, close_requested FROM sessions WHERE id = 's2'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(flags, (None, None, false, false));
+
+    assert_eq!(store.find_session("s1").unwrap(), None);
+    assert_eq!(store.find_session_item("s1").unwrap(), None);
+    for query in [
+        ListQuery::default(),
+        ListQuery {
+            search: Some("s1"),
+            ..ListQuery::default()
+        },
+        ListQuery {
+            hat: Some("hat-1"),
+            ..ListQuery::default()
+        },
+    ] {
+        assert!(store.list(&query).unwrap().sessions.is_empty(), "{query:?}");
+    }
+}
+
+/// A8: once deleted, a session's title and cwd are in neither the database
+/// file nor its WAL: `secure_delete` zeroes what is deleted, and a
+/// checkpoint folds the WAL back.
+#[test]
+fn a_deleted_sessions_title_and_cwd_are_not_left_in_the_database_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    let (title, cwd) = ("zq-title-91c2be", "/srv/zq-cwd-7f3e0a");
+    active(&store, "s1", cwd);
+    store.ingest("s1", 2, &titled(title)).unwrap();
+    store.ingest("s1", 3, &git(Some("main"), false, None)).unwrap();
+    store.close_now("s1").unwrap();
+    let files = || -> Vec<u8> {
+        let mut bytes = std::fs::read(&db).unwrap();
+        bytes.extend(std::fs::read(db.with_extension("db-wal")).unwrap_or_default());
+        bytes
+    };
+    let holds = |bytes: &[u8], needle: &str| bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
+    let before = files();
+    assert!(
+        holds(&before, title) && holds(&before, cwd),
+        "not written to begin with"
+    );
+
+    delete(&store, "s1");
+    // The delete's own checkpoint folded the WAL back already.
+    let now = files();
+    assert!(!holds(&now, title) && !holds(&now, cwd), "left in the WAL");
+    drop(store);
+    let conn = Connection::open(&db).unwrap();
+    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+        .unwrap();
+    drop(conn);
+    let after = files();
+    assert!(!holds(&after, title), "the title is still in the files");
+    assert!(!holds(&after, cwd), "the cwd is still in the files");
+}
+
+/// Decision 6: an image is the owner's while a turn or an event of a kept
+/// session shows it; its row and its file go with the last of them, and
+/// the usage drops by what went.
+#[test]
+fn an_image_two_sessions_show_stays_until_the_second_is_deleted() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    let (shared, own) = (png(1, 1000), png(2, 500));
+    active(&store, "s1", "/srv/a");
+    active(&store, "s2", "/srv/b");
+    prompt_in(&store, "s1", "t1", vec![image(&shared), image(&own)]);
+    store.ingest("s1", 2, &turn_started("t1")).unwrap();
+    prompt_in(&store, "s2", "t2", vec![image(&shared)]);
+    store.ingest("s2", 2, &turn_started("t2")).unwrap();
+    assert_eq!(
+        store.attachment_usage().unwrap(),
+        AttachmentUsage { count: 2, bytes: 1500 }
+    );
+    for id in ["s1", "s2"] {
+        store.close_now(id).unwrap();
+    }
+    // s2 shows the shared image by its event alone: its turn's link gone,
+    // as for a turn of a database from before the links were kept.
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("DELETE FROM turn_attachments WHERE turn_id = 't2'", [])
+        .unwrap();
+
+    delete(&store, "s1");
+    assert_eq!(
+        store.attachment_usage().unwrap(),
+        AttachmentUsage { count: 1, bytes: 1000 }
+    );
+    assert!(store.attachment(&sha(&shared)).unwrap().is_some());
+    assert!(store.attachment(&sha(&own)).unwrap().is_none());
+    assert!(has_file(&db, &sha(&shared)) && !has_file(&db, &sha(&own)));
+
+    delete(&store, "s2");
+    assert_eq!(
+        store.attachment_usage().unwrap(),
+        AttachmentUsage { count: 0, bytes: 0 }
+    );
+    assert!(!has_file(&db, &sha(&shared)));
+}
+
+/// Decision 6: a turn that never started (no `user_turn` event) still
+/// shows its image, so another session's delete keeps it.
+#[test]
+fn an_image_only_a_turn_shows_is_still_referenced() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    let img = png(7, 400);
+    active(&store, "s1", "/srv/a");
+    active(&store, "s2", "/srv/b");
+    prompt_in(&store, "s1", "t1", vec![image(&img)]);
+    store.ingest("s1", 2, &turn_started("t1")).unwrap();
+    // s2's turn is sent, never started.
+    prompt_in(&store, "s2", "t2", vec![image(&img)]);
+    store.close_now("s1").unwrap();
+    delete(&store, "s1");
+    assert_eq!(store.attachment_usage().unwrap().count, 1);
+    assert!(has_file(&db, &sha(&img)));
+}
+
+/// Decision 6: an abandoned turn's images go with it, unless something
+/// else still shows them.
+#[test]
+fn abandoning_a_turn_removes_an_image_only_it_showed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    let (only, shared) = (png(1, 300), png(2, 200));
+    active(&store, "s1", "/srv/a");
+    active(&store, "s2", "/srv/b");
+    prompt_in(&store, "s2", "t2", vec![image(&shared)]);
+    prompt_in(&store, "s1", "t1", vec![image(&only), image(&shared)]);
+    store.abandon_turn("s1", "t1").unwrap();
+    assert_eq!(
+        store.attachment_usage().unwrap(),
+        AttachmentUsage { count: 1, bytes: 200 }
+    );
+    assert!(!has_file(&db, &sha(&only)) && has_file(&db, &sha(&shared)));
+    assert_eq!(store.turn_state("t1").unwrap(), None);
+}
+
+/// Decision 6: a prompt whose image file went missing since it was saved
+/// (a delete in between) writes it again as it opens the turn, and links
+/// the turn to each image at its block's index.
+#[test]
+fn opening_a_prompt_rewrites_a_missing_image_and_links_the_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    let img = png(5, 300);
+    active(&store, "s1", "/srv/a");
+    let checked = content::check(vec![json!({"type": "text", "text": "x"}), image(&img), image(&img)]).unwrap();
+    store.save_images(&checked.images).unwrap();
+    std::fs::remove_file(db.parent().unwrap().join("attachments").join(sha(&img))).unwrap();
+    assert!(store.open_prompt("s1", "t1", &checked).unwrap());
+    assert!(has_file(&db, &sha(&img)));
+    assert_eq!(store.attachment(&sha(&img)).unwrap().unwrap().bytes, img);
+    let conn = Connection::open(&db).unwrap();
+    let links: Vec<(String, i64)> = conn
+        .prepare("SELECT sha256, position FROM turn_attachments WHERE turn_id = 't1' ORDER BY position")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(links, [(sha(&img), 1), (sha(&img), 2)]);
+}
+
+/// Decision 5, A4: only a closed session is deleted as it is. One the
+/// route judged to have no adapter it can reach is closed first, if it is
+/// still exactly what the route saw (compare-and-set); else refused, and
+/// nothing changes.
+#[test]
+fn a_session_not_closed_is_deleted_only_as_the_route_judged_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    let conn = Connection::open(&db).unwrap();
+    let judged = |lifecycle: &str, presumed_parked: bool| Unattached {
+        lifecycle: lifecycle.into(),
+        presumed_parked,
+    };
+    let refused = |id: &str, unattached: Option<&Unattached>, lifecycle: &str| {
+        let row = raw_row(&conn, id);
+        let kinds = event_kinds(&conn, id);
+        match store.delete_session(id, unattached).unwrap() {
+            Deletion::Refused(found) => assert_eq!(found, lifecycle),
+            other => panic!("not refused: {other:?}"),
+        }
+        assert_eq!((raw_row(&conn, id), event_kinds(&conn, id)), (row, kinds));
+    };
+    let deleted = |id: &str, unattached: &Unattached| match store.delete_session(id, Some(unattached)).unwrap() {
+        Deletion::Done { event, unconfirmed } => {
+            assert!(unconfirmed);
+            assert_eq!(event.kind, "session_deleted");
+            assert_eq!(event_kinds(&conn, id), ["session_deleted"]);
+        }
+        other => panic!("not deleted: {other:?}"),
+    };
+
+    store
+        .create_session("s1", "h1", "fake", "/srv/a", "hat-1", None)
+        .unwrap();
+    refused("s1", None, "starting");
+    refused("s1", Some(&judged("active", false)), "starting");
+    deleted("s1", &judged("starting", false));
+
+    active(&store, "s2", "/srv/b");
+    store.open_turn("s2", "t2", &prompt_text()).unwrap();
+    refused("s2", None, "active");
+    refused("s2", Some(&judged("active", true)), "active");
+    store.presume_parked("h1").unwrap();
+    // The route saw it active on an offline host; it is presumed parked by now.
+    refused("s2", Some(&judged("active", false)), "parked");
+    deleted("s2", &judged("parked", true));
+
+    active(&store, "s3", "/srv/c");
+    store
+        .ingest(
+            "s3",
+            2,
+            &SessionBody::SessionParked {
+                reason: ParkReason::Idle,
+            },
+        )
+        .unwrap();
+    refused("s3", None, "parked");
+    refused("s3", Some(&judged("parked", true)), "parked");
+    deleted("s3", &judged("parked", false));
+}
+
+/// Decision 2, A9: the schema itself refuses anything new for a tombstone,
+/// whoever writes it.
+#[test]
+fn the_schema_refuses_writes_for_a_tombstone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    tombstone(&store, "s1", "h1");
+    let conn = Connection::open(&db).unwrap();
+    conn.execute_batch("PRAGMA foreign_keys = ON").unwrap();
+    let owner = store.owner_id();
+    for sql in [
+        "INSERT INTO events(session_id, host_seq, kind, body, ts, owner_id) VALUES ('s1', 9, 'x', '{}', 't', ?1)",
+        "INSERT INTO events(session_id, host_seq, kind, body, ts, owner_id)
+         VALUES ('s1', NULL, 'session_deleted', '{}', 't', ?1)",
+        "INSERT INTO turns(turn_id, session_id, content, created_at, owner_id) VALUES ('t9', 's1', '[]', 't', ?1)",
+        "INSERT INTO pending(pending_id, session_id, kind, payload, state, opened_at, owner_id)
+         VALUES ('p9', 's1', 'permission', '{}', 'open', 't', ?1)",
+        "INSERT INTO answer_queue(pending_id, session_id, request_id, answer, submitted_at, owner_id)
+         VALUES ('p9', 's1', 'r9', '{}', 't', ?1)",
+        "INSERT INTO session_catalog(session_id, config_options, updated_at, owner_id) VALUES ('s1', '[]', 't', ?1)",
+        "UPDATE sessions SET title = 'back' WHERE id = 's1' AND ?1 = ?1",
+        "UPDATE sessions SET lifecycle = 'closed' WHERE id = 's1' AND ?1 = ?1",
+    ] {
+        let err = conn.execute(sql, [owner]).unwrap_err().to_string();
+        assert!(err.contains("a deleted session"), "{sql}: {err}");
+    }
+    assert_eq!(event_kinds(&conn, "s1"), ["session_deleted"]);
+}
+
+/// A1, decision 2: the store's own writers leave a tombstone alone and
+/// answer as they would for a session with nothing to do; one that would
+/// write an event for it fails as for an unknown session.
+#[test]
+fn the_stores_writers_leave_a_tombstone_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    tombstone(&store, "s1", "h1");
+    let conn = Connection::open(&db).unwrap();
+    let row = raw_row(&conn, "s1");
+
+    assert!(store.ingest("s1", 2, &update(1)).unwrap().is_empty());
+    assert!(
+        store
+            .ingest("s1", 1, &SessionBody::session_started("r0", "a0"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(store.ingest("s1", 3, &SessionBody::SessionClosed).unwrap().is_empty());
+    assert!(store.close_now("s1").unwrap().is_empty());
+    assert!(store.close_after_rejected_reconcile_close("s1").unwrap().is_empty());
+    store.mark_failed("s1", "late").unwrap();
+    store.mark_failed_if_starting("s1", "late").unwrap();
+    assert!(!store.open_turn("s1", "t1", &prompt_text()).unwrap());
+    let err = store.record_park_request("s1").unwrap_err().to_string();
+    assert!(err.contains("no session s1"), "{err}");
+    assert_eq!(raw_row(&conn, "s1"), row);
+    assert_eq!(event_kinds(&conn, "s1"), ["session_deleted"]);
+}
+
+/// A1: a tombstone, listed by its host as attached or not, goes through
+/// every statement over a host's sessions untouched, and is no reason to
+/// think its host runs anything.
+#[test]
+fn a_tombstone_goes_through_the_bulk_functions_untouched() {
+    for listed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, db) = file_store(dir.path());
+        tombstone(&store, "s1", "h1");
+        active(&store, "s2", "/srv/b");
+        let conn = Connection::open(&db).unwrap();
+        let row = raw_row(&conn, "s1");
+        let attached: Vec<AttachedSession> = if listed {
+            vec![attached("s1", None), attached("s2", None)]
+        } else {
+            vec![attached("s2", None)]
+        };
+        assert_eq!(store.hosts_with_active_sessions().unwrap(), ["h1"]);
+        store.presume_parked("h1").unwrap();
+        let reconciled = store.reconcile_host("h1", &attached).unwrap();
+        assert!(reconciled.events.iter().all(|e| e.session_id != "s1"), "{reconciled:?}");
+        store.revoke_host("h1").unwrap();
+        assert!(store.hosts_with_active_sessions().unwrap().is_empty());
+        store.reconcile_host("h1", &attached).unwrap();
+        assert_eq!(raw_row(&conn, "s1"), row, "listed: {listed}");
+        assert_eq!(event_kinds(&conn, "s1"), ["session_deleted"], "listed: {listed}");
+    }
+}
+
+/// R1–R4: a delete removes its project recent (host, hat, cwd: exact
+/// bytes) unless another session kept of that host and hat has that cwd.
+#[test]
+fn a_delete_removes_its_recent_unless_another_kept_session_has_that_cwd() {
+    use hennery_kernel::hosts::{Enrollment, Hosts};
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    let hosts = Hosts::open(&db).unwrap();
+    let mut hat = String::new();
+    for (host, key) in [
+        ("h1", "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"),
+        ("h2", "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"),
+    ] {
+        let enrollment = Enrollment {
+            public_key: key.into(),
+            name: "test".into(),
+            host_version: "0".into(),
+            platform: "test".into(),
+        };
+        hosts.register(host, &enrollment, 1_800_000_000).unwrap();
+        hat = hosts.host(host).unwrap().unwrap().default_hat_id;
+    }
+    for (id, host, cwd) in [
+        ("s1", "h1", "/p/a"),
+        ("s2", "h1", "/p/a"),
+        ("s3", "h1", "/p/b"),
+        ("s4", "h2", "/p/b"),
+        ("s5", "h1", "/p/A"),
+    ] {
+        store.create_session(id, host, "fake", cwd, &hat, None).unwrap();
+        store.close_now(id).unwrap();
+        assert!(hosts.remember(host, &hat, cwd, 1_800_000_000).unwrap());
+    }
+    let conn = Connection::open(&db).unwrap();
+    let recents = || -> Vec<(String, String)> {
+        conn.prepare("SELECT host_id, path FROM project_recents ORDER BY host_id, path")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    };
+    let recent = |host: &str, path: &str| (host.to_string(), path.to_string());
+    delete(&store, "s1");
+    assert!(recents().contains(&recent("h1", "/p/a")), "s2 still has it");
+    // h2's s4 is another host's: h1's recent goes.
+    delete(&store, "s3");
+    assert_eq!(
+        recents(),
+        [recent("h1", "/p/A"), recent("h1", "/p/a"), recent("h2", "/p/b")]
+    );
+    // s5's `/p/A` is not `/p/a`, and s1's tombstone keeps nothing.
+    delete(&store, "s2");
+    assert_eq!(recents(), [recent("h1", "/p/A"), recent("h2", "/p/b")]);
+}
+
+/// Decision 6, A6: files are shared by hash, so the owner's row goes with
+/// the owner's last reference, but the file stays while another owner's
+/// row names it.
+#[test]
+fn an_image_file_another_owner_holds_stays_when_the_owners_row_goes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    let img = png(9, 300);
+    active(&store, "s1", "/srv/a");
+    prompt_in(&store, "s1", "t1", vec![image(&img)]);
+    let conn = Connection::open(&db).unwrap();
+    conn.execute(
+        "INSERT INTO owners(id, created_at, set_up_at)
+         VALUES ('owner-00000000000000b2', 9223372036854775807, 9223372036854775807)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO attachments(owner_id, sha256, mime, size, created_at)
+         VALUES ('owner-00000000000000b2', ?1, 'image/png', 300, 't')",
+        [sha(&img)],
+    )
+    .unwrap();
+    store.close_now("s1").unwrap();
+    delete(&store, "s1");
+    assert_eq!(store.attachment_usage().unwrap().count, 0);
+    assert!(has_file(&db, &sha(&img)), "another owner's image lost its file");
 }

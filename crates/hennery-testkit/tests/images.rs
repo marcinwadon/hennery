@@ -336,7 +336,13 @@ async fn an_image_prompt_to_a_host_without_images_is_refused_before_anything_is_
     );
     host.nothing_more().await;
     assert_eq!(
-        collector.state.store.session(&session).unwrap().unwrap().open_turn_id,
+        collector
+            .state
+            .store
+            .find_session(&session)
+            .unwrap()
+            .unwrap()
+            .open_turn_id,
         None
     );
     assert!(collector.files().is_empty(), "{:?}", collector.files());
@@ -409,7 +415,13 @@ async fn refused_content_opens_no_turn_and_writes_no_file() {
     }
     host.nothing_more().await;
     assert_eq!(
-        collector.state.store.session(&session).unwrap().unwrap().open_turn_id,
+        collector
+            .state
+            .store
+            .find_session(&session)
+            .unwrap()
+            .unwrap()
+            .open_turn_id,
         None
     );
     assert!(collector.files().is_empty(), "{:?}", collector.files());
@@ -503,7 +515,13 @@ async fn a_host_refusing_an_image_prompt_frees_the_turn() {
         "{answer}"
     );
     assert_eq!(
-        collector.state.store.session(&session).unwrap().unwrap().open_turn_id,
+        collector
+            .state
+            .store
+            .find_session(&session)
+            .unwrap()
+            .unwrap()
+            .open_turn_id,
         None
     );
 }

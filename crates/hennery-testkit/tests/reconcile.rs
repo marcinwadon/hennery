@@ -95,7 +95,7 @@ impl Collector {
     }
 
     fn lifecycle(&self, session: &str) -> String {
-        self.state.store.session(session).unwrap().unwrap().lifecycle
+        self.state.store.find_session(session).unwrap().unwrap().lifecycle
     }
 
     fn event_kinds(&self, session: &str) -> Vec<String> {
@@ -392,7 +392,7 @@ async fn a_start_lost_in_a_drop_fails_as_not_delivered_after_the_next_handshake(
 
     // The host comes back without the session: the start never happened.
     let _host = ScriptedHost::connect(&collector, vec![], 0).await;
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!(
         (row.lifecycle.as_str(), row.failure_reason.as_deref()),
         ("failed", Some("start_not_delivered"))
@@ -621,7 +621,13 @@ async fn a_request_that_times_out_on_a_live_connection_drops_it() {
 // Plan B: host offline past the threshold (ACP core §5.3, §12 scenario 8).
 
 fn presumed(collector: &Collector, session: &str) -> bool {
-    collector.state.store.session(session).unwrap().unwrap().presumed_parked
+    collector
+        .state
+        .store
+        .find_session(session)
+        .unwrap()
+        .unwrap()
+        .presumed_parked
 }
 
 async fn presumed_parked(collector: &Collector, session: &str) {
@@ -891,7 +897,7 @@ async fn a_resume_the_agent_cannot_load_fails_with_its_reason_and_can_be_retried
     .await;
     let (status, body) = call.await.unwrap();
     assert_eq!((status, body["code"].as_str()), (502, Some("agent_has_no_record")));
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!(
         (row.lifecycle.as_str(), row.failure_reason.as_deref()),
         ("failed", Some("agent_has_no_record"))
@@ -925,7 +931,7 @@ async fn a_resume_the_host_rejects_is_a_502_with_its_code() {
         .await;
         let (status, body) = call.await.unwrap();
         assert_eq!((status, body["code"].as_str()), (502, Some(code)), "{body}");
-        let row = collector.state.store.session(&session).unwrap().unwrap();
+        let row = collector.state.store.find_session(&session).unwrap().unwrap();
         assert_eq!(
             (row.lifecycle.as_str(), row.failure_reason.as_deref()),
             ("failed", Some(code))
@@ -1021,7 +1027,7 @@ async fn a_resume_lost_in_a_drop_is_reconciled_like_a_start() {
     assert_eq!(collector.lifecycle(&session), "starting");
     // The host comes back without it: the resume never happened.
     let _host = ScriptedHost::connect(&collector, vec![], seq).await;
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!(
         (row.lifecycle.as_str(), row.failure_reason.as_deref()),
         ("failed", Some("start_not_delivered"))
@@ -1036,7 +1042,7 @@ async fn the_session_detail_shows_the_open_turn() {
     let turn = started_turn(&collector, &mut host, &session).await;
     let (status, body) = get(&client(&collector), collector.url(&format!("/api/sessions/{session}"))).await;
     assert_eq!(status, 200, "{body}");
-    let item = collector.state.store.session_item(&session).unwrap().unwrap();
+    let item = collector.state.store.find_session_item(&session).unwrap().unwrap();
     // No rule: the host's default hat (umbrella §8.2).
     let hat = collector.state.hosts.host(HOST).unwrap().unwrap().default_hat_id;
     assert_eq!(
@@ -1110,7 +1116,7 @@ async fn reject_after_the_caller_left(
 }
 
 fn failed_with(collector: &Collector, session: &str) -> Option<String> {
-    let row = collector.state.store.session(session).unwrap().unwrap();
+    let row = collector.state.store.find_session(session).unwrap().unwrap();
     (row.lifecycle == "failed").then_some(row.failure_reason).flatten()
 }
 
@@ -1161,7 +1167,7 @@ async fn a_prompt_rejected_after_its_caller_gave_up_still_frees_the_turn_slot() 
     };
     reject_after_the_caller_left(&mut host, caller, request_id).await;
     wait_for("turn slot free", || async {
-        let row = collector.state.store.session(&session).unwrap().unwrap();
+        let row = collector.state.store.find_session(&session).unwrap().unwrap();
         row.open_turn_id.is_none().then_some(())
     })
     .await;
@@ -1217,7 +1223,7 @@ async fn a_cancel_ends_the_open_turn_and_answers_with_its_outcome() {
     let (status, body) = call.await.unwrap();
     assert_eq!(status, 202, "{body}");
     assert_eq!(body, json!({ "turn_id": turn, "outcome": "cancelled" }));
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!((row.open_turn_id, row.activity.as_deref()), (None, Some("idle")));
 }
 
@@ -1975,7 +1981,7 @@ async fn a_revoke_closes_the_hosts_connection_and_parks_its_sessions_for_good() 
     assert!(body["revoked_at"].is_string(), "{body}");
     host.closed().await;
 
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!(
         (row.lifecycle.as_str(), row.presumed_parked, row.open_turn_id),
         ("parked", true, None)
@@ -2028,7 +2034,7 @@ async fn a_revoke_during_a_handshake_is_not_undone_by_its_reconciliation() {
         ))
         .await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!((row.lifecycle.as_str(), row.presumed_parked), ("parked", true));
     assert!(!collector.event_kinds(&session).contains(&"reattached".to_string()));
     assert!(collector.state.hub.connected_hosts().is_empty());
@@ -2047,7 +2053,7 @@ async fn a_connection_that_ends_after_its_host_was_revoked_parks_its_sessions() 
     collector.state.hub.disconnect(HOST);
     host.closed().await;
     wait_for("the session parked", || async {
-        let row = collector.state.store.session(&session).unwrap().unwrap();
+        let row = collector.state.store.find_session(&session).unwrap().unwrap();
         (row.lifecycle == "parked" && row.presumed_parked).then_some(())
     })
     .await;
@@ -2073,7 +2079,7 @@ async fn a_registry_error_when_a_revoked_hosts_connection_ends_is_retried() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     db.execute_batch("ALTER TABLE hosts_away RENAME TO hosts").unwrap();
     wait_for("the session parked", || async {
-        let row = collector.state.store.session(&session).unwrap().unwrap();
+        let row = collector.state.store.find_session(&session).unwrap().unwrap();
         (row.lifecycle == "parked" && row.presumed_parked).then_some(())
     })
     .await;
@@ -2114,7 +2120,7 @@ async fn a_revoked_hosts_resend_complete_does_not_reattach_what_the_revoke_alrea
     collector.state.store.revoke_host(HOST).unwrap();
     host.send(&HostFrame::ResendComplete).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!((row.lifecycle.as_str(), row.presumed_parked), ("parked", true));
     assert!(!collector.event_kinds(&session).contains(&"reattached".to_string()));
     assert!(collector.state.hub.connected_hosts().is_empty(), "never marked ready");
@@ -2145,7 +2151,7 @@ async fn a_revoke_of_an_already_offline_host_still_parks_its_sessions_and_cancel
     let (status, body) = revoke(&collector, HOST).await;
     assert_eq!(status, 200, "{body}");
 
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!(
         (row.lifecycle.as_str(), row.presumed_parked, row.open_turn_id),
         ("parked", true, None)
@@ -2380,7 +2386,7 @@ async fn the_session_detail_carries_the_title_and_the_current_model_and_mode() {
         collector
             .state
             .store
-            .session(&session)
+            .find_session(&session)
             .unwrap()
             .unwrap()
             .title
@@ -2566,7 +2572,7 @@ async fn a_session_closed_and_reassigned_while_its_host_was_away_is_closed_on_it
         panic!("expected the reconcile-driven close_session");
     };
     assert_eq!(session_id, session);
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!((row.lifecycle.as_str(), row.hat_id), ("closed", acme.id));
 }
 

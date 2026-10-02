@@ -879,7 +879,7 @@ async fn a_recent_is_remembered_under_the_hat_its_session_was_given() {
     let stored = collector
         .state
         .store
-        .session(&start.session_id)
+        .find_session(&start.session_id)
         .unwrap()
         .unwrap()
         .hat_id;

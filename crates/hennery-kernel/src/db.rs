@@ -70,6 +70,11 @@ pub fn open_in_memory() -> Result<Connection> {
 fn configure(mut conn: Connection) -> Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
+    // What is deleted is overwritten with zeros, not left in free space
+    // for anyone who reads the file (plan 9a A8): a deleted session's
+    // title, cwd and timeline must not outlive the delete in the database.
+    // The WAL keeps old pages until a checkpoint, which a delete runs.
+    conn.pragma_update(None, "secure_delete", "ON")?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.set_transaction_behavior(rusqlite::TransactionBehavior::Immediate);
     Ok(conn)

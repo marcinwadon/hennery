@@ -407,7 +407,7 @@ async fn a_start_with_unknown_delivery_reports_503_with_the_session_id() {
     assert_eq!(body["code"], "delivery_unknown");
     let session_id = body["session_id"].as_str().expect("session_id present in the 503 body");
 
-    let row = collector.state.store.session(session_id).unwrap().unwrap();
+    let row = collector.state.store.find_session(session_id).unwrap().unwrap();
     assert_eq!(
         row.lifecycle, "starting",
         "an unknown-delivery start must not be marked failed"
@@ -416,7 +416,7 @@ async fn a_start_with_unknown_delivery_reports_503_with_the_session_id() {
 
 async fn lifecycle_is(collector: &Collector, session: &str, want: &str) {
     wait_for(&format!("lifecycle {want}"), || async {
-        let row = collector.state.store.session(session).unwrap().unwrap();
+        let row = collector.state.store.find_session(session).unwrap().unwrap();
         (row.lifecycle == want).then_some(())
     })
     .await;
@@ -631,7 +631,7 @@ async fn a_dropped_connection_mid_turn_parks_nothing_and_loses_nothing() {
     assert!(of_kind(&evs, "host_restarted").is_empty());
     assert!(of_kind(&evs, "turn_ended_synthesized").is_empty());
     assert_eq!(
-        collector.state.store.session(&session).unwrap().unwrap().lifecycle,
+        collector.state.store.find_session(&session).unwrap().unwrap().lifecycle,
         "active"
     );
 }
@@ -1276,7 +1276,7 @@ async fn a_question_outlasts_its_host_being_away_and_an_answer_given_meanwhile_i
     // sessions parked, and takes the answer.
     let away = Collector::start_with(&db, None, Duration::from_millis(200)).await;
     wait_for("presumed parked", || async {
-        let row = away.state.store.session(&session).unwrap().unwrap();
+        let row = away.state.store.find_session(&session).unwrap().unwrap();
         (row.lifecycle == "parked" && row.presumed_parked).then_some(())
     })
     .await;
@@ -1341,7 +1341,7 @@ async fn a_revoked_host_stops_its_adapters_and_exits() {
     let err = outcome.expect_err("a revoked host ends with an error");
     assert!(format!("{err:#}").contains("revoked"), "{err:#}");
     wait_dead(grandchild).await;
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!((row.lifecycle.as_str(), row.presumed_parked), ("parked", true));
 }
 

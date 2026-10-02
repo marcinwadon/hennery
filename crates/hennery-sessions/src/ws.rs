@@ -226,7 +226,7 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                 // connection rather than silently skip the frame: acking a
                 // later frame would tell the host this one is safe to
                 // discard forever (ACP core §3.3, §5).
-                match state.store.session(&session_id) {
+                match state.store.find_session(&session_id) {
                     Ok(Some(row)) if row.host_id == host_id => {}
                     Ok(_) => {
                         tracing::warn!(%host_id, %session_id, "frame for a session this host does not own");
@@ -544,7 +544,7 @@ fn remember_project(state: &AppState, host_id: &str, session_id: &str) {
     // Under the hat the session belongs to, as stored at its start (plan
     // 6c's A3 iii), not what its cwd resolves to now: a recent is where
     // that hat's sessions ran.
-    let (cwd, hat_id) = match state.store.session(session_id) {
+    let (cwd, hat_id) = match state.store.find_session(session_id) {
         Ok(Some(row)) => (row.cwd, row.hat_id),
         Ok(None) => return,
         Err(err) => {

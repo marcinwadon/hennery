@@ -11,6 +11,7 @@ pub mod offline;
 pub mod projects;
 pub mod push;
 mod resolve;
+mod shared_files;
 pub mod store;
 pub mod ws;
 

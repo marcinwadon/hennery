@@ -83,6 +83,14 @@ pub fn read(dir: &Path, sha256: &str) -> std::io::Result<Option<Vec<u8>>> {
     }
 }
 
+/// Remove the file stored as `sha256` in `dir`; one already gone is fine.
+pub fn remove(dir: &Path, sha256: &str) -> std::io::Result<()> {
+    match std::fs::remove_file(path(dir, sha256)?) {
+        Err(err) if err.kind() != std::io::ErrorKind::NotFound => Err(err),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

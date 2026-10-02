@@ -702,7 +702,7 @@ async fn a_start_stores_the_canonical_cwd_and_the_hat_its_rules_give() {
     assert_eq!(cwd, "/home/me/acme/x");
     let (status, body) = call.await.unwrap();
     assert_eq!(status, 202, "{body}");
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     assert_eq!(
         (row.cwd.as_str(), row.hat_id.as_str()),
         ("/home/me/acme/x", acme.as_str())
@@ -724,7 +724,7 @@ async fn a_start_stores_the_canonical_cwd_and_the_hat_its_rules_give() {
     host.answer("/home/me/acme-infra", true).await;
     let (session, _) = host.started().await;
     assert_eq!(call.await.unwrap().0, 202);
-    let row = collector.state.store.session(&session).unwrap().unwrap();
+    let row = collector.state.store.find_session(&session).unwrap().unwrap();
     let default = collector.state.hosts.host(HOST).unwrap().unwrap().default_hat_id;
     assert_eq!(row.hat_id, default);
 }
@@ -777,7 +777,7 @@ async fn a_resume_re_resolves_its_cwd_and_hat_and_refuses_a_change() {
     assert_eq!(call.await.unwrap().0, 202);
     host.parked(&session).await;
     wait_for("parked", || async {
-        let row = collector.state.store.session(&session).unwrap().unwrap();
+        let row = collector.state.store.find_session(&session).unwrap().unwrap();
         (row.lifecycle == "parked").then_some(())
     })
     .await;
@@ -812,7 +812,7 @@ async fn a_resume_re_resolves_its_cwd_and_hat_and_refuses_a_change() {
     let (status, body) = call.await.unwrap();
     assert_eq!((status, body["code"].as_str()), (400, Some("invalid_cwd")), "{body}");
     assert_eq!(
-        collector.state.store.session(&session).unwrap().unwrap().lifecycle,
+        collector.state.store.find_session(&session).unwrap().unwrap().lifecycle,
         "parked"
     );
 
@@ -872,7 +872,7 @@ async fn a_reassigned_session_resumes_in_its_new_hat_once_the_rules_agree() {
 
     host.parked(&session).await;
     wait_for("parked", || async {
-        let row = collector.state.store.session(&session).unwrap().unwrap();
+        let row = collector.state.store.find_session(&session).unwrap().unwrap();
         (row.lifecycle == "parked").then_some(())
     })
     .await;

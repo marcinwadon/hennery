@@ -400,7 +400,7 @@ async fn list_sessions(State(state): State<AppState>, Query(params): Query<ListP
 /// Session detail (ACP core §9): the list item, as stored, plus the open
 /// turn and the open questions.
 async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let (session, item) = match (state.store.session(&id), state.store.session_item(&id)) {
+    let (session, item) = match (state.store.find_session(&id), state.store.find_session_item(&id)) {
         (Ok(Some(s)), Ok(Some(item))) => (s, item),
         (Ok(None), _) | (_, Ok(None)) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
         (Err(err), _) | (_, Err(err)) => return internal(err),
@@ -488,7 +488,7 @@ async fn update_session(
 /// different one refuses the resume (409 `hat_mismatch`) until the session
 /// is re-assigned.
 async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let session = match state.store.session(&id) {
+    let session = match state.store.find_session(&id) {
         Ok(Some(s)) => s,
         Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
         Err(err) => return internal(err),
@@ -615,7 +615,7 @@ async fn prompt(
         Err(Refusal::Invalid(why)) => return error(StatusCode::BAD_REQUEST, "invalid_content", why),
         Err(Refusal::TooLarge(why)) => return error(StatusCode::PAYLOAD_TOO_LARGE, "content_too_large", why),
     };
-    let session = match state.store.session(&id) {
+    let session = match state.store.find_session(&id) {
         Ok(Some(s)) => s,
         Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
         Err(err) => return internal(err),
@@ -741,7 +741,7 @@ async fn attachment_usage(State(state): State<AppState>) -> Response {
 /// turn and sending the cancel: the host then answers `not_running`, and
 /// the stored outcome is the answer.
 async fn cancel(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let session = match state.store.session(&id) {
+    let session = match state.store.find_session(&id) {
         Ok(Some(s)) => s,
         Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
         Err(err) => return internal(err),
@@ -800,7 +800,7 @@ async fn set_config(
     Path(id): Path<String>,
     ApiJson(req): ApiJson<ConfigRequest>,
 ) -> Response {
-    let session = match state.store.session(&id) {
+    let session = match state.store.find_session(&id) {
         Ok(Some(s)) => s,
         Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
         Err(err) => return internal(err),
@@ -869,7 +869,7 @@ fn no_record() -> Response {
 }
 
 fn lifecycle_response(state: &AppState, id: &str) -> Response {
-    match state.store.session(id) {
+    match state.store.find_session(id) {
         Ok(Some(s)) => (
             StatusCode::ACCEPTED,
             Json(LifecycleResponse {
@@ -900,7 +900,7 @@ fn close_unattached(state: &AppState, id: &str) -> Response {
 /// Explicit park of an attached session: 202 with the lifecycle once the
 /// host's `session_parked` is ingested.
 async fn park(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let session = match state.store.session(&id) {
+    let session = match state.store.find_session(&id) {
         Ok(Some(s)) => s,
         Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
         Err(err) => return internal(err),
@@ -939,7 +939,7 @@ async fn park(State(state): State<AppState>, Path(id): Path<String>) -> Response
 /// anything else is closed immediately. A close whose delivery is unknown
 /// stays requested and is re-sent after the host's next handshake.
 async fn close(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let session = match state.store.session(&id) {
+    let session = match state.store.find_session(&id) {
         Ok(Some(s)) => s,
         Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
         Err(err) => return internal(err),
