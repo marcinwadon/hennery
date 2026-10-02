@@ -296,3 +296,7 @@ verified: boolean, };
 export type PathRuleInput = { prefix: string, hat_id: string, };
 
 export type PathRulesRequest = { rules: Array<PathRuleInput>, };
+
+export type HatResolveRequest = { host_id: string, path: string, };
+
+export type HatResolution = { canonical: string, exists: boolean, is_dir: boolean, hat_id: string, rule_id?: string | undefined, };

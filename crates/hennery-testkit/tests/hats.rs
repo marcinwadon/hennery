@@ -1,8 +1,8 @@
 //! Hats over HTTP (kernel spec §5, §8): setup names the default hat, the
 //! owner adds and changes hats, gives a host another default hat, and
-//! replaces a host's path rules. Changing a host or its rules needs a
-//! fresh step-up (plan 5a decisions 7 and 8; `step_up.rs` covers the
-//! refusals).
+//! replaces a host's path rules, which needs the host connected (plan 5b).
+//! Changing a host or its rules needs a fresh step-up (plan 5a decisions 7
+//! and 8; `step_up.rs` covers the refusals).
 
 use hennery_kernel::hosts::{Enrollment, Hosts};
 use hennery_kernel::operator::Operator;
@@ -237,51 +237,48 @@ async fn a_host_is_renamed_and_given_another_default_hat() {
     assert_eq!(code_of(resp).await, (404, "not_found".into()));
 }
 
-/// Kernel spec §5.2, §8: the full set replaces the host's rules; each
-/// prefix is normalised by its text and stored unverified until the host
-/// can resolve it (plan 5a decision 6).
+/// Kernel spec §5.2: rules are resolved through their host when they are
+/// saved, so with the host away a set with any rule is refused and stores
+/// nothing (the review's B1); the empty set clears them. A connected host
+/// resolving them is `resolve.rs`'s.
 #[tokio::test]
-async fn path_rules_are_replaced_as_a_set_normalised_and_unverified() {
+async fn path_rules_are_saved_only_with_their_host_connected() {
     let c = Collector::start().await;
     c.pair("host-1", 0);
     let acme: HatItem = c.create("Acme", None).await.json().await.unwrap();
-    let resp = c
-        .put_rules("host-1", &[("/p/acme/", &acme.id), ("/p//acme/./secret", &acme.id)])
-        .await;
-    assert_eq!(resp.status(), 200);
-    let stored: Vec<PathRuleItem> = resp.json().await.unwrap();
-    let shown: Vec<(&str, bool)> = stored.iter().map(|r| (r.prefix.as_str(), r.verified)).collect();
-    assert_eq!(shown, [("/p/acme/secret", false), ("/p/acme", false)]);
+    let stored = c
+        .state
+        .hosts
+        .replace_path_rules(
+            "host-1",
+            &[hennery_kernel::hats::NewRule {
+                prefix: "/p/acme".into(),
+                hat_id: acme.id.clone(),
+                verified: true,
+            }],
+        )
+        .unwrap();
+    assert!(matches!(stored, hennery_kernel::hats::RulesChange::Done(_)));
+    assert_eq!(
+        code_of(c.put_rules("host-1", &[("/p/acme", &acme.id)]).await).await,
+        (409, "host_offline".into())
+    );
     let resp = c
         .client()
         .get(c.url("/api/hosts/host-1/path-rules"))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.json::<Vec<PathRuleItem>>().await.unwrap(), stored);
-    let resolved = c.state.hosts.resolve_hat("host-1", "/p/acme/x").unwrap().unwrap();
-    assert_eq!(resolved.hat_id, acme.id);
-
-    // A bad set changes nothing.
-    for bad in [
-        vec![("p/acme", acme.id.as_str())],
-        vec![("~/acme", acme.id.as_str())],
-        vec![("/p/acme", "hat-nope")],
-        vec![("/p/a", acme.id.as_str()), ("/p/a/", acme.id.as_str())],
-        vec![("/p/a\u{0}b", acme.id.as_str())],
-        vec![("/p/a\u{202E}b", acme.id.as_str())],
-        vec![("/p/x/../a", acme.id.as_str())],
-        vec![("/", acme.id.as_str())],
-    ] {
-        assert_eq!(
-            code_of(c.put_rules("host-1", &bad).await).await,
-            (400, "invalid".into()),
-            "{bad:?}"
-        );
-    }
-    assert_eq!(c.state.hosts.path_rules("host-1").unwrap().unwrap().len(), 2);
+    let listed: Vec<PathRuleItem> = resp.json().await.unwrap();
     assert_eq!(
-        code_of(c.put_rules("host-nope", &[]).await).await,
+        listed
+            .iter()
+            .map(|r| (r.prefix.as_str(), r.verified))
+            .collect::<Vec<_>>(),
+        [("/p/acme", true)]
+    );
+    assert_eq!(
+        code_of(c.put_rules("host-nope", &[("/p", &acme.id)]).await).await,
         (404, "not_found".into())
     );
     let resp = c
@@ -291,7 +288,7 @@ async fn path_rules_are_replaced_as_a_set_normalised_and_unverified() {
         .await
         .unwrap();
     assert_eq!(code_of(resp).await, (404, "not_found".into()));
-    // The empty set removes them all.
+    // The empty set needs no host: it removes them all.
     let resp = c.put_rules("host-1", &[]).await;
     assert_eq!(resp.json::<Vec<PathRuleItem>>().await.unwrap(), []);
 }

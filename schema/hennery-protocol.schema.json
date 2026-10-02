@@ -726,6 +726,52 @@
       ],
       "type": "object"
     },
+    "HatResolution": {
+      "description": "200 to `POST /api/hats/resolve`: the canonical path, whether it exists\nand is a directory there, and its hat, with the rule that decided it\n(absent: the host's default hat).",
+      "properties": {
+        "canonical": {
+          "type": "string"
+        },
+        "exists": {
+          "type": "boolean"
+        },
+        "hat_id": {
+          "type": "string"
+        },
+        "is_dir": {
+          "type": "boolean"
+        },
+        "rule_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "canonical",
+        "exists",
+        "is_dir",
+        "hat_id"
+      ],
+      "type": "object"
+    },
+    "HatResolveRequest": {
+      "description": "`POST /api/hats/resolve` (kernel spec §8): which hat `path` resolves to\non `host_id`, as a session started there would get. The host resolves\nthe path; `~` and `~/…` are its user's home.",
+      "properties": {
+        "host_id": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "host_id",
+        "path"
+      ],
+      "type": "object"
+    },
     "HostFrame": {
       "description": "Host -> collector.",
       "oneOf": [

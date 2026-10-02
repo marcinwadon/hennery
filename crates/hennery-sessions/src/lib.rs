@@ -5,6 +5,7 @@ pub mod hats;
 pub mod hosts;
 pub mod hub;
 pub mod offline;
+mod resolve;
 pub mod store;
 pub mod ws;
 
