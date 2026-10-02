@@ -352,6 +352,78 @@ mod tests {
         );
     }
 
+    /// Plan 4d-B2: a database as it was just before hat logos keeps its
+    /// hats, each with no logo, and its hats can then hold one. The logo
+    /// migration is found by what it does, not by its number, so a lane
+    /// that takes the number first changes nothing here.
+    #[test]
+    fn a_database_from_before_hat_logos_gains_them_keeping_its_hats() {
+        let logos = MIGRATIONS
+            .iter()
+            .position(|m| m.contains("ADD COLUMN logo_mime"))
+            .expect("the hat logo migration");
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate_component(&mut conn, COMPONENT, &MIGRATIONS[..logos]).unwrap();
+        assert_eq!(kernel_version(&conn), logos as i64);
+        conn.execute(
+            "INSERT INTO hats(id, owner_id, name, colour, created_at) SELECT 'hat-old', id, 'Old', '#123456', 7 FROM owners",
+            [],
+        )
+        .unwrap();
+        crate::db::migrate_component(&mut conn, COMPONENT, MIGRATIONS).unwrap();
+        assert_eq!(kernel_version(&conn), MIGRATIONS.len() as i64);
+        let old: (String, String, i64) = conn
+            .query_row(
+                "SELECT name, colour, created_at FROM hats WHERE id = 'hat-old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(old, ("Old".into(), "#123456".into(), 7));
+        let logo: (Option<String>, Option<Vec<u8>>, Option<String>) = conn
+            .query_row(
+                "SELECT logo_mime, logo_bytes, logo_etag FROM hats WHERE id = 'hat-old'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(logo, (None, None, None));
+        conn.execute(
+            "UPDATE hats SET logo_mime = 'image/png', logo_bytes = x'89504e47', logo_etag = 'e' WHERE id = 'hat-old'",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// Plan 4d-B2: a logo is a PNG, and its kind, bytes and `ETag` are there
+    /// together or not at all, by the schema itself.
+    #[test]
+    fn the_schema_keeps_a_logo_whole_and_a_png() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate_component(&mut conn, COMPONENT, MIGRATIONS).unwrap();
+        let hat: String = conn.query_row("SELECT id FROM hats", [], |r| r.get(0)).unwrap();
+        let refused = [
+            "logo_mime = 'image/svg+xml', logo_bytes = x'3c737667', logo_etag = 'e'",
+            "logo_mime = 'image/webp', logo_bytes = x'52494646', logo_etag = 'e'",
+            "logo_mime = 'image/png', logo_bytes = '<svg/>', logo_etag = 'e'",
+            "logo_mime = 'image/png', logo_bytes = x'89504e47', logo_etag = NULL",
+            "logo_mime = 'image/png', logo_bytes = NULL, logo_etag = 'e'",
+            "logo_mime = NULL, logo_bytes = x'89504e47', logo_etag = 'e'",
+            "logo_mime = NULL, logo_bytes = NULL, logo_etag = 'e'",
+        ];
+        for set in refused {
+            let sql = format!("UPDATE hats SET {set} WHERE id = ?1");
+            assert!(conn.execute(&sql, [&hat]).is_err(), "{set}");
+        }
+        for set in [
+            "logo_mime = 'image/png', logo_bytes = x'89504e47', logo_etag = 'e'",
+            "logo_mime = NULL, logo_bytes = NULL, logo_etag = NULL",
+        ] {
+            let sql = format!("UPDATE hats SET {set} WHERE id = ?1");
+            assert_eq!(conn.execute(&sql, [&hat]).unwrap(), 1, "{set}");
+        }
+    }
+
     /// Plan 6c: the roots a host reported survive every later migration.
     /// It passes trivially until a later migration rebuilds `hosts`; then
     /// it fails unless that rebuild carries the column across.

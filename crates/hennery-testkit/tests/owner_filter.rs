@@ -50,6 +50,12 @@ const SOURCES: &[(&str, &str, usize)] = &[
         include_str!("../../hennery-kernel/src/hats.rs"),
         20,
     ),
+    // Plan 4d-B2: hat logos.
+    (
+        "hennery-kernel/src/logo.rs",
+        include_str!("../../hennery-kernel/src/logo.rs"),
+        3,
+    ),
     (
         "hennery-kernel/src/hosts.rs",
         include_str!("../../hennery-kernel/src/hosts.rs"),
