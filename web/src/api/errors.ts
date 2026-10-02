@@ -45,6 +45,9 @@ export class ApiFailure extends Error {
   readonly serverMessage: string
   /** `Retry-After`, in seconds, on a 429. */
   readonly retryAfter?: number
+  /** The session the refused request still left reachable (ACP core §9: a
+   *  start's 503 `delivery_unknown` carries it). */
+  readonly sessionId?: string
 
   constructor(status: number, body: Partial<ApiError> | undefined, retryAfter?: number) {
     const code = body?.code ?? `http_${status}`
@@ -56,6 +59,7 @@ export class ApiFailure extends Error {
     this.code = code
     this.serverMessage = serverMessage
     this.retryAfter = retryAfter
+    this.sessionId = body?.session_id
   }
 }
 
