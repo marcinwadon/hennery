@@ -599,6 +599,34 @@ async fn assert_gone(pid_file: &Path) {
     assert!(!hennery_testkit::pid_alive(pid), "the app-server outlived its forget");
 }
 
+/// The review's item 4: a fallback whose adapter never answers is cut its
+/// grace before the forget's deadline, so stopping it still ends within
+/// the deadline (and the host's answer inside the collector's wait). Its
+/// archive ran first, so the walk still leaves nothing.
+#[tokio::test]
+async fn a_fallback_adapter_that_never_answers_is_stopped_within_the_deadline() {
+    let root = Root::new();
+    root.populate();
+    let mut ctx = root.ctx(root.fake(FakeDelete::Delete));
+    ctx.codex_app_server = None;
+    ctx.deadline = Duration::from_secs(6);
+    let script = FakeScript {
+        codex_archive_log: Some(root.archive_log().to_str().unwrap().into()),
+        delete_waits_for_file: Some(root.base.join("never").to_str().unwrap().into()),
+        ..FakeScript::default()
+    };
+    let adapter = ctx.agents.get_mut("codex").unwrap();
+    adapter.env.retain(|(k, _)| k != SCRIPT_ENV);
+    adapter
+        .env
+        .push((SCRIPT_ENV.into(), serde_json::to_string(&script).unwrap()));
+    let started = Instant::now();
+    let forgotten = root.forget_with(&ctx).await;
+    // Cut at 4 s (6 s less the 2 s grace), not at 6 s.
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    assert_fell_back(&root, &forgotten, "a hung adapter");
+}
+
 /// B3, decision 12: `sessions/` or `archived_sessions/` that is a symlink
 /// (a composed home's linked `sessions/`, say) is reported, never
 /// followed: nothing is spawned, since `thread/delete` and the archive
