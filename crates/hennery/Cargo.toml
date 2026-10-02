@@ -33,6 +33,8 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 hennery-testkit = { path = "../hennery-testkit" }
+# Writes a subscription `subscribe` would refuse (plan 10b-ii's wiring test).
+rusqlite.workspace = true
 tempfile.workspace = true
 # The supervisor's tests run on a paused clock.
 tokio = { workspace = true, features = ["test-util"] }

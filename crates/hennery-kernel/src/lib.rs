@@ -7,6 +7,7 @@ pub mod auth;
 pub mod auth_api;
 pub mod csp;
 pub mod db;
+pub mod delivery;
 pub mod egress;
 pub mod hats;
 pub mod health;
