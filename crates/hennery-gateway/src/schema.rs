@@ -1,7 +1,8 @@
 //! The gateway's tables in `hennery.db` (gateway spec §2), migrated as a
 //! component of their own (`db::migrate_component`), beside the kernel's
-//! and the sessions store's. Plan 8a makes the first three; later plans add
-//! the session tokens, standalone clients, OAuth clients and stdio servers.
+//! and the sessions store's. Plan 8a makes the first three, plan 8d the
+//! session tokens; later plans add standalone clients, OAuth clients and
+//! stdio servers.
 //!
 //! Every table carries `owner_id` (lane L6). A connection's hat and a
 //! mount's host are the owner's by composite foreign keys (plan 5a decision
@@ -15,7 +16,8 @@
 /// The gateway's component name in `schema_versions`.
 pub(crate) const COMPONENT: &str = "gateway";
 
-pub(crate) const MIGRATIONS: &[&str] = &["
+pub(crate) const MIGRATIONS: &[&str] = &[
+    "
     CREATE TABLE gw_connections (
         id TEXT PRIMARY KEY,
         owner_id TEXT NOT NULL REFERENCES owners(id),
@@ -55,4 +57,27 @@ pub(crate) const MIGRATIONS: &[&str] = &["
         FOREIGN KEY (connection_id, owner_id) REFERENCES gw_connections(id, owner_id),
         FOREIGN KEY (host_id, owner_id) REFERENCES hosts(id, owner_id));
     CREATE INDEX gw_mounts_by_host ON gw_mounts(owner_id, host_id);
-    "];
+    ",
+    // Plan 8d: one token per session (gateway spec §3.1), minted and
+    // revoked inside the sessions store's own transactions (lane L1). The
+    // session id is an opaque value with no foreign key: the gateway never
+    // reads session tables (lane L6). The host and the hat are the
+    // owner's, as everywhere else; a hat's tokens go with its purge
+    // (`tokens::purge_hat_in`) before the hat row can be deleted. Only the
+    // token's SHA-256 is stored.
+    "
+    CREATE TABLE gw_session_tokens (
+        session_id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL REFERENCES owners(id),
+        host_id TEXT NOT NULL,
+        hat_id TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        last_used_at INTEGER,
+        revoked_at INTEGER,
+        FOREIGN KEY (host_id, owner_id) REFERENCES hosts(id, owner_id),
+        FOREIGN KEY (hat_id, owner_id) REFERENCES hats(id, owner_id));
+    CREATE INDEX gw_session_tokens_by_host ON gw_session_tokens(owner_id, host_id);
+    CREATE INDEX gw_session_tokens_by_hat ON gw_session_tokens(owner_id, hat_id);
+    ",
+];
