@@ -29,7 +29,7 @@
 - `src/lib/manage.ts`: the classifiers (a host's state, whether a hat can be purged, a safe colour).
 - `src/hooks/useResource.ts`.
 - `e2e/host.ts`, `e2e/manage.spec.ts`: a real host paired with the command the page shows.
-- Shared files, touched minimally (4c edits them too): `App.tsx` (the `inert` wrapper), `components/Shell.tsx` (two routes and the sign-out button), `api/errors.ts` (nine messages and `Object.hasOwn`), `e2e/collector.ts` (exports `BIN` and `scratchEnv`, runs the collector in the scratch environment, listens for `'error'`).
+- Shared files, touched minimally (4c edits them too): `App.tsx` (the `inert` wrapper), `components/Shell.tsx` (two routes and the sign-out button), `api/errors.ts` (nine messages and `Object.hasOwn`), `e2e/collector.ts` (starts the collector through `spawnHennery`, re-exports `BIN` and `scratchEnv`, listens for `'error'`).
 
 **Tech Stack:** as plan 4b: React 19.3.0, TypeScript 7.0.2, Vite 8.3.1, Tailwind 4.3.3, Vitest 5.0.3, Testing Library, `@playwright/test` 1.63.0 with the flake's Chromium. pnpm only.
 
@@ -62,13 +62,14 @@ Executed 2026-10-03 on `plan/frontend-4d-i` with subagent-driven development. Ea
 | — | `fix(web): the confirmation keeps focus inside it and returns it somewhere that exists`; `fix(web): hosts and hats keep focus, reload what a purge removed, and fit 44 px`; `fix(web): the browser checks run every binary in a scratch environment` | Every finding of Tasks 1–4 taken. None was declined. Each has a test that was watched fail, and each has a revert-probe (36 unit probes, plus 2 e2e probes for the environment). |
 | — | `docs(plan): plan 4d-i after its task reviews` | The plan was regenerated from the fixed code and replayed. Decisions 3, 4, 11, 12, 14 and 15 were amended. |
 | — | `fix(web): a server time is tested escaped, a purge's outcome takes focus, and a hat's name is never spaces`; `docs(plan): plan 4d-i after its whole-branch review` | The whole-branch review approved, with minors: `<When>`'s escaping (the security review's O6) had no test; focus fell to the body after a purge; a hat's name of spaces only could be sent; decision 15 overstated what the CSP check sees; the plan's file table and probe lists were incomplete. All were taken, and 4 more probes were run. It judged that the fix commits tighten what the security review ruled on and loosen nothing, so no further re-confirmation is needed. |
+| — | `test(web): the browser checks start a process only through one helper, in a scratch environment` | The lane asked for a guard on the PR, after the Task 4 finding. `e2e/spawn.ts` is now the only file in `e2e/` that may start a process, and a Vitest guard enforces that. 4 Vitest probes, plus the e2e probe moved onto the helper. |
 
 After each review that changed code, the plan was regenerated from the code (`split.sh`, `fill.py`) and replayed from its own text onto `ecc50cd`. Every step matched its commit byte for byte. Every implementer checked its commit against the plan's reference commit for its task: `git diff` was empty, apart from the plan doc.
 
 **Checks on the final branch** (on `f122101`):
-- Web: typecheck; 274 Vitest tests (by task: 193, 236, 274); the build; 17 Playwright tests in Chromium against the binary (4b's 7, and this plan's 5 at two widths). `check-web-ui.sh` prints `ok`.
+- Web: typecheck; 277 Vitest tests (by task: 193, 236, 274, then 277 with the guard); the build; 17 Playwright tests in Chromium against the binary (4b's 7, and this plan's 5 at two widths). `check-web-ui.sh` prints `ok`.
 - No Rust file changes. CI runs the Rust checks.
-- Revert-probes, all caught: 54 scripted Vitest probes of the original guards, 40 of the review fixes, and 8 Playwright probes. The `clean` run passes.
+- Revert-probes, all caught: 54 scripted Vitest probes of the original guards, 44 of the review fixes, and 7 Playwright probes. The `clean` run passes.
 - The source guard (`security.test.ts`) caught one of this run's own slips: a literal U+202E in a new test, now written as an escape.
 
 ## Scope
@@ -184,7 +185,7 @@ Optional hardening taken: O1 (read before minting), O2 (count from arrival), O3 
     - **Pairing:** the test reads the command from the page and runs it, `hennery host join <url> <code>`, adding `--name` and `--no-runtime` (no adapter download), with `HENNERY_HOST_DATA_DIR`, `HOME` and the `XDG_*` directories in a fresh directory (amended: O4). It then runs `hennery host run` with one stand-in agent (`--agent stand-in=<the binary>`, a path that exists everywhere), which is never started, so the host connects without any adapter set. The tester resolves real paths through it.
     - **Step-up on revoke:** a session is stepped up for 5 minutes after setup, so no real 403 comes during the run. The test answers the first `DELETE /api/hosts/{id}` with 403 `step_up_required` (`page.route`) and lets the retry reach the server. That the server refuses an unstepped revoke is the Rust tests' (`step_up.rs`).
     - **Both widths** run the same three checks, each with a collector and a host of its own, then check that no page broke the Content-Security-Policy: by the console on every page, and by `securitypolicyviolation` events on the last page loaded (an init script's list starts again on each navigation), as 4b's checks do.
-    - **Every binary the checks start** (the collector, `host join`, `host run`) runs in `scratchEnv(dir)`: the runner's environment with every `HENNERY_*` variable removed, and `HOME` and `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` in the test's directory. A sentinel `HENNERY_LOG_DIR` set in the runner's own environment must stay empty (amended after the Task 4 review: the collector inherited the runner's environment, and with it a log directory or `HENNERY_SERVICE`'s home logs). `host run`'s standard error is shown when it fails.
+    - **Every binary the checks start** (the collector, `host join`, `host run`) is started by `spawnHennery` in `e2e/spawn.ts`, the only file of `e2e/` that may start a process (a Vitest guard, `e2e-spawn.test.ts`, fails on any `spawn`, `exec`, `execFile`, `fork` or `child_process` elsewhere in `e2e/` or `scripts/`, and on a second `spawn` in the helper; asked for by the lane), and runs in `scratchEnv(dir)`: the runner's environment with every `HENNERY_*` variable removed, and `HOME` and `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` in the test's directory. A sentinel `HENNERY_LOG_DIR` set in the runner's own environment must stay empty (amended after the Task 4 review: the collector inherited the runner's environment, and with it a log directory or `HENNERY_SERVICE`'s home logs). `host run`'s standard error is shown when it fails.
     - Every process is stopped by its own id, SIGTERM then SIGKILL, the `join` included (amended: A5), and every directory is removed, on every path. A process that never started is not waited for.
     - **`inert` in Chromium** (amended: O4, then at the re-confirmation): while the step-up dialog is open, the page under it is `inert`; focus is in the dialog; a script's `focus()` on the confirmation itself leaves it there (not on its buttons: they are disabled while its action waits, and a disabled button takes no focus, `inert` or not); and Shift+Tab from the dialog's first field, the password while no passkey is offered (asserted), lands nowhere on the page. A click on the covered confirmation is not checked: Playwright refuses it because the overlay is on top, `inert` or not, so it proved nothing.
 
@@ -231,7 +232,7 @@ Optional hardening taken: O1 (read before minting), O2 (count from arrival), O3 
 | `web/src/components/Pairing.tsx`, `web/src/screens/Hosts.tsx`, `web/src/screens/Hosts.test.tsx`, `web/src/manage.css` (new) | Hosts | 2 |
 | `web/src/test-fixtures.ts`, `web/src/test-targets.ts` (new) | One of each item, every field set; the narrow screen's 44 px rules read into jsdom | 2 |
 | `web/src/components/PathRules.tsx`, `web/src/screens/Hats.tsx`, `web/src/screens/Hats.test.tsx` (new) | Hats | 3 |
-| `web/e2e/host.ts`, `web/e2e/manage.spec.ts` (new), `web/e2e/collector.ts` | Playwright | 4 |
+| `web/e2e/spawn.ts`, `web/e2e/host.ts`, `web/e2e/manage.spec.ts`, `web/src/e2e-spawn.test.ts` (new), `web/e2e/collector.ts` | Playwright; the one place the checks start a process, and its guard | 4 |
 
 All commands run from the repository root inside the dev shell (`nix develop -c …`). Work on a feature branch off `main`.
 
@@ -3769,47 +3770,34 @@ In `web/e2e/collector.ts`, replace:
 
   ```ts
   // writes. Stopped by its own process id.
+  import { spawn, type ChildProcess } from 'node:child_process'
+  import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+  import { tmpdir } from 'node:os'
+  import { join, resolve } from 'node:path'
   ```
 
 with:
 
   ```ts
-  // writes. Stopped by its own process id. Every binary the browser checks
-  // start runs in `scratchEnv`: nothing of the runner's own hennery setup,
-  // home or XDG directories reaches it.
+  // writes. Stopped by its own process id. It starts, as every binary the
+  // browser checks start, through `spawnHennery` (`spawn.ts`).
+  import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+  import { tmpdir } from 'node:os'
+  import { join } from 'node:path'
+  import { spawnHennery, type ChildProcess } from './spawn'
+
+  export { BIN, scratchEnv } from './spawn'
   ```
 
 In `web/e2e/collector.ts`, replace:
 
   ```ts
   const BIN = process.env.HENNERY_BIN ?? resolve(process.cwd(), '../target/debug/hennery')
-  ```
 
-with:
-
-  ```ts
-  export const BIN = process.env.HENNERY_BIN ?? resolve(process.cwd(), '../target/debug/hennery')
-
-  /** The runner's environment without any `HENNERY_*` variable (a data or
-   *  log directory, a service flag: each would send the binary to the
-   *  runner's own files), with its home and XDG directories under `dir`. */
-  export function scratchEnv(dir: string): NodeJS.ProcessEnv {
-    const env = { ...process.env }
-    for (const key of Object.keys(env)) if (/^HENNERY_/.test(key)) delete env[key]
-    return {
-      ...env,
-      HOME: dir,
-      XDG_DATA_HOME: join(dir, 'xdg-data'),
-      XDG_CONFIG_HOME: join(dir, 'xdg-config'),
-      XDG_CACHE_HOME: join(dir, 'xdg-cache'),
-      XDG_STATE_HOME: join(dir, 'xdg-state'),
-    }
-  }
-  ```
-
-In `web/e2e/collector.ts`, replace:
-
-  ```ts
+  export async function startCollector(): Promise<Collector> {
+    const dir = mkdtempSync(join(tmpdir(), 'hennery-e2e-'))
+    const child: ChildProcess = spawn(BIN, ['collector', '--data-dir', dir, '--listen', '127.0.0.1:0'], {
+      stdio: ['ignore', 'ignore', 'pipe'],
       env: { ...process.env, RUST_LOG: 'warn' },
     })
     let stderr = ''
@@ -3819,7 +3807,10 @@ In `web/e2e/collector.ts`, replace:
 with:
 
   ```ts
-      env: { ...scratchEnv(dir), RUST_LOG: 'warn' },
+  export async function startCollector(): Promise<Collector> {
+    const dir = mkdtempSync(join(tmpdir(), 'hennery-e2e-'))
+    const child: ChildProcess = spawnHennery(['collector', '--data-dir', dir, '--listen', '127.0.0.1:0'], dir, {
+      RUST_LOG: 'warn',
     })
     let stderr = ''
     child.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
@@ -3836,11 +3827,10 @@ Create `web/e2e/host.ts`:
   // options a hermetic run needs), then run with one stand-in agent, so no
   // adapter is ever downloaded. Its directory is fresh, and every process is
   // stopped by its own id.
-  import { spawn, type ChildProcess } from 'node:child_process'
   import { mkdtempSync, rmSync } from 'node:fs'
   import { tmpdir } from 'node:os'
   import { join } from 'node:path'
-  import { BIN, scratchEnv } from './collector'
+  import { BIN, spawnHennery, type ChildProcess } from './spawn'
 
   /** SIGTERM, then SIGKILL if it has not gone within 5 s. One that never
    *  started (no pid) has nothing to stop. */
@@ -3866,14 +3856,14 @@ Create `web/e2e/host.ts`:
   export function testHost(): TestHost {
     const dir = mkdtempSync(join(tmpdir(), 'hennery-e2e-host-'))
     // Its home is the fresh directory too: the host reads $HOME (for `~`).
-    const env = { ...scratchEnv(dir), HENNERY_HOST_DATA_DIR: dir, RUST_LOG: 'warn' }
+    const env = { HENNERY_HOST_DATA_DIR: dir, RUST_LOG: 'warn' }
     const children: ChildProcess[] = []
     return {
       dir,
       join(command, extra) {
         const words = command.trim().split(/\s+/)
         if (words[0] !== 'hennery') throw new Error(`not a hennery command: ${command}`)
-        const child = spawn(BIN, [...words.slice(1), ...extra], { stdio: ['ignore', 'ignore', 'pipe'], env })
+        const child = spawnHennery([...words.slice(1), ...extra], dir, env)
         children.push(child)
         let stderr = ''
         child.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
@@ -3888,10 +3878,7 @@ Create `web/e2e/host.ts`:
       run() {
         // The stand-in agent is never started (no session runs here); any
         // path that exists will do, and the binary's own does everywhere.
-        const runner = spawn(BIN, ['host', 'run', '--data-dir', dir, '--agent', `stand-in=${BIN}`], {
-          stdio: ['ignore', 'ignore', 'pipe'],
-          env,
-        })
+        const runner = spawnHennery(['host', 'run', '--data-dir', dir, '--agent', `stand-in=${BIN}`], dir, env)
         let stderr = ''
         runner.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
         runner.once('error', (err) => console.error(`host run failed to start: ${err}`))
@@ -3924,7 +3911,8 @@ Create `web/e2e/manage.spec.ts`:
   import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs'
   import { tmpdir } from 'node:os'
   import { join } from 'node:path'
-  import { scratchEnv, startCollector, type Collector } from './collector'
+  import { startCollector, type Collector } from './collector'
+  import { scratchEnv } from './spawn'
   import { testHost, type TestHost } from './host'
 
   const PASSWORD = 'correct horse battery staple'
@@ -4097,11 +4085,100 @@ Create `web/e2e/manage.spec.ts`:
   }
   ```
 
+Create `web/e2e/spawn.ts`:
+
+  ```ts
+  // The one place the browser checks start a process (a guard in
+  // `src/security.test.ts` holds every other file of `e2e/` to that): the
+  // built `hennery` binary, always in `scratchEnv`, so nothing of the
+  // runner's own hennery setup, home or XDG directories reaches it.
+  import { spawn, type ChildProcess, type StdioOptions } from 'node:child_process'
+  import { join, resolve } from 'node:path'
+
+  export type { ChildProcess }
+
+  export const BIN = process.env.HENNERY_BIN ?? resolve(process.cwd(), '../target/debug/hennery')
+
+  /** The runner's environment without any `HENNERY_*` variable (a data or
+   *  log directory, a service flag: each would send the binary to the
+   *  runner's own files), with its home and XDG directories under `dir`. */
+  export function scratchEnv(dir: string): NodeJS.ProcessEnv {
+    const env = { ...process.env }
+    for (const key of Object.keys(env)) if (/^HENNERY_/.test(key)) delete env[key]
+    return {
+      ...env,
+      HOME: dir,
+      XDG_DATA_HOME: join(dir, 'xdg-data'),
+      XDG_CONFIG_HOME: join(dir, 'xdg-config'),
+      XDG_CACHE_HOME: join(dir, 'xdg-cache'),
+      XDG_STATE_HOME: join(dir, 'xdg-state'),
+    }
+  }
+
+  /** `hennery <args>` in `scratchEnv(dir)`, plus `extra` (which may not
+   *  name a `HENNERY_*` variable the test did not choose itself). */
+  export function spawnHennery(
+    args: string[],
+    dir: string,
+    extra: NodeJS.ProcessEnv,
+    stdio: StdioOptions = ['ignore', 'ignore', 'pipe'],
+  ): ChildProcess {
+    return spawn(BIN, args, { stdio, env: { ...scratchEnv(dir), ...extra } })
+  }
+  ```
+
+Create `web/src/e2e-spawn.test.ts`:
+
+  ```ts
+  // The browser checks start processes in one place only, `e2e/spawn.ts`,
+  // whose one `spawn` runs the binary in `scratchEnv`: a check that started
+  // its own would hand the binary the runner's home and any `HENNERY_*`
+  // variable, and with them the operator's own data and log directories.
+  import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+  import { join, relative } from 'node:path'
+  import { describe, expect, it } from 'vitest'
+
+  // Vitest runs from `web/`.
+  const ROOT = process.cwd()
+  const HELPER = join('e2e', 'spawn.ts')
+  // A call of any of these, not as a method of something else, or the module.
+  const STARTS = /(?<![.\w])(spawn|spawnSync|exec|execSync|execFile|execFileSync|fork)\s*\(|child_process/
+
+  function files(dir: string): string[] {
+    if (!existsSync(dir)) return []
+    return readdirSync(dir).flatMap((name) => {
+      const path = join(dir, name)
+      if (statSync(path).isDirectory()) return files(path)
+      return /\.(ts|tsx|js|mjs|cjs)$/.test(name) ? [path] : []
+    })
+  }
+
+  describe('the browser checks', () => {
+    const all = [...files(join(ROOT, 'e2e')), ...files(join(ROOT, 'scripts'))]
+
+    it('are all read', () => {
+      expect(all.map((f) => relative(ROOT, f))).toContain(HELPER)
+      expect(all.length).toBeGreaterThan(4)
+    })
+
+    it('start a process only through spawn.ts', () => {
+      const found = all.filter((f) => relative(ROOT, f) !== HELPER && STARTS.test(readFileSync(f, 'utf8')))
+      expect(found.map((f) => relative(ROOT, f))).toEqual([])
+    })
+
+    it('start it, there, only in scratchEnv', () => {
+      const helper = readFileSync(join(ROOT, HELPER), 'utf8')
+      expect(helper.match(/(?<![.\w])spawn\s*\(/g)).toHaveLength(1)
+      expect(helper).toContain('spawn(BIN, args, { stdio, env: { ...scratchEnv(dir), ...extra } })')
+    })
+  })
+  ```
+
 
 - [ ] **Step 2: Run the checks**
 
-  Run: `nix develop -c sh -c 'pnpm --dir web build && HENNERY_WEB_REQUIRE=1 cargo build -p hennery --locked && pnpm --dir web e2e'`
-  Expected: 17 Playwright tests pass (4b's 7 and these 10), and `ps -ax | grep -i 'hennery '` shows none of the run's processes afterwards.
+  Run: `nix develop -c sh -c 'pnpm --dir web test && pnpm --dir web build && HENNERY_WEB_REQUIRE=1 cargo build -p hennery --locked && pnpm --dir web e2e'`
+  Expected: 277 Vitest tests (the guard's 3 added), and 17 Playwright tests pass (4b's 7 and these 10), and `ps -ax | grep -i 'hennery '` shows none of the run's processes afterwards.
 
 - [ ] **Step 3: Revert-probes** (each must fail `pnpm --dir web e2e`; all were run)
   - drop `inert={…}` in `App.tsx`: the revoke check finds the page not inert;
@@ -4109,8 +4186,9 @@ Create `web/e2e/manage.spec.ts`:
   - drop `inert={…}`, the check of the attribute and the scripted focus: Shift+Tab from the dialog's first field lands on the page;
   - drop the paired `setStage` in `Pairing.tsx`: "Paired: e2e host" never shows;
   - drop the revoke dialog's sentence about running agents;
-  - the collector, then `host join` and `host run`, given the runner's environment again: the sentinel log directory gets files;
+  - `spawnHennery` given the runner's environment again: the sentinel log directory gets files;
   - (`code-kept`) keep the spent code in the Hosts screen's state and show it in the paired notice: the page still holds the spent code.
+  - and, each failing `e2e-spawn.test.ts`: a bare `spawn` in a spec; a bare `exec` in `host.ts`; the helper given `process.env`; a second `spawn` in the helper.
 
 - [ ] **Step 4: Commit**
 
