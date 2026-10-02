@@ -240,6 +240,7 @@ async fn a_passkey_registered_at_setup_signs_in_steps_up_and_is_removed() {
             token,
             password: OWNER_PASSWORD.into(),
             public_url: PUBLIC_URL.into(),
+            default_hat_name: None,
         })
         .send()
         .await

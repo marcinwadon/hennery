@@ -345,11 +345,27 @@ impl Operator {
     }
 
     /// Set the owner up with `password` and store `public_url` (kernel spec
-    /// §3.1), if `token` is the live setup token. The token is used up only
-    /// once the owner is committed. Hashes the password: call it on a
-    /// blocking thread. It takes no `check_password` slot: only the token's
-    /// holder gets as far as the hash, and the setup lock serialises it.
+    /// §3.1), if `token` is the live setup token, keeping the default hat's
+    /// name. See `set_up_naming_hat`.
     pub fn set_up(&self, token: &str, password: &str, public_url: &str, now: i64) -> Result<SetupOutcome> {
+        self.set_up_naming_hat(token, password, public_url, None, now)
+    }
+
+    /// Set the owner up with `password` and store `public_url` (kernel spec
+    /// §3.1), if `token` is the live setup token, and name the default hat
+    /// `hat_name` if one is given (plan 5a decision 1: the hat exists from
+    /// the first start). The token is used up only once the owner is
+    /// committed. Hashes the password: call it on a blocking thread. It
+    /// takes no `check_password` slot: only the token's holder gets as far
+    /// as the hash, and the setup lock serialises it.
+    pub fn set_up_naming_hat(
+        &self,
+        token: &str,
+        password: &str,
+        public_url: &str,
+        hat_name: Option<&str>,
+        now: i64,
+    ) -> Result<SetupOutcome> {
         // Held throughout, so two setups cannot both pass the checks.
         let mut setup = self.setup.lock().expect("setup lock");
         if self.is_set_up()? {
@@ -368,6 +384,9 @@ impl Operator {
             Ok(url) => url,
             Err(problem) => return Ok(SetupOutcome::Invalid(problem)),
         };
+        if let Some(problem) = hat_name.and_then(crate::hats::hat_name_problem) {
+            return Ok(SetupOutcome::Invalid(problem));
+        }
         let phc = password_auth::generate_hash(password);
         let owner_id = self.owner.clone();
         {
@@ -390,6 +409,16 @@ impl Operator {
                 "INSERT INTO settings(owner_id, key, value) VALUES (?1, ?2, ?3)",
                 params![owner_id, PUBLIC_URL_KEY, public_url.origin()],
             )?;
+            if let Some(name) = hat_name {
+                // The one hat there is before setup: the default for new
+                // hosts, which `up`'s host may already have.
+                let renamed = tx.execute(
+                    "UPDATE hats SET name = ?2 WHERE owner_id = ?1
+                         AND id = (SELECT value FROM settings WHERE owner_id = ?1 AND key = ?3)",
+                    params![owner_id, name.trim(), crate::hats::DEFAULT_HAT_KEY],
+                )?;
+                anyhow::ensure!(renamed == 1, "the owner has no default hat to name");
+            }
             tx.commit()?;
             // Still under the connection's lock: no reset lands between
             // the row and the cache (as `reset_public_url` does it too).

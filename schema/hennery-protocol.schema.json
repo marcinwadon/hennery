@@ -571,6 +571,24 @@
       ],
       "description": "The value of one config option (ACP `session/set_config_option`): a\nselect's value id, or a boolean toggle's state."
     },
+    "CreateHatRequest": {
+      "description": "`POST /api/hats`: a name, 1 to 64 printable characters, unique in any\ncase, and a `#rrggbb` colour (slate when absent).",
+      "properties": {
+        "colour": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name"
+      ],
+      "type": "object"
+    },
     "ElicitationAction": {
       "description": "The operator's answer to an elicitation (ACP `elicitation/create`).",
       "enum": [
@@ -653,6 +671,37 @@
         "kind",
         "body",
         "ts"
+      ],
+      "type": "object"
+    },
+    "HatItem": {
+      "description": "One hat (kernel spec §5.1): an entry of `GET /api/hats`, and the answer\nto its creation and its changes.",
+      "properties": {
+        "colour": {
+          "description": "`#rrggbb`, lowercase.",
+          "type": "string"
+        },
+        "created_at": {
+          "description": "RFC 3339.",
+          "type": "string"
+        },
+        "default_for_new_hosts": {
+          "description": "The hat newly paired hosts get as their default.",
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name",
+        "colour",
+        "created_at",
+        "default_for_new_hosts"
       ],
       "type": "object"
     },
@@ -782,6 +831,10 @@
           "description": "RFC 3339.",
           "type": "string"
         },
+        "default_hat_id": {
+          "description": "The hat of its sessions that no path rule claims (kernel spec §5.1).",
+          "type": "string"
+        },
         "host_id": {
           "type": "string"
         },
@@ -813,6 +866,7 @@
         "platform",
         "host_version",
         "capabilities",
+        "default_hat_id",
         "connected",
         "created_at"
       ],
@@ -1016,6 +1070,63 @@
       },
       "required": [
         "label"
+      ],
+      "type": "object"
+    },
+    "PathRuleInput": {
+      "description": "One rule of `PUT /api/hosts/{id}/path-rules`, as the operator typed it.",
+      "properties": {
+        "hat_id": {
+          "type": "string"
+        },
+        "prefix": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "prefix",
+        "hat_id"
+      ],
+      "type": "object"
+    },
+    "PathRuleItem": {
+      "description": "One path rule of a host (kernel spec §5.1, §5.2): sessions whose\ncanonical cwd is `prefix` or under it, by whole segments, belong to\n`hat_id`, unless a longer rule covers them too.",
+      "properties": {
+        "hat_id": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "prefix": {
+          "description": "Canonical: absolute, no `.` or `..`, no trailing slash.",
+          "type": "string"
+        },
+        "verified": {
+          "description": "The host resolved the prefix when the rule was saved; an unverified\nrule is the path as typed, normalised by its text alone.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "id",
+        "prefix",
+        "hat_id",
+        "verified"
+      ],
+      "type": "object"
+    },
+    "PathRulesRequest": {
+      "description": "`PUT /api/hosts/{id}/path-rules` (kernel spec §8): the host's whole set\nof rules, replacing the one before. The answer is the stored set,\nlongest prefix first.",
+      "properties": {
+        "rules": {
+          "items": {
+            "$ref": "#/$defs/PathRuleInput"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "rules"
       ],
       "type": "object"
     },
@@ -1611,6 +1722,13 @@
     "SetupRequest": {
       "description": "`POST /api/setup` (kernel spec §3.1): the one-time owner setup, with the\ntoken from the setup link. `Debug` leaves the password out.",
       "properties": {
+        "default_hat_name": {
+          "description": "The default hat's name (kernel spec §3.1), 1 to 64 printable\ncharacters. Absent: it stays \"Personal\".",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "password": {
           "type": "string"
         },
@@ -1711,6 +1829,48 @@
         "interrupted"
       ],
       "type": "string"
+    },
+    "UpdateHatRequest": {
+      "description": "`PATCH /api/hats/{id}`: absent fields stay as they are.\n`default_for_new_hosts` can only be `true`: a hat stops being that\ndefault when another takes its place.",
+      "properties": {
+        "colour": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "default_for_new_hosts": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
+    },
+    "UpdateHostRequest": {
+      "description": "`PATCH /api/hosts/{id}` (kernel spec §4.3, §8): rename a host, or change\nits default hat. Absent fields stay as they are.",
+      "properties": {
+        "default_hat_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",

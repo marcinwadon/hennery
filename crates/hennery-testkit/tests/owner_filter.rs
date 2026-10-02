@@ -37,12 +37,17 @@ const SOURCES: &[(&str, &str, usize)] = &[
     (
         "hennery-kernel/src/operator.rs",
         include_str!("../../hennery-kernel/src/operator.rs"),
-        21,
+        22,
     ),
     (
         "hennery-kernel/src/passkeys.rs",
         include_str!("../../hennery-kernel/src/passkeys.rs"),
         9,
+    ),
+    (
+        "hennery-kernel/src/hats.rs",
+        include_str!("../../hennery-kernel/src/hats.rs"),
+        13,
     ),
     (
         "hennery-kernel/src/hosts.rs",
@@ -153,14 +158,16 @@ fn string_literals(source: &str) -> Vec<String> {
     out
 }
 
-/// `const NAME: &str = "…";` in `source`, by name.
+/// `const NAME: &str = "…";` in `source`, by name, the literal on the
+/// declaration's line or, wrapped by rustfmt, on the next.
 fn str_consts(source: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for (at, _) in source.match_indices("const ") {
         let decl = &source[at + "const ".len()..];
-        let Some((name, rest)) = decl.split_once(": &str = ") else {
+        let Some((name, rest)) = decl.split_once(": &str =") else {
             continue;
         };
+        let rest = rest.trim_start();
         if !name.chars().all(|c| c.is_ascii_uppercase() || c == '_') || !rest.starts_with('"') {
             continue;
         }

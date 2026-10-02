@@ -112,6 +112,69 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         created_at INTEGER NOT NULL,
         last_used_at INTEGER);
     ",
+    // Hats (kernel spec §5.1; plan 5a decisions 1 to 3). Every owner gets
+    // its default hat here, before setup, as it got its owner row: `up`
+    // pairs its host before setup, and no host is ever without a default
+    // hat. The `default_hat_id` setting names the hat new hosts get.
+    // `hosts` is rebuilt (as in migration 4) to gain `default_hat_id`, NOT
+    // NULL, filled with its owner's default hat. A host's default hat and a
+    // rule's host and hat are the same owner's, by composite foreign keys
+    // (the review's A3). Rules are made last: they reference the rebuilt
+    // `hosts`.
+    //
+    // From now on, `hats` and `hosts` have children (`hosts` references
+    // `hats`; `hat_path_rules` references both), so neither can be rebuilt
+    // by the usual create/copy/drop/rename once child rows exist:
+    // `migrate_component` runs each step in an IMMEDIATE transaction with
+    // `foreign_keys=ON` (`db::configure`), and `PRAGMA foreign_keys` cannot
+    // change inside a transaction. New columns go in with `ADD COLUMN`; a
+    // rebuild needs a runner mode that turns foreign keys off before BEGIN
+    // and runs `PRAGMA foreign_key_check` before COMMIT.
+    "
+    CREATE TABLE hats (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL REFERENCES owners(id),
+        name TEXT NOT NULL,
+        colour TEXT NOT NULL CHECK (colour GLOB '#[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]'),
+        created_at INTEGER NOT NULL,
+        UNIQUE (id, owner_id));
+    INSERT INTO hats(id, owner_id, name, colour, created_at)
+        SELECT 'hat-' || lower(hex(randomblob(8))), id, 'Personal', '#64748b', unixepoch() FROM owners;
+    INSERT INTO settings(owner_id, key, value)
+        SELECT owner_id, 'default_hat_id', id FROM hats;
+    CREATE TABLE hosts_hatted (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL REFERENCES owners(id),
+        name TEXT NOT NULL,
+        public_key TEXT NOT NULL UNIQUE,
+        platform TEXT NOT NULL,
+        host_version TEXT NOT NULL,
+        capabilities TEXT NOT NULL DEFAULT '[]',
+        default_hat_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        last_seen_at INTEGER,
+        revoked_at INTEGER,
+        UNIQUE (id, owner_id),
+        FOREIGN KEY (default_hat_id, owner_id) REFERENCES hats(id, owner_id));
+    INSERT INTO hosts_hatted(id, owner_id, name, public_key, platform, host_version, capabilities,
+                             default_hat_id, created_at, last_seen_at, revoked_at)
+        SELECT h.id, h.owner_id, h.name, h.public_key, h.platform, h.host_version, h.capabilities,
+               (SELECT s.value FROM settings s WHERE s.owner_id = h.owner_id AND s.key = 'default_hat_id'),
+               h.created_at, h.last_seen_at, h.revoked_at
+        FROM hosts h;
+    DROP TABLE hosts;
+    ALTER TABLE hosts_hatted RENAME TO hosts;
+    CREATE TABLE hat_path_rules (
+        id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL REFERENCES owners(id),
+        host_id TEXT NOT NULL,
+        prefix TEXT NOT NULL,
+        hat_id TEXT NOT NULL,
+        verified INTEGER NOT NULL CHECK (verified IN (0, 1)),
+        UNIQUE (host_id, prefix),
+        FOREIGN KEY (host_id, owner_id) REFERENCES hosts(id, owner_id),
+        FOREIGN KEY (hat_id, owner_id) REFERENCES hats(id, owner_id));
+    ",
 ];
 
 #[cfg(test)]

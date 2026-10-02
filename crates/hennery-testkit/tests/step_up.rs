@@ -1,7 +1,8 @@
 //! Step-up (kernel spec §3.4, §11) and the signed-in sessions (§3.2):
-//! minting a pairing code, revoking a host and revoking a session need a
-//! password check within the last five minutes, and are refused without
-//! one, accepted within five minutes, and refused after.
+//! minting a pairing code, changing or revoking a host, replacing its path
+//! rules, changing a hat (plan 5a decisions 7 and 8) and revoking a session
+//! need a password check within the last five minutes, and are refused
+//! without one, accepted within five minutes, and refused after.
 
 use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::Operator;
@@ -81,18 +82,34 @@ async fn code_of(resp: reqwest::Response) -> (u16, String) {
 /// Kernel spec §3.4 and §11: every listed action refused without a fresh
 /// check, accepted within five minutes, and refused after.
 #[tokio::test]
-async fn minting_revoking_a_host_and_revoking_a_session_need_a_fresh_password_check() {
+async fn minting_changing_revoking_a_host_and_revoking_a_session_need_a_fresh_password_check() {
     let c = Collector::start().await;
     let other = c.session(0);
     let actions = [
-        ("POST", "/api/hosts/pairing-codes".to_string(), 201),
-        ("DELETE", "/api/hosts/host-9".to_string(), 404),
-        ("DELETE", format!("/api/auth/sessions/{}", c.id_of(&other)), 204),
+        ("POST", "/api/hosts/pairing-codes".to_string(), None, 201),
+        ("PATCH", "/api/hosts/host-9".to_string(), Some(r#"{"name":"x"}"#), 404),
+        (
+            "PUT",
+            "/api/hosts/host-9/path-rules".to_string(),
+            Some(r#"{"rules":[]}"#),
+            404,
+        ),
+        ("PATCH", "/api/hats/hat-9".to_string(), Some(r#"{"name":"x"}"#), 404),
+        ("DELETE", "/api/hosts/host-9".to_string(), None, 404),
+        ("DELETE", format!("/api/auth/sessions/{}", c.id_of(&other)), None, 204),
     ];
+    let send = |session: &str, method: &str, path: &str, body: Option<&str>| {
+        let req = c.request(session, method, path);
+        match body {
+            Some(body) => req.header("content-type", "application/json").body(body.to_string()),
+            None => req,
+        }
+        .send()
+    };
     // Five minutes after the last check: refused, and nothing happens.
     let stale = c.session(5 * 60);
-    for (method, path, _) in &actions {
-        let resp = c.request(&stale, method, path).send().await.unwrap();
+    for (method, path, body, _) in &actions {
+        let resp = send(&stale, method, path, *body).await.unwrap();
         assert_eq!(code_of(resp).await, (403, "step_up_required".into()), "{method} {path}");
     }
     assert!(c.state.operator.authenticate(&other, unix_now()).unwrap().is_some());
@@ -113,8 +130,8 @@ async fn minting_revoking_a_host_and_revoking_a_session_need_a_fresh_password_ch
     );
     // The right one does, for this session.
     assert_eq!(c.step_up(&stale, OWNER_PASSWORD).await.status(), 204);
-    for (method, path, status) in &actions {
-        let resp = c.request(&stale, method, path).send().await.unwrap();
+    for (method, path, body, status) in &actions {
+        let resp = send(&stale, method, path, *body).await.unwrap();
         assert_eq!(resp.status().as_u16(), *status, "{method} {path}");
     }
     assert!(c.state.operator.authenticate(&other, unix_now()).unwrap().is_none());

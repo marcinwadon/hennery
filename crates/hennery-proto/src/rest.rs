@@ -250,6 +250,8 @@ pub struct HostItem {
     pub host_version: String,
     /// From its latest accepted `hello`.
     pub capabilities: crate::frames::Capabilities,
+    /// The hat of its sessions that no path rule claims (kernel spec §5.1).
+    pub default_hat_id: String,
     /// Connected and reconciled: requests reach it now.
     pub connected: bool,
     /// RFC 3339.
@@ -270,12 +272,18 @@ pub struct SetupRequest {
     pub password: String,
     /// `https://…`, or `http://` to a loopback address; an origin only.
     pub public_url: String,
+    /// The default hat's name (kernel spec §3.1), 1 to 64 printable
+    /// characters. Absent: it stays "Personal".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub default_hat_name: Option<String>,
 }
 
 impl std::fmt::Debug for SetupRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SetupRequest")
             .field("public_url", &self.public_url)
+            .field("default_hat_name", &self.default_hat_name)
             .finish_non_exhaustive()
     }
 }
@@ -380,4 +388,85 @@ pub struct PasskeyItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "string | undefined", optional)]
     pub last_used_at: Option<String>,
+}
+
+/// `PATCH /api/hosts/{id}` (kernel spec §4.3, §8): rename a host, or change
+/// its default hat. Absent fields stay as they are.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct UpdateHostRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub default_hat_id: Option<String>,
+}
+
+/// One hat (kernel spec §5.1): an entry of `GET /api/hats`, and the answer
+/// to its creation and its changes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HatItem {
+    pub id: String,
+    pub name: String,
+    /// `#rrggbb`, lowercase.
+    pub colour: String,
+    /// RFC 3339.
+    pub created_at: String,
+    /// The hat newly paired hosts get as their default.
+    pub default_for_new_hosts: bool,
+}
+
+/// `POST /api/hats`: a name, 1 to 64 printable characters, unique in any
+/// case, and a `#rrggbb` colour (slate when absent).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct CreateHatRequest {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub colour: Option<String>,
+}
+
+/// `PATCH /api/hats/{id}`: absent fields stay as they are.
+/// `default_for_new_hosts` can only be `true`: a hat stops being that
+/// default when another takes its place.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct UpdateHatRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub colour: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "boolean | undefined", optional)]
+    pub default_for_new_hosts: Option<bool>,
+}
+
+/// One path rule of a host (kernel spec §5.1, §5.2): sessions whose
+/// canonical cwd is `prefix` or under it, by whole segments, belong to
+/// `hat_id`, unless a longer rule covers them too.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PathRuleItem {
+    pub id: String,
+    /// Canonical: absolute, no `.` or `..`, no trailing slash.
+    pub prefix: String,
+    pub hat_id: String,
+    /// The host resolved the prefix when the rule was saved; an unverified
+    /// rule is the path as typed, normalised by its text alone.
+    pub verified: bool,
+}
+
+/// One rule of `PUT /api/hosts/{id}/path-rules`, as the operator typed it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PathRuleInput {
+    pub prefix: String,
+    pub hat_id: String,
+}
+
+/// `PUT /api/hosts/{id}/path-rules` (kernel spec §8): the host's whole set
+/// of rules, replacing the one before. The answer is the stored set,
+/// longest prefix first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PathRulesRequest {
+    pub rules: Vec<PathRuleInput>,
 }
