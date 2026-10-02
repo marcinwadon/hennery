@@ -1414,6 +1414,8 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
  "webauthn-authenticator-rs",
  "webauthn-rs",
 ]

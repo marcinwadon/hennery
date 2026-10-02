@@ -112,18 +112,30 @@ async fn main() -> agent_client_protocol::Result<()> {
             {
                 let script = script.clone();
                 let announced = announced.clone();
-                async move |_req: NewSessionRequest, responder, cx| match script.new_session_error {
-                    Some(code) => responder.respond_with_error(agent_client_protocol::Error::new(code, "scripted")),
-                    None if script.config_in_update_only => {
-                        if let Some(options) = announced() {
-                            cx.send_notification(SessionNotification::new(
-                                "fake-session-1",
-                                SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
-                            ))?;
+                async move |req: NewSessionRequest, responder, cx| {
+                    log_session(&script, "session/new", &req);
+                    match script.new_session_error {
+                        Some(code) => {
+                            let message = if script.new_session_error_echoes {
+                                format!("scripted: {}", serde_json::to_string(&req.mcp_servers).unwrap())
+                            } else {
+                                "scripted".into()
+                            };
+                            responder.respond_with_error(agent_client_protocol::Error::new(code, message))
                         }
-                        responder.respond(NewSessionResponse::new("fake-session-1"))
+                        None if script.config_in_update_only => {
+                            if let Some(options) = announced() {
+                                cx.send_notification(SessionNotification::new(
+                                    "fake-session-1",
+                                    SessionUpdate::ConfigOptionUpdate(ConfigOptionUpdate::new(options)),
+                                ))?;
+                            }
+                            responder.respond(NewSessionResponse::new("fake-session-1"))
+                        }
+                        None => {
+                            responder.respond(NewSessionResponse::new("fake-session-1").config_options(announced()))
+                        }
                     }
-                    None => responder.respond(NewSessionResponse::new("fake-session-1").config_options(announced())),
                 }
             },
             agent_client_protocol::on_receive_request!(),
@@ -134,6 +146,7 @@ async fn main() -> agent_client_protocol::Result<()> {
                 let announced = announced.clone();
                 let forms = forms.clone();
                 async move |req: LoadSessionRequest, responder, cx| {
+                    log_session(&script, "session/load", &req);
                     // Owned locals: the captured fields sit behind `&mut
                     // self` (this handler is called via a shared/mut
                     // reference, reused for every `session/load`), so
@@ -186,6 +199,10 @@ async fn main() -> agent_client_protocol::Result<()> {
                 let catalogue = catalogue.clone();
                 async move |req: SetSessionConfigOptionRequest, responder, cx| {
                     log_switch(&script, &req);
+                    if let Some(message) = &script.config_error {
+                        return responder
+                            .respond_with_error(agent_client_protocol::Error::new(-32603, message.clone()));
+                    }
                     if script.hang_config {
                         // Keep the responder alive, unanswered, for good.
                         return cx.spawn(async move {
@@ -357,6 +374,10 @@ async fn main() -> agent_client_protocol::Result<()> {
                 let script = script.clone();
                 let forms = forms.clone();
                 async move |req: PromptRequest, responder, cx| {
+                    if let Some(message) = &script.prompt_error {
+                        return responder
+                            .respond_with_error(agent_client_protocol::Error::new(-32603, message.clone()));
+                    }
                     let script = script.clone();
                     let cx2 = cx.clone();
                     cancel.send_replace(false);
@@ -630,6 +651,21 @@ fn echo(ask: FakeAsk, answer: agent_client_protocol::Result<serde_json::Value>) 
         },
         FakeAsk::Unknown => format!("unknown:answered:{answer}"),
     }
+}
+
+/// One `session_log` line: the request as parsed, so an entry the schema
+/// could not take is missing from it, as from a real adapter's view.
+fn log_session(script: &FakeScript, method: &str, params: &impl serde::Serialize) {
+    let Some(path) = &script.session_log else {
+        return;
+    };
+    let line = serde_json::json!({ "method": method, "params": params });
+    let mut log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .expect("open the session log");
+    writeln!(log, "{line}").expect("write the session log");
 }
 
 /// Record a switch in the script's `config_log`, if it has one.

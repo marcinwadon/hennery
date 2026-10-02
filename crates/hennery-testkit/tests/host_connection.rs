@@ -788,7 +788,7 @@ async fn a_resume_queued_behind_a_close_attaches_a_fresh_adapter_after_the_close
 // Plan B2a: cancel and capabilities over the connection.
 
 /// Plan 6a adds `images`: image prompts, refused per agent when its
-/// `initialize` offers none (decision 2).
+/// `initialize` offers none (decision 2). Plan 8c adds `mcp_servers`.
 #[tokio::test]
 async fn a_host_announces_that_it_can_park_take_images_and_serve_projects() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -809,7 +809,8 @@ async fn a_host_announces_that_it_can_park_take_images_and_serve_projects() {
             Capability::Park,
             Capability::Images,
             Capability::Projects,
-            Capability::ResolvePath
+            Capability::ResolvePath,
+            Capability::McpServers
         ])
     );
 }
@@ -1344,4 +1345,104 @@ async fn a_start_or_resume_in_a_cwd_that_is_not_canonical_is_refused() {
     }
     send_frame(&mut sink, &frame).await;
     read_until(&mut stream, body_is("s1", "session_started")).await;
+}
+
+// Plan 8c: a session's MCP servers (the lane's L3).
+
+/// `frame` carrying one gateway server for its session, the isolation
+/// waived or not, for `agent`.
+fn with_servers(mut frame: CollectorFrame, agent: &str, waived: bool) -> CollectorFrame {
+    match &mut frame {
+        CollectorFrame::StartSession { mcp, agent: a, .. } | CollectorFrame::ResumeSession { mcp, agent: a, .. } => {
+            *a = agent.into();
+            mcp.mcp_servers = vec![hennery_proto::frames::McpServer::Http {
+                name: "hennery-notes".into(),
+                url: "https://hennery.example/mcp/notes".into(),
+                headers: vec![hennery_proto::frames::NameValue::new(
+                    "Authorization",
+                    "Bearer hst_0123456789abcdef",
+                )],
+            }];
+            mcp.isolation_waived = waived;
+        }
+        other => panic!("{other:?}"),
+    }
+    frame
+}
+
+#[tokio::test]
+async fn hello_announces_mcp_servers_and_how_each_agent_is_isolated() {
+    use hennery_host::profile::Profile;
+    use hennery_proto::frames::{Capability, McpIsolation};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut cfg = host_with_fake(addr, "mcp-hello", slow_fake());
+    cfg.agents.insert("claude".into(), slow_fake());
+    cfg.agents.insert("own-cli".into(), slow_fake());
+    cfg.profiles.insert("claude".into(), Profile::Claude);
+    cfg.profiles.insert("own-cli".into(), Profile::ClaudeOwnCli);
+    tokio::spawn(run(cfg));
+    let (tcp, _) = listener.accept().await.unwrap();
+    let ws = accept(tcp).await.unwrap();
+    let (_sink, mut stream) = ws.split();
+    let HostFrame::Hello {
+        capabilities,
+        mcp_isolation,
+        ..
+    } = read_host_frame(&mut stream).await
+    else {
+        panic!("expected hello");
+    };
+    assert!(capabilities.has(Capability::McpServers), "{capabilities:?}");
+    assert_eq!(
+        mcp_isolation.0,
+        [
+            ("claude".to_string(), McpIsolation::ClaudeStrict),
+            ("fake".to_string(), McpIsolation::None),
+            ("own-cli".to_string(), McpIsolation::None),
+        ]
+        .into_iter()
+        .collect()
+    );
+}
+
+/// Servers for an agent the host cannot keep to them are refused before
+/// anything is spawned, on a start and on a resume: never dropped, never
+/// passed. Waived, they pass; for an isolated agent, they pass unwaived.
+#[tokio::test]
+async fn servers_an_agent_cannot_be_kept_to_are_refused_before_any_spawn() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let spawns = dir.path().join("spawns");
+    let mut cfg = host_with_fake(addr, "mcp-refuse", counting_fake(&spawns));
+    cfg.agents.insert("claude".into(), counting_fake(&spawns));
+    cfg.profiles
+        .insert("claude".into(), hennery_host::profile::Profile::Claude);
+    tokio::spawn(run(cfg));
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+
+    for (request_id, frame) in [
+        ("r1", with_servers(start("r1", "s1"), "fake", false)),
+        (
+            "r2",
+            with_servers(resume("r2", "s1", 0, "fake-session-1"), "fake", false),
+        ),
+    ] {
+        send_frame(&mut sink, &frame).await;
+        match read_until(&mut stream, error_for(request_id)).await {
+            HostFrame::Error { code, message, .. } => {
+                assert_eq!(code, "mcp_isolation_unavailable", "{message}");
+                assert!(!message.contains("hst_0123456789abcdef"), "{message}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(!spawns.exists(), "an adapter was spawned");
+
+    send_frame(&mut sink, &with_servers(start("r3", "s2"), "fake", true)).await;
+    read_until(&mut stream, body_is("s2", "session_started")).await;
+    send_frame(&mut sink, &with_servers(start("r4", "s3"), "claude", false)).await;
+    read_until(&mut stream, body_is("s3", "session_started")).await;
+    assert_eq!(std::fs::read_to_string(&spawns).unwrap().lines().count(), 2);
 }

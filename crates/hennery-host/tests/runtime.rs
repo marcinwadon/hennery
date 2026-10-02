@@ -558,6 +558,10 @@ async fn a_host_start_installs_the_pinned_set_and_launches_from_its_absolute_pat
     assert!(claude.env.is_empty());
     assert!(prepared.agents.agents.contains_key("codex"));
     assert!(prepared.in_use.is_some());
+    // The pinned Claude is isolated; Codex is not, until plan 8h.
+    use hennery_host::profile::Profile;
+    assert_eq!(prepared.agents.profiles["claude"], Profile::Claude);
+    assert_eq!(prepared.agents.profiles["codex"], Profile::Generic);
 }
 
 #[tokio::test]
@@ -662,6 +666,11 @@ async fn a_set_without_its_cli_launches_that_agent_only_with_an_override() {
         [("CLAUDE_CODE_EXECUTABLE".to_string(), "/bin/sh".to_string())]
     );
     assert!(prepared.agents.agents["codex"].env.is_empty());
+    // An override is unverified isolation (ACP core §6).
+    assert_eq!(
+        prepared.agents.profiles["claude"],
+        hennery_host::profile::Profile::ClaudeOwnCli
+    );
     // The override gone (a hand edit, say): claude is unavailable.
     std::fs::write(dir.join("host.toml"), "").unwrap();
     let prepared = agents::prepare(&dir, Some(&selection), Some(&server.sources()), &quiet).await;
