@@ -2,9 +2,11 @@
 //! and a working hennery, one check at a time, each `ok`, `warn` or `fail`
 //! with a one-sentence fix. Doctor only reads (decision 2): it never
 //! repairs, pairs, logs in or installs; it opens no database and takes no
-//! lock a host, an install or `up` takes. Everything it reads of the machine
-//! comes through the service commands' `Context` and a `Runner`, which the
-//! tests replace.
+//! lock a host, an install or `up` takes. The one program of the user's it
+//! runs is the login shell, to compare its PATH with the service's (check
+//! 5), as `service install` does. Everything it reads of the machine comes
+//! through the service commands' `Context` and a `Runner`, which the tests
+//! replace.
 
 mod dirs;
 mod disk;
@@ -165,11 +167,13 @@ pub fn checks(doctor: &Doctor) -> Vec<Finding> {
     vec![
         runtime::binary_and_set(doctor),
         platform::platform(doctor),
+        service::service_path(doctor),
         env::environment(doctor),
         disk::disk(doctor),
         service::service(doctor),
         env::hennery_on_path(doctor),
         runtime::adapter_set(doctor),
+        service::host_directory(doctor),
         runtime::cli_overrides(doctor),
     ]
 }

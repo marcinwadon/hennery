@@ -1,7 +1,8 @@
-//! What doctor reads of other processes: whether one still runs the binary
-//! on disk. On Linux it comes from `/proc` under the context's root, so the
-//! tests give it a made-up `/proc`; on macOS from `proc_pidinfo` and
-//! `proc_pidpath`, about real processes only.
+//! What doctor reads of other processes: a process's parent, whether it
+//! still runs the binary on disk, and who holds an `flock`. On Linux all of
+//! it comes from `/proc` under the context's root, so the tests give it a
+//! made-up `/proc`; on macOS from `proc_pidinfo` and `proc_pidpath`, about
+//! real processes only.
 
 use crate::service::{Context, Platform};
 use std::os::unix::fs::MetadataExt;
@@ -11,6 +12,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 struct BsdInfo {
+    ppid: u32,
     /// Its start, as seconds and nanoseconds since the Unix epoch.
     start: (i64, i64),
 }
@@ -24,6 +26,7 @@ fn bsd_info(pid: u32) -> Option<BsdInfo> {
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
     let n = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
     (n == size).then(|| BsdInfo {
+        ppid: info.pbi_ppid,
         start: (info.pbi_start_tvsec as i64, info.pbi_start_tvusec as i64 * 1000),
     })
 }
@@ -47,6 +50,23 @@ fn bsd_path(pid: u32) -> Option<PathBuf> {
 #[cfg(not(target_os = "macos"))]
 fn bsd_path(_pid: u32) -> Option<PathBuf> {
     None
+}
+
+/// The fields after the command name of `/proc/<pid>/stat`: the name may
+/// hold spaces and parentheses, so the split is at the last `)`.
+fn proc_stat(cx: &Context, pid: u32) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(cx.root.join(format!("proc/{pid}/stat"))).ok()?;
+    let (_, rest) = text.rsplit_once(')')?;
+    Some(rest.split_whitespace().map(str::to_string).collect())
+}
+
+/// The parent of process `pid`.
+pub fn parent(cx: &Context, pid: u32) -> Option<u32> {
+    match cx.platform {
+        // The fields after the name: state, then ppid.
+        Platform::Linux => proc_stat(cx, pid)?.get(1)?.parse().ok(),
+        Platform::MacOs => bsd_info(pid).map(|info| info.ppid),
+    }
 }
 
 /// Whether process `pid` still runs the file `exe` is now (decision 7):
@@ -79,4 +99,34 @@ pub fn runs(cx: &Context, pid: u32, exe: &Path) -> Option<bool> {
             Some((on_disk.ctime(), on_disk.ctime_nsec()) <= start)
         }
     }
+}
+
+/// Linux's device number as `/proc/locks` prints it: `major:minor`, hex.
+pub fn linux_device(dev: u64) -> String {
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    format!("{major:02x}:{minor:02x}")
+}
+
+/// Who holds an `flock` on `file`, from Linux's `/proc/locks`, which takes
+/// no lock to read. Only a match is an answer: `None` when it cannot be
+/// read (not Linux, or no `/proc`) and when no line names `file`, since
+/// `/proc/locks` prints the superblock's device, which is not `stat`'s on
+/// btrfs subvolumes or overlayfs (the review's N1).
+pub fn flock_holder(cx: &Context, file: &Path) -> Option<u32> {
+    if cx.platform != Platform::Linux {
+        return None;
+    }
+    let meta = std::fs::metadata(file).ok()?;
+    let locks = std::fs::read_to_string(cx.root.join("proc/locks")).ok()?;
+    let id = format!("{}:{}", linux_device(meta.dev()), meta.ino());
+    // `1: FLOCK  ADVISORY  WRITE 4321 08:01:1234567 0 EOF`; a waiter's line
+    // has `->` after the number.
+    locks.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        match fields.as_slice() {
+            [_, "FLOCK", _, _, pid, file_id, ..] if *file_id == id => pid.parse().ok(),
+            _ => None,
+        }
+    })
 }

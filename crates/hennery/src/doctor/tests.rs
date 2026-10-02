@@ -1083,3 +1083,297 @@ fn a_replaced_binary_asks_for_a_restart() {
         assert_eq!(process::runs(&mac, me, &exe), Some(false));
     }
 }
+
+/// The installed PATH is read back from either file, and nothing else of
+/// it: another key of the plist's environment, or another line of the
+/// environment file, is never returned.
+#[test]
+fn the_service_path_is_read_back_alone() {
+    let awkward = "/a dir/with \"quotes\" & <tags> $HOME `tick` \\back:/usr/bin";
+    let argv = vec!["/bin/hennery".to_string(), "up".to_string()];
+    let plist = unit::plist(Role::Up, &argv, awkward, "/tmp/l");
+    assert_eq!(unit::plist_path(&plist).as_deref(), Some(awkward));
+    let env = unit::env_file(awkward);
+    assert_eq!(unit::env_file_path(&env).as_deref(), Some(awkward));
+
+    let extra = plist.replace(
+        "<key>EnvironmentVariables</key>\n\t<dict>\n",
+        "<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>TOKEN</key>\n\t\t<string>canary-7d-plist</string>\n",
+    );
+    assert_eq!(unit::plist_path(&extra).as_deref(), Some(awkward));
+    let extra = format!("TOKEN=\"canary-7d-env\"\n{env}");
+    assert_eq!(unit::env_file_path(&extra).as_deref(), Some(awkward));
+    // systemd takes the last assignment.
+    let later = format!("{env}PATH=\"/later/bin\"\n");
+    assert_eq!(unit::env_file_path(&later).as_deref(), Some("/later/bin"));
+    assert_eq!(unit::plist_path("<plist></plist>"), None);
+    assert_eq!(unit::env_file_path("PATH=unquoted\n"), None);
+}
+
+/// Executable stand-ins named `names` in a new directory `dir/name`.
+fn tools(dir: &Path, name: &str, names: &[&str]) -> PathBuf {
+    let bin = dir.join(name);
+    std::fs::create_dir_all(&bin).unwrap();
+    for tool in names {
+        std::fs::write(bin.join(tool), "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(bin.join(tool), std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    bin
+}
+
+/// The PATH `service install` would give `cx`'s login shell now.
+fn captured_path(cx: &Context) -> String {
+    let macos = cx.platform == Platform::MacOs;
+    let env = crate::service::path::shell_environment(&cx.env, &cx.shell, macos);
+    let captured =
+        crate::service::path::login_environment(&cx.shell, &env, crate::service::path::CAPTURE_TIMEOUT).unwrap();
+    crate::service::path::service_path(&captured, &cx.home, macos)
+        .unwrap()
+        .path
+}
+
+/// Check 5: `sh` or `git` missing fails, `rg` is optional; an entry that
+/// is gone or short-lived warns; a PATH the login shell no longer gives
+/// warns, naming the shell.
+#[test]
+fn a_service_path_without_sh_or_git_fails_and_drift_warns() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let fake = systemd("active", std::process::id(), "yes");
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let check5 = |path: &str| {
+        install(&cx, Role::Up, &cx.exe, &data, path);
+        let dirs = Dirs::by_contents(data.clone(), Found::Given);
+        line(&checked(&cx, dirs, &nothing, &data), 5).clone()
+    };
+    let no_git = tools(dir.path(), "no-git", &["sh"]);
+    let check = check5(&no_git.display().to_string());
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    assert!(check.summary.contains("git is not on the service's PATH"), "{check:?}");
+
+    let now = captured_path(&cx);
+    let both = tools(dir.path(), "both", &["sh", "git"]);
+    let check = check5(&format!("{}:{now}", both.display()));
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(
+        check
+            .summary
+            .contains("your login shell (/bin/sh) now gives another PATH"),
+        "{check:?}"
+    );
+    assert!(check.fix.contains("--shell"), "{check:?}");
+
+    // What this machine's login shell gives may lack git, or name a
+    // directory the scratch home lacks: only the drift is pinned here.
+    let check = check5(&now);
+    assert!(
+        check.summary.contains("your login shell (/bin/sh) gives the same PATH"),
+        "{check:?}"
+    );
+    assert!(!check.summary.contains("another PATH"), "{check:?}");
+
+    let check = check5(&format!("{now}:/nonexistent-7d:/nix/store/abc-tools/bin"));
+    assert!(
+        check
+            .summary
+            .contains("/nonexistent-7d on the service's PATH does not exist"),
+        "{check:?}"
+    );
+    assert!(check.summary.contains("Nix store"), "{check:?}");
+}
+
+/// Check 14: who holds `host.lock`. Nobody, or a dead pid's file, is no
+/// host; this process holding it is a host started by hand, the host
+/// service's own process, or not the service's; under `up`, its host is
+/// the one whose parent is `up`. Linux's `/proc/locks` is trusted over the
+/// file. A FIFO in its place is named, without blocking.
+#[test]
+fn host_lock_is_judged_by_who_holds_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let me = std::process::id();
+    let up = dir.path().join("up");
+    let host = paired(&up.join("host"));
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let check14 = |cx: &Context| {
+        let dirs = Dirs::by_contents(host.clone(), Found::Given);
+        line(&checked(cx, dirs, &nothing, &host), 14).clone()
+    };
+    assert_eq!(check14(&cx).summary, "no host runs on it");
+
+    let mut gone = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+    gone.wait().unwrap();
+    std::fs::write(host.join("host.lock"), format!("{}\n", gone.id())).unwrap();
+    assert_eq!(check14(&cx).summary, "no host runs on it");
+
+    let lock = crate::lock::acquire(&host, crate::lock::HOST_LOCK, "hennery host run").unwrap();
+    assert_eq!(
+        check14(&cx).summary,
+        format!("pid {me} serves it: a host started by hand")
+    );
+
+    let fake = systemd("active", me, "yes");
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    install(&cx, Role::Host, &cx.exe, &host, "/usr/bin:/bin");
+    assert_eq!(check14(&cx).summary, format!("the host service (pid {me}) serves it"));
+    let fake = systemd("active", 1, "yes");
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let check = check14(&cx);
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("not the host service's host"), "{check:?}");
+    std::fs::remove_file(cx.service_file(Role::Host)).unwrap();
+
+    let fake = systemd("active", 77, "yes");
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    install(&cx, Role::Up, &cx.exe, &up, "/usr/bin:/bin");
+    let proc = cx.root.join(format!("proc/{me}"));
+    std::fs::create_dir_all(&proc).unwrap();
+    std::fs::write(proc.join("stat"), format!("{me} (hennery) S 77 1 1 0\n")).unwrap();
+    assert_eq!(check14(&cx).summary, format!("up's host (pid {me}) serves it"));
+    std::fs::write(proc.join("stat"), format!("{me} (hennery) S 78 1 1 0\n")).unwrap();
+    assert_eq!(check14(&cx).status, Status::Warn);
+    std::fs::remove_file(cx.service_file(Role::Up)).unwrap();
+
+    // `/proc/locks` says who holds it, whatever the file says.
+    let meta = std::fs::metadata(host.join("host.lock")).unwrap();
+    let id = format!("{}:{}", process::linux_device(meta.dev()), meta.ino());
+    std::fs::write(
+        cx.root.join("proc/locks"),
+        format!("1: POSIX  ADVISORY  WRITE 1 00:00:1 0 EOF\n2: FLOCK  ADVISORY  WRITE 5555 {id} 0 EOF\n"),
+    )
+    .unwrap();
+    assert_eq!(check14(&cx).summary, "pid 5555 serves it: a host started by hand");
+    // No line names it (on btrfs or overlayfs the device differs): not an
+    // answer; the lock, really held, is found by the probe.
+    let other = format!("{}:{}", process::linux_device(meta.dev() + 1), meta.ino());
+    std::fs::write(
+        cx.root.join("proc/locks"),
+        format!("2: FLOCK  ADVISORY  WRITE 5555 {other} 0 EOF\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        check14(&cx).summary,
+        format!("pid {me} serves it: a host started by hand")
+    );
+    std::fs::remove_file(cx.root.join("proc/locks")).unwrap();
+    drop(lock);
+    // This live process's pid is still in the file, but nothing holds the
+    // lock: the probe finds it free, so no host runs. A dropped `flock` is
+    // released at once, but a process forked meanwhile by another test
+    // holds a copy of the descriptor until it execs: wait for that.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while check14(&cx).summary != "no host runs on it" {
+        assert!(std::time::Instant::now() < deadline, "{:?}", check14(&cx));
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    std::fs::remove_file(host.join("host.lock")).unwrap();
+    let fifo = std::ffi::CString::new(host.join("host.lock").into_os_string().into_encoded_bytes()).unwrap();
+    // SAFETY: mkfifo(3) with a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let check = check14(&cx);
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("is not a regular file"), "{check:?}");
+}
+
+/// Check 14: a host directory or key other users can read warns, told by
+/// their modes alone: the key is never read.
+#[test]
+fn a_readable_host_directory_or_key_warns_by_mode_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let host = paired(&dir.path().join("host"));
+    std::fs::write(host.join("host.key"), "canary-7d-key\n").unwrap();
+    std::fs::set_permissions(host.join("host.key"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dirs = Dirs::by_contents(host.clone(), Found::Given);
+    let findings = checked(&cx, dirs.clone(), &nothing, &host);
+    assert_eq!(line(&findings, 14).status, Status::Ok);
+
+    std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(host.join("host.key"), std::fs::Permissions::from_mode(0o644)).unwrap();
+    let findings = checked(&cx, dirs.clone(), &nothing, &host);
+    let check = line(&findings, 14);
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(
+        check.fix.contains("chmod 700") && check.fix.contains("chmod 600"),
+        "{check:?}"
+    );
+    assert!(!report(&dirs, &findings).contains("canary-7d-key"));
+
+    // A key that is a link is judged by what it links to.
+    std::fs::set_permissions(&host, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let kept = dir.path().join("kept.key");
+    std::fs::rename(host.join("host.key"), &kept).unwrap();
+    std::fs::set_permissions(&kept, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(&kept, host.join("host.key")).unwrap();
+    let findings = checked(&cx, dirs, &nothing, &host);
+    assert_eq!(line(&findings, 14).status, Status::Ok, "{findings:?}");
+}
+
+/// A process's parent: from `/proc/<pid>/stat` on Linux (here a made-up
+/// one, whose name holds a space and parentheses), from the kernel on
+/// macOS.
+#[test]
+fn the_parent_of_a_process_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let proc = cx.root.join("proc/4242");
+    std::fs::create_dir_all(&proc).unwrap();
+    std::fs::write(proc.join("stat"), "4242 (hennery (up)) S 77 4242 4242 0 -1 4194560\n").unwrap();
+    assert_eq!(process::parent(&cx, 4242), Some(77));
+    assert_eq!(process::parent(&cx, 4243), None);
+    if cfg!(target_os = "macos") {
+        let mac = machine(dir.path(), Platform::MacOs, &fake);
+        // SAFETY: getppid(2) cannot fail.
+        let parent = unsafe { libc::getppid() } as u32;
+        assert_eq!(process::parent(&mac, std::process::id()), Some(parent));
+    }
+}
+
+/// No secret reaches the report: not another key of the plist's
+/// environment, another line of the environment file, the login shell's
+/// exports, the host key, or what `launchctl print` lists.
+#[test]
+fn no_secret_reaches_the_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let host = paired(&data.join("host"));
+    std::fs::write(host.join("host.key"), "canary-7d-key\n").unwrap();
+    std::fs::create_dir_all(dir.path().join("home")).unwrap();
+    std::fs::write(
+        dir.path().join("home/.profile"),
+        "export HENNERY_CANARY=canary-7d-shell\n",
+    )
+    .unwrap();
+    for platform in [Platform::MacOs, Platform::Linux] {
+        let fake = match platform {
+            Platform::MacOs => launchd_running(std::process::id()),
+            Platform::Linux => systemd("active", std::process::id(), "yes"),
+        };
+        let cx = machine(dir.path(), platform, &fake);
+        install(&cx, Role::Up, &cx.exe, &data, "/usr/bin:/bin");
+        match platform {
+            Platform::MacOs => {
+                let file = cx.service_file(Role::Up);
+                let text = std::fs::read_to_string(&file).unwrap().replace(
+                    "<key>EnvironmentVariables</key>\n\t<dict>\n",
+                    "<key>EnvironmentVariables</key>\n\t<dict>\n\t\t<key>TOKEN</key>\n\t\t<string>canary-7d-plist</string>\n",
+                );
+                std::fs::write(&file, text).unwrap();
+            }
+            Platform::Linux => {
+                let text = std::fs::read_to_string(cx.env_file()).unwrap();
+                std::fs::write(cx.env_file(), format!("TOKEN=\"canary-7d-env\"\n{text}")).unwrap();
+            }
+        }
+        let dirs = Dirs::discover(&cx, None).unwrap();
+        let findings = checked(&cx, dirs.clone(), &nothing, &data);
+        let text = report(&dirs, &findings);
+        assert!(!text.contains("canary-7d"), "{platform:?}: {text}");
+        std::fs::remove_file(cx.service_file(Role::Up)).unwrap();
+    }
+}
