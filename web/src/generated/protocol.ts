@@ -259,7 +259,7 @@ agent_session_id: string, model?: string | null, mode?: string | null, axes?: { 
 /**
  * ACP ContentBlocks, built by the frontend.
  */
-content: unknown[], } | { "type": "cancel_turn", request_id: string, session_id: string, turn_id: string, } | { "type": "set_config", request_id: string, session_id: string, config_id: string, value: ConfigValue, } | { "type": "answer_permission", request_id: string, session_id: string, pending_id: string, option_id: string, } | { "type": "answer_elicitation", request_id: string, session_id: string, pending_id: string, action: ElicitationAction, content?: unknown, } | { "type": "ack", session_id: string, ack_seq: number, } | { "type": "resolve_path", request_id: string, path: string, } | { "type": "park_session", request_id: string, session_id: string, } | { "type": "close_session", request_id: string, session_id: string, } | { "type": "list_projects", request_id: string, } | { "type": "browse_directory", request_id: string, path: string, };
+content: unknown[], } | { "type": "cancel_turn", request_id: string, session_id: string, turn_id: string, } | { "type": "set_config", request_id: string, session_id: string, config_id: string, value: ConfigValue, } | { "type": "answer_permission", request_id: string, session_id: string, pending_id: string, option_id: string, } | { "type": "answer_elicitation", request_id: string, session_id: string, pending_id: string, action: ElicitationAction, content?: unknown, } | { "type": "ack", session_id: string, ack_seq: number, } | { "type": "resolve_path", request_id: string, path: string, } | { "type": "park_session", request_id: string, session_id: string, } | { "type": "close_session", request_id: string, session_id: string, } | { "type": "list_projects", request_id: string, } | { "type": "browse_directory", request_id: string, path: string, } | { "type": "forget_hat", hat_id: string, };
 
 /**
  * `POST /api/sessions` (ACP core §9): `{host_id, agent, cwd, model?, mode?, axes?}`.
@@ -745,7 +745,54 @@ created_at: string,
 /**
  * The hat newly paired hosts get as their default.
  */
-default_for_new_hosts: boolean, };
+default_for_new_hosts: boolean, 
+/**
+ * A purge of it began and has not finished (plan 9c A12): it is
+ * frozen, so nothing starts, resumes or moves in or out of it, and a
+ * `POST /api/hats/{id}/purge` again resumes the purge.
+ */
+purging: boolean, };
+
+export type PurgePreview = { hat_id: string, 
+/**
+ * A purge began and has not finished: a purge resumes it.
+ */
+purging: boolean, 
+/**
+ * The hat's sessions, in every lifecycle and on every host.
+ */
+sessions: number, 
+/**
+ * Those `starting` or `active` on a host the collector reaches: a
+ * purge is refused (409 `sessions_running`) until they are closed.
+ */
+running: Array<string>, 
+/**
+ * The path rules that name the hat, on every host.
+ */
+rules: number, 
+/**
+ * The project recents of the hat, on every host.
+ */
+recents: number, 
+/**
+ * The sessions of no hat (from before hats, when no default hat could
+ * be found), the newest first and at most 100: a purge never deletes
+ * them, so they are listed for the operator to look at (plan 5c).
+ */
+unassigned: Array<SessionItem>, 
+/**
+ * How many sessions of no hat there are in all.
+ */
+unassigned_count: number, };
+
+export type PurgeResult = { sessions: number, rules: number, 
+/**
+ * Sessions closed here, collector-side, while their host may still run
+ * them (presumed parked, or starting or active on a host away): that
+ * host closes them when it is back.
+ */
+unconfirmed: Array<string>, };
 
 /**
  * `POST /api/hats`: a name, 1 to 64 printable characters, unique in any

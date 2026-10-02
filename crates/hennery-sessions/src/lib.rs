@@ -85,6 +85,13 @@ impl hennery_kernel::lifecycle::LifecycleHooks for AppState {
         }
         Ok(())
     }
+
+    /// The session module's part of a hat's purge (plan 9c decision 10d):
+    /// `hats::purge_sessions`, which the purge route calls itself for what
+    /// it deleted.
+    fn on_hat_purged(&self, hat_id: &str) -> anyhow::Result<()> {
+        hats::purge_sessions(self, hat_id).map(drop)
+    }
 }
 
 /// Serve until `state.shutdown` is cancelled.

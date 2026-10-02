@@ -393,6 +393,18 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                                 notify(&state, &edge);
                             }
                         }
+                        // Every purged hat, after every reconciled handshake
+                        // and for good (plan 9c decision 12, A7), so a host
+                        // away for any time still forgets it. A failed read
+                        // is retried by the next handshake.
+                        match state.hosts.purged_hats() {
+                            Ok(hats) => {
+                                for hat_id in hats {
+                                    let _ = tx.send(CollectorFrame::ForgetHat { hat_id });
+                                }
+                            }
+                            Err(err) => tracing::warn!(%host_id, error = %err, "reading the purged hats failed"),
+                        }
                         tracing::info!(%host_id, "host reconciled");
                     }
                     Err(err) => {

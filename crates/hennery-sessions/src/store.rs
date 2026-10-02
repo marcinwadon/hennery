@@ -400,6 +400,9 @@ pub enum ResumeRequest {
     /// Its path now resolves to another hat than the one it belongs to
     /// (ACP core §4.3): the stored hat. Nothing changed.
     HatMismatch(String),
+    /// The hat it belongs to is frozen for its purge (plan 9c decision
+    /// 10c): nothing changed.
+    HatPurging,
     NotFound,
 }
 
@@ -415,7 +418,20 @@ pub enum Reassign {
     Attached(String),
     /// No such hat of the owner's.
     UnknownHat,
+    /// The hat it is in, or the one it would move to, is frozen for its
+    /// purge (plan 9c A3): nothing changed.
+    HatPurging,
     NotFound,
+}
+
+/// A kept session of a hat, as a purge judges it (plan 9c decision 10b):
+/// whether it may have an adapter the collector can reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HatSession {
+    pub id: String,
+    pub lifecycle: String,
+    pub presumed_parked: bool,
+    pub host_id: String,
 }
 
 /// The state a delete's route judged to have no adapter it can reach
@@ -1239,6 +1255,17 @@ fn conflict_already_recorded(
     Ok(false)
 }
 
+/// Whether `owner` froze `hat_id` for its purge (plan 9c decision 10c): the
+/// kernel's `purged_hats`, read on the caller's transaction, so a freeze
+/// committed before it is seen and one committed after it fails its write.
+fn hat_frozen(tx: &Transaction<'_>, owner: &str, hat_id: &str) -> Result<bool> {
+    Ok(tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM purged_hats WHERE hat_id = ?1 AND owner_id = ?2)",
+        [hat_id, owner],
+        |r| r.get(0),
+    )?)
+}
+
 /// How a checkpoint after a delete is retried while a reader holds the
 /// WAL (plan 9a A8): every `retry`, `fast_retries` times, then (logged once)
 /// every `slow_retry`, until it completes. The defaults are a second, five
@@ -1429,7 +1456,10 @@ impl Store {
     }
 
     /// A new session, `starting`, in `hat_id` as `rule_id` decided (none:
-    /// its host's default hat). `cwd` is canonical on its host.
+    /// its host's default hat). `cwd` is canonical on its host. `false`,
+    /// and nothing stored, if the hat is frozen for its purge: the start
+    /// resolved its hat before the freeze (plan 9c decision 10c). One
+    /// statement, so the check and the insert cannot be told apart.
     pub fn create_session(
         &self,
         id: &str,
@@ -1438,15 +1468,16 @@ impl Store {
         cwd: &str,
         hat_id: &str,
         rule_id: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let ts = now();
-        self.conn().execute(
+        let created = self.conn().execute(
             "INSERT INTO sessions(id, host_id, agent, cwd, hat_id, hat_rule_id, lifecycle, created_at, last_event_at,
                                   owner_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'starting', ?7, ?7, ?8)",
+             SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'starting', ?7, ?7, ?8
+             WHERE NOT EXISTS (SELECT 1 FROM purged_hats WHERE hat_id = ?5 AND owner_id = ?8)",
             params![id, host_id, agent, cwd, hat_id, rule_id, ts, self.owner],
         )?;
-        Ok(())
+        Ok(created == 1)
     }
 
     /// Fail a session's start; a tombstone is left alone (plan 9a A1).
@@ -1613,6 +1644,59 @@ impl Store {
             sessions: sessions.into_iter().map(SessionItem::bounded).collect(),
             next_cursor,
         })
+    }
+
+    /// Every kept session of `hat_id` (plan 9c decisions 10b and 10d), of
+    /// every lifecycle and host, by id: those re-assigned into it included
+    /// (the 5d hand-on), tombstones not.
+    pub fn hat_sessions(&self, hat_id: &str) -> Result<Vec<HatSession>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, lifecycle, presumed_parked, host_id FROM sessions
+             WHERE hat_id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2 ORDER BY id",
+        )?;
+        let rows = stmt.query_map([hat_id, &self.owner], |r| {
+            Ok(HatSession {
+                id: r.get(0)?,
+                lifecycle: r.get(1)?,
+                presumed_parked: r.get(2)?,
+                host_id: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// The kept sessions of no hat (`hat_id = ''`: from before hats, when
+    /// no default hat could be found), the newest first, at most `limit`,
+    /// each `bounded`; and how many there are (plan 9c decision 11, the 5c
+    /// hand-on). A purge never deletes them: they are listed for the
+    /// operator.
+    pub fn unassigned(&self, limit: u32) -> Result<(Vec<SessionItem>, u64)> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {SESSION_ITEM_COLUMNS} FROM sessions
+             WHERE hat_id = '' AND lifecycle <> 'deleted' AND owner_id = ?1
+             ORDER BY last_event_at DESC, id DESC LIMIT ?2"
+        ))?;
+        let rows = stmt.query_map(params![self.owner, limit], read_item)?;
+        let items = rows
+            .map(|row| row.map(SessionItem::bounded))
+            .collect::<rusqlite::Result<_>>()?;
+        let count: i64 = conn.query_row(
+            "SELECT count(*) FROM sessions WHERE hat_id = '' AND lifecycle <> 'deleted' AND owner_id = ?1",
+            [&self.owner],
+            |r| r.get(0),
+        )?;
+        Ok((items, count as u64))
+    }
+
+    /// Fold the WAL back into the database and truncate it (plan 9a A8),
+    /// best-effort: after a purge, whose kernel steps write pages of their
+    /// own. An in-memory store has none.
+    pub fn checkpoint(&self) {
+        if let Some(checkpoints) = &self.checkpoints {
+            checkpoints.run();
+        }
     }
 
     /// The session's catalogue (ACP core §9): its config options and
@@ -2258,6 +2342,11 @@ impl Store {
         let Some(agent_session_id) = agent_session_id else {
             return Ok(ResumeRequest::NoRecord);
         };
+        // Before the mismatch: the freeze took the hat's rules, so its
+        // path resolves to another hat by now.
+        if hat_frozen(&tx, &self.owner, &stored_hat)? {
+            return Ok(ResumeRequest::HatPurging);
+        }
         if stored_hat != hat_id {
             return Ok(ResumeRequest::HatMismatch(stored_hat));
         }
@@ -2329,6 +2418,9 @@ impl Store {
             .is_some();
         if !known {
             return Ok(Reassign::UnknownHat);
+        }
+        if hat_frozen(&tx, &self.owner, &from)? || hat_frozen(&tx, &self.owner, hat_id)? {
+            return Ok(Reassign::HatPurging);
         }
         if from == hat_id {
             return Ok(Reassign::Unchanged);

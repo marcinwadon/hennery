@@ -133,6 +133,9 @@ fn every_collector_frame_round_trips() {
             request_id: "r".into(),
             path: "~/Projects".into(),
         },
+        CollectorFrame::ForgetHat {
+            hat_id: "hat-0123456789abcdef".into(),
+        },
     ];
     for f in frames {
         let back: CollectorFrame = serde_json::from_str(&serde_json::to_string(&f).unwrap()).unwrap();
@@ -801,4 +804,17 @@ fn resolve_path_and_its_answer_use_the_spec_field_names() {
     });
     assert_eq!(serde_json::to_value(&answer).unwrap(), wire);
     assert_eq!(serde_json::from_value::<HostFrame>(wire).unwrap(), answer);
+}
+
+/// Plan 9c decision 12 (ACP core §3.3): the collector tells a host after
+/// each reconciled handshake which hats are purged; it is no probe.
+#[test]
+fn forget_hat_uses_the_spec_field_names_and_is_no_probe() {
+    let frame = CollectorFrame::ForgetHat {
+        hat_id: "hat-0123456789abcdef".into(),
+    };
+    let wire = json!({"type": "forget_hat", "hat_id": "hat-0123456789abcdef"});
+    assert_eq!(serde_json::to_value(&frame).unwrap(), wire);
+    assert_eq!(serde_json::from_value::<CollectorFrame>(wire).unwrap(), frame);
+    assert!(frame.probe_capability().is_err());
 }

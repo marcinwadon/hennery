@@ -627,6 +627,23 @@
             "path"
           ],
           "type": "object"
+        },
+        {
+          "description": "A hat the operator purged (kernel spec §5.5; plan 9c decisions 10\nand 12, A7): sent after every reconciled handshake, one per purged\nhat, for good. The host forgets what it keeps for the hat (its\ncomposed agent home, plan 8). No answer; a host that does not know\nthe frame logs and ignores it, so no capability is needed.",
+          "properties": {
+            "hat_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "forget_hat",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "hat_id"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -893,6 +910,10 @@
         },
         "name": {
           "type": "string"
+        },
+        "purging": {
+          "description": "A purge of it began and has not finished (plan 9c A12): it is\nfrozen, so nothing starts, resumes or moves in or out of it, and a\n`POST /api/hats/{id}/purge` again resumes the purge.",
+          "type": "boolean"
         }
       },
       "required": [
@@ -900,7 +921,8 @@
         "name",
         "colour",
         "created_at",
-        "default_for_new_hosts"
+        "default_for_new_hosts",
+        "purging"
       ],
       "type": "object"
     },
@@ -1939,6 +1961,95 @@
       },
       "required": [
         "turn_id"
+      ],
+      "type": "object"
+    },
+    "PurgePreview": {
+      "description": "`GET /api/hats/{id}/purge` (kernel spec §5.5; plan 9c decision 11, A13):\nwhat a purge of the hat would delete, read only. Tombstones are not\ncounted.",
+      "properties": {
+        "hat_id": {
+          "type": "string"
+        },
+        "purging": {
+          "description": "A purge began and has not finished: a purge resumes it.",
+          "type": "boolean"
+        },
+        "recents": {
+          "description": "The project recents of the hat, on every host.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rules": {
+          "description": "The path rules that name the hat, on every host.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "running": {
+          "description": "Those `starting` or `active` on a host the collector reaches: a\npurge is refused (409 `sessions_running`) until they are closed.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "sessions": {
+          "description": "The hat's sessions, in every lifecycle and on every host.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unassigned": {
+          "description": "The sessions of no hat (from before hats, when no default hat could\nbe found), the newest first and at most 100: a purge never deletes\nthem, so they are listed for the operator to look at (plan 5c).",
+          "items": {
+            "$ref": "#/$defs/SessionItem"
+          },
+          "type": "array"
+        },
+        "unassigned_count": {
+          "description": "How many sessions of no hat there are in all.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "hat_id",
+        "purging",
+        "sessions",
+        "running",
+        "rules",
+        "recents",
+        "unassigned",
+        "unassigned_count"
+      ],
+      "type": "object"
+    },
+    "PurgeResult": {
+      "description": "200 to `POST /api/hats/{id}/purge` (plan 9c decision 10, A13): what\nthis purge deleted. A purge that resumes one that stopped counts only\nwhat it deleted itself.",
+      "properties": {
+        "rules": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sessions": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "unconfirmed": {
+          "description": "Sessions closed here, collector-side, while their host may still run\nthem (presumed parked, or starting or active on a host away): that\nhost closes them when it is back.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "sessions",
+        "rules",
+        "unconfirmed"
       ],
       "type": "object"
     },

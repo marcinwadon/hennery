@@ -15,7 +15,7 @@
 use crate::hosts::{Hosts, is_format_char, is_valid_display_field};
 use crate::secret::random_bytes;
 use anyhow::Result;
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use std::collections::{BTreeSet, HashMap};
 
 /// The colour a hat gets when none is given: slate, neither a warning nor
@@ -42,6 +42,9 @@ pub struct HatRecord {
     pub created_at: i64,
     /// The hat newly paired hosts get as their default (kernel spec §4.1).
     pub default_for_new_hosts: bool,
+    /// Its purge began and has not finished: it is frozen (plan 9c
+    /// decision 10c, A12).
+    pub purging: bool,
 }
 
 /// One stored path rule of a host (kernel spec §5.1).
@@ -89,8 +92,24 @@ pub enum HatChange {
     NotFound,
     /// Another hat of the owner has this name, in any case.
     NameTaken,
+    /// The hat is frozen for its purge, and cannot become the default for
+    /// new hosts (plan 9c A2); nothing changed.
+    Purging,
     /// The request is not acceptable (why); nothing changed.
     Invalid(String),
+}
+
+/// The outcome of `Hosts::begin_purge`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PurgeStart {
+    /// The hat is frozen (now, or by a purge before): this many of its path
+    /// rules went now.
+    Frozen { rules: u64 },
+    /// No such hat of the owner's, or its purge is done.
+    NotFound,
+    /// It is the hat new hosts get, or a host's default hat, a revoked
+    /// host's included (plan 9c decision 10a, A2): nothing changed.
+    IsDefault,
 }
 
 /// The outcome of `Hosts::replace_path_rules`.
@@ -231,11 +250,14 @@ pub(crate) fn rules_of(conn: &rusqlite::Connection, owner: &str, host_id: &str) 
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// Whether `hat_id` is one of `owner`'s hats.
+/// Whether `hat_id` is one of `owner`'s hats and not frozen for its purge:
+/// a frozen hat is no hat for a rule or a host's default (plan 9c decision
+/// 10c, A2).
 fn hat_exists(conn: &rusqlite::Connection, owner: &str, hat_id: &str) -> Result<bool> {
     Ok(conn
         .query_row(
-            "SELECT 1 FROM hats WHERE id = ?1 AND owner_id = ?2",
+            "SELECT 1 FROM hats h WHERE h.id = ?1 AND h.owner_id = ?2
+                 AND NOT EXISTS (SELECT 1 FROM purged_hats p WHERE p.hat_id = h.id AND p.owner_id = ?2)",
             [hat_id, owner],
             |_| Ok(()),
         )
@@ -243,9 +265,36 @@ fn hat_exists(conn: &rusqlite::Connection, owner: &str, hat_id: &str) -> Result<
         .is_some())
 }
 
+/// Whether `owner` froze `hat_id` for its purge (plan 9c decision 10c): its
+/// `purged_hats` row, which outlives the hat's (A7).
+fn frozen(conn: &rusqlite::Connection, owner: &str, hat_id: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM purged_hats WHERE hat_id = ?1 AND owner_id = ?2",
+            [hat_id, owner],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Whether `hat_id` is the hat `owner`'s new hosts get or the default hat of
+/// any of their hosts, a revoked one's included: the hosts' foreign key
+/// holds it either way (plan 9c decision 10a, A2).
+fn is_default(conn: &rusqlite::Connection, owner: &str, hat_id: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM settings WHERE owner_id = ?2 AND key = ?3 AND value = ?1)
+             OR EXISTS (SELECT 1 FROM hosts WHERE owner_id = ?2 AND default_hat_id = ?1)",
+        params![hat_id, owner, DEFAULT_HAT_KEY],
+        |r| r.get(0),
+    )?)
+}
+
 fn hats_of(conn: &rusqlite::Connection, owner: &str) -> Result<Vec<HatRecord>> {
     let mut stmt = conn.prepare(
-        "SELECT h.id, h.name, h.colour, h.created_at, h.id = s.value FROM hats h
+        "SELECT h.id, h.name, h.colour, h.created_at, h.id = s.value,
+                EXISTS (SELECT 1 FROM purged_hats p WHERE p.hat_id = h.id AND p.owner_id = ?1)
+         FROM hats h
          LEFT JOIN settings s ON s.owner_id = h.owner_id AND s.key = ?2
          WHERE h.owner_id = ?1 ORDER BY h.created_at, h.id",
     )?;
@@ -256,6 +305,7 @@ fn hats_of(conn: &rusqlite::Connection, owner: &str) -> Result<Vec<HatRecord>> {
             colour: r.get(2)?,
             created_at: r.get(3)?,
             default_for_new_hosts: r.get::<_, Option<bool>>(4)?.unwrap_or(false),
+            purging: r.get(5)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -337,8 +387,12 @@ impl Hosts {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let hats = hats_of(&tx, self.owner_id())?;
-        if !hats.iter().any(|hat| hat.id == hat_id) {
+        let Some(hat) = hats.iter().find(|hat| hat.id == hat_id) else {
             return Ok(HatChange::NotFound);
+        };
+        // Its name and colour still change; it is still listed (A12).
+        if default_for_new_hosts == Some(true) && hat.purging {
+            return Ok(HatChange::Purging);
         }
         if let Some(name) = name {
             if name_taken(&hats, name, Some(hat_id)) {
@@ -529,6 +583,93 @@ impl Hosts {
         }
         tx.commit()?;
         Ok(HostChange::Done)
+    }
+
+    /// Whether `hat_id` is the hat new hosts get or a host's default hat, a
+    /// revoked host's included (plan 9c decision 10a): what a purge refuses.
+    pub fn is_default_hat(&self, hat_id: &str) -> Result<bool> {
+        is_default(&self.conn(), self.owner_id(), hat_id)
+    }
+
+    /// Whether a purge of `hat_id` began (plan 9c decision 10c): from then on
+    /// nothing starts, resumes or moves in or out of it, and it is no hat for
+    /// a rule or a host's default. Stays true once the purge is done (A7).
+    pub fn is_frozen(&self, hat_id: &str) -> Result<bool> {
+        frozen(&self.conn(), self.owner_id(), hat_id)
+    }
+
+    /// Freeze `hat_id` for its purge (kernel spec §5.5; plan 9c decision
+    /// 10c), in one transaction that re-checks it is no default (A2):
+    /// record it in `purged_hats`, unless a purge before did, and delete
+    /// every rule that names it, on every host. Again on a frozen hat it
+    /// freezes again, and takes any rule that names it, so a purge that
+    /// stopped resumes from here.
+    pub fn begin_purge(&self, hat_id: &str, now: i64) -> Result<PurgeStart> {
+        let owner = self.owner_id();
+        let mut conn = self.conn();
+        // Immediate: what is read here must still hold at the commit, and a
+        // writer on another connection (the sessions store) waits for it.
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !hats_of(&tx, owner)?.iter().any(|hat| hat.id == hat_id) {
+            return Ok(PurgeStart::NotFound);
+        }
+        if is_default(&tx, owner, hat_id)? {
+            return Ok(PurgeStart::IsDefault);
+        }
+        tx.execute(
+            "INSERT INTO purged_hats(hat_id, owner_id, purged_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(hat_id) DO NOTHING",
+            params![hat_id, owner, now],
+        )?;
+        // Hat ids are unique across owners, so a row of another owner's for
+        // this id is no freeze of this hat.
+        anyhow::ensure!(
+            frozen(&tx, owner, hat_id)?,
+            "another owner's purged_hats row names {hat_id}"
+        );
+        let rules = tx.execute(
+            "DELETE FROM hat_path_rules WHERE hat_id = ?1 AND owner_id = ?2",
+            [hat_id, owner],
+        )?;
+        tx.commit()?;
+        Ok(PurgeStart::Frozen { rules: rules as u64 })
+    }
+
+    /// The last step of `hat_id`'s purge (plan 9c decision 10e): delete the
+    /// hat's row, only while it is frozen; its project recents go with it
+    /// (`ON DELETE CASCADE`). Its `purged_hats` row stays (A7). `false` if
+    /// there was no frozen hat to delete. Whatever still references the hat
+    /// (a rule, a host's default, a module's row) fails it, by its foreign
+    /// key: the hooks ran first.
+    pub fn finish_purge(&self, hat_id: &str) -> Result<bool> {
+        let deleted = self.conn().execute(
+            "DELETE FROM hats WHERE id = ?1 AND owner_id = ?2
+                 AND EXISTS (SELECT 1 FROM purged_hats p WHERE p.hat_id = hats.id AND p.owner_id = ?2)",
+            [hat_id, self.owner_id()],
+        )?;
+        Ok(deleted == 1)
+    }
+
+    /// Every hat the owner purged or is purging, the oldest purge first:
+    /// what `forget_hat` tells a host after its handshake (plan 9c decision
+    /// 12, A7).
+    pub fn purged_hats(&self) -> Result<Vec<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare("SELECT hat_id FROM purged_hats WHERE owner_id = ?1 ORDER BY purged_at, hat_id")?;
+        let rows = stmt.query_map([self.owner_id()], |r| r.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// How many path rules name `hat_id`, and how many project recents it
+    /// has, on every host: what a purge would delete of the kernel's (plan
+    /// 9c decision 11).
+    pub fn purge_counts(&self, hat_id: &str) -> Result<(u64, u64)> {
+        Ok(self.conn().query_row(
+            "SELECT (SELECT count(*) FROM hat_path_rules WHERE hat_id = ?1 AND owner_id = ?2),
+                    (SELECT count(*) FROM project_recents WHERE hat_id = ?1 AND owner_id = ?2)",
+            [hat_id, self.owner_id()],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)),
+        )?)
     }
 }
 

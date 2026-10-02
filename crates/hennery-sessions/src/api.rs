@@ -283,7 +283,7 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
         Err(why) => return why.into_response(),
     };
     let session_id = uuid::Uuid::now_v7().to_string();
-    if let Err(err) = state.store.create_session(
+    match state.store.create_session(
         &session_id,
         &req.host_id,
         &req.agent,
@@ -291,7 +291,10 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
         &hat.hat_id,
         hat.rule_id.as_deref(),
     ) {
-        return internal(err);
+        Ok(true) => {}
+        // The hat resolved before its purge froze it (plan 9c decision 10c).
+        Ok(false) => return hat_purging(&state, &hat.hat_id),
+        Err(err) => return internal(err),
     }
     let request_id = uuid::Uuid::now_v7().to_string();
     let frame = CollectorFrame::StartSession {
@@ -451,6 +454,16 @@ async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -
     .into_response()
 }
 
+/// 409 `hat_purging` (plan 9c decision 10c): the hat is frozen for its
+/// purge, so nothing starts, resumes or moves in or out of it.
+pub(crate) fn hat_purging(state: &AppState, hat_id: &str) -> Response {
+    error(
+        StatusCode::CONFLICT,
+        "hat_purging",
+        format!("{} is being purged", hat_name(state, hat_id)),
+    )
+}
+
 /// `hat_id` for a message: by its name, by its id when it has none, or "no
 /// hat" for a session from before hats that got none.
 fn hat_name(state: &AppState, hat_id: &str) -> String {
@@ -498,6 +511,13 @@ async fn update_session(
             );
         }
         Ok(Reassign::UnknownHat) => return error(StatusCode::BAD_REQUEST, "invalid", "no such hat"),
+        Ok(Reassign::HatPurging) => {
+            return error(
+                StatusCode::CONFLICT,
+                "hat_purging",
+                "the session's hat or the one it would move to is being purged",
+            );
+        }
         Ok(Reassign::NotFound) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
         Err(err) => return internal(err),
     }
@@ -579,6 +599,7 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
                 ),
             );
         }
+        Ok(ResumeRequest::HatPurging) => return hat_purging(&state, &session.hat_id),
         Ok(ResumeRequest::NotFound) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
         Err(err) => return internal(err),
     };
