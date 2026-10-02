@@ -88,6 +88,7 @@ pub fn render_schema() -> String {
         rest::PushPolicyItem,
         rest::SettingsResponse,
         rest::SettingsUpdateRequest,
+        rest::PushPayload,
     );
     // `serde_json::Map` is a `BTreeMap` (always iterates sorted) by default,
     // or an `IndexMap` (iterates in insertion order) when serde_json's
@@ -218,6 +219,7 @@ pub fn render_ts() -> String {
         rest::PushPolicyItem,
         rest::SettingsResponse,
         rest::SettingsUpdateRequest,
+        rest::PushPayload,
     );
     out
 }

@@ -28,6 +28,9 @@ password-auth = "=1.0.0"
 # Web Push (plan 10a): the VAPID key pair (kernel spec §6); `ecdsa` signs
 # its tokens (RFC 8292).
 p256 = { version = "=0.13.2", features = ["ecdsa"] }
+# Web Push (plan 10b-ii): RFC 8291's encryption only. Default features off:
+# `vapid` pulls in `jwt-simple`, and with it `rsa` (plan 10a decision 2).
+web-push-native = { version = "=0.5.0", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 schemars = "1.2"

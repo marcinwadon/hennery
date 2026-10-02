@@ -850,3 +850,17 @@ pub struct SettingsUpdateRequest {
     #[ts(type = "string | undefined", optional)]
     pub contact: Option<String>,
 }
+
+/// What a push carries to the browser's service worker (kernel spec §6;
+/// plan 10b-ii), encrypted to the browser (RFC 8291): the push service sees
+/// its size only, and that is padded. The service worker shows `title` and
+/// `body` as text, tags the notification `tag`, and on a click opens `url`,
+/// a path of this origin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PushPayload {
+    pub title: String,
+    pub body: String,
+    /// `/sessions/<id>`, or `/mcp`: always a path, never a URL.
+    pub url: String,
+    pub tag: String,
+}
