@@ -1549,6 +1549,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "hennery-view"
+version = "0.0.0"
+dependencies = [
+ "hennery-proto",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "ts-rs",
+]
+
+[[package]]
 name = "hermit-abi"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
