@@ -1,32 +1,20 @@
 //! Check 2 (distribution spec §1.1): whether this machine can run a host's
-//! managed runtime. The binary is musl-static on Linux, so it cannot ask
-//! glibc its version: it runs glibc's own loader with `--version`, and only
-//! a GNU C library's banner counts; `/usr/bin/getconf` is asked only when
-//! the loader says nothing, and never on NixOS, whose `getconf` is Nix's own
-//! glibc's (decision 5). What is read is gathered apart from how it is
-//! judged, so the judging is tested on fixtures.
+//! managed runtime. What its C library is, and what stops the runtime, are
+//! the host's own (`hennery_host::runtime::glibc`): the host refuses to
+//! install a set where this check fails it. What is read is gathered apart
+//! from how it is judged, so the judging is tested on fixtures.
 
 use super::{Check, Doctor, Finding, Verdict};
+use hennery_host::runtime::glibc::{self, Said};
+pub use hennery_host::runtime::glibc::{Libc, major_minor};
+// The parsers' fixture tests live with the doctor's.
+#[cfg(test)]
+pub use hennery_host::runtime::glibc::{parse_getconf, parse_loader};
 use hennery_host::runtime::install;
 use hennery_host::runtime::manifest::Platform;
 
-/// The oldest glibc the managed Node and the Claude CLI run on.
-pub const MIN_GLIBC: (u32, u32) = (2, 28);
-
 /// The oldest Linux kernel Node 24 supports.
 pub const MIN_KERNEL: (u32, u32) = (4, 18);
-
-/// What answers as the C library behind glibc's loader path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Libc {
-    Glibc(u32, u32),
-    /// musl's loader (or a compatibility link to it).
-    Musl,
-    /// NixOS's stub loader: nix-ld is not enabled.
-    NixStub,
-    /// Nothing that could be read.
-    Unknown,
-}
 
 /// What check 2 reads of the machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,60 +60,22 @@ pub fn gather(doctor: &Doctor) -> Facts {
 }
 
 /// What the loader at `path` says it is, else what `/usr/bin/getconf`
-/// says (not on NixOS).
+/// says (not on NixOS; decision 5).
 pub fn libc_behind(doctor: &Doctor, path: &str, nixos: bool) -> Libc {
     let root = &doctor.cx.root;
-    if let Some(ran) = (doctor.run)(&root.join(path.trim_start_matches('/')), &["--version"]) {
-        let said = format!("{}\n{}", ran.stdout, ran.stderr);
-        match parse_loader(&said) {
-            Libc::Unknown => {}
-            known => return known,
-        }
-    }
-    if nixos {
-        return Libc::Unknown;
-    }
-    (doctor.run)(&root.join("usr/bin/getconf"), &["GNU_LIBC_VERSION"])
-        .filter(|ran| ran.ok)
-        .and_then(|ran| parse_getconf(&ran.stdout))
-        .map_or(Libc::Unknown, |(major, minor)| Libc::Glibc(major, minor))
-}
-
-/// What a loader printed for `--version`: glibc's banner (`ld.so (Ubuntu
-/// GLIBC 2.35-0ubuntu3) stable release version 2.35.`, `ld.so (GNU libc)
-/// stable release version 2.39.`), musl's (`musl libc (x86_64)`), or
-/// NixOS's stub (`… https://nix.dev/permalink/stub-ld`).
-pub fn parse_loader(text: &str) -> Libc {
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("stub-ld") || lower.contains("nixos cannot run") {
-        return Libc::NixStub;
-    }
-    if lower.contains("musl") {
-        return Libc::Musl;
-    }
-    let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or_default();
-    let glibc = first.contains("GLIBC") || first.contains("GNU libc") || first.contains("GNU C Library");
-    match first
-        .rsplit_once("version ")
-        .and_then(|(_, version)| major_minor(version))
-    {
-        Some((major, minor)) if glibc => Libc::Glibc(major, minor),
-        _ => Libc::Unknown,
-    }
-}
-
-/// `getconf GNU_LIBC_VERSION`'s answer: `glibc 2.35`.
-pub fn parse_getconf(text: &str) -> Option<(u32, u32)> {
-    major_minor(text.trim().strip_prefix("glibc ")?)
-}
-
-/// `5.15.0-91-generic`, `4.18.0-553.el8_10.x86_64`, `2.35.`: the first two
-/// numbers.
-pub fn major_minor(text: &str) -> Option<(u32, u32)> {
-    let mut parts = text.trim().split(|c: char| !c.is_ascii_digit());
-    let major = parts.next()?.parse().ok()?;
-    let minor = parts.next()?.parse().ok()?;
-    Some((major, minor))
+    let run = |program: &std::path::Path, args: &[&str]| {
+        (doctor.run)(program, args).map(|ran| Said {
+            ok: ran.ok,
+            stdout: ran.stdout,
+            stderr: ran.stderr,
+        })
+    };
+    glibc::libc_behind(
+        &root.join(path.trim_start_matches('/')),
+        &root.join("usr/bin/getconf"),
+        nixos,
+        &run,
+    )
 }
 
 /// `uname(2)`'s release.
@@ -158,9 +108,6 @@ pub fn judge(facts: &Facts, strict: bool) -> Check {
             verdict.warn(format!("{summary}: no managed runtime can run here"), fix);
         }
     };
-    let nix_ld =
-        "enable programs.nix-ld, or use the Nix-provided adapters (`hennery host join --no-runtime`, then `--agent`)";
-    let musl = "run only the collector here, or the host on a Linux with glibc 2.28 or later";
     match facts.platform {
         None => bad(
             &mut verdict,
@@ -169,30 +116,12 @@ pub fn judge(facts: &Facts, strict: bool) -> Check {
         ),
         Some(Platform::DarwinArm64) => verdict.ok("macOS on Apple silicon"),
         Some(platform) => {
-            match (facts.loader, facts.libc) {
-                (Some((path, false)), _) if facts.nixos => bad(
-                    &mut verdict,
-                    format!("NixOS without nix-ld: glibc's loader {path} is missing"),
-                    nix_ld,
-                ),
-                (Some((path, false)), _) => bad(
-                    &mut verdict,
-                    format!("no glibc loader ({path}): a musl system, or one without glibc"),
-                    musl,
-                ),
-                (_, Libc::NixStub) => bad(
-                    &mut verdict,
-                    "NixOS without nix-ld: glibc's loader is NixOS's stub".to_string(),
-                    nix_ld,
-                ),
-                (_, Libc::Musl) => bad(&mut verdict, "glibc's loader is musl's".to_string(), musl),
-                (_, Libc::Glibc(major, minor)) if (major, minor) < MIN_GLIBC => bad(
-                    &mut verdict,
-                    format!("glibc {major}.{minor} is older than 2.28"),
-                    "upgrade to a distribution with glibc 2.28 or later",
-                ),
-                (_, Libc::Glibc(major, minor)) => verdict.ok(format!("{} with glibc {major}.{minor}", platform.key())),
-                (_, Libc::Unknown) => verdict.warn(
+            match (glibc::refusal(facts.loader, facts.nixos, facts.libc), facts.libc) {
+                (Some((summary, fix)), _) => bad(&mut verdict, summary, fix),
+                (None, Libc::Glibc(major, minor)) => {
+                    verdict.ok(format!("{} with glibc {major}.{minor}", platform.key()))
+                }
+                (None, _) => verdict.warn(
                     format!("{}: glibc's version is unknown", platform.key()),
                     "check that glibc is 2.28 or later (`ldd --version`)",
                 ),

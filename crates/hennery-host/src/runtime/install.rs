@@ -18,6 +18,7 @@
 
 use super::download::{self, Expected, Sources};
 use super::extract;
+use super::glibc;
 use super::manifest::{self, File, Manifest, NodeArchive, Platform};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -391,7 +392,7 @@ pub async fn install(
     sources: &Sources,
     progress: &(dyn Fn(&str) + Sync),
 ) -> Result<Installed> {
-    check_host(selection.platform)?;
+    check_host(selection.platform).await?;
     let _lock = lock_install(layout, progress).await?;
     install_locked(layout, selection, sources, progress).await
 }
@@ -404,7 +405,7 @@ pub async fn try_install(
     sources: &Sources,
     progress: &(dyn Fn(&str) + Sync),
 ) -> Result<Option<Installed>> {
-    check_host(selection.platform)?;
+    check_host(selection.platform).await?;
     let Some(_lock) = try_lock_install(layout).await? else {
         return Ok(None);
     };
@@ -608,16 +609,25 @@ pub fn glibc_loader(platform: Platform) -> Option<&'static str> {
     }
 }
 
-/// Refuse a host the managed runtime cannot run on: on Linux, one without
-/// glibc's dynamic loader (musl, or NixOS without nix-ld; distribution §1.1).
-pub fn check_host(platform: Platform) -> Result<()> {
+/// Refuse a host the managed runtime cannot run on (distribution §1.1): on
+/// Linux, one where glibc's loader is missing, is NixOS's stub or musl's, or
+/// leads to a glibc older than 2.28. What says nothing (a loader that cannot
+/// be read, or does not answer within `glibc::PROBE_TIMEOUT`) refuses
+/// nothing. The loader runs off the runtime's workers.
+pub async fn check_host(platform: Platform) -> Result<()> {
     let Some(loader) = glibc_loader(platform) else {
         return Ok(());
     };
-    if !Path::new(loader).exists() {
+    let refusal = tokio::task::spawn_blocking(move || {
+        glibc::host_refusal(Path::new("/"), loader, &|program, args| {
+            glibc::run_bounded(program, args, glibc::PROBE_TIMEOUT)
+        })
+    })
+    .await
+    .context("checking this host's glibc")?;
+    if let Some((why, fix)) = refusal {
         bail!(
-            "this host has no glibc loader ({loader}): the managed Node and the Claude CLI are glibc builds. \
-             On musl, run only the collector here; on NixOS, enable programs.nix-ld or use the Nix-provided adapters"
+            "this host cannot run the managed runtime: {why}. The managed Node and the Claude CLI need glibc 2.28 or later; {fix}"
         );
     }
     Ok(())
@@ -1091,9 +1101,9 @@ mod tests {
         assert!(layout.set(id).is_err());
     }
 
-    #[test]
-    fn this_host_can_run_the_runtime() {
-        check_host(Platform::current().unwrap()).unwrap();
+    #[tokio::test]
+    async fn this_host_can_run_the_runtime() {
+        check_host(Platform::current().unwrap()).await.unwrap();
         assert!(free_space(Path::new("/")).unwrap() > 0);
     }
 }
