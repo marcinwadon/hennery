@@ -247,6 +247,13 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     ALTER TABLE hats ADD COLUMN logo_etag TEXT
         CHECK ((logo_mime IS NULL) = (logo_bytes IS NULL) AND (logo_bytes IS NULL) = (logo_etag IS NULL));
     ",
+    // Plan 8e decision E7 (8c's decision 2 deferred it here): per agent,
+    // how the host isolates its MCP servers, from its latest accepted
+    // `hello`, so the host list shows it while the host is away. `NULL`:
+    // no such `hello` recorded yet.
+    "
+    ALTER TABLE hosts ADD COLUMN mcp_isolation TEXT;
+    ",
 ];
 
 #[cfg(test)]
