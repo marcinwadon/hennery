@@ -21,23 +21,24 @@ pub const MAX_ROOTS: usize = 32;
 /// review's A10). Without one, `~/` roots are refused and the browse fence
 /// is the workspace roots alone.
 pub fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .filter(|home| home.is_absolute())
+    home_from(std::env::var_os("HOME"))
+}
+
+/// `home_dir`, from `$HOME`'s value.
+fn home_from(value: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    value.map(PathBuf::from).filter(|home| home.is_absolute())
 }
 
 /// The workspace roots to use (decision 6): `given` (the `--workspace-root`
 /// flags) if there are any, else `configured` (`host.toml`). Flags replace
 /// the file's list, as `--listen` replaces `config.toml`'s (kernel spec §2).
 ///
-/// Each root is absolute, or `~` / `~/…`, expanded against `home`; at most
-/// `MAX_ROOTS`; duplicates are dropped. A root is not checked for
+/// Each root is absolute, or `~` / `~/…`, expanded against `home`, and
+/// normalised lexically (no trailing slash, no `.`, no repeated `/`); at
+/// most `MAX_ROOTS` once duplicates are dropped. A root is not checked for
 /// existence: a missing one is tolerated (ACP core §7).
 pub fn workspace_roots(given: &[String], configured: &[String], home: Option<&Path>) -> Result<Vec<PathBuf>> {
     let raw = if given.is_empty() { configured } else { given };
-    if raw.len() > MAX_ROOTS {
-        bail!("{} workspace roots; at most {MAX_ROOTS} are supported", raw.len());
-    }
     let mut roots: Vec<PathBuf> = Vec::new();
     for root in raw {
         let path = if root == "~" || root.starts_with("~/") {
@@ -45,7 +46,8 @@ pub fn workspace_roots(given: &[String], configured: &[String], home: Option<&Pa
                 bail!("workspace root {root:?} needs $HOME, which is unset or not absolute");
             };
             match root.strip_prefix("~/") {
-                Some(rest) => home.join(rest),
+                // Not `join` of an absolute path, which would replace home.
+                Some(rest) => home.join(rest.trim_start_matches('/')),
                 None => home.to_path_buf(),
             }
         } else {
@@ -54,12 +56,16 @@ pub fn workspace_roots(given: &[String], configured: &[String], home: Option<&Pa
         if !path.is_absolute() {
             bail!("workspace root {root:?} is not absolute; give /… or ~/…");
         }
+        let path: PathBuf = path.components().collect();
         if path.to_str().is_none() {
             bail!("workspace root {root:?} is not valid UTF-8");
         }
         if !roots.contains(&path) {
             roots.push(path);
         }
+    }
+    if roots.len() > MAX_ROOTS {
+        bail!("{} workspace roots; at most {MAX_ROOTS} are supported", roots.len());
     }
     Ok(roots)
 }
@@ -526,5 +532,37 @@ mod tests {
         let err = workspace_roots(&many, &[], None).unwrap_err();
         assert!(err.to_string().contains("at most"), "{err}");
         assert_eq!(workspace_roots(&many[1..], &[], None).unwrap().len(), MAX_ROOTS);
+        // Duplicates do not count.
+        let mut with_duplicate = many[1..].to_vec();
+        with_duplicate.push("/r1/".into());
+        assert_eq!(workspace_roots(&with_duplicate, &[], None).unwrap().len(), MAX_ROOTS);
+    }
+
+    /// Task 2's review: roots are normalised lexically, and `~//x` stays
+    /// under home.
+    #[test]
+    fn roots_are_normalised() {
+        let home = Path::new("/home/u");
+        assert_eq!(
+            workspace_roots(&strings(&["~//etc", "/p/", "/p//q/./r", "~/src/"]), &[], Some(home)).unwrap(),
+            [
+                PathBuf::from("/home/u/etc"),
+                PathBuf::from("/p"),
+                PathBuf::from("/p/q/r"),
+                PathBuf::from("/home/u/src")
+            ]
+        );
+    }
+
+    #[test]
+    fn home_counts_only_when_absolute_and_a_non_utf8_root_is_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(home_from(Some("/home/u".into())), Some(PathBuf::from("/home/u")));
+        assert_eq!(home_from(Some("relative/home".into())), None);
+        assert_eq!(home_from(Some("".into())), None);
+        assert_eq!(home_from(None), None);
+        let odd = Path::new(std::ffi::OsStr::from_bytes(b"/h\xff"));
+        let err = workspace_roots(&strings(&["~/src"]), &[], Some(odd)).unwrap_err();
+        assert!(err.to_string().contains("UTF-8"), "{err}");
     }
 }

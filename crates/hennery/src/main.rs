@@ -634,6 +634,12 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
         inherit::check_pipe("--join-code-fd", fd)?;
     }
     warn_if_dev_token();
+    let home = hennery_host::projects::home_dir();
+    // The flags first, before anything is paired: a bad one must not spend
+    // a pairing code (decision 6). The file's roots are checked below.
+    if !args.workspace_roots.is_empty() {
+        hennery_host::projects::workspace_roots(&args.workspace_roots, &[], home.as_deref())?;
+    }
     let paired = match Paired::load(&args.data_dir)? {
         Some(paired) => {
             // Paired already (kernel spec §4.2): the code is not needed.
@@ -656,14 +662,12 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
         }
     };
     // Checked before connecting: a bad root fails the start (decision 6).
-    let workspace_roots = hennery_host::projects::workspace_roots(
-        &args.workspace_roots,
-        &paired.workspace_roots,
-        hennery_host::projects::home_dir().as_deref(),
-    )?;
+    let workspace_roots =
+        hennery_host::projects::workspace_roots(&args.workspace_roots, &paired.workspace_roots, home.as_deref())?;
     let collector_url = args.collector_url.unwrap_or(paired.collector_url);
     let mut cfg = HostConfig::new(collector_url, paired.host_id, paired.key, args.data_dir);
     cfg.workspace_roots = workspace_roots;
+    cfg.home = home;
     cfg.agents = args.agents.into_iter().collect();
     cfg.idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
     // On SIGINT/SIGTERM, and on a revoke, the host stops its connection and

@@ -52,7 +52,8 @@ pub struct HostConfig {
     /// `hello`.
     pub workspace_roots: Vec<PathBuf>,
     /// The host user's home directory (`projects::home_dir`): browsing is
-    /// allowed under it too.
+    /// allowed under it too. None unless set, so no test reads the real one;
+    /// `hennery host run` sets it.
     pub home: Option<PathBuf>,
 }
 
@@ -72,7 +73,7 @@ impl HostConfig {
             connect_timeout: Duration::from_secs(10),
             healthy_after: Duration::from_secs(60),
             workspace_roots: Vec::new(),
-            home: crate::projects::home_dir(),
+            home: None,
         }
     }
 

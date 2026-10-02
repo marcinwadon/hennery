@@ -109,6 +109,23 @@ fn a_malformed_agent_flag_is_rejected() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("name=command"));
 }
 
+/// Plan 6c decision 6 (Task 2's review): a bad `--workspace-root` fails the
+/// start before anything else, so an unpaired host spends no pairing code.
+#[test]
+fn a_bad_workspace_root_fails_before_pairing() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_hennery"))
+        .args(["host", "run", "--data-dir"])
+        .arg(dir.path())
+        .args(["--workspace-root", "relative/dir"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("not absolute"), "{stderr}");
+    assert!(!stderr.contains("holds no pairing"), "{stderr}");
+}
+
 /// Plan 3b: the development bearer is gone. `--dev-token` is refused, not
 /// ignored, so a service still configured with it fails loudly.
 #[test]
