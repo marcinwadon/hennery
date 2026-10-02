@@ -223,8 +223,10 @@ pub fn service_path(doctor: &Doctor) -> Finding {
         return Finding::Checked(verdict.check(5, "service PATH"));
     };
     let entries: Vec<&str> = installed.split(':').filter(|e| !e.is_empty()).collect();
+    let mut missing = false;
     for tool in ["sh", "git"] {
         if !on_path(&entries, tool) {
+            missing = true;
             verdict.fail(
                 format!("{tool} is not on the service's PATH"),
                 format!("install {tool}, or put its directory on your login shell's PATH, then {reinstall}"),
@@ -232,7 +234,11 @@ pub fn service_path(doctor: &Doctor) -> Finding {
         }
     }
     if on_path(&entries, "rg") {
-        verdict.ok("sh, git and rg are on the service's PATH");
+        verdict.ok(if missing {
+            "rg is on the service's PATH"
+        } else {
+            "sh, git and rg are on the service's PATH"
+        });
     } else {
         verdict.ok("rg is not on the service's PATH (optional)");
     }
@@ -320,20 +326,26 @@ fn holder(doctor: &Doctor, lock: &Path) -> Holder {
 }
 
 /// The installed service whose host directory `host` is, and its process
-/// as the service manager (or, for `up`, its current report) names it.
-fn service_of(doctor: &Doctor, host: &Path) -> Option<(Role, Option<u32>)> {
+/// as the service manager (or, for `up`, its current report) names it:
+/// `Ok(None)` when no service serves `host`, `Err` when which one does
+/// cannot be told (check 10 says why).
+fn service_of(doctor: &Doctor, host: &Path) -> Result<Option<(Role, Option<u32>)>, &'static str> {
     let cx = doctor.cx;
-    let [role] = cx.installed()[..] else {
-        return None;
+    let role = match cx.installed()[..] {
+        [] => return Ok(None),
+        [role] => role,
+        _ => return Err("more than one service is installed"),
     };
-    let data = service::read_command_line(cx, role).and_then(|argv| service::data_dir_of(&argv))?;
+    let Some(data) = service::read_command_line(cx, role).and_then(|argv| service::data_dir_of(&argv)) else {
+        return Err("the service's command line cannot be read");
+    };
     let served = match role {
         Role::Up => data.join("host"),
         Role::Host => data.clone(),
-        Role::Collector => return None,
+        Role::Collector => return Ok(None),
     };
     if canonical(&served) != canonical(host) {
-        return None;
+        return Ok(None);
     }
     let mut pid = service::managed(cx, role).ok().flatten().and_then(|m| m.pid);
     if role == Role::Up
@@ -342,7 +354,7 @@ fn service_of(doctor: &Doctor, host: &Path) -> Option<(Role, Option<u32>)> {
     {
         pid = Some(state.pid);
     }
-    Some((role, pid))
+    Ok(Some((role, pid)))
 }
 
 /// Check 14 (distribution spec §8): one host on the directory, and that
@@ -381,14 +393,18 @@ pub fn host_directory(doctor: &Doctor) -> Finding {
             "see `hennery service status`, and the processes named hennery",
         ),
         Holder::Pid(pid) => match service_of(doctor, host) {
-            None => verdict.ok(format!("pid {pid} serves it: a host started by hand")),
-            Some((Role::Host, Some(service))) if service == pid => {
+            Err(why) => verdict.warn(
+                format!("pid {pid} serves it, and which service should is unknown: {why}"),
+                "see check 10, and keep one service with a command line hennery wrote",
+            ),
+            Ok(None) => verdict.ok(format!("pid {pid} serves it: a host started by hand")),
+            Ok(Some((Role::Host, Some(service)))) if service == pid => {
                 verdict.ok(format!("the host service (pid {pid}) serves it"))
             }
-            Some((Role::Up, Some(up))) if process::parent(doctor.cx, pid) == Some(up) => {
+            Ok(Some((Role::Up, Some(up)))) if process::parent(doctor.cx, pid) == Some(up) => {
                 verdict.ok(format!("up's host (pid {pid}) serves it"))
             }
-            Some((role, _)) => verdict.warn(
+            Ok(Some((role, _))) => verdict.warn(
                 format!("pid {pid}, not the {role} service's host, serves it: the service's host cannot start"),
                 format!("stop pid {pid} (`kill {pid}`), and let the service run its host"),
             ),

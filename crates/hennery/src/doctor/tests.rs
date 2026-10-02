@@ -1147,10 +1147,11 @@ fn a_service_path_without_sh_or_git_fails_and_drift_warns() {
         let dirs = Dirs::by_contents(data.clone(), Found::Given);
         line(&checked(&cx, dirs, &nothing, &data), 5).clone()
     };
-    let no_git = tools(dir.path(), "no-git", &["sh"]);
+    let no_git = tools(dir.path(), "no-git", &["sh", "rg"]);
     let check = check5(&no_git.display().to_string());
     assert_eq!(check.status, Status::Fail, "{check:?}");
     assert!(check.summary.contains("git is not on the service's PATH"), "{check:?}");
+    assert!(!check.summary.contains("sh, git and rg are on"), "{check:?}");
 
     let now = captured_path(&cx);
     let both = tools(dir.path(), "both", &["sh", "git"]);
@@ -1222,6 +1223,12 @@ fn host_lock_is_judged_by_who_holds_it() {
     let check = check14(&cx);
     assert_eq!(check.status, Status::Warn, "{check:?}");
     assert!(check.summary.contains("not the host service's host"), "{check:?}");
+    // Two roles: which one should serve it cannot be told.
+    install(&cx, Role::Collector, &cx.exe, &host, "/usr/bin:/bin");
+    let check = check14(&cx);
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("which service should is unknown"), "{check:?}");
+    std::fs::remove_file(cx.service_file(Role::Collector)).unwrap();
     std::fs::remove_file(cx.service_file(Role::Host)).unwrap();
 
     let fake = systemd("active", 77, "yes");
