@@ -21,6 +21,8 @@ axum.workspace = true
 clap.workspace = true
 libc = "0.2"
 openssl = { workspace = true, optional = true }
+# `doctor`'s requests to the collector (plan 7d-ii): the host's own client.
+reqwest.workspace = true
 hennery-host.workspace = true
 hennery-kernel.workspace = true
 hennery-sessions.workspace = true

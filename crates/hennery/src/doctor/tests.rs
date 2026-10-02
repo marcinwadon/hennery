@@ -1621,7 +1621,7 @@ fn initialize_reads_its_answer_and_nothing_else() {
             env: Vec::new(),
         };
         let env = vec![("HOME".to_string(), dir.path().display().to_string())];
-        spawn::initialize(&agent, &env, std::time::Duration::from_secs(5))
+        spawn::initialize(&agent, &env, spawn::INITIALIZE_TIMEOUT)
     };
     assert_eq!(
         answer(r#"{"jsonrpc":"2.0","id":0,"result":{"agentInfo":{"name":"a","version":"1.2.3"}}}"#),
@@ -1783,4 +1783,270 @@ fn a_services_agents_and_path_are_the_ones_used() {
     let env = std::fs::read_to_string(&env_out).unwrap();
     assert!(env.contains("PATH=/service/bin:/usr/bin:/bin"), "{env}");
     assert!(env.contains("HENNERY_SERVICE=systemd"), "{env}");
+}
+
+/// A collector served in this process on `dir`'s database: the runtime
+/// serving it (keep it alive), its state and its address.
+fn live_collector(
+    dir: &Path,
+) -> (
+    tokio::runtime::Runtime,
+    hennery_sessions::AppState,
+    std::net::SocketAddr,
+) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    let (state, addr) = rt.block_on(async {
+        let db = dir.join("hennery.db");
+        let state = hennery_sessions::AppState::new(
+            hennery_sessions::store::Store::open(&db).unwrap(),
+            hennery_kernel::hosts::Hosts::open(&db).unwrap(),
+            hennery_kernel::operator::Operator::open(&db).unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(hennery_sessions::serve(listener, state.clone()));
+        (state, addr)
+    });
+    (rt, state, addr)
+}
+
+/// `host` paired with the collector at `addr` through a code `state` mints:
+/// its host id.
+fn pair(
+    rt: &tokio::runtime::Runtime,
+    state: &hennery_sessions::AppState,
+    addr: std::net::SocketAddr,
+    host: &Path,
+) -> String {
+    let code = state
+        .hosts
+        .mint_pairing_code(hennery_kernel::secret::unix_now())
+        .unwrap()
+        .code;
+    match rt
+        .block_on(hennery_host::pairing::join(
+            &format!("http://{addr}"),
+            &code,
+            host,
+            "doctor-test",
+        ))
+        .unwrap()
+    {
+        hennery_host::pairing::Joined::Paired { host_id } => host_id,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A server that answers every request with `answer`, on loopback.
+fn answering(answer: String) -> std::net::SocketAddr {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(answer.as_bytes());
+        }
+    });
+    addr
+}
+
+/// `host.toml`'s collector pointed at `addr`, keeping the pairing.
+fn point_at(host: &Path, url: &str) {
+    let path = host.join("host.toml");
+    let mut table: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    table.insert("collector".into(), toml::Value::String(url.to_string()));
+    std::fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
+}
+
+/// Check 7 against a real collector: an accepted hello is ok and gives
+/// check 8 the collector's `Date`; a revoked host fails with re-pairing; an
+/// unknown one fails with the files to remove; a host connected elsewhere
+/// with this key warns; while a host holds `host.lock`, no hello is sent.
+#[test]
+fn the_collector_is_reached_step_by_step_and_its_hello_judged() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let (rt, state, addr) = live_collector(&dir.path().join("collector"));
+    let host = dir.path().join("host");
+    let host_id = pair(&rt, &state, addr, &host);
+    let dirs = Dirs::by_contents(host.clone(), Found::Given);
+    let run = || checked(&cx, dirs.clone(), &nothing, &host);
+    let findings = run();
+    let seven = line(&findings, 7);
+    assert_eq!(seven.status, Status::Ok, "{seven:?}");
+    assert!(seven.summary.contains("its hello is accepted"), "{seven:?}");
+    let eight = line(&findings, 8);
+    assert_eq!(eight.status, Status::Ok, "{eight:?}");
+
+    // A host connected with the key elsewhere: `already_connected`.
+    let paired = hennery_host::identity::Paired::read(&host).unwrap().unwrap();
+    let mut cfg = hennery_host::HostConfig::new(
+        paired.collector_url.clone(),
+        paired.host_id.clone(),
+        paired.key.clone(),
+        dir.path().join("elsewhere"),
+    );
+    cfg.agents = Default::default();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let elsewhere = rt.spawn(hennery_host::run_until(cfg, async {
+        let _ = stopped.await;
+    }));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let seven = loop {
+        let seven = line(&run(), 7).clone();
+        if seven.status != Status::Ok || std::time::Instant::now() > deadline {
+            break seven;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_eq!(seven.status, Status::Warn, "{seven:?}");
+    assert!(
+        seven
+            .summary
+            .contains("another connection with this host's key is live"),
+        "{seven:?}"
+    );
+    let _ = stop.send(());
+    let _ = rt.block_on(elsewhere);
+
+    // A host holds the lock here: no hello.
+    let lock = crate::lock::acquire(&host, crate::lock::HOST_LOCK, "hennery host run").unwrap();
+    assert!(
+        line(&run(), 7).summary.contains("hello not sent"),
+        "{:?}",
+        line(&run(), 7)
+    );
+    drop(lock);
+
+    state
+        .hosts
+        .revoke(&host_id, hennery_kernel::secret::unix_now())
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let seven = loop {
+        let seven = line(&run(), 7).clone();
+        if seven.status == Status::Fail || std::time::Instant::now() > deadline {
+            break seven;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert!(seven.summary.contains("revoked"), "{seven:?}");
+    assert!(seven.fix.contains("hennery host join"), "{seven:?}");
+
+    let mut table: toml::Table = toml::from_str(&std::fs::read_to_string(host.join("host.toml")).unwrap()).unwrap();
+    table.insert("host_id".into(), toml::Value::String("host-unknown".into()));
+    std::fs::write(host.join("host.toml"), toml::to_string(&table).unwrap()).unwrap();
+    let seven = line(&run(), 7).clone();
+    assert_eq!(seven.status, Status::Fail, "{seven:?}");
+    assert!(seven.fix.contains("remove host.key and host.toml"), "{seven:?}");
+}
+
+/// Check 7's earlier steps, each failing on its own: plain http to another
+/// machine, nothing listening, a status other than 200; and check 8 on a
+/// skewed `Date`. Nothing beyond loopback is reached.
+#[test]
+fn each_step_to_the_collector_fails_on_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let host = paired(&dir.path().join("host"));
+    let dirs = Dirs::by_contents(host.clone(), Found::Given);
+    let run = || checked(&cx, dirs.clone(), &nothing, &host);
+
+    point_at(&host, "ws://192.0.2.7:7117/api/hosts/ws");
+    let seven = line(&run(), 7).clone();
+    assert_eq!(seven.status, Status::Fail, "{seven:?}");
+    assert!(
+        seven.summary.contains("only allowed to a loopback address"),
+        "{seven:?}"
+    );
+
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    point_at(&host, &format!("ws://{closed}/api/hosts/ws"));
+    let findings = run();
+    assert!(
+        line(&findings, 7).summary.contains("nothing answers on"),
+        "{findings:?}"
+    );
+    assert!(not_run(&findings, 8));
+
+    let unavailable = answering("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".into());
+    point_at(&host, &format!("ws://{unavailable}/api/hosts/ws"));
+    assert!(
+        line(&run(), 7).summary.contains("answered 503"),
+        "{:?}",
+        line(&run(), 7)
+    );
+
+    let old =
+        "HTTP/1.1 200 OK\r\nDate: Thu, 01 Oct 2026 00:00:00 GMT\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let skewed = answering(old.into());
+    point_at(&host, &format!("ws://{skewed}/api/hosts/ws"));
+    let findings = run();
+    let eight = line(&findings, 8);
+    assert_eq!(eight.status, Status::Fail, "{eight:?}");
+    assert!(eight.fix.contains("NTP"), "{eight:?}");
+
+    assert_eq!(
+        collector::http_date("Thu, 01 Oct 2026 00:00:00 GMT"),
+        Some(1_790_812_800)
+    );
+    assert_eq!(collector::http_date("Sun, 06 Nov 1994 08:49:37 GMT"), Some(784_111_777));
+    assert_eq!(collector::http_date("yesterday"), None);
+    assert_eq!(collector::skew(Some(1000), 1020).status, Status::Ok);
+    assert_eq!(collector::skew(Some(1000), 1031).status, Status::Warn);
+    assert_eq!(collector::skew(Some(1000), 1301).status, Status::Fail);
+    assert_eq!(collector::skew(None, 1000).status, Status::Warn);
+}
+
+/// Check 16: each listen address answers or is named; `public_url`
+/// answering `/healthz` is ok, one that reaches nothing warns.
+#[test]
+fn every_listener_and_public_url_is_tried() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let collector = dir.path().join("collector");
+    let (_rt, _state, addr) = live_collector(&collector);
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    std::fs::write(
+        collector.join("config.toml"),
+        format!("listen = [\"{addr}\", \"{closed}\"]\npublic_url = \"http://{addr}\"\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(collector.join("config.toml"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let dirs = Dirs::by_contents(collector.clone(), Found::Given);
+    let sixteen = line(&checked(&cx, dirs.clone(), &nothing, &collector), 16).clone();
+    assert_eq!(sixteen.status, Status::Warn, "{sixteen:?}");
+    assert!(sixteen.summary.contains(&format!("{addr} answers")), "{sixteen:?}");
+    assert!(
+        sixteen.summary.contains(&format!("{closed}: no collector answers")),
+        "{sixteen:?}"
+    );
+    assert!(
+        sixteen
+            .summary
+            .contains(&format!("public_url http://{addr} answers /healthz")),
+        "{sixteen:?}"
+    );
+
+    std::fs::write(
+        collector.join("config.toml"),
+        format!("listen = [\"{addr}\"]\npublic_url = \"http://{closed}\"\n"),
+    )
+    .unwrap();
+    let sixteen = line(&checked(&cx, dirs, &nothing, &collector), 16).clone();
+    assert_eq!(sixteen.status, Status::Warn, "{sixteen:?}");
+    assert!(sixteen.summary.contains("reaches no listener or proxy"), "{sixteen:?}");
 }

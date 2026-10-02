@@ -9,6 +9,7 @@
 //! replace.
 
 mod agents;
+mod collector;
 mod dirs;
 mod disk;
 mod env;
@@ -183,6 +184,7 @@ impl Doctor<'_> {
 
 /// Every check this binary has, in the spec's order.
 pub fn checks(doctor: &Doctor) -> Vec<Finding> {
+    let [seven, eight] = collector::collector(doctor);
     vec![
         runtime::binary_and_set(doctor),
         platform::platform(doctor),
@@ -190,12 +192,15 @@ pub fn checks(doctor: &Doctor) -> Vec<Finding> {
         agents::logged_in(doctor),
         service::service_path(doctor),
         env::environment(doctor),
+        seven,
+        eight,
         disk::disk(doctor),
         service::service(doctor),
         env::hennery_on_path(doctor),
         runtime::adapter_set(doctor),
         agents::bundled_and_terminal(doctor),
         service::host_directory(doctor),
+        collector::listeners(doctor),
         runtime::cli_overrides(doctor),
     ]
 }

@@ -156,7 +156,7 @@ pub async fn join(public_url: &str, code: &str, data_dir: &Path, name: &str) -> 
             );
         }
         match probe(&collector_url, &paired.host_id, &paired.key).await? {
-            Standing::Accepted => {
+            Standing::Accepted | Standing::Connected => {
                 return Ok(Joined::AlreadyPaired {
                     host_id: paired.host_id,
                 });

@@ -24,6 +24,9 @@ pub const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long `auth status` / `login status` may take (check 4).
 pub const STATUS_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long the output of a program that has exited is waited for.
+const DRAIN: Duration = Duration::from_secs(5);
+
 /// The environment a host run by the installed service gives its agents
 /// (decision 14): what launchd and systemd give a user service (`HOME`,
 /// `USER`, `LOGNAME`, `SHELL`), on Linux the user manager's
@@ -152,10 +155,11 @@ pub fn run(program: &Path, args: &[&str], env: &[(String, String)], timeout: Dur
     kill_group(&mut child);
     let status = status?;
     let (stdout, stderr) = match streams {
-        // The group is gone, so each pipe has reached its end.
+        // The group is gone, so each pipe reaches its end once the reader
+        // has drained it; only a process that left the group could hold one.
         Some((out, err)) => (
-            out.recv_timeout(Duration::from_secs(1)).unwrap_or_default(),
-            err.recv_timeout(Duration::from_secs(1)).unwrap_or_default(),
+            out.recv_timeout(DRAIN).unwrap_or_default(),
+            err.recv_timeout(DRAIN).unwrap_or_default(),
         ),
         None => (Vec::new(), Vec::new()),
     };

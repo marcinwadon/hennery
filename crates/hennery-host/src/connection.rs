@@ -189,8 +189,11 @@ pub fn revoked(err: &anyhow::Error) -> bool {
 /// What the collector makes of a stored pairing (`hennery host join`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Standing {
-    /// It accepts the key (the host may be connected right now).
+    /// It accepts the key.
     Accepted,
+    /// It accepts the key, and another connection with it is live: the host
+    /// itself, or a copy of its data directory (`already_connected`).
+    Connected,
     Revoked,
     /// It does not know this host, or not with this key.
     Unknown,
@@ -225,7 +228,7 @@ pub async fn probe(collector_url: &str, host_id: &str, key: &HostKey) -> Result<
     Ok(match answer {
         CollectorFrame::HelloAck { .. } => Standing::Accepted,
         // Refused only after the proof checked out (ACP core §3.5).
-        CollectorFrame::HelloError { code, .. } if code == "already_connected" => Standing::Accepted,
+        CollectorFrame::HelloError { code, .. } if code == "already_connected" => Standing::Connected,
         CollectorFrame::HelloError { code, .. } if code == "revoked" => Standing::Revoked,
         CollectorFrame::HelloError { code, .. } if code == "bad_proof" => Standing::Unknown,
         CollectorFrame::HelloError { code, message } => return Err(HelloRejected { code, message }.into()),
