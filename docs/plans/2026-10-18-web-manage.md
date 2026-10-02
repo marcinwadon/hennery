@@ -114,12 +114,12 @@ Optional hardening taken: O1 (read before minting), O2 (count from arrival), O3 
 3. **A confirmation runs its action, and stays open while it runs.**
    - **Choice:** `ConfirmDialog` takes `action`. The confirm button runs it; the dialog closes when it resolves and shows the refusal, as text, when it fails.
    - **With step-up:** a refused action opens the step-up dialog over the confirmation. Cancelling the step-up leaves the confirmation open with "Not confirmed.", and nothing is sent again.
-   - **Focus** (amended: A4): it moves to "Cancel" (the safe choice) when the dialog opens, and back to the button that opened it when it closes. Tab and Shift+Tab cycle through the dialog's own controls (buttons, links, inputs, selects, text areas and anything with a non-negative `tabindex`; amended at the re-confirmation), so nothing behind it is reached. While the action runs, its buttons are disabled and the dialog itself holds focus, so a step-up opened over it returns focus into it, where Escape still cancels (except while the action runs).
+   - **Focus** (amended: A4): it moves to "Cancel" (the safe choice) when the dialog opens, and back to the button that opened it when it closes. Tab and Shift+Tab cycle through the dialog's own controls (buttons, links, inputs, selects, text areas and anything with a non-negative `tabindex`; amended at the re-confirmation), so nothing behind it is reached. While the action runs, its buttons are disabled and the dialog itself holds focus, so a step-up opened over it returns focus into it, where Escape still cancels (except while the action runs). A click on its backdrop keeps focus in it. When what opened it is gone when it closes (a revoked host's card loses its buttons; a rename form hides as the confirmation opens), focus goes to a fallback the caller names (`returnFocus`): the card's title, or its Rename button (amended after the Task 1 and Task 2 reviews). Its title's id is its own (`useId`).
 4. **The pairing code is shown once, and kept nowhere else (kernel §4.1; the review's focus).**
    - **Minted on the click**, never on mount: React's StrictMode runs effects twice in development, and two mints would spend two of the 16 live codes. `GET /api/settings` and `GET /api/hosts` are read first, then the code is minted (amended: O1, A1): a failed read spends no code, and the hosts paired before it are known even when the list on the screen never loaded.
    - **The command** is `hennery host join <public_url> <code>`, with `public_url` from `GET /api/settings`, not `location.origin`: hosts reach the collector at the URL setup stored.
-   - **Where the code lives:** the Hosts screen's state and the panel only. It is never in the address bar, the title, storage, a log line or a request but the mint's answer. It leaves the page when it expires, when a new host pairs, when the panel closes or the screen unmounts, and on `pagehide`, so a page restored from the back-forward cache shows none (amended: O3). Switching tabs keeps it: the owner switches to a terminal to paste it.
-   - **The countdown** runs 600 s, the code's lifetime, from the answer's arrival, on the monotonic clock (`performance.now()`), not from the server's `expires_at`: this browser's clock may be off by more than the lifetime (amended: O2). The code dies within the network's delay of what it shows. At 0 it says the code expired. A host that pairs meanwhile is noticed by reading `GET /api/hosts` every 3 s while the code is live, and told from the hosts read before the mint.
+   - **Where the code lives:** the Hosts screen's state and the panel only. It is never in the address bar, the title, storage, a log line or a request but the mint's answer. It leaves the page when it expires, when a new host pairs (it then leaves the Hosts screen's state too, and "Add host" is offered again; amended after the Task 2 review), when the panel closes or the screen unmounts, and on `pagehide`, so a page restored from the back-forward cache shows none (amended: O3). Switching tabs keeps it: the owner switches to a terminal to paste it.
+   - **The countdown** runs 600 s, the code's lifetime, from the answer's arrival, on the monotonic clock (`performance.now()`), not from the server's `expires_at`: this browser's clock may be off by more than the lifetime (amended: O2). The code dies within the network's delay of what it shows. At 0 it says the code expired. A host that pairs meanwhile is noticed by reading `GET /api/hosts` every 3 s while the code is live, one read at a time, and told from the hosts read before the mint.
    - **Closing the panel** only hides the code: there is no route to revoke one, and the panel says it stays valid until it expires.
    - **Its hint:** the host keeps its pairing in `--data-dir` (or `HENNERY_HOST_DATA_DIR`), which `host join` requires today; and leaving the code out makes `host join` read it from standard input, which keeps it out of the shell's history.
 5. **A host's state is one of three, revoked first.** `hostState`: `revoked` when `revoked_at` is set, whatever `connected` says; else `online` when `connected` (connected and reconciled); else `offline`. A revoked host is listed with no action.
@@ -138,12 +138,15 @@ Optional hardening taken: O1 (read before minting), O2 (count from arrival), O3 
 11. **Hats (kernel §5, 5a).**
     - Creating needs no step-up; renaming, recolouring and "make default for new hosts" do (`PATCH /api/hats/{id}`). Only purging is confirmed first (frontend §8); the others are undone as easily as done.
     - Only one hat is the default for new hosts: after one is made so, the others lose the mark.
+    - Each answer is folded into the list as it is when it lands, not as it was when the action began, so two changes that land together both stay (amended after the Task 3 review). Focus returns to "Edit" after an edit, to the card's title once "Make default for new hosts" is gone, and to the name after a hat is created.
     - A hat being purged (`purging`) can be neither edited nor made a default; its button reads "Resume purge".
 12. **Path rules and the tester (kernel §5.2; 5a, 5b).**
     - **The set:** a host's rules are edited as rows and sent whole (`PUT …/path-rules`, step-up). The answer is the set as the host resolved and stored it, which replaces the rows: a typed `/tmp/x` comes back as `/private/tmp/x`, and the next edit starts from that.
     - **Unverified** rules (the path did not exist when saved) are marked.
+    - A row with no path blocks "Save rules", and says so: the server refuses the whole set for one (amended after the Task 3 review). Removing a row moves focus to the next row's path, else to "Add rule".
+    - After a purge is tried, finished or not, the rules are read again: the server deleted the purged hat's rules, and a set naming it would be refused (amended after the Task 3 review).
     - **Offline:** the server refuses a set while the host is away (`host_offline`); the card says so beforehand.
-    - **The tester** asks `POST /api/hats/resolve` 400 ms after typing pauses, against the rules **as saved**, and says so. A newer path aborts the older question, and an answer that comes back after it was aborted is dropped, so an answer never lands under another path. It shows the canonical path, the hat, whether a rule or the host's default decided, and whether the path exists or is a directory. `host_offline`, `resolve_unsupported` and `hat_ambiguous` have plain words; a host's own refusal is shown as escaped text.
+    - **The tester** asks `POST /api/hats/resolve` 400 ms after typing pauses, against the rules **as saved**, and says so. A newer path aborts the older question and clears the last answer at once, and an answer that comes back after it was aborted is dropped, so an answer never lands under another path. It asks again after the rules are saved or a purge is tried (amended after the Task 3 review). Its answer sits in one live region, announced once. It shows the canonical path, the hat, whether a rule or the host's default decided, and whether the path exists or is a directory. `host_offline`, `resolve_unsupported` and `hat_ambiguous` have plain words; a host's own refusal is shown as escaped text.
     - Only hosts that are not revoked are offered.
     - A rule whose hat is being purged keeps that hat in its picker, shown and disabled, so the picker says what a save sends (amended: O5).
 13. **A hat's colour reaches a style only as `#rrggbb` (5a).** `safeColour` accepts `^#[0-9a-f]{6}$`, what the server guarantees, and nothing else; a swatch without one has no colour. The colour picker's value is lower-cased before it is sent.
@@ -156,11 +159,13 @@ Optional hardening taken: O1 (read before minting), O2 (count from arrival), O3 
       - `ready` otherwise.
       The first two disable the confirm button; the card's "Purge" is disabled for a default hat already.
     - **Sessions with no hat** are listed as links: no purge deletes them; the operator re-assigns or deletes them one by one (4c's screens).
+    - **A tried purge**, finished or not, reads the hats again, so a hat the server froze offers "Resume purge" (amended after the Task 3 review).
     - **Afterwards** a notice shows what was deleted, the sessions deleted while their host was away (`unconfirmed`, as text: they no longer exist), and the agents' transcripts on the hosts: removed, removed in part, still to remove.
 15. **The browser checks run a real host, hermetically (frontend §12).**
     - **Pairing:** the test reads the command from the page and runs it, `hennery host join <url> <code>`, adding `--name` and `--no-runtime` (no adapter download), with `HENNERY_HOST_DATA_DIR`, `HOME` and the `XDG_*` directories in a fresh directory (amended: O4). It then runs `hennery host run` with one stand-in agent (`--agent stand-in=<the binary>`, a path that exists everywhere), which is never started, so the host connects without any adapter set. The tester resolves real paths through it.
     - **Step-up on revoke:** a session is stepped up for 5 minutes after setup, so no real 403 comes during the run. The test answers the first `DELETE /api/hosts/{id}` with 403 `step_up_required` (`page.route`) and lets the retry reach the server. That the server refuses an unstepped revoke is the Rust tests' (`step_up.rs`).
-    - **Both widths** run the same three checks, each with a collector and a host of its own, then check that no page broke the Content-Security-Policy.
+    - **Both widths** run the same three checks, each with a collector and a host of its own, then check that no page broke the Content-Security-Policy, by the console and by `securitypolicyviolation` events, as 4b's checks do.
+    - **Every binary the checks start** (the collector, `host join`, `host run`) runs in `scratchEnv(dir)`: the runner's environment with every `HENNERY_*` variable removed, and `HOME` and `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_STATE_HOME` in the test's directory. A sentinel `HENNERY_LOG_DIR` set in the runner's own environment must stay empty (amended after the Task 4 review: the collector inherited the runner's environment, and with it a log directory or `HENNERY_SERVICE`'s home logs). `host run`'s standard error is shown when it fails.
     - Every process is stopped by its own id, SIGTERM then SIGKILL, the `join` included (amended: A5), and every directory is removed, on every path. A process that never started is not waited for.
     - **`inert` in Chromium** (amended: O4, then at the re-confirmation): while the step-up dialog is open, the page under it is `inert`; focus is in the dialog; a script's `focus()` on the confirmation itself leaves it there (not on its buttons: they are disabled while its action waits, and a disabled button takes no focus, `inert` or not); and Shift+Tab from the dialog's first field, the password while no passkey is offered (asserted), lands nowhere on the page. A click on the covered confirmation is not checked: Playwright refuses it because the overlay is on top, `inert` or not, so it proved nothing.
 
@@ -199,12 +204,12 @@ Optional hardening taken: O1 (read before minting), O2 (count from arrival), O3 
 | `web/src/lib/text.tsx` (new) | `visible`, `<Text>` | 1 |
 | `web/src/api/errors.ts` | nine messages; `Object.hasOwn` | 1 |
 | `web/src/components/{ConfirmDialog,SignOut,When}.tsx` (new), `web/src/components/ConfirmDialog.test.tsx` (new) | The confirmation, sign-out, a time | 1 |
-| `web/src/hooks/useResource.ts` (new) | One server read per screen | 1 |
+| `web/src/hooks/useResource.ts`, `web/src/hooks/useResource.test.ts` (new) | One server read per screen | 1 |
 | `web/src/App.tsx`, `web/src/components/Shell.tsx` | The `inert` page; the sign-out button; the two routes | 1, 2, 3 |
 | `web/src/security.test.ts` | No literal hidden characters | 1 |
 | `web/src/api/manage.ts`, `web/src/lib/manage.ts` (new) | The routes; the classifiers | 2 |
 | `web/src/components/Pairing.tsx`, `web/src/screens/Hosts.tsx`, `web/src/manage.css` (new) | Hosts | 2 |
-| `web/src/test-fixtures.ts` (new) | One of each item, every field set | 2 |
+| `web/src/test-fixtures.ts`, `web/src/test-targets.ts` (new) | One of each item, every field set; the narrow screen's 44 px rules read into jsdom | 2 |
 | `web/src/components/PathRules.tsx`, `web/src/screens/Hats.tsx` (new) | Hats | 3 |
 | `web/e2e/host.ts`, `web/e2e/manage.spec.ts` (new), `web/e2e/collector.ts` | Playwright | 4 |
 
@@ -274,7 +279,8 @@ Create `web/src/components/ConfirmDialog.test.tsx`:
   ```tsx
   import { render, screen } from '@testing-library/react'
   import userEvent from '@testing-library/user-event'
-  import { describe, expect, it } from 'vitest'
+  import { useState } from 'react'
+  import { describe, expect, it, vi } from 'vitest'
   import ConfirmDialog from './ConfirmDialog'
 
   describe('the confirmation', () => {
@@ -311,6 +317,75 @@ Create `web/src/components/ConfirmDialog.test.tsx`:
       await userEvent.tab({ shift: true })
       expect(go).toHaveFocus()
       expect(screen.getByRole('button', { name: 'Behind' })).not.toHaveFocus()
+    })
+
+    it('keeps focus when its backdrop is clicked, so Tab and Escape still work', async () => {
+      const onClose = vi.fn()
+      render(
+        <>
+          <button type="button">Behind</button>
+          <ConfirmDialog title="Pick one?" confirm="Go" action={async () => {}} onClose={onClose}>
+            <p>Body</p>
+          </ConfirmDialog>
+        </>,
+      )
+      const dialog = screen.getByRole('dialog', { name: 'Pick one?' })
+      await userEvent.click(dialog.parentElement!)
+      expect(dialog.contains(document.activeElement)).toBe(true)
+      await userEvent.tab()
+      expect(dialog.contains(document.activeElement)).toBe(true)
+      await userEvent.keyboard('{Escape}')
+      expect(onClose).toHaveBeenCalledOnce()
+    })
+
+    it('is named by its own title, whatever else is on the page', () => {
+      render(
+        <>
+          <ConfirmDialog title="First?" confirm="Go" action={async () => {}} onClose={() => {}}>
+            <p>One</p>
+          </ConfirmDialog>
+          <ConfirmDialog title="Second?" confirm="Go" action={async () => {}} onClose={() => {}}>
+            <p>Two</p>
+          </ConfirmDialog>
+        </>,
+      )
+      expect(screen.getByRole('dialog', { name: 'First?' })).toHaveTextContent('One')
+      expect(screen.getByRole('dialog', { name: 'Second?' })).toHaveTextContent('Two')
+    })
+
+    it('returns focus to a fallback when what opened it is gone', async () => {
+      function Page() {
+        const [open, setOpen] = useState(false)
+        const [opener, setOpener] = useState(true)
+        return (
+          <>
+            <h2 tabIndex={-1} id="fallback">
+              Fallback
+            </h2>
+            {opener && (
+              <button type="button" onClick={() => setOpen(true)}>
+                Open
+              </button>
+            )}
+            {open && (
+              <ConfirmDialog
+                title="Go?"
+                confirm="Go"
+                action={async () => setOpener(false)}
+                onClose={() => setOpen(false)}
+                returnFocus={() => document.getElementById('fallback')}
+              >
+                <p>Body</p>
+              </ConfirmDialog>
+            )}
+          </>
+        )
+      }
+      render(<Page />)
+      await userEvent.click(screen.getByRole('button', { name: 'Open' }))
+      await userEvent.click(screen.getByRole('button', { name: 'Go' }))
+      expect(screen.queryByRole('dialog')).toBeNull()
+      expect(screen.getByRole('heading', { name: 'Fallback' })).toHaveFocus()
     })
   })
   ```
@@ -403,6 +478,58 @@ with:
     })
 
     it('closes on Escape, as a cancel', async () => {
+  ```
+
+Create `web/src/hooks/useResource.test.ts`:
+
+  ```ts
+  import { act, renderHook, waitFor } from '@testing-library/react'
+  import { describe, expect, it } from 'vitest'
+  import { useResource } from './useResource'
+
+  /** A load that answers only when told to. */
+  function deferred() {
+    const answers: Array<(value: string) => void> = []
+    const load = () => new Promise<string>((resolve) => answers.push(resolve))
+    return { load, answer: (value: string) => answers.at(-1)!(value) }
+  }
+
+  describe('one server read', () => {
+    it('drops what it read for the old key as the key changes', async () => {
+      const server = deferred()
+      const { result, rerender } = renderHook(({ id }) => useResource(server.load, [id]), { initialProps: { id: 'a' } })
+      act(() => server.answer('rules of a'))
+      await waitFor(() => expect(result.current.data).toBe('rules of a'))
+      rerender({ id: 'b' })
+      expect(result.current.data).toBeNull()
+      act(() => server.answer('rules of b'))
+      await waitFor(() => expect(result.current.data).toBe('rules of b'))
+    })
+
+    it('keeps what it shows while it reads the same key again', async () => {
+      const server = deferred()
+      const { result, rerender } = renderHook(({ id }) => useResource(server.load, [id]), { initialProps: { id: 'a' } })
+      act(() => server.answer('first'))
+      await waitFor(() => expect(result.current.data).toBe('first'))
+      act(() => result.current.reload())
+      rerender({ id: 'a' })
+      expect(result.current.data).toBe('first')
+      act(() => server.answer('second'))
+      await waitFor(() => expect(result.current.data).toBe('second'))
+    })
+
+    it('takes a change as a function of what it holds', async () => {
+      const server = deferred()
+      const { result } = renderHook(() => useResource(server.load))
+      act(() => server.answer('a'))
+      await waitFor(() => expect(result.current.data).toBe('a'))
+      act(() => {
+        result.current.set((prev) => `${prev}b`)
+        result.current.set((prev) => `${prev}c`)
+      })
+      expect(result.current.data).toBe('abc')
+    })
+  })
   ```
 
 Create `web/src/lib/text.test.tsx`:
@@ -513,7 +640,7 @@ with:
 - [ ] **Step 2: Run them, and see them fail**
 
   Run: `nix develop -c pnpm --dir web test`
-  Expected: `text.test.tsx`, `ConfirmDialog.test.tsx` and `SignOut.test.tsx` fail (their modules do not exist); the new rows of `client.test.ts` (the nine messages, the inherited names) and the `inert` test fail.
+  Expected: `text.test.tsx`, `ConfirmDialog.test.tsx`, `useResource.test.ts` and `SignOut.test.tsx` fail (their modules do not exist); the new rows of `client.test.ts` (the nine messages, the inherited names) and the `inert` test fail.
 
 - [ ] **Step 3: The code**
 
@@ -576,9 +703,10 @@ Create `web/src/components/ConfirmDialog.tsx`:
   // §8: renaming or revoking a host, purging a hat, removing a passkey or a
   // device). The action runs from here: while it runs the dialog stays open,
   // so a step-up dialog can open over it, and a refusal is shown in it, as
-  // text. Focus moves in, stays in (Tab cycles within it), and goes back
-  // where it was when it closes.
-  import { useEffect, useRef, useState, type KeyboardEvent, type ReactNode } from 'react'
+  // text. Focus moves in, stays in (Tab cycles within it, and a click on the
+  // backdrop keeps it), and goes back where it was when it closes, or to
+  // `returnFocus` when that is gone.
+  import { useEffect, useId, useRef, useState, type KeyboardEvent, type MouseEvent, type ReactNode } from 'react'
   import { messageOf } from '../api/errors'
   import { Text } from '../lib/text'
 
@@ -593,13 +721,20 @@ Create `web/src/components/ConfirmDialog.tsx`:
     /** Runs on the confirm button; the dialog closes when it resolves. */
     action: () => Promise<void>
     onClose: () => void
+    /** Where focus goes on close when what opened the dialog is gone (the
+     *  action removed it, or it was gone before the dialog opened). Read on
+     *  close. */
+    returnFocus?: () => HTMLElement | null
   }
 
-  export default function ConfirmDialog({ title, children, confirm, danger, disabled, action, onClose }: Props) {
+  export default function ConfirmDialog({ title, children, confirm, danger, disabled, action, onClose, returnFocus }: Props) {
     const [busy, setBusy] = useState(false)
     const [error, setError] = useState<string | null>(null)
     const dialog = useRef<HTMLDivElement>(null)
     const live = useRef(true)
+    const titleId = useId()
+    const fallback = useRef(returnFocus)
+    fallback.current = returnFocus
 
     useEffect(() => {
       live.current = true
@@ -607,9 +742,20 @@ Create `web/src/components/ConfirmDialog.tsx`:
       dialog.current?.querySelector<HTMLElement>('[data-autofocus]')?.focus()
       return () => {
         live.current = false
-        before?.focus?.()
+        // An opener removed as the dialog opened leaves focus on the body.
+        const gone = !before || before === document.body || !before.isConnected
+        const back = gone ? fallback.current?.() : before
+        back?.focus?.()
       }
     }, [])
+
+    // A click on the backdrop would move focus to the body, out of the trap
+    // and out of reach of Escape: it is kept in the dialog.
+    const holdFocus = (e: MouseEvent<HTMLDivElement>) => {
+      if (e.target !== e.currentTarget) return
+      e.preventDefault()
+      dialog.current?.focus()
+    }
 
     const run = async () => {
       // Its buttons are disabled while the action runs: focus is held by the
@@ -657,10 +803,10 @@ Create `web/src/components/ConfirmDialog.tsx`:
     }
 
     return (
-      <div className="overlay" onKeyDown={trap}>
-        <div className="modal dialog" role="dialog" aria-modal="true" aria-labelledby="confirm-title" ref={dialog} tabIndex={-1}>
+      <div className="overlay" onKeyDown={trap} onMouseDown={holdFocus}>
+        <div className="modal dialog" role="dialog" aria-modal="true" aria-labelledby={titleId} ref={dialog} tabIndex={-1}>
           <div className="modal-head">
-            <h2 className="modal-title" id="confirm-title">
+            <h2 className="modal-title" id={titleId}>
               {title}
             </h2>
           </div>
@@ -818,25 +964,31 @@ Create `web/src/hooks/useResource.ts`:
   ```ts
   // One server read for a screen: loads on mount and when `key` changes, can
   // be loaded again, and can be replaced by what a change answered (the
-  // server's own copy, never a local guess). A 401 has sent the browser to
-  // sign in already, so it is no error here.
-  import { useCallback, useEffect, useState } from 'react'
+  // server's own copy, never a local guess), as a function of what it holds
+  // so that two changes landing together both stay. A new key drops what the
+  // old one read; reading the same key again keeps it on screen meanwhile. A
+  // 401 has sent the browser to sign in already, so it is no error here.
+  import { useCallback, useEffect, useRef, useState, type Dispatch, type SetStateAction } from 'react'
   import { Unauthenticated, messageOf } from '../api/errors'
 
   export interface Resource<T> {
     data: T | null
     error: string | null
     reload: () => void
-    set: (data: T) => void
+    set: Dispatch<SetStateAction<T | null>>
   }
 
   export function useResource<T>(load: () => Promise<T>, key: unknown[] = []): Resource<T> {
     const [data, setData] = useState<T | null>(null)
     const [error, setError] = useState<string | null>(null)
     const [attempt, setAttempt] = useState(0)
+    const lastKey = useRef(key)
 
     useEffect(() => {
       let live = true
+      const before = lastKey.current
+      lastKey.current = key
+      if (before.length !== key.length || before.some((k, i) => !Object.is(k, key[i]))) setData(null)
       setError(null)
       load().then(
         (value) => live && setData(value),
@@ -891,7 +1043,7 @@ Create `web/src/lib/text.tsx`:
 - [ ] **Step 4: Run the checks**
 
   Run: `nix develop -c sh -c 'pnpm --dir web typecheck && pnpm --dir web test'`
-  Expected: all pass. 185 Vitest tests.
+  Expected: all pass. 191 Vitest tests.
 
 - [ ] **Step 5: Revert-probes** (each must fail the named test file; restore after each; all were run)
   - `text.tsx`: drop `\p{Cf}`, then `\p{Cc}`, then `\p{Zl}\p{Zp}`, then `\p{Default_Ignorable_Code_Point}` from `HIDDEN` (each fails `text.test.tsx`); `<bdi>` → `<span>` (`text.test.tsx`); render `children` unescaped (`Hosts.test.tsx`'s escaped name).
@@ -899,7 +1051,8 @@ Create `web/src/lib/text.tsx`:
   - `errors.ts`: `MESSAGES[code] ?? serverMessage` (the inherited names); each of the nine new entries dropped in turn (its row of "explains %s in its own words").
   - `App.tsx`: drop `inert={…}` (`StepUpDialog.test.tsx`).
   - `SignOut.tsx`: drop the `return` after a failure, so it navigates anyway; drop `navigate('/login')` (each fails `SignOut.test.tsx`).
-  - `ConfirmDialog.tsx`: Cancel runs the action; close on a failure; drop the focus return; drop `|| disabled`; drop the Tab trap; drop the dialog's own focus while the action runs (each fails `Hosts.test.tsx` or `Hats.test.tsx`); the Tab trap's selector back to buttons, links and inputs only (`ConfirmDialog.test.tsx`).
+  - `ConfirmDialog.tsx`: Cancel runs the action; close on a failure; drop the focus return; drop `|| disabled`; drop the Tab trap; drop the dialog's own focus while the action runs (each fails `Hosts.test.tsx` or `Hats.test.tsx`); the Tab trap's selector back to buttons, links and inputs only; drop the backdrop's focus hold; a fixed title id; drop the `returnFocus` fallback (each fails `ConfirmDialog.test.tsx`).
+  - `useResource.ts`: keep the old key's data; drop it on a reload of the same key; `set` taking only a value (each fails `useResource.test.ts`).
 
 - [ ] **Step 6: Commit**
 
@@ -992,6 +1145,7 @@ Create `web/src/screens/Hosts.test.tsx`:
   import { formatLeft } from '../components/Pairing'
   import { hat, host } from '../test-fixtures'
   import { FULL, json, stubServer, type Answer } from '../test-server'
+  import { loadManageCss, shortTargets } from '../test-targets'
 
   const STEP_UP = json(403, { code: 'step_up_required', message: 'm' })
   const STEPPED_UP = new Response(null, { status: 204 })
@@ -1062,6 +1216,31 @@ Create `web/src/screens/Hosts.test.tsx`:
       open({ 'GET /api/hosts': json(200, []) })
       expect(await screen.findByText('No host is paired yet.')).toBeInTheDocument()
     })
+
+    it('says so when the hats cannot be read', async () => {
+      open({ 'GET /api/hosts': json(200, [host()]), 'GET /api/hats': json(500, { code: 'internal', message: 'the hats are away' }) })
+      expect(await screen.findByRole('alert')).toHaveTextContent('the hats are away')
+    })
+
+    it('has every button and picker at least 44 px tall under 768 px', async () => {
+      const unload = loadManageCss()
+      try {
+        open({
+          'GET /api/hosts': json(200, [host()]),
+          'POST /api/hosts/pairing-codes': json(201, { code: 'ABCD-EFGH', expires_at: new Date(Date.now() + 600_000).toISOString() }),
+        })
+        const laptop = await screen.findByRole('listitem', { name: 'laptop' })
+        await waitFor(() => expect(within(laptop).getByRole('option', { name: 'Work' })).toBeInTheDocument())
+        const page = document.querySelector('.manage')!
+        expect(shortTargets(page)).toEqual([])
+        await userEvent.click(screen.getByRole('button', { name: 'Add host' }))
+        expect(await screen.findByLabelText('Pairing command')).toBeInTheDocument()
+        await userEvent.click(within(laptop).getByRole('button', { name: 'Rename' }))
+        expect(shortTargets(page)).toEqual([])
+      } finally {
+        unload()
+      }
+    })
   })
 
   describe('adding a host', () => {
@@ -1103,6 +1282,52 @@ Create `web/src/screens/Hosts.test.tsx`:
       expect(location.href).not.toContain('ABCD')
     })
 
+    it('offers a new code once the last one expired, counting from the start again', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true })
+      const expires = new Date(Date.now() + 600_000).toISOString()
+      open({
+        'GET /api/hosts': json(200, [host()]),
+        'POST /api/hosts/pairing-codes': [
+          json(201, { code: 'ABCD-EFGH', expires_at: expires }),
+          json(201, { code: 'JKLM-NPQR', expires_at: expires }),
+        ],
+      })
+      const add = await screen.findByRole('button', { name: 'Add host' })
+      await userEvent.click(add)
+      expect(await screen.findByLabelText('Pairing command')).toBeInTheDocument()
+      expect(add).toBeDisabled()
+      await act(async () => {
+        vi.advanceTimersByTime(601_000)
+      })
+      expect(await screen.findByText('The code has expired. Add a host again for a new one.')).toBeInTheDocument()
+      expect(add).toBeEnabled()
+      await userEvent.click(add)
+      expect(await screen.findByLabelText('Pairing command')).toHaveTextContent('JKLM-NPQR')
+      expect(screen.getByRole('timer').textContent).toMatch(/^(10:00|9:5\d)$/)
+      expect(document.body.textContent).not.toContain('ABCD-EFGH')
+    })
+
+    it('reads the hosts once at a time while it waits, however slow a read is', async () => {
+      vi.useFakeTimers({ shouldAdvanceTime: true })
+      const server = open({
+        // The list, the read before the mint, then a poll that never answers.
+        'GET /api/hosts': [json(200, [host()]), json(200, [host()]), () => new Promise<Response>(() => {})],
+        'POST /api/hosts/pairing-codes': json(201, { code: 'ABCD-EFGH', expires_at: new Date(Date.now() + 600_000).toISOString() }),
+      })
+      await userEvent.click(await screen.findByRole('button', { name: 'Add host' }))
+      expect(await screen.findByLabelText('Pairing command')).toBeInTheDocument()
+      await act(async () => {
+        vi.advanceTimersByTime(3_100)
+      })
+      await act(async () => {
+        vi.advanceTimersByTime(3_000)
+      })
+      await act(async () => {
+        vi.advanceTimersByTime(3_000)
+      })
+      expect(sent(server, 'GET', '/api/hosts')).toHaveLength(3)
+    })
+
     it('ends the code when the new host pairs, and lists it', async () => {
       vi.useFakeTimers({ shouldAdvanceTime: true })
       const expires = new Date(Date.now() + 600_000).toISOString()
@@ -1119,6 +1344,8 @@ Create `web/src/screens/Hosts.test.tsx`:
       expect(await screen.findByText(/^Paired:/)).toHaveTextContent('Paired: new box')
       expect(document.body.textContent).not.toContain('ABCD-EFGH')
       expect(await screen.findByRole('listitem', { name: 'new box' })).toBeInTheDocument()
+      // The code is spent: another can be minted.
+      expect(screen.getByRole('button', { name: 'Add host' })).toBeEnabled()
     })
 
     it('tells a new host from those before it even when the list never loaded', async () => {
@@ -1219,6 +1446,53 @@ Create `web/src/screens/Hosts.test.tsx`:
       const patches = sent(server, 'PATCH', '/api/hosts/host-1')
       expect(patches.map((p) => p.body)).toEqual([{ name: 'desk' }, { name: 'desk' }])
       expect(screen.queryByRole('dialog')).toBeNull()
+    })
+
+    it('returns focus to Rename after a rename, done or cancelled', async () => {
+      open({
+        'GET /api/hosts': json(200, [host()]),
+        'PATCH /api/hosts/host-1': json(200, host({ name: 'desk' })),
+      })
+      await userEvent.click(await within(await screen.findByRole('listitem', { name: 'laptop' })).findByRole('button', { name: 'Rename' }))
+      await userEvent.type(screen.getByLabelText('New name'), ' 2')
+      await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+      await userEvent.click(within(await screen.findByRole('dialog', { name: 'Rename this host?' })).getByRole('button', { name: 'Cancel' }))
+      expect(within(card('laptop')).getByRole('button', { name: 'Rename' })).toHaveFocus()
+      await userEvent.click(within(card('laptop')).getByRole('button', { name: 'Rename' }))
+      await userEvent.type(screen.getByLabelText('New name'), ' 2')
+      await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+      await userEvent.click(within(await screen.findByRole('dialog', { name: 'Rename this host?' })).getByRole('button', { name: 'Rename' }))
+      await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+      expect(within(card('desk')).getByRole('button', { name: 'Rename' })).toHaveFocus()
+    })
+
+    it('sends no rename when the trimmed name is empty or unchanged', async () => {
+      const server = open({ 'GET /api/hosts': json(200, [host()]) })
+      const laptop = await screen.findByRole('listitem', { name: 'laptop' })
+      for (const typed of ['laptop  ', '   ']) {
+        await userEvent.click(within(laptop).getByRole('button', { name: 'Rename' }))
+        const input = screen.getByLabelText('New name')
+        await userEvent.clear(input)
+        await userEvent.type(input, typed)
+        await userEvent.click(screen.getByRole('button', { name: 'Save' }))
+        expect(screen.queryByRole('dialog')).toBeNull()
+        expect(within(laptop).getByRole('button', { name: 'Rename' })).toHaveFocus()
+      }
+      await userEvent.click(within(laptop).getByRole('button', { name: 'Rename' }))
+      await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+      expect(within(laptop).getByRole('button', { name: 'Rename' })).toHaveFocus()
+      expect(sent(server, 'PATCH', '/api/hosts/host-1')).toHaveLength(0)
+    })
+
+    it('puts focus on the card’s title once a revoke took its buttons away', async () => {
+      open({
+        'GET /api/hosts': json(200, [host()]),
+        'DELETE /api/hosts/host-1': json(200, host({ connected: false, revoked_at: '2026-10-02T12:00:00Z' })),
+      })
+      await userEvent.click(await within(await screen.findByRole('listitem', { name: 'laptop' })).findByRole('button', { name: 'Revoke' }))
+      await userEvent.click(within(await screen.findByRole('dialog', { name: 'Revoke this host?' })).getByRole('button', { name: 'Revoke' }))
+      await waitFor(() => expect(within(card('laptop')).getByText('Revoked')).toBeInTheDocument())
+      expect(within(card('laptop')).getByRole('heading', { name: 'laptop' })).toHaveFocus()
     })
 
     it('revokes it after a confirmation that says its agents stop when it next connects', async () => {
@@ -1344,6 +1618,47 @@ Create `web/src/test-fixtures.ts`:
   }
   ```
 
+Create `web/src/test-targets.ts`:
+
+  ```ts
+  // The 44 px rule under 768 px (frontend spec §10), checked in jsdom: it does
+  // no layout and applies no media query, so this reads `manage.css` itself
+  // and asks which of its narrow-screen rules match an element.
+  import { readFileSync } from 'node:fs'
+  import { join } from 'node:path'
+
+  /** Puts `manage.css` in the document (Vitest loads no CSS); returns a
+   *  remover. */
+  export function loadManageCss(): () => void {
+    const style = document.createElement('style')
+    style.textContent = readFileSync(join(process.cwd(), 'src/manage.css'), 'utf8')
+    document.head.append(style)
+    return () => style.remove()
+  }
+
+  /** Whether a narrow-screen rule gives `el` a `min-height` of 44 px or
+   *  more. */
+  export function tallEnough(el: Element): boolean {
+    for (const sheet of document.styleSheets) {
+      for (const rule of sheet.cssRules) {
+        if (!(rule instanceof CSSMediaRule) || !/max-width:\s*767px/.test(rule.media.mediaText)) continue
+        for (const inner of rule.cssRules) {
+          if (!(inner instanceof CSSStyleRule) || !el.matches(inner.selectorText)) continue
+          if (parseFloat(inner.style.minHeight) >= 44) return true
+        }
+      }
+    }
+    return false
+  }
+
+  /** The controls in `root` too short to tap under 768 px, named. */
+  export function shortTargets(root: Element): string[] {
+    return [...root.querySelectorAll('button, select, input[type="color"]')]
+      .filter((el) => !tallEnough(el))
+      .map((el) => el.getAttribute('aria-label') ?? (el.textContent?.trim() || el.closest('label')?.textContent || el.tagName))
+  }
+  ```
+
 
 - [ ] **Step 2: Run them, and see them fail**
 
@@ -1447,7 +1762,9 @@ Create `web/src/components/Pairing.tsx`:
   // The code is shown once. It lives in the Hosts screen's state and this
   // panel only: never in the address bar, the title, storage or the console.
   // It is dropped from the page when it expires, when a new host pairs, and
-  // when the panel closes or unmounts.
+  // when the panel closes or unmounts. Expired or paired, the code is spent:
+  // the panel tells Hosts, which drops it and offers "Add host" again while
+  // the panel still says what happened.
   import { useEffect, useRef, useState } from 'react'
   import { hosts as listHosts } from '../api/manage'
   import { useClient } from '../app-client'
@@ -1471,12 +1788,15 @@ Create `web/src/components/Pairing.tsx`:
   type Stage = { kind: 'live' } | { kind: 'expired' } | { kind: 'paired'; host: HostItem }
 
   interface Props {
-    minted: Minted
+    /** `null` once the code is spent. */
+    minted: Minted | null
     onPaired: () => void
+    /** The code expired or a host paired with it: it is of no use now. */
+    onSpent: () => void
     onClose: () => void
   }
 
-  export default function Pairing({ minted, onPaired, onClose }: Props) {
+  export default function Pairing({ minted, onPaired, onSpent, onClose }: Props) {
     const client = useClient()
     const [stage, setStage] = useState<Stage>({ kind: 'live' })
     // Counted from the answer's arrival, on the monotonic clock: the server's
@@ -1485,8 +1805,11 @@ Create `web/src/components/Pairing.tsx`:
     // this.
     const [deadline] = useState(() => performance.now() + CODE_LIFETIME_S * 1000)
     const [left, setLeft] = useState(CODE_LIFETIME_S)
-    const before = useRef(new Set(minted.known))
-    const command = `hennery host join ${minted.publicUrl} ${minted.code}`
+    const before = useRef(new Set(minted?.known))
+    // The parent's callbacks, current at each tick, without restarting the
+    // poll whenever the parent renders.
+    const told = useRef({ onPaired, onSpent })
+    told.current = { onPaired, onSpent }
 
     // The countdown, and the code's end at zero.
     const counting = stage.kind === 'live'
@@ -1495,7 +1818,10 @@ Create `web/src/components/Pairing.tsx`:
       const tick = () => {
         const s = Math.max(0, Math.ceil((deadline - performance.now()) / 1000))
         setLeft(s)
-        if (s === 0) setStage({ kind: 'expired' })
+        if (s === 0) {
+          setStage({ kind: 'expired' })
+          told.current.onSpent()
+        }
       }
       tick()
       const timer = setInterval(tick, 1000)
@@ -1503,22 +1829,29 @@ Create `web/src/components/Pairing.tsx`:
     }, [counting, deadline])
 
     // A host that pairs while the code is live ends it here: the code is
-    // spent.
+    // spent. A tick while a read is still out is skipped, so reads never
+    // pile up on a slow link.
     const waiting = stage.kind === 'live'
     useEffect(() => {
       if (!waiting) return
       let live = true
+      let reading = false
       const timer = setInterval(() => {
+        if (reading) return
+        reading = true
         listHosts(client).then(
           (list) => {
+            reading = false
             const fresh = list.find((h) => !before.current.has(h.host_id))
             if (live && fresh) {
               setStage({ kind: 'paired', host: fresh })
-              onPaired()
+              told.current.onSpent()
+              told.current.onPaired()
             }
           },
           () => {
             // A failed read is tried again at the next tick.
+            reading = false
           },
         )
       }, PAIRED_POLL_MS)
@@ -1526,18 +1859,18 @@ Create `web/src/components/Pairing.tsx`:
         live = false
         clearInterval(timer)
       }
-    }, [client, waiting, onPaired])
+    }, [client, waiting])
 
     return (
       <section className="card pairing" aria-labelledby="pairing-title">
         <h2 id="pairing-title" className="card-title">
           Add a host
         </h2>
-        {stage.kind === 'live' && (
+        {stage.kind === 'live' && minted && (
           <>
             <p>On the machine to pair, run:</p>
             <pre className="command" aria-label="Pairing command">
-              <code>{command}</code>
+              <code>{`hennery host join ${minted.publicUrl} ${minted.code}`}</code>
             </pre>
             <p className="pairing-code">
               Code <code>{minted.code}</code>, valid for{' '}
@@ -1719,8 +2052,8 @@ Create `web/src/manage.css`:
   @media (max-width:767px) {
     .manage { padding:16px 14px calc(24px + env(safe-area-inset-bottom)); }
     .manage-head h1 { font-size:22px; }
-    .card-actions .btn, .inline-form .btn, .rule .btn { min-height:44px; }
-    .select-field select { min-height:44px; }
+    .manage-head .btn, .card-actions .btn, .inline-form .btn, .rule .btn { min-height:44px; }
+    .select-field select, .colour-input { min-height:44px; }
   }
   ```
 
@@ -1730,7 +2063,7 @@ Create `web/src/screens/Hosts.tsx`:
   // Hosts (frontend spec §8, kernel spec §4): every paired host, revoked ones
   // included, with its online state and versions; pairing a new one; and
   // renaming, re-hatting or revoking one, each confirmed, then stepped up.
-  import { useEffect, useState } from 'react'
+  import { useEffect, useRef, useState } from 'react'
   import { messageOf } from '../api/errors'
   import { hats as listHats, hosts as listHosts, mintPairingCode, revokeHost, settings, updateHost } from '../api/manage'
   import { useClient } from '../app-client'
@@ -1743,16 +2076,26 @@ Create `web/src/screens/Hosts.tsx`:
   import When from '../components/When'
   import '../manage.css'
 
+  /** Each carries where focus goes when the confirmation closes and what
+   *  opened it is gone. */
   type Pending =
-    | { kind: 'rename'; host: HostItem; name: string }
-    | { kind: 'default_hat'; host: HostItem; hat: HatItem }
-    | { kind: 'revoke'; host: HostItem }
+    | { kind: 'rename'; host: HostItem; name: string; back: () => HTMLElement | null }
+    | { kind: 'default_hat'; host: HostItem; hat: HatItem; back: () => HTMLElement | null }
+    | { kind: 'revoke'; host: HostItem; back: () => HTMLElement | null }
+
+  /** The pairing panel: a new one per code (`n`), and the code itself until
+   *  it is spent. */
+  interface Panel {
+    n: number
+    minted: Minted | null
+  }
 
   export default function Hosts() {
     const client = useClient()
     const list = useResource(() => listHosts(client))
     const hatList = useResource(() => listHats(client))
-    const [minted, setMinted] = useState<Minted | null>(null)
+    const [panel, setPanel] = useState<Panel | null>(null)
+    const minted = panel?.minted ?? null
     const [adding, setAdding] = useState(false)
     const [addError, setAddError] = useState<string | null>(null)
     const [pending, setPending] = useState<Pending | null>(null)
@@ -1767,7 +2110,7 @@ Create `web/src/screens/Hosts.tsx`:
         const s = await settings(client)
         const known = (await listHosts(client)).map((h) => h.host_id)
         const code = await mintPairingCode(client)
-        setMinted({ code: code.code, publicUrl: s.public_url, known })
+        setPanel((p) => ({ n: (p?.n ?? 0) + 1, minted: { code: code.code, publicUrl: s.public_url, known } }))
       } catch (err) {
         setAddError(messageOf(err))
       } finally {
@@ -1778,12 +2121,12 @@ Create `web/src/screens/Hosts.tsx`:
     // A page restored from the back-forward cache must not show a code: it
     // is dropped as the page is hidden. Switching tabs to paste it keeps it.
     useEffect(() => {
-      const drop = () => setMinted(null)
+      const drop = () => setPanel(null)
       window.addEventListener('pagehide', drop)
       return () => window.removeEventListener('pagehide', drop)
     }, [])
 
-    const replace = (host: HostItem) => list.set((list.data ?? []).map((h) => (h.host_id === host.host_id ? host : h)))
+    const replace = (host: HostItem) => list.set((prev) => (prev ?? []).map((h) => (h.host_id === host.host_id ? host : h)))
 
     const hatName = (id: string) => hatList.data?.find((h) => h.id === id)?.name
 
@@ -1800,16 +2143,23 @@ Create `web/src/screens/Hosts.tsx`:
             <Text>{addError}</Text>
           </p>
         )}
-        {minted && (
+        {panel && (
           <Pairing
-            minted={minted}
+            key={panel.n}
+            minted={panel.minted}
             onPaired={list.reload}
-            onClose={() => setMinted(null)}
+            onSpent={() => setPanel((p) => p && { ...p, minted: null })}
+            onClose={() => setPanel(null)}
           />
         )}
         {list.error && (
           <p className="form-error" role="alert">
             <Text>{list.error}</Text>
+          </p>
+        )}
+        {hatList.error && (
+          <p className="form-error" role="alert">
+            <Text>{hatList.error}</Text>
           </p>
         )}
         {list.data && list.data.length === 0 && <p className="empty">No host is paired yet.</p>}
@@ -1820,9 +2170,9 @@ Create `web/src/screens/Hosts.tsx`:
               host={host}
               hats={hatList.data ?? []}
               hatName={hatName(host.default_hat_id)}
-              onRename={(name) => setPending({ kind: 'rename', host, name })}
-              onDefaultHat={(hat) => setPending({ kind: 'default_hat', host, hat })}
-              onRevoke={() => setPending({ kind: 'revoke', host })}
+              onRename={(name, back) => setPending({ kind: 'rename', host, name, back })}
+              onDefaultHat={(hat, back) => setPending({ kind: 'default_hat', host, hat, back })}
+              onRevoke={(back) => setPending({ kind: 'revoke', host, back })}
             />
           ))}
         </ul>
@@ -1832,6 +2182,7 @@ Create `web/src/screens/Hosts.tsx`:
             confirm="Rename"
             action={async () => replace(await updateHost(client, pending.host.host_id, { name: pending.name }))}
             onClose={() => setPending(null)}
+            returnFocus={pending.back}
           >
             <p>
               <Text>{pending.host.name}</Text> becomes <Text>{pending.name}</Text>.
@@ -1844,6 +2195,7 @@ Create `web/src/screens/Hosts.tsx`:
             confirm="Change"
             action={async () => replace(await updateHost(client, pending.host.host_id, { default_hat_id: pending.hat.id }))}
             onClose={() => setPending(null)}
+            returnFocus={pending.back}
           >
             <p>
               Sessions on <Text>{pending.host.name}</Text> that no path rule covers will belong to{' '}
@@ -1862,6 +2214,7 @@ Create `web/src/screens/Hosts.tsx`:
             danger
             action={async () => replace(await revokeHost(client, pending.host.host_id))}
             onClose={() => setPending(null)}
+            returnFocus={pending.back}
           >
             <p>
               <Text>{pending.host.name}</Text> can no longer connect, and its sessions are parked. Pairing it again
@@ -1874,13 +2227,17 @@ Create `web/src/screens/Hosts.tsx`:
     )
   }
 
+  /** Where focus goes when a confirmation closes and what opened it is
+   *  gone. */
+  type Back = () => HTMLElement | null
+
   interface CardProps {
     host: HostItem
     hats: HatItem[]
     hatName?: string
-    onRename: (name: string) => void
-    onDefaultHat: (hat: HatItem) => void
-    onRevoke: () => void
+    onRename: (name: string, back: Back) => void
+    onDefaultHat: (hat: HatItem, back: Back) => void
+    onRevoke: (back: Back) => void
   }
 
   function HostCard({ host, hats, hatName, onRename, onDefaultHat, onRevoke }: CardProps) {
@@ -1888,11 +2245,31 @@ Create `web/src/screens/Hosts.tsx`:
     const [renaming, setRenaming] = useState(false)
     const [name, setName] = useState(host.name)
     const titleId = `host-${host.host_id}`
+    // The rename form hides as it closes, taking focus with it: focus goes
+    // back to "Rename". A revoke takes every button away: focus goes to the
+    // card's title.
+    const title = useRef<HTMLHeadingElement>(null)
+    const rename = useRef<HTMLButtonElement>(null)
+    const refocus = useRef(false)
+    const toRename = () => rename.current
+    const toTitle = () => title.current
+
+    useEffect(() => {
+      if (!renaming && refocus.current) {
+        refocus.current = false
+        rename.current?.focus()
+      }
+    }, [renaming])
+
+    const closeForm = () => {
+      refocus.current = true
+      setRenaming(false)
+    }
 
     return (
       <li className={`card host host-${state}`} aria-labelledby={titleId}>
         <div className="card-head">
-          <h2 className="card-title" id={titleId}>
+          <h2 className="card-title" id={titleId} ref={title} tabIndex={-1}>
             <Text>{host.name}</Text>
           </h2>
           <span className={`state state-${state}`}>{HOST_STATE_LABEL[state]}</span>
@@ -1932,8 +2309,14 @@ Create `web/src/screens/Hosts.tsx`:
                 className="inline-form"
                 onSubmit={(e) => {
                   e.preventDefault()
+                  const trimmed = name.trim()
+                  if (trimmed === '' || trimmed === host.name) {
+                    closeForm()
+                    return
+                  }
+                  // The confirmation returns focus to "Rename".
                   setRenaming(false)
-                  if (name.trim() !== '' && name !== host.name) onRename(name.trim())
+                  onRename(trimmed, toRename)
                 }}
               >
                 <label className="field">
@@ -1949,7 +2332,7 @@ Create `web/src/screens/Hosts.tsx`:
                 <button type="submit" className="btn btn-primary btn-sm">
                   Save
                 </button>
-                <button type="button" className="btn btn-ghost btn-sm" onClick={() => setRenaming(false)}>
+                <button type="button" className="btn btn-ghost btn-sm" onClick={closeForm}>
                   Cancel
                 </button>
               </form>
@@ -1958,6 +2341,7 @@ Create `web/src/screens/Hosts.tsx`:
                 <button
                   type="button"
                   className="btn btn-ghost btn-sm"
+                  ref={rename}
                   onClick={() => {
                     setName(host.name)
                     setRenaming(true)
@@ -1971,7 +2355,7 @@ Create `web/src/screens/Hosts.tsx`:
                     value={host.default_hat_id}
                     onChange={(e) => {
                       const hat = hats.find((h) => h.id === e.target.value)
-                      if (hat) onDefaultHat(hat)
+                      if (hat) onDefaultHat(hat, toTitle)
                     }}
                   >
                     {hats
@@ -1984,7 +2368,7 @@ Create `web/src/screens/Hosts.tsx`:
                   </select>
                 </label>
                 <span className="spacer" />
-                <button type="button" className="btn btn-danger btn-sm" onClick={onRevoke}>
+                <button type="button" className="btn btn-danger btn-sm" onClick={() => onRevoke(toTitle)}>
                   Revoke
                 </button>
               </>
@@ -2000,7 +2384,7 @@ Create `web/src/screens/Hosts.tsx`:
 - [ ] **Step 4: Run the checks**
 
   Run: `nix develop -c sh -c 'pnpm --dir web typecheck && pnpm --dir web test'`
-  Expected: all pass. 221 Vitest tests.
+  Expected: all pass. 234 Vitest tests.
 
 - [ ] **Step 5: Revert-probes** (each must fail the named test file; all were run)
   - `manage.ts`: drop the revoked line; `connected` always online; always offline (each an outcome of `hostState`; `manage.test.ts`).
@@ -2010,7 +2394,9 @@ Create `web/src/screens/Hosts.tsx`:
     - drop the paired `setStage` ("ends the code when the new host pairs");
     - the hosts before the mint taken as none ("tells a new host from those before it even when the list never loaded");
     - the command from `location.origin` ("steps up, then shows the code and the exact command").
-  - `Hosts.tsx`: mint before the reads ("reads the URL and the hosts before minting"); drop the `pagehide` listener; actions on a revoked host; drop the revoke dialog's sentence about running agents; drop the default-hat warning (each fails `Hosts.test.tsx`).
+  - `Hosts.tsx`: mint before the reads ("reads the URL and the hosts before minting"); drop the `pagehide` listener; actions on a revoked host; drop the revoke dialog's sentence about running agents; drop the default-hat warning; drop each `returnFocus` (the revoked card's title, Rename) and the title's `tabIndex`; compare the untrimmed name; drop the hats' error; keep a spent code, at its expiry and on pairing; one panel for every code (each fails `Hosts.test.tsx`).
+  - `Pairing.tsx`: drop the read-in-flight skip ("reads the hosts once at a time").
+  - `manage.css`: drop `.manage-head .btn` from the 44 px rule ("every button and picker at least 44 px").
   - `manage.ts` (`purgeState`, `isDefault`, `safeColour`; tested here, used in Task 3): drop each of the `default`, `running` and `resume` lines, and answer `resume` for `ready` (four outcomes); `isDefault` without the hosts' defaults; `COLOUR` as `/^#/` (each fails `manage.test.ts`).
 
 - [ ] **Step 6: Commit**
@@ -2032,6 +2418,7 @@ Create `web/src/screens/Hats.test.tsx`:
   import App from '../App'
   import { hat, host, preview } from '../test-fixtures'
   import { FULL, json, stubServer, type Answer } from '../test-server'
+  import { loadManageCss, shortTargets } from '../test-targets'
 
   const STEP_UP = json(403, { code: 'step_up_required', message: 'm' })
   const PERSONAL = hat({ id: 'hat-a', name: 'Personal', colour: '#4c5fd5', default_for_new_hosts: true })
@@ -2121,6 +2508,83 @@ Create `web/src/screens/Hats.test.tsx`:
         { default_for_new_hosts: true },
       ])
     })
+
+    it('keeps both of two changes that land together', async () => {
+      let answerPatch: (r: Response) => void = () => {}
+      open({
+        'PATCH /api/hats/hat-b': () => new Promise<Response>((resolve) => (answerPatch = resolve)),
+        'POST /api/hats': json(201, hat({ id: 'hat-c', name: 'Clients' })),
+      })
+      const work = await screen.findByRole('listitem', { name: 'Work' })
+      await userEvent.click(within(work).getByRole('button', { name: 'Make default for new hosts' }))
+      await userEvent.type(screen.getByRole('textbox', { name: 'Name' }), 'Clients')
+      await userEvent.click(screen.getByRole('button', { name: 'Create' }))
+      expect(await screen.findByRole('listitem', { name: 'Clients' })).toBeInTheDocument()
+      answerPatch(json(200, hat({ default_for_new_hosts: true })))
+      await waitFor(() => expect(within(screen.getByRole('listitem', { name: 'Work' })).getByText('Default for new hosts')).toBeInTheDocument())
+      expect(screen.getByRole('listitem', { name: 'Clients' })).toBeInTheDocument()
+      expect(within(screen.getByRole('listitem', { name: 'Personal' })).queryByText('Default for new hosts')).toBeNull()
+    })
+
+    it('keeps a change that lands while a new hat is being created', async () => {
+      let answerCreate: (r: Response) => void = () => {}
+      open({
+        'PATCH /api/hats/hat-b': json(200, hat({ default_for_new_hosts: true })),
+        'POST /api/hats': () => new Promise<Response>((resolve) => (answerCreate = resolve)),
+      })
+      await userEvent.type(await screen.findByRole('textbox', { name: 'Name' }), 'Clients')
+      await userEvent.click(screen.getByRole('button', { name: 'Create' }))
+      await userEvent.click(within(screen.getByRole('listitem', { name: 'Work' })).getByRole('button', { name: 'Make default for new hosts' }))
+      await waitFor(() => expect(within(screen.getByRole('listitem', { name: 'Work' })).getByText('Default for new hosts')).toBeInTheDocument())
+      answerCreate(json(201, hat({ id: 'hat-c', name: 'Clients' })))
+      expect(await screen.findByRole('listitem', { name: 'Clients' })).toBeInTheDocument()
+      expect(within(screen.getByRole('listitem', { name: 'Work' })).getByText('Default for new hosts')).toBeInTheDocument()
+    })
+
+    it('returns focus to Edit after an edit is saved', async () => {
+      open({ 'PATCH /api/hats/hat-b': json(200, hat({ name: 'Day job' })) })
+      const work = await screen.findByRole('listitem', { name: 'Work' })
+      await userEvent.click(within(work).getByRole('button', { name: 'Edit' }))
+      await userEvent.type(within(work).getByRole('textbox', { name: 'Name' }), ' 2')
+      await userEvent.click(within(work).getByRole('button', { name: 'Save' }))
+      const dayJob = await screen.findByRole('listitem', { name: 'Day job' })
+      await waitFor(() => expect(within(dayJob).getByRole('button', { name: 'Edit' })).toHaveFocus())
+    })
+
+    it('puts focus on the card’s title once “Make default for new hosts” is gone', async () => {
+      open({ 'PATCH /api/hats/hat-b': json(200, hat({ default_for_new_hosts: true })) })
+      const work = await screen.findByRole('listitem', { name: 'Work' })
+      await userEvent.click(within(work).getByRole('button', { name: 'Make default for new hosts' }))
+      await waitFor(() => expect(within(work).queryByRole('button', { name: 'Make default for new hosts' })).toBeNull())
+      expect(within(work).getByRole('heading', { name: 'Work' })).toHaveFocus()
+    })
+
+    it('puts focus back in the name after a hat is created', async () => {
+      open({ 'POST /api/hats': json(201, hat({ id: 'hat-c', name: 'Clients' })) })
+      const name = await screen.findByRole('textbox', { name: 'Name' })
+      await userEvent.type(name, 'Clients')
+      await userEvent.click(screen.getByRole('button', { name: 'Create' }))
+      expect(await screen.findByRole('listitem', { name: 'Clients' })).toBeInTheDocument()
+      expect(name).toHaveFocus()
+    })
+
+    it('says so when the hosts cannot be read', async () => {
+      open({ 'GET /api/hosts': json(500, { code: 'internal', message: 'the hosts are away' }) })
+      expect(await screen.findByRole('alert')).toHaveTextContent('the hosts are away')
+    })
+
+    it('has every button, picker and colour at least 44 px tall under 768 px', async () => {
+      const unload = loadManageCss()
+      try {
+        open({ 'GET /api/hosts/host-1/path-rules': json(200, [{ id: 'r-1', prefix: '/home/me/work', hat_id: 'hat-b', verified: true }]) })
+        await screen.findByDisplayValue('/home/me/work')
+        const work = screen.getByRole('listitem', { name: 'Work' })
+        await userEvent.click(within(work).getByRole('button', { name: 'Edit' }))
+        expect(shortTargets(document.querySelector('.manage')!)).toEqual([])
+      } finally {
+        unload()
+      }
+    })
   })
 
   describe('purging a hat', () => {
@@ -2173,6 +2637,41 @@ Create `web/src/screens/Hats.test.tsx`:
       await userEvent.click(within(dialog).getByRole('button', { name: 'Resume purge' }))
       expect(await screen.findByRole('status', { name: 'Purged Work' })).toBeInTheDocument()
       expect(sent(server, 'POST', '/api/hats/hat-b/purge')).toHaveLength(1)
+    })
+
+    it('reads the hats again when a purge fails, so a hat it froze offers “Resume purge”', async () => {
+      open({
+        'GET /api/hats': [json(200, [PERSONAL, WORK]), json(200, [PERSONAL, hat({ purging: true })])],
+        'GET /api/hats/hat-b/purge': json(200, preview()),
+        'POST /api/hats/hat-b/purge': json(500, { code: 'internal', message: 'stopped half way' }),
+      })
+      await userEvent.click(within(await screen.findByRole('listitem', { name: 'Work' })).getByRole('button', { name: 'Purge' }))
+      const dialog = await screen.findByRole('dialog', { name: 'Purge this hat?' })
+      await userEvent.click(within(dialog).getByRole('button', { name: 'Purge' }))
+      expect(await within(dialog).findByRole('alert')).toHaveTextContent('stopped half way')
+      await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+      expect(await within(screen.getByRole('listitem', { name: 'Work' })).findByRole('button', { name: 'Resume purge' })).toBeInTheDocument()
+    })
+
+    it('reads the rules again after a purge, which deleted the hat’s, and asks the tester again', async () => {
+      const server = open({
+        'GET /api/hosts/host-1/path-rules': [json(200, [{ id: 'r-1', prefix: '/home/me/work', hat_id: 'hat-b', verified: true }]), json(200, [])],
+        'GET /api/hats/hat-b/purge': json(200, preview()),
+        'POST /api/hats/hat-b/purge': json(200, result),
+        'POST /api/hats/resolve': [
+          json(200, { canonical: '/home/me/work/app', exists: true, is_dir: true, hat_id: 'hat-b', rule_id: 'r-1' }),
+          json(200, { canonical: '/home/me/work/app', exists: true, is_dir: true, hat_id: 'hat-a' }),
+        ],
+      })
+      await screen.findByDisplayValue('/home/me/work')
+      await userEvent.type(screen.getByLabelText('Test a path'), '/home/me/work/app')
+      expect(await screen.findByLabelText('Resolution', {}, { timeout: 2000 })).toHaveTextContent('a path rule')
+      await userEvent.click(within(screen.getByRole('listitem', { name: 'Work' })).getByRole('button', { name: 'Purge' }))
+      await userEvent.click(within(await screen.findByRole('dialog', { name: 'Purge this hat?' })).getByRole('button', { name: 'Purge' }))
+      expect(await screen.findByText('No rules: every session on this host gets its default hat.')).toBeInTheDocument()
+      expect(screen.queryByDisplayValue('/home/me/work')).toBeNull()
+      await waitFor(() => expect(screen.getByLabelText('Resolution')).toHaveTextContent('the host’s default hat'), { timeout: 2000 })
+      expect(sent(server, 'POST', '/api/hats/resolve')).toHaveLength(2)
     })
 
     it('lists the sessions of no hat, which no purge deletes', async () => {
@@ -2233,6 +2732,30 @@ Create `web/src/screens/Hats.test.tsx`:
       expect(within(picker).getByRole('option', { name: 'Work' })).toBeDisabled()
     })
 
+    it('cannot save a rule with no path, and says why', async () => {
+      open({ 'GET /api/hosts/host-1/path-rules': json(200, RULES) })
+      await screen.findByDisplayValue('/home/me/work')
+      expect(screen.getByRole('button', { name: 'Save rules' })).toBeEnabled()
+      await userEvent.click(screen.getByRole('button', { name: 'Add rule' }))
+      await userEvent.type(screen.getByLabelText('Path 2'), '   ')
+      expect(screen.getByRole('button', { name: 'Save rules' })).toBeDisabled()
+      expect(screen.getByText('Every rule needs a path.')).toBeInTheDocument()
+      await userEvent.type(screen.getByLabelText('Path 2'), '/srv')
+      expect(screen.getByRole('button', { name: 'Save rules' })).toBeEnabled()
+    })
+
+    it('moves focus to the next rule when one is removed, and to “Add rule” after the last', async () => {
+      open({
+        'GET /api/hosts/host-1/path-rules': json(200, [...RULES, { id: 'r-2', prefix: '/srv', hat_id: 'hat-a', verified: true }]),
+      })
+      await screen.findByDisplayValue('/home/me/work')
+      await userEvent.click(screen.getByRole('button', { name: 'Remove rule 1' }))
+      expect(screen.getByLabelText('Path 1')).toHaveValue('/srv')
+      expect(screen.getByLabelText('Path 1')).toHaveFocus()
+      await userEvent.click(screen.getByRole('button', { name: 'Remove rule 1' }))
+      expect(screen.getByRole('button', { name: 'Add rule' })).toHaveFocus()
+    })
+
     it('says why a set was refused', async () => {
       open({
         'GET /api/hosts/host-1/path-rules': json(200, RULES),
@@ -2289,6 +2812,52 @@ Create `web/src/screens/Hats.test.tsx`:
       expect(screen.getByLabelText('Resolution')).toHaveTextContent('/srv/b')
     })
 
+    it('asks again after the rules are saved, since it answers under the rules as saved', async () => {
+      open({
+        'GET /api/hosts/host-1/path-rules': json(200, []),
+        'PUT /api/hosts/host-1/path-rules': json(200, [{ id: 'r-1', prefix: '/srv', hat_id: 'hat-b', verified: true }]),
+        'POST /api/hats/resolve': [
+          json(200, { canonical: '/srv/x', exists: true, is_dir: true, hat_id: 'hat-a' }),
+          json(200, { canonical: '/srv/x', exists: true, is_dir: true, hat_id: 'hat-b', rule_id: 'r-1' }),
+        ],
+      })
+      await userEvent.type(await screen.findByLabelText('Test a path'), '/srv/x')
+      expect(await screen.findByLabelText('Resolution', {}, { timeout: 2000 })).toHaveTextContent('the host’s default hat')
+      await userEvent.click(screen.getByRole('button', { name: 'Add rule' }))
+      await userEvent.type(screen.getByLabelText('Path 1'), '/srv')
+      await userEvent.click(screen.getByRole('button', { name: 'Save rules' }))
+      await waitFor(() => expect(screen.getByLabelText('Resolution')).toHaveTextContent('a path rule'), { timeout: 2000 })
+      expect(screen.getByLabelText('Test a path')).toHaveValue('/srv/x')
+    })
+
+    it('shows no answer for a path typed after it', async () => {
+      open({ 'POST /api/hats/resolve': json(200, { canonical: '/srv/x', exists: true, is_dir: true, hat_id: 'hat-a' }) })
+      const tester = await screen.findByLabelText('Test a path')
+      await userEvent.type(tester, '/srv/x')
+      expect(await screen.findByLabelText('Resolution', {}, { timeout: 2000 })).toBeInTheDocument()
+      await userEvent.type(tester, 'y')
+      expect(screen.queryByLabelText('Resolution')).toBeNull()
+    })
+
+    it('announces each answer once: in one live region, nested in none', async () => {
+      open({
+        'POST /api/hats/resolve': [
+          json(409, { code: 'host_offline', message: 'm' }),
+          json(200, { canonical: '/srv/xy', exists: true, is_dir: true, hat_id: 'hat-a' }),
+        ],
+      })
+      const LIVE = '[role="status"], [role="alert"], [aria-live]:not([aria-live="off"])'
+      const nested = () => [...document.querySelectorAll(LIVE)].filter((r) => r.parentElement?.closest(LIVE))
+      const tester = await screen.findByLabelText('Test a path')
+      await userEvent.type(tester, '/srv/x')
+      await screen.findByText('The host is offline: it resolves the path.', {}, { timeout: 2000 })
+      expect(nested()).toEqual([])
+      await userEvent.type(tester, 'y')
+      const resolution = await screen.findByLabelText('Resolution', {}, { timeout: 2000 })
+      expect(resolution.closest(LIVE)).not.toBeNull()
+      expect(nested()).toEqual([])
+    })
+
     it.each([
       ['host_offline', 'The host is offline: it resolves the path.'],
       ['resolve_unsupported', 'This host cannot resolve paths yet: update hennery on it.'],
@@ -2324,7 +2893,7 @@ Create `web/src/components/PathRules.tsx`:
   // sent back whole (step-up; the host must be connected, since it resolves
   // each prefix). Beside it, a live tester: which hat a path on that host
   // resolves to under the rules as SAVED, as a session started there would
-  // get.
+  // get: it asks again whenever they are saved, or a purge deleted some.
   import { useEffect, useRef, useState } from 'react'
   import { ApiFailure, messageOf } from '../api/errors'
   import { pathRules, replacePathRules, resolveHat } from '../api/manage'
@@ -2336,8 +2905,10 @@ Create `web/src/components/PathRules.tsx`:
   /** How long typing pauses before the tester asks the host. */
   export const TEST_DELAY_MS = 400
 
-  export default function PathRules({ hosts, hats }: { hosts: HostItem[]; hats: HatItem[] }) {
+  /** `purges` counts the purges tried: each may have deleted rules here. */
+  export default function PathRules({ hosts, hats, purges }: { hosts: HostItem[]; hats: HatItem[]; purges: number }) {
     const [hostId, setHostId] = useState<string | null>(null)
+    const [saves, setSaves] = useState(0)
     const host = hosts.find((h) => h.host_id === hostId) ?? hosts[0]
 
     if (!host) {
@@ -2369,8 +2940,10 @@ Create `web/src/components/PathRules.tsx`:
             ))}
           </select>
         </label>
-        <Rules key={host.host_id} host={host} hats={hats} />
-        <Tester key={`t-${host.host_id}`} host={host} hats={hats} />
+        {/* After a purge the rules are read again; after a save, the answer
+            is the set as stored already. The tester asks again after both. */}
+        <Rules key={`${host.host_id}-${purges}`} host={host} hats={hats} onSaved={() => setSaves((n) => n + 1)} />
+        <Tester key={`t-${host.host_id}`} host={host} hats={hats} rules={`${purges}.${saves}`} />
       </section>
     )
   }
@@ -2386,7 +2959,7 @@ Create `web/src/components/PathRules.tsx`:
     return rules.map((r) => ({ key: next(), prefix: r.prefix, hat_id: r.hat_id, verified: r.verified }))
   }
 
-  function Rules({ host, hats }: { host: HostItem; hats: HatItem[] }) {
+  function Rules({ host, hats, onSaved }: { host: HostItem; hats: HatItem[]; onSaved: () => void }) {
     const client = useClient()
     const counter = useRef(0)
     const next = () => ++counter.current
@@ -2396,6 +2969,17 @@ Create `web/src/components/PathRules.tsx`:
     const [saved, setSaved] = useState(false)
     const stored = useResource(() => pathRules(client, host.host_id), [host.host_id])
     const usable = hats.filter((h) => !h.purging)
+    // A removed row takes its focused button away: focus goes to the next
+    // row's path, or to "Add rule" after the last.
+    const inputs = useRef(new Map<number, HTMLInputElement>())
+    const addRule = useRef<HTMLButtonElement>(null)
+    const refocus = useRef<number | 'add' | null>(null)
+    useEffect(() => {
+      if (refocus.current === null) return
+      const to = refocus.current === 'add' ? addRule.current : inputs.current.get(refocus.current)
+      refocus.current = null
+      to?.focus()
+    })
 
     useEffect(() => {
       if (stored.data) setRows(rowsOf(stored.data, next))
@@ -2416,6 +3000,7 @@ Create `web/src/components/PathRules.tsx`:
         // it, never from what was typed.
         stored.set(await replacePathRules(client, host.host_id, body))
         setSaved(true)
+        onSaved()
       } catch (err) {
         setError(messageOf(err))
       } finally {
@@ -2431,6 +3016,8 @@ Create `web/src/components/PathRules.tsx`:
       )
     }
     if (!rows) return <p role="status">Loading the rules…</p>
+    // The server refuses a whole set for one blank path.
+    const blank = rows.some((r) => r.prefix.trim() === '')
 
     return (
       <div className="rules">
@@ -2441,6 +3028,10 @@ Create `web/src/components/PathRules.tsx`:
               <label className="field rule-prefix">
                 <span className="field-label">Path {i + 1}</span>
                 <input
+                  ref={(el) => {
+                    if (el) inputs.current.set(row.key, el)
+                    else inputs.current.delete(row.key)
+                  }}
                   className="text-input mono"
                   value={row.prefix}
                   placeholder="/home/me/work"
@@ -2475,6 +3066,7 @@ Create `web/src/components/PathRules.tsx`:
                 aria-label={`Remove rule ${i + 1}`}
                 onClick={() => {
                   setSaved(false)
+                  refocus.current = rows[i + 1]?.key ?? 'add'
                   setRows(rows.filter((r) => r.key !== row.key))
                 }}
               >
@@ -2487,6 +3079,7 @@ Create `web/src/components/PathRules.tsx`:
           <button
             type="button"
             className="btn btn-ghost btn-sm"
+            ref={addRule}
             disabled={usable.length === 0}
             onClick={() => {
               setSaved(false)
@@ -2496,10 +3089,11 @@ Create `web/src/components/PathRules.tsx`:
             Add rule
           </button>
           <span className="spacer" />
-          <button type="button" className="btn btn-primary btn-sm" onClick={save} disabled={busy}>
+          <button type="button" className="btn btn-primary btn-sm" onClick={save} disabled={busy || blank}>
             Save rules
           </button>
         </div>
+        {blank && <p className="hint">Every rule needs a path.</p>}
         {!host.connected && <p className="hint">The host is offline: rules can be saved only while it is connected.</p>}
         {saved && <p role="status">Saved.</p>}
         {error && (
@@ -2513,19 +3107,19 @@ Create `web/src/components/PathRules.tsx`:
 
   type Verdict = { kind: 'idle' } | { kind: 'asking' } | { kind: 'resolved'; resolution: HatResolution } | { kind: 'failed'; error: string }
 
-  function Tester({ host, hats }: { host: HostItem; hats: HatItem[] }) {
+  /** `rules` names the saved set: a new value asks again. */
+  function Tester({ host, hats, rules }: { host: HostItem; hats: HatItem[]; rules: string }) {
     const client = useClient()
     const [path, setPath] = useState('')
     const [verdict, setVerdict] = useState<Verdict>({ kind: 'idle' })
 
     // Each change waits for typing to pause, then asks; a newer path aborts
-    // the older question, so an answer never lands on the wrong path.
+    // the older question, so an answer never lands on the wrong path, and
+    // the last answer goes as soon as the path or the rules change.
     useEffect(() => {
+      setVerdict({ kind: 'idle' })
       const typed = path.trim()
-      if (typed === '') {
-        setVerdict({ kind: 'idle' })
-        return
-      }
+      if (typed === '') return
       const abort = new AbortController()
       const timer = setTimeout(() => {
         setVerdict({ kind: 'asking' })
@@ -2543,7 +3137,7 @@ Create `web/src/components/PathRules.tsx`:
         clearTimeout(timer)
         abort.abort()
       }
-    }, [client, host.host_id, path])
+    }, [client, host.host_id, path, rules])
 
     const hatName = (id: string) => hats.find((h) => h.id === id)?.name ?? id
 
@@ -2559,7 +3153,9 @@ Create `web/src/components/PathRules.tsx`:
           />
         </label>
         <p className="hint">Resolved by the host, under the rules as saved.</p>
-        <div aria-live="polite" className="tester-out">
+        {/* Each answer is its own live region, nested in none: announced
+            once. */}
+        <div className="tester-out">
           {verdict.kind === 'asking' && <p role="status">Asking the host…</p>}
           {verdict.kind === 'failed' && (
             <p className="form-error" role="alert">
@@ -2567,30 +3163,32 @@ Create `web/src/components/PathRules.tsx`:
             </p>
           )}
           {verdict.kind === 'resolved' && (
-            <dl className="facts" aria-label="Resolution">
-              <dt>Resolves to</dt>
-              <dd className="mono">
-                <Text>{verdict.resolution.canonical}</Text>
-              </dd>
-              <dt>Hat</dt>
-              <dd>
-                <Text>{hatName(verdict.resolution.hat_id)}</Text>
-              </dd>
-              <dt>Decided by</dt>
-              <dd>{verdict.resolution.rule_id ? 'a path rule' : 'the host’s default hat'}</dd>
-              {!verdict.resolution.exists && (
-                <>
-                  <dt>Note</dt>
-                  <dd>This path does not exist on the host.</dd>
-                </>
-              )}
-              {verdict.resolution.exists && !verdict.resolution.is_dir && (
-                <>
-                  <dt>Note</dt>
-                  <dd>This is not a directory: no session can start in it.</dd>
-                </>
-              )}
-            </dl>
+            <div role="status">
+              <dl className="facts" aria-label="Resolution">
+                <dt>Resolves to</dt>
+                <dd className="mono">
+                  <Text>{verdict.resolution.canonical}</Text>
+                </dd>
+                <dt>Hat</dt>
+                <dd>
+                  <Text>{hatName(verdict.resolution.hat_id)}</Text>
+                </dd>
+                <dt>Decided by</dt>
+                <dd>{verdict.resolution.rule_id ? 'a path rule' : 'the host’s default hat'}</dd>
+                {!verdict.resolution.exists && (
+                  <>
+                    <dt>Note</dt>
+                    <dd>This path does not exist on the host.</dd>
+                  </>
+                )}
+                {verdict.resolution.exists && !verdict.resolution.is_dir && (
+                  <>
+                    <dt>Note</dt>
+                    <dd>This is not a directory: no session can start in it.</dd>
+                  </>
+                )}
+              </dl>
+            </div>
           )}
         </div>
       </div>
@@ -2644,7 +3242,7 @@ Create `web/src/screens/Hats.tsx`:
   // "this path resolves to" tester, and purge a hat after seeing what goes.
   // Every change but creating needs a fresh step-up, which the client asks
   // for when the server refuses.
-  import { useState, type FormEvent } from 'react'
+  import { useEffect, useRef, useState, type FormEvent } from 'react'
   import { messageOf } from '../api/errors'
   import { createHat, hats as listHats, hosts as listHosts, purgeHat, purgePreview, updateHat } from '../api/manage'
   import { useClient } from '../app-client'
@@ -2667,10 +3265,16 @@ Create `web/src/screens/Hats.tsx`:
     const [purge, setPurge] = useState<{ hat: HatItem; preview: PurgePreview } | null>(null)
     const [purged, setPurged] = useState<{ name: string; result: PurgeResult } | null>(null)
     const [error, setError] = useState<string | null>(null)
+    // A purge deletes the hat's path rules on the server: every purge tried,
+    // whether it finished or not, has the rules read again.
+    const [purges, setPurges] = useState(0)
+    const purgeTried = useRef(false)
 
+    // As functions of the list held, so two changes landing together both
+    // stay.
     const replace = (hat: HatItem) =>
-      hats.set(
-        (hats.data ?? []).map((h) => {
+      hats.set((prev) =>
+        (prev ?? []).map((h) => {
           if (h.id === hat.id) return hat
           // Only one hat is the default for new hosts.
           return hat.default_for_new_hosts ? { ...h, default_for_new_hosts: false } : h
@@ -2686,17 +3290,18 @@ Create `web/src/screens/Hats.tsx`:
       }
     }
 
-    const shownError = hats.error ?? error
-
     return (
       <div className="manage">
         <header className="manage-head">
           <h1>Hats</h1>
         </header>
-        {shownError && (
-          <p className="form-error" role="alert">
-            <Text>{shownError}</Text>
-          </p>
+        {[hats.error, hosts.error, error].map(
+          (shown, i) =>
+            shown && (
+              <p key={i} className="form-error" role="alert">
+                <Text>{shown}</Text>
+              </p>
+            ),
         )}
         {purged && (
           <PurgeOutcome name={purged.name} result={purged.result} onClose={() => setPurged(null)} />
@@ -2712,18 +3317,29 @@ Create `web/src/screens/Hats.tsx`:
             />
           ))}
         </ul>
-        <NewHat onCreated={(hat) => hats.set([...(hats.data ?? []), hat])} />
-        <PathRules hosts={(hosts.data ?? []).filter((h) => h.revoked_at === undefined)} hats={hats.data ?? []} />
+        <NewHat onCreated={(hat) => hats.set((prev) => [...(prev ?? []), hat])} />
+        <PathRules
+          hosts={(hosts.data ?? []).filter((h) => h.revoked_at === undefined)}
+          hats={hats.data ?? []}
+          purges={purges}
+        />
         {purge && (
           <PurgeDialog
             hat={purge.hat}
             preview={purge.preview}
             hosts={hosts.data ?? []}
-            onPurged={(result) => {
-              setPurged({ name: purge.hat.name, result })
-              hats.reload()
+            onTried={() => (purgeTried.current = true)}
+            onPurged={(result) => setPurged({ name: purge.hat.name, result })}
+            onClose={() => {
+              setPurge(null)
+              // A purge that failed may have frozen the hat ("Resume purge")
+              // and deleted its rules already: both are read again.
+              if (purgeTried.current) {
+                purgeTried.current = false
+                hats.reload()
+                setPurges((n) => n + 1)
+              }
             }}
-            onClose={() => setPurge(null)}
           />
         )}
       </div>
@@ -2753,12 +3369,29 @@ Create `web/src/screens/Hats.tsx`:
     const [busy, setBusy] = useState(false)
     const [error, setError] = useState<string | null>(null)
     const titleId = `hat-${hat.id}`
+    // A closed form or a done "Make default for new hosts" takes the focused
+    // control away: focus goes to "Edit", or to the card's title.
+    const title = useRef<HTMLHeadingElement>(null)
+    const editButton = useRef<HTMLButtonElement>(null)
+    const refocus = useRef<'edit' | 'title' | null>(null)
+    useEffect(() => {
+      if (refocus.current === null) return
+      const to = refocus.current === 'edit' ? editButton.current : title.current
+      refocus.current = null
+      to?.focus()
+    })
 
-    const change = async (body: Parameters<typeof updateHat>[2]) => {
+    const closeForm = () => {
+      refocus.current = 'edit'
+      setEditing(false)
+    }
+
+    const change = async (body: Parameters<typeof updateHat>[2], then: 'edit' | 'title') => {
       setBusy(true)
       setError(null)
       try {
         onChanged(await updateHat(client, hat.id, body))
+        refocus.current = then
         setEditing(false)
       } catch (err) {
         setError(messageOf(err))
@@ -2772,15 +3405,15 @@ Create `web/src/screens/Hats.tsx`:
       const body: Parameters<typeof updateHat>[2] = {}
       if (name.trim() !== hat.name) body.name = name.trim()
       if (colour !== hat.colour) body.colour = colour
-      if (Object.keys(body).length === 0) setEditing(false)
-      else change(body)
+      if (Object.keys(body).length === 0) closeForm()
+      else change(body, 'edit')
     }
 
     return (
       <li className="card hat" aria-labelledby={titleId}>
         <div className="card-head">
           <Swatch colour={hat.colour} />
-          <h2 className="card-title" id={titleId}>
+          <h2 className="card-title" id={titleId} ref={title} tabIndex={-1}>
             <Text>{hat.name}</Text>
           </h2>
           {hat.default_for_new_hosts && <span className="tag">Default for new hosts</span>}
@@ -2799,7 +3432,7 @@ Create `web/src/screens/Hats.tsx`:
             <button type="submit" className="btn btn-primary btn-sm" disabled={busy}>
               Save
             </button>
-            <button type="button" className="btn btn-ghost btn-sm" onClick={() => setEditing(false)} disabled={busy}>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={closeForm} disabled={busy}>
               Cancel
             </button>
           </form>
@@ -2808,6 +3441,7 @@ Create `web/src/screens/Hats.tsx`:
             <button
               type="button"
               className="btn btn-ghost btn-sm"
+              ref={editButton}
               onClick={() => {
                 setName(hat.name)
                 setColour(safeColour(hat.colour) ?? NEW_COLOUR)
@@ -2821,7 +3455,7 @@ Create `web/src/screens/Hats.tsx`:
               <button
                 type="button"
                 className="btn btn-ghost btn-sm"
-                onClick={() => change({ default_for_new_hosts: true })}
+                onClick={() => change({ default_for_new_hosts: true }, 'title')}
                 disabled={busy}
               >
                 Make default for new hosts
@@ -2851,6 +3485,7 @@ Create `web/src/screens/Hats.tsx`:
     const [colour, setColour] = useState(NEW_COLOUR)
     const [busy, setBusy] = useState(false)
     const [error, setError] = useState<string | null>(null)
+    const nameInput = useRef<HTMLInputElement>(null)
 
     const submit = async (e: FormEvent) => {
       e.preventDefault()
@@ -2859,6 +3494,9 @@ Create `web/src/screens/Hats.tsx`:
       try {
         onCreated(await createHat(client, { name: name.trim(), colour }))
         setName('')
+        // "Create" is disabled with the name empty: focus goes to the name,
+        // ready for the next hat.
+        nameInput.current?.focus()
       } catch (err) {
         setError(messageOf(err))
       } finally {
@@ -2874,7 +3512,14 @@ Create `web/src/screens/Hats.tsx`:
         <form className="inline-form" onSubmit={submit}>
           <label className="field">
             <span className="field-label">Name</span>
-            <input className="text-input" value={name} maxLength={64} required onChange={(e) => setName(e.target.value)} />
+            <input
+              ref={nameInput}
+              className="text-input"
+              value={name}
+              maxLength={64}
+              required
+              onChange={(e) => setName(e.target.value)}
+            />
           </label>
           <label className="field">
             <span className="field-label">Colour</span>
@@ -2897,12 +3542,14 @@ Create `web/src/screens/Hats.tsx`:
     hat,
     preview,
     hosts,
+    onTried,
     onPurged,
     onClose,
   }: {
     hat: HatItem
     preview: PurgePreview
     hosts: HostItem[]
+    onTried: () => void
     onPurged: (result: PurgeResult) => void
     onClose: () => void
   }) {
@@ -2915,7 +3562,10 @@ Create `web/src/screens/Hats.tsx`:
         confirm={state === 'resume' ? 'Resume purge' : 'Purge'}
         danger
         disabled={blocked}
-        action={async () => onPurged(await purgeHat(client, hat.id))}
+        action={async () => {
+          onTried()
+          onPurged(await purgeHat(client, hat.id))
+        }}
         onClose={onClose}
       >
         <p>
@@ -3016,7 +3666,7 @@ Create `web/src/screens/Hats.tsx`:
 - [ ] **Step 4: Run the checks**
 
   Run: `nix develop -c sh -c 'pnpm --dir web typecheck && pnpm --dir web test'`
-  Expected: all pass. 243 Vitest tests.
+  Expected: all pass. 270 Vitest tests.
 
 - [ ] **Step 5: Revert-probes** (each must fail `Hats.test.tsx`; all were run)
   - `Hats.tsx`: drop the dialog's `disabled={blocked}`; the card's purge button enabled for a default hat.
@@ -3026,7 +3676,12 @@ Create `web/src/screens/Hats.tsx`:
     - drop the aborted check on a success (an older answer lands);
     - the tester's error unescaped (`<bdi>` alone);
     - drop the tester's words for `host_offline`;
-    - drop the disabled option for a rule's hat being purged.
+    - drop the disabled option for a rule's hat being purged;
+    - drop the purge or the save from the tester's dependencies, or from the rules' key ("reads the rules again after a purge", "asks again after the rules are saved");
+    - drop the blank-path check or its words; drop the tester's reset to idle; nest its answer in a second live region;
+    - drop the focus move after removing a rule.
+  - `Hats.tsx`: fold an answer into the list as it was when the action began (both updaters); drop each focus return (Edit, the title and its `tabIndex`, the name); drop the hosts' error; drop the reload when the purge dialog closes.
+  - `manage.css`: drop `.colour-input` from the 44 px rule.
 
 - [ ] **Step 6: Commit**
 
@@ -3041,6 +3696,20 @@ Create `web/src/screens/Hats.tsx`:
 In `web/e2e/collector.ts`, replace:
 
   ```ts
+  // writes. Stopped by its own process id.
+  ```
+
+with:
+
+  ```ts
+  // writes. Stopped by its own process id. Every binary the browser checks
+  // start runs in `scratchEnv`: nothing of the runner's own hennery setup,
+  // home or XDG directories reaches it.
+  ```
+
+In `web/e2e/collector.ts`, replace:
+
+  ```ts
   const BIN = process.env.HENNERY_BIN ?? resolve(process.cwd(), '../target/debug/hennery')
   ```
 
@@ -3048,23 +3717,43 @@ with:
 
   ```ts
   export const BIN = process.env.HENNERY_BIN ?? resolve(process.cwd(), '../target/debug/hennery')
+
+  /** The runner's environment without any `HENNERY_*` variable (a data or
+   *  log directory, a service flag: each would send the binary to the
+   *  runner's own files), with its home and XDG directories under `dir`. */
+  export function scratchEnv(dir: string): NodeJS.ProcessEnv {
+    const env = { ...process.env }
+    for (const key of Object.keys(env)) if (/^HENNERY_/.test(key)) delete env[key]
+    return {
+      ...env,
+      HOME: dir,
+      XDG_DATA_HOME: join(dir, 'xdg-data'),
+      XDG_CONFIG_HOME: join(dir, 'xdg-config'),
+      XDG_CACHE_HOME: join(dir, 'xdg-cache'),
+      XDG_STATE_HOME: join(dir, 'xdg-state'),
+    }
+  }
   ```
 
 In `web/e2e/collector.ts`, replace:
 
   ```ts
+      env: { ...process.env, RUST_LOG: 'warn' },
+    })
+    let stderr = ''
     child.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
-    // Stopped and removed on every path, a failed start included: the
   ```
 
 with:
 
   ```ts
+      env: { ...scratchEnv(dir), RUST_LOG: 'warn' },
+    })
+    let stderr = ''
     child.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
     // A binary that cannot start fails the test that asked for it, rather
     // than the worker.
     child.once('error', (err) => (stderr += `${err}`))
-    // Stopped and removed on every path, a failed start included: the
   ```
 
 Create `web/e2e/host.ts`:
@@ -3079,7 +3768,7 @@ Create `web/e2e/host.ts`:
   import { mkdtempSync, rmSync } from 'node:fs'
   import { tmpdir } from 'node:os'
   import { join } from 'node:path'
-  import { BIN } from './collector'
+  import { BIN, scratchEnv } from './collector'
 
   /** SIGTERM, then SIGKILL if it has not gone within 5 s. One that never
    *  started (no pid) has nothing to stop. */
@@ -3105,15 +3794,7 @@ Create `web/e2e/host.ts`:
   export function testHost(): TestHost {
     const dir = mkdtempSync(join(tmpdir(), 'hennery-e2e-host-'))
     // Its home is the fresh directory too: the host reads $HOME (for `~`).
-    const env = {
-      ...process.env,
-      HENNERY_HOST_DATA_DIR: dir,
-      HOME: dir,
-      XDG_DATA_HOME: join(dir, 'xdg-data'),
-      XDG_CONFIG_HOME: join(dir, 'xdg-config'),
-      XDG_CACHE_HOME: join(dir, 'xdg-cache'),
-      RUST_LOG: 'warn',
-    }
+    const env = { ...scratchEnv(dir), HENNERY_HOST_DATA_DIR: dir, RUST_LOG: 'warn' }
     const children: ChildProcess[] = []
     return {
       dir,
@@ -3136,10 +3817,15 @@ Create `web/e2e/host.ts`:
         // The stand-in agent is never started (no session runs here); any
         // path that exists will do, and the binary's own does everywhere.
         const runner = spawn(BIN, ['host', 'run', '--data-dir', dir, '--agent', `stand-in=${BIN}`], {
-          stdio: ['ignore', 'ignore', 'ignore'],
+          stdio: ['ignore', 'ignore', 'pipe'],
           env,
         })
+        let stderr = ''
+        runner.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
         runner.once('error', (err) => console.error(`host run failed to start: ${err}`))
+        runner.once('exit', (code) => {
+          if (code !== 0 && code !== null) console.error(`host run exited ${code}: ${stderr}`)
+        })
         children.push(runner)
       },
       async stop() {
@@ -3163,9 +3849,10 @@ Create `web/e2e/manage.spec.ts`:
   // goes through, and the path tester asking that host, at 1280 px and at
   // 390 px, each width with a collector and a host of its own.
   import { expect, test, type Page } from '@playwright/test'
-  import { mkdirSync, realpathSync } from 'node:fs'
+  import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs'
+  import { tmpdir } from 'node:os'
   import { join } from 'node:path'
-  import { startCollector, type Collector } from './collector'
+  import { scratchEnv, startCollector, type Collector } from './collector'
   import { testHost, type TestHost } from './host'
 
   const PASSWORD = 'correct horse battery staple'
@@ -3178,12 +3865,27 @@ Create `web/e2e/manage.spec.ts`:
       let host: TestHost
       let page: Page
       const violations: string[] = []
+      // A log directory in the runner's own environment, as a developer's
+      // shell may have: no binary started here may write to it.
+      let sentinel: string
+      let runnerLogDir: string | undefined
 
       test.beforeAll(async ({ browser }) => {
+        sentinel = mkdtempSync(join(tmpdir(), 'hennery-e2e-sentinel-'))
+        runnerLogDir = process.env.HENNERY_LOG_DIR
+        process.env.HENNERY_LOG_DIR = sentinel
+        expect(scratchEnv(sentinel).HENNERY_LOG_DIR).toBeUndefined()
         collector = await startCollector()
         host = testHost()
         const context = await browser.newContext({ baseURL: collector.origin, viewport: { width, height: 844 } })
         page = await context.newPage()
+        // Every CSP violation the page sees, whatever its source.
+        await page.addInitScript(() => {
+          document.addEventListener('securitypolicyviolation', (e) => {
+            const seen = ((window as unknown as { __csp?: string[] }).__csp ??= [])
+            seen.push(`${e.violatedDirective} ${e.blockedURI}`)
+          })
+        })
         page.on('console', (m) => {
           if (m.text().includes('Content Security Policy')) violations.push(m.text())
         })
@@ -3204,7 +3906,13 @@ Create `web/e2e/manage.spec.ts`:
           try {
             await host?.stop()
           } finally {
-            await collector?.stop()
+            try {
+              await collector?.stop()
+            } finally {
+              if (runnerLogDir === undefined) delete process.env.HENNERY_LOG_DIR
+              else process.env.HENNERY_LOG_DIR = runnerLogDir
+              if (sentinel) rmSync(sentinel, { recursive: true, force: true })
+            }
           }
         }
       })
@@ -3294,7 +4002,7 @@ Create `web/e2e/manage.spec.ts`:
         // field only while no passkey is offered.
         await expect(stepUp.getByRole('button', { name: 'Confirm with passkey' })).toHaveCount(0)
         await page.keyboard.press('Shift+Tab')
-        expect(await page.evaluate(() => document.activeElement?.closest('.page') ?? null)).toBeNull()
+        expect(await page.evaluate(() => !!document.activeElement?.closest('.page'))).toBe(false)
         await stepUp.getByLabel('Your password').focus()
         await stepUp.getByLabel('Your password').fill(PASSWORD)
         await stepUp.getByRole('button', { name: 'Confirm' }).click()
@@ -3306,6 +4014,12 @@ Create `web/e2e/manage.spec.ts`:
 
       test('broke no Content-Security-Policy rule', async () => {
         expect(violations).toEqual([])
+        const seen = await page.evaluate(() => (window as unknown as { __csp?: string[] }).__csp ?? [])
+        expect(seen).toEqual([])
+      })
+
+      test('wrote nothing where the runner’s own environment pointed', async () => {
+        expect(readdirSync(sentinel)).toEqual([])
       })
     })
   }
@@ -3315,15 +4029,16 @@ Create `web/e2e/manage.spec.ts`:
 - [ ] **Step 2: Run the checks**
 
   Run: `nix develop -c sh -c 'pnpm --dir web build && HENNERY_WEB_REQUIRE=1 cargo build -p hennery --locked && pnpm --dir web e2e'`
-  Expected: 15 Playwright tests pass (4b's 7 and these 8), and `ps -ax | grep -i 'hennery '` shows none of the run's processes afterwards.
+  Expected: 17 Playwright tests pass (4b's 7 and these 10), and `ps -ax | grep -i 'hennery '` shows none of the run's processes afterwards.
 
 - [ ] **Step 3: Revert-probes** (each must fail `pnpm --dir web e2e`; all were run)
   - drop `inert={…}` in `App.tsx`: the revoke check finds the page not inert;
   - drop `inert={…}` and the check of the attribute: a script's `focus()` lands on the confirmation under the dialog;
   - drop `inert={…}`, the check of the attribute and the scripted focus: Shift+Tab from the dialog's first field lands on the page;
   - drop the paired `setStage` in `Pairing.tsx`: "Paired: e2e host" never shows;
-  - show the code in the paired notice: the page still holds the spent code;
-  - drop the revoke dialog's sentence about running agents.
+  - drop the revoke dialog's sentence about running agents;
+  - the collector, then `host join` and `host run`, given the runner's environment again: the sentinel log directory gets files;
+  - (`code-kept`) keep the spent code in the Hosts screen's state and show it in the paired notice: the page still holds the spent code.
 
 - [ ] **Step 4: Commit**
 
