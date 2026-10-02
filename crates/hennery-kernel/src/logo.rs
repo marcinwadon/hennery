@@ -1,3 +1,119 @@
+//! Hat logos (kernel spec §5.1; plan 4d-B2). A logo is uploaded as a PNG,
+//! at most 64 KiB, and stored and served only as this module re-encodes it:
+//! decoded to plain 8-bit pixels, then written afresh as `IHDR`, `IDAT` and
+//! `IEND`, so no text, metadata, profile, animation or trailing bytes of the
+//! upload survive (the security review's ruling B: no SVG, no WebP). The
+//! browser turns any other format into a PNG before it uploads.
+//!
+//! Memory is bounded before anything is allocated by the image's size: the
+//! header alone is read first, and an image over `MAX_SIDE` pixels either way
+//! is refused there (the review's A2).
+
+use base64::Engine;
+use sha2::{Digest, Sha256};
+use std::io::Cursor;
+
+/// The largest upload, decoded (kernel spec §5.1).
+pub const MAX_UPLOAD: usize = 64 * 1024;
+
+/// The widest and tallest logo, in pixels.
+pub const MAX_SIDE: u32 = 1024;
+
+/// The largest logo stored, once re-encoded: a small upload can decode to
+/// pixels that compress worse than it did.
+pub const MAX_STORED: usize = 256 * 1024;
+
+/// The one kind a logo is stored and served as.
+pub const MIME_PNG: &str = "image/png";
+
+const SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+
+/// What the decoder may allocate besides the frame: its row buffers. The
+/// frame itself is bounded by `MAX_SIDE`, checked from the header first.
+const DECODER_LIMIT: usize = 4 << 20;
+
+/// A logo as it is stored: always a PNG of ours.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Logo {
+    pub bytes: Vec<u8>,
+    /// What `GET /api/hats/{id}/logo` answers as its `ETag` (without the
+    /// quotes): the first 128 bits of the bytes' SHA-256, in hex.
+    pub etag: String,
+}
+
+/// Why an upload is not a logo. Each has its own status and fixed message
+/// at the route; none carries the decoder's words or the upload's bytes
+/// (the review's A8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// Not strict standard base64 (padded, no whitespace, no `data:`).
+    NotBase64,
+    /// Over `MAX_UPLOAD` decoded, or over the stored cap once re-encoded.
+    TooLarge,
+    /// Not a PNG by its signature: SVG, WebP, JPEG, GIF, anything else.
+    Unsupported,
+    /// A side of 0, or over `MAX_SIDE`.
+    Dimensions,
+    /// The decoder refused it.
+    Damaged,
+}
+
+/// The upload `data` as a logo: decoded from base64, then re-encoded
+/// (`reencode`) under `MAX_STORED`.
+pub fn from_upload(data: &str) -> Result<Logo, Refusal> {
+    // Checked from the length before anything is decoded (the review's O2).
+    if data.len() > MAX_UPLOAD.div_ceil(3) * 4 {
+        return Err(Refusal::TooLarge);
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|_| Refusal::NotBase64)?;
+    if bytes.len() > MAX_UPLOAD {
+        return Err(Refusal::TooLarge);
+    }
+    reencode(&bytes, MAX_STORED)
+}
+
+/// `input`, a PNG, decoded and written afresh: 8-bit, the colour type its
+/// pixels have once palettes and transparency are expanded, only `IHDR`,
+/// `IDAT` and `IEND`. An animated PNG keeps its first frame. Refused when
+/// it is not a PNG, a side is 0 or over `MAX_SIDE`, the decoder fails, or the
+/// result is over `max_stored` bytes (a parameter, so a test can reach it:
+/// the review's A4).
+pub fn reencode(input: &[u8], max_stored: usize) -> Result<Logo, Refusal> {
+    if !input.starts_with(SIGNATURE) {
+        return Err(Refusal::Unsupported);
+    }
+    let mut decoder = png::Decoder::new_with_limits(Cursor::new(input), png::Limits { bytes: DECODER_LIMIT });
+    // The header alone first, so nothing is sized by it before it is
+    // checked (the review's A2).
+    let header = decoder.read_header_info().map_err(|_| Refusal::Damaged)?;
+    if !(1..=MAX_SIDE).contains(&header.width) || !(1..=MAX_SIDE).contains(&header.height) {
+        return Err(Refusal::Dimensions);
+    }
+    decoder.set_transformations(png::Transformations::normalize_to_color8());
+    decoder.set_ignore_text_chunk(true);
+    decoder.set_ignore_iccp_chunk(true);
+    let mut reader = decoder.read_info().map_err(|_| Refusal::Damaged)?;
+    let size = reader.output_buffer_size().ok_or(Refusal::Damaged)?;
+    let mut pixels = vec![0; size];
+    // The first frame, sized by what the decoder says it wrote (the
+    // review's A3), never by the header.
+    let frame = reader.next_frame(&mut pixels).map_err(|_| Refusal::Damaged)?;
+    let mut bytes = Vec::new();
+    let mut encoder = png::Encoder::new(&mut bytes, frame.width, frame.height);
+    encoder.set_color(frame.color_type);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|_| Refusal::Damaged)?;
+    writer.write_image_data(&pixels).map_err(|_| Refusal::Damaged)?;
+    writer.finish().map_err(|_| Refusal::Damaged)?;
+    if bytes.len() > max_stored {
+        return Err(Refusal::TooLarge);
+    }
+    let etag = hex::encode(&Sha256::digest(&bytes)[..16]);
+    Ok(Logo { bytes, etag })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
