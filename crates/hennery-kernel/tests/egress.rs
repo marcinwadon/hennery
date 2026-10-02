@@ -227,21 +227,32 @@ async fn a_redirect_is_returned_not_followed() {
     assert_eq!(next.accepted(), 0, "the redirect was not followed");
 }
 
-/// Plan 8b (e): https, or plain http to loopback only, for every caller and
-/// allowance; the scheme is refused before anything is resolved.
+/// Plan 8b (e), 8b-ii: https, or plain http to loopback; under
+/// `InternalNetwork` also plain http to an internal address, never to a
+/// public one. The scheme is refused before anything is resolved.
 #[tokio::test]
-async fn plain_http_is_refused_except_to_loopback() {
-    let client = egress().client(Allowance::InternalNetwork);
-    for url in [
-        "http://hennery-egress-test.invalid/",
-        "http://10.0.0.1/",
-        "ftp://example.com/",
+async fn plain_http_is_refused_except_to_loopback_or_an_internal_address() {
+    let egress = egress();
+    for (allowance, url) in [
+        (Allowance::PublicOnly, "http://hennery-egress-test.invalid/"),
+        (Allowance::PublicOnly, "http://10.0.0.1/"),
+        (Allowance::InternalNetwork, "http://8.8.8.8/"),
+        (Allowance::InternalNetwork, "http://[::ffff:10.0.0.1]/"),
+        (Allowance::InternalNetwork, "ftp://example.com/"),
     ] {
-        let err = within(client.send(get(Url::parse(url).unwrap()))).await.unwrap_err();
-        assert!(
-            matches!(err, EgressError::Refused(Refused::Scheme(_))),
-            "{url}: {err:?}"
-        );
+        let client = egress.client(allowance);
+        for streaming in [false, true] {
+            let request = get(Url::parse(url).unwrap());
+            let err = if streaming {
+                within(client.send_streaming(request)).await.unwrap_err()
+            } else {
+                within(client.send(request)).await.unwrap_err()
+            };
+            assert!(
+                matches!(err, EgressError::Refused(Refused::Scheme(_))),
+                "{url} {allowance:?}: {err:?}"
+            );
+        }
     }
 }
 

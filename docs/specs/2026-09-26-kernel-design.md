@@ -585,24 +585,35 @@ host cannot be purged until the hosts are moved to another hat):
 
 One shared policy for every outbound call — gateway proxy, OAuth
 discovery/registration/token calls, Web Push — with one `reqwest` client per
-allowance, so a public-only request never rides a pooled connection that an
-internal-network request opened:
+allowance, plus an internal-only one for plain `http`, so a public-only
+request never rides a pooled connection that an internal-network request
+opened:
 
 - redirects are never followed (a 3xx is the caller's answer), and no proxy
   from the environment is ever used;
-- `https`, or plain `http` to loopback only (a loopback literal or
-  `localhost`, which always resolves to loopback, without a lookup), for
-  every caller and allowance; a URL with credentials in it is refused;
+- `https`, or plain `http` to loopback (a loopback literal or `localhost`,
+  which always resolves to loopback, without a lookup); under the "internal
+  network" allowance, plain `http` to an internal address too — RFC 1918,
+  loopback and unique-local IPv6 — never to a public one, nor to one that is
+  neither (link-local, and AWS's IPv6 metadata address `fd00:ec2::254`
+  although it is unique-local: cloud metadata services answer plain `http`
+  there; CGNAT, which may be the carrier's network; documentation, multicast,
+  `0.0.0.0`, IPv4-mapped, NAT64, 6to4, Teredo). A literal is checked by the
+  URL check; a name goes through a third client, used only for plain `http`
+  under that allowance, whose resolver refuses the name if **any** address is
+  not internal (the operator's decision of 2026-10-02, plan 8b-ii). A URL with
+  credentials in it is refused, under either allowance;
 - DNS is resolved by hennery and each address is checked before connecting:
   loopback, link-local (including `169.254.169.254`), RFC 1918, unique-local
-  IPv6, CGNAT and other non-public ranges are refused, unless the caller passes
-  an explicit "internal network" allowance (a gateway connection the operator
-  marked so; never Web Push). A name with **any** non-public address is
-  refused, not filtered. An IP-literal host never reaches the resolver, so the
-  URL check applies the same rule to it. IPv6 is public only inside
-  `2000::/3`, outside Teredo and benchmarking `2001::/23`, 6to4 `2002::/16`
-  and the documentation ranges; so IPv4-mapped and NAT64 addresses are never
-  public either;
+  IPv6, CGNAT and other non-public ranges are refused, unless the caller
+  passes an explicit "internal network" allowance (a gateway connection the
+  operator marked so; never Web Push), which reaches any address over `https`,
+  and internal ones only over plain `http` (above). Without the allowance, a
+  name with **any** non-public address is refused, not filtered. An IP-literal
+  host never reaches the resolver, so the URL check applies the same rule to
+  it. IPv6 is public only inside `2000::/3`, outside Teredo and benchmarking
+  `2001::/23`, 6to4 `2002::/16` and the documentation ranges; so IPv4-mapped
+  and NAT64 addresses are never public either;
 - a connect timeout (10 s) and a default deadline (30 s): for the whole
   exchange, or, for a streaming response, for its head only — the caller
   decides when a stream has been idle too long;
@@ -614,7 +625,7 @@ internal-network request opened:
 It lives in the kernel so that push delivery can use it without depending on
 the gateway.
 
-*Built so far:* `hennery_kernel::egress` (plan 8b) — `Egress`, its
+*Built so far:* `hennery_kernel::egress` (plans 8b and 8b-ii) — `Egress`, its
 `EgressClient::send` and `send_streaming`, `check_url`, `is_public` and
 `Limiter`. Nothing calls it yet: the gateway's proxy and OAuth and Web Push
 will.
@@ -760,11 +771,24 @@ an existing data directory without `--force`.
 
 ## 12. Open questions
 
-Open:
+Open (for the maintainer; plan 8b-ii's security review, Q1–Q3):
+
+- **Q1, link-local and metadata for plain `http`** under the "internal
+  network" allowance: cloud metadata services answer plain `http` on
+  link-local and on `fd00:ec2::254` (inside unique-local). Until answered,
+  both are `https` only (§7.1); `https` under the allowance reaches any
+  address, link-local included (plan 8b's decision).
+- **Q2, CGNAT for plain `http`** under that allowance: it may be the
+  carrier's network. Until answered, `https` only (§7.1).
+- **Q3, a warning in the UI** that a credential on a plain-`http` connection
+  crosses the network in clear (frontend).
+
+Resolved by the operator on 2026-10-02:
 
 - **Plain `http` to a LAN address for an "internal network" connection** —
-  refused until the maintainer decides (§7.1; plan 8b, decision 6); widening
-  it later breaks nothing.
+  allowed only under that explicit marking, and only to internal addresses
+  (RFC 1918, loopback, unique-local IPv6); a public address stays `https`
+  only (§7.1; plan 8b decision 6, built in plan 8b-ii).
 
 Resolved by the maintainer on 2026-09-27:
 
