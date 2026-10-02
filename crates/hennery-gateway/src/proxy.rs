@@ -563,11 +563,18 @@ async fn proxy(
                     );
                 }
             };
-            let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) else {
+            // Read as an event's data is (plan 2026-10-15): the filter
+            // re-serialises what it read, so a key twice is resolved for
+            // the client, but a key spelt otherwise goes on, and a client
+            // that ignores case or cuts at a NUL reads it.
+            let Some(mut value) = jsonrpc::read(&bytes) else {
                 return refuse(
                     StatusCode::BAD_GATEWAY,
                     "upstream_invalid",
-                    format!("connection {} answered with JSON that does not parse", connection.label),
+                    format!(
+                        "connection {} answered with JSON the gateway cannot read",
+                        connection.label
+                    ),
                 );
             };
             jsonrpc::filter_tools_lists(&mut value, &tools_list, allowlist.as_deref().unwrap_or_default());

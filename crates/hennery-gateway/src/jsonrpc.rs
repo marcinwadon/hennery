@@ -6,8 +6,12 @@
 //!   decision 6): a parser upstream that keeps the first of two `"method"`s
 //!   or `"name"`s would otherwise run what the allowlist check never saw.
 //!   Nor may it spell a key the gateway reads otherwise than exactly
-//!   (`METHOD`, `Name`, `ſampling`): a decoder that matches names whatever
-//!   their case, as Go's `encoding/json` does, would read it.
+//!   (`METHOD`, `Name`, `ſampling`, `method\0x`): a decoder that matches
+//!   names whatever their case, as Go's `encoding/json` does, or cuts them
+//!   at a NUL, as json-c and cJSON do, would read it. Nor may a method the
+//!   gateway reads be spelt otherwise (`tools/call\0x`), nor `method` be
+//!   anything but a string, nor a batch hold anything but objects (plan
+//!   2026-10-15, the differential tests).
 //! - `initialize` goes upstream without `sampling`, `elicitation` and
 //!   `roots` in its client capabilities.
 //! - With an allowlist, a `tools/call` for a tool outside it is answered
@@ -52,29 +56,34 @@ pub enum Inspected {
     /// Answer it here and send nothing upstream: a JSON-RPC answer, or
     /// `None` when nothing in it has an id (202, no body).
     Answer(Option<Value>),
-    /// Not JSON, a key twice in one object, or a key the gateway reads
-    /// spelt otherwise: refused, 400.
+    /// Not JSON, a key twice in one object, or `ambiguous`: refused, 400.
     Invalid(&'static str),
 }
 
 /// What a `POST` body refused 400 is told.
 const INVALID_BODY: &str =
-    "the body is not JSON, has a key twice in one object, or spells a key the gateway reads otherwise";
+    "the body is not JSON, has a key twice in one object, or spells a key or method the gateway reads otherwise";
 
 /// The keys the gateway reads in a message, and in the `params` of the
 /// methods it reads them for. A decoder that matches names whatever their
 /// case (Go's `encoding/json`) takes `METHOD` or `Name` for them, so such
 /// a spelling, at its level, is refused like a key twice (plan 8d decision
-/// 6; the whole-branch review).
-const MESSAGE_KEYS: &[&str] = &["jsonrpc", "id", "method", "params"];
+/// 6; the whole-branch review). `result` is read going down, in a
+/// `tools/list` answer.
+const MESSAGE_KEYS: &[&str] = &["jsonrpc", "id", "method", "params", "result"];
+
+/// The methods the gateway reads, besides the refused server requests.
+const READ_METHODS: &[&str] = &["tools/call", "tools/list", "initialize"];
 
 /// A key as such a decoder compares it with the names the gateway reads:
-/// ASCII case, and `ſ` as `s`. Unicode folds only one other letter to an
-/// ASCII one, the Kelvin sign to `k`, and no name read here has a `k`.
-/// Go's `encoding/json/v2`, matching names case-insensitively, ignores `_`
-/// and `-` as well (the re-confirmation's F1).
+/// up to its first NUL, as json-c and cJSON keep keys and strings in C
+/// strings; ASCII case, and `ſ` as `s`. Unicode folds only one other letter
+/// to an ASCII one, the Kelvin sign to `k`, and no name read here has a
+/// `k`. Go's `encoding/json/v2`, matching names case-insensitively, ignores
+/// `_` and `-` as well (the re-confirmation's F1).
 fn folded(key: &str) -> String {
     key.chars()
+        .take_while(|c| *c != '\0')
         .filter(|c| !matches!(c, '_' | '-'))
         .map(|c| match c {
             '\u{17f}' => 's',
@@ -83,42 +92,84 @@ fn folded(key: &str) -> String {
         .collect()
 }
 
-/// Whether `object` has a key that folds to one of `names` without being it.
-fn respelt(object: &serde_json::Map<String, Value>, names: &[&str]) -> bool {
-    object.keys().any(|key| {
-        let folded = folded(key);
-        names.iter().any(|name| folded == *name && key != name)
-    })
+/// Whether `word` folds to one of `names` without being it.
+fn respelt_word(word: &str, names: &[&str]) -> bool {
+    let folded = folded(word);
+    names.iter().any(|name| folded == self::folded(name) && word != *name)
 }
 
-/// Whether a message, or any in a batch, spells a key the gateway reads
-/// otherwise than exactly: one of the message's own, `name` in a
-/// `tools/call`'s `params`, or `capabilities` and those not forwarded in
-/// an `initialize`'s.
-pub fn respelt_keys(value: &Value) -> bool {
+/// Whether `object` has a key that folds to one of `names` without being it.
+fn respelt(object: &serde_json::Map<String, Value>, names: &[&str]) -> bool {
+    object.keys().any(|key| respelt_word(key, names))
+}
+
+/// Whether a message, or any in a batch, could be read by some decoder
+/// otherwise than the gateway reads it (plan 8d decision 6; plan
+/// 2026-10-15's differential tests):
+/// - a message that is not an object: a batch in a batch, a scalar;
+/// - a key the gateway reads spelt otherwise than exactly: one of the
+///   message's own, `name` in a `tools/call`'s `params`, `capabilities`
+///   and those not forwarded in an `initialize`'s, `tools` in a `result`
+///   and `name` in each of its tools;
+/// - a `method` that is not a string (JavaScript reads `["tools/call"]` as
+///   a property key `tools/call`), or that spells a method the gateway
+///   reads otherwise (`tools/call\0x` is `tools/call` to json-c and cJSON);
+/// - an `initialize` whose `params` or `capabilities` is not an object.
+pub fn ambiguous(value: &Value) -> bool {
     let messages: Vec<&Value> = match value {
         Value::Array(items) => items.iter().collect(),
         other => vec![other],
     };
     messages.into_iter().any(|message| {
         let Some(object) = message.as_object() else {
-            return false;
+            return true;
         };
         if respelt(object, MESSAGE_KEYS) {
             return true;
         }
-        let Some(params) = object.get("params").and_then(Value::as_object) else {
-            return false;
-        };
-        match method(message) {
-            Some("tools/call") => respelt(params, &["name"]),
-            Some("initialize") => {
-                respelt(params, &["capabilities"])
-                    || params
-                        .get("capabilities")
-                        .and_then(Value::as_object)
-                        .is_some_and(|capabilities| respelt(capabilities, STRIPPED_CAPABILITIES))
+        match object.get("method") {
+            None => {}
+            Some(Value::String(method)) => {
+                if respelt_word(method, READ_METHODS) || respelt_word(method, REFUSED_SERVER_REQUESTS) {
+                    return true;
+                }
             }
+            Some(_) => return true,
+        }
+        if let Some(result) = object.get("result").and_then(Value::as_object) {
+            let tools = result.get("tools").and_then(Value::as_array);
+            if respelt(result, &["tools"])
+                || tools.is_some_and(|tools| {
+                    tools
+                        .iter()
+                        .filter_map(Value::as_object)
+                        .any(|tool| respelt(tool, &["name"]))
+                })
+            {
+                return true;
+            }
+        }
+        let params = object.get("params");
+        match method(message) {
+            Some("tools/call") => params
+                .and_then(Value::as_object)
+                .is_some_and(|params| respelt(params, &["name"])),
+            // An `initialize` whose `params` or `capabilities` is not an
+            // object: nothing to strip, yet a server testing `"sampling" in
+            // caps` finds it in `["sampling"]` (the security review's
+            // finding 1).
+            Some("initialize") => match params {
+                None => false,
+                Some(Value::Object(params)) => {
+                    respelt(params, &["capabilities"])
+                        || match params.get("capabilities") {
+                            None => false,
+                            Some(Value::Object(capabilities)) => respelt(capabilities, STRIPPED_CAPABILITIES),
+                            Some(_) => true,
+                        }
+                }
+                Some(_) => true,
+            },
             _ => false,
         }
     })
@@ -126,15 +177,9 @@ pub fn respelt_keys(value: &Value) -> bool {
 
 /// Inspect a `POST` body under `allowlist` (`None`: every tool).
 pub fn inspect_request(body: &[u8], allowlist: Option<&[String]>) -> Inspected {
-    if serde_json::from_slice::<Unique>(body).is_err() {
-        return Inspected::Invalid(INVALID_BODY);
-    }
-    let Ok(mut value) = serde_json::from_slice::<Value>(body) else {
+    let Some(mut value) = read(body) else {
         return Inspected::Invalid(INVALID_BODY);
     };
-    if respelt_keys(&value) {
-        return Inspected::Invalid(INVALID_BODY);
-    }
     let mut rewritten = false;
     let mut blocked = false;
     let mut tools_list = Vec::new();
@@ -148,9 +193,10 @@ pub fn inspect_request(body: &[u8], allowlist: Option<&[String]>) -> Inspected {
                 Some("initialize") => rewritten |= strip_capabilities(message),
                 Some("tools/call") if allowlist.is_some_and(|tools| !call_allowed(message, tools)) => blocked = true,
                 Some("tools/list") if allowlist.is_some() => {
-                    if let Some(id) = message.get("id") {
-                        tools_list.push(id.clone());
-                    }
+                    // Without an id, as `null`: an upstream that answers it
+                    // with `"id": null` is filtered too (the security
+                    // review's finding 3).
+                    tools_list.push(message.get("id").cloned().unwrap_or(Value::Null));
                 }
                 _ => {}
             }
@@ -310,6 +356,17 @@ pub fn take_refused_requests(value: Value) -> (Option<Value>, Vec<Value>) {
     }
 }
 
+/// A body, or an event's data, as the gateway reads it: `None` if it is not
+/// JSON to serde_json, has a key twice in one object at any depth (serde_json
+/// keeps the last, a decoder may keep the first), or is `ambiguous`. The one
+/// reading for both ways: a request, an event, and a `tools/list` answer
+/// read whole (plan 2026-10-15).
+pub fn read(bytes: &[u8]) -> Option<Value> {
+    serde_json::from_slice::<Unique>(bytes).ok()?;
+    let value = serde_json::from_slice::<Value>(bytes).ok()?;
+    (!ambiguous(&value)).then_some(value)
+}
+
 /// Any JSON, refusing a key twice in one object at any depth.
 struct Unique;
 
@@ -441,11 +498,11 @@ pub enum EventOutcome {
     Rewritten(Vec<u8>),
     /// Not passed on.
     Dropped,
-    /// Not passed on: its data is not JSON, has a key twice in an object
-    /// or spells a key the gateway reads otherwise, or a line of it starts
-    /// with a byte-order mark, so the gateway cannot read what a client
-    /// might (the review's B2, the re-confirmation's note 1, the Task 2
-    /// review's finding 3, the whole-branch review).
+    /// Not passed on: it is not UTF-8, its data is not JSON, has a key
+    /// twice in an object or is `ambiguous`, or a line of it starts with a
+    /// byte-order mark, so the gateway cannot read what a client might (the
+    /// review's B2, the re-confirmation's note 1, the Task 2 review's
+    /// finding 3, the whole-branch review, plan 2026-10-15).
     Unreadable,
 }
 
@@ -470,22 +527,22 @@ pub fn rewrite_event(
     {
         return EventOutcome::Unreadable;
     }
+    // Not UTF-8: the gateway would read it with replacement characters, a
+    // client may decode it otherwise, an overlong `"` as a quote (the
+    // security review's finding 2).
+    if std::str::from_utf8(event).is_err() {
+        return EventOutcome::Unreadable;
+    }
     let (Some(data), others) = event_parts(event) else {
         return EventOutcome::Unchanged;
     };
-    // Not JSON to serde_json, or a key twice in an object: serde_json keeps
-    // the last, a client may keep the first (decision 6's reason, for what
-    // comes down).
-    let read = serde_json::from_str::<Unique>(&data).and_then(|_| serde_json::from_str::<Value>(&data));
-    let value = match read {
-        Ok(value) => value,
-        Err(_) => return EventOutcome::Unreadable,
-    };
-    // A refused request's `method` spelt otherwise (the whole-branch
-    // review): a client whose decoder ignores case would run it.
-    if respelt_keys(&value) {
+    // Not JSON to serde_json, a key twice in an object (decision 6's reason,
+    // for what comes down), or a refused request's `method` spelt otherwise
+    // (the whole-branch review): a client whose decoder ignores case, or
+    // cuts at a NUL, would run it.
+    let Some(value) = read(data.as_bytes()) else {
         return EventOutcome::Unreadable;
-    }
+    };
     let (kept, refused) = take_refused_requests(value);
     let changed = !refused.is_empty();
     answers.extend(refused);
