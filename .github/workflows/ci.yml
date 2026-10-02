@@ -8,6 +8,14 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  # A pull request's superseded run is cancelled. Outside pull requests
+  # (pushes to main, manual runs) every commit is a group of its own: a
+  # shared group would let a newer pending run replace an older one even
+  # without cancel-in-progress, so no run there is ever cancelled.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   rust:
     strategy:
