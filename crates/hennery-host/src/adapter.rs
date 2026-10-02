@@ -40,6 +40,11 @@ pub const INHERITED_OVERRIDE_VARS: &[&str] = &[
     "APP_SERVER_LOGS",
 ];
 
+/// How a service-run host chooses its own log (plan 7c-iii): not an
+/// agent's. An agent that runs `hennery` (its test suite, say) must not
+/// log into the host's log directory.
+pub const HOST_LOG_VARS: &[&str] = &["HENNERY_SERVICE", "HENNERY_LOG_DIR"];
+
 /// Bytes of adapter stderr kept for `adapter_exited` (ACP core §11).
 pub const STDERR_TAIL_BYTES: usize = 64 * 1024;
 
@@ -124,7 +129,7 @@ impl Adapter {
             .kill_on_drop(true);
         // After `envs`: a secret is stripped even if the agent's own
         // configuration names it.
-        for var in NESTING_VARS.iter().chain(HOST_SECRET_VARS) {
+        for var in NESTING_VARS.iter().chain(HOST_SECRET_VARS).chain(HOST_LOG_VARS) {
             command.env_remove(var);
         }
         // Read before the fork: getrlimit is not async-signal-safe.
