@@ -3,7 +3,8 @@
 //! the admin socket's recoveries (kernel spec §4.2).
 
 use hennery_kernel::operator::{
-    MAX_PASSWORD_BYTES, Operator, PublicUrl, Reset, SETUP_TOKEN_TTL_SECS, SETUP_URL_FILE, SetupOutcome,
+    MAX_PASSWORD_BYTES, Operator, PublicUrl, PublicUrlChange, Reset, SETUP_TOKEN_TTL_SECS, SETUP_URL_FILE,
+    STEP_UP_SECS, SetupOutcome,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
@@ -383,6 +384,129 @@ fn a_public_url_reset_replaces_the_cached_origin_and_ends_every_session() {
     drop(op);
     let reopened = Operator::open(&db).unwrap();
     assert_eq!(reopened.public_url().unwrap().origin(), "https://moved.example");
+}
+
+/// Plan 4d-B4 decision 1: `PATCH /api/settings` changes `public_url` and
+/// the push contact through `change_public_url`, in one transaction. Both
+/// are checked before anything is written: a refused contact keeps the
+/// old URL and its sessions, a refused URL the old contact. `None` leaves
+/// the contact as it is, `Some(None)` clears it. `Done` names the origin
+/// left and the one taken (the review's A2).
+#[test]
+fn a_public_url_change_sets_the_contact_in_its_transaction_or_changes_nothing() {
+    let op = Operator::open_in_memory().unwrap();
+    assert_eq!(
+        op.change_public_url("https://moved.example", Some(Some("me@example.com")), None)
+            .unwrap(),
+        PublicUrlChange::NotSetUp
+    );
+    assert_eq!(op.contact().unwrap(), None);
+    let token = op.issue_setup_token(NOW).unwrap().unwrap();
+    let SetupOutcome::Done { phc, .. } = op.set_up(&token, PASSWORD, "https://hennery.example", NOW).unwrap() else {
+        panic!("setup failed");
+    };
+    op.set_contact(Some("old@example.com")).unwrap().unwrap();
+    let session = op.open_session("browser", &phc, NOW).unwrap().unwrap();
+    let unchanged = |op: &Operator| {
+        assert_eq!(op.public_url().unwrap().origin(), "https://hennery.example");
+        assert_eq!(op.contact().unwrap().as_deref(), Some("old@example.com"));
+        assert!(op.authenticate(&session, NOW).unwrap().is_some());
+    };
+
+    let refused = op
+        .change_public_url("https://moved.example", Some(Some("me@example.com?cc=x")), None)
+        .unwrap();
+    assert!(matches!(refused, PublicUrlChange::Invalid(_)), "{refused:?}");
+    unchanged(&op);
+    let refused = op
+        .change_public_url("http://moved.example", Some(Some("me@example.com")), None)
+        .unwrap();
+    assert!(matches!(refused, PublicUrlChange::Invalid(_)), "{refused:?}");
+    unchanged(&op);
+
+    assert_eq!(
+        op.change_public_url("https://moved.example", Some(Some("me@example.com")), None)
+            .unwrap(),
+        PublicUrlChange::Done {
+            from: Some(PublicUrl::parse("https://hennery.example").unwrap()),
+            to: PublicUrl::parse("https://moved.example").unwrap(),
+            sessions_ended: 1,
+            passkeys_removed: 0
+        }
+    );
+    assert_eq!(op.public_url().unwrap().origin(), "https://moved.example");
+    assert_eq!(op.contact().unwrap().as_deref(), Some("me@example.com"));
+    assert!(op.authenticate(&session, NOW).unwrap().is_none());
+
+    op.change_public_url("https://hennery.example", None, None).unwrap();
+    assert_eq!(op.contact().unwrap().as_deref(), Some("me@example.com"));
+    op.change_public_url("https://moved.example", Some(None), None).unwrap();
+    assert_eq!(op.contact().unwrap(), None);
+}
+
+/// The review's A1: the change re-checks its caller's session in its
+/// transaction, live and stepped up, as a passkey registration's write
+/// does. A session revoked, or a step-up lapsed, since the request's own
+/// checks changes nothing at all, and announces no ending.
+#[test]
+fn a_change_whose_caller_ended_or_stepped_down_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    let op = Operator::open(&db).unwrap();
+    let token = op.issue_setup_token(NOW).unwrap().unwrap();
+    let SetupOutcome::Done { phc, .. } = op.set_up(&token, PASSWORD, "https://hennery.example", NOW).unwrap() else {
+        panic!("setup failed");
+    };
+    let id = |token: &str| op.authenticate(token, NOW).unwrap().unwrap().session_id;
+    let revoked = id(&op.open_session("browser", &phc, NOW).unwrap().unwrap());
+    let kept = op.open_session("browser", &phc, NOW).unwrap().unwrap();
+    let kept_id = id(&kept);
+    assert!(op.revoke_session(&revoked, NOW).unwrap());
+    let dump = || {
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        ["owners", "settings", "auth_sessions", "push_subscriptions", "passkeys"].map(|table| {
+            let mut stmt = conn.prepare(&format!("SELECT * FROM {table} ORDER BY rowid")).unwrap();
+            let columns = stmt.column_count();
+            stmt.query_map([], |r| {
+                Ok((0..columns)
+                    .map(|i| format!("{:?}", r.get::<_, rusqlite::types::Value>(i).unwrap()))
+                    .collect::<Vec<_>>())
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+        })
+    };
+    let before = dump();
+    let mut ends = op.session_ends();
+    ends.borrow_and_update();
+
+    for (caller, now, outcome) in [
+        ((revoked.as_str(), NOW), NOW, PublicUrlChange::SignedOut),
+        // Exactly five minutes after the last check: no longer fresh.
+        (
+            (kept_id.as_str(), NOW + STEP_UP_SECS),
+            NOW + STEP_UP_SECS,
+            PublicUrlChange::StepUpRequired,
+        ),
+    ] {
+        assert_eq!(
+            op.change_public_url("https://moved.example", Some(Some("me@example.com")), Some(caller))
+                .unwrap(),
+            outcome
+        );
+        assert_eq!(dump(), before, "{outcome:?}");
+        assert_eq!(op.public_url().unwrap().origin(), "https://hennery.example");
+        assert!(op.authenticate(&kept, now).unwrap().is_some());
+    }
+    assert!(!ends.has_changed().unwrap(), "an ending was announced");
+
+    // A second inside the window, the change is made.
+    assert!(matches!(
+        op.change_public_url("https://moved.example", None, Some((&kept_id, NOW + STEP_UP_SECS - 1)))
+            .unwrap(),
+        PublicUrlChange::Done { sessions_ended: 1, .. }
+    ));
 }
 
 /// The admin socket's `setup-url` (kernel spec §4.2): the link announced
