@@ -96,6 +96,7 @@ impl Root {
             data_dir: self.base.join("host"),
             home: Some(self.base.join("home")),
             hooks,
+            account: hennery_host::forget::account(),
         }
     }
 
@@ -317,6 +318,7 @@ async fn a_directory_swapped_for_a_symlink_after_listing_is_not_followed() {
                 symlink(&target, path.join("sub")).unwrap();
             }
         })),
+        ..Hooks::default()
     };
     let forgotten = forget(&root.ctx(hooks), &root.forget_at(&root.root())).await;
     assert!(swapped.load(std::sync::atomic::Ordering::SeqCst), "the hook never ran");
@@ -448,7 +450,12 @@ async fn a_symlinked_project_directory_is_not_walked() {
     let mut ctx = root.ctx(Hooks::default());
     ctx.agents.clear();
     let forgotten = forget(&ctx, &root.forget_at(&root.root())).await;
-    assert_eq!(reasons(&forgotten), []);
+    // Counted, never followed (the review's item 4).
+    assert_eq!(
+        reasons(&forgotten),
+        [(ForgetKind::Transcript, ForgetReason::Symlink, false)]
+    );
+    assert_eq!(forgotten.remaining[0].what.count, 1);
     assert_eq!(
         std::fs::read_to_string(root.outside().join(format!("proj/{ID}.jsonl"))).unwrap(),
         "keep"
@@ -473,4 +480,115 @@ async fn an_entry_the_removal_could_not_finish_is_reported_for_a_retry() {
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(reasons(&forgotten), [(ForgetKind::Tasks, ForgetReason::IoError, true)]);
     assert!(locked.join("f").exists());
+}
+
+/// The review's item 8: a named directory swapped for a symlink after it
+/// was looked at is reported as a symlink, and neither it nor its target
+/// is removed.
+#[tokio::test]
+async fn a_named_directory_swapped_for_a_symlink_is_reported_not_unlinked() {
+    let root = Root::new();
+    std::fs::create_dir_all(root.outside().join("target")).unwrap();
+    std::fs::write(root.outside().join("target/precious"), "keep").unwrap();
+    let named = root.at(&format!("tasks/{ID}"));
+    std::fs::create_dir_all(&named).unwrap();
+    let (target, aside) = (root.outside().join("target"), root.outside().join("aside"));
+    let at = named.clone();
+    let hooks = Hooks {
+        stated: Some(Arc::new(move |path: &Path| {
+            if path == at {
+                std::fs::rename(path, &aside).unwrap();
+                symlink(&target, path).unwrap();
+            }
+        })),
+        ..Hooks::default()
+    };
+    let forgotten = forget(&root.ctx(hooks), &root.forget_at(&root.root())).await;
+    assert_eq!(
+        std::fs::read_to_string(root.outside().join("target/precious")).unwrap(),
+        "keep"
+    );
+    assert!(std::fs::symlink_metadata(&named).unwrap().file_type().is_symlink());
+    assert_eq!(reasons(&forgotten), [(ForgetKind::Tasks, ForgetReason::Symlink, false)]);
+}
+
+/// The review's item 1: a project directory whose listing fails is left
+/// for a retry, counted once, in either pass.
+#[tokio::test]
+async fn a_project_directory_that_cannot_be_listed_is_left_for_a_retry() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Fails the `fail_on`-th listing of `-p` (0: every one).
+    async fn run(fail_on: usize) -> (Root, Forgotten) {
+        let root = Root::new();
+        std::fs::create_dir_all(root.at("projects/-p")).unwrap();
+        std::fs::write(root.at(&format!("projects/-p/{ID}.cast")), "x").unwrap();
+        let project = root.at("projects/-p");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let hooks = Hooks {
+            fail_listing: Some(Arc::new(move |path: &Path| {
+                path == project && {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    fail_on == 0 || n == fail_on
+                }
+            })),
+            ..Hooks::default()
+        };
+        let mut ctx = root.ctx(hooks);
+        ctx.agents.clear();
+        let forgotten = forget(&ctx, &root.forget_at(&root.root())).await;
+        (root, forgotten)
+    }
+    let (root, always) = run(0).await;
+    assert_eq!(
+        reasons(&always),
+        [(ForgetKind::Transcript, ForgetReason::IoError, true)]
+    );
+    assert_eq!(always.remaining[0].what.count, 1);
+    assert!(root.at(&format!("projects/-p/{ID}.cast")).exists());
+    // Only the removal's listing fails: the check after finds it still there.
+    let (_root, first) = run(1).await;
+    assert_eq!(
+        reasons(&first),
+        [
+            (ForgetKind::Transcript, ForgetReason::StillPresent, true),
+            (ForgetKind::Transcript, ForgetReason::IoError, true),
+        ]
+    );
+    // Only the check's listing fails: what it cannot see is not called gone.
+    let (root, second) = run(2).await;
+    assert_eq!(
+        reasons(&second),
+        [(ForgetKind::Transcript, ForgetReason::IoError, true)]
+    );
+    assert!(!root.at(&format!("projects/-p/{ID}.cast")).exists());
+}
+
+/// The review's item 5 end to end: with a umask of 002 the host user's
+/// directories are group-writable; they pass only where that group is the
+/// user's own private one (an Ubuntu runner), never a shared one (macOS's
+/// `staff`).
+#[tokio::test]
+async fn a_group_writable_root_passes_only_for_a_private_group() {
+    let root = Root::new();
+    std::fs::create_dir_all(root.at(&format!("tasks/{ID}"))).unwrap();
+    for dir in [root.root(), root.at("tasks")] {
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o775)).unwrap();
+    }
+    use std::os::unix::fs::MetadataExt;
+    let gid = std::fs::metadata(root.root()).unwrap().gid();
+    let account = hennery_host::forget::account();
+    let private = gid == account.gid
+        && hennery_host::forget::group(gid)
+            .is_some_and(|g| g.name == account.name && (g.members.is_empty() || g.members == [account.name.clone()]));
+    let forgotten = root.forget().await;
+    if private {
+        assert_eq!(reasons(&forgotten), []);
+        assert!(!root.at(&format!("tasks/{ID}")).exists());
+    } else {
+        assert_eq!(
+            reasons(&forgotten),
+            [(ForgetKind::Session, ForgetReason::UnsafeRoot, false)]
+        );
+        assert!(root.at(&format!("tasks/{ID}")).exists());
+    }
 }
