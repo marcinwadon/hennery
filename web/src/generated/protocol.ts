@@ -848,7 +848,12 @@ export type PurgeResult = { sessions: number, rules: number,
  * them (presumed parked, or starting or active on a host away): that
  * host closes them when it is back.
  */
-unconfirmed: Array<string>, };
+unconfirmed: Array<string>, 
+/**
+ * The agents' own transcripts of the purged sessions on their hosts
+ * (plan 9d decision 7).
+ */
+host_transcripts: HostTranscripts, };
 
 /**
  * `POST /api/hats`: a name, 1 to 64 printable characters, unique in any
@@ -1352,3 +1357,11 @@ export type HostRemovalItem = { id: string, host_id: string,
  * The deleted session (a tombstone).
  */
 session_id: string, agent: string, state: HostRemovalState, attempts: number, last_result?: TranscriptRemoval | undefined, created_at: string, };
+
+/**
+ * How many purged sessions' transcripts their hosts removed, removed in
+ * part, or have still to remove (plan 9d decision 7), as each session's
+ * `TranscriptRemoval.state`; a session with no agent record counts in
+ * none. The pending ones are retried at their host's next handshake.
+ */
+export type HostTranscripts = { removed: number, partial: number, pending: number, pending_sessions: Array<string>, };

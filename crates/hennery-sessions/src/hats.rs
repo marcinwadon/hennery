@@ -249,6 +249,9 @@ pub struct PurgedSessions {
     pub deleted: u64,
     /// Closed collector-side while their host may still run them.
     pub unconfirmed: Vec<String>,
+    /// What each delete left for its host to remove (plan 9d decision 2),
+    /// by session.
+    pub forgets: Vec<(String, crate::store::HostForgets)>,
 }
 
 /// Sessions of a hat being purged that may have an adapter the collector
@@ -328,9 +331,14 @@ pub(crate) fn delete_as_read(state: &AppState, session: HatSession, purged: &mut
         .store
         .delete_session_owing_checkpoint(&session.id, unattached.as_ref())?
     {
-        Deletion::Done { event, unconfirmed, .. } => {
+        Deletion::Done {
+            event,
+            unconfirmed,
+            forgets,
+        } => {
             state.hub.publish(event);
             purged.deleted += 1;
+            purged.forgets.push((session.id.clone(), *forgets));
             if unconfirmed {
                 close_deleted_on_host(state, &session.host_id, &session.id);
                 purged.unconfirmed.push(session.id);
@@ -444,10 +452,14 @@ async fn purge_hat(State(state): State<AppState>, Path(id): Path<String>) -> Res
         }
     };
     tracing::info!(hat_id = %id, sessions = purged.deleted, rules, "hat purged");
+    // The agents' own transcripts on the hosts, best effort, within one
+    // wait for the whole purge (plan 9d decision 7, O10).
+    let host_transcripts = crate::forget::after_purge(&state, &purged.forgets).await;
     Json(PurgeResult {
         sessions: purged.deleted,
         rules,
         unconfirmed: purged.unconfirmed,
+        host_transcripts,
     })
     .into_response()
 }

@@ -14,7 +14,9 @@ use crate::AppState;
 use crate::hub::RequestError;
 use crate::store::{ForgetRecord, HostForgets, final_result};
 use hennery_proto::frames::{CollectorFrame, ForgetOutcome, ForgetReason, ForgetRemaining, ForgetWhat, HostFrame};
-use hennery_proto::rest::{HostRemovalItem, RemovalItem, RemovalPending, RemovalState, TranscriptRemoval};
+use hennery_proto::rest::{
+    HostRemovalItem, HostTranscripts, RemovalItem, RemovalPending, RemovalState, TranscriptRemoval,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -249,7 +251,35 @@ async fn attempt_once(state: &AppState, record: &ForgetRecord, wait: Duration) -
 /// records, while `FORGET_WAIT` lasts, all together; then the result for
 /// the delete's answer (decision 7).
 pub async fn after_delete(state: &AppState, forgets: &HostForgets) -> TranscriptRemoval {
+    after_delete_until(state, forgets, tokio::time::Instant::now() + FORGET_WAIT).await
+}
+
+/// After a purge (plan 9d decision 7, O10): each purged session's records,
+/// as `after_delete` sends them, within one `FORGET_WAIT` for all of them,
+/// counted by each session's result. A session with no agent record counts
+/// in none.
+pub async fn after_purge(state: &AppState, purged: &[(String, HostForgets)]) -> HostTranscripts {
     let deadline = tokio::time::Instant::now() + FORGET_WAIT;
+    let mut counts = HostTranscripts::default();
+    for (session_id, forgets) in purged {
+        match after_delete_until(state, forgets, deadline).await.state {
+            RemovalState::Removed => counts.removed += 1,
+            RemovalState::Partial => counts.partial += 1,
+            RemovalState::Pending => {
+                counts.pending += 1;
+                counts.pending_sessions.push(session_id.clone());
+            }
+            RemovalState::None => {}
+        }
+    }
+    counts
+}
+
+async fn after_delete_until(
+    state: &AppState,
+    forgets: &HostForgets,
+    deadline: tokio::time::Instant,
+) -> TranscriptRemoval {
     let mut results = Vec::new();
     for record in &forgets.records {
         let result = match &record.last_result {

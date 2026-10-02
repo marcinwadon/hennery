@@ -688,6 +688,24 @@ pub struct PurgeResult {
     /// them (presumed parked, or starting or active on a host away): that
     /// host closes them when it is back.
     pub unconfirmed: Vec<String>,
+    /// The agents' own transcripts of the purged sessions on their hosts
+    /// (plan 9d decision 7).
+    pub host_transcripts: HostTranscripts,
+}
+
+/// How many purged sessions' transcripts their hosts removed, removed in
+/// part, or have still to remove (plan 9d decision 7), as each session's
+/// `TranscriptRemoval.state`; a session with no agent record counts in
+/// none. The pending ones are retried at their host's next handshake.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HostTranscripts {
+    #[ts(type = "number")]
+    pub removed: u64,
+    #[ts(type = "number")]
+    pub partial: u64,
+    #[ts(type = "number")]
+    pub pending: u64,
+    pub pending_sessions: Vec<String>,
 }
 
 /// `POST /api/hats`: a name, 1 to 64 printable characters, unique in any

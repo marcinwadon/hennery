@@ -258,6 +258,7 @@ pub fn render_ts() -> String {
         rest::DeleteResult,
         rest::HostRemovalState,
         rest::HostRemovalItem,
+        rest::HostTranscripts,
     );
     out
 }
