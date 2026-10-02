@@ -264,6 +264,9 @@ pub fn build(
     Ok(manifest)
 }
 
+/// The npm package of Codex's CLI.
+const CODEX_PACKAGE: &str = "@openai/codex";
+
 /// The app-server's call shape is read from one Codex version (plan 9d
 /// decision 9): its launcher must be a file of a package the codex lockfile
 /// installs, and that package must be at the pinned version.
@@ -280,6 +283,14 @@ fn check_codex_app_server(pin: &CodexAppServer, lock: &Lock) -> Result<()> {
             )
         })?;
     let name = package_name(path, entry)?;
+    // Codex's own CLI, never another package that happens to hold the
+    // launcher's path (the review's item 5).
+    if name != CODEX_PACKAGE {
+        bail!(
+            "codex_app_server: bin {:?} is in {name}, which is not {CODEX_PACKAGE}",
+            pin.bin
+        );
+    }
     let version = entry
         .version
         .as_deref()
@@ -723,17 +734,17 @@ cli = ["node_modules/@vendor/cli-"]
         assert!(!linux.contains(&"node_modules/@vendor/cli-linux-x64-musl"), "{linux:?}");
     }
 
-    /// `PINS`, with a codex adapter bundling `@vendor/codex` and the
+    /// `PINS`, with a codex adapter bundling `@openai/codex` and the
     /// app-server's call shape pinned for its version (plan 9d decision 9).
     const CODEX_PINS: &str = r#"
 [adapters.codex]
 package = "@acp/codex"
 version = "1.0.0"
 entry = "dist/index.js"
-cli = ["node_modules/@vendor/codex-"]
+cli = ["node_modules/@openai/codex-"]
 [codex_app_server]
 codex_version = "0.155.1"
-bin = "node_modules/@vendor/codex/bin/codex.js"
+bin = "node_modules/@openai/codex/bin/codex.js"
 delete_method = "thread/delete"
 params_shape = { threadId = "{thread_id}" }
 [codex_app_server.initialize.clientInfo]
@@ -743,7 +754,7 @@ version = "1"
 "#;
 
     /// The codex adapter's lockfile and registry for `CODEX_PINS`, its
-    /// `@vendor/codex` at `codex_version`.
+    /// `@openai/codex` at `codex_version`.
     fn codex_fixture(codex_version: &str) -> (Pins, BTreeMap<String, Lock>, Registry) {
         let pins = Pins::parse(&format!("{PINS}{CODEX_PINS}")).unwrap();
         let claude = Fixture::new();
@@ -762,8 +773,8 @@ version = "1"
         };
         codex.add("node_modules/@acp/codex", "@acp/codex", "1.0.0", &[], &[], &[], false);
         codex.add(
-            "node_modules/@vendor/codex",
-            "@vendor/codex",
+            "node_modules/@openai/codex",
+            "@openai/codex",
             codex_version,
             &[],
             &[],
@@ -776,8 +787,8 @@ version = "1"
             ("darwin-arm64", "darwin", "arm64"),
         ] {
             codex.add(
-                &format!("node_modules/@vendor/codex-{suffix}"),
-                &format!("@vendor/codex-{suffix}"),
+                &format!("node_modules/@openai/codex-{suffix}"),
+                &format!("@openai/codex-{suffix}"),
                 codex_version,
                 &[os],
                 &[cpu],
@@ -814,10 +825,18 @@ version = "1"
         let manifest = build(&pins, &locks, &registry, &node_archives()).unwrap();
         let pin = manifest.codex_app_server.expect("carried");
         assert_eq!(pin.codex_version, "0.155.1");
-        assert_eq!(pin.bin, "node_modules/@vendor/codex/bin/codex.js");
+        assert_eq!(pin.bin, "node_modules/@openai/codex/bin/codex.js");
         let (pins, locks, registry) = codex_fixture("0.156.0");
         let err = format!("{:#}", build(&pins, &locks, &registry, &node_archives()).unwrap_err());
-        assert!(err.contains("bundles @vendor/codex 0.156.0"), "{err}");
+        assert!(err.contains("bundles @openai/codex 0.156.0"), "{err}");
+        // A launcher in another package, even at the pinned version (the
+        // review's item 5).
+        let (mut pins, locks, registry) = codex_fixture("0.155.1");
+        let pin = pins.codex_app_server.as_mut().unwrap();
+        pin.bin = "node_modules/@acp/codex/dist/index.js".into();
+        pin.codex_version = "1.0.0".into();
+        let err = format!("{:#}", build(&pins, &locks, &registry, &node_archives()).unwrap_err());
+        assert!(err.contains("is not @openai/codex"), "{err}");
         // A launcher outside every package of the codex lockfile.
         let (mut pins, locks, registry) = codex_fixture("0.155.1");
         pins.codex_app_server.as_mut().unwrap().bin = "node_modules/@other/codex/bin/codex.js".into();
