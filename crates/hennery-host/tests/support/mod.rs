@@ -227,6 +227,7 @@ impl Fixture {
                     platforms: BTreeMap::new(),
                 },
                 adapters: BTreeMap::new(),
+                codex_app_server: None,
             },
             bodies: BTreeMap::new(),
         };

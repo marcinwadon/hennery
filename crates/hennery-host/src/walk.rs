@@ -73,7 +73,7 @@ impl std::fmt::Debug for Hooks {
 }
 
 impl Hooks {
-    fn listed(&self, _path: &Path, _entries: &[CString]) {
+    pub(crate) fn listed(&self, _path: &Path, _entries: &[CString]) {
         #[cfg(feature = "test-hooks")]
         if let Some(hook) = &self.listed {
             use std::os::unix::ffi::OsStringExt;
@@ -85,7 +85,7 @@ impl Hooks {
         }
     }
 
-    fn stated(&self, _path: &Path) {
+    pub(crate) fn stated(&self, _path: &Path) {
         #[cfg(feature = "test-hooks")]
         if let Some(hook) = &self.stated {
             hook(_path);
@@ -218,6 +218,17 @@ fn unlink_at(dir: RawFd, name: &CStr, flags: libc::c_int) -> Result<(), i32> {
             e => return Err(e),
         }
     }
+}
+
+/// Unlink the entry `name` in `dir`, never a directory (`unlinkat(…, 0)`):
+/// a regular file the caller found with `stat_at`, or, if one was swapped
+/// in since, the symlink itself, never its target. Gone already is fine.
+pub fn unlink_file_at(dir: RawFd, name: &CStr) -> Result<(), i32> {
+    unlink_at(dir, name, 0)
+}
+
+pub fn is_file(st: &libc::stat) -> bool {
+    st.st_mode & libc::S_IFMT == libc::S_IFREG
 }
 
 /// The entries of the open directory `dir`, `.` and `..` left out, read

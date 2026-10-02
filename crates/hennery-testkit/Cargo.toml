@@ -10,6 +10,11 @@ publish.workspace = true
 name = "hennery-fake-acp"
 path = "src/bin/hennery-fake-acp.rs"
 
+# Codex's CLI as a forget runs it: `--version` and `app-server` (plan 9d-ii).
+[[bin]]
+name = "hennery-fake-codex"
+path = "src/bin/hennery-fake-codex.rs"
+
 [dependencies]
 agent-client-protocol.workspace = true
 # The fake adapter echoes each image it is sent by its hash (plan 6a).

@@ -48,6 +48,10 @@ pub struct HostConfig {
     /// installed set's `claude` is `Claude` (`ClaudeOwnCli` with
     /// `--use-cli`); an agent not listed, a `--agent` command, is `Generic`.
     pub profiles: HashMap<String, Profile>,
+    /// The Codex CLI a forget runs `app-server` from (plan 9d decision 9):
+    /// the installed set's bundled one, or `--use-cli`'s. `None` (no set,
+    /// or `--agent`): a Codex forget takes the fallback.
+    pub codex_app_server: Option<AgentCommand>,
     pub reconnect_min: Duration,
     pub reconnect_max: Duration,
     pub ping_interval: Duration,
@@ -81,6 +85,7 @@ impl HostConfig {
             data_dir,
             agents: HashMap::new(),
             profiles: HashMap::new(),
+            codex_app_server: None,
             reconnect_min: Duration::from_millis(500),
             reconnect_max: Duration::from_secs(30),
             ping_interval: Duration::from_secs(15),
@@ -844,6 +849,7 @@ fn handle(
             agent,
             agent_session_id,
             agent_home,
+            fallback,
         } => forget(
             cfg,
             uplink,
@@ -854,6 +860,7 @@ fn handle(
                 agent,
                 agent_session_id,
                 agent_home,
+                fallback,
             },
         ),
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
@@ -916,6 +923,9 @@ fn forget(
         hooks: crate::walk::Hooks::default(),
         // Looked up in the forget's blocking task, not here.
         account: None,
+        codex_app_server: cfg.codex_app_server.clone(),
+        codex_pin: crate::runtime::manifest::Manifest::embedded().codex_app_server,
+        deadline: crate::forget::FORGET_DEADLINE,
     };
     let (uplink, sessions) = (uplink.clone(), sessions.clone());
     tokio::spawn(async move {

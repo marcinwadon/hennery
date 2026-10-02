@@ -145,6 +145,10 @@ pub struct Agents {
     /// Each launched agent's profile (`Profile::of_installed`): an agent
     /// with its `--use-cli` CLI is not the pinned one any more.
     pub profiles: HashMap<String, Profile>,
+    /// The Codex CLI a forget runs `app-server` from (plan 9d decision 9):
+    /// `<node> <set>/codex/<the pinned launcher>` when the set has it, or
+    /// `--use-cli codex=…`'s binary. Its version is checked when it runs.
+    pub codex_app_server: Option<AgentCommand>,
     /// One line per agent left out, or launched with a caveat.
     pub notes: Vec<String>,
 }
@@ -167,6 +171,13 @@ pub fn from_set(set: &InstalledSet, overrides: &BTreeMap<String, PathBuf>) -> Ag
             (Some(path), Some(var)) => match check_cli(path) {
                 Ok(path) => {
                     own_cli = true;
+                    if name == crate::agent_home::CODEX {
+                        out.codex_app_server = Some(AgentCommand {
+                            program: path.to_string_lossy().into_owned(),
+                            args: Vec::new(),
+                            env: Vec::new(),
+                        });
+                    }
                     command.env.push((var.to_string(), path.to_string_lossy().into_owned()));
                     if !adapter.cli_skipped {
                         out.notes.push(format!(
@@ -195,12 +206,28 @@ pub fn from_set(set: &InstalledSet, overrides: &BTreeMap<String, PathBuf>) -> Ag
                 ));
                 continue;
             }
-            (None, _) => {}
+            (None, _) => {
+                if name == crate::agent_home::CODEX {
+                    out.codex_app_server = bundled_codex(set);
+                }
+            }
         }
         out.profiles.insert(name.clone(), Profile::of_installed(name, own_cli));
         out.agents.insert(name.clone(), command);
     }
     out
+}
+
+/// The set's bundled Codex launcher, as the embedded manifest pins it
+/// (`codex_app_server.bin`), run by the set's Node: if the set has it.
+fn bundled_codex(set: &InstalledSet) -> Option<AgentCommand> {
+    let pin = super::manifest::Manifest::embedded().codex_app_server?;
+    let launcher = set.path.join(crate::agent_home::CODEX).join(&pin.bin);
+    launcher.is_file().then(|| AgentCommand {
+        program: set.node.to_string_lossy().into_owned(),
+        args: vec![launcher.to_string_lossy().into_owned()],
+        env: Vec::new(),
+    })
 }
 
 /// What `prepare` leaves the host with.

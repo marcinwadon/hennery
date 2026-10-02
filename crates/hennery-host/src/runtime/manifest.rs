@@ -72,6 +72,97 @@ pub struct Manifest {
     pub schema: u32,
     pub node: Node,
     pub adapters: BTreeMap<String, Adapter>,
+    /// How a forget calls the bundled Codex's `app-server` (plan 9d
+    /// decision 9): pinned for one Codex version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_app_server: Option<CodexAppServer>,
+}
+
+/// The placeholder `params_shape` holds where the thread id goes.
+pub const THREAD_ID_PLACEHOLDER: &str = "{thread_id}";
+
+/// The call shape of Codex's `thread/delete`, pinned for one Codex version
+/// (plan 9d decision 9). A forget runs the app-server only when its
+/// `--version` is `codex_version`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexAppServer {
+    /// The Codex version (`@openai/codex` in the codex adapter's lockfile)
+    /// this shape was read from, e.g. `0.155.1`.
+    pub codex_version: String,
+    /// The bundled CLI's launcher, relative to the codex adapter's directory
+    /// in a set; run as `<node> <bin> app-server`, as codex-acp runs it.
+    pub bin: String,
+    /// `initialize`'s params, sent as they are.
+    pub initialize: AppServerInitialize,
+    /// `thread/delete`.
+    pub delete_method: String,
+    /// The delete's params: one key whose value is `{thread_id}`.
+    pub params_shape: BTreeMap<String, String>,
+}
+
+/// `initialize`'s params (Codex's `v1::InitializeParams`): the client's name
+/// only. Codex's `initialize` has no protocol version; the pinned Codex
+/// version stands for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AppServerInitialize {
+    pub client_info: AppServerClientInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppServerClientInfo {
+    pub name: String,
+    pub title: String,
+    pub version: String,
+}
+
+impl CodexAppServer {
+    /// Every rule the shape must keep.
+    pub fn validate(&self) -> Result<()> {
+        if !is_version(&self.codex_version) {
+            bail!("codex_app_server: Codex version {:?} is not x.y.z", self.codex_version);
+        }
+        check_relative_path(&self.bin).context("codex_app_server: bin")?;
+        if !self.bin.starts_with("node_modules/") {
+            bail!("codex_app_server: bin {:?} is not under node_modules/", self.bin);
+        }
+        if self.delete_method != "thread/delete" {
+            bail!(
+                "codex_app_server: delete_method {:?} is not thread/delete",
+                self.delete_method
+            );
+        }
+        let placeholders = self
+            .params_shape
+            .values()
+            .filter(|v| v.as_str() == THREAD_ID_PLACEHOLDER)
+            .count();
+        if self.params_shape.len() != 1 || placeholders != 1 {
+            bail!("codex_app_server: params_shape is not one key holding {THREAD_ID_PLACEHOLDER}");
+        }
+        let info = &self.initialize.client_info;
+        if [&info.name, &info.title, &info.version].iter().any(|s| s.is_empty()) {
+            bail!("codex_app_server: an empty clientInfo field");
+        }
+        Ok(())
+    }
+
+    /// The delete's params for `thread_id`.
+    pub fn params(&self, thread_id: &str) -> serde_json::Map<String, serde_json::Value> {
+        self.params_shape
+            .iter()
+            .map(|(key, value)| {
+                let value = if value == THREAD_ID_PLACEHOLDER {
+                    thread_id.to_string()
+                } else {
+                    value.clone()
+                };
+                (key.clone(), serde_json::Value::String(value))
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +271,12 @@ impl Manifest {
         }
         if self.adapters.is_empty() {
             bail!("the manifest pins no adapter");
+        }
+        if let Some(app_server) = &self.codex_app_server {
+            if !self.adapters.contains_key(crate::agent_home::CODEX) {
+                bail!("codex_app_server is pinned, but no codex adapter is");
+            }
+            app_server.validate()?;
         }
         for (name, adapter) in &self.adapters {
             if !is_agent_name(name) {
@@ -377,6 +474,72 @@ mod tests {
         let mut schema = good;
         schema.schema = 2;
         assert!(schema.validate().is_err());
+    }
+
+    /// Plan 9d decision 9: the embedded manifest pins `thread/delete`'s call
+    /// shape for the Codex its codex adapter bundles.
+    #[test]
+    fn the_embedded_manifest_pins_codexs_delete_for_its_bundled_version() {
+        let manifest = Manifest::embedded();
+        let pin = manifest.codex_app_server.as_ref().expect("pinned");
+        assert_eq!(pin.codex_version, "0.155.1");
+        assert_eq!(pin.bin, "node_modules/@openai/codex/bin/codex.js");
+        assert_eq!(pin.delete_method, "thread/delete");
+        assert_eq!(
+            serde_json::Value::Object(pin.params("0b9c1d2e-3f40-4a5b-8c6d-7e8f90a1b2c3")),
+            serde_json::json!({ "threadId": "0b9c1d2e-3f40-4a5b-8c6d-7e8f90a1b2c3" })
+        );
+        assert_eq!(
+            serde_json::to_value(&pin.initialize).unwrap(),
+            serde_json::json!({ "clientInfo": { "name": "hennery", "title": "hennery", "version": "1" } })
+        );
+        // The bundled launcher is a file of the pinned `@openai/codex`.
+        for platform in Platform::ALL {
+            let files = &manifest.adapters["codex"].platforms[platform.key()];
+            assert!(
+                files
+                    .iter()
+                    .any(|f| pin.bin.starts_with(&format!("{}/", f.path)) && f.path == "node_modules/@openai/codex")
+            );
+        }
+    }
+
+    #[test]
+    fn a_codex_app_server_pin_out_of_shape_is_refused() {
+        let good = Manifest::embedded();
+        let pin = || good.codex_app_server.clone().unwrap();
+        let mut cases: Vec<(&str, CodexAppServer)> = Vec::new();
+        let mut version = pin();
+        version.codex_version = "0.155".into();
+        cases.push(("x.y.z", version));
+        let mut bin = pin();
+        bin.bin = "../codex".into();
+        cases.push(("plain relative", bin));
+        let mut outside = pin();
+        outside.bin = "bin/codex".into();
+        cases.push(("under node_modules", outside));
+        let mut method = pin();
+        method.delete_method = "thread/archive".into();
+        cases.push(("thread/delete", method));
+        let mut shape = pin();
+        shape.params_shape.insert("extra".into(), "x".into());
+        cases.push(("one key", shape));
+        let mut no_placeholder = pin();
+        no_placeholder.params_shape = BTreeMap::from([("threadId".into(), "fixed".into())]);
+        cases.push(("one key", no_placeholder));
+        let mut empty = pin();
+        empty.initialize.client_info.name.clear();
+        cases.push(("empty clientInfo", empty));
+        for (want, case) in cases {
+            let mut manifest = good.clone();
+            manifest.codex_app_server = Some(case);
+            let err = format!("{:#}", manifest.validate().unwrap_err());
+            assert!(err.contains(want), "{want}: {err}");
+        }
+        let mut no_codex = good.clone();
+        no_codex.adapters.remove("codex");
+        let err = format!("{:#}", no_codex.validate().unwrap_err());
+        assert!(err.contains("no codex adapter"), "{err}");
     }
 
     #[test]

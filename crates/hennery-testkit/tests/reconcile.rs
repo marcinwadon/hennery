@@ -3283,11 +3283,20 @@ fn forgetting() -> Capabilities {
 /// The next `forget_session`: its request id, after checking it names the
 /// session's agent, id and recorded home.
 async fn expect_forget(host: &mut ScriptedHost) -> String {
+    let (request_id, fallback) = expect_forget_flag(host).await;
+    assert!(!fallback, "a forget flagged fallback");
+    request_id
+}
+
+/// `expect_forget`, with the hybrid's `fallback` flag it carried (plan
+/// 9d-ii).
+async fn expect_forget_flag(host: &mut ScriptedHost) -> (String, bool) {
     let CollectorFrame::ForgetSession {
         request_id,
         agent,
         agent_session_id,
         agent_home: home,
+        fallback,
     } = host.next().await
     else {
         panic!("expected forget_session");
@@ -3296,7 +3305,7 @@ async fn expect_forget(host: &mut ScriptedHost) -> String {
         (agent.as_str(), agent_session_id.as_str(), home),
         ("claude", AGENT_SESSION, agent_home())
     );
-    request_id
+    (request_id, fallback)
 }
 
 fn forgotten(request_id: String, remaining: Vec<hennery_proto::frames::ForgetRemaining>) -> HostFrame {
@@ -3592,4 +3601,133 @@ async fn a_purge_forgets_its_sessions_on_their_hosts_and_counts_them() {
     assert_eq!(listed.len(), 2, "{listed:?}");
     assert!(listed.contains(&(waiting.clone(), hennery_proto::rest::HostRemovalState::Pending)));
     assert!(listed.contains(&("s-old".to_string(), hennery_proto::rest::HostRemovalState::Final)));
+}
+
+/// Plan 9d-ii, B5 as ruled (the hybrid): consecutive answers whose whole
+/// forget timed out in the app-server (`app_server_timed_out`) are counted
+/// on the record; any other answer resets the count; once it reaches
+/// `APP_SERVER_TIMEOUTS_BEFORE_FALLBACK`, the next `forget_session` carries
+/// `fallback`, and its final answer closes the record.
+#[tokio::test]
+async fn app_server_timeouts_in_a_row_flag_the_next_forget_fallback() {
+    use hennery_proto::frames::{ForgetKind, ForgetReason, ForgetRemaining, ForgetWhat};
+    use hennery_sessions::forget::APP_SERVER_TIMEOUTS_BEFORE_FALLBACK;
+    let left = |kind, reason, retry| ForgetRemaining {
+        what: ForgetWhat { kind, count: 0 },
+        reason,
+        retry,
+    };
+    let timed_out = || left(ForgetKind::Session, ForgetReason::AppServerTimedOut, true);
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect_with(&collector, vec![], 0, forgetting()).await;
+    let session = parked_claude_session(&collector, &mut host).await;
+    let c = client(&collector);
+    let url = session_url(&collector, &session);
+    let call = tokio::spawn(async move { delete(&c, url).await });
+    // The delete's own attempt: timed out in the app-server, once.
+    let (first, fallback) = expect_forget_flag(&mut host).await;
+    assert!(!fallback);
+    host.send(&forgotten(first, vec![timed_out()])).await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!(
+        (status, body["host_transcript"]["state"].as_str()),
+        (200, Some("partial")),
+        "{body}"
+    );
+    assert_eq!(APP_SERVER_TIMEOUTS_BEFORE_FALLBACK, 3);
+    let record = || collector.state.store.forgets_to_send(HOST).unwrap().remove(0);
+    assert_eq!(record().app_server_timeouts, 1);
+    // A timeout of the delete itself is no app-server timeout: it resets.
+    let state = collector.state.clone();
+    let r = record();
+    let retry =
+        tokio::spawn(async move { hennery_sessions::forget::attempt(&state, &r, Duration::from_secs(5)).await });
+    let (id, fallback) = expect_forget_flag(&mut host).await;
+    assert!(!fallback);
+    host.send(&forgotten(
+        id,
+        vec![left(ForgetKind::Session, ForgetReason::TimedOut, true)],
+    ))
+    .await;
+    retry.await.unwrap();
+    assert_eq!(record().app_server_timeouts, 0, "reset");
+    // Three in a row; only the fourth is flagged.
+    for n in 1..=APP_SERVER_TIMEOUTS_BEFORE_FALLBACK {
+        let state = collector.state.clone();
+        let r = record();
+        let retry =
+            tokio::spawn(async move { hennery_sessions::forget::attempt(&state, &r, Duration::from_secs(5)).await });
+        let (id, fallback) = expect_forget_flag(&mut host).await;
+        assert!(!fallback, "attempt {n}");
+        host.send(&forgotten(id, vec![timed_out()])).await;
+        retry.await.unwrap();
+        assert_eq!(record().app_server_timeouts, n);
+    }
+    let state = collector.state.clone();
+    let r = record();
+    let retry =
+        tokio::spawn(async move { hennery_sessions::forget::attempt(&state, &r, Duration::from_secs(5)).await });
+    let (id, fallback) = expect_forget_flag(&mut host).await;
+    assert!(fallback, "the threshold flags the next forget");
+    host.send(&forgotten(
+        id,
+        vec![left(ForgetKind::CodexDatabaseCopies, ForgetReason::FallbackOnly, false)],
+    ))
+    .await;
+    let result = retry.await.unwrap();
+    assert_eq!(result.state, hennery_proto::rest::RemovalState::Partial);
+    let listed = removals(&collector).await;
+    assert_eq!(listed[0].state, hennery_proto::rest::HostRemovalState::Final);
+}
+
+/// The hybrid's count across an attempt's second round (plan 9d-ii): an
+/// attempt asked again while in flight sends the count its own first
+/// answer made, not the one it started with. Here the first answer makes
+/// it the threshold, so the second round is flagged.
+#[tokio::test]
+async fn an_attempt_asked_again_sends_the_count_its_first_answer_made() {
+    use hennery_proto::frames::{ForgetKind, ForgetReason, ForgetRemaining, ForgetWhat};
+    use hennery_sessions::forget::{APP_SERVER_TIMEOUTS_BEFORE_FALLBACK, attempt};
+    let left = |kind, reason, retry| ForgetRemaining {
+        what: ForgetWhat { kind, count: 0 },
+        reason,
+        retry,
+    };
+    let timed_out = || left(ForgetKind::Session, ForgetReason::AppServerTimedOut, true);
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect_with(&collector, vec![], 0, forgetting()).await;
+    let session = parked_claude_session(&collector, &mut host).await;
+    let c = client(&collector);
+    let url = session_url(&collector, &session);
+    let call = tokio::spawn(async move { delete(&c, url).await });
+    let (first, _) = expect_forget_flag(&mut host).await;
+    host.send(&forgotten(first, vec![timed_out()])).await;
+    call.await.unwrap();
+    let record = || collector.state.store.forgets_to_send(HOST).unwrap().remove(0);
+    // Up to one short of the threshold.
+    while record().app_server_timeouts < APP_SERVER_TIMEOUTS_BEFORE_FALLBACK - 1 {
+        let (state, r) = (collector.state.clone(), record());
+        let retry = tokio::spawn(async move { attempt(&state, &r, Duration::from_secs(5)).await });
+        let (id, fallback) = expect_forget_flag(&mut host).await;
+        assert!(!fallback);
+        host.send(&forgotten(id, vec![timed_out()])).await;
+        retry.await.unwrap();
+    }
+    // An attempt in flight, and another asked for meanwhile.
+    let (state, r) = (collector.state.clone(), record());
+    let held = tokio::spawn(async move { attempt(&state, &r, Duration::from_secs(10)).await });
+    let (id, fallback) = expect_forget_flag(&mut host).await;
+    assert!(!fallback);
+    let asked = attempt(&collector.state, &record(), Duration::from_secs(5)).await;
+    assert_eq!(asked.pending, Some(hennery_proto::rest::RemovalPending::InProgress));
+    host.send(&forgotten(id, vec![timed_out()])).await;
+    // The holder's second round: the threshold reached, flagged.
+    let (id, fallback) = expect_forget_flag(&mut host).await;
+    assert!(fallback, "the second round sent a stale count");
+    host.send(&forgotten(
+        id,
+        vec![left(ForgetKind::CodexDatabaseCopies, ForgetReason::FallbackOnly, false)],
+    ))
+    .await;
+    assert_eq!(held.await.unwrap().state, hennery_proto::rest::RemovalState::Partial);
 }

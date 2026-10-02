@@ -98,6 +98,9 @@ impl Root {
             hooks,
             // Looked up by the forget itself, as the host's connection does.
             account: None,
+            codex_app_server: None,
+            codex_pin: None,
+            deadline: hennery_host::forget::FORGET_DEADLINE,
         }
     }
 
@@ -109,6 +112,7 @@ impl Root {
                 root: root.to_str().unwrap().into(),
                 sqlite_root: None,
             },
+            fallback: false,
         }
     }
 
@@ -433,13 +437,19 @@ async fn a_tree_past_the_depth_bound_is_left_reported() {
     assert_eq!(reasons(&forgotten), [(ForgetKind::Tasks, ForgetReason::TooDeep, false)]);
 }
 
-/// Decision 8: other agents are not forgotten yet (9d-ii).
+/// Decision 8, 9d-ii: an agent this host cannot forget for (neither
+/// Claude nor Codex) is answered `unsupported_agent`, retryable, and
+/// nothing is touched.
 #[tokio::test]
-async fn a_codex_forget_is_unsupported_for_now() {
+async fn an_agent_with_no_forget_is_unsupported() {
     let root = Root::new();
-    let mut codex = root.forget_at(&root.root());
-    codex.agent = "codex".into();
-    let forgotten = forget(&root.ctx(Hooks::default()), &codex).await;
+    root.populate();
+    let before = root.tree();
+    let mut other = root.forget_at(&root.root());
+    other.agent = "gemini".into();
+    let forgotten = forget(&root.ctx(Hooks::default()), &other).await;
+    assert_eq!(root.tree(), before);
+    assert_eq!(root.adapter_ran(), None);
     assert_eq!(
         reasons(&forgotten),
         [(ForgetKind::Session, ForgetReason::UnsupportedAgent, true)]
@@ -600,4 +610,22 @@ async fn a_group_writable_root_passes_only_for_a_private_group() {
         );
         assert!(root.at(&format!("tasks/{ID}")).exists());
     }
+}
+
+/// Plan 9d-ii's hybrid: `fallback` is Codex's alone. A Claude forget that
+/// carries it (forged, say) is the same forget: the adapter's delete and
+/// the exact entries, nothing more and nothing less.
+#[tokio::test]
+async fn a_claude_forget_flagged_fallback_is_unchanged() {
+    let root = Root::new();
+    root.populate();
+    let mut flagged = root.forget_at(&root.root());
+    flagged.fallback = true;
+    let forgotten = forget(&root.ctx(Hooks::default()), &flagged).await;
+    assert_eq!(reasons(&forgotten), [], "{forgotten:?}");
+    assert!(root.adapter_ran().is_some(), "the adapter's delete ran");
+    let unflagged = Root::new();
+    unflagged.populate();
+    let same = unflagged.forget().await;
+    assert_eq!((forgotten, root.tree()), (same, unflagged.tree()));
 }

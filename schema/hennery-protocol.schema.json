@@ -741,6 +741,10 @@
             "agent_session_id": {
               "type": "string"
             },
+            "fallback": {
+              "description": "Plan 9d-ii, B5 as ruled (the hybrid): the record's last\n`APP_SERVER_TIMEOUTS_BEFORE_FALLBACK` answers were all\n`app_server_timed_out`, so a Codex host spawns no Codex and runs\nthe fallback at once, after the same checks. Only ever a\ndowngrade of this session's own removal; other agents ignore it.\nAbsent when false.",
+              "type": "boolean"
+            },
             "request_id": {
               "type": "string"
             },
@@ -1042,7 +1046,7 @@
         },
         {
           "const": "transcript",
-          "description": "The transcript and its family in each project directory (B9).",
+          "description": "The transcript and its family in each project directory (B9); for\nCodex, its rollout files in `sessions/` and `archived_sessions/`\n(plan 9d-ii).",
           "type": "string"
         },
         {
@@ -1130,7 +1134,12 @@
         },
         {
           "const": "timed_out",
-          "description": "The forget's deadline passed before the removal was done (B6).",
+          "description": "The forget's deadline passed before the removal was done (B6). For\nCodex: after `thread/delete` was written, so it may have run.",
+          "type": "string"
+        },
+        {
+          "const": "app_server_timed_out",
+          "description": "Codex's app-server did not answer in time before `thread/delete`\nwas written (`--version`, its start, `initialize`): retried, and\ncounted by the collector, which flags the record's next forget\n`fallback` after `APP_SERVER_TIMEOUTS_BEFORE_FALLBACK` in a row\n(plan 9d-ii, B5 as ruled).",
           "type": "string"
         },
         {
@@ -1141,6 +1150,26 @@
         {
           "const": "io_error",
           "description": "The removal failed midway (B3).",
+          "type": "string"
+        },
+        {
+          "const": "forked_history",
+          "description": "Codex's `thread/delete` refused: forked history in another thread\nstill references the rollout (plan 9d-ii, decision 9). Final, and\nnever followed by the fallback (B5).",
+          "type": "string"
+        },
+        {
+          "const": "ephemeral",
+          "description": "Codex's `thread/delete` refused: the thread was never persisted\n(plan 9d-ii, decision 9). Final.",
+          "type": "string"
+        },
+        {
+          "const": "home_mismatch",
+          "description": "The app-server named another `CODEX_HOME` than the session's\nrecorded one in its `initialize` answer: nothing was asked of it, and\nno fallback ran (plan 9d-ii, the parent's rule).",
+          "type": "string"
+        },
+        {
+          "const": "fallback_only",
+          "description": "Only the fallback ran (plan 9d-ii, decision 10): Codex's own database\nmay still hold copies of the conversation. Final.",
           "type": "string"
         },
         {

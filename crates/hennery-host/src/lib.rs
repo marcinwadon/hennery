@@ -5,6 +5,7 @@ pub mod adapter;
 pub mod agent_home;
 pub mod connection;
 pub mod forget;
+pub mod forget_codex;
 pub mod git;
 pub mod identity;
 pub mod logging;

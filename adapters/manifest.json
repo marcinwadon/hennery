@@ -2660,5 +2660,20 @@
         ]
       }
     }
+  },
+  "codex_app_server": {
+    "codex_version": "0.155.1",
+    "bin": "node_modules/@openai/codex/bin/codex.js",
+    "initialize": {
+      "clientInfo": {
+        "name": "hennery",
+        "title": "hennery",
+        "version": "1"
+      }
+    },
+    "delete_method": "thread/delete",
+    "params_shape": {
+      "threadId": "{thread_id}"
+    }
   }
 }

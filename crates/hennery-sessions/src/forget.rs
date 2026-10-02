@@ -13,7 +13,9 @@
 use crate::AppState;
 use crate::hub::RequestError;
 use crate::store::{ForgetRecord, HostForgets, final_result};
-use hennery_proto::frames::{CollectorFrame, ForgetOutcome, ForgetReason, ForgetRemaining, ForgetWhat, HostFrame};
+use hennery_proto::frames::{
+    CollectorFrame, ForgetKind, ForgetOutcome, ForgetReason, ForgetRemaining, ForgetWhat, HostFrame,
+};
 use hennery_proto::rest::{
     HostRemovalItem, HostTranscripts, RemovalItem, RemovalPending, RemovalState, TranscriptRemoval,
 };
@@ -27,6 +29,29 @@ use std::time::Duration;
 /// so a live host's answer comes first.
 pub const FORGET_WAIT: Duration = Duration::from_secs(30);
 
+/// How many `app_server_timed_out` answers in a row flag a record's next
+/// forget `fallback` (plan 9d-ii, B5 as ruled).
+pub const APP_SERVER_TIMEOUTS_BEFORE_FALLBACK: u32 = 3;
+
+/// Whether `result` is one the hybrid counts (plan 9d-ii, B5 as ruled):
+/// its `session` item is `app_server_timed_out`. Any other result resets
+/// the count.
+pub fn app_server_timed_out(result: &TranscriptRemoval) -> bool {
+    result
+        .remaining
+        .iter()
+        .any(|r| r.kind == ForgetKind::Session && r.reason == ForgetReason::AppServerTimedOut)
+}
+
+/// A record's count after `result` (the hybrid's): one more, or 0.
+pub fn app_server_timeouts_after(count: u32, result: &TranscriptRemoval) -> u32 {
+    if app_server_timed_out(result) {
+        count.saturating_add(1)
+    } else {
+        0
+    }
+}
+
 /// The most entries of each list an answer may hold (B2's size cap): a
 /// forget names at most a handful of kinds.
 pub const MAX_ANSWER_ITEMS: usize = 16;
@@ -39,12 +64,34 @@ pub const CLAUDE_NOTES: [&str; 3] = [
     "only the transcript's own names in each project directory are removed; anything else there is left",
 ];
 
+/// What is never removed for a Codex session, whatever the outcome (plan
+/// 9d-ii, O12). Always in a Codex session's result.
+pub const CODEX_NOTES: [&str; 1] = ["the agent's history.jsonl and logs_2.sqlite may still name this session"];
+
+/// What the fallback leaves (plan 9d decision 10, B5): in a Codex result
+/// whose remaining items name `codex_database_copies`.
+pub const CODEX_FALLBACK_NOTES: [&str; 2] = [
+    "conversation copies may remain in Codex's own database",
+    "rollouts of the session's subagent threads are out of the fallback's reach",
+];
+
 /// The notes a session of `agent` always gets (plan 9d decision 7).
 pub fn notes(agent: &str) -> Vec<String> {
     match agent {
         "claude" => CLAUDE_NOTES.iter().map(|n| n.to_string()).collect(),
+        "codex" => CODEX_NOTES.iter().map(|n| n.to_string()).collect(),
         _ => Vec::new(),
     }
+}
+
+/// `notes`, and what a result's remaining items add: the fallback's for
+/// `codex_database_copies` (plan 9d-ii).
+pub fn notes_for(agent: &str, remaining: &[RemovalItem]) -> Vec<String> {
+    let mut out = notes(agent);
+    if remaining.iter().any(|r| r.kind == ForgetKind::CodexDatabaseCopies) {
+        out.extend(CODEX_FALLBACK_NOTES.iter().map(|n| n.to_string()));
+    }
+    out
 }
 
 /// The records with an attempt in flight (B7): one at a time each. Each
@@ -166,16 +213,21 @@ pub async fn attempt(state: &AppState, record: &ForgetRecord, wait: Duration) ->
         return pending(RemovalPending::InProgress);
     };
     let until = tokio::time::Instant::now() + wait;
+    // The claim makes this the record's only attempt in flight, so the
+    // hybrid's count is followed here as the store keeps it: a second
+    // round sends what the first one's answer made it (plan 9d-ii).
+    let mut record = record.clone();
     loop {
         let (result, done) = attempt_once(
             state,
-            record,
+            &record,
             until.saturating_duration_since(tokio::time::Instant::now()),
         )
         .await;
         if done || !claim.asked_again() || tokio::time::Instant::now() >= until {
             return result;
         }
+        record.app_server_timeouts = app_server_timeouts_after(record.app_server_timeouts, &result);
     }
 }
 
@@ -212,6 +264,9 @@ async fn attempt_once(state: &AppState, record: &ForgetRecord, wait: Duration) -
         agent: record.agent.clone(),
         agent_session_id: record.agent_session_id.clone(),
         agent_home: home,
+        // B5 as ruled (the hybrid): after this many app-server timeouts in
+        // a row, the host is told to go straight to the fallback.
+        fallback: record.app_server_timeouts >= APP_SERVER_TIMEOUTS_BEFORE_FALLBACK,
     };
     let (result, sent, done) = match state.hub.probe(&record.host_id, &request_id, frame, wait).await {
         Ok(HostFrame::SessionForgotten {
@@ -308,13 +363,12 @@ async fn after_delete_until(
 /// The results of a session's records as one (decision 7): pending if any
 /// is, else partial if any is, else removed; `none` with no agent record.
 pub fn combined(had_agent_record: bool, agent: &str, results: Vec<TranscriptRemoval>) -> TranscriptRemoval {
-    let notes = notes(agent);
     if !had_agent_record {
         return TranscriptRemoval {
             state: RemovalState::None,
             pending: None,
             remaining: Vec::new(),
-            notes,
+            notes: notes(agent),
         };
     }
     let state = if results.iter().any(|r| r.state == RemovalState::Pending) {
@@ -324,17 +378,19 @@ pub fn combined(had_agent_record: bool, agent: &str, results: Vec<TranscriptRemo
     } else {
         RemovalState::Removed
     };
+    let pending = results.iter().find_map(|r| r.pending);
+    let remaining: Vec<RemovalItem> = results.into_iter().flat_map(|r| r.remaining).collect();
     TranscriptRemoval {
         state,
-        pending: results.iter().find_map(|r| r.pending),
-        remaining: results.into_iter().flat_map(|r| r.remaining).collect(),
-        notes,
+        pending,
+        notes: notes_for(agent, &remaining),
+        remaining,
     }
 }
 
 /// A record as `GET /api/settings/host-removals` lists it.
 pub fn listed(record: ForgetRecord) -> HostRemovalItem {
-    let notes = notes(&record.agent);
+    let agent = record.agent.clone();
     HostRemovalItem {
         id: record.id,
         host_id: record.host_id,
@@ -342,7 +398,7 @@ pub fn listed(record: ForgetRecord) -> HostRemovalItem {
         state: record.state,
         attempts: record.attempts,
         last_result: record.last_result.map(|mut result| {
-            result.notes = notes;
+            result.notes = notes_for(&agent, &result.remaining);
             result
         }),
         agent: record.agent,
@@ -435,7 +491,7 @@ mod tests {
         assert!(all.notes[0].contains("context clear"));
         let mixed = combined(true, "codex", vec![removed, final_result(ForgetReason::Shared)]);
         assert_eq!(mixed.state, RemovalState::Partial);
-        assert!(mixed.notes.is_empty());
+        assert_eq!(mixed.notes, CODEX_NOTES);
         let none = combined(false, "claude", Vec::new());
         assert_eq!(none.state, RemovalState::None);
         assert_eq!(none.notes.len(), CLAUDE_NOTES.len());
@@ -448,6 +504,33 @@ mod tests {
             (waiting.state, waiting.pending, waiting.remaining.len()),
             (RemovalState::Pending, Some(RemovalPending::HostOffline), 1)
         );
+    }
+
+    /// Plan 9d-ii, O12, decision 10: a Codex session always names Codex's
+    /// other residue; one the fallback handled also says its database
+    /// copies may remain and that subagent rollouts are out of its reach.
+    /// Any other agent gets none.
+    #[test]
+    fn codex_notes_name_its_residue_and_what_the_fallback_leaves() {
+        let removed = answered(ForgetOutcome::Complete, &[]).0;
+        let deleted = combined(true, "codex", vec![removed.clone()]);
+        assert_eq!(deleted.notes, CODEX_NOTES);
+        assert!(deleted.notes[0].contains("history.jsonl") && deleted.notes[0].contains("logs_2.sqlite"));
+        let copies = left(ForgetKind::CodexDatabaseCopies, ForgetReason::FallbackOnly, false);
+        let (fell_back, done) = answered(ForgetOutcome::Partial, &[copies]);
+        assert_eq!((fell_back.state, done), (RemovalState::Partial, true));
+        let fell_back = combined(true, "codex", vec![fell_back]);
+        let mut want: Vec<&str> = CODEX_NOTES.to_vec();
+        want.extend(CODEX_FALLBACK_NOTES);
+        assert_eq!(fell_back.notes, want);
+        assert!(
+            fell_back
+                .notes
+                .iter()
+                .any(|n| n == "conversation copies may remain in Codex's own database")
+        );
+        assert!(fell_back.notes.iter().any(|n| n.contains("subagent")));
+        assert!(combined(true, "gemini", vec![removed]).notes.is_empty());
     }
 
     #[test]

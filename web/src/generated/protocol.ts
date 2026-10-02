@@ -266,7 +266,7 @@ export type ForgetKind = "session" | "transcript" | "file_history" | "session_en
  * Why something named was not removed: a fixed code the host chooses
  * (plan 9d B2), never free text.
  */
-export type ForgetReason = "attached" | "in_progress" | "unsupported_agent" | "no_recorded_home" | "unknown_to_host" | "shared" | "unsafe_root" | "root_missing" | "symlink" | "not_a_directory" | "unsafe_directory" | "mount_point" | "too_deep" | "timed_out" | "still_present" | "io_error" | "invalid_id" | "host_revoked";
+export type ForgetReason = "attached" | "in_progress" | "unsupported_agent" | "no_recorded_home" | "unknown_to_host" | "shared" | "unsafe_root" | "root_missing" | "symlink" | "not_a_directory" | "unsafe_directory" | "mount_point" | "too_deep" | "timed_out" | "app_server_timed_out" | "still_present" | "io_error" | "forked_history" | "ephemeral" | "home_mismatch" | "fallback_only" | "invalid_id" | "host_revoked";
 
 /**
  * One kind of entry and how many of them (plan 9d B2).
@@ -393,7 +393,16 @@ isolation_waived?: boolean, } | { "type": "prompt", request_id: string, session_
 /**
  * ACP ContentBlocks, built by the frontend.
  */
-content: unknown[], } | { "type": "cancel_turn", request_id: string, session_id: string, turn_id: string, } | { "type": "set_config", request_id: string, session_id: string, config_id: string, value: ConfigValue, } | { "type": "answer_permission", request_id: string, session_id: string, pending_id: string, option_id: string, } | { "type": "answer_elicitation", request_id: string, session_id: string, pending_id: string, action: ElicitationAction, content?: unknown, } | { "type": "ack", session_id: string, ack_seq: number, } | { "type": "resolve_path", request_id: string, path: string, } | { "type": "park_session", request_id: string, session_id: string, } | { "type": "close_session", request_id: string, session_id: string, } | { "type": "list_projects", request_id: string, } | { "type": "browse_directory", request_id: string, path: string, } | { "type": "forget_hat", hat_id: string, } | { "type": "forget_session", request_id: string, agent: string, agent_session_id: string, agent_home: AgentHome, };
+content: unknown[], } | { "type": "cancel_turn", request_id: string, session_id: string, turn_id: string, } | { "type": "set_config", request_id: string, session_id: string, config_id: string, value: ConfigValue, } | { "type": "answer_permission", request_id: string, session_id: string, pending_id: string, option_id: string, } | { "type": "answer_elicitation", request_id: string, session_id: string, pending_id: string, action: ElicitationAction, content?: unknown, } | { "type": "ack", session_id: string, ack_seq: number, } | { "type": "resolve_path", request_id: string, path: string, } | { "type": "park_session", request_id: string, session_id: string, } | { "type": "close_session", request_id: string, session_id: string, } | { "type": "list_projects", request_id: string, } | { "type": "browse_directory", request_id: string, path: string, } | { "type": "forget_hat", hat_id: string, } | { "type": "forget_session", request_id: string, agent: string, agent_session_id: string, agent_home: AgentHome, 
+/**
+ * Plan 9d-ii, B5 as ruled (the hybrid): the record's last
+ * `APP_SERVER_TIMEOUTS_BEFORE_FALLBACK` answers were all
+ * `app_server_timed_out`, so a Codex host spawns no Codex and runs
+ * the fallback at once, after the same checks. Only ever a
+ * downgrade of this session's own removal; other agents ignore it.
+ * Absent when false.
+ */
+fallback?: boolean, };
 
 /**
  * `POST /api/sessions` (ACP core §9): `{host_id, agent, cwd, model?, mode?, axes?}`.

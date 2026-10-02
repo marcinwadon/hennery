@@ -105,11 +105,23 @@ impl Collector {
     /// The answer to the forget `request_id`: a `session_forgotten`, or an
     /// `error` (as its code).
     async fn forget(&mut self, request_id: &str, agent_session_id: &str, root: &Path) -> Result<HostFrame, String> {
+        self.forget_flagged(request_id, agent_session_id, root, false).await
+    }
+
+    /// `forget`, with the hybrid's `fallback` flag as given (plan 9d-ii).
+    async fn forget_flagged(
+        &mut self,
+        request_id: &str,
+        agent_session_id: &str,
+        root: &Path,
+        fallback: bool,
+    ) -> Result<HostFrame, String> {
         self.send(&CollectorFrame::ForgetSession {
             request_id: request_id.into(),
             agent: "claude".into(),
             agent_session_id: agent_session_id.into(),
             agent_home: home(root),
+            fallback,
         })
         .await;
         loop {
@@ -278,6 +290,20 @@ async fn a_forget_runs_only_for_a_registered_home_with_no_live_actor() {
         collector.forget("f4", "../../etc", &setup.root()).await,
         Err("invalid".into())
     );
+    // Plan 9d-ii's hybrid: a forged `fallback` buys nothing past the same
+    // checks. Another root, another id, an id the agent never writes: each
+    // refused as unflagged.
+    for (id, root) in [(AGENT_SESSION, setup.base.join("elsewhere")), (other_id, setup.root())] {
+        let flagged = collector.forget_flagged("f4b", id, &root, true).await.unwrap();
+        assert_eq!(
+            reasons(&flagged),
+            [(ForgetKind::Session, ForgetReason::UnknownToHost, false)]
+        );
+    }
+    assert_eq!(
+        collector.forget_flagged("f4c", "../../etc", &setup.root(), true).await,
+        Err("invalid".into())
+    );
     let ran = collector.forget("f5", AGENT_SESSION, &setup.root()).await.unwrap();
     let HostFrame::SessionForgotten { outcome, .. } = &ran else {
         unreachable!()
@@ -389,6 +415,7 @@ async fn an_attach_waits_out_a_forget_of_the_same_agent_session() {
             agent: "claude".into(),
             agent_session_id: AGENT_SESSION.into(),
             agent_home: home(&setup.root()),
+            fallback: false,
         })
         .await;
     // The forget's adapter has its `session/delete`, and holds it.

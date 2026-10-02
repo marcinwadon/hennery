@@ -383,7 +383,7 @@ host.)*
 | `browse_directory` | path | `directory{entries[]}` \| `error` |
 | `resolve_path` | path | `resolved_path{canonical, exists, is_dir}` \| `error` (kernel spec §5.4) |
 | `probe_agents` | — | `agents{…}` (same shape as in `hello`) |
-| `forget_session` | agent, agent_session_id, agent_home | `session_forgotten{outcome: complete \| partial, removed[{what, count}], remaining[{what, count, reason, retry}]}` \| `error`. Only to a host with the `forget_session` capability; kinds and reason codes are fixed, never paths (§4.10, plan 9d-i). |
+| `forget_session` | agent, agent_session_id, agent_home, fallback? | `session_forgotten{outcome: complete \| partial, removed[{what, count}], remaining[{what, count, reason, retry}]}` \| `error`. Only to a host with the `forget_session` capability; kinds and reason codes are fixed, never paths (§4.10, plan 9d-i). `fallback` (optional, absent when false, plan 9d-ii): for Codex, spawn no app-server and run the fallback at once, after the same checks; set by the collector after three `app_server_timed_out` answers in a row; other agents ignore it. It only ever downgrades that session's own removal. |
 
 **Collector → host, not requests:**
 
@@ -1176,7 +1176,73 @@ deletes every session of the hat the same way. As built (plan 9a):
     lists what is left;
   - **not removed:** transcripts started after a context clear inside the
     agent (a session id hennery never learns), and a session from before 9d
-    (no recorded home). Codex: plan 9d-ii.
+    (no recorded home).
+
+  As built for Codex (plan 9d-ii):
+  - **checks first:** the recorded root and its `sessions/` and
+    `archived_sessions/` get every check Claude's directories get, through
+    descriptors. One that fails (a symlink, as a composed home's linked
+    `sessions/` is) is reported and nothing is spawned;
+  - **the primary path:** Codex's own `thread/delete`, through
+    `codex app-server`. The binary is the installed set's bundled CLI
+    (`<node> <set>/codex/node_modules/@openai/codex/bin/codex.js`) or
+    `--use-cli`'s, run only if its `--version` (`codex-cli X.Y.Z`) is the
+    version `adapters/manifest.json` pins a call shape for
+    (`codex_app_server`: the version, the launcher, `initialize`'s params, the
+    method and its params). It runs with the adapter spawn's hygiene,
+    `CODEX_HOME` the recorded root, `CODEX_SQLITE_HOME` the recorded one or
+    removed, the root as its cwd, one deadline, and its process group killed
+    after. `initialize`'s `codexHome` must be the recorded root
+    (`home_mismatch`, final, otherwise, and nothing more is sent);
+  - **the outcome** is the check afterwards: no rollout of the session
+    (`rollout-<timestamp>-<id>[_<rollout id>].jsonl[.zst]`) left in
+    `sessions/` (three levels down) or at the top of `archived_sessions/`.
+    The SQLite copies (`thread_history`, the state DB) and
+    `session_index.jsonl` are `thread/delete`'s contract and are not
+    verified by hennery; the operator's pin-bump checklist checks them live;
+  - **refusals:** forked history still referencing the thread
+    (`forked_history`) and an unpersisted thread (`ephemeral`) are final; a
+    live internal worker is `in_progress`, retried. Once the delete was
+    written, another error is `io_error` and no answer in time is
+    `timed_out`, both retried. None of them ever leads to the fallback, and
+    none counts toward the hybrid below. "Thread not found" counts as
+    deleted, so the check afterwards decides;
+  - **the fallback** runs only when the app-server path is unavailable: no
+    binary or no pin, a spawn that fails, a version with no pinned shape, an
+    `initialize` that fails, or a `thread/delete` that Codex does not know
+    (`-32601`, or `-32600` whose message starts with `Invalid request:
+    unknown variant`, `… missing field` or `… invalid type`). It runs
+    codex-acp's `session/delete` (an archive, outside the no-follow
+    guarantee) under the same environment. It then opens the root and both
+    directories again, with every check, the root required to be the same
+    directory, since the archive may have created `archived_sessions/`. It
+    then removes the session's rollout files, regular files only and never
+    through a link, and reports `codex_database_copies`/`fallback_only`,
+    final;
+  - **slow app-servers (the bounded hybrid):** a timeout before the delete
+    was written (`--version`, the start, `initialize`) is
+    `app_server_timed_out`, retried. The collector counts such answers in a
+    row on the record (`host_forgets.app_server_timeouts`). Any other
+    result resets it to 0, a pending one included (host offline, no reply),
+    and so does a fallback cut by the deadline (`timed_out`): the next
+    attempt tries the app-server again. After three, the next `forget_session` carries `fallback`: the host
+    spawns no Codex and runs the fallback as above, final. A flag only ever
+    downgrades that one session's removal: the registry, the id and every
+    directory check still apply;
+  - **notes:** every Codex result names `history.jsonl` and `logs_2.sqlite`
+    as residue. A fallback result also says that conversation copies may
+    remain in Codex's own database and that rollouts of the session's
+    subagent threads are out of the fallback's reach (`thread/delete`
+    removes them);
+  - **not removed:** as for Claude, plus whatever only `thread/delete`
+    reaches when the fallback ran. A known gap, left as it is: when
+    `thread/delete` answers "thread not found" while rollouts of the session
+    are still there, the result is `still_present`, retried. That resets the
+    hybrid's count, so such a record never reaches the fallback and is
+    retried at every handshake until it is dismissed. A home where Codex and
+    codex-acp ran under different umasks can have its new `archived_sessions/`
+    refused as `unsafe_directory`, final. A composed per-hat home (plan 8) needs
+    its real root recorded too: its linked `sessions/` is refused.
 
 ---
 
@@ -1502,7 +1568,9 @@ shipped):
    `sessions` must leave tombstones alone;
 14. `sessions.agent_home` and `host_forgets` (owner, host, session, hat,
    agent, agent session id, home, state, attempts, last result) — the
-   agent's transcript on its host (9d-i).
+   agent's transcript on its host (9d-i);
+15. `host_forgets.app_server_timeouts` (an integer, default 0, no backfill):
+   Codex app-server timeouts in a row, for the bounded hybrid (9d-ii).
 
 `sessions` has no `hat_id`, `source_kind`, `title`, git columns or
 `last_event_id` yet, `turns` keeps only `content`, `state`, `outcome` and its

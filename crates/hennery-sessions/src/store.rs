@@ -302,6 +302,13 @@ const MIGRATIONS: &[&str] = &[
     CREATE INDEX host_forgets_by_host ON host_forgets(owner_id, host_id, state);
     CREATE INDEX host_forgets_by_session ON host_forgets(owner_id, session_id);
 ",
+    // Plan 9d-ii, B5 as ruled (the hybrid): how many of a record's answers
+    // in a row were `app_server_timed_out`; any other answer resets it. At
+    // `APP_SERVER_TIMEOUTS_BEFORE_FALLBACK` the next forget is flagged
+    // `fallback`. No backfill: every record starts at 0.
+    "
+    ALTER TABLE host_forgets ADD COLUMN app_server_timeouts INTEGER NOT NULL DEFAULT 0;
+",
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records
@@ -333,6 +340,8 @@ pub struct ForgetRecord {
     pub attempts: u32,
     pub last_result: Option<TranscriptRemoval>,
     pub created_at: String,
+    /// Answers in a row that were `app_server_timed_out` (plan 9d-ii).
+    pub app_server_timeouts: u32,
 }
 
 /// What a delete left for the session's host (plan 9d decision 2, B8).
@@ -348,8 +357,7 @@ pub struct HostForgets {
     pub shared: u32,
 }
 
-const FORGET_COLUMNS: &str =
-    "id, host_id, session_id, agent, agent_session_id, agent_home, state, attempts, last_result, created_at";
+const FORGET_COLUMNS: &str = "id, host_id, session_id, agent, agent_session_id, agent_home, state, attempts, last_result, created_at, app_server_timeouts";
 
 fn read_forget(r: &rusqlite::Row<'_>) -> rusqlite::Result<(ForgetRecord, Option<String>, String, Option<String>)> {
     Ok((
@@ -364,6 +372,7 @@ fn read_forget(r: &rusqlite::Row<'_>) -> rusqlite::Result<(ForgetRecord, Option<
             attempts: r.get(7)?,
             last_result: None,
             created_at: r.get(9)?,
+            app_server_timeouts: r.get(10)?,
         },
         r.get(5)?,
         r.get(6)?,
@@ -1655,6 +1664,7 @@ fn write_forgets(tx: &Transaction<'_>, owner: &str, deleted: ForgetSource<'_>) -
             attempts: 0,
             last_result: known,
             created_at: ts.clone(),
+            app_server_timeouts: 0,
         };
         tx.execute(
             "INSERT INTO host_forgets(id, owner_id, host_id, session_id, hat_id, agent, agent_session_id, agent_home,
@@ -2678,17 +2688,22 @@ impl Store {
             )?;
             return Ok(());
         }
-        // A final record keeps no roots (the review's item 12).
+        // A final record keeps no roots (the review's item 12). The
+        // hybrid's count (plan 9d-ii): one more for an answer whose whole
+        // forget timed out in the app-server, back to 0 for any other.
+        let app_server_timed_out = crate::forget::app_server_timed_out(result);
         conn.execute(
             "UPDATE host_forgets SET attempts = attempts + ?2, last_result = ?3, state = ?4,
-                 agent_home = CASE WHEN ?4 = 'final' THEN NULL ELSE agent_home END
+                 agent_home = CASE WHEN ?4 = 'final' THEN NULL ELSE agent_home END,
+                 app_server_timeouts = CASE WHEN ?6 THEN app_server_timeouts + 1 ELSE 0 END
              WHERE id = ?1 AND state = 'pending' AND owner_id = ?5",
             params![
                 id,
                 i64::from(sent),
                 serde_json::to_string(result)?,
                 if done { "final" } else { "pending" },
-                self.owner
+                self.owner,
+                app_server_timed_out
             ],
         )?;
         Ok(())

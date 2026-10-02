@@ -45,6 +45,14 @@ pub struct ForgetContext {
     /// connection's frame handler, where a slow directory service (LDAP,
     /// sssd) would stall the connection loop.
     pub account: Option<Account>,
+    /// The Codex CLI a forget runs `app-server` from (plan 9d decision 9):
+    /// the set's bundled one, or `--use-cli`'s. `None`: the fallback only.
+    pub codex_app_server: Option<AgentCommand>,
+    /// `thread/delete`'s call shape, pinned for one Codex version (the
+    /// embedded manifest's `codex_app_server`). `None`: the fallback only.
+    pub codex_pin: Option<crate::runtime::manifest::CodexAppServer>,
+    /// The whole forget's deadline (B6): `FORGET_DEADLINE` on a real host.
+    pub deadline: Duration,
 }
 
 /// One forget, as the collector asked for it, checked against the
@@ -54,6 +62,9 @@ pub struct Forget {
     pub agent: String,
     pub agent_session_id: String,
     pub agent_home: hennery_proto::frames::AgentHome,
+    /// The collector's `fallback` (plan 9d-ii's hybrid): for Codex, no
+    /// app-server, the fallback at once. Ignored for any other agent.
+    pub fallback: bool,
 }
 
 /// Whether `id` is an id the agent itself writes (decision 8): a UUID in
@@ -109,11 +120,12 @@ impl Forgotten {
     }
 }
 
-/// Run one forget (plan 9d decision 8) within `FORGET_DEADLINE`. Only
-/// Claude's data is removed so far; any other agent is answered
-/// `unsupported_agent`, retryable, for plan 9d-ii to take up.
+/// Run one forget within the context's deadline: Claude's data (plan 9d
+/// decision 8) or Codex's (plan 9d-ii, decisions 9 and 10). Any other agent
+/// is answered `unsupported_agent`, retryable.
 pub async fn forget(ctx: &ForgetContext, forget: &Forget) -> Forgotten {
-    if forget.agent != crate::agent_home::CLAUDE {
+    let agent = forget.agent.as_str();
+    if agent != crate::agent_home::CLAUDE && agent != crate::agent_home::CODEX {
         return Forgotten {
             removed: Vec::new(),
             remaining: vec![left(ForgetKind::Session, 0, ForgetReason::UnsupportedAgent, true)],
@@ -126,6 +138,9 @@ pub async fn forget(ctx: &ForgetContext, forget: &Forget) -> Forgotten {
             remaining: vec![left(ForgetKind::Session, 0, ForgetReason::InvalidId, false)],
         };
     }
+    if agent == crate::agent_home::CODEX {
+        return crate::forget_codex::forget_codex(ctx, forget).await;
+    }
     forget_claude(ctx, forget).await
 }
 
@@ -135,11 +150,11 @@ pub async fn forget(ctx: &ForgetContext, forget: &Forget) -> Forgotten {
 /// remove the exact names through the descriptor walk, then check what is
 /// left (B4).
 async fn forget_claude(ctx: &ForgetContext, forget: &Forget) -> Forgotten {
-    let until = Instant::now() + FORGET_DEADLINE;
+    let until = Instant::now() + ctx.deadline;
     let root = PathBuf::from(&forget.agent_home.root);
     let checked = {
         let (ctx, root) = (ctx.clone(), root.clone());
-        tokio::task::spawn_blocking(move || check(&ctx, &root)).await
+        tokio::task::spawn_blocking(move || check(&ctx, &root, &CLAUDE_KINDS)).await
     };
     let kinds = match checked {
         Ok(Ok(kinds)) => kinds,
@@ -163,7 +178,8 @@ async fn forget_claude(ctx: &ForgetContext, forget: &Forget) -> Forgotten {
         .iter()
         .any(|(kind, _, opened)| *kind == ForgetKind::Transcript && opened.is_ok());
     if projects_ok {
-        run_adapter(ctx, forget, &root, until).await;
+        let env = vec![("CLAUDE_CONFIG_DIR".to_string(), root.to_string_lossy().into_owned())];
+        run_adapter(ctx, forget, &root, env, FORGET_STRIPPED_VARS, until).await;
     }
     let (id, hooks) = (forget.agent_session_id.clone(), ctx.hooks.clone());
     let until = until.into_std();
@@ -183,27 +199,33 @@ pub const FORGET_STRIPPED_VARS: &[&str] = &["CLAUDE_CODE_PROJECT_DIR_NAME", "COD
 
 /// How long the adapter gets of the forget's deadline (B6); the rest is
 /// for stopping it and for the removal.
-const ADAPTER_SHARE: Duration = Duration::from_secs(12);
+pub(crate) const ADAPTER_SHARE: Duration = Duration::from_secs(12);
 
 /// The grace a forget's adapter gets between SIGTERM and SIGKILL.
-const ADAPTER_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const ADAPTER_GRACE: Duration = Duration::from_secs(2);
 
-/// The agent's own delete (decision 8): its adapter, through
-/// `Adapter::spawn`'s hygiene (B6), with `CLAUDE_CONFIG_DIR` set to the
-/// root and the root as its cwd, then `initialize`, then `session/delete`
-/// if it advertises it. Whatever it answers (not found included) counts
-/// for nothing: the check afterwards decides (B4). Outside the no-follow
-/// guarantee: the adapter resolves its own paths. Its group is killed
-/// after, within the deadline.
-async fn run_adapter(ctx: &ForgetContext, forget: &Forget, root: &Path, until: Instant) {
+/// The agent's own delete (decision 8; for Codex, decision 10's archive):
+/// its adapter, through `Adapter::spawn`'s hygiene (B6), with `env` set
+/// (the root, as the agent's own variable) and `strip` removed, the root
+/// as its cwd, then `initialize`, then `session/delete` if it advertises
+/// it. Whatever it answers (not found included) counts for nothing: the
+/// check afterwards decides (B4). Outside the no-follow guarantee: the
+/// adapter resolves its own paths. Its group is killed after, within the
+/// deadline.
+pub(crate) async fn run_adapter(
+    ctx: &ForgetContext,
+    forget: &Forget,
+    root: &Path,
+    env: Vec<(String, String)>,
+    strip: &[&str],
+    until: Instant,
+) {
     let Some(mut command) = ctx.agents.get(&forget.agent).cloned() else {
         tracing::info!(agent = %forget.agent, "no adapter configured for a forget; only the exact entries go");
         return;
     };
-    command
-        .env
-        .push(("CLAUDE_CONFIG_DIR".into(), root.to_string_lossy().into_owned()));
-    let (mut adapter, io) = match Adapter::spawn_stripped(&command, root, FORGET_STRIPPED_VARS) {
+    command.env.extend(env);
+    let (mut adapter, io) = match Adapter::spawn_stripped(&command, root, strip) {
         Ok(spawned) => spawned,
         Err(err) => {
             tracing::warn!(agent = %forget.agent, error = %err, "a forget's adapter did not spawn");
@@ -243,13 +265,22 @@ async fn run_adapter(ctx: &ForgetContext, forget: &Forget, root: &Path, until: I
             }
             Ok(())
         });
-    let deadline = until.min(Instant::now() + ADAPTER_SHARE);
+    let deadline = adapter_deadline(until, Instant::now());
     match tokio::time::timeout_at(deadline, talk).await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => tracing::info!(error = %err, "a forget's adapter connection ended"),
         Err(_) => tracing::warn!("a forget's adapter ran out of time"),
     }
     adapter.terminate(ADAPTER_GRACE).await;
+}
+
+/// When a forget's adapter is cut (B6; the review's item 4): its share of
+/// the deadline, and never later than the grace before `until`, so its
+/// SIGTERM-to-SIGKILL grace still ends by `until`, inside the collector's
+/// wait.
+pub(crate) fn adapter_deadline(until: Instant, now: Instant) -> Instant {
+    let latest = until.checked_sub(ADAPTER_GRACE).unwrap_or(now).max(now);
+    latest.min(now + ADAPTER_SHARE)
 }
 
 /// The kind directories under a Claude root, each with the kind it holds
@@ -498,28 +529,55 @@ fn open_kind(root: RawFd, name: &str, dev: libc::dev_t, account: &Account) -> Re
 }
 
 /// A retry can change what is left for `reason` (decision 4): an entry
-/// still there, or a removal that failed midway (B3). A symlink, a mount
-/// point, an unsafe directory stay as they are.
-fn retryable(reason: ForgetReason) -> bool {
+/// still there, or a removal that failed midway (B3), a deadline, another
+/// forget or a live worker. A symlink, a mount point, an unsafe directory,
+/// Codex's refusals for forked or unpersisted history, another home and
+/// what only the fallback could reach stay as they are.
+pub(crate) fn retryable(reason: ForgetReason) -> bool {
     matches!(
         reason,
-        ForgetReason::StillPresent | ForgetReason::IoError | ForgetReason::TimedOut | ForgetReason::InProgress
+        ForgetReason::StillPresent
+            | ForgetReason::IoError
+            | ForgetReason::TimedOut
+            | ForgetReason::AppServerTimedOut
+            | ForgetReason::InProgress
     )
 }
 
 /// What is counted per kind.
 #[derive(Default)]
-struct Tally {
-    removed: BTreeMap<ForgetKind, u32>,
+pub(crate) struct Tally {
+    pub(crate) removed: BTreeMap<ForgetKind, u32>,
     left: BTreeMap<(ForgetKind, ForgetReason), u32>,
 }
 
 impl Tally {
-    fn left(&mut self, kind: ForgetKind, reason: ForgetReason) {
+    pub(crate) fn left(&mut self, kind: ForgetKind, reason: ForgetReason) {
         *self.left.entry((kind, reason)).or_default() += 1;
     }
 
-    fn into_forgotten(self) -> Forgotten {
+    /// `kind` left for `reason` with no count of its own (a whole forget,
+    /// or a database): counted once, as 0.
+    pub(crate) fn left_whole(&mut self, kind: ForgetKind, reason: ForgetReason) {
+        self.left.entry((kind, reason)).or_default();
+    }
+
+    /// Whether anything was left for `reason`.
+    pub(crate) fn has_left(&self, reason: ForgetReason) -> bool {
+        self.left.keys().any(|(_, r)| *r == reason)
+    }
+
+    /// Add what `other` counted.
+    pub(crate) fn merge(&mut self, other: Tally) {
+        for (kind, count) in other.removed {
+            *self.removed.entry(kind).or_default() += count;
+        }
+        for (key, count) in other.left {
+            *self.left.entry(key).or_default() += count;
+        }
+    }
+
+    pub(crate) fn into_forgotten(self) -> Forgotten {
         Forgotten {
             removed: self
                 .removed
@@ -535,7 +593,7 @@ impl Tally {
     }
 }
 
-fn stop_reason(stop: walk::Stop) -> ForgetReason {
+pub(crate) fn stop_reason(stop: walk::Stop) -> ForgetReason {
     match stop {
         walk::Stop::MountPoint => ForgetReason::MountPoint,
         walk::Stop::TooDeep => ForgetReason::TooDeep,
@@ -546,21 +604,25 @@ fn stop_reason(stop: walk::Stop) -> ForgetReason {
 
 /// One kind directory as checked: its kind, its name, and it open (none
 /// there), or why it is skipped.
-type KindDir = (ForgetKind, &'static str, Result<Option<OwnedFd>, ForgetReason>);
+pub(crate) type KindDir = (ForgetKind, &'static str, Result<Option<OwnedFd>, ForgetReason>);
 
 /// The checked root's kind directories, as opened before the adapter ran.
-struct Kinds {
-    root: OwnedFd,
-    dev: libc::dev_t,
-    dirs: Vec<KindDir>,
+pub(crate) struct Kinds {
+    pub(crate) root: OwnedFd,
+    pub(crate) dev: libc::dev_t,
+    pub(crate) dirs: Vec<KindDir>,
 }
 
-/// The root and its kind directories, checked (B3). `Err` for the root.
-/// Runs on a blocking thread: the account lookup with it.
-fn check(ctx: &ForgetContext, root: &Path) -> Result<Kinds, ForgetReason> {
+/// The root and the agent's kind directories, checked (B3). `Err` for the
+/// root. Runs on a blocking thread: the account lookup with it.
+pub(crate) fn check(
+    ctx: &ForgetContext,
+    root: &Path,
+    kinds: &[(ForgetKind, &'static str)],
+) -> Result<Kinds, ForgetReason> {
     let me = ctx.account.clone().unwrap_or_else(account);
     let (root_fd, dev) = open_checked_root(ctx, root, &me)?;
-    let dirs = CLAUDE_KINDS
+    let dirs = kinds
         .iter()
         .map(|&(kind, name)| (kind, name, open_kind(root_fd.as_raw_fd(), name, dev, &me)))
         .collect();
@@ -814,6 +876,18 @@ mod tests {
         );
     }
 
+    /// The review's item 4 (9d-ii): the adapter is cut its grace before
+    /// the forget's deadline, or at its own share, whichever comes first.
+    #[test]
+    fn a_forgets_adapter_ends_its_grace_before_the_deadline() {
+        let now = Instant::now();
+        let until = now + Duration::from_secs(20);
+        assert_eq!(adapter_deadline(until, now), now + ADAPTER_SHARE);
+        let soon = now + Duration::from_secs(5);
+        assert_eq!(adapter_deadline(soon, now), soon - ADAPTER_GRACE);
+        assert_eq!(adapter_deadline(now + Duration::from_secs(1), now), now);
+    }
+
     /// The review's item 3: what the deadline left, a retry may finish.
     #[test]
     fn a_removal_cut_by_its_deadline_is_retried() {
@@ -856,6 +930,9 @@ mod tests {
             home: None,
             hooks: walk::Hooks::default(),
             account: None,
+            codex_app_server: None,
+            codex_pin: None,
+            deadline: FORGET_DEADLINE,
         };
         let forgotten = forget(
             &ctx,
@@ -866,6 +943,7 @@ mod tests {
                     root: "/tmp".into(),
                     sqlite_root: None,
                 },
+                fallback: false,
             },
         )
         .await;
