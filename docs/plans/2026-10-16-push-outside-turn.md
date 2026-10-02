@@ -17,7 +17,7 @@
 
 **Spec:** ACP core §10 (push triggers), §4.2; umbrella §5 ("a question the agent asks outside a turn is pending too, but leaves the activity alone"). It builds on plan [10b-i](2026-10-15-push-triggers.md), merged as #61: its decisions 1, 2 and 5 apply as they stand. Every anchor was taken from `main` at `ef75d4f` (10b-i and plan 8b merged).
 
-**Status:** written 2026-10-02. Amended after its review of 2026-10-02 (opus, on the maintainer's behalf): A1, A2 and N3 taken, N1 recorded. Its re-confirmation added A3 (taken).
+**Status:** written 2026-10-02; executed 2026-10-02 (see "Execution status"). Amended after its review of 2026-10-02 (opus, on the maintainer's behalf): A1, A2 and N3 taken, N1 recorded. Its re-confirmation added A3 (taken).
 
 **How the code blocks were made and checked:**
 - The code was built and tested first; every block below was generated from its diff.
@@ -25,9 +25,22 @@
 - The five checks passed: 1023 tests on `ef75d4f`, 4 of them new (2 in the store, 2 through a host socket).
 - Every guard was revert-probed (Step 5): 11 probes, each failing its test.
 
-## Execution status
+## Execution status (2026-10-02)
 
-Not executed yet.
+**Executed** on `main` at `ef75d4f`. The code was built first, reviewed and amended, then cut into the task's two commits (tests first, then code), and the plan was replayed from its text until the trees matched.
+
+| Area | As built | Why |
+|---|---|---|
+| The operator's decision (2026-10-02) | A question opened while no turn runs notifies "needs your answer", as a blocked turn does, under 10b-i's dedup and reconnect rules. | The open question plans 10a and 10b-i left. |
+| Its review (opus, on the maintainer's behalf) | Confirmed with amendments. A1: a blocking question with no turn id is bounded by the owner's prompt too, closing 10b-i's N1. A2: the socket test ends on another session's notice, since the queue keeps one per tag. N3: the bound is ordered by event id, not the clock. N1 is recorded. | `NULL = NULL` left such a question unbounded. Millisecond stamps tied, and either reading of a tie misjudged one case. |
+| Its re-confirmation | A3 taken: the question's own event id is stored (`pending.opened_event_id`, sessions migration 11), with an index on events by kind. The planner's use of the index for the `max()` was checked. Then "confirmed". | A first draft joined events on JSON, scanning the session's events per question under the write lock. |
+| The whole-branch review (opus): approve with fixes | The owner's-prompt reset of a blocking question with no turn id is now tested (the no-turn-id test asks again after a new prompt), and its probe table row names the right test. `Deferred`'s doc and 10b-i's README line are current. | A reset clause no test failed without was unverified. |
+
+Checks:
+- The five checks passed: 1023 tests on `ef75d4f`.
+- The 11 revert-probes each failed their test.
+- The run was macOS only, so ubuntu CI is the Linux check.
+
 
 ## Scope
 
