@@ -17,6 +17,8 @@ futures.workspace = true
 hennery-kernel.workspace = true
 hennery-proto.workspace = true
 hex.workspace = true
+# An upstream's Mcp-Session-Id bound to its token (plan 8e decision 13).
+hmac.workspace = true
 libc = "0.2"
 # The proxy's upstream requests (plan 8d), sent through the kernel's egress
 # clients (`hennery_kernel::egress`), never a client of its own.
@@ -25,6 +27,7 @@ rusqlite.workspace = true
 # What the proxy reads of JSON-RPC (plan 8d): duplicate keys refused.
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 thiserror.workspace = true
 # The proxy answers refused server requests in the background (plan 8d).
 tokio.workspace = true

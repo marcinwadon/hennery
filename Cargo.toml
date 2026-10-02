@@ -28,6 +28,9 @@ flate2 = "=1.1.10"
 futures = "0.3"
 getrandom = "=0.3.4"
 hex = "=0.4.3"
+# The MCP gateway binds an upstream's Mcp-Session-Id to its token (plan 8e
+# decision 13): HMAC-SHA256 over sha2 0.10, already in the lock.
+hmac = "=0.12.1"
 password-auth = "=1.0.0"
 # Hat logos (plan 4d-B2): a PNG upload decoded and written afresh. No other
 # image format: the review's ruling B.
