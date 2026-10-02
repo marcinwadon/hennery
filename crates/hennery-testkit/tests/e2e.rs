@@ -657,15 +657,19 @@ fn fake_recording_sigterm(marker: &Path, pid_file: &Path) -> AgentCommand {
     }
 }
 
-/// SIGKILLs the process group led by the pid in the file, on every path.
+/// SIGKILLs the process group of the pid in the file, on every path. Its
+/// group, not a group of that number: the adapter joins its guard's.
 struct ReapGroup(std::path::PathBuf);
 
 impl Drop for ReapGroup {
     fn drop(&mut self) {
         if let Some(pid) = pid_from(&self.0) {
-            // SAFETY: killpg(2) on the group of an adapter this test started.
+            // SAFETY: getpgid(2) and killpg(2) on an adapter this test started.
             unsafe {
-                libc::killpg(pid, libc::SIGKILL);
+                let pgid = libc::getpgid(pid);
+                if pgid > 0 {
+                    libc::killpg(pgid, libc::SIGKILL);
+                }
             }
         }
     }

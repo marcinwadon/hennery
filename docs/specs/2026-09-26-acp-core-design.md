@@ -178,6 +178,13 @@ is serialised through it. Consequences:
   alive; accumulated trees once exhausted a host's memory.)* After an
   unexpected exit, the rest of the group is SIGKILLed right after the leader
   is reaped: descendants of a crashed adapter are orphans nothing else reaps.
+- **The group dies with the host.** Its leader is a guard, a `/bin/sh` that
+  the adapter joins and that reads a pipe whose writing end only the host
+  holds. However the host dies (SIGKILL, OOM, a panic), the guard reads
+  end-of-file and SIGKILLs its own group: the adapter and everything still
+  in its group. It ignores SIGTERM, so a host killed during a kill grace
+  still leaves no group behind. *(Smoke test #1, F3: after a host SIGKILL, Claude's CLI outlived
+  its adapter's `node` by about 7 s and could still spend tokens.)*
 - **Scrubbing.** Stderr tails and `host_note` text are scrubbed of token-like
   patterns (`Bearer …`, `sk-…`, `ghp_…`, `github_pat_…`, `xox[abp]-…` and
   similar) before they are emitted. Once the stderr ring has truncated, its

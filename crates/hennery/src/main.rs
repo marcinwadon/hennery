@@ -729,6 +729,9 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
         inherit::check_pipe("--join-code-fd", fd)?;
     }
     let parent = args.parent_fd.map(inherit::watch_parent).transpose()?;
+    // Before the first spawn, the installer's included: the pipe whose
+    // end-of-file kills every adapter's group when this host dies.
+    hennery_host::adapter::prepare_death_pipe().context("the adapters' death pipe")?;
     warn_if_dev_token();
     let home = hennery_host::projects::home_dir();
     // The flags first, before anything is paired: a bad one must not spend

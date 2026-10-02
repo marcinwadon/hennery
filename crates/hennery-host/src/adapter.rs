@@ -1,13 +1,14 @@
 //! Adapter process supervision (ACP core §2.3): spawn in its own process
 //! group with a scrubbed environment and no inherited descriptor but its
 //! stdio, capture a bounded stderr tail, watch for exit, and kill the whole
-//! group — never just the direct child.
+//! group — never just the direct child. The group is led by a guard that
+//! kills it when the host dies, however it dies (smoke test #1, F3).
 
 use std::collections::VecDeque;
 use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::process::{ChildStdin, ChildStdout};
@@ -109,9 +110,69 @@ struct StderrRing {
     truncated: bool,
 }
 
+/// The guard's script: wait for end-of-file on stdin, the reading end of
+/// `death_pipe`, then SIGKILL its own process group, the adapter's. It
+/// ignores the group's SIGTERM (`terminate`'s first step) and other polite
+/// signals, so the group stays guarded through the kill grace; only the
+/// group's SIGKILL ends it.
+const GUARD_SCRIPT: &str = "trap '' TERM HUP INT; while read -r _; do :; done; kill -s KILL 0";
+
+/// Make the host's death pipe (`death_pipe`) now, before anything else is
+/// spawned: on macOS std sets close-on-exec only after `pipe()`, and a
+/// child spawned by another thread in between would hold the writing end
+/// and delay every guard's end-of-file until it exits.
+pub fn prepare_death_pipe() -> std::io::Result<()> {
+    death_pipe().map(drop)
+}
+
+/// The host's death pipe: only this process holds the writing end, for as
+/// long as it lives, and close-on-exec keeps it out of every child. When
+/// the host dies, by SIGKILL too, each guard reads end-of-file.
+fn death_pipe() -> std::io::Result<&'static std::io::PipeReader> {
+    static PIPE: OnceLock<(std::io::PipeReader, std::io::PipeWriter)> = OnceLock::new();
+    if let Some((reader, _)) = PIPE.get() {
+        return Ok(reader);
+    }
+    let pipe = std::io::pipe()?;
+    Ok(&PIPE.get_or_init(|| pipe).0)
+}
+
+/// The leader of a new process group, for an adapter to join: a `sh` that
+/// SIGKILLs the group once the host is gone. Nothing else ends a group
+/// whose host died uncleanly: `kill_on_drop` and `Drop` run only in a
+/// living host, and an agent's own children (Claude's CLI under its
+/// adapter's `node`) outlive their parent (smoke test #1, F3). It is
+/// reaped by a task of its own, and dies with the group when the adapter
+/// exits.
+fn spawn_guard(limit: libc::c_int) -> std::io::Result<tokio::process::Child> {
+    let stdin = death_pipe()?.try_clone()?;
+    let mut command = tokio::process::Command::new("/bin/sh");
+    command
+        .args(["-c", GUARD_SCRIPT])
+        .env_clear()
+        .current_dir("/")
+        .stdin(stdin)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0);
+    // SAFETY: as for the adapter, below.
+    unsafe {
+        command.pre_exec(move || {
+            close_inherited(limit);
+            Ok(())
+        });
+    }
+    command.spawn()
+}
+
 impl Adapter {
-    /// Spawn `agent` in `cwd` as the leader of a new process group.
+    /// Spawn `agent` in `cwd`, in a new process group led by a guard that
+    /// kills the group when the host dies (`spawn_guard`).
     pub fn spawn(agent: &AgentCommand, cwd: &Path) -> std::io::Result<(Self, AdapterIo)> {
+        // Read before the fork: getrlimit is not async-signal-safe.
+        let limit = fd_limit();
+        let mut guard = spawn_guard(limit)?;
+        let pgid = guard.id().expect("a just-spawned child has a pid") as i32;
         let mut command = tokio::process::Command::new(&agent.program);
         // Before `envs`: inherited, these are dropped; set by the agent's
         // own configuration, they pass.
@@ -125,15 +186,13 @@ impl Adapter {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .process_group(0)
+            .process_group(pgid)
             .kill_on_drop(true);
         // After `envs`: a secret is stripped even if the agent's own
         // configuration names it.
         for var in NESTING_VARS.iter().chain(HOST_SECRET_VARS).chain(HOST_LOG_VARS) {
             command.env_remove(var);
         }
-        // Read before the fork: getrlimit is not async-signal-safe.
-        let limit = fd_limit();
         // SAFETY: the closure runs in the forked child before `exec` and
         // calls only `syscall(close_range)` (Linux), `fcntl` and `close`,
         // which are async-signal-safe; it allocates nothing.
@@ -143,8 +202,14 @@ impl Adapter {
                 Ok(())
             });
         }
-        let mut child = command.spawn()?;
-        let pgid = child.id().expect("a just-spawned child has a pid") as i32;
+        let spawned = command.spawn();
+        if spawned.is_err() {
+            let _ = guard.start_kill();
+        }
+        tokio::spawn(async move {
+            let _ = guard.wait().await;
+        });
+        let mut child = spawned?;
         let io = AdapterIo {
             stdin: child.stdin.take().expect("piped stdin"),
             stdout: child.stdout.take().expect("piped stdout"),
@@ -186,10 +251,10 @@ impl Adapter {
             };
             // Decision #5: after any exit, SIGKILL whatever remains of the
             // group, right here — before anything else can act on the exit.
-            // The leader's pid is freed the instant `wait` reaps it, so any
-            // gap before this point is a window in which the kernel could
-            // recycle that number for an unrelated process group; doing it
-            // inline, synchronously, keeps the window at zero.
+            // The guard leads the group and lives until the group's first
+            // SIGKILL; when that is this one, the group id cannot have been
+            // recycled. When it came earlier (`terminate`'s escalation,
+            // `Drop`), this kill is redundant.
             signal_group(pgid, libc::SIGKILL);
             let _ = exit_tx.send(Some(info));
         });
@@ -206,7 +271,7 @@ impl Adapter {
         ))
     }
 
-    /// The adapter's process group id (its leader's pid).
+    /// The adapter's process group id (its guard's pid).
     pub fn pgid(&self) -> i32 {
         self.pgid
     }
