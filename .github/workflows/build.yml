@@ -1,6 +1,7 @@
 # Release artifacts, built the way a release builds them (distribution spec
 # §2, plan 7a), and checked: Linux musl-static for both architectures and
-# macOS arm64, the shell installer and the Homebrew formula.
+# macOS arm64, the shell installer, the Homebrew formula and the collector
+# image.
 #
 # This workflow publishes nothing. It has no tag trigger, no release, no
 # registry push, no attestation, and only `contents: read`. What it builds
@@ -38,8 +39,10 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             runner: ubuntu-24.04
+            image: amd64
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
+            image: arm64
           - target: aarch64-apple-darwin
             runner: macos-latest
     runs-on: ${{ matrix.runner }}
@@ -82,6 +85,15 @@ jobs:
       - name: Runs on Alpine (musl)
         if: runner.os == 'Linux'
         run: docker run --rm -v "$BINARY:/hennery:ro" alpine:3@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 /hennery --version
+      - name: Build the collector image
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p "dist/linux-${{ matrix.image }}"
+          cp "$BINARY" "dist/linux-${{ matrix.image }}/hennery"
+          docker build -t hennery-collector:ci .
+      - name: The image starts and is healthy
+        if: runner.os == 'Linux'
+        run: sh packaging/smoke-image.sh hennery-collector:ci
       - uses: actions/upload-artifact@v4
         with:
           name: archive-${{ matrix.target }}
