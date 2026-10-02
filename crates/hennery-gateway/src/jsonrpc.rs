@@ -15,10 +15,12 @@
 //! - `initialize` goes upstream without `sampling`, `elicitation` and
 //!   `roots` in its client capabilities.
 //! - With an allowlist, a `tools/call` for a tool outside it is answered
-//!   here, `-32602`, and never reaches the upstream; the ids of `tools/list`
-//!   requests are kept, and their responses filtered.
+//!   here, `-32602`, and never reaches the upstream; and every
+//!   `result.tools` coming down is filtered to it, whatever its id, in any
+//!   answer (plan 2026-10-15 "gateway JSON answers").
 //! - A server-to-client request for one of those capabilities, arriving in
-//!   an event stream, is answered here with an error and not passed on.
+//!   an event stream, is answered here with an error and not passed on; in
+//!   a JSON answer, the answer is refused whole (`inspect_answer`).
 
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Value, json};
@@ -49,10 +51,8 @@ pub const BOM: &[u8] = b"\xef\xbb\xbf";
 /// What to do with a request body.
 #[derive(Debug, PartialEq)]
 pub enum Inspected {
-    /// Send it upstream: `body` is the client's bytes, or `initialize`
-    /// rewritten. `tools_list` holds the ids of its `tools/list` requests
-    /// when the connection has an allowlist, whose responses are filtered.
-    Forward { body: Vec<u8>, tools_list: Vec<Value> },
+    /// Send it upstream: the client's bytes, or `initialize` rewritten.
+    Forward(Vec<u8>),
     /// Answer it here and send nothing upstream: a JSON-RPC answer, or
     /// `None` when nothing in it has an id (202, no body).
     Answer(Option<Value>),
@@ -182,7 +182,6 @@ pub fn inspect_request(body: &[u8], allowlist: Option<&[String]>) -> Inspected {
     };
     let mut rewritten = false;
     let mut blocked = false;
-    let mut tools_list = Vec::new();
     {
         let messages: Vec<&mut Value> = match &mut value {
             Value::Array(items) => items.iter_mut().collect(),
@@ -192,12 +191,6 @@ pub fn inspect_request(body: &[u8], allowlist: Option<&[String]>) -> Inspected {
             match method(message) {
                 Some("initialize") => rewritten |= strip_capabilities(message),
                 Some("tools/call") if allowlist.is_some_and(|tools| !call_allowed(message, tools)) => blocked = true,
-                Some("tools/list") if allowlist.is_some() => {
-                    // Without an id, as `null`: an upstream that answers it
-                    // with `"id": null` is filtered too (the security
-                    // review's finding 3).
-                    tools_list.push(message.get("id").cloned().unwrap_or(Value::Null));
-                }
                 _ => {}
             }
         }
@@ -210,7 +203,7 @@ pub fn inspect_request(body: &[u8], allowlist: Option<&[String]>) -> Inspected {
     } else {
         body.to_vec()
     };
-    Inspected::Forward { body, tools_list }
+    Inspected::Forward(body)
 }
 
 fn method(message: &Value) -> Option<&str> {
@@ -271,68 +264,103 @@ fn refusal(value: &Value, tools: &[String]) -> Option<Value> {
     }
 }
 
-/// Whether a response's id answers a request's: equal, or the same number
-/// however written (`1` and `1.0`), as a client's matching may read them
-/// (the review's O1).
-fn same_id(a: &Value, b: &Value) -> bool {
-    match (a.as_f64(), b.as_f64()) {
-        (Some(x), Some(y)) => x == y,
-        _ => a == b,
-    }
-}
-
-/// Filter the `tools/list` responses in `value` (a message or a batch)
-/// whose id is in `ids` to `tools`: true if one was found. A result without
-/// a tools array gets an empty one, never `null`.
-pub fn filter_tools_lists(value: &mut Value, ids: &[Value], tools: &[String]) -> bool {
+/// Filter every `result.tools` in `value` (a message or a batch) to
+/// `tools`, whatever the message's id: true if one was there. Not only the
+/// answers to this exchange's `tools/list` (plan 8d decision 17): a `GET`
+/// stream, a replay with `Last-Event-ID`, an answer on another stream or
+/// with an id of another type carry a list too (plan 2026-10-15 "gateway
+/// JSON answers" decision 3). A `tools` that is not an array is `[]`.
+pub fn filter_tools(value: &mut Value, tools: &[String]) -> bool {
     let messages: Vec<&mut Value> = match value {
         Value::Array(items) => items.iter_mut().collect(),
         other => vec![other],
     };
     let mut found = false;
     for message in messages {
-        if !message
-            .get("id")
-            .is_some_and(|id| ids.iter().any(|want| same_id(id, want)))
-        {
-            continue;
-        }
         let Some(result) = message.get_mut("result").and_then(Value::as_object_mut) else {
             continue;
         };
+        let Some(listed) = result.get_mut("tools") else {
+            continue;
+        };
         found = true;
-        let listed = match result.remove("tools") {
-            Some(Value::Array(listed)) => listed,
+        let kept: Vec<Value> = match listed.take() {
+            Value::Array(listed) => listed
+                .into_iter()
+                .filter(|tool| {
+                    tool.get("name")
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| tools.iter().any(|t| t == name))
+                })
+                .collect(),
             _ => Vec::new(),
         };
-        let kept: Vec<Value> = listed
-            .into_iter()
-            .filter(|tool| {
-                tool.get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| tools.iter().any(|t| t == name))
-            })
-            .collect();
-        result.insert("tools".into(), Value::Array(kept));
+        *listed = Value::Array(kept);
     }
     found
+}
+
+/// What to do with a JSON answer, read whole (plan 2026-10-15 "gateway
+/// JSON answers").
+#[derive(Debug, PartialEq)]
+pub enum Answered {
+    /// Passed on as it came (or empty).
+    Unchanged,
+    /// Passed on as these bytes instead: its tools filtered.
+    Rewritten(Vec<u8>),
+    /// Not passed on: not JSON, a key twice, or `ambiguous` (as an event's
+    /// data is judged).
+    Unreadable,
+    /// Not passed on: it holds a server request the gateway refuses. A
+    /// JSON answer is the `POST`'s response, and server requests come only
+    /// in an event stream (MCP's streamable HTTP), so the answer is refused
+    /// whole rather than passed on without it (decision 2).
+    ServerRequest,
+}
+
+/// Judge a JSON answer under `allowlist`: the refusal of server requests
+/// in any answer (gateway spec §5.6), and the tools filter.
+pub fn inspect_answer(bytes: &[u8], allowlist: Option<&[String]>) -> Answered {
+    if bytes.is_empty() {
+        return Answered::Unchanged;
+    }
+    let Some(mut value) = read(bytes) else {
+        return Answered::Unreadable;
+    };
+    let messages: Vec<&Value> = match &value {
+        Value::Array(items) => items.iter().collect(),
+        other => vec![other],
+    };
+    if messages.into_iter().any(|message| refused_request(message).is_some()) {
+        return Answered::ServerRequest;
+    }
+    match allowlist {
+        Some(tools) if filter_tools(&mut value, tools) => {
+            Answered::Rewritten(serde_json::to_vec(&value).expect("a JSON value serialises"))
+        }
+        _ => Answered::Unchanged,
+    }
+}
+
+/// A server request the gateway refuses (one with an id), as the error to
+/// send back for it.
+fn refused_request(message: &Value) -> Option<Value> {
+    let method = method(message)?;
+    let id = message.get("id")?;
+    REFUSED_SERVER_REQUESTS.contains(&method).then(|| {
+        error(
+            id,
+            METHOD_NOT_FOUND,
+            &format!("{method} is not available through hennery"),
+        )
+    })
 }
 
 /// The server-to-client requests in `value` (a message or a batch) the
 /// gateway refuses, removed from it, each with the error to send back.
 /// What is left of `value` is `None` if nothing is.
 pub fn take_refused_requests(value: Value) -> (Option<Value>, Vec<Value>) {
-    let refused = |message: &Value| {
-        let method = method(message)?;
-        let id = message.get("id")?;
-        REFUSED_SERVER_REQUESTS.contains(&method).then(|| {
-            error(
-                id,
-                METHOD_NOT_FOUND,
-                &format!("{method} is not available through hennery"),
-            )
-        })
-    };
+    let refused = refused_request;
     match value {
         Value::Array(items) => {
             let mut answers = Vec::new();
@@ -507,17 +535,12 @@ pub enum EventOutcome {
 }
 
 /// Apply the gateway's rules to one complete event: refused server
-/// requests taken out (their errors pushed to `answers`), `tools/list`
-/// responses whose id is in `ids` filtered to `allowlist`. An event without
+/// requests taken out (their errors pushed to `answers`), every
+/// `result.tools` filtered to `allowlist`. An event without
 /// data (a comment, a ping) or one no rule touches passes as it came, byte
 /// for byte; one whose data is not JSON, or has a key twice, is
 /// `Unreadable`.
-pub fn rewrite_event(
-    event: &[u8],
-    ids: &[Value],
-    allowlist: Option<&[String]>,
-    answers: &mut Vec<Value>,
-) -> EventOutcome {
+pub fn rewrite_event(event: &[u8], allowlist: Option<&[String]>, answers: &mut Vec<Value>) -> EventOutcome {
     // A line that starts with a byte-order mark: if this event is the first
     // the client sees, its parser strips the mark and reads a field the
     // gateway read as another (the re-confirmation's note 1).
@@ -550,7 +573,7 @@ pub fn rewrite_event(
         return EventOutcome::Dropped;
     };
     let filtered = match allowlist {
-        Some(tools) if !ids.is_empty() => filter_tools_lists(&mut kept, ids, tools),
+        Some(tools) => filter_tools(&mut kept, tools),
         _ => false,
     };
     if !changed && !filtered {
@@ -567,9 +590,24 @@ pub fn rewrite_event(
     EventOutcome::Rewritten(out)
 }
 
+/// The differential harness the integration tests share (plan 2026-10-15
+/// "gateway JSON answers" decision 6), for the check below.
+#[cfg(test)]
+#[path = "../tests/support/differential.rs"]
+mod harness;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Its names are the gateway's, so the two cannot drift apart (the
+    /// security review's finding 7).
+    #[test]
+    fn the_differential_harness_reads_the_gateway_s_names() {
+        assert_eq!(harness::REFUSED, REFUSED_SERVER_REQUESTS);
+        assert_eq!(harness::STRIPPED, STRIPPED_CAPABILITIES);
+        assert_eq!(harness::READ_METHODS, READ_METHODS);
+    }
 
     fn tools() -> Vec<String> {
         vec!["search".into()]
@@ -603,15 +641,9 @@ mod tests {
         assert_eq!(answer["id"], 7);
         assert_eq!(answer["error"]["code"], TOOL_NOT_AVAILABLE);
         // Without an allowlist, or for a listed tool, it is forwarded as it came.
-        assert_eq!(
-            inspect_request(body, None),
-            Inspected::Forward {
-                body: body.to_vec(),
-                tools_list: vec![]
-            }
-        );
+        assert_eq!(inspect_request(body, None), Inspected::Forward(body.to_vec()));
         let ok = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"search"}}"#;
-        assert!(matches!(inspect_request(ok, Some(&tools())), Inspected::Forward { .. }));
+        assert!(matches!(inspect_request(ok, Some(&tools())), Inspected::Forward(_)));
         // A name that is not a string is not on any list.
         let odd = br#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":["search"]}}"#;
         assert!(matches!(
@@ -643,7 +675,7 @@ mod tests {
         let body = br#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18",
             "capabilities":{"sampling":{},"elicitation":{},"roots":{"listChanged":true},"experimental":{"x":1}},
             "clientInfo":{"name":"c","version":"1"}}}"#;
-        let Inspected::Forward { body, .. } = inspect_request(body, None) else {
+        let Inspected::Forward(body) = inspect_request(body, None) else {
             panic!("not forwarded");
         };
         let sent: Value = serde_json::from_slice(&body).unwrap();
@@ -651,51 +683,71 @@ mod tests {
         assert_eq!(sent["params"]["clientInfo"]["name"], "c");
         // Nothing to strip: the bytes as they came.
         let plain = br#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"capabilities":{}}}"#;
-        assert_eq!(
-            inspect_request(plain, None),
-            Inspected::Forward {
-                body: plain.to_vec(),
-                tools_list: vec![]
-            }
-        );
+        assert_eq!(inspect_request(plain, None), Inspected::Forward(plain.to_vec()));
     }
 
     #[test]
-    fn tools_list_ids_are_kept_only_under_an_allowlist() {
-        let body = br#"[{"jsonrpc":"2.0","id":"a","method":"tools/list"},{"jsonrpc":"2.0","id":3,"method":"ping"}]"#;
-        let Inspected::Forward { tools_list, .. } = inspect_request(body, Some(&tools())) else {
-            panic!("not forwarded");
-        };
-        assert_eq!(tools_list, vec![json!("a")]);
-        let Inspected::Forward { tools_list, .. } = inspect_request(body, None) else {
-            panic!("not forwarded");
-        };
-        assert!(tools_list.is_empty());
-    }
-
-    #[test]
-    fn a_tools_list_response_is_filtered_and_an_empty_one_is_an_array() {
+    fn every_tools_list_is_filtered_and_an_empty_one_is_an_array() {
         let mut value = json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": [
             { "name": "search" }, { "name": "delete" }, { "nameless": true }
         ], "nextCursor": "c" } });
-        assert!(filter_tools_lists(&mut value, &[json!(1)], &tools()));
+        assert!(filter_tools(&mut value, &tools()));
         assert_eq!(value["result"]["tools"], json!([{ "name": "search" }]));
         assert_eq!(value["result"]["nextCursor"], "c");
         let mut none = json!({ "jsonrpc": "2.0", "id": 1, "result": { "tools": null } });
-        assert!(filter_tools_lists(&mut none, &[json!(1)], &[]));
+        assert!(filter_tools(&mut none, &[]));
         assert_eq!(none["result"]["tools"], json!([]));
-        // Another id, or an error: untouched.
-        let mut other = json!({ "jsonrpc": "2.0", "id": 2, "result": { "tools": [{ "name": "delete" }] } });
-        assert!(!filter_tools_lists(&mut other, &[json!(1)], &tools()));
-        assert_eq!(other["result"]["tools"][0]["name"], "delete");
+        // Whatever the id, a string one or none.
+        let mut other = json!({ "jsonrpc": "2.0", "id": "1", "result": { "tools": [{ "name": "delete" }] } });
+        assert!(filter_tools(&mut other, &tools()));
+        assert_eq!(other["result"]["tools"], json!([]));
+        // A result without tools, or an error: untouched.
+        let mut plain = json!({ "jsonrpc": "2.0", "id": 2, "result": { "content": [] } });
+        assert!(!filter_tools(&mut plain, &tools()));
+        assert_eq!(plain, json!({ "jsonrpc": "2.0", "id": 2, "result": { "content": [] } }));
         // A batch, element by element.
         let mut batch = json!([
             { "jsonrpc": "2.0", "id": 1, "result": { "tools": [{ "name": "delete" }] } },
-            { "jsonrpc": "2.0", "id": 2, "result": { "tools": [{ "name": "delete" }] } }
+            { "jsonrpc": "2.0", "id": 2, "result": {} }
         ]);
-        assert!(filter_tools_lists(&mut batch, &[json!(1)], &tools()));
+        assert!(filter_tools(&mut batch, &tools()));
         assert_eq!(batch[0]["result"]["tools"], json!([]));
-        assert_eq!(batch[1]["result"]["tools"][0]["name"], "delete");
+        assert_eq!(batch[1]["result"], json!({}));
+    }
+
+    #[test]
+    fn a_json_answer_has_one_outcome_of_four() {
+        let tools = tools();
+        let listed = br#"{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"search"},{"name":"delete"}]}}"#;
+        // Unchanged: without an allowlist, nothing touched; and empty.
+        assert_eq!(inspect_answer(listed, None), Answered::Unchanged);
+        assert_eq!(inspect_answer(b"", Some(&tools)), Answered::Unchanged);
+        assert_eq!(
+            inspect_answer(br#"{"jsonrpc":"2.0","id":1,"result":{}}"#, Some(&tools)),
+            Answered::Unchanged
+        );
+        // Rewritten: its tools filtered.
+        let Answered::Rewritten(out) = inspect_answer(listed, Some(&tools)) else {
+            panic!("not rewritten");
+        };
+        let out: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(out["result"]["tools"], json!([{ "name": "search" }]));
+        // Unreadable: as an event's data.
+        for bytes in [&b"{"[..], br#"{"id":1,"id":2}"#, br#"{"Id":1,"result":{}}"#] {
+            assert_eq!(inspect_answer(bytes, None), Answered::Unreadable);
+        }
+        // A server request the gateway refuses, alone or in a batch; one
+        // without an id is a notification and passes.
+        for bytes in [
+            &br#"{"jsonrpc":"2.0","id":"s","method":"roots/list"}"#[..],
+            br#"[{"jsonrpc":"2.0","id":1,"result":{}},{"jsonrpc":"2.0","id":"s","method":"elicitation/create"}]"#,
+        ] {
+            assert_eq!(inspect_answer(bytes, None), Answered::ServerRequest);
+        }
+        assert_eq!(
+            inspect_answer(br#"{"jsonrpc":"2.0","method":"roots/list"}"#, None),
+            Answered::Unchanged
+        );
     }
 
     #[test]
@@ -725,22 +777,21 @@ mod tests {
         let mut answers = Vec::new();
         let plain = b"id: 4\nevent: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":9,\"result\":{}}\n\n";
         assert_eq!(
-            rewrite_event(plain, &[json!(1)], Some(&tools()), &mut answers),
+            rewrite_event(plain, Some(&tools()), &mut answers),
             EventOutcome::Unchanged
         );
         assert_eq!(
-            rewrite_event(b": comment\n\n", &[], None, &mut answers),
+            rewrite_event(b": comment\n\n", None, &mut answers),
             EventOutcome::Unchanged
         );
         assert_eq!(
-            rewrite_event(b"data: not json\n\n", &[], None, &mut answers),
+            rewrite_event(b"data: not json\n\n", None, &mut answers),
             EventOutcome::Unreadable
         );
         // A lone surrogate: JSON to some parsers, not to serde_json.
         assert_eq!(
             rewrite_event(
                 b"data: {\"id\":1,\"method\":\"x\",\"p\":\"\\ud800\"}\n\n",
-                &[],
                 None,
                 &mut answers
             ),
@@ -748,7 +799,7 @@ mod tests {
         );
         let list =
             b"id: 5\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\ndata: \"result\":{\"tools\":[{\"name\":\"delete\"}]}}\n\n";
-        let EventOutcome::Rewritten(out) = rewrite_event(list, &[json!(1)], Some(&tools()), &mut answers) else {
+        let EventOutcome::Rewritten(out) = rewrite_event(list, Some(&tools()), &mut answers) else {
             panic!("not rewritten");
         };
         let out = String::from_utf8(out).unwrap();
@@ -759,17 +810,17 @@ mod tests {
         assert!(answers.is_empty());
         let sampling =
             b"data: {\"jsonrpc\":\"2.0\",\"id\":\"s1\",\"method\":\"sampling/createMessage\",\"params\":{}}\n\n";
-        assert_eq!(rewrite_event(sampling, &[], None, &mut answers), EventOutcome::Dropped);
+        assert_eq!(rewrite_event(sampling, None, &mut answers), EventOutcome::Dropped);
         assert_eq!(answers.len(), 1);
         assert_eq!(answers[0]["id"], "s1");
         assert_eq!(answers[0]["error"]["code"], METHOD_NOT_FOUND);
         // A line that starts with a byte-order mark: unreadable, wherever it is.
         let marked = b"\xef\xbb\xbfdata: {\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"roots/list\"}\n\n";
-        assert_eq!(rewrite_event(marked, &[], None, &mut answers), EventOutcome::Unreadable);
+        assert_eq!(rewrite_event(marked, None, &mut answers), EventOutcome::Unreadable);
         let later = b"id: 1\n\xef\xbb\xbf: x\ndata: {}\n\n";
-        assert_eq!(rewrite_event(later, &[], None, &mut answers), EventOutcome::Unreadable);
+        assert_eq!(rewrite_event(later, None, &mut answers), EventOutcome::Unreadable);
         // A notification of that name has no id: nothing to answer, passed on.
         let note = b"data: {\"jsonrpc\":\"2.0\",\"method\":\"roots/list\"}\n\n";
-        assert_eq!(rewrite_event(note, &[], None, &mut answers), EventOutcome::Unchanged);
+        assert_eq!(rewrite_event(note, None, &mut answers), EventOutcome::Unchanged);
     }
 }
