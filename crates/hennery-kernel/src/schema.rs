@@ -237,6 +237,16 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         owner_id TEXT NOT NULL REFERENCES owners(id),
         purged_at INTEGER NOT NULL);
     ",
+    // Hat logos (kernel spec §5.1; plan 4d-B2): a PNG the kernel wrote
+    // afresh (`logo::reencode`), with its kind and its `ETag`, all three or
+    // none. Added, never rebuilt: `hats` has children (migration 6's note).
+    // The check that spans the three sits on the last, once all exist.
+    "
+    ALTER TABLE hats ADD COLUMN logo_mime TEXT CHECK (logo_mime IS NULL OR logo_mime = 'image/png');
+    ALTER TABLE hats ADD COLUMN logo_bytes BLOB CHECK (logo_bytes IS NULL OR typeof(logo_bytes) = 'blob');
+    ALTER TABLE hats ADD COLUMN logo_etag TEXT
+        CHECK ((logo_mime IS NULL) = (logo_bytes IS NULL) AND (logo_bytes IS NULL) = (logo_etag IS NULL));
+    ",
 ];
 
 #[cfg(test)]

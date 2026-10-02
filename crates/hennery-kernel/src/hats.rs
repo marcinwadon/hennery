@@ -45,6 +45,9 @@ pub struct HatRecord {
     /// Its purge began and has not finished: it is frozen (plan 9c
     /// decision 10c, A12).
     pub purging: bool,
+    /// Its logo's `ETag` (`logo::Logo::etag`), if it has a logo (plan
+    /// 4d-B2). The bytes are read only by `Hosts::hat_logo`.
+    pub logo: Option<String>,
 }
 
 /// One stored path rule of a host (kernel spec §5.1).
@@ -293,7 +296,7 @@ fn is_default(conn: &rusqlite::Connection, owner: &str, hat_id: &str) -> Result<
 fn hats_of(conn: &rusqlite::Connection, owner: &str) -> Result<Vec<HatRecord>> {
     let mut stmt = conn.prepare(
         "SELECT h.id, h.name, h.colour, h.created_at, h.id = s.value,
-                EXISTS (SELECT 1 FROM purged_hats p WHERE p.hat_id = h.id AND p.owner_id = ?1)
+                EXISTS (SELECT 1 FROM purged_hats p WHERE p.hat_id = h.id AND p.owner_id = ?1), h.logo_etag
          FROM hats h
          LEFT JOIN settings s ON s.owner_id = h.owner_id AND s.key = ?2
          WHERE h.owner_id = ?1 ORDER BY h.created_at, h.id",
@@ -306,9 +309,15 @@ fn hats_of(conn: &rusqlite::Connection, owner: &str) -> Result<Vec<HatRecord>> {
             created_at: r.get(3)?,
             default_for_new_hosts: r.get::<_, Option<bool>>(4)?.unwrap_or(false),
             purging: r.get(5)?,
+            logo: r.get(6)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// `owner`'s hat `hat_id`, inside the caller's lock or transaction.
+pub(crate) fn hat_in(conn: &rusqlite::Connection, owner: &str, hat_id: &str) -> Result<Option<HatRecord>> {
+    Ok(hats_of(conn, owner)?.into_iter().find(|hat| hat.id == hat_id))
 }
 
 /// Whether another of the owner's hats than `except` is named `name`,
