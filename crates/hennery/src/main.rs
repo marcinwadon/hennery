@@ -7,6 +7,7 @@ mod config;
 mod healthcheck;
 mod inherit;
 mod lock;
+mod supervisor;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
@@ -252,7 +253,7 @@ async fn main() -> std::process::ExitCode {
         Command::Host {
             command: HostCommand::Run(args),
         } => run_host(args).await,
-        Command::Up(args) => run_up(args).await.map(|()| std::process::ExitCode::SUCCESS),
+        Command::Up(args) => run_up(args).await,
         Command::Admin(args) => admin::run(args).await.map(|()| std::process::ExitCode::SUCCESS),
     };
     match result {
@@ -699,16 +700,12 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
         // Its own exit code, so `hennery up` can tell a revoke apart.
         Err(err) if hennery_host::connection::revoked(&err) => {
             eprintln!("Error: {err:#}");
-            Ok(std::process::ExitCode::from(REVOKED_EXIT))
+            Ok(std::process::ExitCode::from(supervisor::REVOKED_EXIT))
         }
         Err(err) => Err(err),
         Ok(()) => Ok(std::process::ExitCode::SUCCESS),
     }
 }
-
-/// `hennery host run`'s exit code once the collector says the host was
-/// revoked (sysexits' `EX_CONFIG`).
-const REVOKED_EXIT: u8 = 78;
 
 /// Resolves on SIGINT or SIGTERM.
 async fn terminated() {
@@ -742,16 +739,6 @@ impl Signals {
         tokio::select! {
             _ = self.interrupt.recv() => {}
             _ = self.terminate.recv() => {}
-        }
-    }
-}
-
-/// Ask a child to shut down cleanly.
-fn sigterm(child: &tokio::process::Child) {
-    if let Some(pid) = child.id() {
-        // SAFETY: plain kill(2) on a pid we spawned and still own.
-        unsafe {
-            libc::kill(pid as libc::pid_t, libc::SIGTERM);
         }
     }
 }
@@ -805,13 +792,99 @@ fn host_command(
     host_cmd
 }
 
+/// What `up` starts its children from, again after a crash.
+struct UpChildren<'a> {
+    exe: PathBuf,
+    args: &'a UpArgs,
+    host_dir: PathBuf,
+    collector_url: String,
+    collector_ws_url: String,
+    /// Bound once, by `up`, and kept for as long as it runs: a collector
+    /// started again serves the same ports, which the host's URL names.
+    /// While none runs, connections wait in the backlog.
+    listeners: Vec<std::net::TcpListener>,
+}
+
+impl UpChildren<'_> {
+    /// The collector child, handed the listening sockets and, on the first
+    /// start of a host that is not paired, the pipe's writing end.
+    fn collector(&self, pairing: Option<&std::io::PipeWriter>) -> tokio::process::Command {
+        // Both children are kept out of the terminal's foreground process
+        // group: a Ctrl-C there delivers SIGINT to every process in that
+        // group at once, which would race each child's own signal handler
+        // against the ordered shutdown. With their own group, only this
+        // supervisor is signalled and it alone decides the order (host, then
+        // collector).
+        let mut cmd = tokio::process::Command::new(&self.exe);
+        cmd.arg("collector");
+        let mut fds = Vec::new();
+        for (listener, to) in self.listeners.iter().zip(inherit::LISTENER_FD..) {
+            cmd.arg("--listen-fd").arg(to.to_string());
+            fds.push((listener.as_raw_fd(), to));
+        }
+        cmd.arg("--data-dir")
+            .arg(self.args.data_dir.join("collector"))
+            // `up` has warned about it already; the collector has no use for it.
+            .env_remove(DEV_TOKEN_VAR)
+            // `up` bound these addresses already; the child takes the sockets.
+            .env_remove("HENNERY_LISTEN")
+            .kill_on_drop(true)
+            .process_group(0);
+        if let Some(public_url) = &self.args.public_url {
+            cmd.arg("--public-url").arg(public_url);
+        }
+        if let Some(writer) = pairing {
+            fds.push((writer.as_raw_fd(), inherit::CHILD_FD));
+            cmd.arg("--pairing-code-fd").arg(inherit::CHILD_FD.to_string());
+        }
+        inherit::pass_to_child(&mut cmd, &fds);
+        cmd
+    }
+
+    /// The host child, handed the pipe's reading end on its first start if
+    /// it is not paired.
+    fn host(&self, pairing: Option<&std::io::PipeReader>) -> tokio::process::Command {
+        let mut cmd = host_command(&self.exe, &self.host_dir, &self.collector_ws_url, self.args);
+        if let Some(reader) = pairing {
+            inherit::pass_to_child(&mut cmd, &[(reader.as_raw_fd(), inherit::CHILD_FD)]);
+            cmd.arg("--join-url")
+                .arg(&self.collector_url)
+                .arg("--join-code-fd")
+                .arg(inherit::CHILD_FD.to_string());
+        }
+        cmd
+    }
+}
+
+impl supervisor::Children for UpChildren<'_> {
+    type Child = tokio::process::Child;
+
+    fn spawn(&mut self, which: supervisor::Which) -> Result<tokio::process::Child> {
+        let mut cmd = match which {
+            supervisor::Which::Collector => self.collector(None),
+            supervisor::Which::Host => self.host(None),
+        };
+        Ok(cmd.spawn()?)
+    }
+
+    fn host_paired(&self) -> bool {
+        matches!(Paired::load(&self.host_dir), Ok(Some(_)))
+    }
+
+    fn revoked(&self) {
+        tracing::warn!(
+            "the all-in-one host was revoked; the collector keeps serving. To pair it again, stop `hennery up`, remove {} and {}, and start it again",
+            self.host_dir.join(hennery_host::identity::KEY_FILE).display(),
+            self.host_dir.join(hennery_host::identity::CONFIG_FILE).display()
+        );
+    }
+}
+
 /// Two child processes of this binary, exchanging the same frames as a
-/// remote host (architecture spec §3.3). The supervisor exits when the
-/// collector exits, or when the host exits for any reason *other* than a
-/// revoke (exit 78): a revoked host alone does not take `up` down (decision
-/// 11, A1) — restart policy for a genuine crash comes with the distribution
-/// work.
-async fn run_up(args: UpArgs) -> Result<()> {
+/// remote host (architecture spec §3.3), started again when they crash
+/// (distribution spec §5.2; see `supervisor::supervise`). `up` exits 0 when
+/// a signal stopped it, and 1 when it could not go on.
+async fn run_up(args: UpArgs) -> Result<std::process::ExitCode> {
     // First, before any child exists: from here on a SIGINT or SIGTERM is
     // caught and waits for the loop below, which stops both children. Caught
     // only once the loop first ran, one sent just after the collector's
@@ -852,93 +925,52 @@ async fn run_up(args: UpArgs) -> Result<()> {
         Some(_) => None,
         None => Some(std::io::pipe()?),
     };
-    // Keep both children out of the terminal's foreground process group: a
-    // Ctrl-C there delivers SIGINT to every process in that group at once,
-    // which would race each child's own signal handler against the ordered
-    // shutdown below. With their own group, only this supervisor is signalled
-    // and it alone decides the order (host, then collector).
-    let mut collector_cmd = tokio::process::Command::new(&exe);
-    collector_cmd.arg("collector");
-    let mut fds = Vec::new();
-    for (listener, to) in listeners.iter().zip(inherit::LISTENER_FD..) {
-        collector_cmd.arg("--listen-fd").arg(to.to_string());
-        fds.push((listener.as_raw_fd(), to));
-    }
-    collector_cmd
-        .arg("--data-dir")
-        .arg(args.data_dir.join("collector"))
-        // `up` has warned about it already; the collector has no use for it.
-        .env_remove(DEV_TOKEN_VAR)
-        // `up` bound these addresses already; the child takes the sockets.
-        .env_remove("HENNERY_LISTEN")
-        .kill_on_drop(true)
-        .process_group(0);
-    if let Some(public_url) = &args.public_url {
-        collector_cmd.arg("--public-url").arg(public_url);
-    }
-    if let Some((_, writer)) = &pairing {
-        fds.push((writer.as_raw_fd(), inherit::CHILD_FD));
-        collector_cmd
-            .arg("--pairing-code-fd")
-            .arg(inherit::CHILD_FD.to_string());
-    }
-    inherit::pass_to_child(&mut collector_cmd, &fds);
+    let mut children = UpChildren {
+        exe,
+        args: &args,
+        host_dir,
+        collector_url,
+        collector_ws_url,
+        listeners,
+    };
     // A low `ulimit -n` can make `pass_to_child`'s `F_DUPFD_CLOEXEC` at
     // `MOVE_FLOOR` fail with a bare "Invalid argument (os error 22)": named
     // here so that is not left a mystery.
-    let mut collector = collector_cmd
+    let collector = children
+        .collector(pairing.as_ref().map(|(_, writer)| writer))
         .spawn()
         .context("pass the listening sockets to the collector")?;
-    // The collector holds the sockets now. Kept open here, they would hold
-    // the ports after the collector exits.
-    drop(listeners);
-    let mut host_cmd = host_command(&exe, &host_dir, &collector_ws_url, &args);
-    if let Some((reader, _)) = &pairing {
-        inherit::pass_to_child(&mut host_cmd, &[(reader.as_raw_fd(), inherit::CHILD_FD)]);
-        host_cmd
-            .arg("--join-url")
-            .arg(&collector_url)
-            .arg("--join-code-fd")
-            .arg(inherit::CHILD_FD.to_string());
-    }
-    let mut host = host_cmd.spawn()?;
+    let host = children.host(pairing.as_ref().map(|(reader, _)| reader)).spawn()?;
     // Both children hold their ends now; with the supervisor's copies
     // closed, the host sees end-of-file if the collector dies first.
     drop(pairing);
-    // A collector exit, a non-revoked host exit, or a signal ends `up`, the
-    // same as before this host could be revoked. Only a *revoked* host
-    // (exit 78) does not: it exits for good, and the loop below goes back to
-    // waiting on the collector alone, so the collector keeps serving the
-    // operator and every remote host.
-    let mut host_running = true;
-    loop {
-        tokio::select! {
-            status = collector.wait() => {
-                tracing::warn!(?status, "collector exited");
-                break;
-            }
-            status = host.wait(), if host_running => {
-                host_running = false;
-                if status.as_ref().ok().and_then(|s| s.code()) == Some(REVOKED_EXIT as i32) {
-                    tracing::warn!(
-                        "the all-in-one host was revoked; the collector keeps serving. To pair it again, stop `hennery up`, remove {} and {}, and start it again",
-                        host_dir.join(hennery_host::identity::KEY_FILE).display(),
-                        host_dir.join(hennery_host::identity::CONFIG_FILE).display()
-                    );
-                    continue;
-                }
-                tracing::warn!(?status, "host exited");
-                break;
-            }
-            () = signals.recv() => break,
+    let report = |collector: &supervisor::ChildReport, host: &supervisor::ChildReport| {
+        let state = supervisor::State {
+            pid: std::process::id(),
+            updated_at: hennery_kernel::secret::unix_now().try_into().unwrap_or(0),
+            collector: collector.clone(),
+            host: host.clone(),
+        };
+        if let Err(err) = supervisor::write_state(&args.data_dir, &state) {
+            tracing::warn!(error = %format!("{err:#}"), "could not write {}", supervisor::STATE_FILE);
+        }
+    };
+    let outcome = supervisor::supervise(
+        &mut children,
+        collector,
+        host,
+        &supervisor::POLICY,
+        signals.recv(),
+        report,
+    )
+    .await;
+    match outcome {
+        supervisor::Outcome::Stopped => Ok(std::process::ExitCode::SUCCESS),
+        supervisor::Outcome::Failed(why) => {
+            eprintln!("Error: {why}");
+            Ok(std::process::ExitCode::FAILURE)
         }
     }
-    // Host first (it stops its adapters), then the collector.
-    sigterm(&host);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), host.wait()).await;
-    sigterm(&collector);
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), collector.wait()).await;
-    Ok(())
 }
 
 #[cfg(test)]

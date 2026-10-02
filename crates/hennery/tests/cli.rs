@@ -2826,3 +2826,61 @@ fn a_second_up_on_one_data_root_refuses_to_start() {
     first.assert_running("the first up");
     assert!(get_json(&listen, "/api/hosts", &session).is_some());
 }
+
+/// `up`'s report of its children (`supervisor.json`), as JSON.
+fn supervisor_state(data: &std::path::Path) -> Option<serde_json::Value> {
+    serde_json::from_slice(&std::fs::read(data.join("supervisor.json")).ok()?).ok()
+}
+
+/// Distribution spec §5.2: a child killed outright, once past its start, is
+/// started again: the host reconnects with its pairing, and the collector
+/// serves on the same port, with the sessions it had.
+#[test]
+fn a_killed_child_is_started_again() {
+    let dir = scratch_dir("restart");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let (mut up, listen, ids, session) = up_until_connected(&data, &dir.join("up.log"), None);
+    let up_pid = up.up.id() as i32;
+    // Past the startup grace (5 s), counted from now, when both children
+    // run already: the kill counts as a crash, not as a failed start.
+    std::thread::sleep(Duration::from_secs(6));
+    let lock = data.join("host").join("host.lock");
+    let host = pid_from(&lock).expect("the host's pid");
+    let collector = *children_of(up_pid)
+        .iter()
+        .find(|&&pid| pid != host)
+        .expect("the collector child");
+    up.children = vec![host, collector];
+
+    unsafe { libc::kill(host, libc::SIGKILL) };
+    let mut again = 0;
+    up.wait_until("the host started again", || {
+        again = pid_from(&lock).unwrap_or(host);
+        again != host && pid_alive(again)
+    });
+    up.children.push(again);
+    up.wait_until("the host reported running again", || {
+        supervisor_state(&data).is_some_and(|s| s["host"]["restarts"] == 1 && s["host"]["state"] == "running")
+    });
+    up.wait_until("the host connected again", || {
+        get_json(&listen, "/api/hosts", &session).is_some_and(|hosts| {
+            hosts.as_array().is_some_and(|hosts| {
+                hosts.len() == 1 && hosts[0]["host_id"] == ids[0].as_str() && hosts[0]["connected"] == true
+            })
+        })
+    });
+
+    unsafe { libc::kill(collector, libc::SIGKILL) };
+    up.wait_until("the collector reported running again", || {
+        supervisor_state(&data).is_some_and(|s| s["collector"]["restarts"] == 1 && s["collector"]["state"] == "running")
+    });
+    up.children.extend(children_of(up_pid));
+    // The same port, and the session from before the crash.
+    up.wait_until("the collector serving again", || {
+        get_json(&listen, "/api/hosts", &session).is_some_and(|hosts| hosts[0]["connected"] == true)
+    });
+    let state = supervisor_state(&data).unwrap();
+    assert_eq!(state["pid"], up_pid, "{state}");
+    assert_eq!(state["host"]["last_exit"], "signal: 9 (SIGKILL)", "{state}");
+}
