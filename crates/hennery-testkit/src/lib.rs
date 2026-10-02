@@ -18,6 +18,13 @@ pub struct FakeScript {
     /// the host scrubs the stderr tail).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stderr_lines: Vec<String>,
+    /// Lines written raw (not JSON-RPC) to stdout right before answering
+    /// `session/new`: written while that answer does not exist yet, so the
+    /// ACP crate has no JSON-RPC line of its own still being written to the
+    /// same stdout (e.g. a fake token, to test that the host's log never
+    /// shows what an adapter prints to its own stdout, plan 8c).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stdout_lines: Vec<String>,
     /// At startup, spawn a long-lived `sleep` child (a grandchild of the
     /// host) in the adapter's process group and write its pid to this file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -253,6 +260,7 @@ impl Default for FakeScript {
             chunk_delay_ms: 0,
             exit_after_chunks: None,
             stderr_lines: Vec::new(),
+            stdout_lines: Vec::new(),
             grandchild_pid_file: None,
             replay: Vec::new(),
             load_error: None,

@@ -118,6 +118,9 @@ async fn main() -> agent_client_protocol::Result<()> {
                 let announced = announced.clone();
                 async move |req: NewSessionRequest, responder, cx| {
                     log_session(&script, "session/new", &req);
+                    for line in &script.stdout_lines {
+                        write_stdout_line(line);
+                    }
                     let id = script.session_id.clone().unwrap_or_else(|| "fake-session-1".into());
                     match script.new_session_error {
                         Some(code) => {
@@ -717,6 +720,17 @@ fn echo(ask: FakeAsk, answer: agent_client_protocol::Result<serde_json::Value>) 
         },
         FakeAsk::Unknown => format!("unknown:answered:{answer}"),
     }
+}
+
+/// `line` with a trailing newline, in one `write_all` through the same
+/// `std::io::stdout()` the ACP crate's transport writes through (and
+/// flushes after every line it sends). Called before the caller's own
+/// answer exists, so no JSON-RPC line of the transport's is still being
+/// written when this one lands (plan 8c).
+fn write_stdout_line(line: &str) {
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(format!("{line}\n").as_bytes());
+    let _ = out.flush();
 }
 
 /// One `session_log` line: the request as parsed, so an entry the schema
