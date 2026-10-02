@@ -157,11 +157,12 @@ const OPERATOR_ROUTES: &[(&str, &str)] = &[
 ];
 
 /// Every route outside the operator's session, as a method and a path:
-/// the pages, setup, enrollment, the host WebSocket and the health checks.
+/// the web UI (a few of its paths: the router's fallback answers every
+/// other path), setup, enrollment, the host WebSocket and the health checks.
 const EXEMPT_ROUTES: &[(&str, &str)] = &[
     ("GET", "/"),
     ("GET", "/setup"),
-    ("GET", "/setup.js"),
+    ("GET", "/hosts"),
     ("POST", "/api/setup"),
     ("POST", "/api/hosts/enroll"),
     ("GET", "/api/hosts/ws"),
@@ -590,6 +591,9 @@ async fn every_html_response_carries_the_content_security_policy() {
         }
     }
     // Not vacuous: the pages the tables name are HTML.
-    assert!(html.contains(&"/") && html.contains(&"/setup"), "{html:?}");
+    assert!(
+        html.contains(&"/") && html.contains(&"/setup") && html.contains(&"/hosts"),
+        "{html:?}"
+    );
     collector.stop().await;
 }

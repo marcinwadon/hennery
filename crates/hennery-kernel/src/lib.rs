@@ -23,4 +23,4 @@ pub mod ratelimit;
 pub mod recents;
 mod schema;
 pub mod secret;
-mod setup_page;
+pub mod web;

@@ -31,6 +31,10 @@ webauthn-rs.workspace = true
 web-push-native.workspace = true
 zeroize.workspace = true
 
+# The web UI's build is embedded by `build.rs` (plan 4b): it hashes each file.
+[build-dependencies]
+sha2.workspace = true
+
 [dev-dependencies]
 tempfile = "3"
 # Delivery's retry waits run on a paused clock (plan 10b-ii).
