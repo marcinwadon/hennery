@@ -1,6 +1,7 @@
 // A test server for the session screen with its composer: any session id,
 // its page, stream, detail and catalogue, the hosts, an undelivered turn
-// and its images, and the composer's POSTs, recorded with their bodies.
+// and its images, the composer's and the cards' POSTs, recorded with their
+// bodies.
 import type { SessionCatalog, SessionDetail } from '../generated/protocol'
 import type { Item, TurnContent } from '../generated/view'
 import { json, liveStream, routed, type LiveStream } from '../test-stream'
@@ -62,6 +63,8 @@ export interface Opts {
   page?: (id: string) => Response | undefined
   /** What a session's detail holds besides an idle, active session. */
   detail?: Partial<SessionDetail>
+  /** `POST …/pending/{pending_id}/answer`; 202 by default. */
+  answer?: () => Response
 }
 
 export function sessionServer(opts: Opts = {}) {
@@ -83,6 +86,9 @@ export function sessionServer(opts: Opts = {}) {
       const live = liveStream()
       streams.push(live)
       return live.response
+    }
+    if ((m = path.match(/^\/api\/sessions\/[^/]+\/pending\/([^/]+)\/answer$/))) {
+      return opts.answer?.() ?? json({ pending_id: decodeURIComponent(m[1]), request_id: 'r1' }, 202)
     }
     if ((m = path.match(/^\/api\/sessions\/([^/]+)\/resume$/))) {
       return opts.resume?.() ?? json({ session_id: decodeURIComponent(m[1]), lifecycle: 'active' }, 202)
