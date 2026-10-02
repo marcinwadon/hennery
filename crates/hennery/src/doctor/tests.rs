@@ -1711,6 +1711,70 @@ fn initialize_reads_its_answer_and_nothing_else() {
     assert!(!spawn::far_apart((2, 1, 3), (2, 1, 9)));
 }
 
+/// A process the adapter put in a group of its own, holding the adapter's
+/// output open, does not hold doctor: `initialize` returns once the
+/// adapter's group is killed, not when that process ends.
+#[test]
+fn a_process_that_left_the_group_does_not_hold_initialize() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapter = dir.path().join("adapter");
+    let escaped = dir.path().join("escaped");
+    script(
+        &adapter,
+        &format!(
+            "#!/bin/sh\nperl -e 'setpgrp(0, 0); sleep 30' &\necho $! > \"{0}.tmp\"\nmv \"{0}.tmp\" \"{0}\"\nread line\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{}}}}'\nexec sleep 60\n",
+            escaped.display()
+        ),
+    );
+    let agent = hennery_host::AgentCommand {
+        program: adapter.display().to_string(),
+        args: Vec::new(),
+        env: Vec::new(),
+    };
+    let env = vec![("HOME".to_string(), dir.path().display().to_string())];
+    let started = std::time::Instant::now();
+    let answered = spawn::initialize(&agent, &env, spawn::INITIALIZE_TIMEOUT);
+    let took = started.elapsed();
+    let pid: i32 = std::fs::read_to_string(&escaped).unwrap().trim().parse().unwrap();
+    // SAFETY: kill(2) of the one process this test's fixture started.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(answered, spawn::Started::Answered(None));
+    assert!(took < std::time::Duration::from_secs(20), "{took:?}");
+}
+
+/// `kill_all` kills every group still registered, and nothing is started
+/// after it (a Ctrl-C between the kill and doctor's exit starts nothing).
+#[test]
+fn after_kill_all_nothing_more_is_started() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    let groups = spawn::Groups::new();
+    let mut cmd = std::process::Command::new("/bin/sleep");
+    cmd.arg("60").process_group(0);
+    let mut child = groups.spawn(&mut cmd).unwrap();
+    groups.kill_all();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("kill_all left its group running");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    match groups.spawn(&mut cmd) {
+        Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::Interrupted),
+        Ok(mut late) => {
+            let _ = late.kill();
+            let _ = late.wait();
+            panic!("a spawn after kill_all was not refused");
+        }
+    }
+}
+
 /// Check 4: a CLI that says it is logged in is ok, one that does not warns
 /// with how to log in; its output, which may name the account, is never
 /// read.

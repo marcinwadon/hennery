@@ -68,46 +68,70 @@ fn stripped(name: &str) -> bool {
         .any(|v| *v == name)
 }
 
-/// The process groups doctor has started and not yet killed; `None` once
-/// `kill_all` ran, after which nothing more is started.
-static GROUPS: Mutex<Option<BTreeSet<libc::pid_t>>> = Mutex::new(Some(BTreeSet::new()));
+/// The process groups started and not yet killed; `None` once `kill_all`
+/// ran, after which nothing more is started.
+pub struct Groups(Mutex<Option<BTreeSet<libc::pid_t>>>);
+
+impl Groups {
+    pub const fn new() -> Self {
+        Self(Mutex::new(Some(BTreeSet::new())))
+    }
+
+    /// Spawn `cmd`, its group registered; refused once `kill_all` ran. The
+    /// lock is held across the spawn, so a `kill_all` meanwhile waits for
+    /// the group to be registered, and then kills it.
+    pub fn spawn(&self, cmd: &mut Command) -> std::io::Result<Child> {
+        let mut groups = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(groups) = groups.as_mut() else {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        };
+        let child = cmd.spawn()?;
+        if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+            groups.insert(pgid);
+        }
+        Ok(child)
+    }
+
+    /// SIGKILL `child`'s whole process group, then reap it.
+    pub fn kill(&self, child: &mut Child) {
+        if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: kill(2) of the group `spawn`'s caller made the child
+            // the leader of (`process_group(0)`).
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            if let Some(groups) = self.0.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                groups.remove(&pgid);
+            }
+        }
+        let _ = child.wait();
+    }
+
+    /// SIGKILL every group still there, and refuse any later spawn.
+    pub fn kill_all(&self) {
+        let groups = self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+        for pgid in groups.into_iter().flatten() {
+            // SAFETY: kill(2) of a group `spawn` made (`process_group(0)`).
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
+    }
+}
+
+/// The groups doctor has started.
+static GROUPS: Groups = Groups::new();
 
 /// SIGKILL every group doctor started that is still there: when doctor is
 /// interrupted, since its children, in groups of their own, do not see the
-/// terminal's Ctrl-C. Any later spawn is refused.
+/// terminal's Ctrl-C. Any later spawn is refused, so nothing starts between
+/// the kill and doctor's exit.
 pub fn kill_all() {
-    let groups = GROUPS.lock().unwrap_or_else(|e| e.into_inner()).take();
-    for pgid in groups.into_iter().flatten() {
-        // SAFETY: kill(2) of a group doctor made (`process_group(0)`).
-        unsafe { libc::kill(-pgid, libc::SIGKILL) };
-    }
+    GROUPS.kill_all();
 }
 
-/// Spawn `cmd`, its group registered for `kill_all`; refused once
-/// `kill_all` ran.
 fn spawn(cmd: &mut Command) -> std::io::Result<Child> {
-    let mut groups = GROUPS.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(groups) = groups.as_mut() else {
-        return Err(std::io::ErrorKind::Interrupted.into());
-    };
-    let child = cmd.spawn()?;
-    if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
-        groups.insert(pgid);
-    }
-    Ok(child)
+    GROUPS.spawn(cmd)
 }
 
-/// SIGKILL `child`'s whole process group, then reap it.
 fn kill_group(child: &mut Child) {
-    if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
-        // SAFETY: kill(2) of the group this function's caller made the
-        // child the leader of (`process_group(0)`).
-        unsafe { libc::kill(-pgid, libc::SIGKILL) };
-        if let Some(groups) = GROUPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-            groups.remove(&pgid);
-        }
-    }
-    let _ = child.wait();
+    GROUPS.kill(child)
 }
 
 /// `program args` in a group of its own, with only `env` (less what a
@@ -267,7 +291,10 @@ pub fn initialize(agent: &AgentCommand, env: &[(String, String)], timeout: Durat
     };
     drop(stdin);
     kill_group(&mut child);
-    let _ = lines.join();
+    // Not joined: a process that left the group (its own session or group)
+    // can hold the pipe open for as long as it lives, and doctor does not
+    // wait for it. The thread ends when the pipe does, or with doctor.
+    drop(lines);
     started
 }
 
