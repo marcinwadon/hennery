@@ -650,6 +650,15 @@ mod tests {
         assert_eq!(host.state, ChildState::Revoked);
         assert_eq!(host.crashes_in_window, 0);
         assert!(fakes.events().contains(&"revoked".to_string()));
+
+        // Judged before the pairing check too: a host revoked by the
+        // collector may find no whole pairing left, and still does not end
+        // `up`.
+        let mut fakes = Fakes::new(&[], &[Run::Exit(SECS(1), i32::from(REVOKED_EXIT))]);
+        fakes.paired = false;
+        let (outcome, _, host) = supervise_fakes(&mut fakes, SECS(120)).await;
+        assert_eq!(outcome, Outcome::Stopped);
+        assert_eq!(host.state, ChildState::Revoked);
     }
 
     /// A child whose first run ends within the startup grace failed to

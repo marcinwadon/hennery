@@ -2847,10 +2847,13 @@ fn a_killed_child_is_started_again() {
     std::thread::sleep(Duration::from_secs(6));
     let lock = data.join("host").join("host.lock");
     let host = pid_from(&lock).expect("the host's pid");
-    let collector = *children_of(up_pid)
-        .iter()
-        .find(|&&pid| pid != host)
-        .expect("the collector child");
+    // Both children, as `pgrep` sees them: polled, not read once.
+    let mut collector = 0;
+    up.wait_until("up's two children", || {
+        let children = children_of(up_pid);
+        collector = children.iter().copied().find(|&pid| pid != host).unwrap_or(0);
+        children.len() == 2 && children.contains(&host) && collector != 0
+    });
     up.children = vec![host, collector];
 
     unsafe { libc::kill(host, libc::SIGKILL) };
