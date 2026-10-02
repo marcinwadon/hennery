@@ -44,21 +44,19 @@ runCommand "${adapter.pname}-runs"
         timeout 120 "$program" --version < /dev/null || status=$?
         # The CLIs themselves must answer; a helper that takes no
         # `--version` must still have started (not 126 or 127, the loader's
-        # failures, nor a signal or the timeout's 124). A helper linked
-        # against musl's loader (Codex's voice host) runs on no glibc
-        # system, Nix's or another, so it is named and passed over.
+        # failures, nor a signal or the timeout's 124). A helper whose
+        # loader this system does not have (Codex's voice host, left
+        # unpatched: decision 4) is named and passed over.
         case "$(basename "$program"):$status" in
           claude:0 | codex:0 | rg:0) ;;
           claude:* | codex:* | rg:*) echo "$program failed: $status" >&2; exit 1 ;;
           *:127)
             interpreter=$(patchelf --print-interpreter "$program" 2> /dev/null || true)
-            case "$interpreter" in
-              */ld-musl-*)
-                echo "passed over: $program needs musl's loader ($interpreter), as on any glibc system"
-                continue
-                ;;
-            esac
-            echo "$program did not run: $status" >&2
+            if [ -n "$interpreter" ] && [ ! -e "$interpreter" ]; then
+              echo "passed over: $program needs the loader $interpreter, which this system does not have"
+              continue
+            fi
+            echo "$program did not run: $status (loader: ''${interpreter:-none})" >&2
             exit 1
             ;;
           *:124 | *:12[6-9] | *:1[3-9]? | *:2??) echo "$program did not run: $status" >&2; exit 1 ;;

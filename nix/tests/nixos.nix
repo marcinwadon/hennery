@@ -33,6 +33,8 @@ pkgs.testers.runNixOSTest {
       environment.systemPackages = [ pkgs.curl ];
     };
   testScript = ''
+    import re
+
     machine.wait_for_unit("hennery-collector.service")
     machine.wait_for_open_port(7117)
     machine.succeed("curl -sf http://127.0.0.1:7117/healthz")
@@ -71,9 +73,14 @@ pkgs.testers.runNixOSTest {
 
     with subtest("paired, the host runs and connects"):
         try:
-            code = machine.succeed(
-                "runuser -u hennery -- hennery admin --data-dir /var/lib/hennery pairing-code", timeout=30
-            ).strip()
+            # `admin pairing-code` asks on a terminal: `script` gives it one,
+            # and the answer is typed ahead.
+            said = machine.succeed(
+                "{ echo yes; sleep 5; } | script -qec"
+                " 'runuser -u hennery -- hennery admin --data-dir /var/lib/hennery pairing-code' /dev/null",
+                timeout=60,
+            )
+            code = re.search(r"\b[A-Za-z0-9]{4}-[A-Za-z0-9]{4}\b", said).group(0)
             machine.succeed(
                 f"runuser -u alice -- hennery host join http://127.0.0.1:7117 {code} --no-runtime"
                 " --data-dir /var/lib/hennery-host < /dev/null",
@@ -95,7 +102,6 @@ pkgs.testers.runNixOSTest {
             "runuser -u alice -- hennery doctor --data-dir /var/lib/hennery-host < /dev/null || true", timeout=180
         )
         print(report)
-        import re
         lines = {
             int(m.group(2)): m.group(0)
             for m in re.finditer(r"^(ok|warn|fail)\s+(\d+) .*$", report, re.M)
