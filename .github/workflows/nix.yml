@@ -18,9 +18,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: nix-${{ github.ref }}
-  # A pull request's superseded run only: every commit on `main` keeps its own.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # A pull request's superseded run is cancelled; on `main` every commit is
+  # its own group, so each keeps its run.
+  group: nix-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: true
 
 jobs:
   flake:
