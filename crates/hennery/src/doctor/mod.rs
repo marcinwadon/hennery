@@ -134,12 +134,25 @@ pub struct Doctor<'a> {
 }
 
 impl Doctor<'_> {
-    /// The installed service's command line gives its agents (`--agent`,
-    /// e.g. Nix-provided adapters): the host runs no managed set, and needs
-    /// neither glibc nor nix-ld for one (decision 4).
+    /// The command line of the service that runs the host examined gives
+    /// its agents (`--agent`, e.g. Nix-provided adapters): that host runs no
+    /// managed set, and needs neither glibc nor nix-ld for one (decision 4).
+    /// A service of another directory says nothing of this one.
     pub fn agents_given(&self) -> bool {
+        use crate::service::unit::Role;
+        let Some(host) = self.dirs.host.as_ref().and_then(|h| h.canonicalize().ok()) else {
+            return false;
+        };
         self.cx.installed().into_iter().any(|role| {
-            crate::service::read_command_line(self.cx, role).is_some_and(|argv| argv.iter().any(|a| a == "--agent"))
+            let Some(argv) = crate::service::read_command_line(self.cx, role) else {
+                return false;
+            };
+            let served = match (role, crate::service::data_dir_of(&argv)) {
+                (Role::Up, Some(data)) => data.join("host"),
+                (Role::Host, Some(data)) => data,
+                _ => return false,
+            };
+            served.canonicalize().ok() == Some(host.clone()) && argv.iter().any(|a| a == "--agent")
         })
     }
 }
@@ -165,7 +178,11 @@ const MAX_OUTPUT: u64 = 4096;
 /// Run `program` for a check: no standard input, an environment of the base
 /// system's PATH alone (nothing of the shell doctor runs in), at most
 /// `MAX_OUTPUT` bytes of each output read, killed after `RUN_TIMEOUT`. What
-/// it prints is parsed by the check, never printed or logged.
+/// it prints is parsed by the check, never printed or logged. The output is
+/// read once the program exits: one that fills a pipe is killed at the
+/// timeout and gives `None`, and one that leaves a child holding its pipes
+/// would hold the read. The programs run (glibc's loader, `getconf`) do
+/// neither.
 pub fn run_bounded(program: &Path, args: &[&str]) -> Option<Ran> {
     use std::process::{Command, Stdio};
     let mut child = Command::new(program)
@@ -223,12 +240,15 @@ pub fn exit_code(findings: &[Finding]) -> ExitCode {
     if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }
 
-/// `text` with every control character escaped, so no name read from the
-/// machine (a path, a file name) can forge or hide a line of the report.
+/// `text` with every control character escaped, and every character that
+/// reorders text (the bidirectional marks, embeddings, overrides and
+/// isolates), so no name read from the machine (a path, a file name) can
+/// forge or hide a line of the report.
 pub fn printable(text: &str) -> String {
     text.chars()
         .map(|c| {
-            if c.is_control() {
+            let reorders = matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+            if c.is_control() || reorders {
                 c.escape_default().to_string()
             } else {
                 c.to_string()

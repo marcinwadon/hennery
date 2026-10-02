@@ -260,6 +260,7 @@ fn what_a_directory_holds_is_told_by_its_names() {
     let up = dir.path().join("up");
     paired(&up.join("host"));
     std::fs::create_dir_all(up.join("collector")).unwrap();
+    std::fs::write(up.join("collector/hennery.db"), "").unwrap();
     let dirs = Dirs::by_contents(up.clone(), Found::Given);
     assert_eq!(dirs.host, Some(up.join("host")));
     assert_eq!(dirs.collector, Some(up.join("collector")));
@@ -366,6 +367,7 @@ fn the_report_fails_only_on_a_failure_and_escapes_control_characters() {
     let mut warned = Verdict::default();
     warned.ok("fine");
     warned.warn("odd\u{1b}[31m", "do this");
+    warned.ok("a\u{202e}b");
     let findings = vec![
         Finding::Checked(warned.check(6, "environment")),
         Finding::NotRun {
@@ -383,7 +385,7 @@ fn the_report_fails_only_on_a_failure_and_escapes_control_characters() {
         "{text}"
     );
     assert!(
-        text.contains("warn  6 environment: fine; odd\\u{1b}[31m\n        fix: do this\n"),
+        text.contains("warn  6 environment: fine; odd\\u{1b}[31m; a\\u{202e}b\n        fix: do this\n"),
         "{text}"
     );
     assert!(text.contains("not run here: 9, 12 (no host data directory)"), "{text}");
@@ -473,6 +475,17 @@ fn the_pinned_set_present_is_ok_and_a_missing_part_fails() {
     let check = check1("can be written by other users");
     assert_eq!(check.status, Status::Warn, "{check:?}");
     std::fs::set_permissions(&set, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let bin = std::fs::read_dir(host.join("runtimes"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("bin");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let check = check1("can be written by other users");
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
 
     let package = std::fs::read_dir(set.join("claude/node_modules"))
         .unwrap()
@@ -546,6 +559,10 @@ fn a_set_other_than_the_pin_or_none_or_a_hold_warns() {
     let check = check12().unwrap();
     assert_eq!(check.status, Status::Ok, "{check:?}");
     assert!(check.summary.contains("--agent"), "{check:?}");
+    // A service of another directory says nothing of this one.
+    let elsewhere = paired(&dir.path().join("elsewhere"));
+    install_with_agents(&cx, Role::Host, &elsewhere);
+    assert_eq!(check12().unwrap().status, Status::Warn);
     std::fs::remove_file(cx.service_file(Role::Host)).unwrap();
 
     let (id, _) = pinned_set(&host).unwrap();

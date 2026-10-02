@@ -45,7 +45,12 @@ pub fn binary_and_set(doctor: &Doctor) -> Finding {
             Ok(None) => verdict.ok("no adapter set is installed (see check 12)"),
             Ok(Some(set)) => {
                 set_present(&set, pinned(host).ok().as_ref(), &mut verdict);
-                for dir in [&set.path, set.node.parent().and_then(Path::parent).unwrap_or(&set.path)] {
+                // What agents run: the set, every set, the runtime, its
+                // `bin/` and Node itself.
+                let bin = set.node.parent().unwrap_or(&set.node);
+                let runtime = bin.parent().unwrap_or(bin);
+                let sets = set.path.parent().unwrap_or(&set.path);
+                for dir in [&set.path, sets, runtime, bin, &set.node] {
                     if writable_by_others(dir, doctor.cx.uid) {
                         verdict.warn(
                             format!(

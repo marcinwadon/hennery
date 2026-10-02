@@ -116,7 +116,7 @@ impl Dirs {
         } else {
             let host = root.join("host");
             let collector = root.join("collector");
-            match (is_host(&host), collector.is_dir()) {
+            match (is_host(&host), is_collector(&collector)) {
                 (false, false) if is_collector(&root) => (None, Some(root.clone())),
                 (h, c) => (h.then_some(host), c.then_some(collector)),
             }
