@@ -1624,26 +1624,7 @@ fn write_forgets(tx: &Transaction<'_>, owner: &str, deleted: ForgetSource<'_>) -
         )
         .optional()?
         .unwrap_or(false);
-    // The agent sessions the other kept sessions of this host and agent
-    // refer to: by their id, and among their recorded pairs.
-    let in_use: BTreeSet<String> = {
-        let mut stmt = tx.prepare(
-            "SELECT agent_session_id, agent_home FROM sessions
-             WHERE host_id = ?2 AND agent = ?3 AND id <> ?4 AND lifecycle <> 'deleted' AND owner_id = ?1
-                 AND (agent_session_id IS NOT NULL OR agent_home IS NOT NULL)",
-        )?;
-        let rows = stmt.query_map(
-            params![owner, deleted.host_id, deleted.agent, deleted.session_id],
-            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
-        )?;
-        let mut ids = BTreeSet::new();
-        for row in rows {
-            let (id, homes) = row?;
-            ids.extend(id);
-            ids.extend(recorded_homes(homes.as_deref()).into_iter().map(|h| h.agent_session_id));
-        }
-        ids
-    };
+    let in_use = agent_sessions_in_use(tx, owner, deleted.host_id, deleted.agent, deleted.session_id)?;
     let ts = now();
     for (agent_session_id, home) in pairs {
         if in_use.contains(&agent_session_id) {
@@ -1660,6 +1641,9 @@ fn write_forgets(tx: &Transaction<'_>, owner: &str, deleted: ForgetSource<'_>) -
         } else {
             HostRemovalState::Pending
         };
+        // A final record is never sent: it keeps no roots (the review's
+        // item 12).
+        let home = if known.is_some() { None } else { home };
         let record = ForgetRecord {
             id: uuid::Uuid::now_v7().to_string(),
             host_id: deleted.host_id.to_string(),
@@ -1693,6 +1677,32 @@ fn write_forgets(tx: &Transaction<'_>, owner: &str, deleted: ForgetSource<'_>) -
         out.records.push(record);
     }
     Ok(out)
+}
+
+/// The agent sessions the kept sessions of `host_id` and `agent` other than
+/// `except` refer to (B8): by their id, and among their recorded pairs.
+fn agent_sessions_in_use(
+    conn: &Connection,
+    owner: &str,
+    host_id: &str,
+    agent: &str,
+    except: &str,
+) -> Result<BTreeSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT agent_session_id, agent_home FROM sessions
+         WHERE host_id = ?2 AND agent = ?3 AND id <> ?4 AND lifecycle <> 'deleted' AND owner_id = ?1
+             AND (agent_session_id IS NOT NULL OR agent_home IS NOT NULL)",
+    )?;
+    let rows = stmt.query_map(params![owner, host_id, agent, except], |r| {
+        Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?))
+    })?;
+    let mut ids = BTreeSet::new();
+    for row in rows {
+        let (id, homes) = row?;
+        ids.extend(id);
+        ids.extend(recorded_homes(homes.as_deref()).into_iter().map(|h| h.agent_session_id));
+    }
+    Ok(ids)
 }
 
 fn state_name(state: HostRemovalState) -> &'static str {
@@ -2668,8 +2678,10 @@ impl Store {
             )?;
             return Ok(());
         }
+        // A final record keeps no roots (the review's item 12).
         conn.execute(
-            "UPDATE host_forgets SET attempts = attempts + ?2, last_result = ?3, state = ?4
+            "UPDATE host_forgets SET attempts = attempts + ?2, last_result = ?3, state = ?4,
+                 agent_home = CASE WHEN ?4 = 'final' THEN NULL ELSE agent_home END
              WHERE id = ?1 AND state = 'pending' AND owner_id = ?5",
             params![
                 id,
@@ -2680,6 +2692,15 @@ impl Store {
             ],
         )?;
         Ok(())
+    }
+
+    /// Whether another kept session of the record's host and agent now
+    /// refers to its agent session (B8; re-checked before each attempt,
+    /// the review's item 13).
+    pub fn forget_is_shared(&self, record: &ForgetRecord) -> Result<bool> {
+        let conn = self.conn();
+        let in_use = agent_sessions_in_use(&conn, &self.owner, &record.host_id, &record.agent, &record.session_id)?;
+        Ok(in_use.contains(&record.agent_session_id))
     }
 
     /// Dismiss a record (plan 9d O10): it is no longer retried or listed.
@@ -3049,7 +3070,7 @@ impl Store {
         // A revoked host never connects again: what it was left to remove
         // stays listed, final (plan 9d O10).
         tx.execute(
-            "UPDATE host_forgets SET state = 'final', last_result = ?2
+            "UPDATE host_forgets SET state = 'final', last_result = ?2, agent_home = NULL
              WHERE host_id = ?1 AND state = 'pending' AND owner_id = ?3",
             params![
                 host_id,

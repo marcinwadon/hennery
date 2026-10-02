@@ -833,6 +833,10 @@ fn forget(
         if attached {
             return uplink.reply(crate::forget::refused(request_id, ForgetReason::Attached, true));
         }
+        // One forget per agent session at a time (the review's item 3).
+        if map.forgetting.contains_key(&f.agent_session_id) {
+            return uplink.reply(crate::forget::refused(request_id, ForgetReason::InProgress, true));
+        }
         *map.forgetting.entry(f.agent_session_id.clone()).or_default() += 1;
     }
     let ctx = ForgetContext {
