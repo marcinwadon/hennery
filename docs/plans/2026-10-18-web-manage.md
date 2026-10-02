@@ -50,7 +50,26 @@ It builds on [plan 4b](2026-10-16-web-shell.md) (the client, `useClient`, `ApiFa
 
 ## Execution status
 
-Not executed yet.
+Executed 2026-10-03 on `plan/frontend-4d-i` with subagent-driven development. Each task had one implementer, then a review by a stronger model (opus). A whole-branch review (opus) closed the run. The plan was replayed onto `ecc50cd` and executed there, then rebased without conflict onto `f122101`. Commits are named here by subject.
+
+| Task | Commit(s) | Review |
+|---|---|---|
+| Plan | `docs(plan): plan 4d-i, the hosts and hats screens` | — |
+| 1 | `feat(web): server text shown escaped, a confirm dialog, and a sign-out that says when it failed` | Approved, with four minors: a click on the backdrop let Tab leave the dialog; the title's id was fixed; focus had nowhere to go when the opener was gone; a read kept the old key's data. All four were taken in the fixes below. |
+| 2 | `feat(web): hosts: pair one with a one-time code, rename, re-hat or revoke one` | Changes requested. Focus fell to the page's body after a revoke or a rename; "Add host" was under 44 px on a phone; a spent code stayed in the screen's state and kept "Add host" disabled; the rename was untrimmed; the hats' error was never shown; polls could overlap. |
+| 3 | `feat(web): hats: create, recolour, path rules with a live tester, and purge` | Changes requested. The path rules were stale after a purge, so the next save was refused; two hat changes landing together could lose one; focus fell to the body after an edit, "Make default", a create, or a rule's removal; plus six minors (the hosts' error, a blank path, the tester's stale answer, a failed purge's frozen hat, the colour picker's height, a doubled live region). |
+| 4 | `test(web): pair a host, test a path and revoke with a step-up, in Chromium at two widths` | Changes requested. The collector inherited the runner's environment, and `host join`/`host run` kept `HENNERY_*` variables, so a `HENNERY_LOG_DIR` or `HENNERY_SERVICE` set in the runner's shell would have sent logs to the operator's own directories. Also three minors: the CSP check by events, `host run`'s errors, and a node-valued assertion. |
+| — | `fix(web): the confirmation keeps focus inside it and returns it somewhere that exists`; `fix(web): hosts and hats keep focus, reload what a purge removed, and fit 44 px`; `fix(web): the browser checks run every binary in a scratch environment` | Every finding of Tasks 1–4 taken. None was declined. Each has a test that was watched fail, and each has a revert-probe (36 unit probes, plus 2 e2e probes for the environment). |
+| — | `docs(plan): plan 4d-i after its task reviews` | The plan was regenerated from the fixed code and replayed. Decisions 3, 4, 11, 12, 14 and 15 were amended. |
+| — | `fix(web): a server time is tested escaped, a purge's outcome takes focus, and a hat's name is never spaces`; `docs(plan): plan 4d-i after its whole-branch review` | The whole-branch review approved, with minors: `<When>`'s escaping (the security review's O6) had no test; focus fell to the body after a purge; a hat's name of spaces only could be sent; decision 15 overstated what the CSP check sees; the plan's file table and probe lists were incomplete. All were taken, and 4 more probes were run. It judged that the fix commits tighten what the security review ruled on and loosen nothing, so no further re-confirmation is needed. |
+
+After each review that changed code, the plan was regenerated from the code (`split.sh`, `fill.py`) and replayed from its own text onto `ecc50cd`. Every step matched its commit byte for byte. Every implementer checked its commit against the plan's reference commit for its task: `git diff` was empty, apart from the plan doc.
+
+**Checks on the final branch** (on `f122101`):
+- Web: typecheck; 274 Vitest tests (by task: 193, 236, 274); the build; 17 Playwright tests in Chromium against the binary (4b's 7, and this plan's 5 at two widths). `check-web-ui.sh` prints `ok`.
+- No Rust file changes. CI runs the Rust checks.
+- Revert-probes, all caught: 54 scripted Vitest probes of the original guards, 40 of the review fixes, and 8 Playwright probes. The `clean` run passes.
+- The source guard (`security.test.ts`) caught one of this run's own slips: a literal U+202E in a new test, now written as an escape.
 
 ## Scope
 
