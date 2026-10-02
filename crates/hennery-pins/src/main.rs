@@ -8,6 +8,9 @@
 //! - `generate`: the lockfiles + the registry + Node's `SHASUMS256.txt` →
 //!   `adapters/manifest.json`.
 //! - `check`: generate and compare; never re-resolves.
+//! - `extract`: download every pinned package once, check its size and
+//!   digest, and extract it as a host would, into a temporary directory
+//!   removed at once: no link, nothing past its pinned sizes.
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
@@ -39,6 +42,9 @@ enum Command {
     Generate(NodeArgs),
     /// Fail unless adapters/manifest.json is what `generate` would write.
     Check(NodeArgs),
+    /// Download, verify and extract every pinned package, as a host would,
+    /// into a temporary directory removed at once.
+    Extract,
 }
 
 #[derive(clap::Args)]
@@ -82,7 +88,55 @@ async fn main() -> Result<()> {
             eprintln!("{} matches the pins and lockfiles", path.display());
             Ok(())
         }
+        Command::Extract => extract_all(&Manifest::parse(&read(&adapters.join("manifest.json"))?)?).await,
     }
+}
+
+/// Every pinned package, once: its bytes are exactly `archive_size` and
+/// match `integrity`, and it extracts under the host's rules within
+/// `unpacked_size` (decision 8). Nothing is kept.
+async fn extract_all(manifest: &Manifest) -> Result<()> {
+    let mut files: BTreeMap<String, manifest::File> = BTreeMap::new();
+    for adapter in manifest.adapters.values() {
+        for file in adapter.platforms.values().flatten() {
+            files.entry(file.url.clone()).or_insert_with(|| file.clone());
+        }
+    }
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("hennery-pins/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(900))
+        .build()?;
+    let scratch = tempfile::tempdir()?;
+    let total = files.len();
+    for (n, file) in files.values().enumerate() {
+        eprintln!("[{}/{total}] {}", n + 1, file.url);
+        let bytes = client.get(&file.url).send().await?.error_for_status()?.bytes().await?;
+        if bytes.len() as u64 != file.archive_size {
+            bail!(
+                "{}: {} bytes, the manifest says {}",
+                file.url,
+                bytes.len(),
+                file.archive_size
+            );
+        }
+        if <[u8; 64]>::from(sha2::Sha512::digest(&bytes)) != manifest::sri_sha512(&file.integrity)? {
+            bail!("{} does not match its integrity", file.url);
+        }
+        let tgz = scratch.path().join("package.tgz");
+        std::fs::write(&tgz, &bytes)?;
+        let dest = scratch.path().join("out");
+        hennery_host::runtime::extract::package(
+            &tgz,
+            &dest,
+            file.unpacked_size + hennery_host::runtime::extract::SIZE_ALLOWANCE,
+        )
+        .with_context(|| format!("extract {}", file.url))?;
+        std::fs::remove_dir_all(&dest)?;
+        std::fs::remove_file(&tgz)?;
+    }
+    eprintln!("{total} packages download, verify and extract as pinned");
+    Ok(())
 }
 
 fn read(path: &Path) -> Result<String> {

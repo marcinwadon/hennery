@@ -16,6 +16,7 @@ on:
       - adapters/**
       - crates/hennery-pins/**
       - crates/hennery-host/src/runtime/manifest.rs
+      - crates/hennery-host/src/runtime/extract.rs
       - .github/workflows/pins.yml
   push:
     branches: [main]
@@ -23,6 +24,7 @@ on:
       - adapters/**
       - crates/hennery-pins/**
       - crates/hennery-host/src/runtime/manifest.rs
+      - crates/hennery-host/src/runtime/extract.rs
       - .github/workflows/pins.yml
 
 permissions:
@@ -57,6 +59,8 @@ jobs:
           gpgv --keyring ./pubring.kbx SHASUMS256.txt.sig SHASUMS256.txt
       - name: The manifest is what the pins, the lockfiles and the signed checksums give
         run: cargo run -p hennery-pins --locked -- check --node-shasums SHASUMS256.txt
+      - name: Every pinned package is its pinned size and digest, and extracts as a host extracts it
+        run: cargo run -p hennery-pins --locked -- extract
       - name: Registry signatures, and npm installs exactly the manifest's files, per platform
         run: |
           : > "$RUNNER_TEMP/npmrc-user"
