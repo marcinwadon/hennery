@@ -62,6 +62,9 @@ pub struct Forget {
     pub agent: String,
     pub agent_session_id: String,
     pub agent_home: hennery_proto::frames::AgentHome,
+    /// The collector's `fallback` (plan 9d-ii's hybrid): for Codex, no
+    /// app-server, the fallback at once. Ignored for any other agent.
+    pub fallback: bool,
 }
 
 /// Whether `id` is an id the agent itself writes (decision 8): a UUID in
@@ -533,7 +536,11 @@ fn open_kind(root: RawFd, name: &str, dev: libc::dev_t, account: &Account) -> Re
 pub(crate) fn retryable(reason: ForgetReason) -> bool {
     matches!(
         reason,
-        ForgetReason::StillPresent | ForgetReason::IoError | ForgetReason::TimedOut | ForgetReason::InProgress
+        ForgetReason::StillPresent
+            | ForgetReason::IoError
+            | ForgetReason::TimedOut
+            | ForgetReason::AppServerTimedOut
+            | ForgetReason::InProgress
     )
 }
 
@@ -936,6 +943,7 @@ mod tests {
                     root: "/tmp".into(),
                     sqlite_root: None,
                 },
+                fallback: false,
             },
         )
         .await;

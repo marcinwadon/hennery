@@ -29,6 +29,29 @@ use std::time::Duration;
 /// so a live host's answer comes first.
 pub const FORGET_WAIT: Duration = Duration::from_secs(30);
 
+/// How many `app_server_timed_out` answers in a row flag a record's next
+/// forget `fallback` (plan 9d-ii, B5 as ruled).
+pub const APP_SERVER_TIMEOUTS_BEFORE_FALLBACK: u32 = 3;
+
+/// Whether `result` is one the hybrid counts (plan 9d-ii, B5 as ruled):
+/// its `session` item is `app_server_timed_out`. Any other result resets
+/// the count.
+pub fn app_server_timed_out(result: &TranscriptRemoval) -> bool {
+    result
+        .remaining
+        .iter()
+        .any(|r| r.kind == ForgetKind::Session && r.reason == ForgetReason::AppServerTimedOut)
+}
+
+/// A record's count after `result` (the hybrid's): one more, or 0.
+pub fn app_server_timeouts_after(count: u32, result: &TranscriptRemoval) -> u32 {
+    if app_server_timed_out(result) {
+        count.saturating_add(1)
+    } else {
+        0
+    }
+}
+
 /// The most entries of each list an answer may hold (B2's size cap): a
 /// forget names at most a handful of kinds.
 pub const MAX_ANSWER_ITEMS: usize = 16;
@@ -190,16 +213,21 @@ pub async fn attempt(state: &AppState, record: &ForgetRecord, wait: Duration) ->
         return pending(RemovalPending::InProgress);
     };
     let until = tokio::time::Instant::now() + wait;
+    // The claim makes this the record's only attempt in flight, so the
+    // hybrid's count is followed here as the store keeps it: a second
+    // round sends what the first one's answer made it (plan 9d-ii).
+    let mut record = record.clone();
     loop {
         let (result, done) = attempt_once(
             state,
-            record,
+            &record,
             until.saturating_duration_since(tokio::time::Instant::now()),
         )
         .await;
         if done || !claim.asked_again() || tokio::time::Instant::now() >= until {
             return result;
         }
+        record.app_server_timeouts = app_server_timeouts_after(record.app_server_timeouts, &result);
     }
 }
 
@@ -236,6 +264,9 @@ async fn attempt_once(state: &AppState, record: &ForgetRecord, wait: Duration) -
         agent: record.agent.clone(),
         agent_session_id: record.agent_session_id.clone(),
         agent_home: home,
+        // B5 as ruled (the hybrid): after this many app-server timeouts in
+        // a row, the host is told to go straight to the fallback.
+        fallback: record.app_server_timeouts >= APP_SERVER_TIMEOUTS_BEFORE_FALLBACK,
     };
     let (result, sent, done) = match state.hub.probe(&record.host_id, &request_id, frame, wait).await {
         Ok(HostFrame::SessionForgotten {

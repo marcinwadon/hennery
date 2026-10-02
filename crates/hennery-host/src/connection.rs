@@ -849,6 +849,7 @@ fn handle(
             agent,
             agent_session_id,
             agent_home,
+            fallback,
         } => forget(
             cfg,
             uplink,
@@ -859,6 +860,7 @@ fn handle(
                 agent,
                 agent_session_id,
                 agent_home,
+                fallback,
             },
         ),
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}

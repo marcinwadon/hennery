@@ -23,10 +23,16 @@
 //! 4. **The fallback** (decision 10, B5) runs when the app-server path is
 //!    unavailable: no binary or no pin, a spawn that fails, a version with
 //!    no pinned shape, an `initialize` that fails, or a `thread/delete`
-//!    this Codex does not know. Never after `thread/delete` itself
-//!    answered: a refusal, a failure, or no answer in time. Nor when a step
-//!    only ran out of time (a first exec macOS scans, say): that is
-//!    `timed_out`, retried, since the fallback's result is final.
+//!    this Codex does not know. Never after `thread/delete` was written: a
+//!    refusal, a failure, or no answer in time (`timed_out`, retried).
+//! 5. **A slow app-server** (B5 as ruled, the bounded hybrid): a step that
+//!    only ran out of time before `thread/delete` was written (`--version`,
+//!    the start, `initialize`; a first exec macOS scans, say) is
+//!    `app_server_timed_out`, retried, since the fallback's result is final.
+//!    The collector counts such answers in a row; after
+//!    `APP_SERVER_TIMEOUTS_BEFORE_FALLBACK` it flags the next forget
+//!    `fallback`, and the host then spawns no Codex and runs the fallback
+//!    at once, after the same checks.
 
 use crate::adapter::{Adapter, AdapterIo, AgentCommand};
 use crate::forget::{
@@ -88,7 +94,9 @@ enum Verdict {
     /// deleted, and the fallback never runs after it (B5).
     Refused(ForgetReason),
     /// `thread/delete` was sent and did not finish: it failed midway, or
-    /// gave no answer in time. Retried; no fallback (it may have run).
+    /// gave no answer in time (`timed_out`). Retried; no fallback (it may
+    /// have run). Or the app-server ran out of time before it was sent
+    /// (`app_server_timed_out`): retried, and counted by the collector.
     Failed(ForgetReason),
     /// The app-server resolved another `CODEX_HOME` than the recorded one:
     /// nothing more was asked of it, and no fallback runs, since codex-acp
@@ -116,6 +124,10 @@ enum Unavailable {
     /// Invalid request`: how 0.155.1 answers a method or params it cannot
     /// read, before any handler runs).
     MethodNotFound,
+    /// The collector flagged the forget `fallback` (B5 as ruled, the
+    /// hybrid): its app-server timed out too often in a row. No Codex is
+    /// spawned.
+    Flagged,
 }
 
 /// An answer to one request, as the app-server sent it.
@@ -247,7 +259,7 @@ pub async fn forget_codex(ctx: &ForgetContext, forget: &Forget) -> Forgotten {
     let (env, strip) = environment(forget, &root);
     // What is there before, so what `thread/delete` removes can be
     // counted: only if the app-server may run.
-    let before = if ctx.codex_pin.is_some() && ctx.codex_app_server.is_some() {
+    let before = if !forget.fallback && ctx.codex_pin.is_some() && ctx.codex_app_server.is_some() {
         let (kinds, id, hooks) = (kinds.clone(), forget.agent_session_id.clone(), ctx.hooks.clone());
         let until = until.into_std();
         tokio::task::spawn_blocking(move || present(&kinds, &id, &hooks, until))
@@ -257,7 +269,11 @@ pub async fn forget_codex(ctx: &ForgetContext, forget: &Forget) -> Forgotten {
         Some(0)
     };
     let share = until.min(start + app_server_share(ctx.deadline));
-    let verdict = app_server(ctx, forget, &root, &env, &strip, share).await;
+    let verdict = if forget.fallback {
+        Verdict::Unavailable(Unavailable::Flagged)
+    } else {
+        app_server(ctx, forget, &root, &env, &strip, share).await
+    };
     let id = forget.agent_session_id.clone();
     match verdict {
         Verdict::Unavailable(why) => {
@@ -292,7 +308,6 @@ pub async fn forget_codex(ctx: &ForgetContext, forget: &Forget) -> Forgotten {
                     }
                 }
                 tally.merge(rollouts(&kinds, &id, &hooks, true, ForgetReason::StillPresent, until));
-
                 // Decision 10: what only `thread/delete` reaches.
                 tally.left_whole(ForgetKind::CodexDatabaseCopies, ForgetReason::FallbackOnly);
                 tally
@@ -428,7 +443,7 @@ async fn version(
     let read = tokio::time::timeout_at(until, stdout.take(MAX_VERSION).read_to_end(&mut out)).await;
     process.terminate(ADAPTER_GRACE).await;
     match read {
-        Err(_) => Err(Verdict::Failed(ForgetReason::TimedOut)),
+        Err(_) => Err(Verdict::Failed(ForgetReason::AppServerTimedOut)),
         Ok(Err(_)) => Err(Verdict::Unavailable(Unavailable::Spawn)),
         Ok(Ok(_)) => Ok(parse_version(&String::from_utf8_lossy(&out)).map(str::to_string)),
     }
@@ -458,7 +473,9 @@ async fn talk(io: AdapterIo, pin: &CodexAppServer, root: &Path, id: &str, until:
             return Verdict::Unavailable(Unavailable::Initialize);
         }
         Ok(None) => return Verdict::Unavailable(Unavailable::Initialize),
-        Err(_) => return Verdict::Failed(ForgetReason::TimedOut),
+        // Before `thread/delete` was written: the app-server's own
+        // timeout, counted by the collector (B5 as ruled).
+        Err(_) => return Verdict::Failed(ForgetReason::AppServerTimedOut),
     }
     let delete = serde_json::json!({ "id": 2, "method": pin.delete_method, "params": pin.params(id) });
     if send(&mut stdin, &delete).await.is_err() {
@@ -826,6 +843,7 @@ mod tests {
             (ForgetReason::InProgress, true),
             (ForgetReason::IoError, true),
             (ForgetReason::TimedOut, true),
+            (ForgetReason::AppServerTimedOut, true),
             (ForgetReason::StillPresent, true),
         ] {
             assert_eq!(retryable(reason), retried, "{reason:?}");

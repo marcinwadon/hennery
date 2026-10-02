@@ -135,8 +135,15 @@ pub enum ForgetReason {
     MountPoint,
     /// The walk reached its depth bound (R2).
     TooDeep,
-    /// The forget's deadline passed before the removal was done (B6).
+    /// The forget's deadline passed before the removal was done (B6). For
+    /// Codex: after `thread/delete` was written, so it may have run.
     TimedOut,
+    /// Codex's app-server did not answer in time before `thread/delete`
+    /// was written (`--version`, its start, `initialize`): retried, and
+    /// counted by the collector, which flags the record's next forget
+    /// `fallback` after `APP_SERVER_TIMEOUTS_BEFORE_FALLBACK` in a row
+    /// (plan 9d-ii, B5 as ruled).
+    AppServerTimedOut,
     /// Still there after the removal (B4).
     StillPresent,
     /// The removal failed midway (B3).
@@ -1122,5 +1129,13 @@ pub enum CollectorFrame {
         agent: String,
         agent_session_id: String,
         agent_home: AgentHome,
+        /// Plan 9d-ii, B5 as ruled (the hybrid): the record's last
+        /// `APP_SERVER_TIMEOUTS_BEFORE_FALLBACK` answers were all
+        /// `app_server_timed_out`, so a Codex host spawns no Codex and runs
+        /// the fallback at once, after the same checks. Only ever a
+        /// downgrade of this session's own removal; other agents ignore it.
+        /// Absent when false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        fallback: bool,
     },
 }
