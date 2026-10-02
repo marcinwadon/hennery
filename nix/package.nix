@@ -40,6 +40,8 @@ let
       # the placeholder page. The checks below build without it.
       HENNERY_WEB_DIST = "${webUi}";
       HENNERY_WEB_REQUIRE = "1";
+      # The UI is in the binary, so the package never needs it at run time.
+      disallowedReferences = [ webUi ];
       # The tests run in CI's own jobs (`ci.yml`): they spawn processes and
       # bind loopback ports, which a build sandbox does not promise.
       doCheck = false;

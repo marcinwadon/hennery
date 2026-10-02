@@ -34,7 +34,8 @@
           withWebkit = false;
           withFfmpeg = false;
         };
-        webTools = [ web.nodejs_24 web.pnpm ];
+        # The pnpm the web build is pinned to (`nix/web.nix`).
+        webTools = [ web.nodejs_24 webUi.pnpm ];
       in {
         packages.default = hennery.package;
         packages.web = webUi;

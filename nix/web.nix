@@ -7,6 +7,8 @@
 # is the same on every system: the fetcher installs with `--force`, which
 # takes every platform's optional packages, not only this system's. The
 # build itself is offline, from that store.
+#
+# After any change to web/pnpm-lock.yaml: `sh packaging/update-web-hash.sh`.
 { pkgs }:
 let
   inherit (pkgs) lib;
@@ -39,20 +41,24 @@ pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
     # The only version this nixpkgs' fetcher takes for pnpm 11 and newer
     # (D-1: a version nixpkgs removes fails evaluation, it is never kept).
     fetcherVersion = 4;
+    # A workaround for the fetcher of nixpkgs-web at e158d9e with pnpm 12:
     # pnpm 12 keeps every package unpacked under `v11/links`, beside the
-    # content-addressed `files` it is made from. The fetcher's fixup then
-    # rewrites every `*.json` there with jq, and stops at the first package
-    # file that is not strict JSON (a commented `tsdoc-metadata.json`).
-    # `links` is rebuilt from `files` by the offline install, so it is
-    # dropped before that fixup: half the size, and no package file edited.
+    # content-addressed `files` it is made from, and the fetcher's fixup
+    # rewrites every `*.json` in the store with jq. It stops at the first
+    # package file that is not strict JSON (a commented
+    # `tsdoc-metadata.json`). The offline install rebuilds `links` from
+    # `files`, so it is dropped before that fixup: half the size, and no
+    # package file edited. Remove this once the fixup skips `links`; the
+    # hash changes then.
     preFixup = ''
+      [ -d "''${storePath:?}/v11" ] || { echo "no v11 store: revisit this workaround" >&2; exit 1; }
       rm -rf "''${storePath:?}/v11/links"
     '';
-    # Changes with `web/pnpm-lock.yaml`. After a lock change, set it to
-    # `lib.fakeHash`, run `nix build .#web.pnpmDeps`, and copy the hash it
-    # got. A store that already holds the old output never refetches it,
-    # so the offline build is what fails there, with
-    # ERR_PNPM_NO_OFFLINE_TARBALL.
+    # Changes with `web/pnpm-lock.yaml`: after a lock change, run
+    # `sh packaging/update-web-hash.sh`. A stale hash fails CI with a hash
+    # mismatch in `hennery-web-pnpm-deps`. A store that already holds the
+    # old output never refetches it, so locally the build fails instead,
+    # with ERR_PNPM_NO_OFFLINE_TARBALL.
     hash = "sha256-5p7sGn/gcxYo5HKokMqyUG0Y25POOVnJiNFyi8I4vxI=";
   };
 
@@ -70,7 +76,19 @@ pkgs.stdenvNoCC.mkDerivation (finalAttrs: {
 
   installPhase = ''
     runHook preInstall
+    # The page loads the entry script the build made, not a stale name.
+    entry=$(sed -n 's|.*<script type="module" crossorigin src="/\(assets/[^"]*\.js\)".*|\1|p' dist/index.html)
+    if [ -z "$entry" ] || [ ! -f "dist/$entry" ]; then
+      echo "dist/index.html loads no script the build made" >&2
+      exit 1
+    fi
     cp -r dist "$out"
     runHook postInstall
   '';
+
+  # The build is embedded in the binary: it must name no store path.
+  allowedReferences = [ ];
+
+  # The dev shell takes the same pnpm (`flake.nix`).
+  passthru = { inherit pnpm; };
 })
