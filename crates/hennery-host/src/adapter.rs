@@ -171,6 +171,12 @@ impl Adapter {
     /// Spawn `agent` in `cwd`, in a new process group led by a guard that
     /// kills the group when the host dies (`spawn_guard`).
     pub fn spawn(agent: &AgentCommand, cwd: &Path) -> std::io::Result<(Self, AdapterIo)> {
+        Self::spawn_stripped(agent, cwd, &[])
+    }
+
+    /// Like `spawn`, with `strip` removed from the adapter's environment
+    /// too, whoever set them (plan 9d B6: a forget's adapter).
+    pub fn spawn_stripped(agent: &AgentCommand, cwd: &Path, strip: &[&str]) -> std::io::Result<(Self, AdapterIo)> {
         // Read before the fork: getrlimit is not async-signal-safe.
         let limit = fd_limit();
         let mut guard = spawn_guard(limit)?;
@@ -192,7 +198,12 @@ impl Adapter {
             .kill_on_drop(true);
         // After `envs`: a secret is stripped even if the agent's own
         // configuration names it.
-        for var in NESTING_VARS.iter().chain(HOST_SECRET_VARS).chain(HOST_LOG_VARS) {
+        for var in NESTING_VARS
+            .iter()
+            .chain(HOST_SECRET_VARS)
+            .chain(HOST_LOG_VARS)
+            .chain(strip)
+        {
             command.env_remove(var);
         }
         // SAFETY: the closure runs in the forked child before `exec` and

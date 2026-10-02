@@ -14,6 +14,7 @@ pub mod projects;
 pub mod runtime;
 pub mod session;
 pub mod uplink;
+pub mod walk;
 
 pub use adapter::AgentCommand;
 pub use connection::{HostConfig, run, run_until};
