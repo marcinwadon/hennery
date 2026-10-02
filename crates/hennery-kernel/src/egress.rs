@@ -571,7 +571,8 @@ mod tests {
         }
     }
 
-    /// Plan 8b (e): https, or http to loopback.
+    /// Plan 8b (e): https, or http to loopback; under `PublicOnly`, plain
+    /// http to anything else is refused by its scheme.
     #[test]
     fn plain_http_only_to_loopback() {
         for url in [
@@ -582,15 +583,26 @@ mod tests {
         ] {
             let parsed = Url::parse(url).unwrap();
             assert_eq!(check_url(&parsed, Allowance::InternalNetwork), Ok(()), "{url}");
+            // Loopback passes the scheme rule under `PublicOnly` too (its
+            // address is what refuses it there).
+            assert!(
+                !matches!(check_url(&parsed, Allowance::PublicOnly), Err(Refused::Scheme(_))),
+                "{url}"
+            );
         }
         for url in [
             "http://example.com/",
             "http://10.0.0.1/",
             "http://localhost.example.com/",
             "http://8.8.8.8/",
-            "ws://localhost/",
-            "file:///etc/passwd",
         ] {
+            let parsed = Url::parse(url).unwrap();
+            assert!(
+                matches!(check_url(&parsed, Allowance::PublicOnly), Err(Refused::Scheme(_))),
+                "{url}"
+            );
+        }
+        for url in ["ws://localhost/", "ws://10.0.0.1/", "file:///etc/passwd"] {
             let parsed = Url::parse(url).unwrap();
             for allowance in [Allowance::PublicOnly, Allowance::InternalNetwork] {
                 assert!(
@@ -601,27 +613,211 @@ mod tests {
         }
     }
 
+    /// Plan 8b-ii: under `InternalNetwork`, plain `http` may go to an
+    /// internal literal — every internal range, at its edges — or to a
+    /// name (the internal-only client's resolver checks it). A public
+    /// literal, or one that is neither public nor internal, stays `https`
+    /// only. Under `PublicOnly` nothing changes.
+    #[test]
+    fn plain_http_under_internal_network_only_to_internal_addresses() {
+        for url in [
+            "http://10.0.0.1/",
+            "http://10.255.255.254/",
+            "http://127.0.0.2/",
+            "http://127.255.255.254/",
+            "http://172.16.0.1/",
+            "http://172.31.255.254/",
+            "http://192.168.0.1/",
+            "http://192.168.255.254/",
+            "http://[::1]/",
+            "http://[fc00::1]/",
+            "http://[fdff:ffff::1]/",
+            "http://[fd00:ec2::253]/",
+            "http://[fd00:ec2::255]/",
+            "http://nas.lan/",
+            "http://example.com/",
+        ] {
+            let parsed = Url::parse(url).unwrap();
+            assert_eq!(check_url(&parsed, Allowance::InternalNetwork), Ok(()), "{url}");
+            if !is_loopback_host(&parsed) {
+                assert_eq!(
+                    check_url(&parsed, Allowance::PublicOnly),
+                    Err(Refused::Scheme("http".into())),
+                    "{url}"
+                );
+            }
+        }
+        for url in [
+            "http://8.8.8.8/",
+            "http://9.255.255.255/",
+            "http://11.0.0.0/",
+            "http://126.255.255.255/",
+            "http://128.0.0.0/",
+            "http://100.64.0.1/",
+            "http://100.100.100.200/",
+            "http://169.254.169.254/",
+            "http://169.254.0.1/",
+            "http://[fd00:ec2::254]/",
+            "http://172.15.255.255/",
+            "http://172.32.0.0/",
+            "http://192.167.255.255/",
+            "http://192.169.0.0/",
+            "http://0.0.0.0/",
+            "http://192.0.2.1/",
+            "http://198.18.0.1/",
+            "http://224.0.0.1/",
+            "http://255.255.255.255/",
+            "http://[2606:4700:4700::1111]/",
+            "http://[::]/",
+            "http://[::2]/",
+            "http://[fbff:ffff::1]/",
+            "http://[fe00::]/",
+            "http://[fe80::1]/",
+            "http://[fec0::1]/",
+            "http://[ff02::1]/",
+            "http://[::ffff:10.0.0.1]/",
+            "http://[::ffff:8.8.8.8]/",
+            "http://[64:ff9b::a00:1]/",
+            "http://[2002:a00:1::1]/",
+            "http://[2001:0:4136:e378:8000:63bf:3fff:fdd2]/",
+        ] {
+            let parsed = Url::parse(url).unwrap();
+            for allowance in [Allowance::PublicOnly, Allowance::InternalNetwork] {
+                assert_eq!(
+                    check_url(&parsed, allowance),
+                    Err(Refused::Scheme("http".into())),
+                    "{url} {allowance:?}"
+                );
+            }
+        }
+        // Everything else a public-only request may not carry, it still may not.
+        for (url, refusal) in [
+            ("http://user@10.0.0.1/", Refused::Credentials),
+            ("http://user:secret@nas.lan/", Refused::Credentials),
+            ("ws://10.0.0.1/", Refused::Scheme("ws".into())),
+            ("ftp://nas.lan/", Refused::Scheme("ftp".into())),
+        ] {
+            let parsed = Url::parse(url).unwrap();
+            assert_eq!(check_url(&parsed, Allowance::InternalNetwork), Err(refusal), "{url}");
+        }
+    }
+
+    /// Plan 8b-ii: the internal-only client's resolver refuses a name with
+    /// **any** address that is not internal, public or not, in any order.
+    #[test]
+    fn a_name_for_plain_http_needs_every_address_internal() {
+        let lan: SocketAddr = "192.168.1.10:0".parse().unwrap();
+        let ula: SocketAddr = "[fd12:3456::1]:0".parse().unwrap();
+        let public: SocketAddr = "93.184.215.14:0".parse().unwrap();
+        let doc: SocketAddr = "192.0.2.1:0".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:10.0.0.1]:0".parse().unwrap();
+        let metadata: SocketAddr = "[fd00:ec2::254]:0".parse().unwrap();
+        assert_eq!(checked("nas.lan", vec![lan, ula], Reach::Internal), Ok(vec![lan, ula]));
+        for addrs in [
+            vec![public],
+            vec![lan, public],
+            vec![public, lan],
+            vec![lan, doc],
+            vec![lan, mapped],
+            vec![ula, metadata],
+            vec![metadata],
+        ] {
+            let Err(Refused::Resolved { host, addr }) = checked("nas.lan", addrs.clone(), Reach::Internal) else {
+                panic!("{addrs:?} was not refused");
+            };
+            assert_eq!(host, "nas.lan");
+            assert!(!is_internal(addr), "{addr}");
+        }
+    }
+
+    /// A lookup table standing in for the system resolver.
+    fn table(host: String) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>> {
+        Box::pin(async move {
+            let addrs: &[&str] = match host.as_str() {
+                "lan.test" => &["127.0.0.1:0"],
+                "mixed.test" => &["127.0.0.1:0", "192.0.2.1:0"],
+                "public.test" => &["192.0.2.1:0"],
+                _ => return Err(std::io::Error::other("no such name")),
+            };
+            Ok(addrs.iter().map(|addr| addr.parse().unwrap()).collect())
+        })
+    }
+
+    /// Plan 8b-ii: under `InternalNetwork`, plain `http` to a name goes
+    /// through the internal-only client: a name whose addresses are all
+    /// internal connects, one with any other address is refused and nothing
+    /// connects; `https` does not go through it. (Names come from `table`,
+    /// whose other address is a documentation one, never connected to; the
+    /// listener is on loopback, which is internal.)
+    #[tokio::test]
+    async fn plain_http_to_a_name_reaches_only_internal_addresses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = accepted.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                        .await;
+                });
+            }
+        });
+        let timeouts = Timeouts {
+            connect: Duration::from_secs(2),
+            request: Duration::from_secs(5),
+        };
+        let client = EgressClient::build_with(Allowance::InternalNetwork, timeouts, table).unwrap();
+        let get = |host: &str| Request::new(Method::GET, Url::parse(&format!("http://{host}:{port}/x")).unwrap());
+        let response = client.send(get("lan.test")).await.unwrap();
+        assert_eq!(response.text().await.unwrap(), "ok");
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        for host in ["mixed.test", "public.test"] {
+            for streaming in [false, true] {
+                let sent = if streaming {
+                    client.send_streaming(get(host)).await
+                } else {
+                    client.send(get(host)).await
+                };
+                let Err(EgressError::Refused(Refused::Resolved { addr, .. })) = sent else {
+                    panic!("{host}: {sent:?}");
+                };
+                assert_eq!(addr, "192.0.2.1".parse::<IpAddr>().unwrap());
+            }
+        }
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "a refused name connected");
+        // `https` under `InternalNetwork` keeps the client that reaches any
+        // address: `mixed.test` connects (and fails the TLS handshake with
+        // the plain listener), rather than being refused.
+        let https = Request::new(
+            Method::GET,
+            Url::parse(&format!("https://mixed.test:{port}/x")).unwrap(),
+        );
+        let sent = client.send(https).await;
+        assert!(matches!(sent, Err(EgressError::Http(_))), "{sent:?}");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2, "https did not connect");
+    }
+
     /// Plan 8b (d): refuse, not filter: one inward record refuses the name.
     #[test]
     fn a_name_with_any_non_public_address_is_refused() {
         let public: SocketAddr = "93.184.215.14:0".parse().unwrap();
         let private: SocketAddr = "10.0.0.1:0".parse().unwrap();
         let mapped: SocketAddr = "[::ffff:127.0.0.1]:0".parse().unwrap();
-        assert_eq!(
-            checked("example.com", vec![public], Allowance::PublicOnly),
-            Ok(vec![public])
-        );
+        assert_eq!(checked("example.com", vec![public], Reach::Public), Ok(vec![public]));
         for addrs in [vec![public, private], vec![private, public], vec![public, mapped]] {
-            let Err(Refused::Resolved { host, addr }) = checked("example.com", addrs.clone(), Allowance::PublicOnly)
-            else {
+            let Err(Refused::Resolved { host, addr }) = checked("example.com", addrs.clone(), Reach::Public) else {
                 panic!("{addrs:?} was not refused");
             };
             assert_eq!(host, "example.com");
             assert!(!is_public(addr));
-            assert_eq!(
-                checked("example.com", addrs.clone(), Allowance::InternalNetwork),
-                Ok(addrs)
-            );
+            assert_eq!(checked("example.com", addrs.clone(), Reach::Any), Ok(addrs));
         }
     }
 
@@ -630,17 +826,31 @@ mod tests {
     /// machine.
     #[tokio::test]
     async fn localhost_is_loopback_without_a_lookup() {
-        let resolver = CheckedResolver {
-            allowance: Allowance::InternalNetwork,
-        };
-        for name in ["localhost", "localhost.", "LocalHost."] {
-            let addrs: Vec<SocketAddr> = resolver.resolve(name.parse().unwrap()).await.unwrap().collect();
-            assert_eq!(addrs, LOCALHOST.to_vec(), "{name}");
+        fn no_lookup(host: String) -> Pin<Box<dyn Future<Output = std::io::Result<Vec<SocketAddr>>> + Send>> {
+            panic!("{host} was looked up")
+        }
+        for reach in [Reach::Any, Reach::Internal, Reach::Public] {
+            let resolver = CheckedResolver {
+                reach,
+                system: no_lookup,
+            };
+            for name in ["localhost", "localhost.", "LocalHost."] {
+                match resolver.resolve(name.parse().unwrap()).await {
+                    Ok(addrs) => {
+                        assert_ne!(reach, Reach::Public, "{name}");
+                        assert_eq!(addrs.collect::<Vec<_>>(), LOCALHOST.to_vec(), "{name}");
+                    }
+                    Err(err) => {
+                        assert_eq!(reach, Reach::Public, "{name}: {err}");
+                        assert!(err.downcast_ref::<Refused>().is_some(), "{name}: {err}");
+                    }
+                }
+            }
         }
         assert!(!is_localhost("localhost.example.com"));
         assert!(!is_localhost("foo.localhost"));
         // And under `PublicOnly`, loopback is refused like any inward answer.
-        let Err(Refused::Resolved { .. }) = checked("localhost", LOCALHOST.to_vec(), Allowance::PublicOnly) else {
+        let Err(Refused::Resolved { .. }) = checked("localhost", LOCALHOST.to_vec(), Reach::Public) else {
             panic!("localhost was not refused");
         };
     }
