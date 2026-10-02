@@ -390,6 +390,11 @@ use it without depending on the gateway:
   IPv6 and other non-public ranges are refused — unless the operator has marked
   the connection **"internal network"**, which allows them for that connection
   only. Web Push endpoints are always public-only.
+- The upstream URL is `https`, or plain `http` to loopback; a connection
+  marked "internal network" may also use plain `http` to an internal address
+  (RFC 1918, loopback, unique-local IPv6), never to a public one
+  (the operator's decision of 2026-10-02; kernel §7.1). §4's OAuth URLs stay
+  `https` (loopback `http` allowed) even then.
 - Per connection, a cap on concurrent upstream requests and on idle streaming
   responses; beyond it the proxy answers 503.
 

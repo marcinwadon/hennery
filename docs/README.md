@@ -93,6 +93,7 @@ Every open design decision is resolved; the specs carry the details.
 | 6c | Multiple listeners | Supported; browser access stays bound to `public_url` | kernel §7 |
 | 6d | Static-token header | Header name plus optional value prefix | gateway §1 |
 | 6e | Windowing threshold, vendor token behaviour, `GET` SSE | Measured once the code exists | frontend §15, gateway §13 |
+| 7 | Plain `http` to a LAN MCP server (operator, 2026-10-02) | Only for a connection marked "internal network", and only to internal addresses; a public address stays `https` only | kernel §7.1, gateway §5.7 |
 
 ---
 
