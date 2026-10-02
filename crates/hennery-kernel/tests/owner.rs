@@ -213,6 +213,8 @@ fn a_3b_ii_database_keeps_its_owner_or_gets_one() {
                 expected.insert("default_hat_id".into(), Value::Text(default_hat.clone()));
                 // Plan 6c's migration: no roots until a host reports some.
                 expected.insert("workspace_roots".into(), Value::Text("[]".into()));
+                // Plan 8e's: no MCP isolation until a `hello` reports it.
+                expected.insert("mcp_isolation".into(), Value::Null);
             }
             assert_eq!(named_rows(&conn, table), vec![expected], "{table}");
         }

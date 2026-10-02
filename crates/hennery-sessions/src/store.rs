@@ -9,21 +9,25 @@
 
 use crate::content::{Checked, Image};
 use anyhow::{Context, Result};
+use hennery_gateway::revocation::Cut;
+use hennery_gateway::session::{NoSessionMcp, SessionMcp, SessionRef};
 use hennery_proto::frames::{
     AgentHome, AttachedSession, CollectorFrame, ConfigValue, ElicitationAction, ForgetKind, ForgetReason, Indexed,
-    ParkReason, PendingKind, PendingReason, PendingResolution, SessionBody, SessionConfig, TurnOutcome,
+    McpIsolation, McpServer, ParkReason, PendingKind, PendingReason, PendingResolution, SessionBody, SessionConfig,
+    TurnOutcome,
 };
 use hennery_proto::rest::{
-    AnswerRequest, AttachmentUsage, BRANCH_MAX_CHARS, BRANCH_MAX_JSON_BYTES, EventDto, HostRemovalState, PendingItem,
-    PendingState, RemovalItem, RemovalState, SessionCatalog, SessionItem, SessionPage, TITLE_MAX_CHARS,
-    TITLE_MAX_JSON_BYTES, TranscriptRemoval, json_char_width,
+    AnswerRequest, AttachmentUsage, BRANCH_MAX_CHARS, BRANCH_MAX_JSON_BYTES, EventDto, HostRemovalState,
+    McpSessionDelivery, McpSessionDeliveryMode, PendingItem, PendingState, RemovalItem, RemovalState, SessionCatalog,
+    SessionItem, SessionPage, TITLE_MAX_CHARS, TITLE_MAX_JSON_BYTES, TranscriptRemoval, json_char_width,
+    mcp_session_delivery,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 const MIGRATIONS: &[&str] = &[
@@ -309,6 +313,15 @@ const MIGRATIONS: &[&str] = &[
     "
     ALTER TABLE host_forgets ADD COLUMN app_server_timeouts INTEGER NOT NULL DEFAULT 0;
 ",
+    // Plan 8e decision E10: what the session's latest start or resume was
+    // given of the gateway, for its detail: the mode, how many servers,
+    // when. Never a server, a header or a token. `NULL` until a start or
+    // resume since plan 8e.
+    "
+    ALTER TABLE sessions ADD COLUMN mcp_delivery_mode TEXT;
+    ALTER TABLE sessions ADD COLUMN mcp_delivery_servers INTEGER;
+    ALTER TABLE sessions ADD COLUMN mcp_delivery_at TEXT;
+",
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records
@@ -564,6 +577,8 @@ pub enum ResumeRequest {
         committed_seq: u64,
         /// The stored config, re-applied by the host after the load.
         config: SessionConfig,
+        /// Its MCP servers, with a fresh token (plan 8e).
+        mcp: McpGiven,
     },
     /// Refused: the session is `starting` or `active` (this lifecycle).
     Busy(String),
@@ -683,6 +698,65 @@ pub struct Store {
     /// The checkpoint a delete owes (plan 9a A8); an in-memory store has
     /// none.
     checkpoints: Option<Arc<Checkpoints>>,
+    /// The gateway, as sessions reach it (umbrella §9, ACP core §1): handed
+    /// every start's, resume's and revoke's transaction (lane L1). None
+    /// (`NoSessionMcp` stands in) until the collector sets it
+    /// (`set_session_mcp`).
+    mcp: RwLock<Option<Arc<dyn SessionMcp>>>,
+}
+
+/// What the start or resume route read of the host for the delivery
+/// decision (umbrella §8.5, lane L2), outside the store: from the hub, the
+/// host's live connection; from the kernel, whether its rules name another
+/// hat. The rest (the host's default hat, its live sessions' hats) is read
+/// in the transition's own transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpContext {
+    /// The connection announced `mcp_servers`.
+    pub capable: bool,
+    /// How it isolates the session's agent.
+    pub isolation: McpIsolation,
+    /// `Hosts::rules_name_other_hats`.
+    pub rules_name_other_hats: bool,
+}
+
+impl McpContext {
+    /// A host that takes no servers: what a store without a gateway, or a
+    /// host that is not connected, decides.
+    pub const NONE: Self = Self {
+        capable: false,
+        isolation: McpIsolation::None,
+        rules_name_other_hats: false,
+    };
+}
+
+/// What a start or resume was given (plan 8e): its servers, for its frame
+/// and nowhere else, and the mode, for `isolation_waived`.
+#[derive(Clone, PartialEq)]
+pub struct McpGiven {
+    pub mode: McpSessionDeliveryMode,
+    pub servers: Vec<McpServer>,
+}
+
+impl McpGiven {
+    /// The frame's MCP part: `isolation_waived` only for the default hat of
+    /// a host that cannot isolate the agent (plan 8c's hand-off).
+    pub fn frame(self) -> hennery_proto::frames::McpDelivery {
+        hennery_proto::frames::McpDelivery {
+            isolation_waived: self.mode == McpSessionDeliveryMode::Unisolated,
+            mcp_servers: self.servers,
+        }
+    }
+}
+
+// By hand: the servers carry the session's token and stdio values.
+impl std::fmt::Debug for McpGiven {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpGiven")
+            .field("mode", &self.mode)
+            .field("servers", &self.servers)
+            .finish()
+    }
 }
 
 /// What one sweep removed (plan 9b): the owner's rows nothing of theirs
@@ -936,9 +1010,20 @@ fn fact_applies(tx: &Transaction<'_>, owner: &str, session_id: &str, turn_id: Op
     Ok(state.as_deref() == Some("started"))
 }
 
-/// `Store::close_now`'s body, inside the caller's transaction. A tombstone
-/// is left alone (plan 9a A1).
-fn close_in(tx: &Transaction<'_>, owner: &str, session_id: &str) -> Result<Vec<EventDto>> {
+/// `Store::close_now`'s body, inside the caller's transaction, with the
+/// session's token revoked there too (lane L4): the cut is the caller's to
+/// make once it commits. A tombstone is left alone (plan 9a A1).
+fn close_in(tx: &Transaction<'_>, owner: &str, mcp: &dyn SessionMcp, session_id: &str) -> Result<(Vec<EventDto>, Cut)> {
+    let events = close_session_in(tx, owner, session_id)?;
+    // Whether or not this closed it: a closed session's token is revoked
+    // already, so this is a no-op then, never a fresh token's revoke (a
+    // resume moves the row to `starting` first, in its own transaction).
+    let cut = mcp.revoke_in(tx, session_id)?;
+    Ok((events, cut))
+}
+
+/// Closes the session, if it is not closed already: the events that wrote.
+fn close_session_in(tx: &Transaction<'_>, owner: &str, session_id: &str) -> Result<Vec<EventDto>> {
     let row: Option<(String, bool, Option<String>)> = tx
         .query_row(
             "SELECT lifecycle, close_requested, open_turn_id FROM sessions
@@ -1756,7 +1841,34 @@ impl Store {
             owner,
             attachments,
             checkpoints,
+            mcp: RwLock::new(None),
         })
+    }
+
+    /// The gateway, on the same `hennery.db` (the collector sets it before
+    /// it serves; plan 8e).
+    pub fn set_session_mcp(&self, mcp: Arc<dyn SessionMcp>) {
+        *self.mcp.write().expect("session mcp lock") = Some(mcp);
+    }
+
+    /// Whether the gateway is set (the collector's wiring test).
+    pub fn has_session_mcp(&self) -> bool {
+        self.mcp.read().expect("session mcp lock").is_some()
+    }
+
+    /// The gateway's part of a hat's purge (lane L6): through the gateway
+    /// this store was given, so a store without one has none to purge.
+    pub fn purge_gateway_hat(&self, hat_id: &str) -> Result<()> {
+        self.mcp().purge_hat(hat_id)
+    }
+
+    /// The gateway, or the stand-in that gives nothing.
+    pub(crate) fn mcp(&self) -> Arc<dyn SessionMcp> {
+        self.mcp
+            .read()
+            .expect("session mcp lock")
+            .clone()
+            .unwrap_or_else(|| Arc::new(NoSessionMcp))
     }
 
     /// How a checkpoint a reader holds up is retried (plan 9a A8), for the
@@ -1776,11 +1888,8 @@ impl Store {
         &self.owner
     }
 
-    /// A new session, `starting`, in `hat_id` as `rule_id` decided (none:
-    /// its host's default hat). `cwd` is canonical on its host. `false`,
-    /// and nothing stored, if the hat is frozen for its purge: the start
-    /// resolved its hat before the freeze (plan 9c decision 10c). One
-    /// statement, so the check and the insert cannot be told apart.
+    /// `create_session_with_mcp` for a host that takes no MCP servers: what
+    /// the store's own tests start. `false` where that answers `None`.
     pub fn create_session(
         &self,
         id: &str,
@@ -1790,37 +1899,174 @@ impl Store {
         hat_id: &str,
         rule_id: Option<&str>,
     ) -> Result<bool> {
+        Ok(self
+            .create_session_with_mcp(id, host_id, agent, cwd, hat_id, rule_id, McpContext::NONE)?
+            .is_some())
+    }
+
+    /// A new session, `starting`, in `hat_id` as `rule_id` decided (none:
+    /// its host's default hat). `cwd` is canonical on its host. `None`, and
+    /// nothing stored, if the hat is frozen for its purge: the start
+    /// resolved its hat before the freeze (plan 9c decision 10c); the check
+    /// and the insert are one statement. In the same transaction (lane L1):
+    /// the delivery decision and the session's MCP servers, its token
+    /// minted, so a failed mint stores no session.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_session_with_mcp(
+        &self,
+        id: &str,
+        host_id: &str,
+        agent: &str,
+        cwd: &str,
+        hat_id: &str,
+        rule_id: Option<&str>,
+        mcp: McpContext,
+    ) -> Result<Option<McpGiven>> {
         let ts = now();
-        let created = self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let created = tx.execute(
             "INSERT INTO sessions(id, host_id, agent, cwd, hat_id, hat_rule_id, lifecycle, created_at, last_event_at,
                                   owner_id)
              SELECT ?1, ?2, ?3, ?4, ?5, ?6, 'starting', ?7, ?7, ?8
              WHERE NOT EXISTS (SELECT 1 FROM purged_hats WHERE hat_id = ?5 AND owner_id = ?8)",
             params![id, host_id, agent, cwd, hat_id, rule_id, ts, self.owner],
         )?;
-        Ok(created == 1)
+        if created == 0 {
+            return Ok(None);
+        }
+        // A fresh id had no token before this one: nothing to cut.
+        let (given, _superseded) = self.deliver_in(&tx, id, host_id, hat_id, mcp, &ts)?;
+        tx.commit()?;
+        Ok(Some(given))
     }
 
-    /// Fail a session's start; a tombstone is left alone (plan 9a A1).
+    /// The delivery decision (umbrella §8.5, lane L2) and the servers it
+    /// gives, inside a start's or resume's transaction, recorded on the
+    /// session (decision E10). The session is `starting` already, so it
+    /// counts itself in the mixedness: a session outside the default hat
+    /// always finds its host mixed.
+    fn deliver_in(
+        &self,
+        tx: &Transaction<'_>,
+        session_id: &str,
+        host_id: &str,
+        hat_id: &str,
+        mcp: McpContext,
+        ts: &str,
+    ) -> Result<(McpGiven, Cut)> {
+        // A host not in the registry (the store's own tests) has no default
+        // hat: then no session is in it.
+        let default_hat: String = tx
+            .query_row(
+                "SELECT default_hat_id FROM hosts WHERE id = ?1 AND owner_id = ?2",
+                [host_id, &self.owner],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or_default();
+        // One query on `sessions.hat_id` (lane L2): a live session of
+        // another hat than the default, this one included.
+        let other_hat_live: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sessions
+                 WHERE host_id = ?1 AND owner_id = ?2 AND hat_id <> ?3
+                     AND (lifecycle IN ('starting', 'active') OR presumed_parked = 1))",
+            params![host_id, self.owner, default_hat],
+            |r| r.get(0),
+        )?;
+        let mixed = mcp.rules_name_other_hats || other_hat_live;
+        let mode = mcp_session_delivery(mcp.capable, mcp.isolation, mixed, hat_id == default_hat);
+        let delivered = self.mcp().servers_in(
+            tx,
+            SessionRef {
+                session_id,
+                host_id,
+                hat_id,
+            },
+            mode,
+        )?;
+        tx.execute(
+            "UPDATE sessions SET mcp_delivery_mode = ?2, mcp_delivery_servers = ?3, mcp_delivery_at = ?4
+             WHERE id = ?1 AND owner_id = ?5",
+            params![
+                session_id,
+                mode.as_str(),
+                delivered.servers.len() as i64,
+                ts,
+                self.owner
+            ],
+        )?;
+        Ok((
+            McpGiven {
+                mode,
+                servers: delivered.servers,
+            },
+            delivered.cut,
+        ))
+    }
+
+    /// What the session's latest start or resume was given (decision
+    /// E10); `None` before one since plan 8e.
+    pub fn mcp_delivery(&self, id: &str) -> Result<Option<McpSessionDelivery>> {
+        let row: Option<(Option<String>, Option<i64>, Option<String>)> = self
+            .conn()
+            .query_row(
+                "SELECT mcp_delivery_mode, mcp_delivery_servers, mcp_delivery_at FROM sessions
+                 WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?2",
+                [id, &self.owner],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        Ok(match row {
+            Some((Some(mode), Some(servers), Some(at))) => Some(McpSessionDelivery {
+                mode: McpSessionDeliveryMode::parse(&mode).context("a stored delivery mode")?,
+                servers: u32::try_from(servers).context("a stored server count")?,
+                at,
+            }),
+            _ => None,
+        })
+    }
+
+    /// Fail a session's start; a tombstone is left alone (plan 9a A1). Its
+    /// token goes with it (lane L4).
     pub fn mark_failed(&self, id: &str, reason: &str) -> Result<()> {
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let failed = tx.execute(
             "UPDATE sessions SET lifecycle = 'failed', failure_reason = ?2
              WHERE id = ?1 AND lifecycle <> 'deleted' AND owner_id = ?3",
             params![id, reason, self.owner],
         )?;
+        let cut = if failed == 1 {
+            self.mcp().revoke_in(&tx, id)?
+        } else {
+            Cut::default()
+        };
+        tx.commit()?;
+        self.mcp().cut(cut);
         Ok(())
     }
 
     /// Like `mark_failed`, for a resume whose request failed: only a
-    /// session still `starting` is failed. Whatever moved it on while the
-    /// request was out (its `session_started`, a close, a newer resume's
-    /// outcome) is left as it is.
+    /// session still `starting` is failed, and only its token revoked.
+    /// Whatever moved it on while the request was out (its
+    /// `session_started`, a close, a newer resume's outcome) is left as it
+    /// is.
     pub fn mark_failed_if_starting(&self, id: &str, reason: &str) -> Result<()> {
-        self.conn().execute(
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let failed = tx.execute(
             "UPDATE sessions SET lifecycle = 'failed', failure_reason = ?2
              WHERE id = ?1 AND lifecycle = 'starting' AND owner_id = ?3",
             params![id, reason, self.owner],
         )?;
+        let cut = if failed == 1 {
+            self.mcp().revoke_in(&tx, id)?
+        } else {
+            Cut::default()
+        };
+        tx.commit()?;
+        self.mcp().cut(cut);
         Ok(())
     }
 
@@ -2539,11 +2785,13 @@ impl Store {
         let Some((lifecycle, presumed, host_id, hat_id, cwd, agent, agent_session_id, agent_home)) = row else {
             return Ok(Deletion::NotFound);
         };
+        let mcp = self.mcp();
+        let mut cut = Cut::default();
         let mut unconfirmed = false;
         if lifecycle != "closed" {
             match unattached {
                 Some(judged) if judged.lifecycle == lifecycle && judged.presumed_parked == presumed => {
-                    close_in(&tx, &self.owner, session_id)?;
+                    cut = close_in(&tx, &self.owner, mcp.as_ref(), session_id)?.1;
                     // Only its host can still run it: presumed parked, or
                     // starting or active on a host the route cannot reach.
                     unconfirmed = presumed || matches!(lifecycle.as_str(), "starting" | "active");
@@ -2622,15 +2870,19 @@ impl Store {
             "UPDATE sessions SET lifecycle = 'deleted', cwd = '', agent = '', title = NULL, git_branch = NULL,
                  git_dirty = NULL, git_worktree = NULL, base_commit = NULL, model = NULL, mode = NULL,
                  config_axes = NULL, agent_session_id = NULL, failure_reason = NULL, hat_rule_id = NULL,
-                 open_turn_id = NULL, activity = NULL, presumed_parked = 0, close_requested = 0, agent_home = NULL
+                 open_turn_id = NULL, activity = NULL, presumed_parked = 0, close_requested = 0, agent_home = NULL,
+                 mcp_delivery_mode = NULL, mcp_delivery_servers = NULL, mcp_delivery_at = NULL
              WHERE id = ?1 AND owner_id = ?2",
             [session_id, &self.owner],
         )?;
         // Read in this transaction; an event without its tombstone would be
         // worse than an error.
         anyhow::ensure!(scrubbed == 1, "tombstoning {session_id} changed {scrubbed} rows");
+        // Its token, in this transaction (lane L4; the purge lane's marker):
+        // a parked or failed session's is revoked already, a no-op then.
+        let cut = cut.and(mcp.revoke_in(&tx, session_id)?);
         tx.commit()?;
-        // plan 8: revoke the session's gateway tokens here
+        mcp.cut(cut);
         self.remove_files(&conn, &dropped);
         Ok(Deletion::Done {
             event,
@@ -2763,8 +3015,10 @@ impl Store {
     pub fn close_now(&self, session_id: &str) -> Result<Vec<EventDto>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let events = close_in(&tx, &self.owner, session_id)?;
+        let mcp = self.mcp();
+        let (events, cut) = close_in(&tx, &self.owner, mcp.as_ref(), session_id)?;
         tx.commit()?;
+        mcp.cut(cut);
         Ok(events)
     }
 
@@ -2789,13 +3043,21 @@ impl Store {
             )
             .optional()?
             .unwrap_or(false);
-        let events = if still_requested {
-            close_in(&tx, &self.owner, session_id)?
+        let mcp = self.mcp();
+        let (events, cut) = if still_requested {
+            close_in(&tx, &self.owner, mcp.as_ref(), session_id)?
         } else {
-            Vec::new()
+            (Vec::new(), Cut::default())
         };
         tx.commit()?;
+        mcp.cut(cut);
         Ok(events)
+    }
+
+    /// `request_resume_with_mcp` for a host that takes no MCP servers: what
+    /// the store's own tests resume.
+    pub fn request_resume(&self, session_id: &str, hat_id: &str) -> Result<ResumeRequest> {
+        self.request_resume_with_mcp(session_id, hat_id, McpContext::NONE)
     }
 
     /// Move a `parked`, `closed` or `failed` session to `starting` for a
@@ -2804,8 +3066,11 @@ impl Store {
     /// concurrent resumes, the second sees `starting` and is refused (§12
     /// scenario 11), and a re-assignment that lands in between is seen. A
     /// turn still open (a database written before plan B) is released
-    /// first.
-    pub fn request_resume(&self, session_id: &str, hat_id: &str) -> Result<ResumeRequest> {
+    /// first. In the same transaction (lane L1): the delivery decision and
+    /// the session's MCP servers, a fresh token minted that supersedes the
+    /// one before (ACP core §4.3), so a failed mint leaves the session as
+    /// it was.
+    pub fn request_resume_with_mcp(&self, session_id: &str, hat_id: &str, mcp: McpContext) -> Result<ResumeRequest> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let row: Option<ResumeRow> = tx
@@ -2865,12 +3130,21 @@ impl Store {
             [session_id, &self.owner],
             |r| r.get(0),
         )?;
+        let host_id: String = tx.query_row(
+            "SELECT host_id FROM sessions WHERE id = ?1 AND owner_id = ?2",
+            [session_id, &self.owner],
+            |r| r.get(0),
+        )?;
+        let config = stored_config(config)?;
+        let (given, cut) = self.deliver_in(&tx, session_id, &host_id, &stored_hat, mcp, &ts)?;
         tx.commit()?;
+        self.mcp().cut(cut);
         Ok(ResumeRequest::Starting {
             events,
             agent_session_id,
             committed_seq: committed.unwrap_or(0) as u64,
-            config: stored_config(config)?,
+            config,
+            mcp: given,
         })
     }
 
@@ -2932,7 +3206,13 @@ impl Store {
             json!({ "from": from, "to": hat_id }),
             &now(),
         )?;
+        // A token's hat is fixed at its mint (plan 8d's O8): one still live
+        // would reach the old hat's connections. No adapter runs, so none
+        // should be; revoked here whatever a missed revoke left (lane L4).
+        let mcp = self.mcp();
+        let cut = mcp.revoke_in(&tx, session_id)?;
         tx.commit()?;
+        mcp.cut(cut);
         Ok(Reassign::Done(event))
     }
 
@@ -3093,7 +3373,13 @@ impl Store {
                 self.owner
             ],
         )?;
+        // Every token of the host, in this transaction (ACP core §4.8, lane
+        // L4): the proxy refuses a revoked host's tokens by its join anyway,
+        // but a token row must not outlive its host's revoke as live.
+        let mcp = self.mcp();
+        let cut = mcp.revoke_host_in(&tx, host_id)?;
         tx.commit()?;
+        mcp.cut(cut);
         Ok(events)
     }
 
@@ -3135,6 +3421,13 @@ impl Store {
     /// creates nothing and stores nothing, and is not an error (plan 9a
     /// decision 4, A1): the host's frame is acked, so it prunes its outbox.
     pub fn ingest_fact(&self, session_id: &str, seq: u64, body: &SessionBody) -> Result<Ingested> {
+        // Before anything reads it (plan 8e decision 11): a session token
+        // the agent printed is stored, compared, extracted and published
+        // only redacted.
+        let redacted = crate::redact::body(body)?;
+        let body = redacted.as_ref().unwrap_or(body);
+        let mcp = self.mcp();
+        let mut cut = Cut::default();
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         let lifecycle: Option<String> = tx
@@ -3248,6 +3541,11 @@ impl Store {
                 if changed == 0 {
                     created.clear();
                     mark_unapplied(&tx, &self.owner, fact_id)?;
+                } else {
+                    // The start that failed holds its token no more (lane
+                    // L4). Only when it applied: a late one must not end a
+                    // resume's fresh token.
+                    cut = mcp.revoke_in(&tx, session_id)?;
                 }
             }
             SessionBody::TurnStarted { turn_id, .. } => {
@@ -3382,6 +3680,8 @@ impl Store {
                         ParkReason::Idle | ParkReason::Operator => PendingReason::SessionParked,
                     };
                     created.extend(cancel_open_pending(&tx, &self.owner, session_id, reason, &ts)?);
+                    // Detached: its token is done (lane L4).
+                    cut = mcp.revoke_in(&tx, session_id)?;
                 }
             }
             SessionBody::SessionClosed => {
@@ -3404,6 +3704,8 @@ impl Store {
                         PendingReason::SessionClosed,
                         &ts,
                     )?);
+                    // Closed: its token is done (lane L4).
+                    cut = mcp.revoke_in(&tx, session_id)?;
                 }
             }
             SessionBody::AcpUpdate { indexed, .. } => {
@@ -3623,7 +3925,28 @@ impl Store {
             // `adapter_exited` is followed by the `session_parked` that
             // detaches; a `host_note` (e.g. `replay_unknown_dropped` after a
             // load) changes nothing.
-            SessionBody::AdapterExited { .. } | SessionBody::HostNote { .. } => {
+            SessionBody::AdapterExited { .. } => {
+                if !fact_applies(&tx, &self.owner, session_id, None)? {
+                    created.clear();
+                    mark_unapplied(&tx, &self.owner, fact_id)?;
+                } else {
+                    // The adapter of an attached session is gone, and its
+                    // token with it (lane L4), ahead of the `session_parked`
+                    // that follows. Not a `starting` one: its start's own
+                    // `start_failed` revokes, and a resume's fresh token is
+                    // not this adapter's.
+                    let attached: bool = tx.query_row(
+                        "SELECT lifecycle = 'active' OR presumed_parked = 1 FROM sessions
+                         WHERE id = ?1 AND owner_id = ?2",
+                        [session_id, &self.owner],
+                        |r| r.get(0),
+                    )?;
+                    if attached {
+                        cut = mcp.revoke_in(&tx, session_id)?;
+                    }
+                }
+            }
+            SessionBody::HostNote { .. } => {
                 if !fact_applies(&tx, &self.owner, session_id, None)? {
                     created.clear();
                     mark_unapplied(&tx, &self.owner, fact_id)?;
@@ -3661,6 +3984,7 @@ impl Store {
             None => None,
         };
         tx.commit()?;
+        mcp.cut(cut);
         Ok(Ingested { events: created, edge })
     }
 
@@ -3719,6 +4043,8 @@ impl Store {
             rows.collect::<rusqlite::Result<_>>()?
         };
         let mut out = Reconciliation::default();
+        let mcp = self.mcp();
+        let mut cut = Cut::default();
         for (id, lifecycle, open_turn, close_requested, presumed) in rows {
             let host = listed.get(id.as_str());
             // A presumed park was a guess made while the host was away: now
@@ -3740,6 +4066,8 @@ impl Store {
                          WHERE id = ?1 AND owner_id = ?2",
                         [&id, &self.owner],
                     )?;
+                    // Never started: its token goes with it (lane L4).
+                    cut = cut.and(mcp.revoke_in(&tx, &id)?);
                 }
                 ("active", _) => {
                     if host.is_none() {
@@ -3781,6 +4109,8 @@ impl Store {
                              WHERE id = ?1 AND owner_id = ?2",
                             [&id, &self.owner],
                         )?;
+                        // The restarted host runs no adapter of it (lane L4).
+                        cut = cut.and(mcp.revoke_in(&tx, &id)?);
                     } else if close_requested {
                         out.close.push(id);
                     }
@@ -3793,6 +4123,7 @@ impl Store {
             }
         }
         tx.commit()?;
+        mcp.cut(cut);
         Ok(out)
     }
 

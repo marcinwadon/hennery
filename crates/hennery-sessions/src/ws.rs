@@ -109,7 +109,7 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
     let (tx, mut rx) = mpsc::unbounded_channel::<CollectorFrame>();
     let Some(registration) = state
         .hub
-        .register(&host_id, tx.clone(), capabilities.clone(), mcp_isolation)
+        .register(&host_id, tx.clone(), capabilities.clone(), mcp_isolation.clone())
     else {
         let _ = sink
             .send(text(&reject(
@@ -158,6 +158,10 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
         .record_hello(&host_id, &host_version, &capabilities, unix_now())
     {
         tracing::warn!(%host_id, error = %err, "recording the host's hello failed");
+    }
+    // For the host list while it is away (plan 8e decision E7).
+    if let Err(err) = state.hosts.record_mcp_isolation(&host_id, &mcp_isolation) {
+        tracing::warn!(%host_id, error = %err, "recording the host's MCP isolation failed");
     }
     tracing::info!(%host_id, "host connected");
 
@@ -217,8 +221,17 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
         };
         let frame = match serde_json::from_str::<HostFrame>(&t) {
             Ok(f) => f,
+            // By the error's kind and place only: its text can quote a
+            // string of the frame, a token the agent printed say (plan 8e,
+            // as plan 8c did on the host).
             Err(err) => {
-                tracing::warn!(%host_id, error = %err, "ignoring unknown or invalid frame");
+                tracing::warn!(
+                    %host_id,
+                    kind = ?err.classify(),
+                    line = err.line(),
+                    column = err.column(),
+                    "ignoring unknown or invalid frame"
+                );
                 continue;
             }
         };
@@ -333,7 +346,7 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                             }
                         }
                     } else {
-                        tracing::warn!(%host_id, %session_id, %code, %message, "reconcile close_session rejected");
+                        tracing::warn!(%host_id, %session_id, %code, message = %crate::redact::shown(&message), "reconcile close_session rejected");
                     }
                 } else {
                     // Take the waiter first, so no timeout can answer it any
@@ -364,7 +377,7 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                         // No waiter: an answer (its verdict comes from
                         // `answer_result` or its question's resolution),
                         // or a request whose caller already gave up.
-                        tracing::warn!(%host_id, %request_id, %code, %message, "host refused a request nobody waits for");
+                        tracing::warn!(%host_id, %request_id, %code, message = %crate::redact::shown(&message), "host refused a request nobody waits for");
                     }
                 }
             }

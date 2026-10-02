@@ -596,7 +596,7 @@ fn purging_a_hat_deletes_its_connections_and_repeats_harmlessly() {
     }
     // The hat cannot go while it has connections (no cascade, L6).
     assert!(w.sql().execute("DELETE FROM hats WHERE id = ?1", [&work]).is_err());
-    w.store.purge_hat(&work).unwrap();
+    let _ = w.store.purge_hat(&work).unwrap();
     assert_eq!(w.store.connection(&gone).unwrap(), None);
     assert!(w.store.connection(&kept).unwrap().unwrap().has_credential);
     assert_eq!(
@@ -607,10 +607,10 @@ fn purging_a_hat_deletes_its_connections_and_repeats_harmlessly() {
         ),
         (1, 1, 1)
     );
-    w.store.purge_hat(&work).unwrap();
+    let _ = w.store.purge_hat(&work).unwrap();
     w.sql().execute("DELETE FROM hats WHERE id = ?1", [&work]).unwrap();
-    w.store.purge_hat(&work).unwrap();
-    w.store.purge_hat("hat-0000000000000000").unwrap();
+    let _ = w.store.purge_hat(&work).unwrap();
+    let _ = w.store.purge_hat("hat-0000000000000000").unwrap();
     assert_eq!(w.count("gw_connections"), 1);
 }
 
@@ -633,8 +633,9 @@ fn the_store_and_the_kernel_agree_on_the_owner_whichever_opens_first() {
             |r| r.get(0),
         )
         .unwrap();
-    // Plan 8a's tables, then plan 8d's session tokens.
-    assert_eq!(version, 2);
+    // Plan 8a's tables, then plan 8d's session tokens, then plan 8e's
+    // stdio servers.
+    assert_eq!(version, 3);
 }
 
 /// Plan 8a decision 19 (lane L11): a connection's `Debug` shows only its
