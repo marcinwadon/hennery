@@ -101,6 +101,9 @@ export interface SessionItemsSnapshot {
   /** A resync replaced the items a moment ago. */
   resynced: boolean
   catalog: SessionCatalog | null
+  /** First pages taken: bumped by the first load and by every resync (the
+   *  items were replaced). */
+  loads: number
 }
 
 const INITIAL: SessionItemsSnapshot = {
@@ -112,6 +115,7 @@ const INITIAL: SessionItemsSnapshot = {
   stream: 'connecting',
   resynced: false,
   catalog: null,
+  loads: 0,
 }
 
 /** `JSON.parse`, or `undefined` for text that is not JSON. */
@@ -252,6 +256,7 @@ export class SessionItemsController {
         loading: false,
         error: null,
         resynced: resync || this.snapshot.resynced,
+        loads: this.snapshot.loads + 1,
       })
       if (resync) {
         clearTimeout(this.resyncedTimer)

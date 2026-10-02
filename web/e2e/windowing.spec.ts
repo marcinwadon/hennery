@@ -11,13 +11,18 @@
 //   fails the run, so a login screen is never what gets timed.
 // - The session is the golden fixtures' items (both pinned adapters),
 //   repeated with fresh ids and turn ids until it holds N items, all in its
-//   first page. Its stream is held open and never sends.
-// - First render: from the page's response to two frames after the Nth item
-//   is in the DOM. Scrolling: 240 frames of 400 px each from the end, the
-//   gaps between frames and any long task, beside 240 frames standing still
-//   (the frame rate the browser keeps on this machine anyway). A row whose
-//   still frames are slower than about one frame (p95 > 20 ms) is marked
-//   not valid: the machine was busy.
+//   first page. Its stream is held open and never sends. The session list
+//   beside it holds that one session; its stream is held open too.
+// - First render: from the page's response to two frames after the window
+//   is in the DOM: the newest `TAIL` items and, past them, "Load earlier".
+// - Reveal: "Load earlier" clicked until none is left, each click timed
+//   from the click to two frames after its rows are in; the cost of
+//   showing every one of the N items, `TAIL` at a time.
+// - Scrolling, once all N rows are shown: 240 frames of 400 px each from
+//   the end, the gaps between frames and any long task, beside 240 frames
+//   standing still (the frame rate the browser keeps on this machine
+//   anyway). A row whose still frames are slower than about one frame
+//   (p95 > 20 ms) is marked not valid: the machine was busy.
 // - Run at the desktop's speed and with the CPU slowed 4× (a phone).
 //
 // A timing on a shared CI runner says little, so this runs only when asked:
@@ -38,6 +43,9 @@ const FIXTURES = resolve(process.cwd(), '../crates/hennery-view/tests/fixtures')
 const SIZES = [200, 500, 1000, 2000, 5000]
 const SCROLL_FRAMES = 240
 const SCROLL_STEP = 400
+/** The session view's window (`TAIL` in src/screens/Session.tsx): the first
+ *  render is checked against it, so a change there fails here. */
+const TAIL = 200
 const PIXEL = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
 
 type Raw = Record<string, unknown> & { id: string; turn_id?: string }
@@ -95,16 +103,18 @@ async function serve(page: Page, items: Raw[]): Promise<Served> {
     pending: [],
   }
   const page_ = JSON.stringify({ items, older: false, epoch: 'e1', revision: items.length })
+  const list = { sessions: [{ ...detail, pending: undefined, question_waits: false }], epoch: 'l1', revision: 1, waiting: 0 }
   await page.route(`${ORIGIN}/**`, async (route) => {
     const { pathname } = new URL(route.request().url())
     if (pathname.startsWith('/api/')) {
       if (pathname === '/api/capabilities') return json(route, { mode: 'full', features: [] })
       if (pathname === `/api/view/sessions/${ID}`)
         return route.fulfill({ status: 200, contentType: 'application/json', body: page_ })
-      if (pathname === `/api/stream/view/sessions/${ID}`) {
+      if (pathname === `/api/stream/view/sessions/${ID}` || pathname === '/api/stream/sessions') {
         held.push(route)
         return
       }
+      if (pathname === '/api/view/sessions') return json(route, list)
       if (pathname === `/api/sessions/${ID}`) return json(route, detail)
       if (pathname === `/api/sessions/${ID}/catalog`) return json(route, { session_id: ID, config_options: [], commands: [] })
       if (pathname === '/api/hosts') return json(route, [{ host_id: 'h1', name: 'build-box' }])
@@ -129,7 +139,8 @@ async function serve(page: Page, items: Raw[]): Promise<Served> {
 }
 
 /** Installed before the app: the time the page's response came, the time
- *  the Nth item was painted, and every long task. */
+ *  the `want`th child of the transcript (its window, and "Load earlier"
+ *  past `TAIL`) was painted, and every long task. */
 function probe(want: number) {
   const m = { longtasks: [] as [number, number][], t0: 0, t1: 0 }
   ;(window as unknown as { __m: typeof m }).__m = m
@@ -152,6 +163,46 @@ function probe(want: number) {
     requestAnimationFrame(tick)
   }
   requestAnimationFrame(tick)
+}
+
+/** "Load earlier" clicked until none is left: how long each click took to
+ *  paint its rows, and the long tasks meanwhile. */
+async function revealAll(page: Page) {
+  return page.evaluate(async () => {
+    const m = (window as unknown as { __m: { longtasks: [number, number][] } }).__m
+    const frame = () => new Promise<number>((r) => requestAnimationFrame(r))
+    const inner = document.querySelector('.transcript-inner') as HTMLElement
+    const rows = () => inner.querySelectorAll(':scope > :not(.load-earlier)').length
+    const clicks: number[] = []
+    const from = performance.now()
+    for (;;) {
+      const button = inner.querySelector('.load-earlier button') as HTMLButtonElement | null
+      if (!button) break
+      const before = rows()
+      const t = performance.now()
+      button.click()
+      // More rows, or a reveal the scroll handler made itself: either way
+      // the count grows. 600 frames without one is a failure.
+      for (let i = 0; rows() <= before; i++) {
+        if (i === 600) throw new Error(`"Load earlier" showed nothing more after ${before} rows`)
+        await frame()
+      }
+      await frame()
+      await frame()
+      clicks.push(performance.now() - t)
+    }
+    const to = performance.now()
+    const long = m.longtasks.filter(([start]) => start >= from && start <= to)
+    return {
+      clicks: clicks.length,
+      totalMs: to - from,
+      meanClickMs: clicks.length ? clicks.reduce((a, b) => a + b, 0) / clicks.length : 0,
+      maxClickMs: Math.max(0, ...clicks),
+      longTasks: long.length,
+      longestTaskMs: Math.max(0, ...long.map(([, d]) => d)),
+      rows: rows(),
+    }
+  })
 }
 
 async function scrollCost(page: Page) {
@@ -204,7 +255,8 @@ for (const slowdown of [1, 4]) {
           const cdp = await context.newCDPSession(page)
           await cdp.send('Emulation.setCPUThrottlingRate', { rate: slowdown })
         }
-        await page.addInitScript(probe, n)
+        const shown = Math.min(n, TAIL)
+        await page.addInitScript(probe, shown + (n > TAIL ? 1 : 0))
         await page.goto(`${ORIGIN}/sessions/${ID}`)
         await page.waitForFunction(() => (window as unknown as { __m: { t1: number } }).__m.t1 > 0, undefined, {
           timeout: 240_000,
@@ -220,12 +272,20 @@ for (const slowdown of [1, 4]) {
             heapMB: ((performance as unknown as { memory?: { usedJSHeapSize: number } }).memory?.usedJSHeapSize ?? 0) / 2 ** 20,
           }
         })
+        // The window: the newest TAIL rows, and "Load earlier" past them.
+        expect(await page.locator('.transcript-inner > :not(.load-earlier)').count()).toBe(shown)
+        expect(await page.locator('.transcript-inner > .load-earlier').count()).toBe(n > TAIL ? 1 : 0)
+        const reveal = await revealAll(page)
+        // Every row shown, `TAIL` at a time (a reveal the scroll handler
+        // made itself saves a click).
+        expect(reveal.rows).toBe(n)
+        expect(reveal.clicks).toBeLessThanOrEqual(Math.ceil((n - shown) / TAIL))
         const scroll = await scrollCost(page)
         expect(served.unanswered).toEqual([])
         expect(await page.locator('.transcript-inner > *').count()).toBe(n)
         // A row counts only if the browser kept its frame rate standing
         // still: else it measured the machine, not the transcript.
-        const row = { n, slowdown, load1: loadavg()[0], valid: scroll.still.p95 <= 20, ...first, scroll }
+        const row = { n, slowdown, load1: loadavg()[0], valid: scroll.still.p95 <= 20, ...first, reveal, scroll }
         console.log(`WINDOWING ${JSON.stringify(row)}`)
         test.info().annotations.push({ type: 'windowing', description: JSON.stringify(row) })
       } finally {
