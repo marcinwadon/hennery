@@ -13,7 +13,10 @@ use hennery_proto::frames::{
     AttachedSession, CollectorFrame, ConfigValue, ElicitationAction, Indexed, ParkReason, PendingKind, PendingReason,
     PendingResolution, SessionBody, SessionConfig, TurnOutcome,
 };
-use hennery_proto::rest::{AnswerRequest, AttachmentUsage, EventDto, PendingItem, PendingState, SessionCatalog};
+use hennery_proto::rest::{
+    AnswerRequest, AttachmentUsage, EventDto, PendingItem, PendingState, SessionCatalog, SessionItem, SessionPage,
+    TITLE_MAX_CHARS, TITLE_MAX_JSON_BYTES, json_char_width,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -156,6 +159,27 @@ const MIGRATIONS: &[&str] = &[
         FOREIGN KEY (owner_id, sha256) REFERENCES attachments(owner_id, sha256));
     CREATE INDEX event_attachments_by_image ON event_attachments(owner_id, sha256);
 ",
+    // The session list and its extracts (plan 6b, ACP core §8): the title
+    // and the git state the host reports, the session's recency (the list's
+    // sort key: the time and id of its last listed event), and the latest
+    // slash commands, off the list (P-23). Recency is rewritten to one
+    // fixed width, so text order is time order (decision 5); a value that
+    // is not a time is left as it is. The git columns are filled from
+    // `git_state` (6b-ii).
+    "
+    ALTER TABLE sessions ADD COLUMN title TEXT;
+    ALTER TABLE sessions ADD COLUMN git_branch TEXT;
+    ALTER TABLE sessions ADD COLUMN git_dirty INTEGER;
+    ALTER TABLE sessions ADD COLUMN git_worktree INTEGER;
+    ALTER TABLE sessions ADD COLUMN base_commit TEXT;
+    ALTER TABLE sessions ADD COLUMN last_event_id INTEGER;
+    ALTER TABLE session_catalog ADD COLUMN commands TEXT;
+    UPDATE sessions SET last_event_at = COALESCE(strftime('%Y-%m-%dT%H:%M:%fZ', last_event_at), last_event_at);
+    UPDATE sessions SET last_event_id = (
+        SELECT MAX(e.event_id) FROM events e
+        WHERE e.session_id = sessions.id AND e.applied = 1 AND e.owner_id = sessions.owner_id);
+    CREATE INDEX sessions_by_recency ON sessions(owner_id, last_event_at DESC, id DESC);
+",
 ];
 
 #[derive(Debug, Clone, PartialEq)]
@@ -177,6 +201,14 @@ pub struct SessionRow {
     /// The model, mode and other axes the host last reported as current;
     /// a resume re-applies them (ACP core §4.3).
     pub config: SessionConfig,
+    /// When the session's last listed event was written (`stamp`), or its
+    /// creation; the session list's sort key.
+    pub last_event_at: String,
+    /// That event's id; `None` until the session has one.
+    pub last_event_id: Option<i64>,
+    /// The title the agent last reported, on one line and capped (plan 6b
+    /// decision 1); `None` until it reports one, or once it clears it.
+    pub title: Option<String>,
 }
 
 /// The outcome of `Store::request_resume`.
@@ -250,10 +282,26 @@ pub struct Attachment {
     pub bytes: Vec<u8>,
 }
 
+/// `at` as RFC 3339 UTC with exactly three fractional digits
+/// (`2026-10-07T12:34:56.789Z`, truncated to the millisecond). Every stamp
+/// has the same width, so comparing two as text compares the times: the
+/// session list sorts on them (plan 6b decision 5). `time`'s own RFC 3339
+/// output trims trailing zeros, so `…:05.1Z` would sort after `…:05.12Z`.
+fn stamp(at: time::OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        at.year(),
+        u8::from(at.month()),
+        at.day(),
+        at.hour(),
+        at.minute(),
+        at.second(),
+        at.millisecond()
+    )
+}
+
 fn now() -> String {
-    time::OffsetDateTime::now_utc()
-        .format(&time::format_description::well_known::Rfc3339)
-        .expect("RFC 3339 formatting of the current time")
+    stamp(time::OffsetDateTime::now_utc())
 }
 
 /// Write a collector-originated event (`host_seq` NULL, ACP core §8), for
@@ -272,12 +320,13 @@ fn collector_event(
         params![session_id, kind, body.to_string(), ts, owner],
     )?;
     anyhow::ensure!(written == 1, "no session {session_id}");
+    let event_id = tx.last_insert_rowid();
     tx.execute(
-        "UPDATE sessions SET last_event_at = ?2 WHERE id = ?1 AND owner_id = ?3",
-        params![session_id, ts, owner],
+        "UPDATE sessions SET last_event_at = ?2, last_event_id = ?3 WHERE id = ?1 AND owner_id = ?4",
+        params![session_id, ts, event_id, owner],
     )?;
     Ok(EventDto {
-        event_id: tx.last_insert_rowid(),
+        event_id,
         session_id: session_id.to_string(),
         host_seq: None,
         kind: kind.to_string(),
@@ -494,6 +543,186 @@ fn store_catalogue(tx: &Transaction<'_>, owner: &str, session_id: &str, indexed:
         params![session_id, serde_json::to_string(&options)?, ts, owner],
     )?;
     Ok(())
+}
+
+/// `raw` as one line for the session list (plan 6b decision 1): bidi and
+/// zero-width characters dropped, every other control character a space,
+/// runs of whitespace one space and the ends trimmed; then cut, never
+/// inside a character, to `max_chars` characters and `max_json_bytes` bytes
+/// as JSON writes it. With control characters gone, only `"` and `\` are
+/// escaped, as two bytes each; a cap on the raw bytes would not hold, since
+/// JSON writes a control character as six. `None` when nothing is left.
+fn one_line(raw: &str, max_chars: usize, max_json_bytes: usize) -> Option<String> {
+    let spaced: String = raw
+        .chars()
+        .filter(|c| !hennery_proto::rest::is_hidden_format(*c))
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut out = String::new();
+    let (mut chars, mut bytes) = (0, 0);
+    for c in spaced.split_whitespace().collect::<Vec<_>>().join(" ").chars() {
+        let width = json_char_width(c);
+        if chars == max_chars || bytes + width > max_json_bytes {
+            break;
+        }
+        out.push(c);
+        chars += 1;
+        bytes += width;
+    }
+    let out = out.trim_end();
+    (!out.is_empty()).then(|| out.to_string())
+}
+
+/// Store the title and the commands a fact's extracts carry (ACP core §3.2,
+/// §7). The title goes on one line and is capped (decision 1); a title the
+/// adapter sent before the session was announced (`early`, replayed by a
+/// load) may be older than the stored one, so it only fills an empty title
+/// (decision 2). The commands replace the stored list, and never touch the
+/// config catalogue (decision 3).
+fn store_state(tx: &Transaction<'_>, owner: &str, session_id: &str, indexed: &Indexed, ts: &str) -> Result<()> {
+    if let Some(title) = indexed.title.as_deref() {
+        let title = one_line(title, TITLE_MAX_CHARS, TITLE_MAX_JSON_BYTES);
+        if !indexed.early {
+            tx.execute(
+                "UPDATE sessions SET title = ?2 WHERE id = ?1 AND owner_id = ?3",
+                params![session_id, title, owner],
+            )?;
+        } else if title.is_some() {
+            tx.execute(
+                "UPDATE sessions SET title = ?2 WHERE id = ?1 AND title IS NULL AND owner_id = ?3",
+                params![session_id, title, owner],
+            )?;
+        }
+    }
+    if let Some(commands) = &indexed.commands {
+        tx.execute(
+            "INSERT INTO session_catalog(session_id, config_options, commands, updated_at, owner_id)
+             VALUES (?1, '[]', ?2, ?3, ?4)
+             ON CONFLICT(session_id) DO UPDATE SET commands = excluded.commands, updated_at = excluded.updated_at
+                 WHERE session_catalog.owner_id = excluded.owner_id",
+            params![session_id, serde_json::to_string(commands)?, ts, owner],
+        )?;
+    }
+    Ok(())
+}
+
+/// The columns of a list item, in `read_item`'s order.
+const SESSION_ITEM_COLUMNS: &str = "id, host_id, agent, cwd, title, lifecycle, activity, failure_reason,
+     presumed_parked, git_branch, git_dirty, model, mode, created_at, last_event_at";
+
+/// A row of `SESSION_ITEM_COLUMNS` as a list item, as stored.
+fn read_item(r: &rusqlite::Row<'_>) -> rusqlite::Result<SessionItem> {
+    Ok(SessionItem {
+        session_id: r.get(0)?,
+        host_id: r.get(1)?,
+        agent: r.get(2)?,
+        cwd: r.get(3)?,
+        title: r.get(4)?,
+        lifecycle: r.get(5)?,
+        activity: r.get(6)?,
+        failure_reason: r.get(7)?,
+        presumed_parked: r.get(8)?,
+        git_branch: r.get(9)?,
+        git_dirty: r.get(10)?,
+        model: r.get(11)?,
+        mode: r.get(12)?,
+        created_at: r.get(13)?,
+        last_event_at: r.get(14)?,
+    })
+}
+
+/// Every lifecycle a session can be in (ACP core §4.2).
+pub const LIFECYCLES: [&str; 5] = ["starting", "active", "parked", "closed", "failed"];
+
+/// The session list's page size when none is asked for, and the largest
+/// it serves (plan 6b decision 8).
+pub const LIST_DEFAULT_LIMIT: u32 = 50;
+pub const LIST_MAX_LIMIT: u32 = 200;
+
+/// A position in the session list: the last item of a page, by its sort
+/// key (decision 8). It goes out opaque, as hex, and is a position only, so
+/// a cursor from another query is harmless.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cursor {
+    pub last_event_at: String,
+    pub session_id: String,
+}
+
+impl Cursor {
+    pub fn encode(&self) -> String {
+        hex::encode(format!("{}\n{}", self.last_event_at, self.session_id))
+    }
+
+    /// `None` for anything `encode` did not make: not hex, not UTF-8, no
+    /// separator, a part empty or longer than 64 bytes, or more than 256
+    /// characters in all (the review's O4).
+    pub fn decode(cursor: &str) -> Option<Self> {
+        if cursor.len() > 256 {
+            return None;
+        }
+        let text = String::from_utf8(hex::decode(cursor).ok()?).ok()?;
+        let (at, id) = text.split_once('\n')?;
+        let fits = |part: &str| (1..=64).contains(&part.len());
+        (fits(at) && fits(id)).then(|| Self {
+            last_event_at: at.to_string(),
+            session_id: id.to_string(),
+        })
+    }
+}
+
+/// What a page of the session list holds (ACP core §9; plan 6b decision 8).
+#[derive(Debug, Clone, Copy)]
+pub struct ListQuery<'a> {
+    /// Start after this position (the previous page's `next_cursor`).
+    pub after: Option<&'a Cursor>,
+    /// At most this many sessions, clamped to 1..=`LIST_MAX_LIMIT`.
+    pub limit: u32,
+    /// Only sessions in one of these lifecycles (names from `LIFECYCLES`);
+    /// all when `None`. Ignored while `search` is set (frontend §5).
+    pub lifecycles: Option<&'a [&'a str]>,
+    /// Only sessions whose title, cwd, branch or id holds this text.
+    pub search: Option<&'a str>,
+}
+
+impl Default for ListQuery<'_> {
+    fn default() -> Self {
+        Self {
+            after: None,
+            limit: LIST_DEFAULT_LIMIT,
+            lifecycles: None,
+            search: None,
+        }
+    }
+}
+
+/// `search` as a `LIKE` pattern that matches it anywhere, its `%`, `_` and
+/// `\` taken literally (`ESCAPE '\'`). SQLite's `LIKE` ignores case for
+/// ASCII letters only.
+fn like_pattern(search: &str) -> String {
+    let mut pattern = String::from("%");
+    for c in search.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    pattern.push('%');
+    pattern
+}
+
+/// The session list's one statement (decision 8): the owner's sessions
+/// after the cursor `(?2, ?3)`, in one of the lifecycles `?4`…`?8` (a NULL
+/// slot matches nothing), matching the pattern `?9` unless it is NULL, the
+/// newest `last_event_at` first and the id breaking ties, at most `?10`. It
+/// walks `sessions_by_recency` and sorts nothing (the review's A11).
+fn list_statement() -> String {
+    format!(
+        "SELECT {SESSION_ITEM_COLUMNS} FROM sessions
+         WHERE owner_id = ?1 AND (last_event_at, id) < (?2, ?3) AND lifecycle IN (?4, ?5, ?6, ?7, ?8)
+             AND (?9 IS NULL OR title LIKE ?9 ESCAPE '\\' OR cwd LIKE ?9 ESCAPE '\\'
+                  OR git_branch LIKE ?9 ESCAPE '\\' OR id LIKE ?9 ESCAPE '\\')
+         ORDER BY last_event_at DESC, id DESC LIMIT ?10"
+    )
 }
 
 /// A session's `model`, `mode` and `config_axes` columns.
@@ -786,7 +1015,7 @@ impl Store {
             .conn()
             .query_row(
                 "SELECT id, host_id, agent, cwd, lifecycle, activity, open_turn_id, failure_reason, close_requested,
-                        presumed_parked, model, mode, config_axes
+                        presumed_parked, model, mode, config_axes, last_event_at, last_event_id, title
                  FROM sessions WHERE id = ?1 AND owner_id = ?2",
                 [id, &self.owner],
                 |r| {
@@ -803,6 +1032,9 @@ impl Store {
                         close_requested: r.get(8)?,
                         presumed_parked: r.get(9)?,
                         config: SessionConfig::default(),
+                        last_event_at: r.get(13)?,
+                        last_event_id: r.get(14)?,
+                        title: r.get(15)?,
                     };
                     Ok((row, config))
                 },
@@ -815,29 +1047,96 @@ impl Store {
         Ok(Some(row))
     }
 
-    /// The session's config catalogue and current values (ACP core §9);
-    /// `None` for an unknown session, an empty catalogue for one whose
-    /// host has reported none.
-    pub fn catalog(&self, session_id: &str) -> Result<Option<SessionCatalog>> {
-        let row: Option<(ConfigColumns, Option<String>)> = self
+    /// One session as a list item, as stored (the detail's; the list serves
+    /// it `bounded`).
+    pub fn session_item(&self, id: &str) -> Result<Option<SessionItem>> {
+        Ok(self
             .conn()
             .query_row(
-                "SELECT s.model, s.mode, s.config_axes, c.config_options
+                &format!("SELECT {SESSION_ITEM_COLUMNS} FROM sessions WHERE id = ?1 AND owner_id = ?2"),
+                [id, &self.owner],
+                read_item,
+            )
+            .optional()?)
+    }
+
+    /// One page of the session list (ACP core §9; decision 8), each item
+    /// `bounded`, with where the next page starts if there is one.
+    pub fn list(&self, query: &ListQuery<'_>) -> Result<SessionPage> {
+        let limit = query.limit.clamp(1, LIST_MAX_LIMIT);
+        // A page with no cursor starts above every stamp.
+        let (at, id) = match query.after {
+            Some(cursor) => (cursor.last_event_at.as_str(), cursor.session_id.as_str()),
+            None => ("\u{10FFFF}", ""),
+        };
+        let pattern = query.search.map(like_pattern);
+        let slots: [Option<&str>; 5] = match query.lifecycles.filter(|_| pattern.is_none()) {
+            Some(named) => std::array::from_fn(|i| named.get(i).copied()),
+            None => LIFECYCLES.map(Some),
+        };
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&list_statement())?;
+        let rows = stmt.query_map(
+            params![
+                self.owner,
+                at,
+                id,
+                slots[0],
+                slots[1],
+                slots[2],
+                slots[3],
+                slots[4],
+                pattern,
+                limit + 1
+            ],
+            read_item,
+        )?;
+        let mut sessions = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+        let next_cursor = if sessions.len() > limit as usize {
+            sessions.truncate(limit as usize);
+            sessions.last().map(|last| {
+                Cursor {
+                    last_event_at: last.last_event_at.clone(),
+                    session_id: last.session_id.clone(),
+                }
+                .encode()
+            })
+        } else {
+            None
+        };
+        Ok(SessionPage {
+            sessions: sessions.into_iter().map(SessionItem::bounded).collect(),
+            next_cursor,
+        })
+    }
+
+    /// The session's catalogue (ACP core §9): its config options and
+    /// current values, and its slash commands; `None` for an unknown
+    /// session, an empty catalogue for one whose host has reported none.
+    pub fn catalog(&self, session_id: &str) -> Result<Option<SessionCatalog>> {
+        let row: Option<(ConfigColumns, Option<String>, Option<String>)> = self
+            .conn()
+            .query_row(
+                "SELECT s.model, s.mode, s.config_axes, c.config_options, c.commands
                  FROM sessions s LEFT JOIN session_catalog c ON c.session_id = s.id AND c.owner_id = s.owner_id
                  WHERE s.id = ?1 AND s.owner_id = ?2",
                 [session_id, &self.owner],
-                |r| Ok(((r.get(0)?, r.get(1)?, r.get(2)?), r.get(3)?)),
+                |r| Ok(((r.get(0)?, r.get(1)?, r.get(2)?), r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        let Some((config, options)) = row else {
+        let Some((config, options, commands)) = row else {
             return Ok(None);
+        };
+        let list = |json: Option<String>| -> Result<Vec<Value>> {
+            Ok(match json {
+                Some(json) => serde_json::from_str(&json)?,
+                None => Vec::new(),
+            })
         };
         Ok(Some(SessionCatalog {
             session_id: session_id.to_string(),
-            config_options: match options {
-                Some(options) => serde_json::from_str(&options)?,
-                None => Vec::new(),
-            },
+            config_options: list(options)?,
+            commands: list(commands)?,
             current: stored_config(config)?,
         }))
     }
@@ -1662,6 +1961,7 @@ impl Store {
                     // own config); the host never sends a replayed one
                     // with extracts.
                     store_catalogue(&tx, &self.owner, session_id, indexed, &ts)?;
+                    store_state(&tx, &self.owner, session_id, indexed, &ts)?;
                 }
             }
             SessionBody::ConfigApplied { indexed, .. } => {
@@ -1770,10 +2070,17 @@ impl Store {
                 }
             }
         }
-        tx.execute(
-            "UPDATE sessions SET last_event_at = ?2 WHERE id = ?1 AND owner_id = ?3",
-            params![session_id, ts, self.owner],
-        )?;
+        // Only a listed event moves the session's recency (plan 6b decision
+        // 6): a fact kept just as the idempotency key is hidden from the
+        // timeline, so it must not move the session up the list either.
+        // The fact's collector events come after it, so the last of them
+        // is the session's last event.
+        if let Some(last) = created.iter().map(|e| e.event_id).max() {
+            tx.execute(
+                "UPDATE sessions SET last_event_at = ?2, last_event_id = ?3 WHERE id = ?1 AND owner_id = ?4",
+                params![session_id, ts, last, self.owner],
+            )?;
+        }
         tx.commit()?;
         Ok(created)
     }
@@ -1941,6 +2248,175 @@ mod tests {
     fn timestamps_are_rfc3339_utc() {
         let ts = super::now();
         assert!(ts.ends_with('Z') && ts.as_bytes()[10] == b'T', "{ts}");
+    }
+
+    /// Plan 6b decision 1: one line, then the caps, by characters and by
+    /// the bytes JSON takes; never a broken character.
+    #[test]
+    fn one_line_collapses_whitespace_and_cuts_to_the_caps() {
+        assert_eq!(one_line("  a\n\tb \u{7}\u{2028} c ", 10, 10).as_deref(), Some("a b c"));
+        assert_eq!(one_line(" \n\t\u{0} ", 10, 10), None);
+        assert_eq!(one_line("", 10, 10), None);
+        assert_eq!(one_line("abcdef", 4, 100).as_deref(), Some("abcd"));
+        assert_eq!(one_line("abcdef", 100, 4).as_deref(), Some("abcd"));
+        // `"` and `\` take two bytes in JSON.
+        assert_eq!(one_line("a\"b\\c", 100, 3).as_deref(), Some("a\""));
+        assert_eq!(one_line("a\"b\\c", 100, 5).as_deref(), Some("a\"b"));
+        // Two bytes each, then three: the cut never splits a character.
+        assert_eq!(one_line("ééé€€", 100, 7).as_deref(), Some("ééé"));
+        // A cut that ends on a space drops it.
+        assert_eq!(one_line("ab cd", 3, 100).as_deref(), Some("ab"));
+        // Bidi and zero-width characters, which could make a row read as
+        // something else, are dropped.
+        assert_eq!(
+            one_line("a\u{202E}b\u{200B}c\u{FEFF}d\u{061C}e\u{2066}f\u{200F}", 100, 100).as_deref(),
+            Some("abcdef")
+        );
+    }
+
+    /// The review's A11: the list's one statement walks the recency index,
+    /// with no sort of its own, with or without a search.
+    #[test]
+    fn the_list_walks_the_recency_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hennery.db");
+        Store::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {}", list_statement()))
+            .unwrap()
+            .query_map(
+                params![
+                    "o",
+                    "~",
+                    "",
+                    "active",
+                    "parked",
+                    None::<String>,
+                    None::<String>,
+                    None::<String>,
+                    "%x%",
+                    50
+                ],
+                |r| r.get(3),
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        let plan = plan.join("\n");
+        assert!(plan.contains("USING INDEX sessions_by_recency"), "{plan}");
+        assert!(!plan.contains("TEMP B-TREE"), "{plan}");
+    }
+
+    /// Decision 8, the review's O4: a cursor goes out opaque and comes back
+    /// the same; anything else is refused.
+    #[test]
+    fn a_cursor_round_trips_and_a_malformed_one_is_refused() {
+        let cursor = Cursor {
+            last_event_at: "2026-10-07T12:00:00.000Z".into(),
+            session_id: "0199a4c2-7e1f-7c3a-9b2d-4f6e8a0c1d2e".into(),
+        };
+        let encoded = cursor.encode();
+        assert!(encoded.chars().all(|c| c.is_ascii_hexdigit()), "{encoded}");
+        assert_eq!(Cursor::decode(&encoded), Some(cursor));
+        for bad in [
+            "",
+            "zz",
+            "abc",
+            &hex::encode("no separator"),
+            &hex::encode("\nid"),
+            &hex::encode("at\n"),
+            &hex::encode([0xff, b'\n', b'a']),
+            &hex::encode(format!("at\n{}", "x".repeat(65))),
+            // Well formed, each part within 64 bytes, but past 256 characters.
+            &hex::encode(format!("{}\n{}", "a".repeat(64), "b".repeat(64))),
+        ] {
+            assert_eq!(Cursor::decode(bad), None, "{bad}");
+        }
+    }
+
+    /// `%`, `_` and `\` in a search are literal (decision 8).
+    #[test]
+    fn a_search_escapes_like_wildcards() {
+        assert_eq!(like_pattern("100%_a\\b"), "%100\\%\\_a\\\\b%");
+        assert_eq!(like_pattern("plain"), "%plain%");
+    }
+
+    /// Plan 6b decision 5: every stamp has the same width, so comparing
+    /// them as text compares the times, within a second too.
+    #[test]
+    fn stamps_have_one_width_so_text_order_is_time_order() {
+        let at = |nanos: i64| {
+            super::stamp(
+                time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap() + time::Duration::nanoseconds(nanos),
+            )
+        };
+        let stamps = [
+            at(0),
+            at(100_000_000),
+            at(120_000_000),
+            at(999_999_999),
+            at(1_000_000_000),
+        ];
+        assert_eq!(stamps[0], "2027-01-15T08:00:00.000Z");
+        assert_eq!(stamps[1], "2027-01-15T08:00:00.100Z");
+        assert_eq!(stamps[3], "2027-01-15T08:00:00.999Z");
+        assert!(stamps.iter().all(|s| s.len() == 24), "{stamps:?}");
+        assert!(stamps.windows(2).all(|w| w[0] < w[1]), "{stamps:?}");
+    }
+
+    /// Plan 6b's migration on a database from before it: `last_event_at`
+    /// rewritten to the fixed width (an unreadable value left alone),
+    /// `last_event_id` from the session's last listed event, and the list's
+    /// index in place.
+    #[test]
+    fn the_session_list_migration_normalises_recency_on_an_older_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hennery.db");
+        {
+            let mut conn = hennery_kernel::db::open(&db).unwrap();
+            let owner = hennery_kernel::db::kernel_owner(&mut conn).unwrap();
+            hennery_kernel::db::migrate(&mut conn, &MIGRATIONS[..8]).unwrap();
+            conn.execute_batch(&format!(
+                "
+                INSERT INTO sessions(id, host_id, agent, cwd, lifecycle, created_at, last_event_at, owner_id) VALUES
+                    ('s1', 'h1', 'fake', '/tmp', 'active', 't', '2026-10-01T10:00:05.12Z', '{owner}'),
+                    ('s2', 'h1', 'fake', '/tmp', 'active', 't', '2026-10-01T10:00:05Z', '{owner}'),
+                    ('s3', 'h1', 'fake', '/tmp', 'active', 't', 't', '{owner}');
+                INSERT INTO events(session_id, host_seq, kind, body, ts, applied, owner_id) VALUES
+                    ('s1', 1, 'session_started', '{{}}', 't', 1, '{owner}'),
+                    ('s1', 2, 'acp_update', '{{}}', 't', 1, '{owner}'),
+                    ('s1', 3, 'turn_ended', '{{}}', 't', 0, '{owner}');
+                "
+            ))
+            .unwrap();
+        }
+        Store::open(&db).unwrap();
+        let conn = Connection::open(&db).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, last_event_at, last_event_id FROM sessions ORDER BY id")
+            .unwrap();
+        let rows: Vec<(String, String, Option<i64>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                ("s1".into(), "2026-10-01T10:00:05.120Z".into(), Some(2)),
+                ("s2".into(), "2026-10-01T10:00:05.000Z".into(), None),
+                ("s3".into(), "t".into(), None),
+            ]
+        );
+        let index: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'index' AND name = 'sessions_by_recency'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1);
     }
 
     /// The kernel's first two migrations, as 3b-ii shipped them.

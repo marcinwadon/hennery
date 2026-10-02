@@ -370,7 +370,14 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute_batch(
-            "DROP TABLE event_attachments;
+            "DROP INDEX sessions_by_recency;
+             ALTER TABLE sessions DROP COLUMN title;
+             ALTER TABLE sessions DROP COLUMN git_branch;
+             ALTER TABLE sessions DROP COLUMN git_dirty;
+             ALTER TABLE sessions DROP COLUMN git_worktree;
+             ALTER TABLE sessions DROP COLUMN base_commit;
+             ALTER TABLE sessions DROP COLUMN last_event_id;
+             DROP TABLE event_attachments;
              DROP TABLE attachments;
              ALTER TABLE turns DROP COLUMN state;
              ALTER TABLE sessions DROP COLUMN owner_id;
@@ -1810,4 +1817,422 @@ fn a_revoke_converges_even_after_its_wait_timed_out_and_reconciliation_reattache
         (PendingState::Cancelled, Some(PendingReason::HostRevoked))
     );
     assert_eq!(store.pending_item("p1").unwrap().unwrap().delivered, Some(false));
+}
+
+// Plan 6b: a session's recency (the list's sort key, ACP core §9) moves
+// only with an event the timeline lists (decision 6).
+
+fn recency(store: &Store) -> (String, Option<i64>) {
+    let s = store.session("s1").unwrap().unwrap();
+    (s.last_event_at, s.last_event_id)
+}
+
+#[test]
+fn recency_moves_only_with_a_listed_event() {
+    let store = Store::open_in_memory().unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    let (created_at, none) = recency(&store);
+    assert_eq!(none, None);
+    let first = store
+        .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
+        .unwrap();
+    let after_start = recency(&store);
+    assert_eq!(after_start, (first[0].ts.clone(), Some(first[0].event_id)));
+    assert!(after_start.0 >= created_at);
+    // Later than any stamp so far, so a wrongly moved recency would show.
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    // An exact duplicate, and a fact that does not apply (an end for a turn
+    // that is not open), move neither.
+    assert!(
+        store
+            .ingest("s1", 1, &SessionBody::session_started("r0", "a1"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(store.ingest("s1", 2, &ended("t-none")).unwrap().is_empty());
+    assert_eq!(recency(&store), after_start);
+    // A listed update moves both.
+    let listed = store.ingest("s1", 3, &update(1)).unwrap();
+    assert_eq!(recency(&store), (listed[0].ts.clone(), Some(listed[0].event_id)));
+    assert!(listed[0].ts > after_start.0);
+}
+
+#[test]
+fn a_fact_that_writes_collector_events_leaves_recency_at_the_last_of_them() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.open_turn("s1", "t1", &prompt_text()).unwrap();
+    let created = store.ingest("s1", 2, &turn_started("t1")).unwrap();
+    assert_eq!(kinds(&created), ["turn_started", "user_turn"]);
+    assert!(created[1].event_id > created[0].event_id);
+    assert_eq!(recency(&store).1, Some(created[1].event_id));
+    // A collector event of its own moves it too.
+    let parked = store.record_park_request("s1").unwrap();
+    assert_eq!(recency(&store), (parked.ts.clone(), Some(parked.event_id)));
+}
+
+// Plan 6b: the title and the commands, from their extracts (ACP core §3.2,
+// §7, §8).
+
+fn titled(title: &str) -> SessionBody {
+    SessionBody::AcpUpdate {
+        indexed: Indexed {
+            title: Some(title.into()),
+            ..Indexed::default()
+        },
+        payload: json!({ "update": { "sessionUpdate": "session_info_update" } }),
+    }
+}
+
+fn commands(names: &[&str]) -> SessionBody {
+    let list = names.iter().map(|n| json!({ "name": n, "description": n })).collect();
+    SessionBody::AcpUpdate {
+        indexed: Indexed {
+            commands: Some(list),
+            ..Indexed::default()
+        },
+        payload: json!({ "update": { "sessionUpdate": "available_commands_update" } }),
+    }
+}
+
+fn title_of(store: &Store) -> Option<String> {
+    store.session("s1").unwrap().unwrap().title
+}
+
+/// Decision 1: the title is kept on one line and capped, for the list; an
+/// empty one (the agent cleared it) clears it; one in an update that does
+/// not apply changes nothing. The event keeps what the agent sent.
+#[test]
+fn a_title_is_stored_on_one_line_and_capped_and_an_empty_one_clears_it() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    let created = store
+        .ingest("s1", 2, &titled("  Fix\nthe\tlogin \u{1}  bug  "))
+        .unwrap();
+    assert_eq!(title_of(&store).as_deref(), Some("Fix the login bug"));
+    assert_eq!(created[0].body["indexed"]["title"], "  Fix\nthe\tlogin \u{1}  bug  ");
+    store.ingest("s1", 3, &titled(&"x".repeat(300))).unwrap();
+    assert_eq!(title_of(&store), Some("x".repeat(120)));
+    // `"` takes two bytes in JSON: 80 of them is the byte cap (160).
+    store.ingest("s1", 4, &titled(&"\"".repeat(150))).unwrap();
+    assert_eq!(title_of(&store), Some("\"".repeat(80)));
+    store.ingest("s1", 5, &titled("")).unwrap();
+    assert_eq!(title_of(&store), None);
+    store.ingest("s1", 6, &titled("Kept")).unwrap();
+    store.close_now("s1").unwrap();
+    assert!(store.ingest("s1", 7, &titled("Too late")).unwrap().is_empty());
+    assert_eq!(title_of(&store).as_deref(), Some("Kept"));
+}
+
+fn early_titled(title: &str) -> SessionBody {
+    let SessionBody::AcpUpdate { mut indexed, payload } = titled(title) else {
+        unreachable!()
+    };
+    indexed.early = true;
+    SessionBody::AcpUpdate { indexed, payload }
+}
+
+/// Decision 2: a title the adapter sent before the session was announced
+/// (replayed by a load) may be older than the stored one: it only fills an
+/// empty title. A live one always wins.
+#[test]
+fn an_early_title_only_fills_an_empty_one() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.ingest("s1", 2, &early_titled("Old")).unwrap();
+    assert_eq!(title_of(&store).as_deref(), Some("Old"));
+    // Still listed: only the title is left as it was.
+    assert_eq!(store.ingest("s1", 3, &early_titled("Older")).unwrap().len(), 1);
+    assert_eq!(title_of(&store).as_deref(), Some("Old"));
+    store.ingest("s1", 4, &titled("New")).unwrap();
+    assert_eq!(title_of(&store).as_deref(), Some("New"));
+    // An early clear clears nothing.
+    store.ingest("s1", 5, &early_titled("")).unwrap();
+    assert_eq!(title_of(&store).as_deref(), Some("New"));
+    store.ingest("s1", 6, &titled("")).unwrap();
+    store.ingest("s1", 7, &early_titled("Replayed")).unwrap();
+    assert_eq!(title_of(&store).as_deref(), Some("Replayed"));
+}
+
+/// Decision 3: the latest list replaces the stored one (an empty list too),
+/// and commands never touch the config catalogue or its current values.
+#[test]
+fn commands_replace_the_stored_list_and_never_touch_the_config() {
+    let store = Store::open_in_memory().unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    let snapshot = Indexed {
+        config_options: Some(vec![json!({"id": "mode", "currentValue": "plan"})]),
+        current_mode: Some("plan".into()),
+        current_axes: Some(Default::default()),
+        ..Indexed::default()
+    };
+    store
+        .ingest(
+            "s1",
+            1,
+            &SessionBody::SessionStarted {
+                request_id: "r0".into(),
+                agent_session_id: "a1".into(),
+                indexed: snapshot,
+            },
+        )
+        .unwrap();
+    let before = store.catalog("s1").unwrap().unwrap();
+    assert!(before.commands.is_empty());
+    store.ingest("s1", 2, &commands(&["review", "plan"])).unwrap();
+    let after = store.catalog("s1").unwrap().unwrap();
+    assert_eq!(
+        after.commands,
+        [
+            json!({"name": "review", "description": "review"}),
+            json!({"name": "plan", "description": "plan"})
+        ]
+    );
+    assert_eq!(
+        (&after.config_options, &after.current),
+        (&before.config_options, &before.current)
+    );
+    assert_eq!(store.session("s1").unwrap().unwrap().config, before.current);
+    store.ingest("s1", 3, &commands(&[])).unwrap();
+    let emptied = store.catalog("s1").unwrap().unwrap();
+    assert!(emptied.commands.is_empty());
+    assert_eq!(emptied.config_options, before.config_options);
+}
+
+/// Commands reported before any config (or by an adapter that has none)
+/// are served with an empty catalogue.
+#[test]
+fn commands_reported_before_any_config_are_served_with_an_empty_catalogue() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.ingest("s1", 2, &commands(&["review"])).unwrap();
+    let catalog = store.catalog("s1").unwrap().unwrap();
+    assert_eq!(catalog.commands, [json!({"name": "review", "description": "review"})]);
+    assert!(catalog.config_options.is_empty() && catalog.current.is_empty());
+}
+
+// Plan 6b: the list item (ACP core §8, §9).
+
+/// Decision 9: the item is the row, read from `sessions` alone, with the
+/// title and the current model and mode (B2b's "model / mode in the list
+/// and detail items"), unbounded: the detail serves it as it is.
+#[test]
+fn a_session_item_is_the_row_with_its_title_and_current_model_and_mode() {
+    let store = Store::open_in_memory().unwrap();
+    let cwd = format!("/home/someone/{}", "deep/".repeat(40));
+    store.create_session("s1", "h1", "fake", &cwd).unwrap();
+    let snapshot = Indexed {
+        config_options: Some(vec![json!({"id": "model"}), json!({"id": "mode"})]),
+        current_model: Some("opus".into()),
+        current_mode: Some("plan".into()),
+        current_axes: Some(Default::default()),
+        ..Indexed::default()
+    };
+    store
+        .ingest(
+            "s1",
+            1,
+            &SessionBody::SessionStarted {
+                request_id: "r0".into(),
+                agent_session_id: "a1".into(),
+                indexed: snapshot,
+            },
+        )
+        .unwrap();
+    store.ingest("s1", 2, &titled("Fix the login bug")).unwrap();
+    let row = store.session("s1").unwrap().unwrap();
+    let item = store.session_item("s1").unwrap().unwrap();
+    assert_eq!(
+        item,
+        hennery_proto::rest::SessionItem {
+            session_id: "s1".into(),
+            host_id: "h1".into(),
+            agent: "fake".into(),
+            cwd,
+            title: Some("Fix the login bug".into()),
+            lifecycle: "active".into(),
+            activity: Some("idle".into()),
+            failure_reason: None,
+            presumed_parked: false,
+            git_branch: None,
+            git_dirty: None,
+            model: Some("opus".into()),
+            mode: Some("plan".into()),
+            created_at: item.created_at.clone(),
+            last_event_at: row.last_event_at,
+        }
+    );
+    assert_eq!(item.created_at.len(), 24);
+    assert!(store.session_item("nope").unwrap().is_none());
+}
+
+// Plan 6b: the session list (ACP core §9; frontend §5).
+
+use hennery_sessions::store::{Cursor, ListQuery};
+
+/// A store over a file, with a session per `(id, last_event_at, title,
+/// cwd)`, its recency set by hand so the order is known.
+fn listed_store(dir: &std::path::Path, sessions: &[(&str, &str, Option<&str>, &str)]) -> Store {
+    let db = dir.join("hennery.db");
+    let store = Store::open(&db).unwrap();
+    for (id, _, _, cwd) in sessions {
+        store.create_session(id, "h1", "fake", cwd).unwrap();
+    }
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    for (id, at, title, _) in sessions {
+        conn.execute(
+            "UPDATE sessions SET last_event_at = ?2, title = ?3 WHERE id = ?1",
+            rusqlite::params![id, at, title],
+        )
+        .unwrap();
+    }
+    store
+}
+
+fn ids(page: &hennery_proto::rest::SessionPage) -> Vec<&str> {
+    page.sessions.iter().map(|s| s.session_id.as_str()).collect()
+}
+
+/// Stamps from before any real clock this test runs on.
+const T: &str = "2020-01-07T12:00:0";
+
+/// One sort key, newest `last_event_at` first, the id breaking ties
+/// (decision 8); pages follow an opaque cursor, and a session that moves to
+/// the top meanwhile does not shift the next page.
+#[test]
+fn the_list_is_newest_first_and_pages_by_keyset() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = |s: u8| format!("{T}{s}.000Z");
+    let (a1, a2, a3, a5) = (at(1), at(2), at(3), at(5));
+    let store = listed_store(
+        dir.path(),
+        &[
+            ("s1", &a1, None, "/tmp"),
+            ("s2", &a3, None, "/tmp"),
+            ("s3", &a3, None, "/tmp"),
+            ("s4", &a2, None, "/tmp"),
+            ("s5", &a5, None, "/tmp"),
+        ],
+    );
+    assert_eq!(
+        ids(&store.list(&ListQuery::default()).unwrap()),
+        ["s5", "s3", "s2", "s4", "s1"]
+    );
+    let first = store
+        .list(&ListQuery {
+            limit: 2,
+            ..ListQuery::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&first), ["s5", "s3"]);
+    let cursor = Cursor::decode(first.next_cursor.as_deref().unwrap()).unwrap();
+    // s1 moves to the top: the next page is still the one after s3.
+    store.ingest("s1", 1, &SessionBody::session_started("r", "a")).unwrap();
+    let second = store
+        .list(&ListQuery {
+            after: Some(&cursor),
+            limit: 2,
+            ..ListQuery::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&second), ["s2", "s4"]);
+    // s1 now sorts first, so nothing follows s4: no further page.
+    assert_eq!(second.next_cursor, None);
+    let all = store
+        .list(&ListQuery {
+            limit: 6,
+            ..ListQuery::default()
+        })
+        .unwrap();
+    assert_eq!(ids(&all), ["s1", "s5", "s3", "s2", "s4"]);
+    assert_eq!(all.next_cursor, None);
+}
+
+/// Decision 8: `q` matches a substring of the title, cwd, branch or id, with
+/// `%`, `_` and `\` taken literally and ASCII case ignored; while it is set,
+/// the lifecycle filter is bypassed (frontend §5, F-10).
+#[test]
+fn search_matches_title_cwd_branch_and_id_literally_across_every_lifecycle() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = format!("{T}1.000Z");
+    let store = listed_store(
+        dir.path(),
+        &[
+            ("percent", &at, Some("100% done"), "/tmp"),
+            ("plain", &at, Some("1000 done"), "/tmp"),
+            ("under", &at, None, "/src/my_app"),
+            ("nounder", &at, None, "/src/myXapp"),
+            ("slash", &at, Some("a\\b"), "/tmp"),
+            ("branchy", &at, None, "/tmp"),
+        ],
+    );
+    rusqlite::Connection::open(dir.path().join("hennery.db"))
+        .unwrap()
+        .execute(
+            "UPDATE sessions SET git_branch = 'feat/list-search' WHERE id = 'branchy'",
+            [],
+        )
+        .unwrap();
+    store.close_now("percent").unwrap();
+    let found = |q: &str| {
+        let active = ["starting"];
+        let mut found = ids(&store
+            .list(&ListQuery {
+                search: Some(q),
+                lifecycles: Some(&active),
+                ..ListQuery::default()
+            })
+            .unwrap())
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+        found.sort();
+        found
+    };
+    assert_eq!(found("100%"), ["percent"]);
+    assert_eq!(found("DONE"), ["percent", "plain"]);
+    assert_eq!(found("my_app"), ["under"]);
+    assert_eq!(found("a\\b"), ["slash"]);
+    assert_eq!(found("LIST-SEARCH"), ["branchy"]);
+    assert_eq!(found("nounde"), ["nounder"]);
+    assert_eq!(found("%"), ["percent"]);
+}
+
+/// Without `q`, only the named lifecycles are listed ("Hide closed" names
+/// all but `closed`); a presumed park is `parked`.
+#[test]
+fn the_lifecycle_filter_keeps_only_the_named_lifecycles() {
+    let dir = tempfile::tempdir().unwrap();
+    let at = format!("{T}1.000Z");
+    let store = listed_store(dir.path(), &[("open", &at, None, "/tmp"), ("shut", &at, None, "/tmp")]);
+    store.close_now("shut").unwrap();
+    let only = |lifecycles: &[&str]| {
+        ids(&store
+            .list(&ListQuery {
+                lifecycles: Some(lifecycles),
+                ..ListQuery::default()
+            })
+            .unwrap())
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+    };
+    assert_eq!(only(&["starting", "active", "parked", "failed"]), ["open"]);
+    assert_eq!(only(&["closed"]), ["shut"]);
+}
+
+/// The list serves each item bounded (the review's A1); the detail's is as
+/// stored.
+#[test]
+fn the_list_serves_items_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = format!("/home/someone/{}webapp", "deep/".repeat(40));
+    let store = listed_store(dir.path(), &[("s1", &format!("{T}1.000Z"), None, &cwd)]);
+    let listed = store.list(&ListQuery::default()).unwrap().sessions.remove(0);
+    assert!(
+        listed.cwd.starts_with('…') && listed.cwd.ends_with("deep/webapp"),
+        "{}",
+        listed.cwd
+    );
+    assert_eq!(store.session_item("s1").unwrap().unwrap().cwd, cwd);
 }

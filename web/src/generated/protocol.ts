@@ -29,7 +29,27 @@ export type PendingExtract = { id: string, kind: PendingKind,
  */
 option_ids?: Array<string> | null, };
 
-export type Indexed = { turn_id?: string | null, title?: string | null, 
+export type Indexed = { turn_id?: string | null, 
+/**
+ * On a `session_info_update` that names a title: the title the agent
+ * reported, as it sent it; empty when it cleared it (ACP `null`). The
+ * collector normalises and caps it for the session list.
+ */
+title?: string | null, 
+/**
+ * On an `available_commands_update`: the adapter's slash commands, the
+ * full list (ACP `AvailableCommand` objects, those hennery can parse).
+ * An empty list means the adapter has none, unlike an empty
+ * `config_options`. Never part of the catalogue snapshot.
+ */
+commands?: unknown[] | undefined, 
+/**
+ * On an update the adapter sent before the session was announced:
+ * replayed by `session/load`, or sent while the start ran (ACP core
+ * §4.5). What it says may be older than what the collector holds, so
+ * its title only fills an empty one (plan 6b decision 2).
+ */
+early?: boolean, 
 /**
  * The full config catalogue: the adapter's ACP `SessionConfigOption`
  * objects, for the UI. The collector stores it and never reads it.
@@ -182,16 +202,80 @@ export type OpenTurn = { turn_id: string,
  */
 state: string, };
 
-export type SessionDetail = { session_id: string, host_id: string, agent: string, cwd: string, lifecycle: string, activity?: string | undefined, failure_reason?: string | undefined, 
+export type SessionItem = { session_id: string, host_id: string, agent: string, cwd: string, 
+/**
+ * The title the agent reported, on one line and capped.
+ */
+title?: string | undefined, lifecycle: string, activity?: string | undefined, failure_reason?: string | undefined, 
 /**
  * Parked only because its host has been offline past the threshold
  * (ACP core §5.3); the host may still be running it.
  */
-presumed_parked: boolean, open_turn?: OpenTurn | undefined, 
+presumed_parked: boolean, 
+/**
+ * The branch checked out in `cwd`, as the host last reported it.
+ */
+git_branch?: string | undefined, 
+/**
+ * Whether `cwd`'s work tree had changes, as the host last reported.
+ */
+git_dirty?: boolean | undefined, 
+/**
+ * The current model and mode, as the host last reported them.
+ */
+model?: string | undefined, mode?: string | undefined, 
+/**
+ * RFC 3339, UTC.
+ */
+created_at: string, 
+/**
+ * When its last listed event was written (RFC 3339, UTC, three
+ * fractional digits): the list's sort key, newest first.
+ */
+last_event_at: string, };
+
+export type SessionPage = { sessions: Array<SessionItem>, 
+/**
+ * Where the next page starts, for `cursor` (opaque); absent on the last
+ * page.
+ */
+next_cursor?: string | undefined, };
+
+export type SessionDetail = { open_turn?: OpenTurn | undefined, 
 /**
  * Open pending requests, oldest first: what the operator can answer.
  */
-pending: Array<PendingItem>, };
+pending: Array<PendingItem>, session_id: string, host_id: string, agent: string, cwd: string, 
+/**
+ * The title the agent reported, on one line and capped.
+ */
+title?: string | undefined, lifecycle: string, activity?: string | undefined, failure_reason?: string | undefined, 
+/**
+ * Parked only because its host has been offline past the threshold
+ * (ACP core §5.3); the host may still be running it.
+ */
+presumed_parked: boolean, 
+/**
+ * The branch checked out in `cwd`, as the host last reported it.
+ */
+git_branch?: string | undefined, 
+/**
+ * Whether `cwd`'s work tree had changes, as the host last reported.
+ */
+git_dirty?: boolean | undefined, 
+/**
+ * The current model and mode, as the host last reported them.
+ */
+model?: string | undefined, mode?: string | undefined, 
+/**
+ * RFC 3339, UTC.
+ */
+created_at: string, 
+/**
+ * When its last listed event was written (RFC 3339, UTC, three
+ * fractional digits): the list's sort key, newest first.
+ */
+last_event_at: string, };
 
 export type CancelResponse = { turn_id: string, outcome: TurnOutcome, };
 
@@ -201,7 +285,13 @@ export type SessionCatalog = { session_id: string,
 /**
  * The adapter's ACP `SessionConfigOption` objects, as last reported.
  */
-config_options: unknown[], model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, };
+config_options: unknown[], 
+/**
+ * The adapter's slash commands (ACP `AvailableCommand` objects), as
+ * last reported; empty until it reports any (ACP core §7). Always
+ * sent, so the schema and the TypeScript type agree that it is there.
+ */
+commands: unknown[], model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, };
 
 export type PendingState = "open" | "delivered" | "cancelled";
 

@@ -3,7 +3,9 @@
 use crate::AppState;
 use crate::content::{self, Refusal};
 use crate::hub::{RequestError, Undo};
-use crate::store::{AnswerSubmission, ResumeRequest, Store};
+use crate::store::{
+    AnswerSubmission, Cursor, LIFECYCLES, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT, ListQuery, ResumeRequest, Store,
+};
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -15,9 +17,9 @@ use hennery_kernel::json::ApiJson;
 use hennery_kernel::operator::Authenticated;
 use hennery_proto::frames::{Capability, CollectorFrame, Indexed, SessionBody};
 use hennery_proto::rest::{
-    AnswerRequest, AnswerResponse, ApiError, CancelResponse, ConfigRequest, EventDto, LifecycleResponse, OpenTurn,
-    PendingItem, PromptRequest, PromptResponse, SessionCatalog, SessionDetail, StartSessionRequest,
-    StartSessionResponse,
+    AGENT_MAX_JSON_BYTES, AnswerRequest, AnswerResponse, ApiError, CancelResponse, ConfigRequest, EventDto,
+    LifecycleResponse, OpenTurn, PendingItem, PromptRequest, PromptResponse, SessionDetail, StartSessionRequest,
+    StartSessionResponse, json_width,
 };
 use serde::Deserialize;
 use std::convert::Infallible;
@@ -60,7 +62,7 @@ const _: () = assert!(
 /// Every route here is an operator's (kernel spec §3.3).
 pub fn router(state: AppState) -> Router {
     let routes = Router::new()
-        .route("/api/sessions", post(start_session))
+        .route("/api/sessions", post(start_session).get(list_sessions))
         .route("/api/sessions/{id}", get(session_detail))
         .route("/api/sessions/{id}/resume", post(resume))
         // The one route that reads more than axum's default 2 MB (plan 6a).
@@ -151,6 +153,27 @@ fn resume_failed(err: RequestError) -> Response {
 }
 
 async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<StartSessionRequest>) -> Response {
+    // What a list item shows must be bounded (plan 6b, the review's A1): a
+    // paired host's id, and an agent's name within its cap. Refused before
+    // any session exists.
+    if json_width(&req.agent) > AGENT_MAX_JSON_BYTES {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            format!("an agent's name is at most {AGENT_MAX_JSON_BYTES} bytes"),
+        );
+    }
+    match state.hosts.host(&req.host_id) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "unknown_host",
+                "no host is paired with that id",
+            );
+        }
+        Err(err) => return internal(err),
+    }
     let session_id = uuid::Uuid::now_v7().to_string();
     if let Err(err) = state
         .store
@@ -198,12 +221,100 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
     }
 }
 
-/// Session detail (ACP core §9): the list item plus the open turn.
+/// The longest search the list takes, in characters (plan 6b decision 8).
+const SEARCH_MAX_CHARS: usize = 200;
+
+/// `GET /api/sessions`' query (ACP core §9). Every value is read as text,
+/// so a malformed one gets an `ApiError`.
+#[derive(Deserialize)]
+struct ListParams {
+    cursor: Option<String>,
+    limit: Option<String>,
+    q: Option<String>,
+    hat: Option<String>,
+    lifecycle: Option<String>,
+}
+
+/// The session list (ACP core §9; plan 6b decision 8): newest
+/// `last_event_at` first, in pages of `limit` (50 by default, clamped to
+/// 1..=200) after `cursor`; only the comma-separated `lifecycle`s, unless
+/// `q` searches the title, cwd, branch and id of every session.
+async fn list_sessions(State(state): State<AppState>, Query(params): Query<ListParams>) -> Response {
+    // Sessions have no hat until hats (plan 5) gives them `hat_id`; a
+    // filter that cannot be honoured is refused, never ignored. The seam
+    // hats fills.
+    if params.hat.is_some() {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "hat_filter_unavailable",
+            "sessions have no hat yet, so the list cannot be filtered by one",
+        );
+    }
+    let limit = match params.limit.as_deref().map(str::parse::<u32>) {
+        None => LIST_DEFAULT_LIMIT,
+        Some(Ok(limit)) => limit.clamp(1, LIST_MAX_LIMIT),
+        Some(Err(_)) => return error(StatusCode::BAD_REQUEST, "invalid", "limit must be a whole number"),
+    };
+    let cursor = match params.cursor.as_deref().map(Cursor::decode) {
+        None => None,
+        Some(Some(cursor)) => Some(cursor),
+        Some(None) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_cursor",
+                "not a cursor this list gave out",
+            );
+        }
+    };
+    let search = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
+    // A control character would cut the pattern short (a NUL ends it: the
+    // second review's P4).
+    if search.is_some_and(|q| q.chars().count() > SEARCH_MAX_CHARS || q.chars().any(char::is_control)) {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "invalid",
+            format!("a search is at most {SEARCH_MAX_CHARS} characters, with no control characters"),
+        );
+    }
+    let mut lifecycles: Vec<&str> = Vec::new();
+    for name in params
+        .lifecycle
+        .as_deref()
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+    {
+        if name.is_empty() || lifecycles.contains(&name) {
+            continue;
+        }
+        if !LIFECYCLES.contains(&name) {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid",
+                format!("lifecycle is a list of {}", LIFECYCLES.join(", ")),
+            );
+        }
+        lifecycles.push(name);
+    }
+    let query = ListQuery {
+        after: cursor.as_ref(),
+        limit,
+        lifecycles: (!lifecycles.is_empty()).then_some(lifecycles.as_slice()),
+        search,
+    };
+    match state.store.list(&query) {
+        Ok(page) => Json(page).into_response(),
+        Err(err) => internal(err),
+    }
+}
+
+/// Session detail (ACP core §9): the list item, as stored, plus the open
+/// turn and the open questions.
 async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -> Response {
-    let session = match state.store.session(&id) {
-        Ok(Some(s)) => s,
-        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
-        Err(err) => return internal(err),
+    let (session, item) = match (state.store.session(&id), state.store.session_item(&id)) {
+        (Ok(Some(s)), Ok(Some(item))) => (s, item),
+        (Ok(None), _) | (_, Ok(None)) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        (Err(err), _) | (_, Err(err)) => return internal(err),
     };
     let open_turn = match session.open_turn_id {
         Some(turn_id) => match state.store.turn_state(&turn_id) {
@@ -221,14 +332,7 @@ async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -
         Err(err) => return internal(err),
     };
     Json(SessionDetail {
-        session_id: session.id,
-        host_id: session.host_id,
-        agent: session.agent,
-        cwd: session.cwd,
-        lifecycle: session.lifecycle,
-        activity: session.activity,
-        failure_reason: session.failure_reason,
-        presumed_parked: session.presumed_parked,
+        session: item,
         open_turn,
         pending,
     })
@@ -723,15 +827,19 @@ fn sse_event(e: &EventDto) -> Event {
 }
 
 /// The SSE messages for one stored event: the event, then `catalog_changed`
-/// with the same id if it carries a catalogue snapshot, and
-/// `pending_changed` with the same id if it concerns a pending request
-/// (ACP core §9). A listed event with a snapshot is one that changed the
-/// stored catalogue, and both come from the stored row, so a replay from
-/// `Last-Event-ID` sends them too. `pending_changed` carries the request as
-/// it stands when the message is sent.
-fn sse_messages(store: &Store, e: &EventDto) -> Vec<Result<Event, Infallible>> {
+/// with the same id if it changed the catalogue (and `catalog` is asked
+/// for), and `pending_changed` with the same id if it concerns a pending
+/// request (ACP core §9). Both are derived from the stored row, so a replay
+/// from `Last-Event-ID` sends them too, and both carry what they describe
+/// as it stands when the message is sent (plan 6b decision 4: the
+/// catalogue has parts that change apart, the config and the commands, so
+/// one built from the event alone would wipe the part it does not carry).
+fn sse_messages(store: &Store, e: &EventDto, catalog: bool) -> Vec<Result<Event, Infallible>> {
     let mut out = vec![Ok(sse_event(e))];
-    if let Some(catalog) = catalog_in(e) {
+    if catalog
+        && changes_catalogue(e)
+        && let Ok(Some(catalog)) = store.catalog(&e.session_id)
+    {
         out.push(Ok(Event::default()
             .id(e.event_id.to_string())
             .event("catalog_changed")
@@ -758,13 +866,18 @@ fn pending_in(store: &Store, e: &EventDto) -> Option<PendingItem> {
     store.pending_item(pending_id).ok().flatten()
 }
 
-/// The catalogue snapshot a stored host fact carries in its extracts.
-fn catalog_in(e: &EventDto) -> Option<SessionCatalog> {
+/// Whether a stored host fact changed the catalogue: its extracts carry a
+/// config snapshot or the commands. Listed events only reach here, and a
+/// listed one with either changed the stored catalogue.
+fn changes_catalogue(e: &EventDto) -> bool {
     if !matches!(e.kind.as_str(), "session_started" | "config_applied" | "acp_update") {
-        return None;
+        return false;
     }
-    let indexed: Indexed = serde_json::from_value(e.body.get("indexed")?.clone()).ok()?;
-    SessionCatalog::from_indexed(&e.session_id, &indexed)
+    let Some(indexed) = e.body.get("indexed") else {
+        return false;
+    };
+    serde_json::from_value::<Indexed>(indexed.clone())
+        .is_ok_and(|indexed| indexed.current_config().is_some() || indexed.commands.is_some())
 }
 
 /// The session's events as SSE: replays from `Last-Event-ID`, then follows
@@ -785,10 +898,15 @@ async fn stream_session(
     let live = BroadcastStream::new(state.hub.subscribe());
     let backlog = state.store.events(&id, after, u32::MAX).unwrap_or_default();
     let last = backlog.last().map(|e| e.event_id).unwrap_or(after);
+    // The catalogue once, after the last event of the backlog that changed
+    // it: every `catalog_changed` carries the whole catalogue as it stands,
+    // so one per event would only repeat it (the review's A6, P-23).
+    let last_catalogue = backlog.iter().rposition(changes_catalogue);
     let replay = stream::iter(
         backlog
             .iter()
-            .flat_map(|e| sse_messages(&state.store, e))
+            .enumerate()
+            .flat_map(|(at, e)| sse_messages(&state.store, e, Some(at) == last_catalogue))
             .collect::<Vec<_>>(),
     );
     let session = id.clone();
@@ -799,7 +917,7 @@ async fn stream_session(
             let store = store.clone();
             async move {
                 match item {
-                    Ok(e) if e.session_id == session && e.event_id > last => Some(sse_messages(&store, &e)),
+                    Ok(e) if e.session_id == session && e.event_id > last => Some(sse_messages(&store, &e, true)),
                     Ok(_) => None,
                     // Lagged: tell the client to refetch instead of skipping silently.
                     Err(_) => Some(vec![Ok(Event::default().event("resync_required").data("{}"))]),

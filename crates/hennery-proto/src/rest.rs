@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-use crate::frames::{ConfigValue, ElicitationAction, Indexed, PendingKind, PendingReason, SessionConfig};
+use crate::frames::{ConfigValue, ElicitationAction, PendingKind, PendingReason, SessionConfig};
 
 /// `POST /api/sessions` (ACP core §9): `{host_id, agent, cwd, model?, mode?, axes?}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -107,14 +107,95 @@ pub struct OpenTurn {
     pub state: String,
 }
 
-/// `GET /api/sessions/{id}` (ACP core §9): the list item, the open turn and
-/// the pending requests still open.
+/// The session list's caps, in bytes as JSON writes each field (plan 6b
+/// decision 9, the review's A1). With every field at its cap, a list item
+/// stays under 1 KiB with room for a `hat_id` (P-23). The title and the
+/// branch are stored within theirs; an agent past its cap is refused at
+/// the start; a model, mode or failure reason past its cap is left out of
+/// the item (the stored value is kept: a resume re-applies it); a cwd past
+/// its cap is shown by its end.
+pub const TITLE_MAX_CHARS: usize = 120;
+pub const TITLE_MAX_JSON_BYTES: usize = 160;
+pub const BRANCH_MAX_CHARS: usize = 120;
+pub const BRANCH_MAX_JSON_BYTES: usize = 120;
+pub const MODEL_MAX_JSON_BYTES: usize = 48;
+pub const MODE_MAX_JSON_BYTES: usize = 48;
+pub const FAILURE_REASON_MAX_JSON_BYTES: usize = 32;
+pub const AGENT_MAX_JSON_BYTES: usize = 32;
+pub const CWD_MAX_JSON_BYTES: usize = 128;
+/// A paired host's id is `host-` and 16 hex digits (21 bytes); an older
+/// row's, from before the start checked it, is cut to this.
+pub const HOST_ID_MAX_JSON_BYTES: usize = 32;
+
+/// Bidi controls and zero-width characters: never shown as they are, since
+/// they could make a row read as something else (plan 6b, the review's A2).
+pub fn is_hidden_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
+    )
+}
+
+/// How many bytes JSON takes to write `c` inside a string, as serde_json
+/// escapes it: `"`, `\` and the short escapes take two, other control
+/// characters six (`\u00XX`).
+pub fn json_char_width(c: char) -> usize {
+    match c {
+        '"' | '\\' | '\u{8}' | '\u{c}' | '\n' | '\r' | '\t' => 2,
+        c if (c as u32) < 0x20 => 6,
+        c => c.len_utf8(),
+    }
+}
+
+/// How many bytes JSON takes to write `s` inside a string.
+pub fn json_width(s: &str) -> usize {
+    s.chars().map(json_char_width).sum()
+}
+
+/// The longest start of `s` with at most `max_chars` characters and
+/// `max_json_bytes` bytes as JSON writes them; never cut inside a character.
+fn cut(s: &str, max_chars: usize, max_json_bytes: usize) -> String {
+    let mut bytes = 0;
+    s.chars()
+        .take(max_chars)
+        .take_while(|c| {
+            bytes += json_char_width(*c);
+            bytes <= max_json_bytes
+        })
+        .collect()
+}
+
+/// `s` if it fits in `max_json_bytes` as JSON writes it, else its longest
+/// end that fits after `…`; never cut inside a character.
+fn tail(s: &str, max_json_bytes: usize) -> String {
+    if json_width(s) <= max_json_bytes {
+        return s.to_string();
+    }
+    let mut bytes = '…'.len_utf8();
+    let kept: Vec<char> = s
+        .chars()
+        .rev()
+        .take_while(|c| {
+            bytes += json_char_width(*c);
+            bytes <= max_json_bytes
+        })
+        .collect();
+    std::iter::once('…').chain(kept.into_iter().rev()).collect()
+}
+
+/// One session as the session list shows it (ACP core §8, §9; frontend
+/// §5), read from `sessions` alone: never the catalogue, commands or plan
+/// (P-23). The detail serves it as stored; the list, `bounded`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
-pub struct SessionDetail {
+pub struct SessionItem {
     pub session_id: String,
     pub host_id: String,
     pub agent: String,
     pub cwd: String,
+    /// The title the agent reported, on one line and capped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub title: Option<String>,
     pub lifecycle: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "string | undefined", optional)]
@@ -125,6 +206,70 @@ pub struct SessionDetail {
     /// Parked only because its host has been offline past the threshold
     /// (ACP core §5.3); the host may still be running it.
     pub presumed_parked: bool,
+    /// The branch checked out in `cwd`, as the host last reported it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub git_branch: Option<String>,
+    /// Whether `cwd`'s work tree had changes, as the host last reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "boolean | undefined", optional)]
+    pub git_dirty: Option<bool>,
+    /// The current model and mode, as the host last reported them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub mode: Option<String>,
+    /// RFC 3339, UTC.
+    pub created_at: String,
+    /// When its last listed event was written (RFC 3339, UTC, three
+    /// fractional digits): the list's sort key, newest first.
+    pub last_event_at: String,
+}
+
+impl SessionItem {
+    /// The item as the session list serves it, every field within its cap
+    /// (see `TITLE_MAX_CHARS`): with them, it stays under 1 KiB.
+    pub fn bounded(mut self) -> Self {
+        // Shown as they are in every row: one with a control or hidden
+        // character is left out too (the second review's P1).
+        let within = |value: Option<String>, max: usize| {
+            value.filter(|v| json_width(v) <= max && !v.chars().any(|c| c.is_control() || is_hidden_format(c)))
+        };
+        self.title = self.title.map(|t| cut(&t, TITLE_MAX_CHARS, TITLE_MAX_JSON_BYTES));
+        self.git_branch = self
+            .git_branch
+            .map(|b| cut(&b, BRANCH_MAX_CHARS, BRANCH_MAX_JSON_BYTES));
+        self.model = within(self.model, MODEL_MAX_JSON_BYTES);
+        self.mode = within(self.mode, MODE_MAX_JSON_BYTES);
+        self.failure_reason = within(self.failure_reason, FAILURE_REASON_MAX_JSON_BYTES);
+        self.cwd = tail(&self.cwd, CWD_MAX_JSON_BYTES);
+        // An older row's, from before the start checked them.
+        self.agent = cut(&self.agent, usize::MAX, AGENT_MAX_JSON_BYTES);
+        self.host_id = cut(&self.host_id, usize::MAX, HOST_ID_MAX_JSON_BYTES);
+        self
+    }
+}
+
+/// `GET /api/sessions` (ACP core §9): one page of the session list, newest
+/// `last_event_at` first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SessionPage {
+    pub sessions: Vec<SessionItem>,
+    /// Where the next page starts, for `cursor` (opaque); absent on the last
+    /// page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub next_cursor: Option<String>,
+}
+
+/// `GET /api/sessions/{id}` (ACP core §9): the list item, as stored, the
+/// open turn and the pending requests still open.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SessionDetail {
+    #[serde(flatten)]
+    pub session: SessionItem,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "OpenTurn | undefined", optional)]
     pub open_turn: Option<OpenTurn>,
@@ -219,30 +364,24 @@ pub struct ConfigRequest {
     pub value: ConfigValue,
 }
 
-/// A session's config catalogue and its current values: `GET
-/// /api/sessions/{id}/catalog`, the answer to `POST …/config`, and the data
-/// of the SSE `catalog_changed` message (ACP core §9). Commands, plan and
-/// usage join it with the plans that produce them.
+/// A session's catalogue: its config options and their current values,
+/// and its slash commands. `GET /api/sessions/{id}/catalog`, the answer to
+/// `POST …/config`, and the data of the SSE `catalog_changed` message (ACP
+/// core §9), always as it stands when sent. Plan and usage join it with
+/// the plans that produce them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct SessionCatalog {
     pub session_id: String,
     /// The adapter's ACP `SessionConfigOption` objects, as last reported.
     #[ts(type = "unknown[]")]
     pub config_options: Vec<Value>,
+    /// The adapter's slash commands (ACP `AvailableCommand` objects), as
+    /// last reported; empty until it reports any (ACP core §7). Always
+    /// sent, so the schema and the TypeScript type agree that it is there.
+    #[ts(type = "unknown[]")]
+    pub commands: Vec<Value>,
     #[serde(flatten)]
     pub current: SessionConfig,
-}
-
-impl SessionCatalog {
-    /// The catalogue an event's extracts report, if they carry a snapshot.
-    pub fn from_indexed(session_id: &str, indexed: &Indexed) -> Option<Self> {
-        let current = indexed.current_config()?;
-        Some(Self {
-            session_id: session_id.to_string(),
-            config_options: indexed.config_options.clone().unwrap_or_default(),
-            current,
-        })
-    }
 }
 
 /// 201 to `POST /api/hosts/pairing-codes` (kernel spec §4.1): a single-use

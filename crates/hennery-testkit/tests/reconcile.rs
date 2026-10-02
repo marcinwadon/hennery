@@ -981,11 +981,13 @@ async fn the_session_detail_shows_the_open_turn() {
     let turn = started_turn(&collector, &mut host, &session).await;
     let (status, body) = get(&client(&collector), collector.url(&format!("/api/sessions/{session}"))).await;
     assert_eq!(status, 200, "{body}");
+    let item = collector.state.store.session_item(&session).unwrap().unwrap();
     assert_eq!(
         body,
         json!({
             "session_id": session, "host_id": HOST, "agent": "fake", "cwd": "/tmp",
             "lifecycle": "active", "activity": "running", "presumed_parked": false,
+            "created_at": item.created_at, "last_event_at": item.last_event_at,
             "open_turn": { "turn_id": turn, "state": "started" }, "pending": []
         })
     );
@@ -2094,4 +2096,353 @@ async fn a_revoke_of_an_already_offline_host_still_parks_its_sessions_and_cancel
         serde_json::to_value((item.state, item.reason, item.delivered)).unwrap(),
         json!(["cancelled", "host_revoked", false])
     );
+}
+
+// Plan 6b: commands join the catalogue (ACP core §7, §9).
+
+fn commands_update(names: &[&str]) -> SessionBody {
+    let list = names.iter().map(|n| json!({ "name": n, "description": n })).collect();
+    SessionBody::AcpUpdate {
+        indexed: hennery_proto::frames::Indexed {
+            commands: Some(list),
+            ..Default::default()
+        },
+        payload: json!({"update": {"sessionUpdate": "available_commands_update"}}),
+    }
+}
+
+fn mode_update(mode: &str) -> SessionBody {
+    SessionBody::AcpUpdate {
+        indexed: catalogue(mode),
+        payload: json!({"update": {"sessionUpdate": "config_option_update"}}),
+    }
+}
+
+/// The `(id, data)` of every `catalog_changed` message in `stream`.
+fn catalog_messages(stream: &str) -> Vec<(String, Value)> {
+    stream
+        .split("\n\n")
+        .filter(|m| m.contains("event: catalog_changed"))
+        .map(|m| {
+            let field = |name: &str| m.lines().find_map(|l| l.strip_prefix(name)).unwrap().to_string();
+            (field("id: "), serde_json::from_str(&field("data: ")).unwrap())
+        })
+        .collect()
+}
+
+/// The `id:` of the `event` message whose data contains `marker`.
+fn event_id(stream: &str, marker: &str) -> String {
+    let message = stream
+        .split("\n\n")
+        .find(|m| m.contains("event: event") && m.contains(marker))
+        .unwrap();
+    message
+        .lines()
+        .find_map(|l| l.strip_prefix("id: "))
+        .unwrap()
+        .to_string()
+}
+
+/// Decision 4: live, a commands update is a `catalog_changed` too, and each
+/// one carries the whole catalogue as it stands: a later config change
+/// does not wipe the commands, nor commands the config.
+#[tokio::test]
+async fn live_catalog_changed_carries_the_whole_catalogue_commands_included() {
+    use futures::StreamExt;
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    host.emit(&session, mode_update("plan")).await;
+    let resp = client(&collector)
+        .get(collector.url(&format!("/api/stream/sessions/{session}")))
+        .send()
+        .await
+        .unwrap();
+    let mut body = resp.bytes_stream();
+    let mut buf = String::new();
+    let mut read_until = async |count: usize| {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while catalog_messages(&buf).len() < count {
+            let chunk = tokio::time::timeout_at(deadline, body.next())
+                .await
+                .unwrap_or_else(|_| panic!("stream stalled: {buf}"))
+                .unwrap()
+                .unwrap();
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        buf.clone()
+    };
+    // The replayed one, then one per live change.
+    read_until(1).await;
+    host.emit(&session, commands_update(&["review"])).await;
+    let stream = read_until(2).await;
+    let (id, data) = catalog_messages(&stream)[1].clone();
+    assert_eq!(id, event_id(&stream, "available_commands_update"));
+    assert_eq!(data["mode"], "plan", "{data}");
+    assert_eq!(
+        data["commands"],
+        json!([{"name": "review", "description": "review"}]),
+        "{data}"
+    );
+    host.emit(&session, mode_update("bypass")).await;
+    let stream = read_until(3).await;
+    let (_, data) = catalog_messages(&stream)[2].clone();
+    assert_eq!(data["mode"], "bypass", "{data}");
+    assert_eq!(
+        data["commands"],
+        json!([{"name": "review", "description": "review"}]),
+        "{data}"
+    );
+    let catalog: Value = client(&collector)
+        .get(collector.url(&format!("/api/sessions/{session}/catalog")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(catalog, data);
+}
+
+/// The review's A6: a replay from `Last-Event-ID` sends the catalogue once,
+/// after the last event in it that changed the catalogue and with that
+/// event's id, however many did: never one whole catalogue per event
+/// (P-23).
+#[tokio::test]
+async fn a_replay_sends_the_catalogue_once_after_the_last_event_that_changed_it() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    host.emit(&session, mode_update("plan")).await;
+    host.emit(&session, commands_update(&["review"])).await;
+    host.emit(&session, mode_update("bypass")).await;
+    host.emit(
+        &session,
+        SessionBody::AcpUpdate {
+            indexed: Default::default(),
+            payload: json!({"update": {"sessionUpdate": "agent_message_chunk", "marker": "last"}}),
+        },
+    )
+    .await;
+    // `emit` does not wait for the collector: every event must be stored
+    // before the stream opens, or some would arrive live, not replayed.
+    let stored = wait_for("the last event stored", || async {
+        let events = collector.state.store.events(&session, 0, 100).unwrap();
+        events
+            .iter()
+            .any(|e| e.body["payload"]["update"]["marker"] == "last")
+            .then_some(events)
+    })
+    .await;
+    let stream = read_stream(&collector, &session, |s| s.contains(r#""marker":"last""#)).await;
+    let changed = catalog_messages(&stream);
+    assert_eq!(changed.len(), 1, "{stream}");
+    let (id, data) = &changed[0];
+    let bypass = stream
+        .split("\n\n")
+        .filter(|m| m.contains("event: event") && m.contains("config_option_update"))
+        .last()
+        .unwrap();
+    assert_eq!(Some(id.as_str()), bypass.lines().find_map(|l| l.strip_prefix("id: ")));
+    // Right after that event, before the next one.
+    let at = |needle: &str| stream.find(needle).unwrap();
+    assert!(at("event: catalog_changed") > at(bypass) && at("event: catalog_changed") < at(r#""marker":"last""#));
+    assert_eq!(data["mode"], "bypass", "{data}");
+    assert_eq!(
+        data["commands"],
+        json!([{"name": "review", "description": "review"}]),
+        "{data}"
+    );
+    // From `Last-Event-ID`: after the commands, once, after `bypass`; after
+    // `bypass`, not at all.
+    let id_of = |update: &str, mode: Option<&str>| {
+        stored
+            .iter()
+            .rfind(|e| {
+                e.body["payload"]["update"]["sessionUpdate"] == update
+                    && mode.is_none_or(|m| e.body["indexed"]["current_mode"] == m)
+            })
+            .unwrap()
+            .event_id
+    };
+    let after = async |last: i64| {
+        use futures::StreamExt;
+        let resp = client(&collector)
+            .get(collector.url(&format!("/api/stream/sessions/{session}")))
+            .header("last-event-id", last.to_string())
+            .send()
+            .await
+            .unwrap();
+        let mut body = resp.bytes_stream();
+        let mut buf = String::new();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !buf.contains(r#""marker":"last""#) {
+            let chunk = tokio::time::timeout_at(deadline, body.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            buf.push_str(&String::from_utf8_lossy(&chunk));
+        }
+        buf
+    };
+    let bypass_id = id_of("config_option_update", Some("bypass"));
+    let from_commands = after(id_of("available_commands_update", None)).await;
+    let changed = catalog_messages(&from_commands);
+    assert_eq!(changed.len(), 1, "{from_commands}");
+    assert_eq!(changed[0].0, bypass_id.to_string());
+    let from_bypass = after(bypass_id).await;
+    assert!(catalog_messages(&from_bypass).is_empty(), "{from_bypass}");
+}
+
+// Plan 6b: the list item in the detail; what a start may name (the review's
+// A1).
+
+/// The detail is the list item (with the title and the current model and
+/// mode), the open turn and the open questions.
+#[tokio::test]
+async fn the_session_detail_carries_the_title_and_the_current_model_and_mode() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    host.emit(&session, mode_update("plan")).await;
+    host.emit(
+        &session,
+        SessionBody::AcpUpdate {
+            indexed: hennery_proto::frames::Indexed {
+                title: Some("Fix the login bug".into()),
+                ..Default::default()
+            },
+            payload: json!({"update": {"sessionUpdate": "session_info_update"}}),
+        },
+    )
+    .await;
+    wait_for("the title", || async {
+        collector
+            .state
+            .store
+            .session(&session)
+            .unwrap()
+            .unwrap()
+            .title
+            .map(|_| ())
+    })
+    .await;
+    let (status, detail) = get(&client(&collector), collector.url(&format!("/api/sessions/{session}"))).await;
+    assert_eq!(status, 200, "{detail}");
+    assert_eq!(detail["title"], "Fix the login bug");
+    assert_eq!(detail["mode"], "plan");
+    assert_eq!(detail["lifecycle"], "active");
+    assert_eq!(detail["pending"], json!([]));
+    assert_eq!(detail["last_event_at"].as_str().unwrap().len(), 24);
+}
+
+/// A start names a paired host (an unknown one is refused before any
+/// session exists), and an agent of at most 32 bytes as JSON writes them,
+/// so every field of the list item is bounded.
+#[tokio::test]
+async fn a_start_names_a_paired_host_and_an_agent_of_at_most_32_bytes() {
+    let collector = Collector::start().await;
+    let c = client(&collector);
+    let (status, body) = post(
+        &c,
+        collector.url("/api/sessions"),
+        json!({ "host_id": "host-unknown", "agent": "fake", "cwd": "/tmp" }),
+    )
+    .await;
+    assert_eq!((status, body["code"].as_str()), (400, Some("unknown_host")), "{body}");
+    let (status, body) = post(
+        &c,
+        collector.url("/api/sessions"),
+        json!({ "host_id": HOST, "agent": "a".repeat(33), "cwd": "/tmp" }),
+    )
+    .await;
+    assert_eq!((status, body["code"].as_str()), (400, Some("invalid")), "{body}");
+    let (status, body) = post(
+        &c,
+        collector.url("/api/sessions"),
+        json!({ "host_id": HOST, "agent": "\"".repeat(17), "cwd": "/tmp" }),
+    )
+    .await;
+    assert_eq!((status, body["code"].as_str()), (400, Some("invalid")), "{body}");
+    let sessions: i64 = rusqlite::Connection::open(collector._dir.path().join("hennery.db"))
+        .unwrap()
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(sessions, 0);
+    // A paired host that is offline still gets a session, failed as before.
+    let (status, body) = post(
+        &c,
+        collector.url("/api/sessions"),
+        json!({ "host_id": HOST, "agent": "a".repeat(32), "cwd": "/tmp" }),
+    )
+    .await;
+    assert_eq!((status, body["code"].as_str()), (409, Some("host_offline")), "{body}");
+}
+
+// Plan 6b: `GET /api/sessions` (ACP core §9).
+
+/// Pages, searches and filters; every parameter it cannot honour is
+/// refused, never ignored: `hat` until sessions have hats (plan 5).
+#[tokio::test]
+async fn the_session_list_pages_searches_filters_and_refuses_what_it_cannot_honour() {
+    let collector = Collector::start().await;
+    let store = &collector.state.store;
+    for (id, cwd) in [("a", "/src/alpha"), ("b", "/src/beta"), ("c", "/src/gamma")] {
+        store.create_session(id, HOST, "fake", cwd).unwrap();
+        // One millisecond apart at least, so the order is known.
+        tokio::time::sleep(Duration::from_millis(3)).await;
+    }
+    store.close_now("a").unwrap();
+    let c = client(&collector);
+    let list = async |query: &str| get(&c, collector.url(&format!("/api/sessions{query}"))).await;
+    let ids = |page: &Value| -> Vec<String> {
+        page["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["session_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let (status, page) = list("").await;
+    assert_eq!(status, 200, "{page}");
+    assert_eq!(ids(&page), ["a", "c", "b"]);
+    assert_eq!(page.get("next_cursor"), None);
+    assert_eq!(page["sessions"][0]["lifecycle"], "closed");
+
+    let (_, first) = list("?limit=2").await;
+    assert_eq!(ids(&first), ["a", "c"]);
+    let cursor = first["next_cursor"].as_str().unwrap().to_string();
+    let (_, rest) = list(&format!("?limit=2&cursor={cursor}")).await;
+    assert_eq!(ids(&rest), ["b"]);
+    assert_eq!(rest.get("next_cursor"), None);
+    // Clamped to at least one.
+    assert_eq!(ids(&list("?limit=0").await.1), ["a"]);
+
+    let (_, open) = list("?lifecycle=starting,active,parked,failed").await;
+    assert_eq!(ids(&open), ["c", "b"]);
+    // A search bypasses the lifecycle filter.
+    let (_, found) = list("?lifecycle=starting&q=ALPHA").await;
+    assert_eq!(ids(&found), ["a"]);
+    let (_, blank) = list("?q=%20%20").await;
+    assert_eq!(ids(&blank), ["a", "c", "b"]);
+
+    for (query, code) in [
+        ("?hat=work", "hat_filter_unavailable"),
+        ("?hat=", "hat_filter_unavailable"),
+        ("?cursor=zz", "invalid_cursor"),
+        ("?limit=x", "invalid"),
+        ("?limit=-1", "invalid"),
+        ("?lifecycle=active,bogus", "invalid"),
+    ] {
+        let (status, body) = list(query).await;
+        assert_eq!((status, body["code"].as_str()), (400, Some(code)), "{query}: {body}");
+    }
+    let (status, body) = list(&format!("?q={}", "q".repeat(201))).await;
+    assert_eq!((status, body["code"].as_str()), (400, Some("invalid")), "{body}");
+    // A control character would cut the pattern short (a NUL ends it).
+    let (status, body) = list("?q=a%00b").await;
+    assert_eq!((status, body["code"].as_str()), (400, Some("invalid")), "{body}");
+    assert_eq!(list(&format!("?q={}", "q".repeat(200))).await.0, 200);
 }

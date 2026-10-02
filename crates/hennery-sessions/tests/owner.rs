@@ -5,7 +5,7 @@ use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::Operator;
 use hennery_proto::frames::{AttachedSession, SessionBody};
 use hennery_proto::rest::AnswerRequest;
-use hennery_sessions::store::{AnswerSubmission, Reconciliation, ResumeRequest, Store};
+use hennery_sessions::store::{AnswerSubmission, ListQuery, Reconciliation, ResumeRequest, Store};
 use rusqlite::types::Value;
 use serde_json::json;
 
@@ -118,7 +118,22 @@ fn the_owner_id_migration_gives_every_row_the_owner() {
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
         write_world(&conn, &owner, "a");
-        // Back to the store's schema before this plan (version 6).
+        // Back to the store's schema before this plan (version 6): plan
+        // 6b's migration (version 9) undone first, its index on `owner_id`
+        // included.
+        conn.execute_batch(
+            "
+            DROP INDEX sessions_by_recency;
+            ALTER TABLE sessions DROP COLUMN title;
+            ALTER TABLE sessions DROP COLUMN git_branch;
+            ALTER TABLE sessions DROP COLUMN git_dirty;
+            ALTER TABLE sessions DROP COLUMN git_worktree;
+            ALTER TABLE sessions DROP COLUMN base_commit;
+            ALTER TABLE sessions DROP COLUMN last_event_id;
+            ALTER TABLE session_catalog DROP COLUMN commands;
+            ",
+        )
+        .unwrap();
         for table in TABLES {
             conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN owner_id;"))
                 .unwrap();
@@ -192,6 +207,21 @@ fn another_owners_sessions_are_invisible_to_the_store() {
 
     let before = all_rows(&conn, None);
     assert_eq!(store.session("session-b").unwrap(), None);
+    assert_eq!(store.session_item("session-b").unwrap(), None);
+    // The list, and a search that would match only the other owner's.
+    let listed: Vec<String> = store
+        .list(&ListQuery::default())
+        .unwrap()
+        .sessions
+        .into_iter()
+        .map(|s| s.session_id)
+        .collect();
+    assert_eq!(listed, ["session-a"]);
+    let search = ListQuery {
+        search: Some("session-b"),
+        ..ListQuery::default()
+    };
+    assert!(store.list(&search).unwrap().sessions.is_empty());
     assert_eq!(store.catalog("session-b").unwrap(), None);
     assert!(store.open_pending("session-b").unwrap().is_empty());
     assert_eq!(store.pending_item("pending-b").unwrap(), None);
