@@ -68,6 +68,43 @@ describe('request', () => {
     expect(err).toMatchObject({ status: 409, code: 'host_offline', message: 'The host is offline.' })
   })
 
+  // Every code the UI explains, each with its own message: a code dropped
+  // from the table would fall back to the server's text.
+  it.each([
+    ['hat_ambiguous', 'This path matches more than one hat: pick the path exactly as its rule names it.'],
+    ['cwd_moved', 'The session’s directory has moved since it last ran.'],
+    ['hat_mismatch', 'This directory now belongs to another hat than the session’s.'],
+    ['presumed_parked', 'Its host has been away and may still run it: close the session first.'],
+    ['images_unsupported', 'This agent takes no images.'],
+    ['host_offline', 'The host is offline.'],
+    ['host_installing', 'The host is still installing its agents.'],
+    ['already_set_up', 'hennery is set up already: sign in instead.'],
+    ['invalid_setup_token', 'This setup link is used or expired. Run `hennery admin setup-url` on the collector for a new one.'],
+    ['origin_mismatch', 'The public URL must be the address this page is open at.'],
+    ['setup_required', 'hennery is not set up yet. Run `hennery admin setup-url` on the collector for the setup link.'],
+    ['invalid_password', 'Wrong password.'],
+    ['rate_limited', 'Too many attempts. Wait, then try again.'],
+    ['no_passkeys', 'No passkey is registered.'],
+    ['passkeys_unavailable', 'Passkeys need a public URL with a host name, not an IP address.'],
+    ['passkey_refused', 'The passkey was not accepted.'],
+    ['invalid_ceremony', 'The passkey prompt expired. Try again.'],
+    ['already_registered', 'This authenticator holds a passkey for hennery already.'],
+    ['step_up_required', 'Confirm it is you, then try again.'],
+    ['unauthenticated', 'Sign in first.'],
+  ])('explains %s in its own words', async (code, message) => {
+    const { client } = stub([json(409, { code, message: 'server text' })])
+    await expect(client.request('POST', '/api/x')).rejects.toMatchObject({ code, message })
+  })
+
+  it('names the status of a refusal with no JSON body', async () => {
+    const { client } = stub([new Response('upstream broke', { status: 502 })])
+    await expect(client.request('GET', '/api/x')).rejects.toMatchObject({
+      status: 502,
+      code: 'http_502',
+      message: 'The request failed (502).',
+    })
+  })
+
   it('shows the server’s message for a code it does not know', async () => {
     const { client } = stub([json(409, { code: 'brand_new', message: 'server text' })])
     await expect(client.request('POST', '/api/x')).rejects.toMatchObject({ code: 'brand_new', message: 'server text' })

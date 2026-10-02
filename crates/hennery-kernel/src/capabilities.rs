@@ -54,4 +54,13 @@ mod tests {
             serde_json::json!({"mode": "full", "features": ["mcp_connections"]})
         );
     }
+
+    /// The other mode, as the web UI reads it (`lib/views.ts`).
+    #[test]
+    fn the_gateway_mode_is_named_gateway() {
+        assert_eq!(
+            serde_json::to_value(DeploymentMode::Gateway).unwrap(),
+            serde_json::json!("gateway")
+        );
+    }
 }
