@@ -16,8 +16,7 @@ use hennery_kernel::operator::Authenticated;
 use hennery_proto::frames::{Capability, CollectorFrame, Indexed, SessionBody};
 use hennery_proto::rest::{
     AnswerRequest, AnswerResponse, ApiError, CancelResponse, ConfigRequest, EventDto, LifecycleResponse, OpenTurn,
-    PendingItem, PromptRequest, PromptResponse, SessionCatalog, SessionDetail, StartSessionRequest,
-    StartSessionResponse,
+    PendingItem, PromptRequest, PromptResponse, SessionDetail, StartSessionRequest, StartSessionResponse,
 };
 use serde::Deserialize;
 use std::convert::Infallible;
@@ -723,15 +722,19 @@ fn sse_event(e: &EventDto) -> Event {
 }
 
 /// The SSE messages for one stored event: the event, then `catalog_changed`
-/// with the same id if it carries a catalogue snapshot, and
-/// `pending_changed` with the same id if it concerns a pending request
-/// (ACP core §9). A listed event with a snapshot is one that changed the
-/// stored catalogue, and both come from the stored row, so a replay from
-/// `Last-Event-ID` sends them too. `pending_changed` carries the request as
-/// it stands when the message is sent.
-fn sse_messages(store: &Store, e: &EventDto) -> Vec<Result<Event, Infallible>> {
+/// with the same id if it changed the catalogue (and `catalog` is asked
+/// for), and `pending_changed` with the same id if it concerns a pending
+/// request (ACP core §9). Both are derived from the stored row, so a replay
+/// from `Last-Event-ID` sends them too, and both carry what they describe
+/// as it stands when the message is sent (plan 6b decision 4: the
+/// catalogue has parts that change apart, the config and the commands, so
+/// one built from the event alone would wipe the part it does not carry).
+fn sse_messages(store: &Store, e: &EventDto, catalog: bool) -> Vec<Result<Event, Infallible>> {
     let mut out = vec![Ok(sse_event(e))];
-    if let Some(catalog) = catalog_in(e) {
+    if catalog
+        && changes_catalogue(e)
+        && let Ok(Some(catalog)) = store.catalog(&e.session_id)
+    {
         out.push(Ok(Event::default()
             .id(e.event_id.to_string())
             .event("catalog_changed")
@@ -758,13 +761,18 @@ fn pending_in(store: &Store, e: &EventDto) -> Option<PendingItem> {
     store.pending_item(pending_id).ok().flatten()
 }
 
-/// The catalogue snapshot a stored host fact carries in its extracts.
-fn catalog_in(e: &EventDto) -> Option<SessionCatalog> {
+/// Whether a stored host fact changed the catalogue: its extracts carry a
+/// config snapshot or the commands. Listed events only reach here, and a
+/// listed one with either changed the stored catalogue.
+fn changes_catalogue(e: &EventDto) -> bool {
     if !matches!(e.kind.as_str(), "session_started" | "config_applied" | "acp_update") {
-        return None;
+        return false;
     }
-    let indexed: Indexed = serde_json::from_value(e.body.get("indexed")?.clone()).ok()?;
-    SessionCatalog::from_indexed(&e.session_id, &indexed)
+    let Some(indexed) = e.body.get("indexed") else {
+        return false;
+    };
+    serde_json::from_value::<Indexed>(indexed.clone())
+        .is_ok_and(|indexed| indexed.current_config().is_some() || indexed.commands.is_some())
 }
 
 /// The session's events as SSE: replays from `Last-Event-ID`, then follows
@@ -785,10 +793,15 @@ async fn stream_session(
     let live = BroadcastStream::new(state.hub.subscribe());
     let backlog = state.store.events(&id, after, u32::MAX).unwrap_or_default();
     let last = backlog.last().map(|e| e.event_id).unwrap_or(after);
+    // The catalogue once, after the last event of the backlog that changed
+    // it: every `catalog_changed` carries the whole catalogue as it stands,
+    // so one per event would only repeat it (the review's A6, P-23).
+    let last_catalogue = backlog.iter().rposition(changes_catalogue);
     let replay = stream::iter(
         backlog
             .iter()
-            .flat_map(|e| sse_messages(&state.store, e))
+            .enumerate()
+            .flat_map(|(at, e)| sse_messages(&state.store, e, Some(at) == last_catalogue))
             .collect::<Vec<_>>(),
     );
     let session = id.clone();
@@ -799,7 +812,7 @@ async fn stream_session(
             let store = store.clone();
             async move {
                 match item {
-                    Ok(e) if e.session_id == session && e.event_id > last => Some(sse_messages(&store, &e)),
+                    Ok(e) if e.session_id == session && e.event_id > last => Some(sse_messages(&store, &e, true)),
                     Ok(_) => None,
                     // Lagged: tell the client to refetch instead of skipping silently.
                     Err(_) => Some(vec![Ok(Event::default().event("resync_required").data("{}"))]),

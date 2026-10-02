@@ -221,7 +221,12 @@ export type SessionCatalog = { session_id: string,
 /**
  * The adapter's ACP `SessionConfigOption` objects, as last reported.
  */
-config_options: unknown[], model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, };
+config_options: unknown[], 
+/**
+ * The adapter's slash commands (ACP `AvailableCommand` objects), as
+ * last reported; empty until it reports any (ACP core §7).
+ */
+commands: unknown[], model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, };
 
 export type PendingState = "open" | "delivered" | "cancelled";
 

@@ -1870,3 +1870,143 @@ fn a_fact_that_writes_collector_events_leaves_recency_at_the_last_of_them() {
     let parked = store.record_park_request("s1").unwrap();
     assert_eq!(recency(&store), (parked.ts.clone(), Some(parked.event_id)));
 }
+
+// Plan 6b: the title and the commands, from their extracts (ACP core §3.2,
+// §7, §8).
+
+fn titled(title: &str) -> SessionBody {
+    SessionBody::AcpUpdate {
+        indexed: Indexed {
+            title: Some(title.into()),
+            ..Indexed::default()
+        },
+        payload: json!({ "update": { "sessionUpdate": "session_info_update" } }),
+    }
+}
+
+fn commands(names: &[&str]) -> SessionBody {
+    let list = names.iter().map(|n| json!({ "name": n, "description": n })).collect();
+    SessionBody::AcpUpdate {
+        indexed: Indexed {
+            commands: Some(list),
+            ..Indexed::default()
+        },
+        payload: json!({ "update": { "sessionUpdate": "available_commands_update" } }),
+    }
+}
+
+fn title_of(store: &Store) -> Option<String> {
+    store.session("s1").unwrap().unwrap().title
+}
+
+/// Decision 1: the title is kept on one line and capped, for the list; an
+/// empty one (the agent cleared it) clears it; one in an update that does
+/// not apply changes nothing. The event keeps what the agent sent.
+#[test]
+fn a_title_is_stored_on_one_line_and_capped_and_an_empty_one_clears_it() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    let created = store
+        .ingest("s1", 2, &titled("  Fix\nthe\tlogin \u{1}  bug  "))
+        .unwrap();
+    assert_eq!(title_of(&store).as_deref(), Some("Fix the login bug"));
+    assert_eq!(created[0].body["indexed"]["title"], "  Fix\nthe\tlogin \u{1}  bug  ");
+    store.ingest("s1", 3, &titled(&"x".repeat(300))).unwrap();
+    assert_eq!(title_of(&store), Some("x".repeat(120)));
+    // `"` takes two bytes in JSON: 80 of them is the byte cap (160).
+    store.ingest("s1", 4, &titled(&"\"".repeat(150))).unwrap();
+    assert_eq!(title_of(&store), Some("\"".repeat(80)));
+    store.ingest("s1", 5, &titled("")).unwrap();
+    assert_eq!(title_of(&store), None);
+    store.ingest("s1", 6, &titled("Kept")).unwrap();
+    store.close_now("s1").unwrap();
+    assert!(store.ingest("s1", 7, &titled("Too late")).unwrap().is_empty());
+    assert_eq!(title_of(&store).as_deref(), Some("Kept"));
+}
+
+fn early_titled(title: &str) -> SessionBody {
+    let SessionBody::AcpUpdate { mut indexed, payload } = titled(title) else {
+        unreachable!()
+    };
+    indexed.early = true;
+    SessionBody::AcpUpdate { indexed, payload }
+}
+
+/// Decision 2: a title the adapter sent before the session was announced
+/// (replayed by a load) may be older than the stored one: it only fills an
+/// empty title. A live one always wins.
+#[test]
+fn an_early_title_only_fills_an_empty_one() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.ingest("s1", 2, &early_titled("Old")).unwrap();
+    assert_eq!(title_of(&store).as_deref(), Some("Old"));
+    // Still listed: only the title is left as it was.
+    assert_eq!(store.ingest("s1", 3, &early_titled("Older")).unwrap().len(), 1);
+    assert_eq!(title_of(&store).as_deref(), Some("Old"));
+    store.ingest("s1", 4, &titled("New")).unwrap();
+    assert_eq!(title_of(&store).as_deref(), Some("New"));
+    // An early clear clears nothing.
+    store.ingest("s1", 5, &early_titled("")).unwrap();
+    assert_eq!(title_of(&store).as_deref(), Some("New"));
+    store.ingest("s1", 6, &titled("")).unwrap();
+    store.ingest("s1", 7, &early_titled("Replayed")).unwrap();
+    assert_eq!(title_of(&store).as_deref(), Some("Replayed"));
+}
+
+/// Decision 3: the latest list replaces the stored one (an empty list too),
+/// and commands never touch the config catalogue or its current values.
+#[test]
+fn commands_replace_the_stored_list_and_never_touch_the_config() {
+    let store = Store::open_in_memory().unwrap();
+    store.create_session("s1", "h1", "fake", "/tmp").unwrap();
+    let snapshot = Indexed {
+        config_options: Some(vec![json!({"id": "mode", "currentValue": "plan"})]),
+        current_mode: Some("plan".into()),
+        current_axes: Some(Default::default()),
+        ..Indexed::default()
+    };
+    store
+        .ingest(
+            "s1",
+            1,
+            &SessionBody::SessionStarted {
+                request_id: "r0".into(),
+                agent_session_id: "a1".into(),
+                indexed: snapshot,
+            },
+        )
+        .unwrap();
+    let before = store.catalog("s1").unwrap().unwrap();
+    assert!(before.commands.is_empty());
+    store.ingest("s1", 2, &commands(&["review", "plan"])).unwrap();
+    let after = store.catalog("s1").unwrap().unwrap();
+    assert_eq!(
+        after.commands,
+        [
+            json!({"name": "review", "description": "review"}),
+            json!({"name": "plan", "description": "plan"})
+        ]
+    );
+    assert_eq!(
+        (&after.config_options, &after.current),
+        (&before.config_options, &before.current)
+    );
+    assert_eq!(store.session("s1").unwrap().unwrap().config, before.current);
+    store.ingest("s1", 3, &commands(&[])).unwrap();
+    let emptied = store.catalog("s1").unwrap().unwrap();
+    assert!(emptied.commands.is_empty());
+    assert_eq!(emptied.config_options, before.config_options);
+}
+
+/// Commands reported before any config (or by an adapter that has none)
+/// are served with an empty catalogue.
+#[test]
+fn commands_reported_before_any_config_are_served_with_an_empty_catalogue() {
+    let store = Store::open_in_memory().unwrap();
+    started(&store);
+    store.ingest("s1", 2, &commands(&["review"])).unwrap();
+    let catalog = store.catalog("s1").unwrap().unwrap();
+    assert_eq!(catalog.commands, [json!({"name": "review", "description": "review"})]);
+    assert!(catalog.config_options.is_empty() && catalog.current.is_empty());
+}

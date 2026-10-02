@@ -203,6 +203,9 @@ pub struct SessionRow {
     pub last_event_at: String,
     /// That event's id; `None` until the session has one.
     pub last_event_id: Option<i64>,
+    /// The title the agent last reported, on one line and capped (plan 6b
+    /// decision 1); `None` until it reports one, or once it clears it.
+    pub title: Option<String>,
 }
 
 /// The outcome of `Store::request_resume`.
@@ -539,6 +542,86 @@ fn store_catalogue(tx: &Transaction<'_>, owner: &str, session_id: &str, indexed:
     Ok(())
 }
 
+/// The caps on a title in the session list (plan 6b decision 1, the
+/// review's A1): with every field of a list item at its cap, the item stays
+/// under 1 KiB (P-23).
+const TITLE_MAX_CHARS: usize = 120;
+const TITLE_MAX_JSON_BYTES: usize = 160;
+
+/// Bidi controls and zero-width characters: dropped from what the list
+/// shows, since they could make a row read as something else (the review's
+/// A2). Every other control character is a space by then.
+fn is_hidden_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}'
+    )
+}
+
+/// `raw` as one line for the session list (plan 6b decision 1): bidi and
+/// zero-width characters dropped, every other control character a space,
+/// runs of whitespace one space and the ends trimmed; then cut, never
+/// inside a character, to `max_chars` characters and `max_json_bytes` bytes
+/// as JSON writes it. With control characters gone, only `"` and `\` are
+/// escaped, as two bytes each; a cap on the raw bytes would not hold, since
+/// JSON writes a control character as six. `None` when nothing is left.
+fn one_line(raw: &str, max_chars: usize, max_json_bytes: usize) -> Option<String> {
+    let spaced: String = raw
+        .chars()
+        .filter(|c| !is_hidden_format(*c))
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let mut out = String::new();
+    let (mut chars, mut bytes) = (0, 0);
+    for c in spaced.split_whitespace().collect::<Vec<_>>().join(" ").chars() {
+        let width = match c {
+            '"' | '\\' => 2,
+            c => c.len_utf8(),
+        };
+        if chars == max_chars || bytes + width > max_json_bytes {
+            break;
+        }
+        out.push(c);
+        chars += 1;
+        bytes += width;
+    }
+    let out = out.trim_end();
+    (!out.is_empty()).then(|| out.to_string())
+}
+
+/// Store the title and the commands a fact's extracts carry (ACP core §3.2,
+/// §7). The title goes on one line and is capped (decision 1); a title the
+/// adapter sent before the session was announced (`early`, replayed by a
+/// load) may be older than the stored one, so it only fills an empty title
+/// (decision 2). The commands replace the stored list, and never touch the
+/// config catalogue (decision 3).
+fn store_state(tx: &Transaction<'_>, owner: &str, session_id: &str, indexed: &Indexed, ts: &str) -> Result<()> {
+    if let Some(title) = indexed.title.as_deref() {
+        let title = one_line(title, TITLE_MAX_CHARS, TITLE_MAX_JSON_BYTES);
+        if !indexed.early {
+            tx.execute(
+                "UPDATE sessions SET title = ?2 WHERE id = ?1 AND owner_id = ?3",
+                params![session_id, title, owner],
+            )?;
+        } else if title.is_some() {
+            tx.execute(
+                "UPDATE sessions SET title = ?2 WHERE id = ?1 AND title IS NULL AND owner_id = ?3",
+                params![session_id, title, owner],
+            )?;
+        }
+    }
+    if let Some(commands) = &indexed.commands {
+        tx.execute(
+            "INSERT INTO session_catalog(session_id, config_options, commands, updated_at, owner_id)
+             VALUES (?1, '[]', ?2, ?3, ?4)
+             ON CONFLICT(session_id) DO UPDATE SET commands = excluded.commands, updated_at = excluded.updated_at
+                 WHERE session_catalog.owner_id = excluded.owner_id",
+            params![session_id, serde_json::to_string(commands)?, ts, owner],
+        )?;
+    }
+    Ok(())
+}
+
 /// A session's `model`, `mode` and `config_axes` columns.
 type ConfigColumns = (Option<String>, Option<String>, Option<String>);
 
@@ -829,7 +912,7 @@ impl Store {
             .conn()
             .query_row(
                 "SELECT id, host_id, agent, cwd, lifecycle, activity, open_turn_id, failure_reason, close_requested,
-                        presumed_parked, model, mode, config_axes, last_event_at, last_event_id
+                        presumed_parked, model, mode, config_axes, last_event_at, last_event_id, title
                  FROM sessions WHERE id = ?1 AND owner_id = ?2",
                 [id, &self.owner],
                 |r| {
@@ -848,6 +931,7 @@ impl Store {
                         config: SessionConfig::default(),
                         last_event_at: r.get(13)?,
                         last_event_id: r.get(14)?,
+                        title: r.get(15)?,
                     };
                     Ok((row, config))
                 },
@@ -860,29 +944,33 @@ impl Store {
         Ok(Some(row))
     }
 
-    /// The session's config catalogue and current values (ACP core §9);
-    /// `None` for an unknown session, an empty catalogue for one whose
-    /// host has reported none.
+    /// The session's catalogue (ACP core §9): its config options and
+    /// current values, and its slash commands; `None` for an unknown
+    /// session, an empty catalogue for one whose host has reported none.
     pub fn catalog(&self, session_id: &str) -> Result<Option<SessionCatalog>> {
-        let row: Option<(ConfigColumns, Option<String>)> = self
+        let row: Option<(ConfigColumns, Option<String>, Option<String>)> = self
             .conn()
             .query_row(
-                "SELECT s.model, s.mode, s.config_axes, c.config_options
+                "SELECT s.model, s.mode, s.config_axes, c.config_options, c.commands
                  FROM sessions s LEFT JOIN session_catalog c ON c.session_id = s.id AND c.owner_id = s.owner_id
                  WHERE s.id = ?1 AND s.owner_id = ?2",
                 [session_id, &self.owner],
-                |r| Ok(((r.get(0)?, r.get(1)?, r.get(2)?), r.get(3)?)),
+                |r| Ok(((r.get(0)?, r.get(1)?, r.get(2)?), r.get(3)?, r.get(4)?)),
             )
             .optional()?;
-        let Some((config, options)) = row else {
+        let Some((config, options, commands)) = row else {
             return Ok(None);
+        };
+        let list = |json: Option<String>| -> Result<Vec<Value>> {
+            Ok(match json {
+                Some(json) => serde_json::from_str(&json)?,
+                None => Vec::new(),
+            })
         };
         Ok(Some(SessionCatalog {
             session_id: session_id.to_string(),
-            config_options: match options {
-                Some(options) => serde_json::from_str(&options)?,
-                None => Vec::new(),
-            },
+            config_options: list(options)?,
+            commands: list(commands)?,
             current: stored_config(config)?,
         }))
     }
@@ -1707,6 +1795,7 @@ impl Store {
                     // own config); the host never sends a replayed one
                     // with extracts.
                     store_catalogue(&tx, &self.owner, session_id, indexed, &ts)?;
+                    store_state(&tx, &self.owner, session_id, indexed, &ts)?;
                 }
             }
             SessionBody::ConfigApplied { indexed, .. } => {
@@ -1993,6 +2082,30 @@ mod tests {
     fn timestamps_are_rfc3339_utc() {
         let ts = super::now();
         assert!(ts.ends_with('Z') && ts.as_bytes()[10] == b'T', "{ts}");
+    }
+
+    /// Plan 6b decision 1: one line, then the caps, by characters and by
+    /// the bytes JSON takes; never a broken character.
+    #[test]
+    fn one_line_collapses_whitespace_and_cuts_to_the_caps() {
+        assert_eq!(one_line("  a\n\tb \u{7}\u{2028} c ", 10, 10).as_deref(), Some("a b c"));
+        assert_eq!(one_line(" \n\t\u{0} ", 10, 10), None);
+        assert_eq!(one_line("", 10, 10), None);
+        assert_eq!(one_line("abcdef", 4, 100).as_deref(), Some("abcd"));
+        assert_eq!(one_line("abcdef", 100, 4).as_deref(), Some("abcd"));
+        // `"` and `\` take two bytes in JSON.
+        assert_eq!(one_line("a\"b\\c", 100, 3).as_deref(), Some("a\""));
+        assert_eq!(one_line("a\"b\\c", 100, 5).as_deref(), Some("a\"b"));
+        // Two bytes each, then three: the cut never splits a character.
+        assert_eq!(one_line("ééé€€", 100, 7).as_deref(), Some("ééé"));
+        // A cut that ends on a space drops it.
+        assert_eq!(one_line("ab cd", 3, 100).as_deref(), Some("ab"));
+        // Bidi and zero-width characters, which could make a row read as
+        // something else, are dropped.
+        assert_eq!(
+            one_line("a\u{202E}b\u{200B}c\u{FEFF}d\u{061C}e\u{2066}f\u{200F}", 100, 100).as_deref(),
+            Some("abcdef")
+        );
     }
 
     /// Plan 6b decision 5: every stamp has the same width, so comparing

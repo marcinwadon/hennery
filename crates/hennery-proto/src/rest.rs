@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use ts_rs::TS;
 
-use crate::frames::{ConfigValue, ElicitationAction, Indexed, PendingKind, PendingReason, SessionConfig};
+use crate::frames::{ConfigValue, ElicitationAction, PendingKind, PendingReason, SessionConfig};
 
 /// `POST /api/sessions` (ACP core §9): `{host_id, agent, cwd, model?, mode?, axes?}`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
@@ -219,30 +219,24 @@ pub struct ConfigRequest {
     pub value: ConfigValue,
 }
 
-/// A session's config catalogue and its current values: `GET
-/// /api/sessions/{id}/catalog`, the answer to `POST …/config`, and the data
-/// of the SSE `catalog_changed` message (ACP core §9). Commands, plan and
-/// usage join it with the plans that produce them.
+/// A session's catalogue: its config options and their current values,
+/// and its slash commands. `GET /api/sessions/{id}/catalog`, the answer to
+/// `POST …/config`, and the data of the SSE `catalog_changed` message (ACP
+/// core §9), always as it stands when sent. Plan and usage join it with
+/// the plans that produce them.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct SessionCatalog {
     pub session_id: String,
     /// The adapter's ACP `SessionConfigOption` objects, as last reported.
     #[ts(type = "unknown[]")]
     pub config_options: Vec<Value>,
+    /// The adapter's slash commands (ACP `AvailableCommand` objects), as
+    /// last reported; empty until it reports any (ACP core §7).
+    #[serde(default)]
+    #[ts(type = "unknown[]")]
+    pub commands: Vec<Value>,
     #[serde(flatten)]
     pub current: SessionConfig,
-}
-
-impl SessionCatalog {
-    /// The catalogue an event's extracts report, if they carry a snapshot.
-    pub fn from_indexed(session_id: &str, indexed: &Indexed) -> Option<Self> {
-        let current = indexed.current_config()?;
-        Some(Self {
-            session_id: session_id.to_string(),
-            config_options: indexed.config_options.clone().unwrap_or_default(),
-            current,
-        })
-    }
 }
 
 /// 201 to `POST /api/hosts/pairing-codes` (kernel spec §4.1): a single-use

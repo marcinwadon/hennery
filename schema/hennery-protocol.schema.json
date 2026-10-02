@@ -1907,13 +1907,19 @@
       ]
     },
     "SessionCatalog": {
-      "description": "A session's config catalogue and its current values: `GET\n/api/sessions/{id}/catalog`, the answer to `POST …/config`, and the data\nof the SSE `catalog_changed` message (ACP core §9). Commands, plan and\nusage join it with the plans that produce them.",
+      "description": "A session's catalogue: its config options and their current values,\nand its slash commands. `GET /api/sessions/{id}/catalog`, the answer to\n`POST …/config`, and the data of the SSE `catalog_changed` message (ACP\ncore §9), always as it stands when sent. Plan and usage join it with\nthe plans that produce them.",
       "properties": {
         "axes": {
           "additionalProperties": {
             "$ref": "#/$defs/ConfigValue"
           },
           "type": "object"
+        },
+        "commands": {
+          "default": [],
+          "description": "The adapter's slash commands (ACP `AvailableCommand` objects), as\nlast reported; empty until it reports any (ACP core §7).",
+          "items": true,
+          "type": "array"
         },
         "config_options": {
           "description": "The adapter's ACP `SessionConfigOption` objects, as last reported.",
