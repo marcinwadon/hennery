@@ -74,7 +74,7 @@ const SOURCES: &[(&str, &str, usize)] = &[
     (
         "hennery-sessions/src/store.rs",
         include_str!("../../hennery-sessions/src/store.rs"),
-        128,
+        134,
     ),
     (
         "hennery-gateway/src/store.rs",
