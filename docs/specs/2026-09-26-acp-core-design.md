@@ -1358,6 +1358,12 @@ therefore decides the CLI version.
   (retention follows the session). Neither holds the image's bytes, so no
   replay carries them. *(P-22: the predecessor never stored sent images;
   transcripts kept orphaned "[Image #N]" markers.)*
+- **Orphans are swept** at the collector's start and then hourly (plan 9b):
+  the owner's image rows that no turn or event references, then files in
+  `attachments/` that no owner's row names, and leftover `.tmp` files, each
+  only once it is an hour old. Only regular files with a hash or a temporary
+  name are touched, never through a link; an image saved again has its time
+  refreshed, so the hour covers it until its turn records it.
 - **Slash commands** arrive as `available_commands_update` (passed through,
   with a `commands` extract); the collector keeps the latest list per session
   and serves it from the catalogue endpoint, never in the session list.
@@ -1775,8 +1781,9 @@ session, Changes tab, config explorer, auto-naming, memory. Gateway internals
 Resolved by the maintainer on 2026-09-27:
 
 1. **Attachment retention** — no size cap in v1. Images live as long as their
-   session; Settings shows the attachment store's disk usage (frontend §8),
-   from `GET /api/settings/attachments` (§9).
+   session (a delete removes them, §4.10, and the sweep what nothing
+   references, §7); Settings shows the attachment store's disk usage
+   (frontend §8), from `GET /api/settings/attachments` (§9).
 2. **Per-hat "isolate agent user config"** — not in v1, documentation only.
    The docs next to the hat settings say that each session still loads the
    user's own agent configuration (umbrella §8.4) and that a hat needing this
