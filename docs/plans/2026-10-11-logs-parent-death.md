@@ -31,7 +31,7 @@ It builds on the executed [services, supervisor and host lock (7c)](2026-10-09-s
 
 Every anchor below was taken from `main` at `3117743`, which merged PR #51 (7b) after PR #43 (7c-ii), 6b, PR #49 (the probe sockets' close-on-exec) and PR #45 (7e-i). 7b's `git.rs` strips what an agent never inherits from every `git` the host runs; the log variables join that list too (decision 9). Where the code and a spec disagree, the code wins, and the plan says so.
 
-**Status:** not executed; amended after security review and plan review. The security review of 2026-10-02 (opus, binding on the maintainer's behalf) approved after amendments: A-1 to A-6 required and taken; O-1 to O-5, O-7 and O-8 taken; O-6 recorded (see "Decisions", "What the review changed"). It found no open product question. A plan review (opus, 2026-10-02) asked for changes, all taken: the log variables stripped from 7b's `git` commands too (A-3's rest), the plan re-anchored on `3117743` with its counts, no colour codes in the crash log, a failed reopen after a rotation moving the file back, the service-run test reading standard error only once both children are gone, A-2 described as structural, and four wording fixes.
+**Status:** executed 2026-10-02 (see "Execution status"); amended after security review and plan review. The security review of 2026-10-02 (opus, binding on the maintainer's behalf) approved after amendments: A-1 to A-6 required and taken; O-1 to O-5, O-7 and O-8 taken; O-6 recorded (see "Decisions", "What the review changed"). It found no open product question. A plan review (opus, 2026-10-02) asked for changes, all taken: the log variables stripped from 7b's `git` commands too (A-3's rest), the plan re-anchored on `3117743` with its counts, no colour codes in the crash log, a failed reopen after a rotation moving the file back, the service-run test reading standard error only once both children are gone, A-2 described as structural, and four wording fixes.
 
 **How this plan was checked.**
 
@@ -40,6 +40,25 @@ Every anchor below was taken from `main` at `3117743`, which merged PR #51 (7b) 
 - **The plan was replayed from its own text** onto a fresh checkout of `3117743`, task by task, by a harness that parses "Reading the steps" (Task 1: Step 1 7 instructions, its `cargo fmt` among them, and Step 3 8; Task 2: 8 and 14). After each task's Step 1 the test files matched the generator's snapshot, and after each task every file did, byte for byte. Each Step 2 and Step 4 command ran on its replay commit and printed what its "Expected" says. After each task the replay ran fmt, both clippy runs, the workspace tests and the codegen check: 840, then 841 tests, up from 831. (An earlier replay, onto `c05d642` before the plan review, matched too: 742 and 743 there.)
 - **Revert-probes:** 12, run on the replay's final commit (each task's Step 5). Every one was caught.
 - **Under load:** four copies of the CLI test binary at once, on each task's replay commit (each task's Step 6).
+
+## Execution status (2026-10-02)
+
+**Executed** on `feat/logs-parent-death`, one PR. Each task was done by one implementer (sonnet) and then reviewed (opus); a whole-branch review (opus) followed ("ready with minors"). Each task's commit was checked on disk against the replay's snapshot for that task: Task 1 byte for byte; Task 2's `inherit.rs` and `main.rs` byte for byte, its `cli.rs` differing only by Task 1's review fix. Main moved under the lane: the plan was anchored and executed on `3117743`, and the branch was rebased onto `3f666f1` (plans 5b, 5c and 7b's CLI) before the PR. Deviations and fixes:
+
+| Area | As built | Why |
+|---|---|---|
+| Task 1's review (`test(cli): pin the log directory's refusal and fallback through the binary`) | A new CLI test, `a_bad_log_directory_refuses_or_falls_back_to_standard_error`: a relative `HENNERY_LOG_DIR` exits 1 with `Error:`; a directory that cannot be made falls back to standard error, where the development token's `warn` lands, with nothing on standard output (revert-probed twice: a relative directory falling back, the fallback writing to standard output). The service-run test sets `HENNERY_SERVICE=launchd` on macOS. Comments: one "said once" flag for both kinds of failure; a backslash is not escaped, so a literal `\n` in a message is ambiguous, never a second line; only the log directory itself is checked, so `HENNERY_LOG_DIR` should be a private path. | Review: decision 2's failure paths were pinned only as a pure function |
+| Task 2's review (`docs(up): …`) | Comments: the restart test restarts only a host (a restarted collector gets the pipe from the same builder); the 20 s deadline also covers the runtime's drop, trading an orphaned adapter for a process that ends (A-1); a host still pairing when `up` dies stops by the pairing pipe's end-of-file or the deadline, without the "gone" line. | Review minors |
+| Rebase onto `3f666f1` | 7b had already moved every spawn of the binary in `cli.rs` to its own `hennery()`, which keeps the managed runtime offline; this plan's `hennery()` was folded into it: `offline()` also removes `LOG_VARS`. `adapter.rs` keeps 7b's `INHERITED_OVERRIDE_VARS`, removed before the agent's own variables, and `HOST_LOG_VARS` after them, with the other strip lists. `main.rs` declares both `mod log` and 7b's `mod runtime`. The load run of the whole CLI binary passed again (four copies, three rounds, 0 of 12 failed). | Main merged 5b, 5c and 7b meanwhile |
+| Spec write-back (`docs(spec): …`) | Distribution §5.1 (the parent pipe), §6.2 and §8 (the files, `HENNERY_SERVICE`, `HENNERY_LOG_DIR`, the fallback) | "After this plan"'s amendments, applied here, as 5b and 5c did |
+
+Test counts: 879 in the workspace on `3f666f1`; 889 after Task 1 and its review test, 890 after Task 2 (the plan's 840 and 841 are `3117743`'s). Rebased before merge onto `5ec1185` (PR #55, after hats 5d), with `docs/README.md`'s new lines kept beside this plan's: 893, every check passing.
+
+Recorded from the whole-branch review, not changed:
+- When launchd relaunches `up` (10 s) while an old child is still within its 20 s deadline, both may write one `hennery-*.log` for a moment, each counting its own length; a rotation by one moves the other's file to `.1`. Nothing is lost, and the new child backs off on the port or `host.lock`.
+- The deadline can cut 7b's adapter install short if `up` dies during it; the install publishes by rename, so a cut install leaves the previous set.
+- Under systemd, `KillMode=mixed` stops the unit's remaining processes once `up` exits, so the pipe matters mostly under launchd (written into §5.1).
+- launchd's `<role>.log` still has no cap: three "logging to" lines per start, more in a crash loop.
 
 ## Scope
 
@@ -1826,7 +1845,10 @@ git push origin feat/logs-parent-death
 - **`doctor` (7d):**
   - the log locations: `~/Library/Logs/hennery/hennery-{up,collector,host}.log` (macOS) and `$XDG_STATE_HOME/hennery/log/…` (Linux), or `HENNERY_LOG_DIR`; a process that fell back to standard error (decision 2) says so only there, in the crash log, which `doctor` should read;
   - the restart-gave-up state, from `supervisor::read_state`, judged as `service status` judges it (7c decision 6);
-  - `service status` and `uninstall` name `<role>.log` as the service's "output" and "log": they should name hennery's own files as well.
+  - `service status` and `uninstall` name `<role>.log` as the service's "output" and "log": they should name hennery's own files as well;
+  - the crash log's lines to look for: the fallback ("logging warnings and errors to standard error") and the deadline ("still running 20 s after `hennery up` is gone");
+  - warn when the log directory is not private, or when `HENNERY_LOG_DIR` is set in `service.env` or the plist;
+  - the crash log's size (it has no cap).
 - **Recorded from the review:** O-6, the passwd entry's home when `HOME` is unset, so `doctor` and the runtime agree whatever the environment.
 
 **Not tested here:**
