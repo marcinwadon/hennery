@@ -392,6 +392,11 @@ pub struct FakeCodex {
     /// `--version` never ends (writing `pid_file` first).
     #[serde(default)]
     pub hang_version: bool,
+    /// The app-server starts a child of its own (`sleep`, in its process
+    /// group, its stdio detached, SIGTERM ignored) and writes the child's
+    /// pid here: for the group kill (the review's item 6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grandchild_pid_file: Option<String>,
 }
 
 /// Whether `name` is one of `thread`'s rollout files, as Codex names them

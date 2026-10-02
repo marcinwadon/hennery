@@ -549,6 +549,46 @@ async fn an_app_server_that_never_answers_is_cut_at_the_deadline_and_its_group_k
     }
 }
 
+/// B6 (the review's item 6): the app-server's own child, in its process
+/// group and deaf to SIGTERM, is gone after the forget too: the group is
+/// killed, not only the app-server. Its pid is polled for, never read
+/// straight after the spawn.
+#[tokio::test]
+async fn the_app_servers_grandchild_dies_with_its_group() {
+    let root = Root::new();
+    root.populate();
+    let grandchild = root.base.join("grandchild.pid");
+    let mut fake = root.fake(FakeDelete::Hang);
+    fake.grandchild_pid_file = Some(grandchild.to_str().unwrap().into());
+    let mut ctx = root.ctx(fake);
+    // Room for a first exec macOS scans before the app-server starts.
+    ctx.deadline = Duration::from_secs(15);
+    let run = tokio::spawn(async move {
+        root.forget_with(&ctx).await;
+        root
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let pid: i32 = loop {
+        if let Some(pid) = std::fs::read_to_string(&grandchild)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "the grandchild never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert!(
+        hennery_testkit::pid_alive(pid),
+        "the grandchild runs while the forget waits"
+    );
+    let _root = tokio::time::timeout(Duration::from_secs(40), run)
+        .await
+        .expect("the forget keeps its deadline")
+        .unwrap();
+    assert_gone(&grandchild).await;
+}
+
 /// The process whose pid `pid_file` holds is gone (its group killed).
 async fn assert_gone(pid_file: &Path) {
     let pid: i32 = std::fs::read_to_string(pid_file).unwrap().trim().parse().unwrap();

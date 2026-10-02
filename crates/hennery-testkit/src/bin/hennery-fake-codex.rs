@@ -80,6 +80,20 @@ fn app_server(script: &FakeCodex) {
     if let Some(path) = &script.pid_file {
         std::fs::write(path, std::process::id().to_string()).expect("write the pid file");
     }
+    if let Some(path) = &script.grandchild_pid_file {
+        // Never waited on: it must outlive the app-server unless the host
+        // kills the whole group. It ignores SIGTERM (kept across `exec`),
+        // so only the group's SIGKILL ends it.
+        #[allow(clippy::zombie_processes)]
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "trap '' TERM; exec sleep 600"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn the grandchild");
+        std::fs::write(path, child.id().to_string()).expect("write the grandchild's pid");
+    }
     if script.ignore_term {
         // SAFETY: signal(2) with SIG_IGN, before any other thread exists.
         unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
