@@ -19,9 +19,9 @@ const ARG_KEY: &str = "arg-secret-0123456789";
 /// A key in an HTTP server's URL path: only its origin may show (the
 /// gateway lane's rule L11).
 const URL_KEY: &str = "url-secret-0123456789";
-/// A value `scrub` cuts in part (`ghp_…` up to the colon): redacted whole
-/// only if it is redacted before `scrub`.
-const SCRUBBED: &str = "ghp_0123456789:tail-secret-0123";
+/// A value `scrub` cuts in part (`ghp_…` up to the comma, which `Secrets`
+/// does not cut at): redacted whole only if it is redacted before `scrub`.
+const SCRUBBED: &str = "ghp_0123456789,tail-secret-0123";
 
 fn servers() -> Vec<McpServer> {
     vec![
