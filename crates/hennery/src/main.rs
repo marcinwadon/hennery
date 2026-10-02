@@ -810,10 +810,12 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
     // one installed first if it is not current (distribution spec §3.2).
     // The set stays held in use while the host runs.
     // A `--agent` command is a generic agent (ACP core §6): no profile.
-    let (agents, profiles, _set_in_use) = if args.agents.is_empty() {
+    // With `--agent`, no app-server either: a Codex forget takes the
+    // fallback.
+    let (agents, profiles, codex_app_server, _set_in_use) = if args.agents.is_empty() {
         runtime::default_agents(&args.data_dir, &args.mirrors).await
     } else {
-        (args.agents.into_iter().collect(), Default::default(), None)
+        (args.agents.into_iter().collect(), Default::default(), None, None)
     };
     let collector_url = args.collector_url.unwrap_or(paired.collector_url);
     let mut cfg = HostConfig::new(collector_url, paired.host_id, paired.key, args.data_dir);
@@ -821,6 +823,7 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
     cfg.home = home;
     cfg.agents = agents;
     cfg.profiles = profiles;
+    cfg.codex_app_server = codex_app_server;
     cfg.idle_timeout = std::time::Duration::from_secs(args.idle_timeout_secs);
     // On SIGINT/SIGTERM, and on a revoke, the host stops its connection and
     // waits (bounded) for every session actor to SIGTERM its adapter's group

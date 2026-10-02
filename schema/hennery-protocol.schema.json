@@ -1042,7 +1042,7 @@
         },
         {
           "const": "transcript",
-          "description": "The transcript and its family in each project directory (B9).",
+          "description": "The transcript and its family in each project directory (B9); for\nCodex, its rollout files in `sessions/` and `archived_sessions/`\n(plan 9d-ii).",
           "type": "string"
         },
         {
@@ -1141,6 +1141,26 @@
         {
           "const": "io_error",
           "description": "The removal failed midway (B3).",
+          "type": "string"
+        },
+        {
+          "const": "forked_history",
+          "description": "Codex's `thread/delete` refused: forked history in another thread\nstill references the rollout (plan 9d-ii, decision 9). Final, and\nnever followed by the fallback (B5).",
+          "type": "string"
+        },
+        {
+          "const": "ephemeral",
+          "description": "Codex's `thread/delete` refused: the thread was never persisted\n(plan 9d-ii, decision 9). Final.",
+          "type": "string"
+        },
+        {
+          "const": "home_mismatch",
+          "description": "The app-server named another `CODEX_HOME` than the session's\nrecorded one in its `initialize` answer: nothing was asked of it, and\nno fallback ran (plan 9d-ii, the parent's rule).",
+          "type": "string"
+        },
+        {
+          "const": "fallback_only",
+          "description": "Only the fallback ran (plan 9d-ii, decision 10): Codex's own database\nmay still hold copies of the conversation. Final.",
           "type": "string"
         },
         {

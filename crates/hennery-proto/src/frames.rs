@@ -74,7 +74,9 @@ pub enum ForgetKind {
     /// The whole forget, when it could not start (no home, an unknown id,
     /// an agent this host cannot forget for yet).
     Session,
-    /// The transcript and its family in each project directory (B9).
+    /// The transcript and its family in each project directory (B9); for
+    /// Codex, its rollout files in `sessions/` and `archived_sessions/`
+    /// (plan 9d-ii).
     Transcript,
     FileHistory,
     SessionEnv,
@@ -90,7 +92,7 @@ impl ForgetKind {
     pub fn masked(self) -> &'static str {
         match self {
             Self::Session => "<session>",
-            Self::Transcript => "projects/*/<id>.jsonl (and its family)",
+            Self::Transcript => "projects/*/<id>.jsonl (and its family), or sessions/**/rollout-*-<id>.jsonl",
             Self::FileHistory => "file-history/<id>/",
             Self::SessionEnv => "session-env/<id>/",
             Self::Tasks => "tasks/<id>/",
@@ -139,6 +141,20 @@ pub enum ForgetReason {
     StillPresent,
     /// The removal failed midway (B3).
     IoError,
+    /// Codex's `thread/delete` refused: forked history in another thread
+    /// still references the rollout (plan 9d-ii, decision 9). Final, and
+    /// never followed by the fallback (B5).
+    ForkedHistory,
+    /// Codex's `thread/delete` refused: the thread was never persisted
+    /// (plan 9d-ii, decision 9). Final.
+    Ephemeral,
+    /// The app-server named another `CODEX_HOME` than the session's
+    /// recorded one in its `initialize` answer: nothing was asked of it, and
+    /// no fallback ran (plan 9d-ii, the parent's rule).
+    HomeMismatch,
+    /// Only the fallback ran (plan 9d-ii, decision 10): Codex's own database
+    /// may still hold copies of the conversation. Final.
+    FallbackOnly,
     /// The collector's own: the host answered `error{invalid}` for the id
     /// (decision 8, O10).
     InvalidId,

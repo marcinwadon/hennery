@@ -48,6 +48,24 @@ nix develop -c cargo build --profile dist -p hennery --features vendored-openssl
 sh packaging/check-linkage.sh target/dist/hennery
 ```
 
+## Pin bumps
+
+A bump of `adapters/pins.toml` is `hennery-pins lock`, then `generate`,
+then the pin-bump job (`.github/workflows/pins.yml`). These checks are
+live, with logged-in agents, and the operator's to run before it merges:
+
+- the live e2e gate (umbrella spec §14) on every platform;
+- **Codex's `thread/delete` still removes everything** (plan 9d
+  decision 14). After a turn in a scratch `CODEX_HOME`, delete the session
+  from hennery and check that nothing of the thread is left: its rollout
+  files in `sessions/` and `archived_sessions/`, its rows in
+  `thread_history_1.sqlite` (`thread_items`, `thread_turns`,
+  `thread_realtime_items`), its rows in the state DB (`state_5.sqlite`),
+  and its entries in `session_index.jsonl`. hennery itself only checks the
+  rollout files: the rest is `thread/delete`'s contract. If the bundled
+  Codex version changed, read `thread/delete`'s call shape from its source
+  first and update `[codex_app_server]` in `pins.toml`.
+
 ## Publishing is the operator's
 
 These need the operator's decision, credentials, or both. None is set up:

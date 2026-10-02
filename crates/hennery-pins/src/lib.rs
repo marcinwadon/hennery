@@ -6,7 +6,7 @@
 
 use anyhow::{Context, Result, bail};
 use hennery_host::runtime::manifest::{
-    self, Adapter, File, Manifest, NPM_REGISTRY, Node, NodeArchive, Platform, SCHEMA,
+    self, Adapter, CodexAppServer, File, Manifest, NPM_REGISTRY, Node, NodeArchive, Platform, SCHEMA,
 };
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -20,6 +20,10 @@ pub struct Pins {
     pub npm_before: String,
     pub node: NodePin,
     pub adapters: BTreeMap<String, AdapterPin>,
+    /// `thread/delete`'s call shape for the bundled Codex (plan 9d decision
+    /// 9), carried into the manifest as it is.
+    #[serde(default)]
+    pub codex_app_server: Option<CodexAppServer>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -60,6 +64,9 @@ impl Pins {
             if adapter.cli.is_empty() {
                 bail!("{name}: no CLI package prefix");
             }
+        }
+        if let Some(app_server) = &pins.codex_app_server {
+            app_server.validate()?;
         }
         Ok(pins)
     }
@@ -238,6 +245,12 @@ pub fn build(
     if locks.keys().any(|name| !pins.adapters.contains_key(name)) {
         bail!("a lockfile for an adapter pins.toml does not name");
     }
+    if let Some(pin) = &pins.codex_app_server {
+        let lock = locks
+            .get(hennery_host::agent_home::CODEX)
+            .context("codex_app_server is pinned, but no codex adapter is")?;
+        check_codex_app_server(pin, lock)?;
+    }
     let manifest = Manifest {
         schema: SCHEMA,
         node: Node {
@@ -245,9 +258,40 @@ pub fn build(
             platforms: node.iter().map(|(p, a)| (p.key().to_string(), a.clone())).collect(),
         },
         adapters,
+        codex_app_server: pins.codex_app_server.clone(),
     };
     manifest.validate()?;
     Ok(manifest)
+}
+
+/// The app-server's call shape is read from one Codex version (plan 9d
+/// decision 9): its launcher must be a file of a package the codex lockfile
+/// installs, and that package must be at the pinned version.
+fn check_codex_app_server(pin: &CodexAppServer, lock: &Lock) -> Result<()> {
+    let (path, entry) = lock
+        .packages
+        .iter()
+        .filter(|(path, _)| !path.is_empty() && pin.bin.starts_with(&format!("{path}/")))
+        .max_by_key(|(path, _)| path.len())
+        .with_context(|| {
+            format!(
+                "codex_app_server: bin {:?} is not in a package of the codex lockfile",
+                pin.bin
+            )
+        })?;
+    let name = package_name(path, entry)?;
+    let version = entry
+        .version
+        .as_deref()
+        .with_context(|| format!("{path}: no version"))?;
+    if version != pin.codex_version {
+        bail!(
+            "codex_app_server pins Codex {}, but the codex lockfile bundles {name} {version}: \
+             read thread/delete's call shape from that version and update the pin",
+            pin.codex_version
+        );
+    }
+    Ok(())
 }
 
 fn build_adapter(pin: &AdapterPin, lock: &Lock, registry: &Registry) -> Result<Adapter> {
@@ -677,6 +721,120 @@ cli = ["node_modules/@vendor/cli-"]
             .map(|f| f.path.as_str())
             .collect();
         assert!(!linux.contains(&"node_modules/@vendor/cli-linux-x64-musl"), "{linux:?}");
+    }
+
+    /// `PINS`, with a codex adapter bundling `@vendor/codex` and the
+    /// app-server's call shape pinned for its version (plan 9d decision 9).
+    const CODEX_PINS: &str = r#"
+[adapters.codex]
+package = "@acp/codex"
+version = "1.0.0"
+entry = "dist/index.js"
+cli = ["node_modules/@vendor/codex-"]
+[codex_app_server]
+codex_version = "0.155.1"
+bin = "node_modules/@vendor/codex/bin/codex.js"
+delete_method = "thread/delete"
+params_shape = { threadId = "{thread_id}" }
+[codex_app_server.initialize.clientInfo]
+name = "hennery"
+title = "hennery"
+version = "1"
+"#;
+
+    /// The codex adapter's lockfile and registry for `CODEX_PINS`, its
+    /// `@vendor/codex` at `codex_version`.
+    fn codex_fixture(codex_version: &str) -> (Pins, BTreeMap<String, Lock>, Registry) {
+        let pins = Pins::parse(&format!("{PINS}{CODEX_PINS}")).unwrap();
+        let claude = Fixture::new();
+        let mut codex = Fixture {
+            lock: Lock {
+                lockfile_version: 3,
+                packages: BTreeMap::from([(
+                    String::new(),
+                    LockEntry {
+                        dependencies: BTreeMap::from([("@acp/codex".into(), "1.0.0".into())]),
+                        ..LockEntry::default()
+                    },
+                )]),
+            },
+            registry: claude.registry.clone(),
+        };
+        codex.add("node_modules/@acp/codex", "@acp/codex", "1.0.0", &[], &[], &[], false);
+        codex.add(
+            "node_modules/@vendor/codex",
+            "@vendor/codex",
+            codex_version,
+            &[],
+            &[],
+            &[],
+            false,
+        );
+        for (suffix, os, cpu) in [
+            ("linux-x64", "linux", "x64"),
+            ("linux-arm64", "linux", "arm64"),
+            ("darwin-arm64", "darwin", "arm64"),
+        ] {
+            codex.add(
+                &format!("node_modules/@vendor/codex-{suffix}"),
+                &format!("@vendor/codex-{suffix}"),
+                codex_version,
+                &[os],
+                &[cpu],
+                &[],
+                true,
+            );
+        }
+        let locks = BTreeMap::from([("claude".into(), claude.lock), ("codex".into(), codex.lock)]);
+        (pins, locks, codex.registry)
+    }
+
+    fn node_archives() -> BTreeMap<Platform, NodeArchive> {
+        Platform::ALL
+            .into_iter()
+            .map(|p| {
+                (
+                    p,
+                    NodeArchive {
+                        url: format!("https://nodejs.org/dist/v24.21.0/node-v24.21.0-{}.tar.gz", p.key()),
+                        sha256: "a".repeat(64),
+                        archive_size: 10,
+                        node_size: 20,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Plan 9d decision 9: the app-server's call shape is carried into the
+    /// manifest, and only for the Codex version the codex lockfile bundles.
+    #[test]
+    fn the_codex_app_server_pin_is_carried_only_for_the_bundled_codex_version() {
+        let (pins, locks, registry) = codex_fixture("0.155.1");
+        let manifest = build(&pins, &locks, &registry, &node_archives()).unwrap();
+        let pin = manifest.codex_app_server.expect("carried");
+        assert_eq!(pin.codex_version, "0.155.1");
+        assert_eq!(pin.bin, "node_modules/@vendor/codex/bin/codex.js");
+        let (pins, locks, registry) = codex_fixture("0.156.0");
+        let err = format!("{:#}", build(&pins, &locks, &registry, &node_archives()).unwrap_err());
+        assert!(err.contains("bundles @vendor/codex 0.156.0"), "{err}");
+        // A launcher outside every package of the codex lockfile.
+        let (mut pins, locks, registry) = codex_fixture("0.155.1");
+        pins.codex_app_server.as_mut().unwrap().bin = "node_modules/@other/codex/bin/codex.js".into();
+        let err = format!("{:#}", build(&pins, &locks, &registry, &node_archives()).unwrap_err());
+        assert!(err.contains("not in a package of the codex lockfile"), "{err}");
+        // A shape out of its rules is refused as pins.toml is read.
+        let bad = format!("{PINS}{CODEX_PINS}").replace("\"thread/delete\"", "\"thread/archive\"");
+        assert!(format!("{:#}", Pins::parse(&bad).unwrap_err()).contains("thread/delete"));
+        // And none without a pin.
+        let (mut pins, locks, registry) = codex_fixture("0.155.1");
+        pins.codex_app_server = None;
+        assert!(
+            build(&pins, &locks, &registry, &node_archives())
+                .unwrap()
+                .codex_app_server
+                .is_none()
+        );
     }
 
     #[test]
