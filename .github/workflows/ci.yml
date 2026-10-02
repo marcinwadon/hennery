@@ -38,6 +38,13 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Clippy on the shipped binary (test-hooks off)
         run: cargo clippy -p hennery --locked -- -D warnings
-      - run: cargo test --workspace --locked
+      # On Linux, a hard RLIMIT_NOFILE above the adapter's closing loop's cap
+      # (`MAX_CLOSED_FD`, 65536, the runner's own hard limit), so the test of
+      # `close_range` can hold a descriptor past it, as a container's
+      # million-descriptor limit would (it asserts it ran, under `CI`).
+      - name: Tests
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then sudo prlimit --pid $$ --nofile=65536:1048576; fi
+          cargo test --workspace --locked
       - name: Generated files are up to date
         run: cargo run -p hennery-proto --bin gen --locked -- --check

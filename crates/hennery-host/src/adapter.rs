@@ -109,8 +109,8 @@ impl Adapter {
         // Read before the fork: getrlimit is not async-signal-safe.
         let limit = fd_limit();
         // SAFETY: the closure runs in the forked child before `exec` and
-        // calls only `fcntl` and `close`, which are async-signal-safe; it
-        // allocates nothing.
+        // calls only `syscall(close_range)` (Linux), `fcntl` and `close`,
+        // which are async-signal-safe; it allocates nothing.
         unsafe {
             command.pre_exec(move || {
                 close_inherited(limit);
@@ -268,12 +268,14 @@ impl Drop for Adapter {
     }
 }
 
-/// `close_inherited` checks no descriptor at or above this, whatever the
-/// soft limit: a soft `RLIMIT_NOFILE` of a million (a container's default)
-/// would cost every adapter spawn a million `fcntl` calls.
+/// `close_inherited`'s loop checks no descriptor at or above this, whatever
+/// the soft limit: a soft `RLIMIT_NOFILE` of a million (a container's
+/// default) would cost every adapter spawn a million `fcntl` calls. On
+/// Linux 5.11 and later the loop is only the fallback: `close_range`
+/// reaches past it.
 pub const MAX_CLOSED_FD: libc::c_int = 65_536;
 
-/// The first descriptor number `close_inherited` does not check: the hard
+/// The first descriptor number `close_inherited`'s loop does not check: the hard
 /// `RLIMIT_NOFILE`, at most `MAX_CLOSED_FD`. Not the soft limit: a
 /// descriptor opened while it was higher stays open once it is lowered.
 fn fd_limit() -> libc::c_int {
@@ -294,7 +296,31 @@ fn fd_limit() -> libc::c_int {
 /// and whatever another thread opened without it would otherwise reach
 /// every agent. Descriptors that are close-on-exec already are left alone:
 /// std reports a failed `exec` over one of them.
+///
+/// On Linux 5.11 and later, one `close_range(3, ~0, CLOSE_RANGE_CLOEXEC)`
+/// marks every descriptor from 3 up close-on-exec instead, past `limit`
+/// and `MAX_CLOSED_FD` too, and `exec` closes them. Marked, not closed:
+/// std's pipe for a failed `exec` must stay open until then. An older
+/// kernel refuses the call (`ENOSYS` before 5.9, `EINVAL` for the flag
+/// before 5.11), and the loop below does the work.
 fn close_inherited(limit: libc::c_int) {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: a raw close_range(2) on this (forked) process's own
+        // descriptor table: a system call, async-signal-safe, allocating
+        // nothing.
+        let marked = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                3 as libc::c_uint,
+                libc::c_uint::MAX,
+                libc::CLOSE_RANGE_CLOEXEC,
+            )
+        };
+        if marked == 0 {
+            return;
+        }
+    }
     for fd in 3..limit {
         // SAFETY: fcntl(2) and close(2) on a descriptor number of this
         // (forked) process; both are async-signal-safe.

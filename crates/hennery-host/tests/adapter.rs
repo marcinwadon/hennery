@@ -331,3 +331,99 @@ async fn a_descriptor_above_a_lowered_soft_limit_is_closed_too() {
     assert!(out.status.success(), "{text}{}", String::from_utf8_lossy(&out.stderr));
     assert!(text.contains("1 passed"), "{text}");
 }
+
+/// A failed `exec` still fails the spawn: the descriptor closing before
+/// `exec` leaves std's close-on-exec pipe, which reports it, alone.
+#[tokio::test]
+async fn a_program_that_cannot_be_executed_fails_the_spawn() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = AgentCommand {
+        program: dir.path().join("no-such-adapter").display().to_string(),
+        args: Vec::new(),
+        env: Vec::new(),
+    };
+    let err = Adapter::spawn(&missing, dir.path()).err().expect("the spawn failed");
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err}");
+}
+
+/// Set in the copy of this binary that
+/// `a_descriptor_past_the_loops_cap_is_closed_on_linux` runs.
+#[cfg(target_os = "linux")]
+const PAST_THE_CAP: &str = "HENNERY_TEST_PAST_THE_CAP";
+
+/// Held open across `exec` above `MAX_CLOSED_FD`, where the closing loop
+/// never looks.
+#[cfg(target_os = "linux")]
+const BEYOND_THE_LOOP: i32 = hennery_host::adapter::MAX_CLOSED_FD + 64;
+
+/// On Linux, `close_range` reaches every descriptor, also one above
+/// `MAX_CLOSED_FD` that the loop would leave open. The test runs itself
+/// again in a copy of this binary, with the soft `RLIMIT_NOFILE` raised past
+/// that descriptor and the descriptor held open there: the limit is
+/// process-wide. A machine whose hard limit is too low skips it, except in
+/// CI (`CI` set), where it must run.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_descriptor_past_the_loops_cap_is_closed_on_linux() {
+    if std::env::var_os(PAST_THE_CAP).is_some() {
+        // SAFETY: fcntl(2) on a descriptor number.
+        assert!(
+            unsafe { libc::fcntl(BEYOND_THE_LOOP, libc::F_GETFD) } >= 0,
+            "not inherited"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let ls = AgentCommand {
+            program: "ls".into(),
+            args: vec!["/dev/fd".into()],
+            env: Vec::new(),
+        };
+        let (mut adapter, mut io) = Adapter::spawn(&ls, dir.path()).unwrap();
+        let mut out = Vec::new();
+        io.stdout.read_to_end(&mut out).await.unwrap();
+        adapter.exited().await;
+        let fds = listed(&out);
+        assert!(fds.contains(&1), "{fds:?}");
+        assert!(!fds.contains(&BEYOND_THE_LOOP), "the agent inherited it: {fds:?}");
+        return;
+    }
+    let mut hard = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit(2) into a local struct.
+    assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut hard) }, 0);
+    let needed = BEYOND_THE_LOOP as libc::rlim_t + 1;
+    if hard.rlim_max < needed {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "the hard RLIMIT_NOFILE ({}) is below {needed}: CI must run this test",
+            hard.rlim_max
+        );
+        eprintln!("skipped: the hard RLIMIT_NOFILE ({}) is below {needed}", hard.rlim_max);
+        return;
+    }
+    let file = std::fs::File::open("/dev/null").unwrap();
+    let fd = file.as_raw_fd();
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+    child
+        .args(["--exact", "a_descriptor_past_the_loops_cap_is_closed_on_linux"])
+        .env(PAST_THE_CAP, "1");
+    // SAFETY: setrlimit(2) and dup2(2) in the forked child, before exec;
+    // nothing is allocated.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(&mut child, move || {
+            let raised = libc::rlimit {
+                rlim_cur: needed,
+                rlim_max: hard.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            hennery_testkit::place_fd(fd, BEYOND_THE_LOOP)
+        });
+    }
+    let out = child.output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{text}{}", String::from_utf8_lossy(&out.stderr));
+    assert!(text.contains("1 passed"), "{text}");
+}
