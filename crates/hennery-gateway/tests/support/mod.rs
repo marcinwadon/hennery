@@ -96,6 +96,11 @@ impl World {
         })
     }
 
+    /// A connection in `hat` to a loopback upstream, not yet created.
+    pub fn new_connection(&self, slug: &str, hat: &str) -> NewConnection {
+        new_connection(slug, hat)
+    }
+
     pub fn connection_with(&self, new: NewConnection) -> String {
         match self.store.create(&new, unix_now()).unwrap() {
             Change::Done(record) => record.id,
@@ -166,5 +171,45 @@ impl World {
             operator: Arc::new(Operator::open(&self.db).unwrap()),
             revocations: self.revocations.clone(),
         }
+    }
+
+    /// What the proxy would resolve `token` to now.
+    pub fn proxy_store_resolve(&self, token: &str) -> Option<hennery_gateway::scope::Principal> {
+        use hennery_gateway::scope::ClientIdentity;
+        self.proxy_store.resolve(token, unix_now()).unwrap()
+    }
+
+    /// How many session token rows there are, live or not.
+    pub fn token_rows(&self) -> i64 {
+        self.raw()
+            .query_row("SELECT count(*) FROM gw_session_tokens", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Whether `token`'s row is revoked (not whether it resolves: a revoked
+    /// host's tokens stop resolving by the host's join alone).
+    pub fn token_revoked(&self, token: &str) -> bool {
+        self.raw()
+            .query_row(
+                "SELECT revoked_at IS NOT NULL FROM gw_session_tokens WHERE token_hash = ?1",
+                [hennery_kernel::secret::sha256_hex(token.as_bytes())],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+}
+
+/// A `none` connection in `hat` to a loopback upstream, not yet created.
+pub fn new_connection(slug: &str, hat: &str) -> NewConnection {
+    NewConnection {
+        slug: slug.into(),
+        label: format!("Label {slug}"),
+        url: "http://127.0.0.1:9/mcp".into(),
+        hat_id: hat.into(),
+        cred_kind: CredKind::None,
+        static_header: None,
+        static_prefix: None,
+        tool_allowlist: None,
+        internal_network: true,
     }
 }

@@ -609,3 +609,93 @@ async fn an_error_is_the_shared_api_error_and_nothing_more() {
         assert!(answer["message"].as_str().is_some_and(|m| !m.is_empty()), "{answer}");
     }
 }
+
+/// Plan 8e (api-8e-8f A1): a stdio set is read without step-up and
+/// replaced with it; its values are never answered, only their names.
+#[tokio::test]
+async fn a_stdio_set_is_read_freely_and_replaced_behind_step_up() {
+    let api = Api::new();
+    api.host("host-a", 1);
+    let hat = api.hat();
+    let path = format!("/api/mcp/stdio-servers?host_id=host-a&hat_id={hat}");
+    let fresh = api.session(0);
+    let stale = api.session(600);
+    let (status, set) = api.send(&stale, "GET", &path, None).await;
+    assert_eq!(status, StatusCode::OK, "{set}");
+    assert_eq!(set, json!({"host_id": "host-a", "hat_id": hat, "servers": []}));
+    let body = json!({"servers": [{
+        "name": "files", "command": "files-mcp", "args": ["--root", "/srv"],
+        "env": [{"name": "FILES_KEY", "value": "s3cr3t-stdio-value"}, {"name": "EMPTY", "value": ""}]
+    }]});
+    let (status, refused) = api.send(&stale, "PUT", &path, Some(&body)).await;
+    assert_eq!((status, code(&refused)), (StatusCode::FORBIDDEN, "step_up_required"));
+    let (status, _) = api.send(&stale, "GET", &path, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, set) = api.send(&fresh, "PUT", &path, Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{set}");
+    let server = &set["servers"][0];
+    assert_eq!(server["name"], "files");
+    assert_eq!(server["args"], json!(["--root", "/srv"]));
+    assert_eq!(
+        server["env"],
+        json!([{"name": "FILES_KEY", "has_value": true}, {"name": "EMPTY", "has_value": true}])
+    );
+    assert!(server["created_at"].as_str().unwrap().ends_with('Z'), "{set}");
+    let (_, read) = api.send(&stale, "GET", &path, None).await;
+    assert_eq!(read, set);
+    assert!(!read.to_string().contains("s3cr3t-stdio-value"), "{read}");
+}
+
+#[tokio::test]
+async fn the_stdio_routes_answer_their_codes() {
+    let api = Api::new();
+    api.host("host-a", 1);
+    api.host("host-gone", 2);
+    let hat = api.hat();
+    let s = api.session(0);
+    let at = |host: &str, hat: &str| format!("/api/mcp/stdio-servers?host_id={host}&hat_id={hat}");
+    let long = "h".repeat(65);
+    for path in [
+        "/api/mcp/stdio-servers".to_string(),
+        format!("/api/mcp/stdio-servers?host_id=host-a"),
+        format!("/api/mcp/stdio-servers?hat_id={hat}"),
+        at(&long, &hat),
+        at("host-a", &long),
+        at("", &hat),
+    ] {
+        let (status, body) = api.send(&s, "GET", &path, None).await;
+        assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "invalid"), "{path}");
+        assert!(!body.to_string().contains(&long), "{body}");
+    }
+    let (status, body) = api.send(&s, "GET", &at("host-x", &hat), None).await;
+    assert_eq!((status, code(&body)), (StatusCode::NOT_FOUND, "not_found"));
+    let (status, body) = api.send(&s, "GET", &at("host-a", "hat-x"), None).await;
+    assert_eq!((status, code(&body)), (StatusCode::NOT_FOUND, "not_found"));
+    let one = |name: &str, env: Value| json!({"servers": [{"name": name, "command": "c", "env": env}]});
+    let (api, s) = (&api, &s);
+    let put = |path: String, body: Value| async move { api.send(s, "PUT", &path, Some(&body)).await };
+    let (status, body) = put(at("host-a", &hat), one("Bad", json!([]))).await;
+    assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "invalid"));
+    let (status, body) = put(at("host-a", &hat), one("files", json!([{"name": "K"}]))).await;
+    assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "env_value_missing"));
+    api.create("linear").await;
+    let (status, body) = put(at("host-a", &hat), one("linear", json!([]))).await;
+    assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "slug_taken"));
+    let many: Vec<Value> = (0..33).map(|i| json!({"name": format!("s{i}"), "command": "c"})).collect();
+    let (status, body) = put(at("host-a", &hat), json!({ "servers": many })).await;
+    assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "too_many_stdio_servers"));
+    let (status, body) = put(at("host-a", &hat), json!({"servers": [], "extra": 1})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    api.hosts.revoke("host-gone", unix_now()).unwrap();
+    let (status, body) = put(at("host-gone", &hat), json!({"servers": []})).await;
+    assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "host_revoked"));
+    let (status, body) = api.send(s, "GET", &at("host-gone", &hat), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // And the other way: a connection may not take a stdio server's name.
+    let (status, _) = put(at("host-a", &hat), one("files", json!([]))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = api
+        .send(s, "POST", "/api/mcp/connections", Some(&api.new_body("files")))
+        .await;
+    assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "slug_taken"));
+}
