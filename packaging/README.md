@@ -65,6 +65,16 @@ live, with logged-in agents, and the operator's to run before it merges:
   rollout files: the rest is `thread/delete`'s contract. If the bundled
   Codex version changed, read `thread/delete`'s call shape from its source
   first and update `[codex_app_server]` in `pins.toml`.
+- **What the host reads from Codex is still what it says** (the 9d-ii
+  review). Re-read, in the bumped version's source and against a live run
+  in a scratch `CODEX_HOME`:
+  - the refusal texts `classify_delete` matches (`forked history still
+    references it`, `thread is not persisted`, `live internal threads`,
+    `no rollout found for thread id`, `thread not found:`, and the
+    `Invalid request: unknown variant` / `missing field` / `invalid type`
+    prefixes);
+  - the `codexHome` field of `initialize`'s answer, canonical;
+  - `--version`'s `codex-cli X.Y.Z` line.
 
 ## Publishing is the operator's
 
