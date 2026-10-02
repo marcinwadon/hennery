@@ -88,9 +88,12 @@ impl hennery_kernel::lifecycle::LifecycleHooks for AppState {
 
     /// The session module's part of a hat's purge (plan 9c decision 10d):
     /// `hats::purge_sessions`, which the purge route calls itself for what
-    /// it deleted.
+    /// it deleted, and the one checkpoint its deletes owe.
     fn on_hat_purged(&self, hat_id: &str) -> anyhow::Result<()> {
-        hats::purge_sessions(self, hat_id).map(drop)
+        self.store.owe_checkpoint();
+        let purged = hats::purge_sessions(self, hat_id).map(drop);
+        self.store.checkpoint();
+        purged
     }
 }
 

@@ -290,7 +290,8 @@ fn running_ids(state: &AppState, sessions: &[HatSession]) -> Vec<String> {
 /// closed is closed collector-side first, only while it is still what was
 /// read here (A4). Any that may be running, or that changed since, stops it
 /// with `SessionsRunning`: what was deleted stays deleted, and running it
-/// again goes on from there.
+/// again goes on from there. The deletes leave the WAL's checkpoint to the
+/// caller, once after the last (`Store::owe_checkpoint`, `Store::checkpoint`).
 pub fn purge_sessions(state: &AppState, hat_id: &str) -> anyhow::Result<PurgedSessions> {
     let sessions = state.store.hat_sessions(hat_id)?;
     let found = running_ids(state, &sessions);
@@ -323,7 +324,10 @@ pub(crate) fn delete_as_read(state: &AppState, session: HatSession, purged: &mut
         lifecycle: session.lifecycle.clone(),
         presumed_parked: session.presumed_parked,
     });
-    match state.store.delete_session(&session.id, unattached.as_ref())? {
+    match state
+        .store
+        .delete_session_owing_checkpoint(&session.id, unattached.as_ref())?
+    {
         Deletion::Done { event, unconfirmed } => {
             state.hub.publish(event);
             purged.deleted += 1;
@@ -421,7 +425,16 @@ async fn purge_hat(State(state): State<AppState>, Path(id): Path<String>) -> Res
     tracing::info!(hat_id = %id, "hat frozen for its purge");
     // plan 8: the gateway's `on_hat_purged` runs here, before the sessions'
     // (A15), so a hat stuck frozen cannot reach MCP meanwhile.
-    let purged = match purge_sessions(&state, &id) {
+    // One checkpoint for the whole purge, on every way out from here (plan
+    // 9a A8): owed before the first delete, so a crash leaves it owed.
+    state.store.owe_checkpoint();
+    let purged = purge_sessions(&state, &id).and_then(|purged| {
+        // `false`: a purge alongside got there first; it is done either way.
+        state.hosts.finish_purge(&id)?;
+        Ok(purged)
+    });
+    state.store.checkpoint();
+    let purged = match purged {
         Ok(purged) => purged,
         Err(err) => {
             return match err.downcast::<SessionsRunning>() {
@@ -430,11 +443,6 @@ async fn purge_hat(State(state): State<AppState>, Path(id): Path<String>) -> Res
             };
         }
     };
-    // `false`: a purge alongside got there first; it is done either way.
-    if let Err(err) = state.hosts.finish_purge(&id) {
-        return internal(err);
-    }
-    state.store.checkpoint();
     tracing::info!(hat_id = %id, sessions = purged.deleted, rules, "hat purged");
     Json(PurgeResult {
         sessions: purged.deleted,

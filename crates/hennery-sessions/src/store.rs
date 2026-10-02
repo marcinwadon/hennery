@@ -1690,9 +1690,27 @@ impl Store {
         Ok((items, count as u64))
     }
 
-    /// Fold the WAL back into the database and truncate it (plan 9a A8),
-    /// best-effort: after a purge, whose kernel steps write pages of their
-    /// own. An in-memory store has none.
+    /// The checkpoint a purge owes for its deletes (plan 9a A8; plan 9c
+    /// decision 10d), recorded before the first of them
+    /// (`delete_session_owing_checkpoint`), so a crash before `checkpoint`
+    /// normally leaves it owed, paid at the next start (a retry of an
+    /// earlier delete's debt that completes meanwhile settles it early). A failure to record it is
+    /// logged: the purge's own `checkpoint` still runs. An in-memory store
+    /// owes none.
+    pub fn owe_checkpoint(&self) {
+        if let Some(checkpoints) = &self.checkpoints
+            && let Err(err) = checkpoints.owe()
+        {
+            tracing::error!("recording a checkpoint owed failed: {err:#}");
+        }
+    }
+
+    /// Fold the WAL back into the database and truncate it (plan 9a A8), as
+    /// a delete does: once, after a purge, for its deletes and its kernel
+    /// steps' pages. Each of its waits for readers is `CHECKPOINT_WAIT`
+    /// (one held up takes a few seconds in all); one that holds it up
+    /// leaves it owed and retried apart, as a delete's (`Checkpoints::run`).
+    /// An in-memory store has none.
     pub fn checkpoint(&self) {
         if let Some(checkpoints) = &self.checkpoints {
             checkpoints.run();
@@ -2136,6 +2154,30 @@ impl Store {
     /// the deleted pages leave it too (A8). Both best-effort. A crash before the files go
     /// leaves files no row names, for plan 9b's sweep (decision 7).
     pub fn delete_session(&self, session_id: &str, unattached: Option<&Unattached>) -> Result<Deletion> {
+        let deletion = self.delete_rows(session_id, unattached)?;
+        if let Some(checkpoints) = &self.checkpoints {
+            checkpoints.run();
+        }
+        Ok(deletion)
+    }
+
+    /// `delete_session` for a purge (plan 9c decision 10d), without its
+    /// checkpoint: a reader that holds the WAL holds each checkpoint up by
+    /// seconds, so one per session would stall a purge of hundreds for
+    /// minutes. The purge records the debt first
+    /// (`owe_checkpoint`) and pays it once after its last delete
+    /// (`checkpoint`).
+    pub fn delete_session_owing_checkpoint(
+        &self,
+        session_id: &str,
+        unattached: Option<&Unattached>,
+    ) -> Result<Deletion> {
+        self.delete_rows(session_id, unattached)
+    }
+
+    /// The delete's rows, in one transaction, and its files after the
+    /// commit, under the store's lock (`delete_session`).
+    fn delete_rows(&self, session_id: &str, unattached: Option<&Unattached>) -> Result<Deletion> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
         // Its host, hat and cwd are read before the scrub clears them (R1).
@@ -2229,10 +2271,6 @@ impl Store {
         tx.commit()?;
         // plan 8: revoke the session's gateway tokens here
         self.remove_files(&conn, &dropped);
-        drop(conn);
-        if let Some(checkpoints) = &self.checkpoints {
-            checkpoints.run();
-        }
         Ok(Deletion::Done { event, unconfirmed })
     }
 

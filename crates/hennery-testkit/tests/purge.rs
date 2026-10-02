@@ -608,3 +608,45 @@ async fn a_purge_leaves_no_trace_of_the_hat_in_the_database_files() {
         );
     }
 }
+
+/// A8, for a purge: its deletes share one checkpoint, after the last, so a
+/// reader that holds the WAL across the purge holds it up once, not once
+/// per session (a held-up checkpoint takes about 3.5 s here). Once the reader is
+/// gone, the checkpoint owed is retried and the hat's name leaves the WAL.
+#[tokio::test]
+async fn a_reader_holding_the_wal_holds_a_purge_up_once_not_once_per_session() {
+    const SESSIONS: usize = 10;
+    let (c, _, _) = Collector::start().await;
+    let name = "Quagga Holdings";
+    let hat = c.hat(name);
+    for n in 0..SESSIONS {
+        c.parked(&format!("s{n}"), HOST, &hat);
+    }
+    // A read transaction on another connection, open across the purge.
+    let reader = Connection::open(&c.db).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    let started = std::time::Instant::now();
+    let result = c.purged(&hat).await;
+    let took = started.elapsed();
+    assert_eq!(result.sessions, SESSIONS as u64);
+    // Measured: about 3.5 s with one checkpoint, 33 s with one per session.
+    assert!(took < Duration::from_secs(15), "the purge took {took:?}");
+    reader.execute_batch("COMMIT").unwrap();
+    drop(reader);
+    let wal = c.db.with_extension("db-wal");
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::fs::read(&wal)
+        .unwrap_or_default()
+        .windows(name.len())
+        .any(|w| w == name.as_bytes())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the checkpoint owed was not retried"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
