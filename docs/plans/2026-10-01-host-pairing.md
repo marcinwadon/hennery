@@ -70,6 +70,16 @@ Still open: the spec amendments listed in this plan, and the hand-offs in "After
 
 **Spec write-back (2026-10-01):** this plan's spec amendments and spec-level deviations are applied: in #21 (kernel, umbrella) and #22 (ACP core, frontend, distribution). Notes above that call them still to be applied are history.
 
+**Debt sweep (2026-10-02):** closed from this plan's deferred items:
+- M2, the exit hook fails open: retried, bounded, then logged with the remedy (#23);
+- M4, the re-pair crash window: `host.toml.pending` staged first and rolled forward only onto the key it names; `orphan_outbox` fsyncs its directory (#26);
+- `pairing_codes` pruned at every mint and capped at 16 live, 409 `too_many_codes` (#27);
+- Task 4's untested paths:
+  - `--pairing-code-fd` / `--join-code-fd` must be an open pipe numbered 3 or above (#32);
+  - the end-of-file fail-safe, and the code reaching neither argv nor the environment, are pinned (#35; an exec race in the argv test's control was fixed in #37).
+
+The descriptor-placing class behind a load flake in an older test is closed by `hennery_testkit::place_fd` (#33).
+
 ## Scope
 
 This is **plan (3), real auth and pairing**, as every earlier plan handed it on. It does not fit in one plan of right-sized tasks: operator setup, password login, sessions and cookies, the `Origin` rules, step-up, several listeners, the admin socket and passkeys are a second system of about the same size. It is **split**:
