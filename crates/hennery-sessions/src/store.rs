@@ -21,7 +21,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 const MIGRATIONS: &[&str] = &[
     "
@@ -485,9 +487,9 @@ pub struct Store {
     /// Where the attachment files go: `attachments/` beside the database
     /// (kernel spec §1). An in-memory store has none.
     attachments: Option<PathBuf>,
-    /// The database file, for the checkpoint after a delete, which runs on
-    /// a connection of its own; an in-memory store has none.
-    path: Option<PathBuf>,
+    /// The checkpoint a delete owes (plan 9a A8); an in-memory store has
+    /// none.
+    checkpoints: Option<Arc<Checkpoints>>,
 }
 
 /// A stored image (plan 6a), for `GET /api/attachments/{sha256}`.
@@ -1223,19 +1225,138 @@ fn conflict_already_recorded(
     Ok(false)
 }
 
-/// Fold the WAL of the database at `path` back into it and truncate it, so
-/// the pages a delete wrote leave it too (plan 9a A8): best-effort, logged.
-/// On a connection of its own, so the store's lock is not held while it
-/// waits for readers; busy if one stays, and then the next checkpoint does
-/// it. A connection is opened per delete: deletes are rare. Plan 9b's
-/// sweep, which checkpoints too, could keep one connection for both.
-fn checkpoint(path: &Path) {
-    let checkpointed = hennery_kernel::db::open(path)
-        .and_then(|conn| Ok(conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0))?));
-    match checkpointed {
-        Ok(0) => {}
-        Ok(_) => tracing::warn!("the checkpoint after a delete was busy: the WAL keeps its pages until the next"),
-        Err(err) => tracing::warn!("the checkpoint after a delete failed: {err:#}"),
+/// How a checkpoint after a delete is retried while a reader holds the
+/// WAL (plan 9a A8): every `retry`, `fast_retries` times, then (logged once)
+/// every `slow_retry`, until it completes. The defaults are a second, five
+/// minutes of them, then a minute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointPolicy {
+    pub retry: Duration,
+    pub fast_retries: u32,
+    pub slow_retry: Duration,
+}
+
+impl Default for CheckpointPolicy {
+    fn default() -> Self {
+        Self {
+            retry: Duration::from_secs(1),
+            fast_retries: 300,
+            slow_retry: Duration::from_secs(60),
+        }
+    }
+}
+
+/// The checkpoint a delete owes: the WAL folded back into the database and
+/// truncated, so the pages the delete wrote over leave it too (plan 9a A8).
+/// It runs on a connection of its own, so the store's lock is not held
+/// while it waits for readers. Hennery's own reads are single statements
+/// under the store's or the kernel's lock, so only a reader outside it (a
+/// `sqlite3` shell, a backup tool) can hold the WAL for long. While one
+/// does, the debt is durable: `<db>-checkpoint-owed` is written, retried by
+/// one thread until a checkpoint completes, and at the next start. A
+/// connection is opened per attempt: deletes are rare.
+struct Checkpoints {
+    path: PathBuf,
+    policy: Mutex<CheckpointPolicy>,
+    /// A retry thread is running; a new debt joins it.
+    retrying: AtomicBool,
+}
+
+/// How long one attempt waits for readers before it counts as busy.
+const CHECKPOINT_WAIT: Duration = Duration::from_secs(1);
+
+impl Checkpoints {
+    fn owed_marker(&self) -> PathBuf {
+        let mut name = self.path.as_os_str().to_os_string();
+        name.push("-checkpoint-owed");
+        PathBuf::from(name)
+    }
+
+    /// Checkpoint now; if a reader holds it up, record the debt and retry
+    /// it apart until it completes.
+    fn run(self: &Arc<Self>) {
+        if self.once() {
+            self.settle();
+            return;
+        }
+        if let Err(err) = self.owe() {
+            tracing::error!("recording a checkpoint owed failed: {err:#}");
+        }
+        if self.retrying.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let this = Arc::clone(self);
+        std::thread::spawn(move || {
+            let policy = *this.policy.lock().expect("checkpoint policy");
+            let mut attempts: u64 = 0;
+            loop {
+                let pause = if attempts < u64::from(policy.fast_retries) {
+                    policy.retry
+                } else {
+                    if attempts == u64::from(policy.fast_retries) {
+                        tracing::warn!(
+                            "a reader has held the database's WAL since a delete: the deleted pages stay in the \
+                             WAL until it is released; the checkpoint is retried every {:?}",
+                            policy.slow_retry
+                        );
+                    }
+                    policy.slow_retry
+                };
+                std::thread::sleep(pause);
+                attempts += 1;
+                if this.once() {
+                    this.retrying.store(false, Ordering::SeqCst);
+                    this.settle();
+                    tracing::info!(attempts, "the checkpoint a delete owed completed");
+                    return;
+                }
+            }
+        });
+    }
+
+    /// One `wal_checkpoint(TRUNCATE)`, waiting `CHECKPOINT_WAIT` for
+    /// readers: whether it completed. A failure to open or run it is
+    /// logged, and counts as not completed.
+    fn once(&self) -> bool {
+        let checkpointed = hennery_kernel::db::open(&self.path).and_then(|conn| {
+            conn.busy_timeout(CHECKPOINT_WAIT)?;
+            Ok(conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0))?)
+        });
+        match checkpointed {
+            Ok(0) => true,
+            Ok(_) => false,
+            Err(err) => {
+                tracing::warn!("a checkpoint after a delete failed: {err:#}");
+                false
+            }
+        }
+    }
+
+    /// Record the debt durably: the marker, synced, and its directory.
+    fn owe(&self) -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let marker = self.owed_marker();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&marker)
+            .with_context(|| format!("open {}", marker.display()))?;
+        file.sync_all()?;
+        if let Some(dir) = marker.parent() {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// The debt is paid: remove the marker, if there is one.
+    fn settle(&self) {
+        match std::fs::remove_file(self.owed_marker()) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!("removing the checkpoint-owed marker failed: {err}"),
+        }
     }
 }
 
@@ -1255,12 +1376,33 @@ impl Store {
     fn init(mut conn: Connection, attachments: Option<PathBuf>, path: Option<PathBuf>) -> Result<Self> {
         let owner = hennery_kernel::db::kernel_owner(&mut conn)?;
         hennery_kernel::db::migrate(&mut conn, MIGRATIONS)?;
+        let checkpoints = path.map(|path| {
+            Arc::new(Checkpoints {
+                path,
+                policy: Mutex::new(CheckpointPolicy::default()),
+                retrying: AtomicBool::new(false),
+            })
+        });
+        // A checkpoint owed from before a restart is paid first (A8).
+        if let Some(checkpoints) = &checkpoints
+            && checkpoints.owed_marker().exists()
+        {
+            checkpoints.run();
+        }
         Ok(Self {
             conn: Mutex::new(conn),
             owner,
             attachments,
-            path,
+            checkpoints,
         })
+    }
+
+    /// How a checkpoint a reader holds up is retried (plan 9a A8), for the
+    /// next one that is.
+    pub fn set_checkpoint_policy(&self, policy: CheckpointPolicy) {
+        if let Some(checkpoints) = &self.checkpoints {
+            *checkpoints.policy.lock().expect("checkpoint policy") = policy;
+        }
     }
 
     fn conn(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -1914,8 +2056,8 @@ impl Store {
         // plan 8: revoke the session's gateway tokens here
         self.remove_files(&conn, &dropped);
         drop(conn);
-        if let Some(path) = self.path.as_deref() {
-            checkpoint(path);
+        if let Some(checkpoints) = &self.checkpoints {
+            checkpoints.run();
         }
         Ok(Deletion::Done { event, unconfirmed })
     }

@@ -3030,6 +3030,115 @@ fn a_deleted_sessions_title_and_cwd_are_not_left_in_the_database_files() {
     assert!(!holds(&after, cwd), "the cwd is still in the files");
 }
 
+/// A8: a reader that holds the WAL through the delete's checkpoint makes it
+/// busy; once the reader is gone, the checkpoint is retried and the
+/// deleted title and cwd leave the WAL too.
+#[test]
+fn a_checkpoint_a_reader_held_up_is_retried_once_it_is_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    let (title, cwd) = ("zq-held-title-4d1a", "/srv/zq-held-cwd-8b2c");
+    active(&store, "s1", cwd);
+    store.ingest("s1", 2, &titled(title)).unwrap();
+    store.close_now("s1").unwrap();
+    // A read transaction on another connection, open across the delete.
+    let reader = Connection::open(&db).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    delete(&store, "s1");
+    let wal = || std::fs::read(db.with_extension("db-wal")).unwrap_or_default();
+    let holds = |bytes: &[u8], needle: &str| bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
+    assert!(holds(&wal(), title), "the reader held the checkpoint up");
+    reader.execute_batch("COMMIT").unwrap();
+    drop(reader);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while holds(&wal(), title) || holds(&wal(), cwd) {
+        assert!(std::time::Instant::now() < deadline, "the checkpoint was not retried");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    drop(store);
+}
+
+/// A8: a reader held past the retries' deadline. The delete still
+/// succeeds; the debt is recorded beside the database; once the reader
+/// is released, a later retry completes the checkpoint with no other
+/// delete, and the record goes.
+#[test]
+fn a_checkpoint_a_reader_holds_past_the_deadline_is_owed_until_it_completes() {
+    use hennery_sessions::store::CheckpointPolicy;
+    let dir = tempfile::tempdir().unwrap();
+    let (store, db) = file_store(dir.path());
+    store.set_checkpoint_policy(CheckpointPolicy {
+        retry: std::time::Duration::from_millis(20),
+        // No fast retries: past the deadline at once, so only the slow
+        // ones can pay the debt.
+        fast_retries: 0,
+        slow_retry: std::time::Duration::from_millis(100),
+    });
+    let (title, cwd) = ("zq-owed-title-6e0f", "/srv/zq-owed-cwd-1c9d");
+    active(&store, "s1", cwd);
+    store.ingest("s1", 2, &titled(title)).unwrap();
+    store.close_now("s1").unwrap();
+    let reader = Connection::open(&db).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM sessions", [], |r| r.get(0))
+        .unwrap();
+    delete(&store, "s1");
+    let marker = dir.path().join("hennery.db-checkpoint-owed");
+    let wal = || std::fs::read(db.with_extension("db-wal")).unwrap_or_default();
+    let holds = |bytes: &[u8], needle: &str| bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
+    assert!(marker.exists(), "the debt is recorded");
+    // Held well past the deadline: the slow retries keep going.
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    assert!(holds(&wal(), title) && marker.exists(), "still held, still owed");
+    reader.execute_batch("COMMIT").unwrap();
+    drop(reader);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while holds(&wal(), title) || holds(&wal(), cwd) || marker.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owed checkpoint never completed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// A8: a checkpoint owed at a restart (the record left beside the
+/// database) is paid when the store opens.
+#[test]
+fn a_checkpoint_owed_at_a_restart_is_paid_when_the_store_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    drop(Store::open(&db).unwrap());
+    // A connection that stays open keeps the WAL from being removed at
+    // close, as a crash would leave it.
+    let keep = Connection::open(&db).unwrap();
+    keep.execute_batch(
+        "PRAGMA wal_autocheckpoint = 0; CREATE TABLE scratch(x); INSERT INTO scratch VALUES ('zq-owed-at-start');",
+    )
+    .unwrap();
+    let marker = dir.path().join("hennery.db-checkpoint-owed");
+    std::fs::write(&marker, b"").unwrap();
+    assert!(!std::fs::read(db.with_extension("db-wal")).unwrap().is_empty());
+    let _store = Store::open(&db).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while marker.exists()
+        || !std::fs::read(db.with_extension("db-wal"))
+            .unwrap_or_default()
+            .is_empty()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the owed checkpoint was not paid at start"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    drop(keep);
+}
+
 /// Decision 6: an image is the owner's while a turn or an event of a kept
 /// session shows it; its row and its file go with the last of them, and
 /// the usage drops by what went.
