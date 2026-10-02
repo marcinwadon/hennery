@@ -139,15 +139,15 @@ let
     "nix: no assertion fails" = failedAssertions nixNoClaude == [ ];
     "a user who is not there is refused" = lib.any (has "not a normal user") (failedAssertions stranger);
     "host: skipped until paired" =
-      nixNoClaude.systemd.services.hennery-host.unitConfig.ConditionPathExists == "/var/lib/hennery-host/host.key";
+      nixNoClaude.systemd.services.hennery-host.unitConfig.ConditionPathExists or null == "/var/lib/hennery-host/host.key";
     "host: a revoked host is not restarted" =
-      nixNoClaude.systemd.services.hennery-host.serviceConfig.RestartPreventExitStatus == 78;
-    "host: runs as its user" = nixNoClaude.systemd.services.hennery-host.serviceConfig.User == "alice";
+      nixNoClaude.systemd.services.hennery-host.serviceConfig.RestartPreventExitStatus or null == 78;
+    "host: runs as its user" = nixNoClaude.systemd.services.hennery-host.serviceConfig.User or null == "alice";
     "collector: its command line" =
       collector.systemd.services.hennery-collector.serviceConfig.ExecStart
       == ''"${lib.getExe hennery}" "collector" "--data-dir" "/var/lib/hennery" "--listen" "127.0.0.1:7117" "--listen" "[::1]:7117" "--public-url" "https://hennery.example"'';
     "collector: its own system user" =
-      collector.systemd.services.hennery-collector.serviceConfig.User == "hennery"
+      collector.systemd.services.hennery-collector.serviceConfig.User or null == "hennery"
       && collector.users.users.hennery.isSystemUser;
     "home-manager: every word quoted as unit.rs quotes it" =
       homeHost.Service.ExecStart
@@ -156,10 +156,10 @@ let
       home.xdg.configFile."hennery/service.env".text
       == "# Written by the home-manager module of hennery: the services' PATH.\nPATH=\"${pkgs.bash}/bin:${pkgs.git}/bin:/home/alice/.nix-profile/bin:/etc/profiles/per-user/alice/bin:/run/wrappers/bin:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/bin:/bin\"\n";
     "home-manager: the unit reads it" =
-      homeHost.Service.EnvironmentFile == "/home/alice/.config/hennery/service.env";
+      homeHost.Service.EnvironmentFile or null == "/home/alice/.config/hennery/service.env";
     "home-manager: skipped until paired, not restarted once revoked" =
-      homeHost.Unit.ConditionPathExists == "@DATA@/a dir %%h $HOME \"quoted\" \\back/host.key"
-      && homeHost.Service.RestartPreventExitStatus == 78;
+      homeHost.Unit.ConditionPathExists or null == "@DATA@/a dir %%h $HOME \"quoted\" \\back/host.key"
+      && homeHost.Service.RestartPreventExitStatus or null == 78;
     "home-manager: no assertion fails on Linux" = failedAssertions home == [ ];
   };
   failed = lib.attrNames (lib.filterAttrs (_: ok: !ok) results);
