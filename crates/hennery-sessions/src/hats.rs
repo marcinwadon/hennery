@@ -9,19 +9,20 @@ use crate::api::Unplaceable;
 use crate::api::{close_deleted_on_host, error, internal};
 use crate::resolve::{NotResolved, resolve_on_host};
 use crate::store::{Deletion, HatSession, Unattached};
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::handler::Handler;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post};
 use axum::{Json, Router, middleware};
 use futures::stream::{self, StreamExt};
 use hennery_kernel::hats::{HatChange, HatRecord, MAX_RULES, NewRule, PathRule, PurgeStart, RulesChange, SessionHat};
 use hennery_kernel::json::ApiJson;
+use hennery_kernel::logo::{self, Refusal};
 use hennery_kernel::secret::{rfc3339, unix_now};
 use hennery_proto::rest::{
     CreateHatRequest, HatItem, HatResolution, HatResolveRequest, PathRuleInput, PathRuleItem, PathRulesRequest,
-    PurgePreview, PurgeResult, UpdateHatRequest,
+    PurgePreview, PurgeResult, SetHatLogoRequest, UpdateHatRequest,
 };
 
 /// Rule prefixes resolved through the host at once, at most: matches the
@@ -31,6 +32,10 @@ const RESOLVING_AT_ONCE: usize = 4;
 /// The sessions of no hat a purge's preview lists, at most (plan 9c
 /// decision 11).
 const UNASSIGNED_SHOWN: u32 = 100;
+
+/// The most `PUT /api/hats/{id}/logo` reads of a body: a 64 KiB logo is
+/// 87,384 bytes of base64, and its JSON a few more (plan 4d-B2).
+pub const LOGO_BODY_LIMIT: usize = 96 * 1024;
 
 /// Every route needs the operator's session. Changing a hat and replacing a
 /// host's path rules need a fresh step-up too (plan 5a decision 7): the
@@ -51,6 +56,18 @@ pub fn router(state: AppState) -> Router {
             // As for the path rules: step-up on `post` alone.
             get(purge_preview).post(purge_hat.layer(middleware::from_fn(hennery_kernel::auth::require_step_up))),
         )
+        .route(
+            "/api/hats/{id}/logo",
+            // Step-up on `put` and `delete` alone (`Handler::layer`, the
+            // review's A5): `get` is every `<img>` of the hat.
+            get(hat_logo)
+                .put(
+                    put_logo
+                        .layer(middleware::from_fn(hennery_kernel::auth::require_step_up))
+                        .layer(DefaultBodyLimit::max(LOGO_BODY_LIMIT)),
+                )
+                .delete(delete_logo.layer(middleware::from_fn(hennery_kernel::auth::require_step_up))),
+        )
         .route("/api/hats/resolve", post(resolve_hat))
         .route(
             "/api/hosts/{id}/path-rules",
@@ -70,6 +87,7 @@ pub(crate) fn hat_item(record: HatRecord) -> HatItem {
         created_at: rfc3339(record.created_at),
         default_for_new_hosts: record.default_for_new_hosts,
         purging: record.purging,
+        logo: record.logo,
     }
 }
 
@@ -123,6 +141,133 @@ async fn update_hat(
         Ok(change) => hat_changed(change, StatusCode::OK),
         Err(err) => internal(err),
     }
+}
+
+/// What a refused logo is answered with: a fixed `ApiError` per refusal,
+/// never the decoder's words or the upload (the review's A8).
+fn logo_refused(refusal: Refusal) -> Response {
+    tracing::debug!(?refusal, "logo refused");
+    match refusal {
+        Refusal::NotBase64 => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_logo",
+            "the logo must be standard base64, padded, with nothing around it",
+        ),
+        Refusal::TooLarge => error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "logo_too_large",
+            "a logo is at most 64 KiB, and at most 256 KiB once re-encoded",
+        ),
+        Refusal::Unsupported => error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_logo",
+            "a logo must be a PNG: turn other images into one first",
+        ),
+        Refusal::Dimensions => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_logo",
+            "a logo is at most 1024 × 1024 pixels",
+        ),
+        Refusal::Damaged => error(
+            StatusCode::BAD_REQUEST,
+            "invalid_logo",
+            "the logo is not a PNG that can be read",
+        ),
+    }
+}
+
+/// `PUT /api/hats/{id}/logo` (kernel spec §5.1): the upload re-encoded
+/// (`logo::from_upload`) and stored; 200 with the hat as it is now. An
+/// unknown hat is 404 before the upload is read. A hat frozen for its purge
+/// is 409 `hat_purging`, checked as the logo is stored.
+async fn put_logo(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    ApiJson(req): ApiJson<SetHatLogoRequest>,
+) -> Response {
+    match state.hosts.hat(&id) {
+        Ok(Some(_)) => {}
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such hat"),
+        Err(err) => return internal(err),
+    }
+    // Decoding is work for a thread of its own (the review's O1).
+    let logo = match tokio::task::spawn_blocking(move || logo::from_upload(&req.data)).await {
+        Ok(Ok(logo)) => logo,
+        Ok(Err(refusal)) => return logo_refused(refusal),
+        Err(err) => return internal(err.into()),
+    };
+    match state.hosts.set_hat_logo(&id, &logo) {
+        Ok(change) => hat_changed(change, StatusCode::OK),
+        Err(err) => internal(err),
+    }
+}
+
+/// `DELETE /api/hats/{id}/logo`: 200 with the hat, with no logo now, even a
+/// frozen hat's (the review's A6), or 404.
+async fn delete_logo(State(state): State<AppState>, Path(id): Path<String>) -> Response {
+    match state.hosts.clear_hat_logo(&id) {
+        Ok(change) => hat_changed(change, StatusCode::OK),
+        Err(err) => internal(err),
+    }
+}
+
+/// Whether `If-None-Match` names `etag` (quoted), by the weak comparison
+/// RFC 9110 §13.1.2 asks of it, or is `*`.
+fn not_modified(request: &HeaderMap, etag: &str) -> bool {
+    request
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|tags| {
+            tags.split(',')
+                .map(str::trim)
+                .any(|tag| tag == "*" || tag.strip_prefix("W/").unwrap_or(tag) == etag)
+        })
+}
+
+/// `GET /api/hats/{id}/logo` (kernel spec §5.1, §3.3: a browser `GET`,
+/// behind the cookie): the logo as stored, or 404 for a hat with none. Its
+/// URL is on this origin, so the answer stays an image even opened as a
+/// page (the parent's addition, the review's A9): a fixed type from the kind
+/// stored, never sniffed; a sandbox that runs and loads nothing, framed
+/// nowhere; inline under a fixed name; for this origin only. It is private
+/// and revalidated each time by its strong `ETag`: 304 when it still
+/// matches, with the same headers.
+async fn hat_logo(State(state): State<AppState>, Path(id): Path<String>, request: HeaderMap) -> Response {
+    let stored = match state.hosts.hat_logo(&id) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return error(StatusCode::NOT_FOUND, "not_found", "no such logo"),
+        Err(err) => return internal(err),
+    };
+    let content_type = match stored.mime.as_str() {
+        logo::MIME_PNG => HeaderValue::from_static(logo::MIME_PNG),
+        _ => return internal(anyhow::anyhow!("hat {id}'s logo is of a kind not served")),
+    };
+    let etag = format!("\"{}\"", stored.etag);
+    let Ok(etag_value) = HeaderValue::from_str(&etag) else {
+        return internal(anyhow::anyhow!("hat {id}'s logo has an ETag no header can carry"));
+    };
+    let mut response = if not_modified(&request, &etag) {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        ([(header::CONTENT_TYPE, content_type)], stored.bytes).into_response()
+    };
+    let headers = response.headers_mut();
+    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(hennery_kernel::csp::LOGO_POLICY),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("inline; filename=\"logo.png\""),
+    );
+    headers.insert(
+        HeaderName::from_static("cross-origin-resource-policy"),
+        HeaderValue::from_static("same-origin"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, no-cache"));
+    headers.insert(header::ETAG, etag_value);
+    response
 }
 
 /// `GET /api/hosts/{id}/path-rules`: the host's rules, longest prefix
