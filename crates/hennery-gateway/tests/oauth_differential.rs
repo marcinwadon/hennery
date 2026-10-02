@@ -28,17 +28,12 @@ use hennery_kernel::operator::{Operator, SetupOutcome};
 use hennery_kernel::secret::unix_now;
 use serde_json::Value;
 use std::sync::Arc;
-use support::differential::{DECODERS, Decoder, Node};
+use support::differential::{DECODERS, Decoder, Node, cut_at_nul};
 use support::oauth::{Config, FakeAs, PrAt};
 use support::{Recorder, World};
 use tower::ServiceExt;
 
 const ORIGIN: &str = "https://hennery.example";
-
-/// A string cut at its first NUL, as a C reader of the query hands it on.
-fn cut_at_nul(s: &str) -> &str {
-    s.split('\0').next().unwrap_or_default()
-}
 
 /// A field as `decoder` hands it on: a string (cut at NUL where it cuts), a
 /// number, or a list of strings, as text.
