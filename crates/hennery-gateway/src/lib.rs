@@ -14,6 +14,7 @@ pub mod revocation;
 mod schema;
 pub mod scope;
 pub mod session;
+pub mod session_id;
 pub mod stdio;
 pub mod store;
 pub mod tokens;
