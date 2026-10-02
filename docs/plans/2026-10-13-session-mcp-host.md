@@ -91,7 +91,8 @@ Put to the security review on the maintainer's behalf (below); its answers are r
    - `NameValue`'s and `McpServer`'s `Debug` show names, the URL's origin and the command, never a header's or env variable's value, the URL's path, query or userinfo, nor a stdio server's arguments (a key can be one). So does every frame's `Debug`, which `bail!("… {other:?}")` and friends log. The origin is `frames::url_origin` (`scheme://host[:port]`), the gateway lane's rule L11; 8a, 8d and 8f can use it too. `Secrets`' own `Debug` shows only how many it holds.
    - `url_origin` and `url_secrets` fail closed: a URL that does not read one way only shows as `<redacted>` and is a secret whole. That is: a scheme other than `http` or `https` (an MCP server's only ones; else a value put before `://` would show as the origin), a backslash, an `@` past the authority (`https://u:ab/cd@h/x`, a base64 userinfo with a `/`), a host of other characters than `[A-Za-z0-9._-]` or a bracketed IPv6 literal, a port of other than digits. Not a URL parser: a URL it refuses is only shown less.
    - Found while building: at `trace` the ACP crate logs every JSON-RPC line it sends (`Sending JSON-RPC message`, the whole `session/new`). At `debug` it logs the adapter's answers, so an error that quotes the config reaches the log too. tungstenite, through the `log` bridge, logs every WebSocket message on both ends (`Received message`, `Sending frame`). So `RUST_LOG=trace` would print every session's token, and every server's URL.
-   - `hennery_host::logging::capped` holds `agent_client_protocol`, `tungstenite` and `tokio_tungstenite` at `info`. It is a global filter over the subscriber, so no `RUST_LOG` lifts it. `hennery`'s `log::init` installs each of its three subscribers through one `install`, and a source audit test pins that.
+   - Found in the task review: at `warn` the ACP crate logs an adapter's stdout line that is not JSON-RPC whole (`Invalid transport input`, the parse error's `data`), so an adapter printing its config there would leak a token at the default `RUST_LOG`.
+   - `hennery_host::logging::capped` holds `agent_client_protocol` at `error` and `tungstenite` and `tokio_tungstenite` at `info` (each target its own level; the ACP crate's own `error` events quote no message). It is a global filter over the subscriber, so no `RUST_LOG` lifts it. `hennery`'s `log::init` installs each of its three subscribers through one `install`, and a source audit test pins that.
    - A frame the host cannot decode was logged with serde's error text, which quotes a string of the frame (a header value, say). It is now logged by the error's kind, line and column only.
    - The host redacts a session's secret values from the text it writes itself: a `start_failed` message (before its log line too), a `turn_ended` error, a `host_note` (the start's or resume's config note and the replay note before `scrub`, which would otherwise cut a value in part so it no longer matches whole), an `adapter_exited` stderr tail (before `scrub` too), and the actor's `error` answers (`reject`, a refused `set_config` quoting the adapter). `Secrets::redact_body` is exhaustive over `SessionBody`, as `mcp_delivery()` is over the frames: a new body must say whether it carries such text. The actor's log lines that quote an adapter's error go through `Actor::redacted` (defense in depth: their paths, a send to a closing connection, have no test that reaches them, so they are not revert-probed). The `cancel_unanswered` note is not redacted again: its text is the host's own and a tail `stderr_tail` already redacted.
    - A secret value is what `McpServer::secret_values` names (a header's or env variable's value, a stdio server's argument, an HTTP URL's userinfo and everything past its authority), each of its parts between whitespace or the URL delimiters `/?#&=:@` (a bare token echoed without `Bearer `, one segment of a URL's path, the password of its `user:password`), and the JSON-escaped form of each (an adapter may echo its config as JSON), of at least 8 bytes (`MIN_SECRET_LEN`: shorter ones are likely ordinary words). It errs on the safe side: an ordinary word of 8 bytes or more in a stdio argument (`Projects` in a path) is redacted too, which costs diagnostic text, never a secret.
@@ -1961,6 +1962,9 @@ with:
 ```rust
                 async move |req: NewSessionRequest, responder, cx| {
                     log_session(&script, "session/new", &req);
+                    for line in &script.stdout_lines {
+                        write_stdout_line(line);
+                    }
                     match script.new_session_error {
                         Some(code) => {
                             let message = if script.new_session_error_echoes {
@@ -2041,6 +2045,17 @@ with:
 
 ```rust
 
+/// `line` with a trailing newline, in one `write_all` through the same
+/// `std::io::stdout()` the ACP crate's transport writes through (and
+/// flushes after every line it sends). Called before the caller's own
+/// answer exists, so no JSON-RPC line of the transport's is still being
+/// written when this one lands (plan 8c).
+fn write_stdout_line(line: &str) {
+    let mut out = std::io::stdout().lock();
+    let _ = out.write_all(format!("{line}\n").as_bytes());
+    let _ = out.flush();
+}
+
 /// One `session_log` line: the request as parsed, so an entry the schema
 /// could not take is missing from it, as from a real adapter's view.
 fn log_session(script: &FakeScript, method: &str, params: &impl serde::Serialize) {
@@ -2057,6 +2072,25 @@ fn log_session(script: &FakeScript, method: &str, params: &impl serde::Serialize
 }
 
 /// Record a switch in the script's `config_log`, if it has one.
+```
+
+In `crates/hennery-testkit/src/lib.rs`, replace:
+
+```rust
+    pub stderr_lines: Vec<String>,
+```
+
+with:
+
+```rust
+    pub stderr_lines: Vec<String>,
+    /// Lines written raw (not JSON-RPC) to stdout right before answering
+    /// `session/new`: written while that answer does not exist yet, so the
+    /// ACP crate has no JSON-RPC line of its own still being written to the
+    /// same stdout (e.g. a fake token, to test that the host's log never
+    /// shows what an adapter prints to its own stdout, plan 8c).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stdout_lines: Vec<String>,
 ```
 
 In `crates/hennery-testkit/src/lib.rs`, replace:
@@ -2104,12 +2138,19 @@ with:
 In `crates/hennery-testkit/src/lib.rs`, replace:
 
 ```rust
+            grandchild_pid_file: None,
+            replay: Vec::new(),
+            load_error: None,
             new_session_error: None,
 ```
 
 with:
 
 ```rust
+            stdout_lines: Vec::new(),
+            grandchild_pid_file: None,
+            replay: Vec::new(),
+            load_error: None,
             new_session_error: None,
             new_session_error_echoes: false,
             prompt_error: None,
@@ -2308,9 +2349,9 @@ const ARG_KEY: &str = "arg-secret-0123456789";
 /// A key in an HTTP server's URL path: only its origin may show (the
 /// gateway lane's rule L11).
 const URL_KEY: &str = "url-secret-0123456789";
-/// A value `scrub` cuts in part (`ghp_…` up to the colon): redacted whole
-/// only if it is redacted before `scrub`.
-const SCRUBBED: &str = "ghp_0123456789:tail-secret-0123";
+/// A value `scrub` cuts in part (`ghp_…` up to the comma, which `Secrets`
+/// does not cut at): redacted whole only if it is redacted before `scrub`.
+const SCRUBBED: &str = "ghp_0123456789,tail-secret-0123";
 
 fn servers() -> Vec<McpServer> {
     vec![
@@ -4141,7 +4182,11 @@ Create `crates/hennery-testkit/tests/session_mcp_log.rs`:
 //! adapter's `session/new`: tungstenite traces the frame and the ACP crate
 //! the JSON-RPC line, both with the token. The same for a `session/load`,
 //! an adapter error that quotes the servers, and a frame that does not
-//! decode, which the host logs by its error's kind and place only.
+//! decode, which the host logs by its error's kind and place only. The fake
+//! adapter also prints a stray (non-JSON-RPC) stdout line quoting the token
+//! and the URL key, which the ACP crate cannot parse and so quotes whole in
+//! a `warn` event of its own (`agent-client-protocol` 2.2.0) — the reason
+//! that target is held at `error`, not `info`.
 //! Run twice: once under a plain
 //! subscriber, which proves they do, and once under the one the process
 //! installs (`logging::capped`), which must not show it. Each run's
@@ -4225,10 +4270,19 @@ async fn run_sessions_with_the_token() {
         HostKey::from_seed([1; 32]),
         data.path().to_path_buf(),
     );
-    cfg.agents.insert(
-        "claude".into(),
-        hennery_host::AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap(),
-    );
+    let mut claude = hennery_host::AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
+    // A stray (non-JSON-RPC) line on its stdout, quoting the token and the
+    // URL key, right before it answers `session/new`: the ACP crate cannot
+    // parse it and quotes it whole in a `warn` event of its own.
+    let claude_script = hennery_testkit::FakeScript {
+        stdout_lines: vec![format!("debug: servers [{TOKEN}] {URL_KEY}")],
+        ..Default::default()
+    };
+    claude.env.push((
+        hennery_testkit::SCRIPT_ENV.into(),
+        serde_json::to_string(&claude_script).unwrap(),
+    ));
+    cfg.agents.insert("claude".into(), claude);
     let mut echo = hennery_host::AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
     let script = hennery_testkit::FakeScript {
         new_session_error: Some(-32603),
@@ -4349,6 +4403,14 @@ async fn a_sessions_token_is_never_logged_even_at_trace() {
             );
         }
     }
+    // The ACP crate's own `warn`, quoting the adapter's stray stdout whole:
+    // the probe for capping that target at `error`.
+    assert!(
+        control.lines().any(|line| {
+            line.contains("agent_client_protocol") && line.contains("Invalid transport input") && line.contains(TOKEN)
+        }),
+        "no agent_client_protocol warn line quoting the stray stdout's token in the plain log: {control}"
+    );
 
     // ...and the process's own subscriber, which logs, never shows it.
     let capped = Captured::default();
@@ -4431,25 +4493,37 @@ Create `crates/hennery-host/src/logging.rs`:
 //! JSON-RPC line it sends (`session/new`, with a session's gateway token in
 //! its MCP headers) and at `debug` the adapter's answers (an error that
 //! quotes its config), and tungstenite logs every WebSocket message (the
-//! `start_session` frame that carries the token, on both ends). Those
-//! targets are held at `info`, whatever `RUST_LOG` says.
+//! `start_session` frame that carries the token, on both ends). The ACP
+//! crate also quotes a misbehaving adapter's raw stdout whole in its own
+//! `warn` (`agent-client-protocol` 2.2.0: a line it cannot parse as
+//! JSON-RPC becomes a parse-error `Error` whose `data` is that line, logged
+//! at `warn`), so it cannot stop at `info` like the others — it is held at
+//! `error`. `tungstenite` and `tokio_tungstenite` only ever trace whole
+//! messages at `debug` and `trace`, so `info` is enough for them. Each
+//! target is held to its own level, whatever `RUST_LOG` says.
 
 use tracing::Subscriber;
 use tracing_subscriber::filter::{LevelFilter, Targets};
 use tracing_subscriber::layer::{Layered, SubscriberExt};
 
-/// The targets whose `debug` and `trace` events can carry a session's
-/// secrets, and are therefore never shown.
-pub const MESSAGE_TRACING_TARGETS: &[&str] = &["agent_client_protocol", "tungstenite", "tokio_tungstenite"];
+/// The targets whose events can carry a session's secrets, and the level
+/// each is held to at most: `agent_client_protocol` quotes a misbehaving
+/// adapter's stray stdout in its own `warn`, so it is held at `error`;
+/// `tungstenite` and `tokio_tungstenite` only trace whole messages at
+/// `debug`/`trace`, so `info` is enough.
+pub const MESSAGE_TRACING_TARGETS: &[(&str, LevelFilter)] = &[
+    ("agent_client_protocol", LevelFilter::ERROR),
+    ("tungstenite", LevelFilter::INFO),
+    ("tokio_tungstenite", LevelFilter::INFO),
+];
 
-/// Every target at any level, but `MESSAGE_TRACING_TARGETS` at `info` at
-/// most.
+/// Every target at any level, but each of `MESSAGE_TRACING_TARGETS` at its
+/// own level at most.
 pub fn secret_cap() -> Targets {
-    MESSAGE_TRACING_TARGETS
-        .iter()
-        .fold(Targets::new().with_default(LevelFilter::TRACE), |targets, target| {
-            targets.with_target(*target, LevelFilter::INFO)
-        })
+    MESSAGE_TRACING_TARGETS.iter().fold(
+        Targets::new().with_default(LevelFilter::TRACE),
+        |targets, (target, level)| targets.with_target(*target, *level),
+    )
 }
 
 /// `subscriber` with `secret_cap` over it, as a global filter: an event it
@@ -4474,8 +4548,8 @@ with:
 
 ```rust
 /// filters, `info` by default; the targets that trace whole messages stay
-/// at `info` whatever it says, since they would show a session's gateway
-/// token (`hennery_host::logging::capped`, plan 8c).
+/// capped at their own level whatever it says, since they would show a
+/// session's gateway token (`hennery_host::logging::capped`, plan 8c).
 ```
 
 In `crates/hennery/src/log.rs`, replace:
@@ -4584,12 +4658,13 @@ mod tests {
 - [ ] **Step 4: Run them to see them pass**
 
 Run: `cargo test --locked -p hennery-testkit --test session_mcp_log && cargo test --locked -p hennery --bin hennery every_subscriber`
-Expected: PASS. The test's plain run shows the token on a `tungstenite` line and on an `agent_client_protocol` line, so the probe is real.
+Expected: PASS. The test's plain run shows the token on a `tungstenite` line, on an `agent_client_protocol` line and on the ACP crate's `Invalid transport input` warning (the fake's `stdout_lines`), so the probe is real.
 
 - [ ] **Step 5: Revert-probes**
 
 - In `capped`, put a `Targets` that lets everything through in place of `secret_cap()`. `a_sessions_token_is_never_logged_even_at_trace` fails.
 - In `connect_once`, log an undecodable frame with `error = %err` again. `a_sessions_token_is_never_logged_even_at_trace` fails.
+- In `MESSAGE_TRACING_TARGETS`, hold `agent_client_protocol` at `INFO`. `a_sessions_token_is_never_logged_even_at_trace` fails (the ACP crate's warning quotes the stray stdout line).
 - In `log::install`, install the subscriber uncapped; then, at one of `log::init`'s three sites, install one with `.init()` directly. `every_subscriber_is_installed_capped` fails on each.
 
 - [ ] **Step 6: The full checks**
@@ -4745,8 +4820,9 @@ with:
   8c): their `Debug` shows names, and an HTTP server's URL only as
   `scheme://host[:port]`, never a header's or env variable's value, the
   URL's path, query or userinfo, nor a stdio server's arguments; the
-  process's log output holds the ACP crate and tungstenite, which trace
-  whole messages, at `info` whatever `RUST_LOG` says; a frame the host
+  process's log output holds tungstenite, which traces whole messages, at
+  `info` and the ACP crate, which also quotes an adapter's stray stdout in
+  its warnings, at `error`, whatever `RUST_LOG` says; a frame the host
   cannot decode is logged by its error's kind and place, never its text;
   and the host redacts a session's secret values (each of those parts, its
   parts between whitespace or URL delimiters, and its JSON-escaped form)
