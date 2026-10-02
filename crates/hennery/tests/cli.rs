@@ -3740,7 +3740,8 @@ fn lockable(path: &std::path::Path) -> bool {
 /// SIGTERM: the host stops its adapter, and the port and `host.lock` are
 /// free, so a relaunch on the same port and data directory serves again,
 /// its host connected. The host is one `up` started again after a crash, so
-/// a restart hands the pipe on too.
+/// a restart hands the pipe on too. Only a host is restarted here: a
+/// restarted collector gets the pipe from the same `UpChildren` builder.
 #[test]
 fn ups_children_stop_when_up_is_killed() {
     let dir = scratch_dir("parentdeath");

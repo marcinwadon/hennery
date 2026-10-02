@@ -143,7 +143,11 @@ pub async fn read_code(fd: RawFd) -> Result<String> {
 /// for as it shuts down, and not a non-blocking read, whose `O_NONBLOCK`
 /// would be set on the pipe both children share. Once `up` is gone, the same
 /// thread ends the process outright if it is still there after
-/// `PARENT_GONE_DEADLINE`.
+/// `PARENT_GONE_DEADLINE`. That covers the runtime's drop too: should it
+/// block that long, `_exit` skips `Adapter`'s `Drop`, knowingly trading an
+/// orphaned adapter for a process that ends (A-1). A host still pairing
+/// when `up` dies stops by the pairing pipe's end-of-file, or by this
+/// deadline, without the "gone" line.
 pub fn watch_parent(fd: RawFd) -> Result<tokio::sync::oneshot::Receiver<()>> {
     check_pipe("--parent-fd", fd)?;
     // SAFETY: fcntl(2) on the descriptor just checked; it only sets its
