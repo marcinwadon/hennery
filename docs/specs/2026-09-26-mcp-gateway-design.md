@@ -410,11 +410,18 @@ and nothing goes up.
   the first of two `"method"`s or `"name"`s would otherwise run what the
   allowlist never saw. Nor may it spell a key the gateway reads otherwise
   than exactly, folding ASCII case and `ſ` to `s` and ignoring `_` and `-`,
-  as Go's `encoding/json` (v1 and v2) can match names: a message's
-  `jsonrpc`, `id`, `method` and `params`, a `tools/call`'s `name`, an
-  `initialize`'s `capabilities` and the capabilities not forwarded.
-  `METHOD` or `Name` would be read upstream as what the allowlist never
-  saw. The bytes go up as they came, except an
+  as Go's `encoding/json` (v1 and v2) can match names, and cutting the key
+  at its first NUL, as json-c and cJSON keep keys in C strings: a message's
+  `jsonrpc`, `id`, `method`, `params` and `result`, a `tools/call`'s
+  `name`, an `initialize`'s `capabilities` and the capabilities not
+  forwarded. `METHOD`, `Name` or `method\u0000x` would be read upstream as
+  what the allowlist never saw. Nor may a `method` be anything but a
+  string, or spell a method the gateway reads (`tools/call`, `tools/list`,
+  `initialize`, and §5.6's refused requests) otherwise, folded the same
+  way (`tools/call\u0000x` is `tools/call` to json-c and cJSON); nor may a
+  batch hold anything but objects, nor an `initialize` have `params` or
+  `capabilities` that is not an object (`["sampling"]` holds `sampling` to
+  a server that tests membership). The bytes go up as they came, except an
   `initialize` rewritten (§5.6). `GET` and `DELETE` bodies are neither read
   nor sent.
 - **Response headers forwarded:** `Mcp-Session-Id`; `Content-Type` is the
@@ -452,21 +459,24 @@ and nothing goes up.
   for every chunk that ends an event; a partial event waits for its end.
 - Exception: a `tools/list` response in JSON for a connection with an
   allowlist is read fully (cap 8 MiB, error if exceeded — never truncated)
-  and rewritten; in an event stream, its event is.
+  and rewritten; in an event stream, its event is. It is read as an event's
+  data is (below): JSON with a key twice, or spelling a key or method the
+  gateway reads otherwise, is 502 `upstream_invalid`.
 - An event stream is passed on **event by event**: every complete event at
   once, a partial one held until its end, so an event can be rewritten or
   dropped (§5.5, §5.6). One event is at most 8 MiB; past that the stream
   ends. It fails closed: a byte-order mark at its start is dropped, as a
-  client's parser would; an event whose data is not JSON (to serde_json: a
-  lone surrogate, say), has a key twice in an object, spells a key the
-  gateway reads otherwise (§5.2), or has a line that starts with a
+  client's parser would; an event that is not UTF-8 (a client may decode
+  an invalid or overlong byte otherwise than as a replacement character),
+  or whose data is not JSON (to serde_json: a
+  lone surrogate, say), has a key twice in an object, spells a key or
+  method the gateway reads otherwise (§5.2; going down also a `result`'s
+  `tools` and a tool's `name`), or has a line that starts with a
   byte-order mark, is dropped, since a client's parser might read what the
   gateway cannot; a last event the stream never ends is
   dropped (a final lone `\r` included). A rewritten event keeps its other
   fields (`id:`, `event:`) and gets one `data:` line.
-  Events without data (comments, pings) pass byte for byte, and invalid
-  UTF-8 in an event no rule touches goes on as it came, as clients decode
-  it with replacement characters.
+  Events without data (comments, pings) pass byte for byte.
 
 ### 5.4 Upstream 401
 
@@ -499,15 +509,17 @@ and nothing goes up.
   gateway and nothing in it is sent: that call `-32602`, every other request
   in it `-32600` ("batch refused"); notifications get nothing, and a body
   with nothing to answer is 202. A response's id matches a `tools/list`
-  request's if equal or the same number however written (`1`, `1.0`).
+  request's if equal or the same number however written (`1`, `1.0`); a
+  `tools/list` without an id is kept as `null`, so an answer with
+  `"id": null` is filtered too.
 - **The filter hides; the `tools/call` refusal enforces.** The filter
   knows only the ids of the `tools/list` requests of the same exchange, so
   an unfiltered list can still reach a client: an id answered as another
   type (`"1"` for `1`), an interrupted `tools/list` replayed on a `GET`
-  with `Last-Event-ID`, a response the upstream sends on another stream,
-  or one whose `result`, `tools` or a tool's `name` is spelt otherwise or
-  twice, for a client that reads it so. A tool seen that way still cannot
-  be called.
+  with `Last-Event-ID`, or a response the upstream sends on another
+  stream. A tool seen that way still cannot be called. A response whose
+  `id`, `result`, `tools` or a tool's `name` is spelt otherwise or twice
+  is not passed on (§5.3).
 
 ### 5.6 Capabilities not forwarded in v1
 
