@@ -32,7 +32,9 @@ import {
   searching,
   serverQuery,
   shownOf,
+  carryWaiting,
   waitingCount,
+  waitingIds,
   type ListAction,
   type ListFilters,
   type ListState,
@@ -258,7 +260,28 @@ export function useSessionList(filters: ListFilters, timing?: Partial<Timing>): 
     () => shownOf(store, { hat, lifecycle, hideClosed, q }),
       [store, hat, hideClosed, q, lifecycle?.join(',')],
   )
-  const waiting = useMemo(() => waitingCount(store, hat), [store, hat])
+  // The hat's waiting count, never the query's (see `waitingCount`):
+  // - the server's, once a page of this query is loaded: it is the hat's
+  //   whatever the query; while a new query's page loads, the hat's last
+  //   server count holds (never another hat's);
+  // - THE FALLBACK, when the page had no `waiting`: counted from the hat's
+  //   unfiltered list once it is loaded, and carried, with the summaries
+  //   received since, while a search or a lifecycle filter is set or while
+  //   the unfiltered list loads again (the security review's A4).
+  const unfiltered = !searching(filters) && !(lifecycle && lifecycle.length > 0)
+  const held = useRef<{ hat: string | null; ids: ReadonlySet<string>; server?: number }>({ hat: null, ids: new Set() })
+  const waiting = useMemo(() => {
+    const scope = hat ?? null
+    const before = held.current.hat === scope ? held.current : { hat: scope, ids: new Set<string>() }
+    if (!snapshot.loading && store.waiting !== undefined) {
+      held.current = { hat: scope, ids: before.ids, server: store.waiting }
+      return waitingCount(store, hat)
+    }
+    if (snapshot.loading && before.server !== undefined) return before.server
+    const ids = unfiltered && !snapshot.loading ? waitingIds(store, hat) : carryWaiting(before.ids, store, hat)
+    held.current = { hat: scope, ids }
+    return ids.size
+  }, [store, hat, unfiltered, snapshot.loading])
   const counts = useMemo(() => ({ waiting }), [waiting])
   return {
     ...rest,

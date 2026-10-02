@@ -544,3 +544,27 @@ input,textarea { font-family:inherit; }
 .text-input:focus { border-color:var(--accent); background:var(--surface); box-shadow:0 0 0 3px var(--accent-wash); }
 .form-error { color:var(--st-attn); font-size:14px; margin:0 0 14px; overflow-wrap:anywhere; }
 .dialog .modal-body p { margin:0 0 14px; }
+
+/* ── The session list (4c): in the rail from 768px, the whole screen under it ── */
+.slist { display:flex; flex-direction:column; min-width:0; }
+.slist-screen { padding:8px 8px 16px; }
+.slist-title { font-family:var(--font-display); font-weight:800; font-size:20px; margin:8px 10px 10px; }
+.slist .rail-search { margin:6px 6px 10px; }
+.list-hats { flex-wrap:wrap; margin:4px 6px 8px; }
+.list-filters { display:flex; gap:8px; align-items:center; margin:0 6px 8px; }
+.list-filters .toggle:disabled, .list-select:disabled { opacity:.5; }
+.list-select { flex:1; min-width:0; border:1px solid var(--border); background:var(--surface); color:var(--fg-2); border-radius:var(--r-full); padding:7px 12px; font-size:13px; font-weight:600; }
+.list-note { font-size:12.5px; color:var(--fg-muted); margin:6px 10px; }
+.list-more { margin:10px 6px 0; }
+h2.grp-head { margin:0; font-size:inherit; font-weight:inherit; }
+.slist-screen .grp-head { background:var(--bg); }
+.sess { text-decoration:none; color:inherit; }
+.sess-agent { font-size:10.5px; font-weight:600; }
+.sess-flag { font-size:10px; font-weight:700; letter-spacing:.04em; text-transform:uppercase; flex:none; }
+.sess-flag-attn { color:var(--st-attn); }
+.sess-flag-fail { color:var(--st-attn); }
+.sess-flag-idle { color:var(--fg-muted); }
+.sess-why { margin:0 10px 4px; border:none; background:none; padding:2px 0; font-size:11px; font-weight:600; color:var(--st-attn); text-decoration:underline; }
+.sess-reason { margin:0 10px 6px; font-size:12px; color:var(--fg-2); overflow-wrap:anywhere; }
+.led-fail { background:transparent; box-shadow:inset 0 0 0 2px var(--st-attn); }
+.rail-head .badge, .mtopbar .badge { margin-left:auto; }

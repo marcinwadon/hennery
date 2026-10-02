@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { SessionSummary, SummaryPage } from '../generated/view'
 import {
   EMPTY_LIST,
+  carryWaiting,
   compareSummaries,
   isFirstPage,
   isShown,
@@ -261,5 +262,19 @@ describe('waitingCount', () => {
     expect(waitingCount(state, 'hat-a')).toBe(2)
     expect(waitingCount(state, null)).toBe(3)
     expect(isShown(state, summary('d', { hat_id: 'hat-b' }), { hat: 'hat-a', hideClosed: false })).toBe(false)
+  })
+})
+
+describe('carryWaiting', () => {
+  it('keeps the ids held and applies every summary received since', () => {
+    const held = new Set(['kept', 'answered', 'moved'])
+    const since = first([
+      summary('answered', { activity: 'running' }),
+      summary('moved', { activity: 'blocked', hat_id: 'hat-b' }),
+      summary('asks', { question_waits: true }),
+      summary('calm'),
+    ])
+    expect([...carryWaiting(held, since, 'hat-a')].sort()).toEqual(['asks', 'kept'])
+    expect([...held].sort()).toEqual(['answered', 'kept', 'moved'])
   })
 })

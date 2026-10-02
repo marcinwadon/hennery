@@ -170,8 +170,10 @@ describe('adding a host', () => {
   it('reads the hosts once at a time while it waits, however slow a read is', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     const server = open({
-      // The list, the read before the mint, then a poll that never answers.
-      'GET /api/hosts': [json(200, [host()]), json(200, [host()]), () => new Promise<Response>(() => {})],
+      // The list and the session list's host names (both at mount, in
+      // either order), the read before the mint, then a poll that never
+      // answers.
+      'GET /api/hosts': [json(200, [host()]), json(200, [host()]), json(200, [host()]), () => new Promise<Response>(() => {})],
       'POST /api/hosts/pairing-codes': json(201, { code: 'ABCD-EFGH', expires_at: new Date(Date.now() + 600_000).toISOString() }),
     })
     await userEvent.click(await screen.findByRole('button', { name: 'Add host' }))
@@ -185,15 +187,21 @@ describe('adding a host', () => {
     await act(async () => {
       vi.advanceTimersByTime(3_000)
     })
-    expect(sent(server, 'GET', '/api/hosts')).toHaveLength(3)
+    expect(sent(server, 'GET', '/api/hosts')).toHaveLength(4)
   })
 
   it('ends the code when the new host pairs, and lists it', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     const expires = new Date(Date.now() + 600_000).toISOString()
     open({
-      // The list, the read before the mint, then the polls.
-      'GET /api/hosts': [json(200, [host()]), json(200, [host()]), json(200, [host(), host({ host_id: 'host-9', name: 'new box' })])],
+      // The list and the session list's host names (both at mount, in
+      // either order), the read before the mint, then the polls.
+      'GET /api/hosts': [
+        json(200, [host()]),
+        json(200, [host()]),
+        json(200, [host()]),
+        json(200, [host(), host({ host_id: 'host-9', name: 'new box' })]),
+      ],
       'POST /api/hosts/pairing-codes': json(201, { code: 'ABCD-EFGH', expires_at: expires }),
     })
     await userEvent.click(await screen.findByRole('button', { name: 'Add host' }))
@@ -211,7 +219,8 @@ describe('adding a host', () => {
   it('tells a new host from those before it even when the list never loaded', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true })
     open({
-      'GET /api/hosts': [json(500, { code: 'internal', message: 'm' }), json(200, [host()])],
+      // The list and the session list's host names both fail at mount.
+      'GET /api/hosts': [json(500, { code: 'internal', message: 'm' }), json(500, { code: 'internal', message: 'm' }), json(200, [host()])],
       'POST /api/hosts/pairing-codes': json(201, { code: 'ABCD-EFGH', expires_at: new Date(Date.now() + 600_000).toISOString() }),
     })
     await userEvent.click(await screen.findByRole('button', { name: 'Add host' }))
