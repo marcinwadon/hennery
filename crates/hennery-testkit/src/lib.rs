@@ -186,6 +186,17 @@ pub struct FakeScript {
     /// `fake-session-1`: a lowercase UUID, as Claude's SDK makes (plan 9d).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    /// On `session/delete` (advertised as `sessionCapabilities.delete`),
+    /// append the environment and cwd it ran with to this file, one
+    /// `name=value` line each: `CLAUDE_CONFIG_DIR`, `cwd`,
+    /// `CLAUDE_CODE_PROJECT_DIR_NAME` and `CODEX_SQLITE_HOME` (`-` when
+    /// unset). The delete itself acts as Claude's SDK does: it removes
+    /// `<CLAUDE_CONFIG_DIR>/projects/*/<id>.jsonl` (following links) and
+    /// the `<id>/` beside it, and answers an error when there is none. With
+    /// no `CLAUDE_CONFIG_DIR` it removes nothing: the fake never touches a
+    /// real home.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delete_log: Option<String>,
 }
 
 /// One question the fake asks its client during a prompt, and the chunk it
@@ -252,6 +263,7 @@ impl Default for FakeScript {
             no_images: false,
             prompt_updates: Vec::new(),
             session_id: None,
+            delete_log: None,
         }
     }
 }

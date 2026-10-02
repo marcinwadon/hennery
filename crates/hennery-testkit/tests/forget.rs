@@ -420,3 +420,76 @@ async fn a_host_removal_is_listed_until_it_is_dismissed() {
     assert!(removals(&collector).await.is_empty());
     assert_eq!(collector.client().delete(&url).send().await.unwrap().status(), 404);
 }
+
+/// The transcript and the other entries a Claude session leaves under its
+/// root, and one name beside them that is not the session's.
+fn claude_files(roots: &Roots) -> Vec<PathBuf> {
+    let root = roots.claude();
+    std::fs::create_dir_all(root.join("projects/-work")).unwrap();
+    std::fs::create_dir_all(root.join(format!("file-history/{AGENT_SESSION}"))).unwrap();
+    std::fs::create_dir_all(root.join("debug")).unwrap();
+    let files = vec![
+        root.join(format!("projects/-work/{AGENT_SESSION}.jsonl")),
+        root.join(format!("projects/-work/{AGENT_SESSION}.ccr-tip.json")),
+        root.join(format!("file-history/{AGENT_SESSION}/edit-1")),
+        root.join(format!("debug/{AGENT_SESSION}.txt")),
+    ];
+    for file in &files {
+        std::fs::write(file, "content").unwrap();
+    }
+    std::fs::write(root.join("projects/-work/other.jsonl"), "keep").unwrap();
+    files
+}
+
+/// Decisions 7 and 8 end to end: a Claude session deleted over HTTP has
+/// its transcript removed on its host, `removed`, the context-clear note
+/// with it, and nothing names a path (B2).
+#[tokio::test]
+async fn a_delete_over_http_removes_the_claude_transcript_on_its_host() {
+    let roots = Roots::new();
+    let db = roots.base.join("hennery.db");
+    let collector = Collector::start(&db).await;
+    start_host(host_config(collector.addr, &roots, &answering(AGENT_SESSION)));
+    connected(&collector, true).await;
+    let session = start_session(&collector, "claude", &roots).await;
+    let files = claude_files(&roots);
+    let (result, body) = deleted(&collector, &session).await;
+    assert_eq!(result.host_transcript.state, RemovalState::Removed, "{body}");
+    assert!(result.host_transcript.notes[0].contains("context clear"), "{body}");
+    for file in files {
+        assert!(!file.exists(), "{}", file.display());
+    }
+    assert!(roots.claude().join("projects/-work/other.jsonl").exists());
+    assert!(
+        !body.contains(roots.base.to_str().unwrap()) && !body.contains("-work"),
+        "{body}"
+    );
+    assert!(removals(&collector).await.is_empty());
+}
+
+/// Decision 5 end to end: deleted while its host is away, pending; at the
+/// host's return the transcript goes, and so does the record.
+#[tokio::test]
+async fn a_claude_transcript_deleted_while_its_host_was_away_goes_at_its_return() {
+    let roots = Roots::new();
+    let db = roots.base.join("hennery.db");
+    let collector = Collector::start(&db).await;
+    let cfg = host_config(collector.addr, &roots, &answering(AGENT_SESSION));
+    let host = start_host(cfg.clone());
+    connected(&collector, true).await;
+    let session = start_session(&collector, "claude", &roots).await;
+    host.abort();
+    connected(&collector, false).await;
+    let files = claude_files(&roots);
+    let (result, _) = deleted(&collector, &session).await;
+    assert_eq!(result.host_transcript.state, RemovalState::Pending);
+    assert!(files.iter().all(|f| f.exists()));
+    start_host(cfg);
+    wait_for("the record removed at the host's return", || async {
+        removals(&collector).await.is_empty().then_some(())
+    })
+    .await;
+    for file in files {
+        assert!(!file.exists(), "{}", file.display());
+    }
+}
