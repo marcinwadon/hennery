@@ -21,8 +21,10 @@ pub const MAX_OUTPUT: u64 = 4096;
 /// How long an adapter has to answer `initialize` (distribution §7, check 3).
 pub const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How long `auth status` / `login status` may take (check 4).
-pub const STATUS_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long `auth status` / `login status`, or a CLI's `--version`, may
+/// take (checks 4, 13, 17). A CLI's first run after an install can wait
+/// on the machine's scan of a new executable.
+pub const CLI_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// How long the output of a program that has exited is waited for.
 const DRAIN: Duration = Duration::from_secs(5);
@@ -31,9 +33,9 @@ const DRAIN: Duration = Duration::from_secs(5);
 /// (decision 14): what launchd and systemd give a user service (`HOME`,
 /// `USER`, `LOGNAME`, `SHELL`), on Linux the user manager's
 /// `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` (a keyring-backed
-/// login needs them), the service's PATH (or with no service doctor's own),
-/// and `HENNERY_SERVICE` as the unit sets it. No nesting variable, host
-/// secret or inherited override can be in it: it is built, not inherited.
+/// login needs them), and the service's PATH (or with no service doctor's
+/// own). Built, not inherited; and `command` drops what the host's spawn
+/// drops (`stripped`).
 pub fn agent_env(doctor: &Doctor) -> Vec<(String, String)> {
     let cx = doctor.cx;
     let linux = cx.platform == crate::service::Platform::Linux;
@@ -47,35 +49,47 @@ pub fn agent_env(doctor: &Doctor) -> Vec<(String, String)> {
         .filter_map(|name| cx.env.get(*name).map(|v| (name.to_string(), v.clone())))
         .collect();
     env.push(("SHELL".to_string(), cx.shell.display().to_string()));
-    let service = super::service::service_path_of(doctor);
-    if service.is_some() {
-        let manager = if linux { "systemd" } else { "launchd" };
-        env.push(("HENNERY_SERVICE".to_string(), manager.to_string()));
-    }
-    let path = service
+    let path = super::service::service_path_of(doctor)
         .or_else(|| cx.env.get("PATH").cloned())
         .unwrap_or_else(|| "/usr/bin:/bin".to_string());
     env.push(("PATH".to_string(), path));
     env
 }
 
-/// The process groups doctor has started and not yet killed.
-static GROUPS: Mutex<BTreeSet<libc::pid_t>> = Mutex::new(BTreeSet::new());
+/// What a host never passes to an agent, even when the agent's own
+/// configuration names it (`Adapter::spawn`): the nesting variables, the
+/// host's secrets, and how a service-run host picks its log.
+fn stripped(name: &str) -> bool {
+    use hennery_host::adapter::{HOST_LOG_VARS, HOST_SECRET_VARS, NESTING_VARS};
+    NESTING_VARS
+        .iter()
+        .chain(HOST_SECRET_VARS)
+        .chain(HOST_LOG_VARS)
+        .any(|v| *v == name)
+}
+
+/// The process groups doctor has started and not yet killed; `None` once
+/// `kill_all` ran, after which nothing more is started.
+static GROUPS: Mutex<Option<BTreeSet<libc::pid_t>>> = Mutex::new(Some(BTreeSet::new()));
 
 /// SIGKILL every group doctor started that is still there: when doctor is
 /// interrupted, since its children, in groups of their own, do not see the
-/// terminal's Ctrl-C.
+/// terminal's Ctrl-C. Any later spawn is refused.
 pub fn kill_all() {
-    let groups = std::mem::take(&mut *GROUPS.lock().unwrap_or_else(|e| e.into_inner()));
-    for pgid in groups {
+    let groups = GROUPS.lock().unwrap_or_else(|e| e.into_inner()).take();
+    for pgid in groups.into_iter().flatten() {
         // SAFETY: kill(2) of a group doctor made (`process_group(0)`).
         unsafe { libc::kill(-pgid, libc::SIGKILL) };
     }
 }
 
-/// Spawn `cmd`, its group registered for `kill_all`.
+/// Spawn `cmd`, its group registered for `kill_all`; refused once
+/// `kill_all` ran.
 fn spawn(cmd: &mut Command) -> std::io::Result<Child> {
     let mut groups = GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(groups) = groups.as_mut() else {
+        return Err(std::io::ErrorKind::Interrupted.into());
+    };
     let child = cmd.spawn()?;
     if let Ok(pgid) = libc::pid_t::try_from(child.id()) {
         groups.insert(pgid);
@@ -89,14 +103,16 @@ fn kill_group(child: &mut Child) {
         // SAFETY: kill(2) of the group this function's caller made the
         // child the leader of (`process_group(0)`).
         unsafe { libc::kill(-pgid, libc::SIGKILL) };
-        GROUPS.lock().unwrap_or_else(|e| e.into_inner()).remove(&pgid);
+        if let Some(groups) = GROUPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            groups.remove(&pgid);
+        }
     }
     let _ = child.wait();
 }
 
-/// `program args` in a group of its own, with only `env`, in its `HOME`
-/// (never doctor's working directory: a repository there could configure
-/// the CLI with code of its own).
+/// `program args` in a group of its own, with only `env` (less what a
+/// host strips), in its `HOME` (never doctor's working directory: a
+/// repository there could configure the CLI with code of its own).
 fn command(program: &Path, args: &[String], env: &[(String, String)]) -> Command {
     let home = env
         .iter()
@@ -106,7 +122,7 @@ fn command(program: &Path, args: &[String], env: &[(String, String)]) -> Command
     let mut cmd = Command::new(program);
     cmd.args(args)
         .env_clear()
-        .envs(env.iter().cloned())
+        .envs(env.iter().filter(|(k, _)| !stripped(k)).cloned())
         .current_dir(home)
         .process_group(0)
         .stdin(Stdio::null())
@@ -289,11 +305,15 @@ impl Cli {
         }
     }
 
-    /// Run it with `extra` after its own arguments.
-    pub fn run(&self, extra: &[&str], env: &[(String, String)], timeout: Duration, output: bool) -> Option<Ran> {
+    /// Run it with `extra` after its own arguments, within `CLI_TIMEOUT`,
+    /// with `env` and its auto-updater off (a CLI doctor runs installs
+    /// nothing).
+    pub fn run(&self, extra: &[&str], env: &[(String, String)], output: bool) -> Option<Ran> {
         let mut args: Vec<&str> = self.args.iter().map(String::as_str).collect();
         args.extend_from_slice(extra);
-        run(&self.program, &args, env, timeout, output)
+        let mut env = env.to_vec();
+        env.push(("DISABLE_AUTOUPDATER".to_string(), "1".to_string()));
+        run(&self.program, &args, &env, CLI_TIMEOUT, output)
     }
 
     /// What the report calls it.
@@ -305,12 +325,9 @@ impl Cli {
     }
 }
 
-/// `cli --version`, with `env` and the auto-updater off, 5 s: the version
-/// it prints.
+/// `cli --version`, with `env`: the version it prints.
 pub fn cli_version(cli: &Cli, env: &[(String, String)]) -> Option<(u64, u64, u64)> {
-    let mut env = env.to_vec();
-    env.push(("DISABLE_AUTOUPDATER".to_string(), "1".to_string()));
-    let ran = cli.run(&["--version"], &env, super::RUN_TIMEOUT, true)?;
+    let ran = cli.run(&["--version"], env, true)?;
     if !ran.ok {
         return None;
     }

@@ -124,7 +124,7 @@ fn an_interrupted_doctor_leaves_no_adapter_running() {
     std::fs::write(
         &adapter,
         format!(
-            "#!/bin/sh\necho $$ > \"{}.tmp\"\nmv \"{}.tmp\" \"{}\"\nexec sleep 60\n",
+            "#!/bin/sh\n[ \"$1\" = --warm-up ] && exit 0\necho $$ > \"{}.tmp\"\nmv \"{}.tmp\" \"{}\"\nexec sleep 60\n",
             pid_file.display(),
             pid_file.display(),
             pid_file.display()
@@ -132,6 +132,17 @@ fn an_interrupted_doctor_leaves_no_adapter_running() {
     )
     .unwrap();
     std::fs::set_permissions(&adapter, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Its first run, which can wait on the machine's scan of a new
+    // executable, is not the one doctor makes; on Linux a fork elsewhere
+    // can still hold it open for writing (ETXTBSY) for a moment.
+    let warm = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while let Err(err) = Command::new(&adapter).arg("--warm-up").status() {
+        assert!(
+            err.raw_os_error() == Some(libc::ETXTBSY) && std::time::Instant::now() < warm,
+            "{err}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
     let home = dir.path().join("home");
     let config = dir.path().join("config");
     let argv = [
@@ -183,7 +194,8 @@ fn an_interrupted_doctor_leaves_no_adapter_running() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    // Generous: doctor's own first run can wait on the same scan.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let adapter_pid: i32 = loop {
         if let Ok(text) = std::fs::read_to_string(&pid_file) {
             break text.trim().parse().unwrap();

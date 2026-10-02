@@ -184,7 +184,12 @@ pub fn collector(doctor: &Doctor) -> [Finding; 2] {
         Ok(Some(paired)) => paired,
         Ok(None) => return not_run(NOT_PAIRED),
         Err(err) => {
-            verdict.warn(format!("{err}"), "run `hennery host run` once, then doctor again");
+            let fix = if host.join("host.toml.pending").exists() {
+                "run `hennery host run` once (it finishes the pairing), then doctor again"
+            } else {
+                "fix host.toml, or pair this host again (`hennery host join`)"
+            };
+            verdict.warn(format!("{err}"), fix);
             return [
                 Finding::Checked(verdict.check(7, "collector")),
                 Finding::NotRun {
@@ -234,20 +239,26 @@ fn reach(doctor: &Doctor, host: &std::path::Path, paired: &Paired, verdict: &mut
     };
     let port = url.port_or_known_default().unwrap_or(443);
     let name = url.host_str().unwrap_or_default().to_string();
-    let Some(address) = (name.trim_start_matches('[').trim_end_matches(']'), port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut a| a.next())
-    else {
-        verdict.fail(
-            format!("{name} does not resolve"),
-            "check the name in DNS, or the collector's URL in host.toml",
-        );
-        return None;
+    let addresses = match resolve(name.trim_start_matches('[').trim_end_matches(']'), port) {
+        Some(addresses) if !addresses.is_empty() => addresses,
+        Some(_) => {
+            verdict.fail(
+                format!("{name} does not resolve"),
+                "check the name in DNS, or the collector's URL in host.toml",
+            );
+            return None;
+        }
+        None => {
+            verdict.fail(
+                format!("{name} did not resolve within {STEP_TIMEOUT:?}"),
+                "check this machine's DNS",
+            );
+            return None;
+        }
     };
-    if let Err(err) = std::net::TcpStream::connect_timeout(&address, STEP_TIMEOUT) {
+    if let Err(err) = connect(&addresses) {
         verdict.fail(
-            format!("nothing answers on {address} ({})", err.kind()),
+            format!("nothing answers on {} ({})", addresses[0], err.kind()),
             "start the collector, or open the way to it (firewall, VPN)",
         );
         return None;
@@ -276,6 +287,37 @@ fn reach(doctor: &Doctor, host: &std::path::Path, paired: &Paired, verdict: &mut
     verdict.ok(format!("{base} answers"));
     hello(doctor, host, paired, &ws, verdict);
     Some(date)
+}
+
+/// `name`'s addresses, looked up on a thread of its own: `None` when the
+/// lookup takes longer than `STEP_TIMEOUT` (the system's resolver has no
+/// bound of its own; the thread is left to end on its own).
+fn resolve(name: &str, port: u16) -> Option<Vec<std::net::SocketAddr>> {
+    let name = name.to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let found = (name.as_str(), port)
+            .to_socket_addrs()
+            .map(|a| a.collect::<Vec<_>>())
+            .unwrap_or_default();
+        let _ = tx.send(found);
+    });
+    rx.recv_timeout(STEP_TIMEOUT).ok()
+}
+
+/// A TCP connection to the first of `addresses` that takes one, each
+/// within `STEP_TIMEOUT`, closed at once; the first address's error else.
+fn connect(addresses: &[std::net::SocketAddr]) -> std::io::Result<()> {
+    let mut first = None;
+    for address in addresses {
+        match std::net::TcpStream::connect_timeout(address, STEP_TIMEOUT) {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                first.get_or_insert(err);
+            }
+        }
+    }
+    Err(first.unwrap_or_else(|| std::io::ErrorKind::NotFound.into()))
 }
 
 /// The `hello`, only when no host runs on this directory (decision 17).

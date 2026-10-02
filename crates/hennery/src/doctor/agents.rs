@@ -173,7 +173,7 @@ pub fn logged_in(doctor: &Doctor) -> Finding {
             ));
             continue;
         };
-        match cli.run(args, &env, spawn::STATUS_TIMEOUT, false) {
+        match cli.run(args, &env, false) {
             Some(ran) if ran.ok => verdict.ok(format!("{name} is logged in")),
             Some(_) => verdict.warn(format!("{name} is not logged in"), fix),
             None => {
