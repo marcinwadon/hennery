@@ -2,13 +2,18 @@ import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it } from 'vitest'
 import App from './App'
+import { heldFor, hold } from './lib/attachments'
+import { sendingFor, track } from './lib/sending'
 import { FULL, GATEWAY, json, stubServer } from './test-server'
 
 function at(path: string) {
   history.replaceState(null, '', path)
 }
 
-afterEach(() => at('/'))
+afterEach(() => {
+  at('/')
+  sessionStorage.clear()
+})
 
 describe('the shell', () => {
   it('shows every view of the whole cockpit, the current one marked', async () => {
@@ -96,8 +101,9 @@ describe('the shell', () => {
     expect(location.pathname + location.search).toBe('/login?next=%2Fhosts%3Fx%3D1')
   })
 
-  it('signs out', async () => {
+  it('signs out, forgetting the images held for every draft', async () => {
     at('/settings')
+    hold('s1', { attachments: [{ n: 1, file: new File(['x'], 'a.png', { type: 'image/png' }) }], nextN: 2 })
     const server = stubServer({
       'GET /api/capabilities': json(200, FULL),
       'POST /api/auth/logout': new Response(null, { status: 204 }),
@@ -107,5 +113,39 @@ describe('the shell', () => {
     await userEvent.click(await screen.findByRole('button', { name: 'Sign out' }))
     await waitFor(() => expect(location.pathname).toBe('/login'))
     expect(server.sent.some((s) => s.method === 'POST' && s.path === '/api/auth/logout')).toBe(true)
+    expect(heldFor('s1').attachments).toEqual([])
+  })
+
+  it('signs out, letting go of a send still in flight', async () => {
+    at('/settings')
+    track('s1', () => new Promise<never>(() => {}), String)
+    const server = stubServer({
+      'GET /api/capabilities': json(200, FULL),
+      'POST /api/auth/logout': new Response(null, { status: 204 }),
+      'POST /api/auth/passkeys/login/start': json(409, { code: 'no_passkeys', message: 'm' }),
+    })
+    render(<App fetchImpl={server.fetch} />)
+    expect(sendingFor('s1')).toBeDefined()
+    await userEvent.click(await screen.findByRole('button', { name: 'Sign out' }))
+    await waitFor(() => expect(location.pathname).toBe('/login'))
+    expect(sendingFor('s1')).toBeUndefined()
+  })
+
+  it('signs out, forgetting every draft’s text and keeping the rest of sessionStorage', async () => {
+    at('/settings')
+    sessionStorage.setItem('hennery.draft.s1', 'the token is in here')
+    sessionStorage.setItem('hennery.draft.s2', 'and another')
+    sessionStorage.setItem('hennery.hideClosed', '1')
+    const server = stubServer({
+      'GET /api/capabilities': json(200, FULL),
+      'POST /api/auth/logout': new Response(null, { status: 204 }),
+      'POST /api/auth/passkeys/login/start': json(409, { code: 'no_passkeys', message: 'm' }),
+    })
+    render(<App fetchImpl={server.fetch} />)
+    await userEvent.click(await screen.findByRole('button', { name: 'Sign out' }))
+    await waitFor(() => expect(location.pathname).toBe('/login'))
+    expect(sessionStorage.getItem('hennery.draft.s1')).toBeNull()
+    expect(sessionStorage.getItem('hennery.draft.s2')).toBeNull()
+    expect(sessionStorage.getItem('hennery.hideClosed')).toBe('1')
   })
 })
