@@ -283,6 +283,11 @@ pub struct SessionDetail {
     /// Open pending requests, oldest first: what the operator can answer.
     #[serde(default)]
     pub pending: Vec<PendingItem>,
+    /// What its latest start or resume was given (plan 8e decision E10);
+    /// absent for a session not started or resumed since plan 8e.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "McpSessionDelivery | undefined", optional)]
+    pub mcp_delivery: Option<McpSessionDelivery>,
 }
 
 /// Where a pending request stands (ACP core §4.6): `open`, then
@@ -445,6 +450,13 @@ pub struct HostItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "string | undefined", optional)]
     pub revoked_at: Option<String>,
+    /// Per agent id, which hats' sessions get gateway MCP servers, from the
+    /// `mcp_isolation` of its latest accepted `hello` (plan 8e). Absent: no
+    /// such `hello` was recorded yet. Only for a host whose `capabilities`
+    /// include `mcp_servers`; one without receives no servers at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "Record<string, McpAgentDelivery> | undefined", optional)]
+    pub mcp_delivery: Option<std::collections::BTreeMap<String, McpAgentDelivery>>,
 }
 
 /// A directory a session started or resumed in on the host (kernel spec
@@ -1424,4 +1436,264 @@ pub enum DeploymentMode {
 pub struct CapabilitiesResponse {
     pub mode: DeploymentMode,
     pub features: Vec<String>,
+}
+
+/// Which hats' sessions on a host get gateway MCP servers for one agent
+/// (umbrella §8.5, plan 8e), from the agent's isolation as the host last
+/// announced it. Read leniently by the UI: a value it does not know is to be
+/// shown as `default_hat_only`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum McpAgentDelivery {
+    /// The host keeps the agent's sessions to the servers hennery passes:
+    /// every hat's sessions get their own hat's servers.
+    Isolated,
+    /// The host cannot isolate this agent: sessions in the host's default hat
+    /// get the default hat's servers (and also load the user's own MCP
+    /// configuration); sessions in any other hat get none (the fallback).
+    DefaultHatOnly,
+}
+
+impl McpAgentDelivery {
+    /// The one mapping (plan 8e decision E8), which the host list and the
+    /// delivery decision (`mcp_session_delivery`) both read.
+    pub fn of(isolation: crate::frames::McpIsolation) -> Self {
+        match isolation {
+            crate::frames::McpIsolation::ClaudeStrict => Self::Isolated,
+            crate::frames::McpIsolation::None => Self::DefaultHatOnly,
+        }
+    }
+}
+
+/// What a session's latest start or resume was given (plan 8e decision
+/// E10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum McpSessionDeliveryMode {
+    /// Its hat's servers, the agent kept to them.
+    Isolated,
+    /// Its hat's servers, isolation waived: the host's default hat on a host
+    /// that cannot isolate the agent. It also loads the user's own MCP
+    /// configuration.
+    Unisolated,
+    /// None: another hat than the host's default, on a host that cannot
+    /// isolate the agent (umbrella §8.5).
+    Fallback,
+    /// None: the host cannot receive MCP servers (no `mcp_servers`
+    /// capability).
+    Unsupported,
+}
+
+impl McpSessionDeliveryMode {
+    /// Whether the session gets its hat's servers (and a gateway token).
+    pub fn delivers(self) -> bool {
+        matches!(self, Self::Isolated | Self::Unisolated)
+    }
+
+    /// The column value (`sessions.mcp_delivery_mode`), as on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Isolated => "isolated",
+            Self::Unisolated => "unisolated",
+            Self::Fallback => "fallback",
+            Self::Unsupported => "unsupported",
+        }
+    }
+
+    /// The mode a column value names; `None` for anything else.
+    pub fn parse(text: &str) -> Option<Self> {
+        [Self::Isolated, Self::Unisolated, Self::Fallback, Self::Unsupported]
+            .into_iter()
+            .find(|mode| mode.as_str() == text)
+    }
+}
+
+/// The delivery decision for one start or resume (umbrella §8.5; plan 8e
+/// decision E8, the gateway lane's L2): `capable`, the host's connection
+/// announced `mcp_servers`; `isolation`, how it isolates the session's
+/// agent; `mixed`, a rule of the host names another hat than its default,
+/// or a `starting`, `active` or presumed-parked session on it (this one
+/// included) is in another hat; `is_default_hat`, the session is in the
+/// host's default hat.
+///
+/// The session counts itself, so a session outside the default hat always
+/// finds its host mixed: the arm for an unmixed host and another hat is
+/// unreachable, and is the conservative one (no servers).
+pub fn mcp_session_delivery(
+    capable: bool,
+    isolation: crate::frames::McpIsolation,
+    mixed: bool,
+    is_default_hat: bool,
+) -> McpSessionDeliveryMode {
+    if !capable {
+        return McpSessionDeliveryMode::Unsupported;
+    }
+    match (McpAgentDelivery::of(isolation), mixed, is_default_hat) {
+        (McpAgentDelivery::Isolated, _, _) => McpSessionDeliveryMode::Isolated,
+        // A mixed host's fallback keeps the default hat's servers; an
+        // unmixed host is a single-hat host. Either way, waived.
+        (McpAgentDelivery::DefaultHatOnly, _, true) => McpSessionDeliveryMode::Unisolated,
+        (McpAgentDelivery::DefaultHatOnly, true, false) => McpSessionDeliveryMode::Fallback,
+        // Unreachable (see above): conservative.
+        (McpAgentDelivery::DefaultHatOnly, false, false) => McpSessionDeliveryMode::Fallback,
+    }
+}
+
+/// On `SessionDetail` (plan 8e decision E10): never a server, a header or a
+/// token, only the mode and a count.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct McpSessionDelivery {
+    /// What it was given.
+    pub mode: McpSessionDeliveryMode,
+    /// How many servers it was given (connections plus stdio servers): `0`
+    /// with `isolated` means its hat has none on this host.
+    #[ts(type = "number")]
+    pub servers: u32,
+    /// RFC 3339: the start or resume it describes.
+    pub at: String,
+}
+
+/// One environment variable of a stdio server, as `GET` answers it: its
+/// name and whether a value is stored. The value is sealed at rest
+/// (gateway spec §6) and no route answers it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct McpStdioEnvItem {
+    /// `^[A-Za-z_][A-Za-z0-9_]{0,127}$`.
+    pub name: String,
+    /// A value is stored (possibly `""`).
+    pub has_value: bool,
+}
+
+/// One local stdio server of a (host, hat) (gateway spec §3.4): passed to
+/// that hat's sessions on that host as an ACP stdio `mcpServers` entry
+/// named `hennery-<name>`. The agent runs it on the host; the gateway does
+/// not proxy it. Its `Debug` shows the name, the command and how many
+/// args, never the args.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct McpStdioServerItem {
+    /// `^[a-z0-9][a-z0-9-]{0,47}$`, unique in its set, and never one of the
+    /// owner's connection slugs.
+    pub name: String,
+    /// As stored: run by the agent, found on its `PATH` unless absolute.
+    pub command: String,
+    /// As stored. Not sealed: a secret belongs in `env`.
+    pub args: Vec<String>,
+    /// Names only, in the order given.
+    pub env: Vec<McpStdioEnvItem>,
+    /// RFC 3339.
+    pub created_at: String,
+    /// RFC 3339: the `PUT` that last changed it.
+    pub updated_at: String,
+}
+
+impl std::fmt::Debug for McpStdioServerItem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpStdioServerItem")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .field("args", &format_args!("<{} redacted>", self.args.len()))
+            .field("env", &self.env)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `GET /api/mcp/stdio-servers?host_id=&hat_id=` (200), and the answer to
+/// its `PUT` (200): one (host, hat)'s whole set, oldest first. A host or
+/// hat with none answers `servers: []`.
+///
+/// Its own codes, beyond every route's (see `McpConnectionItem`): 400
+/// `invalid` (`host_id` or `hat_id` missing or over 64 bytes, never quoted
+/// back); 404 `not_found` (not one of the owner's hosts or hats; a revoked
+/// host is found).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct McpStdioServerSet {
+    /// The host whose agents run them.
+    pub host_id: String,
+    /// The hat whose sessions get them.
+    pub hat_id: String,
+    /// Oldest first.
+    pub servers: Vec<McpStdioServerItem>,
+}
+
+/// One environment variable in a `PUT`: `value` absent (or `null`) keeps
+/// the value stored for this server name and variable name in the same
+/// (host, hat), and only while the server's `command` is unchanged; a
+/// string sets it. A variable left out of the list is deleted. Its `Debug`
+/// never shows the value.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct McpStdioEnvInput {
+    /// `^[A-Za-z_][A-Za-z0-9_]{0,127}$`, unique per server.
+    pub name: String,
+    /// Absent or `null`: kept. A string (`""` too): set; at most 8192
+    /// bytes, no NUL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub value: Option<String>,
+}
+
+impl std::fmt::Debug for McpStdioEnvInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpStdioEnvInput")
+            .field("name", &self.name)
+            .field("value", &self.value.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// One server in a `PUT`. Its `Debug` shows the name and the command only.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct McpStdioServerInput {
+    /// `^[a-z0-9][a-z0-9-]{0,47}$`, unique in the set, and not one of the
+    /// owner's connection slugs.
+    pub name: String,
+    /// 1 to 1024 bytes, no control characters.
+    pub command: String,
+    /// Absent: none. At most 64, each at most 4096 bytes without NUL, 16
+    /// KiB in all.
+    #[serde(default)]
+    #[ts(type = "string[] | undefined", optional)]
+    pub args: Vec<String>,
+    /// Absent: none. At most 64.
+    #[serde(default)]
+    #[ts(type = "McpStdioEnvInput[] | undefined", optional)]
+    pub env: Vec<McpStdioEnvInput>,
+}
+
+impl std::fmt::Debug for McpStdioServerInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpStdioServerInput")
+            .field("name", &self.name)
+            .field("command", &self.command)
+            .finish_non_exhaustive()
+    }
+}
+
+/// `PUT /api/mcp/stdio-servers?host_id=&hat_id=` (step-up): the (host,
+/// hat)'s whole set, replacing the one before, never a delta. `[]` deletes
+/// them all. 200 with the stored `McpStdioServerSet`. Applies to the next
+/// start or resume of a session of that hat on that host.
+///
+/// Its own codes, beyond every route's (see `McpConnectionItem`): 403
+/// `step_up_required`; 404 `not_found` (host or hat); 409 `host_revoked`;
+/// 400 `invalid` (`message` names the server and the field; a value is
+/// never quoted back); 400 `env_value_missing` (a kept value that is not
+/// stored, or whose server's `command` changed); 409 `slug_taken` (a name
+/// one of the owner's connections has); 409 `too_many_stdio_servers` (more
+/// than 32 in the set, or 1024 for the owner). A refused set changes
+/// nothing.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct McpStdioServersRequest {
+    /// The whole set, in the order to keep for new servers.
+    pub servers: Vec<McpStdioServerInput>,
+}
+
+impl std::fmt::Debug for McpStdioServersRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpStdioServersRequest")
+            .field("servers", &self.servers)
+            .finish()
+    }
 }
