@@ -391,3 +391,29 @@ async fn a_problem_at_startup_is_announced_once() {
     );
     assert_eq!(h.alerts.alerts().len(), 1, "no re-post on an unchanged problem");
 }
+
+/// Gateway spec §7: what a startup announces is every connection in
+/// `needs_auth` or `error`, and only those; an `ok` or `not_connected` one
+/// is not a problem to hear of.
+#[tokio::test]
+async fn startup_problems_are_the_needs_auth_and_error_connections_only() {
+    let (h, _fake, failing) = setup(Config::default()).await;
+    set_status(&h, &failing, Status::Error);
+    let refused = h.connection("refused", "http://127.0.0.1:9/a", CredKind::None);
+    set_status(&h, &refused, Status::NeedsAuth);
+    let ok = h.connection("fine", "http://127.0.0.1:9/b", CredKind::None);
+    set_status(&h, &ok, Status::Ok);
+    h.connection("fresh", "http://127.0.0.1:9/c", CredKind::None);
+    // Created in the same second: their order is by id, which is random.
+    let mut problems: Vec<(String, &str)> = h
+        .proxy_store
+        .problems()
+        .unwrap()
+        .into_iter()
+        .map(|change| (change.connection_id, change.to.as_str()))
+        .collect();
+    problems.sort();
+    let mut expected = vec![(failing, "error"), (refused, "needs_auth")];
+    expected.sort();
+    assert_eq!(problems, expected);
+}

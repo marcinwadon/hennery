@@ -1190,8 +1190,6 @@ async fn run_up(args: UpArgs) -> Result<std::process::ExitCode> {
     }
 }
 
-/// Web Push delivery (plan 10b-ii): the state's notices go to a task that
-/// sends them through `egress`, public addresses only.
 /// The gateway on `db` (plans 8a, 8d, 8f), with the proxy on the same
 /// runtime, so a connection's refresh lock is one:
 /// - its `Notifier` is Web Push (lane L9): a connection moving into or out
@@ -1229,6 +1227,8 @@ fn start_gateway(
     Ok((gateway, proxy))
 }
 
+/// Web Push delivery (plan 10b-ii): the state's notices go to a task that
+/// sends them through `egress`, public addresses only.
 fn start_push(state: &mut AppState, egress: &hennery_kernel::egress::Egress) {
     state.push =
         hennery_kernel::delivery::spawn(state.hosts.clone(), state.operator.clone(), state.vapid.clone(), egress);
