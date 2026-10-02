@@ -249,11 +249,12 @@ pub async fn forget_codex(ctx: &ForgetContext, forget: &Forget) -> Forgotten {
     // counted: only if the app-server may run.
     let before = if ctx.codex_pin.is_some() && ctx.codex_app_server.is_some() {
         let (kinds, id, hooks) = (kinds.clone(), forget.agent_session_id.clone(), ctx.hooks.clone());
-        tokio::task::spawn_blocking(move || present(&kinds, &id, &hooks))
+        let until = until.into_std();
+        tokio::task::spawn_blocking(move || present(&kinds, &id, &hooks, until))
             .await
-            .unwrap_or(0)
+            .unwrap_or(None)
     } else {
-        0
+        Some(0)
     };
     let share = until.min(start + app_server_share(ctx.deadline));
     let verdict = app_server(ctx, forget, &root, &env, &strip, share).await;
@@ -266,8 +267,9 @@ pub async fn forget_codex(ctx: &ForgetContext, forget: &Forget) -> Forgotten {
             );
             crate::forget::run_adapter(ctx, forget, &root, env, &strip, until).await;
             let hooks = ctx.hooks.clone();
+            let until = until.into_std();
             let walked = tokio::task::spawn_blocking(move || {
-                let mut tally = rollouts(&kinds, &id, &hooks, true, ForgetReason::StillPresent);
+                let mut tally = rollouts(&kinds, &id, &hooks, true, ForgetReason::StillPresent, until);
                 // Decision 10: what only `thread/delete` reaches.
                 tally.left_whole(ForgetKind::CodexDatabaseCopies, ForgetReason::FallbackOnly);
                 tally
@@ -285,10 +287,14 @@ pub async fn forget_codex(ctx: &ForgetContext, forget: &Forget) -> Forgotten {
                 _ => (ForgetReason::StillPresent, None),
             };
             let hooks = ctx.hooks.clone();
+            let until = until.into_std();
             let checked = tokio::task::spawn_blocking(move || {
-                let mut tally = rollouts(&kinds, &id, &hooks, false, left_as);
-                let after = present(&kinds, &id, &hooks);
-                if before > after {
+                let mut tally = rollouts(&kinds, &id, &hooks, false, left_as, until);
+                // Counted only from two whole counts: a walk the deadline
+                // cut proves nothing gone.
+                if let (Some(before), Some(after)) = (before, present(&kinds, &id, &hooks, until))
+                    && before > after
+                {
                     tally.removed.insert(ForgetKind::Transcript, before - after);
                 }
                 if let Some(reason) = the_delete {
@@ -483,7 +489,14 @@ async fn answer<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R, want: u64) -
 /// symlink, never through one); then they are counted again, what is still
 /// there left for `left_as` (or why its removal failed), a symlink for
 /// `symlink`. The check afterwards decides (B4).
-fn rollouts(kinds: &Kinds, id: &str, hooks: &walk::Hooks, remove: bool, left_as: ForgetReason) -> Tally {
+fn rollouts(
+    kinds: &Kinds,
+    id: &str,
+    hooks: &walk::Hooks,
+    remove: bool,
+    left_as: ForgetReason,
+    until: std::time::Instant,
+) -> Tally {
     let mut tally = Tally::default();
     // Why a removal failed, by the directory's device and inode and name.
     let mut failed: BTreeMap<(u64, u64, Vec<u8>), ForgetReason> = BTreeMap::new();
@@ -495,6 +508,7 @@ fn rollouts(kinds: &Kinds, id: &str, hooks: &walk::Hooks, remove: bool, left_as:
                 dev: kinds.dev,
                 hooks,
                 max: depth,
+                until,
             };
             walker.dir(
                 dir,
@@ -521,6 +535,7 @@ fn rollouts(kinds: &Kinds, id: &str, hooks: &walk::Hooks, remove: bool, left_as:
             dev: kinds.dev,
             hooks,
             max: depth,
+            until,
         };
         walker.dir(
             dir,
@@ -542,8 +557,9 @@ fn rollouts(kinds: &Kinds, id: &str, hooks: &walk::Hooks, remove: bool, left_as:
     tally
 }
 
-/// How many of the session's rollout files (regular files) are there.
-fn present(kinds: &Kinds, id: &str, hooks: &walk::Hooks) -> u32 {
+/// How many of the session's rollout files (regular files) are there:
+/// `None` if the deadline cut the count short.
+fn present(kinds: &Kinds, id: &str, hooks: &walk::Hooks, until: std::time::Instant) -> Option<u32> {
     let mut count = 0;
     let mut scratch = Tally::default();
     for (dir, path, depth) in kind_dirs(kinds) {
@@ -552,6 +568,7 @@ fn present(kinds: &Kinds, id: &str, hooks: &walk::Hooks) -> u32 {
             dev: kinds.dev,
             hooks,
             max: depth,
+            until,
         };
         walker.dir(
             dir,
@@ -565,7 +582,7 @@ fn present(kinds: &Kinds, id: &str, hooks: &walk::Hooks) -> u32 {
             &mut scratch,
         );
     }
-    count
+    (!scratch.has_left(ForgetReason::TimedOut)).then_some(count)
 }
 
 /// The open kind directories, each with its path (for the hooks only) and
@@ -605,6 +622,9 @@ struct Walk<'a> {
     dev: libc::dev_t,
     hooks: &'a walk::Hooks,
     max: usize,
+    /// The forget's one deadline (the review's item 4): past it the walk
+    /// stops, and what it did not reach is left `timed_out`.
+    until: std::time::Instant,
 }
 
 /// Called for each entry named as one of the session's rollouts, with its
@@ -613,6 +633,9 @@ type OnRollout<'f> = dyn FnMut(RawFd, &CString, &libc::stat, &mut Tally) + 'f;
 
 impl Walk<'_> {
     fn dir(&self, dir: RawFd, path: &Path, depth: usize, on: &mut OnRollout<'_>, tally: &mut Tally) {
+        if std::time::Instant::now() >= self.until {
+            return tally.left(ForgetKind::Transcript, crate::forget::stop_reason(walk::Stop::Deadline));
+        }
         let names = match self.hooks.list(dir, path) {
             Ok(names) => names,
             Err(_) => return tally.left(ForgetKind::Transcript, ForgetReason::IoError),
@@ -849,6 +872,7 @@ mod tests {
                 dev,
                 hooks: &hooks,
                 max: SESSIONS_DEPTH,
+                until: std::time::Instant::now() + Duration::from_secs(60),
             };
             let mut tally = Tally::default();
             found = 0;
@@ -868,6 +892,66 @@ mod tests {
             );
         }
         assert_eq!(found, 1);
+    }
+
+    /// The review's item 4: the walk keeps the forget's one deadline. Past
+    /// it, nothing is listed or reported found; what is left is
+    /// `timed_out`, retried.
+    #[test]
+    fn a_walk_past_its_deadline_stops_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join("sessions/2026/10/02");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join(format!("rollout-2026-10-02T10-00-00-{ID}.jsonl")), "x").unwrap();
+        let sessions = walk::open_root(&dir.path().join("sessions")).unwrap();
+        let dev = walk::stat_fd(sessions.as_raw_fd()).unwrap().st_dev;
+        let hooks = walk::Hooks::default();
+        let walker = Walk {
+            id: ID,
+            dev,
+            hooks: &hooks,
+            max: SESSIONS_DEPTH,
+            until: std::time::Instant::now(),
+        };
+        let (mut tally, mut found) = (Tally::default(), 0);
+        walker.dir(
+            sessions.as_raw_fd(),
+            Path::new("sessions"),
+            0,
+            &mut |_, _, _, _| found += 1,
+            &mut tally,
+        );
+        assert_eq!(found, 0);
+        assert_eq!(
+            tally.into_forgotten().remaining,
+            [left(ForgetKind::Transcript, 1, ForgetReason::TimedOut, true)]
+        );
+    }
+
+    /// The review's item 4: a count the deadline cut is no count, so no
+    /// removal is claimed from it.
+    #[test]
+    fn a_count_past_its_deadline_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let day = root.join("sessions/2026/10/02");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join(format!("rollout-2026-10-02T10-00-00-{ID}.jsonl")), "x").unwrap();
+        let ctx = ForgetContext {
+            agents: std::collections::HashMap::new(),
+            data_dir: PathBuf::from("/nonexistent-data"),
+            home: None,
+            hooks: walk::Hooks::default(),
+            account: None,
+            codex_app_server: None,
+            codex_pin: None,
+            deadline: crate::forget::FORGET_DEADLINE,
+        };
+        let kinds = check(&ctx, &root, &CODEX_KINDS).unwrap();
+        let hooks = walk::Hooks::default();
+        let later = std::time::Instant::now() + Duration::from_secs(60);
+        assert_eq!(present(&kinds, ID, &hooks, later), Some(1));
+        assert_eq!(present(&kinds, ID, &hooks, std::time::Instant::now()), None);
     }
 
     #[test]

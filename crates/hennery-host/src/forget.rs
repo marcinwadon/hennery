@@ -262,13 +262,22 @@ pub(crate) async fn run_adapter(
             }
             Ok(())
         });
-    let deadline = until.min(Instant::now() + ADAPTER_SHARE);
+    let deadline = adapter_deadline(until, Instant::now());
     match tokio::time::timeout_at(deadline, talk).await {
         Ok(Ok(())) => {}
         Ok(Err(err)) => tracing::info!(error = %err, "a forget's adapter connection ended"),
         Err(_) => tracing::warn!("a forget's adapter ran out of time"),
     }
     adapter.terminate(ADAPTER_GRACE).await;
+}
+
+/// When a forget's adapter is cut (B6; the review's item 4): its share of
+/// the deadline, and never later than the grace before `until`, so its
+/// SIGTERM-to-SIGKILL grace still ends by `until`, inside the collector's
+/// wait.
+pub(crate) fn adapter_deadline(until: Instant, now: Instant) -> Instant {
+    let latest = until.checked_sub(ADAPTER_GRACE).unwrap_or(now).max(now);
+    latest.min(now + ADAPTER_SHARE)
 }
 
 /// The kind directories under a Claude root, each with the kind it holds
@@ -544,6 +553,11 @@ impl Tally {
     /// or a database): counted once, as 0.
     pub(crate) fn left_whole(&mut self, kind: ForgetKind, reason: ForgetReason) {
         self.left.entry((kind, reason)).or_default();
+    }
+
+    /// Whether anything was left for `reason`.
+    pub(crate) fn has_left(&self, reason: ForgetReason) -> bool {
+        self.left.keys().any(|(_, r)| *r == reason)
     }
 
     pub(crate) fn into_forgotten(self) -> Forgotten {
@@ -843,6 +857,18 @@ mod tests {
             open_kind(fd.as_raw_fd(), "tasks", dev ^ 1, &me).err(),
             Some(ForgetReason::MountPoint)
         );
+    }
+
+    /// The review's item 4 (9d-ii): the adapter is cut its grace before
+    /// the forget's deadline, or at its own share, whichever comes first.
+    #[test]
+    fn a_forgets_adapter_ends_its_grace_before_the_deadline() {
+        let now = Instant::now();
+        let until = now + Duration::from_secs(20);
+        assert_eq!(adapter_deadline(until, now), now + ADAPTER_SHARE);
+        let soon = now + Duration::from_secs(5);
+        assert_eq!(adapter_deadline(soon, now), soon - ADAPTER_GRACE);
+        assert_eq!(adapter_deadline(now + Duration::from_secs(1), now), now);
     }
 
     /// The review's item 3: what the deadline left, a retry may finish.
