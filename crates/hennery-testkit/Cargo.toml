@@ -35,6 +35,7 @@ hennery-gateway.workspace = true
 hennery-host = { workspace = true, features = ["test-hooks"] }
 hennery-proto.workspace = true
 hennery-sessions.workspace = true
+hennery-view.workspace = true
 hex.workspace = true
 # Hat logos (plan 4d-B2): test images are made by the encoder, never stored.
 png.workspace = true

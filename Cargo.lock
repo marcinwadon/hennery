@@ -1614,6 +1614,7 @@ dependencies = [
  "hennery-kernel",
  "hennery-proto",
  "hennery-sessions",
+ "hennery-view",
  "hex",
  "libc",
  "png",
