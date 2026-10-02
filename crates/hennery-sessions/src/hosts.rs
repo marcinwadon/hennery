@@ -15,7 +15,10 @@ use hennery_kernel::hosts::{EnrollOutcome, Enrollment, HostRecord, Revoke, TooMa
 use hennery_kernel::json::ApiJson;
 use hennery_kernel::lifecycle::LifecycleHooks;
 use hennery_kernel::secret::{rfc3339, unix_now};
-use hennery_proto::rest::{EnrollRequest, EnrollResponse, HostItem, PairingCodeResponse, UpdateHostRequest};
+use hennery_proto::frames::Capability;
+use hennery_proto::rest::{
+    EnrollRequest, EnrollResponse, HostItem, McpAgentDelivery, PairingCodeResponse, UpdateHostRequest,
+};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -167,8 +170,21 @@ async fn update_host(
 
 /// A registry entry as the API shows it, with whether it is connected.
 pub(crate) fn host_item(state: &AppState, record: HostRecord) -> HostItem {
+    // Plan 8e decision E7: per agent, from the latest accepted `hello`, and
+    // only for a host that takes servers at all (one without says so by
+    // its capabilities). The one mapping, `McpAgentDelivery::of`.
+    let mcp_delivery = record
+        .mcp_isolation
+        .filter(|_| record.capabilities.has(Capability::McpServers))
+        .map(|isolation| {
+            isolation
+                .0
+                .into_iter()
+                .map(|(agent, how)| (agent, McpAgentDelivery::of(how)))
+                .collect()
+        });
     HostItem {
-        mcp_delivery: None,
+        mcp_delivery,
         connected: state.hub.is_ready(&record.id),
         host_id: record.id,
         name: record.name,
@@ -191,5 +207,63 @@ async fn list_hosts(State(state): State<AppState>) -> Response {
             Json(items).into_response()
         }
         Err(err) => internal(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hennery_kernel::operator::Operator;
+    use hennery_proto::frames::{AgentIsolation, Capabilities, McpIsolation};
+
+    fn record(capabilities: Capabilities, isolation: Option<AgentIsolation>) -> HostRecord {
+        HostRecord {
+            id: "h".into(),
+            name: "h".into(),
+            platform: "linux".into(),
+            host_version: "1".into(),
+            capabilities,
+            default_hat_id: "hat".into(),
+            workspace_roots: vec![],
+            created_at: 0,
+            last_seen_at: None,
+            revoked_at: None,
+            mcp_isolation: isolation,
+        }
+    }
+
+    /// Plan 8e decision E7: per agent, through the one mapping, and only for
+    /// a host that takes servers at all; none before its first `hello`.
+    #[test]
+    fn a_hosts_delivery_is_shown_only_when_it_takes_servers() {
+        let state = AppState::new(
+            crate::store::Store::open_in_memory().unwrap(),
+            hennery_kernel::hosts::Hosts::open_in_memory().unwrap(),
+            Operator::open_in_memory().unwrap(),
+        );
+        let isolation = AgentIsolation(
+            [
+                ("claude".to_string(), McpIsolation::ClaudeStrict),
+                ("codex".to_string(), McpIsolation::None),
+            ]
+            .into(),
+        );
+        let takes = Capabilities(vec![Capability::McpServers]);
+        let shown = host_item(&state, record(takes.clone(), Some(isolation.clone()))).mcp_delivery;
+        assert_eq!(
+            shown,
+            Some(
+                [
+                    ("claude".to_string(), McpAgentDelivery::Isolated),
+                    ("codex".to_string(), McpAgentDelivery::DefaultHatOnly),
+                ]
+                .into()
+            )
+        );
+        assert_eq!(
+            host_item(&state, record(Capabilities::default(), Some(isolation))).mcp_delivery,
+            None
+        );
+        assert_eq!(host_item(&state, record(takes, None)).mcp_delivery, None);
     }
 }
