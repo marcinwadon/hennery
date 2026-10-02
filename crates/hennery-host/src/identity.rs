@@ -105,6 +105,19 @@ impl Paired {
     /// paired there, an error if only half of it is there.
     pub fn load(data_dir: &Path) -> Result<Option<Self>> {
         finish_interrupted_pairing(data_dir)?;
+        Self::read(data_dir)
+    }
+
+    /// The pairing stored in `data_dir`, read only: unlike `load`, a pairing
+    /// that was interrupted is not finished (only its host may do that,
+    /// under `host.lock`), but refused (`hennery doctor`).
+    pub fn read(data_dir: &Path) -> Result<Option<Self>> {
+        if pending_path(data_dir, CONFIG_FILE).exists() {
+            bail!(
+                "{} holds a pairing that was interrupted: `hennery host run` finishes it",
+                data_dir.display()
+            );
+        }
         let key_path = data_dir.join(KEY_FILE);
         let config_path = data_dir.join(CONFIG_FILE);
         match (key_path.exists(), config_path.exists()) {

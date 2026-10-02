@@ -1431,6 +1431,7 @@ dependencies = [
  "hennery-testkit",
  "libc",
  "openssl",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

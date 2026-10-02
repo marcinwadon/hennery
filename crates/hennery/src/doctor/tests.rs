@@ -1482,3 +1482,879 @@ fn proc_locks_names_the_real_holder() {
     );
     drop(lock);
 }
+
+/// What `script` passes a fixture to run it once: each fixture exits at
+/// once on it, before it records anything.
+const WARM_UP: &str = "--warm-up";
+
+/// Write the shell script `text` (its `#!/bin/sh` line first) to `path`,
+/// executable, with a first line that exits on `WARM_UP`, and run it once
+/// that way. The first run of a new executable can wait on the machine's
+/// scan of it (seconds on a Mac with endpoint security), which would eat
+/// a check's budget; on Linux, a fork elsewhere in the test binary can
+/// still hold the file open for writing (ETXTBSY), so that run is retried.
+fn script(path: &Path, text: &str) {
+    let body = text.strip_prefix("#!/bin/sh\n").expect("a sh script");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        path,
+        format!("#!/bin/sh\nfor a; do [ \"$a\" = {WARM_UP} ] && exit 0; done\n{body}"),
+    )
+    .unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for _ in 0..100 {
+        match std::process::Command::new(path).arg(WARM_UP).status() {
+            Ok(status) => {
+                assert!(status.success(), "{}: {status}", path.display());
+                return;
+            }
+            Err(err) if err.raw_os_error() == Some(libc::ETXTBSY) => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            Err(err) => panic!("{}: {err}", path.display()),
+        }
+    }
+    panic!("{} stayed busy", path.display());
+}
+
+/// A pinned set whose programs are stand-ins (`fake_agents`): `node` runs
+/// an adapter that answers `initialize` with the version written in its
+/// entry file (`silent` never answers), or, given Codex's script, the fake
+/// CLI; Claude's bundled CLI is the fake CLI too. Each program records its
+/// pid, its environment and its working directory in `dir/runs`, and
+/// prints a canary on both outputs. The fake CLI says `--version` from
+/// `dir/<agent>-version` and is logged in while `dir/<agent>-logged-in`
+/// exists.
+struct FakeAgents {
+    host: PathBuf,
+    set: PathBuf,
+    runs: PathBuf,
+    dir: PathBuf,
+}
+
+fn fake_agents(dir: &Path) -> Option<FakeAgents> {
+    let host = paired(&dir.join("host"));
+    let (_, set) = pinned_set(&host)?;
+    let runs = dir.join("runs");
+    std::fs::create_dir_all(&runs).unwrap();
+    let cli = dir.join("fake-cli");
+    script(
+        &cli,
+        &format!(
+            "#!/bin/sh\nagent=$1; shift\nenv > \"{runs}/env-cli-$$\"; pwd > \"{runs}/cwd-cli-$$\"\n\
+             echo canary-7d-cli-out; echo canary-7d-cli-err >&2\n\
+             case \"$1\" in --version) cat \"{dir}/$agent-version\"; exit 0;; esac\n\
+             test -e \"{dir}/$agent-logged-in\"\n",
+            runs = runs.display(),
+            dir = dir.display()
+        ),
+    );
+    let node = std::fs::read_dir(host.join("runtimes"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("bin/node");
+    script(
+        &node,
+        &format!(
+            "#!/bin/sh\ncase \"$1\" in *codex.js) shift; exec \"{cli}\" codex \"$@\";; esac\n\
+             echo $$ > \"{runs}/pid-$$\"; env > \"{runs}/env-$$\"; pwd > \"{runs}/cwd-$$\"\n\
+             sleep 60 & echo $! > \"{runs}/pid-child-$$\"\n\
+             echo canary-7d-adapter-err >&2\nread line\nv=$(cat \"$1\")\n\
+             test \"$v\" = silent && exec sleep 60\n\
+             printf '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"protocolVersion\":1,\"agentCapabilities\":{{}},\"agentInfo\":{{\"name\":\"canary-7d-name\",\"version\":\"%s\"}}}}}}\\n' \"$v\"\n\
+             exec sleep 60\n",
+            cli = cli.display(),
+            runs = runs.display()
+        ),
+    );
+    let record: hennery_host::runtime::install::SetRecord =
+        serde_json::from_str(&std::fs::read_to_string(set.join("hennery-set.json")).unwrap()).unwrap();
+    for (name, adapter) in &record.adapters {
+        std::fs::write(set.join(name).join(&adapter.entry), &adapter.version).unwrap();
+    }
+    script(
+        &set.join(format!(
+            "claude/node_modules/@anthropic-ai/claude-agent-sdk-{}/claude",
+            record.platform
+        )),
+        &format!("#!/bin/sh\nexec \"{}\" claude \"$@\"\n", cli.display()),
+    );
+    let codex = set.join("codex/node_modules/@openai/codex/bin/codex.js");
+    std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    std::fs::write(&codex, "// codex\n").unwrap();
+    for (agent, version) in [("claude", "2.1.3 (Claude Code)\n"), ("codex", "codex-cli 0.155.1\n")] {
+        std::fs::write(dir.join(format!("{agent}-version")), version).unwrap();
+    }
+    Some(FakeAgents {
+        host,
+        set,
+        runs,
+        dir: dir.to_path_buf(),
+    })
+}
+
+impl FakeAgents {
+    /// The entry file of `agent`, whose text is the version it answers.
+    fn entry(&self, agent: &str) -> PathBuf {
+        let record: hennery_host::runtime::install::SetRecord =
+            serde_json::from_str(&std::fs::read_to_string(self.set.join("hennery-set.json")).unwrap()).unwrap();
+        self.set.join(agent).join(&record.adapters[agent].entry)
+    }
+
+    /// Every file of `runs` whose name starts with `prefix`, read.
+    fn runs(&self, prefix: &str) -> Vec<String> {
+        std::fs::read_dir(&self.runs)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
+            .map(|e| std::fs::read_to_string(e.path()).unwrap())
+            .collect()
+    }
+}
+
+/// Every pid the fake adapters recorded is gone: their groups were killed.
+/// Polled, as the kernel reaps the group's other members on its own time.
+fn all_gone(fake: &FakeAgents) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    for pid in fake.runs("pid-") {
+        let pid: i32 = pid.trim().parse().unwrap();
+        // SAFETY: kill(2) with signal 0 only checks.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(std::time::Instant::now() < deadline, "pid {pid} is still running");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+}
+
+/// Check 3: each adapter answers `initialize` with its pinned version; one
+/// that answers another warns; one that never answers fails within its
+/// budget, and on a Mac only warns. Each was started in the home directory, with an environment
+/// built rather than inherited, and its whole group is gone afterwards.
+#[test]
+fn adapters_start_as_the_host_starts_them_and_are_all_stopped() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let mut cx = machine(dir.path(), Platform::Linux, &fake);
+    cx.env.insert("CLAUDECODE".into(), "canary-7d-nesting".into());
+    cx.env
+        .insert("HENNERY_DOCTOR_SHELL_ONLY".into(), "canary-7d-shell".into());
+    let Some(agents) = fake_agents(dir.path()) else {
+        return;
+    };
+    let dirs = Dirs::by_contents(agents.host.clone(), Found::Given);
+    let check3 = || line(&checked(&cx, dirs.clone(), &nothing, &agents.host), 3).clone();
+    let check = check3();
+    assert_eq!(check.status, Status::Ok, "{check:?}");
+    assert!(check.summary.contains("claude 0.81.0 answers"), "{check:?}");
+    all_gone(&agents);
+    for env in agents.runs("env-") {
+        assert!(!env.contains("CLAUDECODE"), "{env}");
+        assert!(!env.contains("HENNERY_DOCTOR_SHELL_ONLY"), "{env}");
+        assert!(env.contains(&format!("HOME={}", cx.home.display())), "{env}");
+        assert!(env.contains("PATH=/usr/bin:/bin"), "{env}");
+    }
+    for cwd in agents.runs("cwd-") {
+        assert_eq!(
+            Path::new(cwd.trim()).canonicalize().unwrap(),
+            cx.home.canonicalize().unwrap()
+        );
+    }
+
+    std::fs::write(agents.entry("claude"), "0.80.9").unwrap();
+    let check = check3();
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("not the pinned 0.81.0"), "{check:?}");
+
+    // Silent, elsewhere: a failure, within its budget.
+    std::fs::write(agents.entry("claude"), "silent").unwrap();
+    let started = std::time::Instant::now();
+    let check = check3();
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    assert!(check.summary.contains("did not answer `initialize`"), "{check:?}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(40),
+        "{:?}",
+        started.elapsed()
+    );
+    all_gone(&agents);
+
+    // Silent, on a Mac: a warning, which says what a first run there can be.
+    let mac = machine(dir.path(), Platform::MacOs, &fake);
+    let started = std::time::Instant::now();
+    let check = line(&checked(&mac, dirs.clone(), &nothing, &agents.host), 3).clone();
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("did not answer `initialize`"), "{check:?}");
+    assert!(
+        check.summary.contains("macOS checks a newly written program"),
+        "{check:?}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(40),
+        "{:?}",
+        started.elapsed()
+    );
+    all_gone(&agents);
+    let text = report(&dirs, &[Finding::Checked(check)]);
+    assert!(!text.contains("canary-7d"), "{text}");
+}
+
+/// The adapter's answer is read for its version alone, and one that
+/// writes noise first, or answers with an error, is told apart.
+#[test]
+fn initialize_reads_its_answer_and_nothing_else() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapter = dir.path().join("adapter");
+    let answer = |text: &str| {
+        script(
+            &adapter,
+            &format!("#!/bin/sh\nread line\nprintf '%s\\n' '{text}'\nexec sleep 60\n"),
+        );
+        let agent = hennery_host::AgentCommand {
+            program: adapter.display().to_string(),
+            args: Vec::new(),
+            env: Vec::new(),
+        };
+        let env = vec![("HOME".to_string(), dir.path().display().to_string())];
+        spawn::initialize(&agent, &env, spawn::INITIALIZE_TIMEOUT)
+    };
+    assert_eq!(
+        answer(r#"{"jsonrpc":"2.0","id":0,"result":{"agentInfo":{"name":"a","version":"1.2.3"}}}"#),
+        spawn::Started::Answered(Some("1.2.3".into()))
+    );
+    assert_eq!(
+        answer(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#),
+        spawn::Started::Answered(None)
+    );
+    assert_eq!(
+        answer(r#"{"jsonrpc":"2.0","id":0,"result":{"agentInfo":{"version":"1.2.3 canary-7d see https://x"}}}"#),
+        spawn::Started::Answered(Some("an unreadable version".into()))
+    );
+    assert_eq!(spawn::readable_version(&"9".repeat(65)), "an unreadable version");
+    assert_eq!(spawn::readable_version("0.81.0-beta+1"), "0.81.0-beta+1");
+    assert!(matches!(
+        answer(r#"{"jsonrpc":"2.0","id":0,"error":{"code":-1,"message":"canary-7d"}}"#),
+        spawn::Started::Failed(why) if !why.contains("canary")
+    ));
+    assert!(matches!(
+        answer(r#"{"jsonrpc":"2.0","id":7,"result":{}}"#),
+        spawn::Started::Failed(why) if why.contains("did not answer")
+    ));
+
+    // An agent's own variables pass, but not what the host's spawn drops
+    // even when the agent's configuration names it.
+    let seen = dir.path().join("seen");
+    script(
+        &adapter,
+        &format!(
+            "#!/bin/sh\nenv > \"{}\"\nread line\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{}}}}'\nexec sleep 60\n",
+            seen.display()
+        ),
+    );
+    let env: Vec<(String, String)> = [
+        "CODEX_PATH",
+        "CLAUDECODE",
+        "HENNERY_DEV_TOKEN",
+        "HENNERY_LOG_DIR",
+        "HENNERY_SERVICE",
+    ]
+    .iter()
+    .map(|name| (name.to_string(), "canary-7d-own".to_string()))
+    .collect();
+    let agent = hennery_host::AgentCommand {
+        program: adapter.display().to_string(),
+        args: Vec::new(),
+        env,
+    };
+    let home = vec![("HOME".to_string(), dir.path().display().to_string())];
+    assert_eq!(
+        spawn::initialize(&agent, &home, spawn::INITIALIZE_TIMEOUT),
+        spawn::Started::Answered(None)
+    );
+    let seen = std::fs::read_to_string(&seen).unwrap();
+    assert!(seen.contains("CODEX_PATH=canary-7d-own"), "{seen}");
+    for name in ["CLAUDECODE", "HENNERY_DEV_TOKEN", "HENNERY_LOG_DIR", "HENNERY_SERVICE"] {
+        assert!(!seen.contains(name), "{name}: {seen}");
+    }
+    assert_eq!(spawn::version_in("2.1.3 (Claude Code)"), Some((2, 1, 3)));
+    assert_eq!(spawn::version_in("codex-cli 0.155.1"), Some((0, 155, 1)));
+    assert_eq!(spawn::version_in("no version"), None);
+    assert!(spawn::far_apart((2, 1, 3), (2, 2, 0)) && spawn::far_apart((2, 1, 3), (3, 1, 3)));
+    assert!(!spawn::far_apart((2, 1, 3), (2, 1, 9)));
+}
+
+/// A process the adapter put in a group of its own, holding the adapter's
+/// output open, does not hold doctor: `initialize` returns once the
+/// adapter's group is killed, not when that process ends.
+#[test]
+fn a_process_that_left_the_group_does_not_hold_initialize() {
+    let dir = tempfile::tempdir().unwrap();
+    let adapter = dir.path().join("adapter");
+    let escaped = dir.path().join("escaped");
+    script(
+        &adapter,
+        &format!(
+            "#!/bin/sh\nperl -e 'setpgrp(0, 0); open(my $f, \">\", \"{0}.tmp\"); print $f $$; close($f); rename(\"{0}.tmp\", \"{0}\"); sleep 30' &\nwhile [ ! -s \"{0}\" ]; do sleep 0.05; done\nread line\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{}}}}'\nexec sleep 60\n",
+            escaped.display()
+        ),
+    );
+    let agent = hennery_host::AgentCommand {
+        program: adapter.display().to_string(),
+        args: Vec::new(),
+        env: Vec::new(),
+    };
+    let env = vec![("HOME".to_string(), dir.path().display().to_string())];
+    let started = std::time::Instant::now();
+    let answered = spawn::initialize(&agent, &env, spawn::INITIALIZE_TIMEOUT);
+    let took = started.elapsed();
+    let pid: i32 = std::fs::read_to_string(&escaped).unwrap().trim().parse().unwrap();
+    // SAFETY: kill(2) of the one process this test's fixture started.
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    assert_eq!(answered, spawn::Started::Answered(None));
+    assert!(took < std::time::Duration::from_secs(20), "{took:?}");
+}
+
+/// `kill_all` kills every group still registered, and nothing is started
+/// after it (a Ctrl-C between the kill and doctor's exit starts nothing).
+#[test]
+fn after_kill_all_nothing_more_is_started() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    let groups = spawn::Groups::new();
+    let mut cmd = std::process::Command::new("/bin/sleep");
+    cmd.arg("60").process_group(0);
+    let mut child = groups.spawn(&mut cmd).unwrap();
+    groups.kill_all();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("kill_all left its group running");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    assert_eq!(status.signal(), Some(libc::SIGKILL));
+    match groups.spawn(&mut cmd) {
+        Err(err) => assert_eq!(err.kind(), std::io::ErrorKind::Interrupted),
+        Ok(mut late) => {
+            let _ = late.kill();
+            let _ = late.wait();
+            panic!("a spawn after kill_all was not refused");
+        }
+    }
+}
+
+/// Check 4: a CLI that says it is logged in is ok, one that does not warns
+/// with how to log in; its output, which may name the account, is never
+/// read.
+#[test]
+fn logged_in_is_the_clis_exit_code_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let Some(agents) = fake_agents(dir.path()) else {
+        return;
+    };
+    let dirs = Dirs::by_contents(agents.host.clone(), Found::Given);
+    let check4 = || {
+        let findings = checked(&cx, dirs.clone(), &nothing, &agents.host);
+        assert!(!report(&dirs, &findings).contains("canary-7d"));
+        line(&findings, 4).clone()
+    };
+    let check = check4();
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(
+        check
+            .summary
+            .contains("claude is not logged in; codex is not logged in"),
+        "{check:?}"
+    );
+    assert!(check.fix.contains("doctor never logs in"), "{check:?}");
+    assert!(
+        check.fix.contains("does not read a login given by a variable"),
+        "{check:?}"
+    );
+    for agent in ["claude", "codex"] {
+        std::fs::write(agents.dir.join(format!("{agent}-logged-in")), "").unwrap();
+    }
+    let check = check4();
+    assert_eq!(check.status, Status::Ok, "{check:?}");
+    assert_eq!(check.summary, "claude is logged in; codex is logged in");
+    // A CLI doctor runs installs nothing: its auto-updater is off.
+    for env in agents.runs("env-cli-") {
+        assert!(env.contains("DISABLE_AUTOUPDATER=1"), "{env}");
+    }
+    for cwd in agents.runs("cwd-cli-") {
+        assert_eq!(
+            Path::new(cwd.trim()).canonicalize().unwrap(),
+            cx.home.canonicalize().unwrap()
+        );
+    }
+}
+
+/// Check 13: the bundled CLI against the terminal's: another minor warns,
+/// the same is ok, none on PATH is ok. Check 17: an override against the
+/// bundled CLI.
+#[test]
+fn bundled_and_terminal_clis_are_compared() {
+    use hennery_host::runtime::agents::{UseCli, set_cli_override};
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let mut cx = machine(dir.path(), Platform::Linux, &fake);
+    let Some(agents) = fake_agents(dir.path()) else {
+        return;
+    };
+    let dirs = Dirs::by_contents(agents.host.clone(), Found::Given);
+    let check = |n| line(&checked(&cx, dirs.clone(), &nothing, &agents.host), n).clone();
+    let thirteen = check(13);
+    assert_eq!(
+        thirteen.summary,
+        "claude: bundled 2.1.3, none on PATH; codex: bundled 0.155.1, none on PATH"
+    );
+
+    let terminal = dir.path().join("terminal");
+    std::fs::create_dir_all(&terminal).unwrap();
+    script(&terminal.join("claude"), "#!/bin/sh\necho '2.4.0 (Claude Code)'\n");
+    cx.env
+        .insert("PATH".into(), format!("{}:/usr/bin:/bin", terminal.display()));
+    let thirteen = line(&checked(&cx, dirs.clone(), &nothing, &agents.host), 13).clone();
+    assert_eq!(thirteen.status, Status::Warn, "{thirteen:?}");
+    assert!(
+        thirteen.summary.contains("bundled 2.1.3, terminal 2.4.0"),
+        "{thirteen:?}"
+    );
+    script(&terminal.join("claude"), "#!/bin/sh\necho '2.1.9 (Claude Code)'\n");
+    assert_eq!(
+        line(&checked(&cx, dirs.clone(), &nothing, &agents.host), 13).status,
+        Status::Ok
+    );
+
+    set_cli_override(
+        &agents.host,
+        &UseCli {
+            agent: "claude".into(),
+            path: Some(terminal.join("claude")),
+        },
+    )
+    .unwrap();
+    let seventeen = line(&checked(&cx, dirs.clone(), &nothing, &agents.host), 17).clone();
+    assert!(
+        seventeen.summary.contains("your CLI 2.1.9, the pinned 2.1.3"),
+        "{seventeen:?}"
+    );
+    script(&terminal.join("claude"), "#!/bin/sh\necho '3.0.0 (Claude Code)'\n");
+    let seventeen = line(&checked(&cx, dirs.clone(), &nothing, &agents.host), 17).clone();
+    assert_eq!(seventeen.status, Status::Warn, "{seventeen:?}");
+    assert!(
+        seventeen.summary.contains("your CLI is 3.0.0, the pinned one 2.1.3"),
+        "{seventeen:?}"
+    );
+
+    // Other users can write to its directory: doctor runs it for no check.
+    let ran = dir.path().join("terminal-ran");
+    script(
+        &terminal.join("claude"),
+        &format!("#!/bin/sh\ntouch \"{}\"\necho '2.1.3 (Claude Code)'\n", ran.display()),
+    );
+    std::fs::set_permissions(&terminal, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let findings = checked(&cx, dirs, &nothing, &agents.host);
+    std::fs::set_permissions(&terminal, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(!ran.exists(), "{findings:?}");
+    let four = line(&findings, 4);
+    assert!(
+        four.summary
+            .contains("claude's CLI is not run: other users can write to"),
+        "{four:?}"
+    );
+    let thirteen = line(&findings, 13);
+    assert_eq!(thirteen.status, Status::Warn, "{thirteen:?}");
+    assert!(
+        thirteen.summary.contains("is not run: other users can write to"),
+        "{thirteen:?}"
+    );
+    let seventeen = line(&findings, 17);
+    assert!(seventeen.summary.contains("its version is not read"), "{seventeen:?}");
+}
+
+/// The service's `--agent` commands are started in place of a set, with
+/// the service's PATH, and without what a host never gives an agent.
+#[test]
+fn a_services_agents_and_path_are_the_ones_used() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = systemd("active", 1, "yes");
+    let mut cx = machine(dir.path(), Platform::Linux, &fake);
+    for name in ["HENNERY_SERVICE", "HENNERY_LOG_DIR", "HENNERY_DEV_TOKEN"] {
+        cx.env.insert(name.into(), "canary-7d-host".into());
+    }
+    let host = paired(&dir.path().join("host"));
+    let adapter = dir.path().join("given-adapter");
+    let env_out = dir.path().join("given-env");
+    script(
+        &adapter,
+        &format!(
+            "#!/bin/sh\nenv > \"{}\"\nread line\nprintf '%s\\n' '{{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{{\"agentInfo\":{{\"name\":\"n\",\"version\":\"9.9.9\"}}}}}}'\nexec sleep 60\n",
+            env_out.display()
+        ),
+    );
+    let mut argv = unit::command_line(Role::Host, &cx.exe, &host).unwrap();
+    argv.extend(["--agent".to_string(), format!("nix={}", adapter.display())]);
+    let file = cx.service_file(Role::Host);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(cx.env_file().parent().unwrap()).unwrap();
+    std::fs::write(cx.env_file(), unit::env_file("/service/bin:/usr/bin:/bin")).unwrap();
+    std::fs::write(
+        &file,
+        unit::systemd_unit(Role::Host, &argv, "/tmp/service.env").unwrap(),
+    )
+    .unwrap();
+    let dirs = Dirs::by_contents(host.clone(), Found::Given);
+    let findings = checked(&cx, dirs, &nothing, &host);
+    let check = line(&findings, 3);
+    assert_eq!(check.summary, "nix answers (9.9.9; given by --agent, no pin)");
+    let env = std::fs::read_to_string(&env_out).unwrap();
+    assert!(env.contains("PATH=/service/bin:/usr/bin:/bin"), "{env}");
+    // The host's spawn drops what picks its own log, and its secrets.
+    for name in ["HENNERY_SERVICE", "HENNERY_LOG_DIR", "HENNERY_DEV_TOKEN"] {
+        assert!(!env.contains(name), "{name}: {env}");
+    }
+}
+
+/// A collector served in this process on `dir`'s database: the runtime
+/// serving it (keep it alive), its state and its address.
+fn live_collector(
+    dir: &Path,
+) -> (
+    tokio::runtime::Runtime,
+    hennery_sessions::AppState,
+    std::net::SocketAddr,
+) {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    let (state, addr) = rt.block_on(async {
+        let db = dir.join("hennery.db");
+        let state = hennery_sessions::AppState::new(
+            hennery_sessions::store::Store::open(&db).unwrap(),
+            hennery_kernel::hosts::Hosts::open(&db).unwrap(),
+            hennery_kernel::operator::Operator::open(&db).unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(hennery_sessions::serve(listener, state.clone()));
+        (state, addr)
+    });
+    (rt, state, addr)
+}
+
+/// `host` paired with the collector at `addr` through a code `state` mints:
+/// its host id.
+fn pair(
+    rt: &tokio::runtime::Runtime,
+    state: &hennery_sessions::AppState,
+    addr: std::net::SocketAddr,
+    host: &Path,
+) -> String {
+    let code = state
+        .hosts
+        .mint_pairing_code(hennery_kernel::secret::unix_now())
+        .unwrap()
+        .code;
+    match rt
+        .block_on(hennery_host::pairing::join(
+            &format!("http://{addr}"),
+            &code,
+            host,
+            "doctor-test",
+        ))
+        .unwrap()
+    {
+        hennery_host::pairing::Joined::Paired { host_id } => host_id,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// A server that answers every request with `answer`, on loopback.
+fn answering(answer: String) -> std::net::SocketAddr {
+    use std::io::{Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(answer.as_bytes());
+        }
+    });
+    addr
+}
+
+/// `host.toml`'s collector pointed at `addr`, keeping the pairing.
+fn point_at(host: &Path, url: &str) {
+    let path = host.join("host.toml");
+    let mut table: toml::Table = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    table.insert("collector".into(), toml::Value::String(url.to_string()));
+    std::fs::write(&path, toml::to_string(&table).unwrap()).unwrap();
+}
+
+/// Check 7 against a real collector: an accepted hello is ok and gives
+/// check 8 the collector's `Date`; a revoked host fails with re-pairing; an
+/// unknown one fails with the files to remove; a host connected elsewhere
+/// with this key warns; while a host holds `host.lock`, no hello is sent.
+#[test]
+fn the_collector_is_reached_step_by_step_and_its_hello_judged() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let (rt, state, addr) = live_collector(&dir.path().join("collector"));
+    let host = dir.path().join("host");
+    let host_id = pair(&rt, &state, addr, &host);
+    let dirs = Dirs::by_contents(host.clone(), Found::Given);
+    let run = || checked(&cx, dirs.clone(), &nothing, &host);
+    let findings = run();
+    let seven = line(&findings, 7);
+    assert_eq!(seven.status, Status::Ok, "{seven:?}");
+    assert!(seven.summary.contains("its hello is accepted"), "{seven:?}");
+    let eight = line(&findings, 8);
+    assert_eq!(eight.status, Status::Ok, "{eight:?}");
+
+    // A host connected with the key elsewhere: `already_connected`.
+    let paired = hennery_host::identity::Paired::read(&host).unwrap().unwrap();
+    let mut cfg = hennery_host::HostConfig::new(
+        paired.collector_url.clone(),
+        paired.host_id.clone(),
+        paired.key.clone(),
+        dir.path().join("elsewhere"),
+    );
+    cfg.agents = Default::default();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    let elsewhere = rt.spawn(hennery_host::run_until(cfg, async {
+        let _ = stopped.await;
+    }));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let seven = loop {
+        let seven = line(&run(), 7).clone();
+        if seven.status != Status::Ok || std::time::Instant::now() > deadline {
+            break seven;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_eq!(seven.status, Status::Warn, "{seven:?}");
+    assert!(
+        seven
+            .summary
+            .contains("this host's key is in use by another live connection"),
+        "{seven:?}"
+    );
+    let _ = stop.send(());
+    let _ = rt.block_on(elsewhere);
+
+    // A host holds the lock here: no hello.
+    let lock = crate::lock::acquire(&host, crate::lock::HOST_LOCK, "hennery host run").unwrap();
+    assert!(
+        line(&run(), 7).summary.contains("hello not sent"),
+        "{:?}",
+        line(&run(), 7)
+    );
+    drop(lock);
+
+    state
+        .hosts
+        .revoke(&host_id, hennery_kernel::secret::unix_now())
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let seven = loop {
+        let seven = line(&run(), 7).clone();
+        if seven.status == Status::Fail || std::time::Instant::now() > deadline {
+            break seven;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_eq!(seven.status, Status::Fail, "{seven:?}");
+    assert!(seven.summary.contains("revoked"), "{seven:?}");
+    assert!(seven.fix.contains("hennery host join"), "{seven:?}");
+
+    let mut table: toml::Table = toml::from_str(&std::fs::read_to_string(host.join("host.toml")).unwrap()).unwrap();
+    table.insert("host_id".into(), toml::Value::String("host-unknown".into()));
+    std::fs::write(host.join("host.toml"), toml::to_string(&table).unwrap()).unwrap();
+    let seven = line(&run(), 7).clone();
+    assert_eq!(seven.status, Status::Fail, "{seven:?}");
+    assert!(seven.fix.contains("remove host.key and host.toml"), "{seven:?}");
+}
+
+/// Check 7's earlier steps, each failing on its own: plain http to another
+/// machine, nothing listening, a status other than 200; and check 8 on a
+/// skewed `Date`. Nothing beyond loopback is reached.
+#[test]
+fn each_step_to_the_collector_fails_on_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let host = paired(&dir.path().join("host"));
+    let dirs = Dirs::by_contents(host.clone(), Found::Given);
+    let run = || checked(&cx, dirs.clone(), &nothing, &host);
+
+    point_at(&host, "ws://doctor:canary-7d-secret@192.0.2.7:7117/api/hosts/ws");
+    let findings = run();
+    assert!(!report(&dirs, &findings).contains("canary-7d"), "{findings:?}");
+    let seven = line(&findings, 7).clone();
+    assert_eq!(seven.status, Status::Fail, "{seven:?}");
+    assert!(
+        seven.summary.contains("only allowed to a loopback address"),
+        "{seven:?}"
+    );
+
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    point_at(&host, &format!("ws://{closed}/api/hosts/ws"));
+    let findings = run();
+    assert!(
+        line(&findings, 7).summary.contains("nothing answers on"),
+        "{findings:?}"
+    );
+    assert!(not_run(&findings, 8));
+
+    let unavailable = answering("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n".into());
+    point_at(
+        &host,
+        &format!("ws://doctor:canary-7d-secret@{unavailable}/api/hosts/ws"),
+    );
+    let findings = run();
+    let seven = line(&findings, 7);
+    assert!(seven.summary.contains("answered 503"), "{seven:?}");
+    assert!(seven.summary.contains(&format!("http://{unavailable}/")), "{seven:?}");
+    assert!(!report(&dirs, &findings).contains("canary-7d"), "{findings:?}");
+
+    // A redirect is not followed: its own status is the answer.
+    let moved = answering(format!(
+        "HTTP/1.1 302 Found\r\nLocation: http://{unavailable}/healthz\r\nContent-Length: 0\r\n\r\n"
+    ));
+    point_at(&host, &format!("ws://{moved}/api/hosts/ws"));
+    let seven = line(&run(), 7).clone();
+    assert!(seven.summary.contains("answered 302"), "{seven:?}");
+
+    // A connection closed without an answer, over plain http: not a TLS
+    // failure, whatever the URL's words (the error is judged without it).
+    let closing = answering(String::new());
+    point_at(&host, &format!("ws://tls:certificate@{closing}/api/hosts/ws"));
+    let seven = line(&run(), 7).clone();
+    assert_eq!(seven.status, Status::Fail, "{seven:?}");
+    assert!(!seven.summary.contains("TLS failed"), "{seven:?}");
+
+    // https to a server that speaks no TLS: check 7 fails, and check 8
+    // does not run on what it said.
+    let plain = answering("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".into());
+    point_at(&host, &format!("wss://doctor:canary-7d-secret@{plain}/api/hosts/ws"));
+    let findings = run();
+    let seven = line(&findings, 7);
+    assert_eq!(seven.status, Status::Fail, "{seven:?}");
+    assert!(seven.summary.contains("TLS failed"), "{seven:?}");
+    assert!(not_run(&findings, 8), "{findings:?}");
+    assert!(!report(&dirs, &findings).contains("canary-7d"), "{findings:?}");
+    assert_eq!(
+        collector::shown_url("https://doctor:canary-7d-secret@127.0.0.1:9/"),
+        "https://127.0.0.1:9/"
+    );
+    assert_eq!(
+        collector::shown_url("https://doctor:canary-7d-secret@[127.0.0.1"),
+        "an unreadable URL"
+    );
+    for base in ["http://127.0.0.1:7117", "http://127.0.0.1:7117/"] {
+        assert_eq!(collector::health_shown(base), "http://127.0.0.1:7117/healthz");
+    }
+
+    let old =
+        "HTTP/1.1 200 OK\r\nDate: Thu, 01 Oct 2026 00:00:00 GMT\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    let skewed = answering(old.into());
+    point_at(&host, &format!("ws://{skewed}/api/hosts/ws"));
+    let findings = run();
+    let eight = line(&findings, 8);
+    assert_eq!(eight.status, Status::Fail, "{eight:?}");
+    assert!(eight.fix.contains("NTP"), "{eight:?}");
+
+    assert_eq!(
+        collector::http_date("Thu, 01 Oct 2026 00:00:00 GMT"),
+        Some(1_790_812_800)
+    );
+    assert_eq!(collector::http_date("Sun, 06 Nov 1994 08:49:37 GMT"), Some(784_111_777));
+    assert_eq!(collector::http_date("yesterday"), None);
+    assert_eq!(collector::skew(Some(1000), 1020).status, Status::Ok);
+    assert_eq!(collector::skew(Some(1000), 1031).status, Status::Warn);
+    assert_eq!(collector::skew(Some(1000), 1301).status, Status::Fail);
+    assert_eq!(collector::skew(None, 1000).status, Status::Warn);
+}
+
+/// Check 7 on a pairing that was interrupted: it warns, and the pairing is
+/// left as it is (only its host finishes it, under `host.lock`): nothing
+/// in the directory changes, and no hello is sent.
+#[test]
+fn an_interrupted_pairing_is_left_as_it_is() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let host = dir.path().join("host");
+    let staged = dir.path().join("staged");
+    paired(&staged);
+    std::fs::create_dir_all(&host).unwrap();
+    std::fs::copy(staged.join("host.key"), host.join("host.key")).unwrap();
+    std::fs::copy(staged.join("host.toml"), host.join("host.toml.pending")).unwrap();
+    let dirs = Dirs::by_contents(host.clone(), Found::Given);
+    let findings = checked(&cx, dirs, &nothing, &host);
+    let seven = line(&findings, 7);
+    assert_eq!(seven.status, Status::Warn, "{seven:?}");
+    assert!(seven.summary.contains("interrupted"), "{seven:?}");
+    assert!(seven.fix.contains("`hennery host run` once"), "{seven:?}");
+    assert!(not_run(&findings, 8));
+    assert!(host.join("host.toml.pending").exists());
+    assert!(!host.join("host.toml").exists());
+}
+
+/// Check 16: each listen address answers or is named; `public_url`
+/// answering `/healthz` is ok, one that reaches nothing warns.
+#[test]
+fn every_listener_and_public_url_is_tried() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let collector = dir.path().join("collector");
+    let (_rt, _state, addr) = live_collector(&collector);
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    std::fs::write(
+        collector.join("config.toml"),
+        format!("listen = [\"{addr}\", \"{closed}\"]\npublic_url = \"http://{addr}\"\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(collector.join("config.toml"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    let dirs = Dirs::by_contents(collector.clone(), Found::Given);
+    let sixteen = line(&checked(&cx, dirs.clone(), &nothing, &collector), 16).clone();
+    assert_eq!(sixteen.status, Status::Warn, "{sixteen:?}");
+    assert!(sixteen.summary.contains(&format!("{addr} answers")), "{sixteen:?}");
+    assert!(
+        sixteen.summary.contains(&format!("{closed}: no collector answers")),
+        "{sixteen:?}"
+    );
+    assert!(
+        sixteen
+            .summary
+            .contains(&format!("public_url http://{addr} answers /healthz")),
+        "{sixteen:?}"
+    );
+
+    std::fs::write(
+        collector.join("config.toml"),
+        format!("listen = [\"{addr}\"]\npublic_url = \"http://{closed}\"\n"),
+    )
+    .unwrap();
+    let sixteen = line(&checked(&cx, dirs, &nothing, &collector), 16).clone();
+    assert_eq!(sixteen.status, Status::Warn, "{sixteen:?}");
+    assert!(sixteen.summary.contains("reaches no listener or proxy"), "{sixteen:?}");
+}

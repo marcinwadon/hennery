@@ -187,6 +187,14 @@ fn installed_path(doctor: &Doctor, role: Role) -> Option<String> {
     }
 }
 
+/// The PATH the one installed service gives the host, if there is one.
+pub fn service_path_of(doctor: &Doctor) -> Option<String> {
+    match doctor.cx.installed()[..] {
+        [role] => installed_path(doctor, role),
+        _ => None,
+    }
+}
+
 /// Whether an executable `name` is in one of `entries`.
 fn on_path(entries: &[&str], name: &str) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -279,7 +287,7 @@ pub fn service_path(doctor: &Doctor) -> Finding {
 
 /// Who holds `host.lock`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Holder {
+pub enum Holder {
     Nobody,
     Pid(u32),
     Unknown(String),
@@ -292,7 +300,7 @@ const MAX_LOCK_TEXT: u64 = 32;
 /// `/proc/locks` naming it says so without a lock. Else a shared `flock` is
 /// tried only while the pid written in the file is a live process, and
 /// released at once.
-fn holder(doctor: &Doctor, lock: &Path) -> Holder {
+pub fn holder(doctor: &Doctor, lock: &Path) -> Holder {
     match std::fs::symlink_metadata(lock) {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Holder::Nobody,
         Err(err) => return Holder::Unknown(format!("{}: {err}", lock.display())),

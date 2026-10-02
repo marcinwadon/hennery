@@ -8,6 +8,8 @@
 //! through the service commands' `Context` and a `Runner`, which the tests
 //! replace.
 
+mod agents;
+mod collector;
 mod dirs;
 mod disk;
 mod env;
@@ -15,6 +17,7 @@ mod platform;
 mod process;
 mod runtime;
 mod service;
+mod spawn;
 
 #[cfg(test)]
 mod tests;
@@ -23,10 +26,10 @@ use crate::service::{Context, Ran, System};
 use anyhow::Result;
 use clap::Args;
 use dirs::Dirs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Args)]
 pub struct DoctorArgs {
@@ -144,36 +147,60 @@ impl Doctor<'_> {
     /// managed set, and needs neither glibc nor nix-ld for one (decision 4).
     /// A service of another directory says nothing of this one.
     pub fn agents_given(&self) -> bool {
+        self.given_agents().is_some()
+    }
+
+    /// The `--agent` commands of that service's command line, parsed as
+    /// `host run` parses them; `None` when it gives none.
+    pub fn given_agents(&self) -> Option<Vec<(String, hennery_host::AgentCommand)>> {
         use crate::service::unit::Role;
-        let Some(host) = self.dirs.host.as_ref().and_then(|h| h.canonicalize().ok()) else {
-            return false;
-        };
-        self.cx.installed().into_iter().any(|role| {
-            let Some(argv) = crate::service::read_command_line(self.cx, role) else {
-                return false;
-            };
+        let host = self.dirs.host.as_ref().and_then(|h| h.canonicalize().ok())?;
+        self.cx.installed().into_iter().find_map(|role| {
+            let argv = crate::service::read_command_line(self.cx, role)?;
             let served = match (role, crate::service::data_dir_of(&argv)) {
                 (Role::Up, Some(data)) => data.join("host"),
                 (Role::Host, Some(data)) => data,
-                _ => return false,
+                _ => return None,
             };
-            served.canonicalize().ok() == Some(host.clone()) && argv.iter().any(|a| a == "--agent")
+            if served.canonicalize().ok() != Some(host.clone()) {
+                return None;
+            }
+            let mut given = Vec::new();
+            let mut words = argv.iter();
+            while let Some(word) = words.next() {
+                let spec = match word.strip_prefix("--agent=") {
+                    Some(spec) => Some(spec),
+                    None if word == "--agent" => words.next().map(String::as_str),
+                    None => None,
+                };
+                if let Some(agent) = spec.and_then(|spec| crate::parse_agent(spec).ok()) {
+                    given.push(agent);
+                }
+            }
+            (!given.is_empty()).then_some(given)
         })
     }
 }
 
 /// Every check this binary has, in the spec's order.
 pub fn checks(doctor: &Doctor) -> Vec<Finding> {
+    let [seven, eight] = collector::collector(doctor);
     vec![
         runtime::binary_and_set(doctor),
         platform::platform(doctor),
+        agents::adapters_start(doctor),
+        agents::logged_in(doctor),
         service::service_path(doctor),
         env::environment(doctor),
+        seven,
+        eight,
         disk::disk(doctor),
         service::service(doctor),
         env::hennery_on_path(doctor),
         runtime::adapter_set(doctor),
+        agents::bundled_and_terminal(doctor),
         service::host_directory(doctor),
+        collector::listeners(doctor),
         runtime::cli_overrides(doctor),
     ]
 }
@@ -181,49 +208,14 @@ pub fn checks(doctor: &Doctor) -> Vec<Finding> {
 /// How long a program run for a check may take.
 pub const RUN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The most output read from a program run for a check.
-const MAX_OUTPUT: u64 = 4096;
-
 /// Run `program` for a check: no standard input, an environment of the base
-/// system's PATH alone (nothing of the shell doctor runs in), at most
-/// `MAX_OUTPUT` bytes of each output read, killed after `RUN_TIMEOUT`. What
-/// it prints is parsed by the check, never printed or logged. The output is
-/// read once the program exits: one that fills a pipe is killed at the
-/// timeout and gives `None`, and one that leaves a child holding its pipes
-/// would hold the read. The programs run (glibc's loader, `getconf`) do
-/// neither.
+/// system's PATH alone (nothing of the shell doctor runs in), in `/`, at
+/// most `spawn::MAX_OUTPUT` bytes of each output read, killed with its
+/// group after `RUN_TIMEOUT`, and by `spawn::kill_all` when doctor is
+/// stopped. What it prints is parsed by the check, never printed or logged.
 pub fn run_bounded(program: &Path, args: &[&str]) -> Option<Ran> {
-    use std::process::{Command, Stdio};
-    let mut child = Command::new(program)
-        .args(args)
-        .env_clear()
-        .env("PATH", "/usr/bin:/bin")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let deadline = Instant::now() + RUN_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    };
-    let mut stdout = Vec::new();
-    child.stdout.take()?.take(MAX_OUTPUT).read_to_end(&mut stdout).ok()?;
-    let mut stderr = Vec::new();
-    child.stderr.take()?.take(MAX_OUTPUT).read_to_end(&mut stderr).ok()?;
-    Some(Ran {
-        ok: status.success(),
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-    })
+    let env = [("PATH".to_string(), "/usr/bin:/bin".to_string())];
+    spawn::run(program, args, &env, RUN_TIMEOUT, true)
 }
 
 /// `hennery doctor`.
@@ -236,9 +228,33 @@ pub fn run(args: DoctorArgs) -> Result<ExitCode> {
         dirs,
         run: &run_bounded,
     };
+    stop_children_on_signals()?;
     let findings = checks(&doctor);
     render(&doctor.dirs, &findings, &mut std::io::stdout())?;
     Ok(exit_code(&findings))
+}
+
+/// On SIGINT or SIGTERM to doctor, kill every program it started, then
+/// exit 130: they run in groups of their own, so a terminal's Ctrl-C does
+/// not reach them. The handlers exist from here on: they are made now, on
+/// `main`'s runtime, whose other threads run the task while the checks run
+/// on this one.
+fn stop_children_on_signals() -> Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    // A dropped SSH session's hangup reaches doctor, not its groups.
+    let mut hangup = signal(SignalKind::hangup())?;
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+            _ = hangup.recv() => {}
+        }
+        spawn::kill_all();
+        std::process::exit(130);
+    });
+    Ok(())
 }
 
 /// 1 when a check failed; warnings alone exit 0.
