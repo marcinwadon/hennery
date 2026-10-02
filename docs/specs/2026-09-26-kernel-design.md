@@ -249,7 +249,7 @@ frontend), and `SetupRequest` has no default hat name; hats add it.
   - From then on the old origin is refused (§3.3), so a wrong value locks
     every browser out; the way back is `hennery admin reset-public-url` on
     the collector's machine. A request already past the `Origin` check when
-    the change lands still runs (one in-flight request per session; recorded,
+    the change lands still runs (any request already in flight; recorded,
     not closed). So does a password login checked before it: its session
     outlives "every session ended", and proves the password anyway.
 
