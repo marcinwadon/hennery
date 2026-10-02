@@ -174,8 +174,20 @@ async fn a_source_that_does_not_resume_is_read_from_the_start() {
         install::install(&layout, &selection(&fixture, &[]), &server.sources(), &quiet)
             .await
             .unwrap_or_else(|err| panic!("{mode:?}: {err:#}"));
-        let asked = server.requests().iter().filter(|(p, _)| *p == path).count();
-        assert!(asked >= 2, "{mode:?}: asked {asked} times");
+        let asked: Vec<Option<String>> = server
+            .requests()
+            .into_iter()
+            .filter(|(p, _)| *p == path)
+            .map(|(_, range)| range)
+            .collect();
+        let resumed = Some(format!("bytes={half}-"));
+        let expected = match mode {
+            // The 200 is taken as the whole file.
+            support::RangeMode::Ignore => vec![None, resumed],
+            // The wrong 206 is dropped, and the next attempt starts over.
+            _ => vec![None, resumed, None],
+        };
+        assert_eq!(asked, expected, "{mode:?}");
     }
 }
 
@@ -194,7 +206,8 @@ async fn a_set_without_its_runtime_gets_it_back() {
         .unwrap()
         .set()
         .clone();
-    std::fs::remove_dir_all(set.node.parent().unwrap().parent().unwrap()).unwrap();
+    // Only `bin/node` goes: the runtime's directory stays behind, empty.
+    std::fs::remove_file(&set.node).unwrap();
     let again = install::install(&layout, &selection(&one, &[]), &server.sources(), &quiet)
         .await
         .unwrap();

@@ -716,6 +716,11 @@ async fn install_node(
     extract::sync_dir(&staging)?;
     extract::barrier(&binary)?;
     let path = layout.runtimes().join(&name);
+    // A runtime directory left without its `bin/node` (by hand, by a crash)
+    // is replaced, not renamed onto.
+    if std::fs::symlink_metadata(&path).is_ok() {
+        std::fs::remove_dir_all(&path)?;
+    }
     std::fs::rename(&staging, &path)?;
     extract::sync_dir(&layout.runtimes())?;
     Ok(())
