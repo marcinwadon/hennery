@@ -35,8 +35,9 @@ use tokio_stream::wrappers::BroadcastStream;
 
 const START_TIMEOUT: Duration = Duration::from_secs(90);
 /// At least the WebSocket read deadline, so a half-open socket is detected
-/// before the request gives up (ACP core §3.4).
-const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
+/// before the request gives up (ACP core §3.4). Public for tests that wait
+/// on a prompt as long as the collector would.
+pub const PROMPT_TIMEOUT: Duration = Duration::from_secs(60);
 /// `park_session` / `close_session` (ACP core §3.4).
 const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
 /// `cancel_turn` (ACP core §3.4). The host stops an adapter that ignores the

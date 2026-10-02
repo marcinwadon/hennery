@@ -3279,6 +3279,9 @@ async fn an_adapter_lost_with_a_question_open_cancels_it_adapter_lost() {
     wait_ended(&handle).await;
 }
 
+/// The idle window of `the_reaper_never_parks_a_session_with_a_question_open`.
+const IDLE_WINDOW: Duration = Duration::from_millis(500);
+
 /// No timeout on a question (ACP core §4.6, scenario 10): one asked
 /// outside any turn keeps the session through many idle windows, and is
 /// still answered.
@@ -3296,13 +3299,18 @@ async fn the_reaper_never_parks_a_session_with_a_question_open() {
         "agent-7".into(),
         fake_with(&script),
         std::env::temp_dir(),
+        // The window is also all the time the adapter has, once the answer
+        // restarts the reaper's clock, to report what it was given before
+        // the reaper parks it: 100 ms was too short once on a macOS CI
+        // runner (PR #62). 500 ms is five times that, and ten windows still
+        // pass below with the question open.
         SessionOptions {
-            idle_timeout: Some(Duration::from_millis(100)),
+            idle_timeout: Some(IDLE_WINDOW),
             ..SessionOptions::default()
         },
     );
     let pending = nth_pending(&uplink, 0).await;
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(IDLE_WINDOW * 10).await;
     assert_eq!(
         kinds(&uplink.pending().unwrap()),
         ["session_started", "pending_opened:permission"],
