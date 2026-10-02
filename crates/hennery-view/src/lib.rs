@@ -9,8 +9,15 @@
 //! never dropped (D3).
 
 pub mod cap;
+pub mod fold;
 pub mod item;
 pub mod question;
 pub mod tool;
 
+pub use fold::{Answerable, Fold, Items, fold};
 pub use item::*;
+
+/// The fold's rules' version. Ordinal ids and versions follow the rules:
+/// raise it whenever they change what an event makes, so a client holding
+/// items of the old rules resyncs.
+pub const FOLD_VERSION: u32 = 1;
