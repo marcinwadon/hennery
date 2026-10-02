@@ -2503,3 +2503,71 @@ fn the_list_filters_by_hat_with_or_without_a_search() {
     assert_eq!(ids(&rest), ["s3"]);
     assert_eq!(rest.next_cursor, None);
 }
+
+/// ACP core §4.9, plan 5d decision 1: a session with no running adapter
+/// moves to another of the owner's hats, with a `hat_reassigned` event;
+/// one that may still run (`starting`, `active`, or presumed parked while
+/// its host is away) does not, nor to a hat that is not the owner's.
+#[test]
+fn a_session_with_no_running_adapter_is_reassigned_to_another_hat() {
+    use hennery_kernel::hats::HatChange;
+    use hennery_kernel::hosts::Hosts;
+    use hennery_sessions::store::Reassign;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    let hosts = Hosts::open(&db).unwrap();
+    let personal = hosts.default_hat_for_new_hosts().unwrap();
+    let HatChange::Done(acme) = hosts.create_hat("Acme", None, 1).unwrap() else {
+        panic!("no hat");
+    };
+    let store = Store::open(&db).unwrap();
+    store
+        .create_session("s1", "h1", "fake", "/tmp", &personal, Some("rule-1"))
+        .unwrap();
+    // `starting`, then `active`: an adapter may run.
+    assert_eq!(
+        store.reassign_hat("s1", &acme.id).unwrap(),
+        Reassign::Attached("starting".into())
+    );
+    store
+        .ingest("s1", 1, &SessionBody::session_started("r1", "agent-1"))
+        .unwrap();
+    assert_eq!(
+        store.reassign_hat("s1", &acme.id).unwrap(),
+        Reassign::Attached("active".into())
+    );
+    // Presumed parked: its host is away and may still run it.
+    store.presume_parked("h1").unwrap();
+    assert_eq!(
+        store.reassign_hat("s1", &acme.id).unwrap(),
+        Reassign::Attached("presumed_parked".into())
+    );
+    store.close_now("s1").unwrap();
+
+    assert_eq!(store.reassign_hat("s1", "hat-nope").unwrap(), Reassign::UnknownHat);
+    // Nor to another owner's hat.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute_batch(
+        "INSERT INTO owners(id, created_at, set_up_at) VALUES ('owner-00000000000000b2', 9223372036854775807, 9223372036854775807);
+         INSERT INTO hats(id, owner_id, name, colour, created_at)
+             VALUES ('hat-theirs', 'owner-00000000000000b2', 'Theirs', '#000000', 9);",
+    )
+    .unwrap();
+    let events = store.events("s1", 0, 100).unwrap().len();
+    assert_eq!(store.reassign_hat("s1", "hat-theirs").unwrap(), Reassign::UnknownHat);
+    assert_eq!(store.events("s1", 0, 100).unwrap().len(), events, "nothing written");
+    assert_eq!(store.reassign_hat("s1", &personal).unwrap(), Reassign::Unchanged);
+    let Reassign::Done(event) = store.reassign_hat("s1", &acme.id).unwrap() else {
+        panic!("not re-assigned");
+    };
+    assert_eq!(
+        (event.kind.as_str(), event.body.clone()),
+        ("hat_reassigned", json!({ "from": personal, "to": acme.id }))
+    );
+    assert_eq!(store.session("s1").unwrap().unwrap().hat_id, acme.id);
+    let rule: Option<String> = conn
+        .query_row("SELECT hat_rule_id FROM sessions WHERE id = 's1'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rule, None, "the rule that decided the old hat no longer does");
+    assert_eq!(store.reassign_hat("s-nope", &acme.id).unwrap(), Reassign::NotFound);
+}
