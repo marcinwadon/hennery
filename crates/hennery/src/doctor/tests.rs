@@ -592,6 +592,84 @@ fn a_set_other_than_the_pin_or_none_or_a_hold_warns() {
     assert!(check.summary.contains("a rollback holds this host"), "{check:?}");
 }
 
+/// The NixOS module's host runs as a system unit (plan 7e-ii-a): its
+/// `--agent` words count as a user service's do, on Linux, for the
+/// directory it serves only. Nothing else of it is judged.
+#[test]
+fn the_nixos_modules_system_unit_gives_its_agents() {
+    for platform in [Platform::Linux, Platform::MacOs] {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = Fake::none();
+        let cx = machine(dir.path(), platform, &fake);
+        let host = paired(&dir.path().join("host"));
+        let dirs = Dirs::by_contents(host.clone(), Found::Given);
+        let check1 = || line(&checked(&cx, dirs.clone(), &nothing, &host), 1).clone();
+        assert!(check1().summary.contains("no adapter set is installed"), "{platform:?}");
+
+        // As the module writes it: every word quoted as `systemd_word`
+        // quotes it, among the unit's other lines.
+        let system = cx.root.join("etc/systemd/system");
+        std::fs::create_dir_all(&system).unwrap();
+        let unit_with = |data: &Path, agents: &[&str]| {
+            let mut argv = unit::command_line(Role::Host, &cx.exe, data).unwrap();
+            for agent in agents {
+                argv.extend(["--agent".to_string(), agent.to_string()]);
+            }
+            let exec = unit::systemd_unit(Role::Host, &argv, "/tmp/service.env").unwrap();
+            let exec = exec.lines().find(|l| l.starts_with("ExecStart=")).unwrap().to_string();
+            format!(
+                "[Unit]\nConditionPathExists={}/host.key\n\n[Service]\n{exec}\nUser=alice\n",
+                data.display()
+            )
+        };
+        let unit = |data: &Path| unit_with(data, &["codex=/nix/store/x-codex/bin/hennery-codex-acp"]);
+        std::fs::write(system.join("hennery-host.service"), unit(&host)).unwrap();
+        let check = check1();
+        assert_eq!(check.status, Status::Ok, "{check:?}");
+        match platform {
+            // Named, as check 10 finds no service.
+            Platform::Linux => assert!(
+                check
+                    .summary
+                    .contains("the system unit /etc/systemd/system/hennery-host.service gives its agents with --agent"),
+                "{check:?}"
+            ),
+            Platform::MacOs => assert!(check.summary.contains("no adapter set is installed"), "{check:?}"),
+        }
+        // Not a user service: check 10 still finds none.
+        assert!(cx.installed().is_empty());
+
+        // A system unit of another directory says nothing of this one.
+        let elsewhere = paired(&dir.path().join("elsewhere"));
+        std::fs::write(system.join("hennery-host.service"), unit(&elsewhere)).unwrap();
+        assert!(check1().summary.contains("no adapter set is installed"), "{platform:?}");
+        // Nor does one that gives no agent (`adapters.source = "managed"`).
+        std::fs::write(system.join("hennery-host.service"), unit_with(&host, &[])).unwrap();
+        assert!(check1().summary.contains("no adapter set is installed"), "{platform:?}");
+    }
+}
+
+/// A user service's `--agent` is named as the service's, not a system
+/// unit's, even with a system unit beside it.
+#[test]
+fn a_user_services_agents_are_the_services() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let host = paired(&dir.path().join("host"));
+    let dirs = Dirs::by_contents(host.clone(), Found::Given);
+    install_with_agents(&cx, Role::Host, &host);
+    let system = cx.root.join("etc/systemd/system");
+    std::fs::create_dir_all(&system).unwrap();
+    std::fs::copy(cx.service_file(Role::Host), system.join("hennery-host.service")).unwrap();
+    let check = line(&checked(&cx, dirs, &nothing, &host), 1).clone();
+    assert_eq!(check.status, Status::Ok, "{check:?}");
+    assert!(
+        check.summary.contains("the service gives its agents with --agent"),
+        "{check:?}"
+    );
+}
+
 /// Check 17: no override is ok; one that runs is named; one that cannot
 /// run fails; one for an agent that takes none warns; one others can write
 /// warns.

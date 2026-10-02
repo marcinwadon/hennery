@@ -225,14 +225,38 @@ runtime (§3.2), so the installer never touches the npm registry.
   removed, and kept a second, older nixpkgs input to stay on it.)*
 - **Adapters:** the flake reads the same manifest (`builtins.fromJSON`),
   fetches each tarball for the system with `fetchurl { url; hash = integrity; }`
-  and unpacks them, then wraps with nixpkgs' Node 24. On Linux the Claude CLI
-  gets `autoPatchelfHook` (to be verified). The Claude adapter derivation is
-  marked `unfree` so no public cache ever holds it. *(D-2: the predecessor's
-  adapters were network-fetching fixed-output derivations with one hand-kept
-  hash per system and no lockfile, so a transitive release could break the hash
-  at any time.)*
-- NixOS/home-manager modules: `services.hennery.{collector,host}` with
-  `adapters.source = "nix" | "managed"` (default `nix` on NixOS).
+  and unpacks each at its lockfile path under the host installer's rules (§3.2:
+  files and directories only, no absolute, `.`, `..` or empty component, no
+  name twice; no npm and no install script), then wraps with nixpkgs' Node 24.
+  On Linux the Claude CLI gets `autoPatchelfHook` and is never stripped (a
+  bun-compiled CLI keeps its program after the ELF); Codex's CLI is
+  musl-static and runs as it is. A check runs every bundled native program's
+  `--version` and the adapter's ACP `initialize`, offline. The Claude adapter
+  derivation is marked `unfree`, so Hydra never builds it, and it is no flake
+  package that `nix flake check` evaluates (`legacyPackages.claude-acp`). CI
+  builds and runs it on Linux only, never caching or uploading it. Its CLI's
+  fetched tarball is a store path with no licence: a cache that uploads every
+  path built must stay off a machine that builds this adapter.
+  *(D-2: the predecessor's adapters were network-fetching fixed-output
+  derivations with one hand-kept hash per system and no lockfile, so a
+  transitive release could break the hash at any time.)*
+- **NixOS/home-manager modules:** `services.hennery.{collector,host}` with
+  `adapters.source = "nix" | "managed"` (default `nix`), plan 7e-ii-a.
+  - `nix` gives each agent of `adapters.agents` (default both) with
+    `--agent name=<wrapper>`, so the host installs no managed set. A host with
+    `claude` evaluates only once the operator's nixpkgs accepts its licence
+    (`allowUnfree`, or `allowUnfreePredicate` for `hennery-claude-acp`).
+    `managed` on NixOS needs `programs.nix-ld.enable` (an assertion).
+  - **NixOS:** system units. The collector runs as the `hennery` system user,
+    in a hardened unit with no capability; the host runs as `host.user`, the
+    login user whose agents it runs, unhardened. Each keeps §5.2's policy
+    (restart on failure under a start limit; exit 78, revoked, is not
+    restarted), `KillMode=mixed`, and logs in its own `LogsDirectory=`. The
+    host is skipped until its directory holds `host.key`.
+  - **home-manager (Linux):** the user units `service install` writes (§6.3),
+    at its paths, with the PATH in its `service.env` (no `SHELL=` line: the
+    user manager gives the account's shell).
+  - Doctor reads the host's `--agent` from the NixOS system unit too (§7).
 
 ---
 
@@ -435,6 +459,14 @@ are never printed (only "logged in" and the method).
 
 The host runs checks 3–4, 9, 12 and 13 on demand (`probe_agents`) and reports
 them to the collector, so the Hosts view shows them without a terminal.
+
+On Linux, doctor also reads the NixOS module's system unit,
+`/etc/systemd/system/hennery-host.service` (§4.3), for the `--agent` words its
+`ExecStart` gives the directory checked. They count as a user service's do,
+for every check that reads them (1, 2, 3–4, 9, 12); check 3 starts them with
+doctor's own PATH. No other check judges a system unit, drop-ins in
+`hennery-host.service.d/` are not read, and check 10 looks for user services
+only.
 
 ---
 

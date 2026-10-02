@@ -1,7 +1,9 @@
-# The Nix flake (distribution spec §4.3, §9; plan 7e-i): `nix flake check`
-# builds the package and runs clippy, rustfmt and cargo-audit through crane,
-# on Linux and on macOS, and the package's binary runs. Nothing is pushed to
-# a binary cache: that would publish. The tests stay `ci.yml`'s.
+# The Nix flake (distribution spec §4.3, §9; plans 7e-i and 7e-ii-a):
+# `nix flake check` builds the package and runs clippy, rustfmt and
+# cargo-audit through crane, checks the pinned adapters and the modules, and
+# on ubuntu runs the NixOS module in a virtual machine; the package's binary
+# runs. Nothing is pushed to a binary cache: that would publish. The tests
+# stay `ci.yml`'s.
 #
 # The Nix installer is pinned by commit. The job's own read-only token goes
 # to Nix only to fetch the locked GitHub inputs without hitting the
@@ -32,16 +34,65 @@ jobs:
       matrix:
         os: [ubuntu-24.04, macos-latest]
     runs-on: ${{ matrix.os }}
-    # A cold build takes about 9 minutes; a hung one should not run for hours.
-    timeout-minutes: 30
+    # A cold build takes about 9 minutes, and on ubuntu the NixOS test and
+    # the adapters add more; a hung one should not run for hours.
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      # The NixOS test's virtual machines run under KVM, which the runner's
+      # user may not open by default.
+      - name: KVM for the NixOS test (ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
       - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
         with:
           github_access_token: ${{ github.token }}
-      - name: Flake checks (package, clippy, rustfmt, cargo-audit)
-        run: nix flake check -L
+          extra_nix_config: |
+            system-features = nixos-test benchmark big-parallel kvm
+      - name: Flake checks (package, clippy, rustfmt, cargo-audit, adapters, modules)
+        run: nix flake check -L --keep-going
       - name: The package runs
         run: nix run . -- --version
+      # The Claude adapter is unfree (distribution spec §3.3): built and run
+      # here, with the licence accepted for this one command, and never
+      # pushed anywhere (the maintainer's decision of 2026-10-02: build and
+      # check only). Nothing in this job writes to a cache or uploads. On
+      # Linux only, where `autoPatchelfHook` must leave its CLI working;
+      # macOS runners are scarce, and there the CLI is unpatched.
+      - name: The Claude adapter runs (unfree, built locally only)
+        if: always() && runner.os == 'Linux'
+        run: NIXPKGS_ALLOW_UNFREE=1 nix build --impure --no-link -L .#claude-acp-runs
+      # The systems no runner builds: every output evaluates.
+      - name: Every system evaluates
+        if: runner.os == 'Linux'
+        run: nix flake check --all-systems --no-build
+  # Scratch only (plan 7e-ii-a): the Linux revert-probes, each expected to
+  # make its check fail. Never part of the real PR.
+  probes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: KVM for the NixOS test
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ github.token }}
+          extra_nix_config: |
+            system-features = nixos-test benchmark big-parallel kvm
+      - name: Linux revert-probes
+        run: PROBE_SCRATCH=/tmp/probes python3 .github/scratch-probes.py . linux hm-doctor-dollar vm-doctor vm-host-log vm-host-mode
+      - name: Probe logs
+        if: always()
+        run: tail -n 60 /tmp/probes/*.log
