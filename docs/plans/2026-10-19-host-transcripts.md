@@ -118,7 +118,7 @@ Checks:
 
 ## Decisions this plan makes where the spec is silent
 
-The design is in plan 9's `decisions-9d.md` (in the lane's scratch), and these are its decisions as built. The security reviews confirmed them on the maintainer's behalf.
+The design is in plan 9's [design record](2026-10-21-delete-and-purge-design-record.md) §2, and these are its decisions as built. The security reviews confirmed them on the maintainer's behalf.
 
 1. **The home is recorded at start** (decision 1, B1, B8).
    - The host resolves the agent's roots from the adapter's environment.
