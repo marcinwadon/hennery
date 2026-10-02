@@ -1099,8 +1099,7 @@ async fn delete_session(State(state): State<AppState>, Path(id): Path<String>) -
     };
     // The agent's own transcript on the host, best effort (plan 9d
     // decisions 5 and 7): what the host answers within the wait, or why it
-    // is still pending. A purge's `PurgeResult` gets these as counts when
-    // plan 9c rebases onto this (plan 9d decision 7): 9c hand-off.
+    // is still pending. A purge counts these (`forget::after_purge`).
     let host_transcript = crate::forget::after_delete(&state, &forgets).await;
     (StatusCode::OK, Json(DeleteResult { host_transcript })).into_response()
 }

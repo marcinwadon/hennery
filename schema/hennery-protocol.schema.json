@@ -1634,6 +1634,39 @@
         }
       ]
     },
+    "HostTranscripts": {
+      "description": "How many purged sessions' transcripts their hosts removed, removed in\npart, or have still to remove (plan 9d decision 7), as each session's\n`TranscriptRemoval.state`; a session with no agent record counts in\nnone. The pending ones are retried at their host's next handshake.",
+      "properties": {
+        "partial": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pending": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pending_sessions": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "removed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "removed",
+        "partial",
+        "pending",
+        "pending_sessions"
+      ],
+      "type": "object"
+    },
     "Indexed": {
       "description": "Fields the collector may read from a session event. Closed set (ACP core §3.2).\n\nThe catalogue extracts (`config_options`, `current_model`,\n`current_mode`, `current_axes`) travel together: when `config_options`\nis present and not empty, the four are one snapshot of the adapter's\nconfig. An absent or empty `config_options` means \"no read-back\", never\n\"the adapter has no config\" (a response that failed to parse looks\nempty).",
       "properties": {
@@ -2361,6 +2394,10 @@
     "PurgeResult": {
       "description": "200 to `POST /api/hats/{id}/purge` (plan 9c decision 10, A13): what\nthis purge deleted. A purge that resumes one that stopped counts only\nwhat it deleted itself.",
       "properties": {
+        "host_transcripts": {
+          "$ref": "#/$defs/HostTranscripts",
+          "description": "The agents' own transcripts of the purged sessions on their hosts\n(plan 9d decision 7)."
+        },
         "rules": {
           "format": "uint64",
           "minimum": 0,
@@ -2382,7 +2419,8 @@
       "required": [
         "sessions",
         "rules",
-        "unconfirmed"
+        "unconfirmed",
+        "host_transcripts"
       ],
       "type": "object"
     },
