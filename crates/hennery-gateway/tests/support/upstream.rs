@@ -188,13 +188,24 @@ pub struct Harness {
 
 /// The proxy over `world`, on a loopback port of its own.
 async fn serve(world: &World, limits: Limits) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    serve_edited(world, limits, |_| {}).await
+}
+
+/// As `serve`, with the proxy's state changed by `edit` first.
+async fn serve_edited(
+    world: &World,
+    limits: Limits,
+    edit: impl FnOnce(&mut ProxyState),
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let egress = Egress::new(Timeouts {
         connect: Duration::from_secs(2),
         request: Duration::from_secs(10),
     })
     .unwrap();
     let gateway = world.gateway();
-    let app = router(ProxyState::full(world.proxy_store.clone(), &gateway, egress, limits));
+    let mut state = ProxyState::full(world.proxy_store.clone(), &gateway, egress, limits);
+    edit(&mut state);
+    let app = router(state);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
@@ -240,6 +251,15 @@ impl Harness {
     pub async fn restart(&mut self) {
         self.task.abort();
         let (addr, task) = serve(&self.world, self.limits.clone()).await;
+        self.addr = addr;
+        self.task = task;
+    }
+
+    /// A new proxy on the same world, its state changed by `edit` (a
+    /// test's own `ClientIdentity`), on a new port.
+    pub async fn restart_with(&mut self, edit: impl FnOnce(&mut ProxyState)) {
+        self.task.abort();
+        let (addr, task) = serve_edited(&self.world, self.limits.clone(), edit).await;
         self.addr = addr;
         self.task = task;
     }

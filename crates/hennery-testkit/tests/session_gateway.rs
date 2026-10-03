@@ -555,3 +555,83 @@ fn a_claude_session_gets_its_hats_servers_and_a_token_that_ends_with_its_park() 
         "the upstream's URL past its origin reached the log"
     );
 }
+
+/// The security review's finding 2: a host revoke cuts the streams open on
+/// the host's tokens at once, not only once its connection has closed. The
+/// host here holds a connection that never closes, so the route waits its
+/// whole bound (10 s) for it; the stream ends well before that.
+#[tokio::test]
+async fn a_host_revoke_cuts_its_streams_without_waiting_for_its_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let (upstream, _) = upstream().await;
+    let c = Collector::start(dir.path(), upstream).await;
+    // A connection that never ends: the revoke's wait for it runs out.
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let _held = c
+        .state
+        .hub
+        .register(HOST, tx, Default::default(), Default::default())
+        .expect("registered");
+    let token = {
+        let mut conn = rusqlite::Connection::open(&c.db).unwrap();
+        let tx = conn.transaction().unwrap();
+        let token = hennery_gateway::tokens::mint_in(
+            &tx,
+            c.gateway.store.owner_id(),
+            "s1",
+            HOST,
+            &c.hat,
+            hennery_kernel::secret::unix_now(),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        token.expose().to_string()
+    };
+    let response = c
+        .proxy_client
+        .get(c.url("/mcp/linear"))
+        .bearer_auth(&token)
+        .header(header::ACCEPT, "text/event-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.bytes_stream();
+    let first = tokio::time::timeout(BOUND, stream.next()).await.unwrap();
+    assert!(matches!(first, Some(Ok(_))), "the first event");
+    let revoke = {
+        let client = c.client.clone();
+        let url = c.url(&format!("/api/hosts/{HOST}"));
+        tokio::spawn(async move { client.delete(url).send().await.unwrap().status() })
+    };
+    let started = std::time::Instant::now();
+    // The stream ends (broken, or closed) without another event.
+    let next = tokio::time::timeout(BOUND, stream.next()).await.unwrap();
+    assert!(!matches!(next, Some(Ok(_))), "another event came: {next:?}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "the stream was cut only after {:?}, with the wait for the connection",
+        started.elapsed()
+    );
+    // Revoked too, not only cut (the re-confirmation's note 1): while the
+    // route still waits, the token's row is revoked, and the token opens
+    // nothing new (that, the host's own revoke already refuses).
+    assert!(
+        !revoke.is_finished(),
+        "the route no longer waits: the test proves nothing"
+    );
+    let live: i64 = rusqlite::Connection::open(&c.db)
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM gw_session_tokens WHERE session_id = 's1' AND revoked_at IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(live, 0, "the token's row is still live while the route waits");
+    assert_eq!(c.call("linear", &token).await, 404);
+    assert_eq!(
+        tokio::time::timeout(BOUND, revoke).await.unwrap().unwrap(),
+        StatusCode::OK
+    );
+}
