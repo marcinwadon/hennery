@@ -120,8 +120,8 @@ Its scoped re-confirmation (opus, 2026-10-03): "confirmed", A1 to A3 and every O
 10. **Status claims that other lanes deliver** (the review's A2). On `1e09a0c` the MCP and Settings views are placeholders. Each such claim is checked against `main` before the PR leaves draft, and dropped if its lane has not landed:
     - sessions from the browser, and step 4's labels ("New session", "Start session"): **4c**;
     - "The MCP gateway" bullet and step 4's MCP line: **4e**, the gateway screens;
-    - the Push bullet: the part of 4d that builds the Settings screen, where the browser subscribes.
-    The lane decides, at the rebase, between waiting and dropping a bullet.
+    - Push: the Settings screen, where the browser subscribes, is not on the testers' path. The lane's ruling (2026-10-03): Push moves to the limitations ("built on the collector, no subscribe button in the web UI yet"), and the hats bullet no longer mentions notification settings.
+    The lane decides, at the rebase, between waiting and dropping a bullet. Its ruling of 2026-10-03: 4f merges after 4e-i and 4e-ii and keeps the MCP lines, which are checked against `main` then; the sessions claims are checked once 4c-ii merges.
 11. **The Codex line is the gateway lane's wording,** verbatim (parent ruling, 2026-10-03): "Codex sessions also load the user's own ~/.codex MCP servers until per-hat isolation lands."
 12. **Cost:** the `readme` job does a release build on each OS (about 15 minutes cold), with its own cache key. `-p hennery` builds the shipped binary only, as the existing `web` job does in debug.
 
@@ -1189,9 +1189,7 @@ What works:
   machine, prompt them, answer their permission requests, and park and
   resume them.
 - **Hats.** Path rules put each session in a hat by its project directory,
-  and each hat keeps its sessions and notification settings apart.
-- **Push.** The browser can get Web Push notices when a session asks a
-  question, finishes or fails.
+  and each hat keeps its sessions apart.
 - **The MCP gateway.** Connect an MCP server once, and choose the hosts
   whose sessions may use it.
 
@@ -1199,6 +1197,8 @@ Known limitations:
 
 - One owner per collector, and a password to sign in; passkeys have an API
   but no screen yet.
+- Web Push is built on the collector, but the web UI has no subscribe
+  button yet.
 - Codex sessions also load the user's own ~/.codex MCP servers until per-hat isolation lands.
 - The designs are in [`docs/specs/`](docs/specs/) and the plans in
   [`docs/plans/`](docs/plans/); [`docs/README.md`](docs/README.md) lists
@@ -1470,10 +1470,15 @@ git commit -m "docs(readme): a quickstart for early testers, every shell block r
 
 - [ ] Write "Execution status" here and this plan's line in `docs/README.md`. Commit as `docs(plan): record the execution of plan 4f`.
 
+## Deferred
+
+- **Indented code blocks** (four spaces, no fence) are not detected by `readme-blocks.sh` (decision 1). Accepted by the lane, 2026-10-03: a reviewer reading the README diff is the check.
+
 ## After this plan
 
 - **4e** (the gateway screens): when they land, check the README's MCP line against the screen's name and what it does.
 - **Releases** (plan 7, the operator's): when there is one, the Quickstart's build step becomes the second route, after installing. The installer's and Homebrew's commands get tagged blocks and runners too.
+- **The Push subscribe button:** when the Settings screen lands, move Push back from the limitations to what works.
 - **Passkey screens:** when they land, remove the Status line saying passkeys have no screen.
 - **Codex isolation:** when per-hat isolation for Codex lands, remove the limitation line.
 

@@ -22,9 +22,7 @@ What works:
   machine, prompt them, answer their permission requests, and park and
   resume them.
 - **Hats.** Path rules put each session in a hat by its project directory,
-  and each hat keeps its sessions and notification settings apart.
-- **Push.** The browser can get Web Push notices when a session asks a
-  question, finishes or fails.
+  and each hat keeps its sessions apart.
 - **The MCP gateway.** Connect an MCP server once, and choose the hosts
   whose sessions may use it.
 
@@ -32,6 +30,8 @@ Known limitations:
 
 - One owner per collector, and a password to sign in; passkeys have an API
   but no screen yet.
+- Web Push is built on the collector, but the web UI has no subscribe
+  button yet.
 - Codex sessions also load the user's own ~/.codex MCP servers until per-hat isolation lands.
 - The designs are in [`docs/specs/`](docs/specs/) and the plans in
   [`docs/plans/`](docs/plans/); [`docs/README.md`](docs/README.md) lists
