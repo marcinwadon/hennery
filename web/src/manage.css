@@ -56,3 +56,23 @@
   .manage-head .btn, .card-actions .btn, .inline-form .btn, .rule .btn { min-height:44px; }
   .select-field select, .colour-input { min-height:44px; }
 }
+
+/* MCP (plan 4e): the connection form, the token and the mounts. */
+.connection-form { display:flex; flex-direction:column; gap:10px; margin-top:8px; }
+.connection-form .field, .connection-form .hint { margin:0; }
+.field-row { display:flex; gap:10px; flex-wrap:wrap; }
+.field-row .field { flex:1; min-width:160px; }
+.check { display:flex; align-items:center; gap:8px; min-height:36px; cursor:pointer; }
+.check input { width:18px; height:18px; margin:0; flex:none; }
+.hint.warn { color:#B26A00; }
+.token-form { border-top:1px solid var(--border); padding-top:12px; margin-top:12px; }
+.mounts { border:0; border-top:1px solid var(--border); margin:12px 0 0; padding:12px 0 0; min-width:0; }
+.mounts legend { font-weight:700; font-size:13px; padding:0; margin-bottom:6px; }
+.mcp-ok { background:rgba(47,158,68,.13); color:#247A33; }
+.mcp-not_connected { background:var(--surface-3); color:var(--fg-muted); }
+.mcp-needs_auth { background:rgba(232,145,12,.14); color:#B26A00; }
+.mcp-error { background:rgba(229,72,77,.12); color:var(--st-attn); }
+
+@media (max-width:767px) {
+  .check { min-height:44px; }
+}
