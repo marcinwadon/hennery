@@ -706,3 +706,205 @@ async fn a_reader_holding_the_wal_holds_a_purge_up_once_not_once_per_session() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
+
+/// The collector's gateway on `c`'s database, given to its sessions (plan
+/// 8e, as `hennery`'s `gateway()` does).
+fn gateway(c: &Collector) -> hennery_gateway::api::GatewayState {
+    let keys = hennery_gateway::key::KeySource::from_vars(c._dir.path(), Some("07".repeat(32).into()), None).unwrap();
+    let gateway = hennery_gateway::open(&c.db, &keys, c.state.operator.clone()).unwrap();
+    c.state
+        .store
+        .set_session_mcp(std::sync::Arc::new(hennery_gateway::session::GatewayMcp::new(&gateway)));
+    gateway
+}
+
+/// A connection labelled `label`, a stdio server on `HOST` running
+/// `label`, and a session token, in `hat`.
+fn gateway_rows(c: &Collector, gateway: &hennery_gateway::api::GatewayState, hat: &str, session: &str, label: &str) {
+    let slug = format!("linear-{}", &hat[hat.len() - 6..]);
+    let new = hennery_gateway::model::NewConnection {
+        slug: slug.clone(),
+        label: label.into(),
+        url: "https://mcp.linear.example/mcp".into(),
+        hat_id: hat.into(),
+        cred_kind: hennery_gateway::model::CredKind::None,
+        static_header: None,
+        static_prefix: None,
+        tool_allowlist: None,
+        internal_network: false,
+    };
+    assert!(matches!(
+        gateway.store.create(&new, NOW).unwrap(),
+        hennery_gateway::model::Change::Done(_)
+    ));
+    let stdio = hennery_gateway::stdio::StdioInput {
+        name: format!("files-{}", &hat[hat.len() - 6..]),
+        command: label.into(),
+        args: vec![],
+        env: vec![],
+    };
+    assert!(matches!(
+        gateway
+            .store
+            .replace_stdio_set(HOST, hat, &[stdio], &gateway.key, NOW)
+            .unwrap(),
+        hennery_gateway::stdio::StdioChange::Done(_)
+    ));
+    let mut conn = Connection::open(&c.db).unwrap();
+    let tx = conn.transaction().unwrap();
+    hennery_gateway::tokens::mint_in(&tx, gateway.store.owner_id(), session, HOST, hat, NOW).unwrap();
+    tx.commit().unwrap();
+}
+
+/// How many of the gateway's rows `hat` has: connections, stdio servers,
+/// session tokens.
+fn gateway_rows_of(c: &Collector, hat: &str) -> i64 {
+    let conn = Connection::open(&c.db).unwrap();
+    ["gw_connections", "gw_stdio_servers", "gw_session_tokens"]
+        .iter()
+        .map(|table| {
+            conn.query_row(&format!("SELECT count(*) FROM {table} WHERE hat_id = ?1"), [hat], |r| {
+                r.get::<_, i64>(0)
+            })
+            .unwrap()
+        })
+        .sum()
+}
+
+/// Plan 9c's hand-off to plan 8 (lane L6, A15): the purge route runs the
+/// gateway's part at its reserved place, before the sessions': the hat's
+/// connections, stdio servers and session tokens go, another hat's stay,
+/// and the hat row can go after them; nothing of the gateway's rows is
+/// left in the database's files (A8). Run again, the part deletes nothing
+/// and succeeds.
+#[tokio::test]
+async fn a_purge_takes_the_hats_gateway_rows_and_leaves_another_hats() {
+    let (c, acme, other) = Collector::start().await;
+    let gateway = gateway(&c);
+    c.parked("a1", HOST, &acme);
+    c.parked("o1", HOST, &other);
+    let marker = "okapi-ledger-7d1c";
+    gateway_rows(&c, &gateway, &acme, "a1", marker);
+    gateway_rows(&c, &gateway, &other, "o1", "Linear");
+    assert_eq!(gateway_rows_of(&c, &acme), 3);
+    let result = c.purged(&acme).await;
+    assert_eq!(result.sessions, 1);
+    assert_eq!(gateway_rows_of(&c, &acme), 0);
+    assert_eq!(gateway_rows_of(&c, &other), 3);
+    let dir = c.db.parent().unwrap();
+    for file in ["hennery.db", "hennery.db-wal"] {
+        let bytes = std::fs::read(dir.join(file)).unwrap_or_default();
+        assert!(
+            !bytes.windows(marker.len()).any(|w| w == marker.as_bytes()),
+            "{file} still holds the hat's gateway rows"
+        );
+    }
+    assert_eq!(c.state.hosts.hat(&acme).unwrap(), None);
+    c.state.on_hat_purged(&acme).unwrap();
+    assert_eq!(gateway_rows_of(&c, &other), 3);
+}
+
+/// The gateway's part only, failing or recording whether the purge's
+/// checkpoint was owed when it ran: everything else is no gateway's.
+struct FailingPurge;
+
+struct RecordingPurge {
+    owed_marker: PathBuf,
+    owed: std::sync::Arc<std::sync::Mutex<Vec<bool>>>,
+}
+
+impl hennery_gateway::session::SessionMcp for FailingPurge {
+    fn servers_in(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        session: hennery_gateway::session::SessionRef<'_>,
+        mode: hennery_proto::rest::McpSessionDeliveryMode,
+    ) -> anyhow::Result<hennery_gateway::session::Delivered> {
+        hennery_gateway::session::NoSessionMcp.servers_in(tx, session, mode)
+    }
+    fn revoke_in(&self, tx: &rusqlite::Transaction<'_>, id: &str) -> anyhow::Result<hennery_gateway::revocation::Cut> {
+        hennery_gateway::session::NoSessionMcp.revoke_in(tx, id)
+    }
+    fn revoke_host_in(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        id: &str,
+    ) -> anyhow::Result<hennery_gateway::revocation::Cut> {
+        hennery_gateway::session::NoSessionMcp.revoke_host_in(tx, id)
+    }
+    fn cut(&self, _: hennery_gateway::revocation::Cut) {}
+    fn purge_hat(&self, _: &str) -> anyhow::Result<()> {
+        anyhow::bail!("the gateway's part failed")
+    }
+}
+
+impl hennery_gateway::session::SessionMcp for RecordingPurge {
+    fn servers_in(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        session: hennery_gateway::session::SessionRef<'_>,
+        mode: hennery_proto::rest::McpSessionDeliveryMode,
+    ) -> anyhow::Result<hennery_gateway::session::Delivered> {
+        hennery_gateway::session::NoSessionMcp.servers_in(tx, session, mode)
+    }
+    fn revoke_in(&self, tx: &rusqlite::Transaction<'_>, id: &str) -> anyhow::Result<hennery_gateway::revocation::Cut> {
+        hennery_gateway::session::NoSessionMcp.revoke_in(tx, id)
+    }
+    fn revoke_host_in(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        id: &str,
+    ) -> anyhow::Result<hennery_gateway::revocation::Cut> {
+        hennery_gateway::session::NoSessionMcp.revoke_host_in(tx, id)
+    }
+    fn cut(&self, _: hennery_gateway::revocation::Cut) {}
+    fn purge_hat(&self, _: &str) -> anyhow::Result<()> {
+        self.owed.lock().unwrap().push(self.owed_marker.exists());
+        Ok(())
+    }
+}
+
+/// A15's order: the gateway's part runs first, so when it fails the purge
+/// stops before deleting any session, on the route and in the hook alike;
+/// the hat stays frozen, and a purge again completes it.
+#[tokio::test]
+async fn a_failed_gateway_part_stops_a_purge_before_its_sessions() {
+    let (c, acme, _) = Collector::start().await;
+    c.parked("a1", HOST, &acme);
+    c.state.store.set_session_mcp(std::sync::Arc::new(FailingPurge));
+    let (status, code, _) = code_of(c.purge(&acme).await).await;
+    assert_eq!((status, code.as_str()), (500, "internal"));
+    assert_eq!(c.lifecycle("a1").as_deref(), Some("parked"));
+    assert!(c.state.hosts.hat(&acme).unwrap().unwrap().purging);
+    assert!(c.state.on_hat_purged(&acme).is_err());
+    assert_eq!(c.lifecycle("a1").as_deref(), Some("parked"));
+    c.state
+        .store
+        .set_session_mcp(std::sync::Arc::new(hennery_gateway::session::NoSessionMcp));
+    assert_eq!(c.purged(&acme).await.sessions, 1);
+}
+
+/// A8 for the gateway's part: its deletes are the purge's first, so the
+/// purge's one checkpoint is owed (durably, `<db>-checkpoint-owed`) before
+/// they run, on the route and in the hook alike; a crash in them leaves it
+/// owed.
+#[tokio::test]
+async fn the_purges_checkpoint_is_owed_before_the_gateways_part() {
+    let (c, acme, other) = Collector::start().await;
+    c.parked("a1", HOST, &acme);
+    c.parked("o1", HOST, &other);
+    let mut owed_marker = c.db.clone().into_os_string();
+    owed_marker.push("-checkpoint-owed");
+    let owed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    c.state.store.set_session_mcp(std::sync::Arc::new(RecordingPurge {
+        owed_marker: owed_marker.into(),
+        owed: owed.clone(),
+    }));
+    assert_eq!(c.purged(&acme).await.sessions, 1);
+    assert!(matches!(
+        c.state.hosts.begin_purge(&other, NOW).unwrap(),
+        PurgeStart::Frozen { .. }
+    ));
+    c.state.on_hat_purged(&other).unwrap();
+    assert_eq!(*owed.lock().unwrap(), [true, true], "route, then hook");
+}
