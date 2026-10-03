@@ -19,6 +19,10 @@
 - **The list** (`components/SessionList.tsx`, `SessionRow.tsx`, `SessionScope.tsx`, `HatSwitch.tsx`; `lib/status.ts`, `hats.ts`, `agent.ts`): in the rail's `.rail-scroll` from 768 px, the whole `/sessions` screen below it. `SessionScope` holds the hat, the filters, the query and the selection for the list and the badge.
 - **The view** (`screens/Session.tsx`; `components/Transcript.tsx`, `SessionHeader.tsx`, `StepList.tsx`, `Markdown.tsx`, `ItemBoundary.tsx`, `items/*`): `/sessions/:id`, side by side with the list on a desktop, full screen with a back control on a phone.
 - **Tests:** Vitest against stubs (`test-server.ts`, `test-stream.ts`); a gated Chromium measurement of the transcript's cost (`e2e/windowing.spec.ts`).
+- **Part 2: the composer** (`components/Composer.tsx`, `composerWords.ts`; `lib/attachments.ts`, `catalog.ts`, `drafts.ts`, `sendAgain.ts`; `api/turns.ts`): under the transcript, one instance per session; its handle is the seam the cards and the markers fill, and it never sends on their behalf.
+- **Part 2: cards** (`components/items/QuestionCard.tsx`, `Elicitation.tsx`; `lib/delivery.ts`, `elicitation.ts`; `store/useAnswer.ts`, `api/answer.ts`): the answer book, one per session view, holds what the tab did with each question.
+- **Part 2: New Session** (`screens/NewSession.tsx`, `components/ProjectPicker.tsx`; `lib/agents.ts`, `projects.ts`, `start.ts`) at `/new`; **footers and the header menu** (`components/SessionFooter.tsx`, `SessionMenu.tsx`, `sessionWords.ts`).
+- **Part 2: the browser check** (`e2e/sessions.spec.ts`, `e2e/host.ts`): the built binary and a paired host whose agent is `hennery-fake-acp`, at 1280 and 390 px.
 
 **Tech Stack:** 4b's (React 19.3.0, TypeScript 7.0.2, Vite 8.3.1, Tailwind 4.3.3, Vitest 5.0.3, jsdom 30.1.1, `@playwright/test` 1.63.0 with the flake's Chromium). New, pinned exactly in `web/package.json` (Task 4): `react-markdown` 10.1.0, `remark-gfm` 4.0.1, `remark-breaks` 4.0.0, `rehype-sanitize` 6.0.0, `rehype-highlight` 7.0.2. No `rehype-raw`; no package with a build script.
 
@@ -30,6 +34,8 @@
 It builds on [plan 4a-i](2026-10-16-view-fold.md) (the items), [plan 4a-ii](2026-10-17-view-api.md) (the view API and the list stream) and [plan 4b](2026-10-16-web-shell.md) (the shell): their "After this plan" lists what 4c must do (see "Where the hand-offs land"). The code was built on `main` at `b046e28` plus plan 4a-ii's five commits (the view API, not yet merged; the branch rebases onto it when it merges), where every anchor was taken.
 
 **Status:** written 2026-10-02. Part 1 (Tasks 1–5) built, replayed and executed. The security review on the maintainer's behalf (a stronger model, opus) approved it after amendments A1–A4; a scoped re-confirmation (a fresh opus subagent, 2026-10-03) found A1–A3 and O1–O5 in the code, A4 superseded by the server's count, and re-confirmed after three more amendments, all taken: R1 (a refused search keeps the waiting count; the search box takes at most 200 characters), R2 (consecutive resyncs back off) and R3 (the hats and hosts are read again after `/hats` or `/hosts`). The task reviews and the whole-branch review (opus) followed; every finding was taken (see "Execution status").
+
+**Part 2 (Tasks 6–10)** written 2026-10-03, built, replayed and executed. The security review of Part 2 on the maintainer's behalf (a stronger model, opus) approved it after amendments MUST-1..3, took SHOULD-1..5 as well, and ruled on the 18 items its builders left open. Its re-confirmation (a fresh opus subagent, 2026-10-03) found MUST-1..3 and SHOULD-1..5 in the code, and re-confirmed after one more amendment, NEW-1, and MUST-3's write-back in this plan (decisions 25, 36), both taken. Task reviews by a stronger model (opus) followed, Tasks 6–7 and 8–10, each approved with minors; every finding was taken (marked "task review" where it lands) but one, declined: the T8–10 review's M-9, the class locators (decision 45). A whole-branch review and a review of its fixes (opus) closed the run (see "Execution status").
 
 **How the code blocks were made and checked:**
 - Task 1 is an import commit, like 4b's Task 1 (decision 0): styles and three helpers taken from the predecessor's frontend, described by a manifest, not code blocks. Its patch id (`git show <commit> | git patch-id --stable`) is `54dfd4be7f80f153fcad942e50344e5723a610a2`. Every later task replays onto it.
@@ -53,6 +59,20 @@ Executed 2026-10-03 with subagent-driven development. The code was built first (
 
 **Checks on the final branch** (on `main` at `b046e28` with 4a-ii's five commits): every task commit typechecks and passes Vitest (307, 436, 534, 729, 749, then 769 with the guard); the build (199 kB gzip); the browser checks the guard edited, in Chromium (17 passed); the windowing measurement at N = 500 (both rates). Revert-probes on the final code: every guard of Part 1 has one that fails as it should, but two of the list store's defence lines that no test can reach (see Task 2), from 500 scripted probes plus the amendments' 32, the task reviews' fixes' 23 and the guard's 8. The Rust workspace is untouched; CI runs its checks.
 
+Part 2 executed 2026-10-03, as Part 1 was: the code built first (one implementer per task), reviewed for security and re-confirmed (above), cut into the task commits below; the plan generated from them and replayed from its own text onto Part 1's last commit, every step matching its commit byte for byte. Task reviews by a stronger model (opus), Tasks 6–7 and 8–10, followed, then a whole-branch review (opus), and a read-only review of that review's fixes (opus). The fixes were folded into their tasks' commits, the plan regenerated and replayed again. Commits are named here by subject.
+
+| Task | Commit | Review |
+|---|---|---|
+| Plan | `docs(plan): plan 4c-ii, the composer, cards, New Session and the session menu` | — |
+| 6 | `feat(web): a composer under each session's transcript that sends text and images, stops a turn, switches config and keeps a draft per session` | Approved with minors, all taken: work added while a send is in flight is refused with a word, never lost when the 202 clears the draft; markers run from 1 to 999999; an agent's `[Image #` never links an image; the missing wordings; the signal passed to the turn's own GET. The whole-branch review's I-1 and M-5 were fixed here, and four of the fix review's five minors taken (decisions 33, 34). |
+| 7 | `feat(web): question cards answer permissions and forms, with every delivery state` | Approved with minors, all taken: a question that comes with a resync never takes the focus; the host's absence follows the host (Task 8's `hostAway`); the window starts at `isAnswerable`; a form that names one field twice is refused; the commit body names MUST-1 and NEW-1. |
+| 8 | `feat(web): the New Session screen starts a session and sends its first prompt; a question's host note follows the host` | Approved with minors, all taken: the agent branch that could never run is gone (decision 38); the unknown start's notice names a prompt only when one was typed; a link's `cwd` is taken only as a literal path; every outcome has its own test; the picker's active option is announced. The subject names the host note it also carries (the whole-branch review's nit). |
+| 9 | `feat(web): session footers resume, explain a failure or show a start, and a header menu parks, closes and deletes` | Approved with minors, all taken: Delete is disabled while any of the menu's actions runs; the footer's "The host is offline" follows the host by the cards' rule. The whole-branch review's M-4 was fixed here: one resume for the footer and the composer. |
+| 10 | `test(web): a browser check starts a session on a paired host, answers its permission and sees it parked after a host crash`; `ci: the web job builds the fake agent beside the binary`; `test(web): the browser check resumes the parked session from its footer and answers a second prompt's question`; `test(web): at 390 px the session menu, its buttons and the footer's Resume are at least 44 px tall` | Approved with minors: I-1, the first start on macOS, taken (a 45 s wait); `hostEnv` now checks what it promises; 10 s per assertion; decision 44 records the spawn allowlist as done. Declined: M-9, the class locators (decision 45). |
+| — | (whole branch) | Approved with minors. I-1, M-4 and M-5 fixed in Tasks 6 and 9; the rest taken in this text: a stale CI claim, the file table, an owner and a scope, the branch name, a comment naming Task 6, Task 8's subject. The fix review approved with minors, four of five taken; the fifth is recorded (decision 34). |
+
+**Checks on the final branch** (on Part 1's last commit): every task commit typechecks and passes Vitest (914, 1093, 1209, 1298, then 1303 at each of Task 10's four commits); the build (702 kB raw, one chunk); the browser checks in Chromium, with the binary and the fake agent built from the branch (38 passed, 11 skipped); the replay GREEN. Revert-probes on the final code are listed per task; every one fails as it should but those recorded there as surviving by design. Nothing in the Rust workspace changes; CI runs its checks.
+
 ## Scope
 
 The client view spec's part 4c (§8), with the obligations 4a-i, 4a-ii and 4b hand the frontend. **10 tasks in two parts:**
@@ -70,11 +90,15 @@ Two PRs, not one (the spec's §8 has one per part): Part 1 alone gives the first
 
 **In (Part 1):** the list above, and their tests.
 
+**In (Part 2):** the composer, question cards, New Session, footers and the header menu, the browser check of a whole session at two widths, and CI building the fake agent it needs; and their tests. Nothing in the Rust workspace changes, and no dependency is added.
+
 **Out** (see "After this plan"):
 - everything that acts on a session (Part 2): answering, sending, cancelling, config, resume, park, close, delete, New Session;
 - `catalog_changed` on the item stream (4a-ii): handled when it comes, and the catalogue is fetched on open (decision 4);
 - the PWA and its service worker (4d): a notification's link is `/sessions/<id>`, which Task 5 restores;
 - hosts, hats and settings screens (4d), the gateway screens (4e).
+
+**Out of Part 2** (see "After this plan"): a host's agents from `GET /api/hosts/{id}/agents` (4d; `agentsFor` stands in), the hat re-assignment control, Settings and a phone's Sign out (4d-ii), push (4d), images in New Session's first prompt, and `inert` behind every `ConfirmDialog` (4d).
 
 **Where the hand-offs land:**
 
@@ -96,10 +120,19 @@ Two PRs, not one (the spec's §8 has one per part): Part 1 alone gives the first
 | frontend F-4, F-7–F-11, F-14, F-19 | Decisions 5–11, 14; Tasks 2–5 |
 | client view §9 OQ1: the windowing threshold | Decision 20; Tasks 4, 5 |
 | 4b deferred: `inert` behind dialogs, a failed sign-out, `MESSAGES` own keys | A failed sign-out and own keys: done by plan 4d-i (#109). `inert` only partly: the step-up dialog makes the page inert, 4d-i's `ConfirmDialog` does not. Part 2 reuses `ConfirmDialog` and `SignOut`, and amends brief item 36 instead (Part 2's decision 36, PR 4c-ii; `inert` behind every `ConfirmDialog` is a follow-up for 4d) |
+| Part 1: `QuestionCard`'s actions through its environment; the env passed down memoised | The answer book in the env (decision 21); Tasks 6, 7 |
+| Part 1: "Send again" only with a handler; `setCatalog` for a config's 202 | Decisions 32, 33; Task 6 |
+| Part 1: the composer and the footers under the transcript; New Session replaces `/new`'s placeholder | Tasks 6, 8, 9 |
+| 4a-ii O-6: a `turn_not_delivered` turn's content, fetched to send again | Decision 33; Task 6 |
+| 4b deferred: the Markdown list markers in a real browser | Decision 45; Task 10 |
+| 4d-i: `ConfirmDialog`, `SignOut`, `scratchEnv` | Decisions 34, 36, 44; Tasks 6, 9, 10 |
+| frontend F-15, F-16, F-17 | Decisions 21, 25, 34; Tasks 6, 7 |
 
 ## Decisions this plan makes where the specs are silent
 
 Two reviews by a stronger model (opus) on the maintainer's behalf shaped these: the security review of Part 1 (2026-10-02), which approved after amendments A1–A4 and ruled on decisions 8, 11 and 20, and its scoped re-confirmation (2026-10-03), which added R1–R3. Each amendment is marked where it lands.
+
+Part 2's decisions (21–46) were shaped by the security review of Part 2 (2026-10-03), which approved after amendments MUST-1..3, took SHOULD-1..5 too and ruled on 18 open items; by its re-confirmation (2026-10-03), which added NEW-1 and asked for MUST-3's write-back; by the task reviews of Tasks 6–10, whose findings were all taken but one, declined (decision 45); and by the whole-branch review and the review of its fixes (2026-10-03), whose fixes landed in Tasks 6 and 9 (decisions 33, 34). Each amendment, ruling and fix is marked where it lands.
 
 Decisions are numbered as the build brief numbered them, so a code comment's "plan 4c decision N" names one of these. Part 1 holds 0–20; Part 2 adds 21–46.
 
@@ -169,6 +202,59 @@ Decisions are numbered as the build brief numbered them, so a code comment's "pl
 - Since Task 5 the spec measures the windowed first render (the newest 200 rows and "Load earlier"; it asserts both, so a change of the window fails it), then the reveal: "Load earlier" clicked until none is left, each click timed, and all N rows asserted at the end; then scrolling over all N. Taken again at N = 500 (a load of 14 on 18 cores): first render 132 ms (×4: 961 ms), the whole reveal 298 ms in 2 clicks (×4: 1326 ms). The scroll numbers of that run are not valid by the spec's own rule (the browser held about 7.5 frames a second standing still).
 - The spec stays in the tree, skipped unless `HENNERY_WINDOWING=1`, to take the numbers again on a quiet machine.
 
+**Part 2 (PR 4c-ii): decisions 21–46,** numbered as the build brief's items 21–46, and written as the code does them. Where the code departs from the brief, the decision says so ("amends brief item N"). The security review's amendments (MUST-1..3, SHOULD-1..5), its re-confirmation's (NEW-1), its rulings on the builders' 18 open items ("ruling N") and the task reviews' fixes ("task review") are marked where they land.
+
+21. **Actionability is the server's `answerable`** (F-15), and nothing else: a permission with no options is never actionable, whatever `answerable` says (the server does not look at the options). Cards are rows of the transcript, keyed by item id (`question:<pending_id>`). What the tab did with each question lives in an **answer book**, one per session view and outside React's tree (`store/useAnswer.ts`), so a card rendered again or remounted (the window moved) loses nothing.
+22. **The delivery states** (`lib/delivery.ts`): the frontend spec's §6.3 table, top row first, from `delivered`, `state`, `answered`, `answerable` and `reason`:
+    - `delivered: true` → "Answered"; `state: cancelled` → "The agent stopped waiting (<reason in words>)", with "Answer as a new message"; `delivered: false` → "Sent, but the agent was no longer waiting"; `state: delivered` with no verdict → "Answered"; `answered` → "Sent", with "delivers when the host reconnects" while the host is away (below); a permission with no options → "This question cannot be answered here: stop, park or close the session"; `answerable` → "Needs your answer".
+    - The seven reasons have words (the agent withdrew the question, the host restarted, …); a reason not known shows as sent. **The reason is looked up by own key only** (amended: SHOULD-1): a reason `constructor` showed native code.
+    - **Whether the host is away follows the host while the view is open** (`lib/hostAway.ts`; task review): the session's `presumed_parked` (the summary, kept current by the list stream) is away; else the newest host marker newer than the first page says it (`host_offline` away; `host_back`, `host_restarted` and `resumed` back; newest by `ts`, a tie to the later item, a `ts` that does not parse not read); else the seed, `connected` from the view's one `GET /api/hosts`, read on open. The first page's markers, and older pages loaded later, are history the seed already says; a resync's new markers count. No event fetches. Before, the hosts list read once decided it, so the note neither came when the host dropped nor went when it came back. The footer's "The host is offline" reads the same rule (decision 35). One gap stays: a session the list does not hold has its `presumed_parked` from its detail, read once.
+    - What the tab did adds to that: "Sending…" while the answer is in flight (held over any upsert), then "Sent", or a 409's or a 404's words (decision 27). Each outcome holds only while the item is at the version it was answered at: the next upsert says the rest.
+23. **The verdict is monotonic in the client too:** the item store folds a held `delivered: true` into any later version that lacks it, and that question is then not answerable (`foldVerdict`). Versions never go back already (decision 4).
+24. **A permission:** its options are buttons in the adapter's order, styled by `option_kind` only, never by their agent-chosen names: `reject_*` destructive, `allow_always` ghost, anything else primary. An option posts `{option_id}` to `/api/sessions/{id}/pending/{pending_id}/answer`, both ids encoded. A card that cannot answer lists the options as text.
+25. **Digits and the focus** (F-16, frontend §10):
+    - Keys 1–9 answer the option at that place, from a listener on the card (`tabIndex=0` while it can answer), never on the window; never from an input, a textarea, a select or a contenteditable, never with Ctrl, Cmd or Alt; on a desktop only (`(min-width: 768px) and (pointer: fine)`), where each option shows its digit, outside its accessible name.
+    - A question that opens at the tail after the first page has loaded may take the focus once (never one that was there on load, or was prepended; **and never one that came with a resync**, task review: the book takes a new baseline with every page that replaces the items, even when the last item it had seen survives). **It moves only when the composer is empty and the focus is free** (amended: MUST-1): nothing is focused, or a control inside the transcript that takes no typing. Never from any field (a form card's included: stricter than the review asked), the session menu, a dialog or the list's search. Before the amendment, a card opening while the operator sat in an empty composer took the focus, and the next key `1` answered the agent's first option, which may be `allow_always`.
+    - **Amended at re-confirmation (NEW-1):** the focus is not free in another card that can still answer. Before, a second question opening while the first held the focus took it, and the `1` meant for the first answered the second. A card that opens without taking the focus is said instead, in the view's one polite live region (`role="status"`, `aria-live="polite"`): "New question: <agent> asks for permission" or "… asks for an answer", never the agent's title; never a question from the first page, nor one that took the focus; the same words twice in a row differ by a trailing no-break space, so a screen reader says them again.
+    - **Once a question is answered, the focus stays where it is**, and no shortcut jumps to the next open question (the maintainer's ruling, 2026-10-03, given through the lane; to be revisited once testers have used it).
+26. **A form** (`lib/elicitation.ts`, `Elicitation.tsx`): single selects are radios, multi selects checkboxes, text an input, an unsupported field says so, and every hint shows. `form_supported: false` offers Decline and Cancel only and never invents a value. A text paired `exclusive` with a select answers instead of it: choosing clears the text, typing a real answer clears the choice; a `note` clears nothing; whitespace is no answer. Send appears once one real answer exists and every `required` key has one (an exclusive text answers its select). Accept sends `{action: "accept", content}`, Decline and Cancel `{action}`; nothing is chosen or sent on its own. **The content is built with `Object.defineProperty`** (amended: SHOULD-2): a field the agent keys `__proto__` lost its answer to `content[key] = answer`. A half-filled form lives in the answer book by question id, in memory, dropped with the view (ruling 7). **A form that names one field twice is refused** (task review): its content is keyed by field, so it could not carry an answer to each; it shows its fields, says why, and offers Decline and Cancel only.
+27. **Answer races:** one answer in flight per question (the book refuses a second, and the controls are disabled); a 202 shows "Sent" until the next upsert; 409 `already_answered` says "Already answered from another device", 409 `not_open` "This question is no longer open" (two wordings, not one: ruling 8); 404 "This question is gone"; any other refusal shows its message beside the controls. The route never asks for a step-up (`stepUp: false`): a 403 is an error, never a dialog.
+28. **"Answer as a new message"** (amends brief item 28; ruling 6): offered on a question the agent stopped waiting on, and only when the view gives the seam. The card hands over the question's text only (a permission's title, an elicitation's message); the view words the draft `You asked: <question> My answer: ` (no second stop after `?`, `.` or `!`), labelled "Answering a question as a new message", the cursor at its end. **It never resumes and never sends:** the operator writes the answer and sends it. On a parked, closed or failed session, the composer's "Resume and send" (decision 33) or the footer's Resume (decision 35) runs it again. The brief said "resume if needed, then prompt"; the review approved the deviation (the operator has to type the answer anyway, and a card that resumes a session on its own is the less safe default) and asks for a spec write-back (see "After this plan"). A prefill is added after a blank line to whatever the draft holds, never replacing it (ruling 1); its label is lost on a session switch, and the words themselves say what it is (ruling 3).
+    - **The window holds no answerable question above it** (extends decision 20): when one the card can answer (`isAnswerable`: a permission with no options does not count, task review) is older than the tail, the window starts at it, and stays there once it is answered. Being answerable it is pending in the open turn, so this reaches back only as far as that turn.
+29. **Keys:** Cmd/Ctrl+Enter sends, Enter is a new line, and a key in an input method's composition does nothing. A Send button shows on every width; while a turn runs a Cancel takes its place.
+30. **Images** (`lib/attachments.ts`): pasted, dropped or picked; PNG, JPEG, GIF or WebP, at most 5 MiB each, 20 per prompt and 16 MiB in all; each refused file named, with why. They are hidden only when the host's capabilities are known and lack `images` (none known: shown); a paste or a drop there says "This host takes no images." (ruling 5). The `[Image #N]` markers of one action are spliced in at once, at the cursor, over the selection. **N runs from 1 to 999999** (task review): a marker of seven digits, or with a leading zero, is plain text, because `Number` loses precision past 2^53 and two images came to share one number; an image past #999999 is refused. N never comes back within a draft, also across a session switch and past any marker already in the text (a restored draft, a turn put back). **The text is the source of truth:** only images whose marker is still there are sent, each at its first marker, as ordered ACP blocks. Each preview's object URL lives as long as its chip: revoked on remove, send and unmount.
+    - **While a prompt is being sent, nothing is added** (task review): a paste, a drop, a pick, "Answer as a new message" or "Send again" (also one asked for before the send) is refused, with "Not added: a prompt was being sent. Add it again." Before, the 202 cleared the draft, and whatever had landed during the send went with it, unsent.
+    - **An agent's words never link an image** (task review): in the words "Answer as a new message" puts in the draft, each `[Image #` gets a word joiner (U+2060, invisible) after its bracket, so an agent's `[Image #1]` never brings back an image the operator took out of the text. Only there: "Send again" puts the operator's own turn back byte for byte. **Known edge:** a literal `[Image #N]` in a turn put back can therefore link an image N the draft already holds.
+31. **Slash commands** from `catalog.commands`, read defensively, each name once in the adapter's order: the menu shows while the text is `/` and a word with no space; names that start with it, then names that contain it; ↑/↓ wrap, Enter or a click picks (`/name `), Escape dismisses it until the next edit.
+32. **The config bar:** a switcher per option the catalogue holds, a select (with its groups) or an on/off box; the model, then the mode (by category, else the conventional id that no category claims), then the rest by id, whatever order the adapter reports them in. A pick shows at once, is replaced by the 202's catalogue (`setCatalog`), and is taken back on any refusal, with its words (409 `not_attached`, `unknown_option`, `host_offline`; 400 `invalid`; 502 `config_failed`). A value the adapter reports but does not list shows as held.
+33. **Send and Cancel:**
+    - Send is disabled while `activity` is `running` or `blocked`, and Cancel takes its place. Cancel shows the open turn's real outcome (completed "The turn finished before it could be stopped.", cancelled "Stopped.", failed, interrupted); `no_open_turn` and `not_running` say "Nothing was running.".
+    - One send at a time: while one is in flight the draft is read-only and Send disabled, and a second click before the composer renders again is refused (the fix review). Whatever its outcome, the draft is editable again after it (the whole-branch review's I-1).
+    - Every prompt refusal has its words and **keeps the draft**: `not_attached` offers "Resume and send" (never while the session is starting, which says to send again once it runs: ruling 5; disabled while the draft is blank, I-1; it resumes through the view's one resume, the footer's, M-4), `host_offline`, `turn_in_progress`, `images_unsupported`, `empty_prompt`, `invalid_content`, `invalid`, `content_too_large`, `body_too_large`, and 503 `delivery_unknown` ("Delivery unknown: the outcome shows when the host reconnects."). Codes are looked up by own key; these words are the composer's, apart from the app-wide messages.
+    - **"Send again"** on a `turn_not_delivered` marker (amends brief item 33; ruling 4): the stored turn comes back **as a draft**, labelled, after what the draft holds; it is never sent on its own. Its images are fetched back by hash (`/api/attachments/<sha256>`, encoded) as files, encoded when the operator sends. All or nothing: a block that is not text or an allowed image, an image gone, the limits, or a host without images leave the draft as it was and say why.
+34. **Per session** (F-17): the composer is remounted by session id. The draft's text is kept in `sessionStorage` (`hennery.draft.<id>`), so it survives a reload and a switch; its images in memory, per session. A send clears both at the source, so an answer that comes after a switch clears the right session; a deleted session's are dropped. **A successful sign-out removes every `hennery.draft.` key, and only those, and every held image** (amended: MUST-2; ruling 2): the text is the half most likely to hold a pasted secret. A failed sign-out, and a 401's redirect to the login screen, keep them, so work survives an expired session. Other tabs keep their own `sessionStorage` until they close.
+    - **A send in flight is held per session too** (`lib/sending.ts`, outside React; the whole-branch review's M-5): a composer mounted again before the answer (a switch away and back) is read-only until it ends, and takes its outcome, a 202 clearing the draft it shows. A send whose work rejects still ends, its error in words; a successful sign-out lets go of every send in flight (the fix review). Accepted: a request that hangs keeps that session's composer read-only until it settles, as the client sets no timeout (the fix review's fifth minor; a timeout for every request is the client's, not this plan's).
+35. **Footers** (`SessionFooter.tsx`), under the composer, which stays whatever the lifecycle so a draft is never lost:
+    - parked or closed: "Resume", with a line when the host is away, by the cards' rule (decision 22; task review): presumed parked, "it may still be running this session"; otherwise "resume once it is back";
+    - starting: a spinner, as a status;
+    - failed: why, in words; a reason not known shows as sent, in a `<bdi>` (amended: SHOULD-3; ruling 13). A failed session offers Resume too (ruling 11: ACP core §4.2, `failed` → resume → `starting`), except `agent_has_no_record`, which offers "Start a new session in this project" (`/new?host=…&cwd=…`). `agent_not_logged_in` says how to log the agent in on that host (`claude`, `codex`, or any other), then offers Resume.
+    - A refused resume says why in the footer's words, until the lifecycle changes (the footer is keyed by it). `hat_mismatch` names the session's hat and the hat its directory now resolves to (the names from `GET /api/hats`, the directory's hat from `POST /api/hats/resolve`) and links to Hats: "Change the path rules in Hats, then resume." **The words "or re-assign the session" are gone** (amended: SHOULD-4; ruling 14): the web UI has no such control yet (see "After this plan").
+36. **The header menu** (`SessionMenu.tsx`), a disclosure and not an ARIA menu: Park for an active session on a host that announced `park` (none while its capabilities are unknown); Close for any session not closed, without a confirmation (Resume undoes it: ruling 12); while any of its actions runs, every entry is disabled, Delete included (task review); a refusal shows under the header, as text, until the next menu action (ruling 16). "Delete session" opens a confirmation (4d-i's `ConfirmDialog`: modal, the focus held in it, a step-up can open over it); the DELETE goes through the client, which asks for the step-up; a 404 is as deleted. The deleted view says what the delete left of the agent's transcript on the host (partial or pending, and the host's notes), and the session leaves the list.
+    - **Amends brief item 36 (MUST-3, option (b)):** the page behind the dialog is **not** made `inert`; only the step-up dialog does that (`App.tsx`). A card opening behind the dialog cannot take the focus, or a digit, because of decision 25's rule; a test opens the Delete dialog, opens a question behind it, presses `1`, and sees no answer sent. `inert` behind every `ConfirmDialog` (Hosts, Hats, this menu) is a follow-up for 4d.
+    - The brief's "a failed sign-out must not land on /login" was done by plan 4d-i's `SignOut`.
+37. **Hosts:** connected first, offline listed but disabled, revoked never offered; the first connected one is picked. `/new?host=<id>&cwd=<path>` fills both, but only for a connected host; otherwise a notice says why and nothing is picked in its place (ruling 15: a crafted link only prefills; Start is explicit, and the hat preview shows).
+38. **Agents** behind one function, `agentsFor(client, hostId)` (`lib/agents.ts`): today it answers `claude` and `codex` (available, auth unknown) and an "Other…" name typed by hand; 4d's `GET /api/hosts/{id}/agents` changes only that function, and the local types that mirror its shape (ruling 9: approved; the server refuses an unknown agent with 502 `unknown_agent`). The picker lists `available` agents only; auth `missing` is listed, disabled, with its note; `unknown` may be picked; images are hidden only on `images: false`. **A host change resets the agent** (amended by the task review, as frontend §7 says: "Changing the host resets agent"): the branch that replaced an agent the new host lacked, with a notice, could never run after that reset, and is gone.
+39. **The project:** the host's recents (`GET /api/hosts/{id}/projects`, the recents of `recents_hat_id`, asked again with `?path=` once the path resolves to another hat) and its repositories, merged, deduplicated by path, recents first; ranked exact, prefix, substring, subsequence, case-insensitive and stable; colliding names as `parent/name`. Text starting with `/` or `~` is a path as typed; a search is no path until one is picked; a `/new` link's `cwd` is taken as the path only when it is a literal path, else it is only the search's text (task review). Browsing (`…/browse?path=`) starts at the host's home, else its first workspace root. The picker is remounted per host. Its combobox names the option the arrow keys reach (`aria-activedescendant`, each option with an id) and its list (`aria-controls`) only while the list shows (task review).
+40. **The hat preview:** `POST /api/hats/resolve {host_id, path}` once the path has rested 300 ms; an answer for a path or host no longer chosen is dropped. It says "Starts in the hat <name> at <canonical path>", and adds that the directory does not exist yet, or is not a directory.
+41. **Start:** `POST /api/sessions {host_id, agent, cwd}`, then the first prompt, if any, as its own `POST …/prompt` (the server takes no first prompt with a start yet). The first prompt is plain text, no images (ruling 10). Refusals in words: `hat_ambiguous`, `host_offline` and `invalid_cwd` (the server's words, which name the path or say that a first start installs the agents), `unknown_host`, a 502 with its code. A 503 `delivery_unknown` with a `session_id` goes to that session with a notice that it may still start, the prompt kept as its draft; the notice mentions a kept draft only when a prompt was kept (`?notice=start_unknown_draft`, else `start_unknown`; task review). **A first prompt that is refused also opens the session** (amends brief item 41), with a notice and the prompt kept as its draft. The notice travels in the link as a code only (`?notice=…&code=…`, `^[a-z0-9_]{1,64}$`, worded by own key); the view reads it once and drops it from the address, so a reload does not show it again.
+42. **Changing the host** resets the agent, the path, the picker and its listing, in the click handler (never in an effect, so a prefilled path survives the prefilled host being chosen on load).
+43. **Then** `/sessions/<id>`: the address is the selection (decision 11).
+44. **The browser check's harness** (amends brief item 44): not `hennery up`, but the collector the earlier browser checks start (the built binary on a fresh data directory and a port of its own) and a test host: `host join` with the exact command the Hosts screen shows, then `host run --agent claude=<target/debug/hennery-fake-acp>`, with the fake's script in `HENNERY_FAKE_ACP_SCRIPT` (one permission ask per prompt, the answer echoed, then a Markdown list). A crash is a SIGKILL of `host run` by its own pid; the test runs it again (nothing supervises it). Every process starts through `spawn.ts` in main's allowlisted scratch environment (#114: only `PATH`, the locale, the time zone and `TMPDIR` from the runner; its home and XDG directories under a temp directory). A host's agents may be given `HENNERY_FAKE_ACP_SCRIPT` and no other `HENNERY_*` variable, and neither `HOME` nor an XDG directory (`hostEnv`, tested; the last, task review), so nothing a test adds moves the host's data directory: the host takes no `--data-dir`, its default living under the scratch home (#111). The session's start may take 45 s (a fresh binary's first run on macOS), and each assertion 10 s (a round trip through the collector, the host and the agent; task review). Each is stopped by its own pid (SIGTERM, then SIGKILL), and its directory removed. A sentinel `HENNERY_LOG_DIR` in the runner's environment stays empty.
+45. **At 1280 and 390 px,** each width with a collector and a host of its own: setup and sign-in; pairing; New Session with a first prompt; the permission answered from its card while the badge says "Waiting on a question"; the message's list markers in computed style; the composer's Send on screen and on top, a phone's way back on screen and 44 px tall, a desktop's hidden; the crash, the `host_restarted` marker and Parked; Resume from the footer and a second question answered Reject; on a phone, the menu's controls and Resume at least 44 px tall; no CSP violation. The hat preview's line is matched whole, with the project's path escaped (amended: SHOULD-5; it was a substring match). A phone has no Sign out (it lives in the desktop rail; frontend spec puts Account in Settings): at 390 px the check clears the cookies instead (ruling 17; an obligation for 4d-ii). `host_back` is not exercised: the collector's offline threshold is 10 minutes, and the marker is unit-tested (ruling 18). Four locators find by class (`.session-head .badge`, `.bubble.user`, `.marker-host_restarted .divider > span`, `.session-menu-list`): they are structural, not loose text, and the T8–10 task review called them acceptable; its M-9, to find them by role, is declined.
+46. **CI:** the web job builds the fake agent beside the binary: `cargo build -p hennery -p hennery-testkit --bins --locked`, one line.
+
+**The bundle** after Part 2 (decision 19): 215 kB gzip (702 kB raw), one chunk, as Vite reports it (under decision 19's 350 KiB).
+
 ## Global Constraints
 
 - After every task, in `web/`: `pnpm typecheck`, `pnpm test` and `pnpm build` pass (`nix develop -c sh -c 'cd web && pnpm …'` from the repository root). The Rust workspace is untouched by Part 1: its checks pass as on the base.
@@ -181,6 +267,7 @@ Decisions are numbered as the build brief numbered them, so a code comment's "pl
   - the contract's two greps, over tracked text and over `web/` including binary files, find none of the predecessor's name, the two company names, the commercial font's name, or home-directory paths, in this plan's diff;
   - test fixtures use `/srv/work/…` or `~/work/…`; no one's initials stand for the user;
   - commit subjects say what the code does.
+- **Part 2** changes nothing in the Rust workspace and adds no dependency (`pnpm-lock.yaml` is untouched). Its browser check needs `web/dist/` built first, then the binary and `hennery-fake-acp` (`cargo build -p hennery -p hennery-testkit --bins`): the binary embeds the UI.
 
 ## Review Focus
 
@@ -202,6 +289,24 @@ Decisions are numbered as the build brief numbered them, so a code comment's "pl
 6. **Push links** (decision 11, F-19).
    - Expected: `/sessions/<id>` shows that session outside the hat and outside the loaded rows, and auto-select never overrides it.
    - Tests: Task 5.
+7. **An agent never answers for the operator** (decisions 24–26).
+   - Expected: digits answer only from the card itself, on a desktop, never from a field or with a modifier; a new card takes the focus only from an empty composer with the focus free, never from a field, the menu, a dialog or the list's search or another live card; a card that does not take it is said in the view's polite live region; a form is never filled or sent on its own; options are styled by kind, never by name.
+   - Tests: Task 7 `QuestionCard.test.tsx`, `delivery.test.ts`, `Session.answer.test.tsx`.
+8. **A card says what is true** (decisions 22, 23, 27).
+   - Expected: a `delivered: true` is never undone; one answer in flight; a 409's and a 404's own words; no step-up on the answer route.
+   - Tests: Task 7 `delivery.test.ts`, `QuestionCard.test.tsx`, `items.test.ts`.
+9. **Nothing is sent on the operator's behalf** (decisions 28, 33).
+   - Expected: "Answer as a new message" and "Send again" only fill the draft; neither resumes nor sends.
+   - Tests: Task 6 `Session.seams.test.tsx`, `Session.composer.test.tsx`.
+10. **A draft stays with its session, and goes with a sign-out** (decision 34).
+    - Expected: a draft or an image is never shown in, or sent to, another session; a successful sign-out removes every `hennery.draft.` key and every held image, a failed one keeps them.
+    - Tests: Task 6 `Composer.test.tsx`, `Session.composer.test.tsx`, `drafts.test.ts`, `App.test.tsx`; Task 9 `SignOut.test.tsx`.
+11. **Text from a server, an agent or a link stays text** (decisions 30, 35, 41).
+    - Expected: a start's notice carries a code, worded by own key; an unknown failure reason is shown as sent, in a `<bdi>`; only images of the four types, within the limits, are attached.
+    - Tests: Task 8 `start.test.ts`, `Session.start.test.tsx`; Task 9 `Session.footer.test.tsx`; Task 6 `attachments.test.ts`.
+12. **The browser check's processes are its own** (decision 44).
+    - Expected: every process starts in a scratch environment, a host's agents get no `HENNERY_*` variable but the fake's script, and each is stopped by its own pid.
+    - Tests: Task 10 `e2e-host-env.test.ts`, `sessions.spec.ts` ("wrote nothing where the runner's own environment pointed").
 
 ## File structure
 
@@ -212,8 +317,13 @@ Decisions are numbered as the build brief numbered them, so a code comment's "pl
 | `web/src/components/{SessionList,SessionRow,SessionScope,HatSwitch,Shell}.tsx`, `web/src/lib/{status,hats,agent}.ts`, `web/src/hooks/useNow.ts`, `index.css`, tests; `web/src/screens/Hosts.test.tsx` (the list's mount read of `GET /api/hosts`) | The list | 3 |
 | `web/package.json`, `pnpm-lock.yaml`, `web/src/screens/Session.tsx`, `web/src/components/{Transcript,SessionHeader,StepList,Markdown,ItemBoundary}.tsx`, `components/items/*`, `web/src/api/names.ts`, `index.css`, tests; `web/e2e/windowing.spec.ts` | The view | 4 |
 | `web/src/components/{Shell,SessionLink.test}.tsx`, `web/src/screens/Session.tsx`, `web/src/store/useSessionItems.ts`, tests; `web/vite.config.ts`, `web/src/test-setup.ts`; `web/src/test/{textLocators,text-locators.test}.ts`, `web/e2e/{manage,shell}.spec.ts` | Links, the header, the window; the tests' time; the locator guard | 5 |
+| `web/src/components/{Composer.tsx,composerWords.ts,SignOut.tsx}`, `web/src/components/items/types.ts`, `web/src/lib/{attachments,catalog,drafts,sendAgain,sending,image}.ts`, `web/src/api/{turns,errors,view}.ts`, `web/src/screens/{Session.tsx,test-session.ts}`, `web/src/index.css`, tests | The composer | 6 |
+| `web/src/lib/{delivery,elicitation}.ts`, `web/src/store/{useAnswer,items}.ts`, `web/src/api/answer.ts`, `web/src/hooks/useAnnouncement.ts`, `web/src/components/{Transcript.tsx,composerWords.ts}`, `web/src/components/items/{QuestionCard,Elicitation}.tsx`, `items/types.ts`, `Session.tsx`, `test-session.ts`, `index.css`, tests | Cards | 7 |
+| `web/src/screens/NewSession.tsx`, `web/src/components/{ProjectPicker,Shell}.tsx`, `web/src/lib/{agents,projects,start,hostAway}.ts`, `web/src/api/{client,errors}.ts`, `web/src/store/useAnswer.ts`, `Session.tsx`, `index.css`, tests | New Session | 8 |
+| `web/src/components/{SessionFooter,SessionMenu,SessionHeader,Shell,Composer}.tsx`, `sessionWords.ts`, `web/src/components/items/Marker.tsx`, `web/src/store/{useSessionList,useSessionItems,useAnswer}.ts`, `web/src/api/turns.ts`, `web/src/lib/start.ts`, `web/src/router.tsx`, `NewSession.tsx`, `Session.tsx`, `test-session.ts`, `index.css`, tests | Footers and the menu | 9 |
+| `web/e2e/{sessions.spec,host}.ts`, `web/playwright.config.ts`, `web/src/e2e-host-env.test.ts`; `.github/workflows/ci.yml` | The browser check; CI | 10 |
 
-All commands run from the repository root inside the dev shell (`nix develop -c …`). Work on a feature branch off `main` (`plan/frontend-4c`).
+All commands run from the repository root inside the dev shell (`nix develop -c …`). Work on a feature branch off `main` (`plan/frontend-4c-i` for Part 1, then `plan/frontend-4c-ii` on it for Part 2).
 
 **Reading the steps:** each code block is preceded by exactly one of these instructions, and it means exactly this:
 - "Create `path`:" makes a new file with the block, and a final newline.
@@ -11143,6 +11253,13353 @@ git add web
 git commit -m "test(web): guard against loose text locators in the web tests"
 ```
 
+---
+
+### Task 6: The composer
+
+A composer under each session's transcript: text and images, slash commands, the config bar, Send and Cancel, a draft per session, and the seams the cards and the markers use (decisions 29–34).
+
+**Files:**
+- Create: `web/src/components/Composer.tsx`, `composerWords.ts`; `web/src/lib/attachments.ts`, `catalog.ts`, `drafts.ts`, `sendAgain.ts`, `sending.ts` (a send in flight, per session); `web/src/api/turns.ts`; `web/src/screens/test-session.ts` (a stubbed server for the session view's tests); their tests, and `web/src/screens/Session.composer.test.tsx`, `Session.seams.test.tsx`.
+- Modify: `web/src/screens/Session.tsx` (the composer under the transcript; the hosts read once for the header and the composer; the seams `onSendAgain`, `onAnswerAsMessage`, `composerEmpty`; a deleted session's draft and images dropped), `web/src/components/items/types.ts` (the seams), `web/src/components/SignOut.tsx` (a sign-out forgets every draft and image), `web/src/api/errors.ts` (own keys only), `web/src/lib/image.ts` (`ALLOWED_IMAGE_TYPES` exported), `web/src/api/view.ts` (the undelivered turn's GET takes a signal), `web/src/index.css` (the draft's label), `web/src/App.test.tsx`, `web/src/api/errors.test.ts`.
+
+- [ ] **Step 1: Write the tests**
+
+Test files: `web/src/App.test.tsx`, `web/src/api/errors.test.ts`, `web/src/api/turns.test.ts`, `web/src/components/Composer.test.tsx`, `web/src/lib/attachments.test.ts`, `web/src/lib/catalog.test.ts`, `web/src/lib/drafts.test.ts`, `web/src/lib/sendAgain.test.ts`, `web/src/lib/sending.test.ts`, `web/src/screens/Session.composer.test.tsx`, `web/src/screens/Session.seams.test.tsx`, `web/src/screens/test-session.ts`.
+
+In `web/src/App.test.tsx`, replace:
+
+  ```tsx
+  import App from './App'
+  import { FULL, GATEWAY, json, stubServer } from './test-server'
+  ```
+
+with:
+
+  ```tsx
+  import App from './App'
+  import { heldFor, hold } from './lib/attachments'
+  import { sendingFor, track } from './lib/sending'
+  import { FULL, GATEWAY, json, stubServer } from './test-server'
+  ```
+
+In `web/src/App.test.tsx`, replace:
+
+  ```tsx
+  afterEach(() => at('/'))
+  ```
+
+with:
+
+  ```tsx
+  afterEach(() => {
+    at('/')
+    sessionStorage.clear()
+  })
+  ```
+
+In `web/src/App.test.tsx`, replace:
+
+  ```tsx
+    it('signs out', async () => {
+      at('/settings')
+  ```
+
+with:
+
+  ```tsx
+    it('signs out, forgetting the images held for every draft', async () => {
+      at('/settings')
+      hold('s1', { attachments: [{ n: 1, file: new File(['x'], 'a.png', { type: 'image/png' }) }], nextN: 2 })
+  ```
+
+In `web/src/App.test.tsx`, replace:
+
+  ```tsx
+      expect(server.sent.some((s) => s.method === 'POST' && s.path === '/api/auth/logout')).toBe(true)
+    })
+  ```
+
+with:
+
+  ```tsx
+      expect(server.sent.some((s) => s.method === 'POST' && s.path === '/api/auth/logout')).toBe(true)
+      expect(heldFor('s1').attachments).toEqual([])
+    })
+
+    it('signs out, letting go of a send still in flight', async () => {
+      at('/settings')
+      track('s1', () => new Promise<never>(() => {}), String)
+      const server = stubServer({
+        'GET /api/capabilities': json(200, FULL),
+        'POST /api/auth/logout': new Response(null, { status: 204 }),
+        'POST /api/auth/passkeys/login/start': json(409, { code: 'no_passkeys', message: 'm' }),
+      })
+      render(<App fetchImpl={server.fetch} />)
+      expect(sendingFor('s1')).toBeDefined()
+      await userEvent.click(await screen.findByRole('button', { name: 'Sign out' }))
+      await waitFor(() => expect(location.pathname).toBe('/login'))
+      expect(sendingFor('s1')).toBeUndefined()
+    })
+
+    it('signs out, forgetting every draft’s text and keeping the rest of sessionStorage', async () => {
+      at('/settings')
+      sessionStorage.setItem('hennery.draft.s1', 'the token is in here')
+      sessionStorage.setItem('hennery.draft.s2', 'and another')
+      sessionStorage.setItem('hennery.hideClosed', '1')
+      const server = stubServer({
+        'GET /api/capabilities': json(200, FULL),
+        'POST /api/auth/logout': new Response(null, { status: 204 }),
+        'POST /api/auth/passkeys/login/start': json(409, { code: 'no_passkeys', message: 'm' }),
+      })
+      render(<App fetchImpl={server.fetch} />)
+      await userEvent.click(await screen.findByRole('button', { name: 'Sign out' }))
+      await waitFor(() => expect(location.pathname).toBe('/login'))
+      expect(sessionStorage.getItem('hennery.draft.s1')).toBeNull()
+      expect(sessionStorage.getItem('hennery.draft.s2')).toBeNull()
+      expect(sessionStorage.getItem('hennery.hideClosed')).toBe('1')
+    })
+  ```
+
+Create `web/src/api/errors.test.ts`:
+
+  ```ts
+  import { describe, expect, it } from 'vitest'
+  import { ApiFailure } from './errors'
+
+  describe('ApiFailure', () => {
+    it('gives its own wording for a code it knows', () => {
+      expect(new ApiFailure(409, { code: 'host_offline', message: 'srv' }).message).toBe('The host is offline.')
+    })
+
+    it('gives the server’s message for a code named like an Object property', () => {
+      for (const code of ['constructor', '__proto__', 'toString', 'hasOwnProperty']) {
+        const err = new ApiFailure(400, { code, message: `srv-${code}` })
+        expect(err.message).toBe(`srv-${code}`)
+        expect(err.code).toBe(code)
+      }
+    })
+  })
+  ```
+
+Create `web/src/api/turns.test.ts`:
+
+  ```ts
+  import { describe, expect, it } from 'vitest'
+  import { json, routed } from '../test-stream'
+  import { cancel, prompt, resume, setConfig } from './turns'
+
+  describe('turn routes', () => {
+    it('posts the prompt, cancel, config and resume of a session, its id encoded', async () => {
+      const t = routed(() => json({ turn_id: 't1' }, 202))
+      await prompt(t.client, 'a/b?c', [{ type: 'text', text: 'hi' }])
+      await cancel(t.client, 'a/b?c')
+      await setConfig(t.client, 'a/b?c', 'model', 'fast')
+      await resume(t.client, 'a/b?c')
+      const bodies = t.fetch.mock.calls.map((call) => (call[1]?.body === undefined ? undefined : JSON.parse(String(call[1].body))))
+      expect(t.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+        'POST /api/sessions/a%2Fb%3Fc/prompt',
+        'POST /api/sessions/a%2Fb%3Fc/cancel',
+        'POST /api/sessions/a%2Fb%3Fc/config',
+        'POST /api/sessions/a%2Fb%3Fc/resume',
+      ])
+      expect(bodies).toEqual([{ content: [{ type: 'text', text: 'hi' }] }, undefined, { config_id: 'model', value: 'fast' }, undefined])
+    })
+  })
+  ```
+
+Create `web/src/components/Composer.test.tsx`:
+
+  ```tsx
+  import '@testing-library/jest-dom/vitest'
+  import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+  import { createRef, useState } from 'react'
+  import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+  import { Client } from '../api/client'
+  import { ClientContext } from '../app-client'
+  import type { Capabilities, SessionCatalog } from '../generated/protocol'
+  import { forgetAllAttachments, heldFor } from '../lib/attachments'
+  import { forgetAllSends } from '../lib/sending'
+  import { Composer, STILL_SENDING, type ComposerHandle, type ComposerProps } from './Composer'
+
+  const WAIT = { timeout: 3000 }
+
+  interface Post {
+    path: string
+    body: unknown
+  }
+
+  type Handler = (method: string, path: string, body: unknown) => Response | Promise<Response>
+
+  function json(body: unknown, status = 200): Response {
+    return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } })
+  }
+
+  const accepted: Handler = () => json({ turn_id: 't-new' }, 202)
+
+  function catalogOf(model = 'a', mode = 'plan', cmds: unknown[] = []): SessionCatalog {
+    return {
+      session_id: 's1',
+      config_options: [
+        {
+          id: 'model',
+          name: 'Model',
+          category: 'model',
+          type: 'select',
+          currentValue: model,
+          options: ['a', 'b', 'c'].map((v) => ({ value: v, name: v.toUpperCase() })),
+        },
+        {
+          id: 'mode',
+          name: 'Mode',
+          category: 'mode',
+          type: 'select',
+          currentValue: mode,
+          options: [
+            { value: 'plan', name: 'Plan' },
+            { value: 'edit', name: 'Edit' },
+          ],
+        },
+        { id: 'think', name: 'Think', type: 'boolean', currentValue: false },
+      ],
+      commands: cmds,
+    } as SessionCatalog
+  }
+
+  type HostProps = Omit<ComposerProps, 'catalog' | 'onCatalog'> & { initialCatalog?: SessionCatalog | null }
+
+  /** The composer as the session screen holds it: the catalogue in state,
+   *  replaced by what `onCatalog` hands back. */
+  function Host({ initialCatalog = null, ...rest }: HostProps) {
+    const [catalog, setCatalog] = useState<SessionCatalog | null>(initialCatalog)
+    return <Composer {...rest} catalog={catalog} onCatalog={setCatalog} />
+  }
+
+  function mount(handler: Handler = accepted, props: Partial<HostProps> = {}) {
+    const posts: Post[] = []
+    const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = String(input)
+      const body = typeof init?.body === 'string' ? (JSON.parse(init.body) as unknown) : undefined
+      if ((init?.method ?? 'GET') === 'POST') posts.push({ path, body })
+      return handler(init?.method ?? 'GET', path, body)
+    })
+    const client = new Client({
+      fetch: fetch as unknown as typeof globalThis.fetch,
+      navigate: vi.fn(),
+      here: () => ({ pathname: '/sessions/s1', search: '' }),
+      stepUp: async () => {},
+    })
+    const base: HostProps = {
+      sessionId: 's1',
+      session: { lifecycle: 'active', activity: 'idle' },
+      capabilities: ['images'],
+      ...props,
+    }
+    const view = render(
+      <ClientContext.Provider value={client}>
+        <Host {...base} />
+      </ClientContext.Provider>,
+    )
+    const rerender = (next: Partial<HostProps>) =>
+      view.rerender(
+        <ClientContext.Provider value={client}>
+          <Host {...base} {...next} />
+        </ClientContext.Provider>,
+      )
+    const prompts = () => posts.filter((p) => p.path.endsWith('/prompt'))
+    return { ...view, rerender, posts, prompts, fetch }
+  }
+
+  const textarea = () => screen.getByLabelText('Prompt') as HTMLTextAreaElement
+  const type = (text: string) => fireEvent.change(textarea(), { target: { value: text } })
+  const sendButton = () => screen.getByRole('button', { name: 'Send' })
+
+  function png(name: string, body = name): File {
+    return new File([body], name, { type: 'image/png' })
+  }
+
+  function paste(...files: File[]) {
+    fireEvent.paste(textarea(), {
+      clipboardData: { items: files.map((f) => ({ kind: 'file', type: f.type, getAsFile: () => f })) },
+    })
+  }
+
+  let urls = 0
+  beforeEach(() => {
+    urls = 0
+    sessionStorage.clear()
+    forgetAllAttachments()
+    forgetAllSends()
+    URL.createObjectURL = vi.fn(() => `blob:u${++urls}`)
+    URL.revokeObjectURL = vi.fn()
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  describe('Composer: sending', () => {
+    it('Ctrl+Enter sends the prompt', async () => {
+      const c = mount()
+      type('hello')
+      fireEvent.keyDown(textarea(), { key: 'Enter', ctrlKey: true })
+      await waitFor(() => expect(c.prompts()).toEqual([{ path: '/api/sessions/s1/prompt', body: { content: [{ type: 'text', text: 'hello' }] } }]), WAIT)
+    })
+
+    it('Cmd+Enter sends the prompt', async () => {
+      const c = mount()
+      type('hello')
+      fireEvent.keyDown(textarea(), { key: 'Enter', metaKey: true })
+      await waitFor(() => expect(c.prompts()).toHaveLength(1), WAIT)
+    })
+
+    it('Enter alone sends nothing and leaves the newline to the text area', async () => {
+      const c = mount()
+      type('hello')
+      const notPrevented = fireEvent.keyDown(textarea(), { key: 'Enter' })
+      expect(notPrevented).toBe(true)
+      await new Promise((r) => setTimeout(r, 30))
+      expect(c.prompts()).toEqual([])
+    })
+
+    it('the Send button sends, then clears the text, the stored draft and the images', async () => {
+      const c = mount()
+      type('see ')
+      paste(png('a.png', 'ONE'))
+      await screen.findByRole('img', { name: 'Image #1' }, WAIT)
+      expect(sessionStorage.getItem('hennery.draft.s1')).toBe('see [Image #1] ')
+      fireEvent.click(sendButton())
+      await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+      expect(c.prompts()[0].body).toEqual({
+        content: [
+          { type: 'text', text: 'see ' },
+          { type: 'image', mimeType: 'image/png', data: btoa('ONE') },
+        ],
+      })
+      expect(sessionStorage.getItem('hennery.draft.s1')).toBeNull()
+      expect(screen.queryByRole('img')).toBeNull()
+      // A new draft: its images are numbered from 1 again.
+      paste(png('b.png'))
+      expect(textarea().value).toBe('[Image #1] ')
+    })
+
+    it('Send is disabled for an empty or blank draft', () => {
+      mount()
+      expect(sendButton()).toBeDisabled()
+      type('   \n ')
+      expect(sendButton()).toBeDisabled()
+      type('x')
+      expect(sendButton()).toBeEnabled()
+    })
+
+    it('keeps the draft in sessionStorage as it is typed, and brings it back', () => {
+      sessionStorage.setItem('hennery.draft.s1', 'kept from before')
+      mount()
+      expect(textarea().value).toBe('kept from before')
+      type('changed')
+      expect(sessionStorage.getItem('hennery.draft.s1')).toBe('changed')
+    })
+  })
+
+  describe('Composer: a turn in flight', () => {
+    it.each(['running', 'blocked'])('Cancel replaces Send while the session is %s, and Ctrl+Enter sends nothing', async (activity) => {
+      const c = mount(accepted, { session: { lifecycle: 'active', activity } })
+      type('queued')
+      expect(screen.queryByRole('button', { name: 'Send' })).toBeNull()
+      expect(screen.getByRole('button', { name: 'Cancel' })).toBeInTheDocument()
+      fireEvent.keyDown(textarea(), { key: 'Enter', ctrlKey: true })
+      await new Promise((r) => setTimeout(r, 30))
+      expect(c.prompts()).toEqual([])
+    })
+
+    it('offers Send, not Cancel, when idle', () => {
+      mount()
+      expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull()
+      expect(sendButton()).toBeInTheDocument()
+    })
+
+    it.each([
+      ['completed', 'The turn finished before it could be stopped.'],
+      ['cancelled', 'Stopped.'],
+      ['failed', 'The turn failed before it could be stopped.'],
+      ['interrupted', 'The turn was interrupted: the session was parked or closed, or its agent exited.'],
+    ])('cancel outcome %s is said as it was', async (outcome, words) => {
+      const c = mount(() => json({ turn_id: 't1', outcome }, 202), { session: { lifecycle: 'active', activity: 'running' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+      expect(await screen.findByText(words, undefined, WAIT)).toBeInTheDocument()
+      expect(c.posts.map((p) => p.path)).toEqual(['/api/sessions/s1/cancel'])
+    })
+
+    it.each([
+      [409, 'not_attached', 'The session is not running: there is nothing to stop.'],
+      [409, 'host_offline', 'The host is offline: the turn cannot be stopped from here until it is back.'],
+    ])('cancel refused with %i %s says why', async (status, code, words) => {
+      mount(() => json({ code, message: 'srv-x' }, status), { session: { lifecycle: 'active', activity: 'running' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+      expect(await screen.findByText(words, undefined, WAIT)).toBeInTheDocument()
+    })
+
+    it.each(['no_open_turn', 'not_running'])('cancel refused with %s says nothing was running', async (code) => {
+      mount(() => json({ code, message: 'srv-x' }, 409), { session: { lifecycle: 'active', activity: 'running' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+      expect(await screen.findByText('Nothing was running.', undefined, WAIT)).toBeInTheDocument()
+    })
+  })
+
+  describe('Composer: prompt refusals keep the draft', () => {
+    it.each([
+      [409, 'host_offline', 'The host is offline; send again once it is back.'],
+      [409, 'turn_in_progress', 'A turn is still running: wait for it to end, or stop it, then send again.'],
+      [409, 'images_unsupported', 'This host takes no images: remove them, then send again.'],
+      [400, 'empty_prompt', 'There is nothing to send: write something, or attach an image.'],
+      [400, 'invalid_content', 'This prompt holds something that cannot be sent (srv-x).'],
+      [400, 'invalid', 'The prompt was refused as not valid (srv-x).'],
+      [413, 'content_too_large', 'The prompt is too large (srv-x).'],
+      [413, 'body_too_large', 'The prompt is too large to send: take out some images, or send them in parts.'],
+      [503, 'delivery_unknown', 'Delivery unknown: the outcome shows when the host reconnects.'],
+    ])('refusal %i %s keeps the draft and says why', async (status, code, words) => {
+      mount(() => json({ code, message: 'srv-x' }, status))
+      type('my words ')
+      paste(png('a.png'))
+      await screen.findByRole('img', { name: 'Image #1' }, WAIT)
+      fireEvent.click(sendButton())
+      expect(await screen.findByText(words, undefined, WAIT)).toBeInTheDocument()
+      expect(textarea().value).toBe('my words [Image #1] ')
+      expect(sessionStorage.getItem('hennery.draft.s1')).toBe('my words [Image #1] ')
+      expect(screen.getByRole('img', { name: 'Image #1' })).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Resume and send' })).toBeNull()
+    })
+
+    it('refusal not_attached keeps the draft and offers Resume and send', async () => {
+      mount(() => json({ code: 'not_attached', message: 'srv-x' }, 409))
+      type('later')
+      fireEvent.click(sendButton())
+      expect(await screen.findByText('The session is not running: resume it to send this.', undefined, WAIT)).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Resume and send' })).toBeInTheDocument()
+      expect(textarea().value).toBe('later')
+      expect(textarea().readOnly).toBe(false)
+    })
+
+    it.each([
+      ['empty', ''],
+      ['only blanks', '   \n '],
+    ])('Resume and send waits for words: a draft %s resumes nothing and stays editable', async (_what, words) => {
+      const c = mount(() => json({ code: 'not_attached', message: 'srv-x' }, 409))
+      type('later')
+      fireEvent.click(sendButton())
+      const button = await screen.findByRole('button', { name: 'Resume and send' }, WAIT)
+      type(words)
+      expect(button).toBeDisabled()
+      fireEvent.click(button)
+      await act(() => new Promise((resolve) => setTimeout(resolve, 200)))
+      expect(textarea().readOnly).toBe(false)
+      expect(c.posts.map((p) => p.path)).toEqual(['/api/sessions/s1/prompt'])
+      // Words again: the draft sends as before.
+      type('later again')
+      expect(button).not.toBeDisabled()
+      expect(sendButton()).not.toBeDisabled()
+    })
+
+    it('Send clicked twice before the composer renders again sends once', async () => {
+      const c = mount()
+      type('once')
+      const button = sendButton()
+      act(() => {
+        button.click()
+        button.click()
+      })
+      await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+      expect(c.posts.map((p) => p.path)).toEqual(['/api/sessions/s1/prompt'])
+    })
+
+    it('Resume and send clicked twice before the composer renders again resumes once', async () => {
+      const c = mount((_m, path) =>
+        path.endsWith('/resume')
+          ? json({ session_id: 's1', lifecycle: 'active' }, 202)
+          : json({ code: 'not_attached', message: 'srv-x' }, 409),
+      )
+      type('later')
+      fireEvent.click(sendButton())
+      const button = await screen.findByRole('button', { name: 'Resume and send' }, WAIT)
+      act(() => {
+        button.click()
+        button.click()
+      })
+      await waitFor(() => expect(c.posts).toHaveLength(3), WAIT)
+      await act(() => new Promise((resolve) => setTimeout(resolve, 50)))
+      expect(c.posts.map((p) => p.path)).toEqual([
+        '/api/sessions/s1/prompt',
+        '/api/sessions/s1/resume',
+        '/api/sessions/s1/prompt',
+      ])
+    })
+
+    it('Resume and send resumes the session, then sends the draft', async () => {
+      let attached = false
+      const c = mount((_m, path) => {
+        if (path.endsWith('/resume')) {
+          attached = true
+          return json({ session_id: 's1', lifecycle: 'active' }, 202)
+        }
+        return attached ? accepted('POST', path, undefined) : json({ code: 'not_attached', message: 'srv-x' }, 409)
+      })
+      type('later')
+      fireEvent.click(sendButton())
+      fireEvent.click(await screen.findByRole('button', { name: 'Resume and send' }, WAIT))
+      await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+      expect(c.posts.map((p) => p.path)).toEqual([
+        '/api/sessions/s1/prompt',
+        '/api/sessions/s1/resume',
+        '/api/sessions/s1/prompt',
+      ])
+    })
+
+    it('Resume and send shows a resume refusal and sends nothing', async () => {
+      const c = mount((_m, path) =>
+        path.endsWith('/resume')
+          ? json({ code: 'hat_mismatch', message: 'srv-x' }, 409)
+          : json({ code: 'not_attached', message: 'srv-x' }, 409),
+      )
+      type('later')
+      fireEvent.click(sendButton())
+      fireEvent.click(await screen.findByRole('button', { name: 'Resume and send' }, WAIT))
+      expect(await screen.findByText('This directory now belongs to another hat than the session’s.', undefined, WAIT)).toBeInTheDocument()
+      expect(c.prompts()).toHaveLength(1)
+      expect(textarea().value).toBe('later')
+      expect(textarea().readOnly).toBe(false)
+      expect(sendButton()).not.toBeDisabled()
+    })
+
+    it('Resume and send refused at the prompt leaves the draft editable', async () => {
+      const c = mount((_m, path) =>
+        path.endsWith('/resume')
+          ? json({ session_id: 's1', lifecycle: 'active' }, 202)
+          : json({ code: 'not_attached', message: 'srv-x' }, 409),
+      )
+      type('later')
+      fireEvent.click(sendButton())
+      fireEvent.click(await screen.findByRole('button', { name: 'Resume and send' }, WAIT))
+      await waitFor(() => expect(c.prompts()).toHaveLength(2), WAIT)
+      await waitFor(() => expect(textarea().readOnly).toBe(false), WAIT)
+      expect(textarea().value).toBe('later')
+      expect(sendButton()).not.toBeDisabled()
+    })
+
+    it('Resume and send goes through the onResume it is given', async () => {
+      const onResume = vi.fn(async () => {})
+      let resumed = false
+      onResume.mockImplementation(async () => {
+        resumed = true
+      })
+      const c = mount((_m, path) => (resumed ? accepted('POST', path, undefined) : json({ code: 'not_attached', message: 'x' }, 409)), {
+        onResume,
+      })
+      type('later')
+      fireEvent.click(sendButton())
+      fireEvent.click(await screen.findByRole('button', { name: 'Resume and send' }, WAIT))
+      await waitFor(() => expect(c.prompts()).toHaveLength(2), WAIT)
+      expect(onResume).toHaveBeenCalledOnce()
+      expect(c.posts.some((p) => p.path.endsWith('/resume'))).toBe(false)
+    })
+
+    it('a refusal code named like an Object property shows the server’s message', async () => {
+      mount(() => json({ code: 'toString', message: 'srv-x' }, 400))
+      type('x')
+      fireEvent.click(sendButton())
+      expect(await screen.findByText('srv-x', undefined, WAIT)).toBeInTheDocument()
+    })
+
+    it('a session still starting is never offered a resume', async () => {
+      mount(() => json({ code: 'not_attached', message: 'srv-x' }, 409), { session: { lifecycle: 'starting' } })
+      type('early')
+      fireEvent.click(sendButton())
+      expect(await screen.findByText('The session is still starting: send again once it runs.', undefined, WAIT)).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Resume and send' })).toBeNull()
+    })
+  })
+
+  describe('Composer: images', () => {
+    it('paste inserts an [Image #1] marker at the cursor and shows the image', async () => {
+      mount()
+      type('ab')
+      textarea().setSelectionRange(1, 1)
+      paste(png('a.png'))
+      expect(textarea().value).toBe('a[Image #1] b')
+      expect(await screen.findByRole('img', { name: 'Image #1' }, WAIT)).toHaveAttribute('src', 'blob:u1')
+    })
+
+    it('a drop of two images splices both markers in at once, over the selection', async () => {
+      mount()
+      type('ab XX cd')
+      textarea().setSelectionRange(3, 5)
+      fireEvent.drop(textarea().closest('.composer-box')!, { dataTransfer: { files: [png('1.png'), png('2.png')], types: ['Files'] } })
+      expect(textarea().value).toBe('ab [Image #1] [Image #2]  cd')
+      expect(await screen.findAllByRole('img', undefined, WAIT)).toHaveLength(2)
+    })
+
+    it('the picker attaches the files chosen', async () => {
+      mount()
+      fireEvent.change(screen.getByTestId('image-input'), { target: { files: [png('p.png')] } })
+      expect(textarea().value).toBe('[Image #1] ')
+      expect(await screen.findByRole('img', { name: 'Image #1' }, WAIT)).toBeInTheDocument()
+    })
+
+    it('says which image was refused, and why', () => {
+      mount()
+      paste(new File(['<svg/>'], 'v.svg', { type: 'image/svg+xml' }))
+      expect(screen.getByRole('alert')).toHaveTextContent('v.svg is not a PNG, JPEG, GIF or WebP image.')
+      expect(textarea().value).toBe('')
+    })
+
+    it('hides images when the host is known to lack the images capability', () => {
+      mount(accepted, { capabilities: ['projects', 'park'] as Capabilities })
+      expect(screen.queryByRole('button', { name: 'Attach images' })).toBeNull()
+      expect(screen.queryByTestId('image-input')).toBeNull()
+      paste(png('a.png'))
+      expect(textarea().value).toBe('')
+    })
+
+    it('shows images while the host’s capabilities are not known yet', () => {
+      mount(accepted, { capabilities: null })
+      expect(screen.getByRole('button', { name: 'Attach images' })).toBeInTheDocument()
+    })
+
+    it('sends only the images whose marker is still in the text', async () => {
+      const c = mount()
+      paste(png('a.png', 'A'), png('b.png', 'B'))
+      expect(textarea().value).toBe('[Image #1] [Image #2] ')
+      type('[Image #2] only')
+      fireEvent.click(sendButton())
+      await waitFor(() => expect(c.prompts()).toHaveLength(1), WAIT)
+      expect(c.prompts()[0].body).toEqual({
+        content: [
+          { type: 'image', mimeType: 'image/png', data: btoa('B') },
+          { type: 'text', text: ' only' },
+        ],
+      })
+    })
+
+    it('removing an image takes its marker out, and its number is never used again', async () => {
+      mount()
+      paste(png('a.png'), png('b.png'))
+      await screen.findAllByRole('img', undefined, WAIT)
+      fireEvent.click(screen.getByRole('button', { name: 'Remove image #2' }))
+      expect(textarea().value).toBe('[Image #1] ')
+      paste(png('c.png'))
+      expect(textarea().value).toBe('[Image #1] [Image #3] ')
+      expect(screen.queryByText('#2')).toBeNull()
+      expect(screen.getByText('#3')).toBeInTheDocument()
+    })
+
+    it('a restored draft numbers new images past the markers it holds', () => {
+      sessionStorage.setItem('hennery.draft.s1', 'old [Image #4] ')
+      mount()
+      textarea().setSelectionRange(15, 15)
+      paste(png('a.png'))
+      expect(textarea().value).toBe('old [Image #4] [Image #5] ')
+    })
+
+    it('a marker of more than six digits is text: two images pasted after it get two numbers', async () => {
+      sessionStorage.setItem('hennery.draft.s1', 'old [Image #99999999999999999999] ')
+      mount()
+      textarea().setSelectionRange(34, 34)
+      paste(png('a.png'), png('b.png'))
+      expect(textarea().value).toBe('old [Image #99999999999999999999] [Image #1] [Image #2] ')
+      expect((await screen.findAllByRole('img', undefined, WAIT)).map((i) => i.getAttribute('alt'))).toEqual(['Image #1', 'Image #2'])
+    })
+
+    it('revokes an image’s object URL when it is removed', async () => {
+      mount()
+      paste(png('a.png'))
+      await screen.findByRole('img', { name: 'Image #1' }, WAIT)
+      fireEvent.click(screen.getByRole('button', { name: 'Remove image #1' }))
+      expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:u1')
+    })
+
+    it('revokes the object URLs once the prompt is sent', async () => {
+      mount()
+      paste(png('a.png'))
+      await screen.findByRole('img', { name: 'Image #1' }, WAIT)
+      expect(URL.revokeObjectURL).not.toHaveBeenCalled()
+      fireEvent.click(sendButton())
+      await waitFor(() => expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:u1'), WAIT)
+    })
+
+    it('revokes the object URLs when the composer goes', async () => {
+      const c = mount()
+      paste(png('a.png'))
+      await screen.findByRole('img', { name: 'Image #1' }, WAIT)
+      c.unmount()
+      expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:u1')
+    })
+  })
+
+  describe('Composer: slash commands', () => {
+    const menuOptions = () => within(screen.getByRole('listbox')).getAllByRole('option')
+    const cmds = [{ name: 'compact', description: 'Compact the context' }, { name: 'cost' }, { name: 'review', input: { hint: 'pr' } }]
+
+    it('lists the catalogue’s commands while the text is a slash and a word', () => {
+      mount(accepted, { initialCatalog: catalogOf('a', 'plan', cmds) })
+      type('/co')
+      const menu = screen.getByRole('listbox', { name: 'Slash commands' })
+      expect(within(menu).getAllByRole('option').map((o) => o.textContent)).toEqual(['/compactCompact the context', '/cost'])
+      type('/co x')
+      expect(screen.queryByRole('listbox')).toBeNull()
+      type('a /co')
+      expect(screen.queryByRole('listbox')).toBeNull()
+    })
+
+    it('the menu rule holds for any command name the adapter reports', () => {
+      // Names are the adapter's data: one may hold a space or a slash.
+      mount(accepted, { initialCatalog: catalogOf('a', 'plan', [{ name: 'review pr' }, { name: 'x/co' }]) })
+      type('/review')
+      expect(screen.getByRole('listbox')).toBeInTheDocument()
+      type('/review p')
+      expect(screen.queryByRole('listbox')).toBeNull()
+      type('x/co')
+      expect(screen.queryByRole('listbox')).toBeNull()
+    })
+
+    it('arrow keys move through the menu, wrapping, and Enter picks', () => {
+      const c = mount(accepted, { initialCatalog: catalogOf('a', 'plan', cmds) })
+      type('/')
+      expect(menuOptions()[0]).toHaveAttribute('aria-selected', 'true')
+      fireEvent.keyDown(textarea(), { key: 'ArrowUp' })
+      expect(menuOptions()[2]).toHaveAttribute('aria-selected', 'true')
+      fireEvent.keyDown(textarea(), { key: 'ArrowDown' })
+      fireEvent.keyDown(textarea(), { key: 'ArrowDown' })
+      expect(menuOptions()[1]).toHaveAttribute('aria-selected', 'true')
+      fireEvent.keyDown(textarea(), { key: 'Enter' })
+      expect(textarea().value).toBe('/cost ')
+      expect(screen.queryByRole('listbox')).toBeNull()
+      expect(c.prompts()).toEqual([])
+    })
+
+    it('Escape dismisses the menu until the text changes', () => {
+      mount(accepted, { initialCatalog: catalogOf('a', 'plan', cmds) })
+      type('/c')
+      fireEvent.keyDown(textarea(), { key: 'Escape' })
+      expect(screen.queryByRole('listbox')).toBeNull()
+      type('/co')
+      expect(screen.getByRole('listbox')).toBeInTheDocument()
+    })
+
+    it('a click picks a command', () => {
+      mount(accepted, { initialCatalog: catalogOf('a', 'plan', cmds) })
+      type('/r')
+      fireEvent.mouseDown(within(screen.getByRole('listbox')).getByRole('option'))
+      expect(textarea().value).toBe('/review ')
+    })
+  })
+
+  describe('Composer: config bar', () => {
+    function deferred() {
+      let resolve!: (r: Response) => void
+      const promise = new Promise<Response>((r) => (resolve = r))
+      return { promise, resolve }
+    }
+
+    it('shows one switcher per option: model, mode, then the rest', () => {
+      mount(accepted, { initialCatalog: catalogOf() })
+      const bar = screen.getByRole('group', { name: 'Session settings' })
+      expect(within(bar).getAllByRole('combobox').map((s) => s.getAttribute('aria-label'))).toEqual(['Model', 'Mode'])
+      expect(within(bar).getByRole('checkbox', { name: 'Think' })).not.toBeChecked()
+    })
+
+    it('config success: shows the pick at once, then the catalogue the 202 returns', async () => {
+      const answer = deferred()
+      const c = mount(() => answer.promise, { initialCatalog: catalogOf('a') })
+      const model = screen.getByRole('combobox', { name: 'Model' })
+      fireEvent.change(model, { target: { value: 'b' } })
+      expect(model).toHaveValue('b')
+      expect(model).toBeDisabled()
+      expect(c.posts).toEqual([{ path: '/api/sessions/s1/config', body: { config_id: 'model', value: 'b' } }])
+      // The agent clamped it: what it reports wins over the pick.
+      await act(async () => answer.resolve(json(catalogOf('c', 'edit'), 202)))
+      await waitFor(() => expect(model).toHaveValue('c'), WAIT)
+      expect(model).toBeEnabled()
+      expect(screen.getByRole('combobox', { name: 'Mode' })).toHaveValue('edit')
+      expect(screen.queryByRole('alert')).toBeNull()
+    })
+
+    it('switches an on/off option', async () => {
+      const c = mount(() => json(catalogOf(), 202), { initialCatalog: catalogOf() })
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Think' }))
+      await waitFor(() => expect(c.posts).toEqual([{ path: '/api/sessions/s1/config', body: { config_id: 'think', value: true } }]), WAIT)
+    })
+
+    it.each([
+      [409, 'unknown_option', 'Model: The agent no longer offers this.'],
+      [409, 'not_attached', 'Model: The session is not running: resume it to change this.'],
+      [400, 'invalid', 'Model: The agent refused this value (srv-x).'],
+      [502, 'config_failed', 'Model: The agent could not apply it (srv-x).'],
+      [409, 'host_offline', 'Model: The host is offline: try again once it is back.'],
+    ])('config rollback on %i %s, with the message', async (status, code, words) => {
+      mount(() => json({ code, message: 'srv-x' }, status), { initialCatalog: catalogOf('a') })
+      const model = screen.getByRole('combobox', { name: 'Model' })
+      fireEvent.change(model, { target: { value: 'b' } })
+      expect(await screen.findByRole('alert', undefined, WAIT)).toHaveTextContent(words)
+      expect(model).toHaveValue('a')
+      expect(model).toBeEnabled()
+    })
+  })
+
+  describe('Composer: per session', () => {
+    it('switching sessions shows the other session’s draft and images, and sends only to it', async () => {
+      const c = mount()
+      type('for a ')
+      paste(png('a.png', 'AAA'))
+      await screen.findByRole('img', { name: 'Image #1' }, WAIT)
+
+      c.rerender({ sessionId: 's2' })
+      expect(textarea().value).toBe('')
+      expect(screen.queryByRole('img')).toBeNull()
+      expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:u1')
+      type('for b')
+      fireEvent.click(sendButton())
+      await waitFor(() => expect(c.prompts()).toHaveLength(1), WAIT)
+      expect(c.prompts()[0]).toEqual({ path: '/api/sessions/s2/prompt', body: { content: [{ type: 'text', text: 'for b' }] } })
+      await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+
+      c.rerender({ sessionId: 's1' })
+      expect(textarea().value).toBe('for a [Image #1] ')
+      expect(await screen.findByRole('img', { name: 'Image #1' }, WAIT)).toBeInTheDocument()
+      textarea().setSelectionRange(17, 17)
+      paste(png('b.png'))
+      expect(textarea().value).toBe('for a [Image #1] [Image #2] ')
+    })
+
+    it('a sent prompt’s images do not come back with its session', async () => {
+      const c = mount()
+      paste(png('a.png'))
+      await screen.findByRole('img', { name: 'Image #1' }, WAIT)
+      fireEvent.click(sendButton())
+      await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+      c.rerender({ sessionId: 's2' })
+      c.rerender({ sessionId: 's1' })
+      expect(screen.queryByRole('img')).toBeNull()
+      expect(screen.queryByRole('list', { name: 'Images' })).toBeNull()
+    })
+
+    it('an image number stays used across a session switch', async () => {
+      const c = mount()
+      paste(png('a.png'), png('b.png'))
+      await screen.findAllByRole('img', undefined, WAIT)
+      fireEvent.click(screen.getByRole('button', { name: 'Remove image #2' }))
+      c.rerender({ sessionId: 's2' })
+      c.rerender({ sessionId: 's1' })
+      expect(textarea().value).toBe('[Image #1] ')
+      textarea().setSelectionRange(11, 11)
+      paste(png('c.png'))
+      expect(textarea().value).toBe('[Image #1] [Image #3] ')
+    })
+
+    it('a send answered after a switch clears only its own session’s draft', async () => {
+      let release!: () => void
+      const held = new Promise<void>((r) => (release = r))
+      const c = mount(async (_m, path) => {
+        if (path === '/api/sessions/s1/prompt') await held
+        return accepted('POST', path, undefined)
+      })
+      type('for a')
+      fireEvent.click(sendButton())
+      await waitFor(() => expect(c.prompts()).toHaveLength(1), WAIT)
+      c.rerender({ sessionId: 's2' })
+      type('for b')
+      await act(async () => release())
+      await waitFor(() => expect(sessionStorage.getItem('hennery.draft.s1')).toBeNull(), WAIT)
+      expect(textarea().value).toBe('for b')
+      expect(sessionStorage.getItem('hennery.draft.s2')).toBe('for b')
+    })
+  })
+
+  describe('Composer: words put in the draft', () => {
+    function withHandle(handler: Handler = accepted) {
+      const handle = createRef<ComposerHandle>()
+      const c = mount(handler, { handle })
+      return { ...c, handle: () => handle.current! }
+    }
+
+    it('an agent’s marker of more than six digits is text: two images pasted after it get two numbers', async () => {
+      const c = withHandle()
+      act(() => c.handle().prefill('You asked: [Image #99999999999999999999]? My answer: '))
+      paste(png('a.png'), png('b.png'))
+      expect((await screen.findAllByRole('img', undefined, WAIT)).map((i) => i.getAttribute('alt'))).toEqual(['Image #1', 'Image #2'])
+    })
+
+    it('an agent’s words never link an image the operator took out of the text', async () => {
+      const c = withHandle()
+      paste(png('a.png', 'A'))
+      await screen.findByRole('img', { name: 'Image #1' }, WAIT)
+      // The marker deleted by hand: the chip stays, unlinked.
+      type('mine')
+      act(() => c.handle().prefill('You asked: show [Image #1]? My answer: '))
+      expect(textarea().value.replaceAll('\u2060', '')).toBe('mine\n\nYou asked: show [Image #1]? My answer: ')
+      expect(textarea().value).not.toContain('[Image #1]')
+      fireEvent.click(sendButton())
+      await waitFor(() => expect(c.prompts()).toHaveLength(1), WAIT)
+      const content = (c.prompts()[0].body as { content: { type: string }[] }).content
+      expect(content.map((b) => b.type)).toEqual(['text'])
+    })
+  })
+
+  describe('Composer: work added while a prompt is being sent', () => {
+    /** Every prompt POST held until `release`. */
+    function heldSend(handler: Handler = accepted) {
+      let release!: () => void
+      const gate = new Promise<void>((r) => (release = r))
+      const handle = createRef<ComposerHandle>()
+      const c = mount(
+        async (method, path, body) => {
+          if (path.endsWith('/prompt')) await gate
+          return handler(method, path, body)
+        },
+        { handle },
+      )
+      return { ...c, handle: () => handle.current!, release: () => act(async () => release()) }
+    }
+
+    const refusal = () => screen.getByRole('alert').textContent
+
+    async function sendFirst(c: ReturnType<typeof heldSend>) {
+      type('first ')
+      fireEvent.click(sendButton())
+      await waitFor(() => expect(c.prompts()).toHaveLength(1), WAIT)
+    }
+
+    it.each([
+      ['a paste', () => paste(png('late.png'))],
+      ['a drop', () => fireEvent.drop(textarea().closest('.composer-box')!, { dataTransfer: { files: [png('late.png')], types: ['Files'] } })],
+      ['a pick', () => fireEvent.change(screen.getByTestId('image-input'), { target: { files: [png('late.png')] } })],
+    ])('refuses %s, saying why, and the image is not lost in silence', async (_what, add) => {
+      const c = heldSend()
+      await sendFirst(c)
+      add()
+      expect(refusal()).toBe(STILL_SENDING)
+      expect(textarea().value).toBe('first ')
+      expect(screen.queryByRole('list', { name: 'Images' })).toBeNull()
+      await c.release()
+      await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+      // Still said once the send has gone: the operator adds the image again.
+      expect(refusal()).toBe(STILL_SENDING)
+      expect(heldFor('s1').attachments).toEqual([])
+      expect(c.prompts()[0].body).toEqual({ content: [{ type: 'text', text: 'first ' }] })
+    })
+
+    it('refuses an answer as a new message, saying why, and the 202 clears the draft that was sent', async () => {
+      const c = heldSend()
+      await sendFirst(c)
+      act(() => c.handle().prefill('You asked: go? My answer: ', 'Answering a question as a new message'))
+      expect(refusal()).toBe(STILL_SENDING)
+      expect(textarea().value).toBe('first ')
+      expect(screen.queryByText('Answering a question as a new message', { exact: true })).toBeNull()
+      await c.release()
+      await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+      expect(refusal()).toBe(STILL_SENDING)
+      expect(sessionStorage.getItem('hennery.draft.s1')).toBeNull()
+    })
+
+    it('refuses a turn put back that lands while the send is in flight, with its images', async () => {
+      const c = heldSend((method, path, body) => {
+        if (path.startsWith('/api/view/sessions/s1/turns/')) {
+          return json({
+            turn_id: 't9',
+            content: [
+              { type: 'text', text: 'look at' },
+              { type: 'image', mimeType: 'image/png', sha256: 'ab', size: 4 },
+            ],
+          })
+        }
+        if (path.startsWith('/api/attachments/')) return new Response('PNG!', { status: 200 })
+        return accepted(method, path, body)
+      })
+      await sendFirst(c)
+      await act(() => c.handle().refill('t9'))
+      expect(c.fetch.mock.calls.some((call) => String(call[0]) === '/api/attachments/ab')).toBe(true)
+      expect(refusal()).toBe(STILL_SENDING)
+      expect(textarea().value).toBe('first ')
+      expect(screen.queryByRole('list', { name: 'Images' })).toBeNull()
+      await c.release()
+      await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+      expect(heldFor('s1').attachments).toEqual([])
+    })
+
+    it('refuses a turn put back that was asked for before the send and lands during it', async () => {
+      let image!: (r: Response) => void
+      const c = heldSend((method, path, body) => {
+        if (path.startsWith('/api/view/sessions/s1/turns/')) {
+          return json({ turn_id: 't9', content: [{ type: 'image', mimeType: 'image/png', sha256: 'ab', size: 4 }] })
+        }
+        if (path.startsWith('/api/attachments/')) return new Promise<Response>((r) => (image = r))
+        return accepted(method, path, body)
+      })
+      let landed!: Promise<void>
+      act(() => {
+        landed = c.handle().refill('t9')
+      })
+      await waitFor(() => expect(image).toBeDefined(), WAIT)
+      await sendFirst(c)
+      await act(async () => {
+        image(new Response('PNG!', { status: 200 }))
+        await landed
+      })
+      expect(refusal()).toBe(STILL_SENDING)
+      expect(textarea().value).toBe('first ')
+      expect(screen.queryByRole('list', { name: 'Images' })).toBeNull()
+      await c.release()
+      await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+      expect(heldFor('s1').attachments).toEqual([])
+    })
+
+    it('takes work again once the send has gone', async () => {
+      const c = heldSend()
+      await sendFirst(c)
+      await c.release()
+      await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+      paste(png('next.png'))
+      expect(textarea().value).toBe('[Image #1] ')
+      expect(screen.queryByRole('alert')).toBeNull()
+    })
+  })
+  ```
+
+Create `web/src/lib/attachments.test.ts`:
+
+  ```ts
+  import { beforeEach, describe, expect, it } from 'vitest'
+  import {
+    MAX_IMAGES,
+    MAX_MARKER,
+    MAX_TOTAL_BYTES,
+    admit,
+    forgetAllAttachments,
+    forgetAttachments,
+    heldFor,
+    highestMarker,
+    hold,
+    inertMarkers,
+    live,
+    marker,
+    promptBlocks,
+    splice,
+    withoutMarker,
+    type Attachment,
+  } from './attachments'
+  import { MAX_IMAGE_BYTES } from './image'
+
+  const MiB = 1024 * 1024
+
+  /** A file that claims `size` bytes without holding them. */
+  function sized(name: string, size: number, type = 'image/png'): File {
+    const file = new File(['x'], name, { type })
+    Object.defineProperty(file, 'size', { value: size })
+    return file
+  }
+
+  function held(sizes: number[]): Attachment[] {
+    return sizes.map((size, i) => ({ n: i + 1, file: sized(`h${i + 1}.png`, size) }))
+  }
+
+  beforeEach(() => forgetAllAttachments())
+
+  describe('admit: image limits', () => {
+    it('limit type: takes png, jpeg, gif and webp, and refuses an svg or a pdf', () => {
+      const files = ['image/png', 'image/jpeg', 'image/gif', 'image/webp', 'image/svg+xml', 'application/pdf'].map((t, i) =>
+        sized(`f${i}`, 10, t),
+      )
+      const { accepted, refused } = admit([], files, 1)
+      expect(accepted.map((a) => a.file.type)).toEqual(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
+      expect(refused).toEqual(['f4 is not a PNG, JPEG, GIF or WebP image.', 'f5 is not a PNG, JPEG, GIF or WebP image.'])
+    })
+
+    it('limit size: takes an image of exactly 5 MiB, refuses one byte more', () => {
+      const { accepted, refused } = admit([], [sized('ok.png', MAX_IMAGE_BYTES), sized('big.png', MAX_IMAGE_BYTES + 1)], 1)
+      expect(accepted.map((a) => a.file.name)).toEqual(['ok.png'])
+      expect(refused).toEqual(['big.png is over 5 MiB.'])
+    })
+
+    it('limit count: takes the 20th image, refuses the 21st', () => {
+      const { accepted, refused } = admit(held(Array(19).fill(10)), [sized('20th.png', 10), sized('21st.png', 10)], 20)
+      expect(MAX_IMAGES).toBe(20)
+      expect(accepted.map((a) => a.file.name)).toEqual(['20th.png'])
+      expect(refused).toEqual(['21st.png: a prompt takes at most 20 images.'])
+    })
+
+    it('limit total: takes images up to exactly 16 MiB in all, refuses one byte more', () => {
+      expect(MAX_TOTAL_BYTES).toBe(16 * MiB)
+      const three = held([5 * MiB, 5 * MiB, 5 * MiB])
+      const exact = admit(three, [sized('last.png', MiB)], 4)
+      expect(exact.accepted.map((a) => a.file.name)).toEqual(['last.png'])
+      const over = admit(three, [sized('over.png', MiB + 1)], 4)
+      expect(over.accepted).toEqual([])
+      expect(over.refused).toEqual(['over.png: a prompt takes at most 16 MiB of images in all.'])
+    })
+
+    it('limit number: takes image #999999, refuses a seventh digit, saying why', () => {
+      const { accepted, refused } = admit([], [sized('last.png', 1), sized('over.png', 1)], MAX_MARKER)
+      expect(accepted.map((a) => a.n)).toEqual([999_999])
+      expect(refused).toEqual(['over.png: this draft has no image number left; send it first.'])
+    })
+
+    it('numbers what it takes from the next number, skipping the refused', () => {
+      const { accepted } = admit([], [sized('a', 1), sized('b', 1, 'text/plain'), sized('c', 1)], 7)
+      expect(accepted.map((a) => [a.file.name, a.n])).toEqual([
+        ['a', 7],
+        ['c', 8],
+      ])
+    })
+  })
+
+  describe('markers', () => {
+    it('splice places text over the selection and puts the cursor after it', () => {
+      expect(splice('hello world', 6, 11, '[Image #1] ')).toEqual({ text: 'hello [Image #1] ', cursor: 17 })
+      expect(splice('ab', 1, 1, 'X')).toEqual({ text: 'aXb', cursor: 2 })
+      expect(splice('ab', 9, 9, 'X')).toEqual({ text: 'abX', cursor: 3 })
+    })
+
+    it('withoutMarker takes out the first marker and one space after it', () => {
+      expect(withoutMarker('a [Image #2] b [Image #2]', 2)).toBe('a b [Image #2]')
+      expect(withoutMarker('a [Image #12] b', 1)).toBe('a [Image #12] b')
+    })
+
+    it('highestMarker is past every number a draft names', () => {
+      expect(highestMarker('x [Image #3] y [Image #11] [Image #2]')).toBe(11)
+      expect(highestMarker('none')).toBe(0)
+    })
+
+    it('highestMarker reads six digits at most: a longer number, or a leading zero, is plain text', () => {
+      // Past 2^53 every such number is the same to Number: images would share one.
+      expect(highestMarker('[Image #99999999999999999999]')).toBe(0)
+      expect(highestMarker('[Image #1000000]')).toBe(0)
+      expect(highestMarker('[Image #999999] [Image #1000000]')).toBe(999_999)
+      expect(highestMarker('[Image #01]')).toBe(0)
+    })
+
+    it('inertMarkers keeps the words readable but links no image', async () => {
+      const words = 'see [Image #1] and [Image #2]'
+      const inert = inertMarkers(words)
+      expect(inert.replaceAll('\u2060', '')).toBe(words)
+      expect(highestMarker(inert)).toBe(0)
+      expect(live(inert, held([1, 1]))).toEqual([])
+      expect(await promptBlocks(inert, held([1, 1]))).toEqual([{ type: 'text', text: inert }])
+    })
+
+    it('live keeps only images whose marker is in the text', () => {
+      const atts = held([1, 1, 1])
+      expect(live(`${marker(1)} ${marker(3)}`, atts).map((a) => a.n)).toEqual([1, 3])
+    })
+  })
+
+  describe('promptBlocks', () => {
+    it('sends text runs and images in order, each image at its first marker', async () => {
+      const atts: Attachment[] = [
+        { n: 1, file: new File(['ONE'], 'a.png', { type: 'image/png' }) },
+        { n: 2, file: new File(['TWO'], 'b.gif', { type: 'image/gif' }) },
+      ]
+      const blocks = await promptBlocks('look [Image #2] then [Image #1] end [Image #1]', atts)
+      expect(blocks).toEqual([
+        { type: 'text', text: 'look ' },
+        { type: 'image', mimeType: 'image/gif', data: btoa('TWO') },
+        { type: 'text', text: ' then ' },
+        { type: 'image', mimeType: 'image/png', data: btoa('ONE') },
+        { type: 'text', text: ' end [Image #1]' },
+      ])
+    })
+
+    it('sends no image whose marker was deleted, and keeps a marker naming no image as text', async () => {
+      const atts: Attachment[] = [{ n: 1, file: new File(['ONE'], 'a.png', { type: 'image/png' }) }]
+      expect(await promptBlocks('only text [Image #9]', atts)).toEqual([{ type: 'text', text: 'only text [Image #9]' }])
+    })
+
+    it('keeps a marker with a leading zero or seven digits as text', async () => {
+      const atts: Attachment[] = [{ n: 1, file: new File(['ONE'], 'a.png', { type: 'image/png' }) }]
+      expect(await promptBlocks('[Image #01] [Image #0000001]', atts)).toEqual([{ type: 'text', text: '[Image #01] [Image #0000001]' }])
+    })
+
+    it('drops runs of only whitespace between images', async () => {
+      const atts: Attachment[] = [
+        { n: 1, file: new File(['A'], 'a.png', { type: 'image/png' }) },
+        { n: 2, file: new File(['B'], 'b.png', { type: 'image/png' }) },
+      ]
+      const blocks = await promptBlocks('[Image #1] [Image #2] ', atts)
+      expect(blocks.map((b) => b.type)).toEqual(['image', 'image'])
+    })
+  })
+
+  describe('held images per session', () => {
+    it('keeps each session’s images apart, and forgets one session only', () => {
+      hold('a', { attachments: held([1]), nextN: 2 })
+      hold('b', { attachments: held([1, 1]), nextN: 3 })
+      expect(heldFor('a').attachments).toHaveLength(1)
+      forgetAttachments('a')
+      expect(heldFor('a')).toEqual({ attachments: [], nextN: 1 })
+      expect(heldFor('b').nextN).toBe(3)
+    })
+
+    it('remembers the next number even with no image left', () => {
+      hold('a', { attachments: [], nextN: 4 })
+      expect(heldFor('a').nextN).toBe(4)
+    })
+  })
+  ```
+
+Create `web/src/lib/catalog.test.ts`:
+
+  ```ts
+  import { describe, expect, it } from 'vitest'
+  import type { SessionCatalog } from '../generated/protocol'
+  import { commands, configOptions, matchCommands, parseOption } from './catalog'
+
+  function cat(config_options: unknown[], cmds: unknown[] = []): SessionCatalog {
+    return { session_id: 's1', config_options, commands: cmds } as SessionCatalog
+  }
+
+  const select = (id: string, category: string | undefined, current = 'a', extra: object = {}) => ({
+    id,
+    name: id.toUpperCase(),
+    ...(category === undefined ? {} : { category }),
+    type: 'select',
+    currentValue: current,
+    options: [
+      { value: 'a', name: 'A' },
+      { value: 'b', name: 'B' },
+    ],
+    ...extra,
+  })
+
+  describe('parseOption', () => {
+    it('reads a select, flat or grouped, and a boolean', () => {
+      expect(parseOption(select('model', 'model'))).toMatchObject({ kind: 'select', id: 'model', current: 'a' })
+      const grouped = parseOption({
+        id: 'model',
+        name: 'Model',
+        type: 'select',
+        currentValue: 'x',
+        options: [{ group: 'g1', name: 'Fast', options: [{ value: 'x', name: 'X' }] }],
+      })
+      expect(grouped).toMatchObject({ choices: [{ value: 'x', name: 'X', group: 'Fast' }] })
+      expect(parseOption({ id: 'think', name: 'Think', type: 'boolean', currentValue: true })).toMatchObject({
+        kind: 'boolean',
+        current: true,
+      })
+    })
+
+    it('skips what it cannot show, never throwing', () => {
+      for (const bad of [null, 'x', [], {}, { id: '' }, { id: 'a', type: 'select', currentValue: 1 }, { id: 'a', type: 'slider' }]) {
+        expect(parseOption(bad)).toBeNull()
+      }
+      expect(parseOption(select('m', undefined, 'a', { options: [] }))).toBeNull()
+    })
+  })
+
+  describe('configOptions', () => {
+    it('orders the model, then the mode, then the rest by id, whatever the adapter’s order', () => {
+      const list = configOptions(
+        cat([select('zeta', undefined), select('mode', 'mode'), select('alpha', 'other'), select('model', 'model')]),
+      )
+      expect(list.map((o) => o.id)).toEqual(['model', 'mode', 'alpha', 'zeta'])
+    })
+
+    it('finds the model and mode by category first, else by a conventional id', () => {
+      const byCategory = configOptions(cat([select('b-thing', 'mode'), select('a-thing', 'model'), select('mode', undefined)]))
+      expect(byCategory.map((o) => o.id)).toEqual(['a-thing', 'b-thing', 'mode'])
+    })
+
+    it('takes each id once, and nothing from a catalogue that is not there', () => {
+      expect(configOptions(cat([select('x', undefined), select('x', undefined, 'b')])).map((o) => o.current)).toEqual(['a'])
+      expect(configOptions(null)).toEqual([])
+      expect(configOptions(cat('nope' as unknown as unknown[]))).toEqual([])
+    })
+  })
+
+  describe('commands', () => {
+    it('lists each command once, in the adapter’s order, with its hint', () => {
+      const list = commands(
+        cat([], [{ name: 'review', description: 'Review' }, { name: 'init', input: { hint: 'path' } }, { name: 'review' }, { nope: 1 }]),
+      )
+      expect(list).toEqual([
+        { name: 'review', description: 'Review', hint: undefined },
+        { name: 'init', description: undefined, hint: 'path' },
+      ])
+    })
+
+    it('matchCommands lists names that start with the query first, then those that contain it', () => {
+      const list = commands(cat([], [{ name: 'compact' }, { name: 'pr-comments' }, { name: 'cost' }, { name: 'clear' }]))
+      expect(matchCommands(list, 'co').map((c) => c.name)).toEqual(['compact', 'cost', 'pr-comments'])
+      expect(matchCommands(list, '').map((c) => c.name)).toEqual(['compact', 'pr-comments', 'cost', 'clear'])
+    })
+  })
+  ```
+
+Create `web/src/lib/drafts.test.ts`:
+
+  ```ts
+  import { afterEach, describe, expect, it, vi } from 'vitest'
+  import { draftKey, forgetAllDrafts, loadDraft, saveDraft } from './drafts'
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+    sessionStorage.clear()
+  })
+
+  describe('drafts', () => {
+    it('keeps a draft per session in sessionStorage under hennery.draft.<id>', () => {
+      expect(draftKey('s1')).toBe('hennery.draft.s1')
+      saveDraft('s1', 'one')
+      saveDraft('s2', 'two')
+      expect(sessionStorage.getItem('hennery.draft.s1')).toBe('one')
+      expect(loadDraft('s1')).toBe('one')
+      expect(loadDraft('s2')).toBe('two')
+      expect(loadDraft('s3')).toBe('')
+    })
+
+    it('removes an emptied draft', () => {
+      saveDraft('s1', 'one')
+      saveDraft('s1', '')
+      expect(sessionStorage.getItem('hennery.draft.s1')).toBeNull()
+    })
+
+    it('lives in the page only when storage refuses', () => {
+      vi.spyOn(Storage.prototype, 'setItem').mockImplementation(() => {
+        throw new Error('quota')
+      })
+      vi.spyOn(Storage.prototype, 'getItem').mockImplementation(() => {
+        throw new Error('denied')
+      })
+      expect(() => saveDraft('s1', 'x')).not.toThrow()
+      expect(loadDraft('s1')).toBe('')
+    })
+
+    it('forgets every draft at once, and only the drafts', () => {
+      saveDraft('s1', 'one')
+      saveDraft('s2', 'two')
+      saveDraft('s3', 'three')
+      sessionStorage.setItem('hennery.hideClosed', '1')
+      sessionStorage.setItem('hennery.draftless', 'kept')
+      forgetAllDrafts()
+      expect(loadDraft('s1')).toBe('')
+      expect(loadDraft('s2')).toBe('')
+      expect(loadDraft('s3')).toBe('')
+      expect(sessionStorage.getItem('hennery.hideClosed')).toBe('1')
+      expect(sessionStorage.getItem('hennery.draftless')).toBe('kept')
+    })
+
+    it('does not throw when storage refuses', () => {
+      saveDraft('s1', 'one')
+      const key = vi.spyOn(Storage.prototype, 'key').mockImplementation(() => {
+        throw new Error('denied')
+      })
+      expect(() => forgetAllDrafts()).not.toThrow()
+      expect(key).toHaveBeenCalled()
+    })
+  })
+  ```
+
+Create `web/src/lib/sendAgain.test.ts`:
+
+  ```ts
+  import { describe, expect, it } from 'vitest'
+  import type { TurnContent } from '../generated/view'
+  import { json, routed } from '../test-stream'
+  import { undeliveredDraft, type DraftPart } from './sendAgain'
+
+  const SHA = 'ab/c?d'
+  const TURN = '/api/view/sessions/s%2F1/turns/t%231'
+
+  /** Bytes past one chunk of an encoder, none of them alike in a row. */
+  const BYTES = Uint8Array.from({ length: 0x8000 * 2 + 17 }, (_, i) => (i * 31 + 7) % 256)
+
+  function server(turn: TurnContent, attachment: () => Response = () => new Response(BYTES, { status: 200 })) {
+    return routed(async (call) => {
+      if (call.path === TURN) return json(turn)
+      if (call.path.startsWith('/api/attachments/')) return attachment()
+      return json({ code: 'not_found', message: 'no' }, 404)
+    })
+  }
+
+  async function shown(parts: DraftPart[]) {
+    return Promise.all(
+      parts.map(async (p) =>
+        p.type === 'text' ? p : { type: 'image', mimeType: p.file.type, bytes: new Uint8Array(await p.file.arrayBuffer()) },
+      ),
+    )
+  }
+
+  describe('undeliveredDraft', () => {
+    it('rebuilds the stored prompt in order, its images fetched back by hash, and sends nothing', async () => {
+      const s = server({
+        turn_id: 't#1',
+        content: [
+          { type: 'text', text: 'look' },
+          { type: 'image', mimeType: 'image/png', sha256: SHA, size: BYTES.length },
+          { type: 'text', text: 'again' },
+        ],
+      })
+      const parts = await undeliveredDraft(s.client, 's/1', 't#1')
+      expect(await shown(parts)).toEqual([
+        { type: 'text', text: 'look' },
+        { type: 'image', mimeType: 'image/png', bytes: BYTES },
+        { type: 'text', text: 'again' },
+      ])
+      expect(s.calls.map((c) => c.path)).toEqual([TURN, '/api/attachments/ab%2Fc%3Fd'])
+      expect(s.calls.every((c) => c.method === 'GET')).toBe(true)
+    })
+
+    it('rejects when an image is gone', async () => {
+      const s = server(
+        { turn_id: 't#1', content: [{ type: 'image', mimeType: 'image/png', sha256: SHA, size: 1 }] },
+        () => json({ code: 'not_found', message: 'no' }, 404),
+      )
+      await expect(undeliveredDraft(s.client, 's/1', 't#1')).rejects.toMatchObject({ code: 'attachment_gone' })
+    })
+
+    it('rejects, reading no image, when a stored image is not of a type a prompt takes', async () => {
+      const s = server({
+        turn_id: 't#1',
+        content: [
+          { type: 'image', mimeType: 'image/png', sha256: SHA, size: 1 },
+          { type: 'image', mimeType: 'image/svg+xml', sha256: SHA, size: 1 },
+        ],
+      })
+      await expect(undeliveredDraft(s.client, 's/1', 't#1')).rejects.toThrow(/cannot be sent again/)
+      expect(s.calls.some((c) => c.path.startsWith('/api/attachments/'))).toBe(false)
+    })
+
+    it('hands the turn’s own GET the signal it was given', async () => {
+      const s = server({ turn_id: 't#1', content: [{ type: 'text', text: 'look' }] })
+      const abort = new AbortController()
+      await undeliveredDraft(s.client, 's/1', 't#1', abort.signal)
+      const call = s.fetch.mock.calls.find((c) => String(c[0]) === TURN)
+      expect(call?.[1]?.signal).toBe(abort.signal)
+    })
+
+    it('rejects with the refusal of the turn itself', async () => {
+      const t = routed(async () => json({ code: 'not_found', message: 'srv' }, 404))
+      await expect(undeliveredDraft(t.client, 's/1', 't#1')).rejects.toMatchObject({ status: 404 })
+    })
+  })
+  ```
+
+Create `web/src/lib/sending.test.ts`:
+
+  ```ts
+  import { beforeEach, describe, expect, it } from 'vitest'
+  import { forgetAllSends, sendingFor, track } from './sending'
+
+  beforeEach(() => forgetAllSends())
+
+  describe('sending', () => {
+    it('holds a send per session until it ends, and is gone before its outcome is handed on', async () => {
+      let finish!: (v: string) => void
+      const pending = track('s1', () => new Promise<string>((resolve) => (finish = resolve)), String)
+      expect(sendingFor('s1')).toBe(pending)
+      expect(sendingFor('s2')).toBeUndefined()
+      const seen = pending.then((outcome) => ({ outcome, held: sendingFor('s1') }))
+      finish('sent')
+      expect(await seen).toEqual({ outcome: 'sent', held: undefined })
+    })
+
+    it('a send that ends after a newer one began leaves the newer one held', async () => {
+      let first!: (v: string) => void
+      const older = track('s1', () => new Promise<string>((resolve) => (first = resolve)), String)
+      const newer = track('s1', () => new Promise<string>(() => {}), String)
+      first('sent')
+      await older
+      expect(sendingFor('s1')).toBe(newer)
+    })
+
+    it('a send whose work rejects ends too, with the outcome its error is given', async () => {
+      const pending = track('s1', () => Promise.reject(new Error('boom')), (err) => `refused: ${(err as Error).message}`)
+      expect(await pending).toBe('refused: boom')
+      expect(sendingFor('s1')).toBeUndefined()
+    })
+
+    it('a send let go of still ends, and leaves nothing held', async () => {
+      let finish!: (v: string) => void
+      const pending = track('s1', () => new Promise<string>((resolve) => (finish = resolve)), String)
+      forgetAllSends()
+      expect(sendingFor('s1')).toBeUndefined()
+      finish('sent')
+      expect(await pending).toBe('sent')
+      expect(sendingFor('s1')).toBeUndefined()
+    })
+  })
+  ```
+
+Create `web/src/screens/Session.composer.test.tsx`:
+
+  ```tsx
+  import '@testing-library/jest-dom/vitest'
+  import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+  import { beforeEach, describe, expect, it, vi } from 'vitest'
+  import type { Item } from '../generated/view'
+  import { STILL_SENDING } from '../components/Composer'
+  import { forgetAllAttachments, heldFor, hold } from '../lib/attachments'
+  import { forgetAllSends } from '../lib/sending'
+  import { json } from '../test-stream'
+  import SessionView from './Session'
+  import { FAST, UNDELIVERED, catalogOf, message, sessionServer } from './test-session'
+
+  const WAIT = { timeout: 5000 }
+
+  const textarea = () => screen.getByLabelText('Prompt') as HTMLTextAreaElement
+  const type = (text: string) => fireEvent.change(textarea(), { target: { value: text } })
+  const send = () => fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+
+  function png(name: string, body = name): File {
+    return new File([body], name, { type: 'image/png' })
+  }
+
+  function paste(...files: File[]) {
+    fireEvent.paste(textarea(), {
+      clipboardData: { items: files.map((f) => ({ kind: 'file', type: f.type, getAsFile: () => f })) },
+    })
+  }
+
+  const base64 = (s: string) => Buffer.from(s).toString('base64')
+
+  beforeEach(() => {
+    sessionStorage.clear()
+    forgetAllAttachments()
+    forgetAllSends()
+    URL.createObjectURL = vi.fn(() => 'blob:u')
+    URL.revokeObjectURL = vi.fn()
+  })
+
+  /** The view as the shell mounts it: a new one per session id. */
+  function view(id: string) {
+    return <SessionView key={id} id={id} timing={FAST} />
+  }
+
+  describe('SessionView: the composer', () => {
+    it('sends a prompt to the session shown', async () => {
+      const s = sessionServer({ items: (id) => [message(`${id}-m`, 't1')] })
+      render(view('s1'), { wrapper: s.wrapper })
+      await screen.findByText('s1-m')
+      type('hello there')
+      send()
+      await waitFor(() => expect(s.posted('/prompt')).toHaveLength(1), WAIT)
+      expect(s.posted('/prompt')).toEqual([
+        { path: '/api/sessions/s1/prompt', body: { content: [{ type: 'text', text: 'hello there' }] } },
+      ])
+      await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+    })
+
+    it('a config switch is replaced by the catalogue the 202 returns', async () => {
+      const s = sessionServer({ config: (id) => json(catalogOf(id, 'c'), 202) })
+      render(view('s1'), { wrapper: s.wrapper })
+      const select = (await screen.findByRole('combobox', { name: 'Model' }, WAIT)) as HTMLSelectElement
+      expect(select.value).toBe('a')
+      fireEvent.change(select, { target: { value: 'b' } })
+      await waitFor(() => expect(select.value).toBe('c'), WAIT)
+      expect(s.posted('/config')).toEqual([{ path: '/api/sessions/s1/config', body: { config_id: 'model', value: 'b' } }])
+      expect(select).not.toBeDisabled()
+    })
+
+    it('hides images on a host without the images capability, fetching the hosts once', async () => {
+      const s = sessionServer({
+        hosts: () =>
+          json([
+            { host_id: 'h0', name: 'other-box', capabilities: ['images'] },
+            { host_id: 'h1', name: 'build-box', capabilities: ['park'] },
+          ]),
+      })
+      render(view('s1'), { wrapper: s.wrapper })
+      await screen.findByText('build-box', {}, WAIT)
+      await waitFor(() => expect(screen.queryByRole('button', { name: 'Attach images' })).toBeNull(), WAIT)
+      expect(s.of('/api/hosts')).toHaveLength(1)
+    })
+
+    it('offers images while the host reports no list of capabilities', async () => {
+      const s = sessionServer({ hosts: () => json([{ host_id: 'h1', name: 'build-box' }]) })
+      render(view('s1'), { wrapper: s.wrapper })
+      await screen.findByText('build-box', {}, WAIT)
+      expect(screen.getByRole('button', { name: 'Attach images' })).toBeInTheDocument()
+    })
+
+    it('offers Cancel, not Send, while the session runs a turn', async () => {
+      const s = sessionServer({ detail: { activity: 'running' } })
+      render(view('s1'), { wrapper: s.wrapper })
+      await screen.findByRole('button', { name: 'Cancel' }, WAIT)
+      expect(screen.queryByRole('button', { name: 'Send' })).toBeNull()
+    })
+
+    it('offers images on a host with the images capability', async () => {
+      const s = sessionServer({ hosts: () => json([{ host_id: 'h1', name: 'build-box', capabilities: ['images'] }]) })
+      render(view('s1'), { wrapper: s.wrapper })
+      await screen.findByText('build-box', {}, WAIT)
+      expect(screen.getByRole('button', { name: 'Attach images' })).toBeInTheDocument()
+    })
+
+    it('switching sessions keeps each draft to its own session, and sends only the one shown (F-17)', async () => {
+      const s = sessionServer({ items: (id) => [message(`${id}-m`, 't1')] })
+      const r = render(view('s1'), { wrapper: s.wrapper })
+      await screen.findByText('s1-m')
+      type('first ')
+      paste(png('one.png', 'ONE'))
+      await waitFor(() => expect(textarea().value).toBe('first [Image #1] '))
+
+      r.rerender(view('s2'))
+      await screen.findByText('s2-m')
+      expect(textarea().value).toBe('')
+      expect(screen.queryByRole('list', { name: 'Images' })).toBeNull()
+      type('second ')
+      paste(png('two.png', 'TWO'))
+      await waitFor(() => expect(textarea().value).toBe('second [Image #1] '))
+      send()
+      await waitFor(() => expect(s.posted('/prompt')).toHaveLength(1), WAIT)
+      expect(s.posted('/prompt')).toEqual([
+        {
+          path: '/api/sessions/s2/prompt',
+          body: {
+            content: [
+              { type: 'text', text: 'second ' },
+              { type: 'image', mimeType: 'image/png', data: base64('TWO') },
+            ],
+          },
+        },
+      ])
+      await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+
+      r.rerender(view('s1'))
+      await screen.findByText('s1-m')
+      expect(textarea().value).toBe('first [Image #1] ')
+      expect(within(screen.getByRole('list', { name: 'Images' })).getByAltText('Image #1')).toBeInTheDocument()
+      expect(s.posted('/prompt')).toHaveLength(1)
+    })
+
+    it('hides the composer of a deleted session and drops its draft and images', async () => {
+      sessionStorage.setItem('hennery.draft.s1', 'unsent [Image #1] ')
+      hold('s1', { attachments: [{ n: 1, file: png('a.png') }], nextN: 2 })
+      const s = sessionServer({ page: () => json({ code: 'not_found', message: 'gone' }, 404) })
+      render(view('s1'), { wrapper: s.wrapper })
+      await screen.findByText('This session was deleted', {}, WAIT)
+      expect(screen.queryByLabelText('Prompt')).toBeNull()
+      await waitFor(() => expect(sessionStorage.getItem('hennery.draft.s1')).toBeNull(), WAIT)
+      expect(heldFor('s1').attachments).toEqual([])
+    })
+  })
+
+  describe('SessionView: a send in flight when the composer is mounted again', () => {
+    /** A response held until `answer` is called. */
+    function held() {
+      let answer!: (r: Response) => void
+      const promise = new Promise<Response>((resolve) => (answer = resolve))
+      return { respond: () => promise, answer: (r: Response) => act(async () => answer(r)) }
+    }
+
+    /** Away to s2 and back to s1, the composer mounted again. */
+    async function awayAndBack(r: ReturnType<typeof render>) {
+      r.rerender(view('s2'))
+      await screen.findByText('s2-m')
+      r.rerender(view('s1'))
+      await screen.findByText('s1-m')
+    }
+
+    const items = (id: string) => [message(`${id}-m`, 't1')]
+
+    it('stays read-only with Send disabled until the 202, which clears the draft it shows', async () => {
+      const answer = held()
+      const s = sessionServer({ items, prompt: answer.respond })
+      const r = render(view('s1'), { wrapper: s.wrapper })
+      await screen.findByText('s1-m')
+      type('sent once')
+      send()
+      await waitFor(() => expect(s.posted('/prompt')).toHaveLength(1), WAIT)
+      await awayAndBack(r)
+      expect(textarea().value).toBe('sent once')
+      expect(textarea().readOnly).toBe(true)
+      expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+      // Work added meanwhile is refused, as in the composer that sent.
+      paste(png('late.png'))
+      expect(screen.getByRole('alert').textContent).toBe(STILL_SENDING)
+      expect(screen.queryByRole('list', { name: 'Images' })).toBeNull()
+
+      await answer.answer(json({ turn_id: 'new' }, 202))
+      await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+      expect(sessionStorage.getItem('hennery.draft.s1')).toBeNull()
+      expect(textarea().readOnly).toBe(false)
+      type('next')
+      expect(sessionStorage.getItem('hennery.draft.s1')).toBe('next')
+      expect(s.posted('/prompt')).toHaveLength(1)
+    })
+
+    it('a refusal after the composer was mounted again keeps the draft, editable, and says why', async () => {
+      const answer = held()
+      const s = sessionServer({ items, prompt: answer.respond })
+      const r = render(view('s1'), { wrapper: s.wrapper })
+      await screen.findByText('s1-m')
+      type('kept')
+      send()
+      await waitFor(() => expect(s.posted('/prompt')).toHaveLength(1), WAIT)
+      await awayAndBack(r)
+      await answer.answer(json({ code: 'not_attached', message: 'srv-x' }, 409))
+      expect(await screen.findByText('The session is not running: resume it to send this.', undefined, WAIT)).toBeInTheDocument()
+      expect(textarea().readOnly).toBe(false)
+      expect(textarea().value).toBe('kept')
+      expect(sessionStorage.getItem('hennery.draft.s1')).toBe('kept')
+      expect(screen.getByRole('button', { name: 'Send' })).not.toBeDisabled()
+    })
+
+    it('once the send has ended, a composer mounted again is not held', async () => {
+      const s = sessionServer({ items })
+      const r = render(view('s1'), { wrapper: s.wrapper })
+      await screen.findByText('s1-m')
+      type('first')
+      send()
+      await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+      type('second')
+      await awayAndBack(r)
+      expect(textarea().readOnly).toBe(false)
+      await act(() => new Promise((resolve) => setTimeout(resolve, 50)))
+      expect(textarea().value).toBe('second')
+      expect(screen.getByRole('button', { name: 'Send' })).not.toBeDisabled()
+    })
+
+    it('a composer mounted again while Resume and send waits on the resume waits for the send too', async () => {
+      const resumed = held()
+      let attached = false
+      const s = sessionServer({
+        items,
+        prompt: () => (attached ? json({ turn_id: 'new' }, 202) : json({ code: 'not_attached', message: 'srv-x' }, 409)),
+        resume: () => resumed.respond().then((res) => ((attached = true), res)),
+      })
+      const r = render(view('s1'), { wrapper: s.wrapper })
+      await screen.findByText('s1-m')
+      type('later')
+      send()
+      fireEvent.click(await screen.findByRole('button', { name: 'Resume and send' }, WAIT))
+      await waitFor(() => expect(s.of('/api/sessions/s1/resume')).toHaveLength(1), WAIT)
+      await awayAndBack(r)
+      expect(textarea().readOnly).toBe(true)
+      expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+      await resumed.answer(json({ session_id: 's1', lifecycle: 'active' }, 202))
+      await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+      expect(textarea().readOnly).toBe(false)
+      expect(s.posted('/prompt').map((p) => p.body)).toEqual([
+        { content: [{ type: 'text', text: 'later' }] },
+        { content: [{ type: 'text', text: 'later' }] },
+      ])
+    })
+  })
+
+  describe('SessionView: Send again', () => {
+    const marker = {
+      id: 'mk',
+      version: 1,
+      ts: '2026-10-02T10:00:00.000Z',
+      turn_id: 't9',
+      kind: 'marker',
+      marker: 'turn_not_delivered',
+      about_turn: 't9',
+    } as Item
+
+    it('puts the turn back in the draft with its images, sends nothing, then sends it as the operator does', async () => {
+      const s = sessionServer({
+        items: () => [message('m1', 't8'), marker],
+        turn: () => json(UNDELIVERED),
+        attachment: () => new Response('PNG!', { status: 200 }),
+      })
+      render(view('s1'), { wrapper: s.wrapper })
+      fireEvent.click(await screen.findByRole('button', { name: 'Send again' }, WAIT))
+      await waitFor(() => expect(textarea().value).toBe('look at [Image #1] and fix it'), WAIT)
+      expect(screen.getByText(/The turn that was not delivered, back in the draft/)).toBeInTheDocument()
+      expect(within(screen.getByRole('list', { name: 'Images' })).getByAltText('Image #1')).toBeInTheDocument()
+      expect(s.of('/api/view/sessions/s1/turns/t9')).toHaveLength(1)
+      expect(s.of('/api/attachments/ab%2Fc')).toHaveLength(1)
+      expect(s.posted('/prompt')).toEqual([])
+
+      send()
+      await waitFor(() => expect(s.posted('/prompt')).toHaveLength(1), WAIT)
+      expect(s.posted('/prompt')[0].body).toEqual({
+        content: [
+          { type: 'text', text: 'look at ' },
+          { type: 'image', mimeType: 'image/png', data: base64('PNG!') },
+          { type: 'text', text: ' and fix it' },
+        ],
+      })
+      await waitFor(() => expect(screen.queryByText(/^The turn that was not delivered, back in the draft/)).toBeNull(), WAIT)
+    })
+
+    it('a marker written in the turn’s own text never names its image', async () => {
+      const s = sessionServer({
+        items: () => [marker],
+        turn: () =>
+          json({
+            turn_id: 't9',
+            content: [
+              { type: 'text', text: 'see [Image #1] above' },
+              { type: 'image', mimeType: 'image/png', sha256: 'ab/c', size: 4 },
+            ],
+          }),
+        attachment: () => new Response('PNG!', { status: 200 }),
+      })
+      render(view('s1'), { wrapper: s.wrapper })
+      fireEvent.click(await screen.findByRole('button', { name: 'Send again' }, WAIT))
+      await waitFor(() => expect(textarea().value).toBe('see [Image #1] above [Image #2]'), WAIT)
+      send()
+      await waitFor(() => expect(s.posted('/prompt')).toHaveLength(1), WAIT)
+      expect(s.posted('/prompt')[0].body).toEqual({
+        content: [
+          { type: 'text', text: 'see [Image #1] above ' },
+          { type: 'image', mimeType: 'image/png', data: base64('PNG!') },
+        ],
+      })
+    })
+
+    it('an image attached after a refill takes the next number', async () => {
+      const s = sessionServer({
+        items: () => [marker],
+        turn: () => json(UNDELIVERED),
+        attachment: () => new Response('PNG!', { status: 200 }),
+      })
+      render(view('s1'), { wrapper: s.wrapper })
+      fireEvent.click(await screen.findByRole('button', { name: 'Send again' }, WAIT))
+      await waitFor(() => expect(textarea().value).toBe('look at [Image #1] and fix it'), WAIT)
+      textarea().setSelectionRange(textarea().value.length, textarea().value.length)
+      paste(png('more.png'))
+      await waitFor(() => expect(textarea().value).toBe('look at [Image #1] and fix it[Image #2] '), WAIT)
+    })
+
+    it('a turn the image limits refuse in part leaves the draft as it was, saying why', async () => {
+      hold('s1', { attachments: Array.from({ length: 19 }, (_, i) => ({ n: i + 1, file: png(`p${i}.png`) })), nextN: 20 })
+      const s = sessionServer({
+        items: () => [marker],
+        turn: () =>
+          json({
+            turn_id: 't9',
+            content: [
+              { type: 'text', text: 'two' },
+              { type: 'image', mimeType: 'image/png', sha256: 'ab/c', size: 4 },
+              { type: 'image', mimeType: 'image/png', sha256: 'ab/c', size: 4 },
+            ],
+          }),
+        attachment: () => new Response('PNG!', { status: 200 }),
+      })
+      render(view('s1'), { wrapper: s.wrapper })
+      const again = await screen.findByRole('button', { name: 'Send again' }, WAIT)
+      type('mine')
+      fireEvent.click(again)
+      await screen.findByText(/a prompt takes at most 20 images/, {}, WAIT)
+      expect(textarea().value).toBe('mine')
+      expect(heldFor('s1').attachments).toHaveLength(19)
+    })
+
+    it('a turn of only blanks adds nothing to the draft', async () => {
+      const s = sessionServer({
+        items: () => [marker],
+        turn: () => json({ turn_id: 't9', content: [{ type: 'text', text: '  ' }] }),
+      })
+      render(view('s1'), { wrapper: s.wrapper })
+      const again = await screen.findByRole('button', { name: 'Send again' }, WAIT)
+      type('mine')
+      fireEvent.click(again)
+      await waitFor(() => expect(s.of('/api/view/sessions/s1/turns/t9')).toHaveLength(1), WAIT)
+      await act(() => new Promise((resolve) => setTimeout(resolve, 50)))
+      expect(textarea().value).toBe('mine')
+      expect(screen.queryByText(/^The turn that was not delivered, back in the draft/)).toBeNull()
+    })
+
+    it('keeps the draft there, adding the turn after it', async () => {
+      const s = sessionServer({
+        items: () => [marker],
+        turn: () => json({ turn_id: 't9', content: [{ type: 'text', text: 'again' }] }),
+      })
+      render(view('s1'), { wrapper: s.wrapper })
+      const again = await screen.findByRole('button', { name: 'Send again' }, WAIT)
+      type('mine')
+      fireEvent.click(again)
+      await waitFor(() => expect(textarea().value).toBe('mine\n\nagain'), WAIT)
+      expect(s.posted('/prompt')).toEqual([])
+    })
+
+    it('says why a turn cannot be put back, and leaves the draft as it was', async () => {
+      const s = sessionServer({
+        items: () => [marker],
+        turn: () => json(UNDELIVERED),
+        attachment: () => json({ code: 'not_found', message: 'no' }, 404),
+      })
+      render(view('s1'), { wrapper: s.wrapper })
+      const again = await screen.findByRole('button', { name: 'Send again' }, WAIT)
+      type('mine')
+      fireEvent.click(again)
+      await screen.findByText(/The turn could not be put back: An image of this prompt could not be read \(404\)/, {}, WAIT)
+      expect(textarea().value).toBe('mine')
+      expect(screen.queryByRole('list', { name: 'Images' })).toBeNull()
+      expect(s.posted('/prompt')).toEqual([])
+    })
+
+    it('refuses a turn with images on a host that takes none, leaving the draft as it was', async () => {
+      const s = sessionServer({
+        items: () => [marker],
+        hosts: () => json([{ host_id: 'h1', name: 'build-box', capabilities: [] }]),
+        turn: () => json(UNDELIVERED),
+        attachment: () => new Response('PNG!', { status: 200 }),
+      })
+      render(view('s1'), { wrapper: s.wrapper })
+      await screen.findByText('build-box', {}, WAIT)
+      fireEvent.click(await screen.findByRole('button', { name: 'Send again' }, WAIT))
+      await screen.findByText('This turn holds images, and this host takes no images.', {}, WAIT)
+      expect(textarea().value).toBe('')
+    })
+
+    it('a turn answering after the session was left lands in no draft', async () => {
+      let answer!: (r: Response) => void
+      const s = sessionServer({
+        items: (id) => (id === 's1' ? [marker] : [message('s2-m', 't1')]),
+        turn: () => new Promise<Response>((resolve) => (answer = resolve)),
+        attachment: () => new Response('PNG!', { status: 200 }),
+      })
+      const r = render(view('s1'), { wrapper: s.wrapper })
+      fireEvent.click(await screen.findByRole('button', { name: 'Send again' }, WAIT))
+      await waitFor(() => expect(s.of('/api/view/sessions/s1/turns/t9')).toHaveLength(1), WAIT)
+      r.rerender(view('s2'))
+      await screen.findByText('s2-m')
+      await act(async () => answer(json(UNDELIVERED)))
+      await waitFor(() => expect(s.of('/api/attachments/ab%2Fc')).toHaveLength(1), WAIT)
+      await act(() => new Promise((resolve) => setTimeout(resolve, 50)))
+      expect(textarea().value).toBe('')
+      expect(heldFor('s1').attachments).toEqual([])
+      expect(heldFor('s2').attachments).toEqual([])
+      r.rerender(view('s1'))
+      await screen.findByRole('button', { name: 'Send again' }, WAIT)
+      expect(textarea().value).toBe('')
+      expect(screen.queryByRole('list', { name: 'Images' })).toBeNull()
+    })
+  })
+  ```
+
+Create `web/src/screens/Session.seams.test.tsx`:
+
+  ```tsx
+  // The seams the question cards reach the composer through, from the view:
+  // the transcript is replaced by one that keeps the env it is given.
+  import '@testing-library/jest-dom/vitest'
+  import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+  import { beforeEach, describe, expect, it, vi } from 'vitest'
+  import type { ItemEnv } from '../components/items/types'
+  import type { Item } from '../generated/view'
+  import { forgetAllAttachments } from '../lib/attachments'
+  import SessionView from './Session'
+  import { FAST, message, sessionServer } from './test-session'
+
+  const seen = vi.hoisted(() => ({ envs: [] as unknown[] }))
+
+  vi.mock('../components/Transcript', () => ({
+    default: ({ items, env }: { items: Item[]; env: unknown }) => {
+      seen.envs.push(env)
+      return (
+        <ul>
+          {items.map((i) => (
+            <li key={i.id}>{i.id}</li>
+          ))}
+        </ul>
+      )
+    },
+  }))
+
+  const WAIT = { timeout: 5000 }
+  const textarea = () => screen.getByLabelText('Prompt') as HTMLTextAreaElement
+  const lastEnv = () => seen.envs[seen.envs.length - 1] as ItemEnv
+
+  beforeEach(() => {
+    seen.envs = []
+    sessionStorage.clear()
+    forgetAllAttachments()
+    URL.createObjectURL = vi.fn(() => 'blob:u')
+    URL.revokeObjectURL = vi.fn()
+  })
+
+  describe('SessionView: the seams of the question cards', () => {
+    it('onAnswerAsMessage puts the question in the draft, labelled, the cursor at its end, and sends nothing', async () => {
+      const s = sessionServer({ items: () => [message('m1', 't1')] })
+      render(<SessionView id="s1" timing={FAST} />, { wrapper: s.wrapper })
+      await screen.findByText('m1')
+      act(() => lastEnv().onAnswerAsMessage?.('Which branch'))
+      const want = 'You asked: Which branch. My answer: '
+      await waitFor(() => expect(textarea().value).toBe(want))
+      expect(screen.getByText('Answering a question as a new message')).toBeInTheDocument()
+      expect(document.activeElement).toBe(textarea())
+      expect(textarea().selectionStart).toBe(want.length)
+      expect(textarea().selectionEnd).toBe(want.length)
+      expect(s.posted('/prompt')).toEqual([])
+    })
+
+    it('the label goes once the draft is emptied', async () => {
+      const s = sessionServer()
+      render(<SessionView id="s1" timing={FAST} />, { wrapper: s.wrapper })
+      await waitFor(() => expect(seen.envs.length).toBeGreaterThan(0), WAIT)
+      act(() => lastEnv().onAnswerAsMessage?.('Which branch'))
+      await screen.findByText('Answering a question as a new message')
+      fireEvent.change(textarea(), { target: { value: '' } })
+      expect(screen.queryByText('Answering a question as a new message')).toBeNull()
+    })
+
+    it('composerEmpty says whether the draft holds text or an image', async () => {
+      const s = sessionServer()
+      render(<SessionView id="s1" timing={FAST} />, { wrapper: s.wrapper })
+      await waitFor(() => expect(seen.envs.length).toBeGreaterThan(0), WAIT)
+      expect(lastEnv().composerEmpty?.()).toBe(true)
+      fireEvent.change(textarea(), { target: { value: '   ' } })
+      expect(lastEnv().composerEmpty?.()).toBe(true)
+      fireEvent.change(textarea(), { target: { value: 'half an answer' } })
+      expect(lastEnv().composerEmpty?.()).toBe(false)
+      fireEvent.change(textarea(), { target: { value: '' } })
+      expect(lastEnv().composerEmpty?.()).toBe(true)
+      const file = new File(['x'], 'a.png', { type: 'image/png' })
+      fireEvent.paste(textarea(), { clipboardData: { items: [{ kind: 'file', type: file.type, getAsFile: () => file }] } })
+      await waitFor(() => expect(textarea().value).toBe('[Image #1] '))
+      // Only an image, its marker taken out of the text: still a draft.
+      fireEvent.change(textarea(), { target: { value: '' } })
+      expect(lastEnv().composerEmpty?.()).toBe(false)
+    })
+
+    it('the env stays the same object while the view re-renders for other reasons', async () => {
+      const s = sessionServer({ items: () => [message('m1', 't1')] })
+      render(<SessionView id="s1" timing={FAST} />, { wrapper: s.wrapper })
+      await screen.findByText('m1')
+      await screen.findByText('build-box', {}, WAIT)
+      await screen.findByRole('combobox', { name: 'Model' }, WAIT)
+      const before = lastEnv()
+      const renders = seen.envs.length
+      act(() => s.streams[0].event('item', message('m2', 't1')))
+      await screen.findByText('m2')
+      fireEvent.change(textarea(), { target: { value: 'typing re-renders the composer only' } })
+      expect(seen.envs.length).toBeGreaterThan(renders)
+      expect(lastEnv()).toBe(before)
+      expect(typeof before.onSendAgain).toBe('function')
+      expect(typeof before.onAnswerAsMessage).toBe('function')
+      expect(typeof before.composerEmpty).toBe('function')
+    })
+  })
+  ```
+
+Create `web/src/screens/test-session.ts`:
+
+  ```ts
+  // A test server for the session screen with its composer: any session id,
+  // its page, stream, detail and catalogue, the hosts, an undelivered turn
+  // and its images, and the composer's POSTs, recorded with their bodies.
+  import type { SessionCatalog, SessionDetail } from '../generated/protocol'
+  import type { Item, TurnContent } from '../generated/view'
+  import { json, liveStream, routed, type LiveStream } from '../test-stream'
+
+  export function message(id: string, turn: string, text = id): Item {
+    return { id, version: 1, ts: '2026-10-02T10:00:00.000Z', turn_id: turn, kind: 'message', text } as Item
+  }
+
+  export function catalogOf(id: string, model = 'a'): SessionCatalog {
+    return {
+      session_id: id,
+      config_options: [
+        {
+          id: 'model',
+          name: 'Model',
+          category: 'model',
+          type: 'select',
+          currentValue: model,
+          options: ['a', 'b', 'c'].map((v) => ({ value: v, name: v.toUpperCase() })),
+        },
+      ],
+      commands: [],
+    } as SessionCatalog
+  }
+
+  function detail(id: string, patch: Partial<SessionDetail> = {}): SessionDetail {
+    return {
+      session_id: id,
+      host_id: 'h1',
+      agent: 'claude',
+      cwd: '/srv/work/project',
+      hat_id: 'hat1',
+      lifecycle: 'active',
+      activity: 'idle',
+      presumed_parked: false,
+      created_at: '2026-10-02T09:00:00.000Z',
+      last_event_at: '2026-10-02T10:00:00.000Z',
+      pending: [],
+      ...patch,
+    } as SessionDetail
+  }
+
+  export interface Opts {
+    /** The items of a session's first page; none by default. */
+    items?: (id: string) => Item[]
+    /** `GET /api/hosts`. */
+    hosts?: () => Response
+    /** `GET …/turns/{turn}`. */
+    turn?: () => Response | Promise<Response>
+    /** `GET /api/attachments/{sha256}`. */
+    attachment?: () => Response
+    /** `POST …/prompt`; 202 by default. */
+    prompt?: () => Response | Promise<Response>
+    /** `POST …/resume`, the composer's own "Resume and send"; 202 by default. */
+    resume?: () => Response | Promise<Response>
+    /** `POST …/config`. */
+    config?: (id: string) => Response
+    /** `GET /api/view/sessions/{id}`, before `items`. */
+    page?: (id: string) => Response | undefined
+    /** What a session's detail holds besides an idle, active session. */
+    detail?: Partial<SessionDetail>
+  }
+
+  export function sessionServer(opts: Opts = {}) {
+    const streams: LiveStream[] = []
+    const t = routed((call) => {
+      const path = new URL(call.path, 'http://h').pathname
+      let m: RegExpMatchArray | null
+      if (path === '/api/hosts') return opts.hosts?.() ?? json([{ host_id: 'h1', name: 'build-box', capabilities: ['images'] }])
+      if (path.startsWith('/api/attachments/')) return opts.attachment?.() ?? json({ code: 'not_found', message: 'no' }, 404)
+      if (opts.prompt && /^\/api\/sessions\/[^/]+\/prompt$/.test(path)) return opts.prompt()
+      if ((m = path.match(/^\/api\/view\/sessions\/([^/]+)\/turns\/[^/]+$/))) {
+        return opts.turn?.() ?? json({ code: 'not_found', message: 'no' }, 404)
+      }
+      if ((m = path.match(/^\/api\/view\/sessions\/([^/]+)$/))) {
+        const id = decodeURIComponent(m[1])
+        return opts.page?.(id) ?? json({ items: opts.items?.(id) ?? [], older: false, epoch: 'e1', revision: 1 })
+      }
+      if (path.startsWith('/api/stream/view/sessions/')) {
+        const live = liveStream()
+        streams.push(live)
+        return live.response
+      }
+      if ((m = path.match(/^\/api\/sessions\/([^/]+)\/resume$/))) {
+        return opts.resume?.() ?? json({ session_id: decodeURIComponent(m[1]), lifecycle: 'active' }, 202)
+      }
+      if ((m = path.match(/^\/api\/sessions\/([^/]+)\/catalog$/))) return json(catalogOf(decodeURIComponent(m[1])))
+      if ((m = path.match(/^\/api\/sessions\/([^/]+)\/prompt$/))) return json({ turn_id: 'new' }, 202)
+      if ((m = path.match(/^\/api\/sessions\/([^/]+)\/config$/))) {
+        const id = decodeURIComponent(m[1])
+        return opts.config?.(id) ?? json(catalogOf(id), 202)
+      }
+      if ((m = path.match(/^\/api\/sessions\/([^/]+)$/))) return json(detail(decodeURIComponent(m[1]), opts.detail))
+      return json({ code: 'not_found', message: 'no' }, 404)
+    })
+    /** The POSTs to paths ending in `suffix`, with their bodies. */
+    const posted = (suffix: string) =>
+      t.fetch.mock.calls
+        .filter((c) => c[1]?.method === 'POST' && String(c[0]).endsWith(suffix))
+        .map((c) => ({ path: String(c[0]), body: JSON.parse(String(c[1]?.body)) as unknown }))
+    const of = (path: string) => t.calls.filter((c) => new URL(c.path, 'http://h').pathname === path)
+    return { ...t, streams, posted, of }
+  }
+
+  export const FAST = { retryMs: () => 5, resyncedMs: 300 }
+
+  /** A turn the host never started, with a picture. */
+  export const UNDELIVERED: TurnContent = {
+    turn_id: 't9',
+    content: [
+      { type: 'text', text: 'look at' },
+      { type: 'image', mimeType: 'image/png', sha256: 'ab/c', size: 4 },
+      { type: 'text', text: 'and fix it' },
+    ],
+  }
+  ```
+
+- [ ] **Step 2: Run them, and see them fail**
+
+Run: `nix develop -c sh -c 'cd web && pnpm vitest run src/components/Composer.test.tsx src/lib src/api src/screens src/App.test.tsx'`
+Expected: FAIL: 10 test files cannot resolve `./attachments`, `./catalog`, `./drafts`, `./sendAgain`, `./sending` and `./turns` (the composer's, the view's and the App's tests import them); the other 21 pass, 337 tests.
+
+- [ ] **Step 3: The composer, mounted under the transcript**
+
+In `web/src/api/errors.ts`, replace:
+
+  ```ts
+      const serverMessage = body?.message ?? `The request failed (${status}).`
+      super(Object.hasOwn(MESSAGES, code) ? MESSAGES[code] : serverMessage)
+  ```
+
+with:
+
+  ```ts
+      const serverMessage = body?.message ?? `The request failed (${status}).`
+      // Own keys only: a code like `constructor` is the server's, not Object's.
+      super(Object.hasOwn(MESSAGES, code) ? MESSAGES[code] : serverMessage)
+  ```
+
+Create `web/src/api/turns.ts`:
+
+  ```ts
+  // What the composer asks of a session (ACP core §9): a prompt, a cancel, a
+  // config switch, and the resume behind "Resume and send". Every id in a path
+  // is encoded: ids are server data, never trusted to be path-safe.
+  import type { Client } from './client'
+  import type {
+    CancelResponse,
+    ConfigValue,
+    LifecycleResponse,
+    PromptResponse,
+    SessionCatalog,
+  } from '../generated/protocol'
+
+  const enc = encodeURIComponent
+
+  /** One ACP content block of a prompt, in order: a run of text, or an image
+   *  as base64 (ACP core §7). */
+  export type PromptBlock = { type: 'text'; text: string } | { type: 'image'; mimeType: string; data: string }
+
+  /** `POST /api/sessions/{id}/prompt` → 202 `{turn_id}`. */
+  export function prompt(client: Client, id: string, content: PromptBlock[]): Promise<PromptResponse> {
+    return client.request<PromptResponse>('POST', `/api/sessions/${enc(id)}/prompt`, { content })
+  }
+
+  /** `POST /api/sessions/{id}/cancel` → 202 with the open turn's real outcome. */
+  export function cancel(client: Client, id: string): Promise<CancelResponse> {
+    return client.request<CancelResponse>('POST', `/api/sessions/${enc(id)}/cancel`)
+  }
+
+  /** `POST /api/sessions/{id}/config` → 202 with the session's catalogue as the
+   *  agent now reports it. */
+  export function setConfig(client: Client, id: string, configId: string, value: ConfigValue): Promise<SessionCatalog> {
+    return client.request<SessionCatalog>('POST', `/api/sessions/${enc(id)}/config`, { config_id: configId, value })
+  }
+
+  /** `POST /api/sessions/{id}/resume` → 202 once the session has started again. */
+  export function resume(client: Client, id: string): Promise<LifecycleResponse> {
+    return client.request<LifecycleResponse>('POST', `/api/sessions/${enc(id)}/resume`)
+  }
+  ```
+
+In `web/src/api/view.ts`, replace:
+
+  ```ts
+   *  delivered, whole, to send again. */
+  export function undeliveredTurn(client: Client, id: string, turnId: string): Promise<TurnContent> {
+    return client.request<TurnContent>('GET', `/api/view/sessions/${enc(id)}/turns/${enc(turnId)}`)
+  ```
+
+with:
+
+  ```ts
+   *  delivered, whole, to send again. `signal` aborts the request. */
+  export function undeliveredTurn(client: Client, id: string, turnId: string, signal?: AbortSignal): Promise<TurnContent> {
+    return client.request<TurnContent>('GET', `/api/view/sessions/${enc(id)}/turns/${enc(turnId)}`, undefined, { signal })
+  ```
+
+Create `web/src/components/Composer.tsx`:
+
+  ```tsx
+  // The composer (frontend spec §6.5): a prompt with images, slash commands,
+  // the config bar, and Send, which a Cancel replaces while a turn runs.
+  //
+  // Mount it as `<Composer sessionId=… />`: the export is keyed by the
+  // session id, so each session gets its own instance, and nothing typed or
+  // attached for one session is ever shown in, or sent to, another (F-17).
+  // The draft lives in `sessionStorage` (`hennery.draft.<id>`), the images in
+  // memory (lib/attachments.ts); both come back when the session does. So
+  // does a send still in flight (lib/sending.ts): the composer mounted again
+  // stays read-only until it ends, and a 202 clears the draft it shows.
+  //
+  // A `handle` lets the session screen put words in the draft: a question's
+  // "Answer as a new message", a turn that was not delivered ("Send again").
+  // Neither sends on its own: the operator does.
+  import {
+    useEffect,
+    useId,
+    useImperativeHandle,
+    useLayoutEffect,
+    useRef,
+    useState,
+    type ClipboardEvent,
+    type KeyboardEvent,
+    type Ref,
+  } from 'react'
+  import { useClient } from '../app-client'
+  import { ApiFailure, messageOf } from '../api/errors'
+  import { cancel, prompt, resume, setConfig } from '../api/turns'
+  import type { Capabilities, ConfigValue, SessionCatalog } from '../generated/protocol'
+  import type { SessionSummary } from '../generated/view'
+  import {
+    admit,
+    forgetAttachments,
+    heldFor,
+    highestMarker,
+    hold,
+    inertMarkers,
+    live,
+    marker,
+    promptBlocks,
+    splice,
+    withoutMarker,
+    type Attachment,
+  } from '../lib/attachments'
+  import { commands, configOptions, matchCommands, type Choice, type Command, type ConfigOption } from '../lib/catalog'
+  import { loadDraft, saveDraft } from '../lib/drafts'
+  import { sendingFor, track } from '../lib/sending'
+  import { undeliveredDraft, type DraftPart } from '../lib/sendAgain'
+  import { Icon } from '../lib/ui'
+  import { CANCEL_OUTCOME, SEND_AGAIN_LABEL, cancelRefusal, configRefusal, promptRefusal } from './composerWords'
+
+  /** What the session screen may ask of its composer. */
+  export interface ComposerHandle {
+    /** Put `text` in the draft, after what is there (an empty draft is
+     *  replaced), with `label` shown above it until it is sent; the cursor
+     *  goes to its end. Sends nothing. */
+    prefill(text: string, label?: string): void
+    /** Nothing is written or attached: the draft holds no work. */
+    isEmpty(): boolean
+    /** Put the undelivered turn `turnId` back in the draft, its images
+     *  fetched again, for the operator to send. All or nothing: a turn that
+     *  cannot be rebuilt whole says why and leaves the draft as it was. */
+    refill(turnId: string): Promise<void>
+  }
+
+  export interface ComposerProps {
+    /** The session prompts go to. A new id is a new composer (see above). */
+    sessionId: string
+    /** The session as the list shows it, null while unknown. A turn in
+     *  flight (`activity` is `running` or `blocked`) disables Send and offers
+     *  Cancel instead; while `starting`, a refusal never offers a resume. */
+    session: Pick<SessionSummary, 'activity' | 'lifecycle'> | null
+    /** The session's host's capabilities (`HostItem.capabilities`), null
+     *  while unknown. Images are hidden only when they are known and lack
+     *  `images`. */
+    capabilities: Capabilities | null
+    /** The session's catalogue (config options, slash commands); null while
+     *  it loads. */
+    catalog: SessionCatalog | null
+    /** A config switch answered with the catalogue the agent now reports:
+     *  it replaces the one held (useSessionItems' `setCatalog`). */
+    onCatalog: (catalog: SessionCatalog) => void
+    /** "Resume and send" resumes through this, then sends the draft; it
+     *  rejects with the refusal to show. Absent: `POST …/resume`. */
+    onResume?: () => Promise<unknown>
+    /** The handle above, bound to the composer of the session shown. */
+    handle?: Ref<ComposerHandle>
+  }
+
+  /** The composer of one session, remounted whenever the session changes. */
+  export function Composer(props: ComposerProps) {
+    return <SessionComposer key={props.sessionId} {...props} />
+  }
+
+  const STILL_STARTING = 'The session is still starting: send again once it runs.'
+
+  /** Said when work is added while a prompt is being sent: the 202 clears
+   *  the draft, so whatever came in meanwhile would be lost. It stays after
+   *  the send, so it is worded to be true then too. */
+  export const STILL_SENDING = 'Not added: a prompt was being sent. Add it again.'
+
+  interface Notice {
+    text: string
+    /** Offer "Resume and send" (a prompt refused with `not_attached`). */
+    resume?: boolean
+  }
+
+  /** How a send ended: sent (a 202), or refused, saying why. */
+  type Outcome = { sent: true } | { sent: false; notice: Notice }
+
+  function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog, onResume, handle }: ComposerProps) {
+    const client = useClient()
+    const ids = useId()
+    const [text, setText] = useState(() => loadDraft(sessionId))
+    const [atts, setAtts] = useState<Attachment[]>(() => heldFor(sessionId).attachments)
+    // The next image's number: past every number this draft has used, and
+    // past any marker a restored draft still holds.
+    const nextN = useRef(0)
+    if (nextN.current === 0) nextN.current = Math.max(heldFor(sessionId).nextN, highestMarker(text) + 1)
+    // A send in flight, this composer's or one made before it was mounted
+    // again (lib/sending.ts). Read once: the flag and the mount's follower
+    // below hold the same send, even one that ends before the effect runs.
+    const [mountedSend] = useState(() => sendingFor<Outcome>(sessionId))
+    const [sending, setSending] = useState(mountedSend !== undefined)
+    // The same, read synchronously: a refill answering later, or a paste in
+    // the render a send started from, sees it at once.
+    const sendingNow = useRef(sending)
+    const setSendingBoth = (on: boolean) => {
+      sendingNow.current = on
+      setSending(on)
+    }
+    const [cancelling, setCancelling] = useState(false)
+    const [notice, setNotice] = useState<Notice | null>(null)
+    // What a paste, a drop, a pick or a put-in draft could not add: shown
+    // until the next such action or the next send, never cleared by a send's
+    // answer (a refusal made while it was in flight would vanish with it).
+    const [draftError, setDraftError] = useState<string | null>(null)
+    const [pendingConfig, setPendingConfig] = useState<Record<string, ConfigValue>>({})
+    const [configError, setConfigError] = useState<string | null>(null)
+    const [sel, setSel] = useState(0)
+    const [dismissed, setDismissed] = useState(false)
+    const [dragging, setDragging] = useState(false)
+    // What a draft put in for the operator is (see the handle).
+    const [label, setLabel] = useState<string | null>(null)
+    const taRef = useRef<HTMLTextAreaElement>(null)
+    const fileRef = useRef<HTMLInputElement>(null)
+    const cursor = useRef<number | null>(null)
+
+    useEffect(() => saveDraft(sessionId, text), [sessionId, text])
+
+    // Put the cursor after markers just spliced in.
+    useLayoutEffect(() => {
+      const ta = taRef.current
+      if (ta && cursor.current !== null) {
+        ta.focus()
+        ta.setSelectionRange(cursor.current, cursor.current)
+        cursor.current = null
+      }
+    }, [text])
+
+    const inFlight = session?.activity === 'running' || session?.activity === 'blocked'
+    const hostImages = capabilities === null || capabilities.includes('images')
+    // A session still starting refuses a resume too: it runs soon on its own.
+    const canResume = session?.lifecycle !== 'starting'
+    // Nothing to send: Send and "Resume and send" both wait for words.
+    const blank = text.trim() === ''
+    const canSend = !sending && !inFlight && !blank
+
+    // The draft as last rendered, for the handle and for a refill that
+    // answers later.
+    const latest = useRef({ text, atts, hostImages })
+    useLayoutEffect(() => {
+      latest.current = { text, atts, hostImages }
+    })
+    // Aborted when the composer goes: a refill answering later lands nowhere.
+    const alive = useRef<AbortController | null>(null)
+    useEffect(() => {
+      const controller = new AbortController()
+      alive.current = controller
+      // A send made before this composer was mounted again ends here.
+      if (mountedSend) void follow(mountedSend)
+      return () => controller.abort()
+      // Once per composer: its session never changes (see Composer).
+    }, [])
+
+    const options = configOptions(catalog)
+    const cmds = commands(catalog)
+    // The slash menu: the text starts with `/` and has no space yet.
+    const query = !dismissed && /^\/\S*$/.test(text) ? text.slice(1) : null
+    const matches = query === null ? [] : matchCommands(cmds, query)
+    const menuOpen = matches.length > 0
+    const selIdx = Math.min(sel, matches.length - 1)
+    const optionId = (i: number) => `${ids}-cmd-${i}`
+
+    function keep(next: Attachment[]) {
+      setAtts(next)
+      hold(sessionId, { attachments: next, nextN: nextN.current })
+    }
+
+    function edit(next: string) {
+      setText(next)
+      setSel(0)
+      setDismissed(false)
+      if (next.trim() === '') setLabel(null)
+    }
+
+    /** Add `parts` to the draft as one action: after the text there (or in
+     *  place of a blank one), each image as a new marker. All or nothing. */
+    function addToDraft(parts: DraftPart[], why: string | null) {
+      if (sendingNow.current) {
+        setDraftError(STILL_SENDING)
+        return
+      }
+      const { text: current, atts: held, hostImages: images } = latest.current
+      const files = parts.flatMap((p) => (p.type === 'image' ? [p.file] : []))
+      if (files.length > 0 && !images) {
+        setNotice({ text: 'This turn holds images, and this host takes no images.' })
+        return
+      }
+      // Past every marker the draft or the words put in name: a literal
+      // `[Image #N]` in them never comes to name a new image.
+      const words = parts.flatMap((p) => (p.type === 'text' ? [p.text] : [])).join(' ')
+      nextN.current = Math.max(nextN.current, highestMarker(`${current} ${words}`) + 1)
+      const { accepted, refused } = admit(held, files, nextN.current)
+      if (refused.length > 0) {
+        setNotice({ text: refused.join(' ') })
+        return
+      }
+      const numbers = new Map(accepted.map((a) => [a.file, a.n]))
+      let added = ''
+      for (const part of parts) {
+        const n = part.type === 'image' ? numbers.get(part.file) : undefined
+        const piece = part.type === 'text' ? part.text : n === undefined ? '' : marker(n)
+        if (added !== '' && !/\s$/.test(added) && !/^\s/.test(piece)) added += ' '
+        added += piece
+      }
+      if (added.trim() === '') return
+      if (accepted.length > 0) nextN.current = accepted[accepted.length - 1].n + 1
+      const next = current.trim() === '' ? added : current + (current.endsWith('\n') ? '\n' : '\n\n') + added
+      cursor.current = next.length
+      edit(next)
+      setLabel(why)
+      if (accepted.length > 0) keep([...held, ...accepted])
+    }
+
+    async function refill(turnId: string) {
+      const signal = alive.current?.signal
+      setNotice(null)
+      let parts: DraftPart[]
+      try {
+        parts = await undeliveredDraft(client, sessionId, turnId, signal)
+      } catch (err) {
+        if (!signal?.aborted) setNotice({ text: `The turn could not be put back: ${messageOf(err)}` })
+        return
+      }
+      if (!signal?.aborted) addToDraft(parts, SEND_AGAIN_LABEL)
+    }
+
+    useImperativeHandle(handle, () => ({
+      // Words an agent wrote never link a held image. A turn put back is the
+      // operator's own, and goes back as it was sent.
+      prefill: (words: string, why?: string) => addToDraft([{ type: 'text', text: inertMarkers(words) }], why ?? null),
+      isEmpty: () => latest.current.text.trim() === '' && latest.current.atts.length === 0,
+      refill,
+    }))
+
+    function pickCommand(c: Command) {
+      edit(`/${c.name} `)
+      cursor.current = c.name.length + 2
+    }
+
+    /** Attach `files` as one action: every marker spliced in at once, at the
+     *  cursor (over the selection). */
+    function attach(files: File[]) {
+      if (files.length === 0) return
+      if (sendingNow.current) {
+        setDraftError(STILL_SENDING)
+        return
+      }
+      if (!hostImages) {
+        setDraftError('This host takes no images.')
+        return
+      }
+      const { accepted, refused } = admit(atts, files, nextN.current)
+      setDraftError(refused.length > 0 ? refused.join(' ') : null)
+      if (accepted.length === 0) return
+      nextN.current = accepted[accepted.length - 1].n + 1
+      const ta = taRef.current
+      const start = ta ? ta.selectionStart : text.length
+      const end = ta ? ta.selectionEnd : text.length
+      const placed = splice(text, start, end, accepted.map((a) => marker(a.n)).join(' ') + ' ')
+      cursor.current = placed.cursor
+      edit(placed.text)
+      keep([...atts, ...accepted])
+    }
+
+    function removeAttachment(n: number) {
+      keep(atts.filter((a) => a.n !== n))
+      edit(withoutMarker(text, n))
+    }
+
+    /** POST `draft` with `images`. Kept on any refusal; a 202 clears the
+     *  draft at its source, as this may answer after the composer went. */
+    async function deliver(draft: string, images: Attachment[]): Promise<Outcome> {
+      try {
+        await prompt(client, sessionId, await promptBlocks(draft, images))
+      } catch (err) {
+        return {
+          sent: false,
+          notice: { text: promptRefusal(err), resume: err instanceof ApiFailure && err.code === 'not_attached' },
+        }
+      }
+      saveDraft(sessionId, '')
+      forgetAttachments(sessionId)
+      return { sent: true }
+    }
+
+    /** A send's outcome, taken by the composer shown when it ends (one that
+     *  went takes nothing: React drops its updates). */
+    async function follow(pending: Promise<Outcome>) {
+      const outcome = await pending
+      if (outcome.sent) {
+        nextN.current = 1
+        setAtts([])
+        setText('')
+        setLabel(null)
+      } else {
+        setNotice(outcome.notice)
+      }
+      // Whatever came of it, the draft is the operator's again.
+      setSendingBoth(false)
+    }
+
+    /** Start `work` as this session's send, the draft as it stands. */
+    function begin(work: (draft: string, images: Attachment[]) => Promise<Outcome>) {
+      // One send at a time: a second click before the composer renders again
+      // finds the first one here.
+      if (sendingNow.current) return
+      setSendingBoth(true)
+      setNotice(null)
+      setDraftError(null)
+      const draft = text
+      const images = atts
+      // Every path of `work` ends in an outcome; a throw is worded all the same.
+      const thrown = (err: unknown): Outcome => ({ sent: false, notice: { text: messageOf(err) } })
+      void follow(track(sessionId, () => work(draft, images), thrown))
+    }
+
+    function send() {
+      if (canSend) begin(deliver)
+    }
+
+    /** Resume, then send; tracked as one send, so a composer mounted again
+     *  while the resume is answered waits for both. */
+    function resumeAndSend() {
+      begin(async (draft, images) => {
+        try {
+          await (onResume ? onResume() : resume(client, sessionId))
+        } catch (err) {
+          return { sent: false, notice: { text: messageOf(err) } }
+        }
+        return deliver(draft, images)
+      })
+    }
+
+    async function stop() {
+      setCancelling(true)
+      setNotice(null)
+      try {
+        const answer = await cancel(client, sessionId)
+        setNotice({
+          text: Object.hasOwn(CANCEL_OUTCOME, answer.outcome)
+            ? CANCEL_OUTCOME[answer.outcome]
+            : `The turn ended: ${answer.outcome}.`,
+        })
+      } catch (err) {
+        setNotice({ text: cancelRefusal(err) })
+      } finally {
+        setCancelling(false)
+      }
+    }
+
+    /** Show the pick at once; the agent's answer replaces it, a refusal
+     *  takes it back. */
+    async function switchConfig(option: ConfigOption, value: ConfigValue) {
+      const settle = () =>
+        setPendingConfig((p) => {
+          const rest = { ...p }
+          delete rest[option.id]
+          return rest
+        })
+      setPendingConfig((p) => ({ ...p, [option.id]: value }))
+      setConfigError(null)
+      let answer: SessionCatalog
+      try {
+        answer = await setConfig(client, sessionId, option.id, value)
+      } catch (err) {
+        // Taken back: the catalogue held still says what the agent runs.
+        settle()
+        setConfigError(`${option.name}: ${configRefusal(err)}`)
+        return
+      }
+      // Replaced by what the agent now reports, which may differ from the pick.
+      onCatalog(answer)
+      settle()
+    }
+
+    function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
+      if (e.nativeEvent.isComposing) return
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault()
+        send()
+        return
+      }
+      if (!menuOpen) return
+      if (e.key === 'ArrowDown') {
+        e.preventDefault()
+        setSel((s) => (Math.min(s, matches.length - 1) + 1) % matches.length)
+      } else if (e.key === 'ArrowUp') {
+        e.preventDefault()
+        setSel((s) => (Math.min(s, matches.length - 1) - 1 + matches.length) % matches.length)
+      } else if (e.key === 'Enter') {
+        e.preventDefault()
+        pickCommand(matches[selIdx])
+      } else if (e.key === 'Escape') {
+        e.preventDefault()
+        setDismissed(true)
+      }
+    }
+
+    function onPaste(e: ClipboardEvent<HTMLTextAreaElement>) {
+      const files: File[] = []
+      for (const item of Array.from(e.clipboardData.items)) {
+        if (item.kind === 'file' && item.type.startsWith('image/')) {
+          const file = item.getAsFile()
+          if (file) files.push(file)
+        }
+      }
+      if (files.length > 0) {
+        e.preventDefault()
+        attach(files)
+      }
+    }
+
+    const liveNs = new Set(live(text, atts).map((a) => a.n))
+
+    return (
+      <div className="composer">
+        <div className="composer-inner">
+          {label && (
+            <p className="composer-label" role="status">
+              {label}
+            </p>
+          )}
+          {options.length > 0 && (
+            <div className="composer-controls" role="group" aria-label="Session settings">
+              {options.map((option) => (
+                <Switcher
+                  key={option.id}
+                  option={option}
+                  value={Object.hasOwn(pendingConfig, option.id) ? pendingConfig[option.id] : option.current}
+                  busy={Object.hasOwn(pendingConfig, option.id)}
+                  onPick={(value) => void switchConfig(option, value)}
+                />
+              ))}
+            </div>
+          )}
+          {configError && (
+            <p className="form-error" role="alert">
+              <bdi>{configError}</bdi>
+            </p>
+          )}
+          <div
+            className={'composer-box' + (dragging ? ' dragging' : '')}
+            onDragOver={(e) => {
+              if (!e.dataTransfer.types.includes('Files')) return
+              e.preventDefault()
+              setDragging(hostImages)
+            }}
+            onDragLeave={(e) => {
+              if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragging(false)
+            }}
+            onDrop={(e) => {
+              if (e.dataTransfer.files.length === 0) return
+              e.preventDefault()
+              setDragging(false)
+              attach(Array.from(e.dataTransfer.files))
+            }}
+          >
+            {menuOpen && (
+              <ul className="slash-menu" role="listbox" id={`${ids}-cmds`} aria-label="Slash commands">
+                {matches.map((c, i) => (
+                  <li
+                    key={c.name}
+                    id={optionId(i)}
+                    role="option"
+                    aria-selected={i === selIdx}
+                    className={'slash-item' + (i === selIdx ? ' sel' : '')}
+                    onMouseEnter={() => setSel(i)}
+                    // Before the textarea loses focus.
+                    onMouseDown={(e) => {
+                      e.preventDefault()
+                      pickCommand(c)
+                    }}
+                  >
+                    <span className="slash-name">
+                      <bdi>/{c.name}</bdi>
+                    </span>
+                    {(c.description || c.hint) && (
+                      <span className="slash-desc">
+                        <bdi>{c.description || c.hint}</bdi>
+                      </span>
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+            <textarea
+              ref={taRef}
+              aria-label="Prompt"
+              aria-autocomplete="list"
+              aria-controls={menuOpen ? `${ids}-cmds` : undefined}
+              aria-activedescendant={menuOpen ? optionId(selIdx) : undefined}
+              rows={1}
+              value={text}
+              readOnly={sending}
+              placeholder={cmds.length > 0 ? 'Write a prompt… (/ for commands)' : 'Write a prompt…'}
+              onChange={(e) => {
+                edit(e.target.value)
+                e.target.style.height = 'auto'
+                e.target.style.height = `${e.target.scrollHeight}px`
+              }}
+              onKeyDown={onKeyDown}
+              onPaste={onPaste}
+            />
+            {hostImages && (
+              <>
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/gif,image/webp"
+                  multiple
+                  hidden
+                  aria-hidden="true"
+                  tabIndex={-1}
+                  data-testid="image-input"
+                  onChange={(e) => {
+                    attach(Array.from(e.target.files ?? []))
+                    e.target.value = ''
+                  }}
+                />
+                <button className="attach-btn" type="button" aria-label="Attach images" onClick={() => fileRef.current?.click()}>
+                  <Icon.Paperclip size={18} />
+                </button>
+              </>
+            )}
+            {inFlight ? (
+              <button
+                className="btn btn-danger btn-sm"
+                type="button"
+                disabled={cancelling}
+                onClick={() => void stop()}
+              >
+                {cancelling ? 'Stopping…' : 'Cancel'}
+              </button>
+            ) : (
+              <button className="send-btn" type="button" aria-label="Send" disabled={!canSend} onClick={send}>
+                <Icon.ArrowUp size={18} />
+              </button>
+            )}
+          </div>
+          {atts.length > 0 && (
+            <ul className="att-strip" aria-label="Images">
+              {atts.map((a) => (
+                <li
+                  className="att-chip"
+                  key={a.n}
+                  title={liveNs.has(a.n) ? undefined : `${marker(a.n)} is no longer in the text: it will not be sent.`}
+                >
+                  <Thumb file={a.file} n={a.n} />
+                  <span className="att-n">#{a.n}</span>
+                  <button className="att-x" type="button" aria-label={`Remove image #${a.n}`} onClick={() => removeAttachment(a.n)}>
+                    <Icon.X size={12} />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          {draftError && (
+            <p className="form-error" role="alert">
+              <bdi>{draftError}</bdi>
+            </p>
+          )}
+          {notice && (
+            <div className="composer-hint" role="status">
+              <span>
+                <bdi>{notice.resume && !canResume ? STILL_STARTING : notice.text}</bdi>
+              </span>
+              {notice.resume && canResume && (
+                <button className="btn btn-primary btn-sm" type="button" disabled={sending || blank} onClick={resumeAndSend}>
+                  Resume and send
+                </button>
+              )}
+            </div>
+          )}
+          <div className="composer-hint">
+            <span>
+              <kbd>⌘</kbd>/<kbd>Ctrl</kbd> <kbd>↵</kbd> to send
+            </span>
+            <span>·</span>
+            <span>
+              <kbd>↵</kbd> for a new line
+            </span>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  /** An attached image's preview. Its object URL lives exactly as long as the
+   *  chip: revoked when the image is removed, sent, or the composer goes. */
+  function Thumb({ file, n }: { file: File; n: number }) {
+    const [url, setUrl] = useState<string | null>(null)
+    useEffect(() => {
+      const made = URL.createObjectURL(file)
+      setUrl(made)
+      return () => URL.revokeObjectURL(made)
+    }, [file])
+    return url ? <img src={url} alt={`Image #${n}`} /> : null
+  }
+
+  /** One config option: a select of its values, or an on/off box. */
+  function Switcher({
+    option,
+    value,
+    busy,
+    onPick,
+  }: {
+    option: ConfigOption
+    value: ConfigValue
+    busy: boolean
+    onPick: (value: ConfigValue) => void
+  }) {
+    if (option.kind === 'boolean') {
+      return (
+        <label className="switcher">
+          <input type="checkbox" checked={value === true} disabled={busy} onChange={(e) => onPick(e.target.checked)} />
+          <bdi>{option.name}</bdi>
+        </label>
+      )
+    }
+    const current = String(value)
+    // A value the adapter reports but does not list is still shown as held.
+    const listed: Choice[] = option.choices.some((c) => c.value === current)
+      ? option.choices
+      : [{ value: current, name: current }, ...option.choices]
+    const groups: { name?: string; choices: Choice[] }[] = []
+    for (const c of listed) {
+      const last = groups[groups.length - 1]
+      if (last && last.name === c.group) last.choices.push(c)
+      else groups.push({ name: c.group, choices: [c] })
+    }
+    const render = (c: Choice) => (
+      <option key={c.value} value={c.value} title={c.description}>
+        {c.name}
+      </option>
+    )
+    return (
+      <label className="switcher">
+        <bdi>{option.name}</bdi>
+        <select aria-label={option.name} value={current} disabled={busy} onChange={(e) => onPick(e.target.value)}>
+          {groups.map((g, i) =>
+            g.name === undefined ? (
+              g.choices.map(render)
+            ) : (
+              <optgroup key={`${i}-${g.name}`} label={g.name}>
+                {g.choices.map(render)}
+              </optgroup>
+            ),
+          )}
+        </select>
+      </label>
+    )
+  }
+  ```
+
+In `web/src/components/SignOut.tsx`, replace:
+
+  ```tsx
+  import { useClient } from '../app-client'
+  import { navigate } from '../router'
+  ```
+
+with:
+
+  ```tsx
+  import { useClient } from '../app-client'
+  import { forgetAllAttachments } from '../lib/attachments'
+  import { forgetAllDrafts } from '../lib/drafts'
+  import { forgetAllSends } from '../lib/sending'
+  import { navigate } from '../router'
+  ```
+
+In `web/src/components/SignOut.tsx`, replace:
+
+  ```tsx
+      }
+      navigate('/login')
+  ```
+
+with:
+
+  ```tsx
+      }
+      // Signed out: the drafts go with the session, their text in
+      // sessionStorage and their images in memory, and a send still in flight
+      // is let go of, so no composer waits on it. Only here: a failed
+      // sign-out keeps them (still signed in), and so does a 401's redirect to
+      // the login screen, so work survives an expired session.
+      forgetAllDrafts()
+      forgetAllAttachments()
+      forgetAllSends()
+      navigate('/login')
+  ```
+
+Create `web/src/components/composerWords.ts`:
+
+  ```ts
+  // What the composer says when a prompt, a cancel or a config switch is
+  // refused (frontend spec §6.5, ACP core §9). The wording is the composer's
+  // own: these codes mean something else on other routes (`invalid` on the
+  // session list, say), so they stay out of the app-wide messages.
+  import { ApiFailure, messageOf } from '../api/errors'
+  import type { TurnOutcome } from '../generated/protocol'
+
+  /** A sentence per code; a function when the server's reason is worth
+   *  showing after it, as text. */
+  type Wording = string | ((serverMessage: string) => string)
+
+  const PROMPT: Record<string, Wording> = {
+    not_attached: 'The session is not running: resume it to send this.',
+    host_offline: 'The host is offline; send again once it is back.',
+    turn_in_progress: 'A turn is still running: wait for it to end, or stop it, then send again.',
+    images_unsupported: 'This host takes no images: remove them, then send again.',
+    empty_prompt: 'There is nothing to send: write something, or attach an image.',
+    invalid_content: (why) => `This prompt holds something that cannot be sent (${why}).`,
+    invalid: (why) => `The prompt was refused as not valid (${why}).`,
+    content_too_large: (why) => `The prompt is too large (${why}).`,
+    body_too_large: 'The prompt is too large to send: take out some images, or send them in parts.',
+    delivery_unknown: 'Delivery unknown: the outcome shows when the host reconnects.',
+  }
+
+  const CANCEL: Record<string, Wording> = {
+    no_open_turn: 'Nothing was running.',
+    not_running: 'Nothing was running.',
+    not_attached: 'The session is not running: there is nothing to stop.',
+    host_offline: 'The host is offline: the turn cannot be stopped from here until it is back.',
+  }
+
+  const CONFIG: Record<string, Wording> = {
+    not_attached: 'The session is not running: resume it to change this.',
+    unknown_option: 'The agent no longer offers this.',
+    invalid: (why) => `The agent refused this value (${why}).`,
+    config_failed: (why) => `The agent could not apply it (${why}).`,
+    host_offline: 'The host is offline: try again once it is back.',
+  }
+
+  /** What a cancel answers with: the open turn's real outcome. */
+  export const CANCEL_OUTCOME: Record<TurnOutcome, string> = {
+    completed: 'The turn finished before it could be stopped.',
+    cancelled: 'Stopped.',
+    failed: 'The turn failed before it could be stopped.',
+    interrupted: 'The turn was interrupted: the session was parked or closed, or its agent exited.',
+  }
+
+  function say(words: Record<string, Wording>, err: unknown): string {
+    // Own keys only: a code is server data (`constructor` is not a wording).
+    if (err instanceof ApiFailure && Object.hasOwn(words, err.code)) {
+      const wording = words[err.code]
+      return typeof wording === 'string' ? wording : wording(err.serverMessage)
+    }
+    return messageOf(err)
+  }
+
+  /** Why a prompt was not sent. The draft is kept whatever the reason. */
+  export function promptRefusal(err: unknown): string {
+    return say(PROMPT, err)
+  }
+
+  /** Why a cancel stopped nothing. */
+  export function cancelRefusal(err: unknown): string {
+    return say(CANCEL, err)
+  }
+
+  /** Why a config switch was taken back. */
+  export function configRefusal(err: unknown): string {
+    return say(CONFIG, err)
+  }
+
+  /** The draft a question the agent stopped waiting on is answered in, as a
+   *  new message (frontend spec §6.3, "Answer as a new message"): the operator
+   *  writes the answer after it. */
+  export function answerAsMessage(question: string): string {
+    return `You asked: ${question}. My answer: `
+  }
+
+  /** The labels a draft put in for the operator carries until it is sent. */
+  export const ANSWER_LABEL = 'Answering a question as a new message'
+  export const SEND_AGAIN_LABEL = 'The turn that was not delivered, back in the draft: send it when ready'
+  ```
+
+In `web/src/components/items/types.ts`, replace:
+
+  ```ts
+    onSendAgain?: (item: ItemOf<'marker'>) => void
+  }
+  ```
+
+with:
+
+  ```ts
+    onSendAgain?: (item: ItemOf<'marker'>) => void
+    /** "Answer as a new message": `question` is the question's own text. The
+     *  composer's draft gets `You asked: <question>. My answer: `
+     *  (composerWords' `answerAsMessage`), labelled, the cursor at its end.
+     *  Nothing is sent: the operator writes the answer and sends it. */
+    onAnswerAsMessage?: (question: string) => void
+    /** The composer holds no draft (no text, no image): only then may a newly
+     *  opened answerable card take the focus (brief item 25, §10). */
+    composerEmpty?: () => boolean
+  }
+  ```
+
+In `web/src/index.css`, replace:
+
+  ```css
+  .composer-hint kbd { font-family:var(--font-mono); background:var(--surface-3); border:1px solid var(--border); border-radius:4px; padding:1px 6px; font-size:11px; color:var(--fg-2); }
+
+  ```
+
+with:
+
+  ```css
+  .composer-hint kbd { font-family:var(--font-mono); background:var(--surface-3); border:1px solid var(--border); border-radius:4px; padding:1px 6px; font-size:11px; color:var(--fg-2); }
+  .composer-label { margin:0 0 8px; font-size:12px; font-weight:600; color:var(--accent); }
+
+  ```
+
+Create `web/src/lib/attachments.ts`:
+
+  ```ts
+  // A draft's images (frontend spec §6.5, ACP core §7 and §11): the limits,
+  // the `[Image #N]` markers, the blocks a prompt is sent as, and where each
+  // session's images wait while another session is shown (F-17).
+  //
+  // The text is the source of truth: an image is sent only while its marker
+  // is in the text, at the place of its first marker.
+  import type { PromptBlock } from '../api/turns'
+  import { ALLOWED_IMAGE_TYPES, MAX_IMAGE_BYTES, fileToBase64 } from './image'
+
+  export const MAX_IMAGES = 20
+  export const MAX_TOTAL_BYTES = 16 * 1024 * 1024 // 16 MiB decoded per prompt
+
+  export interface Attachment {
+    /** Its number in `[Image #N]`; never reused within a draft. */
+    n: number
+    file: File
+  }
+
+  export function marker(n: number): string {
+    return `[Image #${n}]`
+  }
+
+  /** The greatest N a marker may name. A marker of more digits is plain
+   *  text: `Number` loses precision past 2^53, and two images would come to
+   *  share one number. */
+  export const MAX_MARKER = 999_999
+
+  /** What `marker` writes: N from 1 to `MAX_MARKER`, with no leading zero.
+   *  Anything else (`[Image #01]`, seven digits) is plain text. */
+  const MARKER = /\[Image #([1-9]\d{0,5})\]/g
+
+  /** `text` with every `[Image #` made plain text, readable as it was: a
+   *  word joiner (U+2060, invisible) after the bracket. For words an agent
+   *  wrote that the composer puts in the draft (a question answered as a new
+   *  message): they never link a held image, also one whose marker the
+   *  operator took out of the text. Never for the operator's own words: a
+   *  turn put back goes back byte for byte. */
+  export function inertMarkers(text: string): string {
+    return text.replaceAll('[Image #', '[\u2060Image #')
+  }
+
+  /** The greatest N any marker in `text` names (0 for none): a draft restored
+   *  from storage numbers its next image past it, so a marker left in the
+   *  text never comes to name a new image. */
+  export function highestMarker(text: string): number {
+    let max = 0
+    for (const m of text.matchAll(MARKER)) max = Math.max(max, Number(m[1]))
+    return max
+  }
+
+  export interface Admitted {
+    accepted: Attachment[]
+    /** One sentence per file refused, in the order given. */
+    refused: string[]
+  }
+
+  /** Which of `files` may join `held`, numbered from `nextN`: an allowed type,
+   *  at most 5 MiB each, at most 20 images and 16 MiB in all. */
+  export function admit(held: readonly Attachment[], files: readonly File[], nextN: number): Admitted {
+    const accepted: Attachment[] = []
+    const refused: string[] = []
+    let count = held.length
+    let total = held.reduce((sum, a) => sum + a.file.size, 0)
+    let n = nextN
+    for (const file of files) {
+      const name = file.name || 'image'
+      if (!ALLOWED_IMAGE_TYPES.has(file.type)) {
+        refused.push(`${name} is not a PNG, JPEG, GIF or WebP image.`)
+      } else if (file.size > MAX_IMAGE_BYTES) {
+        refused.push(`${name} is over 5 MiB.`)
+      } else if (count >= MAX_IMAGES) {
+        refused.push(`${name}: a prompt takes at most ${MAX_IMAGES} images.`)
+      } else if (total + file.size > MAX_TOTAL_BYTES) {
+        refused.push(`${name}: a prompt takes at most 16 MiB of images in all.`)
+      } else if (n > MAX_MARKER) {
+        refused.push(`${name}: this draft has no image number left; send it first.`)
+      } else {
+        accepted.push({ n: n++, file })
+        count++
+        total += file.size
+      }
+    }
+    return { accepted, refused }
+  }
+
+  /** `text` with `inserted` placed between `start` and `end` (the selection),
+   *  and where the cursor goes after it. */
+  export function splice(text: string, start: number, end: number, inserted: string): { text: string; cursor: number } {
+    const a = Math.max(0, Math.min(start, text.length))
+    const b = Math.max(a, Math.min(end, text.length))
+    return { text: text.slice(0, a) + inserted + text.slice(b), cursor: a + inserted.length }
+  }
+
+  /** `text` without the first `[Image #n]` marker (and one space after it). */
+  export function withoutMarker(text: string, n: number): string {
+    const at = text.indexOf(marker(n))
+    if (at < 0) return text
+    let end = at + marker(n).length
+    if (text[end] === ' ') end++
+    return text.slice(0, at) + text.slice(end)
+  }
+
+  /** The attachments whose marker is still in `text`. */
+  export function live(text: string, held: readonly Attachment[]): Attachment[] {
+    return held.filter((a) => text.includes(marker(a.n)))
+  }
+
+  /** The prompt as ordered blocks: runs of text, and each live image in place
+   *  of its first marker. A marker that names no live image, or repeats one,
+   *  stays text. Runs of only whitespace between images are dropped. */
+  export async function promptBlocks(text: string, held: readonly Attachment[]): Promise<PromptBlock[]> {
+    const byN = new Map(held.map((a) => [a.n, a]))
+    const placed = new Set<number>()
+    const blocks: PromptBlock[] = []
+    let run = ''
+    let from = 0
+    const flush = () => {
+      if (run.trim() !== '') blocks.push({ type: 'text', text: run })
+      run = ''
+    }
+    for (const m of text.matchAll(MARKER)) {
+      const n = Number(m[1])
+      const attachment = byN.get(n)
+      run += text.slice(from, m.index)
+      from = m.index + m[0].length
+      if (!attachment || placed.has(n)) {
+        run += m[0]
+        continue
+      }
+      placed.add(n)
+      flush()
+      blocks.push({ type: 'image', mimeType: attachment.file.type, data: await fileToBase64(attachment.file) })
+    }
+    run += text.slice(from)
+    flush()
+    return blocks
+  }
+
+  // Each session's images while the composer shows another session: the
+  // composer is remounted per session (`key={sessionId}`), so its state goes,
+  // and the images wait here, in memory only (they never reach storage).
+  interface Held {
+    attachments: Attachment[]
+    nextN: number
+  }
+
+  const bySession = new Map<string, Held>()
+
+  export function heldFor(sessionId: string): Held {
+    return bySession.get(sessionId) ?? { attachments: [], nextN: 1 }
+  }
+
+  export function hold(sessionId: string, held: Held): void {
+    if (held.attachments.length === 0 && held.nextN <= 1) bySession.delete(sessionId)
+    else bySession.set(sessionId, held)
+  }
+
+  /** Drop a session's images (it was sent, or the session is gone). */
+  export function forgetAttachments(sessionId: string): void {
+    bySession.delete(sessionId)
+  }
+
+  /** Drop every session's images (sign-out; tests). */
+  export function forgetAllAttachments(): void {
+    bySession.clear()
+  }
+  ```
+
+Create `web/src/lib/catalog.ts`:
+
+  ```ts
+  // A session's catalogue, read defensively (ACP core §7, §9). The collector
+  // stores the adapter's ACP objects as they came (`SessionConfigOption`,
+  // `AvailableCommand`) and never reads them, so here they are `unknown`: an
+  // entry that does not have the shape is skipped, never a crash.
+  //
+  // The shapes read (agent-client-protocol, as serialized):
+  // - a select: `{id, name, description?, category?, type: "select",
+  //   currentValue: string, options}`, where `options` is a flat list of
+  //   `{value, name, description?}` or a list of groups `{group, name, options}`;
+  // - a boolean: `{id, name, description?, category?, type: "boolean",
+  //   currentValue: boolean}`;
+  // - a command: `{name, description?, input?: {hint}}`.
+  import type { SessionCatalog } from '../generated/protocol'
+
+  export interface Choice {
+    value: string
+    name: string
+    description?: string
+    /** The name of the group it is listed under, if the adapter grouped them. */
+    group?: string
+  }
+
+  interface OptionBase {
+    id: string
+    name: string
+    description?: string
+    category?: string
+  }
+
+  export type ConfigOption =
+    | (OptionBase & { kind: 'select'; current: string; choices: Choice[] })
+    | (OptionBase & { kind: 'boolean'; current: boolean })
+
+  export interface Command {
+    name: string
+    description?: string
+    /** What the command takes after its name, as the adapter hints it. */
+    hint?: string
+  }
+
+  type Obj = Record<string, unknown>
+
+  function isObj(value: unknown): value is Obj {
+    return typeof value === 'object' && value !== null && !Array.isArray(value)
+  }
+
+  function str(value: unknown): string | undefined {
+    return typeof value === 'string' ? value : undefined
+  }
+
+  function choice(value: unknown, group?: string): Choice | null {
+    if (!isObj(value) || typeof value.value !== 'string') return null
+    return {
+      value: value.value,
+      name: str(value.name) || value.value,
+      description: str(value.description),
+      ...(group === undefined ? {} : { group }),
+    }
+  }
+
+  function choices(list: unknown): Choice[] {
+    if (!Array.isArray(list)) return []
+    const out: Choice[] = []
+    for (const entry of list) {
+      if (isObj(entry) && Array.isArray(entry.options)) {
+        const group = str(entry.name) || str(entry.group) || ''
+        for (const inner of entry.options) {
+          const c = choice(inner, group)
+          if (c) out.push(c)
+        }
+      } else {
+        const c = choice(entry)
+        if (c) out.push(c)
+      }
+    }
+    return out
+  }
+
+  /** One config option, or null when it is not one this build can show. */
+  export function parseOption(value: unknown): ConfigOption | null {
+    if (!isObj(value) || typeof value.id !== 'string' || value.id === '') return null
+    const base: OptionBase = {
+      id: value.id,
+      name: str(value.name) || value.id,
+      description: str(value.description),
+      category: str(value.category),
+    }
+    if (value.type === 'boolean' && typeof value.currentValue === 'boolean') {
+      return { ...base, kind: 'boolean', current: value.currentValue }
+    }
+    if (value.type === 'select' && typeof value.currentValue === 'string') {
+      const list = choices(value.options)
+      // A select with nothing to pick is noise; adapters do report empty ones.
+      if (list.length === 0) return null
+      return { ...base, kind: 'select', current: value.currentValue, choices: list }
+    }
+    return null
+  }
+
+  /** The option that plays `category`'s part, as the host decides it: the
+   *  first of that category, else one with the conventional id that no other
+   *  category claims (no category, or a custom `_`-prefixed one). */
+  function axis(options: ConfigOption[], category: string): ConfigOption | undefined {
+    const uncategorized = (o: ConfigOption) => o.category === undefined || o.category.startsWith('_')
+    return options.find((o) => o.category === category) ?? options.find((o) => uncategorized(o) && o.id === category)
+  }
+
+  /** The switchers to show: the model, the mode, then every other option by
+   *  id. The order is stable whatever order the adapter reports them in. */
+  export function configOptions(catalog: SessionCatalog | null | undefined): ConfigOption[] {
+    const raw = Array.isArray(catalog?.config_options) ? catalog.config_options : []
+    const seen = new Set<string>()
+    const options: ConfigOption[] = []
+    for (const entry of raw) {
+      const option = parseOption(entry)
+      if (option && !seen.has(option.id)) {
+        seen.add(option.id)
+        options.push(option)
+      }
+    }
+    const model = axis(options, 'model')
+    const mode = axis(options, 'mode')
+    const rest = options
+      .filter((o) => o !== model && o !== mode)
+      .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+    return [...(model ? [model] : []), ...(mode && mode !== model ? [mode] : []), ...rest]
+  }
+
+  /** The slash commands, each name once, in the adapter's order. */
+  export function commands(catalog: SessionCatalog | null | undefined): Command[] {
+    const raw = Array.isArray(catalog?.commands) ? catalog.commands : []
+    const seen = new Set<string>()
+    const out: Command[] = []
+    for (const entry of raw) {
+      if (!isObj(entry) || typeof entry.name !== 'string' || entry.name === '' || seen.has(entry.name)) continue
+      seen.add(entry.name)
+      out.push({
+        name: entry.name,
+        description: str(entry.description),
+        hint: isObj(entry.input) ? str(entry.input.hint) : undefined,
+      })
+    }
+    return out
+  }
+
+  /** The commands a `/query` lists: names that start with it first, then
+   *  names that contain it, each in the adapter's order. */
+  export function matchCommands(list: Command[], query: string): Command[] {
+    const q = query.toLowerCase()
+    const starts = list.filter((c) => c.name.toLowerCase().startsWith(q))
+    const contains = list.filter((c) => !c.name.toLowerCase().startsWith(q) && c.name.toLowerCase().includes(q))
+    return [...starts, ...contains]
+  }
+  ```
+
+Create `web/src/lib/drafts.ts`:
+
+  ```ts
+  // A draft per session (frontend spec §6.5, F-17), in `sessionStorage`: it
+  // survives a reload and a switch to another session, and is never shown,
+  // or sent, in any session but its own.
+
+  const PREFIX = 'hennery.draft.'
+
+  export function draftKey(sessionId: string): string {
+    return `${PREFIX}${sessionId}`
+  }
+
+  export function loadDraft(sessionId: string): string {
+    try {
+      return sessionStorage.getItem(draftKey(sessionId)) ?? ''
+    } catch {
+      // Storage refused (private mode, quota): a draft only lives in the page.
+      return ''
+    }
+  }
+
+  /** Keep `text` as the session's draft; an empty one is removed. */
+  export function saveDraft(sessionId: string, text: string): void {
+    try {
+      if (text === '') sessionStorage.removeItem(draftKey(sessionId))
+      else sessionStorage.setItem(draftKey(sessionId), text)
+    } catch {
+      // As above: the draft stays in the page only.
+    }
+  }
+
+  /** Drop every session's draft, and nothing else held in `sessionStorage`
+   *  (a sign-out: the text is the half most likely to hold a pasted secret). */
+  export function forgetAllDrafts(): void {
+    try {
+      // Keys first: removing while walking the indices would skip some.
+      const keys: string[] = []
+      for (let i = 0; i < sessionStorage.length; i++) {
+        const key = sessionStorage.key(i)
+        if (key?.startsWith(PREFIX)) keys.push(key)
+      }
+      for (const key of keys) sessionStorage.removeItem(key)
+    } catch {
+      // Storage refused: no draft was kept there either.
+    }
+  }
+  ```
+
+In `web/src/lib/image.ts`, replace:
+
+  ```ts
+  const ALLOWED = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
+
+  /** Returns an error string if the file isn't an allowed image, else null. */
+  export function isAllowedImage(file: File): string | null {
+    if (!ALLOWED.has(file.type)) return `unsupported image type: ${file.type || 'unknown'}`
+  ```
+
+with:
+
+  ```ts
+  export const ALLOWED_IMAGE_TYPES: ReadonlySet<string> = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp'])
+
+  /** Returns an error string if the file isn't an allowed image, else null. */
+  export function isAllowedImage(file: File): string | null {
+    if (!ALLOWED_IMAGE_TYPES.has(file.type)) return `unsupported image type: ${file.type || 'unknown'}`
+  ```
+
+Create `web/src/lib/sendAgain.ts`:
+
+  ```ts
+  // "Send again" for a `turn_not_delivered` marker (frontend spec §6.5, 4a-ii
+  // O-6): the prompt as it was stored, whole, put back into the composer as a
+  // draft for the operator to send. Nothing is sent from here: a refill never
+  // sends on its own. Its images are the owner's attachments, fetched back by
+  // hash as files; the composer encodes them when the draft is sent.
+  // Nothing comes back unless every block could be rebuilt.
+  import type { Client } from '../api/client'
+  import { ApiFailure } from '../api/errors'
+  import { undeliveredTurn } from '../api/view'
+  import { ALLOWED_IMAGE_TYPES } from './image'
+
+  /** A block of the turn as the composer takes it back: a run of text, or an
+   *  image as a file. */
+  export type DraftPart = { type: 'text'; text: string } | { type: 'image'; file: File }
+
+  /** `GET /api/attachments/{sha256}` as a file of type `mimeType`. */
+  async function attachment(client: Client, sha256: string, mimeType: string, n: number, signal: AbortSignal): Promise<File> {
+    const response = await client.open(`/api/attachments/${encodeURIComponent(sha256)}`, { Accept: 'image/*' }, signal)
+    if (!response.ok) {
+      void response.body?.cancel().catch(() => {})
+      throw new ApiFailure(response.status, {
+        code: response.status === 404 ? 'attachment_gone' : `http_${response.status}`,
+        message: `An image of this prompt could not be read (${response.status}).`,
+      })
+    }
+    const bytes = await response.arrayBuffer()
+    return new File([bytes], `image-${n}`, { type: mimeType })
+  }
+
+  /** The undelivered turn `turnId` of session `sessionId`, rebuilt as draft
+   *  parts in order. Rejects, having read no image, when a block cannot be
+   *  sent again; rejects when the turn or one of its images cannot be read. */
+  export async function undeliveredDraft(
+    client: Client,
+    sessionId: string,
+    turnId: string,
+    signal: AbortSignal = new AbortController().signal,
+  ): Promise<DraftPart[]> {
+    const turn = await undeliveredTurn(client, sessionId, turnId, signal)
+    for (const block of turn.content) {
+      if (block.type === 'text') continue
+      if (block.type === 'image' && ALLOWED_IMAGE_TYPES.has(block.mimeType)) continue
+      throw new Error('This prompt holds content that cannot be sent again.')
+    }
+    const parts: DraftPart[] = []
+    let n = 0
+    for (const block of turn.content) {
+      if (block.type === 'text') parts.push({ type: 'text', text: block.text })
+      else if (block.type === 'image') {
+        parts.push({ type: 'image', file: await attachment(client, block.sha256, block.mimeType, ++n, signal) })
+      }
+    }
+    return parts
+  }
+  ```
+
+Create `web/src/lib/sending.ts`:
+
+  ```ts
+  // A prompt being sent, per session (frontend spec §6.5): held outside React,
+  // as the draft's images are (lib/attachments.ts). A switch away and back
+  // before the answer mounts a new composer: it finds the send here, stays
+  // read-only until it ends, and takes its outcome (a 202 clears the draft).
+
+  const bySession = new Map<string, Promise<unknown>>()
+
+  /** The send in flight for `sessionId`, if any. */
+  export function sendingFor<T>(sessionId: string): Promise<T> | undefined {
+    return bySession.get(sessionId) as Promise<T> | undefined
+  }
+
+  /** Run `work` as the send of `sessionId`: it is in flight until it ends,
+   *  and is gone from here before its outcome is handed on. A `work` that
+   *  rejects ends too, with `onError`'s outcome: a send held for ever would
+   *  leave every composer of the session read-only until a reload. */
+  export function track<T>(sessionId: string, work: () => Promise<T>, onError: (err: unknown) => T): Promise<T> {
+    let done!: (outcome: T) => void
+    const pending = new Promise<T>((resolve) => (done = resolve))
+    bySession.set(sessionId, pending)
+    const end = (outcome: T) => {
+      if (bySession.get(sessionId) === pending) bySession.delete(sessionId)
+      done(outcome)
+    }
+    void work().then(end, (err: unknown) => end(onError(err)))
+    return pending
+  }
+
+  /** Let go of every send: a sign-out's, and the tests'. A send let go of
+   *  still ends, and its composer, if still shown, takes its outcome. */
+  export function forgetAllSends(): void {
+    bySession.clear()
+  }
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+  // - A deleted session says so, and nothing more is fetched.
+  import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+  import { hatList, hostList, namesOf } from '../api/names'
+  import { sessionDetail } from '../api/view'
+  import { useClient } from '../app-client'
+  import SessionHeader, { type HeaderInfo } from '../components/SessionHeader'
+  import Transcript from '../components/Transcript'
+  import type { ItemEnv } from '../components/items/types'
+  ```
+
+with:
+
+  ```tsx
+  // - The composer sits under the transcript: the session's own (F-17), fed
+  //   the header's session, the item store's catalogue and the capabilities
+  //   of the session's host. Through it, a turn that was not delivered comes
+  //   back as a draft ("Send again"), and a question the agent stopped
+  //   waiting on is answered as a new message; neither sends on its own.
+  // - A deleted session says so, nothing more is fetched, and its draft and
+  //   images are dropped.
+  import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+  import { hatList, hostList, namesOf } from '../api/names'
+  import { sessionDetail } from '../api/view'
+  import { useClient } from '../app-client'
+  import { Composer, type ComposerHandle } from '../components/Composer'
+  import { ANSWER_LABEL, answerAsMessage } from '../components/composerWords'
+  import SessionHeader, { type HeaderInfo } from '../components/SessionHeader'
+  import Transcript from '../components/Transcript'
+  import type { ItemEnv } from '../components/items/types'
+  import type { Capabilities } from '../generated/protocol'
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+  import { agentLabel } from '../lib/agent'
+  import { Icon } from '../lib/ui'
+  ```
+
+with:
+
+  ```tsx
+  import { agentLabel } from '../lib/agent'
+  import { forgetAttachments } from '../lib/attachments'
+  import { saveDraft } from '../lib/drafts'
+  import { Icon } from '../lib/ui'
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+    /** Seams for later tasks: question actions and "Send again". */
+    env?: Pick<ItemEnv, 'questionActions' | 'onSendAgain'>
+  ```
+
+with:
+
+  ```tsx
+    /** The seam for the cards: question actions. */
+    env?: Pick<ItemEnv, 'questionActions'>
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+  /** `id → name` from a list fetched once, when `wanted`; on failure, none. */
+  function useNames(fetch: 'hosts' | 'hats', wanted: boolean): Map<string, string> {
+    const client = useClient()
+    const [names, setNames] = useState<Map<string, string>>(() => new Map())
+  ```
+
+with:
+
+  ```tsx
+  /** A list fetched once, when `wanted`; on failure, none (`undefined`). */
+  function useList(fetch: 'hosts' | 'hats', wanted: boolean): unknown {
+    const client = useClient()
+    const [list, setList] = useState<unknown>(undefined)
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+        (list) => live && setNames(namesOf(list, fetch === 'hosts' ? 'host_id' : 'id')),
+  ```
+
+with:
+
+  ```tsx
+        (answer) => live && setList(answer),
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+    return names
+  ```
+
+with:
+
+  ```tsx
+    return list
+  }
+
+  /** The capabilities `GET /api/hosts` reports for host `hostId`; null while
+   *  unknown (no list yet, the host not in it, or no list of capabilities). */
+  function capabilitiesOf(hosts: unknown, hostId: string | undefined): Capabilities | null {
+    if (hostId === undefined || !Array.isArray(hosts)) return null
+    for (const entry of hosts as unknown[]) {
+      if (!entry || typeof entry !== 'object') continue
+      const host = entry as Record<string, unknown>
+      if (host.host_id === hostId) return Array.isArray(host.capabilities) ? (host.capabilities as Capabilities) : null
+    }
+    return null
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+    const hosts = useNames('hosts', true)
+    const wantsHats = useMemo(() => s.items.some((i) => i.kind === 'marker' && i.marker === 'hat_reassigned'), [s.items])
+    const hats = useNames('hats', wantsHats)
+    const plan = useMemo(() => latestPlan(s.items), [s.items])
+  ```
+
+with:
+
+  ```tsx
+    const hostItems = useList('hosts', true)
+    const hosts = useMemo(() => namesOf(hostItems, 'host_id'), [hostItems])
+    const wantsHats = useMemo(() => s.items.some((i) => i.kind === 'marker' && i.marker === 'hat_reassigned'), [s.items])
+    const hatItems = useList('hats', wantsHats)
+    const hats = useMemo(() => namesOf(hatItems, 'id'), [hatItems])
+    const plan = useMemo(() => latestPlan(s.items), [s.items])
+
+    // The composer's handle: the item seams reach the draft through it, and
+    // stay the same functions for as long as the view is shown.
+    const composer = useRef<ComposerHandle>(null)
+    const onSendAgain = useCallback((item: Extract<Item, { kind: 'marker' }>) => {
+      if (item.about_turn) void composer.current?.refill(item.about_turn)
+    }, [])
+    const onAnswerAsMessage = useCallback(
+      (question: string) => composer.current?.prefill(answerAsMessage(question), ANSWER_LABEL),
+      [],
+    )
+    const composerEmpty = useCallback(() => composer.current?.isEmpty() ?? true, [])
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+        ...seams,
+      }),
+      [id, info?.agent, hats, seams],
+    )
+  ```
+
+with:
+
+  ```tsx
+        onSendAgain,
+        onAnswerAsMessage,
+        composerEmpty,
+        ...seams,
+      }),
+      [id, info?.agent, hats, onSendAgain, onAnswerAsMessage, composerEmpty, seams],
+    )
+
+    // A deleted session's draft and images can never be sent: drop them.
+    useEffect(() => {
+      if (!s.removed) return
+      saveDraft(id, '')
+      forgetAttachments(id)
+    }, [id, s.removed])
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+        </Scroller>
+      </div>
+  ```
+
+with:
+
+  ```tsx
+        </Scroller>
+        <Composer
+          handle={composer}
+          sessionId={id}
+          session={info ? { activity: info.activity, lifecycle: info.lifecycle } : null}
+          capabilities={capabilitiesOf(hostItems, info?.host_id)}
+          catalog={s.catalog}
+          onCatalog={s.setCatalog}
+        />
+      </div>
+  ```
+
+- [ ] **Step 4: Run the checks**
+
+Run: `nix develop -c sh -c 'cd web && pnpm typecheck && pnpm test && pnpm build'`
+Expected: PASS, 914 tests (769 before).
+
+- [ ] **Step 5: Revert-probes** (each must fail the test named; restore after each)
+
+161 probes, run by script, all fail as they should: 115 on the composer alone, 46 on the composer mounted in the view. Three earlier results were fixed before the final run. Two probes of the slash menu's rule survived, because ordinary command names never hold a space or a slash: a test now runs the rule on any name the adapter reports. "Send again"'s all-or-nothing rule held only by accident (without it, the marker loop threw): markers are now numbered by file, and its test refuses one image of two.
+- **Keys and Send** (10): Ctrl+Enter and Cmd+Enter send, Enter alone is a new line; the Send button; a blank draft is not sent; a send clears the text, the images, the stored draft at the source, the held images, and numbers the next draft from 1.
+- **The draft** (5): saved as typed under `hennery.draft.<id>`, restored, an emptied draft removed, storage refused keeps it in the page.
+- **A turn in flight** (3): `running` and `blocked` disable Send, and keys send nothing.
+- **Cancel** (7): the four outcomes in words, the outcome read from the answer, `no_open_turn` and `not_running` as "Nothing was running".
+- **Prompt refusals** (19): each code in words (`not_attached`, `host_offline`, `turn_in_progress`, `images_unsupported`, `empty_prompt`, `invalid_content`, `invalid`, `content_too_large`, `body_too_large`, `delivery_unknown`), the draft kept, own keys only; "Resume and send" offered on `not_attached` only, never while starting, through `onResume` when the view passes one and else the composer's own `POST …/resume` (Task 9 passes the view's, the one path), then the send, and a refused resume sends nothing.
+- **Images** (32): type, size, count and total, each at its boundary and counting what is held, 16 MiB in all; the refusal shown; paste, drop and pick; every marker of one action at once, at the cursor, over the selection; numbers never reused, also across a switch and past a restored draft's markers; a removal takes its marker out; only live markers sent, each image at its first marker, whitespace runs dropped; object URLs revoked on remove, send and unmount; hidden on a host without `images`, shown while unknown, no paste there.
+- **Slash commands** (10): only a slash and a word, only at the start; arrows, wrap, Enter picks, a click picks, Escape dismisses until the next edit; names that start before names that contain; each command once.
+- **The config bar** (19): the model, the mode, then the rest by id; an axis by category first; grouped choices; an empty select skipped; each id once; optimistic, replaced by the 202's catalogue, settled, busy while pending; rolled back on 409, 400 and 502 with the message, and each wording; an on/off option.
+- **Send again** (23): the stored turn rebuilt, as first written and as mounted (the hash encoded, the text kept, a gone image rejects, only allowed types, the images encoded whole when sent), wired to the marker, refilled and never sent, labelled; a space between text and marker; its images held, past every marker in its words, numbered on; after the draft; the reason shown when it cannot come back; none on a host without images; the limits all or nothing; blanks add nothing; an answer after the session was left lands nowhere, aborted on unmount.
+- **Per session** (8): remounted by key; images and drafts kept per session; a deleted session's draft and images dropped; ids in paths encoded.
+- **Mounting** (7): the session shown, the header's session, the host's capabilities by the session's host id (none known is unknown), the catalogue from the store, replaced by a 202.
+- **The seams** (17): the handle bound; "Answer as a new message" worded by the view, labelled, the cursor at its end, the label gone when the draft is emptied or sent; `isEmpty` reads the live text, ignores blanks, counts images; `composerEmpty` and `onAnswerAsMessage` wired; the env memoised with stable callbacks; a sign-out forgets the images.
+- **Own keys** (1): `errors.ts` looks a code up by own key only.
+
+**Amended at the security review (MUST-2):** a successful sign-out removes every `hennery.draft.` key and nothing else. 5 more probes, all failing as they should: the call removed, `sessionStorage.clear()` instead, a shorter prefix, removing while walking the indices, and the `catch` dropped. The last one first missed (the test's storage was empty, so `key()` was never reached); the test now saves a draft first.
+
+**The task review's fixes** (2026-10-03, all taken): 16 more probes, all failing as they should.
+- **Nothing added mid-send is lost** (4): while a prompt is being sent, a paste, a drop, a pick, an answer as a new message and a Send again (also one asked for before the send) are refused with a word, which stays after the send succeeds. Before, the 202 cleared the draft and took with it whatever had landed during the send.
+- **Markers run from 1 to 999999** (3): a marker of seven digits, or with a leading zero, is plain text (`Number` loses precision past 2^53, and two images came to share a number); an image past #999999 is refused, saying why.
+- **An agent's words never link an image** (4): the words "Answer as a new message" puts in the draft get a word joiner (U+2060) after each `[Image #`, so an agent's `[Image #1]` never revives an image the operator took out of the text; "Send again" puts the operator's own turn back byte for byte, unescaped.
+- **Wordings** (3): config refused with `host_offline`; cancel refused with `not_attached` and `host_offline`.
+- **The signal** (2): the undelivered turn's own GET is aborted with the composer.
+
+Load: 4 parallel copies of the composer's seven test files, 3 rounds: 12 of 12 green (90 tests each); of the view's composer, seams, session, send-again, App and composer tests, 3 rounds: 12 of 12 green (126 tests each).
+
+**The whole-branch review's fixes** (2026-10-03; its I-1 and M-5, folded into this task): 14 more tests, and 14 more probes that fail as they should.
+- **"Resume and send" waits for words** (I-1; 3 probes): it is disabled while the draft is blank, and however the resume and the send end, the composer is editable again (one `follow` clears `sending` on every path; a resume refused is an outcome, never a promise left open). Before, a blank draft resumed the session and left the composer read-only until a remount.
+- **A send in flight outlives its composer** (M-5; `lib/sending.ts`, 8 probes): the send is held per session outside React, as the images are. A composer mounted again before the answer (a switch away and back) is read-only, Send disabled, refuses what is added meanwhile, and takes the outcome: a 202 clears the draft it shows; a refusal says why and leaves it editable. "Resume and send" is held as one send, the resume included. A send that ends after a newer one began leaves the newer one held. Before, the new composer showed the sent text, could send it again, and saved it back.
+- **The fix review's minors** (a review of these fixes by a stronger model, opus, approved with minors; 4 of 5 taken, 3 probes): the composer reads the held send once, so the flag and its follower hold the same send; a send whose work rejects ends too, its error worded (`track`'s `onError`), so no send is held for ever; a second click before the composer renders again is refused by `begin` itself, so Send and "Resume and send" send once; a successful sign-out lets go of every send in flight, as it forgets the drafts and images. The fifth (a request with no timeout keeps the composer read-only while it hangs) is recorded in decision 34. Two of M-5's probes lost their line to the first minor; retargeted, both still fail.
+- Two probes survive by design: the composer reading the held send twice (render, then the effect) cannot be told apart under `act()`, which runs both in one task; the words given to a thrown error are unreachable today, as every path of the send's work ends in an outcome (`track`'s own test throws).
+
+Load: 4 parallel copies of the composer's, the view's composer, `sending`, the footer's and the App's tests, 3 rounds: 12 of 12 green (149 tests each).
+
+**Re-run on the final code** (after the rebase onto Part 1's final commits and the security amendments, 2026-10-03): the composer's 115 and the mounting's 46 again. 147 fail as they should. Each of the other 14 had lost its line: 10 were retargeted, as 11 probes (the send's clear, the next image number, the slash menu's dismissal, the refill's encoding twice, the host's capabilities and their lookup, the refill that never sends, the answer's words, `composerEmpty`'s wiring, the env's memo), and 4 were superseded by a probe of the same guard (the first "Send again"'s hash, text and gone image by `sendAgain.test.ts`'s; the sign-out's by Task 9's). Every one of those fails as it should.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add web/src
+git commit -m "feat(web): a composer under each session's transcript that sends text and images, stops a turn, switches config and keeps a draft per session"
+```
+
+---
+
+### Task 7: Question cards
+
+A question card answers: a permission's options as buttons and digits, a form's fields, every delivery state of the §6.3 table, races between devices, and "Answer as a new message" through the composer's seam (decisions 21–28).
+
+**Files:**
+- Create: `web/src/lib/delivery.ts`, `elicitation.ts`; `web/src/store/useAnswer.ts` (the answer book); `web/src/api/answer.ts`; `web/src/components/items/Elicitation.tsx`; `web/src/hooks/useAnnouncement.ts` (the view's live region); their tests; `web/src/screens/Session.answer.test.tsx`, `web/src/components/composerWords.test.ts`.
+- Modify: `web/src/components/items/QuestionCard.tsx` (the card answers), `types.ts` (the answer book replaces Part 1's `questionActions`), `web/src/components/Transcript.tsx` (the env reaches the card), `web/src/store/items.ts` (the verdict folded), `web/src/screens/Session.tsx` (the answer book, fed the hosts' connection; the window starts at an answerable question), `web/src/components/composerWords.ts` (one stop after the question), `web/src/index.css` (the card's controls, 44 px on a phone), `web/src/components/items/items.test.tsx` (the read-only seam's test goes), `web/src/screens/test-session.ts` (the answer route), `web/src/store/items.test.ts`.
+
+- [ ] **Step 1: Write the tests**
+
+Test files: `web/src/components/composerWords.test.ts`, `web/src/components/items/QuestionCard.test.tsx`, `web/src/components/items/items.test.tsx`, `web/src/lib/delivery.test.ts`, `web/src/lib/elicitation.test.ts`, `web/src/screens/Session.answer.test.tsx`, `web/src/screens/test-session.ts`, `web/src/store/items.test.ts`, `web/src/store/useAnswer.test.ts`.
+
+Create `web/src/components/composerWords.test.ts`:
+
+  ```ts
+  import { describe, expect, it } from 'vitest'
+  import { answerAsMessage } from './composerWords'
+
+  describe('answerAsMessage', () => {
+    it('ends a question without a stop of its own with one', () => {
+      expect(answerAsMessage('Which branch')).toBe('You asked: Which branch. My answer: ')
+    })
+
+    it.each([
+      ['Run it?', 'You asked: Run it? My answer: '],
+      ['Pick a name.', 'You asked: Pick a name. My answer: '],
+      ['Careful!', 'You asked: Careful! My answer: '],
+      ['Run it?  ', 'You asked: Run it? My answer: '],
+    ])('never doubles the stop of %j', (question, draft) => {
+      expect(answerAsMessage(question)).toBe(draft)
+    })
+  })
+  ```
+
+Create `web/src/components/items/QuestionCard.test.tsx`:
+
+  ```tsx
+  import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+  import { afterEach, describe, expect, it, vi } from 'vitest'
+  import { Client } from '../../api/client'
+  import type { Item } from '../../generated/view'
+  import { json, stubServer, type Answer } from '../../test-server'
+  import { AnswerBook } from '../../store/useAnswer'
+  import { ItemView } from '../Transcript'
+  import type { ItemEnv, ItemOf } from './types'
+
+  type Q = ItemOf<'question'>
+  // The query as the spec words it, not the module's constant: a test that
+  // imported it would follow a wrong one.
+  const DESKTOP = '(min-width: 768px) and (pointer: fine)'
+  const TS = '2026-10-02T10:00:00.000Z'
+  const SESSION = 's/1'
+  const PATH = (pending: string) => `/api/sessions/s%2F1/pending/${encodeURIComponent(pending)}/answer`
+
+  const OPTIONS = [
+    { option_id: 'a', name: 'Yes, always', option_kind: 'allow_always' },
+    { option_id: 'b', name: 'Allow', option_kind: 'allow_once' },
+    { option_id: 'c', name: 'Allow (really reject)', option_kind: 'reject_once' },
+    { option_id: 'd', name: 'Never', option_kind: 'reject_always' },
+    { option_id: 'e', name: 'Reject (really new)', option_kind: 'shiny_new_kind' },
+  ]
+
+  function permission(patch: Partial<Q> = {}): Q {
+    return {
+      id: 'question:p/1',
+      version: 1,
+      ts: TS,
+      turn_id: 't1',
+      kind: 'question',
+      pending_id: 'p/1',
+      question_kind: 'permission',
+      request: { type: 'permission', title: 'Run rm -rf build?', options: OPTIONS },
+      answerable: true,
+      state: 'open',
+      answered: false,
+      ...patch,
+    } as Q
+  }
+
+  function elicitation(request: Partial<Extract<Q['request'], { type: 'elicitation' }>>, patch: Partial<Q> = {}): Q {
+    return permission({
+      id: 'question:e1',
+      pending_id: 'e1',
+      question_kind: 'elicitation',
+      request: { type: 'elicitation', message: 'Tabs or spaces?', fields: [], form_supported: true, ...request },
+      ...patch,
+    })
+  }
+
+  /** A deferred response: the test decides when the server answers. */
+  function later() {
+    let settle!: (r: Response) => void
+    const promise = new Promise<Response>((r) => (settle = r))
+    return { answer: () => promise, settle }
+  }
+
+  function setup(routes: Record<string, Answer | Answer[]> = {}) {
+    const server = stubServer(routes)
+    const client = new Client({ fetch: server.fetch, navigate: vi.fn(), here: () => ({ pathname: '/sessions/s', search: '' }), stepUp: vi.fn(async () => {}) })
+    const book = new AnswerBook(client, SESSION)
+    const posts = () => server.sent.filter((s) => s.method === 'POST')
+    return { server, client, book, posts }
+  }
+
+  function show(item: Item, env: ItemEnv) {
+    const view = render(<ItemView item={item} env={env} />)
+    return { ...view, again: (next: Item, nextEnv: ItemEnv = env) => view.rerender(<ItemView item={next} env={nextEnv} />) }
+  }
+
+  const card = () => screen.getByRole('region', { name: /Question from/ })
+
+  /** A matchMedia that matches only `matching` queries. */
+  function media(matching: string[]) {
+    window.matchMedia = ((query: string) => ({
+      matches: matching.includes(query),
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    })) as unknown as typeof window.matchMedia
+  }
+
+  afterEach(() => {
+    // @ts-expect-error clear a stub between tests
+    delete window.matchMedia
+  })
+
+  describe('permission card', () => {
+    it('answers with the option clicked, posting its id to the encoded route', async () => {
+      const t = setup({ [`POST ${PATH('p/1')}`]: json(202, { pending_id: 'p/1', request_id: 'r1' }) })
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      fireEvent.click(screen.getByRole('button', { name: 'Never' }))
+      await screen.findByText('Sent')
+      expect(t.posts()).toEqual([{ method: 'POST', path: PATH('p/1'), body: { option_id: 'd' } }])
+    })
+
+    it('lists the options as buttons in the adapter’s order', () => {
+      const t = setup()
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      const names = within(screen.getByRole('group', { name: 'Options' }))
+        .getAllByRole('button')
+        .map((b) => b.textContent)
+      expect(names).toEqual(OPTIONS.map((o) => o.name))
+    })
+
+    it.each([
+      ['allow_once', 'Allow', 'btn-primary', 'q-opt-allow'],
+      ['allow_always', 'Yes, always', 'btn-ghost', 'q-opt-always'],
+      ['reject_once', 'Allow (really reject)', 'btn-danger', 'q-opt-reject'],
+      ['reject_always', 'Never', 'btn-danger', 'q-opt-reject'],
+      ['an unknown kind', 'Reject (really new)', 'btn-primary', 'q-opt-allow'],
+    ])('styles option kind %s by its kind, never its name', (_kind, name, button, tone) => {
+      const t = setup()
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      const el = screen.getByRole('button', { name })
+      expect(el).toHaveClass(button, tone)
+      for (const other of ['btn-primary', 'btn-ghost', 'btn-danger'].filter((c) => c !== button)) expect(el).not.toHaveClass(other)
+    })
+
+    it('keeps one answer in flight: a second click sends nothing', async () => {
+      const reply = later()
+      const t = setup({ [`POST ${PATH('p/1')}`]: reply.answer })
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      fireEvent.click(screen.getByRole('button', { name: 'Allow' }))
+      expect(screen.getByRole('button', { name: 'Never' })).toBeDisabled()
+      fireEvent.click(screen.getByRole('button', { name: 'Never' }))
+      await t.book.answer(permission(), { option_id: 'd' })
+      expect(t.posts()).toHaveLength(1)
+      reply.settle(json(202, { pending_id: 'p/1', request_id: 'r1' }))
+      await screen.findByText('Sent')
+    })
+
+    it('stays disabled while in flight even when the item is upserted meanwhile', async () => {
+      const reply = later()
+      const t = setup({ [`POST ${PATH('p/1')}`]: reply.answer })
+      const v = show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      fireEvent.click(screen.getByRole('button', { name: 'Allow' }))
+      v.again(permission({ version: 2 }))
+      expect(screen.getByRole('button', { name: 'Allow' })).toBeDisabled()
+      expect(screen.getByText('Sending…')).toBeInTheDocument()
+      await act(async () => reply.settle(json(202, { pending_id: 'p/1', request_id: 'r1' })))
+    })
+
+    it('shows a 202 as “Sent” until the item’s next upsert, then the item’s state', async () => {
+      const t = setup({ [`POST ${PATH('p/1')}`]: json(202, { pending_id: 'p/1', request_id: 'r1' }) })
+      const v = show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      fireEvent.click(screen.getByRole('button', { name: 'Allow' }))
+      await screen.findByText('Sent')
+      expect(screen.queryByRole('button', { name: 'Allow' })).toBeNull()
+      v.again(permission({ version: 2, answered: true, answerable: false, delivered: true }))
+      expect(screen.getByText('Answered')).toBeInTheDocument()
+    })
+
+    it.each([
+      ['already_answered', 'Already answered from another device', 'This question is no longer open'],
+      ['not_open', 'This question is no longer open', 'Already answered from another device'],
+    ])('shows a 409 %s in its own words until the next upsert', async (code, words, never) => {
+      const t = setup({ [`POST ${PATH('p/1')}`]: json(409, { code, message: 'x' }) })
+      const v = show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      fireEvent.click(screen.getByRole('button', { name: 'Allow' }))
+      await screen.findByText(words)
+      expect(screen.queryByText(never)).toBeNull()
+      expect(screen.queryByRole('button', { name: 'Allow' })).toBeNull()
+      // The same version again is no upsert: the message stays.
+      v.again(permission())
+      expect(screen.getByText(words)).toBeInTheDocument()
+      v.again(permission({ version: 2, answered: true, answerable: false, delivered: false }))
+      expect(screen.queryByText(words)).toBeNull()
+      expect(screen.getByText('Sent, but the agent was no longer waiting')).toBeInTheDocument()
+    })
+
+    it('shows a 404 as “This question is gone”', async () => {
+      const t = setup({ [`POST ${PATH('p/1')}`]: json(404, { code: 'not_found', message: 'no such pending request' }) })
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      fireEvent.click(screen.getByRole('button', { name: 'Allow' }))
+      await screen.findByText('This question is gone')
+      expect(screen.queryByRole('button', { name: 'Allow' })).toBeNull()
+    })
+
+    it('shows another refusal’s message and offers the options again', async () => {
+      const t = setup({ [`POST ${PATH('p/1')}`]: json(400, { code: 'invalid', message: 'the request offers no option z' }) })
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      fireEvent.click(screen.getByRole('button', { name: 'Allow' }))
+      expect(await screen.findByRole('alert')).toHaveTextContent('the request offers no option z')
+      expect(screen.getByRole('button', { name: 'Allow' })).toBeEnabled()
+    })
+
+    it('never asks for a step-up: a 403 is a message, not a dialog', async () => {
+      const t = setup({ [`POST ${PATH('p/1')}`]: json(403, { code: 'step_up_required', message: 'x' }) })
+      const stepUp = vi.fn(async () => {})
+      const client = new Client({ fetch: t.server.fetch, navigate: vi.fn(), here: () => ({ pathname: '/', search: '' }), stepUp })
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: new AnswerBook(client, SESSION) })
+      fireEvent.click(screen.getByRole('button', { name: 'Allow' }))
+      await screen.findByRole('alert')
+      expect(stepUp).not.toHaveBeenCalled()
+      expect(t.posts()).toHaveLength(1)
+    })
+
+    it('offers no buttons for a permission with no options, even one the server holds answerable', () => {
+      const t = setup()
+      show(permission({ request: { type: 'permission', title: 'Do it?', options: [] } }), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      expect(screen.queryByRole('button')).toBeNull()
+      expect(screen.getByText('This question cannot be answered here: stop, park or close the session.')).toBeInTheDocument()
+      expect(screen.queryByText('Needs your answer')).toBeNull()
+      expect(card()).not.toHaveAttribute('tabindex')
+    })
+
+    it('takes actionability from the item: not answerable, no buttons', () => {
+      const t = setup()
+      show(permission({ answerable: false }), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      expect(screen.queryByRole('button')).toBeNull()
+    })
+
+    it('names the session’s agent as the one asking', () => {
+      const t = setup()
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      expect(screen.getByText('Codex asks for permission')).toBeInTheDocument()
+      expect(card()).toHaveAccessibleName('Question from Codex')
+    })
+  })
+
+  describe('digit shortcuts', () => {
+    it('answer from the card itself on a desktop', async () => {
+      media([DESKTOP])
+      const t = setup({ [`POST ${PATH('p/1')}`]: json(202, { pending_id: 'p/1', request_id: 'r1' }) })
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      expect(card()).toHaveAttribute('tabindex', '0')
+      fireEvent.keyDown(card(), { key: '2' })
+      await screen.findByText('Sent')
+      expect(t.posts().map((p) => p.body)).toEqual([{ option_id: 'b' }])
+    })
+
+    it('answer from a button inside the card', async () => {
+      media([DESKTOP])
+      const t = setup({ [`POST ${PATH('p/1')}`]: json(202, { pending_id: 'p/1', request_id: 'r1' }) })
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      fireEvent.keyDown(screen.getByRole('button', { name: 'Never' }), { key: '1' })
+      await screen.findByText('Sent')
+      expect(t.posts().map((p) => p.body)).toEqual([{ option_id: 'a' }])
+    })
+
+    it('are never heard from the window or a field outside the card', () => {
+      media([DESKTOP])
+      const t = setup()
+      render(
+        <>
+          <textarea aria-label="composer" />
+          <ItemView item={permission()} env={{ sessionId: SESSION, agent: 'Codex', answers: t.book }} />
+        </>,
+      )
+      fireEvent.keyDown(window, { key: '1' })
+      fireEvent.keyDown(document.body, { key: '1' })
+      fireEvent.keyDown(screen.getByRole('textbox', { name: 'composer' }), { key: '1' })
+      expect(t.posts()).toHaveLength(0)
+    })
+
+    it('are ignored from an editable target inside the card', () => {
+      media([DESKTOP])
+      const t = setup()
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      const field = document.createElement('input')
+      card().appendChild(field)
+      fireEvent.keyDown(field, { key: '1' })
+      expect(t.posts()).toHaveLength(0)
+    })
+
+    it('are off on a phone or a touch screen', () => {
+      media(['(min-width: 768px)', '(pointer: fine)'])
+      const t = setup()
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      fireEvent.keyDown(card(), { key: '1' })
+      expect(t.posts()).toHaveLength(0)
+      expect(document.querySelector('.q-key')).toBeNull()
+    })
+
+    it('ignore a digit past the options, and a digit with a modifier', () => {
+      media([DESKTOP])
+      const t = setup()
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      // A digit past the options is not an option: nothing is read for it.
+      const thrown: unknown[] = []
+      const onError = (e: ErrorEvent) => {
+        thrown.push(e.error)
+        e.preventDefault()
+      }
+      window.addEventListener('error', onError)
+      try {
+        fireEvent.keyDown(card(), { key: '6' })
+      } finally {
+        window.removeEventListener('error', onError)
+      }
+      expect(thrown).toEqual([])
+      fireEvent.keyDown(card(), { key: '1', metaKey: true })
+      fireEvent.keyDown(card(), { key: '1', ctrlKey: true })
+      fireEvent.keyDown(card(), { key: '1', altKey: true })
+      expect(t.posts()).toHaveLength(0)
+    })
+
+    it('show each digit beside its option, and keep its bare name as the option’s name', () => {
+      media([DESKTOP])
+      const t = setup()
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      expect(screen.getByRole('button', { name: 'Allow' })).toHaveTextContent('Allow2')
+      expect(Array.from(document.querySelectorAll('.q-key')).map((k) => k.textContent)).toEqual(['1', '2', '3', '4', '5'])
+    })
+  })
+
+  describe('delivery states', () => {
+    const env = (book: AnswerBook): ItemEnv => ({ sessionId: SESSION, agent: 'Codex', answers: book })
+
+    it('reads “Needs your answer” while answerable', () => {
+      show(permission(), env(setup().book))
+      expect(screen.getByText('Needs your answer')).toBeInTheDocument()
+    })
+
+    it('reads “Sent” for an answer with no verdict yet', () => {
+      show(permission({ answered: true, answerable: false }), env(setup().book))
+      expect(screen.getByText('Sent')).toBeInTheDocument()
+      expect(screen.queryByText('delivers when the host reconnects')).toBeNull()
+    })
+
+    it('adds that it delivers when the host reconnects while the host is away', () => {
+      const t = setup()
+      show(permission({ answered: true, answerable: false }), env(t.book))
+      act(() => t.book.setHostAway(true))
+      expect(screen.getByText('Sent')).toBeInTheDocument()
+      expect(screen.getByText('delivers when the host reconnects')).toBeInTheDocument()
+    })
+
+    it('reads “Answered” for a verdict delivered', () => {
+      show(permission({ answered: true, answerable: false, delivered: true }), env(setup().book))
+      expect(screen.getByText('Answered')).toBeInTheDocument()
+    })
+
+    it('reads “Sent, but the agent was no longer waiting” for a verdict not delivered', () => {
+      show(permission({ answered: true, answerable: false, delivered: false }), env(setup().book))
+      expect(screen.getByText('Sent, but the agent was no longer waiting')).toBeInTheDocument()
+    })
+
+    it('reads “Answered” for a question cancelled after its answer was delivered, with no new message offered', () => {
+      const onAnswerAsMessage = vi.fn()
+      show(permission({ state: 'cancelled', reason: 'turn_cancelled', answered: true, delivered: true, answerable: false }), {
+        ...env(setup().book),
+        onAnswerAsMessage,
+      })
+      expect(screen.getByText('Answered')).toBeInTheDocument()
+      expect(screen.queryByRole('button', { name: 'Answer as a new message' })).toBeNull()
+    })
+
+    it('reads “Answered” for a delivered state with no verdict', () => {
+      show(permission({ state: 'delivered', answerable: false }), env(setup().book))
+      expect(screen.getByText('Answered')).toBeInTheDocument()
+    })
+
+    it('offers “Answer as a new message” for a cancelled question, handing the composer the question’s text only', () => {
+      const onAnswerAsMessage = vi.fn()
+      show(permission({ state: 'cancelled', reason: 'session_parked', answerable: false }), { ...env(setup().book), onAnswerAsMessage })
+      expect(screen.getByText('The agent stopped waiting (the session was parked)')).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('button', { name: 'Answer as a new message' }))
+      expect(onAnswerAsMessage).toHaveBeenCalledWith('Run rm -rf build?')
+    })
+
+    it('hands over an elicitation’s message', () => {
+      const onAnswerAsMessage = vi.fn()
+      show(elicitation({}, { state: 'cancelled', reason: 'adapter_lost', answerable: false }), { ...env(setup().book), onAnswerAsMessage })
+      fireEvent.click(screen.getByRole('button', { name: 'Answer as a new message' }))
+      expect(onAnswerAsMessage).toHaveBeenCalledWith('Tabs or spaces?')
+    })
+
+    it('offers no new message without the composer’s seam', () => {
+      show(permission({ state: 'cancelled', reason: 'session_parked', answerable: false }), env(setup().book))
+      expect(screen.queryByRole('button', { name: 'Answer as a new message' })).toBeNull()
+    })
+  })
+
+  describe('focus on a newly opened question', () => {
+    const items = (...extra: Item[]): Item[] => [
+      { id: 'm1', version: 1, ts: TS, turn_id: 't1', kind: 'message', text: 'hi' } as Item,
+      ...extra,
+    ]
+
+    it('moves to an answerable card opened at the tail when the composer is empty', () => {
+      const t = setup()
+      t.book.observe(items())
+      t.book.observe(items(permission()))
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book, composerEmpty: () => true })
+      expect(card()).toHaveFocus()
+    })
+
+    it('stays put while the composer holds text, and does not come back later', () => {
+      const t = setup()
+      t.book.observe(items())
+      t.book.observe(items(permission()))
+      const v = show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book, composerEmpty: () => false })
+      expect(card()).not.toHaveFocus()
+      v.again(permission({ version: 2 }), { sessionId: SESSION, agent: 'Codex', answers: t.book, composerEmpty: () => true })
+      expect(card()).not.toHaveFocus()
+    })
+
+    it('never moves without the composer’s seam', () => {
+      const t = setup()
+      t.book.observe(items())
+      t.book.observe(items(permission()))
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+      expect(card()).not.toHaveFocus()
+    })
+
+    it('stays in a field inside the transcript that no open card holds, and says the card instead', () => {
+      const t = setup()
+      t.book.observe(items())
+      t.book.observe(items(permission()))
+      const v = render(
+        <div className="transcript">
+          <input aria-label="Note" />
+        </div>,
+      )
+      const note = screen.getByRole('textbox', { name: 'Note' })
+      note.focus()
+      v.rerender(
+        <div className="transcript">
+          <input aria-label="Note" />
+          <ItemView item={permission()} env={{ sessionId: SESSION, agent: 'Codex', answers: t.book, composerEmpty: () => true }} />
+        </div>,
+      )
+      expect(note).toHaveFocus()
+      expect(t.book.announcement).toBe('New question: Codex asks for permission')
+    })
+
+    it('never moves to a card that was there on the first page', () => {
+      const t = setup()
+      t.book.observe(items(permission()))
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book, composerEmpty: () => true })
+      expect(card()).not.toHaveFocus()
+    })
+  })
+
+  describe('elicitation card', () => {
+    const env = (book: AnswerBook): ItemEnv => ({ sessionId: SESSION, agent: 'Codex', answers: book })
+    const ok = () => json(202, { pending_id: 'e1', request_id: 'r1' })
+    const single = { key: 'indent', label: 'Indent', hint: 'Pick one', field_kind: 'single' as const, options: [{ value: 'tabs', label: 'Tabs', description: 'one char' }, { value: 'spaces' }] }
+    const custom = { key: 'indent_custom', label: 'Other', field_kind: 'text' as const, pairing: { with: 'indent', kind: 'exclusive' as const } }
+    const multi = { key: 'langs', label: 'Languages', hint: 'Any', field_kind: 'multi' as const, options: [{ value: 'rs', label: 'Rust' }, { value: 'ts', label: 'TypeScript' }] }
+    const note = { key: 'langs_note', label: 'Note', field_kind: 'text' as const, pairing: { with: 'langs', kind: 'note' as const } }
+    const text = { key: 'name', label: 'Name', hint: 'Your name', field_kind: 'text' as const }
+
+    it('fills a single select as radios, with its hint and descriptions', async () => {
+      const t = setup({ [`POST ${PATH('e1')}`]: ok() })
+      show(elicitation({ fields: [single] }), env(t.book))
+      expect(screen.getByText('Pick one')).toBeInTheDocument()
+      expect(screen.getByRole('radio', { name: 'Tabs' })).toHaveAccessibleDescription('one char')
+      expect(screen.getByRole('radio', { name: 'spaces' })).not.toBeChecked()
+      fireEvent.click(screen.getByRole('radio', { name: 'Tabs' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      await screen.findByText('Sent')
+      expect(t.posts().map((p) => p.body)).toEqual([{ action: 'accept', content: { indent: 'tabs' } }])
+    })
+
+    it('fills a multi select as checkboxes, sending a list', async () => {
+      const t = setup({ [`POST ${PATH('e1')}`]: ok() })
+      show(elicitation({ fields: [multi] }), env(t.book))
+      expect(screen.getByText('Any')).toBeInTheDocument()
+      fireEvent.click(screen.getByRole('checkbox', { name: 'TypeScript' }))
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Rust' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      await screen.findByText('Sent')
+      expect(t.posts().map((p) => p.body)).toEqual([{ action: 'accept', content: { langs: ['ts', 'rs'] } }])
+    })
+
+    it('fills a text field, sending it trimmed', async () => {
+      const t = setup({ [`POST ${PATH('e1')}`]: ok() })
+      show(elicitation({ fields: [text] }), env(t.book))
+      expect(screen.getByText('Your name')).toBeInTheDocument()
+      fireEvent.change(screen.getByRole('textbox', { name: 'Name' }), { target: { value: '  Ada ' } })
+      expect(screen.getByRole('textbox', { name: 'Name' })).toHaveValue('  Ada ')
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      await screen.findByText('Sent')
+      expect(t.posts().map((p) => p.body)).toEqual([{ action: 'accept', content: { name: 'Ada' } }])
+    })
+
+    it('sends the answer of a field the agent keyed __proto__', async () => {
+      const t = setup({ [`POST ${PATH('e1')}`]: ok() })
+      show(elicitation({ fields: [{ key: '__proto__', label: 'Proto', field_kind: 'text' }] }), env(t.book))
+      fireEvent.change(screen.getByRole('textbox', { name: 'Proto' }), { target: { value: 'kept' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      await screen.findByText('Sent')
+      // Parsed from the JSON sent: `__proto__` is an own key there.
+      const [body] = t.posts().map((p) => p.body as { content: object })
+      expect(Object.getOwnPropertyDescriptor(body.content, '__proto__')?.value).toBe('kept')
+      expect(Object.keys(body.content)).toEqual(['__proto__'])
+    })
+
+    it('keeps a half-filled form in the answer book: the card mounted again shows it', () => {
+      const t = setup()
+      const form = elicitation({ fields: [text, single] })
+      const first = show(form, env(t.book))
+      fireEvent.change(screen.getByRole('textbox', { name: 'Name' }), { target: { value: 'Ad' } })
+      fireEvent.click(screen.getByRole('radio', { name: 'Tabs' }))
+      first.unmount()
+      show(form, env(t.book))
+      expect(screen.getByRole('textbox', { name: 'Name' })).toHaveValue('Ad')
+      expect(screen.getByRole('radio', { name: 'Tabs' })).toBeChecked()
+      expect(screen.getByRole('button', { name: 'Send' })).toBeInTheDocument()
+      expect(t.posts()).toEqual([])
+    })
+
+    it('keeps each question’s draft apart', () => {
+      const t = setup()
+      show(elicitation({ fields: [text] }), env(t.book))
+      fireEvent.change(screen.getByRole('textbox', { name: 'Name' }), { target: { value: 'Ada' } })
+      show(elicitation({ fields: [text] }, { id: 'question:e2', pending_id: 'e2' }), env(t.book))
+      expect(screen.getAllByRole('textbox', { name: 'Name' }).map((i) => (i as HTMLInputElement).value)).toEqual(['Ada', ''])
+      // Typing into the second leaves the first's draft as it was.
+      fireEvent.change(screen.getAllByRole('textbox', { name: 'Name' })[1], { target: { value: 'Bob' } })
+      expect(screen.getAllByRole('textbox', { name: 'Name' }).map((i) => (i as HTMLInputElement).value)).toEqual(['Ada', 'Bob'])
+    })
+
+    it('says an unsupported field cannot be filled in, and offers Decline and Cancel only', () => {
+      const t = setup()
+      show(elicitation({ fields: [text, { key: 'when', label: 'When', field_kind: 'unsupported' }], form_supported: false }), env(t.book))
+      expect(screen.getByText('This field cannot be filled in here.')).toBeInTheDocument()
+      expect(screen.getByText(/can only be declined or cancelled/)).toBeInTheDocument()
+      expect(screen.queryByRole('textbox')).toBeNull()
+      expect(screen.getAllByRole('button').map((b) => b.textContent)).toEqual(['Decline', 'Cancel'])
+    })
+
+    it('does not fill in a form that names one field twice: Decline and Cancel only, each field shown', () => {
+      const t = setup()
+      const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+      show(elicitation({ fields: [text, { ...text, label: 'Name again' }] }), env(t.book))
+      expect(screen.getByText('This form names one field twice, so it cannot be filled in here: it can only be declined or cancelled.', { exact: true })).toBeInTheDocument()
+      expect(screen.getByText('Name', { exact: true })).toBeInTheDocument()
+      expect(screen.getByText('Name again', { exact: true })).toBeInTheDocument()
+      expect(screen.queryByRole('textbox')).toBeNull()
+      expect(screen.getAllByRole('button').map((b) => b.textContent)).toEqual(['Decline', 'Cancel'])
+      // React keys by place: no duplicate-key warning for the agent's keys.
+      expect(errors.mock.calls.filter((c) => String(c[0]).includes('same key'))).toEqual([])
+      errors.mockRestore()
+    })
+
+    it.each([
+      ['Decline', 'decline'],
+      ['Cancel', 'cancel'],
+    ])('%s sends its action with no content', async (label, action) => {
+      const t = setup({ [`POST ${PATH('e1')}`]: ok() })
+      show(elicitation({ fields: [text], form_supported: false }), env(t.book))
+      fireEvent.click(screen.getByRole('button', { name: label }))
+      await screen.findByText('Sent')
+      expect(t.posts().map((p) => p.body)).toEqual([{ action }])
+    })
+
+    it('declines a form it can fill without sending what was typed', async () => {
+      const t = setup({ [`POST ${PATH('e1')}`]: ok() })
+      show(elicitation({ fields: [text] }), env(t.book))
+      fireEvent.change(screen.getByRole('textbox', { name: 'Name' }), { target: { value: 'Ada' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Decline' }))
+      await screen.findByText('Sent')
+      expect(t.posts().map((p) => p.body)).toEqual([{ action: 'decline' }])
+    })
+
+    it('pairs an exclusive text with its select: choosing clears the text, typing clears the choice', async () => {
+      const t = setup({ [`POST ${PATH('e1')}`]: ok() })
+      show(elicitation({ fields: [single, custom], required: ['indent'] }), env(t.book))
+      const other = screen.getByRole('textbox', { name: 'Other' })
+      fireEvent.change(other, { target: { value: 'two spaces' } })
+      fireEvent.click(screen.getByRole('radio', { name: 'Tabs' }))
+      expect(other).toHaveValue('')
+      fireEvent.change(other, { target: { value: 'three' } })
+      expect(screen.getByRole('radio', { name: 'Tabs' })).not.toBeChecked()
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      await screen.findByText('Sent')
+      expect(t.posts().map((p) => p.body)).toEqual([{ action: 'accept', content: { indent_custom: 'three' } }])
+    })
+
+    it('keeps the choice when only whitespace is typed into its exclusive text', () => {
+      show(elicitation({ fields: [single, custom] }), env(setup().book))
+      fireEvent.click(screen.getByRole('radio', { name: 'Tabs' }))
+      fireEvent.change(screen.getByRole('textbox', { name: 'Other' }), { target: { value: '   ' } })
+      expect(screen.getByRole('radio', { name: 'Tabs' })).toBeChecked()
+    })
+
+    it('keeps a note alongside its select: neither clears the other', async () => {
+      const t = setup({ [`POST ${PATH('e1')}`]: ok() })
+      show(elicitation({ fields: [multi, note] }), env(t.book))
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Rust' }))
+      fireEvent.change(screen.getByRole('textbox', { name: 'Note' }), { target: { value: 'mostly' } })
+      expect(screen.getByRole('checkbox', { name: 'Rust' })).toBeChecked()
+      fireEvent.click(screen.getByRole('checkbox', { name: 'TypeScript' }))
+      expect(screen.getByRole('textbox', { name: 'Note' })).toHaveValue('mostly')
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      await screen.findByText('Sent')
+      expect(t.posts().map((p) => p.body)).toEqual([{ action: 'accept', content: { langs: ['rs', 'ts'], langs_note: 'mostly' } }])
+    })
+
+    it('offers Send only once a real answer exists: whitespace is none', () => {
+      show(elicitation({ fields: [text] }), env(setup().book))
+      expect(screen.queryByRole('button', { name: 'Send' })).toBeNull()
+      fireEvent.change(screen.getByRole('textbox', { name: 'Name' }), { target: { value: '   ' } })
+      expect(screen.queryByRole('button', { name: 'Send' })).toBeNull()
+      fireEvent.change(screen.getByRole('textbox', { name: 'Name' }), { target: { value: 'x' } })
+      expect(screen.getByRole('button', { name: 'Send' })).toBeInTheDocument()
+    })
+
+    it('offers Send only once every required key has an answer', () => {
+      show(elicitation({ fields: [text, multi], required: ['langs'] }), env(setup().book))
+      fireEvent.change(screen.getByRole('textbox', { name: 'Name' }), { target: { value: 'Ada' } })
+      expect(screen.queryByRole('button', { name: 'Send' })).toBeNull()
+      fireEvent.click(screen.getByRole('checkbox', { name: 'Rust' }))
+      expect(screen.getByRole('button', { name: 'Send' })).toBeInTheDocument()
+    })
+
+    it('sends nothing on its own: no choice and no Enter sends', () => {
+      const t = setup()
+      show(elicitation({ fields: [single, text] }), env(t.book))
+      fireEvent.click(screen.getByRole('radio', { name: 'Tabs' }))
+      const name = screen.getByRole('textbox', { name: 'Name' })
+      fireEvent.change(name, { target: { value: 'Ada' } })
+      fireEvent.keyDown(name, { key: 'Enter' })
+      fireEvent.submit(name)
+      expect(t.posts()).toHaveLength(0)
+      expect(screen.getByText('Needs your answer')).toBeInTheDocument()
+    })
+
+    it('chooses nothing for the operator', () => {
+      show(elicitation({ fields: [single, multi] }), env(setup().book))
+      for (const input of screen.getAllByRole('radio').concat(screen.getAllByRole('checkbox'))) expect(input).not.toBeChecked()
+    })
+
+    it('names the session’s agent as the one asking', () => {
+      show(elicitation({ fields: [text] }), env(setup().book))
+      expect(screen.getByText('Codex asks')).toBeInTheDocument()
+    })
+
+    it('takes no digit shortcut', () => {
+      media([DESKTOP])
+      const t = setup()
+      show(elicitation({ fields: [single] }), env(t.book))
+      fireEvent.keyDown(card(), { key: '1' })
+      expect(t.posts()).toHaveLength(0)
+    })
+  })
+
+  describe('a card without an answer book', () => {
+    it('only shows', () => {
+      show(permission(), { sessionId: SESSION, agent: 'Codex' })
+      expect(screen.queryByRole('button')).toBeNull()
+      expect(card()).not.toHaveAttribute('tabindex')
+    })
+  })
+
+  describe('answering through the book', () => {
+    it('waits for the post before it lets another go', async () => {
+      const t = setup({ [`POST ${PATH('p/1')}`]: [json(400, { code: 'invalid', message: 'x' }), json(202, { pending_id: 'p/1', request_id: 'r' })] })
+      await t.book.answer(permission(), { option_id: 'b' })
+      expect(t.book.localOf('question:p/1')).toMatchObject({ phase: 'failed' })
+      await t.book.answer(permission(), { option_id: 'b' })
+      await waitFor(() => expect(t.book.localOf('question:p/1')).toMatchObject({ phase: 'sent', version: 1 }))
+      expect(t.posts()).toHaveLength(2)
+    })
+  })
+  ```
+
+In `web/src/components/items/items.test.tsx`, replace:
+
+  ```tsx
+    it('renders the actions it is given (the seam for answering)', () => {
+      show(item('question', permission), { ...env, questionActions: (q) => <button type="button">answer {q.pending_id}</button> })
+      expect(screen.getByRole('button', { name: 'answer p1' })).toBeInTheDocument()
+    })
+
+  ```
+
+with:
+
+  ```tsx
+  ```
+
+Create `web/src/lib/delivery.test.ts`:
+
+  ```ts
+  import { describe, expect, it } from 'vitest'
+  import type { PendingReason } from '../generated/protocol'
+  import type { Item } from '../generated/view'
+  import {
+    GONE,
+    HOST_AWAY_NOTE,
+    NOT_OPEN,
+    NO_OPTIONS,
+    REASON_WORDS,
+    TAKEN,
+    deliveryOf,
+    digitIndex,
+    foldVerdict,
+    freshQuestions,
+    isEditable,
+    optionTone,
+    questionText,
+    type LocalAnswer,
+  } from './delivery'
+
+  type Q = Extract<Item, { kind: 'question' }>
+  const TS = '2026-10-02T10:00:00.000Z'
+
+  function q(patch: Partial<Q> = {}): Q {
+    return {
+      id: 'question:p1',
+      version: 3,
+      ts: TS,
+      turn_id: 't1',
+      kind: 'question',
+      pending_id: 'p1',
+      question_kind: 'permission',
+      request: { type: 'permission', title: 'Run it?', options: [{ option_id: 'a', name: 'Allow', option_kind: 'allow_once' }] },
+      answerable: true,
+      state: 'open',
+      answered: false,
+      ...patch,
+    } as Q
+  }
+
+  const msg = (id: string): Item => ({ id, version: 1, ts: TS, turn_id: 't1', kind: 'message', text: id }) as Item
+
+  describe('deliveryOf: the §6.3 table', () => {
+    it('pending, live: the controls, “Needs your answer”', () => {
+      expect(deliveryOf(q(), undefined)).toMatchObject({ text: 'Needs your answer', controls: true, busy: false, answerAsMessage: false })
+    })
+
+    it('answer queued, no verdict yet: “Sent”', () => {
+      const d = deliveryOf(q({ answered: true, answerable: false }), undefined)
+      expect(d).toMatchObject({ text: 'Sent', controls: false })
+      expect(d.note).toBeUndefined()
+    })
+
+    it('answer queued while the host is away: “Sent” and when it delivers', () => {
+      expect(deliveryOf(q({ answered: true, answerable: false }), undefined, true)).toMatchObject({ text: 'Sent', note: HOST_AWAY_NOTE })
+    })
+
+    it('no host note once a verdict is in, or with no answer', () => {
+      expect(deliveryOf(q({ answered: true, answerable: false, delivered: true }), undefined, true).note).toBeUndefined()
+      expect(deliveryOf(q(), undefined, true).note).toBeUndefined()
+    })
+
+    it('delivered: “Answered”', () => {
+      expect(deliveryOf(q({ answered: true, answerable: false, delivered: true }), undefined).text).toBe('Answered')
+    })
+
+    it('verdict delivered false: “Sent, but the agent was no longer waiting”', () => {
+      expect(deliveryOf(q({ answered: true, answerable: false, delivered: false }), undefined).text).toBe('Sent, but the agent was no longer waiting')
+    })
+
+    it('cancelled: “The agent stopped waiting”, and a new message offered', () => {
+      expect(deliveryOf(q({ state: 'cancelled', answerable: false }), undefined)).toMatchObject({ text: 'The agent stopped waiting', answerAsMessage: true, controls: false })
+    })
+
+    it('cancelled with a verdict not delivered: still stopped waiting', () => {
+      expect(deliveryOf(q({ state: 'cancelled', reason: 'host_restarted', answered: true, delivered: false, answerable: false }), undefined)).toMatchObject({
+        text: 'The agent stopped waiting (the host restarted)',
+        answerAsMessage: true,
+      })
+    })
+
+    it('cancelled with delivered true: “Answered”, no new message', () => {
+      expect(deliveryOf(q({ state: 'cancelled', reason: 'turn_cancelled', answered: true, delivered: true, answerable: false }), undefined)).toMatchObject({
+        text: 'Answered',
+        answerAsMessage: false,
+      })
+    })
+
+    it('a permission with no option ids: no controls, and why', () => {
+      const none = q({ request: { type: 'permission', options: [] } })
+      expect(deliveryOf(none, undefined)).toMatchObject({ text: NO_OPTIONS, controls: false })
+    })
+
+    it('state delivered with no verdict: “Answered”', () => {
+      expect(deliveryOf(q({ state: 'delivered', answerable: false }), undefined).text).toBe('Answered')
+    })
+
+    it('open, not answerable, nothing queued: “Open”', () => {
+      expect(deliveryOf(q({ answerable: false }), undefined)).toMatchObject({ text: 'Open', controls: false })
+    })
+  })
+
+  describe('deliveryOf: what this tab did', () => {
+    const at = (phase: LocalAnswer['phase'], version = 3): LocalAnswer =>
+      phase === 'failed' ? { phase, version, message: 'nope' } : ({ phase, version } as LocalAnswer)
+
+    it('in flight: the controls, disabled', () => {
+      expect(deliveryOf(q(), at('sending'))).toMatchObject({ text: 'Sending…', controls: true, busy: true })
+    })
+
+    it('in flight holds over an upsert that leaves it answerable', () => {
+      expect(deliveryOf(q({ version: 4 }), at('sending', 3))).toMatchObject({ controls: true, busy: true })
+    })
+
+    it('in flight gives way to an upsert that answered it', () => {
+      expect(deliveryOf(q({ version: 4, answered: true, answerable: false }), at('sending', 3))).toMatchObject({ text: 'Sent', busy: false, controls: false })
+    })
+
+    it('a 202: “Sent” until the next upsert', () => {
+      expect(deliveryOf(q(), at('sent'))).toMatchObject({ text: 'Sent', controls: false })
+      expect(deliveryOf(q(), at('sent'), true).note).toBe(HOST_AWAY_NOTE)
+      expect(deliveryOf(q({ version: 4 }), at('sent', 3)).text).toBe('Needs your answer')
+    })
+
+    it('a 409: “Already answered from another device” until the next upsert', () => {
+      expect(deliveryOf(q(), at('taken'))).toMatchObject({ text: TAKEN, controls: false })
+      expect(deliveryOf(q({ version: 4, answered: true, answerable: false }), at('taken', 3)).text).toBe('Sent')
+    })
+
+    it('a 409 not_open: “This question is no longer open”, never another device, until the next upsert', () => {
+      expect(deliveryOf(q(), at('closed'))).toMatchObject({ text: NOT_OPEN, controls: false })
+      expect(deliveryOf(q(), at('closed')).text).not.toBe(TAKEN)
+      expect(deliveryOf(q({ version: 4, state: 'cancelled', reason: 'turn_cancelled', answerable: false }), at('closed', 3)).text).toBe(
+        'The agent stopped waiting (the turn was stopped)',
+      )
+    })
+
+    it('a 404: “This question is gone”', () => {
+      expect(deliveryOf(q(), at('gone'))).toMatchObject({ text: GONE, controls: false })
+    })
+
+    it('another refusal: its message, and the controls again', () => {
+      expect(deliveryOf(q(), at('failed'))).toMatchObject({ text: 'Needs your answer', controls: true, busy: false, error: 'nope' })
+    })
+  })
+
+  describe('cancel reasons in words', () => {
+    const words: [PendingReason, string][] = [
+      ['turn_cancelled', 'the turn was stopped'],
+      ['session_closed', 'the session was closed'],
+      ['session_parked', 'the session was parked'],
+      ['adapter_lost', 'the agent’s process was lost'],
+      ['host_restarted', 'the host restarted'],
+      ['agent_withdrew', 'the agent withdrew the question'],
+      ['host_revoked', 'the host was revoked'],
+    ]
+
+    it('covers all 7 reasons, each once', () => {
+      expect(Object.keys(REASON_WORDS).sort()).toEqual(words.map(([r]) => r).sort())
+    })
+
+    it.each(words)('reason %s reads “%s”', (reason, text) => {
+      expect(deliveryOf(q({ state: 'cancelled', reason, answerable: false }), undefined).text).toBe(`The agent stopped waiting (${text})`)
+    })
+
+    it('shows a reason it does not know as sent', () => {
+      const reason = 'brand_new' as PendingReason
+      expect(deliveryOf(q({ state: 'cancelled', reason, answerable: false }), undefined).text).toBe('The agent stopped waiting (brand_new)')
+    })
+
+    it.each(['constructor', 'toString', '__proto__', 'hasOwnProperty'])('shows a reason named like an Object member (%s) as sent', (name) => {
+      const reason = name as PendingReason
+      expect(deliveryOf(q({ state: 'cancelled', reason, answerable: false }), undefined).text).toBe(`The agent stopped waiting (${name})`)
+    })
+  })
+
+  describe('the verdict is monotonic', () => {
+    it('a held delivered true is never replaced by false', () => {
+      const folded = foldVerdict(q({ answered: true, answerable: false, delivered: true, version: 3 }), q({ answered: true, answerable: false, delivered: false, version: 4 }))
+      expect(folded).toMatchObject({ delivered: true, version: 4 })
+    })
+
+    it('a held delivered true survives a cancellation', () => {
+      const folded = foldVerdict(q({ answered: true, delivered: true, answerable: false }), q({ state: 'cancelled', reason: 'turn_cancelled', answerable: false, version: 4 }))
+      expect(folded).toMatchObject({ delivered: true, state: 'cancelled' })
+      expect(deliveryOf(folded as Q, undefined).text).toBe('Answered')
+    })
+
+    it('a held true makes the question not answerable', () => {
+      expect(foldVerdict(q({ delivered: true }), q({ version: 4 }))).toMatchObject({ delivered: true, answerable: false })
+    })
+
+    it('false gives way to true, and no verdict to any', () => {
+      const t = q({ delivered: true, version: 4 })
+      expect(foldVerdict(q({ delivered: false }), t)).toBe(t)
+      const f = q({ delivered: false, version: 4 })
+      expect(foldVerdict(q(), f)).toBe(f)
+    })
+
+    it('leaves other kinds alone', () => {
+      const next = msg('a')
+      expect(foldVerdict(msg('a'), next)).toBe(next)
+    })
+  })
+
+  describe('option tones, by kind only', () => {
+    it.each([
+      ['allow_once', 'allow'],
+      ['allow_always', 'always'],
+      ['reject_once', 'reject'],
+      ['reject_always', 'reject'],
+      ['something_else', 'allow'],
+      ['', 'allow'],
+    ])('kind %s is %s', (kind, tone) => {
+      expect(optionTone(kind)).toBe(tone)
+    })
+  })
+
+  describe('the question’s text, for “Answer as a new message”', () => {
+    it('is a permission’s title, as asked', () => {
+      expect(questionText(q().request)).toBe('Run it?')
+    })
+
+    it('names an untitled permission', () => {
+      expect(questionText({ type: 'permission', options: [] })).toBe('Permission')
+    })
+
+    it('is an elicitation’s message, as asked', () => {
+      expect(questionText({ type: 'elicitation', message: 'Which?', fields: [], form_supported: true })).toBe('Which?')
+    })
+  })
+
+  describe('digit keys', () => {
+    const key = (k: string, target: EventTarget | null = document.body, mods: Partial<Record<'ctrlKey' | 'metaKey' | 'altKey', boolean>> = {}) =>
+      digitIndex({ key: k, ctrlKey: false, metaKey: false, altKey: false, target, ...mods })
+
+    it('1–9 pick an option', () => {
+      expect(key('1')).toBe(0)
+      expect(key('9')).toBe(8)
+    })
+
+    it('0, letters and longer keys pick none', () => {
+      for (const k of ['0', 'a', 'F1', 'Enter', '10']) expect(key(k)).toBeUndefined()
+    })
+
+    it('a modifier picks none', () => {
+      expect(key('1', document.body, { ctrlKey: true })).toBeUndefined()
+      expect(key('1', document.body, { metaKey: true })).toBeUndefined()
+      expect(key('1', document.body, { altKey: true })).toBeUndefined()
+    })
+
+    it.each(['input', 'textarea', 'select'])('a %s is editable', (tag) => {
+      const el = document.createElement(tag)
+      expect(isEditable(el)).toBe(true)
+      expect(key('1', el)).toBeUndefined()
+    })
+
+    it('anything inside a contenteditable is editable', () => {
+      const box = document.createElement('div')
+      box.setAttribute('contenteditable', 'true')
+      const inner = document.createElement('span')
+      box.appendChild(inner)
+      expect(isEditable(box)).toBe(true)
+      expect(isEditable(inner)).toBe(true)
+      expect(key('1', inner)).toBeUndefined()
+    })
+
+    it('contenteditable="false" and a button are not', () => {
+      const off = document.createElement('div')
+      off.setAttribute('contenteditable', 'false')
+      expect(isEditable(off)).toBe(false)
+      expect(isEditable(document.createElement('button'))).toBe(false)
+      expect(isEditable(null)).toBe(false)
+    })
+  })
+
+  describe('freshQuestions: what opened at the tail', () => {
+    const open = (id: string, patch: Partial<Q> = {}) => q({ id, ...patch })
+
+    it('none on a first load', () => {
+      expect(freshQuestions([msg('a'), open('q1')], null, undefined)).toEqual([])
+    })
+
+    it('an answerable question appended at the tail', () => {
+      expect(freshQuestions([msg('a'), open('q1')], new Set(), 'a')).toEqual(['q1'])
+    })
+
+    it('the first item of an empty transcript', () => {
+      expect(freshQuestions([open('q1')], new Set(), undefined)).toEqual(['q1'])
+    })
+
+    it('none prepended from an older page', () => {
+      expect(freshQuestions([open('q0'), msg('a')], new Set(), 'a')).toEqual([])
+    })
+
+    it('none after a resync dropped the last item seen', () => {
+      expect(freshQuestions([msg('x'), open('q1')], new Set(), 'a')).toEqual([])
+    })
+
+    it('none already known, none not answerable, none without options', () => {
+      const items = [msg('a'), open('q1'), open('q2', { answerable: false }), open('q3', { request: { type: 'permission', options: [] } })]
+      expect(freshQuestions(items, new Set(['q1']), 'a')).toEqual([])
+    })
+  })
+  ```
+
+Create `web/src/lib/elicitation.test.ts`:
+
+  ```ts
+  import { describe, expect, it } from 'vitest'
+  import type { Field } from '../generated/view'
+  import { canSend, choose, contentOf, elicitationBody, hasDuplicateKeys, toggle, typeText, type Draft } from './elicitation'
+
+  // The shape `question.rs` reads from the adapters: a select with one agent's
+  // exclusive custom answer, a multi select with Codex's note and answer.
+  const FIELDS: Field[] = [
+    { key: 'zeta', label: 'Colour', field_kind: 'single', options: [{ value: 'Red', label: 'Rouge' }, { value: 'Blue' }] },
+    { key: 'zeta_custom', label: 'Other', field_kind: 'text', pairing: { with: 'zeta', kind: 'exclusive' } },
+    { key: 'alpha', label: 'alpha', field_kind: 'multi', options: [{ value: 'A' }, { value: 'B' }] },
+    { key: 'note', label: 'note', field_kind: 'text', pairing: { with: 'alpha', kind: 'note' } },
+    { key: 'other', label: 'other', field_kind: 'text', pairing: { with: 'alpha', kind: 'exclusive' } },
+  ]
+  const REQUIRED = ['zeta', 'alpha']
+
+  describe('exclusive pairing', () => {
+    it('choosing an option clears its paired text', () => {
+      let d: Draft = typeText(FIELDS, {}, 'zeta_custom', 'green')
+      d = choose(FIELDS, d, 'zeta', 'Red')
+      expect(d).toEqual({ zeta: 'Red' })
+    })
+
+    it('typing a real answer clears the option it pairs with', () => {
+      let d: Draft = choose(FIELDS, {}, 'zeta', 'Red')
+      d = typeText(FIELDS, d, 'zeta_custom', 'green')
+      expect(d).toEqual({ zeta_custom: 'green' })
+    })
+
+    it('whitespace clears nothing, and is held as typed', () => {
+      let d: Draft = choose(FIELDS, {}, 'zeta', 'Red')
+      d = typeText(FIELDS, d, 'zeta_custom', '  ')
+      expect(d).toEqual({ zeta: 'Red', zeta_custom: '  ' })
+    })
+
+    it('toggling a multi option clears its paired text', () => {
+      let d: Draft = typeText(FIELDS, {}, 'other', 'C')
+      d = toggle(FIELDS, d, 'alpha', 'A')
+      expect(d).toEqual({ alpha: ['A'] })
+      d = typeText(FIELDS, d, 'other', 'C')
+      expect(d).toEqual({ other: 'C' })
+    })
+  })
+
+  describe('note pairing', () => {
+    it('a note and its select live side by side', () => {
+      let d: Draft = toggle(FIELDS, {}, 'alpha', 'B')
+      d = typeText(FIELDS, d, 'note', 'why')
+      d = toggle(FIELDS, d, 'alpha', 'A')
+      expect(d).toEqual({ alpha: ['B', 'A'], note: 'why' })
+    })
+  })
+
+  describe('multi select', () => {
+    it('toggles off, and an empty list is no answer', () => {
+      let d: Draft = toggle(FIELDS, {}, 'alpha', 'A')
+      d = toggle(FIELDS, d, 'alpha', 'A')
+      expect(d).toEqual({})
+    })
+  })
+
+  describe('content', () => {
+    it('carries real answers only, text trimmed', () => {
+      const d: Draft = { zeta: 'Red', zeta_custom: '   ', alpha: [], note: ' why ', unknown: 'x' }
+      expect(contentOf(FIELDS, d)).toEqual({ zeta: 'Red', note: 'why' })
+    })
+
+    it('a list stays a list', () => {
+      expect(contentOf(FIELDS, { alpha: ['A', 'B'] })).toEqual({ alpha: ['A', 'B'] })
+    })
+
+    it('keeps the answer of a field keyed like an Object member (__proto__, constructor)', () => {
+      const fields = [
+        { key: '__proto__', label: 'Proto', field_kind: 'text' as const },
+        { key: 'constructor', label: 'Ctor', field_kind: 'multi' as const, options: [{ value: 'a' }] },
+      ]
+      let d: Draft = {}
+      d = typeText(fields, d, '__proto__', ' polluted? ')
+      d = toggle(fields, d, 'constructor', 'a')
+      const content = contentOf(fields, d)
+      expect(Object.hasOwn(content, '__proto__')).toBe(true)
+      expect(Object.getPrototypeOf(content)).toBe(Object.prototype)
+      expect(JSON.stringify(elicitationBody('accept', content))).toBe(
+        '{"action":"accept","content":{"__proto__":"polluted?","constructor":["a"]}}',
+      )
+    })
+  })
+
+  describe('Send', () => {
+    it('needs one real answer', () => {
+      expect(canSend(FIELDS, undefined, true, {})).toBe(false)
+      expect(canSend(FIELDS, undefined, true, { note: '   ' })).toBe(false)
+      expect(canSend(FIELDS, undefined, true, { note: 'x' })).toBe(true)
+    })
+
+    it('needs every required key', () => {
+      expect(canSend(FIELDS, REQUIRED, true, { zeta: 'Red' })).toBe(false)
+      expect(canSend(FIELDS, REQUIRED, true, { zeta: 'Red', alpha: ['A'] })).toBe(true)
+    })
+
+    it('takes an exclusive text as the answer to the required key it pairs with', () => {
+      expect(canSend(FIELDS, REQUIRED, true, { zeta_custom: 'green', alpha: ['A'] })).toBe(true)
+      expect(canSend(FIELDS, REQUIRED, true, { zeta_custom: '  ', alpha: ['A'] })).toBe(false)
+    })
+
+    it('never takes a note as the answer to a required key', () => {
+      expect(canSend(FIELDS, REQUIRED, true, { zeta: 'Red', note: 'why' })).toBe(false)
+    })
+
+    it('is never offered for a form the card cannot fill', () => {
+      expect(canSend(FIELDS, undefined, false, { note: 'x' })).toBe(false)
+    })
+
+    it('is never offered for a form with two fields of one key: one answer could not reach each', () => {
+      const twice: Field[] = [
+        { key: 'name', label: 'First', field_kind: 'text' },
+        { key: 'name', label: 'Second', field_kind: 'text' },
+      ]
+      expect(hasDuplicateKeys(twice)).toBe(true)
+      expect(hasDuplicateKeys(FIELDS)).toBe(false)
+      // Keys like Object members are keys like any other.
+      expect(hasDuplicateKeys([{ key: '__proto__', label: 'a', field_kind: 'text' }, { key: 'constructor', label: 'b', field_kind: 'text' }])).toBe(false)
+      expect(canSend(twice, undefined, true, { name: 'Ada' })).toBe(false)
+    })
+  })
+
+  describe('bodies', () => {
+    it('accept carries the content', () => {
+      expect(elicitationBody('accept', { zeta: 'Red' })).toEqual({ action: 'accept', content: { zeta: 'Red' } })
+    })
+
+    it.each(['decline', 'cancel'] as const)('%s carries no content key', (action) => {
+      const body = elicitationBody(action, { zeta: 'Red' })
+      expect(body).toEqual({ action })
+      expect('content' in body).toBe(false)
+    })
+  })
+  ```
+
+Create `web/src/screens/Session.answer.test.tsx`:
+
+  ```tsx
+  // The session view answers its questions, through its real composer: the
+  // book is wired, a question opened on the stream takes the focus only when
+  // the composer is empty, a verdict that comes back as `delivered: false`
+  // never undoes "Answered", the host's connection comes from the view's one
+  // hosts list, and a question that can be answered is never held above the
+  // transcript's window.
+  import '@testing-library/jest-dom/vitest'
+  import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+  import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+  import type { Item } from '../generated/view'
+  import { forgetAllAttachments } from '../lib/attachments'
+  import { json } from '../test-stream'
+  import SessionView from './Session'
+  import { FAST, message, sessionServer, type Opts } from './test-session'
+
+  const ID = 's1'
+  const TS = '2026-10-02T10:00:00.000Z'
+  const ANSWER = '/api/sessions/s1/pending/p1/answer'
+  const WAIT = { timeout: 5000 }
+
+  const question = (patch: object = {}): Item =>
+    ({
+      id: 'question:p1',
+      version: 5,
+      ts: TS,
+      turn_id: 't1',
+      kind: 'question',
+      pending_id: 'p1',
+      question_kind: 'permission',
+      request: { type: 'permission', title: 'Run it?', options: [{ option_id: 'a', name: 'Allow', option_kind: 'allow_once' }] },
+      answerable: true,
+      state: 'open',
+      answered: false,
+      ...patch,
+    }) as Item
+
+  const form = (patch: object = {}): Item =>
+    question({
+      question_kind: 'elicitation',
+      request: { type: 'elicitation', message: 'Your name?', fields: [{ key: 'name', label: 'Name', field_kind: 'text' }], form_supported: true },
+      ...patch,
+    })
+
+  /** A cheap row: the operator's words, no Markdown. */
+  const said = (n: number): Item =>
+    ({ id: `u${n}`, version: 1, ts: TS, turn_id: 't1', kind: 'user_turn', content: [{ type: 'text', text: `row ${n}` }] }) as Item
+
+  function server(items: Item[], opts: Opts = {}) {
+    return sessionServer({
+      items: () => items,
+      detail: { agent: 'codex' },
+      hosts: () => json([{ host_id: 'h1', name: 'build-box', connected: true, capabilities: ['images'] }]),
+      ...opts,
+    })
+  }
+
+  const card = () => screen.getByRole('region', { name: /Question from/ })
+  const textarea = () => screen.getByLabelText('Prompt') as HTMLTextAreaElement
+  const hostCalls = (s: ReturnType<typeof server>) => s.of('/api/hosts')
+
+  beforeEach(() => {
+    sessionStorage.clear()
+    forgetAllAttachments()
+    URL.createObjectURL = vi.fn(() => 'blob:u')
+    URL.revokeObjectURL = vi.fn()
+  })
+
+  describe('SessionView answering', () => {
+    it('answers a question through its route, as the session’s agent asks it', async () => {
+      const s = server([message('m1', 't1'), question()])
+      render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+      fireEvent.click(await screen.findByRole('button', { name: 'Allow' }))
+      await screen.findByText('Sent')
+      expect(s.posted('/answer')).toEqual([{ path: ANSWER, body: { option_id: 'a' } }])
+      expect(await screen.findByText('Codex asks for permission', {}, WAIT)).toBeInTheDocument()
+    })
+
+    it('moves the focus to a question opened on the stream while the composer is empty', async () => {
+      const s = server([message('m1', 't1')])
+      render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+      await screen.findByText('m1')
+      await waitFor(() => expect(s.streams).toHaveLength(1))
+      expect(textarea().value).toBe('')
+      act(() => s.streams[0].event('item', question()))
+      await screen.findByText('Run it?')
+      await waitFor(() => expect(card()).toHaveFocus())
+    })
+
+    it('leaves the focus in the composer while it holds text', async () => {
+      const s = server([message('m1', 't1')])
+      render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+      await screen.findByText('m1')
+      await waitFor(() => expect(s.streams).toHaveLength(1))
+      textarea().focus()
+      fireEvent.change(textarea(), { target: { value: 'half a thought' } })
+      act(() => s.streams[0].event('item', question()))
+      await screen.findByText('Run it?')
+      // A later event: once it shows, the card's effects have run.
+      act(() => s.streams[0].event('item', message('m2', 't1')))
+      await screen.findByText('m2')
+      expect(card()).not.toHaveFocus()
+      expect(document.activeElement).toBe(textarea())
+    })
+
+    it('never takes the focus for a question that was there when the session opened', async () => {
+      const s = server([message('m1', 't1'), question()])
+      render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+      await screen.findByText('Run it?')
+      expect(card()).not.toHaveFocus()
+    })
+
+    it('keeps “Answered” when a later version says not delivered', async () => {
+      const s = server([message('m1', 't1'), question({ answered: true, answerable: false, delivered: true })])
+      render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+      await screen.findByText('Answered')
+      await waitFor(() => expect(s.streams).toHaveLength(1))
+      act(() => {
+        s.streams[0].event('item', question({ version: 6, answered: true, answerable: false, delivered: false }))
+        // A later event: once it shows, the one before was taken in.
+        s.streams[0].event('item', message('m2', 't1'))
+      })
+      await screen.findByText('m2')
+      expect(screen.getByText('Answered')).toBeInTheDocument()
+      expect(screen.queryByText('Sent, but the agent was no longer waiting')).toBeNull()
+    })
+
+    it('says an answer delivers when the host reconnects while the session is presumed parked', async () => {
+      const s = server([message('m1', 't1'), question({ answered: true, answerable: false })], { detail: { agent: 'codex', presumed_parked: true } })
+      render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+      await screen.findByText('Sent')
+      expect(await screen.findByText('delivers when the host reconnects', {}, WAIT)).toBeInTheDocument()
+    })
+
+    it('reads the host’s connection from the view’s one hosts request, shared with the composer', async () => {
+      const s = server([message('m1', 't1'), question({ answered: true, answerable: false })], {
+        hosts: () => json([{ host_id: 'h1', name: 'build-box', connected: false, capabilities: [] }]),
+      })
+      render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+      await screen.findByText('Sent')
+      // The card used the list: the host is not connected.
+      expect(await screen.findByText('delivers when the host reconnects', {}, WAIT)).toBeInTheDocument()
+      // The composer used it: the host takes no images.
+      await waitFor(() => expect(screen.queryByRole('button', { name: 'Attach images' })).toBeNull(), WAIT)
+      // And the header named the host from it.
+      expect(screen.getByText('build-box')).toBeInTheDocument()
+      expect(hostCalls(s)).toHaveLength(1)
+    })
+
+    it('says nothing of the host while it is connected', async () => {
+      const s = server([message('m1', 't1'), question({ answered: true, answerable: false })])
+      render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+      await screen.findByText('Sent')
+      await screen.findByText('build-box', {}, WAIT)
+      expect(screen.queryByText('delivers when the host reconnects')).toBeNull()
+    })
+
+    it('answers a question as a new message in the composer, one stop after the question', async () => {
+      const s = server([message('m1', 't1'), question({ state: 'cancelled', reason: 'adapter_lost', answerable: false })])
+      render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+      fireEvent.click(await screen.findByRole('button', { name: 'Answer as a new message' }))
+      await waitFor(() => expect(textarea().value).toBe('You asked: Run it? My answer: '))
+      expect(screen.getByText('Answering a question as a new message')).toBeInTheDocument()
+      expect(s.posted('/prompt')).toEqual([])
+    })
+  })
+
+  describe('SessionView: questions and the transcript’s window', () => {
+    // 250 rows, the open question 11th: the newest 200 would start at row 50.
+    const long = (q: Item) => [...Array.from({ length: 10 }, (_, n) => said(n)), q, ...Array.from({ length: 239 }, (_, n) => said(n + 11))]
+
+    it('starts the window at a question that can be answered, however far above the tail it is', async () => {
+      const s = server(long(question()))
+      render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+      expect(await screen.findByRole('button', { name: 'Allow' }, WAIT)).toBeInTheDocument()
+      expect(screen.getByText('Needs your answer')).toBeInTheDocument()
+      expect(screen.getByText('row 11')).toBeInTheDocument()
+      expect(screen.getByText('row 249')).toBeInTheDocument()
+      expect(screen.queryByText('row 9')).toBeNull()
+      expect(screen.getByRole('button', { name: /Load earlier/ })).toBeInTheDocument()
+    })
+
+    it('holds a question that cannot be answered above the window as before', async () => {
+      const s = server(long(question({ answered: true, answerable: false, delivered: true })))
+      render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+      await screen.findByText('row 249', {}, WAIT)
+      expect(screen.queryByText('Run it?')).toBeNull()
+      expect(screen.queryByText('row 49')).toBeNull()
+      expect(screen.getByText('row 50')).toBeInTheDocument()
+    })
+
+    it('holds a permission with no options above the window: it cannot be answered here', async () => {
+      const s = server(long(question({ request: { type: 'permission', title: 'Run it?', options: [] } })))
+      render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+      await screen.findByText('row 249', {}, WAIT)
+      expect(screen.queryByText('Run it?')).toBeNull()
+      expect(screen.queryByText('row 49')).toBeNull()
+      expect(screen.getByText('row 50')).toBeInTheDocument()
+    })
+
+    it('keeps the window where it is once the question is answered', async () => {
+      const s = server(long(question()))
+      render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+      await screen.findByRole('button', { name: 'Allow' }, WAIT)
+      await waitFor(() => expect(s.streams).toHaveLength(1))
+      act(() => s.streams[0].event('item', question({ version: 6, answered: true, answerable: false, delivered: true })))
+      await screen.findByText('Answered')
+      expect(screen.getByText('row 11')).toBeInTheDocument()
+    })
+
+    it('keeps a half-filled form across a reveal of earlier rows', async () => {
+      // The form 61st of 250: inside the newest 200, with rows held above.
+      const items = [...Array.from({ length: 60 }, (_, n) => said(n)), form(), ...Array.from({ length: 189 }, (_, n) => said(n + 61))]
+      const s = server(items)
+      render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+      const name = (await screen.findByRole('textbox', { name: 'Name' }, WAIT)) as HTMLInputElement
+      fireEvent.change(name, { target: { value: 'Ad' } })
+      expect(screen.queryByText('row 0')).toBeNull()
+      fireEvent.click(screen.getByRole('button', { name: /Load earlier/ }))
+      await screen.findByText('row 0')
+      expect(screen.getByRole('textbox', { name: 'Name' })).toHaveValue('Ad')
+      expect(within(card()).getByRole('button', { name: 'Send' })).toBeInTheDocument()
+    })
+  })
+
+  /** The digit shortcuts work on a desktop only: a matchMedia that says so. */
+  const DESKTOP = '(min-width: 768px) and (pointer: fine)'
+  function desktop() {
+    window.matchMedia = ((query: string) => ({
+      matches: query === DESKTOP,
+      media: query,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+    })) as unknown as typeof window.matchMedia
+  }
+
+  /** The key the operator types next, wherever the focus is. */
+  const typeOne = () => fireEvent.keyDown(document.activeElement ?? document.body, { key: '1', code: 'Digit1' })
+
+  describe('SessionView: a new question never steals typing', () => {
+    beforeEach(desktop)
+    afterEach(() => {
+      // @ts-expect-error clear a stub between tests
+      delete window.matchMedia
+    })
+
+    /** Opens question p1 on the stream, then waits for a later event: once it
+     *  shows, the card's effects have run. */
+    async function open(s: ReturnType<typeof server>, item: Item = question()) {
+      act(() => s.streams[0].event('item', item))
+      await screen.findByText('Run it?')
+      act(() => s.streams[0].event('item', message('m2', 't1')))
+      await screen.findByText('m2')
+    }
+
+    /** A later event after the key: whatever the key set off has run. */
+    async function settle(s: ReturnType<typeof server>) {
+      act(() => s.streams[0].event('item', message('m3', 't1')))
+      await screen.findByText('m3')
+    }
+
+    async function shown(s: ReturnType<typeof server>, ui = <SessionView id={ID} timing={FAST} />) {
+      render(ui, { wrapper: s.wrapper })
+      await screen.findByText('m1')
+      await waitFor(() => expect(s.streams).toHaveLength(1))
+    }
+
+    it('with nothing focused and an empty composer, the card takes the focus and 1 answers it', async () => {
+      const s = server([message('m1', 't1')])
+      await shown(s)
+      expect(document.activeElement).toBe(document.body)
+      await open(s)
+      expect(card()).toHaveFocus()
+      typeOne()
+      await screen.findByText('Sent')
+      expect(s.posted('/answer')).toEqual([{ path: ANSWER, body: { option_id: 'a' } }])
+    })
+
+    it('leaves the focus in the empty composer: 1 types there, no answer is sent', async () => {
+      const s = server([message('m1', 't1')])
+      await shown(s)
+      textarea().focus()
+      expect(textarea().value).toBe('')
+      await open(s)
+      expect(document.activeElement).toBe(textarea())
+      typeOne()
+      await settle(s)
+      expect(s.posted('/answer')).toEqual([])
+    })
+
+    it('leaves the focus in a field outside the transcript: no answer is sent', async () => {
+      const s = server([message('m1', 't1')])
+      await shown(
+        s,
+        <>
+          <input aria-label="Search sessions" />
+          <SessionView id={ID} timing={FAST} />
+        </>,
+      )
+      const search = screen.getByRole('textbox', { name: 'Search sessions' })
+      search.focus()
+      await open(s)
+      expect(search).toHaveFocus()
+      typeOne()
+      await settle(s)
+      expect(s.posted('/answer')).toEqual([])
+    })
+
+    it('leaves the focus in a form card’s field inside the transcript: no answer is sent', async () => {
+      const s = server([message('m1', 't1'), form({ id: 'question:p2', pending_id: 'p2' })])
+      await shown(s)
+      const name = await screen.findByRole('textbox', { name: 'Name' })
+      name.focus()
+      await open(s)
+      expect(name).toHaveFocus()
+      typeOne()
+      await settle(s)
+      expect(s.posted('/answer')).toEqual([])
+    })
+
+    it('moves from a control in the transcript that takes no typing', async () => {
+      const other = question({
+        id: 'question:p2',
+        pending_id: 'p2',
+        request: { type: 'permission', title: 'Delete it?', options: [{ option_id: 'n', name: 'Never', option_kind: 'reject_once' }] },
+        state: 'cancelled',
+        reason: 'adapter_lost',
+        answerable: false,
+      })
+      // A closed card's button: no open card holds the focus.
+      const s = server([message('m1', 't1'), other])
+      await shown(s)
+      screen.getByRole('button', { name: 'Answer as a new message' }).focus()
+      await open(s)
+      expect(screen.getByText('Run it?').closest('section')).toHaveFocus()
+      typeOne()
+      await waitFor(() => expect(s.posted('/answer')).toEqual([{ path: ANSWER, body: { option_id: 'a' } }]))
+    })
+
+    it('moves from “Load earlier” in the transcript', async () => {
+      const s = server([said(0), said(1), message('m1', 't1')])
+      await shown(s, <SessionView id={ID} timing={FAST} tail={2} />)
+      screen.getByRole('button', { name: 'Load earlier' }).focus()
+      await open(s)
+      expect(card()).toHaveFocus()
+      typeOne()
+      await waitFor(() => expect(s.posted('/answer')).toEqual([{ path: ANSWER, body: { option_id: 'a' } }]))
+    })
+
+    it('stays on an open card when a second question opens: 1 answers the first, never the second', async () => {
+      const first = question({
+        id: 'question:p2',
+        pending_id: 'p2',
+        request: { type: 'permission', title: 'Delete it?', options: [{ option_id: 'n', name: 'Never', option_kind: 'reject_once' }] },
+      })
+      const second = question({
+        request: { type: 'permission', title: 'Run it?', options: [{ option_id: 'a', name: 'Always', option_kind: 'allow_always' }] },
+      })
+      const s = server([message('m1', 't1')])
+      await shown(s)
+      expect(document.activeElement).toBe(document.body)
+      act(() => s.streams[0].event('item', first))
+      await screen.findByText('Delete it?')
+      act(() => s.streams[0].event('item', message('m2', 't1')))
+      await screen.findByText('m2')
+      const held = screen.getByText('Delete it?').closest('section')
+      expect(held).toHaveFocus()
+      act(() => s.streams[0].event('item', second))
+      await screen.findByText('Run it?')
+      act(() => s.streams[0].event('item', message('m3', 't1')))
+      await screen.findByText('m3')
+      expect(held).toHaveFocus()
+      typeOne()
+      await waitFor(() => expect(s.posted('/answer')).toEqual([{ path: '/api/sessions/s1/pending/p2/answer', body: { option_id: 'n' } }]))
+      act(() => s.streams[0].event('item', message('m4', 't1')))
+      await screen.findByText('m4')
+      expect(s.posted('/answer')).toEqual([{ path: '/api/sessions/s1/pending/p2/answer', body: { option_id: 'n' } }])
+    })
+  })
+
+  describe('SessionView: a question that opens without the focus is said', () => {
+    const SAID = 'New question: Codex asks for permission'
+    const anySaid = () => screen.queryAllByText(/^New question: /)
+
+    async function shown(s: ReturnType<typeof server>) {
+      render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+      await screen.findByText('m1')
+      await waitFor(() => expect(s.streams).toHaveLength(1))
+    }
+
+    /** Sends `item`, then `marker`: once the marker shows, the item's card
+     *  has run its effects. */
+    async function send(s: ReturnType<typeof server>, item: Item, marker: string) {
+      act(() => s.streams[0].event('item', item))
+      act(() => s.streams[0].event('item', message(marker, 't1')))
+      await screen.findByText(marker)
+    }
+
+    it('says a question opened while the composer holds text, in a polite status region, as the session’s agent', async () => {
+      const s = server([message('m1', 't1')])
+      await shown(s)
+      textarea().focus()
+      fireEvent.change(textarea(), { target: { value: 'half a thought' } })
+      await send(s, question(), 'm2')
+      const region = screen.getByText(SAID, { exact: true })
+      expect(region).toHaveAttribute('role', 'status')
+      expect(region).toHaveAttribute('aria-live', 'polite')
+      expect(document.activeElement).toBe(textarea())
+    })
+
+    it('says a form as asking for an answer', async () => {
+      const s = server([message('m1', 't1')])
+      await shown(s)
+      textarea().focus()
+      fireEvent.change(textarea(), { target: { value: 'half a thought' } })
+      await send(s, form(), 'm2')
+      expect(screen.getByText('New question: Codex asks for an answer', { exact: true })).toHaveAttribute('role', 'status')
+    })
+
+    it('says nothing when the card takes the focus', async () => {
+      const s = server([message('m1', 't1')])
+      await shown(s)
+      await send(s, question(), 'm2')
+      expect(card()).toHaveFocus()
+      expect(anySaid()).toEqual([])
+    })
+
+    it('says nothing of a question that was open when the session opened', async () => {
+      sessionStorage.setItem('hennery.draft.s1', 'half a thought')
+      const s = server([message('m1', 't1'), question()])
+      await shown(s)
+      await screen.findByText('Run it?')
+      // The kept draft: the card could not take the focus, yet is not said.
+      expect(textarea().value).toBe('half a thought')
+      await send(s, message('m2', 't1'), 'm3')
+      expect(anySaid()).toEqual([])
+    })
+
+    it('says a second question that opens while the first holds the focus', async () => {
+      const first = question({ id: 'question:p2', pending_id: 'p2' })
+      const s = server([message('m1', 't1')])
+      await shown(s)
+      await send(s, first, 'm2')
+      expect(card()).toHaveFocus()
+      expect(anySaid()).toEqual([])
+      await send(s, question(), 'm3')
+      expect(screen.getByText(SAID, { exact: true })).toHaveAttribute('role', 'status')
+    })
+
+    it('says the same words again for the next such question, in the one region', async () => {
+      const s = server([message('m1', 't1')])
+      await shown(s)
+      textarea().focus()
+      fireEvent.change(textarea(), { target: { value: 'half a thought' } })
+      await send(s, question({ id: 'question:p2', pending_id: 'p2' }), 'm2')
+      const region = screen.getByText(SAID, { exact: true })
+      const once = region.textContent
+      await send(s, question(), 'm3')
+      expect(anySaid()).toEqual([region])
+      // The region's text changed, so a screen reader says it again.
+      expect(region.textContent).not.toBe(once)
+      expect(region.textContent?.trim()).toBe(SAID)
+    })
+  })
+  ```
+
+In `web/src/screens/test-session.ts`, replace:
+
+  ```ts
+  // and its images, and the composer's POSTs, recorded with their bodies.
+  ```
+
+with:
+
+  ```ts
+  // and its images, the composer's and the cards' POSTs, recorded with their
+  // bodies.
+  ```
+
+In `web/src/screens/test-session.ts`, replace:
+
+  ```ts
+    detail?: Partial<SessionDetail>
+  }
+  ```
+
+with:
+
+  ```ts
+    detail?: Partial<SessionDetail>
+    /** `POST …/pending/{pending_id}/answer`; 202 by default. */
+    answer?: () => Response
+  }
+  ```
+
+In `web/src/screens/test-session.ts`, replace:
+
+  ```ts
+        return live.response
+      }
+  ```
+
+with:
+
+  ```ts
+        return live.response
+      }
+      if ((m = path.match(/^\/api\/sessions\/[^/]+\/pending\/([^/]+)\/answer$/))) {
+        return opts.answer?.() ?? json({ pending_id: decodeURIComponent(m[1]), request_id: 'r1' }, 202)
+      }
+  ```
+
+In `web/src/store/items.test.ts`, replace:
+
+  ```ts
+      expect(state.items[0]).toBe(same)
+    })
+  ```
+
+with:
+
+  ```ts
+      expect(state.items[0]).toBe(same)
+    })
+
+    it('keeps a question’s verdict delivered when a later version says not delivered', () => {
+      const q = (version: number, patch: object) =>
+        ({ id: 'q', version, ts: '2026-10-02T10:00:00.000Z', turn_id: 't1', kind: 'question', pending_id: 'p', question_kind: 'permission', request: { type: 'permission', options: [] }, state: 'open', answered: true, answerable: false, ...patch }) as Item
+      let state = loaded([q(1, { delivered: true })])
+      state = itemsReducer(state, { type: 'upsert', item: q(2, { delivered: false, state: 'cancelled', reason: 'turn_cancelled' }) })
+      expect(state.items[0]).toMatchObject({ version: 2, delivered: true, state: 'cancelled', answerable: false })
+    })
+  ```
+
+Create `web/src/store/useAnswer.test.ts`:
+
+  ```ts
+  import { renderHook, waitFor } from '@testing-library/react'
+  import { describe, expect, it } from 'vitest'
+  import type { Item } from '../generated/view'
+  import { json, routed } from '../test-stream'
+  import { useAnswering } from './useAnswer'
+
+  const TS = '2026-10-02T10:00:00.000Z'
+  const msg = (id: string): Item => ({ id, version: 1, ts: TS, turn_id: 't1', kind: 'message', text: id }) as Item
+  const question = (id: string, patch: object = {}): Item =>
+    ({
+      id,
+      version: 1,
+      ts: TS,
+      turn_id: 't1',
+      kind: 'question',
+      pending_id: id,
+      question_kind: 'permission',
+      request: { type: 'permission', options: [{ option_id: 'a', name: 'Allow', option_kind: 'allow_once' }] },
+      answerable: true,
+      state: 'open',
+      answered: false,
+      ...patch,
+    }) as Item
+
+  const sent = (id: string) => question(id, { answered: true, answerable: false })
+
+  function hosts(list: unknown) {
+    return routed((call) => (call.path === '/api/hosts' ? json(list) : json({ code: 'not_found', message: 'no' }, 404)))
+  }
+
+  type Props = { info?: { presumed_parked: boolean }; items: Item[]; loading: boolean; connected?: boolean }
+
+  function use(t: ReturnType<typeof routed>, initial: Props) {
+    return renderHook((p: Props) => useAnswering('s1', p.info, p.items, p.loading, p.connected), { initialProps: initial, wrapper: t.wrapper })
+  }
+
+  describe('useAnswering', () => {
+    it('keeps one book for the session', () => {
+      const t = hosts([])
+      const h = use(t, { items: [], loading: true })
+      const first = h.result.current
+      h.rerender({ items: [msg('a')], loading: false })
+      expect(h.result.current).toBe(first)
+    })
+
+    it('says the host is away while the session is presumed parked', async () => {
+      const t = hosts([])
+      const h = use(t, { info: { presumed_parked: true }, items: [], loading: false, connected: true })
+      await waitFor(() => expect(h.result.current.hostAway).toBe(true))
+    })
+
+    it('says the host is away when the view says it is not connected, and fetches no hosts itself', async () => {
+      const t = hosts([{ host_id: 'h1', name: 'box', connected: true }])
+      const info = { presumed_parked: false }
+      const h = use(t, { info, items: [sent('q')], loading: false })
+      expect(h.result.current.hostAway).toBe(false)
+      h.rerender({ info, items: [sent('q')], loading: false, connected: false })
+      await waitFor(() => expect(h.result.current.hostAway).toBe(true))
+      expect(t.calls).toHaveLength(0)
+    })
+
+    it('a connected host, or one not known yet, is not away', async () => {
+      const t = hosts([])
+      const info = { presumed_parked: false }
+      const h = use(t, { info, items: [sent('q')], loading: false, connected: true })
+      await Promise.resolve()
+      expect(h.result.current.hostAway).toBe(false)
+      h.rerender({ info, items: [sent('q')], loading: false })
+      await Promise.resolve()
+      expect(h.result.current.hostAway).toBe(false)
+    })
+
+    it('marks fresh only a question opened at the tail after the first page', () => {
+      const t = hosts([])
+      const h = use(t, { items: [], loading: true })
+      h.rerender({ items: [msg('a'), question('old')], loading: false })
+      h.rerender({ items: [question('older'), msg('a'), question('old'), question('new')], loading: false })
+      const book = h.result.current
+      expect(book.claimFocus('old')).toBe(false)
+      expect(book.claimFocus('older')).toBe(false)
+      expect(book.claimFocus('new')).toBe(true)
+      expect(book.claimFocus('new')).toBe(false)
+    })
+
+    it('takes nothing in while the first page loads', () => {
+      const t = hosts([])
+      const h = use(t, { items: [msg('a')], loading: true })
+      h.rerender({ items: [msg('a'), question('q')], loading: true })
+      h.rerender({ items: [msg('a'), question('q')], loading: false })
+      expect(h.result.current.claimFocus('q')).toBe(false)
+    })
+  })
+  ```
+
+- [ ] **Step 2: Run them, and see them fail**
+
+Run: `nix develop -c sh -c 'cd web && pnpm vitest run src/lib src/store src/components src/screens'`
+Expected: FAIL: `delivery.test.ts`, `elicitation.test.ts`, `useAnswer.test.ts` and `QuestionCard.test.tsx` cannot resolve `./delivery`, `./elicitation` and `useAnswer`; 24 tests fail: the answer's one stop (`composerWords.test.ts`), the verdict that sticks (`items.test.ts`), and `Session.answer.test.tsx`'s answering, focus, live-region and window tests.
+
+- [ ] **Step 3: Cards that answer**
+
+Create `web/src/api/answer.ts`:
+
+  ```ts
+  // Answering a question (ACP core §4.6, §9):
+  // `POST /api/sessions/{id}/pending/{pending_id}/answer`. 202 once the
+  // answer is queued, whatever the host's state; the verdict follows on the
+  // item stream. The route never asks for a step-up, so a 403 is an error
+  // here, never a dialog.
+  import type { AnswerRequest, AnswerResponse } from '../generated/protocol'
+  import type { Client } from './client'
+
+  export function answerPath(sessionId: string, pendingId: string): string {
+    return `/api/sessions/${encodeURIComponent(sessionId)}/pending/${encodeURIComponent(pendingId)}/answer`
+  }
+
+  export function answerQuestion(client: Client, sessionId: string, pendingId: string, body: AnswerRequest): Promise<AnswerResponse> {
+    return client.request<AnswerResponse>('POST', answerPath(sessionId, pendingId), body, { stepUp: false })
+  }
+  ```
+
+In `web/src/components/Transcript.tsx`, replace:
+
+  ```tsx
+        return <QuestionCard item={item} agent={env.agent} actions={env.questionActions?.(item)} />
+  ```
+
+with:
+
+  ```tsx
+        return <QuestionCard item={item} env={env} />
+  ```
+
+In `web/src/components/composerWords.ts`, replace:
+
+  ```ts
+   *  writes the answer after it. */
+  export function answerAsMessage(question: string): string {
+    return `You asked: ${question}. My answer: `
+  ```
+
+with:
+
+  ```ts
+   *  writes the answer after it. A question that ends its own sentence (`?`,
+   *  `.`, `!`) gets no second stop. */
+  export function answerAsMessage(question: string): string {
+    const q = question.trimEnd()
+    const stop = /[?.!]$/.test(q) ? '' : '.'
+    return `You asked: ${q}${stop} My answer: `
+  ```
+
+Create `web/src/components/items/Elicitation.tsx`:
+
+  ```tsx
+  // An elicitation's form (frontend spec §6.3): its fields, read-only or to
+  // fill in, and the answers it can send.
+  //
+  // - Single selects are radios, multi selects checkboxes, text an input; an
+  //   unsupported field says so. Every field's hint shows.
+  // - A form the card cannot fill (`form_supported: false`, or two fields of
+  //   one key) offers Decline and Cancel only, and never invents a value.
+  // - Fields are keyed by their place, never by the agent's key.
+  // - Send appears once one real answer exists and every required key has
+  //   one. Nothing is chosen for the operator, and nothing is sent on its own:
+  //   no choice and no key sends, only the buttons.
+  import { useId } from 'react'
+  import type { ElicitationAction } from '../../generated/protocol'
+  import type { Field, FieldOption } from '../../generated/view'
+  import { canSend, choose, contentOf, elicitationBody, hasDuplicateKeys, toggle, typeText, type Draft } from '../../lib/elicitation'
+
+  type Request = { fields: Field[]; required?: string[]; form_supported: boolean }
+  type Body = ReturnType<typeof elicitationBody>
+
+  /** An option's text. Its name is the bare label (§10): the description is
+   *  its description, not part of its name. */
+  function OptionText({ option, id }: { option: FieldOption; id: string }) {
+    const descId = `${id}-d`
+    return (
+      <>
+        <span className="elic-opt-value" id={id}>
+          {option.label || option.value}
+        </span>
+        {option.description && (
+          <span className="elic-opt-desc" id={descId}>
+            {option.description}
+          </span>
+        )}
+      </>
+    )
+  }
+
+  function FieldHead({ field, inputId }: { field: Field; inputId?: string }) {
+    return (
+      <>
+        {inputId ? (
+          <label className="elic-label" htmlFor={inputId}>
+            {field.label || field.key}
+          </label>
+        ) : (
+          <span className="elic-label">{field.label || field.key}</span>
+        )}
+        {field.hint && <span className="elic-hint">{field.hint}</span>}
+      </>
+    )
+  }
+
+  /** A select's legend and hint. */
+  function GroupHead({ field }: { field: Field }) {
+    return (
+      <>
+        <legend className="elic-label">{field.label || field.key}</legend>
+        {field.hint && <span className="elic-hint">{field.hint}</span>}
+      </>
+    )
+  }
+
+  /** A field as it was asked: its options listed, nothing to fill in. */
+  export function FieldView({ field }: { field: Field }) {
+    return (
+      <div className="elic-field">
+        <FieldHead field={field} />
+        {field.options && field.options.length > 0 && (
+          <ul className="elic-opts">
+            {field.options.map((option, i) => (
+              <li key={i} className="elic-opt">
+                <span className="elic-opt-value">{option.label || option.value}</span>
+                {option.description && <span className="elic-opt-desc">{option.description}</span>}
+              </li>
+            ))}
+          </ul>
+        )}
+        {field.field_kind === 'unsupported' && <span className="elic-unsupported-msg">This field cannot be filled in here.</span>}
+      </div>
+    )
+  }
+
+  interface FieldInputProps {
+    field: Field
+    draft: Draft
+    disabled: boolean
+    /** The field's own prefix for names and ids: from the form's id and the
+     *  field's place, never its key (a key may hold spaces, which an id
+     *  reference cannot). */
+    prefix: string
+    onDraft: (next: (draft: Draft) => Draft) => void
+    fields: readonly Field[]
+  }
+
+  function FieldInput({ field, draft, disabled, prefix, onDraft, fields }: FieldInputProps) {
+    const name = prefix
+    const options = field.options ?? []
+    switch (field.field_kind) {
+      case 'single':
+        return (
+          <fieldset className="elic-field">
+            <GroupHead field={field} />
+            <div className="elic-opts">
+              {options.map((option, i) => {
+                const checked = draft[field.key] === option.value
+                const id = `${name}-o${i}`
+                return (
+                  <label key={i} className={'elic-opt' + (checked ? ' sel' : '')}>
+                    <input
+                      type="radio"
+                      name={name}
+                      value={option.value}
+                      checked={checked}
+                      disabled={disabled}
+                      aria-labelledby={id}
+                      aria-describedby={option.description ? `${id}-d` : undefined}
+                      onChange={() => onDraft((d) => choose(fields, d, field.key, option.value))}
+                    />
+                    <OptionText option={option} id={id} />
+                  </label>
+                )
+              })}
+            </div>
+          </fieldset>
+        )
+      case 'multi': {
+        const held = draft[field.key]
+        const chosen = Array.isArray(held) ? held : []
+        return (
+          <fieldset className="elic-field">
+            <GroupHead field={field} />
+            <div className="elic-opts">
+              {options.map((option, i) => {
+                const checked = chosen.includes(option.value)
+                const id = `${name}-o${i}`
+                return (
+                  <label key={i} className={'elic-opt' + (checked ? ' sel' : '')}>
+                    <input
+                      type="checkbox"
+                      name={name}
+                      value={option.value}
+                      checked={checked}
+                      disabled={disabled}
+                      aria-labelledby={id}
+                      aria-describedby={option.description ? `${id}-d` : undefined}
+                      onChange={() => onDraft((d) => toggle(fields, d, field.key, option.value))}
+                    />
+                    <OptionText option={option} id={id} />
+                  </label>
+                )
+              })}
+            </div>
+          </fieldset>
+        )
+      }
+      case 'text': {
+        const value = draft[field.key]
+        return (
+          <div className="elic-field">
+            <FieldHead field={field} inputId={name} />
+            <input
+              id={name}
+              type="text"
+              className="elic-text"
+              value={typeof value === 'string' ? value : ''}
+              disabled={disabled}
+              onChange={(e) => {
+                const text = e.target.value
+                onDraft((d) => typeText(fields, d, field.key, text))
+              }}
+            />
+          </div>
+        )
+      }
+      default:
+        return <FieldView field={field} />
+    }
+  }
+
+  interface Props {
+    request: Request
+    /** The card can answer it now. */
+    live: boolean
+    /** An answer is in flight. */
+    busy: boolean
+    /** What the operator filled in: held by the card's owner (the answer
+     *  book), never by this component, so a remount keeps it. */
+    draft: Draft
+    onDraft: (next: (draft: Draft) => Draft) => void
+    onAnswer: (body: Body) => void
+  }
+
+  export default function Elicitation({ request, live, busy, draft, onDraft, onAnswer }: Props) {
+    const prefix = useId()
+    const { fields, required, form_supported: supported } = request
+    const twice = hasDuplicateKeys(fields)
+    if (!live || !supported || twice) {
+      return (
+        <>
+          {fields.length > 0 && (
+            <div className="elic-fields">
+              {fields.map((field, i) => (
+                <FieldView key={i} field={field} />
+              ))}
+            </div>
+          )}
+          {!supported ? (
+            <p className="item-note">This form cannot be filled in here: it can only be declined or cancelled.</p>
+          ) : (
+            twice && <p className="item-note">This form names one field twice, so it cannot be filled in here: it can only be declined or cancelled.</p>
+          )}
+          {live && <Actions busy={busy} send={false} onAction={(action) => onAnswer(elicitationBody(action))} />}
+        </>
+      )
+    }
+    const sendable = canSend(fields, required, supported, draft)
+    return (
+      <>
+        {fields.length > 0 && (
+          <div className="elic-fields">
+            {fields.map((field, i) => (
+              <FieldInput key={i} field={field} draft={draft} disabled={busy} prefix={`${prefix}f${i}`} onDraft={onDraft} fields={fields} />
+            ))}
+          </div>
+        )}
+        <Actions
+          busy={busy}
+          send={sendable}
+          onAction={(action) => onAnswer(action === 'accept' ? elicitationBody('accept', contentOf(fields, draft)) : elicitationBody(action))}
+        />
+      </>
+    )
+  }
+
+  function Actions({ busy, send, onAction }: { busy: boolean; send: boolean; onAction: (action: ElicitationAction) => void }) {
+    return (
+      <div className="ask-actions">
+        {send && (
+          <button type="button" className="btn btn-primary btn-sm" disabled={busy} onClick={() => onAction('accept')}>
+            Send
+          </button>
+        )}
+        <button type="button" className="btn btn-ghost btn-sm" disabled={busy} onClick={() => onAction('decline')}>
+          Decline
+        </button>
+        <button type="button" className="btn btn-ghost btn-sm" disabled={busy} onClick={() => onAction('cancel')}>
+          Cancel
+        </button>
+      </div>
+    )
+  }
+  ```
+
+In `web/src/components/items/QuestionCard.tsx`, replace:
+
+  ```tsx
+  // A question the agent asked (frontend spec §6.3), read-only here: the
+  // request, its options or fields, and where it stands, in words. The
+  // answering controls come in through `actions`; without them the card only
+  // shows. Options are styled by their kind, never by their agent-chosen names.
+  import type { ReactNode } from 'react'
+  import type { PendingReason } from '../../generated/protocol'
+  import type { Field } from '../../generated/view'
+  import type { ItemOf } from './types'
+
+  type Question = ItemOf<'question'>
+
+  export const REASON_WORDS: Record<PendingReason, string> = {
+    turn_cancelled: 'the turn was stopped',
+    session_closed: 'the session was closed',
+    session_parked: 'the session was parked',
+    adapter_lost: 'the agent’s process was lost',
+    host_restarted: 'the host restarted',
+    agent_withdrew: 'the agent withdrew the question',
+    host_revoked: 'the host was revoked',
+  }
+
+  /** Where a question stands, from the item alone (the table in §6.3 without
+   *  its local states: an answer in flight, an answer refused). */
+  export function questionStateText(q: Question): string {
+    if (q.delivered === true) return 'Answered'
+    if (q.state === 'cancelled') {
+      // Own keys only: a reason of `constructor` must read as sent.
+      const why = q.reason ? (Object.hasOwn(REASON_WORDS, q.reason) ? REASON_WORDS[q.reason] : q.reason) : undefined
+      return why ? `The agent stopped waiting (${why})` : 'The agent stopped waiting'
+    }
+    if (q.delivered === false) return 'Sent, but the agent was no longer waiting'
+    if (q.state === 'delivered') return 'Answered'
+    if (q.answered) return 'Sent'
+    if (q.answerable) return 'Needs your answer'
+    return 'Open'
+  }
+
+  /** A permission option's style, from its kind alone. */
+  export function optionClass(kind: string): string {
+    if (kind.startsWith('reject')) return 'q-opt q-opt-reject'
+    if (kind === 'allow_always') return 'q-opt q-opt-always'
+    return 'q-opt q-opt-allow'
+  }
+
+  function FieldView({ field }: { field: Field }) {
+    return (
+      <div className="elic-field">
+        <span className="elic-label">{field.label || field.key}</span>
+        {field.hint && <span className="elic-hint">{field.hint}</span>}
+        {field.options && field.options.length > 0 && (
+          <ul className="elic-opts">
+            {field.options.map((option, i) => (
+              <li key={i} className="elic-opt">
+                <span className="elic-opt-value">{option.label || option.value}</span>
+                {option.description && <span className="elic-opt-desc">{option.description}</span>}
+              </li>
+            ))}
+          </ul>
+        )}
+        {field.field_kind === 'unsupported' && <span className="elic-unsupported-msg">This field cannot be filled in here.</span>}
+      </div>
+    )
+  ```
+
+with:
+
+  ```tsx
+  // A question the agent asked (frontend spec §6.3): the request, its options
+  // or form, and where it stands, in words (lib/delivery.ts).
+  //
+  // - Only an item the server holds `answerable` can be answered (F-15), and
+  //   only through the session's answer book (`env.answers`); without one the
+  //   card only shows.
+  // - A permission's options are buttons in the adapter's order, styled by
+  //   their kind, never by their agent-chosen names. Keys 1–9 pick one, but
+  //   only while the card itself has the focus, never from a text field, and
+  //   only on a desktop (F-16): the listener is on the card, not the window.
+  // - A newly opened question takes the focus only when the composer is empty
+  //   and the focus is free (§10, "never steal typing"): nothing holds it, or
+  //   a control in the transcript that takes no typing does. Never from
+  //   another open card, a text field, the session menu, a dialog or the
+  //   list's search: the next key there would be a digit that answers the
+  //   agent's first option. One that opens without taking the focus is said
+  //   in the view's live region instead (the answer book's announcement).
+  // - A question the agent stopped waiting on offers "Answer as a new
+  //   message": the question's text goes to `env.onAnswerAsMessage`, and the
+  //   view words the composer's draft around it.
+  // - A form's draft lives in the answer book, by question: the card can be
+  //   mounted again without losing it.
+  import { useEffect, useRef, type KeyboardEvent } from 'react'
+  import type { AnswerRequest } from '../../generated/protocol'
+  import { useMediaQuery } from '../../hooks/useMediaQuery'
+  import { deliveryOf, digitIndex, isEditable, optionTone, questionText, type OptionTone } from '../../lib/delivery'
+  import { useAnswerState, useFormDraft } from '../../store/useAnswer'
+  import Elicitation from './Elicitation'
+  import type { ItemEnv, ItemOf } from './types'
+
+  type Question = ItemOf<'question'>
+
+  /** Where the digit shortcuts work: a wide screen with a fine pointer. */
+  export const DESKTOP = '(min-width: 768px) and (pointer: fine)'
+
+  const BUTTON_TONE: Record<OptionTone, string> = {
+    allow: 'btn-primary',
+    always: 'btn-ghost',
+    reject: 'btn-danger',
+  }
+
+  /** Whether a card may take the focus from where it is now: an allowlist.
+   *  Nothing focused, or a control inside the card's own transcript that
+   *  takes no typing ("Load earlier", a closed card's button). Everything
+   *  else keeps it: another live card (its next digit answers that card, not
+   *  this one), the composer, any field (a form card's included), the
+   *  header's menu, a dialog over the page, the session list. */
+  function focusIsFree(card: HTMLElement): boolean {
+    const active = document.activeElement
+    if (active === null || active === document.body) return true
+    if (isEditable(active)) return false
+    const holder = active.closest('section.ask:not(.stale)')
+    if (holder !== null && holder !== card) return false
+    const transcript = card.closest('.transcript')
+    return transcript !== null && transcript.contains(active)
+  ```
+
+In `web/src/components/items/QuestionCard.tsx`, replace:
+
+  ```tsx
+    /** The agent's label: who is asking. */
+    agent: string
+    /** Controls that answer it; absent, the card is read-only. */
+    actions?: ReactNode
+  }
+
+  export default function QuestionCard({ item, agent, actions }: Props) {
+    const { request } = item
+    const state = questionStateText(item)
+    const live = item.answerable
+    return (
+      <section className={'ask fade-in' + (live ? '' : ' stale')} aria-label={`Question from ${agent}`}>
+        <div className="ask-eyebrow">
+          <span className="e-tag">
+            {request.type === 'permission' ? `${agent} asks for permission` : `${agent} asks`}
+          </span>
+  ```
+
+with:
+
+  ```tsx
+    env: ItemEnv
+  }
+
+  export default function QuestionCard({ item, env }: Props) {
+    const { request } = item
+    const book = env.answers
+    const { local, hostAway } = useAnswerState(book, item.id)
+    const [draft, onDraft] = useFormDraft(book, item.id)
+    const d = deliveryOf(item, book ? local : undefined, hostAway)
+    // Live: this card can answer now.
+    const live = book !== undefined && d.controls
+    const desktop = useMediaQuery(DESKTOP)
+    const ref = useRef<HTMLElement>(null)
+    const { composerEmpty, agent } = env
+    const kind = request.type
+
+    useEffect(() => {
+      if (!live || !book) return
+      // Claimed once, whatever the composer holds: a question opened while
+      // the operator typed never takes the focus later.
+      if (!book.claimFocus(item.id)) return
+      const el = ref.current
+      if (el && composerEmpty?.() === true && focusIsFree(el)) el.focus({ preventScroll: true })
+      else book.announce(`New question: ${agent} ${kind === 'permission' ? 'asks for permission' : 'asks for an answer'}`)
+    }, [live, book, item.id, composerEmpty, agent, kind])
+
+    const answer = (body: AnswerRequest) => {
+      if (book && !d.busy) void book.answer(item, body)
+    }
+
+    const onKeyDown = (e: KeyboardEvent<HTMLElement>) => {
+      if (!live || !desktop || d.busy || request.type !== 'permission') return
+      const at = digitIndex(e)
+      if (at === undefined || at >= request.options.length) return
+      e.preventDefault()
+      answer({ option_id: request.options[at].option_id })
+    }
+
+    return (
+      <section
+        ref={ref}
+        className={'ask fade-in' + (live ? '' : ' stale')}
+        aria-label={`Question from ${agent}`}
+        tabIndex={live ? 0 : undefined}
+        onKeyDown={live ? onKeyDown : undefined}
+      >
+        <div className="ask-eyebrow">
+          <span className="e-tag">{request.type === 'permission' ? `${agent} asks for permission` : `${agent} asks`}</span>
+  ```
+
+In `web/src/components/items/QuestionCard.tsx`, replace:
+
+  ```tsx
+            {request.options.length === 0 ? (
+              <p className="item-note">This question cannot be answered here: stop, park or close the session.</p>
+            ) : (
+              <ul className="q-opts">
+                {request.options.map((option) => (
+                  <li key={option.option_id} className={optionClass(option.option_kind)}>
+                    {option.name}
+                  </li>
+                ))}
+              </ul>
+            )}
+  ```
+
+with:
+
+  ```tsx
+            {request.options.length > 0 &&
+              (live ? (
+                <div className="q-opts" role="group" aria-label="Options">
+                  {request.options.map((option, i) => {
+                    const tone = optionTone(option.option_kind)
+                    return (
+                      <button
+                        key={option.option_id}
+                        type="button"
+                        className={`btn btn-sm ${BUTTON_TONE[tone]} q-opt q-opt-${tone}`}
+                        disabled={d.busy}
+                        onClick={() => answer({ option_id: option.option_id })}
+                      >
+                        {option.name}
+                        {desktop && i < 9 && (
+                          <kbd className="q-key" aria-hidden="true">
+                            {i + 1}
+                          </kbd>
+                        )}
+                      </button>
+                    )
+                  })}
+                </div>
+              ) : (
+                <ul className="q-opts">
+                  {request.options.map((option) => (
+                    <li key={option.option_id} className={`q-opt q-opt-${optionTone(option.option_kind)}`}>
+                      {option.name}
+                    </li>
+                  ))}
+                </ul>
+              ))}
+  ```
+
+In `web/src/components/items/QuestionCard.tsx`, replace:
+
+  ```tsx
+            {request.fields.length > 0 && (
+              <div className="elic-fields">
+                {request.fields.map((field) => (
+                  <FieldView key={field.key} field={field} />
+                ))}
+              </div>
+            )}
+            {!request.form_supported && (
+              <p className="item-note">This form cannot be filled in here: it can only be declined or cancelled.</p>
+            )}
+          </>
+        )}
+        <p className="q-state">{state}</p>
+        {actions && <div className="ask-actions">{actions}</div>}
+  ```
+
+with:
+
+  ```tsx
+            <Elicitation request={request} live={live} busy={d.busy} draft={draft} onDraft={onDraft} onAnswer={answer} />
+          </>
+        )}
+        <p className="q-state">
+          <span>{d.text}</span>
+          {d.note && <span className="q-note">{d.note}</span>}
+        </p>
+        {d.error && (
+          <p className="form-error q-error" role="alert">
+            <bdi>{d.error}</bdi>
+          </p>
+        )}
+        {d.answerAsMessage && env.onAnswerAsMessage && (
+          <div className="ask-actions">
+            <button type="button" className="btn btn-ghost btn-sm" onClick={() => env.onAnswerAsMessage?.(questionText(request))}>
+              Answer as a new message
+            </button>
+          </div>
+        )}
+  ```
+
+In `web/src/components/items/types.ts`, replace:
+
+  ```ts
+  // What every item renderer is given besides its item: the session it is in
+  // and the seams later tasks fill (answering a question, sending a turn
+  // again).
+  import type { ReactNode } from 'react'
+  import type { Item } from '../../generated/view'
+  ```
+
+with:
+
+  ```ts
+  // What every item renderer is given besides its item: the session it is in,
+  // what answers its questions, and the composer's seams (its emptiness, its
+  // prefill, sending a turn again).
+  import type { Item } from '../../generated/view'
+  import type { AnswerBook } from '../../store/useAnswer'
+  ```
+
+In `web/src/components/items/types.ts`, replace:
+
+  ```ts
+    /** A question card's actions; none makes the card read-only. */
+    questionActions?: (item: ItemOf<'question'>) => ReactNode
+    /** "Send again" for a turn that was not delivered; absent, none is offered. */
+    onSendAgain?: (item: ItemOf<'marker'>) => void
+    /** "Answer as a new message": `question` is the question's own text. The
+     *  composer's draft gets `You asked: <question>. My answer: `
+  ```
+
+with:
+
+  ```ts
+    /** Answers the session's questions; none makes every card read-only. */
+    answers?: AnswerBook
+    /** "Send again" for a turn that was not delivered; absent, none is offered. */
+    onSendAgain?: (item: ItemOf<'marker'>) => void
+    /** "Answer as a new message" for a question the agent stopped waiting
+     *  on; absent, none is offered. `question` is the question's own text,
+     *  nothing more: the view words the composer's draft around it
+  ```
+
+In `web/src/components/items/types.ts`, replace:
+
+  ```ts
+     *  opened answerable card take the focus (brief item 25, §10). */
+  ```
+
+with:
+
+  ```ts
+     *  opened answerable card take the focus (brief item 25, §10). Absent,
+     *  no card ever does. */
+  ```
+
+Create `web/src/hooks/useAnnouncement.ts`:
+
+  ```ts
+  // What a session view's one live region says: the answer book's last
+  // announcement, a question that opened without taking the focus.
+  import { useSyncExternalStore } from 'react'
+  import type { AnswerBook } from '../store/useAnswer'
+
+  export function useAnnouncement(book: AnswerBook): string {
+    return useSyncExternalStore(book.subscribe, () => book.announcement)
+  }
+  ```
+
+In `web/src/index.css`, replace:
+
+  ```css
+  .rot-180 { transform:rotate(180deg); }
+  .stream-state:empty { display:none; }
+  ```
+
+with:
+
+  ```css
+  .rot-180 { transform:rotate(180deg); }
+  /* Heard, not seen: kept in the accessibility tree (never display:none). */
+  .sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0 0 0 0); clip-path:inset(50%); white-space:nowrap; border:0; }
+  .stream-state:empty { display:none; }
+  ```
+
+In `web/src/index.css`, replace:
+
+  ```css
+  .q-opt { border-radius:var(--r-full); padding:6px 14px; font-size:13px; font-weight:600; border:1.5px solid var(--border-strong); background:var(--surface); }
+  .q-opt-allow { border-color:var(--accent); color:var(--accent); }
+  .q-opt-always { border-style:dashed; color:var(--fg-2); }
+  .q-opt-reject { border-color:var(--st-attn); color:var(--st-attn); }
+  .q-state { margin:12px 0 0; font-size:13px; font-weight:700; color:var(--fg-2); }
+  ```
+
+with:
+
+  ```css
+  li.q-opt { border-radius:var(--r-full); padding:6px 14px; font-size:13px; font-weight:600; border:1.5px solid var(--border-strong); background:var(--surface); }
+  li.q-opt-allow { border-color:var(--accent); color:var(--accent); }
+  li.q-opt-always { border-style:dashed; color:var(--fg-2); }
+  li.q-opt-reject { border-color:var(--st-attn); color:var(--st-attn); }
+  .q-key { font-family:var(--font-mono); font-size:11px; font-weight:500; opacity:.65; }
+  .q-state { margin:12px 0 0; font-size:13px; font-weight:700; color:var(--fg-2); display:flex; flex-wrap:wrap; gap:0 8px; }
+  .q-note { font-weight:500; color:var(--fg-muted); }
+  .q-error { margin:10px 0 0; font-size:13px; }
+  .ask:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+  .elic-field { border:0; margin:0; padding:0; min-width:0; }
+  .elic-field > legend { padding:0; margin-bottom:7px; }
+  .elic-opt { flex-direction:row; align-items:flex-start; gap:9px; }
+  .elic-opt input { margin:3px 0 0; accent-color:var(--accent); flex:none; }
+  .elic-opt > .elic-opt-desc { flex-basis:100%; margin-left:22px; }
+  .elic-opts .elic-opt { flex-wrap:wrap; }
+  ```
+
+In `web/src/index.css`, replace:
+
+  ```css
+    .q-opts { flex-direction:column; }
+  }
+  ```
+
+with:
+
+  ```css
+    .q-opts { flex-direction:column; }
+    .q-opts .btn, .ask-actions .btn, .elic-opt { min-height:44px; }
+  }
+  ```
+
+Create `web/src/lib/delivery.ts`:
+
+  ```ts
+  // Where a question stands (frontend spec §6.3), read from the item and what
+  // this tab did with it. Pure: the card renders what these return.
+  //
+  // - The item says what the server knows: `answerable`, `state`, `reason`,
+  //   `answered` and the verdict `delivered`.
+  // - The tab adds what only it knows: an answer in flight, a 202 not yet
+  //   shown by an upsert, a 409 or a 404. Each of those holds only while the
+  //   item is still at the version it was answered at: the next upsert of the
+  //   item says the rest.
+  // - The verdict is monotonic (ACP core §4.6): a held `delivered: true` is
+  //   never replaced by `false`.
+  import type { PendingReason } from '../generated/protocol'
+  import type { Item, Request } from '../generated/view'
+
+  type Question = Extract<Item, { kind: 'question' }>
+
+  export const REASON_WORDS: Record<PendingReason, string> = {
+    turn_cancelled: 'the turn was stopped',
+    session_closed: 'the session was closed',
+    session_parked: 'the session was parked',
+    adapter_lost: 'the agent’s process was lost',
+    host_restarted: 'the host restarted',
+    agent_withdrew: 'the agent withdrew the question',
+    host_revoked: 'the host was revoked',
+  }
+
+  /** What this tab did with a question. `version` is the item's when it was
+   *  answered: an outcome holds only while the item is at it. */
+  export type LocalAnswer =
+    | { phase: 'sending'; version: number }
+    | { phase: 'sent'; version: number }
+    /** 409 `already_answered`: another tab or device answered first. */
+    | { phase: 'taken'; version: number }
+    /** 409 `not_open`: the question closed before the answer reached it. */
+    | { phase: 'closed'; version: number }
+    /** 404: the question no longer exists. */
+    | { phase: 'gone'; version: number }
+    /** Any other refusal: the message, and the controls again. */
+    | { phase: 'failed'; version: number; message: string }
+
+  export interface Delivery {
+    /** The state in words. */
+    text: string
+    /** A second line: "delivers when the host reconnects". */
+    note?: string
+    /** The answering controls are shown. */
+    controls: boolean
+    /** They are shown but disabled: an answer is in flight. */
+    busy: boolean
+    /** A refusal's message, beside the controls. */
+    error?: string
+    /** "Answer as a new message" is offered. */
+    answerAsMessage: boolean
+  }
+
+  export const NO_OPTIONS = 'This question cannot be answered here: stop, park or close the session.'
+  export const TAKEN = 'Already answered from another device'
+  export const NOT_OPEN = 'This question is no longer open'
+  export const GONE = 'This question is gone'
+  export const HOST_AWAY_NOTE = 'delivers when the host reconnects'
+
+  /** A permission with no option ids: nothing here can answer it, whatever
+   *  the server's `answerable` says (it does not look at the options). */
+  export function hasNoOptions(request: Request): boolean {
+    return request.type === 'permission' && request.options.length === 0
+  }
+
+  /** Whether the card can answer it now: the server's pending set says so
+   *  (F-15), and it has something to answer with. */
+  export function isAnswerable(q: Question): boolean {
+    return q.answerable && !hasNoOptions(q.request)
+  }
+
+  /** The state from the item alone: the §6.3 table, top row first. */
+  function serverState(q: Question): { text: string; awaiting: boolean; cancelled: boolean } {
+    const plain = { awaiting: false, cancelled: false }
+    if (q.delivered === true) return { text: 'Answered', ...plain }
+    if (q.state === 'cancelled') {
+      // Own keys only: a reason named like an Object member (`constructor`)
+      // is shown as sent, never as that member's text.
+      const why = q.reason ? (Object.hasOwn(REASON_WORDS, q.reason) ? REASON_WORDS[q.reason] : q.reason) : undefined
+      const text = why ? `The agent stopped waiting (${why})` : 'The agent stopped waiting'
+      return { text, awaiting: false, cancelled: true }
+    }
+    if (q.delivered === false) return { text: 'Sent, but the agent was no longer waiting', ...plain }
+    if (q.state === 'delivered') return { text: 'Answered', ...plain }
+    if (q.answered) return { text: 'Sent', awaiting: true, cancelled: false }
+    if (hasNoOptions(q.request)) return { text: NO_OPTIONS, ...plain }
+    if (q.answerable) return { text: 'Needs your answer', ...plain }
+    return { text: 'Open', ...plain }
+  }
+
+  /** Where the question stands, as the card shows it. `hostAway`: the session
+   *  is presumed parked, or its host is not connected. */
+  export function deliveryOf(q: Question, local: LocalAnswer | undefined, hostAway = false): Delivery {
+    // An answer in flight holds whatever the item's version: an upsert
+    // meanwhile must not offer the controls again. Its outcome holds only
+    // until the next upsert.
+    const held = local && (local.phase === 'sending' || local.version === q.version) ? local : undefined
+    const none: Delivery = { text: '', controls: false, busy: false, answerAsMessage: false }
+    const awayNote = hostAway ? { note: HOST_AWAY_NOTE } : {}
+    switch (held?.phase) {
+      case 'sending':
+        if (isAnswerable(q)) return { ...none, text: 'Sending…', controls: true, busy: true }
+        break
+      case 'sent':
+        return { ...none, text: 'Sent', ...awayNote }
+      case 'taken':
+        return { ...none, text: TAKEN }
+      case 'closed':
+        return { ...none, text: NOT_OPEN }
+      case 'gone':
+        return { ...none, text: GONE }
+      case 'failed':
+        if (isAnswerable(q)) return { ...none, text: 'Needs your answer', controls: true, error: held.message }
+        break
+    }
+    const s = serverState(q)
+    return {
+      ...none,
+      text: s.text,
+      ...(s.awaiting && q.state === 'open' ? awayNote : {}),
+      controls: isAnswerable(q),
+      answerAsMessage: s.cancelled,
+    }
+  }
+
+  /** The question in one line: a permission's title, an elicitation's
+   *  message. "Answer as a new message" hands this, and only this, to the
+   *  composer, which words the draft around it. */
+  export function questionText(request: Request): string {
+    return request.type === 'permission' ? request.title || 'Permission' : request.message
+  }
+
+  /** A permission option's tone, from its kind alone, never its name:
+   *  `reject_*` destructive, `allow_always` ghost, anything else primary. */
+  export type OptionTone = 'reject' | 'always' | 'allow'
+
+  export function optionTone(kind: string): OptionTone {
+    if (kind.startsWith('reject_')) return 'reject'
+    if (kind === 'allow_always') return 'always'
+    return 'allow'
+  }
+
+  /** The store's upsert of a held item by a newer one: a question's verdict
+   *  `delivered: true` sticks, and with it the question is not answerable. */
+  export function foldVerdict(held: Item, next: Item): Item {
+    if (held.kind !== 'question' || next.kind !== 'question') return next
+    if (held.delivered !== true || next.delivered === true) return next
+    return { ...next, delivered: true, answerable: false }
+  }
+
+  /** A digit 1–9 as an option's index, when the key may answer: no modifier,
+   *  not typed into an editable target. */
+  export function digitIndex(e: {
+    key: string
+    ctrlKey: boolean
+    metaKey: boolean
+    altKey: boolean
+    target: EventTarget | null
+  }): number | undefined {
+    if (e.ctrlKey || e.metaKey || e.altKey) return undefined
+    if (!/^[1-9]$/.test(e.key)) return undefined
+    if (isEditable(e.target)) return undefined
+    return Number(e.key) - 1
+  }
+
+  /** Whether typing in `target` is text: an input, a textarea, a select, or
+   *  anything inside a contenteditable. */
+  export function isEditable(target: EventTarget | null): boolean {
+    if (!target || typeof (target as Element).closest !== 'function') return false
+    const el = target as Element
+    const tag = el.tagName
+    if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return true
+    const editable = el.closest('[contenteditable]')
+    return editable !== null && editable.getAttribute('contenteditable') !== 'false'
+  }
+
+  /** The question ids that opened at the tail since `known` was taken: new,
+   *  and after `lastId` (the last item before; none: the transcript was
+   *  empty). Nothing on a first load (`known` null), or when `lastId` is not
+   *  held any more (a resync replaced the items); never a question prepended
+   *  from an older page. */
+  export function freshQuestions(items: readonly Item[], known: ReadonlySet<string> | null, lastId: string | undefined): string[] {
+    if (known === null) return []
+    const after = lastId === undefined ? -1 : items.findIndex((item) => item.id === lastId)
+    if (lastId !== undefined && after < 0) return []
+    const fresh: string[] = []
+    for (let i = after + 1; i < items.length; i++) {
+      const item = items[i]
+      if (item.kind === 'question' && !known.has(item.id) && isAnswerable(item)) fresh.push(item.id)
+    }
+    return fresh
+  }
+  ```
+
+Create `web/src/lib/elicitation.ts`:
+
+  ```ts
+  // An elicitation form's draft (frontend spec §6.3), as pure functions: what
+  // the operator chose or typed, per field key, and the answer it makes.
+  //
+  // - A draft holds the text as typed (an input shows what it holds); only
+  //   the answer trims it, and whitespace alone is no answer.
+  // - A text field paired `exclusive` with a select answers instead of it
+  //   (the adapter gives the text precedence on the wire): choosing an option
+  //   clears the text, and typing a real answer clears the option. A `note`
+  //   is free text alongside and clears nothing.
+  // - The answer carries only real answers: `{key: string | string[]}`.
+  import type { ElicitationAction } from '../generated/protocol'
+  import type { Field } from '../generated/view'
+
+  export type Draft = Readonly<Record<string, string | readonly string[]>>
+
+  /** The keys of the text fields paired `exclusive` with `key`. */
+  function exclusiveTexts(fields: readonly Field[], key: string): string[] {
+    return fields.filter((f) => f.pairing?.kind === 'exclusive' && f.pairing.with === key).map((f) => f.key)
+  }
+
+  function without(draft: Draft, keys: readonly string[]): Record<string, string | readonly string[]> {
+    const next = { ...draft }
+    for (const key of keys) delete next[key]
+    return next
+  }
+
+  /** A single select's choice: clears the text paired `exclusive` with it. */
+  export function choose(fields: readonly Field[], draft: Draft, key: string, value: string): Draft {
+    return { ...without(draft, exclusiveTexts(fields, key)), [key]: value }
+  }
+
+  /** A multi select's option on or off: clears the text paired `exclusive`
+   *  with it. */
+  export function toggle(fields: readonly Field[], draft: Draft, key: string, value: string): Draft {
+    const held = draft[key]
+    const now = Array.isArray(held) ? held : []
+    const next = now.includes(value) ? now.filter((v) => v !== value) : [...now, value]
+    const rest = without(draft, [key, ...exclusiveTexts(fields, key)])
+    return next.length > 0 ? { ...rest, [key]: next } : rest
+  }
+
+  /** Text typed into `key`: held as typed. A real answer in a text paired
+   *  `exclusive` clears the select it pairs with; whitespace does not. */
+  export function typeText(fields: readonly Field[], draft: Draft, key: string, text: string): Draft {
+    const field = fields.find((f) => f.key === key)
+    const pair = field?.pairing?.kind === 'exclusive' && text.trim() !== '' ? [field.pairing.with] : []
+    return { ...without(draft, pair), [key]: text }
+  }
+
+  /** The draft's real answer for `key`, if any: trimmed text, a non-empty
+   *  choice list. */
+  function answerOf(draft: Draft, key: string): string | string[] | undefined {
+    const value = draft[key]
+    if (typeof value === 'string') return value.trim() === '' ? undefined : value.trim()
+    if (Array.isArray(value)) return value.length > 0 ? [...value] : undefined
+    return undefined
+  }
+
+  /** The accepted form's `content`: every real answer, and nothing else. */
+  export function contentOf(fields: readonly Field[], draft: Draft): Record<string, string | string[]> {
+    const content: Record<string, string | string[]> = {}
+    for (const field of fields) {
+      const answer = answerOf(draft, field.key)
+      // Defined, never assigned: the keys are the agent's, and `__proto__`
+      // assigned would set the object's prototype and drop the answer.
+      if (answer !== undefined) {
+        Object.defineProperty(content, field.key, { value: answer, enumerable: true, writable: true, configurable: true })
+      }
+    }
+    return content
+  }
+
+  /** Whether a required `key` is answered: by its own value, or by the real
+   *  text of a field paired `exclusive` with it (that text answers instead). */
+  function requiredMet(fields: readonly Field[], draft: Draft, key: string): boolean {
+    if (answerOf(draft, key) !== undefined) return true
+    return exclusiveTexts(fields, key).some((k) => answerOf(draft, k) !== undefined)
+  }
+
+  /** Whether two of the agent's fields share a key. The answer's `content`
+   *  is keyed by field, so such a form cannot carry an answer to each, and
+   *  the card does not fill it in: it can only be declined or cancelled. */
+  export function hasDuplicateKeys(fields: readonly Field[]): boolean {
+    const seen = new Set<string>()
+    for (const field of fields) {
+      if (seen.has(field.key)) return true
+      seen.add(field.key)
+    }
+    return false
+  }
+
+  /** Send is offered once one real answer exists and every required key has
+   *  one; and only for a form the card can fill (supported, each key once). */
+  export function canSend(fields: readonly Field[], required: readonly string[] | undefined, formSupported: boolean, draft: Draft): boolean {
+    if (!formSupported || hasDuplicateKeys(fields)) return false
+    if (Object.keys(contentOf(fields, draft)).length === 0) return false
+    return (required ?? []).every((key) => requiredMet(fields, draft, key))
+  }
+
+  /** The answer's body for each action: content only with `accept`. */
+  export function elicitationBody(
+    action: ElicitationAction,
+    content?: Record<string, string | string[]>,
+  ): { action: ElicitationAction; content?: Record<string, string | string[]> } {
+    return action === 'accept' ? { action, content: content ?? {} } : { action }
+  }
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+  // One session (frontend spec §6): its header and its transcript, read-only.
+  ```
+
+with:
+
+  ```tsx
+  // One session (frontend spec §6): its header, its transcript, whose question
+  // cards answer, and its composer.
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+  //   items replaced) goes back to the tail, and to the end.
+  // - The stream's state shows as "Reconnecting…", and "Resynced" for a moment
+  ```
+
+with:
+
+  ```tsx
+  //   items replaced) goes back to the tail, and to the end.
+  // - A question the operator can answer is never held above the window: the
+  //   window starts at it when it is older than the tail, and stays there
+  //   once it is answered. Being answerable, it is pending in the open turn,
+  //   so this grows the window only as far as that turn reaches back.
+  // - The stream's state shows as "Reconnecting…", and "Resynced" for a moment
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+  //   of the session's host. Through it, a turn that was not delivered comes
+  ```
+
+with:
+
+  ```tsx
+  //   of the session's host. The hosts are fetched once per view: the header
+  //   names the host, the composer reads its capabilities, and the question
+  //   cards whether it is connected. Through it, a turn that was not delivered comes
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+  import type { Item } from '../generated/view'
+  import { useMediaQuery } from '../hooks/useMediaQuery'
+  ```
+
+with:
+
+  ```tsx
+  import type { Item } from '../generated/view'
+  import { useAnnouncement } from '../hooks/useAnnouncement'
+  import { isAnswerable } from '../lib/delivery'
+  import { useMediaQuery } from '../hooks/useMediaQuery'
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+  import { Link } from '../router'
+  import { useSessionItems, type Timing } from '../store/useSessionItems'
+  ```
+
+with:
+
+  ```tsx
+  import { Link } from '../router'
+  import { useAnswering } from '../store/useAnswer'
+  import { useSessionItems, type Timing } from '../store/useSessionItems'
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+    /** The seam for the cards: question actions. */
+    env?: Pick<ItemEnv, 'questionActions'>
+  ```
+
+with:
+
+  ```tsx
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+  /** Where the transcript's window starts: the pinned item's index, or the
+   *  newest `size` items when nothing is pinned for these `loads`. */
+  function windowStart(items: readonly Item[], pin: string | null, size: number): number {
+    const tail = Math.max(0, items.length - size)
+    if (pin === null) return tail
+    const at = items.findIndex((item) => item.id === pin)
+    return at < 0 ? tail : at
+  ```
+
+with:
+
+  ```tsx
+  /** Whether `connected` is what `GET /api/hosts` reports for host `hostId`;
+   *  undefined while unknown. */
+  function connectedOf(hosts: unknown, hostId: string | undefined): boolean | undefined {
+    if (hostId === undefined || !Array.isArray(hosts)) return undefined
+    for (const entry of hosts as unknown[]) {
+      if (!entry || typeof entry !== 'object') continue
+      const host = entry as Record<string, unknown>
+      if (host.host_id === hostId) return typeof host.connected === 'boolean' ? host.connected : undefined
+    }
+    return undefined
+  }
+
+  /** Where the transcript's window starts: the pinned item's index, or the
+   *  newest `size` items when nothing is pinned for these `loads`; earlier
+   *  when a question that can be answered is held above it. Decided while
+   *  rendering, never after: a card that left the window for one render
+   *  would be mounted again. */
+  function windowStart(items: readonly Item[], pin: string | null, size: number): number {
+    const tail = Math.max(0, items.length - size)
+    const at = pin === null ? -1 : items.findIndex((item) => item.id === pin)
+    const start = at < 0 ? tail : at
+    const open = items.findIndex((item) => item.kind === 'question' && isAnswerable(item))
+    return open >= 0 && open < start ? open : start
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+  export default function SessionView({ id, summary, awaitSummary = false, tail = TAIL, timing, env: seams }: Props) {
+  ```
+
+with:
+
+  ```tsx
+  export default function SessionView({ id, summary, awaitSummary = false, tail = TAIL, timing }: Props) {
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+    const plan = useMemo(() => latestPlan(s.items), [s.items])
+
+  ```
+
+with:
+
+  ```tsx
+    const plan = useMemo(() => latestPlan(s.items), [s.items])
+    const answers = useAnswering(id, info, s.items, s.loading, connectedOf(hostItems, info?.host_id))
+    const announcement = useAnnouncement(answers)
+
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+        onSendAgain,
+        onAnswerAsMessage,
+        composerEmpty,
+        ...seams,
+      }),
+      [id, info?.agent, hats, onSendAgain, onAnswerAsMessage, composerEmpty, seams],
+  ```
+
+with:
+
+  ```tsx
+        answers,
+        onSendAgain,
+        onAnswerAsMessage,
+        composerEmpty,
+      }),
+      [id, info?.agent, hats, answers, onSendAgain, onAnswerAsMessage, composerEmpty],
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+        </div>
+        {s.error && (
+  ```
+
+with:
+
+  ```tsx
+        </div>
+        {/* One region for the view: a question that opened without taking the
+            focus is said here, politely, never one from the first page. */}
+        <p className="sr-only" role="status" aria-live="polite">
+          {announcement}
+        </p>
+        {s.error && (
+  ```
+
+In `web/src/store/items.ts`, replace:
+
+  ```ts
+  //   one held.
+  ```
+
+with:
+
+  ```ts
+  //   one held; a question's verdict `delivered: true` sticks (ACP core §4.6).
+  ```
+
+In `web/src/store/items.ts`, replace:
+
+  ```ts
+  import type { Item, ItemPage } from '../generated/view'
+
+  ```
+
+with:
+
+  ```ts
+  import type { Item, ItemPage } from '../generated/view'
+  import { foldVerdict } from '../lib/delivery'
+
+  ```
+
+In `web/src/store/items.ts`, replace:
+
+  ```ts
+          items[at] = item
+  ```
+
+with:
+
+  ```ts
+          items[at] = foldVerdict(state.items[at], item)
+  ```
+
+Create `web/src/store/useAnswer.ts`:
+
+  ```ts
+  // Answering a session's questions (frontend spec §6.3): one book per
+  // session view, outside React's tree, so what a card did survives the card
+  // being rendered again or remounted.
+  //
+  // - One answer in flight per question: a second one is not sent.
+  // - Each answer's outcome (202, 409, 404, another refusal) is held with the
+  //   item's version when it was sent; the card shows it until the item's
+  //   next upsert (lib/delivery.ts).
+  // - Whether the host is away: the session is presumed parked, or its host
+  //   is not connected (the view's one `GET /api/hosts`, read when it opens).
+  // - Each form's draft, by question: a card mounted again (the window moved,
+  //   the transcript was rendered anew) finds what the operator had filled in.
+  // - Which questions opened at the tail since the first page: the one card
+  //   that may take the focus (§10), once.
+  // - What the view's one live region says last: a question that opened
+  //   without taking the focus.
+  import { useEffect, useLayoutEffect, useMemo, useSyncExternalStore } from 'react'
+  import { answerQuestion } from '../api/answer'
+  import type { Client } from '../api/client'
+  import { ApiFailure, messageOf } from '../api/errors'
+  import { useClient } from '../app-client'
+  import type { AnswerRequest, SessionItem } from '../generated/protocol'
+  import type { Item } from '../generated/view'
+  import { freshQuestions, type LocalAnswer } from '../lib/delivery'
+  import type { Draft } from '../lib/elicitation'
+
+  /** No draft: one object, so a card's snapshot stays the same. */
+  const NO_DRAFT: Draft = Object.freeze({})
+
+  type Question = Extract<Item, { kind: 'question' }>
+
+  export class AnswerBook {
+    private readonly local = new Map<string, LocalAnswer>()
+    private readonly inFlight = new Set<string>()
+    private readonly listeners = new Set<() => void>()
+    private away = false
+    private known: Set<string> | null = null
+    private lastId: string | undefined
+    private readonly fresh = new Set<string>()
+    private readonly drafts = new Map<string, Draft>()
+    private said = ''
+
+    constructor(
+      private readonly client: Client,
+      readonly sessionId: string,
+    ) {}
+
+    subscribe = (listener: () => void): (() => void) => {
+      this.listeners.add(listener)
+      return () => {
+        this.listeners.delete(listener)
+      }
+    }
+
+    private emit() {
+      for (const listener of [...this.listeners]) listener()
+    }
+
+    private set(id: string, answer: LocalAnswer) {
+      this.local.set(id, answer)
+      this.emit()
+    }
+
+    /** What this tab did with the question `id`. */
+    localOf(id: string): LocalAnswer | undefined {
+      return this.local.get(id)
+    }
+
+    /** The form's draft of the question `id`: the same object until it
+     *  changes. */
+    draftOf(id: string): Draft {
+      return this.drafts.get(id) ?? NO_DRAFT
+    }
+
+    /** Change the draft of the question `id`, from the one held now. */
+    updateDraft(id: string, next: (draft: Draft) => Draft) {
+      const held = this.draftOf(id)
+      const draft = next(held)
+      if (draft === held) return
+      this.drafts.set(id, draft)
+      this.emit()
+    }
+
+    get hostAway(): boolean {
+      return this.away
+    }
+
+    setHostAway(away: boolean) {
+      if (away === this.away) return
+      this.away = away
+      this.emit()
+    }
+
+    /** Send `body` as the answer to `item`, unless one is in flight already. */
+    async answer(item: Question, body: AnswerRequest): Promise<void> {
+      if (this.inFlight.has(item.id)) return
+      this.inFlight.add(item.id)
+      const version = item.version
+      this.set(item.id, { phase: 'sending', version })
+      try {
+        await answerQuestion(this.client, this.sessionId, item.pending_id, body)
+        this.set(item.id, { phase: 'sent', version })
+      } catch (err) {
+        this.set(item.id, outcomeOf(err, version))
+      } finally {
+        this.inFlight.delete(item.id)
+      }
+    }
+
+    /** Take in the session's items once its first page is loaded: the
+     *  questions that opened at the tail since the last look are fresh. */
+    observe(items: readonly Item[]) {
+      for (const id of freshQuestions(items, this.known, this.lastId)) this.fresh.add(id)
+      const known = this.known ?? new Set<string>()
+      for (const item of items) if (item.kind === 'question') known.add(item.id)
+      this.known = known
+      this.lastId = items.length > 0 ? items[items.length - 1].id : undefined
+    }
+
+    /** Whether the card of question `id` may take the focus: once, and only
+     *  for a question that opened at the tail. */
+    claimFocus(id: string): boolean {
+      return this.fresh.delete(id)
+    }
+
+    /** What the view's live region says: the last question that opened
+     *  without taking the focus. */
+    get announcement(): string {
+      return this.said
+    }
+
+    /** Say `text` in the view's live region. The same words twice in a row
+     *  differ by a trailing no-break space, so the region's text changes and
+     *  a screen reader says them again. */
+    announce(text: string) {
+      this.said = this.said === text ? text + '\u00a0' : text
+      this.emit()
+    }
+  }
+
+  function outcomeOf(err: unknown, version: number): LocalAnswer {
+    if (err instanceof ApiFailure) {
+      if (err.status === 409 && err.code === 'already_answered') return { phase: 'taken', version }
+      if (err.status === 409 && err.code === 'not_open') return { phase: 'closed', version }
+      if (err.status === 404) return { phase: 'gone', version }
+    }
+    return { phase: 'failed', version, message: messageOf(err) }
+  }
+
+  /** The card's view of the book: what this tab did, and whether the host is
+   *  away. Without a book, nothing. */
+  export function useAnswerState(book: AnswerBook | undefined, id: string): { local?: LocalAnswer; hostAway: boolean } {
+    const subscribe = book ? book.subscribe : noSubscribe
+    const local = useSyncExternalStore(subscribe, () => book?.localOf(id))
+    const hostAway = useSyncExternalStore(subscribe, () => book?.hostAway ?? false)
+    return { local, hostAway }
+  }
+
+  const noSubscribe = () => () => {}
+
+  /** A form's draft in the book, and how to change it. Without a book, an
+   *  empty draft that does not change. */
+  export function useFormDraft(book: AnswerBook | undefined, id: string): [Draft, (next: (draft: Draft) => Draft) => void] {
+    const subscribe = book ? book.subscribe : noSubscribe
+    const draft = useSyncExternalStore(subscribe, () => book?.draftOf(id) ?? NO_DRAFT)
+    const update = useMemo(() => (next: (draft: Draft) => Draft) => book?.updateDraft(id, next), [book, id])
+    return [draft, update]
+  }
+
+  /** The session view's book: one per session, fed its items once the first
+   *  page is in, and told whether the host is away. `connected`: what the
+   *  view's hosts list says of the session's host (undefined: unknown). */
+  export function useAnswering(
+    sessionId: string,
+    info: Pick<SessionItem, 'presumed_parked'> | undefined,
+    items: readonly Item[],
+    loading: boolean,
+    connected: boolean | undefined,
+  ): AnswerBook {
+    const client = useClient()
+    const book = useMemo(() => new AnswerBook(client, sessionId), [client, sessionId])
+    // Before the cards' effects (a layout effect runs first): a fresh card
+    // finds itself fresh when it mounts.
+    useLayoutEffect(() => {
+      if (!loading) book.observe(items)
+    }, [book, items, loading])
+    const away = Boolean(info?.presumed_parked) || connected === false
+    useEffect(() => book.setHostAway(away), [book, away])
+    return book
+  }
+  ```
+
+- [ ] **Step 4: Run the checks**
+
+Run: `nix develop -c sh -c 'cd web && pnpm typecheck && pnpm test && pnpm build'`
+Expected: PASS, 1093 tests (914 before).
+
+- [ ] **Step 5: Revert-probes** (each must fail the test named; restore after each)
+
+168 probes, run by script: 137 on the cards, 31 on the cards in the session view with the composer. 167 fail as they should, and one survives by design (below). The first runs had four results that were not failures. One test passed while only an unhandled error failed the run (a digit past the options): the test now asserts that nothing throws. Two probes named no test (a bad name pattern) and were re-run. A probe that let one form's draft leak into every question's survived: the test now types into the second form too.
+- **States** (11): the §6.3 table, top row first (delivered, cancelled, a verdict of false, the `delivered` state, queued as "Sent", no options, "Needs your answer"); no buttons without options; actionable from `answerable`; "delivers when the host reconnects" only while an answer waits.
+- **The answer book** (19): an outcome held only at the version it was sent at; an answer in flight held over an upsert, and giving way; "Sent" with its host note; 409 `already_answered` and `not_open`, and 404, each in words; another refusal with the controls back; one answer in flight, its end, the version at send; the host's absence reaches the card; no step-up; both ids encoded; the buttons disabled in flight.
+- **Reasons** (9): each of the seven in words, a reason not known as sent, the lookup itself.
+- **The verdict** (4): `delivered: true` is never replaced by `false`, the question is then not answerable, folded in the store and seen in the view.
+- **Options** (10): tones by kind (`reject_once`, `reject_always`, `allow_always`, `allow_once`, an unknown kind) and their buttons; the adapter's order; the option id sent.
+- **Digits** (18): the card focusable, the listener on the card, desktop only and its query, the option at the digit, a digit past the options, the hint on a desktop only and outside the option's name; never from an input, a textarea, a select or a contenteditable (and a `contenteditable="false"` is not one); no modifier; 1–9 only.
+- **Focus** (14): only with an empty composer, never without the seam, only a card opened at the tail, claimed once, and it moves; a fresh question: none on a first load, after a resync or prepended, none already known, answerable only, observed only after loading, and the view passes its loading.
+- **Host away** (3): presumed parked, not connected, read only while an answer waits.
+- **Answer as a new message** (8): offered on a cancelled question only, only with the seam; the prefill's words, an untitled permission, an elicitation's message; the view's wiring.
+- **The card** (6): read-only without a book, the host note, the error, "<agent> asks for permission" and "<agent> asks", the env reaching the card.
+- **Forms** (35): an exclusive pair (choosing clears the text, real text clears the choice, whitespace and a note clear nothing, a toggle clears the text); a multi select toggles off, and empty is no answer; answers trimmed, whitespace and an empty list no answer; Send once one real answer exists and every required key has one (an exclusive text answers its select), never on an unsupported form; Decline and Cancel carry no content, Accept carries it; radios, checkboxes and a text input, each wired; an unsupported field says so; hints; an option's bare name and its description; an unsupported form read-only with Decline and Cancel only.
+- **In the view** (31): the window starts at an answerable question however far above the tail, only an answerable one, decided while rendering, and stays once it is answered; a form's draft kept in the book by question (the card remounted), one empty draft, changed only from the one held; 409 `not_open` its own phase and never "another device", `already_answered` its own words; one stop after the question, trailing spaces trimmed; the card hands over the question's text only; one memoised env with the book and the seams; the hosts read once by the view and shared with the composer, the session's host by id, the book fetching none, not connected as away; the view asks the real composer, an empty one lets the focus move, the book sees the first page. One probe survives by design: a reveal does not remount a card (rows are keyed by id), so the probe of the draft across a reveal is the remount probe's twin.
+
+**Amended at the security review (MUST-1, SHOULD-1, SHOULD-2):** 7 more probes, all failing as they should. MUST-1 has five: `focusIsFree`'s body-or-null branch, the editable branch, the transcript branch made true and made false, and the guard dropped (all four new tests fail). The transcript branch made true is caught by the Delete dialog's test alone: the editable branch also guards the field outside the transcript. SHOULD-1 and SHOULD-2 have one each: the reason looked up by own key (`constructor`, `toString`, `__proto__`, `hasOwnProperty`), and a field keyed `__proto__` (`Object.defineProperty`).
+
+**Amended at re-confirmation (NEW-1, and the review's SHOULD on a live region):** 15 more probes; 14 fail as they should, and one cannot be reached. The focus is not free in another live card: removing that rule, or letting a closed card count as live, fails "stays on an open card when a second question opens: 1 answers the first, never the second" and the retargeted "moves from a control in the transcript that takes no typing" (now a closed card's button). `holder !== card` survives: a card cannot hold the focus before it opens, since its claim runs once, in its first live effect; the line is kept as defence. MUST-1's five were run again against the new tests, and a unit test now anchors the editable branch, which NEW-1's rule also covers inside the transcript. The live region (seven): the announcement dropped, made even when the card takes the focus, made before the claim, a repeat not made to differ, `role="status"` and `aria-live="polite"` removed, and the agent's name hard-coded; each fails as it should.
+
+**The task review's fixes** (all taken): 5 more probes, all failing as they should: the window held open only by a question the card can answer (`isAnswerable`, so a permission with no options no longer stretches it), and a form that names one field twice is refused, keyed by index, with Send never offered.
+
+Load: 4 parallel copies of the cards' test files, 3 rounds: 12 of 12 green (250 tests each).
+
+**Re-run on the final code:** the cards' 137 and the view's 31 again: 157 fail as they should. Of the other 11, eight had lost their line and were retargeted, as nine probes (the answer as a new message on a cancel; 409 `already_answered` and `not_open`, each now its own line; the view passing its loading; not connected as away; the prefill, now the composer's words, in the unit and in the view; an elicitation's message; the view's wiring); one was superseded (the book no longer reads the hosts: the view's one request does, probed with the view); one survived, a draft leaking into every question's, which the test now catches (two probes); and one survives by design (a reveal). Every retargeted and new probe fails as it should.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add web/src
+git commit -m "feat(web): question cards answer permissions and forms, with every delivery state"
+```
+
+---
+
+### Task 8: New Session
+
+`/new`: a host, an agent, a project with its resolved hat, an optional first prompt, then Start; the session opens as the selection, with a notice when its start or its first prompt did not fully go through (decisions 37–43).
+
+**Files:**
+- Create: `web/src/screens/NewSession.tsx`; `web/src/components/ProjectPicker.tsx`; `web/src/lib/agents.ts` (`agentsFor`, the one switch point for 4d), `projects.ts`, `start.ts`; `web/src/lib/hostAway.ts` (whether the session's host is away); their tests; `web/src/screens/Session.start.test.tsx`, `Session.host.test.tsx`.
+- Modify: `web/src/components/Shell.tsx` (`/new` is the form), `web/src/screens/Session.tsx` (a start's notice, read from the link once), `web/src/api/client.ts` and `errors.ts` (a refusal keeps its `session_id`), `web/src/store/useAnswer.ts` (the host's absence follows the host; a question that comes with a resync is never fresh), `web/src/index.css` (the notice), `web/src/api/client.test.ts`, `web/src/components/items/QuestionCard.test.tsx`, `web/src/screens/Session.answer.test.tsx`, `web/src/store/useAnswer.test.ts`.
+
+- [ ] **Step 1: Write the tests**
+
+Test files: `web/src/api/client.test.ts`, `web/src/components/items/QuestionCard.test.tsx`, `web/src/lib/agents.test.ts`, `web/src/lib/hostAway.test.ts`, `web/src/lib/projects.test.ts`, `web/src/lib/start.test.ts`, `web/src/screens/NewSession.test.tsx`, `web/src/screens/Session.answer.test.tsx`, `web/src/screens/Session.host.test.tsx`, `web/src/screens/Session.start.test.tsx`, `web/src/store/useAnswer.test.ts`.
+
+In `web/src/api/client.test.ts`, replace:
+
+  ```ts
+
+    it('reads Retry-After on a 429', async () => {
+  ```
+
+with:
+
+  ```ts
+
+    it('keeps the session a refused start still names', async () => {
+      const body = { code: 'delivery_unknown', message: 'host disconnected; delivery unknown', session_id: 's-9' }
+      const { client } = stub([json(503, body), json(409, { code: 'x', message: 'm', session_id: 7 })])
+      await expect(client.request('POST', '/api/sessions', {})).rejects.toMatchObject({ status: 503, sessionId: 's-9' })
+      // Anything but a string is no session id.
+      const err = await client.request('POST', '/api/sessions', {}).catch((e: unknown) => e)
+      expect(err).toBeInstanceOf(ApiFailure)
+      expect((err as ApiFailure).sessionId).toBeUndefined()
+    })
+
+    it('reads Retry-After on a 429', async () => {
+  ```
+
+In `web/src/components/items/QuestionCard.test.tsx`, replace:
+
+  ```tsx
+      const t = setup()
+      t.book.observe(items())
+      t.book.observe(items(permission()))
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book, composerEmpty: () => true })
+  ```
+
+with:
+
+  ```tsx
+      const t = setup()
+      t.book.observe(items(), 1)
+      t.book.observe(items(permission()), 1)
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book, composerEmpty: () => true })
+  ```
+
+In `web/src/components/items/QuestionCard.test.tsx`, replace:
+
+  ```tsx
+      const t = setup()
+      t.book.observe(items())
+      t.book.observe(items(permission()))
+      const v = show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book, composerEmpty: () => false })
+  ```
+
+with:
+
+  ```tsx
+      const t = setup()
+      t.book.observe(items(), 1)
+      t.book.observe(items(permission()), 1)
+      const v = show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book, composerEmpty: () => false })
+  ```
+
+In `web/src/components/items/QuestionCard.test.tsx`, replace:
+
+  ```tsx
+      const t = setup()
+      t.book.observe(items())
+      t.book.observe(items(permission()))
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+  ```
+
+with:
+
+  ```tsx
+      const t = setup()
+      t.book.observe(items(), 1)
+      t.book.observe(items(permission()), 1)
+      show(permission(), { sessionId: SESSION, agent: 'Codex', answers: t.book })
+  ```
+
+In `web/src/components/items/QuestionCard.test.tsx`, replace:
+
+  ```tsx
+      t.book.observe(items())
+      t.book.observe(items(permission()))
+  ```
+
+with:
+
+  ```tsx
+      t.book.observe(items(), 1)
+      t.book.observe(items(permission()), 1)
+  ```
+
+In `web/src/components/items/QuestionCard.test.tsx`, replace:
+
+  ```tsx
+      t.book.observe(items(permission()))
+  ```
+
+with:
+
+  ```tsx
+      t.book.observe(items(permission()), 1)
+  ```
+
+Create `web/src/lib/agents.test.ts`:
+
+  ```ts
+  import { describe, expect, it, vi } from 'vitest'
+  import { Client } from '../api/client'
+  import { agentOptions, agentsFor, takesImages, type AgentInfo } from './agents'
+
+  const info = (agent: string, patch: Partial<AgentInfo> = {}): AgentInfo => ({
+    agent,
+    available: true,
+    auth: 'unknown',
+    cli: 'bundled',
+    ...patch,
+  })
+
+  describe('agentsFor', () => {
+    it('offers claude and codex, unchecked, and a name typed by hand, without asking the server', async () => {
+      const fetch = vi.fn()
+      const client = new Client({
+        fetch: fetch as unknown as typeof globalThis.fetch,
+        navigate: vi.fn(),
+        here: () => ({ pathname: '/new', search: '' }),
+        stepUp: vi.fn(),
+      })
+      const got = await agentsFor(client, 'h1')
+      expect(got.agents.map((a) => [a.agent, a.available, a.auth])).toEqual([
+        ['claude', true, 'unknown'],
+        ['codex', true, 'unknown'],
+      ])
+      expect(got.other).toBe(true)
+      expect(fetch).not.toHaveBeenCalled()
+    })
+  })
+
+  describe('agentOptions', () => {
+    it('lists only available agents', () => {
+      expect(agentOptions([info('claude'), info('codex', { available: false })]).map((o) => o.agent)).toEqual([
+        'claude',
+      ])
+    })
+
+    it('disables an agent whose auth is missing, with its note', () => {
+      const [opt] = agentOptions([info('codex', { auth: 'missing', note: 'Run `codex login` on the host.' })])
+      expect(opt.disabled).toBe('Run `codex login` on the host.')
+    })
+
+    it('disables an agent whose auth is missing even without a note', () => {
+      const [opt] = agentOptions([info('codex', { auth: 'missing' })])
+      expect(opt.disabled).toBe('Not signed in on this host.')
+    })
+
+    it('allows an agent whose auth is unknown or ok', () => {
+      const opts = agentOptions([info('claude', { auth: 'unknown' }), info('codex', { auth: 'ok' })])
+      expect(opts.map((o) => o.disabled)).toEqual([undefined, undefined])
+    })
+  })
+
+  describe('takesImages', () => {
+    it('hides images only for an agent known to take none', () => {
+      expect(takesImages({ images: false })).toBe(false)
+      expect(takesImages({ images: true })).toBe(true)
+      expect(takesImages({})).toBe(true)
+    })
+  })
+  ```
+
+Create `web/src/lib/hostAway.test.ts`:
+
+  ```ts
+  import { describe, expect, it } from 'vitest'
+  import type { Item } from '../generated/view'
+  import { hostAway, newestTs, type HostAwayInput } from './hostAway'
+
+  const T0 = '2026-10-02T10:00:00.000Z'
+  const at = (minute: number) => `2026-10-02T10:${String(minute).padStart(2, '0')}:00.000Z`
+  const SINCE = Date.parse(T0)
+
+  const marker = (kind: string, ts: string, id = `${kind}@${ts}`): Item => ({ id, version: 1, ts, kind: 'marker', marker: kind }) as Item
+  const msg = (id: string, ts: string): Item => ({ id, version: 1, ts, turn_id: 't1', kind: 'message', text: id }) as Item
+
+  const away = (patch: Partial<HostAwayInput>) => hostAway({ presumedParked: false, seed: true, items: [], since: SINCE, ...patch })
+
+  describe('hostAway', () => {
+    describe('the seed, with no marker since the first page', () => {
+      it('a host the hosts list said was connected is not away', () => {
+        expect(away({ seed: true })).toBe(false)
+      })
+
+      it('a host the hosts list said was not connected is away', () => {
+        expect(away({ seed: false })).toBe(true)
+      })
+
+      it('a host the hosts list did not name, or no list yet, is not away', () => {
+        expect(away({ seed: undefined })).toBe(false)
+      })
+    })
+
+    describe('presumed parked', () => {
+      it('is away, whatever the seed says', () => {
+        expect(away({ presumedParked: true, seed: true })).toBe(true)
+        expect(away({ presumedParked: true, seed: undefined })).toBe(true)
+      })
+
+      it('is away even after a newer marker says the host is back', () => {
+        expect(away({ presumedParked: true, items: [marker('host_back', at(5))] })).toBe(true)
+      })
+
+      it('off, the seed and the markers say it', () => {
+        expect(away({ presumedParked: false, seed: true, items: [marker('host_offline', at(5))] })).toBe(true)
+        expect(away({ presumedParked: false, seed: false, items: [marker('host_back', at(5))] })).toBe(false)
+      })
+    })
+
+    describe('a marker since the first page overrules the seed', () => {
+      it('host_offline: away', () => {
+        expect(away({ seed: true, items: [marker('host_offline', at(5))] })).toBe(true)
+      })
+
+      it.each(['host_back', 'host_restarted', 'resumed'])('%s: back', (kind) => {
+        expect(away({ seed: false, items: [marker(kind, at(5))] })).toBe(false)
+      })
+
+      it('a marker of another kind says nothing of the host', () => {
+        expect(away({ seed: false, items: [marker('parked', at(5)), marker('closed', at(6))] })).toBe(true)
+        expect(away({ seed: true, items: [marker('turn_failed', at(5))] })).toBe(false)
+      })
+
+      it('a marker whose time does not parse is not read', () => {
+        expect(away({ seed: true, items: [marker('host_offline', 'soon')] })).toBe(false)
+      })
+    })
+
+    describe('the newest marker wins', () => {
+      it('offline, then back: back', () => {
+        expect(away({ seed: true, items: [marker('host_offline', at(5)), marker('host_back', at(7))] })).toBe(false)
+      })
+
+      it('back, then offline: away', () => {
+        expect(away({ seed: false, items: [marker('host_back', at(5)), marker('host_offline', at(7))] })).toBe(true)
+      })
+
+      it('by time, not by place: an older marker later in the items does not win', () => {
+        expect(away({ seed: true, items: [marker('host_offline', at(7)), marker('host_back', at(5))] })).toBe(true)
+      })
+
+      it('a tie goes to the later item', () => {
+        expect(away({ seed: true, items: [marker('host_back', at(5)), marker('host_offline', at(5))] })).toBe(true)
+        expect(away({ seed: true, items: [marker('host_offline', at(5)), marker('host_back', at(5))] })).toBe(false)
+      })
+    })
+
+    describe('the first page is history the seed already says', () => {
+      it('a host_back in the first page does not hide a seed that says not connected', () => {
+        expect(away({ seed: false, items: [marker('host_back', at(0)), msg('m', T0)] })).toBe(true)
+      })
+
+      it('a host_offline in the first page does not overrule a seed that says connected', () => {
+        expect(away({ seed: true, items: [marker('host_offline', T0)] })).toBe(false)
+      })
+
+      it('an older page loaded later is history too: a live host_offline still wins', () => {
+        const older = marker('host_back', '2026-10-02T09:00:00.000Z')
+        expect(away({ seed: true, items: [older, msg('m', T0), marker('host_offline', at(5))] })).toBe(true)
+      })
+
+      it('a resync’s marker newer than the first page counts', () => {
+        expect(away({ seed: true, items: [msg('m', T0), marker('host_offline', at(3))] })).toBe(true)
+      })
+
+      it('with no first-page time, every marker counts', () => {
+        expect(away({ seed: false, since: -Infinity, items: [marker('host_back', '2020-01-01T00:00:00.000Z')] })).toBe(false)
+      })
+    })
+  })
+
+  describe('newestTs', () => {
+    it('is the newest time the items hold, a time that does not parse left out', () => {
+      expect(newestTs([msg('a', at(3)), msg('b', 'soon'), msg('c', at(1))])).toBe(Date.parse(at(3)))
+    })
+
+    it('is -Infinity for no items', () => {
+      expect(newestTs([])).toBe(-Infinity)
+    })
+  })
+  ```
+
+Create `web/src/lib/projects.test.ts`:
+
+  ```ts
+  import { describe, expect, it } from 'vitest'
+  import {
+    childPath,
+    disambiguate,
+    filterProjects,
+    isLiteralPath,
+    mergeProjects,
+    projectEntries,
+    type ProjectEntry,
+  } from './projects'
+
+  const entry = (name: string): ProjectEntry => ({ name, path: '/srv/work/' + name })
+
+  describe('filterProjects', () => {
+    it('returns everything for an empty or whitespace query', () => {
+      const all = [entry('harbor'), entry('dotfiles')]
+      expect(filterProjects(all, '')).toEqual(all)
+      expect(filterProjects(all, '   ')).toEqual(all)
+    })
+
+    it('matches a prefix', () => {
+      const got = filterProjects([entry('harbor'), entry('dotfiles')], 'dot')
+      expect(got.map((e) => e.name)).toEqual(['dotfiles'])
+    })
+
+    it('ranks exact over prefix over substring over subsequence', () => {
+      const got = filterProjects([entry('web-api-kit'), entry('kanban-pkit'), entry('api-gw'), entry('api')], 'api')
+      expect(got.map((e) => e.name)).toEqual(['api', 'api-gw', 'web-api-kit', 'kanban-pkit'])
+    })
+
+    it('matches a subsequence, so wsh finds web-shell', () => {
+      const got = filterProjects([entry('web-shell'), entry('harbor')], 'wsh')
+      expect(got.map((e) => e.name)).toEqual(['web-shell'])
+    })
+
+    it('is case-insensitive and keeps the incoming order within one rank', () => {
+      const got = filterProjects([entry('Ledger-infra'), entry('ledger-k8s')], 'LEDGER')
+      expect(got.map((e) => e.name)).toEqual(['Ledger-infra', 'ledger-k8s'])
+    })
+
+    it('keeps the incoming order within the subsequence rank too', () => {
+      const got = filterProjects([entry('a-x-b'), entry('ab-not'), entry('axb')], 'ab')
+      // ab-not is a prefix (rank 1); a-x-b and axb are subsequences, in order.
+      expect(got.map((e) => e.name)).toEqual(['ab-not', 'a-x-b', 'axb'])
+    })
+
+    it('drops non-matches', () => {
+      expect(filterProjects([entry('harbor')], 'zzz')).toEqual([])
+    })
+  })
+
+  describe('mergeProjects', () => {
+    const e = (name: string, path: string, lastUsed?: string): ProjectEntry => ({
+      name,
+      path,
+      ...(lastUsed === undefined ? {} : { lastUsed }),
+    })
+
+    it('puts recents first, then the rest alphabetically', () => {
+      const got = mergeProjects(
+        [e('dotfiles', '/srv/work/dotfiles', '2026-07-28T09:00:00Z')],
+        [e('zed', '/srv/work/zed'), e('dotfiles', '/srv/work/dotfiles'), e('harbor', '/srv/work/harbor')],
+      )
+      expect(got.map((x) => x.name)).toEqual(['dotfiles', 'harbor', 'zed'])
+    })
+
+    it('dedupes by path so a recent is not repeated', () => {
+      const got = mergeProjects(
+        [e('harbor', '/srv/work/harbor', '2026-07-28T09:00:00Z')],
+        [e('harbor', '/srv/work/harbor')],
+      )
+      expect(got).toHaveLength(1)
+      expect(got[0].lastUsed).toBe('2026-07-28T09:00:00Z')
+    })
+
+    it('qualifies name collisions across the merged set', () => {
+      const got = mergeProjects(
+        [e('harbor', '/srv/work/alpha/harbor', '2026-07-28T09:00:00Z')],
+        [e('harbor', '/srv/work/beta/harbor')],
+      )
+      expect(got.map((x) => x.name)).toEqual(['alpha/harbor', 'beta/harbor'])
+    })
+
+    it('returns just the recents when the enumeration is empty', () => {
+      const recents = [e('harbor', '/srv/work/harbor', '2026-07-28T09:00:00Z')]
+      expect(mergeProjects(recents, [])).toEqual(recents)
+    })
+  })
+
+  describe('disambiguate', () => {
+    it('leaves unique names bare', () => {
+      const got = disambiguate([
+        { name: 'app', path: '/srv/work/one/app' },
+        { name: 'app', path: '/srv/work/two/app' },
+        { name: 'notes', path: '/srv/work/notes' },
+      ])
+      expect(got.map((x) => x.name)).toEqual(['one/app', 'two/app', 'notes'])
+    })
+  })
+
+  describe('projectEntries', () => {
+    it('names recents and repositories by their directory', () => {
+      const got = projectEntries({
+        recents_hat_id: 'hat-a',
+        recents: [{ path: '/srv/work/ledger', last_used_at: '2026-10-01T10:00:00Z' }],
+        items: [{ path: '/srv/work/atlas' }, { path: '/srv/work/ledger' }],
+        partial: false,
+      })
+      expect(got).toEqual([
+        { name: 'ledger', path: '/srv/work/ledger', lastUsed: '2026-10-01T10:00:00Z' },
+        { name: 'atlas', path: '/srv/work/atlas' },
+      ])
+    })
+  })
+
+  describe('isLiteralPath', () => {
+    it.each([
+      ['/srv/work/app', true],
+      ['~/work/app', true],
+      ['~', true],
+      ['app', false],
+      ['', false],
+    ])('%s → %s', (text, literal) => {
+      expect(isLiteralPath(text)).toBe(literal)
+    })
+  })
+
+  describe('childPath', () => {
+    it('joins with one slash, at the root too', () => {
+      expect(childPath('/srv/work', 'app')).toBe('/srv/work/app')
+      expect(childPath('/', 'srv')).toBe('/srv')
+    })
+  })
+  ```
+
+Create `web/src/lib/start.test.ts`:
+
+  ```ts
+  import { describe, expect, it } from 'vitest'
+  import { ApiFailure } from '../api/errors'
+  import { readStartNotice, sessionHref, startNoticeText, startRefusal } from './start'
+
+  const refused = (status: number, code: string, message: string) => new ApiFailure(status, { code, message })
+
+  describe('startRefusal', () => {
+    it('words hat_ambiguous with the rule the server names', () => {
+      const text = startRefusal(refused(409, 'hat_ambiguous', 'the rule for "/srv/Work" matches only in another case'))
+      expect(text).toContain('more than one hat')
+      expect(text).toContain('the rule for "/srv/Work"')
+    })
+
+    it('words host_offline in the server words, which say a new host installs first', () => {
+      const text = startRefusal(refused(409, 'host_offline', 'the host has not connected since it was paired'))
+      expect(text).toBe('the host has not connected since it was paired')
+    })
+
+    it('words invalid_cwd with the path the server names', () => {
+      const text = startRefusal(refused(400, 'invalid_cwd', '"/srv/work/x" is not a directory on that host'))
+      expect(text).toBe('"/srv/work/x" is not a directory on that host')
+    })
+
+    it('words unknown_host as a host no longer paired', () => {
+      expect(startRefusal(refused(400, 'unknown_host', 'no host is paired with that id'))).toBe(
+        'That host is no longer paired. Pick another host.',
+      )
+    })
+
+    it('words a 502 as the host refusing, with its code', () => {
+      const text = startRefusal(refused(502, 'agent_not_logged_in', 'log in first'))
+      expect(text).toBe('The host refused to start the session (agent_not_logged_in): log in first')
+    })
+
+    it('words delivery_unknown without a session', () => {
+      expect(startRefusal(refused(503, 'delivery_unknown', 'gone'))).toContain('its outcome is not known')
+    })
+
+    it('falls back to the error message for anything else', () => {
+      expect(startRefusal(refused(503, 'host_jammed', 'the host is busy; try again'))).toBe('the host is busy; try again')
+      expect(startRefusal(new Error('offline'))).toBe('offline')
+    })
+  })
+
+  describe('sessionHref', () => {
+    it('encodes the id and carries only a code', () => {
+      expect(sessionHref('a/b')).toBe('/sessions/a%2Fb')
+      expect(sessionHref('s1', { kind: 'start_unknown', kept: false })).toBe('/sessions/s1?notice=start_unknown')
+      expect(sessionHref('s1', { kind: 'start_unknown', kept: true })).toBe('/sessions/s1?notice=start_unknown_draft')
+      expect(sessionHref('s1', { kind: 'prompt_failed', code: 'host_offline' })).toBe(
+        '/sessions/s1?notice=prompt_failed&code=host_offline',
+      )
+    })
+  })
+
+  describe('readStartNotice', () => {
+    it('reads a start whose delivery is unknown, and mentions no draft when no first prompt was typed', () => {
+      const notice = readStartNotice('?notice=start_unknown')
+      expect(notice).toEqual({ kind: 'start_unknown', kept: false })
+      expect(startNoticeText(notice!)).toBe(
+        'The host went away while this session was starting: it may still start, and shows here when the host reconnects.',
+      )
+    })
+
+    it('reads a start whose delivery is unknown with its first prompt kept as the draft', () => {
+      const notice = readStartNotice('?notice=start_unknown_draft')
+      expect(notice).toEqual({ kind: 'start_unknown', kept: true })
+      expect(startNoticeText(notice!)).toBe(
+        'The host went away while this session was starting: it may still start, and shows here when the host reconnects. A first prompt was not sent: it waits as this session’s draft.',
+      )
+    })
+
+    it.each([
+      ['not_attached', 'The session was no longer running when the first prompt arrived; resume it and send it again.'],
+      ['turn_in_progress', 'A turn was already running; send the first prompt again once it ends.'],
+      ['delivery_unknown', 'Delivery of the first prompt is unknown: the outcome shows when the host reconnects.'],
+      ['content_too_large', 'The first prompt was too large to send.'],
+      ['body_too_large', 'The first prompt was too large to send.'],
+    ])('words a first prompt refused with %s', (code, words) => {
+      const notice = readStartNotice(`?notice=prompt_failed&code=${code}`)
+      expect(startNoticeText(notice!)).toBe(`${words} It waits as this session’s draft.`)
+    })
+
+    it('words a refused first prompt by its code', () => {
+      const notice = readStartNotice('?notice=prompt_failed&code=host_offline')
+      expect(notice?.kind).toBe('prompt_failed')
+      expect(startNoticeText(notice!)).toContain('went offline before the first prompt')
+      expect(startNoticeText(notice!)).toContain('draft')
+    })
+
+    it('words a code it does not know by the code, never by a message in the link', () => {
+      const notice = readStartNotice('?notice=prompt_failed&code=brand_new&message=evil')
+      expect(startNoticeText(notice!)).toBe('The first prompt was not sent (brand_new). It waits as this session’s draft.')
+    })
+
+    it('shows no free text from the link, and no inherited key', () => {
+      const odd = readStartNotice('?notice=prompt_failed&code=' + encodeURIComponent('Call this number now'))
+      expect(startNoticeText(odd!)).toBe('The first prompt was not sent (unknown). It waits as this session’s draft.')
+      const inherited = readStartNotice('?notice=prompt_failed&code=constructor')
+      expect(startNoticeText(inherited!)).toBe('The first prompt was not sent (constructor). It waits as this session’s draft.')
+    })
+
+    it('reads no notice from anything else', () => {
+      expect(readStartNotice('')).toBeNull()
+      expect(readStartNotice('?notice=other')).toBeNull()
+    })
+  })
+  ```
+
+Create `web/src/screens/NewSession.test.tsx`:
+
+  ```tsx
+  // The New Session screen (frontend spec §7): hosts, agents, the project
+  // picker, the hat preview, Start then the first prompt, every refusal of a
+  // start, and the session it opens as an explicit selection.
+  import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+  import userEvent from '@testing-library/user-event'
+  import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+  import App from '../App'
+  import { Client } from '../api/client'
+  import { ClientContext } from '../app-client'
+  import { DESKTOP } from '../components/Shell'
+  import type { HatItem, HostItem, HostProjects } from '../generated/protocol'
+  import type { SessionSummary } from '../generated/view'
+  import type { HostAgentChoices } from '../lib/agents'
+  import { navigate } from '../router'
+  import { json, stubServer, type Answer } from '../test-server'
+  import { liveStream } from '../test-stream'
+  import NewSession, { RESOLVE_DEBOUNCE_MS } from './NewSession'
+
+  // The agents a test wants `agentsFor` to answer, or `null` for its own.
+  const agents = vi.hoisted(() => ({ current: null as HostAgentChoices | null }))
+  vi.mock('../lib/agents', async (importOriginal) => {
+    const real = await importOriginal<typeof import('../lib/agents')>()
+    return {
+      ...real,
+      agentsFor: (client: Client, hostId: string) =>
+        agents.current ? Promise.resolve(agents.current) : real.agentsFor(client, hostId),
+    }
+  })
+
+  function host(id: string, name: string, patch: Partial<HostItem> = {}): HostItem {
+    return {
+      host_id: id,
+      name,
+      platform: 'linux',
+      host_version: '0.1.0',
+      capabilities: ['projects', 'resolve_path'],
+      default_hat_id: 'hat-a',
+      workspace_roots: ['/srv/work'],
+      connected: true,
+      created_at: '2026-10-01T00:00:00Z',
+      ...patch,
+    }
+  }
+
+  // Server order: an offline host between two connected ones, and a revoked one.
+  const HOSTS = [
+    host('h1', 'laptop'),
+    host('h2', 'server', { connected: false }),
+    host('h3', 'retired', { revoked_at: '2026-10-01T12:00:00Z' }),
+    host('h4', 'desk'),
+  ]
+
+  function hat(id: string, name: string): HatItem {
+    return { id, name, colour: '#112233', created_at: '2026-10-01T00:00:00Z', default_for_new_hosts: false, purging: false }
+  }
+  const HATS = [hat('hat-a', 'Work'), hat('hat-b', 'Home')]
+
+  const PROJECTS: HostProjects = {
+    recents_hat_id: 'hat-a',
+    // Recents come first, so a recent prefix match (cat-tools) is held before
+    // the exact one (cat): only the ranking puts `cat` first.
+    recents: [
+      { path: '/srv/work/data-cat', last_used_at: '2026-10-01T10:00:00Z' },
+      { path: '/srv/work/cat-tools', last_used_at: '2026-09-30T10:00:00Z' },
+    ],
+    items: [
+      { path: '/srv/work/concat' },
+      { path: '/srv/work/chart' },
+      { path: '/srv/work/catalog' },
+      { path: '/srv/work/cat' },
+      { path: '/srv/work/one/app' },
+      { path: '/srv/work/two/app' },
+    ],
+    partial: false,
+    home: '/srv/work',
+  }
+
+  const RESOLVED = { canonical: '/srv/work/cat', exists: true, is_dir: true, hat_id: 'hat-a' }
+
+  function base(): Record<string, Answer | Answer[]> {
+    return {
+      'GET /api/hosts': json(200, HOSTS),
+      'GET /api/hats': json(200, HATS),
+      'GET /api/hosts/h1/projects': json(200, PROJECTS),
+      'GET /api/hosts/h4/projects': json(200, { ...PROJECTS, recents: [], items: [] }),
+      'POST /api/hats/resolve': json(200, RESOLVED),
+      'POST /api/sessions': json(202, { session_id: 's-1' }),
+      'POST /api/sessions/s-1/prompt': json(202, { turn_id: 't-1' }),
+    }
+  }
+
+  function mount(routes: Record<string, Answer | Answer[]> = {}, path = '/new') {
+    history.replaceState(null, '', path)
+    const server = stubServer({ ...base(), ...routes })
+    const client = new Client({
+      fetch: server.fetch,
+      navigate: (to) => navigate(to),
+      here: () => ({ pathname: location.pathname, search: location.search }),
+      stepUp: async () => {},
+    })
+    render(
+      <ClientContext.Provider value={client}>
+        <NewSession />
+      </ClientContext.Provider>,
+    )
+    return server
+  }
+
+  const hostButton = (name: string) => screen.getByRole('button', { name: new RegExp(`^${name}`) })
+  const projectField = () => screen.findByRole('combobox', { name: /^Project/ })
+  const startButton = () => screen.getByRole('button', { name: /Start session/ })
+  const posts = (sent: { method: string; path: string }[]) => sent.filter((s) => s.method === 'POST').map((s) => s.path)
+
+  /** Host laptop, Claude, `path` typed as a path, `prompt` typed. */
+  async function fill(path = '/srv/work/cat', prompt = '') {
+    const user = userEvent.setup()
+    await screen.findByRole('button', { name: 'Claude' })
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Claude' })).toHaveAttribute('aria-pressed', 'true'))
+    await user.type(await projectField(), path)
+    if (prompt) await user.type(screen.getByLabelText(/^First prompt/), prompt)
+    return user
+  }
+
+  beforeEach(() => {
+    agents.current = null
+    sessionStorage.clear()
+    localStorage.clear()
+  })
+
+  afterEach(() => {
+    vi.useRealTimers()
+    history.replaceState(null, '', '/')
+  })
+
+  describe('hosts', () => {
+    it('lists connected hosts first and offline ones disabled, never a revoked one', async () => {
+      mount()
+      await screen.findByRole('button', { name: /^laptop/ })
+      const group = screen.getByRole('group', { name: /Host/ })
+      const names = within(group)
+        .getAllByRole('button')
+        .map((b) => b.querySelector('.seg-name')?.textContent)
+      expect(names).toEqual(['laptop', 'desk', 'server'])
+      expect(hostButton('server')).toBeDisabled()
+      expect(hostButton('server')).toHaveTextContent('offline')
+      expect(hostButton('laptop')).toBeEnabled()
+      expect(screen.queryByRole('button', { name: /retired/ })).toBeNull()
+    })
+
+    it('picks the first connected host', async () => {
+      mount({ 'GET /api/hosts': json(200, [host('h2', 'server', { connected: false }), host('h4', 'desk')]) })
+      await waitFor(() => expect(hostButton('desk')).toHaveAttribute('aria-pressed', 'true'))
+    })
+
+    it('prefills the host and the path from a link', async () => {
+      mount({}, '/new?host=h4&cwd=%2Fsrv%2Fwork%2Fapp')
+      await waitFor(() => expect(hostButton('desk')).toHaveAttribute('aria-pressed', 'true'))
+      expect(await projectField()).toHaveValue('/srv/work/app')
+    })
+
+    it('says why a prefilled offline host is not chosen, and chooses none', async () => {
+      mount({}, '/new?host=h2&cwd=%2Fsrv%2Fwork%2Fapp')
+      expect(await screen.findByText(/server is offline, so the session cannot start there/)).toBeInTheDocument()
+      expect(hostButton('laptop')).toHaveAttribute('aria-pressed', 'false')
+      expect(screen.queryByRole('combobox', { name: /^Project/ })).toBeNull()
+    })
+  })
+
+  describe('agents', () => {
+    it('offers the fallback agents and Other, and starts one named by hand', async () => {
+      const server = mount()
+      const user = await fill()
+      expect(screen.getByRole('button', { name: 'Codex' })).toBeEnabled()
+      await user.click(screen.getByRole('button', { name: 'Other…' }))
+      await user.type(screen.getByRole('textbox', { name: 'Agent name' }), 'my-agent')
+      await user.click(startButton())
+      await waitFor(() => expect(location.pathname).toBe('/sessions/s-1'))
+      expect(server.sent.find((s) => s.path === '/api/sessions')?.body).toEqual({
+        host_id: 'h1',
+        agent: 'my-agent',
+        cwd: '/srv/work/cat',
+      })
+      // The fallback asks the server nothing.
+      expect(server.sent.some((s) => s.path.endsWith('/agents'))).toBe(false)
+    })
+
+    it('disables an agent not signed in with its note, and lists no unavailable one', async () => {
+      agents.current = {
+        agents: [
+          { agent: 'claude', available: true, auth: 'unknown', cli: 'bundled' },
+          { agent: 'codex', available: true, auth: 'missing', cli: 'bundled', note: 'Run the login on the host.' },
+          { agent: 'gemini', available: false, auth: 'ok', cli: 'given' },
+        ],
+        other: false,
+      }
+      mount()
+      const codex = await screen.findByRole('button', { name: /^Codex/ })
+      expect(codex).toBeDisabled()
+      expect(codex).toHaveTextContent('Run the login on the host.')
+      expect(screen.getByRole('button', { name: 'Claude' })).toBeEnabled()
+      expect(screen.queryByRole('button', { name: /gemini/i })).toBeNull()
+      expect(screen.queryByRole('button', { name: 'Other…' })).toBeNull()
+    })
+  })
+
+  describe('project picker', () => {
+    it('ranks exact, prefix, substring, subsequence, recents first within a rank', async () => {
+      mount()
+      await screen.findByText(/Recent projects of the hat/)
+      const user = userEvent.setup()
+      await user.type(await projectField(), 'cat')
+      const options = within(screen.getByRole('listbox'))
+        .getAllByRole('option')
+        .map((o) => o.querySelector('bdi')?.textContent)
+      expect(options).toEqual(['cat', 'cat-tools', 'catalog', 'data-cat', 'concat', 'chart'])
+    })
+
+    it('labels colliding names as parent and name', async () => {
+      mount()
+      await screen.findByText(/Recent projects of the hat/)
+      const user = userEvent.setup()
+      await user.type(await projectField(), 'app')
+      const options = within(screen.getByRole('listbox'))
+        .getAllByRole('option')
+        .map((o) => o.textContent)
+      expect(options).toEqual(['one/app', 'two/app'])
+    })
+
+    it('names the hat the recents belong to and marks them', async () => {
+      mount()
+      expect(await screen.findByText(/Recent projects of the hat/)).toHaveTextContent('Recent projects of the hat Work')
+      const user = userEvent.setup()
+      await user.click(await projectField())
+      expect(screen.getByRole('option', { name: /data-cat/ })).toHaveTextContent('recent')
+    })
+
+    it('asks for the recents of the hat the chosen path resolves to', async () => {
+      const notes = { canonical: '/srv/notes', exists: true, is_dir: true, hat_id: 'hat-b' }
+      const server = mount({
+        'POST /api/hats/resolve': json(200, notes),
+        'GET /api/hosts/h1/projects?path=%2Fsrv%2Fnotes': json(200, {
+          ...PROJECTS,
+          recents_hat_id: 'hat-b',
+          recents: [{ path: '/srv/notes', last_used_at: '2026-10-01T10:00:00Z' }],
+        }),
+      })
+      await fill('~/notes')
+      await waitFor(() => expect(screen.getByText(/Recent projects of the hat/)).toHaveTextContent('of the hat Home'), {
+        timeout: 3000,
+      })
+      expect(server.sent.map((s) => s.path)).toContain('/api/hosts/h1/projects?path=%2Fsrv%2Fnotes')
+    })
+
+    it('says the host listed only some of its repositories', async () => {
+      mount({ 'GET /api/hosts/h1/projects': json(200, { ...PROJECTS, partial: true }) })
+      expect(await screen.findByText('The host listed only some of its repositories.', { exact: true })).toBeInTheDocument()
+    })
+
+    it('says the projects could not be listed, and a path can still be typed', async () => {
+      const server = mount({ 'GET /api/hosts/h1/projects': json(409, { code: 'host_offline', message: 'the host is not connected' }) })
+      const alert = await screen.findByRole('alert')
+      expect(alert.textContent).toMatch(/^Projects could not be listed: .+ You can still type a path\.$/)
+      const user = await fill('/srv/work/cat')
+      await user.click(startButton())
+      await waitFor(() => expect(location.pathname).toBe('/sessions/s-1'))
+      expect(server.sent.find((s) => s.path === '/api/sessions')?.body).toMatchObject({ cwd: '/srv/work/cat' })
+    })
+
+    it('tells a screen reader which option the arrow keys reach, and names the list only while it shows', async () => {
+      mount()
+      await screen.findByText(/Recent projects of the hat/)
+      const field = await projectField()
+      expect(field).not.toHaveAttribute('aria-controls')
+      const user = userEvent.setup()
+      await user.type(field, 'cat')
+      const list = screen.getByRole('listbox')
+      expect(field).toHaveAttribute('aria-controls', list.id)
+      expect(field).not.toHaveAttribute('aria-activedescendant')
+      const options = within(list).getAllByRole('option')
+      await user.keyboard('{ArrowDown}')
+      expect(document.getElementById(field.getAttribute('aria-activedescendant')!)).toBe(options[0])
+      await user.keyboard('{ArrowDown}')
+      expect(document.getElementById(field.getAttribute('aria-activedescendant')!)).toBe(options[1])
+      await user.keyboard('{Escape}')
+      expect(screen.queryByRole('listbox')).toBeNull()
+      expect(field).not.toHaveAttribute('aria-activedescendant')
+      expect(field).not.toHaveAttribute('aria-controls')
+    })
+
+    it('says why a directory could not be browsed', async () => {
+      mount({ 'GET /api/hosts/h1/browse?path=%2Fsrv%2Fwork': json(409, { code: 'host_offline', message: 'the host is not connected' }) })
+      await screen.findByText(/Recent projects of the hat/)
+      const user = userEvent.setup()
+      await user.click(screen.getByRole('button', { name: 'Browse' }))
+      const panel = await screen.findByRole('group', { name: 'Browse directories' })
+      expect(await within(panel).findByRole('alert')).toHaveTextContent(/\S/)
+      expect(within(panel).getByText('/srv/work', { exact: true })).toBeInTheDocument()
+      expect(within(panel).queryByRole('button', { name: 'Use this directory' })).toBeNull()
+    })
+
+    it('says when not every directory is listed', async () => {
+      mount({
+        'GET /api/hosts/h1/browse?path=%2Fsrv%2Fwork': json(200, { path: '/srv/work', entries: [{ name: 'atlas' }], truncated: true }),
+      })
+      await screen.findByText(/Recent projects of the hat/)
+      const user = userEvent.setup()
+      await user.click(screen.getByRole('button', { name: 'Browse' }))
+      const panel = await screen.findByRole('group', { name: 'Browse directories' })
+      expect(await within(panel).findByText('Not every directory is listed.', { exact: true })).toBeInTheDocument()
+    })
+
+    it('takes text starting with a slash or a tilde as a path, not a search', async () => {
+      const server = mount()
+      const user = await fill('~/work/cat')
+      expect(screen.queryByRole('listbox')).toBeNull()
+      await user.click(startButton())
+      await waitFor(() => expect(location.pathname).toBe('/sessions/s-1'))
+      expect(server.sent.find((s) => s.path === '/api/sessions')?.body).toMatchObject({ cwd: '~/work/cat' })
+    })
+
+    it('a search is no path until a project is picked', async () => {
+      mount()
+      await screen.findByText(/Recent projects of the hat/)
+      const user = userEvent.setup()
+      await user.type(await projectField(), 'catal')
+      expect(startButton()).toBeDisabled()
+      await user.click(screen.getByRole('option', { name: /catalog/ }))
+      expect(await projectField()).toHaveValue('catalog')
+      await waitFor(() => expect(startButton()).toBeEnabled())
+    })
+
+    it('browses the host directories and uses the one chosen', async () => {
+      const server = mount({
+        'GET /api/hosts/h1/browse?path=%2Fsrv%2Fwork': json(200, {
+          path: '/srv/work',
+          parent: '/srv',
+          entries: [{ name: 'atlas', git: true }],
+          truncated: false,
+        }),
+        'GET /api/hosts/h1/browse?path=%2Fsrv%2Fwork%2Fatlas': json(200, {
+          path: '/srv/work/atlas',
+          parent: '/srv/work',
+          entries: [],
+          truncated: false,
+        }),
+      })
+      await screen.findByText(/Recent projects of the hat/)
+      const user = userEvent.setup()
+      await user.click(screen.getByRole('button', { name: 'Browse' }))
+      const panel = await screen.findByRole('group', { name: 'Browse directories' })
+      await user.click(await within(panel).findByRole('button', { name: 'atlas' }))
+      await within(panel).findByText('/srv/work/atlas')
+      await user.click(within(panel).getByRole('button', { name: 'Use this directory' }))
+      expect(screen.queryByRole('group', { name: 'Browse directories' })).toBeNull()
+      expect(await projectField()).toHaveValue('atlas')
+      await user.click(startButton())
+      await waitFor(() => expect(location.pathname).toBe('/sessions/s-1'))
+      expect(server.sent.find((s) => s.path === '/api/sessions')?.body).toMatchObject({ cwd: '/srv/work/atlas' })
+    })
+  })
+
+  describe('hat preview', () => {
+    it('resolves the hat only once the path has rested', async () => {
+      const server = mount()
+      const field = await projectField()
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Claude' })).toHaveAttribute('aria-pressed', 'true'))
+      vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+      const resolves = () => server.sent.filter((s) => s.path === '/api/hats/resolve')
+      for (const text of ['/s', '/srv/wo', '/srv/work/cat']) {
+        fireEvent.change(field, { target: { value: text } })
+        await act(async () => {
+          vi.advanceTimersByTime(RESOLVE_DEBOUNCE_MS - 100)
+        })
+      }
+      expect(resolves()).toHaveLength(0)
+      await act(async () => {
+        vi.advanceTimersByTime(99)
+      })
+      expect(resolves()).toHaveLength(0)
+      await act(async () => {
+        vi.advanceTimersByTime(1)
+      })
+      expect(resolves().map((s) => s.body)).toEqual([{ host_id: 'h1', path: '/srv/work/cat' }])
+      vi.useRealTimers()
+      expect(await screen.findByText(/^Starts in the hat/)).toHaveTextContent('Starts in the hat Work at /srv/work/cat')
+    })
+
+    it('says when the path is not a directory', async () => {
+      mount({ 'POST /api/hats/resolve': json(200, { ...RESOLVED, canonical: '/srv/work/cat.txt', exists: true, is_dir: false }) })
+      await fill('/srv/work/cat.txt')
+      expect(await screen.findByText(/^Starts in the hat/, undefined, { timeout: 3000 })).toHaveTextContent(
+        /^Starts in the hat Work at \/srv\/work\/cat\.txt: this is not a directory$/,
+      )
+    })
+
+    it('shows a refused resolve as an alert under the preview', async () => {
+      mount({ 'POST /api/hats/resolve': json(400, { code: 'invalid_cwd', message: '"/srv/work/x" is not a directory on that host' }) })
+      await fill('/srv/work/x')
+      const alert = await screen.findByText('"/srv/work/x" is not a directory on that host', { exact: true }, { timeout: 3000 })
+      expect(alert.closest('[role="alert"]')).not.toBeNull()
+    })
+
+    it('says when the directory does not exist yet', async () => {
+      mount({ 'POST /api/hats/resolve': json(200, { ...RESOLVED, canonical: '/srv/work/new', exists: false, is_dir: false }) })
+      await fill('/srv/work/new')
+      expect(await screen.findByText(/^Starts in the hat/, undefined, { timeout: 3000 })).toHaveTextContent(
+        'this directory does not exist yet',
+      )
+    })
+  })
+
+  describe('start', () => {
+    it('starts the session, then sends the first prompt, then opens the session', async () => {
+      const server = mount()
+      const user = await fill('/srv/work/cat', 'Fix the tests')
+      await user.click(startButton())
+      await waitFor(() => expect(location.pathname).toBe('/sessions/s-1'))
+      expect(location.search).toBe('')
+      expect(posts(server.sent).filter((p) => p !== '/api/hats/resolve')).toEqual([
+        '/api/sessions',
+        '/api/sessions/s-1/prompt',
+      ])
+      expect(server.sent.find((s) => s.path === '/api/sessions/s-1/prompt')?.body).toEqual({
+        content: [{ type: 'text', text: 'Fix the tests' }],
+      })
+    })
+
+    it('sends no prompt when the first prompt is empty', async () => {
+      const server = mount()
+      const user = await fill('/srv/work/cat', '   ')
+      await user.click(startButton())
+      await waitFor(() => expect(location.pathname).toBe('/sessions/s-1'))
+      expect(posts(server.sent)).not.toContain('/api/sessions/s-1/prompt')
+    })
+
+    it.each([
+      ['hat_ambiguous', 409, 'the rule for "/srv/Work" matches only in another case', /more than one hat.*the rule for/],
+      ['host_offline', 409, 'the host has not connected since it was paired', /^the host has not connected since it was paired$/],
+      ['invalid_cwd', 400, '"/srv/work/cat" is not a directory on that host', /^"\/srv\/work\/cat" is not a directory on that host$/],
+      ['unknown_host', 400, 'no host is paired with that id', /^That host is no longer paired/],
+      ['start_failed', 502, 'the adapter exited', /^The host refused to start the session \(start_failed\): the adapter exited$/],
+    ])('says why a start was refused: %s', async (code, status, message, shown) => {
+      const server = mount({ 'POST /api/sessions': json(status, { code, message }) })
+      const user = await fill('/srv/work/cat', 'Fix the tests')
+      await user.click(startButton())
+      const alert = await screen.findByText(shown)
+      expect(alert.closest('[role="alert"]')).not.toBeNull()
+      expect(location.pathname).toBe('/new')
+      expect(posts(server.sent)).not.toContain('/api/sessions/s-1/prompt')
+      // The form stays, ready for another try.
+      expect(startButton()).toBeEnabled()
+      expect(screen.getByLabelText(/^First prompt/)).toHaveValue('Fix the tests')
+    })
+
+    it('a start whose delivery is unknown opens its session with a notice and keeps the prompt', async () => {
+      const server = mount({
+        'POST /api/sessions': json(503, {
+          code: 'delivery_unknown',
+          message: 'host disconnected; delivery unknown',
+          session_id: 's-9',
+        }),
+      })
+      const user = await fill('/srv/work/cat', 'Fix the tests')
+      await user.click(startButton())
+      await waitFor(() => expect(location.pathname).toBe('/sessions/s-9'))
+      expect(location.search).toBe('?notice=start_unknown_draft')
+      expect(sessionStorage.getItem('hennery.draft.s-9')).toBe('Fix the tests')
+      expect(posts(server.sent).some((p) => p.endsWith('/prompt'))).toBe(false)
+    })
+
+    it('a start whose delivery is unknown, with no first prompt, says nothing of a draft', async () => {
+      mount({ 'POST /api/sessions': json(503, { code: 'delivery_unknown', message: 'gone', session_id: 's-9' }) })
+      const user = await fill('/srv/work/cat')
+      await user.click(startButton())
+      await waitFor(() => expect(location.pathname).toBe('/sessions/s-9'))
+      expect(location.search).toBe('?notice=start_unknown')
+      expect(sessionStorage.getItem('hennery.draft.s-9')).toBeNull()
+    })
+
+    it('a delivery unknown that names no session stays on the form', async () => {
+      mount({ 'POST /api/sessions': json(503, { code: 'delivery_unknown', message: 'gone' }) })
+      const user = await fill('/srv/work/cat', 'Fix the tests')
+      await user.click(startButton())
+      expect(await screen.findByText(/its outcome is not known/)).toBeInTheDocument()
+      expect(location.pathname).toBe('/new')
+    })
+
+    it('a refused first prompt opens the session with a notice and keeps the prompt as its draft', async () => {
+      mount({ 'POST /api/sessions/s-1/prompt': json(409, { code: 'host_offline', message: 'the host is not connected' }) })
+      const user = await fill('/srv/work/cat', 'Fix the tests')
+      await user.click(startButton())
+      await waitFor(() => expect(location.pathname).toBe('/sessions/s-1'))
+      expect(location.search).toBe('?notice=prompt_failed&code=host_offline')
+      expect(sessionStorage.getItem('hennery.draft.s-1')).toBe('Fix the tests')
+    })
+  })
+
+  describe('changing the host', () => {
+    it('resets the agent, the path and the browser', async () => {
+      mount({
+        'GET /api/hosts/h1/browse?path=%2Fsrv%2Fwork%2Fcat': json(200, {
+          path: '/srv/work/cat',
+          entries: [],
+          truncated: false,
+        }),
+      })
+      const user = await fill('/srv/work/cat')
+      await user.click(screen.getByRole('button', { name: 'Codex' }))
+      await user.click(screen.getByRole('button', { name: 'Browse' }))
+      await screen.findByRole('group', { name: 'Browse directories' })
+      await screen.findByText(/^Starts in the hat/, undefined, { timeout: 3000 })
+
+      await user.click(hostButton('desk'))
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Claude' })).toHaveAttribute('aria-pressed', 'true'))
+      expect(screen.getByRole('button', { name: 'Codex' })).toHaveAttribute('aria-pressed', 'false')
+      expect(await projectField()).toHaveValue('')
+      expect(screen.queryByRole('group', { name: 'Browse directories' })).toBeNull()
+      expect(screen.queryByText(/^Starts in the hat/)).toBeNull()
+      expect(startButton()).toBeDisabled()
+    })
+  })
+
+  describe('in the app', () => {
+    function summary(id: string, hat_id: string): SessionSummary {
+      return {
+        session_id: id,
+        host_id: 'h1',
+        agent: 'claude',
+        cwd: `/srv/work/${id}`,
+        hat_id,
+        lifecycle: 'active',
+        activity: 'idle',
+        presumed_parked: false,
+        created_at: '2026-10-01T00:00:00.000Z',
+        last_event_at: '2026-10-02T10:00:00.000Z',
+        question_waits: false,
+      }
+    }
+
+    it('opens the started session as an explicit selection, even outside the hat', async () => {
+      window.matchMedia = ((query: string) => ({
+        matches: query === DESKTOP,
+        media: query,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      })) as unknown as typeof window.matchMedia
+      localStorage.setItem('hennery.hat', 'hat-a')
+      history.replaceState(null, '', '/new')
+      const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(input), 'http://h')
+        const method = init?.method ?? 'GET'
+        switch (`${method} ${url.pathname}`) {
+          case 'GET /api/capabilities':
+            return json(200, { mode: 'full', features: [] })
+          case 'GET /api/hats':
+            return json(200, HATS)
+          case 'GET /api/hosts':
+            return json(200, HOSTS)
+          case 'GET /api/hosts/h1/projects':
+            return json(200, PROJECTS)
+          case 'POST /api/hats/resolve':
+            return json(200, { ...RESOLVED, hat_id: 'hat-b' })
+          case 'POST /api/sessions':
+            return json(202, { session_id: 's-new' })
+          case 'GET /api/view/sessions':
+            return json(200, {
+              sessions: [summary('old', 'hat-a'), summary('s-new', 'hat-b')],
+              epoch: 'e1',
+              revision: 1,
+            })
+          case 'GET /api/stream/sessions':
+            return liveStream().response
+          default:
+            return json(404, { code: 'not_found', message: url.pathname })
+        }
+      })
+      render(<App fetchImpl={fetch as unknown as typeof globalThis.fetch} />)
+      expect(await screen.findByRole('heading', { name: 'New session' })).toBeInTheDocument()
+      const user = await fill('/srv/work/cat')
+      await user.click(startButton())
+      await waitFor(() => expect(location.pathname).toBe('/sessions/s-new'))
+      // The list has loaded, and its newest visible row did not take over.
+      await screen.findByText('old')
+      await new Promise((r) => setTimeout(r, 50))
+      expect(location.pathname).toBe('/sessions/s-new')
+      // @ts-expect-error jsdom has none; each test sets its own
+      delete window.matchMedia
+    })
+  })
+  ```
+
+In `web/src/screens/Session.answer.test.tsx`, replace:
+
+  ```tsx
+
+    it('says nothing of a question that was open when the session opened', async () => {
+  ```
+
+with:
+
+  ```tsx
+
+    it('never takes the focus for, or says, a question that came with a resync', async () => {
+      const items = [message('m1', 't1')]
+      const s = server(items)
+      await shown(s)
+      // Where a question opened at the tail would take the focus.
+      expect(document.activeElement).toBe(document.body)
+      expect(textarea().value).toBe('')
+      // The resync's page keeps m1, the last item seen, with a question after it.
+      items.push(question(), message('m2', 't1'))
+      act(() => s.streams[0].event('resync_required', {}))
+      await screen.findByText('Run it?', {}, WAIT)
+      await waitFor(() => expect(s.streams).toHaveLength(2), WAIT)
+      // A later event: once it shows, the card's effects have run.
+      act(() => s.streams[1].event('item', message('m3', 't1')))
+      await screen.findByText('m3')
+      expect(card()).not.toHaveFocus()
+      expect(document.activeElement).toBe(document.body)
+      expect(anySaid()).toEqual([])
+    })
+
+    it('says nothing of a question that was open when the session opened', async () => {
+  ```
+
+Create `web/src/screens/Session.host.test.tsx`:
+
+  ```tsx
+  // Whether a question card says its answer "delivers when the host
+  // reconnects" follows the host while the view is open (decision 22): the
+  // view's one hosts request seeds it, and then the item stream's host
+  // markers and the summary's `presumed_parked` say it. No event fetches.
+  import '@testing-library/jest-dom/vitest'
+  import { act, render, screen, waitFor } from '@testing-library/react'
+  import { beforeEach, describe, expect, it, vi } from 'vitest'
+  import type { SessionSummary } from '../generated/view'
+  import type { Item } from '../generated/view'
+  import { forgetAllAttachments } from '../lib/attachments'
+  import { json } from '../test-stream'
+  import SessionView from './Session'
+  import { FAST, message, sessionServer } from './test-session'
+
+  const TS = '2026-10-02T10:00:00.000Z'
+  const NOTE = 'delivers when the host reconnects'
+  const WAIT = { timeout: 5000 }
+
+  const sent: Item = {
+    id: 'question:p1',
+    version: 5,
+    ts: TS,
+    turn_id: 't1',
+    kind: 'question',
+    pending_id: 'p1',
+    question_kind: 'permission',
+    request: { type: 'permission', title: 'Run it?', options: [{ option_id: 'a', name: 'Allow', option_kind: 'allow_once' }] },
+    answerable: false,
+    state: 'open',
+    answered: true,
+  } as Item
+
+  const hostMarker = (kind: string, ts: string): Item => ({ id: `marker:${kind}:${ts}`, version: 1, ts, kind: 'marker', marker: kind }) as Item
+
+  function server(connected: boolean, items: Item[] = [message('m1', 't1'), sent]) {
+    return sessionServer({
+      items: () => items,
+      hosts: () => json([{ host_id: 'h1', name: 'build-box', connected, capabilities: [] }]),
+    })
+  }
+
+  /** Once the view has made every request it makes on opening. */
+  async function settled(s: ReturnType<typeof server>) {
+    await screen.findByText('Sent', {}, WAIT)
+    await screen.findByText('build-box', {}, WAIT)
+    await waitFor(() => expect(s.streams).toHaveLength(1), WAIT)
+    await waitFor(() => expect(s.of('/api/sessions/s1/catalog')).toHaveLength(1), WAIT)
+  }
+
+  beforeEach(() => {
+    sessionStorage.clear()
+    forgetAllAttachments()
+    URL.createObjectURL = vi.fn(() => 'blob:u')
+    URL.revokeObjectURL = vi.fn()
+  })
+
+  describe('SessionView: the host’s reach on a question card', () => {
+    it('a host_offline marker on the stream turns the note on, and host_back turns it off, with no request', async () => {
+      const s = server(true)
+      render(<SessionView id="s1" timing={FAST} />, { wrapper: s.wrapper })
+      await settled(s)
+      expect(screen.queryByText(NOTE, { exact: true })).toBeNull()
+      const calls = s.calls.length
+
+      act(() => s.streams[0].event('item', hostMarker('host_offline', '2026-10-02T10:05:00.000Z')))
+      expect(await screen.findByText(NOTE, { exact: true }, WAIT)).toBeInTheDocument()
+
+      act(() => s.streams[0].event('item', hostMarker('host_back', '2026-10-02T10:07:00.000Z')))
+      await waitFor(() => expect(screen.queryByText(NOTE, { exact: true })).toBeNull(), WAIT)
+      expect(screen.getByText('Sent', { exact: true })).toBeInTheDocument()
+      expect(s.calls.length).toBe(calls)
+    })
+
+    it('a host the hosts list said was not connected comes back by host_restarted, with no request', async () => {
+      const s = server(false)
+      render(<SessionView id="s1" timing={FAST} />, { wrapper: s.wrapper })
+      await settled(s)
+      expect(await screen.findByText(NOTE, { exact: true }, WAIT)).toBeInTheDocument()
+      const calls = s.calls.length
+
+      act(() => s.streams[0].event('item', hostMarker('host_restarted', '2026-10-02T10:05:00.000Z')))
+      await waitFor(() => expect(screen.queryByText(NOTE, { exact: true })).toBeNull(), WAIT)
+      expect(s.calls.length).toBe(calls)
+    })
+
+    it('a host_back already in the first page does not hide a host the hosts list says is not connected', async () => {
+      const s = server(false, [hostMarker('host_back', '2026-10-02T09:30:00.000Z'), message('m1', 't1'), sent])
+      render(<SessionView id="s1" timing={FAST} />, { wrapper: s.wrapper })
+      await settled(s)
+      expect(await screen.findByText(NOTE, { exact: true }, WAIT)).toBeInTheDocument()
+    })
+
+    it('the summary’s presumed_parked, as a session_upsert changes it, turns the note on and off, with no request', async () => {
+      const s = server(true)
+      const summary = (presumed_parked: boolean): SessionSummary =>
+        ({
+          session_id: 's1',
+          host_id: 'h1',
+          agent: 'claude',
+          cwd: '/srv/work/project',
+          hat_id: 'hat1',
+          lifecycle: presumed_parked ? 'parked' : 'active',
+          activity: presumed_parked ? undefined : 'idle',
+          presumed_parked,
+          created_at: '2026-10-02T09:00:00.000Z',
+          last_event_at: TS,
+          question_waits: true,
+        }) as SessionSummary
+      const r = render(<SessionView id="s1" summary={summary(false)} timing={FAST} />, { wrapper: s.wrapper })
+      await settled(s)
+      expect(screen.queryByText(NOTE, { exact: true })).toBeNull()
+      const calls = s.calls.length
+
+      r.rerender(<SessionView id="s1" summary={summary(true)} timing={FAST} />)
+      expect(await screen.findByText(NOTE, { exact: true }, WAIT)).toBeInTheDocument()
+
+      r.rerender(<SessionView id="s1" summary={summary(false)} timing={FAST} />)
+      await waitFor(() => expect(screen.queryByText(NOTE, { exact: true })).toBeNull(), WAIT)
+      expect(s.calls.length).toBe(calls)
+    })
+  })
+  ```
+
+Create `web/src/screens/Session.start.test.tsx`:
+
+  ```tsx
+  // A session the New Session screen opened with a notice: the notice shows
+  // above the composer, the link is cleaned so a reload does not show it
+  // again, and the first prompt that was not sent is the composer's draft.
+  import '@testing-library/jest-dom/vitest'
+  import { render, screen, waitFor } from '@testing-library/react'
+  import { beforeEach, describe, expect, it, vi } from 'vitest'
+  import { forgetAllAttachments } from '../lib/attachments'
+  import SessionView from './Session'
+  import { FAST, sessionServer } from './test-session'
+
+  const HOST_OFFLINE = 'The host went offline before the first prompt reached it; send it again once it is back. It waits as this session’s draft.'
+  const textarea = () => screen.getByLabelText('Prompt') as HTMLTextAreaElement
+
+  beforeEach(() => {
+    sessionStorage.clear()
+    forgetAllAttachments()
+    URL.createObjectURL = vi.fn(() => 'blob:u')
+    URL.revokeObjectURL = vi.fn()
+    history.replaceState(null, '', '/')
+  })
+
+  describe('SessionView: the notice a start leaves', () => {
+    it('shows a refused first prompt’s notice above the composer, and cleans the link without a new history entry', async () => {
+      history.replaceState(null, '', '/sessions/s1?notice=prompt_failed&code=host_offline')
+      const entries = history.length
+      const s = sessionServer()
+      render(<SessionView id="s1" timing={FAST} />, { wrapper: s.wrapper })
+      const notice = await screen.findByText(HOST_OFFLINE)
+      expect(notice.compareDocumentPosition(textarea()) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+      await waitFor(() => expect(location.search).toBe(''))
+      expect(location.pathname).toBe('/sessions/s1')
+      expect(history.length).toBe(entries)
+      // The link is clean: the notice stays for as long as the view does.
+      expect(screen.getByText(HOST_OFFLINE)).toBeInTheDocument()
+    })
+
+    it('says a start whose delivery is unknown may still start', async () => {
+      history.replaceState(null, '', '/sessions/s1?notice=start_unknown')
+      const s = sessionServer()
+      render(<SessionView id="s1" timing={FAST} />, { wrapper: s.wrapper })
+      expect(await screen.findByText(/^The host went away while this session was starting: it may still start/)).toBeInTheDocument()
+    })
+
+    it('shows nothing once the link is clean: a reload does not show it again', async () => {
+      history.replaceState(null, '', '/sessions/s1?notice=prompt_failed&code=host_offline')
+      const s = sessionServer()
+      const first = render(<SessionView id="s1" timing={FAST} />, { wrapper: s.wrapper })
+      await waitFor(() => expect(location.search).toBe(''))
+      first.unmount()
+      render(<SessionView id="s1" timing={FAST} />, { wrapper: s.wrapper })
+      await screen.findByLabelText('Prompt')
+      expect(screen.queryByText(HOST_OFFLINE)).toBeNull()
+    })
+
+    it('drops the notice when the view moves to another session', async () => {
+      history.replaceState(null, '', '/sessions/s1?notice=prompt_failed&code=host_offline')
+      const s = sessionServer()
+      const view = render(<SessionView id="s1" timing={FAST} />, { wrapper: s.wrapper })
+      await screen.findByText(HOST_OFFLINE)
+      history.replaceState(null, '', '/sessions/s2')
+      view.rerender(<SessionView id="s2" timing={FAST} />)
+      await waitFor(() => expect(screen.queryByText(HOST_OFFLINE)).toBeNull())
+    })
+
+    it('opens the composer with the first prompt that was not sent', async () => {
+      history.replaceState(null, '', '/sessions/s1?notice=prompt_failed&code=host_offline')
+      // Where the New Session screen keeps it (its own test reads this key).
+      sessionStorage.setItem('hennery.draft.s1', 'Fix the tests')
+      const s = sessionServer()
+      render(<SessionView id="s1" timing={FAST} />, { wrapper: s.wrapper })
+      await screen.findByText(HOST_OFFLINE)
+      expect(textarea().value).toBe('Fix the tests')
+    })
+  })
+  ```
+
+In `web/src/store/useAnswer.test.ts`, replace:
+
+  ```ts
+  type Props = { info?: { presumed_parked: boolean }; items: Item[]; loading: boolean; connected?: boolean }
+
+  function use(t: ReturnType<typeof routed>, initial: Props) {
+    return renderHook((p: Props) => useAnswering('s1', p.info, p.items, p.loading, p.connected), { initialProps: initial, wrapper: t.wrapper })
+  ```
+
+with:
+
+  ```ts
+  type Props = { info?: { presumed_parked: boolean }; items: Item[]; loading: boolean; loads?: number; connected?: boolean }
+
+  function use(t: ReturnType<typeof routed>, initial: Props) {
+    return renderHook((p: Props) => useAnswering('s1', p.info, p.items, p.loading, p.loads ?? 1, p.connected), {
+      initialProps: initial,
+      wrapper: t.wrapper,
+    })
+  ```
+
+In `web/src/store/useAnswer.test.ts`, replace:
+
+  ```ts
+
+    it('marks fresh only a question opened at the tail after the first page', () => {
+  ```
+
+with:
+
+  ```ts
+
+    it('reads host markers newer than the first page only, the first page’s time taken once', async () => {
+      const t = hosts([])
+      const info = { presumed_parked: false }
+      const mark = (kind: string, ts: string) => ({ id: `${kind}${ts}`, version: 1, ts, kind: 'marker', marker: kind }) as Item
+      const page = [mark('host_back', '2026-10-02T09:00:00.000Z'), sent('q')]
+      const h = use(t, { info, items: [], loading: true, connected: false })
+      // Before the first page: the seed alone.
+      await waitFor(() => expect(h.result.current.hostAway).toBe(true))
+      h.rerender({ info, items: page, loading: false, connected: false })
+      await Promise.resolve()
+      // The first page's host_back is history the seed already says.
+      expect(h.result.current.hostAway).toBe(true)
+      const back = [...page, mark('host_back', '2026-10-02T10:05:00.000Z')]
+      h.rerender({ info, items: back, loading: false, connected: false })
+      await waitFor(() => expect(h.result.current.hostAway).toBe(false))
+      // A resync (a new first page) keeps the first time: its new marker counts.
+      h.rerender({ info, items: [...back, mark('host_offline', '2026-10-02T10:09:00.000Z')], loading: false, loads: 2, connected: false })
+      await waitFor(() => expect(h.result.current.hostAway).toBe(true))
+      expect(t.calls).toHaveLength(0)
+    })
+
+    it('reads a seed that comes after the first page, the items unchanged', async () => {
+      const t = hosts([])
+      const info = { presumed_parked: false }
+      const items = [sent('q')]
+      const h = use(t, { info, items, loading: false })
+      await Promise.resolve()
+      expect(h.result.current.hostAway).toBe(false)
+      h.rerender({ info, items, loading: false, connected: false })
+      await waitFor(() => expect(h.result.current.hostAway).toBe(true))
+    })
+
+    it('marks fresh only a question opened at the tail after the first page', () => {
+  ```
+
+In `web/src/store/useAnswer.test.ts`, replace:
+
+  ```ts
+
+    it('takes nothing in while the first page loads', () => {
+  ```
+
+with:
+
+  ```ts
+
+    it('marks nothing fresh that came with a resync, even after the last item seen; then marks the tail again', () => {
+      const t = hosts([])
+      const h = use(t, { items: [], loading: true, loads: 0 })
+      h.rerender({ items: [msg('a')], loading: false, loads: 1 })
+      // The resync's page: the last item seen survives, a question after it.
+      h.rerender({ items: [msg('a'), question('came'), msg('b')], loading: false, loads: 2 })
+      const book = h.result.current
+      expect(book.claimFocus('came')).toBe(false)
+      h.rerender({ items: [msg('a'), question('came'), msg('b'), question('new')], loading: false, loads: 2 })
+      expect(book.claimFocus('came')).toBe(false)
+      expect(book.claimFocus('new')).toBe(true)
+    })
+
+    it('takes nothing in while the first page loads', () => {
+  ```
+
+- [ ] **Step 2: Run them, and see them fail**
+
+Run: `nix develop -c sh -c 'cd web && pnpm vitest run src/lib src/screens src/api/client.test.ts'`
+Expected: FAIL: `NewSession.test.tsx`, `agents.test.ts`, `hostAway.test.ts`, `projects.test.ts` and `start.test.ts` cannot resolve their modules; 9 tests fail: a refusal's `session_id` (`client.test.ts`), the session view's five notice tests (`Session.start.test.tsx`), two of the host's reach on a card (`Session.host.test.tsx`), and a question that came with a resync (`Session.answer.test.tsx`).
+
+- [ ] **Step 3: The New Session screen**
+
+In `web/src/api/client.ts`, replace:
+
+  ```ts
+  async function errorBody(response: Response): Promise<{ code?: string; message?: string } | undefined> {
+    try {
+      const body: unknown = await response.json()
+      if (body && typeof body === 'object') {
+        const { code, message } = body as Record<string, unknown>
+        return {
+          code: typeof code === 'string' ? code : undefined,
+          message: typeof message === 'string' ? message : undefined,
+  ```
+
+with:
+
+  ```ts
+  async function errorBody(
+    response: Response,
+  ): Promise<{ code?: string; message?: string; session_id?: string } | undefined> {
+    try {
+      const body: unknown = await response.json()
+      if (body && typeof body === 'object') {
+        const { code, message, session_id } = body as Record<string, unknown>
+        return {
+          code: typeof code === 'string' ? code : undefined,
+          message: typeof message === 'string' ? message : undefined,
+          // A start whose delivery is unknown names the session it created.
+          session_id: typeof session_id === 'string' ? session_id : undefined,
+  ```
+
+In `web/src/api/errors.ts`, replace:
+
+  ```ts
+    readonly retryAfter?: number
+
+  ```
+
+with:
+
+  ```ts
+    readonly retryAfter?: number
+    /** The session the refused request still left reachable (ACP core §9: a
+     *  start's 503 `delivery_unknown` carries it). */
+    readonly sessionId?: string
+
+  ```
+
+In `web/src/api/errors.ts`, replace:
+
+  ```ts
+      this.retryAfter = retryAfter
+    }
+  ```
+
+with:
+
+  ```ts
+      this.retryAfter = retryAfter
+      this.sessionId = body?.session_id
+    }
+  ```
+
+Create `web/src/components/ProjectPicker.tsx`:
+
+  ```tsx
+  // The New Session project field (frontend spec §7): type to search the
+  // host's recent projects and repositories, type a path (`/…` or `~…`) to
+  // use it as it is, or browse the host's directories.
+  //
+  // One host per mount: the screen remounts it (`key={hostId}`) when the host
+  // changes, which resets the query, the list and the browser at once.
+  import { useEffect, useId, useMemo, useState, type KeyboardEvent } from 'react'
+  import { messageOf } from '../api/errors'
+  import { useClient } from '../app-client'
+  import type { DirectoryListing } from '../generated/protocol'
+  import { childPath, filterProjects, isLiteralPath, type ProjectEntry } from '../lib/projects'
+  import { basename } from '../lib/time'
+  import { Icon } from '../lib/ui'
+
+  interface Props {
+    hostId: string
+    /** Recents then repositories, already merged and labelled. */
+    entries: ProjectEntry[]
+    /** Where browsing starts: the host user's home, else a workspace root. */
+    browseRoot?: string
+    /** The text the field opens with (a prefilled path). */
+    initialText?: string
+    /** The chosen directory, or `''` while the text is only a search. */
+    onChange: (path: string) => void
+    /** The field's accessible name comes from this element. */
+    labelledBy: string
+  }
+
+  type Browse =
+    | { state: 'closed' }
+    | { state: 'loading'; path: string }
+    | { state: 'shown'; listing: DirectoryListing }
+    | { state: 'failed'; path: string; error: string }
+
+  export default function ProjectPicker({ hostId, entries, browseRoot, initialText = '', onChange, labelledBy }: Props) {
+    const client = useClient()
+    // From React, never the host's id: an id reference holds no spaces.
+    const listId = useId()
+    const [query, setQuery] = useState(initialText)
+    const [open, setOpen] = useState(false)
+    const [active, setActive] = useState(-1)
+    const [browse, setBrowse] = useState<Browse>({ state: 'closed' })
+
+    const matches = useMemo(() => (isLiteralPath(query) ? [] : filterProjects(entries, query)), [entries, query])
+
+    // Only a directory being loaded is fetched: a failed one stays failed
+    // until another (or the same one, again) is asked for.
+    const browsePath = browse.state === 'loading' ? browse.path : null
+    useEffect(() => {
+      if (browsePath === null) return
+      let live = true
+      client
+        .request<DirectoryListing>(
+          'GET',
+          `/api/hosts/${encodeURIComponent(hostId)}/browse?path=${encodeURIComponent(browsePath)}`,
+        )
+        .then(
+          (listing) => live && setBrowse({ state: 'shown', listing }),
+          (err) => live && setBrowse({ state: 'failed', path: browsePath, error: messageOf(err) }),
+        )
+      return () => {
+        live = false
+      }
+    }, [client, hostId, browsePath])
+
+    function pick(path: string, label: string) {
+      setQuery(label)
+      setOpen(false)
+      setActive(-1)
+      setBrowse({ state: 'closed' })
+      onChange(path)
+    }
+
+    function onInput(next: string) {
+      setQuery(next)
+      setActive(-1)
+      setOpen(!isLiteralPath(next))
+      // A path needs no picking; a search is no choice until one is picked.
+      onChange(isLiteralPath(next) ? next : '')
+    }
+
+    function onKeyDown(e: KeyboardEvent<HTMLInputElement>) {
+      if (e.key === 'Escape') {
+        setOpen(false)
+        return
+      }
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault()
+        if (matches.length === 0) return
+        setOpen(true)
+        setActive((cur) => {
+          const next = cur + (e.key === 'ArrowDown' ? 1 : -1)
+          if (next < 0) return matches.length - 1
+          if (next >= matches.length) return 0
+          return next
+        })
+        return
+      }
+      if (e.key === 'Enter' && open && active >= 0 && active < matches.length) {
+        e.preventDefault()
+        pick(matches[active].path, matches[active].name)
+      }
+    }
+
+    const browsing = browse.state !== 'closed'
+    const showList = open && !browsing && matches.length > 0
+    const optionId = (i: number) => `${listId}-o${i}`
+    // The option arrow keys moved to, told to a screen reader while it shows.
+    const activeId = showList && active >= 0 && active < matches.length ? optionId(active) : undefined
+    const go = (path: string) => setBrowse({ state: 'loading', path })
+
+    return (
+      <div className="picker">
+        <div className="picker-row">
+          <div className="picker-anchor">
+            <div className="path-input">
+              <span className="ic">
+                <Icon.Folder size={15} />
+              </span>
+              <input
+                value={query}
+                onChange={(e) => onInput(e.target.value)}
+                onFocus={() => setOpen(!isLiteralPath(query))}
+                onBlur={() => window.setTimeout(() => setOpen(false), 120)}
+                onKeyDown={onKeyDown}
+                spellCheck={false}
+                autoComplete="off"
+                placeholder="A project's name, or a path: /srv/… or ~/…"
+                role="combobox"
+                aria-labelledby={labelledBy}
+                aria-expanded={showList}
+                aria-controls={showList ? listId : undefined}
+                aria-activedescendant={activeId}
+                aria-autocomplete="list"
+              />
+            </div>
+            {showList && (
+              <ul className="picker-list" id={listId} role="listbox">
+                {matches.map((m, i) => (
+                  <li
+                    key={m.path}
+                    id={optionId(i)}
+                    role="option"
+                    aria-selected={i === active}
+                    title={m.path}
+                    className={'picker-item' + (i === active ? ' active' : '')}
+                    // On mousedown: a click would blur the input, closing the list first.
+                    onMouseDown={(e) => {
+                      e.preventDefault()
+                      pick(m.path, m.name)
+                    }}
+                  >
+                    <bdi>{m.name}</bdi>
+                    {m.lastUsed !== undefined && <span className="hint"> recent</span>}
+                  </li>
+                ))}
+              </ul>
+            )}
+            {browsing && (
+              <div className="picker-list" role="group" aria-label="Browse directories">
+                {browse.state === 'loading' && (
+                  <div className="picker-path">
+                    <bdi>{browse.path}</bdi> Loading…
+                  </div>
+                )}
+                {browse.state === 'failed' && (
+                  <>
+                    <div className="picker-path">
+                      <bdi>{browse.path}</bdi>
+                    </div>
+                    <div className="picker-item form-error" role="alert">
+                      <bdi>{browse.error}</bdi>
+                    </div>
+                  </>
+                )}
+                {browse.state === 'shown' && (
+                  <>
+                    <div className="picker-path">
+                      <bdi>{browse.listing.path}</bdi>
+                    </div>
+                    {browse.listing.parent !== undefined && (
+                      <button type="button" className="picker-item" onClick={() => go(browse.listing.parent!)}>
+                        .. (up)
+                      </button>
+                    )}
+                    {browse.listing.entries.map((d) => (
+                      <button
+                        key={d.name}
+                        type="button"
+                        className={'picker-item' + (d.git ? ' git' : '')}
+                        // Every row descends, a repository too: a worktree can
+                        // live inside one. Choosing is "Use this directory".
+                        onClick={() => go(childPath(browse.listing.path, d.name))}
+                      >
+                        <bdi>{d.name}</bdi>
+                      </button>
+                    ))}
+                    {browse.listing.truncated && <div className="picker-path">Not every directory is listed.</div>}
+                    <button
+                      type="button"
+                      className="picker-item"
+                      onClick={() => pick(browse.listing.path, basename(browse.listing.path))}
+                    >
+                      Use this directory
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+          <button
+            type="button"
+            className="btn btn-ghost btn-sm"
+            disabled={browseRoot === undefined}
+            title={browseRoot === undefined ? 'This host reported no directory to browse from' : undefined}
+            aria-pressed={browsing}
+            onClick={() => {
+              if (browsing) {
+                setBrowse({ state: 'closed' })
+                return
+              }
+              setOpen(false)
+              if (browseRoot !== undefined) go(isLiteralPath(query) && query.startsWith('/') ? query : browseRoot)
+            }}
+          >
+            Browse
+          </button>
+        </div>
+      </div>
+    )
+  }
+  ```
+
+In `web/src/components/Shell.tsx`, replace:
+
+  ```tsx
+  import Hosts from '../screens/Hosts'
+  import Placeholder from '../screens/Placeholder'
+  ```
+
+with:
+
+  ```tsx
+  import Hosts from '../screens/Hosts'
+  import NewSession from '../screens/NewSession'
+  import Placeholder from '../screens/Placeholder'
+  ```
+
+In `web/src/components/Shell.tsx`, replace:
+
+  ```tsx
+              <SessionList screen />
+            ) : route.name === 'session' ? (
+  ```
+
+with:
+
+  ```tsx
+              <SessionList screen />
+            ) : route.name === 'new' ? (
+              <NewSession />
+            ) : route.name === 'session' ? (
+  ```
+
+In `web/src/index.css`, replace:
+
+  ```css
+  .session-error { padding:8px 20px 0; margin:0; }
+  .transcript-empty { color:var(--fg-quiet); padding:20px 0; }
+  ```
+
+with:
+
+  ```css
+  .session-error { padding:8px 20px 0; margin:0; }
+  .start-notice { padding:8px 20px; margin:0; font-size:14px; color:var(--st-attn); overflow-wrap:anywhere; }
+  .transcript-empty { color:var(--fg-quiet); padding:20px 0; }
+  ```
+
+Create `web/src/lib/agents.ts`:
+
+  ```ts
+  // Which agents a host can start (frontend spec §7). Everything the New
+  // Session form knows about a host's agents comes through `agentsFor`.
+  import type { Client } from '../api/client'
+  import { agentLabel } from './agent'
+
+  // LOCAL TYPES: these mirror the shape of 4d's `GET /api/hosts/{id}/agents`
+  // (B1-i, shape v2) until its generated types land in
+  // `generated/protocol.ts`. Then they are deleted and imported from there;
+  // nothing else changes.
+
+  /** Whether the agent is signed in on its host: `unknown` when the host has
+   *  not checked. */
+  export type AgentAuth = 'ok' | 'missing' | 'unknown'
+
+  /** Which CLI the agent runs. */
+  export type AgentCli = 'bundled' | 'override' | 'given'
+
+  /** One agent of a host. */
+  export interface AgentInfo {
+    /** The profile name: what `StartSessionRequest.agent` takes. */
+    agent: string
+    /** Launchable as configured. */
+    available: boolean
+    auth: AgentAuth
+    cli: AgentCli
+    adapter_version?: string
+    /** `false`: it takes no images. Absent: not probed, so images are
+     *  allowed and the server's 409 `images_unsupported` stays the guard. */
+    images?: boolean
+    /** Why it is unavailable, or a caveat, in the host's words. */
+    note?: string
+  }
+
+  /** Where a host's agents come from. */
+  export type RuntimeSource = 'managed' | 'given'
+
+  export interface RuntimeInfo {
+    source: RuntimeSource
+    set_id?: string
+    pinned?: boolean
+    held?: boolean
+  }
+
+  /** Where a `HostAgents` report comes from. */
+  export type AgentsSource = 'none' | 'hello' | 'probe'
+
+  /** `GET /api/hosts/{id}/agents[?refresh=1]`: the host's latest report. */
+  export interface HostAgents {
+    host_id: string
+    agents: AgentInfo[]
+    runtime?: RuntimeInfo
+    /** RFC 3339; absent with `source: none`. */
+    reported_at?: string
+    source: AgentsSource
+    /** The host is connected and reconciled now. */
+    live: boolean
+  }
+
+  /** What the form may offer on one host. */
+  export interface HostAgentChoices {
+    agents: AgentInfo[]
+    /** The form also takes an agent name typed by hand ("Other…"). */
+    other: boolean
+  }
+
+  /** The agents to offer on `hostId`.
+   *
+   *  THE SWITCH POINT: no host reports its agents yet, so today this answers
+   *  the two built-in profiles, unchecked (`auth: 'unknown'`, which the
+   *  picker allows), plus a name typed by hand. When
+   *  `GET /api/hosts/{id}/agents` lands, this becomes
+   *  `client.request<HostAgents>('GET', \`/api/hosts/${encodeURIComponent(hostId)}/agents\`)`
+   *  mapped to `{agents: answer.agents, other: true}`; nothing else changes. */
+  export async function agentsFor(client: Client, hostId: string): Promise<HostAgentChoices> {
+    void client
+    void hostId
+    return {
+      agents: [
+        { agent: 'claude', available: true, auth: 'unknown', cli: 'bundled' },
+        { agent: 'codex', available: true, auth: 'unknown', cli: 'bundled' },
+      ],
+      other: true,
+    }
+  }
+
+  /** Images are hidden only for an agent known to take none
+   *  (`images === false`); an agent not probed may take them. */
+  export function takesImages(agent: Pick<AgentInfo, 'images'>): boolean {
+    return agent.images !== false
+  }
+
+  /** An agent as the picker shows it. */
+  export interface AgentOption {
+    agent: string
+    label: string
+    /** Why it cannot be picked; absent when it can. */
+    disabled?: string
+  }
+
+  /** The picker's rules: only `available` agents are listed; auth `missing`
+   *  is listed but disabled, with its note; `ok` and `unknown` may be
+   *  picked. */
+  export function agentOptions(agents: AgentInfo[]): AgentOption[] {
+    return agents
+      .filter((a) => a.available)
+      .map((a) => ({
+        agent: a.agent,
+        label: agentLabel(a.agent),
+        ...(a.auth === 'missing' ? { disabled: a.note || 'Not signed in on this host.' } : {}),
+      }))
+  }
+  ```
+
+Create `web/src/lib/hostAway.ts`:
+
+  ```ts
+  // Whether a session's host is away, for a question card's "delivers when
+  // the host reconnects" (decision 22). Pure: the answer book feeds it what
+  // the view already holds, and nothing here fetches.
+  //
+  // - The session's `presumed_parked` (its summary, kept current by the
+  //   list's `session_upsert`): the host is away.
+  // - Else the newest host marker on the session's item stream says it:
+  //   `host_offline` (a presumed park, the host offline or revoked) is away;
+  //   `host_back` (reattached), `host_restarted` (the host is back after a
+  //   restart) and `resumed` (a resume, which the server refuses while the
+  //   host is not connected) are back. Newest by `ts`, a tie to the later
+  //   item; a `ts` that does not parse is not read.
+  // - Else the seed: `connected` from the view's one `GET /api/hosts`, read
+  //   when the view opens. A host known not to be connected is away; one not
+  //   known is not.
+  // - Only markers newer than the first page count (`since`: the newest `ts`
+  //   that page held). The seed was read as the page was, so the page's own
+  //   markers are history it already says; so are older pages loaded later.
+  //   A resync's new markers do count.
+  import type { Item } from '../generated/view'
+
+  /** Marker kinds that say the host is back. */
+  const BACK: ReadonlySet<string> = new Set(['host_back', 'host_restarted', 'resumed'])
+
+  /** What says the host is away. */
+  export interface HostAwayInput {
+    /** The session's `presumed_parked`. */
+    presumedParked: boolean
+    /** `connected` from the view's hosts list; undefined while not known. */
+    seed: boolean | undefined
+    /** The session's items. */
+    items: readonly Item[]
+    /** Markers at or before this time (ms) are history the seed says. */
+    since: number
+  }
+
+  /** The newest `ts` in `items`, in ms; `-Infinity` when none parses. */
+  export function newestTs(items: readonly Item[]): number {
+    let newest = -Infinity
+    for (const item of items) {
+      const at = Date.parse(item.ts)
+      if (at > newest) newest = at
+    }
+    return newest
+  }
+
+  /** Whether the host is away: see the rules above. */
+  export function hostAway({ presumedParked, seed, items, since }: HostAwayInput): boolean {
+    if (presumedParked) return true
+    let newest: { at: number; away: boolean } | undefined
+    for (const item of items) {
+      if (item.kind !== 'marker') continue
+      const away = item.marker === 'host_offline'
+      if (!away && !BACK.has(item.marker)) continue
+      const at = Date.parse(item.ts)
+      if (Number.isNaN(at) || at <= since) continue
+      if (newest === undefined || at >= newest.at) newest = { at, away }
+    }
+    return newest !== undefined ? newest.away : seed === false
+  }
+  ```
+
+Create `web/src/lib/projects.ts`:
+
+  ```ts
+  // The New Session project picker's list (frontend spec §7): the host's
+  // recent projects and its enumerated repositories, merged, labelled and
+  // ranked against what the operator types.
+  import type { HostProjects } from '../generated/protocol'
+  import { basename } from './time'
+
+  /** One selectable project: a directory on the host. */
+  export interface ProjectEntry {
+    /** The directory's name, or `parent/name` when another entry shares it. */
+    name: string
+    /** Absolute and canonical, as the host reported it. */
+    path: string
+    /** RFC 3339, for a recent project. */
+    lastUsed?: string
+  }
+
+  function segments(p: string): string[] {
+    return p.split('/').filter(Boolean)
+  }
+
+  /** `parent/name`: the label for names that collide. */
+  function qualified(p: string): string {
+    const parts = segments(p)
+    return parts.length >= 2 ? parts[parts.length - 2] + '/' + parts[parts.length - 1] : basename(p)
+  }
+
+  /** Every entry whose name another entry shares is labelled `parent/name`,
+   *  both sides of the collision, so no two rows read the same. */
+  export function disambiguate(entries: ProjectEntry[]): ProjectEntry[] {
+    const counts = new Map<string, number>()
+    for (const e of entries) counts.set(e.name, (counts.get(e.name) ?? 0) + 1)
+    return entries.map((e) => ((counts.get(e.name) ?? 0) > 1 ? { ...e, name: qualified(e.path) } : e))
+  }
+
+  /** Recents first, in the server's order (newest first), then the
+   *  enumerated repositories alphabetically. A path that is both appears
+   *  once, as the recent. */
+  export function mergeProjects(recents: ProjectEntry[], enumerated: ProjectEntry[]): ProjectEntry[] {
+    const seen = new Set(recents.map((r) => r.path))
+    const rest = enumerated.filter((e) => !seen.has(e.path)).sort((a, b) => a.name.localeCompare(b.name))
+    return disambiguate([...recents, ...rest])
+  }
+
+  /** The picker's entries for one host's `GET /api/hosts/{id}/projects`. */
+  export function projectEntries(projects: HostProjects): ProjectEntry[] {
+    return mergeProjects(
+      projects.recents.map((r) => ({ name: basename(r.path), path: r.path, lastUsed: r.last_used_at })),
+      projects.items.map((p) => ({ name: basename(p.path), path: p.path })),
+    )
+  }
+
+  /** Every character of `q` appears in `s`, in order. */
+  function subsequence(s: string, q: string): boolean {
+    let i = 0
+    for (let k = 0; k < s.length && i < q.length; k++) if (s[k] === q[i]) i++
+    return i === q.length
+  }
+
+  /** Filtered and ranked by how directly the name matches: exact, prefix,
+   *  substring, subsequence; case-insensitive. Non-matches are dropped. The
+   *  sort is stable, so recency order survives within a rank. */
+  export function filterProjects(entries: ProjectEntry[], query: string): ProjectEntry[] {
+    const q = query.trim().toLowerCase()
+    if (q === '') return entries
+    const scored: { entry: ProjectEntry; rank: number }[] = []
+    for (const entry of entries) {
+      const name = entry.name.toLowerCase()
+      let rank: number
+      if (name === q) rank = 0
+      else if (name.startsWith(q)) rank = 1
+      else if (name.includes(q)) rank = 2
+      else if (subsequence(name, q)) rank = 3
+      else continue
+      scored.push({ entry, rank })
+    }
+    return scored.sort((a, b) => a.rank - b.rank).map((x) => x.entry)
+  }
+
+  /** Text meant as a path, not a search: it starts with `/` or `~` (the
+   *  host expands `~` to its user's home). */
+  export function isLiteralPath(text: string): boolean {
+    return text.startsWith('/') || text.startsWith('~')
+  }
+
+  /** A subdirectory's path under a listed directory. */
+  export function childPath(dir: string, name: string): string {
+    return dir.endsWith('/') ? dir + name : dir + '/' + name
+  }
+  ```
+
+Create `web/src/lib/start.ts`:
+
+  ```ts
+  // Starting a session (frontend spec §7, ACP core §9 `POST /api/sessions`):
+  // what a refused start says, and how the New Session screen hands the
+  // session view a notice about a start or a first prompt that did not
+  // fully go through.
+  import { ApiFailure, messageOf } from '../api/errors'
+
+  /** A refused `POST /api/sessions`, in words. Nothing was started, except
+   *  for a 503 `delivery_unknown` with a `session_id`, which the caller
+   *  handles before this. */
+  export function startRefusal(err: unknown): string {
+    if (!(err instanceof ApiFailure)) return messageOf(err)
+    switch (err.code) {
+      case 'hat_ambiguous':
+        return `${err.message} (${err.serverMessage})`
+      case 'host_offline':
+        // The server's words: on a host that never connected they say that
+        // its first start installs its agents first.
+        return err.serverMessage
+      case 'invalid_cwd':
+        // The server's words name the path: `"<path>" is not a directory on that host`.
+        return err.serverMessage
+      case 'unknown_host':
+        return 'That host is no longer paired. Pick another host.'
+      case 'delivery_unknown':
+        return 'The host went away while the session was starting; its outcome is not known.'
+    }
+    if (err.status === 502) return `The host refused to start the session (${err.code}): ${err.serverMessage}`
+    return err.message
+  }
+
+  /** Why the session view opens with a notice:
+   *  - `start_unknown`: the start's delivery is unknown (503 with
+   *    `session_id`); the session exists and may still start; `kept`: a first
+   *    prompt was typed, and waits as the session's draft;
+   *  - `prompt_failed`: the session started, but the first prompt was
+   *    refused (its code travels as `code`). */
+  export type StartNotice = { kind: 'start_unknown'; kept: boolean } | { kind: 'prompt_failed'; code: string; message: string }
+
+  /** `/sessions/<id>`, with the notice as a query flag.
+   *
+   *  The flag is a query string, not history state, so it needs nothing
+   *  from the router: `?notice=start_unknown` (`start_unknown_draft` when a
+   *  first prompt was kept), or `?notice=prompt_failed&code=<code>`. The session view reads it with
+   *  `readStartNotice(search)` and then drops it with
+   *  `navigate(pathname, {replace: true})`, so a reload does not show it
+   *  again. Only a code travels, never a server's message: the reader
+   *  words it. */
+  export function sessionHref(
+    id: string,
+    notice?: { kind: 'start_unknown'; kept: boolean } | { kind: 'prompt_failed'; code: string },
+  ): string {
+    const path = `/sessions/${encodeURIComponent(id)}`
+    if (!notice) return path
+    const query = new URLSearchParams({ notice: notice.kind === 'start_unknown' && notice.kept ? 'start_unknown_draft' : notice.kind })
+    if (notice.kind === 'prompt_failed') query.set('code', notice.code)
+    return `${path}?${query.toString()}`
+  }
+
+  /** What a refused first prompt says, by its code. */
+  const PROMPT_REFUSED: Record<string, string> = {
+    host_offline: 'The host went offline before the first prompt reached it; send it again once it is back.',
+    not_attached: 'The session was no longer running when the first prompt arrived; resume it and send it again.',
+    turn_in_progress: 'A turn was already running; send the first prompt again once it ends.',
+    delivery_unknown: 'Delivery of the first prompt is unknown: the outcome shows when the host reconnects.',
+    content_too_large: 'The first prompt was too large to send.',
+    body_too_large: 'The first prompt was too large to send.',
+    empty_prompt: 'The first prompt was empty.',
+  }
+
+  /** What an error code looks like. */
+  const CODE = /^[a-z0-9_]{1,64}$/
+
+  /** The notice `search` (a `?…` query) carries, if any. */
+  export function readStartNotice(search: string): StartNotice | null {
+    const query = new URLSearchParams(search)
+    const kind = query.get('notice')
+    if (kind === 'start_unknown') return { kind, kept: false }
+    if (kind === 'start_unknown_draft') return { kind: 'start_unknown', kept: true }
+    if (kind === 'prompt_failed') {
+      // A link is anyone's to write: only a code's shape is shown, never
+      // free text, and only the table's own keys pick a wording.
+      const given = query.get('code') ?? ''
+      const code = CODE.test(given) ? given : 'unknown'
+      const message = Object.hasOwn(PROMPT_REFUSED, code) ? PROMPT_REFUSED[code] : `The first prompt was not sent (${code}).`
+      return { kind, code, message }
+    }
+    return null
+  }
+
+  /** A notice in words, for the session view. */
+  export function startNoticeText(notice: StartNotice): string {
+    if (notice.kind === 'start_unknown') {
+      const started = 'The host went away while this session was starting: it may still start, and shows here when the host reconnects.'
+      return notice.kept ? `${started} A first prompt was not sent: it waits as this session’s draft.` : started
+    }
+    return `${notice.message} It waits as this session’s draft.`
+  }
+  ```
+
+Create `web/src/screens/NewSession.tsx`:
+
+  ```tsx
+  // New session (frontend spec §7): a host, an agent, a project, the hat the
+  // project resolves to, an optional first prompt, then Start.
+  //
+  // - Hosts: connected ones first; offline ones listed but disabled; revoked
+  //   ones never offered.
+  // - Changing the host resets the agent, the path and the browser (in the
+  //   click handler, never in an effect, so a prefilled path survives the
+  //   prefilled host being chosen on load).
+  // - `/new?host=<id>&cwd=<path>` prefills both ("Start a new session in this
+  //   project"). A prefilled host that cannot be used is not replaced by
+  //   another in silence: a notice says why.
+  // - Start: `POST /api/sessions`, then the first prompt as its own
+  //   `POST …/prompt` (the server takes no first prompt with a start yet),
+  //   then `/sessions/<id>`. A first prompt that does not go through, or a
+  //   start whose delivery is unknown, still goes to the session, with a
+  //   notice (lib/start.ts) and the prompt kept as that session's draft.
+  import { useEffect, useId, useMemo, useRef, useState, type FormEvent } from 'react'
+  import { ApiFailure, messageOf } from '../api/errors'
+  import { useClient } from '../app-client'
+  import ProjectPicker from '../components/ProjectPicker'
+  import type {
+    HatItem,
+    HatResolution,
+    HostItem,
+    HostProjects,
+    StartSessionRequest,
+    StartSessionResponse,
+  } from '../generated/protocol'
+  import { agentLabel } from '../lib/agent'
+  import { agentOptions, agentsFor, type HostAgentChoices } from '../lib/agents'
+  import { saveDraft } from '../lib/drafts'
+  import { projectEntries } from '../lib/projects'
+  import { sessionHref, startRefusal } from '../lib/start'
+  import { Icon } from '../lib/ui'
+  import { Link, navigate, useLocation } from '../router'
+
+  /** How long the path must stay unchanged before its hat is resolved. */
+  export const RESOLVE_DEBOUNCE_MS = 300
+
+  /** The other agent choice: a name typed by hand. */
+  const OTHER = '\u0000other'
+
+  /** Hosts to offer: never a revoked one; connected first, each group in the
+   *  server's order. */
+  export function offeredHosts(hosts: HostItem[]): HostItem[] {
+    const live = hosts.filter((h) => h.revoked_at == null)
+    return [...live.filter((h) => h.connected), ...live.filter((h) => !h.connected)]
+  }
+
+  type Resolved =
+    | { state: 'idle' }
+    | { state: 'pending' }
+    | { state: 'ok'; resolution: HatResolution }
+    | { state: 'failed'; error: string }
+
+  function readPrefill(search: string): { host?: string; cwd?: string } {
+    const query = new URLSearchParams(search)
+    return { host: query.get('host') ?? undefined, cwd: query.get('cwd') ?? undefined }
+  }
+
+  export default function NewSession() {
+    const client = useClient()
+    const { search } = useLocation()
+    // Read once: the form owns its fields after that.
+    const [prefill] = useState(() => readPrefill(search))
+    const ids = { host: useId(), agent: useId(), project: useId(), prompt: useId() }
+
+    const [hosts, setHosts] = useState<HostItem[] | null>(null)
+    const [hostsError, setHostsError] = useState<string | null>(null)
+    const [hostId, setHostId] = useState('')
+    const [notice, setNotice] = useState<string | null>(null)
+
+    const [choices, setChoices] = useState<HostAgentChoices | null>(null)
+    const [agent, setAgent] = useState('')
+    const [otherName, setOtherName] = useState('')
+
+    const [projects, setProjects] = useState<HostProjects | null>(null)
+    const [projectsError, setProjectsError] = useState<string | null>(null)
+    /** The canonical path whose hat the recents are asked for, once it
+     *  differs from the one they came for. */
+    const [recentsFor, setRecentsFor] = useState<string | null>(null)
+    const [cwd, setCwd] = useState('')
+    const [initialText, setInitialText] = useState('')
+
+    const [hats, setHats] = useState<HatItem[]>([])
+    const [resolved, setResolved] = useState<Resolved>({ state: 'idle' })
+
+    const [prompt, setPrompt] = useState('')
+    const [busy, setBusy] = useState(false)
+    const busyRef = useRef(false)
+    const [error, setError] = useState<string | null>(null)
+
+    // The hosts, once, and the prefilled (or first connected) host.
+    useEffect(() => {
+      let live = true
+      client.request<HostItem[]>('GET', '/api/hosts').then(
+        (all) => {
+          if (!live) return
+          const offered = offeredHosts(all)
+          setHosts(offered)
+          if (prefill.host !== undefined) {
+            const wanted = offered.find((h) => h.host_id === prefill.host)
+            if (wanted?.connected) {
+              setHostId(wanted.host_id)
+              if (prefill.cwd) {
+                setCwd(prefill.cwd)
+                setInitialText(prefill.cwd)
+              }
+              return
+            }
+            setNotice(
+              wanted
+                ? `${wanted.name} is offline, so the session cannot start there: pick another host.`
+                : 'The host this link names is not paired any more: pick another host.',
+            )
+            return
+          }
+          const first = offered.find((h) => h.connected)
+          if (first) setHostId(first.host_id)
+        },
+        (err) => live && setHostsError(messageOf(err)),
+      )
+      return () => {
+        live = false
+      }
+    }, [client, prefill])
+
+    // The hats, for names.
+    useEffect(() => {
+      let live = true
+      client.request<HatItem[]>('GET', '/api/hats').then(
+        (all) => live && setHats(all),
+        () => {
+          // Without names the preview shows the hat's id.
+        },
+      )
+      return () => {
+        live = false
+      }
+    }, [client])
+    const hatName = (id: string) => hats.find((h) => h.id === id)?.name ?? id
+
+    // The host's agents, the first usable one picked. A host change resets
+    // the agent first (`chooseHost`), so no pick of another host is kept.
+    useEffect(() => {
+      if (!hostId) return
+      let live = true
+      setChoices(null)
+      agentsFor(client, hostId).then(
+        (got) => {
+          if (!live) return
+          setChoices(got)
+          const usable = agentOptions(got.agents).filter((o) => o.disabled === undefined)
+          setAgent((current) => (current !== '' ? current : (usable[0]?.agent ?? (got.other ? OTHER : ''))))
+        },
+        (err) => live && setError(messageOf(err)),
+      )
+      return () => {
+        live = false
+      }
+    }, [client, hostId])
+
+    // The host's projects: the recents of the hat the chosen path resolves to
+    // (the host's default hat until one is resolved), and its repositories.
+    useEffect(() => {
+      if (!hostId) return
+      let live = true
+      setProjectsError(null)
+      const path = `/api/hosts/${encodeURIComponent(hostId)}/projects`
+      client
+        .request<HostProjects>('GET', recentsFor === null ? path : `${path}?path=${encodeURIComponent(recentsFor)}`)
+        .then(
+          (got) => live && setProjects(got),
+          (err) => live && setProjectsError(messageOf(err)),
+        )
+      return () => {
+        live = false
+      }
+    }, [client, hostId, recentsFor])
+
+    // The hat the path resolves to, once the path has rested a moment. An
+    // answer for a path or host no longer chosen is dropped.
+    useEffect(() => {
+      if (!hostId || cwd.trim() === '') {
+        setResolved({ state: 'idle' })
+        return
+      }
+      let live = true
+      const abort = new AbortController()
+      setResolved({ state: 'pending' })
+      const timer = setTimeout(() => {
+        client
+          .request<HatResolution>('POST', '/api/hats/resolve', { host_id: hostId, path: cwd.trim() }, { signal: abort.signal })
+          .then(
+            (resolution) => live && setResolved({ state: 'ok', resolution }),
+            (err) => live && setResolved({ state: 'failed', error: startRefusal(err) }),
+          )
+      }, RESOLVE_DEBOUNCE_MS)
+      return () => {
+        live = false
+        clearTimeout(timer)
+        abort.abort()
+      }
+    }, [client, hostId, cwd])
+
+    // Recents for the resolved hat, when the list holds another hat's.
+    useEffect(() => {
+      if (resolved.state !== 'ok' || !projects) return
+      if (resolved.resolution.hat_id !== projects.recents_hat_id) setRecentsFor(resolved.resolution.canonical)
+    }, [resolved, projects])
+
+    const entries = useMemo(() => (projects ? projectEntries(projects) : []), [projects])
+    const host = hosts?.find((h) => h.host_id === hostId)
+    const browseRoot = projects?.home ?? host?.workspace_roots[0]
+
+    function chooseHost(id: string) {
+      if (id === hostId) return
+      setHostId(id)
+      // A path, an agent and a listing of one host mean nothing on another.
+      setAgent('')
+      setOtherName('')
+      setCwd('')
+      setInitialText('')
+      setProjects(null)
+      setRecentsFor(null)
+      setNotice(null)
+      setError(null)
+    }
+
+    const agentName = agent === OTHER ? otherName.trim() : agent
+    const canStart = !busy && host?.connected === true && agentName !== '' && cwd.trim() !== ''
+
+    async function start(e: FormEvent) {
+      e.preventDefault()
+      if (!canStart || busyRef.current) return
+      busyRef.current = true
+      setBusy(true)
+      setError(null)
+      const request: StartSessionRequest = { host_id: hostId, agent: agentName, cwd: cwd.trim() }
+      let sessionId: string
+      try {
+        sessionId = (await client.request<StartSessionResponse>('POST', '/api/sessions', request)).session_id
+      } catch (err) {
+        if (err instanceof ApiFailure && err.code === 'delivery_unknown' && err.sessionId) {
+          navigate(sessionHref(err.sessionId, { kind: 'start_unknown', kept: keepDraft(err.sessionId, prompt) }))
+          return
+        }
+        busyRef.current = false
+        setBusy(false)
+        setError(startRefusal(err))
+        return
+      }
+      // Images are not part of the first prompt yet: the composer's image
+      // rules (Task 6) take them once it is shared with this form.
+      if (prompt.trim() !== '') {
+        try {
+          await client.request('POST', `/api/sessions/${encodeURIComponent(sessionId)}/prompt`, {
+            content: [{ type: 'text', text: prompt }],
+          })
+        } catch (err) {
+          keepDraft(sessionId, prompt)
+          const code = err instanceof ApiFailure ? err.code : 'unknown'
+          navigate(sessionHref(sessionId, { kind: 'prompt_failed', code }))
+          return
+        }
+      }
+      navigate(sessionHref(sessionId))
+    }
+
+    const options = choices ? agentOptions(choices.agents) : []
+
+    return (
+      <form className="new-session" onSubmit={start} aria-labelledby="new-session-title">
+        <div className="modal-head">
+          <div className="modal-eyebrow">Start a session</div>
+          <h1 className="modal-title" id="new-session-title">
+            New session
+          </h1>
+        </div>
+        <div className="modal-body">
+          {notice !== null && (
+            <p className="hint" role="status">
+              <bdi>{notice}</bdi>
+            </p>
+          )}
+
+          <div className="field" role="group" aria-labelledby={ids.host}>
+            <div className="field-label" id={ids.host}>
+              <Icon.Terminal size={16} /> Host <span className="hint">where the agent runs</span>
+            </div>
+            {hostsError !== null ? (
+              <p className="form-error" role="alert">
+                <bdi>{hostsError}</bdi>
+              </p>
+            ) : hosts === null ? (
+              <p className="hint">Loading…</p>
+            ) : hosts.length === 0 ? (
+              <p className="hint">
+                No host is paired yet. <Link to="/hosts">Pair one</Link>.
+              </p>
+            ) : (
+              <div className="seg">
+                {hosts.map((h) => (
+                  <button
+                    key={h.host_id}
+                    type="button"
+                    className={'seg-item' + (hostId === h.host_id ? ' sel' : '')}
+                    aria-pressed={hostId === h.host_id}
+                    disabled={!h.connected}
+                    title={h.connected ? undefined : 'Offline'}
+                    onClick={() => chooseHost(h.host_id)}
+                  >
+                    <span className={'seg-led ' + (h.connected ? 'led-run' : 'led-idle')} />
+                    <span>
+                      <span className="seg-name">
+                        <bdi>{h.name}</bdi>
+                      </span>
+                      {!h.connected && <span className="seg-host"> offline</span>}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {hostId !== '' && (
+            <>
+              <div className="field" role="group" aria-labelledby={ids.agent}>
+                <div className="field-label" id={ids.agent}>
+                  <Icon.Cpu size={16} /> Agent
+                </div>
+                {choices === null ? (
+                  <p className="hint">Loading…</p>
+                ) : (
+                  <div className="seg">
+                    {options.map((o) => (
+                      <button
+                        key={o.agent}
+                        type="button"
+                        className={'seg-item' + (agent === o.agent ? ' sel' : '')}
+                        aria-pressed={agent === o.agent}
+                        disabled={o.disabled !== undefined}
+                        title={o.disabled}
+                        onClick={() => setAgent(o.agent)}
+                      >
+                        <span className="seg-name">
+                          <bdi>{o.label}</bdi>
+                        </span>
+                        {o.disabled !== undefined && (
+                          <span className="seg-host">
+                            <bdi>{o.disabled}</bdi>
+                          </span>
+                        )}
+                      </button>
+                    ))}
+                    {choices.other && (
+                      <button
+                        type="button"
+                        className={'seg-item' + (agent === OTHER ? ' sel' : '')}
+                        aria-pressed={agent === OTHER}
+                        onClick={() => setAgent(OTHER)}
+                      >
+                        <span className="seg-name">Other…</span>
+                      </button>
+                    )}
+                  </div>
+                )}
+                {agent === OTHER && (
+                  <div className="path-input">
+                    <input
+                      aria-label="Agent name"
+                      value={otherName}
+                      onChange={(e) => setOtherName(e.target.value)}
+                      placeholder="The agent's name on the host"
+                      spellCheck={false}
+                    />
+                  </div>
+                )}
+              </div>
+
+              <div className="field">
+                <div className="field-label" id={ids.project}>
+                  <Icon.Folder size={16} /> Project <span className="hint">type a name, or a path</span>
+                </div>
+                <ProjectPicker
+                  key={hostId}
+                  hostId={hostId}
+                  entries={entries}
+                  browseRoot={browseRoot}
+                  initialText={initialText}
+                  onChange={setCwd}
+                  labelledBy={ids.project}
+                />
+                {projects !== null && projects.recents.length > 0 && (
+                  <div className="picker-path">
+                    Recent projects of the hat <bdi>{hatName(projects.recents_hat_id)}</bdi>
+                  </div>
+                )}
+                {projects?.partial && <div className="picker-path">The host listed only some of its repositories.</div>}
+                {projectsError !== null && (
+                  <div className="picker-path" role="alert">
+                    Projects could not be listed: <bdi>{projectsError}</bdi> You can still type a path.
+                  </div>
+                )}
+                <HatPreview resolved={resolved} hatName={hatName} />
+              </div>
+
+              <div className="field">
+                <label className="field-label" htmlFor={ids.prompt}>
+                  <Icon.Sparkle size={16} /> First prompt <span className="hint">optional</span>
+                </label>
+                <div className="prompt-box">
+                  <textarea
+                    id={ids.prompt}
+                    value={prompt}
+                    onChange={(e) => setPrompt(e.target.value)}
+                    placeholder={`What should ${agentName && agent !== OTHER ? agentLabel(agentName) : 'the agent'} work on?`}
+                  />
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+        <div className="modal-foot">
+          {error !== null && (
+            <p className="form-error" role="alert">
+              <bdi>{error}</bdi>
+            </p>
+          )}
+          <div className="spacer" />
+          <button type="submit" className="btn btn-primary" disabled={!canStart}>
+            <Icon.Bolt size={16} /> {busy ? 'Starting…' : 'Start session'}
+          </button>
+        </div>
+      </form>
+    )
+  }
+
+  /** Where the session will land: its hat, before it starts. */
+  function HatPreview({ resolved, hatName }: { resolved: Resolved; hatName: (id: string) => string }) {
+    if (resolved.state === 'idle') return null
+    if (resolved.state === 'pending') {
+      return (
+        <p className="picker-path" role="status">
+          Finding the hat…
+        </p>
+      )
+    }
+    if (resolved.state === 'failed') {
+      return (
+        <p className="form-error" role="alert">
+          <bdi>{resolved.error}</bdi>
+        </p>
+      )
+    }
+    const { resolution } = resolved
+    return (
+      <p className="picker-path" role="status">
+        Starts in the hat <b><bdi>{hatName(resolution.hat_id)}</bdi></b> at <bdi>{resolution.canonical}</bdi>
+        {!resolution.exists ? ': this directory does not exist yet' : !resolution.is_dir ? ': this is not a directory' : ''}
+      </p>
+    )
+  }
+
+  /** A prompt that was not sent becomes the session's draft: the composer
+   *  opens with it (lib/drafts.ts, the composer's own store). Whether there
+   *  was one to keep; storage refused, the notice still says it was not sent. */
+  function keepDraft(sessionId: string, prompt: string): boolean {
+    if (prompt.trim() === '') return false
+    saveDraft(sessionId, prompt)
+    return true
+  }
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+  //   waiting on is answered as a new message; neither sends on its own.
+  // - A deleted session says so, nothing more is fetched, and its draft and
+  ```
+
+with:
+
+  ```tsx
+  //   waiting on is answered as a new message; neither sends on its own.
+  // - A session the New Session screen opened with a notice (its start's
+  //   delivery unknown, or its first prompt refused: lib/start.ts) shows it
+  //   above the composer. The notice is read from the link once, then dropped
+  //   from the address, so a reload does not show it again.
+  // - A deleted session says so, nothing more is fetched, and its draft and
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+  import { Icon } from '../lib/ui'
+  import { Link } from '../router'
+  ```
+
+with:
+
+  ```tsx
+  import { readStartNotice, startNoticeText } from '../lib/start'
+  import { Icon } from '../lib/ui'
+  import { Link, navigate, useLocation } from '../router'
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+
+  /** Where the transcript's window starts: the pinned item's index, or the
+  ```
+
+with:
+
+  ```tsx
+
+  /** The notice a start left in the link to session `id`, in words: shown
+   *  while the view shows that session, the link cleaned at once (replacing
+   *  the history entry) so a reload does not show it again. */
+  function useStartNotice(id: string): string | null {
+    const { pathname, search } = useLocation()
+    const fromLink = useMemo(() => {
+      const notice = readStartNotice(search)
+      return notice ? startNoticeText(notice) : null
+    }, [search])
+    const [held, setHeld] = useState<{ id: string; text: string } | null>(null)
+    useEffect(() => {
+      if (fromLink === null) return
+      setHeld({ id, text: fromLink })
+      navigate(pathname, { replace: true })
+    }, [fromLink, id, pathname])
+    return fromLink ?? (held && held.id === id ? held.text : null)
+  }
+
+  /** Where the transcript's window starts: the pinned item's index, or the
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+    const answers = useAnswering(id, info, s.items, s.loading, connectedOf(hostItems, info?.host_id))
+  ```
+
+with:
+
+  ```tsx
+    const startNotice = useStartNotice(id)
+    const answers = useAnswering(id, info, s.items, s.loading, s.loads, connectedOf(hostItems, info?.host_id))
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+        </Scroller>
+        <Composer
+  ```
+
+with:
+
+  ```tsx
+        </Scroller>
+        {startNotice && (
+          <p className="start-notice" role="status">
+            {startNotice}
+          </p>
+        )}
+        <Composer
+  ```
+
+In `web/src/store/useAnswer.ts`, replace:
+
+  ```ts
+  // - Whether the host is away: the session is presumed parked, or its host
+  //   is not connected (the view's one `GET /api/hosts`, read when it opens).
+  ```
+
+with:
+
+  ```ts
+  // - Whether the host is away (lib/hostAway.ts): the session is presumed
+  //   parked; else the newest host marker since the first page; else the
+  //   view's one `GET /api/hosts`, read when it opens. No event fetches.
+  ```
+
+In `web/src/store/useAnswer.ts`, replace:
+
+  ```ts
+  import { useEffect, useLayoutEffect, useMemo, useSyncExternalStore } from 'react'
+  ```
+
+with:
+
+  ```ts
+  import { useLayoutEffect, useMemo, useSyncExternalStore } from 'react'
+  ```
+
+In `web/src/store/useAnswer.ts`, replace:
+
+  ```ts
+  import { freshQuestions, type LocalAnswer } from '../lib/delivery'
+  import type { Draft } from '../lib/elicitation'
+  ```
+
+with:
+
+  ```ts
+  import { freshQuestions, type LocalAnswer } from '../lib/delivery'
+  import { hostAway, newestTs } from '../lib/hostAway'
+  import type { Draft } from '../lib/elicitation'
+  ```
+
+In `web/src/store/useAnswer.ts`, replace:
+
+  ```ts
+    private lastId: string | undefined
+    private readonly fresh = new Set<string>()
+  ```
+
+with:
+
+  ```ts
+    private lastId: string | undefined
+    private loads: number | undefined
+    private since: number | undefined
+    private readonly fresh = new Set<string>()
+  ```
+
+In `web/src/store/useAnswer.ts`, replace:
+
+  ```ts
+
+    setHostAway(away: boolean) {
+  ```
+
+with:
+
+  ```ts
+
+    /** The newest time the first page held (ms), once it is observed. */
+    get baseline(): number | undefined {
+      return this.since
+    }
+
+    setHostAway(away: boolean) {
+  ```
+
+In `web/src/store/useAnswer.ts`, replace:
+
+  ```ts
+     *  questions that opened at the tail since the last look are fresh. */
+    observe(items: readonly Item[]) {
+      for (const id of freshQuestions(items, this.known, this.lastId)) this.fresh.add(id)
+      const known = this.known ?? new Set<string>()
+      for (const item of items) if (item.kind === 'question') known.add(item.id)
+      this.known = known
+  ```
+
+with:
+
+  ```ts
+     *  questions that opened at the tail since the last look are fresh.
+     *  `loads` counts the pages that replaced the items (the first, and each
+     *  resync's): a new one is a new baseline, so a question that came with a
+     *  resync is never fresh, wherever it sits. */
+    observe(items: readonly Item[], loads: number) {
+      // The first page's newest time, once: host markers after it count.
+      if (this.since === undefined) this.since = newestTs(items)
+      const known = loads === this.loads ? this.known : null
+      this.loads = loads
+      for (const id of freshQuestions(items, known, this.lastId)) this.fresh.add(id)
+      const held = known ?? new Set<string>()
+      for (const item of items) if (item.kind === 'question') held.add(item.id)
+      this.known = held
+  ```
+
+In `web/src/store/useAnswer.ts`, replace:
+
+  ```ts
+   *  page is in, and told whether the host is away. `connected`: what the
+   *  view's hosts list says of the session's host (undefined: unknown). */
+  ```
+
+with:
+
+  ```ts
+   *  page is in, and told whether the host is away. `loads`: the item store's
+   *  count of pages that replaced the items (a resync's included).
+   *  `connected`: what the view's hosts list said of the session's host when
+   *  it opened (undefined: unknown), the seed the host markers since then
+   *  overrule. */
+  ```
+
+In `web/src/store/useAnswer.ts`, replace:
+
+  ```ts
+    loading: boolean,
+    connected: boolean | undefined,
+  ```
+
+with:
+
+  ```ts
+    loading: boolean,
+    loads: number,
+    connected: boolean | undefined,
+  ```
+
+In `web/src/store/useAnswer.ts`, replace:
+
+  ```ts
+      if (!loading) book.observe(items)
+    }, [book, items, loading])
+    const away = Boolean(info?.presumed_parked) || connected === false
+    useEffect(() => book.setHostAway(away), [book, away])
+  ```
+
+with:
+
+  ```ts
+      if (!loading) book.observe(items, loads)
+    }, [book, items, loading, loads])
+    // After `observe`: the first page's time is known before its markers
+    // are read (before it, the store holds no items).
+    const presumedParked = Boolean(info?.presumed_parked)
+    useLayoutEffect(() => {
+      book.setHostAway(hostAway({ presumedParked, seed: connected, items, since: book.baseline ?? -Infinity }))
+    }, [book, items, loading, presumedParked, connected])
+  ```
+
+- [ ] **Step 4: Run the checks**
+
+Run: `nix develop -c sh -c 'cd web && pnpm typecheck && pnpm test && pnpm build'`
+Expected: PASS, 1209 tests (1093 before).
+
+- [ ] **Step 5: Revert-probes** (each must fail the test named; restore after each)
+
+81 probes, run by script, all fail as they should: 71 on the screen, 10 on the session view's side of it. One survivor of the first run was fixed: the exact-before-prefix rank could not be told apart, because `cat` sorted first in the input anyway; the fixture now holds a recent `cat-tools` ahead of `cat`, and every project probe was run again.
+- **Hosts** (6): a revoked host never offered, connected first, offline disabled, the first connected one picked, a prefilled host taken only when connected, and a notice when it is not.
+- **Agents** (13): only `available` ones (unit and screen); `missing` disabled with its note, or a default one; `unknown` allowed (unit and screen); one label function; the fallback asks the server nothing; images hidden only on `images: false`; disabled ones rendered so; "Other…" offered and the typed name sent.
+- **Projects** (13): exact, prefix, substring and subsequence ranks (unit and screen), stable within a rank, case-insensitive; colliding names as `parent/name`; recents first (unit and screen), deduplicated by path; a leading `/` or `~` is a path.
+- **The picker** (5): a search is no path until one is picked; a pick sends its path; browsing descends; "Use this directory"; a recent marked.
+- **Recents and the hat** (6): the recents' hat named; asked again for the resolved hat; the preview debounced, restarted by typing, naming the hat, and saying "does not exist yet".
+- **Start** (12): the session first, then the first prompt, none when empty; the session opened as the selection; a 503 with a session id opens it, keeps the prompt and says so, and one without an id stays; a refused first prompt kept, with its notice; a refusal shown; the form usable after it.
+- **Refusals** (6): `hat_ambiguous`, `host_offline`, `invalid_cwd`, `unknown_host`, a 502, and a 503 without a session.
+- **A host change** (3): the agent, the path and the picker reset.
+- **The client** (3): a refusal's `session_id` read, only when a string, and kept on the error.
+- **The notice** (13): a code's shape only, own keys only, the id encoded; shown above the composer, the link cleaned without a new history entry, none after a reload, kept after the clean, for this session only, the unknown start's words; the draft's key in one place, New Session keeps the prompt, the composer opens with it.
+- **The shell** (1): `/new` is the form.
+
+**The task reviews' fixes** (2026-10-03, all taken): 36 more probes, all failing as they should.
+- **New Session** (18): a host change resets the agent (the old "replaced, with a notice" branch could never run, and is gone); an unknown start's notice mentions a kept draft only when a prompt was kept (`?notice=start_unknown_draft`), in the link, the reader and the words; the project picker names its active option (`aria-activedescendant`, each option's id) and its list only while it shows; the first prompt's refusal wordings (`turn_in_progress`, `body_too_large`); the preview's "this is not a directory" and a refused resolve as an alert; "listed only some", "could not be listed", a failed browse and its reason, "not every directory is listed".
+- **A resync's question is never fresh** (2): the book takes a new baseline with every page that replaces the items, and the view passes it the count of those pages (Task 7's review, M-6).
+- **The host's absence follows the host** (16): presumed parked is away; else the newest host marker newer than the first page (`host_offline` away; `host_back`, `host_restarted` and `resumed` back; newest by time, a tie to the later item, a time that does not parse not read); else the seed from the view's one hosts request. The first page's newest time is taken once, so its markers and older pages are history; a resync's new markers count; the view follows `presumed_parked`, the items and the seed. One probe first passed (a seed that comes after the first page, the items unchanged): a test was added, and it fails as it should.
+
+Load: 4 parallel copies of the screen's, start's, agents', projects' and client's tests, 3 rounds: 12 of 12 green (102 tests each).
+
+**Re-run on the final code:** 71 of 71, and the view's 10 of 10, fail as they should.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add web/src
+git commit -m "feat(web): the New Session screen starts a session on a host and sends its first prompt"
+```
+
+---
+
+### Task 9: Footers and the header menu
+
+A session that is not running gets a footer under its composer: Resume, the start's spinner, or why it failed. The header gets a menu: Park, Close and "Delete session" (decisions 35, 36).
+
+**Files:**
+- Create: `web/src/components/SessionFooter.tsx`, `SessionMenu.tsx`, `sessionWords.ts`; `web/src/screens/Session.footer.test.tsx`, `Session.menu.test.tsx`.
+- Modify: `web/src/screens/Session.tsx` (the footer under the composer, keyed by the lifecycle; the menu in the header; what a delete left on the host; `onRemoved`), `web/src/components/SessionHeader.tsx` (the menu's place; the failure's reason in words), `web/src/components/Shell.tsx` (a session found gone leaves the list), `web/src/store/useSessionList.ts` (`remove`), `web/src/store/useSessionItems.ts` (`markRemoved`), `web/src/api/turns.ts` (park, close, delete), `web/src/components/items/Marker.tsx` (four more reasons a start failed), `web/src/lib/start.ts` (`newSessionHref`), `web/src/screens/NewSession.tsx` (prefilled from it), `web/src/router.tsx` (a `Link` takes a ref), `web/src/components/Composer.tsx` (`onResume` required: the view's one resume), `web/src/store/useAnswer.ts` (`useHostAway`, the footer's host note), `web/src/index.css` (the footer, the menu, 44 px on a phone); the tests of these, `web/src/components/Composer.test.tsx`, `SignOut.test.tsx` (a failed sign-out keeps the drafts and their images), `SessionLink.test.tsx`, `SessionList.test.tsx`, `web/src/screens/Session.answer.test.tsx` (the Delete dialog holds the focus), `Session.test.tsx` and `test-session.ts`.
+
+- [ ] **Step 1: Write the tests**
+
+Test files: `web/src/api/turns.test.ts`, `web/src/components/Composer.test.tsx`, `web/src/components/SessionLink.test.tsx`, `web/src/components/SessionList.test.tsx`, `web/src/components/SignOut.test.tsx`, `web/src/components/items/items.test.tsx`, `web/src/lib/start.test.ts`, `web/src/screens/NewSession.test.tsx`, `web/src/screens/Session.answer.test.tsx`, `web/src/screens/Session.footer.test.tsx`, `web/src/screens/Session.menu.test.tsx`, `web/src/screens/Session.test.tsx`, `web/src/screens/test-session.ts`, `web/src/store/useAnswer.test.ts`, `web/src/store/useSessionItems.test.ts`, `web/src/store/useSessionList.test.ts`.
+
+In `web/src/api/turns.test.ts`, replace:
+
+  ```ts
+  import { cancel, prompt, resume, setConfig } from './turns'
+  ```
+
+with:
+
+  ```ts
+  import { cancel, close, deleteSession, park, prompt, resume, setConfig } from './turns'
+  ```
+
+In `web/src/api/turns.test.ts`, replace:
+
+  ```ts
+    })
+  })
+  ```
+
+with:
+
+  ```ts
+    })
+
+    it('parks, closes and deletes a session, its id encoded', async () => {
+      const t = routed(() => json({ session_id: 'a/b?c', lifecycle: 'parked' }, 202))
+      await park(t.client, 'a/b?c')
+      await close(t.client, 'a/b?c')
+      await deleteSession(t.client, 'a/b?c')
+      expect(t.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+        'POST /api/sessions/a%2Fb%3Fc/park',
+        'POST /api/sessions/a%2Fb%3Fc/close',
+        'DELETE /api/sessions/a%2Fb%3Fc',
+      ])
+    })
+  })
+  ```
+
+In `web/src/components/Composer.test.tsx`, replace:
+
+  ```tsx
+  import { Client } from '../api/client'
+  import { ClientContext } from '../app-client'
+  ```
+
+with:
+
+  ```tsx
+  import { Client } from '../api/client'
+  import { resume } from '../api/turns'
+  import { ClientContext } from '../app-client'
+  ```
+
+In `web/src/components/Composer.test.tsx`, replace:
+
+  ```tsx
+      capabilities: ['images'],
+      ...props,
+  ```
+
+with:
+
+  ```tsx
+      capabilities: ['images'],
+      // As the view resumes: `POST …/resume`.
+      onResume: () => resume(client, 's1'),
+      ...props,
+  ```
+
+In `web/src/components/SessionLink.test.tsx`, replace:
+
+  ```tsx
+    const listStreams: LiveStream[] = []
+    const fetch = vi.fn(async (input: RequestInfo | URL) => {
+  ```
+
+with:
+
+  ```tsx
+    const listStreams: LiveStream[] = []
+    const itemStreams: LiveStream[] = []
+    const fetch = vi.fn(async (input: RequestInfo | URL) => {
+  ```
+
+In `web/src/components/SessionLink.test.tsx`, replace:
+
+  ```tsx
+      if (/^\/api\/stream\/view\/sessions\/[^/]+$/.test(path)) return liveStream().response
+  ```
+
+with:
+
+  ```tsx
+      if (/^\/api\/stream\/view\/sessions\/[^/]+$/.test(path)) {
+        const live = liveStream()
+        itemStreams.push(live)
+        return live.response
+      }
+  ```
+
+In `web/src/components/SessionLink.test.tsx`, replace:
+
+  ```tsx
+    return { fetch: fetch as unknown as typeof globalThis.fetch, calls, listStreams, of }
+  ```
+
+with:
+
+  ```tsx
+    return { fetch: fetch as unknown as typeof globalThis.fetch, calls, listStreams, itemStreams, of }
+  ```
+
+In `web/src/components/SessionLink.test.tsx`, replace:
+
+  ```tsx
+      // The view opened before the list's first page came: it waited for it.
+      expect(s.of('/api/sessions/a')).toHaveLength(0)
+    })
+
+  ```
+
+with:
+
+  ```tsx
+      // The view opened before the list's first page came: it waited for it.
+      expect(s.of('/api/sessions/a')).toHaveLength(0)
+    })
+
+    it('a session the view finds removed leaves the list at once', async () => {
+      at('/sessions/a')
+      const s = server()
+      render(<App fetchImpl={s.fetch} />)
+      await titled('Task a')
+      const list = await screen.findByRole('complementary', { name: 'Views' })
+      expect(within(list).getByText('Task a', { exact: true })).toBeInTheDocument()
+      await waitFor(() => expect(s.itemStreams).toHaveLength(1))
+      // The item stream says so; the list stream has not yet.
+      act(() => s.itemStreams[0].event('session_removed', { session_id: 'a' }))
+      expect(await within(main()).findByRole('heading', { name: 'This session was deleted' })).toBeInTheDocument()
+      await waitFor(() => expect(within(list).queryByText('Task a', { exact: true })).toBeNull())
+      expect(within(list).getByText('Task a-old', { exact: true })).toBeInTheDocument()
+    })
+
+  ```
+
+In `web/src/components/SessionList.test.tsx`, replace:
+
+  ```tsx
+        default:
+          return json({ code: 'not_found', message: 'no' }, 404)
+  ```
+
+with:
+
+  ```tsx
+        default: {
+          // A selected session's view: an empty transcript that stays open
+          // (a 404 there would mean the session is gone, and drop its row).
+          if (/^\/api\/view\/sessions\/[^/]+$/.test(url.pathname)) return json({ items: [], older: false, epoch: 'e1', revision: 1 })
+          if (url.pathname.startsWith('/api/stream/view/sessions/')) return liveStream().response
+          return json({ code: 'not_found', message: 'no' }, 404)
+        }
+  ```
+
+In `web/src/components/SignOut.test.tsx`, replace:
+
+  ```tsx
+  import { FULL, json, stubServer } from '../test-server'
+
+  afterEach(() => history.replaceState(null, '', '/'))
+  ```
+
+with:
+
+  ```tsx
+  import { forgetAllAttachments, heldFor, hold } from '../lib/attachments'
+  import { FULL, json, stubServer } from '../test-server'
+
+  afterEach(() => {
+    history.replaceState(null, '', '/')
+    forgetAllAttachments()
+    sessionStorage.clear()
+  })
+  ```
+
+In `web/src/components/SignOut.test.tsx`, replace:
+
+  ```tsx
+
+    it('stays when the request never reached the server', async () => {
+  ```
+
+with:
+
+  ```tsx
+
+    it('a failed sign-out keeps the images held for drafts: the browser is still signed in', async () => {
+      const image = { n: 1, file: new File(['x'], 'a.png', { type: 'image/png' }) }
+      hold('s1', { attachments: [image], nextN: 2 })
+      signedIn(json(403, { code: 'origin_mismatch', message: 'm' }))
+      await userEvent.click(await screen.findByRole('button', { name: 'Sign out' }))
+      await screen.findByRole('alert')
+      expect(heldFor('s1').attachments).toEqual([image])
+    })
+
+    it('a failed sign-out keeps every draft’s text: the browser is still signed in', async () => {
+      sessionStorage.setItem('hennery.draft.s1', 'half a thought')
+      sessionStorage.setItem('hennery.draft.s2', 'another')
+      signedIn(json(403, { code: 'origin_mismatch', message: 'm' }))
+      await userEvent.click(await screen.findByRole('button', { name: 'Sign out' }))
+      await screen.findByRole('alert')
+      expect(sessionStorage.getItem('hennery.draft.s1')).toBe('half a thought')
+      expect(sessionStorage.getItem('hennery.draft.s2')).toBe('another')
+    })
+
+    it('stays when the request never reached the server', async () => {
+  ```
+
+In `web/src/components/items/items.test.tsx`, replace:
+
+  ```tsx
+      ['start_failed', 'start_failed', 'the agent could not start'],
+      ['host_note', 'config_failed', 'a setting did not take'],
+  ```
+
+with:
+
+  ```tsx
+      ['start_failed', 'start_failed', 'the agent could not start'],
+      ['start_failed', 'start_not_delivered', 'the start never reached the host'],
+      ['start_failed', 'host_offline', 'the host went offline before it started'],
+      ['start_failed', 'host_revoked', 'the host was revoked'],
+      ['start_failed', 'unknown_agent', 'the host does not know this agent'],
+      ['host_note', 'config_failed', 'a setting did not take'],
+  ```
+
+In `web/src/lib/start.test.ts`, replace:
+
+  ```ts
+  import { readStartNotice, sessionHref, startNoticeText, startRefusal } from './start'
+  ```
+
+with:
+
+  ```ts
+  import { newSessionHref, readNewSessionPrefill, readStartNotice, sessionHref, startNoticeText, startRefusal } from './start'
+  ```
+
+In `web/src/lib/start.test.ts`, replace:
+
+  ```ts
+      expect(readStartNotice('?notice=other')).toBeNull()
+    })
+  })
+  ```
+
+with:
+
+  ```ts
+      expect(readStartNotice('?notice=other')).toBeNull()
+    })
+  })
+
+  describe('newSessionHref', () => {
+    it('names the host and the project, both encoded, and reads them back', () => {
+      const href = newSessionHref('h/1&x', '/srv/work/a b&cwd=x#y')
+      expect(href).toBe('/new?host=h%2F1%26x&cwd=%2Fsrv%2Fwork%2Fa+b%26cwd%3Dx%23y')
+      expect(readNewSessionPrefill(href.slice('/new'.length))).toEqual({ host: 'h/1&x', cwd: '/srv/work/a b&cwd=x#y' })
+    })
+
+    it('reads nothing a link does not name', () => {
+      expect(readNewSessionPrefill('')).toEqual({ host: undefined, cwd: undefined })
+    })
+  })
+  ```
+
+In `web/src/screens/NewSession.test.tsx`, replace:
+
+  ```tsx
+  import type { HostAgentChoices } from '../lib/agents'
+  import { navigate } from '../router'
+  ```
+
+with:
+
+  ```tsx
+  import type { HostAgentChoices } from '../lib/agents'
+  import { newSessionHref } from '../lib/start'
+  import { navigate } from '../router'
+  ```
+
+In `web/src/screens/NewSession.test.tsx`, replace:
+
+  ```tsx
+
+    it('prefills the host and the path from a link', async () => {
+  ```
+
+with:
+
+  ```tsx
+
+    it('prefills a link’s text that is not a path as a search: no path until a project is picked', async () => {
+      const server = mount({}, '/new?host=h1&cwd=cat')
+      await waitFor(() => expect(hostButton('laptop')).toHaveAttribute('aria-pressed', 'true'))
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Claude' })).toHaveAttribute('aria-pressed', 'true'))
+      expect(await projectField()).toHaveValue('cat')
+      expect(startButton()).toBeDisabled()
+      await new Promise((r) => setTimeout(r, RESOLVE_DEBOUNCE_MS + 50))
+      expect(server.sent.some((s) => s.path === '/api/hats/resolve')).toBe(false)
+    })
+
+    it('prefills the host and the path from a link', async () => {
+  ```
+
+In `web/src/screens/NewSession.test.tsx`, replace:
+
+  ```tsx
+      expect(await projectField()).toHaveValue('/srv/work/app')
+    })
+  ```
+
+with:
+
+  ```tsx
+      expect(await projectField()).toHaveValue('/srv/work/app')
+    })
+
+    it('prefills from the link a failed session offers, whatever its path holds', async () => {
+      mount({}, newSessionHref('h4', '/srv/work/a b&c=d#e?f+g%h'))
+      await waitFor(() => expect(hostButton('desk')).toHaveAttribute('aria-pressed', 'true'))
+      expect(await projectField()).toHaveValue('/srv/work/a b&c=d#e?f+g%h')
+    })
+  ```
+
+In `web/src/screens/Session.answer.test.tsx`, replace:
+
+  ```tsx
+
+    it('moves from a control in the transcript that takes no typing', async () => {
+  ```
+
+with:
+
+  ```tsx
+
+    it('leaves the focus in the Delete dialog over the page: no answer is sent while it is open', async () => {
+      // The page behind the dialog is not inert (as on Hosts and Hats): only
+      // the card's focus guard keeps a question opened behind it from taking
+      // the focus, and a digit from answering it.
+      const s = server([message('m1', 't1')])
+      await shown(s)
+      fireEvent.click(screen.getByRole('button', { name: 'Session actions' }))
+      fireEvent.click(screen.getByRole('button', { name: 'Delete session' }))
+      const dialog = await screen.findByRole('dialog', { name: 'Delete this session?' })
+      expect(dialog).toContainElement(document.activeElement as HTMLElement)
+      await open(s)
+      expect(dialog).toContainElement(document.activeElement as HTMLElement)
+      typeOne()
+      await settle(s)
+      expect(s.posted('/answer')).toEqual([])
+      expect(screen.getByRole('dialog', { name: 'Delete this session?' })).toBeInTheDocument()
+    })
+
+    it('moves from a control in the transcript that takes no typing', async () => {
+  ```
+
+Create `web/src/screens/Session.footer.test.tsx`:
+
+  ```tsx
+  import '@testing-library/jest-dom/vitest'
+  import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
+  import { beforeEach, describe, expect, it } from 'vitest'
+  import type { SessionDetail } from '../generated/protocol'
+  import { forgetAllAttachments } from '../lib/attachments'
+  import { forgetAllSends } from '../lib/sending'
+  import { json } from '../test-stream'
+  import SessionView from './Session'
+  import { FAST, sessionServer, type Opts } from './test-session'
+
+  const WAIT = { timeout: 5000 }
+
+  beforeEach(() => {
+    sessionStorage.clear()
+    forgetAllAttachments()
+    forgetAllSends()
+  })
+
+  /** The view of session `s1` as its detail says, on host `build-box`. */
+  async function show(detail: Partial<SessionDetail>, opts: Opts = {}) {
+    const s = sessionServer({ detail, ...opts })
+    const r = render(<SessionView id="s1" timing={FAST} />, { wrapper: s.wrapper })
+    // The header names the host once the hosts are in.
+    await waitFor(() => expect(screen.getByLabelText('Host')).toHaveTextContent('build-box'), WAIT)
+    return { ...s, ...r }
+  }
+
+  const footer = (r: { container: HTMLElement }) => r.container.querySelector('.session-footer')
+  const text = (el: Element | null | undefined) => el?.textContent?.replace(/\s+/g, ' ').trim()
+  const resumeButton = () => screen.getByRole('button', { name: 'Resume' })
+
+  async function refused(answer: Response, detail: Partial<SessionDetail> = { lifecycle: 'parked' }, opts: Opts = {}) {
+    const r = await show(detail, { resume: () => answer, ...opts })
+    fireEvent.click(resumeButton())
+    const alert = await screen.findByRole('alert', {}, WAIT)
+    return { ...r, alert }
+  }
+
+  describe('SessionView: the footer of a session that is not running', () => {
+    it('a parked session offers Resume, which resumes it; the composer stays', async () => {
+      const r = await show({ lifecycle: 'parked' })
+      expect(text(footer(r)?.querySelector('.txt'))).toBe('This session is parked.')
+      expect(r.container.querySelector('.session-footer-offline')).toBeNull()
+      expect(screen.getByLabelText('Prompt')).toBeInTheDocument()
+      fireEvent.click(resumeButton())
+      await waitFor(() => expect(r.changes()).toEqual(['POST /api/sessions/s1/resume']), WAIT)
+      await waitFor(() => expect(resumeButton()).toBeEnabled(), WAIT)
+      expect(screen.queryByRole('alert')).toBeNull()
+    })
+
+    it('the composer’s Resume and send goes through the view’s resume, as the footer’s Resume does', async () => {
+      let attached = false
+      const r = await show(
+        { lifecycle: 'parked' },
+        {
+          prompt: () => (attached ? json({ turn_id: 'new' }, 202) : json({ code: 'not_attached', message: 'srv-x' }, 409)),
+          resume: () => {
+            attached = true
+            return json({ session_id: 's1', lifecycle: 'active' }, 202)
+          },
+        },
+      )
+      fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'later' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+      fireEvent.click(await screen.findByRole('button', { name: 'Resume and send' }, WAIT))
+      await waitFor(() => expect((screen.getByLabelText('Prompt') as HTMLTextAreaElement).value).toBe(''), WAIT)
+      expect(r.changes()).toEqual([
+        'POST /api/sessions/s1/prompt',
+        'POST /api/sessions/s1/resume',
+        'POST /api/sessions/s1/prompt',
+      ])
+    })
+
+    it('a closed session offers Resume', async () => {
+      const r = await show({ lifecycle: 'closed' })
+      expect(text(footer(r)?.querySelector('.txt'))).toBe('This session is closed.')
+      expect(resumeButton()).toBeEnabled()
+    })
+
+    it('a presumed parked session says its host is offline, and still offers Resume', async () => {
+      const r = await show({ lifecycle: 'parked', presumed_parked: true })
+      expect(text(r.container.querySelector('.session-footer-offline'))).toBe(
+        'The host is offline: it has been away, and may still be running this session.',
+      )
+      expect(resumeButton()).toBeEnabled()
+    })
+
+    it('a parked session on a host that is not connected says so', async () => {
+      const r = await show(
+        { lifecycle: 'parked' },
+        { hosts: () => json([{ host_id: 'h1', name: 'build-box', capabilities: [], connected: false }]) },
+      )
+      expect(text(r.container.querySelector('.session-footer-offline'))).toBe('The host is offline: resume once it is back.')
+    })
+
+    it('a parked session on a connected host says nothing of it', async () => {
+      const r = await show(
+        { lifecycle: 'parked' },
+        { hosts: () => json([{ host_id: 'h1', name: 'build-box', capabilities: [], connected: true }]) },
+      )
+      expect(r.container.querySelector('.session-footer-offline')).toBeNull()
+    })
+
+    it('a host_offline marker on the stream turns the parked footer’s note on, and host_back turns it off, with no request', async () => {
+      const r = await show(
+        { lifecycle: 'parked' },
+        { hosts: () => json([{ host_id: 'h1', name: 'build-box', capabilities: [], connected: true }]) },
+      )
+      await waitFor(() => expect(r.streams).toHaveLength(1), WAIT)
+      await waitFor(() => expect(r.of('/api/sessions/s1/catalog')).toHaveLength(1), WAIT)
+      expect(r.container.querySelector('.session-footer-offline')).toBeNull()
+      const calls = r.calls.length
+      const mark = (marker: string, ts: string) => ({ id: `marker:${marker}`, version: 1, ts, kind: 'marker', marker })
+
+      act(() => r.streams[0].event('item', mark('host_offline', '2026-10-02T10:05:00.000Z')))
+      await waitFor(
+        () => expect(text(r.container.querySelector('.session-footer-offline'))).toBe('The host is offline: resume once it is back.'),
+        WAIT,
+      )
+
+      act(() => r.streams[0].event('item', mark('host_back', '2026-10-02T10:07:00.000Z')))
+      await waitFor(() => expect(r.container.querySelector('.session-footer-offline')).toBeNull(), WAIT)
+      expect(resumeButton()).toBeEnabled()
+      expect(r.calls.length).toBe(calls)
+    })
+
+    it('a starting session shows a spinner, in words, and no Resume', async () => {
+      const r = await show({ lifecycle: 'starting' })
+      const bar = footer(r)
+      expect(bar).toHaveAttribute('role', 'status')
+      expect(text(bar)).toBe('The session is starting…')
+      expect(bar?.querySelector('.spinner')).toHaveAttribute('aria-hidden', 'true')
+      expect(screen.queryByRole('button', { name: 'Resume' })).toBeNull()
+    })
+
+    it('an active session has no footer', async () => {
+      const r = await show({ lifecycle: 'active' })
+      expect(footer(r)).toBeNull()
+      expect(screen.getByLabelText('Prompt')).toBeInTheDocument()
+    })
+
+    it('a failed session the agent has no record of offers a new session in its project, not a resume', async () => {
+      const r = await show({ lifecycle: 'failed', failure_reason: 'agent_has_no_record', cwd: '/srv/work/a b&c' })
+      expect(text(footer(r)?.querySelector('.txt'))).toBe('This session failed: the agent has no record of this session.')
+      const link = screen.getByRole('link', { name: 'Start a new session in this project' })
+      expect(link).toHaveAttribute('href', '/new?host=h1&cwd=%2Fsrv%2Fwork%2Fa+b%26c')
+      expect(screen.queryByRole('button', { name: 'Resume' })).toBeNull()
+    })
+
+    it.each([
+      ['claude', 'Run `claude` in a terminal there and sign in (`/login`), then resume.'],
+      ['codex', 'Run `codex login` in a terminal there, then resume.'],
+      ['my-agent', 'Sign the agent’s command-line tool in there, then resume. `hennery doctor` on that host checks it.'],
+    ])('a failed %s session that is not logged in says how to log it in on its host, then offers Resume', async (agent, steps) => {
+      const r = await show({ lifecycle: 'failed', failure_reason: 'agent_not_logged_in', agent })
+      const lines = [...(footer(r)?.querySelectorAll('.txt') ?? [])].map(text)
+      expect(lines).toEqual([
+        'This session failed: the agent is not logged in on the host.',
+        `The agent is not logged in on build-box. ${steps}`,
+      ])
+      expect(footer(r)?.querySelector('bdi')?.textContent).toBe('build-box')
+      expect(resumeButton()).toBeEnabled()
+    })
+
+    it.each([
+      ['start_failed', 'This session failed: the agent could not start.'],
+      ['start_not_delivered', 'This session failed: the start never reached the host.'],
+      ['some_new_reason', 'This session failed: some_new_reason.'],
+      [undefined, 'This session failed.'],
+    ])('a failed session (%s) says why, and offers Resume', async (reason, words) => {
+      const r = await show({ lifecycle: 'failed', failure_reason: reason })
+      expect(text(footer(r)?.querySelector('.txt'))).toBe(words)
+      expect(resumeButton()).toBeEnabled()
+    })
+
+    it('a reason it does not know is shown as sent, isolated in a <bdi>; a known one is not', async () => {
+      const r = await show({ lifecycle: 'failed', failure_reason: 'סיבה_חדשה' })
+      const said = footer(r)?.querySelector('.txt')
+      expect(text(said)).toBe('This session failed: סיבה_חדשה.')
+      expect(said?.querySelector('bdi')?.textContent).toBe('סיבה_חדשה')
+      r.unmount()
+      const known = await show({ lifecycle: 'failed', failure_reason: 'start_failed' })
+      expect(footer(known)?.querySelector('.txt bdi')).toBeNull()
+    })
+
+    it('a reason named like an Object member (constructor) is shown as sent', async () => {
+      const r = await show({ lifecycle: 'failed', failure_reason: 'constructor' })
+      expect(text(footer(r)?.querySelector('.txt'))).toBe('This session failed: constructor.')
+      expect(footer(r)?.querySelector('.txt bdi')?.textContent).toBe('constructor')
+    })
+  })
+
+  describe('SessionView: a refused resume, in words', () => {
+    it('hat_mismatch names both hats by name, and links to Hats', async () => {
+      const r = await refused(json({ code: 'hat_mismatch', message: 'the session belongs to Work, but …' }, 409), { lifecycle: 'parked' }, {
+        hats: () => json([{ id: 'hat1', name: 'Work' }, { id: 'hat2', name: 'Home' }]),
+        resolve: () => json({ canonical: '/srv/work/project', exists: true, is_dir: true, hat_id: 'hat2' }),
+      })
+      await waitFor(
+        () =>
+          expect(text(r.alert)).toBe(
+            'This session belongs to Work, but its directory now belongs to Home. Change the path rules in Hats, then resume.',
+          ),
+        WAIT,
+      )
+      expect([...r.alert.querySelectorAll('bdi')].map((b) => b.textContent)).toEqual(['Work', 'Home'])
+      expect(screen.getByRole('link', { name: 'Hats' })).toHaveAttribute('href', '/hats')
+      expect(r.of('/api/hats/resolve')).toHaveLength(1)
+      expect(JSON.parse(String(r.fetch.mock.calls.find((c) => String(c[0]) === '/api/hats/resolve')?.[1]?.body))).toEqual({
+        host_id: 'h1',
+        path: '/srv/work/project',
+      })
+    })
+
+    it('hat_mismatch names the hats by id when their names are not known', async () => {
+      const r = await refused(json({ code: 'hat_mismatch', message: 'm' }, 409), { lifecycle: 'parked' }, {
+        hats: () => json({ code: 'internal', message: 'no' }, 500),
+        resolve: () => json({ canonical: '/srv/work/project', exists: true, is_dir: true, hat_id: 'hat2' }),
+      })
+      await waitFor(() => expect(text(r.alert)).toContain('now belongs to hat2.'), WAIT)
+      expect([...r.alert.querySelectorAll('bdi')].map((b) => b.textContent)).toEqual(['hat1', 'hat2'])
+    })
+
+    it('hat_mismatch says "another hat" when the directory’s hat cannot be resolved, and "no hat" for a session from before hats', async () => {
+      const r = await refused(json({ code: 'hat_mismatch', message: 'm' }, 409), { lifecycle: 'parked', hat_id: '' })
+      await waitFor(() => expect(r.of('/api/hats/resolve')).toHaveLength(1), WAIT)
+      expect(text(r.alert)).toBe(
+        'This session belongs to no hat, but its directory now belongs to another hat. Change the path rules in Hats, then resume.',
+      )
+    })
+
+    it('agent_has_no_record offers a new session in the project', async () => {
+      const r = await refused(json({ code: 'agent_has_no_record', message: 'm' }, 409))
+      expect(text(r.alert)).toBe(
+        'The agent has no record of this session, so it cannot be resumed. Start a new session in this project',
+      )
+      expect(screen.getByRole('link', { name: 'Start a new session in this project' })).toHaveAttribute(
+        'href',
+        '/new?host=h1&cwd=%2Fsrv%2Fwork%2Fproject',
+      )
+    })
+
+    it('agent_not_logged_in (the host’s 502) says how to log in on the host', async () => {
+      const r = await refused(json({ code: 'agent_not_logged_in', message: 'm' }, 502))
+      expect(text(r.alert)).toBe(
+        'The agent is not logged in on build-box. Run `claude` in a terminal there and sign in (`/login`), then resume.',
+      )
+    })
+
+    it.each([
+      ['cwd_moved', 409, 'The session’s directory now resolves to another place on its host: it cannot be resumed there. Start a new session in that directory instead.'],
+      ['hat_ambiguous', 409, 'The session’s directory now matches the path rules of more than one hat: change the rules so that one hat claims it, then resume.'],
+      ['host_offline', 409, 'The host is offline: resume once it is back.'],
+      ['starting', 409, 'The session is already starting.'],
+      ['active', 409, 'The session is already running.'],
+      ['invalid_cwd', 400, 'The session’s directory is no longer a directory on its host.'],
+      ['delivery_unknown', 503, 'The host went away while the session was resuming: its outcome shows when the host reconnects.'],
+      ['load_unsupported', 502, 'The agent cannot open an earlier session, so this one cannot be resumed.'],
+      ['start_failed', 502, 'The agent could not start.'],
+    ] as const)('%s (%i) is put in words', async (code, status, words) => {
+      const r = await refused(json({ code, message: `server words for ${code}` }, status))
+      expect(text(r.alert)).toBe(words)
+      expect(resumeButton()).toBeEnabled()
+    })
+
+    it('a code it does not know shows the server’s message, as text', async () => {
+      const r = await refused(json({ code: 'something_new', message: 'the host said <b>no</b>' }, 409))
+      expect(text(r.alert)).toBe('the host said <b>no</b>')
+      expect(r.alert.querySelector('b')).toBeNull()
+    })
+
+    it('a code named like an Object property is the server’s, not a wording', async () => {
+      const r = await refused(json({ code: 'constructor', message: 'odd' }, 409))
+      expect(text(r.alert)).toBe('odd')
+    })
+
+    it('a resume tried again clears the refusal before it', async () => {
+      let n = 0
+      await show({ lifecycle: 'parked' }, { resume: () => (n++ === 0 ? json({ code: 'host_offline', message: 'm' }, 409) : new Promise<Response>(() => {})) })
+      fireEvent.click(resumeButton())
+      await screen.findByRole('alert', {}, WAIT)
+      fireEvent.click(resumeButton())
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Resuming…' })).toBeDisabled())
+      expect(screen.queryByRole('alert')).toBeNull()
+    })
+
+    it('a refusal goes when the lifecycle moves on', async () => {
+      const s = sessionServer({ detail: { lifecycle: 'parked' }, resume: () => json({ code: 'host_offline', message: 'm' }, 409) })
+      const summary = (lifecycle: string) =>
+        ({
+          session_id: 's1',
+          host_id: 'h1',
+          agent: 'claude',
+          cwd: '/srv/work/project',
+          hat_id: 'hat1',
+          lifecycle,
+          presumed_parked: false,
+          created_at: '2026-10-02T09:00:00.000Z',
+          last_event_at: '2026-10-02T10:00:00.000Z',
+          question_waits: false,
+        }) as const
+      const r = render(<SessionView id="s1" summary={summary('parked')} timing={FAST} />, { wrapper: s.wrapper })
+      fireEvent.click(await screen.findByRole('button', { name: 'Resume' }, WAIT))
+      await screen.findByRole('alert', {}, WAIT)
+      r.rerender(<SessionView id="s1" summary={summary('closed')} timing={FAST} />)
+      await waitFor(() => expect(text(r.container.querySelector('.session-footer .txt'))).toBe('This session is closed.'))
+      expect(screen.queryByRole('alert')).toBeNull()
+    })
+  })
+  ```
+
+Create `web/src/screens/Session.menu.test.tsx`:
+
+  ```tsx
+  import '@testing-library/jest-dom/vitest'
+  import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+  import { beforeEach, describe, expect, it, vi } from 'vitest'
+  import type { SessionDetail } from '../generated/protocol'
+  import { forgetAllAttachments, heldFor, hold } from '../lib/attachments'
+  import { loadDraft, saveDraft } from '../lib/drafts'
+  import { json } from '../test-stream'
+  import SessionView from './Session'
+  import { FAST, sessionServer, type Opts } from './test-session'
+
+  const WAIT = { timeout: 5000 }
+
+  beforeEach(() => {
+    sessionStorage.clear()
+    forgetAllAttachments()
+  })
+
+  const PARK_HOST = () => json([{ host_id: 'h1', name: 'build-box', capabilities: ['park'], connected: true }])
+
+  /** Session `s1` as its detail says; its host announces `park` unless the
+   *  options say otherwise. */
+  async function show(detail: Partial<SessionDetail> = {}, opts: Opts = {}, onRemoved = vi.fn()) {
+    const s = sessionServer({ detail, hosts: PARK_HOST, ...opts })
+    const r = render(<SessionView id="s1" timing={FAST} onRemoved={onRemoved} />, { wrapper: s.wrapper })
+    await waitFor(() => expect(screen.getByLabelText('Host')).toHaveTextContent('build-box'), WAIT)
+    await waitFor(() => expect(s.streams).toHaveLength(1), WAIT)
+    return { ...s, ...r, onRemoved }
+  }
+
+  const trigger = () => screen.getByRole('button', { name: 'Session actions' })
+  const entries = () =>
+    [...(document.querySelector('.session-menu-list')?.querySelectorAll('button') ?? [])].map((b) => b.textContent)
+  const text = (el: Element | null | undefined) => el?.textContent?.replace(/\s+/g, ' ').trim()
+
+  function openMenu() {
+    fireEvent.click(trigger())
+    expect(trigger()).toHaveAttribute('aria-expanded', 'true')
+  }
+
+  function pick(name: string) {
+    openMenu()
+    fireEvent.click(screen.getByRole('button', { name }))
+  }
+
+  describe('SessionView: the header menu', () => {
+    it('an active session on a host that parks offers Park, Close and Delete', async () => {
+      await show()
+      expect(trigger()).toHaveAttribute('aria-expanded', 'false')
+      expect(document.querySelector('.session-menu-list')).toBeNull()
+      openMenu()
+      expect(entries()).toEqual(['Park', 'Close', 'Delete session'])
+      // Opened from a click or a key, focus goes to its first entry.
+      expect(screen.getByRole('button', { name: 'Park' })).toHaveFocus()
+    })
+
+    it('offers no Park when the host does not announce it', async () => {
+      await show({}, { hosts: () => json([{ host_id: 'h1', name: 'build-box', capabilities: ['images'] }]) })
+      openMenu()
+      expect(entries()).toEqual(['Close', 'Delete session'])
+    })
+
+    it('offers no Park while the host’s capabilities are unknown', async () => {
+      await show({}, { hosts: () => json([{ host_id: 'h1', name: 'build-box' }]) })
+      openMenu()
+      expect(entries()).toEqual(['Close', 'Delete session'])
+    })
+
+    it.each([
+      ['parked', ['Close', 'Delete session']],
+      ['starting', ['Close', 'Delete session']],
+      ['failed', ['Close', 'Delete session']],
+      ['closed', ['Delete session']],
+    ])('a %s session offers no Park; a closed one no Close', async (lifecycle, offered) => {
+      await show({ lifecycle })
+      openMenu()
+      expect(entries()).toEqual(offered)
+    })
+
+    it('Park parks the session, and the menu closes with focus back on its button', async () => {
+      const r = await show()
+      pick('Park')
+      await waitFor(() => expect(r.changes()).toEqual(['POST /api/sessions/s1/park']), WAIT)
+      expect(document.querySelector('.session-menu-list')).toBeNull()
+      expect(trigger()).toHaveFocus()
+      expect(screen.queryByRole('alert')).toBeNull()
+    })
+
+    it.each([
+      ['not_attached', 'The session is not running, or its host is not ready: there is nothing to park.'],
+      ['park_unsupported', 'This host cannot park sessions: update hennery on it.'],
+    ])('a park refused with %s says why', async (code, words) => {
+      await show({}, { park: () => json({ code, message: 'm' }, 409) })
+      pick('Park')
+      expect(text(await screen.findByRole('alert', {}, WAIT))).toBe(words)
+    })
+
+    it('Close closes the session', async () => {
+      const r = await show({ lifecycle: 'parked' })
+      pick('Close')
+      await waitFor(() => expect(r.changes()).toEqual(['POST /api/sessions/s1/close']), WAIT)
+      expect(screen.queryByRole('alert')).toBeNull()
+    })
+
+    it.each([
+      ['starting', 409, 'The session is still starting: close it once the start settles.'],
+      ['delivery_unknown', 503, 'The host went away before it confirmed the close: the session closes when the host is back.'],
+    ] as const)('a close refused with %s says why', async (code, status, words) => {
+      await show({ lifecycle: 'starting' }, { close: () => json({ code, message: 'server words' }, status) })
+      pick('Close')
+      expect(text(await screen.findByRole('alert', {}, WAIT))).toBe(words)
+    })
+
+    it('while a Park runs, no entry starts another action: Delete is disabled too', async () => {
+      let answer: (r: Response) => void = () => {}
+      const r = await show({}, { park: () => new Promise<Response>((done) => (answer = done)) })
+      pick('Park')
+      await waitFor(() => expect(r.changes()).toEqual(['POST /api/sessions/s1/park']), WAIT)
+      openMenu()
+      for (const name of ['Park', 'Close', 'Delete session']) expect(screen.getByRole('button', { name })).toBeDisabled()
+      await act(async () => answer(json({ session_id: 's1', lifecycle: 'parked' }, 202)))
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Delete session' })).toBeEnabled(), WAIT)
+    })
+
+    it('Escape closes the menu and gives focus back to its button', async () => {
+      await show()
+      openMenu()
+      fireEvent.keyDown(screen.getByRole('button', { name: 'Close' }), { key: 'Escape' })
+      expect(document.querySelector('.session-menu-list')).toBeNull()
+      expect(trigger()).toHaveAttribute('aria-expanded', 'false')
+      expect(trigger()).toHaveFocus()
+    })
+
+    it('a click outside closes the menu', async () => {
+      await show()
+      openMenu()
+      fireEvent.mouseDown(document.body)
+      expect(document.querySelector('.session-menu-list')).toBeNull()
+    })
+
+    it('a click inside keeps it open, and the button toggles it', async () => {
+      await show()
+      openMenu()
+      fireEvent.mouseDown(document.querySelector('.session-menu-list')!)
+      expect(document.querySelector('.session-menu-list')).not.toBeNull()
+      fireEvent.click(trigger())
+      expect(document.querySelector('.session-menu-list')).toBeNull()
+    })
+  })
+
+  describe('SessionView: deleting the session', () => {
+    async function confirmDelete(r: Awaited<ReturnType<typeof show>>) {
+      pick('Delete session')
+      const dialog = await screen.findByRole('dialog', { name: 'Delete this session?' })
+      expect(document.querySelector('.session-menu-list')).toBeNull()
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Delete' }))
+      return { dialog, r }
+    }
+
+    it('asks first, then deletes; the view says so, the list drops it, and its draft and images go', async () => {
+      saveDraft('s1', 'half written')
+      hold('s1', { attachments: [{ n: 1, file: new File(['x'], 'a.png', { type: 'image/png' }) }], nextN: 2 })
+      const r = await show()
+      await confirmDelete(r)
+      expect(await screen.findByRole('heading', { name: 'This session was deleted' }, WAIT)).toBeInTheDocument()
+      expect(r.changes()).toEqual(['DELETE /api/sessions/s1'])
+      expect(screen.queryByRole('dialog')).toBeNull()
+      expect(document.querySelector('.delete-note')).toBeNull()
+      await waitFor(() => expect(r.onRemoved).toHaveBeenCalledWith('s1'))
+      expect(loadDraft('s1')).toBe('')
+      expect(heldFor('s1').attachments).toEqual([])
+      // Nothing more is read of it: its stream is closed.
+      expect(r.streams[0].cancelled).toBe(true)
+      // The menu that opened the dialog is gone: focus goes to the way back.
+      await waitFor(() => expect(screen.getByRole('link', { name: 'Back to sessions' })).toHaveFocus())
+    })
+
+    it('while a delete runs, Delete is disabled: the menu cannot start a second one', async () => {
+      let answer: (r: Response) => void = () => {}
+      const r = await show({}, { remove: () => new Promise<Response>((done) => (answer = done)) })
+      await confirmDelete(r)
+      await waitFor(() => expect(r.changes()).toEqual(['DELETE /api/sessions/s1']), WAIT)
+      // The menu behind the dialog, reached anyway.
+      fireEvent.click(trigger())
+      expect(screen.getByRole('button', { name: 'Delete session' })).toBeDisabled()
+      expect(screen.getByRole('button', { name: 'Close' })).toBeDisabled()
+      await act(async () => answer(json({ code: 'starting', message: 'm' }, 409)))
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Delete session' })).toBeEnabled(), WAIT)
+    })
+
+    it('Cancel deletes nothing, and focus goes back to the menu’s button', async () => {
+      const r = await show()
+      pick('Delete session')
+      const dialog = await screen.findByRole('dialog', { name: 'Delete this session?' })
+      fireEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }))
+      expect(screen.queryByRole('dialog')).toBeNull()
+      expect(r.changes()).toEqual([])
+      expect(trigger()).toHaveFocus()
+    })
+
+    it('the step-up is the client’s: a 403 step_up_required is stepped up and sent once more', async () => {
+      let n = 0
+      const r = await show(
+        {},
+        {
+          remove: () =>
+            n++ === 0
+              ? json({ code: 'step_up_required', message: 'm' }, 403)
+              : json({ host_transcript: { state: 'removed', remaining: [], notes: [] } }),
+        },
+      )
+      await confirmDelete(r)
+      expect(await screen.findByRole('heading', { name: 'This session was deleted' }, WAIT)).toBeInTheDocument()
+      expect(r.changes()).toEqual(['DELETE /api/sessions/s1', 'DELETE /api/sessions/s1'])
+    })
+
+    it.each([
+      [
+        'partial',
+        { state: 'partial', remaining: [{ kind: 'transcript', count: 2, reason: 'denied' }], notes: [] },
+        'The agent’s own transcript on the host was removed only in part: 2 entries are left there.',
+      ],
+      [
+        'pending (host offline)',
+        { state: 'pending', pending: 'host_offline', remaining: [], notes: [] },
+        'The agent’s own transcript on the host is not removed yet: the host is offline; it is removed when the host is back.',
+      ],
+      [
+        'pending (attached)',
+        { state: 'pending', pending: 'attached', remaining: [], notes: [] },
+        'The agent’s own transcript on the host is not removed yet: the agent still has it open; it is tried again when the host next connects.',
+      ],
+      [
+        'pending (no reason)',
+        { state: 'pending', remaining: [], notes: [] },
+        'The agent’s own transcript on the host is not removed yet: it is tried again when the host next connects.',
+      ],
+    ])('a delete whose transcript removal is %s says so', async (_, transcript, words) => {
+      const r = await show({}, { remove: () => json({ host_transcript: transcript }) })
+      await confirmDelete(r)
+      await screen.findByRole('heading', { name: 'This session was deleted' }, WAIT)
+      expect([...document.querySelectorAll('p.delete-note')].map(text)).toEqual([words])
+    })
+
+    it('shows the notes the host gave, as text', async () => {
+      const r = await show(
+        {},
+        { remove: () => json({ host_transcript: { state: 'removed', remaining: [], notes: ['<b>logs</b> are kept'] } }) },
+      )
+      await confirmDelete(r)
+      await screen.findByRole('heading', { name: 'This session was deleted' }, WAIT)
+      const notes = document.querySelector('ul.delete-note')
+      expect(text(notes)).toBe('<b>logs</b> are kept')
+      expect(notes?.querySelector('b')).toBeNull()
+    })
+
+    it('a server that answers 204 deletes with nothing to say', async () => {
+      const r = await show({}, { remove: () => new Response(null, { status: 204 }) })
+      await confirmDelete(r)
+      await screen.findByRole('heading', { name: 'This session was deleted' }, WAIT)
+      expect(document.querySelector('.delete-note')).toBeNull()
+    })
+
+    it('a session gone already (404) shows as deleted', async () => {
+      const r = await show({}, { remove: () => json({ code: 'not_found', message: 'no such session' }, 404) })
+      await confirmDelete(r)
+      expect(await screen.findByRole('heading', { name: 'This session was deleted' }, WAIT)).toBeInTheDocument()
+      await waitFor(() => expect(r.onRemoved).toHaveBeenCalledWith('s1'))
+    })
+
+    it.each([
+      ['starting', 409, 'The session is still starting: delete it once the start settles.'],
+      ['delivery_unknown', 503, 'The host went away before it confirmed the close, so nothing was deleted: try again once the host is back.'],
+      ['active', 409, 'The session changed while it was being deleted, so nothing was deleted: try again.'],
+      ['parked', 409, 'The session changed while it was being deleted, so nothing was deleted: try again.'],
+      ['closed', 409, 'The session changed while it was being deleted, so nothing was deleted: try again.'],
+      ['failed', 409, 'The session changed while it was being deleted, so nothing was deleted: try again.'],
+    ] as const)('a delete refused with %s says why in the dialog, and deletes nothing', async (code, status, words) => {
+      const r = await show({}, { remove: () => json({ code, message: 'm' }, status) })
+      const { dialog } = await confirmDelete(r)
+      expect(text(await within(dialog).findByRole('alert', {}, WAIT))).toBe(words)
+      expect(screen.getByRole('dialog')).toBeInTheDocument()
+      expect(screen.queryByRole('heading', { name: 'This session was deleted' })).toBeNull()
+      expect(r.onRemoved).not.toHaveBeenCalled()
+    })
+
+    it('says what the delete left on the host even when the stream said the session was removed first', async () => {
+      let answer: (r: Response) => void = () => {}
+      const r = await show({}, { remove: () => new Promise<Response>((done) => (answer = done)) })
+      await confirmDelete(r)
+      await waitFor(() => expect(r.changes()).toEqual(['DELETE /api/sessions/s1']), WAIT)
+      act(() => r.streams[0].event('session_removed', { session_id: 's1' }))
+      await screen.findByRole('heading', { name: 'This session was deleted' }, WAIT)
+      await act(async () => answer(json({ host_transcript: { state: 'pending', pending: 'no_reply', remaining: [], notes: [] } })))
+      await waitFor(() =>
+        expect([...document.querySelectorAll('p.delete-note')].map(text)).toEqual([
+          'The agent’s own transcript on the host is not removed yet: the host did not answer in time; it is tried again when the host next connects.',
+        ]),
+      )
+    })
+
+    it('a session the stream says was removed leaves the list too', async () => {
+      const r = await show()
+      act(() => r.streams[0].event('session_removed', { session_id: 's1' }))
+      await screen.findByRole('heading', { name: 'This session was deleted' }, WAIT)
+      await waitFor(() => expect(r.onRemoved).toHaveBeenCalledWith('s1'))
+    })
+  })
+  ```
+
+In `web/src/screens/Session.test.tsx`, replace:
+
+  ```tsx
+      if (patch.failure_reason) expect(container.querySelector('header')?.textContent).toContain(`Reason: ${patch.failure_reason}`)
+  ```
+
+with:
+
+  ```tsx
+      // The reason in words, never its code.
+      if (patch.failure_reason) {
+        expect(container.querySelector('header')?.textContent).toContain('Reason: the agent is not logged in on the host')
+        expect(container.querySelector('header')?.textContent).not.toContain(patch.failure_reason)
+      }
+  ```
+
+In `web/src/screens/test-session.ts`, replace:
+
+  ```ts
+  // bodies.
+  ```
+
+with:
+
+  ```ts
+  // bodies; the footer's resume, the header menu's park, close and delete,
+  // and the hats and their resolution a resume refused as `hat_mismatch`
+  // asks for.
+  ```
+
+In `web/src/screens/test-session.ts`, replace:
+
+  ```ts
+    /** `POST …/resume`, the composer's own "Resume and send"; 202 by default. */
+    resume?: () => Response | Promise<Response>
+  ```
+
+with:
+
+  ```ts
+  ```
+
+In `web/src/screens/test-session.ts`, replace:
+
+  ```ts
+    answer?: () => Response
+  }
+
+  ```
+
+with:
+
+  ```ts
+    answer?: () => Response
+    /** `POST …/resume`, `…/park`, `…/close`; 202 by default. */
+    resume?: () => Response | Promise<Response>
+    park?: () => Response | Promise<Response>
+    close?: () => Response | Promise<Response>
+    /** `DELETE /api/sessions/{id}`; 200 with every transcript removed by
+     *  default. */
+    remove?: () => Response | Promise<Response>
+    /** `GET /api/hats`; none by default. */
+    hats?: () => Response
+    /** `POST /api/hats/resolve`; 404 by default. */
+    resolve?: () => Response
+  }
+
+  const lifecycle = (id: string, lifecycle: string) => json({ session_id: id, lifecycle }, 202)
+
+  ```
+
+In `web/src/screens/test-session.ts`, replace:
+
+  ```ts
+      if ((m = path.match(/^\/api\/sessions\/([^/]+)\/resume$/))) {
+        return opts.resume?.() ?? json({ session_id: decodeURIComponent(m[1]), lifecycle: 'active' }, 202)
+  ```
+
+with:
+
+  ```ts
+      if (path === '/api/hats') return opts.hats?.() ?? json([])
+      if (path === '/api/hats/resolve') return opts.resolve?.() ?? json({ code: 'not_found', message: 'no' }, 404)
+      if ((m = path.match(/^\/api\/sessions\/([^/]+)\/resume$/))) return opts.resume?.() ?? lifecycle(decodeURIComponent(m[1]), 'active')
+      if ((m = path.match(/^\/api\/sessions\/([^/]+)\/park$/))) return opts.park?.() ?? lifecycle(decodeURIComponent(m[1]), 'parked')
+      if ((m = path.match(/^\/api\/sessions\/([^/]+)\/close$/))) return opts.close?.() ?? lifecycle(decodeURIComponent(m[1]), 'closed')
+      if (call.method === 'DELETE' && /^\/api\/sessions\/[^/]+$/.test(path)) {
+        return opts.remove?.() ?? json({ host_transcript: { state: 'removed', remaining: [], notes: [] } })
+  ```
+
+In `web/src/screens/test-session.ts`, replace:
+
+  ```ts
+    return { ...t, streams, posted, of }
+  ```
+
+with:
+
+  ```ts
+    /** `METHOD path` of every call but the GETs. */
+    const changes = () => t.calls.filter((c) => c.method !== 'GET').map((c) => `${c.method} ${c.path}`)
+    return { ...t, streams, posted, of, changes }
+  ```
+
+In `web/src/store/useAnswer.test.ts`, replace:
+
+  ```ts
+  import { renderHook, waitFor } from '@testing-library/react'
+  import { describe, expect, it } from 'vitest'
+  import type { Item } from '../generated/view'
+  import { json, routed } from '../test-stream'
+  import { useAnswering } from './useAnswer'
+  ```
+
+with:
+
+  ```ts
+  import { act, renderHook, waitFor } from '@testing-library/react'
+  import { describe, expect, it } from 'vitest'
+  import type { Item } from '../generated/view'
+  import { json, routed } from '../test-stream'
+  import { AnswerBook, useAnswering, useHostAway } from './useAnswer'
+  ```
+
+In `web/src/store/useAnswer.test.ts`, replace:
+
+  ```ts
+    })
+  })
+  ```
+
+with:
+
+  ```ts
+    })
+  })
+
+  describe('useHostAway', () => {
+    it('renders again when the book says the host is away, and back', () => {
+      const t = hosts([])
+      const book = new AnswerBook(t.client, 's1')
+      const h = renderHook(() => useHostAway(book))
+      expect(h.result.current).toBe(false)
+      act(() => book.setHostAway(true))
+      expect(h.result.current).toBe(true)
+      act(() => book.setHostAway(false))
+      expect(h.result.current).toBe(false)
+    })
+  })
+  ```
+
+In `web/src/store/useSessionItems.test.ts`, replace:
+
+  ```ts
+      expect(result.current.items.map((i) => i.id)).toEqual(['a'])
+      await new Promise((r) => setTimeout(r, 30))
+  ```
+
+with:
+
+  ```ts
+      expect(result.current.items.map((i) => i.id)).toEqual(['a'])
+      await new Promise((r) => setTimeout(r, 30))
+      expect(s.of(STREAM_PATH)).toHaveLength(1)
+    })
+
+    it('markRemoved (a delete made here) marks the session removed and closes the stream', async () => {
+      const s = server([page([message('a', 't1')], 10)])
+      const { result } = renderHook(() => useSessionItems(ID, FAST), { wrapper: s.wrapper })
+      await waitFor(() => expect(result.current.stream).toBe('open'))
+      act(() => result.current.markRemoved())
+      await waitFor(() => expect(result.current.removed).toBe(true))
+      expect(result.current.stream).toBe('closed')
+      expect(s.streams[0].cancelled).toBe(true)
+      await new Promise((r) => setTimeout(r, 30))
+  ```
+
+In `web/src/store/useSessionList.test.ts`, replace:
+
+  ```ts
+      expect(result.current.all.has('a')).toBe(false)
+    })
+  ```
+
+with:
+
+  ```ts
+      expect(result.current.all.has('a')).toBe(false)
+    })
+
+    it('remove (a session the view found gone) takes it away, with no fetch', async () => {
+      const s = server([page([summary('a'), summary('b')], 10)])
+      const { result } = render(s, { hideClosed: false })
+      await waitFor(() => expect(s.streams).toHaveLength(1))
+      const fetched = s.calls.length
+      act(() => result.current.remove('a'))
+      await waitFor(() => expect(ids(result.current.shown)).toEqual(['b']))
+      expect(result.current.all.has('a')).toBe(false)
+      act(() => result.current.remove('a'))
+      expect(ids(result.current.shown)).toEqual(['b'])
+      expect(s.calls).toHaveLength(fetched)
+    })
+  ```
+
+- [ ] **Step 2: Run them, and see them fail**
+
+Run: `nix develop -c sh -c 'cd web && pnpm vitest run src/screens src/components src/store src/api src/lib'`
+Expected: FAIL: 85 tests in 12 files: the footer's and the menu's (`Session.footer.test.tsx`, `Session.menu.test.tsx`: no footer, no menu), `park`, `newSessionHref`, `readNewSessionPrefill`, `useHostAway`, `markRemoved` and the list's `remove` are not functions yet, a link's `cwd` that is not a path is taken, the four start-failure reasons and the header's reason are not in words, a deleted session stays in the list, and the Delete dialog's focus test finds no menu.
+
+- [ ] **Step 3: Footers and the menu**
+
+In `web/src/api/turns.ts`, replace:
+
+  ```ts
+  // What the composer asks of a session (ACP core §9): a prompt, a cancel, a
+  // config switch, and the resume behind "Resume and send". Every id in a path
+  // is encoded: ids are server data, never trusted to be path-safe.
+  ```
+
+with:
+
+  ```ts
+  // What the session view asks of a session (ACP core §9): a prompt, a
+  // cancel, a config switch, a resume (the footer's, and the composer's
+  // "Resume and send"), and the header menu's park, close and delete. Every id
+  // in a path is encoded: ids are server data, never trusted to be path-safe.
+  ```
+
+In `web/src/api/turns.ts`, replace:
+
+  ```ts
+    ConfigValue,
+    LifecycleResponse,
+  ```
+
+with:
+
+  ```ts
+    ConfigValue,
+    DeleteResult,
+    LifecycleResponse,
+  ```
+
+In `web/src/api/turns.ts`, replace:
+
+  ```ts
+    return client.request<LifecycleResponse>('POST', `/api/sessions/${enc(id)}/resume`)
+  }
+  ```
+
+with:
+
+  ```ts
+    return client.request<LifecycleResponse>('POST', `/api/sessions/${enc(id)}/resume`)
+  }
+
+  /** `POST /api/sessions/{id}/park` → 202 once the session is parked. */
+  export function park(client: Client, id: string): Promise<LifecycleResponse> {
+    return client.request<LifecycleResponse>('POST', `/api/sessions/${enc(id)}/park`)
+  }
+
+  /** `POST /api/sessions/{id}/close` → 202 once the session is closed. */
+  export function close(client: Client, id: string): Promise<LifecycleResponse> {
+    return client.request<LifecycleResponse>('POST', `/api/sessions/${enc(id)}/close`)
+  }
+
+  /** `DELETE /api/sessions/{id}` → 200 `DeleteResult` (a server from before
+   *  it answers 204: `undefined`). Step-up: the client asks for it. */
+  export function deleteSession(client: Client, id: string): Promise<DeleteResult | undefined> {
+    return client.request<DeleteResult | undefined>('DELETE', `/api/sessions/${enc(id)}`)
+  }
+  ```
+
+In `web/src/components/Composer.tsx`, replace:
+
+  ```tsx
+  import { cancel, prompt, resume, setConfig } from '../api/turns'
+  ```
+
+with:
+
+  ```tsx
+  import { cancel, prompt, setConfig } from '../api/turns'
+  ```
+
+In `web/src/components/Composer.tsx`, replace:
+
+  ```tsx
+     *  rejects with the refusal to show. Absent: `POST …/resume`. */
+    onResume?: () => Promise<unknown>
+  ```
+
+with:
+
+  ```tsx
+     *  rejects with the refusal to show. The view passes its one resume, the
+     *  one its footer's Resume goes through. */
+    onResume: () => Promise<unknown>
+  ```
+
+In `web/src/components/Composer.tsx`, replace:
+
+  ```tsx
+          await (onResume ? onResume() : resume(client, sessionId))
+  ```
+
+with:
+
+  ```tsx
+          await onResume()
+  ```
+
+Create `web/src/components/SessionFooter.tsx`:
+
+  ```tsx
+  // The footer of a session that is not running (frontend spec §6.6), under
+  // its composer. The composer stays: a draft put there ("Answer as a new
+  // message", "Send again") is sent once the session runs again, and a prompt
+  // refused as `not_attached` offers its own "Resume and send".
+  //
+  // - Parked or closed: "Resume", with "the host is offline" while the host
+  //   is away (lib/hostAway.ts: the session is presumed parked, or the newest
+  //   host marker, else the view's hosts list, says the host is not there).
+  // - Starting: a spinner, in words.
+  // - Failed: the reason in words. A session the agent has no record of
+  //   cannot be resumed: it offers "Start a new session in this project"
+  //   (New Session with its host and directory filled in). One whose agent is
+  //   not logged in says how to log it in on the host, then offers Resume.
+  // - A refused resume says why, in the footer's own words. `hat_mismatch`
+  //   names the session's hat and the hat its directory now belongs to (the
+  //   hats' names from `GET /api/hats`, else their ids), and links to Hats.
+  //
+  // Mount it keyed by the lifecycle: a refusal belongs to the state it was
+  // made in.
+  import { useEffect, useState } from 'react'
+  import { ApiFailure } from '../api/errors'
+  import { hats as fetchHats, resolveHat } from '../api/manage'
+  import { namesOf } from '../api/names'
+  import { useClient } from '../app-client'
+  import { newSessionHref } from '../lib/start'
+  import { PATH } from '../lib/views'
+  import { Link } from '../router'
+  import type { HeaderInfo } from './SessionHeader'
+  import { failureWords, loginSteps, resumeRefusal } from './sessionWords'
+
+  /** Why a session failed, as a sentence. A reason this client does not know
+   *  is shown as sent, in a <bdi>: it is the server's text, and its direction
+   *  is its own. */
+  function FailureText({ reason }: { reason: string | undefined }) {
+    if (!reason) return <>This session failed.</>
+    const words = failureWords(reason)
+    return <>This session failed: {words ?? <bdi>{reason}</bdi>}.</>
+  }
+
+  interface Props {
+    info: HeaderInfo
+    /** The host's name, when known. */
+    hostName?: string
+    /** Whether the host is away: the view's answer book says it, as it says
+     *  it to the question cards. */
+    hostAway?: boolean
+    /** `POST …/resume`; rejects with the refusal. */
+    onResume: () => Promise<unknown>
+  }
+
+  export default function SessionFooter({ info, hostName, hostAway = false, onResume }: Props) {
+    const [busy, setBusy] = useState(false)
+    const [refusal, setRefusal] = useState<unknown>(null)
+    const lifecycle = info.lifecycle
+
+    if (lifecycle === 'starting') {
+      return (
+        <div className="resume-bar session-footer" role="status">
+          <span className="spinner" aria-hidden="true" />
+          <span className="txt">The session is starting…</span>
+        </div>
+      )
+    }
+    if (lifecycle !== 'parked' && lifecycle !== 'closed' && lifecycle !== 'failed') return null
+
+    const reason = lifecycle === 'failed' ? info.failure_reason : undefined
+    const noRecord = reason === 'agent_has_no_record'
+    const host = hostName ?? 'its host'
+
+    const resume = async () => {
+      setBusy(true)
+      setRefusal(null)
+      try {
+        await onResume()
+      } catch (err) {
+        setRefusal(err)
+      } finally {
+        setBusy(false)
+      }
+    }
+
+    return (
+      <div className="resume-bar session-footer">
+        <div className="session-footer-text">
+          <p className="txt">
+            {lifecycle === 'parked'
+              ? 'This session is parked.'
+              : lifecycle === 'closed'
+                ? 'This session is closed.'
+                : <FailureText reason={reason} />}
+          </p>
+          {hostAway && (
+            <p className="txt session-footer-offline">
+              {info.presumed_parked
+                ? 'The host is offline: it has been away, and may still be running this session.'
+                : 'The host is offline: resume once it is back.'}
+            </p>
+          )}
+          {reason === 'agent_not_logged_in' && <LoginSteps agent={info.agent} host={host} />}
+          {refusal !== null && (
+            <div className="form-error" role="alert">
+              <Refusal err={refusal} info={info} host={host} />
+            </div>
+          )}
+        </div>
+        {noRecord ? (
+          <Link to={newSessionHref(info.host_id, info.cwd)} className="btn btn-primary btn-sm">
+            Start a new session in this project
+          </Link>
+        ) : (
+          <button type="button" className="btn btn-primary btn-sm" disabled={busy} onClick={() => void resume()}>
+            {busy ? 'Resuming…' : 'Resume'}
+          </button>
+        )}
+      </div>
+    )
+  }
+
+  function LoginSteps({ agent, host }: { agent: string; host: string }) {
+    return (
+      <p className="txt">
+        The agent is not logged in on <bdi>{host}</bdi>. {loginSteps(agent)}
+      </p>
+    )
+  }
+
+  /** A refused resume, in words. */
+  function Refusal({ err, info, host }: { err: unknown; info: HeaderInfo; host: string }) {
+    const code = err instanceof ApiFailure ? err.code : null
+    if (code === 'hat_mismatch') return <HatMismatch info={info} />
+    if (code === 'agent_has_no_record') {
+      return (
+        <p>
+          {resumeRefusal(err)}{' '}
+          <Link to={newSessionHref(info.host_id, info.cwd)}>Start a new session in this project</Link>
+        </p>
+      )
+    }
+    if (code === 'agent_not_logged_in') return <LoginSteps agent={info.agent} host={host} />
+    return (
+      <p>
+        <bdi>{resumeRefusal(err)}</bdi>
+      </p>
+    )
+  }
+
+  /** The session's hat and the one its directory now resolves to, by name. */
+  function HatMismatch({ info }: { info: HeaderInfo }) {
+    const client = useClient()
+    const [names, setNames] = useState<Map<string, string>>(() => new Map())
+    /** The hat the directory resolves to now; null while unknown. */
+    const [now, setNow] = useState<string | null>(null)
+    const { host_id: host, cwd } = info
+
+    useEffect(() => {
+      let live = true
+      fetchHats(client).then(
+        (list) => live && setNames(namesOf(list, 'id')),
+        () => {},
+      )
+      resolveHat(client, host, cwd).then(
+        (r) => live && typeof r?.hat_id === 'string' && setNow(r.hat_id),
+        () => {},
+      )
+      return () => {
+        live = false
+      }
+    }, [client, host, cwd])
+
+    const hatName = (id: string) => (id === '' ? 'no hat' : (names.get(id) ?? id))
+    return (
+      <p>
+        This session belongs to <bdi>{hatName(info.hat_id)}</bdi>, but its directory now belongs to{' '}
+        {now === null ? 'another hat' : <bdi>{hatName(now)}</bdi>}. Change the path rules in <Link to={PATH.hats}>Hats</Link>,
+        then resume.
+      </p>
+    )
+  }
+  ```
+
+In `web/src/components/SessionHeader.tsx`, replace:
+
+  ```tsx
+  import type { SessionItem } from '../generated/protocol'
+  ```
+
+with:
+
+  ```tsx
+  // The session's menu (Park, Close, Delete) sits at the end of its title row.
+  import type { SessionItem } from '../generated/protocol'
+  import type { ReactNode } from 'react'
+  ```
+
+In `web/src/components/SessionHeader.tsx`, replace:
+
+  ```tsx
+  import StepList from './StepList'
+
+  ```
+
+with:
+
+  ```tsx
+  import StepList from './StepList'
+  import { reasonWords } from './items/Marker'
+
+  ```
+
+In `web/src/components/SessionHeader.tsx`, replace:
+
+  ```tsx
+  }
+
+  export default function SessionHeader({ id, info, hostName, plan, narrow }: Props) {
+  ```
+
+with:
+
+  ```tsx
+    /** The session's menu, at the end of the title row. */
+    menu?: ReactNode
+  }
+
+  export default function SessionHeader({ id, info, hostName, plan, narrow, menu }: Props) {
+  ```
+
+In `web/src/components/SessionHeader.tsx`, replace:
+
+  ```tsx
+          </h1>
+        </div>
+  ```
+
+with:
+
+  ```tsx
+          </h1>
+          {menu}
+        </div>
+  ```
+
+In `web/src/components/SessionHeader.tsx`, replace:
+
+  ```tsx
+                Reason: <bdi>{info.failure_reason}</bdi>
+  ```
+
+with:
+
+  ```tsx
+                Reason: <bdi>{reasonWords('start_failed', info.failure_reason)}</bdi>
+  ```
+
+Create `web/src/components/SessionMenu.tsx`:
+
+  ```tsx
+  // The session header's menu (frontend spec §6.6): Park, Close and "Delete
+  // session".
+  //
+  // - Park only for an active session on a host that announced `park`; Close
+  //   for any session not closed yet (a starting one on a reachable host is
+  //   refused, 409 `starting`, in words). Delete always.
+  // - A disclosure, not an ARIA menu: a button that opens a list of plain
+  //   buttons, reached with Tab. Escape closes it, and so does a click
+  //   outside; either way focus goes back to the button.
+  // - "Delete session" closes the menu and opens a confirmation (ConfirmDialog:
+  //   modal, focus held in it, a step-up can open over it). The DELETE goes
+  //   through the client, which asks for the step-up. A 404 means the session
+  //   is gone already: as deleted. The view shows the deleted state with what
+  //   the delete left on the host.
+  // - Park and Close answer with the lifecycle; the list stream's upsert
+  //   brings it to the header. A refusal shows under the header, as text.
+  import { useEffect, useId, useRef, useState, type KeyboardEvent } from 'react'
+  import { ApiFailure } from '../api/errors'
+  import { close, deleteSession, park } from '../api/turns'
+  import { useClient } from '../app-client'
+  import type { DeleteResult } from '../generated/protocol'
+  import { Icon } from '../lib/ui'
+  import ConfirmDialog from './ConfirmDialog'
+  import { closeRefusal, deleteRefusal, parkRefusal } from './sessionWords'
+
+  interface Props {
+    id: string
+    /** The session's lifecycle; undefined while unknown (Delete only). */
+    lifecycle?: string
+    /** The session's host announced the `park` capability. */
+    canPark: boolean
+    /** The session was deleted (`undefined`: a server that answers 204, or
+     *  a session already gone). */
+    onDeleted: (result: DeleteResult | undefined) => void
+    /** Where focus goes when the dialog closes and this menu is gone (the
+     *  deleted session's view). */
+    focusAfterDelete?: () => HTMLElement | null
+  }
+
+  export default function SessionMenu({ id, lifecycle, canPark, onDeleted, focusAfterDelete }: Props) {
+    const client = useClient()
+    const menuId = useId()
+    const [open, setOpen] = useState(false)
+    const [confirming, setConfirming] = useState(false)
+    const [busy, setBusy] = useState(false)
+    const [error, setError] = useState<string | null>(null)
+    const trigger = useRef<HTMLButtonElement>(null)
+    const box = useRef<HTMLDivElement>(null)
+
+    const showPark = lifecycle === 'active' && canPark
+    const showClose = lifecycle !== undefined && lifecycle !== 'closed'
+
+    // A click anywhere outside closes the menu.
+    useEffect(() => {
+      if (!open) return
+      const outside = (e: MouseEvent) => {
+        if (box.current && !box.current.contains(e.target as Node)) setOpen(false)
+      }
+      document.addEventListener('mousedown', outside)
+      return () => document.removeEventListener('mousedown', outside)
+    }, [open])
+
+    // Opened: focus its first entry.
+    useEffect(() => {
+      if (open) box.current?.querySelector<HTMLElement>('.session-menu-list button')?.focus()
+    }, [open])
+
+    const dismiss = () => {
+      setOpen(false)
+      trigger.current?.focus()
+    }
+
+    const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
+      if (e.key === 'Escape' && open) {
+        e.preventDefault()
+        e.stopPropagation()
+        dismiss()
+      }
+    }
+
+    const act = async (run: () => Promise<unknown>, refusal: (err: unknown) => string) => {
+      dismiss()
+      setBusy(true)
+      setError(null)
+      try {
+        await run()
+      } catch (err) {
+        setError(refusal(err))
+      } finally {
+        setBusy(false)
+      }
+    }
+
+    // A delete is an action like the others: while it runs, no entry starts
+    // another (a second Delete included).
+    const remove = async () => {
+      let result: DeleteResult | undefined
+      setBusy(true)
+      try {
+        result = await deleteSession(client, id)
+      } catch (err) {
+        // Gone already: as deleted, with nothing to say about the host.
+        if (err instanceof ApiFailure && err.status === 404) return onDeleted(undefined)
+        throw new Error(deleteRefusal(err))
+      } finally {
+        setBusy(false)
+      }
+      onDeleted(result)
+    }
+
+    return (
+      <div className="session-menu" ref={box} onKeyDown={onKeyDown}>
+        <button
+          ref={trigger}
+          type="button"
+          className="session-menu-btn"
+          aria-label="Session actions"
+          aria-expanded={open}
+          aria-controls={open ? menuId : undefined}
+          onClick={() => setOpen((o) => !o)}
+        >
+          <Icon.Menu size={18} />
+        </button>
+        {open && (
+          <div className="session-menu-list" id={menuId}>
+            {showPark && (
+              <button type="button" disabled={busy} onClick={() => void act(() => park(client, id), parkRefusal)}>
+                Park
+              </button>
+            )}
+            {showClose && (
+              <button type="button" disabled={busy} onClick={() => void act(() => close(client, id), closeRefusal)}>
+                Close
+              </button>
+            )}
+            <button
+              type="button"
+              className="danger"
+              disabled={busy}
+              onClick={() => {
+                setOpen(false)
+                setError(null)
+                setConfirming(true)
+              }}
+            >
+              Delete session
+            </button>
+          </div>
+        )}
+        {error && (
+          <p className="form-error session-menu-error" role="alert">
+            <bdi>{error}</bdi>
+          </p>
+        )}
+        {/* The page behind this dialog is not made inert (as on Hosts and Hats;
+            plan 4c amendment of brief item 36, MUST-3): a question card opening
+            behind it cannot take the focus, or a digit, because a card moves
+            the focus only while it is free (QuestionCard's focusIsFree). */}
+        {confirming && (
+          <ConfirmDialog
+            title="Delete this session?"
+            confirm="Delete"
+            danger
+            action={remove}
+            onClose={() => setConfirming(false)}
+            returnFocus={() => (trigger.current?.isConnected ? trigger.current : (focusAfterDelete?.() ?? null))}
+          >
+            <p>
+              Its transcript, its questions and the images only it holds are deleted here for good. A running session is
+              closed first.
+            </p>
+            <p>The agent’s own transcript on the host is removed too, where the host can.</p>
+          </ConfirmDialog>
+        )}
+      </div>
+    )
+  }
+  ```
+
+In `web/src/components/Shell.tsx`, replace:
+
+  ```tsx
+   *  (kept current by the list stream) when the list holds it. While the
+  ```
+
+with:
+
+  ```tsx
+   *  (kept current by the list stream) when the list holds it. A session the
+   *  view finds gone leaves the list. While the
+  ```
+
+In `web/src/components/Shell.tsx`, replace:
+
+  ```tsx
+    return <SessionView id={id} summary={list?.all.get(id)} awaitSummary={!!list && list.loading && !list.error} />
+  ```
+
+with:
+
+  ```tsx
+    return (
+      <SessionView
+        id={id}
+        summary={list?.all.get(id)}
+        awaitSummary={!!list && list.loading && !list.error}
+        onRemoved={list?.remove}
+      />
+    )
+  ```
+
+In `web/src/components/items/Marker.tsx`, replace:
+
+  ```tsx
+      start_failed: 'the agent could not start',
+    },
+  ```
+
+with:
+
+  ```tsx
+      start_failed: 'the agent could not start',
+      start_not_delivered: 'the start never reached the host',
+      host_offline: 'the host went offline before it started',
+      host_revoked: 'the host was revoked',
+      unknown_agent: 'the host does not know this agent',
+    },
+  ```
+
+Create `web/src/components/sessionWords.ts`:
+
+  ```ts
+  // What the session's footer and header menu say (frontend spec §6.6, ACP
+  // core §9): why a session failed, why a resume, a park, a close or a delete
+  // was refused, and what a delete left on the host. The wording is the
+  // view's own: each table is looked up first, by the code's own keys, and
+  // only a code none of them knows falls back to the app-wide message (whose
+  // words for `hat_mismatch`, `cwd_moved`, `hat_ambiguous` or `host_offline`
+  // were written for other routes).
+  import { ApiFailure, messageOf } from '../api/errors'
+  import type { DeleteResult, RemovalPending } from '../generated/protocol'
+  import { reasonWords } from './items/Marker'
+
+  /** A sentence per code. */
+  type Words = Record<string, string>
+
+  function say(words: Words, err: unknown): string {
+    if (err instanceof ApiFailure && Object.hasOwn(words, err.code)) return words[err.code]
+    return messageOf(err)
+  }
+
+  /** Why a session failed, in words: its `failure_reason` looked up by own
+   *  key; undefined for a reason this client does not know (the footer shows
+   *  that one as sent, isolated as the server's text). */
+  export function failureWords(reason: string): string | undefined {
+    const words = reasonWords('start_failed', reason)
+    // reasonWords gives an unknown reason back as it came.
+    return words === reason ? undefined : words
+  }
+
+  /** How the agent's CLI is signed in on its host: `hennery doctor`'s own
+   *  instructions, by agent. */
+  export function loginSteps(agent: string): string {
+    switch (agent) {
+      case 'claude':
+        return 'Run `claude` in a terminal there and sign in (`/login`), then resume.'
+      case 'codex':
+        return 'Run `codex login` in a terminal there, then resume.'
+      default:
+        return 'Sign the agent’s command-line tool in there, then resume. `hennery doctor` on that host checks it.'
+    }
+  }
+
+  /** The resume refusals the footer words itself; `hat_mismatch`,
+   *  `agent_has_no_record` and `agent_not_logged_in` get more than a
+   *  sentence (see the footer). */
+  const RESUME: Words = {
+    hat_mismatch: 'This session’s directory now belongs to another hat than the session’s.',
+    cwd_moved:
+      'The session’s directory now resolves to another place on its host: it cannot be resumed there. Start a new session in that directory instead.',
+    hat_ambiguous:
+      'The session’s directory now matches the path rules of more than one hat: change the rules so that one hat claims it, then resume.',
+    host_offline: 'The host is offline: resume once it is back.',
+    agent_has_no_record: 'The agent has no record of this session, so it cannot be resumed.',
+    agent_not_logged_in: 'The agent is not logged in on the host.',
+    starting: 'The session is already starting.',
+    active: 'The session is already running.',
+    invalid_cwd: 'The session’s directory is no longer a directory on its host.',
+    delivery_unknown: 'The host went away while the session was resuming: its outcome shows when the host reconnects.',
+    load_unsupported: 'The agent cannot open an earlier session, so this one cannot be resumed.',
+    start_failed: 'The agent could not start.',
+  }
+
+  /** Why a resume was refused. */
+  export function resumeRefusal(err: unknown): string {
+    return say(RESUME, err)
+  }
+
+  const PARK: Words = {
+    not_attached: 'The session is not running, or its host is not ready: there is nothing to park.',
+    park_unsupported: 'This host cannot park sessions: update hennery on it.',
+  }
+
+  /** Why a park was refused. */
+  export function parkRefusal(err: unknown): string {
+    return say(PARK, err)
+  }
+
+  const CLOSE: Words = {
+    starting: 'The session is still starting: close it once the start settles.',
+    delivery_unknown: 'The host went away before it confirmed the close: the session closes when the host is back.',
+  }
+
+  /** Why a close was refused. */
+  export function closeRefusal(err: unknown): string {
+    return say(CLOSE, err)
+  }
+
+  /** The lifecycle codes a delete answers when the session moved while it
+   *  was being deleted. */
+  const MOVED = 'The session changed while it was being deleted, so nothing was deleted: try again.'
+
+  const DELETE: Words = {
+    starting: 'The session is still starting: delete it once the start settles.',
+    delivery_unknown:
+      'The host went away before it confirmed the close, so nothing was deleted: try again once the host is back.',
+    active: MOVED,
+    parked: MOVED,
+    closed: MOVED,
+    failed: MOVED,
+  }
+
+  /** Why a delete was refused. */
+  export function deleteRefusal(err: unknown): string {
+    return say(DELETE, err)
+  }
+
+  const PENDING: Record<RemovalPending, string> = {
+    host_offline: 'the host is offline; it is removed when the host is back',
+    host_needs_update: 'the host needs a newer hennery to remove it',
+    no_reply: 'the host did not answer in time; it is tried again when the host next connects',
+    attached: 'the agent still has it open; it is tried again when the host next connects',
+    in_progress: 'a removal is running on the host right now',
+  }
+
+  /** What a delete left of the agent's own transcript on the host, in
+   *  sentences: nothing to say when it was removed, or there was none. */
+  export function deleteNotes(result: DeleteResult | undefined | null): string[] {
+    const t = result?.host_transcript
+    if (!t) return []
+    const notes: string[] = []
+    if (t.state === 'partial') {
+      const left = (t.remaining ?? []).reduce((sum, item) => sum + (Number.isFinite(item.count) ? item.count : 0), 0)
+      notes.push(
+        left > 0
+          ? `The agent’s own transcript on the host was removed only in part: ${left} ${left === 1 ? 'entry is' : 'entries are'} left there.`
+          : 'The agent’s own transcript on the host was removed only in part.',
+      )
+    } else if (t.state === 'pending') {
+      const why = t.pending !== undefined && Object.hasOwn(PENDING, t.pending) ? PENDING[t.pending] : null
+      notes.push(
+        why
+          ? `The agent’s own transcript on the host is not removed yet: ${why}.`
+          : 'The agent’s own transcript on the host is not removed yet: it is tried again when the host next connects.',
+      )
+    }
+    return notes
+  }
+  ```
+
+In `web/src/index.css`, replace:
+
+  ```css
+  .resume-bar .txt { font-size:13.5px; color:var(--fg-muted); }
+
+  ```
+
+with:
+
+  ```css
+  .resume-bar .txt { font-size:13.5px; color:var(--fg-muted); }
+  .resume-bar .txt { margin:0; }
+  .session-footer { flex-wrap:wrap; }
+  .session-footer-text { flex:1 1 260px; min-width:0; display:flex; flex-direction:column; gap:4px; }
+  .session-footer-text .form-error p { margin:0; }
+  .session-footer-offline { color:var(--st-attn) !important; }
+  .spinner { width:16px; height:16px; flex:none; border-radius:50%; border:2px solid var(--border-strong); border-top-color:var(--accent); animation:spin .8s linear infinite; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  /* The session header's menu: a disclosure of plain buttons */
+  .session-menu { position:relative; margin-left:auto; flex:none; }
+  .session-menu-btn { width:34px; height:34px; display:flex; align-items:center; justify-content:center; border-radius:8px; border:1px solid var(--border); background:var(--surface); color:var(--fg-1); }
+  .session-menu-btn:hover { background:var(--surface-2); }
+  .session-menu-list { position:absolute; right:0; top:calc(100% + 6px); min-width:190px; display:flex; flex-direction:column; padding:6px; background:var(--surface); border:1.5px solid var(--border-strong); border-radius:var(--r-md); box-shadow:0 8px 28px rgba(0,0,0,.14); z-index:30; }
+  .session-menu-list button { text-align:left; border:none; background:none; padding:9px 12px; border-radius:var(--r-sm); font-size:14px; color:var(--fg-1); }
+  .session-menu-list button:hover:not(:disabled), .session-menu-list button:focus-visible { background:var(--surface-2); }
+  .session-menu-list button.danger { color:var(--st-attn); }
+  .session-menu-error { position:absolute; right:0; top:calc(100% + 6px); width:max-content; max-width:min(360px,80vw); background:var(--surface); padding:8px 10px; border-radius:var(--r-sm); box-shadow:var(--sh-sm); z-index:29; }
+  .delete-note { font-size:14px !important; margin:0 0 12px !important; }
+  /* Touch: every control of the footer and the menu is at least 44px. */
+  @media (pointer: coarse), (max-width:767px) {
+    .session-menu-btn { width:44px; height:44px; }
+    .session-menu-list button, .session-footer .btn { min-height:44px; }
+  }
+
+  ```
+
+In `web/src/index.css`, replace:
+
+  ```css
+  @media (prefers-reduced-motion: reduce) { .fade-in,.led-run,.td { animation:none; } }
+  ```
+
+with:
+
+  ```css
+  @media (prefers-reduced-motion: reduce) { .fade-in,.led-run,.td,.spinner { animation:none; } }
+  ```
+
+In `web/src/lib/start.ts`, replace:
+
+  ```ts
+  // fully go through.
+  ```
+
+with:
+
+  ```ts
+  // fully go through; and the `/new?host=…&cwd=…` link that opens New Session
+  // on a project (a failed session's "Start a new session in this project").
+  ```
+
+In `web/src/lib/start.ts`, replace:
+
+  ```ts
+    return `${notice.message} It waits as this session’s draft.`
+  }
+  ```
+
+with:
+
+  ```ts
+    return `${notice.message} It waits as this session’s draft.`
+  }
+
+  /** `/new?host=<host>&cwd=<cwd>`: New Session with the host and the project
+   *  filled in. Both are encoded; `readNewSessionPrefill` reads them back. */
+  export function newSessionHref(host: string, cwd: string): string {
+    return `/new?${new URLSearchParams({ host, cwd }).toString()}`
+  }
+
+  /** The host and the project a `/new` link names (`newSessionHref`). */
+  export function readNewSessionPrefill(search: string): { host?: string; cwd?: string } {
+    const query = new URLSearchParams(search)
+    return { host: query.get('host') ?? undefined, cwd: query.get('cwd') ?? undefined }
+  }
+  ```
+
+In `web/src/router.tsx`, replace:
+
+  ```tsx
+  import { useSyncExternalStore, type AnchorHTMLAttributes, type MouseEvent } from 'react'
+  ```
+
+with:
+
+  ```tsx
+  import { useSyncExternalStore, type AnchorHTMLAttributes, type MouseEvent, type Ref } from 'react'
+  ```
+
+In `web/src/router.tsx`, replace:
+
+  ```tsx
+  type LinkProps = Omit<AnchorHTMLAttributes<HTMLAnchorElement>, 'href'> & { to: string }
+  ```
+
+with:
+
+  ```tsx
+  type LinkProps = Omit<AnchorHTMLAttributes<HTMLAnchorElement>, 'href'> & { to: string; ref?: Ref<HTMLAnchorElement> }
+  ```
+
+In `web/src/screens/NewSession.tsx`, replace:
+
+  ```tsx
+  import { projectEntries } from '../lib/projects'
+  import { sessionHref, startRefusal } from '../lib/start'
+  ```
+
+with:
+
+  ```tsx
+  import { isLiteralPath, projectEntries } from '../lib/projects'
+  import { readNewSessionPrefill, sessionHref, startRefusal } from '../lib/start'
+  ```
+
+In `web/src/screens/NewSession.tsx`, replace:
+
+  ```tsx
+  function readPrefill(search: string): { host?: string; cwd?: string } {
+    const query = new URLSearchParams(search)
+    return { host: query.get('host') ?? undefined, cwd: query.get('cwd') ?? undefined }
+  }
+
+  ```
+
+with:
+
+  ```tsx
+  ```
+
+In `web/src/screens/NewSession.tsx`, replace:
+
+  ```tsx
+    const [prefill] = useState(() => readPrefill(search))
+  ```
+
+with:
+
+  ```tsx
+    const [prefill] = useState(() => readNewSessionPrefill(search))
+  ```
+
+In `web/src/screens/NewSession.tsx`, replace:
+
+  ```tsx
+                setCwd(prefill.cwd)
+  ```
+
+with:
+
+  ```tsx
+                // Only a path is taken as one: other text is a search, no
+                // path until a project is picked (as typed).
+                if (isLiteralPath(prefill.cwd)) setCwd(prefill.cwd)
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+  // - A deleted session says so, nothing more is fetched, and its draft and
+  //   images are dropped.
+  import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+  import { hatList, hostList, namesOf } from '../api/names'
+  ```
+
+with:
+
+  ```tsx
+  // - Under the composer, a session that is not running has its footer
+  //   (SessionFooter: Resume, the start's spinner, why it failed); the header
+  //   carries its menu (SessionMenu: Park, Close, Delete). The composer stays
+  //   whatever the lifecycle, so a draft put there is never lost.
+  // - A deleted session (deleted from here, `session_removed`, or a 404) says
+  //   so, nothing more is fetched, its draft and images are dropped, and it
+  //   leaves the session list (`onRemoved`). Deleted from here, it also says
+  //   what the delete left of the agent's transcript on the host.
+  import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+  import { hatList, hostList, namesOf } from '../api/names'
+  import { resume } from '../api/turns'
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+  import SessionHeader, { type HeaderInfo } from '../components/SessionHeader'
+  import Transcript from '../components/Transcript'
+  import type { ItemEnv } from '../components/items/types'
+  import type { Capabilities } from '../generated/protocol'
+  ```
+
+with:
+
+  ```tsx
+  import SessionFooter from '../components/SessionFooter'
+  import SessionHeader, { type HeaderInfo } from '../components/SessionHeader'
+  import SessionMenu from '../components/SessionMenu'
+  import { deleteNotes } from '../components/sessionWords'
+  import Transcript from '../components/Transcript'
+  import type { ItemEnv } from '../components/items/types'
+  import type { Capabilities, DeleteResult } from '../generated/protocol'
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+  import { useAnswering } from '../store/useAnswer'
+  ```
+
+with:
+
+  ```tsx
+  import { useAnswering, useHostAway } from '../store/useAnswer'
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+    timing?: Partial<Timing>
+  }
+  ```
+
+with:
+
+  ```tsx
+    timing?: Partial<Timing>
+    /** The session was found gone (deleted from here or elsewhere, or a
+     *  404): the list drops it (useSessionList's `remove`). */
+    onRemoved?: (id: string) => void
+  }
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+  export default function SessionView({ id, summary, awaitSummary = false, tail = TAIL, timing }: Props) {
+  ```
+
+with:
+
+  ```tsx
+  export default function SessionView({ id, summary, awaitSummary = false, tail = TAIL, timing, onRemoved }: Props) {
+    const client = useClient()
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+    const announcement = useAnnouncement(answers)
+
+  ```
+
+with:
+
+  ```tsx
+    const announcement = useAnnouncement(answers)
+    const hostAway = useHostAway(answers)
+
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+    const composerEmpty = useCallback(() => composer.current?.isEmpty() ?? true, [])
+
+  ```
+
+with:
+
+  ```tsx
+    const composerEmpty = useCallback(() => composer.current?.isEmpty() ?? true, [])
+    // The view's one resume: the footer's Resume and the composer's "Resume
+    // and send" both go through it.
+    const onResume = useCallback(() => resume(client, id), [client, id])
+
+    // A delete made here: what it left on the host, shown with the deleted
+    // state. The answer may come after the stream's `session_removed`.
+    const [deleted, setDeleted] = useState<{ id: string; result?: DeleteResult } | null>(null)
+    const { markRemoved } = s
+    const onDeleted = useCallback(
+      (result: DeleteResult | undefined) => {
+        setDeleted({ id, result })
+        markRemoved()
+      },
+      [id, markRemoved],
+    )
+    const back = useRef<HTMLAnchorElement>(null)
+    const capabilities = capabilitiesOf(hostItems, info?.host_id)
+
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+    // A deleted session's draft and images can never be sent: drop them.
+  ```
+
+with:
+
+  ```tsx
+    // A deleted session's draft and images can never be sent: drop them, and
+    // the session leaves the list.
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+    }, [id, s.removed])
+
+    if (s.removed) {
+  ```
+
+with:
+
+  ```tsx
+      onRemoved?.(id)
+    }, [id, s.removed, onRemoved])
+
+    if (s.removed) {
+      const notes = deleted?.id === id ? deleteNotes(deleted.result) : []
+      const hostNotes = deleted?.id === id ? (deleted.result?.host_transcript?.notes ?? []) : []
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+            <Link to="/sessions" className="btn btn-ghost">
+  ```
+
+with:
+
+  ```tsx
+            {notes.map((note) => (
+              <p key={note} className="delete-note">
+                {note}
+              </p>
+            ))}
+            {hostNotes.length > 0 && (
+              <ul className="delete-note">
+                {hostNotes.map((note, i) => (
+                  <li key={i}>
+                    <bdi>{String(note)}</bdi>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <Link to="/sessions" className="btn btn-ghost" ref={back}>
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+        <SessionHeader id={id} info={info} hostName={info ? hosts.get(info.host_id) : undefined} plan={plan} narrow={narrow} />
+  ```
+
+with:
+
+  ```tsx
+        <SessionHeader
+          id={id}
+          info={info}
+          hostName={info ? hosts.get(info.host_id) : undefined}
+          plan={plan}
+          narrow={narrow}
+          menu={
+            <SessionMenu
+              id={id}
+              lifecycle={info?.lifecycle}
+              canPark={capabilities?.includes('park') ?? false}
+              onDeleted={onDeleted}
+              focusAfterDelete={() => back.current}
+            />
+          }
+        />
+  ```
+
+In `web/src/screens/Session.tsx`, replace:
+
+  ```tsx
+          capabilities={capabilitiesOf(hostItems, info?.host_id)}
+          catalog={s.catalog}
+          onCatalog={s.setCatalog}
+        />
+  ```
+
+with:
+
+  ```tsx
+          capabilities={capabilities}
+          catalog={s.catalog}
+          onCatalog={s.setCatalog}
+          onResume={onResume}
+        />
+        {info && (
+          <SessionFooter
+            key={info.lifecycle}
+            info={info}
+            hostName={hosts.get(info.host_id)}
+            hostAway={hostAway}
+            onResume={onResume}
+          />
+        )}
+  ```
+
+In `web/src/store/useAnswer.ts`, replace:
+
+  ```ts
+
+  /** A form's draft in the book, and how to change it. Without a book, an
+  ```
+
+with:
+
+  ```ts
+
+  /** Whether the book says the host is away. */
+  export function useHostAway(book: AnswerBook): boolean {
+    return useSyncExternalStore(book.subscribe, () => book.hostAway)
+  }
+
+  /** A form's draft in the book, and how to change it. Without a book, an
+  ```
+
+In `web/src/store/useSessionItems.ts`, replace:
+
+  ```ts
+  //   closes and the session is marked removed.
+  ```
+
+with:
+
+  ```ts
+  //   closes and the session is marked removed. So does `markRemoved`, for
+  //   a delete this view made (its answer may come before the stream's).
+  ```
+
+In `web/src/store/useSessionItems.ts`, replace:
+
+  ```ts
+
+    /** A catalogue from a config answer (202) replaces the one held. */
+  ```
+
+with:
+
+  ```ts
+
+    /** The session was deleted from here: as a `session_removed`. */
+    markRemoved = (): void => this.gone()
+
+    /** A catalogue from a config answer (202) replaces the one held. */
+  ```
+
+In `web/src/store/useSessionItems.ts`, replace:
+
+  ```ts
+    setCatalog: (catalog: SessionCatalog) => void
+  }
+  ```
+
+with:
+
+  ```ts
+    setCatalog: (catalog: SessionCatalog) => void
+    markRemoved: () => void
+  }
+  ```
+
+In `web/src/store/useSessionItems.ts`, replace:
+
+  ```ts
+    return { ...rest, items: store.items, older: store.older, loadOlder: controller.loadOlder, setCatalog: controller.setCatalog }
+  ```
+
+with:
+
+  ```ts
+    return { ...rest, items: store.items, older: store.older, loadOlder: controller.loadOlder, setCatalog: controller.setCatalog, markRemoved: controller.markRemoved }
+  ```
+
+In `web/src/store/useSessionList.ts`, replace:
+
+  ```ts
+  //   so harmless.
+  ```
+
+with:
+
+  ```ts
+  //   so harmless. `remove(id)` is the same delete, for a session the view
+  //   found gone (deleted from here, or its page or stream answered 404).
+  ```
+
+In `web/src/store/useSessionList.ts`, replace:
+
+  ```ts
+      clearTimeout(this.resyncedTimer)
+    }
+
+    /** The next page, by `next_cursor`. */
+  ```
+
+with:
+
+  ```ts
+      clearTimeout(this.resyncedTimer)
+    }
+
+    /** Drop session `id`, as a `session_removed` does. */
+    remove = (id: string): void => this.apply({ type: 'removed', id })
+
+    /** The next page, by `next_cursor`. */
+  ```
+
+In `web/src/store/useSessionList.ts`, replace:
+
+  ```ts
+    loadMore: () => Promise<void>
+    searching: boolean
+  ```
+
+with:
+
+  ```ts
+    loadMore: () => Promise<void>
+    /** Drop a session the view found gone (a keyed delete). */
+    remove: (id: string) => void
+    searching: boolean
+  ```
+
+In `web/src/store/useSessionList.ts`, replace:
+
+  ```ts
+      loadMore: controller.loadMore,
+      searching: searching(filters),
+  ```
+
+with:
+
+  ```ts
+      loadMore: controller.loadMore,
+      remove: controller.remove,
+      searching: searching(filters),
+  ```
+
+- [ ] **Step 4: Run the checks**
+
+Run: `nix develop -c sh -c 'cd web && pnpm typecheck && pnpm test && pnpm build'`
+Expected: PASS, 1298 tests (1209 before).
+
+- [ ] **Step 5: Revert-probes** (each must fail the test named; restore after each)
+
+110 probes, run by script, all fail as they should, on the first run.
+- **The footer** (20): Resume resumes, through the session's route, and ends busy; the parked and closed words; closed and failed shown, none while active; "the host is offline" when presumed parked or not connected, nothing when connected, and the presumed wording; a starting session's spinner, as a status; no record offers "Start a new session in this project", the link naming the host and the directory; the login steps; a refusal shown, cleared on a retry, and gone when the lifecycle changes.
+- **A failure in words** (10): Claude's, Codex's and another agent's login steps; the reason in words, and none; four more start-failure reasons on the marker; the header's reason in words.
+- **Resume refusals** (23): `hat_mismatch` names both hats (fetched, the directory's hat resolved with the session's directory, by id when unnamed, "no hat", "another hat" while unknown) and links Hats; `agent_has_no_record` and `agent_not_logged_in`; ten codes in words (`cwd_moved`, `hat_ambiguous`, `host_offline`, `starting`, `active`, `invalid_cwd`, `delivery_unknown`, `load_unsupported`, `start_failed`, `agent_has_no_record`); the view's table before the app-wide messages, own keys only, an unknown code as the server's message.
+- **The menu** (19): in the header; Park only for an active session on a host that announced `park` (from the host, none while unknown); no Close once closed; Park and Close post; a refusal shown, and four wordings; Escape and a click outside close it and give the focus back, a click inside keeps it; the focus to its first entry; `aria-expanded`.
+- **Delete** (33): it asks first, the menu closing for the dialog; DELETE sent; the result handed on, a 404 as deleted, a refusal in words; the focus after a delete and after Cancel; the view's way back focusable; the session marked removed, the result kept, its notes and the host's shown, and the session leaving the list (the shell's wiring, the list's `remove`, the items' `markRemoved`); six refusal wordings; partial and pending in words (the count, `host_offline`, `attached`, `no_reply`, no reason); the park, close and delete paths.
+- **The link to New Session** (3): encoded, read back by New Session.
+- **Sign-out** (2): the images forgotten, and only once signed out.
+
+**Amended at the security review (MUST-2, SHOULD-3, SHOULD-4):** 3 more probes, all failing as they should: `forgetAllDrafts()` moved before the sign-out's request (a failed sign-out keeps every draft's text), an unknown failure reason out of its `<bdi>`, and "or re-assign the session" put back in the `hat_mismatch` words.
+
+**The task review's fixes** (2026-10-03, all taken): 7 more probes, all failing as they should: Delete is disabled while any of the menu's actions runs (three: the button, busy set and cleared around the delete); New Session takes a link's `cwd` only when it is a literal path; the footer's "The host is offline" follows the host by the cards' rule (Task 8's `hostAway`), not the hosts list read once (three: the footer, the view's wiring, and `useHostAway`'s subscription, whose probe first passed until a test called the book outside a render).
+
+Load: 4 parallel copies of the footer's, menu's and the touched tests (11 files), 3 rounds: 12 of 12 green (264 tests each).
+
+**The whole-branch review's M-4** (2026-10-03, folded into this task): the view's one resume (`onResume`) goes to the footer and to the composer, whose "Resume and send" no longer posts `/resume` of its own. 1 more test; 2 more probes, both failing as they should: the composer handed another resume, and the view's resume emptied (which also fails every resume refusal's test).
+
+**Re-run on the final code:** 110 of 110 fail as they should.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add web/src
+git commit -m "feat(web): session footers resume, explain a failure or show a start, and a header menu parks, closes and deletes"
+```
+
+---
+
+### Task 10: The browser check of a whole session, and CI
+
+At 1280 and 390 px, in Chromium, against the built binary: set up and sign in, pair a host whose agent is the scripted `hennery-fake-acp`, start a session with a first prompt, answer its permission from the card, read its Markdown with list markers, crash the host and see the session parked, resume it from the footer and answer a second question; the controls a phone needs on screen and 44 px tall; no Content-Security-Policy violation (decisions 44–46).
+
+**Files:**
+- Create: `web/e2e/sessions.spec.ts`; `web/src/e2e-host-env.test.ts` (the hosts' environment, checked without a browser).
+- Modify: `web/e2e/host.ts` (`--agent` given, the fake agent's script, `crash()`, `hostEnv`), `web/playwright.config.ts` (each assertion waits up to 10 s).
+- Then: `.github/workflows/ci.yml` (the web job builds the fake agent); `web/e2e/sessions.spec.ts` twice (the footer's Resume; the 44 px controls).
+
+- [ ] **Step 1: Write the tests**
+
+Test files: `web/e2e/sessions.spec.ts`, `web/src/e2e-host-env.test.ts`.
+
+Create `web/e2e/sessions.spec.ts`:
+
+  ```ts
+  // A session in a real browser, against the real binary (plan 4c, frontend
+  // spec §12): set up and sign in, pair a host whose agent is the scripted
+  // `hennery-fake-acp`, start a session from New Session, answer the
+  // permission it asks for, read its streamed Markdown, then crash the host
+  // and see the session parked when it comes back. At 1280 px and at 390 px,
+  // each width with a collector and a host of its own, and not one
+  // Content-Security-Policy violation.
+  //
+  // The fake asks before it streams (its `asks` come first in every prompt),
+  // and echoes the answer it got as the start of its message: the transcript
+  // shows that the option chosen on the card is the one the agent received.
+  import { expect, test, type Page } from '@playwright/test'
+  import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs'
+  import { tmpdir } from 'node:os'
+  import { join } from 'node:path'
+  import { startCollector, type Collector } from './collector'
+  import { FAKE_ACP, fakeAgent, testHost, type TestHost } from './host'
+  import { scratchEnv } from './spawn'
+
+  const PASSWORD = 'correct horse battery staple'
+  const PROMPT = 'Write the notes, please.'
+
+  // Every prompt: one permission ask, then a short Markdown message after the
+  // echo of its answer (`permission:selected:<option>`, no newline of its own).
+  const SCRIPT = {
+    asks: ['permission'],
+    chunks: ['\n\nTwo steps:\n\n', '- first step\n', '- second step\n'],
+    chunk_delay_ms: 20,
+  }
+
+  for (const width of [1280, 390]) {
+    test.describe(`at ${width} px`, () => {
+      test.describe.configure({ mode: 'serial' })
+
+      const narrow = width < 768
+      let collector: Collector
+      let host: TestHost
+      let page: Page
+      let project: string
+      const violations: string[] = []
+      // A log directory in the runner's own environment, as a developer's
+      // shell may have: no process started here may write to it.
+      let sentinel: string
+      let runnerLogDir: string | undefined
+
+      test.beforeAll(async ({ browser }) => {
+        if (!existsSync(FAKE_ACP)) {
+          throw new Error(`no ${FAKE_ACP}: cargo build -p hennery -p hennery-testkit --bins`)
+        }
+        sentinel = mkdtempSync(join(tmpdir(), 'hennery-e2e-sentinel-'))
+        runnerLogDir = process.env.HENNERY_LOG_DIR
+        process.env.HENNERY_LOG_DIR = sentinel
+        expect(scratchEnv(sentinel).HENNERY_LOG_DIR).toBeUndefined()
+        collector = await startCollector()
+        host = testHost(fakeAgent('claude', SCRIPT))
+        project = join(realpathSync(host.dir), 'notes')
+        mkdirSync(project)
+        const context = await browser.newContext({ baseURL: collector.origin, viewport: { width, height: 844 } })
+        page = await context.newPage()
+        // Every CSP violation the page sees, whatever its source.
+        await page.addInitScript(() => {
+          document.addEventListener('securitypolicyviolation', (e) => {
+            const seen = ((window as unknown as { __csp?: string[] }).__csp ??= [])
+            seen.push(`${e.violatedDirective} ${e.blockedURI}`)
+          })
+        })
+        page.on('console', (m) => {
+          if (m.text().includes('Content Security Policy')) violations.push(m.text())
+        })
+      })
+
+      test.afterAll(async () => {
+        try {
+          await page?.context().close()
+        } finally {
+          try {
+            await host?.stop()
+          } finally {
+            try {
+              await collector?.stop()
+            } finally {
+              if (runnerLogDir === undefined) delete process.env.HENNERY_LOG_DIR
+              else process.env.HENNERY_LOG_DIR = runnerLogDir
+              if (sentinel) rmSync(sentinel, { recursive: true, force: true })
+            }
+          }
+        }
+      })
+
+      test('the setup link sets hennery up, and the password signs in', async () => {
+        await page.goto(collector.setupLink)
+        await expect(page).toHaveURL(`${collector.origin}/setup`)
+        await page.getByLabel(/^Password at least/).fill(PASSWORD)
+        await page.getByLabel('Password again', { exact: true }).fill(PASSWORD)
+        await page.getByRole('button', { name: 'Set up', exact: true }).click()
+        await expect(page.getByRole('heading', { name: 'hennery is set up', exact: true })).toBeVisible()
+        await page.getByRole('button', { name: 'Skip', exact: true }).click()
+        await expect(page).toHaveURL(`${collector.origin}/sessions`)
+        // Signed out: the rail's button on a desktop; a phone shows none, so
+        // the browser drops its session there.
+        if (narrow) await page.context().clearCookies()
+        else await page.getByRole('button', { name: 'Sign out', exact: true }).click()
+        await page.goto('/sessions')
+        await expect(page).toHaveURL(`${collector.origin}/login?next=%2Fsessions`)
+        await page.getByLabel('Password', { exact: true }).fill(PASSWORD)
+        await page.getByRole('button', { name: 'Sign in', exact: true }).click()
+        await expect(page).toHaveURL(`${collector.origin}/sessions`)
+      })
+
+      test('a host pairs with the command the page shows, and comes online', async () => {
+        await page.goto('/hosts')
+        await page.getByRole('button', { name: 'Add host', exact: true }).click()
+        const command = (await page.getByLabel('Pairing command', { exact: true }).textContent())!
+        expect(command).toMatch(new RegExp(`^hennery host join ${collector.origin} [0-9A-Z]{4}-[0-9A-Z]{4}$`))
+        expect(await host.join(command, ['--name', 'e2e host', '--no-runtime'])).toBe(0)
+        await expect(page.getByText('Paired: e2e host', { exact: true })).toBeVisible({ timeout: 15_000 })
+        host.run()
+        await expect(async () => {
+          await page.reload()
+          await expect(
+            page.getByRole('listitem', { name: 'e2e host', exact: true }).getByText('Online', { exact: true }),
+          ).toBeVisible({ timeout: 1000 })
+        }).toPass({ timeout: 20_000 })
+      })
+
+      test('New Session starts a session with its first prompt, and opens it', async () => {
+        // The rail's link on a desktop, the tab bar's on a phone.
+        if (narrow) {
+          await page.getByRole('navigation', { name: 'Tabs', exact: true }).getByRole('link', { name: 'New', exact: true }).click()
+        } else {
+          await page.getByRole('link', { name: 'New session', exact: true }).click()
+        }
+        // The form's own controls: the session list beside it has a search.
+        const form = page.getByRole('form', { name: 'New session', exact: true })
+        await expect(form).toBeVisible()
+        await expect(form.getByRole('button', { name: 'e2e host', exact: true })).toHaveAttribute('aria-pressed', 'true')
+        await expect(form.getByRole('button', { name: 'Claude', exact: true })).toHaveAttribute('aria-pressed', 'true')
+        await form.getByRole('combobox').fill(project)
+        // The whole line: the directory as resolved is the project itself,
+        // and it exists (nothing follows it).
+        const at = project.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+        await expect(form.getByRole('status').filter({ hasText: /^Starts in the hat / })).toHaveText(new RegExp(`^Starts in the hat .+ at ${at}$`))
+        await form.getByRole('textbox', { name: /^First prompt/ }).fill(PROMPT)
+        await form.getByRole('button', { name: 'Start session', exact: true }).click()
+        // The start waits for the host to start the agent: on a loaded runner,
+        // more than the default wait, and on macOS a fresh binary's first exec
+        // waits for its online check (20 s and more has been seen).
+        await expect(page).toHaveURL(new RegExp(`^${collector.origin}/sessions/[^/?#]+$`), { timeout: 45_000 })
+        await expect(page.locator('.bubble.user')).toHaveText(PROMPT)
+      })
+
+      test('the agent’s permission question is answered from its card', async () => {
+        const card = page.getByRole('region', { name: 'Question from Claude', exact: true })
+        await expect(card.getByText('Write notes.txt', { exact: true })).toBeVisible({ timeout: 15_000 })
+        await expect(page.locator('.session-head .badge')).toHaveText('Waiting on a question')
+        await card.getByRole('button', { name: 'Allow', exact: true }).click()
+        await expect(card.getByText('Answered', { exact: true })).toBeVisible()
+        await expect(card.getByRole('button')).toHaveCount(0)
+      })
+
+      test('the agent’s message streams in as Markdown, its list markers shown', async () => {
+        // The echo of the answer opens the message: `allow` reached the agent.
+        const message = page.locator('.bubble', { has: page.getByText('permission:selected:allow', { exact: true }) })
+        await expect(message.getByRole('listitem')).toHaveText(['first step', 'second step'])
+        await expect(page.locator('.session-head .badge')).toHaveText('Idle')
+        // Tailwind's preflight strips list markers: the transcript's own rule
+        // must bring them back (client view spec §5.3; jsdom cannot see it).
+        const list = message.getByRole('list')
+        expect(await list.evaluate((el) => getComputedStyle(el).listStyleType)).toBe('disc')
+        const item = message.getByRole('listitem').first()
+        // An item draws its marker only as a list item, of its own (inherited) type.
+        expect(await item.evaluate((el) => getComputedStyle(el).display)).toBe('list-item')
+        expect(await item.evaluate((el) => getComputedStyle(el).listStyleType)).toBe('disc')
+      })
+
+      test('the composer’s Send, and a phone’s way back, are on screen', async () => {
+        const send = page.getByRole('button', { name: 'Send', exact: true })
+        await expect(send).toBeVisible()
+        await expect(send).toBeInViewport()
+        // Nothing covers it (a tab bar, a sheet): the point at its centre is it.
+        const onTop = await send.evaluate((el) => {
+          const r = el.getBoundingClientRect()
+          const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2)
+          return hit !== null && el.contains(hit)
+        })
+        expect(onTop).toBe(true)
+        const back = page.getByRole('link', { name: 'Back to sessions', exact: true })
+        if (narrow) {
+          await expect(back).toBeVisible()
+          await expect(back).toBeInViewport()
+          expect((await back.boundingBox())!.height).toBeGreaterThanOrEqual(44)
+          await expect(page.getByRole('navigation', { name: 'Tabs', exact: true })).toBeVisible()
+        } else {
+          // Not shown, so out of the accessibility tree: found by its class.
+          await expect(back).toHaveCount(0)
+          const hidden = page.locator('.session-head .back-btn')
+          expect(await hidden.evaluate((el) => getComputedStyle(el).display)).toBe('none')
+        }
+      })
+
+      test('a host that crashed and came back leaves the session parked', async () => {
+        // Idle first, so no turn is cut short by the crash.
+        await expect(page.locator('.session-head .badge')).toHaveText('Idle')
+        await host.crash()
+        host.run()
+        // The restarted host holds no session: the collector parks it.
+        const marker = page.locator('.marker-host_restarted .divider > span')
+        await expect(marker).toHaveText(/^The host restarted( · .+)?$/, { timeout: 20_000 })
+        await expect(page.locator('.session-head .badge')).toHaveText('Parked')
+      })
+
+      // TODO(4c T8): the footer's Resume, once T8's footers land. Click
+      // `getByRole('button', { name: 'Resume', exact: true })` in the session's
+      // footer, see the badge go back to Idle and a "Resumed" marker. The fake
+      // asks for permission on EVERY prompt: a prompt sent after the resume
+      // raises a second permission card, to answer like the first.
+      test.fixme('the session resumes from its footer after the host restart', async () => {})
+
+      test('broke no Content-Security-Policy rule', async () => {
+        expect(violations).toEqual([])
+        const seen = await page.evaluate(() => (window as unknown as { __csp?: string[] }).__csp ?? [])
+        expect(seen).toEqual([])
+      })
+
+      test('wrote nothing where the runner’s own environment pointed', async () => {
+        expect(readdirSync(sentinel)).toEqual([])
+      })
+    })
+  }
+  ```
+
+Create `web/src/e2e-host-env.test.ts`:
+
+  ```ts
+  // What a test host's processes are handed (e2e/host.ts): `spawnHennery`
+  // runs each in `scratchEnv(dir)` plus `hostEnv(…)` (the composition
+  // `e2e-spawn.test.ts` pins), and the agents the host starts inherit it. So
+  // with the runner's own `HENNERY_*` variables set, the home and XDG
+  // directories must still be the host's fresh directory (its data directory
+  // is the platform's default under it), and the only `HENNERY_*` variable the
+  // fake agent's script.
+  import { readFileSync } from 'node:fs'
+  import { join } from 'node:path'
+  import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+  import { AGENT_VARS, fakeAgent, hostEnv } from '../e2e/host'
+  import { scratchEnv } from '../e2e/spawn'
+
+  const DIR = '/srv/work/e2e-host'
+  const RUNNER = {
+    HENNERY_DATA_DIR: '/srv/work/runner-data',
+    HENNERY_HOST_DATA_DIR: '/srv/work/runner-host',
+    HENNERY_LOG_DIR: '/srv/work/runner-logs',
+    HENNERY_DEV_TOKEN: 'runner-token',
+  }
+
+  /** The environment `spawnHennery(args, dir, extra)` gives its process. */
+  function handed(extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    return { ...scratchEnv(DIR), ...extra }
+  }
+
+  const henneryKeys = (env: NodeJS.ProcessEnv) => Object.keys(env).filter((k) => /^HENNERY_/i.test(k)).sort()
+
+  describe('a test host for the browser checks', () => {
+    const saved: Record<string, string | undefined> = {}
+    beforeEach(() => {
+      for (const [key, value] of Object.entries(RUNNER)) {
+        saved[key] = process.env[key]
+        process.env[key] = value
+      }
+    })
+    afterEach(() => {
+      for (const key of Object.keys(RUNNER)) {
+        if (saved[key] === undefined) delete process.env[key]
+        else process.env[key] = saved[key]
+      }
+    })
+
+    it('runs with the fake agent in its own home, and only the script beside it', () => {
+      const agent = fakeAgent('claude', { chunks: ['hi'] })
+      const env = handed(hostEnv(agent.agentEnv))
+      expect(env.HOME).toBe(DIR)
+      for (const key of ['XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME']) {
+        expect(env[key]?.startsWith(`${DIR}/`)).toBe(true)
+      }
+      expect(henneryKeys(env)).toEqual(['HENNERY_FAKE_ACP_SCRIPT'])
+      expect(JSON.parse(env.HENNERY_FAKE_ACP_SCRIPT!)).toEqual({ chunks: ['hi'] })
+      expect(agent.agent).toMatch(/^claude=\S+\/hennery-fake-acp$/)
+    })
+
+    it('without an agent, hands it no HENNERY_* variable at all', () => {
+      expect(henneryKeys(handed(hostEnv()))).toEqual([])
+    })
+
+    it('refuses any other HENNERY_* variable for its agents, whatever its case', () => {
+      expect(AGENT_VARS).toEqual(['HENNERY_FAKE_ACP_SCRIPT'])
+      for (const key of [...Object.keys(RUNNER), 'HENNERY_MASTER_KEY', 'HENNERY_SERVICE', 'hennery_log_dir']) {
+        expect(() => hostEnv({ [key]: '/srv/work/elsewhere' })).toThrow(key)
+      }
+    })
+
+    it('refuses the home and every XDG directory scratchEnv sets: none may move the host’s data directory', () => {
+      const scratch = ['HOME', 'XDG_DATA_HOME', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_STATE_HOME']
+      for (const key of scratch) expect(Object.keys(scratchEnv(DIR))).toContain(key)
+      for (const key of [...scratch, 'home', 'xdg_data_home']) {
+        expect(() => hostEnv({ [key]: '/srv/work/elsewhere' })).toThrow(key)
+      }
+      // Any other variable an agent needs is its own.
+      expect(hostEnv({ LANG: 'C.UTF-8' }).LANG).toBe('C.UTF-8')
+    })
+
+    it('starts every process of the host in that environment', () => {
+      const source = readFileSync(join(process.cwd(), 'e2e', 'host.ts'), 'utf8')
+      expect(source).toContain('const env = hostEnv(options.agentEnv)')
+      const calls = source.match(/spawnHennery\([^\n]*\)/g) ?? []
+      expect(calls).toHaveLength(2)
+      for (const call of calls) expect(call).toMatch(/, dir, env\)$/)
+    })
+  })
+  ```
+
+- [ ] **Step 2: Run them, and see them fail**
+
+Run: `nix develop -c sh -c 'cd web && pnpm vitest run src/e2e-host-env.test.ts'`
+Expected: FAIL: 5 of 5: `hostEnv` and `fakeAgent` are not functions, `AGENT_VARS` is undefined, and `host.ts` does not hand its processes `hostEnv`.
+
+- [ ] **Step 3: The host runs the fake agent, and can crash**
+
+In `web/e2e/host.ts`, replace:
+
+  ```ts
+  // options a hermetic run needs), then run with one stand-in agent, so no
+  // adapter is ever downloaded. Its directory is fresh, and every process is
+  // stopped by its own id.
+  import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+  import { tmpdir } from 'node:os'
+  import { isAbsolute, join } from 'node:path'
+  ```
+
+with:
+
+  ```ts
+  // options a hermetic run needs), then run with one agent given by
+  // `--agent`, so no adapter is ever downloaded: a stand-in never started, or
+  // the scripted `hennery-fake-acp`. Its directory is fresh, and every
+  // process is stopped by its own id.
+  import { existsSync, mkdtempSync, rmSync } from 'node:fs'
+  import { tmpdir } from 'node:os'
+  import { dirname, isAbsolute, join } from 'node:path'
+  ```
+
+In `web/e2e/host.ts`, replace:
+
+  ```ts
+      : join(scratchEnv(home).XDG_DATA_HOME as string, 'hennery')
+  }
+  ```
+
+with:
+
+  ```ts
+      : join(scratchEnv(home).XDG_DATA_HOME as string, 'hennery')
+  }
+
+  /** The scripted stand-in agent (crates/hennery-testkit), built beside the
+   *  binary: `cargo build -p hennery -p hennery-testkit --bins`. */
+  export const FAKE_ACP = join(dirname(BIN), 'hennery-fake-acp')
+
+  /** The one `HENNERY_*` variable a test may hand a host's agents: the fake
+   *  agent's script. Any other (a data or log directory, a secret) is the
+   *  host's own to set, or nobody's. */
+  export const AGENT_VARS: readonly string[] = ['HENNERY_FAKE_ACP_SCRIPT']
+
+  export interface HostOptions {
+    /** `--agent <name>=<command>`; else a stand-in that is never started. */
+    agent?: string
+    /** More of the host's environment, which its agents inherit. */
+    agentEnv?: NodeJS.ProcessEnv
+  }
+
+  /** `hennery-fake-acp` as the agent `name`, following `script` (its
+   *  `FakeScript`, as JSON). */
+  export function fakeAgent(name: string, script: object): HostOptions {
+    return { agent: `${name}=${FAKE_ACP}`, agentEnv: { HENNERY_FAKE_ACP_SCRIPT: JSON.stringify(script) } }
+  }
+
+  /** The directories `scratchEnv` sets: a test that set one would move the
+   *  host's data directory (`spawnHennery` spreads `extra` over them). */
+  const SCRATCH_DIRS = /^(HOME|XDG_(DATA|CONFIG|CACHE|STATE)_HOME)$/i
+
+  /** What a host's processes get on top of `scratchEnv(dir)`: the agents'
+   *  environment, which may name no `HENNERY_*` variable but `AGENT_VARS`,
+   *  and none of the home and XDG directories `scratchEnv` sets. Its data
+   *  directory is the platform's default under the scratch home
+   *  (`defaultHostDir`), which nothing the test adds can move. */
+  export function hostEnv(agentEnv: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+    for (const key of Object.keys(agentEnv)) {
+      if ((/^HENNERY_/i.test(key) && !AGENT_VARS.includes(key)) || SCRATCH_DIRS.test(key)) {
+        throw new Error(`a test host's agents may not be given ${key}`)
+      }
+    }
+    return { ...agentEnv, RUST_LOG: 'warn' }
+  }
+  ```
+
+In `web/e2e/host.ts`, replace:
+
+  ```ts
+    /** `host run` in the background, until `stop`. */
+    run(): void
+    stop(): Promise<void>
+  }
+
+  export function testHost(): TestHost {
+  ```
+
+with:
+
+  ```ts
+    /** `host run` in the background, until `stop` (or `crash`). */
+    run(): void
+    /** SIGKILLs the running `host run` by its own id, as a crash would, and
+     *  resolves once it is gone; its agents' guard ends their group. */
+    crash(): Promise<void>
+    stop(): Promise<void>
+  }
+
+  export function testHost(options: HostOptions = {}): TestHost {
+  ```
+
+In `web/e2e/host.ts`, replace:
+
+  ```ts
+    const env = { RUST_LOG: 'warn' }
+    const children: ChildProcess[] = []
+  ```
+
+with:
+
+  ```ts
+    const env = hostEnv(options.agentEnv)
+    const agent = options.agent ?? `stand-in=${BIN}`
+    const children: ChildProcess[] = []
+    let runner: ChildProcess | undefined
+  ```
+
+In `web/e2e/host.ts`, replace:
+
+  ```ts
+        // The stand-in agent is never started (no session runs here); any
+        // path that exists will do, and the binary's own does everywhere.
+        const runner = spawnHennery(['host', 'run', '--agent', `stand-in=${BIN}`], dir, env)
+        let stderr = ''
+        runner.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
+        runner.once('error', (err) => console.error(`host run failed to start: ${err}`))
+        runner.once('exit', (code) => {
+          if (code !== 0 && code !== null) console.error(`host run exited ${code}: ${stderr}`)
+        })
+        children.push(runner)
+  ```
+
+with:
+
+  ```ts
+        // The default stand-in agent is never started (no session runs);
+        // any path that exists will do, and the binary's own does everywhere.
+        const child = spawnHennery(['host', 'run', '--agent', agent], dir, env)
+        let stderr = ''
+        child.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
+        child.once('error', (err) => console.error(`host run failed to start: ${err}`))
+        child.once('exit', (code) => {
+          if (code !== 0 && code !== null) console.error(`host run exited ${code}: ${stderr}`)
+        })
+        children.push(child)
+        runner = child
+      },
+      async crash() {
+        const child = runner
+        if (child?.pid === undefined || child.exitCode !== null || child.signalCode !== null) {
+          throw new Error('no host run to crash')
+        }
+        const gone = new Promise((done) => child.once('exit', done))
+        child.kill('SIGKILL')
+        await gone
+  ```
+
+In `web/playwright.config.ts`, replace:
+
+  ```ts
+    timeout: 60_000,
+    use: { ...devices['Desktop Chrome'], headless: true },
+  ```
+
+with:
+
+  ```ts
+    timeout: 60_000,
+    // Each wait is a round trip through the collector, the host and the agent:
+    // 10 s, not the default 5, on a 2-4 vCPU runner.
+    expect: { timeout: 10_000 },
+    use: { ...devices['Desktop Chrome'], headless: true },
+  ```
+
+- [ ] **Step 4: Run the checks**
+
+Run: `nix develop -c sh -c 'cd web && pnpm typecheck && pnpm test && pnpm build'`
+Expected: PASS, 1303 tests (1298 before).
+
+Run: `nix develop -c cargo build -p hennery -p hennery-testkit --bins --locked && nix develop -c pnpm --dir web e2e sessions`
+Expected: PASS. The binary embeds `web/dist/`, so the web build comes first; the spec refuses to start without `target/debug/hennery-fake-acp`.
+
+- [ ] **Step 5: Revert-probes** (each must fail the test named; restore after each)
+
+13 probes, run by script, all fail as they should. A probe counts only when a failure line names the expected test.
+- **The environment** (5, Vitest): the strip of `HENNERY_*` from the runner's environment removed (since replaced by main's allowlisted `scratchEnv`, #114, which its own guard covers); `hostEnv`'s refusal removed; `host run` given a `HENNERY_LOG_DIR`; the refusal's pattern made case-sensitive; `HENNERY_DATA_DIR` allowed to the agents.
+- **The browser** (8, Playwright): the list's markers set to none, an item's marker set to none, an item made a block; the composer's Send hidden, and covered (visible and in the viewport, but not what is at its centre); a phone's way back hidden; a desktop's shown; the crash and the restart removed. The probes change the computed state from the test (`element.style`, which the CSP allows), not the CSS: the binary embeds `dist/`, and a CSS probe would need a cargo build per probe. One first passed: an item's `::marker` content never changes, so the check now reads the item's own computed `list-style-type`.
+
+**The task review's fixes** (2026-10-03, all taken): `hostEnv` also refuses `HOME` and the four XDG directories `scratchEnv` sets, so nothing a test adds moves the host's data directory (1 probe, failing as it should); the host takes no `--data-dir`, its default living under the scratch home (#111); the session's start may take 45 s (a fresh binary's first run on macOS), and each assertion 10 s, not Playwright's 5 (a round trip through the collector, the host and the agent on a 2–4 vCPU runner). The two waits have no probe: no local run can fail without them.
+
+Runs: the spec 3 times in a row, and 4 copies in parallel at a load of about 32, all green; 4 parallel copies of the environment's test, all green.
+
+**Re-run:** these probes ran on the code before the security review's amendments, which changed one assertion of the spec: the hat preview's line is matched whole, with the project's path escaped (SHOULD-5). After the task reviews' fixes the whole browser suite ran 5 + 2 times, each 38 passed and 11 skipped (Step 9). Of the two waits only macOS needs, the 15 s one was green on macOS CI before the fixes; the 45 s one has since been green on macOS and Ubuntu CI (the scratch CI's run 37098766795, on the code before the whole-branch review's fixes).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add web/e2e web/src/e2e-host-env.test.ts
+git commit -m "test(web): a browser check starts a session on a paired host, answers its permission and sees it parked after a host crash"
+```
+
+- [ ] **Step 7: CI builds the fake agent**
+
+The web job's browser checks need `hennery-fake-acp` beside the binary. `.github/workflows` is a fast-merge hotspot: the change is one line.
+
+In `.github/workflows/ci.yml`, replace:
+
+  ```yaml
+        - name: The binary, with the UI embedded
+          run: nix develop -c cargo build -p hennery --locked
+  ```
+
+with:
+
+  ```yaml
+        - name: The binary, with the UI embedded, and the fake agent
+          run: nix develop -c cargo build -p hennery -p hennery-testkit --bins --locked
+  ```
+
+```bash
+git add .github/workflows/ci.yml
+git commit -m "ci: the web job builds the fake agent beside the binary"
+```
+
+- [ ] **Step 8: Resume from the footer**
+
+With Task 9's footer in, the restarted host's parked session resumes from it, and a second prompt raises a second card, answered Reject: the agent's reply opens with `permission:selected:reject`.
+
+In `web/e2e/sessions.spec.ts`, replace:
+
+  ```ts
+  // and see the session parked when it comes back. At 1280 px and at 390 px,
+  ```
+
+with:
+
+  ```ts
+  // and see the session parked when it comes back, then resume it from its
+  // footer and answer its second prompt's question. At 1280 px and at 390 px,
+  ```
+
+In `web/e2e/sessions.spec.ts`, replace:
+
+  ```ts
+      // TODO(4c T8): the footer's Resume, once T8's footers land. Click
+      // `getByRole('button', { name: 'Resume', exact: true })` in the session's
+      // footer, see the badge go back to Idle and a "Resumed" marker. The fake
+      // asks for permission on EVERY prompt: a prompt sent after the resume
+      // raises a second permission card, to answer like the first.
+      test.fixme('the session resumes from its footer after the host restart', async () => {})
+  ```
+
+with:
+
+  ```ts
+      test('the footer’s Resume runs the session again, and it answers a second prompt', async () => {
+        const resume = page.getByRole('button', { name: 'Resume', exact: true })
+        await expect(resume).toBeVisible()
+        await resume.click()
+        await expect(page.locator('.session-head .badge')).toHaveText('Idle', { timeout: 20_000 })
+        await expect(resume).toHaveCount(0)
+        // The fake asks on every prompt: a second card, answered like the first.
+        await page.getByRole('textbox', { name: 'Prompt', exact: true }).fill('And the second part.')
+        await page.getByRole('button', { name: 'Send', exact: true }).click()
+        const cards = page.getByRole('region', { name: 'Question from Claude', exact: true })
+        await expect(cards).toHaveCount(2, { timeout: 15_000 })
+        const second = cards.nth(1)
+        await second.getByRole('button', { name: 'Reject', exact: true }).click()
+        await expect(second.getByText('Answered', { exact: true })).toBeVisible()
+        // The reply opens with what the agent got this time.
+        const reply = page.locator('.bubble', { has: page.getByText('permission:selected:reject', { exact: true }) })
+        await expect(reply.getByRole('listitem')).toHaveText(['first step', 'second step'])
+        await expect(page.locator('.session-head .badge')).toHaveText('Idle')
+      })
+  ```
+
+**Revert-probes:** 2, failing as they should: the Resume click removed (the badge never says Idle), and the second card answered Allow (no `permission:selected:reject`).
+
+```bash
+git add web/e2e/sessions.spec.ts
+git commit -m "test(web): the browser check resumes the parked session from its footer and answers a second prompt's question"
+```
+
+- [ ] **Step 9: A phone's controls are big enough to tap**
+
+At 390 px the menu's button, each entry in it, and the footer's Resume are at least 44 px tall (frontend spec §10). The menu's check is a phone's: at 1280 px it is skipped.
+
+In `web/e2e/sessions.spec.ts`, replace:
+
+  ```ts
+        await expect(resume).toBeVisible()
+        await resume.click()
+  ```
+
+with:
+
+  ```ts
+        await expect(resume).toBeVisible()
+        if (narrow) expect((await resume.boundingBox())!.height).toBeGreaterThanOrEqual(44)
+        await resume.click()
+  ```
+
+In `web/e2e/sessions.spec.ts`, replace:
+
+  ```ts
+
+      test('broke no Content-Security-Policy rule', async () => {
+  ```
+
+with:
+
+  ```ts
+
+      test('the session menu’s controls are big enough to tap on a phone', async () => {
+        test.skip(!narrow, 'the 44 px touch targets are a phone’s')
+        const trigger = page.getByRole('button', { name: 'Session actions', exact: true })
+        expect((await trigger.boundingBox())!.height).toBeGreaterThanOrEqual(44)
+        await trigger.click()
+        await expect(trigger).toHaveAttribute('aria-expanded', 'true')
+        // An active session: Close, Delete, and Park if its host can park.
+        const list = page.locator('.session-menu-list')
+        const names = await list.getByRole('button').allTextContents()
+        expect(names.filter((n) => n !== 'Park')).toEqual(['Close', 'Delete session'])
+        for (const name of names) {
+          const box = await list.getByRole('button', { name, exact: true }).boundingBox()
+          expect(box!.height).toBeGreaterThanOrEqual(44)
+        }
+        await page.keyboard.press('Escape')
+        await expect(trigger).toHaveAttribute('aria-expanded', 'false')
+      })
+
+      test('broke no Content-Security-Policy rule', async () => {
+  ```
+
+**Revert-probes:** 4, failing as they should: Resume shrunk to 30 px, the menu's button to 34 px, "Delete session" and Close to 36 px. Resume's probe first passed twice: `.btn` has `transition: all .15s`, so the changed height was still animating from 44 px when measured. The probe now sets `transition: none` first; a real CSS change has no such lag, and the assertion is unchanged.
+
+Run: `nix develop -c sh -c 'cd web && pnpm build' && nix develop -c cargo build -p hennery -p hennery-testkit --bins --locked && nix develop -c pnpm --dir web e2e`
+Expected: PASS: 38 passed, 11 skipped (the 10 gated windowing measurements, and the menu's phone-only check at 1280 px), locally on macOS; CI as in Step 5's re-run note.
+
+```bash
+git add web/e2e/sessions.spec.ts
+git commit -m "test(web): at 390 px the session menu, its buttons and the footer's Resume are at least 44 px tall"
+```
+
 
 ## After this plan
 
@@ -11168,7 +24625,7 @@ git commit -m "test(web): guard against loose text locators in the web tests"
 
 **Deferred** (owner named):
 - **Windowing, again on a quiet machine** (any lane, before 4f's release notes): `HENNERY_WINDOWING=1 pnpm exec playwright test windowing` after `pnpm build`. Every number here was taken at a load of 34–74. If the quiet desktop threshold is well above the reach, `TAIL` can grow; it never needs to shrink.
-- **The tail window** (Part 2 or a later polish): it grows at the tail while the reader stays at the end, so a session open for hours renders more than 200 rows (trimming the top while at the end is not built); a resync jumps to the end even when the reader had scrolled up; a removed pinned item falls back to the tail.
+- **The tail window** (a later polish; Part 2 only starts it at an answerable question): it grows at the tail while the reader stays at the end, so a session open for hours renders more than 200 rows (trimming the top while at the end is not built); a resync jumps to the end even when the reader had scrolled up; a removed pinned item falls back to the tail.
 - **The phone's top bar** still says "Sessions" above the session's own header; hiding it on the session route would also hide the waiting badge there (4d's layout pass).
 - **Footnotes:** two messages that both use `[^1]` share ids, so a footnote link may jump to another message's note (decision 18).
 
@@ -11182,5 +24639,44 @@ git commit -m "test(web): guard against loose text locators in the web tests"
 - **frontend §5:** the badge's words are "Waiting on a question" for `blocked` or `question_waits`, not "needs you" (decision 8); a hat switch always clears the selection (decision 11).
 - **frontend §6 and client view §9 OQ1:** the transcript renders a tail window of 200 items, revealed before fetching older pages; the threshold was measured under load only (decision 20).
 - **client view §8:** 4c ships as two PRs, 4c-i and 4c-ii.
+
+**After Part 2 (PR 4c-ii).** Part 1's lists above still hold where Part 2 does not settle them; Part 2 adds these.
+
+**Obligations Part 2 hands on:**
+- **4d:**
+  - `agentsFor` in `lib/agents.ts` becomes `GET /api/hosts/{id}/agents` (its comment holds the exact call); the local types that mirror `HostAgents` are deleted and imported from `generated/protocol.ts`. Nothing else changes. Decide then whether a report with `source: "none"` keeps the `claude`/`codex` fallback (the lane's answer so far: yes, until a host has reported).
+  - **A phone has no Sign out** until 4d-ii's `/settings` (the frontend spec puts Account in Settings): Sign out lives in the desktop rail. The 390 px browser check clears the cookies instead; once `/settings` lands, it signs out there (ruling 17).
+  - **The hat re-assignment control:** `PATCH /api/sessions/{id} {hat_id}` with a step-up and a warning, for a session with no running adapter (ACP core §4.9, frontend §6.6). Until it exists, a resume refused with `hat_mismatch` links to Hats only (decision 35, SHOULD-4); with it, the footer can offer it (ruling 14).
+  - **`inert` behind every `ConfirmDialog`** (Hosts, Hats, the session menu), as the step-up dialog already does: the review's option (a), kept as a follow-up when Part 2 took option (b) (decision 36, MUST-3).
+- **The CI hotspot's owner:** `actions/checkout@v4` in `.github/workflows/ci.yml` is not pinned to a SHA in the web job (line 33) nor in the rust job (line 68), unlike the other actions (review SHOULD-7). It predates Part 2; not this PR's change.
+- **4f:** the quickstart can show a whole session from the first tester build with Part 2: New Session with a first prompt, a question answered from its card, the composer with an image, Park, Resume from the footer, and Delete.
+
+**Maintainer ruling** (2026-10-03, through the lane): once a question is answered, the focus does not move on, and there is no shortcut to the next open question (decision 25). Revisit after testers have used it.
+
+**Deferred** (owner named):
+- **New Session's first prompt takes no images** (ruling 10): plain text until the composer's image rules are shared with the form (4d's New Session pass, or a 4c follow-up).
+- **A draft in another tab** survives a sign-out in this one until that tab closes: `sessionStorage` is per tab, and that tab's 401 keeps drafts by design (decision 34). Inherent; recorded.
+- **A test that types into a composer, signs out, and sees its key gone** (the re-confirmation's optional test): the code shows no write-back after a sign-out (the composer saves only on a change of its text, with no unmount or `pagehide` flush), but no test proves it (any lane).
+- **`presumed_parked` on the detail-only path:** a session the list does not hold (a push link outside the hat) reads it once, from its detail, so the cards' and the footer's host note follow only its host markers (decision 22). Every other part of the host note follows the host while the view is open (4d, with its hosts stream; or any lane).
+- **A literal `[Image #N]` in a turn put back** ("Send again") can link an image N the draft already holds: the operator's own words go back byte for byte, unescaped (decision 30). Recorded; no fix planned.
+- **A sign-out while a send is in flight** lets go of it, but its late 202 still clears that session's stored draft, which a new sign-in in the same tab may have written by then (the fix review; an edge of an edge, any lane).
+- **`host_back` in a browser** (ruling 18): it needs a collector whose offline threshold (10 minutes) can be shortened for a test (a testkit change; any lane).
+
+**Not tested here:**
+- `host_back` end to end (above); its marker is unit-tested.
+- A 401's redirect keeping the drafts: no code is on that path, and no test.
+- `agentsFor` against a real `/agents` report: 4d.
+- The frontend spec's §12 also lists a push in Chromium (4d) and visual snapshots of the list, a transcript and both cards (not built; any lane).
+- The 44 px touch targets are measured at 390 px only.
+- The session start's 45 s wait (a fresh binary's first run on macOS) has run on CI once before the whole-branch review's fixes, green on macOS and Ubuntu (the scratch CI's `ci` run 37098766795); the PR's own CI is its run on the final code.
+
+**Spec amendments** (to write back):
+- **frontend §6.3 and brief item 28:** "Answer as a new message" puts `You asked: <question> My answer: ` in the composer's draft, labelled, after what is there; the operator writes and sends it; it never resumes the session or sends on its own, and a parked, closed or failed session goes through "Resume and send" or the footer's Resume (decision 28, ruling 6).
+- **frontend §6.5:** a turn reported `not_delivered` comes back as a draft for the operator to send, never sent again on its own (decision 33, ruling 4).
+- **frontend §6.6:** a resume refused with `hat_mismatch` links to Hats and its path rules, not to a re-assignment, until that control exists (decision 35, ruling 14). "Delete session"'s confirmation does not make the page inert; a card cannot take the focus from it (decision 36, MUST-3 option (b), which amends brief item 36).
+- **frontend §10:** a new card takes the focus only when the composer is empty **and** the focus is free: nothing focused, or a control in the transcript that takes no typing and is not another live card; a card that does not take it is said in a polite live region (decision 25, MUST-1, NEW-1).
+- **frontend §11:** the session list is not windowed: 50 rows at a time (decision 12).
+- **frontend §7 and brief item 41:** a start is two requests, the session then its first prompt (plain text); a refused first prompt still opens the session, with a notice and the prompt kept as its draft (decision 41).
+- **frontend §12 and brief item 44:** the browser check's host is `host join` plus `host run` with the fake agent, and a host restart is a SIGKILL of `host run` and a new one, not `hennery up` restarting its child (decision 44).
 
 Generated with Claude AI — please review before distribution.

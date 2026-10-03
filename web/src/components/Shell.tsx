@@ -12,6 +12,7 @@ import { Icon } from '../lib/ui'
 import { Link, type Route } from '../router'
 import Hats from '../screens/Hats'
 import Hosts from '../screens/Hosts'
+import NewSession from '../screens/NewSession'
 import Placeholder from '../screens/Placeholder'
 import SignOut from './SignOut'
 import SessionView from '../screens/Session'
@@ -32,13 +33,21 @@ const ICON: Record<View, (p: { size?: number }) => React.JSX.Element> = {
 }
 
 /** `/sessions/:id`: the session, its header fed by the list store's summary
- *  (kept current by the list stream) when the list holds it. While the
+ *  (kept current by the list stream) when the list holds it. A session the
+ *  view finds gone leaves the list. While the
  *  list's first page is on its way the header waits for it; only a session
  *  the list does not hold fetches its detail. The address is the selection
  *  (F-11, F-19): shown whatever the hat, and whether or not the list holds it. */
 function SessionRoute({ id }: { id: string }) {
   const list = useSessionScope()?.list
-  return <SessionView id={id} summary={list?.all.get(id)} awaitSummary={!!list && list.loading && !list.error} />
+  return (
+    <SessionView
+      id={id}
+      summary={list?.all.get(id)}
+      awaitSummary={!!list && list.loading && !list.error}
+      onRemoved={list?.remove}
+    />
+  )
 }
 
 export default function Shell({ route }: { route: Route }) {
@@ -142,6 +151,8 @@ export default function Shell({ route }: { route: Route }) {
             <Hats />
           ) : route.name === 'sessions' && !desktop ? (
             <SessionList screen />
+          ) : route.name === 'new' ? (
+            <NewSession />
           ) : route.name === 'session' ? (
             <SessionRoute key={route.id} id={route.id ?? ''} />
           ) : route.name === 'sessions' ? (

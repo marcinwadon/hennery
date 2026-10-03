@@ -76,8 +76,13 @@ function server({ list = () => page([]), hats = HATS, hosts = HOSTS }: Options =
         streams.push(live)
         return live.response
       }
-      default:
+      default: {
+        // A selected session's view: an empty transcript that stays open
+        // (a 404 there would mean the session is gone, and drop its row).
+        if (/^\/api\/view\/sessions\/[^/]+$/.test(url.pathname)) return json({ items: [], older: false, epoch: 'e1', revision: 1 })
+        if (url.pathname.startsWith('/api/stream/view/sessions/')) return liveStream().response
         return json({ code: 'not_found', message: 'no' }, 404)
+      }
     }
   })
   const of = (path: string) => calls.filter((u) => u.pathname === path)

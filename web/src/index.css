@@ -273,6 +273,7 @@ input,textarea { font-family:inherit; }
 .send-btn:disabled { opacity:.4; box-shadow:none; transform:none; cursor:not-allowed; background:var(--border-strong); }
 .composer-hint { display:flex; align-items:center; gap:14px; margin-top:9px; font-size:12px; color:var(--fg-quiet); }
 .composer-hint kbd { font-family:var(--font-mono); background:var(--surface-3); border:1px solid var(--border); border-radius:4px; padding:1px 6px; font-size:11px; color:var(--fg-2); }
+.composer-label { margin:0 0 8px; font-size:12px; font-weight:600; color:var(--accent); }
 
 /* Image attachments: the attach button, the drag-over state and the thumbnail chips. */
 .attach-btn { display:flex; align-items:center; justify-content:center; flex:none; width:34px; height:34px; border-radius:var(--r-sm); border:1px solid var(--border); background:var(--surface); color:var(--fg-muted); transition:border-color .12s,color .12s; }
@@ -288,6 +289,29 @@ input,textarea { font-family:inherit; }
 /* Resume bar */
 .resume-bar { flex:none; border-top:1px solid var(--border); background:var(--bg); padding:16px 28px; display:flex; align-items:center; gap:14px; }
 .resume-bar .txt { font-size:13.5px; color:var(--fg-muted); }
+.resume-bar .txt { margin:0; }
+.session-footer { flex-wrap:wrap; }
+.session-footer-text { flex:1 1 260px; min-width:0; display:flex; flex-direction:column; gap:4px; }
+.session-footer-text .form-error p { margin:0; }
+.session-footer-offline { color:var(--st-attn) !important; }
+.spinner { width:16px; height:16px; flex:none; border-radius:50%; border:2px solid var(--border-strong); border-top-color:var(--accent); animation:spin .8s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+
+/* The session header's menu: a disclosure of plain buttons */
+.session-menu { position:relative; margin-left:auto; flex:none; }
+.session-menu-btn { width:34px; height:34px; display:flex; align-items:center; justify-content:center; border-radius:8px; border:1px solid var(--border); background:var(--surface); color:var(--fg-1); }
+.session-menu-btn:hover { background:var(--surface-2); }
+.session-menu-list { position:absolute; right:0; top:calc(100% + 6px); min-width:190px; display:flex; flex-direction:column; padding:6px; background:var(--surface); border:1.5px solid var(--border-strong); border-radius:var(--r-md); box-shadow:0 8px 28px rgba(0,0,0,.14); z-index:30; }
+.session-menu-list button { text-align:left; border:none; background:none; padding:9px 12px; border-radius:var(--r-sm); font-size:14px; color:var(--fg-1); }
+.session-menu-list button:hover:not(:disabled), .session-menu-list button:focus-visible { background:var(--surface-2); }
+.session-menu-list button.danger { color:var(--st-attn); }
+.session-menu-error { position:absolute; right:0; top:calc(100% + 6px); width:max-content; max-width:min(360px,80vw); background:var(--surface); padding:8px 10px; border-radius:var(--r-sm); box-shadow:var(--sh-sm); z-index:29; }
+.delete-note { font-size:14px !important; margin:0 0 12px !important; }
+/* Touch: every control of the footer and the menu is at least 44px. */
+@media (pointer: coarse), (max-width:767px) {
+  .session-menu-btn { width:44px; height:44px; }
+  .session-menu-list button, .session-footer .btn { min-height:44px; }
+}
 
 /* Interactive / permission card */
 .ask { background:var(--surface); border:1.5px solid var(--accent); border-radius:var(--r-md); padding:18px 20px; box-shadow:var(--sh-accent); }
@@ -410,7 +434,7 @@ input,textarea { font-family:inherit; }
 @keyframes td { 0%,60%,100%{ opacity:.3; transform:translateY(0);} 30%{ opacity:1; transform:translateY(-3px);} }
 .fade-in { opacity:1; animation:fadeUp .4s var(--ease); }
 @keyframes fadeUp { from{transform:translateY(8px);} to{transform:none;} }
-@media (prefers-reduced-motion: reduce) { .fade-in,.led-run,.td { animation:none; } }
+@media (prefers-reduced-motion: reduce) { .fade-in,.led-run,.td,.spinner { animation:none; } }
 
 /* ── Mobile bar and tab bar (hidden on desktop) ─────────────
    Both are part of the mobile layout; the desktop grid never shows them. */
@@ -581,9 +605,12 @@ h2.grp-head { margin:0; font-size:inherit; font-weight:inherit; }
 .session-head .conv-name { margin:0; }
 .back-btn { display:none; }
 .rot-180 { transform:rotate(180deg); }
+/* Heard, not seen: kept in the accessibility tree (never display:none). */
+.sr-only { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0 0 0 0); clip-path:inset(50%); white-space:nowrap; border:0; }
 .stream-state:empty { display:none; }
 .stream-state { flex:none; padding:6px 20px; font-size:12.5px; font-weight:600; color:var(--st-wait); background:var(--surface-2); border-bottom:1px solid var(--border); }
 .session-error { padding:8px 20px 0; margin:0; }
+.start-notice { padding:8px 20px; margin:0; font-size:14px; color:var(--st-attn); overflow-wrap:anywhere; }
 .transcript-empty { color:var(--fg-quiet); padding:20px 0; }
 .load-earlier { display:flex; justify-content:center; margin:0 0 18px; }
 .item-note { font-size:12.5px; color:var(--fg-muted); margin:6px 0 0; }
@@ -605,11 +632,21 @@ h2.grp-head { margin:0; font-size:inherit; font-weight:inherit; }
 .unrec { margin:0 0 22px; }
 .ask { margin:0 0 22px; }
 .q-opts { display:flex; flex-wrap:wrap; gap:8px; margin:0; padding:0; list-style:none; }
-.q-opt { border-radius:var(--r-full); padding:6px 14px; font-size:13px; font-weight:600; border:1.5px solid var(--border-strong); background:var(--surface); }
-.q-opt-allow { border-color:var(--accent); color:var(--accent); }
-.q-opt-always { border-style:dashed; color:var(--fg-2); }
-.q-opt-reject { border-color:var(--st-attn); color:var(--st-attn); }
-.q-state { margin:12px 0 0; font-size:13px; font-weight:700; color:var(--fg-2); }
+li.q-opt { border-radius:var(--r-full); padding:6px 14px; font-size:13px; font-weight:600; border:1.5px solid var(--border-strong); background:var(--surface); }
+li.q-opt-allow { border-color:var(--accent); color:var(--accent); }
+li.q-opt-always { border-style:dashed; color:var(--fg-2); }
+li.q-opt-reject { border-color:var(--st-attn); color:var(--st-attn); }
+.q-key { font-family:var(--font-mono); font-size:11px; font-weight:500; opacity:.65; }
+.q-state { margin:12px 0 0; font-size:13px; font-weight:700; color:var(--fg-2); display:flex; flex-wrap:wrap; gap:0 8px; }
+.q-note { font-weight:500; color:var(--fg-muted); }
+.q-error { margin:10px 0 0; font-size:13px; }
+.ask:focus-visible { outline:2px solid var(--accent); outline-offset:3px; }
+.elic-field { border:0; margin:0; padding:0; min-width:0; }
+.elic-field > legend { padding:0; margin-bottom:7px; }
+.elic-opt { flex-direction:row; align-items:flex-start; gap:9px; }
+.elic-opt input { margin:3px 0 0; accent-color:var(--accent); flex:none; }
+.elic-opt > .elic-opt-desc { flex-basis:100%; margin-left:22px; }
+.elic-opts .elic-opt { flex-wrap:wrap; }
 .elic-opts { list-style:none; margin:0; padding:0; }
 .steps-item { border:1px solid var(--border); border-radius:var(--r-sm); }
 .meta-dirty { color:var(--st-wait); font-weight:600; }
@@ -619,4 +656,5 @@ h2.grp-head { margin:0; font-size:inherit; font-weight:inherit; }
   .back-btn { display:flex; align-items:center; justify-content:center; width:44px; height:44px; flex:none; border-radius:11px; border:1px solid var(--border); background:var(--surface); color:var(--fg-1); }
   .session-head .conv-name { display:block; font-size:16px; }
   .q-opts { flex-direction:column; }
+  .q-opts .btn, .ask-actions .btn, .elic-opt { min-height:44px; }
 }

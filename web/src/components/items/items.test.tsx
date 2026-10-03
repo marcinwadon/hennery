@@ -279,11 +279,6 @@ describe('question', () => {
     expect(screen.getByText('Needs your answer')).toBeInTheDocument()
   })
 
-  it('renders the actions it is given (the seam for answering)', () => {
-    show(item('question', permission), { ...env, questionActions: (q) => <button type="button">answer {q.pending_id}</button> })
-    expect(screen.getByRole('button', { name: 'answer p1' })).toBeInTheDocument()
-  })
-
   it('says a permission with no options cannot be answered here', () => {
     show(item('question', { ...permission, request: { type: 'permission', options: [] } }))
     expect(screen.getByText(/cannot be answered here: stop, park or close the session/)).toBeInTheDocument()
@@ -383,6 +378,10 @@ describe('marker', () => {
     ['start_failed', 'agent_not_logged_in', 'the agent is not logged in on the host'],
     ['start_failed', 'load_unsupported', 'the agent cannot open an earlier session'],
     ['start_failed', 'start_failed', 'the agent could not start'],
+    ['start_failed', 'start_not_delivered', 'the start never reached the host'],
+    ['start_failed', 'host_offline', 'the host went offline before it started'],
+    ['start_failed', 'host_revoked', 'the host was revoked'],
+    ['start_failed', 'unknown_agent', 'the host does not know this agent'],
     ['host_note', 'config_failed', 'a setting did not take'],
     ['host_note', 'reapply_failed', 'a setting could not be applied again'],
     ['host_note', 'cancel_unanswered', 'a question was left unanswered when the turn stopped'],

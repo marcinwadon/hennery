@@ -106,14 +106,18 @@ export class Client {
   }
 }
 
-async function errorBody(response: Response): Promise<{ code?: string; message?: string } | undefined> {
+async function errorBody(
+  response: Response,
+): Promise<{ code?: string; message?: string; session_id?: string } | undefined> {
   try {
     const body: unknown = await response.json()
     if (body && typeof body === 'object') {
-      const { code, message } = body as Record<string, unknown>
+      const { code, message, session_id } = body as Record<string, unknown>
       return {
         code: typeof code === 'string' ? code : undefined,
         message: typeof message === 'string' ? message : undefined,
+        // A start whose delivery is unknown names the session it created.
+        session_id: typeof session_id === 'string' ? session_id : undefined,
       }
     }
   } catch {
