@@ -41,24 +41,36 @@ The Cargo workspace (Rust, umbrella §9.1):
 | `hennery` | bin | CLI (including `hennery mcp apply`, which wires the gateway's renderers), supervisor, wiring. |
 | `hennery-testkit` | lib + bin (dev only) | The fake ACP adapter (§12) and shared test helpers. Never a dependency of a shipped crate. |
 
-*Built so far:* the `hennery-gateway` crate exists (plan 8a): connections,
-mounts and static credentials at rest, and their API. No `SessionMcp` trait
-yet (plan 8e), so `hennery-sessions` does not depend on the gateway; the
-binary merges the two routers side by side.
+*Built so far:* the `hennery-gateway` crate (plans 8a–8d): connections,
+mounts and static credentials at rest, their API, and the proxy. Plan 8e
+built `SessionMcp` as below, amended: the sessions store calls it inside its
+own transitions' transactions (gateway spec §3.1, §3.2).
 
 **Sessions → gateway interface.** `hennery-sessions` obtains a session's MCP
 servers through a trait that `hennery-gateway` defines and implements:
 
 ```rust
 trait SessionMcp {
-    /// Mints the per-session gateway token and returns the servers to pass
-    /// in `session/new` / `session/load` for this session.
-    fn servers_for(&self, host_id: HostId, hat_id: HatId, session_id: SessionId)
-        -> Result<Vec<McpServerSpec>>;
-    /// Revokes the session's token (park, close, adapter exit, host revoke).
-    fn revoke(&self, session_id: SessionId);
+    /// In the start's or resume's transaction: for a delivering `mode`,
+    /// mints the per-session gateway token and returns the servers to pass
+    /// in `session/new` / `session/load`; otherwise none, and the previous
+    /// token revoked. An error rolls the transition back.
+    fn servers_in(&self, tx: &Transaction<'_>, session: SessionRef<'_>, mode: McpSessionDeliveryMode)
+        -> Result<Delivered>;
+    /// Revokes the session's token in the caller's transaction (park,
+    /// close, adapter exit, re-assignment, delete, a failed start or resume).
+    fn revoke_in(&self, tx: &Transaction<'_>, session_id: &str) -> Result<Cut>;
+    /// Revokes every live token of a host (host revoke).
+    fn revoke_host_in(&self, tx: &Transaction<'_>, host_id: &str) -> Result<Cut>;
+    /// Ends what is open on the tokens a committed transaction invalidated.
+    fn cut(&self, cut: Cut);
+    /// The gateway's part of a hat's purge (kernel §5.5).
+    fn purge_hat(&self, hat_id: &str) -> Result<()>;
 }
 ```
+
+The sessions module decides the delivery (umbrella §8.5) and passes it in;
+it owns `sessions.hat_id`.
 
 The dependency points sessions → gateway; the gateway never sees session
 types. In `hennery gateway` (standalone) the trait is simply unused.
@@ -482,7 +494,8 @@ since plan 5b: probes, answered only by the connection they went out on.
   `session/load` with each agent's isolation, and refuses those it cannot
   isolate unless waived (`mcp_isolation_unavailable`). `mcp_servers[]`,
   `isolation_waived` and `hat_id` have been on the wire since plan 8c; the
-  collector sends no servers until the gateway mints them (plan 8e).
+  collector sends servers, minted by the gateway, since plan 8e, only to a
+  host that announces this capability.
 - `mcp_isolation` (plan 8c): per agent id, how the host keeps its sessions to
   the servers it is given: `claude_strict` (the strict flag, §6) or `none`.
   An agent left out is `none`. Deserialized leniently like `capabilities`:
@@ -758,7 +771,8 @@ the resume.
 
 **Built so far:** the first prompt is not built yet; start and resume carry
 agent, cwd, the config, the hat and (plan 8c) the MCP servers with Claude's
-`_meta`. The collector sends no servers until plan 8e.
+`_meta`. Since plan 8e the collector sends the session's servers
+(gateway spec §3.2).
 
 **Config axes.** Axes are ACP config options, and model and mode are two of
 them. The model is the option in category `model`; without one, the option
@@ -1089,8 +1103,11 @@ is killed before the final fact.
   attaches a fresh adapter (§2.2). The reachable case is reconciliation's
   `close_session` followed at once by an operator's resume.
 - The session's gateway token is revoked on host-reported `session_parked`
-  and `session_closed`, on adapter exit, on a close of an unattached session
-  and on host revoke (`SessionMcp::revoke`). A presumed park
+  and `session_closed`, on adapter exit, on a close of an unattached session,
+  on host revoke, on re-assignment, on delete and on a start or resume the
+  route fails (`SessionMcp::revoke_in`, `revoke_host_in`), in the
+  transition's transaction; what was open on it is cut once that commits
+  (gateway spec §3.1). A presumed park
   (`presumed_parked{host_offline}`) does **not** revoke it: the host may still
   be running the session, which would then return with a dead token and no
   resume to mint a new one.
@@ -1570,7 +1587,10 @@ shipped):
    agent, agent session id, home, state, attempts, last result) — the
    agent's transcript on its host (9d-i);
 15. `host_forgets.app_server_timeouts` (an integer, default 0, no backfill):
-   Codex app-server timeouts in a row, for the bounded hybrid (9d-ii).
+   Codex app-server timeouts in a row, for the bounded hybrid (9d-ii);
+16. `sessions.mcp_delivery_mode`, `mcp_delivery_servers` and
+   `mcp_delivery_at`: what the latest start or resume was given, the mode
+   and a count (plan 8e decision E10). A delete scrubs them.
 
 `sessions` has no `hat_id`, `source_kind`, `title`, git columns or
 `last_event_id` yet, `turns` keeps only `content`, `state`, `outcome` and its
@@ -1647,7 +1667,9 @@ other tables arrive with the plans that need them.
   `turn_ended.error`, `host_note`, the stderr tail of `adapter_exited`, its
   `error` answers and its own log lines. Whether ACP payloads are redacted
   too (a token an agent prints into a tool's output, against §2.3's
-  verbatim payloads) is open, for the maintainer before plan 8e.
+  verbatim payloads) was the maintainer's open question; plan 8e took the
+  default, reversible: a session token in an ACP payload is stored and
+  published redacted by shape (gateway spec §3.1, plan 8e decision 11).
 
 ---
 
