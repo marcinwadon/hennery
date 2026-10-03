@@ -45,3 +45,8 @@ jobs:
         run: nix flake check -L
       - name: The package runs
         run: nix run . -- --version
+      # The README's nix block (plan 4f), run as written.
+      - name: The README's nix block
+        run: |
+          sh packaging/readme-blocks.sh README.md nix > "$RUNNER_TEMP/nix.sh"
+          sh -eux "$RUNNER_TEMP/nix.sh"
