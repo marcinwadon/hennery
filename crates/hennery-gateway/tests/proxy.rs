@@ -1132,6 +1132,40 @@ fn trickle(spaces: Option<usize>) -> Response {
         .unwrap()
 }
 
+/// A replay's cursor (`Last-Event-ID`) goes up only beside a session id
+/// bound to this token (plan 8e, the security review's finding 4): an
+/// upstream that replays by event id alone cannot be asked for another
+/// session's stream by a token that has none of its own.
+#[tokio::test]
+async fn a_replay_cursor_goes_up_only_with_a_bound_session_id() {
+    let s = setup(CredKind::None, None).await;
+    let session =
+        s.h.session_id(&s.upstream, "linear", &s.token, "upstream-session-1")
+            .await;
+    s.upstream.reply(|_, _| sse(&[]));
+    for with_session in [false, true] {
+        let mut get =
+            s.h.client
+                .get(s.h.url("linear"))
+                .bearer_auth(&s.token)
+                .header(header::ACCEPT, "text/event-stream")
+                .header("last-event-id", "41");
+        if with_session {
+            get = get.header("mcp-session-id", &session);
+        }
+        assert_eq!(get.send().await.unwrap().status(), StatusCode::OK);
+    }
+    let seen = s.upstream.seen();
+    assert_eq!(seen.len(), 3, "the session's ping, then the two streams");
+    assert_eq!(
+        seen[1].header("last-event-id"),
+        None,
+        "a cursor without a session id went up"
+    );
+    assert_eq!(seen[2].header("mcp-session-id"), Some("upstream-session-1"));
+    assert_eq!(seen[2].header("last-event-id"), Some("41"));
+}
+
 /// Plan 8e decision 14: a JSON answer, read whole before any of it goes
 /// down, has `answer_timeout` from its head to arrive. One that trickles
 /// and never ends is 502 `upstream_unreachable` then, not when the client
