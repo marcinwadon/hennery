@@ -10,6 +10,7 @@ mod healthcheck;
 mod inherit;
 mod lock;
 mod log;
+mod revoked;
 mod runtime;
 mod service;
 mod supervisor;
@@ -762,6 +763,7 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
         inherit::check_pipe("--join-code-fd", fd)?;
     }
     let parent = args.parent_fd.map(inherit::watch_parent).transpose()?;
+    let under_up = args.parent_fd.is_some();
     // Before the first spawn, the installer's included: the pipe whose
     // end-of-file kills every adapter's group when this host dies.
     hennery_host::adapter::prepare_death_pipe().context("the adapters' death pipe")?;
@@ -822,7 +824,17 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
     } else {
         (args.agents.into_iter().collect(), Default::default(), None, None)
     };
+    // The pairing's collector, as `host join` takes it again: never a
+    // `--collector-url` override (development only).
+    let paired_collector = paired.collector_url.clone();
     let collector_url = args.collector_url.unwrap_or(paired.collector_url);
+    // What a revoke records, beside the pairing it names.
+    let record_dir = data_dir.clone();
+    let revoke = revoked::Revoked {
+        host_id: paired.host_id.clone(),
+        collector_url: paired_collector,
+        at: 0,
+    };
     let mut cfg = HostConfig::new(collector_url, paired.host_id, paired.key, data_dir);
     cfg.workspace_roots = workspace_roots;
     cfg.home = home;
@@ -847,10 +859,29 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
         }
     };
     match hennery_host::run_until(cfg, shutdown).await {
-        // Its own exit code, so `hennery up` can tell a revoke apart.
+        // Its own exit code, so `hennery up` can tell a revoke apart; and a
+        // record of it, still under `host.lock`, for `service status` and
+        // doctor (launchd's host exits 0, so the code does not say it).
         Err(err) if hennery_host::connection::revoked(&err) => {
             eprintln!("Error: {err:#}");
-            Ok(std::process::ExitCode::from(supervisor::REVOKED_EXIT))
+            let revoke = revoked::Revoked {
+                at: hennery_kernel::secret::unix_now(),
+                ..revoke
+            };
+            if let Err(why) = revoked::record(&record_dir, &revoke) {
+                eprintln!("warning: the revoke could not be recorded: {why:#}");
+            }
+            let code = revoked::exit_code(std::env::var("HENNERY_SERVICE").ok().as_deref(), under_up);
+            if code == 0 {
+                // SAFETY: getuid(2) cannot fail.
+                let uid = unsafe { libc::getuid() };
+                let start = format!("launchctl kickstart -k gui/{uid}/{}", service::unit::Role::Host.label());
+                let (_, fix) = revoke.said(&start);
+                eprintln!(
+                    "this host stays down: launchd does not start it again after exit 0. To bring it back, {fix}"
+                );
+            }
+            Ok(std::process::ExitCode::from(code))
         }
         Err(err) => Err(err),
         Ok(()) => Ok(std::process::ExitCode::SUCCESS),

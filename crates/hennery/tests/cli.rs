@@ -767,6 +767,72 @@ fn a_revoked_all_in_one_host_leaves_the_collector_serving() {
     assert!(second.up.try_wait().unwrap().is_none());
 }
 
+/// A revoked host run by its own service stays down (distribution spec
+/// §5.2): run as launchd runs the host service (`HENNERY_SERVICE=launchd`,
+/// not `up`'s child), it exits 0, which launchd's `KeepAlive` does not
+/// restart; run otherwise, 78. Either way it records the revoke for
+/// `service status` and doctor.
+#[test]
+fn a_revoked_host_records_it_and_exits_0_only_as_launchds_host_service() {
+    let dir = scratch_dir("revokedsvc");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let log = dir.join("up.log");
+    let mut up = up_logging_to(&data, &log);
+    let listen = up.listening();
+    let session = sign_in(&mut up, &listen, &data.join("collector"));
+    let mut host_id = String::new();
+    up.wait_until("the host connected", || {
+        let Some(serde_json::Value::Array(hosts)) = get_json(&listen, "/api/hosts", &session) else {
+            return false;
+        };
+        match hosts.first() {
+            Some(h) if h["connected"] == true => {
+                host_id = h["host_id"].as_str().unwrap().to_string();
+                true
+            }
+            _ => false,
+        }
+    });
+    assert_eq!(delete(&listen, &format!("/api/hosts/{host_id}"), &session), Some(200));
+    up.wait_until("up's host stopped", || {
+        std::fs::read_to_string(&log).is_ok_and(|text| text.contains("the all-in-one host was revoked"))
+    });
+    let host_dir = data.join("host");
+    let run_host = |service: Option<&str>| {
+        let mut cmd = hennery();
+        cmd.args(["host", "run", "--data-dir"])
+            .arg(&host_dir)
+            .env("HENNERY_LOG_DIR", dir.join("logs"));
+        if let Some(service) = service {
+            cmd.env("HENNERY_SERVICE", service);
+        }
+        let mut child = cmd
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let status = wait_with_timeout(&mut child, Duration::from_secs(30)).expect("the revoked host stopped");
+        (
+            status.code(),
+            std::fs::read_to_string(host_dir.join("revoked")).unwrap_or_default(),
+        )
+    };
+    let (code, record) = run_host(Some("launchd"));
+    assert_eq!(code, Some(0));
+    assert!(record.contains(&format!("host_id = \"{host_id}\"")), "{record}");
+    std::fs::remove_file(host_dir.join("revoked")).unwrap();
+    let (code, record) = run_host(None);
+    assert_eq!(code, Some(78));
+    assert!(record.contains(&host_id), "{record}");
+    std::fs::remove_file(host_dir.join("revoked")).unwrap();
+    let (code, record) = run_host(Some("systemd"));
+    assert_eq!(code, Some(78));
+    assert!(record.contains(&host_id), "{record}");
+    unsafe { libc::kill(up.up.id() as i32, libc::SIGTERM) };
+    assert!(wait_with_timeout(&mut up.up, Duration::from_secs(15)).is_some());
+}
+
 /// Task 4 review (controller ruling): `up` must compute and validate its
 /// host's collector URL (`collector_ws_url`) *before* spawning the collector
 /// child, so a `--listen` address that `collector_ws_url` cannot make sense

@@ -2684,3 +2684,82 @@ fn the_collectors_secret_files_are_judged_as_the_collector_takes_them() {
     };
     assert!(matches!(secret_files(&doctor), Finding::NotRun { number: 18, .. }));
 }
+
+/// Check 10: a host service whose host was revoked fails with the re-pair
+/// fix, whatever its service manager says (launchd's revoked host exits 0);
+/// a record a re-pair retired says nothing.
+#[test]
+fn check_10_reports_a_revoked_host_from_its_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = systemd("inactive", 0, "yes");
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let data = dir.path().join("host");
+    let pair = |host_id: &str| {
+        hennery_host::identity::Paired {
+            collector_url: "ws://127.0.0.1:7117/api/hosts/ws".into(),
+            host_id: host_id.into(),
+            key: hennery_host::identity::HostKey::generate(),
+            workspace_roots: Vec::new(),
+        }
+        .save(&data)
+        .unwrap();
+    };
+    pair("host-1");
+    install(&cx, Role::Host, &cx.exe, &data, "/usr/bin:/bin");
+    crate::revoked::record(
+        &data,
+        &crate::revoked::Revoked {
+            host_id: "host-1".into(),
+            collector_url: "ws://127.0.0.1:7117/api/hosts/ws".into(),
+            at: 1,
+        },
+    )
+    .unwrap();
+    let check = check10(&cx, &data);
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    assert!(check.summary.contains("host was revoked by the collector"), "{check:?}");
+    assert!(
+        check.fix.contains("hennery host join http://127.0.0.1:7117")
+            && check.fix.contains("systemctl --user restart hennery-host.service"),
+        "{check:?}"
+    );
+    assert!(!check.fix.contains("service install"), "{check:?}");
+
+    // Paired again since: the record names another host, and counts no more.
+    pair("host-2");
+    let check = check10(&cx, &data);
+    assert!(!check.summary.contains("revoked by the collector"), "{check:?}");
+    assert!(check.summary.contains("not running"), "{check:?}");
+}
+
+/// Check 10: a revoke is said even when the service manager cannot be
+/// asked (`systemctl --user` unavailable, as under `su`).
+#[test]
+fn check_10_reports_a_revoke_without_the_service_manager() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut fake = Fake::none();
+    fake.unreachable = true;
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let data = dir.path().join("host");
+    hennery_host::identity::Paired {
+        collector_url: "ws://127.0.0.1:7117/api/hosts/ws".into(),
+        host_id: "host-1".into(),
+        key: hennery_host::identity::HostKey::generate(),
+        workspace_roots: Vec::new(),
+    }
+    .save(&data)
+    .unwrap();
+    install(&cx, Role::Host, &cx.exe, &data, "/usr/bin:/bin");
+    crate::revoked::record(
+        &data,
+        &crate::revoked::Revoked {
+            host_id: "host-1".into(),
+            collector_url: "ws://127.0.0.1:7117/api/hosts/ws".into(),
+            at: 1,
+        },
+    )
+    .unwrap();
+    let check = check10(&cx, &data);
+    assert_eq!(check.status, Status::Fail, "{check:?}");
+    assert!(check.summary.contains("host was revoked by the collector"), "{check:?}");
+}
