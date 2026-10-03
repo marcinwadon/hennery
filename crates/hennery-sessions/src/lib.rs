@@ -18,6 +18,7 @@ pub mod sweep;
 pub mod ws;
 
 use axum::Router;
+use hennery_kernel::deployment::Deployment;
 use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::Operator;
 use hennery_kernel::push::{Push, VapidKey};
@@ -58,6 +59,10 @@ pub struct AppState {
     pub sweep_interval: Duration,
     /// The host removals with an attempt in flight (plan 9d B7).
     pub forgets: Arc<forget::InFlight>,
+    /// What kernel spec §10's deployment warning is drawn from (plan
+    /// 4d-B3). `new` gives a collector on its own with no gateway; the
+    /// collector replaces it with its own before it serves.
+    pub deployment: Deployment,
 }
 
 impl AppState {
@@ -76,6 +81,7 @@ impl AppState {
             push: Push::detached(),
             sweep_interval: sweep::INTERVAL,
             forgets: Arc::new(forget::InFlight::default()),
+            deployment: Deployment::alone(),
         }
     }
 }

@@ -155,6 +155,10 @@ struct CollectorArgs {
     /// At its end-of-file `up` is gone, and the collector stops.
     #[arg(long, hide = true, value_parser = clap::value_parser!(i32).range(3..))]
     parent_fd: Option<i32>,
+    /// `hennery up` only: this collector runs beside `up`'s host child, as
+    /// its OS user, and so as every agent's (kernel spec §10's warning).
+    #[arg(long, hide = true)]
+    beside_host: bool,
 }
 
 #[derive(Args, Clone)]
@@ -436,6 +440,14 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     // (plan 8a decision 8; `KeyUnavailable` tells that case apart).
     let keys = hennery_gateway::key::KeySource::from_env(&data_dir)?;
     let gateway = hennery_gateway::open(&db, &keys, state.operator.clone())?;
+    // Kernel spec §10 (plan 4d-B3): `up` says when this collector shares its
+    // OS user with its host child; the gateway counts the hats with a
+    // credential, read when asked. Only the count leaves the store.
+    state.deployment = {
+        let store = gateway.store.clone();
+        hennery_kernel::deployment::Deployment::new(args.beside_host, move || Ok(store.hats_with_credentials()?.len()))
+    };
+    warn_if_shared_user(&state.deployment);
     // The gateway's proxy (plan 8d), `/mcp/<slug>`: bearer tokens, beside
     // the operator's routes and outside them (lane L8), sending only
     // through the kernel's egress policy, the collector's one `Egress`
@@ -656,6 +668,33 @@ fn warn_if_public_url_differs(stored: Option<&PublicUrl>, configured: Option<&Pu
             "the configured public_url is not the one setup stored, which stays in effect; \
              run `hennery admin reset-public-url` to move it"
         );
+    }
+}
+
+/// Kernel spec §10, at start: the collector runs as the OS user of `hennery
+/// up`'s agents while the gateway holds credentials for more than one hat.
+fn warn_if_shared_user(deployment: &hennery_kernel::deployment::Deployment) {
+    if let Some(line) = start_warning(deployment.facts()) {
+        tracing::warn!("{line}");
+    }
+}
+
+/// What the collector says of kernel spec §10's warning at start, if
+/// anything: the count of hats, never one of them. A check that could not
+/// run says so, rather than passing for a quiet one.
+fn start_warning(facts: Result<hennery_kernel::deployment::Facts>) -> Option<String> {
+    match facts {
+        Ok(facts) if facts.isolation().warns() => Some(format!(
+            "the collector runs as the OS user of hennery up's agents and holds MCP gateway credentials for {} \
+             hats: any of those agents can read them all; {}",
+            facts.hats,
+            hennery_kernel::deployment::RECOMMENDATION
+        )),
+        Ok(_) => None,
+        Err(err) => Some(format!(
+            "could not check whether the collector shares its OS user with agents while holding credentials for \
+             several hats (kernel spec §10): {err:#}"
+        )),
     }
 }
 
@@ -1007,6 +1046,9 @@ impl UpChildren<'_> {
         }
         cmd.arg("--data-dir")
             .arg(self.data_dir.join("collector"))
+            // Both children run as `up`'s own user, always: the collector's
+            // credentials are within every agent's reach (kernel spec §10).
+            .arg("--beside-host")
             // `up` has warned about it already; the collector has no use for it.
             .env_remove(DEV_TOKEN_VAR)
             // `up` bound these addresses already; the child takes the sockets.
@@ -1248,6 +1290,61 @@ mod tests {
     /// environment (`HENNERY_DEV_TOKEN`, left in a shell from before 3b);
     /// its host child must not inherit it, so neither can any agent that
     /// host runs.
+    /// Plan 4d-B3 (kernel spec §10): every collector `up` starts, the first
+    /// and every one started again after a crash, is told it runs beside the
+    /// host child; the host child is not.
+    #[test]
+    fn ups_collector_child_is_told_it_runs_beside_the_host() {
+        let args = UpArgs {
+            listen: vec!["127.0.0.1:7117".into()],
+            public_url: None,
+            data_dir: Some("/nonexistent".into()),
+            agents: Vec::new(),
+            idle_timeout_secs: 0,
+            workspace_roots: Vec::new(),
+        };
+        let children = UpChildren {
+            exe: "/bin/hennery".into(),
+            args: &args,
+            data_dir: "/nonexistent".into(),
+            host_dir: "/nonexistent/host".into(),
+            collector_url: "http://127.0.0.1:7117".into(),
+            collector_ws_url: "ws://127.0.0.1:7117/api/hosts/ws".into(),
+            listeners: Vec::new(),
+            parent: std::io::pipe().unwrap(),
+        };
+        let (_reader, writer) = std::io::pipe().unwrap();
+        let beside = |cmd: &tokio::process::Command| cmd.as_std().get_args().filter(|a| *a == "--beside-host").count();
+        assert_eq!(beside(&children.collector(None)), 1, "a collector started again");
+        assert_eq!(beside(&children.collector(Some(&writer))), 1, "the first collector");
+        assert_eq!(beside(&children.host(None)), 0, "the host child");
+    }
+
+    /// Plan 4d-B3: the start line names the count and the fix when the
+    /// warning is due, nothing when it is not, and a check that could not
+    /// run as such (the review's A5).
+    #[test]
+    fn the_start_line_says_what_the_verdict_is() {
+        use hennery_kernel::deployment::{Facts, RECOMMENDATION};
+        let line = start_warning(Ok(Facts {
+            beside_host: true,
+            hats: 3,
+        }))
+        .unwrap();
+        assert!(line.contains("gateway credentials for 3 hats"), "{line}");
+        assert!(line.contains(RECOMMENDATION), "{line}");
+        for quiet in [(true, 1), (false, 3)] {
+            let facts = Facts {
+                beside_host: quiet.0,
+                hats: quiet.1,
+            };
+            assert_eq!(start_warning(Ok(facts)), None, "{facts:?}");
+        }
+        let line = start_warning(Err(anyhow::anyhow!("the store is gone"))).unwrap();
+        assert!(line.starts_with("could not check"), "{line}");
+        assert!(line.contains("the store is gone"), "{line}");
+    }
+
     #[test]
     fn ups_host_child_does_not_inherit_the_operator_token() {
         let args = UpArgs {
