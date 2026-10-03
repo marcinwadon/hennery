@@ -29,6 +29,26 @@ const VERSION_LEN: usize = 4;
 /// clients, stdio servers' environments) never share one with these.
 pub const STATIC_TOKEN: &str = "gw_credentials.static_token";
 
+/// An OAuth connection's grant (`cred_kind = oauth_dcr | oauth_client`):
+/// its access and refresh tokens, as one JSON object (plan 8f).
+pub const OAUTH_TOKENS: &str = "gw_credentials.oauth_tokens";
+
+/// An OAuth client's secret: the client the grant was made with.
+pub const CLIENT_SECRET: &str = "gw_oauth_clients.client_secret";
+
+/// The secret of a pre-registered client saved while a grant is live
+/// (G-7): a field of its own, so it never opens as the active client's.
+pub const PENDING_CLIENT_SECRET: &str = "gw_oauth_clients.pending_client_secret";
+
+/// The field a connection's credential is sealed under, from its kind: a
+/// row left under another kind does not open as this one's (G-14).
+pub fn credential_field(kind: crate::model::CredKind) -> &'static str {
+    match kind {
+        crate::model::CredKind::OauthDcr | crate::model::CredKind::OauthClient => OAUTH_TOKENS,
+        crate::model::CredKind::None | crate::model::CredKind::Static => STATIC_TOKEN,
+    }
+}
+
 /// Why a blob did not open. None of them says more than this: a caller
 /// names the row.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

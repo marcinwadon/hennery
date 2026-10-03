@@ -13,7 +13,7 @@
 //! Every SQL statement of this file names the owner, and the owner audit
 //! reads it (`hennery-testkit/tests/owner_filter.rs`).
 
-use crate::model::{CredKind, url_for_logs};
+use crate::model::{CredKind, Status, StatusChange, url_for_logs};
 use crate::schema::{COMPONENT, MIGRATIONS};
 use crate::tokens::{is_session_token, token_hash};
 use anyhow::{Context, Result, anyhow};
@@ -73,6 +73,8 @@ pub struct ScopedConnection {
     pub tool_allowlist: Option<Vec<String>>,
     /// `not_connected`, `ok`, `needs_auth` or `error`.
     pub status: String,
+    /// Whether a credential is stored, as of the read.
+    pub has_credential: bool,
 }
 
 // `Debug` by hand: the URL shows only its origin (lane L11).
@@ -122,30 +124,203 @@ impl ProxyStore {
 
     /// Live traffic got a 2xx through `id` with its URL `url` (gateway spec
     /// §7): its status becomes `ok` if it was anything else. Not if the
-    /// connection was changed meanwhile, to another URL or to a `static`
-    /// kind without a credential: the answer was about what it was. True if
-    /// the status changed.
-    pub fn mark_ok(&self, id: &str, url: &str, now: i64) -> Result<bool> {
-        let changed = self.conn().execute(
-            "UPDATE gw_connections SET status = 'ok', status_note = NULL, status_at = ?4
-             WHERE id = ?1 AND owner_id = ?2 AND url = ?3 AND status != 'ok'
-                 AND (cred_kind = 'none'
-                      OR EXISTS (SELECT 1 FROM gw_credentials k WHERE k.connection_id = ?1 AND k.owner_id = ?2))",
-            params![id, self.owner, url, now],
+    /// connection was changed meanwhile, to another URL or to a kind
+    /// without a credential: the answer was about what it was. `checked_at`
+    /// moves at most every `LAST_USED_EVERY` seconds (plan 8d's hand-off),
+    /// not on every request. The transition, if there was one.
+    pub fn record_traffic_ok(&self, id: &str, url: &str, now: i64) -> Result<Option<StatusChange>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row: Option<(String, String, String, Option<i64>)> = tx
+            .query_row(
+                "SELECT status, label, hat_id, checked_at FROM gw_connections
+                 WHERE id = ?1 AND owner_id = ?2 AND url = ?3
+                     AND (cred_kind = 'none'
+                          OR EXISTS (SELECT 1 FROM gw_credentials k WHERE k.connection_id = ?1 AND k.owner_id = ?2))",
+                params![id, self.owner, url],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((status, label, hat_id, checked_at)) = row else {
+            return Ok(None);
+        };
+        let from = Status::parse(&status).ok_or_else(|| anyhow!("a stored status"))?;
+        if from == Status::Ok {
+            if checked_at.is_none_or(|at| now - at >= LAST_USED_EVERY) {
+                tx.execute(
+                    "UPDATE gw_connections SET checked_at = ?3 WHERE id = ?1 AND owner_id = ?2",
+                    params![id, self.owner, now],
+                )?;
+                tx.commit()?;
+            }
+            return Ok(None);
+        }
+        tx.execute(
+            "UPDATE gw_connections SET status = 'ok', status_note = NULL, status_at = ?3, checked_at = ?3
+             WHERE id = ?1 AND owner_id = ?2",
+            params![id, self.owner, now],
         )?;
-        Ok(changed == 1)
+        tx.commit()?;
+        Ok(Some(StatusChange {
+            connection_id: id.to_string(),
+            hat_id,
+            label,
+            from,
+            to: Status::Ok,
+        }))
+    }
+
+    /// `id`'s status is `to` as of `now`, with `note`, unless the
+    /// connection was changed to another URL than `url` meanwhile (gateway
+    /// spec §5.4, §7): the upstream refused its credential (`needs_auth`),
+    /// or the probe says `ok` or `error`. `checked_at` moves either way.
+    /// The transition, if there was one.
+    pub fn record_status(
+        &self,
+        id: &str,
+        url: &str,
+        to: Status,
+        note: Option<&str>,
+        now: i64,
+    ) -> Result<Option<StatusChange>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let row: Option<(String, String, String)> = tx
+            .query_row(
+                "SELECT status, label, hat_id FROM gw_connections WHERE id = ?1 AND owner_id = ?2 AND url = ?3",
+                params![id, self.owner, url],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((status, label, hat_id)) = row else {
+            return Ok(None);
+        };
+        let from = Status::parse(&status).ok_or_else(|| anyhow!("a stored status"))?;
+        tx.execute(
+            "UPDATE gw_connections SET status = ?3, status_note = ?4, checked_at = ?5,
+                 status_at = CASE WHEN status = ?3 THEN status_at ELSE ?5 END
+             WHERE id = ?1 AND owner_id = ?2",
+            params![id, self.owner, to.as_str(), note, now],
+        )?;
+        tx.commit()?;
+        Ok((from != to).then(|| StatusChange {
+            connection_id: id.to_string(),
+            hat_id,
+            label,
+            from,
+            to,
+        }))
     }
 
     /// The upstream at `url` refused `id`'s credential, or its lack of one
-    /// (401; gateway spec §5.4, §7): `needs_auth`, unless the connection
-    /// was changed to another URL meanwhile. True if the status changed.
-    pub fn mark_needs_auth(&self, id: &str, url: &str, now: i64) -> Result<bool> {
-        let changed = self.conn().execute(
-            "UPDATE gw_connections SET status = 'needs_auth', status_note = ?4, status_at = ?5
-             WHERE id = ?1 AND owner_id = ?2 AND url = ?3 AND status != 'needs_auth'",
-            params![id, self.owner, url, "the upstream refused the credential (401)", now],
+    /// (401; gateway spec §5.4, §7): `needs_auth`, with `note`.
+    pub fn mark_needs_auth(&self, id: &str, url: &str, note: &str, now: i64) -> Result<Option<StatusChange>> {
+        self.record_status(id, url, Status::NeedsAuth, Some(note), now)
+    }
+
+    /// Only `checked_at` moves: the probe learned nothing that changes the
+    /// status (another 4xx: gateway spec §7), while the URL is `url`.
+    pub fn record_checked(&self, id: &str, url: &str, now: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE gw_connections SET checked_at = ?4 WHERE id = ?1 AND owner_id = ?2 AND url = ?3",
+            params![id, self.owner, url, now],
         )?;
-        Ok(changed == 1)
+        Ok(())
+    }
+
+    /// Every connection in `needs_auth` or `error` now, as the transition
+    /// a startup announces once (gateway spec §7).
+    pub fn problems(&self) -> Result<Vec<StatusChange>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, hat_id, label, status FROM gw_connections
+             WHERE owner_id = ?1 AND status IN ('needs_auth', 'error') ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([&self.owner], |r| {
+            Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (connection_id, hat_id, label, status) = row?;
+            out.push(StatusChange {
+                connection_id,
+                hat_id,
+                label,
+                from: Status::Ok,
+                to: Status::parse(&status).ok_or_else(|| anyhow!("a stored status"))?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The connections the background probe checks (gateway spec §7): the
+    /// OAuth ones with a grant. Static and `none` connections are not
+    /// probed, nor any without a credential.
+    pub fn probe_targets(&self) -> Result<Vec<ScopedConnection>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT c.id FROM gw_connections c
+             WHERE c.owner_id = ?1 AND c.cred_kind IN ('oauth_dcr', 'oauth_client')
+                 AND EXISTS (SELECT 1 FROM gw_credentials k WHERE k.connection_id = c.id AND k.owner_id = ?1)
+             ORDER BY c.created_at, c.id",
+        )?;
+        let ids = stmt
+            .query_map([&self.owner], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        drop(conn);
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(connection) = self.connection_by_id(&id)? {
+                out.push(connection);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The connection `id` as the proxy reads one, whatever its mounts: for
+    /// a probe, which acts for the operator, not for a principal. With
+    /// whether it has a credential.
+    pub fn connection_by_id(&self, id: &str) -> Result<Option<ScopedConnection>> {
+        type Row = (String, String, String, String, bool, Option<String>, String, bool);
+        let row: Option<Row> = self
+            .conn()
+            .query_row(
+                "SELECT c.slug, c.label, c.url, c.cred_kind, c.internal_network, c.tool_allowlist, c.status,
+                        EXISTS (SELECT 1 FROM gw_credentials k WHERE k.connection_id = c.id AND k.owner_id = ?1)
+                 FROM gw_connections c WHERE c.owner_id = ?1 AND c.id = ?2",
+                params![self.owner, id],
+                |r| {
+                    Ok((
+                        r.get(0)?,
+                        r.get(1)?,
+                        r.get(2)?,
+                        r.get(3)?,
+                        r.get(4)?,
+                        r.get(5)?,
+                        r.get(6)?,
+                        r.get(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((slug, label, url, kind, internal_network, allowlist, status, has_credential)) = row else {
+            return Ok(None);
+        };
+        Ok(Some(ScopedConnection {
+            cred_kind: CredKind::parse(&kind).ok_or_else(|| anyhow!("a stored credential kind"))?,
+            tool_allowlist: allowlist
+                .map(|json| serde_json::from_str(&json))
+                .transpose()
+                .context("a stored tool allowlist")?,
+            id: id.to_string(),
+            slug,
+            label,
+            url,
+            internal_network,
+            status,
+            has_credential,
+        }))
     }
 }
 
@@ -187,11 +362,12 @@ impl ClientIdentity for ProxyStore {
 impl MountPolicy for ProxyStore {
     fn connection(&self, principal: &Principal, slug: &str) -> Result<Option<ScopedConnection>> {
         let PrincipalKind::Session { host_id, .. } = &principal.kind;
-        type Row = (String, String, String, String, bool, Option<String>, String);
+        type Row = (String, String, String, String, bool, Option<String>, String, bool);
         let row: Option<Row> = self
             .conn()
             .query_row(
-                "SELECT c.id, c.label, c.url, c.cred_kind, c.internal_network, c.tool_allowlist, c.status
+                "SELECT c.id, c.label, c.url, c.cred_kind, c.internal_network, c.tool_allowlist, c.status,
+                        EXISTS (SELECT 1 FROM gw_credentials k WHERE k.connection_id = c.id AND k.owner_id = ?1)
                  FROM gw_connections c
                  WHERE c.owner_id = ?1 AND c.slug = ?2 AND c.hat_id = ?3
                      AND EXISTS (SELECT 1 FROM gw_mounts m JOIN hosts h ON h.id = m.host_id AND h.owner_id = ?1
@@ -207,11 +383,12 @@ impl MountPolicy for ProxyStore {
                         r.get(4)?,
                         r.get(5)?,
                         r.get(6)?,
+                        r.get(7)?,
                     ))
                 },
             )
             .optional()?;
-        let Some((id, label, url, kind, internal_network, allowlist, status)) = row else {
+        let Some((id, label, url, kind, internal_network, allowlist, status, has_credential)) = row else {
             return Ok(None);
         };
         Ok(Some(ScopedConnection {
@@ -226,6 +403,7 @@ impl MountPolicy for ProxyStore {
             url,
             internal_network,
             status,
+            has_credential,
         }))
     }
 }

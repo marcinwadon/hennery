@@ -186,6 +186,9 @@ async fn create(State(state): State<GatewayState>, ApiJson(req): ApiJson<CreateM
         tool_allowlist: req.tool_allowlist,
         internal_network: req.internal_network,
     };
+    if new.cred_kind.is_oauth() {
+        return changed(Change::Unsupported(new.cred_kind), StatusCode::CREATED);
+    }
     match state.store.create(&new, unix_now()) {
         Ok(change) => {
             if let Change::Done(record) = &change {
@@ -230,6 +233,9 @@ async fn update(
         tool_allowlist: req.tool_allowlist,
         internal_network: req.internal_network,
     };
+    if let Some(kind) = patch.cred_kind.filter(|kind| kind.is_oauth()) {
+        return changed(Change::Unsupported(kind), StatusCode::OK);
+    }
     match state.store.update(&id, &patch, unix_now()) {
         Ok(change) => {
             if let Change::Done(record) = &change {

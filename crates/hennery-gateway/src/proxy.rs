@@ -480,10 +480,12 @@ async fn proxy(
     if status == StatusCode::UNAUTHORIZED {
         drop(response);
         tracing::warn!(connection_id = %connection.id, slug = %connection.slug, "gateway proxy: the upstream refused the credential");
-        if let Err(err) = state
-            .statuses
-            .mark_needs_auth(&connection.id, upstream.url.as_str(), now)
-        {
+        if let Err(err) = state.statuses.mark_needs_auth(
+            &connection.id,
+            upstream.url.as_str(),
+            "the upstream refused the credential (401)",
+            now,
+        ) {
             tracing::error!(connection_id = %connection.id, error = %err, "gateway proxy: status not recorded");
         }
         return upstream_auth(&connection);
@@ -513,7 +515,9 @@ async fn proxy(
     if status.is_success()
         && !matches!(kind, BodyKind::Empty)
         && response.content_length() != Some(0)
-        && let Err(err) = state.statuses.mark_ok(&connection.id, upstream.url.as_str(), now)
+        && let Err(err) = state
+            .statuses
+            .record_traffic_ok(&connection.id, upstream.url.as_str(), now)
     {
         tracing::error!(connection_id = %connection.id, error = %err, "gateway proxy: status not recorded");
     }
