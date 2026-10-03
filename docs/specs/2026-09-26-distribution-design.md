@@ -215,12 +215,22 @@ runtime (§3.2), so the installer never touches the npm registry.
 - **Rust:** `crane` (`buildDepsOnly` for caching; clippy/test/audit as flake
   checks; crate hashes come from `Cargo.lock`, so no per-system vendor hash),
   toolchain pinned through an overlay.
-- **Frontend:** a separate derivation with `fetchPnpmDeps` and
-  **`fetcherVersion = 4`**, pnpm major pinned. `pnpm-workspace.yaml` declares
-  `supportedArchitectures` (linux/darwin × x64/arm64 × glibc) so the dependency
-  hash is the same on every system (to be verified when the flake is written).
-  The build passes the output to `build.rs` via `HENNERY_FRONTEND_DIST`; a plain
-  `cargo build` builds or stubs the frontend itself.
+- **Frontend:** a separate derivation (`nix/web.nix`, plan 7e-ii-b) on the
+  flake's `nixpkgs-web`, the dev shell's Node 24 and pnpm, with the pnpm major
+  pinned (`pnpm_12`). Its dependencies come from `fetchPnpmDeps` with
+  **`fetcherVersion = 4`**, the only version that fetcher takes for pnpm 11 and
+  newer. The fetcher installs with `--force`, which fetches every platform's
+  optional packages whatever `supportedArchitectures` says, so there is no
+  `pnpm-workspace.yaml` and the dependency hash is the same on every system:
+  verified on aarch64-darwin and x86_64-linux; aarch64-linux is built by no CI
+  runner. A change to `web/pnpm-lock.yaml` needs a new hash
+  (`sh packaging/update-web-hash.sh`). Under pnpm 12 the fetcher's fixup breaks
+  on package files that are not strict JSON, so `nix/web.nix` drops the store's
+  unpacked `v11/links` before it. The package passes the output to `build.rs`
+  via `HENNERY_WEB_DIST`, with `HENNERY_WEB_REQUIRE=1`, so a Nix build fails
+  rather than embed the placeholder page; a flake check greps the binary for
+  the placeholder's marker. A plain `cargo build` embeds `web/dist`, or the
+  placeholder without it (kernel §7).
   *(D-1: the predecessor pinned a pnpm fetcher version that current nixpkgs
   removed, and kept a second, older nixpkgs input to stay on it.)*
 - **Adapters:** the flake reads the same manifest (`builtins.fromJSON`),

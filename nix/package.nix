@@ -3,7 +3,7 @@
 # shell has, so `nix flake check` and the dev shell's `cargo clippy` agree.
 # OpenSSL is nixpkgs', not the release build's vendored copy: a Nix build
 # links its dependencies from the store.
-{ pkgs, crane, advisory-db }:
+{ pkgs, crane, advisory-db, webUi }:
 let
   inherit (pkgs) lib stdenv;
   craneLib = crane.mkLib pkgs;
@@ -35,6 +35,13 @@ let
     // {
       inherit cargoArtifacts;
       cargoExtraArgs = "--locked -p hennery";
+      # The web UI's build (`nix/web.nix`, plan 7e-ii-b), embedded by the
+      # kernel's build script. Without it the build fails rather than embed
+      # the placeholder page. The checks below build without it.
+      HENNERY_WEB_DIST = "${webUi}";
+      HENNERY_WEB_REQUIRE = "1";
+      # The UI is in the binary, so the package never needs it at run time.
+      disallowedReferences = [ webUi ];
       # The tests run in CI's own jobs (`ci.yml`): they spawn processes and
       # bind loopback ports, which a build sandbox does not promise.
       doCheck = false;
@@ -59,6 +66,12 @@ in
         cargoClippyExtraArgs = "--workspace --all-targets -- -D warnings";
       }
     );
+    # The binary embeds the web UI, not the placeholder: the release
+    # archives' own check (plan 4b), run on the Nix-built binary.
+    web-ui = pkgs.runCommand "hennery-web-ui-check" { } ''
+      sh ${../packaging/check-web-ui.sh} ${lib.getExe package}
+      touch "$out"
+    '';
     fmt = craneLib.cargoFmt { inherit (common) src pname version; };
     audit = craneLib.cargoAudit { inherit (common) src pname version; inherit advisory-db; };
   };
