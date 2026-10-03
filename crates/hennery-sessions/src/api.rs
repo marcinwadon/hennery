@@ -359,10 +359,11 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
 /// The longest search the list takes, in characters (plan 6b decision 8).
 const SEARCH_MAX_CHARS: usize = 200;
 
-/// `GET /api/sessions`' query (ACP core §9). Every value is read as text,
-/// so a malformed one gets an `ApiError`.
+/// `GET /api/sessions`' query (ACP core §9), and the view's summaries'
+/// (plan 4a-ii). Every value is read as text, so a malformed one gets an
+/// `ApiError`.
 #[derive(Deserialize)]
-struct ListParams {
+pub(crate) struct ListParams {
     cursor: Option<String>,
     limit: Option<String>,
     q: Option<String>,
@@ -370,74 +371,118 @@ struct ListParams {
     lifecycle: Option<String>,
 }
 
-/// The session list (ACP core §9; plan 6b decision 8): newest
-/// `last_event_at` first, in pages of `limit` (50 by default, clamped to
-/// 1..=200) after `cursor`; only the comma-separated `lifecycle`s, unless
-/// `q` searches the title, cwd, branch and id of every session; and only
-/// the sessions of `hat`, with or without `q` (frontend §5; plan 5c). The
-/// hat is matched as given: an empty one lists the sessions from before
-/// hats that got none.
-async fn list_sessions(State(state): State<AppState>, Query(params): Query<ListParams>) -> Response {
-    let limit = match params.limit.as_deref().map(str::parse::<u32>) {
-        None => LIST_DEFAULT_LIMIT,
-        Some(Ok(limit)) => limit.clamp(1, LIST_MAX_LIMIT),
-        Some(Err(_)) => return error(StatusCode::BAD_REQUEST, "invalid", "limit must be a whole number"),
-    };
-    let cursor = match params.cursor.as_deref().map(Cursor::decode) {
-        None => None,
-        Some(Some(cursor)) => Some(cursor),
-        Some(None) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "invalid_cursor",
-                "not a cursor this list gave out",
-            );
-        }
-    };
-    let search = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
-    // A control character would cut the pattern short (a NUL ends it: the
-    // second review's P4).
-    if search.is_some_and(|q| q.chars().count() > SEARCH_MAX_CHARS || q.chars().any(char::is_control)) {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "invalid",
-            format!("a search is at most {SEARCH_MAX_CHARS} characters, with no control characters"),
-        );
+/// A list query's value that cannot be honoured: 400 with this code and
+/// message.
+pub(crate) struct Refused(&'static str, String);
+
+impl IntoResponse for Refused {
+    fn into_response(self) -> Response {
+        error(StatusCode::BAD_REQUEST, self.0, self.1)
     }
-    let mut lifecycles: Vec<&str> = Vec::new();
-    for name in params
-        .lifecycle
-        .as_deref()
-        .unwrap_or_default()
-        .split(',')
-        .map(str::trim)
-    {
-        if name.is_empty() || lifecycles.contains(&name) {
-            continue;
-        }
-        if !LIFECYCLES.contains(&name) {
-            return error(
-                StatusCode::BAD_REQUEST,
+}
+
+/// An empty hat names none: refused, so that "no hat chosen" sent as
+/// `hat=` is not answered with an empty list, or a count of none (6b: a
+/// filter it cannot honour is refused, never ignored). The session list's
+/// rule, and the list stream's.
+pub(crate) fn refuse_empty_hat(hat: Option<&str>) -> Result<(), Refused> {
+    if hat == Some("") {
+        return Err(Refused("invalid", "hat names no hat".into()));
+    }
+    Ok(())
+}
+
+/// A list's query, checked: what a `ListQuery` borrows.
+pub(crate) struct ListFilter<'a> {
+    cursor: Option<Cursor>,
+    limit: u32,
+    lifecycles: Vec<&'a str>,
+    search: Option<&'a str>,
+    hat: Option<&'a str>,
+}
+
+impl<'a> ListFilter<'a> {
+    /// The session list's filters (ACP core §9; plan 6b decision 8): pages
+    /// of `limit` (50 by default, clamped to 1..=200) after `cursor`; only
+    /// the comma-separated `lifecycle`s, unless `q` searches the title,
+    /// cwd, branch and id of every session; and only the sessions of
+    /// `hat`, with or without `q` (frontend §5; plan 5c). The hat is
+    /// matched as given.
+    pub(crate) fn parse(params: &'a ListParams) -> Result<Self, Refused> {
+        let limit = match params.limit.as_deref().map(str::parse::<u32>) {
+            None => LIST_DEFAULT_LIMIT,
+            Some(Ok(limit)) => limit.clamp(1, LIST_MAX_LIMIT),
+            Some(Err(_)) => return Err(Refused("invalid", "limit must be a whole number".into())),
+        };
+        let cursor = match params.cursor.as_deref().map(Cursor::decode) {
+            None => None,
+            Some(Some(cursor)) => Some(cursor),
+            Some(None) => {
+                return Err(Refused("invalid_cursor", "not a cursor this list gave out".into()));
+            }
+        };
+        let search = params.q.as_deref().map(str::trim).filter(|q| !q.is_empty());
+        // A control character would cut the pattern short (a NUL ends it:
+        // the second review's P4).
+        if search.is_some_and(|q| q.chars().count() > SEARCH_MAX_CHARS || q.chars().any(char::is_control)) {
+            return Err(Refused(
                 "invalid",
-                format!("lifecycle is a list of {}", LIFECYCLES.join(", ")),
-            );
+                format!("a search is at most {SEARCH_MAX_CHARS} characters, with no control characters"),
+            ));
         }
-        lifecycles.push(name);
+        let mut lifecycles: Vec<&str> = Vec::new();
+        for name in params
+            .lifecycle
+            .as_deref()
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+        {
+            if name.is_empty() || lifecycles.contains(&name) {
+                continue;
+            }
+            if !LIFECYCLES.contains(&name) {
+                return Err(Refused(
+                    "invalid",
+                    format!("lifecycle is a list of {}", LIFECYCLES.join(", ")),
+                ));
+            }
+            lifecycles.push(name);
+        }
+        refuse_empty_hat(params.hat.as_deref())?;
+        Ok(Self {
+            cursor,
+            limit,
+            lifecycles,
+            search,
+            hat: params.hat.as_deref(),
+        })
     }
-    // An empty hat names none: refused, so that "no hat chosen" sent as
-    // `hat=` is not answered with an empty list (6b: a filter it cannot
-    // honour is refused, never ignored).
-    if params.hat.as_deref() == Some("") {
-        return error(StatusCode::BAD_REQUEST, "invalid", "hat names no hat");
+
+    /// The hat the list is within, if one is named.
+    pub(crate) fn hat(&self) -> Option<&'a str> {
+        self.hat
     }
-    let query = ListQuery {
-        after: cursor.as_ref(),
-        limit,
-        lifecycles: (!lifecycles.is_empty()).then_some(lifecycles.as_slice()),
-        search,
-        hat: params.hat.as_deref(),
+
+    pub(crate) fn query(&self) -> ListQuery<'_> {
+        ListQuery {
+            after: self.cursor.as_ref(),
+            limit: self.limit,
+            lifecycles: (!self.lifecycles.is_empty()).then_some(self.lifecycles.as_slice()),
+            search: self.search,
+            hat: self.hat,
+        }
+    }
+}
+
+/// The session list (ACP core §9; plan 6b decision 8): newest
+/// `last_event_at` first, filtered and paged as `ListFilter` reads.
+async fn list_sessions(State(state): State<AppState>, Query(params): Query<ListParams>) -> Response {
+    let filter = match ListFilter::parse(&params) {
+        Ok(filter) => filter,
+        Err(refused) => return refused.into_response(),
     };
-    match state.store.list(&query) {
+    match state.store.list(&filter.query()) {
         Ok(page) => Json(page).into_response(),
         Err(err) => internal(err),
     }
@@ -1268,7 +1313,7 @@ fn pending_in(store: &Store, e: &EventDto) -> Option<PendingItem> {
 /// Whether a stored host fact changed the catalogue: its extracts carry a
 /// config snapshot or the commands. Listed events only reach here, and a
 /// listed one with either changed the stored catalogue.
-fn changes_catalogue(e: &EventDto) -> bool {
+pub(crate) fn changes_catalogue(e: &EventDto) -> bool {
     if !matches!(e.kind.as_str(), "session_started" | "config_applied" | "acp_update") {
         return false;
     }

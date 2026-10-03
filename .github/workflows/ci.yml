@@ -127,3 +127,5 @@ jobs:
           HENNERY_REQUIRE_SYSTEMD_ANALYZE: ${{ runner.os == 'Linux' && '1' || '' }}
       - name: Generated files are up to date
         run: cargo run -p hennery-proto --bin gen --locked -- --check
+      - name: Generated view types are up to date
+        run: cargo run -p hennery-view --bin gen-view --locked -- --check

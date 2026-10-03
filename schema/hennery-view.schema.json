@@ -1,0 +1,1135 @@
+{
+  "$defs": {
+    "Field": {
+      "description": "One field of an elicitation's form.",
+      "properties": {
+        "field_kind": {
+          "$ref": "#/$defs/FieldKind"
+        },
+        "hint": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "key": {
+          "type": "string"
+        },
+        "label": {
+          "type": "string"
+        },
+        "options": {
+          "items": {
+            "$ref": "#/$defs/FieldOption"
+          },
+          "type": "array"
+        },
+        "pairing": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Pairing"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "This free-text field belongs to another field of the form."
+        }
+      },
+      "required": [
+        "key",
+        "label",
+        "field_kind"
+      ],
+      "type": "object"
+    },
+    "FieldKind": {
+      "enum": [
+        "single",
+        "multi",
+        "text",
+        "unsupported"
+      ],
+      "type": "string"
+    },
+    "FieldOption": {
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "description": "What the card shows for it: the option's title.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "value": {
+          "description": "What the answer carries.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "value"
+      ],
+      "type": "object"
+    },
+    "Item": {
+      "description": "One display item of a session. Its `id` is stable for the session's\nlife; `version` is the `event_id` of the last event that changed it, so\na client keeps the item with the higher version.",
+      "oneOf": [
+        {
+          "description": "The operator's prompt, as the collector stored it: text, and images\nas attachments (`GET /api/attachments/{sha256}`).",
+          "properties": {
+            "content": {
+              "items": {
+                "$ref": "#/$defs/StoredBlock"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "user_turn",
+              "type": "string"
+            },
+            "truncated": {
+              "description": "A text block went past `TEXT_MAX_BYTES` and was cut there.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "content"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/Text",
+          "description": "The agent's reply: consecutive message chunks, merged.",
+          "properties": {
+            "kind": {
+              "const": "message",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/Text",
+          "description": "The agent's reasoning: consecutive thought chunks, merged.",
+          "properties": {
+            "kind": {
+              "const": "thinking",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/ToolCall",
+          "properties": {
+            "kind": {
+              "const": "tool_call",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The agent's plan, as its latest update in the group left it.",
+          "properties": {
+            "entries": {
+              "items": {
+                "$ref": "#/$defs/PlanEntry"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "const": "plan",
+              "type": "string"
+            },
+            "truncated": {
+              "description": "Steps past `PLAN_MAX_ENTRIES` were left out, or a step was cut.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "kind",
+            "entries"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/Question",
+          "description": "A permission or elicitation the agent asked.",
+          "properties": {
+            "kind": {
+              "const": "question",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/Marker",
+          "description": "A collector or host event, shown as a divider.",
+          "properties": {
+            "kind": {
+              "const": "marker",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "$ref": "#/$defs/Unrecognised",
+          "description": "An update the fold does not know, or could not read: never dropped\n(client view spec D3). Shown collapsed, its JSON as text.",
+          "properties": {
+            "kind": {
+              "const": "unrecognised",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "ts": {
+          "description": "When the item's first event was stored (RFC 3339, UTC): a merged\nmessage keeps its first chunk's.",
+          "type": "string"
+        },
+        "turn_id": {
+          "description": "The turn whose group the item is in: the events from its\n`user_turn` up to the next one. Absent before the first turn.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "version": {
+          "description": "The `event_id` of the last event that changed the item.",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "version",
+        "ts"
+      ],
+      "type": "object"
+    },
+    "ItemPage": {
+      "description": "`GET /api/view/sessions/{id}`: whole groups of a session's items,\noldest first.",
+      "properties": {
+        "epoch": {
+          "description": "The collector's epoch: `?after=<epoch>:<revision>` on the item stream.",
+          "type": "string"
+        },
+        "items": {
+          "items": {
+            "$ref": "#/$defs/Item"
+          },
+          "type": "array"
+        },
+        "older": {
+          "description": "Groups exist before the page's first: `before_turn=<its turn_id>`\ngets them.",
+          "type": "boolean"
+        },
+        "revision": {
+          "description": "The session's greatest event id when the page was read: no item\nhere is from a later event. The item stream resumes after it.",
+          "format": "int64",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "items",
+        "revision",
+        "epoch",
+        "older"
+      ],
+      "type": "object"
+    },
+    "ItemRemoved": {
+      "description": "SSE `item_removed`'s data. Reserved: the fold removes nothing yet, and\na client must still handle it.",
+      "properties": {
+        "id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "type": "object"
+    },
+    "Location": {
+      "description": "A file a tool call touches.",
+      "properties": {
+        "line": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path"
+      ],
+      "type": "object"
+    },
+    "Marker": {
+      "description": "A divider.",
+      "properties": {
+        "about_turn": {
+          "description": "The turn the marker is about: for `turn_not_delivered`, the prompt\nthat was not delivered; a client offers to send it again.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "from": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "marker": {
+          "$ref": "#/$defs/MarkerKind"
+        },
+        "reason": {
+          "description": "A machine code: the park's reason, the host note's code, the start\nfailure's code, the exit code or signal, the conflicting seq.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "text": {
+          "description": "Text to show behind a disclosure: an error, a stderr tail, a note.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "to": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "marker"
+      ],
+      "type": "object"
+    },
+    "MarkerKind": {
+      "oneOf": [
+        {
+          "enum": [
+            "host_restarted",
+            "turn_cancelled",
+            "start_not_delivered"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "parked",
+          "description": "`session_parked`; `reason`: idle, adapter_exited or operator.",
+          "type": "string"
+        },
+        {
+          "const": "resumed",
+          "description": "`operator_resumed`.",
+          "type": "string"
+        },
+        {
+          "const": "closed",
+          "description": "`operator_closed`.",
+          "type": "string"
+        },
+        {
+          "const": "host_offline",
+          "description": "`presumed_parked`; `reason`: host_offline or host_revoked.",
+          "type": "string"
+        },
+        {
+          "const": "host_back",
+          "description": "`reattached`.",
+          "type": "string"
+        },
+        {
+          "const": "turn_interrupted",
+          "description": "`turn_ended{interrupted}` or `turn_ended_synthesized`.",
+          "type": "string"
+        },
+        {
+          "const": "turn_failed",
+          "description": "`turn_ended{failed}`; `text`: the error.",
+          "type": "string"
+        },
+        {
+          "const": "turn_not_delivered",
+          "description": "`about_turn`: the prompt that was not delivered.",
+          "type": "string"
+        },
+        {
+          "const": "start_failed",
+          "description": "`reason`: the code; `text`: the message.",
+          "type": "string"
+        },
+        {
+          "const": "adapter_exited",
+          "description": "`reason`: `code <n>` or `signal <n>`; `text`: the stderr tail.",
+          "type": "string"
+        },
+        {
+          "const": "transcript_gap",
+          "description": "`reason`: `<from_seq>..<to_seq>`.",
+          "type": "string"
+        },
+        {
+          "const": "host_note",
+          "description": "`reason`: the note's code (`config_failed` and `reapply_failed`: a\nconfig switch did not take); `text`: the note.",
+          "type": "string"
+        },
+        {
+          "const": "conflict",
+          "description": "`reason`: the seq; `text`: the body received, as JSON text.",
+          "type": "string"
+        },
+        {
+          "const": "hat_reassigned",
+          "description": "`from` and `to`: hat ids.",
+          "type": "string"
+        },
+        {
+          "const": "elided",
+          "description": "The turn made more than the view holds (`GROUP_MAX_*`): nothing\nafter this in the turn is shown; the raw events route has it all.\n`reason`: `items`, `questions` or `bytes`.",
+          "type": "string"
+        }
+      ]
+    },
+    "Pairing": {
+      "description": "A free-text field's tie to the select it goes with.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/PairingKind"
+        },
+        "with": {
+          "description": "The key of the field it goes with.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "with",
+        "kind"
+      ],
+      "type": "object"
+    },
+    "PairingKind": {
+      "oneOf": [
+        {
+          "const": "exclusive",
+          "description": "An answer instead of the other field's: choosing an option clears\nthe text, and typing clears the option (frontend §6.3).",
+          "type": "string"
+        },
+        {
+          "const": "note",
+          "description": "An addition to the other field's answer, which stays as chosen.",
+          "type": "string"
+        }
+      ]
+    },
+    "PendingKind": {
+      "description": "What a pending request asks the operator (ACP core §4.6).",
+      "oneOf": [
+        {
+          "const": "permission",
+          "description": "`session/request_permission`: pick one of the offered options.",
+          "type": "string"
+        },
+        {
+          "const": "elicitation",
+          "description": "`elicitation/create`: fill in a form, or decline.",
+          "type": "string"
+        }
+      ]
+    },
+    "PendingReason": {
+      "description": "Why a pending request was cancelled (ACP core §4.6).",
+      "oneOf": [
+        {
+          "enum": [
+            "turn_cancelled",
+            "session_closed",
+            "session_parked",
+            "adapter_lost",
+            "host_restarted"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "agent_withdrew",
+          "description": "The adapter withdrew its own question (`$/cancel_request`).",
+          "type": "string"
+        },
+        {
+          "const": "host_revoked",
+          "description": "The operator revoked the session's host (kernel spec §4.3): it will\nnever connect again to deliver an answer.",
+          "type": "string"
+        }
+      ]
+    },
+    "PendingState": {
+      "description": "Where a pending request stands (ACP core §4.6): `open`, then\n`delivered` or `cancelled`.",
+      "enum": [
+        "open",
+        "delivered",
+        "cancelled"
+      ],
+      "type": "string"
+    },
+    "PermissionOption": {
+      "description": "One answer a permission offers.",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "option_id": {
+          "type": "string"
+        },
+        "option_kind": {
+          "description": "`allow_once`, `allow_always`, `reject_once` or `reject_always`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "option_id",
+        "name",
+        "option_kind"
+      ],
+      "type": "object"
+    },
+    "PlanEntry": {
+      "description": "One step of the agent's plan.",
+      "properties": {
+        "content": {
+          "description": "Empty when the agent sent none: the step is still shown.",
+          "type": "string"
+        },
+        "priority": {
+          "description": "`high`, `medium` or `low`, as the agent sent it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "`pending`, `in_progress` or `completed`, as the agent sent it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "type": "object"
+    },
+    "Question": {
+      "description": "A question the agent asked (ACP core §4.6), with where its answer\nstands. The state fields mirror `PendingItem`'s.",
+      "properties": {
+        "answerable": {
+          "description": "The server's pending set holds it open with no answer queued: only\nthen can a card answer it (F-15). Never derived from position.",
+          "type": "boolean"
+        },
+        "answered": {
+          "description": "An answer was accepted for it.",
+          "type": "boolean"
+        },
+        "delivered": {
+          "description": "The host's verdict on that answer; `true` sticks.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "pending_id": {
+          "type": "string"
+        },
+        "question_kind": {
+          "$ref": "#/$defs/PendingKind"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PendingReason"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why it was cancelled."
+        },
+        "request": {
+          "$ref": "#/$defs/Request"
+        },
+        "state": {
+          "$ref": "#/$defs/PendingState"
+        }
+      },
+      "required": [
+        "pending_id",
+        "question_kind",
+        "request",
+        "answerable",
+        "state",
+        "answered"
+      ],
+      "type": "object"
+    },
+    "Request": {
+      "description": "A question's request, parsed for its card.",
+      "oneOf": [
+        {
+          "properties": {
+            "options": {
+              "description": "In the adapter's order. Empty: nothing here can answer it.",
+              "items": {
+                "$ref": "#/$defs/PermissionOption"
+              },
+              "type": "array"
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tool_call_id": {
+              "description": "The tool call it asks about: the `tool_call_id` of a `tool_call`\nitem.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "permission",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "options"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "fields": {
+              "items": {
+                "$ref": "#/$defs/Field"
+              },
+              "type": "array"
+            },
+            "form_supported": {
+              "description": "Every field is one the card can fill; otherwise it can only\ndecline or cancel, and never invents a value.",
+              "type": "boolean"
+            },
+            "message": {
+              "type": "string"
+            },
+            "required": {
+              "description": "The keys the form requires, as the schema lists them.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "elicitation",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "message",
+            "fields",
+            "form_supported"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SessionRemoved": {
+      "description": "SSE `session_removed`'s data: the session was deleted (plan 9a). On the\nitem stream it is the last message, with no id; on the list stream it\ncarries `<epoch>:<cursor>` only when it ends a burst, as any message.",
+      "properties": {
+        "session_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id"
+      ],
+      "type": "object"
+    },
+    "SessionSummary": {
+      "description": "One session in the view's list: the list item, bounded, and whether a\nquestion waits for the operator.",
+      "properties": {
+        "activity": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent": {
+          "type": "string"
+        },
+        "created_at": {
+          "description": "RFC 3339, UTC.",
+          "type": "string"
+        },
+        "cwd": {
+          "description": "Canonical on its host since hats (umbrella §8.2).",
+          "type": "string"
+        },
+        "failure_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_branch": {
+          "description": "The branch checked out in `cwd`, as the host last reported it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "git_dirty": {
+          "description": "Whether `cwd`'s work tree had changes, as the host last reported.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "hat_id": {
+          "description": "The hat the session belongs to (umbrella §8.2), decided at its\nstart: a hat's id, or empty for a session from before hats whose\nhost and owner had no default hat to give it.",
+          "type": "string"
+        },
+        "host_id": {
+          "type": "string"
+        },
+        "last_event_at": {
+          "description": "When its last listed event was written (RFC 3339, UTC, three\nfractional digits): the list's sort key, newest first.",
+          "type": "string"
+        },
+        "lifecycle": {
+          "type": "string"
+        },
+        "mode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "description": "The current model and mode, as the host last reported them.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "presumed_parked": {
+          "description": "Parked only because its host has been offline past the threshold\n(ACP core §5.3); the host may still be running it.",
+          "type": "boolean"
+        },
+        "question_waits": {
+          "description": "An open question: the agent waits on it, in a turn or outside one,\nwhether or not an answer is queued (a question outside a turn sets\nno `blocked` activity).",
+          "type": "boolean"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "title": {
+          "description": "The title the agent reported, on one line and capped.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "session_id",
+        "host_id",
+        "agent",
+        "cwd",
+        "hat_id",
+        "lifecycle",
+        "presumed_parked",
+        "created_at",
+        "last_event_at",
+        "question_waits"
+      ],
+      "type": "object"
+    },
+    "StoredBlock": {
+      "description": "One block of a prompt as the collector stores it (ACP core §7, plan 6a):\nin `turns.content` and in the `user_turn` event's `content`. Text as it\nwas sent; an image as the attachment it was stored as, never its bytes.\n`GET /api/attachments/{sha256}` serves the image.",
+      "oneOf": [
+        {
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "mimeType": {
+              "type": "string"
+            },
+            "sha256": {
+              "description": "The SHA-256 of the image's bytes, 64 lowercase hex digits.",
+              "type": "string"
+            },
+            "size": {
+              "description": "The image's size in bytes, decoded.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "image",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "mimeType",
+            "sha256",
+            "size"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "SummaryPage": {
+      "description": "`GET /api/view/sessions`: a page of summaries, as `GET /api/sessions`\npages its items.",
+      "properties": {
+        "epoch": {
+          "description": "The collector's epoch: `?after=<epoch>:<revision>` on the list stream.",
+          "type": "string"
+        },
+        "next_cursor": {
+          "description": "Where the next page starts, for `cursor` (opaque); absent on the\nlast page.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "revision": {
+          "description": "The owner's greatest event id, read before the page: the list\nstream resumes after it.",
+          "format": "int64",
+          "type": "integer"
+        },
+        "sessions": {
+          "items": {
+            "$ref": "#/$defs/SessionSummary"
+          },
+          "type": "array"
+        },
+        "waiting": {
+          "description": "How many of the owner's sessions wait for the operator: `blocked`,\nor with an open question (`question_waits`). Within `hat` when one\nis given; whatever the cursor, `q` and `lifecycle`.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sessions",
+        "revision",
+        "epoch",
+        "waiting"
+      ],
+      "type": "object"
+    },
+    "Text": {
+      "description": "Merged text, cut at `TEXT_MAX_BYTES`.",
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "truncated": {
+          "description": "The text went past `TEXT_MAX_BYTES` and was cut there.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "text"
+      ],
+      "type": "object"
+    },
+    "ToolCall": {
+      "description": "A tool call, merged from its `tool_call` and `tool_call_update`s.",
+      "properties": {
+        "content": {
+          "items": {
+            "$ref": "#/$defs/ToolContent"
+          },
+          "type": "array"
+        },
+        "fabricated": {
+          "description": "The tool-invocation syntax found in the output: a sign the agent\nwrote a tool call and its result instead of making one (F-13).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "input": {
+          "description": "The tool's raw input. Over `INPUT_MAX_BYTES` it is a string: the\nstart of its JSON text."
+        },
+        "locations": {
+          "items": {
+            "$ref": "#/$defs/Location"
+          },
+          "type": "array"
+        },
+        "output": {
+          "description": "The tool's text output, from whichever shape the adapter sent.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "status": {
+          "description": "`pending`, `in_progress`, `completed` or `failed`, as the agent sent it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tool_call_id": {
+          "type": "string"
+        },
+        "tool_kind": {
+          "description": "ACP's tool kind (`read`, `edit`, `execute`, …).",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "truncated": {
+          "description": "A field went past its cap and was cut or left out.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "tool_call_id"
+      ],
+      "type": "object"
+    },
+    "ToolContent": {
+      "description": "One block of a tool call's `content`.",
+      "oneOf": [
+        {
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "new_text": {
+              "type": "string"
+            },
+            "old_text": {
+              "description": "Absent for a new file.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "const": "diff",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "path",
+            "new_text"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "data": {
+              "description": "Base64; absent past `IMAGE_MAX_BYTES`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "mime_type": {
+              "type": "string"
+            },
+            "type": {
+              "const": "image",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "mime_type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "terminal_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "terminal",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "terminal_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A block of a type the fold does not know: its JSON as text.",
+          "properties": {
+            "raw": {
+              "type": "string"
+            },
+            "type": {
+              "const": "other",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "raw"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "TurnContent": {
+      "description": "`GET /api/view/sessions/{id}/turns/{turn_id}`: the prompt of a turn\nthat was not delivered (a `turn_not_delivered` marker's `about_turn`),\nso a client can offer to send it again. A turn that was delivered has\nits `user_turn` item instead.",
+      "properties": {
+        "content": {
+          "description": "The prompt as it was stored, whole (4a-ii's security review, B-4):\nsent again, it is the prompt the operator wrote. Images are the\nowner's attachments, by `sha256`.",
+          "items": {
+            "$ref": "#/$defs/StoredBlock"
+          },
+          "type": "array"
+        },
+        "turn_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "turn_id",
+        "content"
+      ],
+      "type": "object"
+    },
+    "Unrecognised": {
+      "description": "An update the fold could not place.",
+      "properties": {
+        "raw": {
+          "description": "The event's body as JSON text, at most `RAW_MAX_BYTES`. Text, never\na value: a cut one is not JSON, and a client shows it as it is.",
+          "type": "string"
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "update_kind": {
+          "description": "The event's kind, and for an ACP update its `sessionUpdate`\n(`acp_update/<sessionUpdate>`).",
+          "type": "string"
+        }
+      },
+      "required": [
+        "update_kind",
+        "raw"
+      ],
+      "type": "object"
+    },
+    "WaitingChanged": {
+      "description": "SSE `waiting_changed`'s data, on the list stream: `SummaryPage`'s\n`waiting`, within the stream's `?hat=`, as of the burst it ends. Sent\nafter every resume, then whenever it changes.",
+      "properties": {
+        "count": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "count"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "hennery view"
+}
