@@ -488,6 +488,10 @@ that speaks the socket protocol directly (§10).
   `probe_agents`. *Built so far:* an accepted `hello` updates `host_version`
   (only if it has enrollment's shape), `capabilities` and `last_seen_at`, which
   is the last accepted `hello`, not liveness; no rename or default hat yet.
+  Since plan 8e it also keeps the `hello`'s per-agent `mcp_isolation`
+  (`hosts.mcp_isolation`, JSON, `NULL` until such a `hello`), so the host list
+  shows each agent's MCP delivery while the host is away (`HostItem`, plan 8e
+  decision E7).
 - One live connection per host (ACP core §3.5).
 
 ## 5. Hats
@@ -579,7 +583,7 @@ The kernel defines a `LifecycleHooks` trait with `on_host_revoked(host_id)`
 and `on_hat_purged(hat_id)`; `hennery-sessions` and `hennery-gateway` each
 implement it, so the kernel never imports either. Hooks must be idempotent: a
 repeated revoke, and a revoked host's socket ending, call them again (§4.3).
-*Built so far:* `on_host_revoked` and `on_hat_purged`, implemented by the sessions module; the gateway's purge hook is plan 8's.
+*Built so far:* `on_host_revoked` and `on_hat_purged`, implemented by the sessions module. The gateway's part of a purge (its connections with their credentials and mounts, its stdio sets, its session tokens, their streams cut) runs through `SessionMcp::purge_hat`, first: the purge route and the hook owe the purge's checkpoint, then run the gateway's part, then the sessions' (plan 8e; A15), so a hat stuck frozen cannot reach MCP meanwhile, and a failed gateway part stops the purge before any session is deleted.
 
 **Purge a hat** (`POST /api/hats/{id}/purge`, step-up; the default hat of any
 host, revoked ones included, and the `default_hat_id` setting's hat cannot be

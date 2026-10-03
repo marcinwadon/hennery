@@ -147,7 +147,7 @@ included, since a table with children cannot be rebuilt later to widen one
 
 | Principal | Created | Scope |
 |---|---|---|
-| session | automatically, by `SessionMcp::servers_for` at every start and resume of a session (ACP core §1) | connections of the session's hat mounted on the session's host |
+| session | automatically, by `SessionMcp::servers_in` inside every start and resume of a session (ACP core §1) | connections of the session's hat mounted on the session's host |
 | `standalone` client | manually in standalone mode (`hennery gateway`) or for tools outside hennery | the connections pinned to the client (`gw_client_pins`) |
 
 - Tokens are 32 random bytes, stored only as SHA-256 hashes. A standalone
@@ -162,10 +162,29 @@ included, since a table with children cannot be rebuilt later to widen one
   back leaves no token minted or revoked. A mint replaces the session's
   row: the previous token no longer resolves. A hat purge deletes its
   tokens, revoked ones too (`purge_hat_in`).
-- **One token per session.** It is revoked on park, close, adapter exit and
-  host revoke (`SessionMcp::revoke`), and superseded by the token minted at the
-  next resume. A presumed park while the host is merely offline does not revoke
-  it (ACP core §4.8).
+- **One token per session.** It is revoked on park, close, adapter exit,
+  host revoke, re-assignment to another hat, a start or resume the route
+  fails, and delete (`SessionMcp::revoke_in`, `revoke_host_in`), each in
+  the transition's own transaction; it is superseded by the token minted at
+  the next resume, and a hat's purge deletes it. A presumed park while the
+  host is merely offline does not revoke it (ACP core §4.8), nor does a
+  host's report about a session that a newer resume has since superseded.
+- **A revoke ends what is open on the token** (plan 8e decision 12; the
+  fleet parent's ruling of 2026-10-02): for a token's revoke, scope checked
+  only when a request arrives is not revocation. Every request the proxy
+  serves on a session
+  token watches that token from before it is resolved until its answer's
+  body ends; a revoke, a supersession and a purge, once their transaction
+  has committed, cut every watch on the tokens they invalidated: a request
+  not yet answered ends, and a stream open on it is cut. Cutting before the
+  commit would race a rollback; registering the watch before the resolve
+  closes the race with a revoke in flight. Another token's streams are
+  untouched. The sessions module cuts in one place only, after the commit
+  (`commit_then_cut`, held by a source audit). A host revoke revokes and
+  cuts its tokens at once, before it waits for the host's connection to
+  close. A change to a connection (an unmount, a delete, an edit) is
+  refused at request time only (§3.2): what is already open on it runs
+  until the client or the upstream ends it (open for the maintainer).
 - **Scope is checked at request time** from the token's (host, hat) and the
   mounts as they are now, never from anything the request claims. An unknown
   token, a revoked token, an unmounted connection, or a connection of another
@@ -175,7 +194,13 @@ included, since a table with children cannot be rebuilt later to widen one
   never 401 (G-17). A revoked host's tokens and mounts are out of scope
   whether or not its tokens were revoked.
 - Tokens are never logged, and the `headers` of `mcp_servers` entries never
-  appear in timeline events or SSE (ACP core §8).
+  appear in timeline events or SSE (ACP core §8). A session token the agent
+  printed into an ACP payload is stored and published redacted, by shape:
+  every run of `hnry_session_` (any case) and at least 8 hexadecimal digits
+  (plan 8e decision 11, the default of the maintainer's open question Q2 of
+  plan 8c, reversible). A token split across two updates, or encoded
+  otherwise, is not caught; it stops working at the session's next park.
+  Two object keys that redact alike are merged into one.
 
 ### 3.2 Delivery to hennery sessions (primary path)
 
@@ -183,12 +208,19 @@ Per the spike, hennery-driven sessions get their MCP servers **per session over
 ACP**, not through agent config files:
 
 1. When the collector prepares `start_session` / `resume_session` (ACP core
-   §3.3) it calls `SessionMcp::servers_for(host, hat, session)`, which mints the
-   session token and returns every connection of the session's hat mounted on
-   the session's host, as
+   §3.3) it decides the delivery (umbrella §8.5;
+   `hennery_proto::rest::mcp_session_delivery`, the one mapping the host list
+   reads too, plan 8e decision E8) and, inside the start's or resume's own
+   transaction, calls `SessionMcp::servers_in(tx, session, mode)`. For a
+   mode that delivers, it mints the session token (a failed mint rolls the
+   transition back) and returns every connection of the session's hat
+   mounted on the session's host, as
    `{type: "http", name: "hennery-<slug>", url: "<public_url>/mcp/<slug>",
    headers: [{name: "Authorization", value: "Bearer <session token>"}]}`,
-   followed by the stdio servers for that (host, hat) (§3.4).
+   followed by the stdio servers for that (host, hat) (§3.4). For any other
+   mode it returns none, and the previous token is revoked. What was decided
+   is recorded on the session, `SessionDetail.mcp_delivery`: the mode and a
+   count, never a server, header or token (plan 8e decision E10).
 2. The host passes them in `session/new` / `session/load`, with the agent's
    isolation mechanism (Claude strict flag, Codex composed home; ACP core §6),
    or applies the fallback (umbrella §8.5). The collector decides the
@@ -237,6 +269,15 @@ like credentials, §6) and passes them to sessions of that hat on that host as
 ACP stdio `mcpServers` entries, named `hennery-<name>`. They run on the host as
 the agent's child processes and are not proxied. Editing them requires step-up
 authentication (kernel §3.4), since they are commands the host will execute.
+
+As built (plan 8e decisions E1–E6): a set is replaced whole (`PUT`), and a
+server keeps its row while its name stays; names follow the slug rules, are
+unique in their set and disjoint from every connection slug of the owner;
+env values are write-only (a `GET` returns each name and whether it has a
+value); `command` and `args` are returned as stored, not sealed (secrets
+belong in env); a revoked host's sets stay readable and refuse a `PUT` (409
+`host_revoked`); a hat's purge deletes its sets; standalone mode has no stdio
+routes. A host without the `mcp_servers` capability is given none.
 
 ---
 
@@ -401,7 +442,11 @@ and nothing goes up.
   (and, for `tools/list`, the allowlist).
 - **Request headers forwarded:** `Content-Type`, `Accept` (default
   `application/json, text/event-stream`), `Mcp-Session-Id`,
-  `Mcp-Protocol-Version`, `Last-Event-ID`. `Authorization` is replaced by the
+  `Mcp-Protocol-Version`, and `Last-Event-ID` only beside a session id bound
+  to the token (plan 8e: an upstream that replays by event id alone would
+  otherwise replay another session's stream; one that ignores
+  `Mcp-Session-Id` altogether can still do so, which the gateway cannot
+  prevent). `Authorization` is replaced by the
   upstream credential (or removed for `none`). Everything else is dropped.
   `Content-Type: application/json` goes up with a `POST` (the gateway checked
   the body is JSON), `Accept-Encoding: identity` is sent, and the upstream
@@ -443,10 +488,22 @@ and nothing goes up.
   client read as an event stream what the gateway passed as JSON.
 - Upstream redirects are never followed (§5.7): a 3xx is 502
   `upstream_redirect`, its `Location` never forwarded.
-- **Sessions:** `Mcp-Session-Id` passes through in both directions, so each
-  downstream client session maps to its own upstream session and the gateway
-  holds no session table. `DELETE` is forwarded so client terminations reach
-  the upstream. *(G-16: the predecessor answered DELETE with 405, leaving
+- **Sessions:** each downstream client session maps to its own upstream
+  session, and the gateway holds no session table: the `Mcp-Session-Id` it
+  sends down is the upstream's, bound to the token and the connection (plan
+  8e decision 13), `<upstream id>.<tag>`, `tag` the lowercase hex of an
+  HMAC-SHA256 under a key of the process's own over the token's hash, the
+  connection's id and the upstream id, each length-prefixed. A request's id
+  is verified and stripped (split at its last `.`) before it goes up; one
+  unbound or tagged for another token or connection, or more than one, is
+  the same 404 as an unknown token, and nothing is forwarded. An upstream
+  answer with more than one id is 502 `upstream_invalid`. Every token on a
+  connection uses the same upstream credential, so without this a token
+  presenting another session's id would get what the upstream serves for
+  it. The key is per process: after a restart every id is refused and the
+  client initializes again (a 404 on a request with a session id means so
+  in MCP's streamable HTTP). `DELETE` is forwarded so client terminations
+  reach the upstream. *(G-16: the predecessor answered DELETE with 405, leaving
   upstream sessions until the vendor expired them.)*
 - `GET` (the optional server-to-client SSE channel) is forwarded and streamed.
 
@@ -529,10 +586,9 @@ and nothing goes up.
   - *An answer on another stream.* The proxy routes nothing between
     requests: each `POST` or `GET` is its own upstream exchange, and every
     stream is filtered alike. The upstream's `Mcp-Session-Id` is the only
-    thing that separates two sessions' streams: the gateway forwards the
-    client's, does not bind it to the token, and every token on a connection
-    uses the same upstream credential, so a token presenting another
-    session's id gets what the upstream serves for it (open for 8e).
+    thing that separates two sessions' streams, and the gateway binds it to
+    the token and the connection (§5.2, plan 8e decision 13): a token cannot
+    present another session's id.
   - *A tool list in an error* (`error.data.tools`) is passed on: no client
     reads tools from an error, and the refusal still enforces.
   - A response whose `id`, `result`, `tools` or a tool's `name` is spelt
@@ -591,6 +647,10 @@ use it without depending on the gateway:
     request permit.
   - The response head must arrive within 300 s (a long `tools/call` may
     answer in JSON only when done).
+  - A JSON answer, read whole to be judged (§5.3), must arrive whole within
+    60 s of its head; past it the answer is 502 `upstream_unreachable` and
+    nothing of it goes down (plan 8e decision 14). An event stream has no
+    such deadline.
 - The egress client is chosen at every request from the connection's
   stored `internal_network` flag, read with its URL from the same row, never
   from anything in the request; it applies the rules above (kernel §7.1).
