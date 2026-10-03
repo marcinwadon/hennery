@@ -17,8 +17,10 @@ use std::time::Duration;
 pub struct AdminArgs {
     /// The collector's data directory, or `hennery up`'s (whose collector
     /// keeps its own in `collector/`).
+    /// Else the one the installed `up` or collector service runs on, else
+    /// the platform's (distribution spec §8).
     #[arg(long, env = "HENNERY_DATA_DIR")]
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
     /// How long to wait for the collector, in milliseconds: for tests.
     #[arg(long, env = "HENNERY_ADMIN_TIMEOUT_MS", hide = true, value_parser = clap::value_parser!(u64).range(1..=600_000))]
     timeout_ms: Option<u64>,
@@ -63,7 +65,8 @@ fn socket_path(dir: &Path) -> PathBuf {
 }
 
 pub async fn run(args: AdminArgs) -> Result<()> {
-    let socket = socket_path(&args.data_dir);
+    let data_dir = crate::data_dir::collector_or_installed(args.data_dir.clone())?;
+    let socket = socket_path(&data_dir);
     let timeout = args.timeout_ms.map_or(CLIENT_TIMEOUT, Duration::from_millis);
     // What prompts checks first that a collector answers there, so nothing
     // is typed into a dead end (3b-ii's deferred item); the terminal is

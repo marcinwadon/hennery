@@ -10,7 +10,7 @@
 
 mod agents;
 mod collector;
-mod dirs;
+pub(crate) mod dirs;
 mod disk;
 mod env;
 mod platform;

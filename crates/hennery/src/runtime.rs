@@ -42,9 +42,10 @@ impl MirrorArgs {
 #[derive(Args)]
 pub struct UpdateArgs {
     /// The host's data directory, as for `host run`: for `hennery up`, its
-    /// `<data-dir>/host`.
+    /// `<data-dir>/host`. Else the installed service's host, else the
+    /// platform's (distribution spec §8).
     #[arg(long, env = "HENNERY_HOST_DATA_DIR")]
-    pub data_dir: PathBuf,
+    pub data_dir: Option<PathBuf>,
     /// Run this agent with your own CLI instead of the bundled one
     /// (`claude=/path/to/claude`, `codex=/path/to/codex`), or go back to it
     /// (`claude=bundled`). Recorded in `host.toml`; repeatable. Advanced: the
@@ -58,9 +59,10 @@ pub struct UpdateArgs {
 #[derive(Args)]
 pub struct RollbackArgs {
     /// The host's data directory, as for `host run`: for `hennery up`, its
-    /// `<data-dir>/host`.
+    /// `<data-dir>/host`. Else the installed service's host, else the
+    /// platform's (distribution spec §8).
     #[arg(long, env = "HENNERY_HOST_DATA_DIR")]
-    pub data_dir: PathBuf,
+    pub data_dir: Option<PathBuf>,
 }
 
 /// The adapter commands act on a paired host's data directory only: one
@@ -93,9 +95,11 @@ pub async fn run(command: AdaptersCommand) -> Result<()> {
         AdaptersCommand::Update(args) => {
             // Before anything is recorded: a bad mirror changes nothing.
             args.mirrors.sources()?;
-            require_host_dir(&args.data_dir)?;
-            record_cli_choices(&args.data_dir, &args.use_cli)?;
-            if update(&args.data_dir, &args.mirrors).await? {
+            let data_dir =
+                crate::data_dir::host_or_installed(args.data_dir.clone(), crate::data_dir::HostUse::Adapters)?;
+            require_host_dir(&data_dir)?;
+            record_cli_choices(&data_dir, &args.use_cli)?;
+            if update(&data_dir, &args.mirrors).await? {
                 println!(
                     "A running host keeps starting agents from the set it started with until it restarts; \
                      running sessions keep theirs."
@@ -104,8 +108,10 @@ pub async fn run(command: AdaptersCommand) -> Result<()> {
             Ok(())
         }
         AdaptersCommand::Rollback(args) => {
-            require_host_dir(&args.data_dir)?;
-            let layout = Layout::new(&args.data_dir)?;
+            let data_dir =
+                crate::data_dir::host_or_installed(args.data_dir.clone(), crate::data_dir::HostUse::Adapters)?;
+            require_host_dir(&data_dir)?;
+            let layout = Layout::new(&data_dir)?;
             let back = install::rollback(&layout, &progress).await?;
             println!(
                 "rolled back from adapter set {} to {} ({}); the host stays on it until `hennery host adapters update`",

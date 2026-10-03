@@ -446,8 +446,29 @@ them to the collector, so the Hosts view shows them without a terminal.
 | Logs | `$XDG_STATE_HOME/hennery/log` | `~/Library/Logs/hennery` |
 | Service env | `~/.config/hennery/service.env` | in the plist |
 
-`HENNERY_DATA_DIR` overrides the data directory (containers, tests). Logs rotate
-at 10 MiB × 5 files: the file being written and four rotated ones (`.1` to
+`HENNERY_DATA_DIR` overrides the data directory (containers, tests).
+
+**With no `--data-dir` or variable**, a command takes the data directory above:
+- `up` and `collector` take it as their root, since they make or run an install.
+- `admin` takes the one installed `up` or collector service's directory, else
+  the default.
+- `host join`, `host run` and `host adapters` take the one installed host
+  service's directory, else the default as a dedicated host's own.
+  `host join <url> <code>` then `service install --role host` therefore work as
+  typed.
+- A default that isn't a host's is refused, naming `--data-dir`:
+  - `up`'s root (installed, or `collector/` or `host/` in the default) makes
+    `host join` and `host run` refuse, since `up` pairs and runs its own host.
+    `host adapters` takes its `host/` instead.
+  - A collector's directory makes every host command refuse, as does an
+    installed collector service on it.
+  - `up` and `collector` refuse a default that holds another role's install:
+    `up` takes only an empty directory or its own layout, and `collector` only
+    an empty directory or a collector's.
+  - Several installed services leave no directory to take: `admin` and the host
+    commands then refuse, naming `--data-dir`.
+
+Logs rotate at 10 MiB × 5 files: the file being written and four rotated ones (`.1` to
 `.4`). Only a run by a service (`HENNERY_SERVICE`, which both units set) logs to
 these files, one per process: `hennery-up.log`, `hennery-collector.log`,
 `hennery-host.log` (0600, in a 0700 directory of the user's own), beside

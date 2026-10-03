@@ -30,11 +30,33 @@ fn offline(cmd: &mut Command) {
         // And never the gateway's key from whoever runs the tests (plan 8a):
         // a test that wants one sets it.
         .env_remove("HENNERY_MASTER_KEY")
-        .env_remove("CREDENTIALS_DIRECTORY");
+        .env_remove("CREDENTIALS_DIRECTORY")
+        // And never the real home: a command given no data directory takes
+        // the platform's default under it (distribution spec §8). This one
+        // cannot be created, so a test that forgets its directory fails at
+        // once rather than writing into the account of whoever runs it. A
+        // test that needs a home sets its own.
+        .env("HOME", UNWRITABLE_HOME)
+        .env("XDG_DATA_HOME", format!("{UNWRITABLE_HOME}/.local/share"))
+        .env("XDG_CONFIG_HOME", format!("{UNWRITABLE_HOME}/.config"))
+        .env("XDG_STATE_HOME", format!("{UNWRITABLE_HOME}/.local/state"))
+        .env("XDG_CACHE_HOME", format!("{UNWRITABLE_HOME}/.cache"))
+        .env_remove("HENNERY_DATA_DIR")
+        .env_remove("HENNERY_HOST_DATA_DIR")
+        // The agents' own homes, which the forget and purge paths prefer to
+        // HOME: never the ones whoever runs the tests exported.
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .env_remove("CODEX_SQLITE_HOME");
     for var in LOG_VARS {
         cmd.env_remove(var);
     }
 }
+
+/// A home no test can write to: under a directory that does not exist,
+/// below the root, which only root could create (a CI job run as root
+/// could, and would write there, harmlessly: never into a real home).
+const UNWRITABLE_HOME: &str = "/nonexistent-hennery-test/home";
 
 #[test]
 fn help_lists_the_skeleton_commands() {
@@ -1929,10 +1951,11 @@ fn the_host_fails_and_pairs_nothing_when_the_collector_dies_before_the_code() {
     let _cleanup = RemoveDir(dir.clone());
     let (_rt, addr, _code) = collector_with_a_pairing_code(&dir);
     let host_dir = dir.join("host");
-    let mut child = Command::new("/bin/sh")
-        // Offline, as `hennery()` is: this host may reach the managed path.
-        .env("HENNERY_NPM_REGISTRY", OFFLINE)
-        .env("HENNERY_NODE_MIRROR", OFFLINE)
+    // Offline and away from the real home, as `hennery()` is: this host
+    // may reach the managed path.
+    let mut cmd = Command::new("/bin/sh");
+    offline(&mut cmd);
+    let mut child = cmd
         .args([
             "-c",
             ": | exec \"$0\" \"$@\" 3<&0 </dev/null",
@@ -2060,6 +2083,7 @@ fn the_pairing_code_never_reaches_ups_childrens_argv_or_environment() {
         .env_clear()
         .env("HENNERY_NPM_REGISTRY", OFFLINE)
         .env("HENNERY_NODE_MIRROR", OFFLINE)
+        .env("HOME", UNWRITABLE_HOME)
         .env("PATH", "/usr/bin:/bin")
         .env("HENNERY_PROBE_MARKER", "yes");
     let mut up = up_logging_to_with(command, &data, &log, &[]);
@@ -3031,23 +3055,50 @@ fn the_healthcheck_passes_while_the_collector_serves_and_fails_once_it_stops() {
     }
 }
 
-/// `collector` still needs its data directory; `collector healthcheck`
-/// takes none of the collector's own flags.
+/// `collector` with no data directory takes the platform's (distribution
+/// spec §8), here under a home that cannot be created, so it fails at once
+/// naming it; `collector healthcheck` takes none of the collector's own
+/// flags.
 #[test]
-fn the_collector_without_a_data_dir_or_with_the_healthcheck_and_its_flags_is_refused() {
-    let run = |args: &[&str]| {
-        hennery()
-            .args(args)
-            .env_remove("HENNERY_DATA_DIR")
-            .env_remove("HENNERY_LISTEN")
-            .output()
-            .unwrap()
-    };
+fn the_collector_without_a_data_dir_takes_the_default_and_the_healthcheck_no_collector_flags() {
+    let run = |args: &[&str]| hennery().args(args).env_remove("HENNERY_LISTEN").output().unwrap();
     let out = run(&["collector"]);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("--data-dir"));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("/nonexistent-hennery-test/home"), "{stderr}");
     let out = run(&["collector", "--data-dir", "/nonexistent", "healthcheck"]);
     assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// `host join` with no data directory, where the platform's default is
+/// `hennery up`'s, refuses before reaching any collector, and names
+/// `--data-dir`: up pairs its own host.
+#[test]
+fn host_join_with_no_data_dir_refuses_ups_default_directory() {
+    let dir = scratch_dir("joinup");
+    let _cleanup = RemoveDir(dir.clone());
+    let home = dir.join("home");
+    let data = if cfg!(target_os = "macos") {
+        home.join("Library/Application Support/hennery")
+    } else {
+        dir.join("xdg-data/hennery")
+    };
+    std::fs::create_dir_all(data.join("host")).unwrap();
+    std::fs::write(data.join("host").join(hennery_host::identity::CONFIG_FILE), "").unwrap();
+    let out = hennery()
+        .args(["host", "join", "http://127.0.0.1:1", "AAAA-AAAA"])
+        .env("HOME", &home)
+        .env("XDG_DATA_HOME", dir.join("xdg-data"))
+        .env("XDG_CONFIG_HOME", dir.join("xdg-config"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("up pairs its own host") && stderr.contains("--data-dir"),
+        "{stderr}"
+    );
+    assert!(!data.join("host.key").exists() && !data.join(hennery_host::identity::CONFIG_FILE).exists());
 }
 
 /// `host.lock` (distribution spec §8): while `up`'s host child runs on
@@ -3317,32 +3368,51 @@ fn every_spawn_of_the_binary_is_offline() {
         ],
         "spawn the binary through hennery() or under_umask_022(), which keep it offline"
     );
-    assert_eq!(source.matches(concat!("offline(&mut ", "cmd)")).count(), 2);
-    // `offline`, the one spawn through a shell of its own, and the one test
-    // that clears the environment set both mirrors (the Task 7 review: a
-    // cleared environment reached the real registry).
+    assert_eq!(source.matches(concat!("offline(&mut ", "cmd)")).count(), 3);
+    // And `offline` keeps every spawn away from the real home, and from
+    // the agents' own homes whoever runs the tests exported.
+    assert!(source.contains(concat!(".env(\"HOME\", ", "UNWRITABLE_HOME)")));
+    for var in ["XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"] {
+        assert!(
+            source.contains(&format!(".env(\"{var}\", format!(\"{{UNWRITABLE_HOME}}")),
+            "{var}"
+        );
+    }
+    for var in [
+        "HENNERY_DATA_DIR",
+        "HENNERY_HOST_DATA_DIR",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "CODEX_SQLITE_HOME",
+    ] {
+        assert!(source.contains(&format!(".env_remove(\"{var}\")")), "{var}");
+    }
+    // `offline` and the one test that clears the environment set both
+    // mirrors (the Task 7 review: a cleared environment reached the real
+    // registry).
     assert_eq!(
         source
             .matches(concat!(".env(\"HENNERY_NPM_REGISTRY\", ", "OFFLINE)"))
             .count(),
-        3
+        2
     );
     assert_eq!(
         source
             .matches(concat!(".env(\"HENNERY_NODE_MIRROR\", ", "OFFLINE)"))
             .count(),
-        3
+        2
     );
     // A cleared environment is offline again on the very next lines.
     let lines: Vec<&str> = source.lines().map(str::trim).collect();
     for (i, line) in lines.iter().enumerate() {
         if line.contains(concat!(".env_", "clear()")) {
-            let next = lines[i + 1..(i + 3).min(lines.len())].join(" ");
+            let next = lines[i + 1..(i + 4).min(lines.len())].join(" ");
             assert!(
                 next.contains("HENNERY_NPM_REGISTRY")
                     && next.contains("HENNERY_NODE_MIRROR")
-                    && next.matches("OFFLINE").count() == 2,
-                "line {}: a cleared environment must set both mirrors again",
+                    && next.matches("OFFLINE").count() == 2
+                    && next.contains("UNWRITABLE_HOME"),
+                "line {}: a cleared environment must set both mirrors and the unwritable home again",
                 i + 1
             );
         }

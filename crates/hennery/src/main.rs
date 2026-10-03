@@ -4,6 +4,7 @@
 
 mod admin;
 mod config;
+mod data_dir;
 mod doctor;
 mod healthcheck;
 mod inherit;
@@ -77,8 +78,10 @@ struct JoinArgs {
     /// How the collector lists this host; defaults to the host name.
     #[arg(long)]
     name: Option<String>,
+    /// The host's data directory. Else the one the installed host service
+    /// runs, else the platform's (distribution spec §8).
     #[arg(long, env = "HENNERY_HOST_DATA_DIR")]
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
     /// Run this agent with your own CLI instead of the bundled one
     /// (`claude=/path/to/claude`, `codex=/path/to/codex`). Recorded in
     /// `host.toml`; repeatable. Advanced: the agent loses the pin's guarantee.
@@ -99,7 +102,7 @@ struct CollectorCli {
     #[command(subcommand)]
     command: Option<CollectorCommand>,
     #[command(flatten)]
-    run: Option<CollectorArgs>,
+    run: CollectorArgs,
 }
 
 #[derive(Subcommand)]
@@ -128,8 +131,10 @@ struct CollectorArgs {
     /// 127.0.0.1:7117.
     #[arg(long = "listen", env = "HENNERY_LISTEN", value_delimiter = ',')]
     listen: Vec<String>,
+    /// The collector's data directory; else the platform's (distribution
+    /// spec §8).
     #[arg(long, env = "HENNERY_DATA_DIR")]
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
     /// Where browsers reach the collector, for the setup link until setup
     /// stores its own (kernel spec §3.1). Else `public_url` in
     /// `config.toml`.
@@ -155,8 +160,10 @@ struct CollectorArgs {
 #[derive(Args, Clone)]
 struct HostArgs {
     /// Holds the pairing `hennery host join` stored (`host.key`, `host.toml`).
+    /// Else the one the installed host service runs, else the platform's
+    /// (distribution spec §8).
     #[arg(long, env = "HENNERY_HOST_DATA_DIR")]
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
     /// Agent adapter, as `name=command args…`. Repeatable. With none,
     /// `claude` and `codex` come from the installed adapter set. An agent
     /// never inherits CLAUDE_CODE_EXECUTABLE, CODEX_PATH, CODEX_CONFIG,
@@ -202,8 +209,10 @@ struct UpArgs {
     /// As for `collector`, handed on to the collector child.
     #[arg(long, env = "HENNERY_PUBLIC_URL")]
     public_url: Option<String>,
+    /// The data root, holding `collector/` and `host/`; else the platform's
+    /// (distribution spec §8).
     #[arg(long, env = "HENNERY_DATA_DIR")]
-    data_dir: PathBuf,
+    data_dir: Option<PathBuf>,
     /// Agent adapter for the host child, as for `host run --agent`. With
     /// none, `claude` and `codex` come from the host's installed adapter set
     /// (`<data-dir>/host`; the mirrors from `HENNERY_NPM_REGISTRY` and
@@ -273,10 +282,7 @@ impl Command {
     fn log_name(&self) -> Option<&'static str> {
         match self {
             Self::Up(_) => Some("up"),
-            Self::Collector(CollectorCli {
-                run: Some(_),
-                command: None,
-            }) => Some("collector"),
+            Self::Collector(CollectorCli { command: None, .. }) => Some("collector"),
             Self::Host {
                 command: HostCommand::Run(_),
             } => Some("host"),
@@ -307,13 +313,9 @@ async fn main() -> std::process::ExitCode {
             ..
         }) => Ok(collector_healthcheck(args)),
         Command::Collector(CollectorCli {
-            run: Some(args),
+            run: args,
             command: None,
         }) => run_collector(args).await.map(|()| std::process::ExitCode::SUCCESS),
-        Command::Collector(CollectorCli {
-            run: None,
-            command: None,
-        }) => unreachable!("clap requires --data-dir when no subcommand is given"),
         Command::Host {
             command: HostCommand::Join(args),
         } => join_host(args).await.map(|()| std::process::ExitCode::SUCCESS),
@@ -361,6 +363,7 @@ fn collector_healthcheck(args: HealthcheckArgs) -> std::process::ExitCode {
 }
 
 async fn run_collector(args: CollectorArgs) -> Result<()> {
+    let data_dir = data_dir::or_default(args.data_dir.clone(), service::unit::Role::Collector)?;
     // First: a SIGINT or SIGTERM from here on shuts down cleanly, removing
     // the admin socket, instead of killing the collector by the default
     // action while it starts.
@@ -372,13 +375,13 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     }
     let parent = args.parent_fd.map(inherit::watch_parent).transpose()?;
     warn_if_dev_token();
-    let file = config::FileConfig::load(&args.data_dir)?;
+    let file = config::FileConfig::load(&data_dir)?;
     // Named by its source: an operator cannot otherwise tell whether a flag,
     // `HENNERY_PUBLIC_URL` or the file gave the bad value.
     let public_url_source = if args.public_url.is_some() {
         "--public-url or HENNERY_PUBLIC_URL".to_string()
     } else {
-        args.data_dir.join(config::CONFIG_FILE).display().to_string()
+        data_dir.join(config::CONFIG_FILE).display().to_string()
     };
     let public_url = file
         .public_url(args.public_url.as_deref())
@@ -407,18 +410,18 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
             .map(|&fd| inherited_listener(fd))
             .collect::<Result<_>>()?
     };
-    private_data_dir(&args.data_dir)?;
+    private_data_dir(&data_dir)?;
     // Before the database and the setup link: a second collector on this
     // data directory stops here, while the first still answers on it.
-    let admin_socket = hennery_kernel::admin::bind(&args.data_dir)?;
-    let db = args.data_dir.join("hennery.db");
+    let admin_socket = hennery_kernel::admin::bind(&data_dir)?;
+    let db = data_dir.join("hennery.db");
     let store = Store::open(&db)?;
     let hosts = Hosts::open(&db)?;
     let operator = Operator::open(&db)?;
     let mut state = AppState::new(store, hosts, operator);
     // Before anything serves: every push subscription is bound to this key
     // (kernel spec §6).
-    state.vapid = std::sync::Arc::new(hennery_kernel::push::VapidKey::load_or_create(&args.data_dir)?);
+    state.vapid = std::sync::Arc::new(hennery_kernel::push::VapidKey::load_or_create(&data_dir)?);
     // The collector's one outbound HTTP policy (kernel spec §7.1), built
     // once: Web Push takes it here, and the gateway shares this same one
     // (agreed with plan 8), never a second. Delivery starts before anything
@@ -431,7 +434,7 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     // credential or `<data>/master.key`. A key that is missing while
     // credentials are stored, or that does not open them, stops the start
     // (plan 8a decision 8; `KeyUnavailable` tells that case apart).
-    let keys = hennery_gateway::key::KeySource::from_env(&args.data_dir)?;
+    let keys = hennery_gateway::key::KeySource::from_env(&data_dir)?;
     let gateway = hennery_gateway::open(&db, &keys, state.operator.clone())?;
     // The gateway's proxy (plan 8d), `/mcp/<slug>`: bearer tokens, beside
     // the operator's routes and outside them (lane L8), sending only
@@ -468,7 +471,7 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     warn_if_public_url_differs(state.operator.public_url().as_ref(), public_url.as_ref());
     if let Some(link) = state
         .operator
-        .announce_setup(&args.data_dir, &base_url, hennery_kernel::secret::unix_now())?
+        .announce_setup(&data_dir, &base_url, hennery_kernel::secret::unix_now())?
     {
         announce_setup(&link);
     }
@@ -498,7 +501,7 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
         let admin = hennery_kernel::admin::Admin {
             operator: state.operator.clone(),
             hosts: state.hosts.clone(),
-            dir: args.data_dir.clone(),
+            dir: data_dir.clone(),
             base_url,
         };
         tokio::spawn(hennery_kernel::admin::serve(
@@ -690,6 +693,7 @@ fn private_data_dir(dir: &std::path::Path) -> Result<()> {
 }
 
 async fn join_host(args: JoinArgs) -> Result<()> {
+    let data_dir = data_dir::host_or_installed(args.data_dir.clone(), data_dir::HostUse::Join)?;
     // Before the code is spent: a bad mirror stops the join here.
     if !args.no_runtime {
         args.mirrors.sources()?;
@@ -699,7 +703,7 @@ async fn join_host(args: JoinArgs) -> Result<()> {
         Some(code) => code,
         None => read_code_from_stdin()?,
     };
-    let host_id = match hennery_host::pairing::join(&args.url, &code, &args.data_dir, &name).await? {
+    let host_id = match hennery_host::pairing::join(&args.url, &code, &data_dir, &name).await? {
         Joined::Paired { host_id } => {
             println!("paired as {host_id}");
             host_id
@@ -713,7 +717,7 @@ async fn join_host(args: JoinArgs) -> Result<()> {
         return Ok(());
     }
     // Then the runtime (distribution spec §3.2); the pairing stands either way.
-    runtime::after_join(&args.data_dir, &host_id, &args.use_cli, &args.mirrors).await
+    runtime::after_join(&data_dir, &host_id, &args.use_cli, &args.mirrors).await
 }
 
 /// The most bytes of standard input `host join` takes for one code: a code
@@ -751,6 +755,7 @@ fn read_code_from_stdin() -> Result<String> {
 }
 
 async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
+    let data_dir = data_dir::host_or_installed(args.data_dir.clone(), data_dir::HostUse::Run)?;
     // Before anything else, the paired branch's `close` included: the pipe
     // `up` hands over, or a clear refusal.
     if let Some(fd) = args.join_code_fd {
@@ -772,17 +777,17 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
     // `Paired::load` is not only a read: it rolls an interrupted pairing
     // forward (renames, and moves the outbox aside). A directory that is not
     // there yet is made, 0700, only by `up`'s first start, which pairs in it.
-    if !args.data_dir.exists() && args.join_url.is_some() {
-        hennery_host::identity::create_private_dir(&args.data_dir)?;
+    if !data_dir.exists() && args.join_url.is_some() {
+        hennery_host::identity::create_private_dir(&data_dir)?;
     }
-    if !args.data_dir.is_dir() {
+    if !data_dir.is_dir() {
         bail!(
             "{} holds no pairing; run `hennery host join <url> <code>` first",
-            args.data_dir.display()
+            data_dir.display()
         );
     }
-    let _lock = lock::acquire(&args.data_dir, lock::HOST_LOCK, "hennery host run")?;
-    let paired = match Paired::load(&args.data_dir)? {
+    let _lock = lock::acquire(&data_dir, lock::HOST_LOCK, "hennery host run")?;
+    let paired = match Paired::load(&data_dir)? {
         Some(paired) => {
             // Paired already (kernel spec §4.2): the code is not needed.
             if let Some(fd) = args.join_code_fd {
@@ -794,13 +799,13 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
             let (Some(url), Some(fd)) = (&args.join_url, args.join_code_fd) else {
                 bail!(
                     "{} holds no pairing; run `hennery host join <url> <code>` first",
-                    args.data_dir.display()
+                    data_dir.display()
                 );
             };
             let code = inherit::read_code(fd).await?;
             let name = hennery_host::pairing::default_name();
-            hennery_host::pairing::join(url, &code, &args.data_dir, &name).await?;
-            Paired::load(&args.data_dir)?.context("the pairing just stored")?
+            hennery_host::pairing::join(url, &code, &data_dir, &name).await?;
+            Paired::load(&data_dir)?.context("the pairing just stored")?
         }
     };
     // Checked before connecting: a bad root fails the start (decision 6).
@@ -813,12 +818,12 @@ async fn run_host(args: HostArgs) -> Result<std::process::ExitCode> {
     // With `--agent`, no app-server either: a Codex forget takes the
     // fallback.
     let (agents, profiles, codex_app_server, _set_in_use) = if args.agents.is_empty() {
-        runtime::default_agents(&args.data_dir, &args.mirrors).await
+        runtime::default_agents(&data_dir, &args.mirrors).await
     } else {
         (args.agents.into_iter().collect(), Default::default(), None, None)
     };
     let collector_url = args.collector_url.unwrap_or(paired.collector_url);
-    let mut cfg = HostConfig::new(collector_url, paired.host_id, paired.key, args.data_dir);
+    let mut cfg = HostConfig::new(collector_url, paired.host_id, paired.key, data_dir);
     cfg.workspace_roots = workspace_roots;
     cfg.home = home;
     cfg.agents = agents;
@@ -967,6 +972,8 @@ fn pairing_in(dir: &std::path::Path) -> Pairing {
 struct UpChildren<'a> {
     exe: PathBuf,
     args: &'a UpArgs,
+    /// `up`'s data root.
+    data_dir: PathBuf,
     host_dir: PathBuf,
     collector_url: String,
     collector_ws_url: String,
@@ -999,7 +1006,7 @@ impl UpChildren<'_> {
             fds.push((listener.as_raw_fd(), to));
         }
         cmd.arg("--data-dir")
-            .arg(self.args.data_dir.join("collector"))
+            .arg(self.data_dir.join("collector"))
             // `up` has warned about it already; the collector has no use for it.
             .env_remove(DEV_TOKEN_VAR)
             // `up` bound these addresses already; the child takes the sockets.
@@ -1066,6 +1073,7 @@ impl supervisor::Children for UpChildren<'_> {
 /// (distribution spec §5.2; see `supervisor::supervise`). `up` exits 0 when
 /// a signal stopped it, and 1 when it could not go on.
 async fn run_up(args: UpArgs) -> Result<std::process::ExitCode> {
+    let data_dir = data_dir::or_default(args.data_dir.clone(), service::unit::Role::Up)?;
     // First, before any child exists: from here on a SIGINT or SIGTERM is
     // caught and waits for `supervisor::supervise`, which stops both
     // children. Caught
@@ -1075,8 +1083,8 @@ async fn run_up(args: UpArgs) -> Result<std::process::ExitCode> {
     let mut signals = Signals::new()?;
     warn_if_dev_token();
     let exe = std::env::current_exe()?;
-    let host_dir = args.data_dir.join("host");
-    let file = config::FileConfig::load(&args.data_dir.join("collector"))?;
+    let host_dir = data_dir.join("host");
+    let file = config::FileConfig::load(&data_dir.join("collector"))?;
     let addresses = listen_addresses(&file.listen(&args.listen)?)?;
     // Validated before any child starts: with no address that loopback
     // reaches (or only schemes it cannot make sense of) `up` fails here,
@@ -1096,11 +1104,11 @@ async fn run_up(args: UpArgs) -> Result<std::process::ExitCode> {
     let collector_url = loopback_url(&listeners[host_listener].local_addr()?.to_string());
     let collector_ws_url = hennery_host::pairing::collector_ws_url(&collector_url)?;
     // Before either child creates its own directory in it.
-    private_data_dir(&args.data_dir)?;
+    private_data_dir(&data_dir)?;
     // Held until `up` returns, before either child starts: a second `up` on
     // this data root would run a second collector on its database, also
     // where the collector's admin socket cannot tell (its path too long).
-    let _lock = lock::acquire(&args.data_dir, lock::UP_LOCK, "hennery up")?;
+    let _lock = lock::acquire(&data_dir, lock::UP_LOCK, "hennery up")?;
     // The host pairs itself on first start only; a pairing that was revoked
     // is not replaced (kernel spec §4.2). One left half-done needs no code:
     // the host child finishes it, under its lock.
@@ -1111,6 +1119,7 @@ async fn run_up(args: UpArgs) -> Result<std::process::ExitCode> {
     let mut children = UpChildren {
         exe,
         args: &args,
+        data_dir: data_dir.clone(),
         host_dir,
         collector_url,
         collector_ws_url,
@@ -1139,7 +1148,7 @@ async fn run_up(args: UpArgs) -> Result<std::process::ExitCode> {
             collector: collector.clone(),
             host: host.clone(),
         };
-        if let Err(err) = supervisor::write_state(&args.data_dir, &state) {
+        if let Err(err) = supervisor::write_state(&data_dir, &state) {
             tracing::warn!(error = %format!("{err:#}"), "could not write {}", supervisor::STATE_FILE);
         }
     };
@@ -1244,7 +1253,7 @@ mod tests {
         let args = UpArgs {
             listen: vec!["127.0.0.1:7117".into()],
             public_url: None,
-            data_dir: "/nonexistent".into(),
+            data_dir: Some("/nonexistent".into()),
             agents: Vec::new(),
             idle_timeout_secs: 0,
             workspace_roots: Vec::new(),
@@ -1272,7 +1281,7 @@ mod tests {
         let args = UpArgs {
             listen: vec!["127.0.0.1:7117".into()],
             public_url: None,
-            data_dir: "/nonexistent".into(),
+            data_dir: Some("/nonexistent".into()),
             agents: Vec::new(),
             idle_timeout_secs: 0,
             workspace_roots: Vec::new(),
@@ -1297,7 +1306,7 @@ mod tests {
         let args = UpArgs {
             listen: vec!["127.0.0.1:7117".into()],
             public_url: None,
-            data_dir: "/nonexistent".into(),
+            data_dir: Some("/nonexistent".into()),
             agents: Vec::new(),
             idle_timeout_secs: 0,
             workspace_roots: vec!["/srv/projects".into(), "~/src".into()],
