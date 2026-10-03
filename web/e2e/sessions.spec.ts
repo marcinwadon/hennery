@@ -213,6 +213,7 @@ for (const width of [1280, 390]) {
     test('the footer’s Resume runs the session again, and it answers a second prompt', async () => {
       const resume = page.getByRole('button', { name: 'Resume', exact: true })
       await expect(resume).toBeVisible()
+      if (narrow) expect((await resume.boundingBox())!.height).toBeGreaterThanOrEqual(44)
       await resume.click()
       await expect(page.locator('.session-head .badge')).toHaveText('Idle', { timeout: 20_000 })
       await expect(resume).toHaveCount(0)
@@ -228,6 +229,24 @@ for (const width of [1280, 390]) {
       const reply = page.locator('.bubble', { has: page.getByText('permission:selected:reject', { exact: true }) })
       await expect(reply.getByRole('listitem')).toHaveText(['first step', 'second step'])
       await expect(page.locator('.session-head .badge')).toHaveText('Idle')
+    })
+
+    test('the session menu’s controls are big enough to tap on a phone', async () => {
+      test.skip(!narrow, 'the 44 px touch targets are a phone’s')
+      const trigger = page.getByRole('button', { name: 'Session actions', exact: true })
+      expect((await trigger.boundingBox())!.height).toBeGreaterThanOrEqual(44)
+      await trigger.click()
+      await expect(trigger).toHaveAttribute('aria-expanded', 'true')
+      // An active session: Close, Delete, and Park if its host can park.
+      const list = page.locator('.session-menu-list')
+      const names = await list.getByRole('button').allTextContents()
+      expect(names.filter((n) => n !== 'Park')).toEqual(['Close', 'Delete session'])
+      for (const name of names) {
+        const box = await list.getByRole('button', { name, exact: true }).boundingBox()
+        expect(box!.height).toBeGreaterThanOrEqual(44)
+      }
+      await page.keyboard.press('Escape')
+      await expect(trigger).toHaveAttribute('aria-expanded', 'false')
     })
 
     test('broke no Content-Security-Policy rule', async () => {
