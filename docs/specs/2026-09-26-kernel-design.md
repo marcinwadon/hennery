@@ -804,7 +804,7 @@ frontend spec §6.4) this makes agent output unable to run script in the UI.
 | `GET /api/auth/passkeys`, `DELETE /api/auth/passkeys/{id}` | List passkeys (label, created, last used); remove (step-up) |
 | `POST /api/auth/step-up/password`, `…/step-up/passkey/{start,finish}` | Step-up (§3.4) |
 | `GET/DELETE /api/auth/sessions[/{id}]` | Signed-in devices (revoke: step-up) |
-| `GET/PATCH /api/settings` | `{public_url, contact}`; PATCH takes `{contact?, public_url?}`: `public_url` needs step-up and ends every session (§3.2), `contact` alone none (§6) |
+| `GET/PATCH /api/settings` | `{public_url, contact?, deployment_warning}`; PATCH takes `{contact?, public_url?}`: `public_url` needs step-up and ends every session (§3.2), `contact` alone none (§6). `deployment_warning` is §10's warning, read when asked (a `PATCH` reads it before it writes) |
 | `POST /api/hosts/pairing-codes` | Mint a pairing code (step-up) → 201 `{code, expires_at}`, or 409 `too_many_codes` (§4.1) |
 | `POST /api/hosts/enroll` | Host enrollment (code-authenticated, §4.1) → 201 `{host_id}` |
 | `GET /api/hosts`, `PATCH/DELETE /api/hosts/{id}` | List, rename/default hat, revoke (step-up) |
@@ -827,7 +827,8 @@ reconciled and not being kicked. `DELETE /api/hosts/{id}` answers 200
 `HostItem`, or 404.
 
 *Built so far:* the auth, passkey, host, push and health routes,
-`/api/settings` (its `PATCH` taking `public_url` since plan 4d-B4),
+`/api/settings` (its `PATCH` taking `public_url` since plan 4d-B4, and
+`deployment_warning` in every answer since plan 4d-B3),
 `POST /api/setup` and the setup page. No `/api/capabilities`,
 `PATCH /api/hosts/{id}`, hats or path rules yet.
 
@@ -851,6 +852,21 @@ an existing data directory without `--force`.
 - **`hennery up` warns** at start, in Settings and in `doctor` when gateway
   credentials exist for more than one hat and the collector shares its OS user
   with the host child.
+  - **How the collector knows** (plan 4d-B3): `up` starts both children as its
+    own user, always, and tells its collector so with a hidden
+    `--beside-host`, at the first start and every restart. Nothing is
+    inferred: a loopback host connection proves nothing (the recommended
+    separate-user install pairs local hosts over loopback too). A collector
+    started on its own has no host child and does not warn; a host run by
+    hand as the collector's user is the same exposure and is not detected.
+  - **What counts:** every hat with a row in `gw_credentials`, whatever its
+    kind (gateway spec §2); two connections in one hat are one hat.
+  - **Where it shows:** the collector logs it at `warn` once at start, with
+    the count and this recommendation, never a hat (in `up`'s output on a
+    terminal; in the collector's own log under a service); a start whose
+    check fails says so. `GET /api/settings` carries `deployment_warning`,
+    read on every request, for the Settings banner; a failed read is a 500,
+    never a quiet `false`. The banner is advice, not access control.
 - The admin socket's TTY confirmation (§4.2) protects against accidents, not
   against a local process of the same user. The socket is operator-equivalent
   for any process of the collector's user: no password or session is needed to
