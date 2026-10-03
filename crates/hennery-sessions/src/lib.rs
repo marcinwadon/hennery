@@ -91,17 +91,18 @@ impl hennery_kernel::lifecycle::LifecycleHooks for AppState {
         Ok(())
     }
 
-    /// The session module's part of a hat's purge (plan 9c decision 10d):
-    /// `hats::purge_sessions`, which the purge route calls itself for what
-    /// it deleted, then the gateway's part (lane L6, plan 8e: its tokens,
-    /// stdio servers and connections, with their open streams cut), and
-    /// the one checkpoint the deletes owe. Each is idempotent: a purge that
-    /// stopped runs both again.
+    /// A hat's purge past its freeze, as the purge route runs it: the
+    /// gateway's part first (lane L6, A15; plan 8e: its tokens, stdio
+    /// servers and connections, with their open streams cut), then the
+    /// session module's (plan 9c decision 10d, `hats::purge_sessions`),
+    /// and the one checkpoint the deletes owe. Each is idempotent: a purge
+    /// that stopped runs both again.
     fn on_hat_purged(&self, hat_id: &str) -> anyhow::Result<()> {
         self.store.owe_checkpoint();
-        let purged = hats::purge_sessions(self, hat_id)
-            .map(drop)
-            .and_then(|()| self.store.purge_gateway_hat(hat_id));
+        let purged = self
+            .store
+            .purge_gateway_hat(hat_id)
+            .and_then(|()| hats::purge_sessions(self, hat_id).map(drop));
         self.store.checkpoint();
         purged
     }
