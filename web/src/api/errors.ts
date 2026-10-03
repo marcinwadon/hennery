@@ -36,6 +36,10 @@ const MESSAGES: Record<string, string> = {
   busy: 'The host is busy. Try again.',
   too_many_subscriptions: 'Remove a device before adding another: 32 at most.',
   endpoint_taken: 'This browser receives notifications for another account.',
+  slug_taken: 'This slug is taken: pick another.',
+  too_many_connections: 'There are 256 connections already: delete one first.',
+  unsupported_cred_kind: 'This collector cannot sign in to a server this way yet.',
+  wrong_cred_kind: 'Only a connection that authenticates with a token takes one.',
 }
 
 export class ApiFailure extends Error {
