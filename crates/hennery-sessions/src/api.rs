@@ -512,6 +512,7 @@ async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -
         Err(err) => return internal(err),
     };
     Json(SessionDetail {
+        mcp_delivery: None,
         session: item,
         open_turn,
         pending,

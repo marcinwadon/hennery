@@ -168,6 +168,7 @@ async fn update_host(
 /// A registry entry as the API shows it, with whether it is connected.
 pub(crate) fn host_item(state: &AppState, record: HostRecord) -> HostItem {
     HostItem {
+        mcp_delivery: None,
         connected: state.hub.is_ready(&record.id),
         host_id: record.id,
         name: record.name,

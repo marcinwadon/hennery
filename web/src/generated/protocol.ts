@@ -539,7 +539,12 @@ export type SessionDetail = { open_turn?: OpenTurn | undefined,
 /**
  * Open pending requests, oldest first: what the operator can answer.
  */
-pending: Array<PendingItem>, session_id: string, host_id: string, agent: string, 
+pending: Array<PendingItem>, 
+/**
+ * What its latest start or resume was given (plan 8e decision E10);
+ * absent for a session not started or resumed since plan 8e.
+ */
+mcp_delivery?: McpSessionDelivery | undefined, session_id: string, host_id: string, agent: string, 
 /**
  * Canonical on its host since hats (umbrella §8.2).
  */
@@ -722,7 +727,14 @@ connected: boolean,
 /**
  * RFC 3339.
  */
-created_at: string, last_seen_at?: string | undefined, revoked_at?: string | undefined, };
+created_at: string, last_seen_at?: string | undefined, revoked_at?: string | undefined, 
+/**
+ * Per agent id, which hats' sessions get gateway MCP servers, from the
+ * `mcp_isolation` of its latest accepted `hello` (plan 8e). Absent: no
+ * such `hello` was recorded yet. Only for a host whose `capabilities`
+ * include `mcp_servers`; one without receives no servers at all.
+ */
+mcp_delivery?: Record<string, McpAgentDelivery> | undefined, };
 
 /**
  * A directory a session started or resumed in on the host (kernel spec
@@ -1523,3 +1535,171 @@ export type DeploymentMode = "full" | "gateway";
  * know.
  */
 export type CapabilitiesResponse = { mode: DeploymentMode, features: Array<string>, };
+
+/**
+ * Which hats' sessions on a host get gateway MCP servers for one agent
+ * (umbrella §8.5, plan 8e), from the agent's isolation as the host last
+ * announced it. Read leniently by the UI: a value it does not know is to be
+ * shown as `default_hat_only`.
+ */
+export type McpAgentDelivery = "isolated" | "default_hat_only";
+
+/**
+ * What a session's latest start or resume was given (plan 8e decision
+ * E10).
+ */
+export type McpSessionDeliveryMode = "isolated" | "unisolated" | "fallback" | "unsupported";
+
+/**
+ * On `SessionDetail` (plan 8e decision E10): never a server, a header or a
+ * token, only the mode and a count.
+ */
+export type McpSessionDelivery = { 
+/**
+ * What it was given.
+ */
+mode: McpSessionDeliveryMode, 
+/**
+ * How many servers it was given (connections plus stdio servers): `0`
+ * with `isolated` means its hat has none on this host.
+ */
+servers: number, 
+/**
+ * RFC 3339: the start or resume it describes.
+ */
+at: string, };
+
+/**
+ * One environment variable of a stdio server, as `GET` answers it: its
+ * name and whether a value is stored. The value is sealed at rest
+ * (gateway spec §6) and no route answers it.
+ */
+export type McpStdioEnvItem = { 
+/**
+ * `^[A-Za-z_][A-Za-z0-9_]{0,127}$`.
+ */
+name: string, 
+/**
+ * A value is stored (possibly `""`).
+ */
+has_value: boolean, };
+
+/**
+ * One local stdio server of a (host, hat) (gateway spec §3.4): passed to
+ * that hat's sessions on that host as an ACP stdio `mcpServers` entry
+ * named `hennery-<name>`. The agent runs it on the host; the gateway does
+ * not proxy it. Its `Debug` shows the name, the command and how many
+ * args, never the args.
+ */
+export type McpStdioServerItem = { 
+/**
+ * `^[a-z0-9][a-z0-9-]{0,47}$`, unique in its set, and never one of the
+ * owner's connection slugs.
+ */
+name: string, 
+/**
+ * As stored: run by the agent, found on its `PATH` unless absolute.
+ */
+command: string, 
+/**
+ * As stored. Not sealed: a secret belongs in `env`.
+ */
+args: Array<string>, 
+/**
+ * Names only, in the order given.
+ */
+env: Array<McpStdioEnvItem>, 
+/**
+ * RFC 3339.
+ */
+created_at: string, 
+/**
+ * RFC 3339: the `PUT` that last changed it.
+ */
+updated_at: string, };
+
+/**
+ * `GET /api/mcp/stdio-servers?host_id=&hat_id=` (200), and the answer to
+ * its `PUT` (200): one (host, hat)'s whole set, oldest first. A host or
+ * hat with none answers `servers: []`.
+ *
+ * Its own codes, beyond every route's (see `McpConnectionItem`): 400
+ * `invalid` (`host_id` or `hat_id` missing or over 64 bytes, never quoted
+ * back); 404 `not_found` (not one of the owner's hosts or hats; a revoked
+ * host is found).
+ */
+export type McpStdioServerSet = { 
+/**
+ * The host whose agents run them.
+ */
+host_id: string, 
+/**
+ * The hat whose sessions get them.
+ */
+hat_id: string, 
+/**
+ * Oldest first.
+ */
+servers: Array<McpStdioServerItem>, };
+
+/**
+ * One environment variable in a `PUT`: `value` absent (or `null`) keeps
+ * the value stored for this server name and variable name in the same
+ * (host, hat), and only while the server's `command` is unchanged; a
+ * string sets it. A variable left out of the list is deleted. Its `Debug`
+ * never shows the value.
+ */
+export type McpStdioEnvInput = { 
+/**
+ * `^[A-Za-z_][A-Za-z0-9_]{0,127}$`, unique per server.
+ */
+name: string, 
+/**
+ * Absent or `null`: kept. A string (`""` too): set; at most 8192
+ * bytes, no NUL.
+ */
+value?: string | undefined, };
+
+/**
+ * One server in a `PUT`. Its `Debug` shows the name and the command only.
+ */
+export type McpStdioServerInput = { 
+/**
+ * `^[a-z0-9][a-z0-9-]{0,47}$`, unique in the set, and not one of the
+ * owner's connection slugs.
+ */
+name: string, 
+/**
+ * 1 to 1024 bytes, no control characters.
+ */
+command: string, 
+/**
+ * Absent: none. At most 64, each at most 4096 bytes without NUL, 16
+ * KiB in all.
+ */
+args?: string[] | undefined, 
+/**
+ * Absent: none. At most 64.
+ */
+env?: McpStdioEnvInput[] | undefined, };
+
+/**
+ * `PUT /api/mcp/stdio-servers?host_id=&hat_id=` (step-up): the (host,
+ * hat)'s whole set, replacing the one before, never a delta. `[]` deletes
+ * them all. 200 with the stored `McpStdioServerSet`. Applies to the next
+ * start or resume of a session of that hat on that host.
+ *
+ * Its own codes, beyond every route's (see `McpConnectionItem`): 403
+ * `step_up_required`; 404 `not_found` (host or hat); 409 `host_revoked`;
+ * 400 `invalid` (`message` names the server and the field; a value is
+ * never quoted back); 400 `env_value_missing` (a kept value that is not
+ * stored, or whose server's `command` changed); 409 `slug_taken` (a name
+ * one of the owner's connections has); 409 `too_many_stdio_servers` (more
+ * than 32 in the set, or 1024 for the owner). A refused set changes
+ * nothing.
+ */
+export type McpStdioServersRequest = { 
+/**
+ * The whole set, in the order to keep for new servers.
+ */
+servers: Array<McpStdioServerInput>, };
