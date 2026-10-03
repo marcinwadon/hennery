@@ -486,6 +486,25 @@ pub enum FakeDelete {
 /// Exit status of the fake adapter when `exit_after_chunks` fires.
 pub const CRASH_EXIT_CODE: i32 = 3;
 
+/// Run `program --version` once and wait for it to end, before a test times
+/// anything that runs it. macOS checks a newly built program at its first
+/// exec, one program at a time for the whole machine: 4–15 s here, more in
+/// a workspace run, which would otherwise land inside a deadline the test
+/// means to measure (a Codex forget's app-server share is 8 s). The host's
+/// install runs the programs it downloads once for the same reason
+/// (`install::first_runs`).
+pub fn first_exec(program: &str) {
+    let status = std::process::Command::new(program)
+        .arg("--version")
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap_or_else(|err| panic!("{program} --version: {err}"));
+    assert!(status.success(), "{program} --version: {status}");
+}
+
 /// Whether a process with this pid is still alive (signal 0 probe). A zombie
 /// counts as alive until its parent reaps it.
 pub fn pid_alive(pid: i32) -> bool {

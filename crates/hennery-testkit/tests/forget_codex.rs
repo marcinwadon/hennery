@@ -107,7 +107,10 @@ impl Root {
     /// The forget's context: `codex` as the fake app-server, and as the
     /// fake adapter in codex-acp's archive mode. Each also carries
     /// variables of its own that the forget must override or strip (B6).
+    /// The app-server is run once first, so that macOS's check of it is not
+    /// timed as the forget's.
     fn ctx(&self, codex: FakeCodex) -> ForgetContext {
+        hennery_testkit::first_exec(env!("CARGO_BIN_EXE_hennery-fake-codex"));
         let mut app_server = AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-codex")).unwrap();
         app_server
             .env
