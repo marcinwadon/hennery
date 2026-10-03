@@ -247,6 +247,15 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     ALTER TABLE hats ADD COLUMN logo_etag TEXT
         CHECK ((logo_mime IS NULL) = (logo_bytes IS NULL) AND (logo_bytes IS NULL) = (logo_etag IS NULL));
     ",
+    // A host's agents (kernel spec §1.1, §4.3; plan 4d-B1-i): its latest
+    // report, as JSON (`{"agents": […], "runtime": {…}}`), when the
+    // collector received it, and from what: `hello` or `probe` (`none`
+    // until the first). Columns added, never a rebuild of `hosts`.
+    "
+    ALTER TABLE hosts ADD COLUMN agents TEXT;
+    ALTER TABLE hosts ADD COLUMN agents_reported_at INTEGER;
+    ALTER TABLE hosts ADD COLUMN agents_source TEXT NOT NULL DEFAULT 'none';
+    ",
 ];
 
 #[cfg(test)]
@@ -460,5 +469,34 @@ mod tests {
             })
             .unwrap();
         assert_eq!(roots, "[\"/srv/projects\"]");
+    }
+
+    /// Plan 4d-B1-i: the agents' columns are added to the hosts there are,
+    /// which keep every other column and have reported nothing yet.
+    #[test]
+    fn a_paired_host_gains_the_agents_columns_with_nothing_reported() {
+        let added = MIGRATIONS
+            .iter()
+            .position(|m| m.contains("ADD COLUMN agents_source"))
+            .unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate_component(&mut conn, COMPONENT, &MIGRATIONS[..added]).unwrap();
+        conn.execute(
+            "INSERT INTO hosts(id, owner_id, name, public_key, platform, host_version, default_hat_id, created_at,
+                               workspace_roots)
+             SELECT 'host-1', s.owner_id, 'n', 'k', 'p', 'v', s.value, 0, '[\"/srv/projects\"]'
+             FROM settings s WHERE s.key = 'default_hat_id'",
+            [],
+        )
+        .unwrap();
+        crate::db::migrate_component(&mut conn, COMPONENT, MIGRATIONS).unwrap();
+        let row: (Option<String>, Option<i64>, String, String) = conn
+            .query_row(
+                "SELECT agents, agents_reported_at, agents_source, workspace_roots FROM hosts WHERE id = 'host-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (None, None, "none".into(), "[\"/srv/projects\"]".into()));
     }
 }

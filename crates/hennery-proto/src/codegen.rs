@@ -1,7 +1,7 @@
 //! Renders the generated artefacts. The `gen` binary writes them to disk or,
 //! with `--check`, fails if the checked-in copies differ.
 
-use crate::{frames, rest};
+use crate::{agents, frames, rest};
 use schemars::generate::SchemaSettings;
 use ts_rs::{Config, TS};
 
@@ -56,6 +56,7 @@ pub fn render_schema() -> String {
         rest::EnrollRequest,
         rest::EnrollResponse,
         rest::HostItem,
+        rest::HostAgents,
         rest::RecentProject,
         rest::HostProjects,
         rest::DirectoryListing,
@@ -193,6 +194,11 @@ pub fn render_ts() -> String {
         frames::ForgetWhat,
         frames::ForgetRemaining,
         frames::ForgetOutcome,
+        agents::AgentAuth,
+        agents::AgentCli,
+        agents::AgentInfo,
+        agents::RuntimeSource,
+        agents::RuntimeInfo,
         frames::HostFrame,
         frames::CollectorFrame,
         rest::StartSessionRequest,
@@ -219,6 +225,8 @@ pub fn render_ts() -> String {
         rest::EnrollRequest,
         rest::EnrollResponse,
         rest::HostItem,
+        rest::AgentsSource,
+        rest::HostAgents,
         rest::RecentProject,
         rest::HostProjects,
         rest::DirectoryListing,

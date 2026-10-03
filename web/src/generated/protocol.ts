@@ -286,6 +286,79 @@ export type ForgetRemaining = { what: ForgetWhat, reason: ForgetReason, retry: b
 export type ForgetOutcome = "complete" | "partial";
 
 /**
+ * Whether an agent's CLI says it is logged in (ACP core §6): only the
+ * verdict, never the account. `unknown` until a probe asked, and when the
+ * host knows no CLI to ask, or it did not answer (in time, or at all: a CLI
+ * ended by a signal said nothing). A host fact: agent logins
+ * are per OS user in v1, every hat's included. If plan 8h ever makes
+ * `auth.json` private per hat, `auth` must become per (host, hat).
+ */
+export type AgentAuth = "ok" | "missing" | "unknown";
+
+/**
+ * Which CLI an agent runs (distribution spec §3.2, §13 decision 5).
+ */
+export type AgentCli = "bundled" | "override" | "given";
+
+/**
+ * One agent of a host (ACP core §6).
+ */
+export type AgentInfo = { 
+/**
+ * The profile name: what `StartSessionRequest.agent` takes.
+ */
+agent: string, 
+/**
+ * In `hello`: launchable as configured. After a probe: its adapter
+ * started and answered `initialize`.
+ */
+available: boolean, auth: AgentAuth, cli: AgentCli, 
+/**
+ * In `hello`: the version the adapter set records. After a probe: the
+ * version the adapter's `initialize` answered with (`agentInfo`), if
+ * it gave a readable one. Absent for a `given` agent until a probe.
+ */
+adapter_version?: string | undefined, 
+/**
+ * Whether the agent takes images in prompts (its `initialize`'s
+ * `promptCapabilities.image`). Clients hide images only when this is
+ * `false`. Absent means no probe answered (none has run, or the
+ * adapter did not answer): a client then allows images, and the
+ * server's 409 `images_unsupported` remains the guard.
+ */
+images?: boolean | undefined, 
+/**
+ * Why the agent is unavailable, or a caveat, in the host's words: never
+ * anything an agent or its CLI printed.
+ */
+note?: string | undefined, };
+
+/**
+ * Where a host's agents come from (distribution spec §3.2).
+ */
+export type RuntimeSource = "managed" | "given";
+
+/**
+ * The host's adapter runtime. `set_id`, `pinned` and `held` are a managed
+ * runtime's only.
+ */
+export type RuntimeInfo = { source: RuntimeSource, 
+/**
+ * The adapter set the agents launch from; absent when none is
+ * installed.
+ */
+set_id?: string | undefined, 
+/**
+ * That set is the one this host's binary pins.
+ */
+pinned?: boolean | undefined, 
+/**
+ * A rollback holds the host on its set (`hennery host adapters
+ * rollback`).
+ */
+held?: boolean | undefined, };
+
+/**
  * Host -> collector.
  */
 export type HostFrame = { "type": "hello", protocol_version: string, host_version: string, host_id: string, 
@@ -723,6 +796,28 @@ connected: boolean,
  * RFC 3339.
  */
 created_at: string, last_seen_at?: string | undefined, revoked_at?: string | undefined, };
+
+/**
+ * Where `HostAgents` comes from.
+ */
+export type AgentsSource = "none" | "hello" | "probe";
+
+/**
+ * `GET /api/hosts/{id}/agents[?refresh=1]` (plan 4d-B1-i): the host's
+ * latest report of its agents, whatever its age; with `refresh=1`, after
+ * one probe of a connected host that can be probed (or the probe's
+ * budget, 20 s).
+ */
+export type HostAgents = { host_id: string, agents: Array<AgentInfo>, runtime?: RuntimeInfo | undefined, 
+/**
+ * When the collector received the report, RFC 3339; absent with
+ * `source: none`.
+ */
+reported_at?: string | undefined, source: AgentsSource, 
+/**
+ * The host is connected and reconciled now.
+ */
+live: boolean, };
 
 /**
  * A directory a session started or resumed in on the host (kernel spec

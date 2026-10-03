@@ -447,6 +447,40 @@ pub struct HostItem {
     pub revoked_at: Option<String>,
 }
 
+/// Where `HostAgents` comes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentsSource {
+    /// The host never reported its agents: an older host, or one not
+    /// reconciled since it was paired.
+    None,
+    /// Its latest reconciled connection's `hello`: the static view.
+    Hello,
+    /// A `probe_agents`: the live view.
+    Probe,
+}
+
+/// `GET /api/hosts/{id}/agents[?refresh=1]` (plan 4d-B1-i): the host's
+/// latest report of its agents, whatever its age; with `refresh=1`, after
+/// one probe of a connected host that can be probed (or the probe's
+/// budget, 20 s).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct HostAgents {
+    pub host_id: String,
+    pub agents: Vec<crate::agents::AgentInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "RuntimeInfo | undefined", optional)]
+    pub runtime: Option<crate::agents::RuntimeInfo>,
+    /// When the collector received the report, RFC 3339; absent with
+    /// `source: none`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub reported_at: Option<String>,
+    pub source: AgentsSource,
+    /// The host is connected and reconciled now.
+    pub live: bool,
+}
+
 /// A directory a session started or resumed in on the host (kernel spec
 /// §5.3).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]

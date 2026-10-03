@@ -3,8 +3,8 @@
 
 use ed25519_dalek::{Signer, SigningKey};
 use hennery_kernel::hosts::{
-    EnrollOutcome, Enrollment, HelloCheck, Hosts, MAX_LIVE_PAIRING_CODES, PAIRING_CODE_TTL_SECS, Registered, Revoke,
-    TooManyPairingCodes, normalize_code, verify_proof,
+    EnrollOutcome, Enrollment, HelloCheck, Hosts, MAX_LIVE_PAIRING_CODES, PAIRING_CODE_TTL_SECS, Registered,
+    ReportedIn, Revoke, TooManyPairingCodes, normalize_code, verify_proof,
 };
 use hennery_proto::frames::{Capabilities, Capability};
 use hennery_proto::hello_proof_message;
@@ -364,4 +364,156 @@ fn minting_prunes_spent_and_expired_codes_and_caps_the_live_ones() {
             .enroll(&later.code, &enrollment(&key(2)), NOW + PAIRING_CODE_TTL_SECS + 2)
             .unwrap(),
     );
+}
+
+// Plan 4d-B1-i: a host's agents.
+
+fn agent(name: &str) -> hennery_proto::agents::AgentInfo {
+    hennery_proto::agents::AgentInfo {
+        agent: name.into(),
+        available: true,
+        auth: hennery_proto::agents::AgentAuth::Unknown,
+        cli: hennery_proto::agents::AgentCli::Bundled,
+        adapter_version: Some("1.0.0".into()),
+        images: None,
+        note: None,
+    }
+}
+
+fn managed() -> hennery_proto::agents::RuntimeInfo {
+    hennery_proto::agents::RuntimeInfo {
+        source: hennery_proto::agents::RuntimeSource::Managed,
+        set_id: Some("abc".into()),
+        pinned: Some(true),
+        held: Some(false),
+    }
+}
+
+/// Nothing until a report; then the latest report, `hello`'s or a probe's,
+/// with the collector's time. An unknown host has none at all.
+#[test]
+fn a_hosts_agents_are_its_latest_report() {
+    use hennery_proto::rest::AgentsSource;
+    let hosts = Hosts::open_in_memory().unwrap();
+    hosts.register("host-1", &enrollment(&key(1)), NOW).unwrap();
+    assert_eq!(hosts.agents("host-9").unwrap(), None);
+    let none = hosts.agents("host-1").unwrap().unwrap();
+    assert_eq!(none.source, AgentsSource::None);
+    assert_eq!((none.agents.len(), none.runtime, none.reported_at), (0, None, None));
+
+    hosts
+        .record_agents("host-1", ReportedIn::Hello, vec![agent("claude")], Some(managed()), NOW)
+        .unwrap();
+    let hello = hosts.agents("host-1").unwrap().unwrap();
+    assert_eq!(hello.source, AgentsSource::Hello);
+    assert_eq!(hello.agents, [agent("claude")]);
+    assert_eq!(hello.runtime, Some(managed()));
+    assert_eq!(hello.reported_at, Some(NOW));
+
+    let mut live = agent("claude");
+    live.auth = hennery_proto::agents::AgentAuth::Ok;
+    hosts
+        .record_agents("host-1", ReportedIn::Probe, vec![live.clone()], None, NOW + 9)
+        .unwrap();
+    let probe = hosts.agents("host-1").unwrap().unwrap();
+    assert_eq!(probe.source, AgentsSource::Probe);
+    assert_eq!(
+        (probe.agents, probe.runtime, probe.reported_at),
+        (vec![live], None, Some(NOW + 9))
+    );
+}
+
+/// A host may lie, but only about itself, and only within the bounds.
+#[test]
+fn a_hosts_report_is_bounded_before_it_is_stored() {
+    let hosts = Hosts::open_in_memory().unwrap();
+    hosts.register("host-1", &enrollment(&key(1)), NOW).unwrap();
+    let mut noisy = agent("claude");
+    noisy.note = Some("a\u{202E}b".into());
+    noisy.adapter_version = Some("1.0 see https://x".into());
+    let mut many = vec![noisy, agent("claude"), agent("bad name")];
+    many.extend((0..30).map(|i| agent(&format!("a{i}"))));
+    let mut runtime = managed();
+    runtime.set_id = Some("../x".into());
+    hosts
+        .record_agents("host-1", ReportedIn::Probe, many, Some(runtime), NOW)
+        .unwrap();
+    let stored = hosts.agents("host-1").unwrap().unwrap();
+    assert_eq!(stored.agents.len(), hennery_proto::agents::MAX_AGENTS);
+    assert_eq!(stored.agents[0].note.as_deref(), Some("a\u{fffd}b"));
+    assert_eq!(stored.agents[0].adapter_version, None);
+    assert_eq!(
+        stored.agents[1].agent, "a0",
+        "the duplicate and the bad name are dropped"
+    );
+    assert_eq!(stored.runtime.unwrap().set_id, None);
+}
+
+/// What a host can make the collector store is bounded in bytes too,
+/// whatever it sends: `MAX_AGENTS` entries of at most `MAX_AGENT_NAME` +
+/// `MAX_AGENT_VERSION` + `MAX_AGENT_NOTE` bytes, which JSON's escaping at
+/// most doubles, and the set id. Here every field is at its limit and made
+/// of `"`, which escapes to two bytes: about 21 KiB, under 32 KiB.
+#[test]
+fn a_stored_report_is_bounded_in_bytes() {
+    use hennery_proto::agents::{MAX_AGENT_NAME, MAX_AGENT_NOTE, MAX_AGENT_VERSION, MAX_AGENTS, MAX_SET_ID};
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    let hosts = Hosts::open(&db).unwrap();
+    hosts.register("host-1", &enrollment(&key(1)), NOW).unwrap();
+    let worst: Vec<_> = (0..MAX_AGENTS * 4)
+        .map(|i| {
+            let mut a = agent(&format!("{i:03}{}", "\"".repeat(MAX_AGENT_NAME * 8)));
+            a.agent.truncate(MAX_AGENT_NAME);
+            a.adapter_version = Some("9".repeat(MAX_AGENT_VERSION));
+            a.note = Some("\"".repeat(MAX_AGENT_NOTE * 100));
+            a
+        })
+        .collect();
+    let mut runtime = managed();
+    runtime.set_id = Some("s".repeat(MAX_SET_ID));
+    hosts
+        .record_agents("host-1", ReportedIn::Probe, worst, Some(runtime), NOW)
+        .unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let bytes: i64 = conn
+        .query_row(
+            "SELECT length(CAST(agents AS BLOB)) FROM hosts WHERE id = 'host-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(bytes > 16 * 1024, "every field at its limit: {bytes}");
+    assert!(bytes <= 32 * 1024, "{bytes}");
+}
+
+/// A revoked host's report is not stored.
+#[test]
+fn a_revoked_hosts_report_is_not_stored() {
+    let hosts = Hosts::open_in_memory().unwrap();
+    hosts.register("host-1", &enrollment(&key(1)), NOW).unwrap();
+    hosts.revoke("host-1", NOW).unwrap();
+    hosts
+        .record_agents("host-1", ReportedIn::Hello, vec![agent("claude")], None, NOW)
+        .unwrap();
+    let record = hosts.agents("host-1").unwrap().unwrap();
+    assert_eq!(record.source, hennery_proto::rest::AgentsSource::None);
+}
+
+/// A stored report that cannot be read is no report.
+#[test]
+fn an_unreadable_report_is_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    let hosts = Hosts::open(&db).unwrap();
+    hosts.register("host-1", &enrollment(&key(1)), NOW).unwrap();
+    hosts
+        .record_agents("host-1", ReportedIn::Hello, vec![agent("claude")], None, NOW)
+        .unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute("UPDATE hosts SET agents = 'not json' WHERE id = 'host-1'", [])
+        .unwrap();
+    let record = hosts.agents("host-1").unwrap().unwrap();
+    assert_eq!(record.source, hennery_proto::rest::AgentsSource::None);
+    assert!(record.agents.is_empty() && record.reported_at.is_none());
 }
