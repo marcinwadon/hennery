@@ -111,4 +111,33 @@ mod tests {
         assert_eq!(text, "abc");
         assert_eq!(append(&mut String::new(), "", 0), (0, false));
     }
+
+    /// A cap landing at every byte inside a 3-byte and a 4-byte character,
+    /// with a byte before it and with nothing before it (the cut keeps
+    /// nothing): the character is left out whole.
+    #[test]
+    fn a_cut_inside_a_3_or_4_byte_character_leaves_it_out() {
+        for c in ["漢", "🦀"] {
+            for inside in 1..c.len() {
+                assert_eq!(cut(c, inside), (String::new(), true), "{c} at {inside}");
+                let s = format!("a{c}b");
+                assert_eq!(cut(&s, 1 + inside), ("a".to_string(), true), "{c} at {inside}");
+                assert_eq!(clip(&s, 1 + inside), "a");
+                // `append` with the room ending inside it: nothing of it.
+                let mut text = "a".to_string();
+                assert_eq!(append(&mut text, c, 1 + inside), (0, true), "{c} at {inside}");
+                assert_eq!(text, "a");
+                let mut text = "a".to_string();
+                assert_eq!(append(&mut text, &format!("b{c}"), 2 + inside), (1, true));
+                assert_eq!(text, "ab");
+            }
+            // At its end, it is kept.
+            assert_eq!(cut(&format!("a{c}b"), 1 + c.len()), (format!("a{c}"), true));
+            // No room left: nothing is appended.
+            let mut text = "abc".to_string();
+            assert_eq!(append(&mut text, c, 2), (0, true));
+            assert_eq!(append(&mut text, c, 3), (0, true));
+            assert_eq!(text, "abc");
+        }
+    }
 }
