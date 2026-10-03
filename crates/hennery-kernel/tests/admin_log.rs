@@ -41,6 +41,7 @@ async fn a_connection_closed_without_a_request_is_not_warned_about() {
         hosts,
         dir: dir.path().to_path_buf(),
         base_url: "http://localhost:7117".into(),
+        deployment: hennery_kernel::deployment::Deployment::alone(),
     };
     let (_stop, stopped) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(serve(

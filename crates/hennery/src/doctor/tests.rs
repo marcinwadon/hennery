@@ -9,6 +9,7 @@ use super::dirs::{Found, HOST_DIR_VAR};
 use super::*;
 use crate::service::unit::{self, Role};
 use crate::service::{Manager, Platform};
+use hennery_kernel::admin::{AdminResponse, Unreachable, Why};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -2762,4 +2763,194 @@ fn check_10_reports_a_revoke_without_the_service_manager() {
     let check = check10(&cx, &data);
     assert_eq!(check.status, Status::Fail, "{check:?}");
     assert!(check.summary.contains("host was revoked by the collector"), "{check:?}");
+}
+
+/// Check 15 (plan 4d-B3) on a collector directory, answered by `answer`
+/// as the collector's admin socket would, with `cx`'s service.
+fn check15(cx: &Context, collector: &Path, answer: impl Fn() -> anyhow::Result<AdminResponse>) -> Finding {
+    let before = snapshot(collector);
+    let doctor = Doctor {
+        cx,
+        dirs: Dirs::by_contents(collector.to_path_buf(), Found::Given),
+        run: &nothing,
+    };
+    let finding = super::isolation::isolation_with(&doctor, &|asked: &Path| {
+        assert_eq!(asked, collector);
+        answer()
+    });
+    assert_eq!(snapshot(collector), before, "doctor changed what it looked at");
+    if let Finding::Checked(check) = &finding {
+        assert_eq!(check.name, "collector isolation");
+        if check.status != Status::Ok {
+            assert!(!check.fix.is_empty(), "{check:?}");
+        }
+    }
+    finding
+}
+
+fn checked15(finding: Finding) -> Check {
+    match finding {
+        Finding::Checked(check) => check,
+        other => panic!("check 15 did not run: {other:?}"),
+    }
+}
+
+/// A collector directory under `dir`: its database's name is enough.
+fn collector_dir(dir: &Path) -> PathBuf {
+    let collector = dir.join("collector");
+    std::fs::create_dir_all(&collector).unwrap();
+    std::fs::write(collector.join("hennery.db"), b"").unwrap();
+    collector
+}
+
+/// An admin client's error of kind `why`. The real client's errors are
+/// pinned in the kernel's `admin_deployment.rs`; a second user, or a CI
+/// that runs as root, cannot give every kind here.
+fn unreachable(why: Why) -> anyhow::Error {
+    Unreachable::new(why, format!("{why:?}")).into()
+}
+
+/// Check 15: no collector directory, or no collector running, is not run;
+/// every other way of getting no answer warns, each with its own fix.
+#[test]
+fn check_15_never_takes_no_answer_for_a_quiet_collector() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+
+    // A host's directory: nothing to ask.
+    let host = paired(&dir.path().join("host"));
+    let doctor = Doctor {
+        cx: &cx,
+        dirs: Dirs::by_contents(host, Found::Given),
+        run: &nothing,
+    };
+    let finding = super::isolation::isolation_with(&doctor, &|_: &Path| panic!("asked"));
+    assert_eq!(
+        finding,
+        Finding::NotRun {
+            number: 15,
+            why: "no collector data directory"
+        }
+    );
+
+    let collector = collector_dir(dir.path());
+    for why in [Why::NoSocket, Why::Stale] {
+        assert_eq!(
+            check15(&cx, &collector, || Err(unreachable(why))),
+            Finding::NotRun {
+                number: 15,
+                why: "the collector is not running"
+            },
+            "{why:?}"
+        );
+    }
+    let cases: [(Why, &str, &str); 5] = [
+        (Why::TimedOut, "did not answer in time", "run doctor again"),
+        (
+            Why::Unanswered,
+            "closed the connection without answering",
+            "run doctor again",
+        ),
+        (Why::PathTooLong, "path is too long", "shorter path"),
+        (Why::Denied, "is not this user's", "run doctor as the collector's user"),
+        (
+            Why::OtherUser,
+            "is not this user's",
+            "run doctor as the collector's user",
+        ),
+    ];
+    for (why, summary, fix) in cases {
+        let check = checked15(check15(&cx, &collector, || Err(unreachable(why))));
+        assert_eq!(check.status, Status::Warn, "{why:?}: {check:?}");
+        assert!(check.summary.contains(summary), "{why:?}: {check:?}");
+        assert!(check.fix.contains(fix), "{why:?}: {check:?}");
+    }
+    // An error of no known kind is shown, cut, and warns.
+    let check = checked15(check15(&cx, &collector, || Err(anyhow::anyhow!("not a socket"))));
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(
+        check.summary.contains("cannot ask the collector: not a socket"),
+        "{check:?}"
+    );
+}
+
+/// Check 15: while the collector's service runs, no answer from its socket
+/// warns as such, whatever the kind.
+#[test]
+fn check_15_warns_when_the_running_service_does_not_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = systemd("active", std::process::id(), "yes");
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let collector = collector_dir(dir.path());
+    install(&cx, Role::Collector, &cx.exe, &collector, "/usr/bin:/bin");
+    for why in [Why::NoSocket, Why::Stale, Why::TimedOut, Why::Unanswered] {
+        let check = checked15(check15(&cx, &collector, || Err(unreachable(why))));
+        assert_eq!(check.status, Status::Warn, "{why:?}: {check:?}");
+        assert!(
+            check
+                .summary
+                .contains("service runs but its admin socket does not answer"),
+            "{why:?}: {check:?}"
+        );
+    }
+}
+
+/// Check 15: the collector's answers. Credentials for several hats beside
+/// up's host warn with kernel spec §10's recommendation, by count; one hat,
+/// or a collector up did not start, is ok, the latter saying what is not
+/// detected; an older collector, a failed read and an answer to another
+/// question each warn with their own fix.
+#[test]
+fn check_15_judges_the_collectors_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let fake = Fake::none();
+    let cx = machine(dir.path(), Platform::Linux, &fake);
+    let collector = collector_dir(dir.path());
+    let answer = |response: AdminResponse| checked15(check15(&cx, &collector, move || Ok(response.clone())));
+
+    let check = answer(AdminResponse::Deployment {
+        beside_host: true,
+        hats: 3,
+    });
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("credentials for 3 hats"), "{check:?}");
+    assert_eq!(check.fix, hennery_kernel::deployment::RECOMMENDATION);
+
+    for hats in [0, 1] {
+        let check = answer(AdminResponse::Deployment {
+            beside_host: true,
+            hats,
+        });
+        assert_eq!(check.status, Status::Ok, "{check:?}");
+        assert!(check.summary.contains("at most one"), "{check:?}");
+    }
+
+    let check = answer(AdminResponse::Deployment {
+        beside_host: false,
+        hats: 4,
+    });
+    assert_eq!(check.status, Status::Ok, "{check:?}");
+    assert!(check.summary.contains("not started by hennery up"), "{check:?}");
+    assert!(check.summary.contains("not detected"), "{check:?}");
+
+    let check = answer(AdminResponse::Refused {
+        message: "not an admin request: unknown variant `deployment`".into(),
+    });
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(
+        check.fix.contains("restart the collector after an upgrade"),
+        "{check:?}"
+    );
+
+    let check = answer(AdminResponse::Failed {
+        message: "the gateway's store is gone".into(),
+    });
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("the gateway's store is gone"), "{check:?}");
+    assert!(check.fix.contains("the collector's log"), "{check:?}");
+
+    let check = answer(AdminResponse::AlreadySetUp);
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("another question"), "{check:?}");
 }
