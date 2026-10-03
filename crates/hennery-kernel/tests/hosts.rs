@@ -365,3 +365,44 @@ fn minting_prunes_spent_and_expired_codes_and_caps_the_live_ones() {
             .unwrap(),
     );
 }
+
+/// Plan 8e decision E7: a `hello`'s per-agent MCP isolation is kept for the
+/// host list, as of the latest one; none before the first.
+#[test]
+fn a_hellos_mcp_isolation_is_kept_as_of_the_latest() {
+    use hennery_proto::frames::{AgentIsolation, McpIsolation};
+    let hosts = Hosts::open_in_memory().unwrap();
+    hosts.register("host-1", &enrollment(&key(1)), NOW).unwrap();
+    assert_eq!(hosts.host("host-1").unwrap().unwrap().mcp_isolation, None);
+    let first = AgentIsolation(
+        [
+            ("claude".to_string(), McpIsolation::ClaudeStrict),
+            ("codex".to_string(), McpIsolation::None),
+        ]
+        .into(),
+    );
+    hosts.record_mcp_isolation("host-1", &first).unwrap();
+    assert_eq!(hosts.host("host-1").unwrap().unwrap().mcp_isolation, Some(first));
+    let second = AgentIsolation([("codex".to_string(), McpIsolation::None)].into());
+    hosts.record_mcp_isolation("host-1", &second).unwrap();
+    assert_eq!(hosts.host("host-1").unwrap().unwrap().mcp_isolation, Some(second));
+}
+
+/// The host's own words, bounded: at most 32 agents, each id displayable
+/// and at most 64 bytes.
+#[test]
+fn a_hellos_mcp_isolation_is_bounded() {
+    use hennery_kernel::hosts::MAX_AGENTS;
+    use hennery_proto::frames::{AgentIsolation, McpIsolation};
+    let hosts = Hosts::open_in_memory().unwrap();
+    hosts.register("host-1", &enrollment(&key(1)), NOW).unwrap();
+    let mut many: std::collections::BTreeMap<String, McpIsolation> =
+        (0..40).map(|i| (format!("agent-{i:02}"), McpIsolation::None)).collect();
+    many.insert("a".repeat(65), McpIsolation::ClaudeStrict);
+    many.insert("bidi\u{202e}".into(), McpIsolation::ClaudeStrict);
+    many.insert(String::new(), McpIsolation::ClaudeStrict);
+    hosts.record_mcp_isolation("host-1", &AgentIsolation(many)).unwrap();
+    let kept = hosts.host("host-1").unwrap().unwrap().mcp_isolation.unwrap();
+    assert_eq!(kept.0.len(), MAX_AGENTS);
+    assert!(kept.0.keys().all(|agent| agent.starts_with("agent-")), "{kept:?}");
+}
