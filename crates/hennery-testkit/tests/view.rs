@@ -215,7 +215,7 @@ impl Collector {
         assert_eq!(resp.status(), 200);
         Sse {
             resp,
-            buf: String::new(),
+            reader: Reader::default(),
         }
     }
 }
@@ -258,7 +258,54 @@ impl Message {
 
 struct Sse {
     resp: reqwest::Response,
-    buf: String,
+    reader: Reader,
+}
+
+/// The SSE wire format, read from raw chunks: a chunk may end anywhere,
+/// inside a character too, so bytes are held until a message is whole,
+/// and only a whole message is decoded.
+#[derive(Default)]
+struct Reader {
+    buf: Vec<u8>,
+}
+
+impl Reader {
+    fn feed(&mut self, chunk: &[u8]) {
+        self.buf.extend_from_slice(chunk);
+    }
+
+    /// The next whole message, keep-alives skipped.
+    fn next(&mut self) -> Option<Message> {
+        // `\n` is never a byte of a multi-byte character: a split there
+        // leaves every character whole.
+        while let Some(end) = self.buf.windows(2).position(|w| w == b"\n\n") {
+            let block: Vec<u8> = self.buf.drain(..end + 2).collect();
+            let block = std::str::from_utf8(&block).expect("an SSE message in UTF-8");
+            let mut message = Message {
+                event: "message".into(),
+                data: String::new(),
+                id: None,
+            };
+            let mut fields = false;
+            for line in block.lines() {
+                let Some((field, value)) = line.split_once(':') else {
+                    continue;
+                };
+                let value = value.strip_prefix(' ').unwrap_or(value).to_string();
+                match field {
+                    "event" => message.event = value,
+                    "data" => message.data = value,
+                    "id" => message.id = Some(value),
+                    _ => continue,
+                }
+                fields = true;
+            }
+            if fields {
+                return Some(message);
+            }
+        }
+        None
+    }
 }
 
 impl Sse {
@@ -266,36 +313,14 @@ impl Sse {
     async fn next(&mut self) -> Option<Message> {
         let deadline = Instant::now() + WAIT;
         loop {
-            while let Some(end) = self.buf.find("\n\n") {
-                let block: String = self.buf.drain(..end + 2).collect();
-                let mut message = Message {
-                    event: "message".into(),
-                    data: String::new(),
-                    id: None,
-                };
-                let mut fields = false;
-                for line in block.lines() {
-                    let Some((field, value)) = line.split_once(':') else {
-                        continue;
-                    };
-                    let value = value.strip_prefix(' ').unwrap_or(value).to_string();
-                    match field {
-                        "event" => message.event = value,
-                        "data" => message.data = value,
-                        "id" => message.id = Some(value),
-                        _ => continue,
-                    }
-                    fields = true;
-                }
-                if fields {
-                    return Some(message);
-                }
+            if let Some(message) = self.reader.next() {
+                return Some(message);
             }
             let chunk = tokio::time::timeout_at(deadline, self.resp.chunk())
                 .await
                 .expect("an SSE message in time")
                 .unwrap()?;
-            self.buf.push_str(std::str::from_utf8(&chunk).unwrap());
+            self.reader.feed(&chunk);
         }
     }
 
@@ -500,9 +525,22 @@ async fn one_owner_never_sees_anothers_summaries() {
     assert_eq!(stream.counted().await, (0, Some(after.clone())));
     let theirs = collector.write(OTHER, "theirs", "user_turn", &turn("t2"));
     collector.state.hub.publish(theirs);
-    collector.event("mine", "user_turn", &turn("t3"));
-    let message = stream.message().await;
-    assert_eq!(message.summary().session.session_id, "mine");
+    let mine = collector.event("mine", "user_turn", &turn("t3"));
+    // The whole burst, up to the message carrying its id: only `mine`.
+    let until = format!("{}:{}", page.epoch, mine.event_id);
+    loop {
+        let message = stream.message().await;
+        if message.event == "session_upsert" {
+            assert_eq!(message.summary().session.session_id, "mine");
+        }
+        if message.id.as_deref() == Some(until.as_str()) {
+            break;
+        }
+    }
+    // Nothing of theirs was held behind it: the next message is ours.
+    collector.session(&collector.owner(), "sentinel");
+    collector.event("sentinel", "user_turn", &turn("t4"));
+    assert_eq!(stream.message().await.summary().session.session_id, "sentinel");
 }
 
 /// A7, the security review's B-5: `question_waits` is set by an open
@@ -2147,4 +2185,192 @@ async fn the_count_follows_a_question_asked_and_resolved_in_a_turn() {
         (Some("running"), false)
     );
     assert_eq!(stream.counted().await.0, 0);
+}
+
+/// Polish, a 4-byte emoji, box-drawing and CJK: what early testers write
+/// and what agents print.
+const SCRIPTS: &str = "Zażółć gęślą jaźń 🦀 ┌─┐│└┘ 漢字テスト";
+
+/// An agent's reply in chunks, split inside characters as shown: between a
+/// flag's two regional indicators, before a skin tone, before a combining
+/// accent. An event cannot split a code point (its body is JSON text, and
+/// a lone surrogate is refused), so these are the closest splits an
+/// adapter can send; byte splits are the reader's and `cap`'s to test.
+const SAID: [&str; 5] = [
+    "Zażółć gęślą jaźń 🇵",
+    "🇱 👍",
+    "🏽 ┌─┐│└┘ cafe",
+    "\u{301} 漢字",
+    "テスト",
+];
+
+/// The user turn `t2`, the reply and the tool call `c1` hold their text
+/// exactly as written: `str` equality is byte equality.
+fn scripts_intact(items: &[Item], leg: &str) {
+    let find = |id: &str| {
+        items
+            .iter()
+            .find(|i| i.id == id)
+            .unwrap_or_else(|| panic!("{leg}: no {id} in {items:?}"))
+    };
+    let Body::UserTurn { content, truncated } = &find("t2:0").body else {
+        panic!("{leg}: a user turn");
+    };
+    assert!(!truncated, "{leg}");
+    assert!(
+        matches!(&content[..], [StoredBlock::Text { text }] if text == SCRIPTS),
+        "{leg}: {content:?}"
+    );
+    let Body::Message(said) = &find("t2:1").body else {
+        panic!("{leg}: a message");
+    };
+    assert_eq!(said.text, SAID.concat(), "{leg}");
+    let Body::ToolCall(call) = &find("t2:tool:c1").body else {
+        panic!("{leg}: a tool call");
+    };
+    assert_eq!(call.title.as_deref(), Some(SCRIPTS), "{leg}");
+    assert_eq!(call.output.as_deref(), Some(SCRIPTS), "{leg}");
+    assert!(
+        matches!(&call.content[..], [hennery_view::ToolContent::Text { text }] if text == SCRIPTS),
+        "{leg}: {:?}",
+        call.content
+    );
+    assert!(!call.truncated, "{leg}");
+}
+
+/// A summary shows the session's title, branch and cwd as stored.
+fn summary_intact(summary: &SessionSummary, leg: &str) {
+    let session = &summary.session;
+    assert_eq!(session.title.as_deref(), Some(SCRIPTS), "{leg}");
+    assert_eq!(session.git_branch.as_deref(), Some(BRANCH), "{leg}");
+    assert_eq!(session.cwd, CWD, "{leg}");
+}
+
+const BRANCH: &str = "feature/zażółć-🦀-漢字";
+const CWD: &str = "/tmp/jaźń/┌─┐/漢字テスト";
+
+/// Early testers write Polish, and agents print emoji, box-drawing and
+/// CJK: a prompt, a reply in chunks, a tool's output and the session's
+/// summary arrive byte for byte on the page, on the item stream (live and
+/// on a resume) and on the list.
+#[tokio::test]
+async fn text_in_any_script_crosses_the_view_api_intact() {
+    let collector = Collector::start().await;
+    let anchor = opened(&collector, "s").await;
+    collector
+        .conn()
+        .execute(
+            "UPDATE sessions SET title = ?1, git_branch = ?2, cwd = ?3 WHERE id = 's'",
+            params![SCRIPTS, BRANCH, CWD],
+        )
+        .unwrap();
+    let mut items = collector.stream(&format!("{ITEMS}?after={anchor}"), None).await;
+    live(&collector, &mut items).await;
+    let list = collector.summaries("").await;
+    let [listed] = &list.sessions[..] else {
+        panic!("{:?}", list.sessions);
+    };
+    summary_intact(listed, "list page");
+    let mut sessions = collector
+        .stream(&format!("{LIST}?after={}:{}", list.epoch, list.revision), None)
+        .await;
+    sessions.counted().await;
+
+    collector.event(
+        "s",
+        "user_turn",
+        &json!({"turn_id": "t2", "content": [{"type": "text", "text": SCRIPTS}]}),
+    );
+    let chunks: Vec<Value> = SAID.iter().map(|text| chunk(text)).collect();
+    collector.events_at_once("s", &chunks);
+    let call = collector.event(
+        "s",
+        "acp_update",
+        &acp(
+            json!({"sessionUpdate": "tool_call", "toolCallId": "c1", "title": SCRIPTS,
+                    "status": "completed", "rawOutput": SCRIPTS,
+                    "content": [{"type": "content", "content": {"type": "text", "text": SCRIPTS}}]}),
+        ),
+    );
+    let last = format!("{}:{}", epoch_of(&anchor), call.event_id);
+    let mut sent = Vec::new();
+    while sent.len() < 3 {
+        sent.push(items.message().await.item());
+    }
+    scripts_intact(&sent, "live");
+
+    scripts_intact(&collector.page("s", "").await.items, "page");
+
+    let mut resumed = collector.stream(ITEMS, Some(&anchor)).await;
+    let mut again = Vec::new();
+    loop {
+        let message = resumed.message().await;
+        let end = message.id.is_some();
+        again.push(message.item());
+        if end {
+            assert_eq!(message.id.as_deref(), Some(last.as_str()));
+            break;
+        }
+    }
+    scripts_intact(&again, "resume");
+
+    // The list: each upsert of the burst shows the summary as stored.
+    let until = format!("{}:{}", list.epoch, call.event_id);
+    let mut upserts = 0;
+    loop {
+        let message = sessions.message().await;
+        if message.event == "session_upsert" {
+            summary_intact(&message.summary(), "list stream");
+            upserts += 1;
+        }
+        if message.id.as_deref() == Some(until.as_str()) {
+            break;
+        }
+    }
+    assert!(upserts > 0);
+    let [listed] = &collector.summaries("").await.sessions[..] else {
+        panic!("one session");
+    };
+    summary_intact(listed, "list page after");
+}
+
+/// The reader holds a chunk that ends inside a character until the rest
+/// comes: a 4-byte emoji split after each of its bytes, a 3-byte and a
+/// 2-byte character likewise, and a message fed a byte at a time.
+#[test]
+fn the_sse_reader_decodes_a_character_split_across_chunks() {
+    let wire = "event: item\ndata: {\"t\":\"a🦀b漢cż\"}\nid: e:1\n\n";
+    let whole = |message: Option<Message>| {
+        let message = message.expect("a message");
+        assert_eq!(
+            (message.event.as_str(), message.data.as_str(), message.id.as_deref()),
+            ("item", "{\"t\":\"a🦀b漢cż\"}", Some("e:1"))
+        );
+    };
+    let starts = |c: &str| wire.find(c).unwrap();
+    let mut splits = Vec::new();
+    for (c, len) in [("🦀", 4), ("漢", 3), ("ż", 2)] {
+        for inside in 1..len {
+            splits.push(starts(c) + inside);
+        }
+    }
+    assert_eq!(splits.len(), 3 + 2 + 1);
+    for at in splits {
+        assert!(!wire.is_char_boundary(at));
+        let mut reader = Reader::default();
+        reader.feed(&wire.as_bytes()[..at]);
+        assert!(reader.next().is_none(), "split at {at}");
+        reader.feed(&wire.as_bytes()[at..]);
+        whole(reader.next());
+        assert!(reader.next().is_none());
+    }
+    let mut reader = Reader::default();
+    let bytes = wire.as_bytes();
+    for (n, byte) in bytes.iter().enumerate() {
+        reader.feed(std::slice::from_ref(byte));
+        if n + 1 < bytes.len() {
+            assert!(reader.next().is_none(), "a message after {} bytes", n + 1);
+        }
+    }
+    whole(reader.next());
 }
