@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { ApiFailure } from '../api/errors'
-import { readStartNotice, sessionHref, startNoticeText, startRefusal } from './start'
+import { newSessionHref, readNewSessionPrefill, readStartNotice, sessionHref, startNoticeText, startRefusal } from './start'
 
 const refused = (status: number, code: string, message: string) => new ApiFailure(status, { code, message })
 
@@ -103,5 +103,17 @@ describe('readStartNotice', () => {
   it('reads no notice from anything else', () => {
     expect(readStartNotice('')).toBeNull()
     expect(readStartNotice('?notice=other')).toBeNull()
+  })
+})
+
+describe('newSessionHref', () => {
+  it('names the host and the project, both encoded, and reads them back', () => {
+    const href = newSessionHref('h/1&x', '/srv/work/a b&cwd=x#y')
+    expect(href).toBe('/new?host=h%2F1%26x&cwd=%2Fsrv%2Fwork%2Fa+b%26cwd%3Dx%23y')
+    expect(readNewSessionPrefill(href.slice('/new'.length))).toEqual({ host: 'h/1&x', cwd: '/srv/work/a b&cwd=x#y' })
+  })
+
+  it('reads nothing a link does not name', () => {
+    expect(readNewSessionPrefill('')).toEqual({ host: undefined, cwd: undefined })
   })
 })

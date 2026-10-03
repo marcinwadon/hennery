@@ -174,6 +174,11 @@ export function useAnswerState(book: AnswerBook | undefined, id: string): { loca
 
 const noSubscribe = () => () => {}
 
+/** Whether the book says the host is away. */
+export function useHostAway(book: AnswerBook): boolean {
+  return useSyncExternalStore(book.subscribe, () => book.hostAway)
+}
+
 /** A form's draft in the book, and how to change it. Without a book, an
  *  empty draft that does not change. */
 export function useFormDraft(book: AnswerBook | undefined, id: string): [Draft, (next: (draft: Draft) => Draft) => void] {

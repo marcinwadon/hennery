@@ -1,7 +1,9 @@
 // A test server for the session screen with its composer: any session id,
 // its page, stream, detail and catalogue, the hosts, an undelivered turn
 // and its images, the composer's and the cards' POSTs, recorded with their
-// bodies.
+// bodies; the footer's resume, the header menu's park, close and delete,
+// and the hats and their resolution a resume refused as `hat_mismatch`
+// asks for.
 import type { SessionCatalog, SessionDetail } from '../generated/protocol'
 import type { Item, TurnContent } from '../generated/view'
 import { json, liveStream, routed, type LiveStream } from '../test-stream'
@@ -55,8 +57,6 @@ export interface Opts {
   attachment?: () => Response
   /** `POST …/prompt`; 202 by default. */
   prompt?: () => Response | Promise<Response>
-  /** `POST …/resume`, the composer's own "Resume and send"; 202 by default. */
-  resume?: () => Response | Promise<Response>
   /** `POST …/config`. */
   config?: (id: string) => Response
   /** `GET /api/view/sessions/{id}`, before `items`. */
@@ -65,7 +65,20 @@ export interface Opts {
   detail?: Partial<SessionDetail>
   /** `POST …/pending/{pending_id}/answer`; 202 by default. */
   answer?: () => Response
+  /** `POST …/resume`, `…/park`, `…/close`; 202 by default. */
+  resume?: () => Response | Promise<Response>
+  park?: () => Response | Promise<Response>
+  close?: () => Response | Promise<Response>
+  /** `DELETE /api/sessions/{id}`; 200 with every transcript removed by
+   *  default. */
+  remove?: () => Response | Promise<Response>
+  /** `GET /api/hats`; none by default. */
+  hats?: () => Response
+  /** `POST /api/hats/resolve`; 404 by default. */
+  resolve?: () => Response
 }
+
+const lifecycle = (id: string, lifecycle: string) => json({ session_id: id, lifecycle }, 202)
 
 export function sessionServer(opts: Opts = {}) {
   const streams: LiveStream[] = []
@@ -90,8 +103,13 @@ export function sessionServer(opts: Opts = {}) {
     if ((m = path.match(/^\/api\/sessions\/[^/]+\/pending\/([^/]+)\/answer$/))) {
       return opts.answer?.() ?? json({ pending_id: decodeURIComponent(m[1]), request_id: 'r1' }, 202)
     }
-    if ((m = path.match(/^\/api\/sessions\/([^/]+)\/resume$/))) {
-      return opts.resume?.() ?? json({ session_id: decodeURIComponent(m[1]), lifecycle: 'active' }, 202)
+    if (path === '/api/hats') return opts.hats?.() ?? json([])
+    if (path === '/api/hats/resolve') return opts.resolve?.() ?? json({ code: 'not_found', message: 'no' }, 404)
+    if ((m = path.match(/^\/api\/sessions\/([^/]+)\/resume$/))) return opts.resume?.() ?? lifecycle(decodeURIComponent(m[1]), 'active')
+    if ((m = path.match(/^\/api\/sessions\/([^/]+)\/park$/))) return opts.park?.() ?? lifecycle(decodeURIComponent(m[1]), 'parked')
+    if ((m = path.match(/^\/api\/sessions\/([^/]+)\/close$/))) return opts.close?.() ?? lifecycle(decodeURIComponent(m[1]), 'closed')
+    if (call.method === 'DELETE' && /^\/api\/sessions\/[^/]+$/.test(path)) {
+      return opts.remove?.() ?? json({ host_transcript: { state: 'removed', remaining: [], notes: [] } })
     }
     if ((m = path.match(/^\/api\/sessions\/([^/]+)\/catalog$/))) return json(catalogOf(decodeURIComponent(m[1])))
     if ((m = path.match(/^\/api\/sessions\/([^/]+)\/prompt$/))) return json({ turn_id: 'new' }, 202)
@@ -108,7 +126,9 @@ export function sessionServer(opts: Opts = {}) {
       .filter((c) => c[1]?.method === 'POST' && String(c[0]).endsWith(suffix))
       .map((c) => ({ path: String(c[0]), body: JSON.parse(String(c[1]?.body)) as unknown }))
   const of = (path: string) => t.calls.filter((c) => new URL(c.path, 'http://h').pathname === path)
-  return { ...t, streams, posted, of }
+  /** `METHOD path` of every call but the GETs. */
+  const changes = () => t.calls.filter((c) => c.method !== 'GET').map((c) => `${c.method} ${c.path}`)
+  return { ...t, streams, posted, of, changes }
 }
 
 export const FAST = { retryMs: () => 5, resyncedMs: 300 }

@@ -11,6 +11,7 @@ import { DESKTOP } from '../components/Shell'
 import type { HatItem, HostItem, HostProjects } from '../generated/protocol'
 import type { SessionSummary } from '../generated/view'
 import type { HostAgentChoices } from '../lib/agents'
+import { newSessionHref } from '../lib/start'
 import { navigate } from '../router'
 import { json, stubServer, type Answer } from '../test-server'
 import { liveStream } from '../test-stream'
@@ -152,10 +153,26 @@ describe('hosts', () => {
     await waitFor(() => expect(hostButton('desk')).toHaveAttribute('aria-pressed', 'true'))
   })
 
+  it('prefills a link’s text that is not a path as a search: no path until a project is picked', async () => {
+    const server = mount({}, '/new?host=h1&cwd=cat')
+    await waitFor(() => expect(hostButton('laptop')).toHaveAttribute('aria-pressed', 'true'))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Claude' })).toHaveAttribute('aria-pressed', 'true'))
+    expect(await projectField()).toHaveValue('cat')
+    expect(startButton()).toBeDisabled()
+    await new Promise((r) => setTimeout(r, RESOLVE_DEBOUNCE_MS + 50))
+    expect(server.sent.some((s) => s.path === '/api/hats/resolve')).toBe(false)
+  })
+
   it('prefills the host and the path from a link', async () => {
     mount({}, '/new?host=h4&cwd=%2Fsrv%2Fwork%2Fapp')
     await waitFor(() => expect(hostButton('desk')).toHaveAttribute('aria-pressed', 'true'))
     expect(await projectField()).toHaveValue('/srv/work/app')
+  })
+
+  it('prefills from the link a failed session offers, whatever its path holds', async () => {
+    mount({}, newSessionHref('h4', '/srv/work/a b&c=d#e?f+g%h'))
+    await waitFor(() => expect(hostButton('desk')).toHaveAttribute('aria-pressed', 'true'))
+    expect(await projectField()).toHaveValue('/srv/work/a b&c=d#e?f+g%h')
   })
 
   it('says why a prefilled offline host is not chosen, and chooses none', async () => {
