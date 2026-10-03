@@ -88,7 +88,7 @@ fn another_owners_connections_are_invisible_to_the_store() {
     );
     assert_eq!(store.static_credential(THEIRS, &key).unwrap(), None);
     assert!(!store.delete(THEIRS).unwrap());
-    store.purge_hat(THEIR_HAT).unwrap();
+    let _ = store.purge_hat(THEIR_HAT).unwrap();
     store.check_key(&MasterKey::from_bytes([9; 32])).unwrap();
     assert_eq!(rows(&conn), before);
 
@@ -119,6 +119,6 @@ fn another_owners_connections_are_invisible_to_the_store() {
         Change::Invalid(_)
     ));
     // The owner's own purge of their own hat leaves theirs alone.
-    store.purge_hat(&hat).unwrap();
+    let _ = store.purge_hat(&hat).unwrap();
     assert_eq!(rows(&conn), before);
 }

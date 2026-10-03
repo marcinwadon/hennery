@@ -211,13 +211,8 @@ impl Harness {
             request: Duration::from_secs(10),
         })
         .unwrap();
-        let app = router(ProxyState::full(
-            world.proxy_store.clone(),
-            world.store.clone(),
-            world.key.clone(),
-            egress,
-            limits,
-        ));
+        let gateway = world.gateway();
+        let app = router(ProxyState::full(world.proxy_store.clone(), &gateway, egress, limits));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
