@@ -1212,6 +1212,103 @@ fn start_push(state: &mut AppState, egress: &hennery_kernel::egress::Egress) {
 mod tests {
     use super::*;
 
+    /// Plan 8f (lane L9, gateway spec §7): the gateway's `Notifier` is the
+    /// collector's Web Push, a problem present at startup is announced once
+    /// through it, and the background probe runs.
+    #[tokio::test]
+    async fn the_gateway_announces_through_push_and_probes() {
+        use hennery_gateway::model::{AuthMethod, CredKind, GrantTokens, NewConnection, Status, TokenClient};
+        use hennery_gateway::store::{ClientSource, GrantToStore};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hennery.db");
+        let mut state = AppState::new(
+            Store::open(&db).unwrap(),
+            Hosts::open(&db).unwrap(),
+            Operator::open(&db).unwrap(),
+        );
+        let (push, mut notices) = hennery_kernel::push::Push::new();
+        state.push = push;
+        let egress = hennery_kernel::egress::Egress::new(hennery_kernel::egress::Timeouts::DEFAULT).unwrap();
+        let keys = hennery_gateway::key::KeySource::from_vars(dir.path(), None, None).unwrap();
+        // A first start makes the key; an OAuth connection in `error`, with
+        // a grant whose upstream is a listener here.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let (first, _) = start_gateway(&db, &keys, &state, &egress, std::time::Duration::from_secs(3600)).unwrap();
+        let runtime = first.runtime.clone();
+        let hennery_gateway::model::Change::Done(record) = runtime
+            .store
+            .create(
+                &NewConnection {
+                    slug: "linear".into(),
+                    label: "Linear".into(),
+                    url: url.clone(),
+                    hat_id: state.hosts.default_hat_for_new_hosts().unwrap(),
+                    cred_kind: CredKind::OauthDcr,
+                    static_header: None,
+                    static_prefix: None,
+                    tool_allowlist: None,
+                    internal_network: true,
+                },
+                1,
+            )
+            .unwrap()
+        else {
+            panic!("not created");
+        };
+        let client = TokenClient {
+            client_id: "c".into(),
+            secret: None,
+            auth_method: AuthMethod::None,
+            token_endpoint: format!("{url}/token"),
+        };
+        let tokens = GrantTokens::from_opened(br#"{"access_token":"a"}"#).unwrap();
+        runtime
+            .store
+            .store_grant(
+                &GrantToStore {
+                    connection_id: &record.id,
+                    url: &url,
+                    cred_kind: CredKind::OauthDcr,
+                    internal_network: true,
+                    source: ClientSource::Registered,
+                    client: &client,
+                    issuer: &url,
+                    authorization_endpoint: &url,
+                    redirect_uri: "https://hennery.example/api/mcp/oauth/callback",
+                    scopes: &[],
+                    resource: &url,
+                    resource_param_accepted: true,
+                    registered_at: 1,
+                    tokens: &tokens,
+                    expires_at: None,
+                },
+                &runtime.key,
+                1,
+            )
+            .unwrap();
+        runtime
+            .statuses
+            .record_status(&record.id, &url, Status::Error, Some("down"), 1)
+            .unwrap();
+        while notices.try_recv().is_some() {}
+        drop((first, runtime));
+        // The start this test is about.
+        let started = start_gateway(&db, &keys, &state, &egress, std::time::Duration::from_millis(20)).unwrap();
+        // One runtime for the API and the proxy: one refresh lock per
+        // connection (plan 8f decision 3).
+        assert!(std::sync::Arc::ptr_eq(&started.0.runtime, &started.1.runtime));
+        let notice = notices.try_recv().expect("the problem is announced at startup");
+        assert_eq!(notice.tag, format!("mcp-{}", record.id));
+        assert_eq!(notice.body, "is failing");
+        assert_eq!(notice.url, "/mcp");
+        assert!(notices.try_recv().is_none(), "once");
+        // The probe reaches the upstream.
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(10), listener.accept()).await;
+        assert!(accepted.is_ok(), "the probe never ran");
+        state.shutdown.cancel();
+    }
+
     /// Plan 10b-ii: the collector's notices reach delivery, and delivery is
     /// public only. A subscription at a loopback address gets a notice
     /// refused, recorded on it; nothing is sent.
