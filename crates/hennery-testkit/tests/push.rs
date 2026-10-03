@@ -330,6 +330,7 @@ async fn the_push_contact_is_set_in_the_settings() {
         SettingsResponse {
             public_url: PUBLIC_URL.into(),
             contact: None,
+            deployment_warning: false,
         }
     );
     let patch = |body: serde_json::Value| client.patch(c.url("/api/settings")).json(&body).send();

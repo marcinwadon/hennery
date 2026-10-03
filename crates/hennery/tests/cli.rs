@@ -1405,6 +1405,82 @@ fn the_collector_serves_the_mcp_proxy_outside_the_operator_s_routes() {
     stop(&mut collector);
 }
 
+/// A static connection in `hat`, with a token stored for it, on the
+/// collector at `listen`.
+fn credentialled_connection(listen: &str, session: &str, slug: &str, hat: &str) {
+    let body = serde_json::json!({
+        "slug": slug,
+        "label": slug,
+        "url": format!("https://mcp.{slug}.example/mcp"),
+        "hat_id": hat,
+        "cred_kind": "static",
+    })
+    .to_string();
+    let (status, created) = send_json(listen, "POST", "/api/mcp/connections", session, Some(&body)).unwrap();
+    assert_eq!(status, 201, "{created}");
+    let id = serde_json::from_str::<serde_json::Value>(&created).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let credential = format!("/api/mcp/connections/{id}/credential");
+    let (status, _) = send_json(listen, "PUT", &credential, session, Some(r#"{"token":"tok"}"#)).unwrap();
+    assert_eq!(status, 204);
+}
+
+/// Plan 4d-B3 (kernel spec §10, distribution spec §5.1): under `hennery up`
+/// the collector shares its OS user with the host child, so gateway
+/// credentials for two hats are warned about. Settings says so as soon as
+/// the second hat has one; the next start says so in the log, with the
+/// count and never a hat's id. A collector started on its own on the same
+/// data has no host child, and says nothing of it.
+#[test]
+fn up_warns_when_its_collector_holds_credentials_for_several_hats() {
+    const LINE: &str = "holds MCP gateway credentials for 2 hats";
+    let dir = scratch_dir("deploy-warning");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let collector_dir = data.join("collector");
+    let mut up = up_logging_to(&data, &dir.join("first.log"));
+    let listen = up.listening();
+    let session = sign_in(&mut up, &listen, &collector_dir);
+    let warning = |listen: &str| get_json(listen, "/api/settings", &session).unwrap()["deployment_warning"].clone();
+    assert_eq!(warning(&listen), false);
+
+    let hats = get_json(&listen, "/api/hats", &session).unwrap();
+    let first_hat = hats[0]["id"].as_str().unwrap().to_string();
+    let (status, created) = send_json(&listen, "POST", "/api/hats", &session, Some(r#"{"name":"Work"}"#)).unwrap();
+    assert_eq!(status, 201, "{created}");
+    let second_hat = serde_json::from_str::<serde_json::Value>(&created).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    credentialled_connection(&listen, &session, "linear", &first_hat);
+    credentialled_connection(&listen, &session, "tracker", &first_hat);
+    assert_eq!(warning(&listen), false, "two connections, one hat");
+    credentialled_connection(&listen, &session, "github", &second_hat);
+    assert_eq!(warning(&listen), true);
+    stop(&mut up);
+    let first = std::fs::read_to_string(dir.join("first.log")).unwrap();
+    assert!(!first.contains("gateway credentials for"), "{first}");
+
+    let mut again = up_logging_to(&data, &dir.join("second.log"));
+    let listen = again.listening();
+    assert_eq!(warning(&listen), true);
+    let second = std::fs::read_to_string(dir.join("second.log")).unwrap();
+    assert!(second.contains(LINE), "{second}");
+    assert!(!second.contains("could not check"), "{second}");
+    for hat in [&first_hat, &second_hat] {
+        assert!(!second.contains(hat.as_str()), "{hat}: {second}");
+    }
+    stop(&mut again);
+
+    let (mut alone, listen) = collector_on(&collector_dir, &dir.join("alone.log"));
+    assert_eq!(warning(&listen), false);
+    let log = std::fs::read_to_string(dir.join("alone.log")).unwrap();
+    assert!(!log.contains("gateway credentials for"), "{log}");
+    stop(&mut alone);
+}
+
 /// Start a collector on `data` that must fail to start: its standard error.
 fn refused_start(data: &std::path::Path) -> String {
     let mut refused = hennery()
