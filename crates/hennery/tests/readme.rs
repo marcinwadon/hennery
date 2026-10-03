@@ -63,7 +63,7 @@ fn blocks(file: &Path, arg: &str) -> (Option<i32>, String, String) {
         .arg(repo().join("packaging/readme-blocks.sh"))
         .arg(file)
         .arg(arg)
-        .env_remove("AWK")
+        .env_remove("README_BLOCKS_AWK")
         .output()
         .unwrap();
     (
@@ -269,7 +269,7 @@ fn a_failing_awk_exits_3() {
         .arg(repo().join("packaging/readme-blocks.sh"))
         .arg(&readme.0)
         .arg("--list")
-        .env("AWK", &awk.0)
+        .env("README_BLOCKS_AWK", &awk.0)
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(3));
@@ -598,9 +598,12 @@ struct KillOnDrop(std::process::Child);
 
 impl Drop for KillOnDrop {
     fn drop(&mut self) {
-        // SAFETY: kill(2) on this test's own process group.
-        unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
-        let _ = self.0.wait();
+        // Only while it runs: once reaped, its id may be another's.
+        if let Ok(None) = self.0.try_wait() {
+            // SAFETY: kill(2) on this test's own process group.
+            unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+            let _ = self.0.wait();
+        }
     }
 }
 

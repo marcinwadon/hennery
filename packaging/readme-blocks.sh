@@ -24,7 +24,7 @@
 #   2  wrong arguments, or the file cannot be read;
 #   3  awk itself failed.
 #
-# `AWK` names the awk to run, for the tests; else `awk`.
+# `README_BLOCKS_AWK` names the awk to run, for the tests; else `awk`.
 set -eu
 
 if [ $# -ne 2 ]; then
@@ -39,7 +39,7 @@ if [ ! -f "$file" ] || [ ! -r "$file" ]; then
 fi
 
 status=0
-LC_ALL=C "${AWK:-awk}" -v want="$want" '
+LC_ALL=C "${README_BLOCKS_AWK:-awk}" -v want="$want" '
 function fail(msg) { print "readme-blocks.sh: " FILENAME ":" NR ": " msg > "/dev/stderr"; failed = 1; exit 1 }
 BEGIN {
     split("toml json jsonc yaml yml rust ts tsx js html css diff mermaid", list, " ")
