@@ -79,8 +79,15 @@ const DEFAULT_ACCEPT: &str = "application/json, text/event-stream";
 
 /// The request headers passed upstream as they came (gateway spec §5.2).
 /// `Content-Type` is the gateway's own (the review's O6); `Mcp-Session-Id`
-/// goes up unwrapped (`SessionIds`, plan 8e decision 13).
-const FORWARDED_REQUEST_HEADERS: &[&str] = &["accept", "mcp-protocol-version", "last-event-id"];
+/// goes up unwrapped (`SessionIds`, plan 8e decision 13), and
+/// `Last-Event-ID` only beside it (`LAST_EVENT_ID`).
+const FORWARDED_REQUEST_HEADERS: &[&str] = &["accept", "mcp-protocol-version"];
+
+/// A replay's cursor, passed up only with a session id this token may use
+/// (plan 8e, the security review's finding 4): an upstream that replays by
+/// event id alone would otherwise replay another session's stream to any
+/// token on the connection.
+const LAST_EVENT_ID: &str = "last-event-id";
 
 /// The one response header passed downstream, wrapped (`SessionIds`, plan
 /// 8e decision 13; gateway spec §5.2). `Content-Type` is set from what the
@@ -365,6 +372,9 @@ fn upstream_headers(
     }
     if let Some(session) = session {
         out.insert(SESSION_ID, session.clone());
+        for value in downstream.get_all(LAST_EVENT_ID) {
+            out.append(LAST_EVENT_ID, value.clone());
+        }
     }
     if !out.contains_key(header::ACCEPT) {
         out.insert(header::ACCEPT, HeaderValue::from_static(DEFAULT_ACCEPT));

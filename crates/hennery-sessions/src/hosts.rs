@@ -117,15 +117,25 @@ async fn enroll(
 }
 
 /// `DELETE /api/hosts/{id}`: revoke a host (kernel spec §4.3), 200 with its
-/// entry. In this order: the registry refuses its `hello`s from now on,
-/// its live connection is closed and gone, and only then are its sessions
-/// parked, so no reconciliation on that connection can bring them back.
+/// entry. In this order: the registry refuses its `hello`s from now on, its
+/// gateway tokens are revoked and their streams cut, its live connection is
+/// closed and gone, and only then are its sessions parked, so no
+/// reconciliation on that connection can bring them back.
 /// Repeating it repeats the steps, which heals a revoke cut short.
 async fn revoke_host(State(state): State<AppState>, Path(host_id): Path<String>) -> Response {
     match state.hosts.revoke(&host_id, unix_now()) {
         Ok(Revoke::NotFound) => return error(StatusCode::NOT_FOUND, "not_found", "no such host"),
         Ok(Revoke::Revoked | Revoke::AlreadyRevoked) => {}
         Err(err) => return internal(err),
+    }
+    // Its gateway tokens, with what is open on them, at once (plan 8e; the
+    // security review's finding 2): not only after the wait below, which a
+    // connection that does not close holds up for its whole bound.
+    // On failure it goes on: the disconnect is the stronger control, and
+    // `on_host_revoked` revokes the tokens again below (the
+    // re-confirmation's note 2).
+    if let Err(err) = state.store.revoke_host_tokens(&host_id) {
+        tracing::error!(%host_id, "revoking the host's gateway tokens at once failed: {err:#}");
     }
     if !state.hub.disconnect_and_wait(&host_id, REVOKE_DISCONNECT_BOUND).await {
         tracing::warn!(%host_id, "the revoked host's connection did not close in time");
