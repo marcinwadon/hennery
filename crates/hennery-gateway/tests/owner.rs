@@ -122,3 +122,16 @@ fn another_owners_connections_are_invisible_to_the_store() {
     store.purge_hat(&hat).unwrap();
     assert_eq!(rows(&conn), before);
 }
+
+/// Plan 4d-B3: another owner's credentials put none of their hats among the
+/// owner's hats with credentials.
+#[test]
+fn another_owners_credentials_are_not_counted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    let _hosts = Hosts::open(&db).unwrap();
+    let store = GatewayStore::open(&db).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    write_other_owner(&conn, &MasterKey::from_bytes([7; 32]));
+    assert!(store.hats_with_credentials().unwrap().is_empty());
+}
