@@ -35,7 +35,11 @@ export default function App({ fetchImpl }: { fetchImpl?: typeof fetch }) {
 
   return (
     <ClientContext.Provider value={client}>
-      {route.name === 'setup' ? <Setup /> : route.name === 'login' ? <Login /> : <Shell route={route} />}
+      {/* While the step-up dialog is open, nothing under it can be focused
+          or clicked. */}
+      <div className="page" inert={waiting !== null} style={{ display: 'contents' }}>
+        {route.name === 'setup' ? <Setup /> : route.name === 'login' ? <Login /> : <Shell route={route} />}
+      </div>
       {waiting && <StepUpDialog onDone={() => close('done')} onCancel={() => close('cancelled')} />}
     </ClientContext.Provider>
   )

@@ -91,6 +91,15 @@ describe('request', () => {
     ['already_registered', 'This authenticator holds a passkey for hennery already.'],
     ['step_up_required', 'Confirm it is you, then try again.'],
     ['unauthenticated', 'Sign in first.'],
+    ['too_many_codes', 'Sixteen pairing codes are live already: wait for one to expire.'],
+    ['name_taken', 'Another hat has this name.'],
+    ['hat_purging', 'This hat is being purged.'],
+    ['hat_is_default', 'This hat is the default for new hosts, or a host’s default hat: make another hat that default first.'],
+    ['resolve_unsupported', 'This host cannot resolve paths yet: update hennery on it.'],
+    ['no_answer', 'The host did not answer in time. Try again.'],
+    ['busy', 'The host is busy. Try again.'],
+    ['too_many_subscriptions', 'Remove a device before adding another: 32 at most.'],
+    ['endpoint_taken', 'This browser receives notifications for another account.'],
   ])('explains %s in its own words', async (code, message) => {
     const { client } = stub([json(409, { code, message: 'server text' })])
     await expect(client.request('POST', '/api/x')).rejects.toMatchObject({ code, message })
@@ -109,6 +118,14 @@ describe('request', () => {
     const { client } = stub([json(409, { code: 'brand_new', message: 'server text' })])
     await expect(client.request('POST', '/api/x')).rejects.toMatchObject({ code: 'brand_new', message: 'server text' })
   })
+
+  it.each(['toString', 'constructor', '__proto__', 'hasOwnProperty'])(
+    'shows the server’s message for %s, a name every object inherits',
+    async (code) => {
+      const { client } = stub([json(409, { code, message: 'server text' })])
+      await expect(client.request('POST', '/api/x')).rejects.toMatchObject({ code, message: 'server text' })
+    },
+  )
 
   it('reads Retry-After on a 429', async () => {
     const { client } = stub([json(429, { code: 'rate_limited', message: 'm' }, { 'Retry-After': '42' })])

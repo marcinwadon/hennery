@@ -26,6 +26,16 @@ const MESSAGES: Record<string, string> = {
   already_registered: 'This authenticator holds a passkey for hennery already.',
   step_up_required: 'Confirm it is you, then try again.',
   unauthenticated: 'Sign in first.',
+  too_many_codes: 'Sixteen pairing codes are live already: wait for one to expire.',
+  name_taken: 'Another hat has this name.',
+  hat_purging: 'This hat is being purged.',
+  hat_is_default:
+    'This hat is the default for new hosts, or a host’s default hat: make another hat that default first.',
+  resolve_unsupported: 'This host cannot resolve paths yet: update hennery on it.',
+  no_answer: 'The host did not answer in time. Try again.',
+  busy: 'The host is busy. Try again.',
+  too_many_subscriptions: 'Remove a device before adding another: 32 at most.',
+  endpoint_taken: 'This browser receives notifications for another account.',
 }
 
 export class ApiFailure extends Error {
@@ -39,7 +49,7 @@ export class ApiFailure extends Error {
   constructor(status: number, body: Partial<ApiError> | undefined, retryAfter?: number) {
     const code = body?.code ?? `http_${status}`
     const serverMessage = body?.message ?? `The request failed (${status}).`
-    super(MESSAGES[code] ?? serverMessage)
+    super(Object.hasOwn(MESSAGES, code) ? MESSAGES[code] : serverMessage)
     this.name = 'ApiFailure'
     this.status = status
     this.code = code

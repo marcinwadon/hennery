@@ -1,11 +1,14 @@
 // A real collector for the browser checks: the built `hennery` binary
 // (`HENNERY_BIN`, else the workspace's debug build), on a fresh data
 // directory and a port of its own choosing, read from the setup link it
-// writes. Stopped by its own process id.
-import { spawn, type ChildProcess } from 'node:child_process'
+// writes. Stopped by its own process id. It starts, as every binary the
+// browser checks start, through `spawnHennery` (`spawn.ts`).
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
+import { spawnHennery, type ChildProcess } from './spawn'
+
+export { BIN, scratchEnv } from './spawn'
 
 export interface Collector {
   /** `http://localhost:<port>`. */
@@ -15,16 +18,16 @@ export interface Collector {
   stop(): Promise<void>
 }
 
-const BIN = process.env.HENNERY_BIN ?? resolve(process.cwd(), '../target/debug/hennery')
-
 export async function startCollector(): Promise<Collector> {
   const dir = mkdtempSync(join(tmpdir(), 'hennery-e2e-'))
-  const child: ChildProcess = spawn(BIN, ['collector', '--data-dir', dir, '--listen', '127.0.0.1:0'], {
-    stdio: ['ignore', 'ignore', 'pipe'],
-    env: { ...process.env, RUST_LOG: 'warn' },
+  const child: ChildProcess = spawnHennery(['collector', '--data-dir', dir, '--listen', '127.0.0.1:0'], dir, {
+    RUST_LOG: 'warn',
   })
   let stderr = ''
   child.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
+  // A binary that cannot start fails the test that asked for it, rather
+  // than the worker.
+  child.once('error', (err) => (stderr += `${err}`))
   // Stopped and removed on every path, a failed start included: the
   // directory holds a live setup token.
   const stop = async () => {

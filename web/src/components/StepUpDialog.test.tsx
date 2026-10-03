@@ -35,7 +35,7 @@ vi.mock('../screens/Placeholder', () => ({ default: () => <Form /> }))
 afterEach(() => history.replaceState(null, '', '/'))
 
 async function open(server: ReturnType<typeof stubServer>) {
-  history.replaceState(null, '', '/hosts')
+  history.replaceState(null, '', '/mcp')
   render(<App fetchImpl={server.fetch} />)
   await userEvent.type(await screen.findByLabelText('Name'), 'laptop')
   await userEvent.click(screen.getByRole('button', { name: 'Pair' }))
@@ -89,6 +89,20 @@ describe('the step-up dialog', () => {
     expect(server.sent.filter((s) => s.path === '/api/hosts/pairing-codes')).toHaveLength(1)
     // Focus is back on what opened the dialog.
     expect(screen.getByRole('button', { name: 'Pair' })).toHaveFocus()
+  })
+
+  it('leaves the page under it inert while it is open, and only then', async () => {
+    const server = stubServer({
+      'GET /api/capabilities': json(200, FULL),
+      'POST /api/hosts/pairing-codes': json(403, STEP_UP),
+    })
+    await open(server)
+    const page = screen.getByLabelText('Name').closest('.page')!
+    expect(page).toHaveAttribute('inert')
+    expect(screen.getByRole('dialog').closest('.page')).toBeNull()
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+    expect(page).not.toHaveAttribute('inert')
   })
 
   it('closes on Escape, as a cancel', async () => {

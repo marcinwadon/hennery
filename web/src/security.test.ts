@@ -4,6 +4,7 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
+import { HIDDEN } from './lib/text'
 
 // Vitest runs from `web/`.
 const SRC = join(process.cwd(), 'src')
@@ -37,6 +38,20 @@ describe('the sources', () => {
 
   it.each(FORBIDDEN)('never use %s', (word) => {
     const found = files.filter((f) => readFileSync(f, 'utf8').includes(word))
+    expect(found).toEqual([])
+  })
+
+  it('hold no character `visible()` would escape, but tab and newlines: tests write them as escapes', () => {
+    const all = (dir: string): string[] =>
+      readdirSync(dir).flatMap((name) => {
+        const path = join(dir, name)
+        if (statSync(path).isDirectory()) return all(path)
+        return /\.(ts|tsx|css|js|html|webmanifest)$/.test(name) ? [path] : []
+      })
+    const root = process.cwd()
+    const files = [...all(SRC), ...all(join(root, 'public')), ...all(join(root, 'e2e')), join(root, 'index.html')]
+    const found = files.filter((f) => [...readFileSync(f, 'utf8')].some((c) => !'\t\n\r'.includes(c) && HIDDEN.test(c)))
+    expect(files.length).toBeGreaterThan(30)
     expect(found).toEqual([])
   })
 
