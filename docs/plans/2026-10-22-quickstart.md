@@ -22,13 +22,38 @@
 
 **Spec:** client view §8, the row for 4f: "A README quickstart: build from source, `hennery up`, setup, pair", after 4c. Kernel §3.1 (setup link), §4.1 (pairing codes), §4.2 (admin commands); distribution §8 (data directories). Every anchor is from `main` at `1e09a0c`. Every command and flag in the README was read from `hennery … --help` on that commit, not from the specs.
 
-**Status:** written 2026-10-03; amended after its review of 2026-10-03 (opus, binding on the maintainer's behalf): "approve with amendments". A1 to A4 are taken, with O1 to O4 and N1 to N5, and the scoped re-confirmation (opus) "confirmed" them (see "What the review changed"). Its merge condition is A4.
+**Status:** written 2026-10-03; executed 2026-10-03 (see "Execution status"). Amended after its review of 2026-10-03 (opus, binding on the maintainer's behalf): "approve with amendments". A1 to A4 are taken, with O1 to O4 and N1 to N5, and the scoped re-confirmation (opus) "confirmed" them (see "What the review changed"). Its merge condition, A4, is met in "Execution status"; decision 10's checks are the lane's, at the rebase.
 
 **How the code blocks were made and checked:**
 - The code was built first on `scratch/4f`, and its CI ran on draft PR #122.
 - Every block below is generated from that branch.
 - The plan was replayed from its own text onto `1e09a0c`, and the tree matched the scratch branch byte for byte.
 - Every local probe in Step 6 was run and failed as written; the CI probes are recorded with their runs.
+
+## Execution status (2026-10-03)
+
+**Executed** on branch `plan/frontend-4f`, on `main` at `1e09a0c`. The code was built on `scratch/4f`, its CI ran on draft PR #122, and the plan was replayed from its text: the tree matched the scratch branch's last commit, `a55f2d4`, byte for byte.
+- **Commits:** the plan, then Task 1, then this record.
+- **Reviews:**
+  - the plan review and its re-confirmation (opus), as "What the review changed" says;
+  - the whole-branch review (opus): "ready with fixes", no Critical finding. Its findings and what was done:
+    - Important 1, taken: Recovery's `--data-dir` goes right after `admin`, as `AdminArgs` declares it; after a subcommand it is refused.
+    - Important 2, taken: `Group`'s drop and `stop` stop at a shell already reaped, since its id may be another's.
+    - Important 3: the merge conditions. A4 is recorded below; decision 10's checks stay with the lane.
+    - Minor, taken: `host join` runs under a 60 s limit (`output_within`); a `pgrep` that fails fails the test instead of passing as "no children"; the setup link is said to stay in `collector/setup-url` until setup; the README says that leaving the code out keeps it out of the shell history.
+    - Minor, accepted: a commented-out workflow line passes `every_readme_block_is_run`, as N8.
+- **Checks:** the five checks passed, with 1556 tests, on Task 1 before the review fixes. After them the readme tests passed again (20), as four copies of the test binary in parallel too, and leave no `/tmp/hennery-readme-*` behind.
+- **Revert-probes:** Q01 to Q22 and R01 to R11 were each run and failed their test; Q22 sends the awk override to plain `awk`. R01, R02, R04 and R05 were run again after the review fixes. The CI probes, each failing at its own step on both OSes:
+  - C01, the clone block: run 37105283992;
+  - C02, the nix block: run 37105283979;
+  - C03, the build block without `pnpm build`: run 37106839944, `HENNERY_WEB_REQUIRE=1, but there is no web build`.
+- **Green CI (A4):** run 37106159259 (`ci`) and run 37106159239 (`nix`) on `eaf3aa7`, every job on both OSes, the `readme` and `flake` jobs included. The workflows and the README's `nix`, `clone` and `build` blocks have not changed since. The final tree's own run is the PR's.
+- **Guards with no probe:** each fails only if something else is already broken. They are `stop`'s wait for every process, the `pgrep` status check, `output_within`'s limit and the drops' kills. Turning one off fails no test while hennery behaves.
+
+| Area | As built | Why |
+|---|---|---|
+| Plan dates | `2026-10-22` | The next free date: the frontend lane's plans take 10-16 to 10-18, plan 7's 10-20 |
+| The base | `1e09a0c`; `main` has moved since (4a-ii, #123) | Rebased last, as the lane asked: the README is a hotspot |
 
 ## What the review changed
 
