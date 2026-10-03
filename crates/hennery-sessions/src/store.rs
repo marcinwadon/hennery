@@ -1012,6 +1012,17 @@ fn fact_applies(tx: &Transaction<'_>, owner: &str, session_id: &str, turn_id: Op
     Ok(state.as_deref() == Some("started"))
 }
 
+/// Commit `tx`, then end what is open on the tokens it invalidated (plan 8e
+/// decision 12): never before, or a rollback would leave a token working
+/// with its streams cut, and a request arriving between the cut and the
+/// commit would hold a fresh watch nothing cuts. The one place the sessions
+/// module cuts (`tests/cut_after_commit.rs` holds it to that).
+fn commit_then_cut(tx: Transaction<'_>, mcp: &dyn SessionMcp, cut: Cut) -> Result<()> {
+    tx.commit()?;
+    mcp.cut(cut);
+    Ok(())
+}
+
 /// `Store::close_now`'s body, inside the caller's transaction, with the
 /// session's token revoked there too (lane L4): the cut is the caller's to
 /// make once it commits. A tombstone is left alone (plan 9a A1).
@@ -1865,6 +1876,18 @@ impl Store {
         self.mcp().purge_hat(hat_id)
     }
 
+    /// A revoked host's tokens, and what is open on them, at once (plan 8e,
+    /// the security review's finding 2): the host revoke route runs this
+    /// before it waits for the host's connection to close. Idempotent: the
+    /// revoke's own `revoke_host` revokes what is left, none.
+    pub fn revoke_host_tokens(&self, host_id: &str) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let mcp = self.mcp();
+        let cut = mcp.revoke_host_in(&tx, host_id)?;
+        commit_then_cut(tx, mcp.as_ref(), cut)
+    }
+
     /// The gateway, or the stand-in that gives nothing.
     pub(crate) fn mcp(&self) -> Arc<dyn SessionMcp> {
         self.mcp
@@ -2045,8 +2068,7 @@ impl Store {
         } else {
             Cut::default()
         };
-        tx.commit()?;
-        self.mcp().cut(cut);
+        commit_then_cut(tx, self.mcp().as_ref(), cut)?;
         Ok(())
     }
 
@@ -2068,8 +2090,7 @@ impl Store {
         } else {
             Cut::default()
         };
-        tx.commit()?;
-        self.mcp().cut(cut);
+        commit_then_cut(tx, self.mcp().as_ref(), cut)?;
         Ok(())
     }
 
@@ -2884,8 +2905,7 @@ impl Store {
         // Its token, in this transaction (lane L4; the purge lane's marker):
         // a parked or failed session's is revoked already, a no-op then.
         let cut = cut.and(mcp.revoke_in(&tx, session_id)?);
-        tx.commit()?;
-        mcp.cut(cut);
+        commit_then_cut(tx, mcp.as_ref(), cut)?;
         self.remove_files(&conn, &dropped);
         Ok(Deletion::Done {
             event,
@@ -3020,8 +3040,7 @@ impl Store {
         let tx = conn.transaction()?;
         let mcp = self.mcp();
         let (events, cut) = close_in(&tx, &self.owner, mcp.as_ref(), session_id)?;
-        tx.commit()?;
-        mcp.cut(cut);
+        commit_then_cut(tx, mcp.as_ref(), cut)?;
         Ok(events)
     }
 
@@ -3052,8 +3071,7 @@ impl Store {
         } else {
             (Vec::new(), Cut::default())
         };
-        tx.commit()?;
-        mcp.cut(cut);
+        commit_then_cut(tx, mcp.as_ref(), cut)?;
         Ok(events)
     }
 
@@ -3140,8 +3158,7 @@ impl Store {
         )?;
         let config = stored_config(config)?;
         let (given, cut) = self.deliver_in(&tx, session_id, &host_id, &stored_hat, mcp, &ts)?;
-        tx.commit()?;
-        self.mcp().cut(cut);
+        commit_then_cut(tx, self.mcp().as_ref(), cut)?;
         Ok(ResumeRequest::Starting {
             events,
             agent_session_id,
@@ -3214,8 +3231,7 @@ impl Store {
         // should be; revoked here whatever a missed revoke left (lane L4).
         let mcp = self.mcp();
         let cut = mcp.revoke_in(&tx, session_id)?;
-        tx.commit()?;
-        mcp.cut(cut);
+        commit_then_cut(tx, mcp.as_ref(), cut)?;
         Ok(Reassign::Done(event))
     }
 
@@ -3381,8 +3397,7 @@ impl Store {
         // but a token row must not outlive its host's revoke as live.
         let mcp = self.mcp();
         let cut = mcp.revoke_host_in(&tx, host_id)?;
-        tx.commit()?;
-        mcp.cut(cut);
+        commit_then_cut(tx, mcp.as_ref(), cut)?;
         Ok(events)
     }
 
@@ -3986,8 +4001,7 @@ impl Store {
             }),
             None => None,
         };
-        tx.commit()?;
-        mcp.cut(cut);
+        commit_then_cut(tx, mcp.as_ref(), cut)?;
         Ok(Ingested { events: created, edge })
     }
 
@@ -4125,8 +4139,7 @@ impl Store {
                 _ => {}
             }
         }
-        tx.commit()?;
-        mcp.cut(cut);
+        commit_then_cut(tx, mcp.as_ref(), cut)?;
         Ok(out)
     }
 
