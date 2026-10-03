@@ -269,7 +269,9 @@ collector.
 
 At start `hennery up` checks whether gateway credentials exist for more than one
 hat while the collector shares its OS user with the host child, and warns if so
-(kernel spec §10).
+(kernel spec §10). The check is the collector child's, told by `--beside-host`
+that it runs beside the host child (plan 4d-B3): its `warn` line is in `up`'s
+output on a terminal, and in `collector.log` under a service.
 
 Before its first child, `hennery up` makes one more pipe, the parent pipe, and
 holds its write end for as long as it runs; every child it starts, restarts

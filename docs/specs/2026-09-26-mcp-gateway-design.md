@@ -98,6 +98,12 @@ included, since a table with children cannot be rebuilt later to widen one
   prepares the list's statements under SQLite's authorizer and finds
   `connection_id` and `owner_id` the only columns of `gw_credentials` read
   (plan 8a).
+- **The hats with a credential** (`GatewayStore::hats_with_credentials`, plan
+  4d-B3) are read the same way, for kernel §10's deployment warning: the
+  distinct hats of the owner's connections that have a `gw_credentials` row,
+  by key and owner alone, whatever the kind (an OAuth grant counts as a
+  static token does). Only their count leaves the gateway. Once stdio servers
+  store environment values (plan 8e), a hat with one counts too.
 - A connection belongs to **exactly one hat**. The same vendor in two hats is
   two connections with separate grants (umbrella §8.3). Its slug and its hat
   never change once created (moving it would carry its grant into another

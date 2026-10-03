@@ -385,7 +385,8 @@ One form, one request (`POST /api/sessions`):
   §6), attachment store disk usage (ACP core §15), per-hat push policy (mute,
   include details, generic title), and the deployment warning when the collector shares its OS
   user with agents while holding credentials for several hats (kernel spec
-  §10).
+  §10; `deployment_warning` in `GET /api/settings`, which the page shows as
+  advice, with the spec's recommendation).
 
 **Theme:** the selected hat's colours are applied as custom properties on
 `<html>` before first render (from a small inline script reading the persisted
