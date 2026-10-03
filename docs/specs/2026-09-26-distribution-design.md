@@ -289,6 +289,10 @@ unit's remaining processes anyway; the pipe matters most under launchd.
 - A host child that exits 78 (revoked) is not restarted: `up` logs which files
   to remove to pair it again, and keeps the collector serving the operator and
   remote hosts.
+- A host run by its own service is not restarted after a revoke either. On
+  systemd its unit carries `RestartPreventExitStatus=78` (§6.3). launchd has no
+  per-exit-code switch, so the host service's own handling of a revoke is a
+  follow-up.
 - Both children run in their own process groups, so a terminal's Ctrl-C
   reaches only the supervisor. The supervisor handles SIGINT like SIGTERM and
   forwards it: host first (it flushes its outbox, closes adapters; sessions
@@ -396,6 +400,7 @@ ExecStart=/home/me/.local/bin/hennery host run
 EnvironmentFile=-%h/.config/hennery/service.env
 Environment=HENNERY_SERVICE=systemd
 Restart=on-failure
+RestartPreventExitStatus=78
 RestartSec=3
 KillMode=mixed
 TimeoutStopSec=30

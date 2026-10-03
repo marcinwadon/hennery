@@ -187,11 +187,19 @@ fn systemd_word(text: &str) -> String {
 /// file is required: a missing one would fall back to the user manager's
 /// PATH, the failure D-3 describes. `EnvironmentFile=` takes its path as it
 /// stands, but for `%` specifiers, so a path with `\` or `"` is refused.
+/// A host that exits 78 was revoked (`supervisor::REVOKED_EXIT`): systemd
+/// does not start it again, as `up` does not (spec §5.2), where it would
+/// only be refused again until its start limit.
 pub fn systemd_unit(role: Role, argv: &[String], env_file: &str) -> Result<String> {
     if env_file.contains(['\\', '"']) {
         bail!("{env_file} holds a backslash or a double quote, which an EnvironmentFile= path cannot");
     }
     let exec: Vec<String> = argv.iter().map(|a| systemd_word(a)).collect();
+    let revoked = if role == Role::Host {
+        format!("RestartPreventExitStatus={}\n", crate::supervisor::REVOKED_EXIT)
+    } else {
+        String::new()
+    };
     Ok(format!(
         "[Unit]
 Description=hennery {role}
@@ -204,7 +212,7 @@ ExecStart={exec}
 EnvironmentFile={env_file}
 Environment=HENNERY_SERVICE=systemd
 Restart=on-failure
-RestartSec=3
+{revoked}RestartSec=3
 KillMode=mixed
 TimeoutStopSec=30
 
@@ -407,6 +415,7 @@ mod tests {
             "EnvironmentFile=/home/me/.config/hennery 100%%/service.env\n",
             "Environment=HENNERY_SERVICE=systemd",
             "Restart=on-failure",
+            "RestartPreventExitStatus=78\n",
             "RestartSec=3",
             "KillMode=mixed",
             "TimeoutStopSec=30",
@@ -415,6 +424,12 @@ mod tests {
             assert!(text.contains(wanted), "{wanted:?} not in:\n{text}");
         }
         assert!(text.contains("with %%h $$HOME \\\"quotes\\\""), "{text}");
+        // Only a host exits 78.
+        for role in [Role::Up, Role::Collector] {
+            let argv = command_line(role, exe, &awkward()).unwrap();
+            let text = systemd_unit(role, &argv, "/tmp/service.env").unwrap();
+            assert!(!text.contains("RestartPreventExitStatus"), "{role}: {text}");
+        }
         assert!(systemd_unit(Role::Host, &argv, "/home/me/a\\b/service.env").is_err());
         assert!(systemd_unit(Role::Host, &argv, "/home/me/a\"b/service.env").is_err());
     }
