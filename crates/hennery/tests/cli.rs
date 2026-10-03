@@ -3842,6 +3842,14 @@ fn a_host_without_agent_flags_runs_the_installed_set() {
         &entries,
     );
     link_set(&host, "current", &selection.set_id());
+    // Both run once first, so that macOS's check of a new program (the
+    // binary, and the `node` script just written) is not timed as the
+    // collector's start or the session's. The script's report of that run
+    // goes.
+    assert!(hennery().arg("--version").status().unwrap().success());
+    let node = host.join("runtimes").join(selection.runtime_name()).join("bin/node");
+    hennery_testkit::first_exec(node.to_str().unwrap());
+    std::fs::remove_file(&report).unwrap();
 
     let log = dir.join("up.log");
     let mut command = hennery();
