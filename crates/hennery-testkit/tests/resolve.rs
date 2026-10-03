@@ -996,3 +996,106 @@ async fn starts_and_resumes_carry_the_sessions_hat_and_no_servers() {
         .await;
     assert_eq!(call.await.unwrap().0, 202);
 }
+
+/// The host's own refusal of a start or resume for its MCP servers, as a
+/// host sends it (`mcp_isolation_unavailable`, plan 8c).
+fn mcp_refusal(request_id: String) -> HostFrame {
+    HostFrame::Error {
+        request_id,
+        code: "mcp_isolation_unavailable".into(),
+        message: "the agent cannot be kept to its MCP servers".into(),
+    }
+}
+
+/// Wait until `session_id` is `failed`, and return its reason.
+async fn failure_reason(collector: &Collector, session_id: &str) -> Option<String> {
+    wait_for("the session failed", || async {
+        let row = collector.state.store.find_session(session_id).unwrap().unwrap();
+        (row.lifecycle == "failed").then_some(row.failure_reason)
+    })
+    .await
+}
+
+/// Plan 8e Task 10 (api-8e-8f, its [firm] item 14): a start the host itself
+/// refuses for its MCP servers answers 409 `mcp_isolation_unavailable`, as
+/// the hub's own refusal does — one status on every path — and the session
+/// fails with that code.
+#[tokio::test]
+async fn a_start_the_host_refuses_for_its_servers_answers_409() {
+    let collector = Collector::start().await;
+    let acme = collector.hat("Acme");
+    rule(&collector, "/home/me/acme", &acme, true);
+    let mut host = ScriptedHost::connect(&collector).await;
+
+    let call = start(&collector, "/home/me/acme");
+    host.answer("/home/me/acme", true).await;
+    let CollectorFrame::StartSession {
+        request_id, session_id, ..
+    } = host.next().await
+    else {
+        panic!("expected a start");
+    };
+    host.send(&mcp_refusal(request_id)).await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("mcp_isolation_unavailable")),
+        "{body}"
+    );
+    assert_eq!(
+        failure_reason(&collector, &session_id).await.as_deref(),
+        Some("mcp_isolation_unavailable")
+    );
+}
+
+/// As for a start: a resume the host itself refuses for its MCP servers
+/// answers 409 `mcp_isolation_unavailable`, not the 502 of other host
+/// refusals of a resume, and the session fails with that code.
+#[tokio::test]
+async fn a_resume_the_host_refuses_for_its_servers_answers_409() {
+    use hennery_proto::frames::SessionBody;
+    let collector = Collector::start().await;
+    let acme = collector.hat("Acme");
+    rule(&collector, "/home/me/acme", &acme, true);
+    let mut host = ScriptedHost::connect(&collector).await;
+
+    let call = start(&collector, "/home/me/acme");
+    host.answer("/home/me/acme", true).await;
+    let CollectorFrame::StartSession {
+        request_id, session_id, ..
+    } = host.next().await
+    else {
+        panic!("expected a start");
+    };
+    host.emit(&session_id, SessionBody::session_started(request_id, "agent-1"))
+        .await;
+    assert_eq!(call.await.unwrap().0, 202);
+    host.parked(&session_id).await;
+    wait_for("parked", || async {
+        let row = collector.state.store.find_session(&session_id).unwrap().unwrap();
+        (row.lifecycle == "parked").then_some(())
+    })
+    .await;
+
+    let call = send(
+        &collector,
+        "POST",
+        &format!("/api/sessions/{session_id}/resume"),
+        json!({}),
+    );
+    host.answer("/home/me/acme", true).await;
+    let CollectorFrame::ResumeSession { request_id, .. } = host.next().await else {
+        panic!("expected a resume");
+    };
+    host.send(&mcp_refusal(request_id)).await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!(
+        (status, body["code"].as_str()),
+        (409, Some("mcp_isolation_unavailable")),
+        "{body}"
+    );
+    assert_eq!(
+        failure_reason(&collector, &session_id).await.as_deref(),
+        Some("mcp_isolation_unavailable")
+    );
+}
