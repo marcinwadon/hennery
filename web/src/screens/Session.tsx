@@ -271,6 +271,9 @@ export default function SessionView({ id, summary, awaitSummary = false, tail = 
     [],
   )
   const composerEmpty = useCallback(() => composer.current?.isEmpty() ?? true, [])
+  // The view's one resume: the footer's Resume and the composer's "Resume
+  // and send" both go through it.
+  const onResume = useCallback(() => resume(client, id), [client, id])
 
   // A delete made here: what it left on the host, shown with the deleted
   // state. The answer may come after the stream's `session_removed`.
@@ -394,6 +397,7 @@ export default function SessionView({ id, summary, awaitSummary = false, tail = 
         capabilities={capabilities}
         catalog={s.catalog}
         onCatalog={s.setCatalog}
+        onResume={onResume}
       />
       {info && (
         <SessionFooter
@@ -401,7 +405,7 @@ export default function SessionView({ id, summary, awaitSummary = false, tail = 
           info={info}
           hostName={hosts.get(info.host_id)}
           hostAway={hostAway}
-          onResume={() => resume(client, id)}
+          onResume={onResume}
         />
       )}
     </div>

@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it } from 'vitest'
 import type { SessionDetail } from '../generated/protocol'
 import { forgetAllAttachments } from '../lib/attachments'
+import { forgetAllSends } from '../lib/sending'
 import { json } from '../test-stream'
 import SessionView from './Session'
 import { FAST, sessionServer, type Opts } from './test-session'
@@ -12,6 +13,7 @@ const WAIT = { timeout: 5000 }
 beforeEach(() => {
   sessionStorage.clear()
   forgetAllAttachments()
+  forgetAllSends()
 })
 
 /** The view of session `s1` as its detail says, on host `build-box`. */
@@ -44,6 +46,29 @@ describe('SessionView: the footer of a session that is not running', () => {
     await waitFor(() => expect(r.changes()).toEqual(['POST /api/sessions/s1/resume']), WAIT)
     await waitFor(() => expect(resumeButton()).toBeEnabled(), WAIT)
     expect(screen.queryByRole('alert')).toBeNull()
+  })
+
+  it('the composer’s Resume and send goes through the view’s resume, as the footer’s Resume does', async () => {
+    let attached = false
+    const r = await show(
+      { lifecycle: 'parked' },
+      {
+        prompt: () => (attached ? json({ turn_id: 'new' }, 202) : json({ code: 'not_attached', message: 'srv-x' }, 409)),
+        resume: () => {
+          attached = true
+          return json({ session_id: 's1', lifecycle: 'active' }, 202)
+        },
+      },
+    )
+    fireEvent.change(screen.getByLabelText('Prompt'), { target: { value: 'later' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    fireEvent.click(await screen.findByRole('button', { name: 'Resume and send' }, WAIT))
+    await waitFor(() => expect((screen.getByLabelText('Prompt') as HTMLTextAreaElement).value).toBe(''), WAIT)
+    expect(r.changes()).toEqual([
+      'POST /api/sessions/s1/prompt',
+      'POST /api/sessions/s1/resume',
+      'POST /api/sessions/s1/prompt',
+    ])
   })
 
   it('a closed session offers Resume', async () => {

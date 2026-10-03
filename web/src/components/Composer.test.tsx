@@ -3,6 +3,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { createRef, useState } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { Client } from '../api/client'
+import { resume } from '../api/turns'
 import { ClientContext } from '../app-client'
 import type { Capabilities, SessionCatalog } from '../generated/protocol'
 import { forgetAllAttachments, heldFor } from '../lib/attachments'
@@ -80,6 +81,8 @@ function mount(handler: Handler = accepted, props: Partial<HostProps> = {}) {
     sessionId: 's1',
     session: { lifecycle: 'active', activity: 'idle' },
     capabilities: ['images'],
+    // As the view resumes: `POST …/resume`.
+    onResume: () => resume(client, 's1'),
     ...props,
   }
   const view = render(

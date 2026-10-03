@@ -25,7 +25,7 @@ import {
 } from 'react'
 import { useClient } from '../app-client'
 import { ApiFailure, messageOf } from '../api/errors'
-import { cancel, prompt, resume, setConfig } from '../api/turns'
+import { cancel, prompt, setConfig } from '../api/turns'
 import type { Capabilities, ConfigValue, SessionCatalog } from '../generated/protocol'
 import type { SessionSummary } from '../generated/view'
 import {
@@ -81,8 +81,9 @@ export interface ComposerProps {
    *  it replaces the one held (useSessionItems' `setCatalog`). */
   onCatalog: (catalog: SessionCatalog) => void
   /** "Resume and send" resumes through this, then sends the draft; it
-   *  rejects with the refusal to show. Absent: `POST …/resume`. */
-  onResume?: () => Promise<unknown>
+   *  rejects with the refusal to show. The view passes its one resume, the
+   *  one its footer's Resume goes through. */
+  onResume: () => Promise<unknown>
   /** The handle above, bound to the composer of the session shown. */
   handle?: Ref<ComposerHandle>
 }
@@ -349,7 +350,7 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
   function resumeAndSend() {
     begin(async (draft, images) => {
       try {
-        await (onResume ? onResume() : resume(client, sessionId))
+        await onResume()
       } catch (err) {
         return { sent: false, notice: { text: messageOf(err) } }
       }
