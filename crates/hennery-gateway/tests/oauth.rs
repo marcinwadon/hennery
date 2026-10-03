@@ -1351,24 +1351,31 @@ async fn a_token_response_reads_one_way_or_not_at_all() {
             assert_eq!(h.item(&id).await["has_credential"], false, "{raw}");
         }
     }
-    // `expires_in` that is not a whole number: unknown, not expired.
-    let h = Harness::new();
-    let fake = FakeAs::start(Config {
-        raw_token: Some(r#"{"access_token":"good-1","expires_in":"36e2"}"#.into()),
-        ..Config::default()
-    })
-    .await;
-    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
-    assert_eq!(h.connect(&id, &fake).await.result(), "connected");
-    assert_eq!(
-        h.world
-            .store
-            .oauth_credential(&id, &h.world.key)
-            .unwrap()
-            .unwrap()
-            .expires_at,
-        None
-    );
+    // `expires_in` that is not a whole number, or below zero: unknown,
+    // not expired.
+    for raw in [
+        r#"{"access_token":"good-1","expires_in":"36e2"}"#,
+        r#"{"access_token":"good-1","expires_in":-5}"#,
+    ] {
+        let h = Harness::new();
+        let fake = FakeAs::start(Config {
+            raw_token: Some(raw.into()),
+            ..Config::default()
+        })
+        .await;
+        let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+        assert_eq!(h.connect(&id, &fake).await.result(), "connected", "{raw}");
+        assert_eq!(
+            h.world
+                .store
+                .oauth_credential(&id, &h.world.key)
+                .unwrap()
+                .unwrap()
+                .expires_at,
+            None,
+            "{raw}"
+        );
+    }
 }
 
 /// api-8e-8f B5 step 7: a refusal names only a fixed RFC 6749 `error`,
@@ -1775,6 +1782,23 @@ async fn a_pinned_client_refuses_another_token_endpoint() {
     let moved = format!("{}/token2", fake.origin());
     fake.configure(|c| c.token_endpoint = Some(moved));
     refused(&h, &id, json!({}), StatusCode::CONFLICT, "issuer_changed").await;
+}
+
+/// The egress policy's refusal of a document discovery fetches ends it
+/// as that (`egress_refused`), never as a server that was not there or did
+/// not answer: here an authorization server named with credentials in its
+/// URL, which egress refuses whatever the allowance.
+#[tokio::test]
+async fn a_metadata_fetch_the_egress_policy_refuses_ends_discovery() {
+    let h = Harness::new();
+    let fake = FakeAs::start(Config::default()).await;
+    let refused_at = format!("https://u:p@127.0.0.1:{}", fake.addr.port());
+    let mcp = fake.mcp_url();
+    fake.configure(|c| {
+        c.raw_pr = Some(json!({ "resource": mcp, "authorization_servers": [refused_at] }).to_string());
+    });
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+    refused(&h, &id, json!({}), StatusCode::BAD_GATEWAY, "egress_refused").await;
 }
 
 /// Each `RegisterError` (gateway spec §4.2) has its code: the egress

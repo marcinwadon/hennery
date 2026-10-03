@@ -436,3 +436,49 @@ async fn a_probe_the_gateway_fails_changes_nothing() {
     assert_eq!(h.status(&id), "ok");
     assert!(h.alerts.alerts().is_empty());
 }
+
+/// Decision 13 for the probe: a grant for another URL found by the 401's
+/// refresh is not sent, and concludes nothing about the upstream: no
+/// status change, no alert, and the old upstream never sees its token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_probe_whose_connection_moved_during_its_refresh_changes_nothing() {
+    let (h, a, id) = setup(Config::default()).await;
+    set_status(&h, &id, Status::Ok);
+    let b = FakeAs::start(Config {
+        prefix: "b-".into(),
+        ..Config::default()
+    })
+    .await;
+    let held = h.runtime.lock(&id).await;
+    a.expire_access();
+    let probing = tokio::spawn({
+        let runtime = h.runtime.clone();
+        let connection = h.proxy_store.connection_by_id(&id).unwrap().unwrap();
+        async move { probe::probe_now(&runtime, &connection).await }
+    });
+    // The upstream answered 401: the refresh now waits for the lock.
+    for _ in 0..1000 {
+        if a.with(|r| !r.bearers.is_empty()) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(a.with(|r| !r.bearers.is_empty()), "never sent");
+    h.store
+        .update(
+            &id,
+            &hennery_gateway::model::ConnectionPatch {
+                url: Some(b.mcp_url()),
+                ..Default::default()
+            },
+            unix_now(),
+        )
+        .unwrap();
+    let (b_access, b_refresh) = b.issue();
+    seed_grant(&h, &id, &b, &b_access, Some(&b_refresh), None);
+    drop(held);
+    assert_eq!(probing.await.unwrap(), Verdict::NoChange);
+    assert!(!a.with(|r| r.bearers.contains(&b_access)), "b's token went to a");
+    assert!(b.with(|r| r.bearers.is_empty()));
+    assert!(h.alerts.alerts().is_empty());
+}

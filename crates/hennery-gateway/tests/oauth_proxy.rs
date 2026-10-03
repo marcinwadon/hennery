@@ -752,3 +752,33 @@ async fn a_retry_keeps_the_allowance_it_was_read_with() {
     assert_eq!(body["code"], "upstream_changed", "{body}");
     assert_eq!(a.with(|r| r.bearers.len()), 1, "no retry");
 }
+
+/// Decision 13 on the path production takes: an origin edit and a new
+/// Connect each take the connection's lock, so they land before the 401's
+/// refresh holds it, never during. The refresh then finds another token
+/// than the one that failed and sends nothing to the vendor; that token is
+/// for another URL, so it is not retried: 502 `upstream_changed`, no
+/// `needs_auth`, and the old upstream never sees it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_connected_elsewhere_before_the_refresh_is_not_retried() {
+    let (h, a, id, token) = setup(Config::default(), None).await;
+    // Its tokens are named apart from `a`'s.
+    let b = FakeAs::start(Config {
+        prefix: "b-".into(),
+        ..Config::default()
+    })
+    .await;
+    let mut b_access = String::new();
+    let response = while_a_401_waits(&h, &a, &token, || b_access = moved_to(&h, &id, &b)).await;
+    assert_eq!(response.status(), 502);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["code"], "upstream_changed", "{body}");
+    assert_eq!(
+        token_requests(&a),
+        0,
+        "the refresh sent nothing: another token was there"
+    );
+    assert!(!a.with(|r| r.bearers.contains(&b_access)), "b's token went to a");
+    assert!(b.with(|r| r.bearers.is_empty()), "nothing was retried at b either");
+    assert_ne!(h.status(&id), "needs_auth");
+}
