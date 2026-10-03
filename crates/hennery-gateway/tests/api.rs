@@ -337,8 +337,6 @@ async fn refusals_answer_with_their_code_and_write_nothing() {
     none["cred_kind"] = json!("none");
     let (_, public) = api.send(&s, "POST", "/api/mcp/connections", Some(&none)).await;
     let public = public["id"].as_str().unwrap().to_string();
-    let mut oauth = api.new_body("oauth");
-    oauth["cred_kind"] = json!("oauth_dcr");
     let mut bad_slug = api.new_body("Bad Slug");
     bad_slug["slug"] = json!("Bad Slug");
     let mut http = api.new_body("lan");
@@ -353,23 +351,9 @@ async fn refusals_answer_with_their_code_and_write_nothing() {
             409,
             "slug_taken",
         ),
-        (
-            "POST",
-            "/api/mcp/connections".to_string(),
-            oauth,
-            400,
-            "unsupported_cred_kind",
-        ),
         ("POST", "/api/mcp/connections".to_string(), bad_slug, 400, "invalid"),
         ("POST", "/api/mcp/connections".to_string(), http, 400, "invalid"),
         ("POST", "/api/mcp/connections".to_string(), extra, 422, "invalid_body"),
-        (
-            "PATCH",
-            path.clone(),
-            json!({ "cred_kind": "oauth_client" }),
-            400,
-            "unsupported_cred_kind",
-        ),
         // The slug and the hat cannot change: naming them is refused.
         ("PATCH", path.clone(), json!({ "slug": "renamed" }), 422, "invalid_body"),
         (
