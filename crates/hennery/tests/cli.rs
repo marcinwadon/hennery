@@ -591,6 +591,25 @@ impl Drop for RemoveDir {
     }
 }
 
+/// Prints these files to standard error when dropped during a panic: a
+/// failing test's collector logs would otherwise go with its scratch dir,
+/// leaving a CI failure nothing to read. Declare it after the `RemoveDir`
+/// and before the process's guard, so it runs once the process is stopped
+/// and before the dir is removed.
+struct DumpOnPanic(Vec<std::path::PathBuf>);
+
+impl Drop for DumpOnPanic {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        for path in &self.0 {
+            let text = std::fs::read_to_string(path).unwrap_or_else(|err| format!("({err})"));
+            eprintln!("--- {}:\n{text}", path.display());
+        }
+    }
+}
+
 /// Start `up` on `dir`, logging to `log`, wait until its host is connected,
 /// and return the address it listens on, the connected host ids and the
 /// owner's session: `session`, or else a new one from setting the collector
@@ -1442,7 +1461,11 @@ fn the_collector_serves_the_mcp_proxy_outside_the_operator_s_routes() {
     let dir = scratch_dir("mcp-proxy");
     let _cleanup = RemoveDir(dir.clone());
     let data = dir.join("collector");
-    let (mut collector, listen) = collector_on(&data, &dir.join("collector.log"));
+    let log = dir.join("collector.log");
+    // Dropped after the collector is stopped and before the scratch dir
+    // goes: a failure here prints what the collector said.
+    let _dump = DumpOnPanic(vec![log.clone(), log.with_extension("err")]);
+    let (mut collector, listen) = collector_on(&data, &log);
     let token = format!("hnry_session_{}", "0".repeat(64));
     for (method, body) in [
         ("POST", r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#),
