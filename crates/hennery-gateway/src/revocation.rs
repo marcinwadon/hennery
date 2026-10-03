@@ -1,6 +1,8 @@
 //! A revoke ends what is open on the token (plan 8e decision 12, the
-//! fleet parent's ruling of 2026-10-02): scope that is checked only when a
-//! request arrives is not revocation. Every request the proxy serves on a
+//! fleet parent's ruling of 2026-10-02): for a token's revoke, scope that
+//! is checked only when a request arrives is not revocation. (A change to a
+//! connection, an unmount, delete or edit, is refused at request time only,
+//! gateway spec §3.2.) Every request the proxy serves on a
 //! session token watches that token here, from before the token is
 //! resolved until the answer's body ends; a revoke, once its transaction
 //! has committed, cuts every watch on the tokens it invalidated.
