@@ -114,6 +114,12 @@ describe('adding a host', () => {
     await stepUp()
     const command = await screen.findByLabelText('Pairing command')
     expect(command).toHaveTextContent('hennery host join https://hennery.example.com ABCD-EFGH')
+    // The command runs as shown: `host join` takes the platform's data
+    // directory when given none, so the panel names no option to add.
+    const panel = screen.getByRole('region', { name: 'Add a host' })
+    expect(panel).toContainElement(command)
+    expect(panel).toHaveTextContent('keeps it out of your shell history')
+    expect(panel).not.toHaveTextContent(/--data-dir|HENNERY_HOST_DATA_DIR/)
     expect(sent(server, 'POST', '/api/hosts/pairing-codes')).toHaveLength(2)
     expect(screen.getByRole('timer').textContent).toMatch(/^(10:00|9:5\d)$/)
   })
