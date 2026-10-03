@@ -54,6 +54,42 @@ jobs:
         env:
           CI: "1"
 
+  # The README's quickstart (plan 4f): its clone and build blocks, run as
+  # written, by name (`packaging/readme-blocks.sh`). The rest of its blocks
+  # run in `crates/hennery/tests/readme.rs`, which checks every name has a
+  # runner. No job-wide HENNERY_WEB_REQUIRE: the build block sets it itself.
+  readme:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@13d8dd58da0234aa297dedd986986ccb8e7f3e24 # v31.11.1
+        with:
+          github_access_token: ${{ github.token }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: readme
+      # The clone is of `main`, not of this change: it checks the address
+      # and the directory, and the build below runs on this checkout.
+      - name: The README's clone block
+        run: |
+          sh packaging/readme-blocks.sh README.md clone > "$RUNNER_TEMP/clone.sh"
+          scratch=$(mktemp -d)
+          (cd "$scratch" && sh -eux "$RUNNER_TEMP/clone.sh" && test -f hennery/Cargo.toml)
+          rm -rf "$scratch"
+      # Its last line puts the binary on PATH, for the checks after it.
+      - name: The README's build block
+        run: |
+          sh packaging/readme-blocks.sh README.md build > "$RUNNER_TEMP/build.sh"
+          echo 'sh packaging/check-web-ui.sh "$(command -v hennery)"' >> "$RUNNER_TEMP/build.sh"
+          sh -eux "$RUNNER_TEMP/build.sh"
+
   rust:
     strategy:
       fail-fast: false
