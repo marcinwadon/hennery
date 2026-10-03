@@ -63,6 +63,7 @@ fn blocks(file: &Path, arg: &str) -> (Option<i32>, String, String) {
         .arg(repo().join("packaging/readme-blocks.sh"))
         .arg(file)
         .arg(arg)
+        .env_remove("AWK")
         .output()
         .unwrap();
     (
@@ -112,7 +113,7 @@ fn refused(text: &str, message: &str) {
 
 #[test]
 fn a_named_block_is_printed_without_its_indent() {
-    let text = "# t\n\n- a step:\n\n  <!-- check: one -->\n  ```sh\n  echo one\n    echo nested\n  ```\n\n<!-- check: two -->\n```bash\necho two\n```\n";
+    let text = "# t\n\n- a step:\n\n  <!-- check: one -->\n  ```sh\n  echo one\n    echo nested\n  ```\n\n<!-- check: two -->\n```sh title=x\necho two\n```\n";
     assert_eq!(
         blocks_of(text, "one"),
         (Some(0), "echo one\n  echo nested\n".into(), String::new())
@@ -121,10 +122,19 @@ fn a_named_block_is_printed_without_its_indent() {
     assert_eq!(blocks_of(text, "--list"), (Some(0), "one\ntwo\n".into(), String::new()));
 }
 
+/// The languages that are not shell, in any case, need no tag.
 #[test]
-fn a_block_in_another_language_needs_no_tag() {
-    let text = "```toml\nkey = 1\n```\n\n<!-- check: one -->\n```sh\necho one\n```\n";
-    assert_eq!(blocks_of(text, "--list"), (Some(0), "one\n".into(), String::new()));
+fn a_block_in_a_language_that_is_not_shell_needs_no_tag() {
+    for info in [
+        "toml", "json", "jsonc", "yaml", "yml", "rust", "ts", "tsx", "js", "html", "css", "diff", "mermaid", "TOML",
+    ] {
+        let text = format!("```{info}\nkey = 1\n```\n\n<!-- check: one -->\n```sh\necho one\n```\n");
+        assert_eq!(
+            blocks_of(&text, "--list"),
+            (Some(0), "one\n".into(), String::new()),
+            "{info}"
+        );
+    }
 }
 
 #[test]
@@ -133,9 +143,29 @@ fn a_shell_block_without_a_tag_is_refused() {
         "text\n\n```sh\necho hi\n```\n",
         "a shell block without a <!-- check: <name> --> line",
     );
-    // Every shell info string, and none, is a shell block.
-    for info in ["", "bash", "shell", "console", "zsh"] {
-        refused(&format!("```{info}\necho hi\n```\n"), "a shell block without");
+}
+
+/// Fail closed: a block neither `sh` nor a language that is not shell is
+/// refused, tagged or not.
+#[test]
+fn any_other_block_is_refused() {
+    for info in [
+        "",
+        "SH",
+        "bash",
+        "shell",
+        "console",
+        "zsh",
+        "fish",
+        "text",
+        "shell-session",
+        "{.sh}",
+    ] {
+        refused(&format!("```{info}\necho hi\n```\n"), &format!("a block in \"{info}\""));
+        refused(
+            &format!("<!-- check: one -->\n```{info}\necho hi\n```\n"),
+            &format!("a block in \"{info}\""),
+        );
     }
 }
 
@@ -150,6 +180,18 @@ fn a_tag_must_be_just_before_a_shell_block() {
         "<!-- check: one -->\n```toml\nk = 1\n```\n",
         "the tag one is on a block in toml",
     );
+}
+
+#[test]
+fn a_malformed_tag_is_refused() {
+    for tag in [
+        "<!-- check: --list -->",
+        "<!-- check: Up -->",
+        "<!--check: up-->",
+        "<!-- check:up -->",
+    ] {
+        refused(&format!("{tag}\n```sh\necho a\n```\n"), "a malformed tag");
+    }
 }
 
 #[test]
@@ -168,6 +210,28 @@ fn a_block_never_closed_is_refused() {
 #[test]
 fn a_tilde_fence_is_refused() {
     refused("~~~sh\necho a\n~~~\n", "a ~~~ fence");
+    refused("> ~~~sh\n> echo a\n> ~~~\n", "a ~~~ fence");
+}
+
+#[test]
+fn a_fence_in_a_block_quote_is_refused() {
+    refused("> ```sh\n> echo a\n> ```\n", "a fence in a block quote");
+}
+
+#[test]
+fn a_fence_indented_with_a_tab_is_refused() {
+    refused("-\n\t```sh\n\techo a\n\t```\n", "a fence indented with a tab");
+    refused("-\n  \t```sh\n  \techo a\n  \t```\n", "a fence indented with a tab");
+}
+
+#[test]
+fn a_fence_of_more_backticks_is_refused() {
+    refused("````sh\necho a\n````\n", "a fence of more than three backticks");
+}
+
+#[test]
+fn a_carriage_return_is_refused() {
+    refused("<!-- check: one -->\r\n```sh\r\necho a\r\n```\r\n", "a carriage return");
 }
 
 #[test]
@@ -178,7 +242,7 @@ fn a_missing_name_is_refused() {
 }
 
 #[test]
-fn wrong_arguments_and_an_unreadable_file_exit_2() {
+fn wrong_arguments_exit_2() {
     let out = Command::new("sh")
         .arg(repo().join("packaging/readme-blocks.sh"))
         .arg(repo().join("README.md"))
@@ -186,9 +250,34 @@ fn wrong_arguments_and_an_unreadable_file_exit_2() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&out.stderr).contains("usage:"));
+}
+
+#[test]
+fn an_unreadable_file_exits_2() {
     let (status, _, err) = blocks(Path::new("/nonexistent-hennery-test/README.md"), "--list");
     assert_eq!(status, Some(2));
     assert!(err.contains("cannot read"), "{err}");
+}
+
+/// awk failing is not mistaken for a broken file (1) or bad arguments (2).
+#[test]
+fn a_failing_awk_exits_3() {
+    let awk = Fixture::new("#!/bin/sh\nexit 2\n");
+    std::fs::set_permissions(&awk.0, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let readme = Fixture::new("<!-- check: one -->\n```sh\necho a\n```\n");
+    let out = Command::new("sh")
+        .arg(repo().join("packaging/readme-blocks.sh"))
+        .arg(&readme.0)
+        .arg("--list")
+        .env("AWK", &awk.0)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(3));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("awk failed (exit status 2)"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Every block of the README has a runner: these tests, or a workflow
@@ -199,7 +288,14 @@ fn every_readme_block_is_run() {
     assert_eq!(status, Some(0), "{err}");
     let expected: Vec<&str> = BLOCKS.iter().map(|(name, _)| *name).collect();
     assert_eq!(names.lines().collect::<Vec<_>>(), expected);
+    let here = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/readme.rs")).unwrap();
     for (name, runner) in BLOCKS {
+        if let Runner::Here = runner {
+            assert!(
+                here.contains(&format!("block(\"{name}\")")),
+                "no test here runs the block {name}"
+            );
+        }
         if let Runner::Workflow(file) = runner {
             let workflow = std::fs::read_to_string(repo().join(".github/workflows").join(file)).unwrap();
             assert!(
@@ -496,6 +592,18 @@ fn setup_url(group: &mut Group, machine: &Machine) -> String {
     url.trim_end().to_string()
 }
 
+/// A command on a terminal, its process group killed on drop: a test that
+/// fails mid-prompt leaves nothing waiting on the terminal.
+struct KillOnDrop(std::process::Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        // SAFETY: kill(2) on this test's own process group.
+        unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+        let _ = self.0.wait();
+    }
+}
+
 /// Run `script` with a terminal on its standard input and error, as a
 /// person would: each `(prompt, answer)` answered once `prompt` shows. Its
 /// exit status, its standard output, and what the terminal showed.
@@ -514,13 +622,17 @@ fn on_a_terminal(machine: &Machine, script: &str, answers: &[(&str, &str)]) -> (
     assert_eq!(made, 0, "openpty: {}", std::io::Error::last_os_error());
     // SAFETY: both descriptors were just opened, and are owned here alone.
     let (master, slave) = unsafe { (std::fs::File::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
-    let mut child = machine
-        .sh(script)
-        .stdin(Stdio::from(slave.try_clone().unwrap()))
-        .stderr(Stdio::from(slave))
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut child = KillOnDrop(
+        machine
+            .sh(script)
+            .process_group(0)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave))
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let child = &mut child.0;
     let shown = Arc::new(Mutex::new(String::new()));
     let reader = {
         let shown = shown.clone();
@@ -559,7 +671,6 @@ fn on_a_terminal(machine: &Machine, script: &str, answers: &[(&str, &str)]) -> (
             break status;
         }
         if Instant::now() > deadline {
-            let _ = child.kill();
             panic!("still running after 30 s:\n{}", shown.lock().unwrap());
         }
         std::thread::sleep(Duration::from_millis(50));

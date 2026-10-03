@@ -87,8 +87,9 @@ hennery up
 
 `hennery up` runs the collector and a host for this machine, and pairs the
 two. It listens on `http://127.0.0.1:7117` and keeps its data in
-`~/Library/Application Support/hennery` (macOS) or `~/.local/share/hennery`
-(Linux). The first start downloads the agents' adapters, about 272 MB.
+`~/Library/Application Support/hennery` (macOS) or `$XDG_DATA_HOME/hennery`,
+by default `~/.local/share/hennery` (Linux). The first start downloads the
+agents' adapters, about 272 MB.
 
 On its first start it prints a one-time setup link, valid for an hour (when
 its output is not a terminal, the link is in `collector/setup-url` in the
@@ -98,19 +99,24 @@ credentials cannot be read without it.
 
 ### 3. Pair another machine
 
-A host on another machine reaches the collector over HTTPS only. Put the
-collector behind a reverse proxy that serves it at an `https://` address
-and passes WebSocket upgrades on, and start it with that address before
-you set it up:
+A host on another machine reaches the collector over HTTPS only. `up`
+listens on loopback, so put a reverse proxy on the same machine that serves
+it at an `https://` address and passes WebSocket upgrades on. Start `up`
+with that address before you set it up:
 
 <!-- check: up-public -->
 ```sh
 hennery up --public-url https://hennery.example
 ```
 
+Already set up at `localhost`? Then `--public-url` is ignored: move it
+with `hennery admin reset-public-url` (see [Recovery](#recovery)), and from
+then on open hennery at the new address, since the old one is refused.
+
 In the web UI, **Hosts → Add host** shows a pairing code, valid for ten
 minutes, and the command that uses it. Build hennery on the other machine,
-run that command there, then start the host:
+run that command there (it too downloads the adapters), then start the
+host:
 
 <!-- check: join -->
 ```sh
@@ -147,7 +153,8 @@ the default place, add `--data-dir`.
   sign-in and change is refused with `origin_mismatch` until hennery knows
   the address the browser now uses. Give it that origin: `https://`, or
   `http://` to a loopback address, with no path. It signs out every
-  session; passkeys stop working if the host name changes.
+  session; passkeys stop working if the host name changes, and are then
+  removed.
 
   <!-- check: reset-public-url -->
   ```sh
