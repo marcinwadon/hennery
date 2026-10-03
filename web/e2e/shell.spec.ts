@@ -62,17 +62,17 @@ test('the setup link sets hennery up, its token gone from the address bar', asyn
   expect(await page.evaluate(() => location.hash)).toBe('')
   // Replaced, not pushed: the visit adds one history entry, without the token.
   expect(await page.evaluate(() => history.length)).toBe(entries + 1)
-  await expect(page.getByLabel('Public URL')).toHaveValue(collector.origin)
+  await expect(page.getByLabel(/^Public URL/)).toHaveValue(collector.origin)
   await page.getByLabel(/^Password at least/).fill(PASSWORD)
-  await page.getByLabel('Password again').fill(PASSWORD)
+  await page.getByLabel('Password again', { exact: true }).fill(PASSWORD)
   await page.getByRole('button', { name: 'Set up' }).click()
   await expect(page.getByRole('heading', { name: 'hennery is set up' })).toBeVisible()
 })
 
 test('a passkey is registered right after setup, with no second password', async () => {
-  await page.getByLabel('Passkey name').fill('Test authenticator')
+  await page.getByLabel('Passkey name', { exact: true }).fill('Test authenticator')
   await page.getByRole('button', { name: 'Add a passkey' }).click()
-  await expect(page.getByText('Your passkey is added')).toBeVisible()
+  await expect(page.getByText(/^Your passkey is added/)).toBeVisible()
   await page.getByRole('button', { name: 'Continue' }).click()
   await expect(page).toHaveURL(`${collector.origin}/sessions`)
   await expect(page.getByRole('heading', { name: 'Sessions' })).toBeVisible()
@@ -116,7 +116,7 @@ test('signed out, a link goes to sign-in and back; the passkey signs in', async 
 test('the password signs in, and a step-up from the page is accepted', async () => {
   await page.getByRole('button', { name: 'Sign out' }).click()
   await expect(page).toHaveURL(`${collector.origin}/login`)
-  await page.getByLabel('Password').fill(PASSWORD)
+  await page.getByLabel('Password', { exact: true }).fill(PASSWORD)
   await page.getByRole('button', { name: 'Sign in', exact: true }).click()
   await expect(page).toHaveURL(`${collector.origin}/sessions`)
   // What the step-up dialog sends, from the page: a same-origin POST under

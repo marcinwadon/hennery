@@ -75,11 +75,11 @@ for (const width of [1280, 390]) {
     test('a host pairs with the command the page shows, and the code goes', async () => {
       await page.goto('/hosts')
       await page.getByRole('button', { name: 'Add host' }).click()
-      const command = (await page.getByLabel('Pairing command').textContent())!
+      const command = (await page.getByLabel('Pairing command', { exact: true }).textContent())!
       expect(command).toMatch(new RegExp(`^hennery host join ${collector.origin} [0-9A-Z]{4}-[0-9A-Z]{4}$`))
       const code = command.split(' ').at(-1)!
       expect(await host.join(command, ['--name', 'e2e host', '--no-runtime'])).toBe(0)
-      await expect(page.getByText('Paired: e2e host')).toBeVisible({ timeout: 15_000 })
+      await expect(page.getByText('Paired: e2e host', { exact: true })).toBeVisible({ timeout: 15_000 })
       const card = page.getByRole('listitem', { name: 'e2e host' })
       await expect(card.getByText('Offline', { exact: true })).toBeVisible()
       // The code is spent, and gone from the page, its storage and its URL.
@@ -100,15 +100,17 @@ for (const width of [1280, 390]) {
       await page.getByRole('textbox', { name: 'Name' }).fill('Work')
       await page.getByRole('button', { name: 'Create' }).click()
       await expect(page.getByRole('listitem', { name: 'Work' })).toBeVisible()
-      const tester = page.getByLabel('Test a path')
+      const tester = page.getByLabel('Test a path', { exact: true })
       await tester.fill(join(project, 'work'))
-      const resolution = page.getByLabel('Resolution')
+      const resolution = page.getByLabel('Resolution', { exact: true })
       await expect(resolution).toContainText(join(project, 'work'))
       await expect(resolution).toContainText('Personal')
       await expect(resolution).toContainText('the host’s default hat')
       await page.getByRole('button', { name: 'Add rule' }).click()
-      await page.getByLabel('Path 1').fill(join(project, 'work'))
-      await page.getByLabel('Hat 1').selectOption({ label: 'Work' })
+      await page.getByLabel('Path 1', { exact: true }).fill(join(project, 'work'))
+      // The label holds the select, so its name is "Hat 1" and the options'
+      // names: anchored, and never "Hat 10".
+      await page.getByLabel(/^Hat 1(?!\d)/).selectOption({ label: 'Work' })
       await page.getByRole('button', { name: 'Save rules' }).click()
       // By role and exact text: the resolution hint ("…under the rules as
       // saved.") also contains "saved.", and getByText matches substrings.
@@ -149,19 +151,19 @@ for (const width of [1280, 390]) {
       // The page under it is inert while it is open: the confirmation
       // beneath can take no focus, by script or by keyboard.
       expect(await page.locator('.page').getAttribute('inert')).not.toBeNull()
-      await expect(stepUp.getByLabel('Your password')).toBeFocused()
+      await expect(stepUp.getByLabel('Your password', { exact: true })).toBeFocused()
       // The confirmation itself, not its buttons: they are disabled while
       // its action waits, and a disabled button takes no focus anyway.
       await confirm.evaluate((d: HTMLElement) => d.focus())
-      await expect(stepUp.getByLabel('Your password')).toBeFocused()
+      await expect(stepUp.getByLabel('Your password', { exact: true })).toBeFocused()
       // Shift+Tab from the dialog's first field would land on the page
       // before it, were the page not inert. The password is its first
       // field only while no passkey is offered.
       await expect(stepUp.getByRole('button', { name: 'Confirm with passkey' })).toHaveCount(0)
       await page.keyboard.press('Shift+Tab')
       expect(await page.evaluate(() => !!document.activeElement?.closest('.page'))).toBe(false)
-      await stepUp.getByLabel('Your password').focus()
-      await stepUp.getByLabel('Your password').fill(PASSWORD)
+      await stepUp.getByLabel('Your password', { exact: true }).focus()
+      await stepUp.getByLabel('Your password', { exact: true }).fill(PASSWORD)
       await stepUp.getByRole('button', { name: 'Confirm' }).click()
       await expect(card.getByText('Revoked', { exact: true })).toBeVisible()
       expect(refused).toBe(1)
