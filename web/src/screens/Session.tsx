@@ -31,18 +31,28 @@
 //   delivery unknown, or its first prompt refused: lib/start.ts) shows it
 //   above the composer. The notice is read from the link once, then dropped
 //   from the address, so a reload does not show it again.
-// - A deleted session says so, nothing more is fetched, and its draft and
-//   images are dropped.
+// - Under the composer, a session that is not running has its footer
+//   (SessionFooter: Resume, the start's spinner, why it failed); the header
+//   carries its menu (SessionMenu: Park, Close, Delete). The composer stays
+//   whatever the lifecycle, so a draft put there is never lost.
+// - A deleted session (deleted from here, `session_removed`, or a 404) says
+//   so, nothing more is fetched, its draft and images are dropped, and it
+//   leaves the session list (`onRemoved`). Deleted from here, it also says
+//   what the delete left of the agent's transcript on the host.
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { hatList, hostList, namesOf } from '../api/names'
+import { resume } from '../api/turns'
 import { sessionDetail } from '../api/view'
 import { useClient } from '../app-client'
 import { Composer, type ComposerHandle } from '../components/Composer'
 import { ANSWER_LABEL, answerAsMessage } from '../components/composerWords'
+import SessionFooter from '../components/SessionFooter'
 import SessionHeader, { type HeaderInfo } from '../components/SessionHeader'
+import SessionMenu from '../components/SessionMenu'
+import { deleteNotes } from '../components/sessionWords'
 import Transcript from '../components/Transcript'
 import type { ItemEnv } from '../components/items/types'
-import type { Capabilities } from '../generated/protocol'
+import type { Capabilities, DeleteResult } from '../generated/protocol'
 import type { SessionSummary } from '../generated/view'
 import type { Item } from '../generated/view'
 import { useAnnouncement } from '../hooks/useAnnouncement'
@@ -54,7 +64,7 @@ import { saveDraft } from '../lib/drafts'
 import { readStartNotice, startNoticeText } from '../lib/start'
 import { Icon } from '../lib/ui'
 import { Link, navigate, useLocation } from '../router'
-import { useAnswering } from '../store/useAnswer'
+import { useAnswering, useHostAway } from '../store/useAnswer'
 import { useSessionItems, type Timing } from '../store/useSessionItems'
 
 /** Within this many pixels of the end, the reader is at the end. */
@@ -77,6 +87,9 @@ interface Props {
   tail?: number
   /** The item store's timing (tests). */
   timing?: Partial<Timing>
+  /** The session was found gone (deleted from here or elsewhere, or a
+   *  404): the list drops it (useSessionList's `remove`). */
+  onRemoved?: (id: string) => void
 }
 
 /** The newest plan among the loaded items. */
@@ -230,7 +243,8 @@ function useTailWindow(items: Item[], loads: number, size: number) {
   return { visible, held: start, reveal }
 }
 
-export default function SessionView({ id, summary, awaitSummary = false, tail = TAIL, timing }: Props) {
+export default function SessionView({ id, summary, awaitSummary = false, tail = TAIL, timing, onRemoved }: Props) {
+  const client = useClient()
   const s = useSessionItems(id, timing)
   const info = useHeaderInfo(id, summary, awaitSummary)
   const win = useTailWindow(s.items, s.loads, tail)
@@ -244,6 +258,7 @@ export default function SessionView({ id, summary, awaitSummary = false, tail = 
   const startNotice = useStartNotice(id)
   const answers = useAnswering(id, info, s.items, s.loading, s.loads, connectedOf(hostItems, info?.host_id))
   const announcement = useAnnouncement(answers)
+  const hostAway = useHostAway(answers)
 
   // The composer's handle: the item seams reach the draft through it, and
   // stay the same functions for as long as the view is shown.
@@ -256,6 +271,23 @@ export default function SessionView({ id, summary, awaitSummary = false, tail = 
     [],
   )
   const composerEmpty = useCallback(() => composer.current?.isEmpty() ?? true, [])
+  // The view's one resume: the footer's Resume and the composer's "Resume
+  // and send" both go through it.
+  const onResume = useCallback(() => resume(client, id), [client, id])
+
+  // A delete made here: what it left on the host, shown with the deleted
+  // state. The answer may come after the stream's `session_removed`.
+  const [deleted, setDeleted] = useState<{ id: string; result?: DeleteResult } | null>(null)
+  const { markRemoved } = s
+  const onDeleted = useCallback(
+    (result: DeleteResult | undefined) => {
+      setDeleted({ id, result })
+      markRemoved()
+    },
+    [id, markRemoved],
+  )
+  const back = useRef<HTMLAnchorElement>(null)
+  const capabilities = capabilitiesOf(hostItems, info?.host_id)
 
   const env: ItemEnv = useMemo(
     () => ({
@@ -270,14 +302,18 @@ export default function SessionView({ id, summary, awaitSummary = false, tail = 
     [id, info?.agent, hats, answers, onSendAgain, onAnswerAsMessage, composerEmpty],
   )
 
-  // A deleted session's draft and images can never be sent: drop them.
+  // A deleted session's draft and images can never be sent: drop them, and
+  // the session leaves the list.
   useEffect(() => {
     if (!s.removed) return
     saveDraft(id, '')
     forgetAttachments(id)
-  }, [id, s.removed])
+    onRemoved?.(id)
+  }, [id, s.removed, onRemoved])
 
   if (s.removed) {
+    const notes = deleted?.id === id ? deleteNotes(deleted.result) : []
+    const hostNotes = deleted?.id === id ? (deleted.result?.host_transcript?.notes ?? []) : []
     return (
       <div className="session">
         <div className="welcome" role="status">
@@ -285,7 +321,21 @@ export default function SessionView({ id, summary, awaitSummary = false, tail = 
           <p>
             <bdi>{id}</bdi>
           </p>
-          <Link to="/sessions" className="btn btn-ghost">
+          {notes.map((note) => (
+            <p key={note} className="delete-note">
+              {note}
+            </p>
+          ))}
+          {hostNotes.length > 0 && (
+            <ul className="delete-note">
+              {hostNotes.map((note, i) => (
+                <li key={i}>
+                  <bdi>{String(note)}</bdi>
+                </li>
+              ))}
+            </ul>
+          )}
+          <Link to="/sessions" className="btn btn-ghost" ref={back}>
             Back to sessions
           </Link>
         </div>
@@ -295,7 +345,22 @@ export default function SessionView({ id, summary, awaitSummary = false, tail = 
 
   return (
     <div className="session">
-      <SessionHeader id={id} info={info} hostName={info ? hosts.get(info.host_id) : undefined} plan={plan} narrow={narrow} />
+      <SessionHeader
+        id={id}
+        info={info}
+        hostName={info ? hosts.get(info.host_id) : undefined}
+        plan={plan}
+        narrow={narrow}
+        menu={
+          <SessionMenu
+            id={id}
+            lifecycle={info?.lifecycle}
+            canPark={capabilities?.includes('park') ?? false}
+            onDeleted={onDeleted}
+            focusAfterDelete={() => back.current}
+          />
+        }
+      />
       <div className="stream-state" role="status">
         {s.stream === 'reconnecting' ? 'Reconnecting…' : s.resynced ? 'Resynced' : ''}
       </div>
@@ -329,10 +394,20 @@ export default function SessionView({ id, summary, awaitSummary = false, tail = 
         handle={composer}
         sessionId={id}
         session={info ? { activity: info.activity, lifecycle: info.lifecycle } : null}
-        capabilities={capabilitiesOf(hostItems, info?.host_id)}
+        capabilities={capabilities}
         catalog={s.catalog}
         onCatalog={s.setCatalog}
+        onResume={onResume}
       />
+      {info && (
+        <SessionFooter
+          key={info.lifecycle}
+          info={info}
+          hostName={hosts.get(info.host_id)}
+          hostAway={hostAway}
+          onResume={onResume}
+        />
+      )}
     </div>
   )
 }

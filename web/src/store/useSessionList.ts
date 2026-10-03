@@ -7,7 +7,8 @@
 // - `session_upsert`, `session_removed` and `waiting_changed` change the
 //   store and nothing else: no event ever refetches (F-4). A repeated
 //   `session_removed` (the server may send one twice) is a keyed delete,
-//   so harmless.
+//   so harmless. `remove(id)` is the same delete, for a session the view
+//   found gone (deleted from here, or its page or stream answered 404).
 // - The stream is opened with the query's hat (never an empty one): it
 //   scopes `waiting_changed`'s count only. A new hat is a new query, so a
 //   new page and a new stream.
@@ -119,6 +120,9 @@ export class SessionListController {
     clearTimeout(this.retryTimer)
     clearTimeout(this.resyncedTimer)
   }
+
+  /** Drop session `id`, as a `session_removed` does. */
+  remove = (id: string): void => this.apply({ type: 'removed', id })
 
   /** The next page, by `next_cursor`. */
   loadMore = async (): Promise<void> => {
@@ -252,6 +256,8 @@ export interface SessionList extends Omit<SessionListSnapshot, 'store'> {
   /** More pages exist. */
   hasMore: boolean
   loadMore: () => Promise<void>
+  /** Drop a session the view found gone (a keyed delete). */
+  remove: (id: string) => void
   searching: boolean
   /** The server query, as a key: a new one is a new list (its pages start
    *  over), whatever filter changed. */
@@ -315,6 +321,7 @@ export function useSessionList(filters: ListFilters, timing?: Partial<Timing>): 
     counts,
     hasMore: store.nextCursor !== undefined,
     loadMore: controller.loadMore,
+    remove: controller.remove,
     searching: searching(filters),
     queryKey: key,
   }

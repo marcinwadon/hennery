@@ -362,7 +362,11 @@ describe('SessionView', () => {
     await screen.findByText('t5-0')
     expect(container.querySelector('header .badge')?.textContent).toBe(text)
     expect(container.querySelector('header .badge')?.className).toBe(`badge badge-${tone}`)
-    if (patch.failure_reason) expect(container.querySelector('header')?.textContent).toContain(`Reason: ${patch.failure_reason}`)
+    // The reason in words, never its code.
+    if (patch.failure_reason) {
+      expect(container.querySelector('header')?.textContent).toContain('Reason: the agent is not logged in on the host')
+      expect(container.querySelector('header')?.textContent).not.toContain(patch.failure_reason)
+    }
   })
 
   it('shows the newest plan’s steps in the header', async () => {
