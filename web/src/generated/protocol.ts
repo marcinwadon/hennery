@@ -1141,7 +1141,14 @@ export type SettingsResponse = { public_url: string,
  * push services may write to. Absent: they are given an `https`
  * `public_url`, and nothing for an `http` one, which Apple refuses.
  */
-contact?: string | undefined, };
+contact?: string | undefined, 
+/**
+ * Kernel spec §10's deployment warning: the collector runs as the OS
+ * user of `hennery up`'s host child, and so of every agent of that
+ * host, while the MCP gateway holds credentials for more than one hat.
+ * Any of those agents can read every one of them. Read when asked.
+ */
+deployment_warning: boolean, };
 
 /**
  * `PATCH /api/settings`: absent fields stay as they are, and so does a
@@ -1164,7 +1171,11 @@ export type SettingsUpdateRequest = { contact?: string | undefined, public_url?:
  * when `public_url` was changed, what the change ended. Without
  * `public_url_changed` it is exactly `SettingsResponse`.
  */
-export type SettingsUpdateResponse = { public_url: string, contact?: string | undefined, public_url_changed?: PublicUrlChanged | undefined, };
+export type SettingsUpdateResponse = { public_url: string, contact?: string | undefined, 
+/**
+ * As in `SettingsResponse`, read before anything was changed.
+ */
+deployment_warning: boolean, public_url_changed?: PublicUrlChanged | undefined, };
 
 /**
  * What a `public_url` change ended, as `hennery admin reset-public-url`

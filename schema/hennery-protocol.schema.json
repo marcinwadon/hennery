@@ -3602,12 +3602,17 @@
             "null"
           ]
         },
+        "deployment_warning": {
+          "description": "Kernel spec §10's deployment warning: the collector runs as the OS\nuser of `hennery up`'s host child, and so of every agent of that\nhost, while the MCP gateway holds credentials for more than one hat.\nAny of those agents can read every one of them. Read when asked.",
+          "type": "boolean"
+        },
         "public_url": {
           "type": "string"
         }
       },
       "required": [
-        "public_url"
+        "public_url",
+        "deployment_warning"
       ],
       "type": "object"
     },
@@ -3639,6 +3644,10 @@
             "null"
           ]
         },
+        "deployment_warning": {
+          "description": "As in `SettingsResponse`, read before anything was changed.",
+          "type": "boolean"
+        },
         "public_url": {
           "type": "string"
         },
@@ -3654,7 +3663,8 @@
         }
       },
       "required": [
-        "public_url"
+        "public_url",
+        "deployment_warning"
       ],
       "type": "object"
     },

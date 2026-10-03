@@ -932,6 +932,11 @@ pub struct SettingsResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "string | undefined", optional)]
     pub contact: Option<String>,
+    /// Kernel spec §10's deployment warning: the collector runs as the OS
+    /// user of `hennery up`'s host child, and so of every agent of that
+    /// host, while the MCP gateway holds credentials for more than one hat.
+    /// Any of those agents can read every one of them. Read when asked.
+    pub deployment_warning: bool,
 }
 
 /// `PATCH /api/settings`: absent fields stay as they are, and so does a
@@ -966,6 +971,8 @@ pub struct SettingsUpdateResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "string | undefined", optional)]
     pub contact: Option<String>,
+    /// As in `SettingsResponse`, read before anything was changed.
+    pub deployment_warning: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "PublicUrlChanged | undefined", optional)]
     pub public_url_changed: Option<PublicUrlChanged>,

@@ -223,9 +223,10 @@ async fn set_policy(
     }
 }
 
-/// `GET /api/settings`: `public_url` and the push contact.
+/// `GET /api/settings`: `public_url`, the push contact, and whether kernel
+/// spec §10's deployment warning is due, read as the request is answered.
 async fn settings(State(state): State<AppState>) -> Response {
-    match settings_now(&state) {
+    match deployment_warning(&state).and_then(|warning| settings_now(&state, warning)) {
         Ok(settings) => Json(settings).into_response(),
         Err(err) => internal(err),
     }
@@ -250,8 +251,18 @@ async fn update_settings(
         if !session.stepped_up(unix_now()) {
             return hennery_kernel::auth::step_up_required();
         }
-        return change_public_url(&state, &session, public_url, contact);
+        // Read before anything is written (plan 4d-B3, the review's A4):
+        // its failure changes nothing.
+        let warning = match deployment_warning(&state) {
+            Ok(warning) => warning,
+            Err(err) => return internal(err),
+        };
+        return change_public_url(&state, &session, public_url, contact, warning);
     }
+    let warning = match deployment_warning(&state) {
+        Ok(warning) => warning,
+        Err(err) => return internal(err),
+    };
     if let Some(contact) = contact {
         match state.operator.set_contact(contact) {
             Ok(Ok(())) => {}
@@ -259,10 +270,11 @@ async fn update_settings(
             Err(err) => return internal(err),
         }
     }
-    match settings_now(&state) {
+    match settings_now(&state, warning) {
         Ok(settings) => Json(SettingsUpdateResponse {
             public_url: settings.public_url,
             contact: settings.contact,
+            deployment_warning: settings.deployment_warning,
             public_url_changed: None,
         })
         .into_response(),
@@ -275,11 +287,13 @@ async fn update_settings(
 /// (the review's A1). Every session ended, the caller's too, so the cookie
 /// is cleared, as the old `public_url` set it (decision 4): this answer
 /// goes to the old origin. The move is logged as soon as it is made (A2).
+/// `deployment_warning` was read before the move (plan 4d-B3).
 fn change_public_url(
     state: &AppState,
     session: &Authenticated,
     input: &str,
     contact: Option<Option<&str>>,
+    deployment_warning: bool,
 ) -> Response {
     let caller = Some((session.session_id.as_str(), unix_now()));
     let (from, to, sessions_ended, passkeys_removed) = match state.operator.change_public_url(input, contact, caller) {
@@ -320,6 +334,7 @@ fn change_public_url(
         Ok(contact) => Json(SettingsUpdateResponse {
             public_url: to.origin().to_string(),
             contact,
+            deployment_warning,
             public_url_changed: Some(PublicUrlChanged {
                 sessions_ended: sessions_ended as u64,
                 passkeys_removed: passkeys_removed as u64,
@@ -340,12 +355,24 @@ fn with_cleared_cookie(mut response: Response, secure: bool) -> Response {
     response
 }
 
-fn settings_now(state: &AppState) -> anyhow::Result<SettingsResponse> {
+fn settings_now(state: &AppState, deployment_warning: bool) -> anyhow::Result<SettingsResponse> {
     let public_url = state
         .operator
         .public_url()
         .map(|url| url.origin().to_string())
         .unwrap_or_default();
     let contact = state.operator.contact()?;
-    Ok(SettingsResponse { public_url, contact })
+    Ok(SettingsResponse {
+        public_url,
+        contact,
+        deployment_warning,
+    })
+}
+
+/// Whether kernel spec §10's warning is due (plan 4d-B3): the collector
+/// runs as the OS user of `hennery up`'s agents while the gateway holds
+/// credentials for more than one hat. A failed read is an error, never a
+/// quiet `false`.
+fn deployment_warning(state: &AppState) -> anyhow::Result<bool> {
+    Ok(state.deployment.facts()?.isolation().warns())
 }
