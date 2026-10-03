@@ -146,6 +146,10 @@ fn request_failed(err: RequestError) -> Response {
                 "not_attached" | "turn_in_progress" | "not_running" | "unknown_option" | "images_unsupported" => {
                     StatusCode::CONFLICT
                 }
+                // The host's own refusal of the servers answers as the
+                // hub's does (`McpUndeliverable` below): one status for
+                // the code on every path (api-8e-8f, item 14).
+                MCP_UNDELIVERABLE => StatusCode::CONFLICT,
                 "unknown_agent" | "start_failed" => StatusCode::BAD_GATEWAY,
                 "invalid" => StatusCode::BAD_REQUEST,
                 _ => StatusCode::BAD_GATEWAY,
@@ -163,8 +167,8 @@ fn request_failed(err: RequestError) -> Response {
         // themselves (`projects::probe_failed`): unreachable here.
         RequestError::Unsupported => error(StatusCode::CONFLICT, "unsupported", "the host does not support this"),
         RequestError::Busy => error(StatusCode::SERVICE_UNAVAILABLE, "busy", "the host is busy; try again"),
-        // Unreachable until plan 8e sends servers; 8e also fails the
-        // session it left `starting`.
+        // The hub refused to send a start or resume its servers; the
+        // route has failed the session it left `starting` (plan 8e).
         RequestError::McpUndeliverable => error(
             StatusCode::CONFLICT,
             "mcp_isolation_unavailable",
@@ -175,12 +179,19 @@ fn request_failed(err: RequestError) -> Response {
 
 /// A resume answers like a start (decision 3): whatever code the host
 /// rejects it with, the session is marked `failed` with that code and the
-/// answer is 502 with it, so the answer and the session agree. An offline
-/// host and an unknown delivery answer as for any other request.
+/// answer is 502 with it, so the answer and the session agree, except the
+/// host's refusal of its MCP servers, which is 409 as on every path (plan
+/// 8e). An offline host and an unknown delivery answer as for any other
+/// request.
 fn resume_failed(err: RequestError) -> Response {
     match err {
         RequestError::Rejected { code, message } => {
-            error(StatusCode::BAD_GATEWAY, &code, crate::redact::shown(&message))
+            let status = if code == MCP_UNDELIVERABLE {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_GATEWAY
+            };
+            error(status, &code, crate::redact::shown(&message))
         }
         other => request_failed(other),
     }
@@ -1939,11 +1950,15 @@ mod not_sent_tests {
     #[tokio::test]
     async fn a_refusals_message_is_answered_redacted() {
         let token = format!("{}{}", hennery_gateway::tokens::SESSION_TOKEN_PREFIX, "0a".repeat(32));
-        let rejected = || RequestError::Rejected {
-            code: "start_failed".into(),
+        let rejected = |code: &str| RequestError::Rejected {
+            code: code.into(),
             message: format!("the agent said {token}"),
         };
-        for response in [request_failed(rejected()), resume_failed(rejected())] {
+        let mut answers = Vec::new();
+        for code in ["start_failed", MCP_UNDELIVERABLE] {
+            answers.extend([request_failed(rejected(code)), resume_failed(rejected(code))]);
+        }
+        for response in answers {
             let (_, body) = answer(response).await;
             let message = body["message"].as_str().unwrap();
             assert!(!message.contains(&token) && message.contains("<redacted>"), "{message}");
