@@ -106,6 +106,27 @@ fn a_set_is_stored_listed_and_replaced_whole() {
     assert!(done(w.store.replace_stdio_set("host-a", &hat, &[], &w.key, 300).unwrap()).is_empty());
 }
 
+/// A set replaced with a change to a server bumps its `updated_at`, its
+/// `created_at` kept; one replaced as it was keeps both (the whole-branch
+/// review: the bump had no test).
+#[test]
+fn a_changed_server_bumps_its_updated_at() {
+    let w = World::new();
+    w.host("host-a", 1);
+    let hat = w.hat();
+    let replace =
+        |servers: &[StdioInput], at| done(w.store.replace_stdio_set("host-a", &hat, servers, &w.key, at).unwrap());
+    replace(&[input("files", &[("KEY", Some(SECRET))])], 100);
+    let kept = replace(&[input("files", &[("KEY", None)])], 200);
+    assert_eq!((kept[0].created_at, kept[0].updated_at), (100, 100), "nothing changed");
+    let set = replace(&[input("files", &[("KEY", Some("another"))])], 300);
+    assert_eq!((set[0].created_at, set[0].updated_at), (100, 300), "a new value");
+    let mut moved = input("files", &[("KEY", None)]);
+    moved.args.push("--verbose".into());
+    let set = replace(&[moved], 400);
+    assert_eq!((set[0].created_at, set[0].updated_at), (100, 400), "new arguments");
+}
+
 /// Decision E3: absent keeps the stored value, a string sets it (`""` too),
 /// a name left out is deleted.
 #[test]

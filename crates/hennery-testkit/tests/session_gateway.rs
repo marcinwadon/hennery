@@ -347,6 +347,9 @@ async fn host_connected(c: &Collector) {
 
 #[test]
 fn a_claude_session_gets_its_hats_servers_and_a_token_that_ends_with_its_park() {
+    // macOS checks a newly built program at its first exec, one at a time
+    // machine-wide: before anything here is timed (`BOUND`).
+    hennery_testkit::first_exec(env!("CARGO_BIN_EXE_hennery-fake-acp"));
     let logs = Captured::default();
     let subscriber = hennery_host::logging::capped(
         tracing_subscriber::fmt()

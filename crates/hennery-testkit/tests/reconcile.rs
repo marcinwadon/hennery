@@ -3733,3 +3733,58 @@ async fn an_attempt_asked_again_sends_the_count_its_first_answer_made() {
     .await;
     assert_eq!(held.await.unwrap().state, hennery_proto::rest::RemovalState::Partial);
 }
+
+/// A `tracing` writer into a shared buffer.
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Plan 8e (ACP core §8, decision 11; the whole-branch review): a forget
+/// the host refuses is logged with the host's words redacted, as every
+/// other refusal is: they can quote a session token. The runtime is
+/// current-thread, so the collector's tasks log to this thread's
+/// subscriber.
+#[tokio::test]
+async fn a_refused_forget_is_logged_without_a_token() {
+    use tracing_subscriber::util::SubscriberInitExt;
+    let token = format!("{}{}", hennery_gateway::tokens::SESSION_TOKEN_PREFIX, "5a".repeat(32));
+    let logs = Captured::default();
+    let _default = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_ansi(false)
+        .with_writer({
+            let logs = logs.clone();
+            move || logs.clone()
+        })
+        .finish()
+        .set_default();
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect_with(&collector, vec![], 0, forgetting()).await;
+    let session = parked_claude_session(&collector, &mut host).await;
+    let c = client(&collector);
+    let url = session_url(&collector, &session);
+    let call = tokio::spawn(async move { delete(&c, url).await });
+    let request_id = expect_forget(&mut host).await;
+    host.send(&HostFrame::Error {
+        request_id,
+        code: "io_error".into(),
+        message: format!("could not remove {token}"),
+    })
+    .await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    let logged = String::from_utf8_lossy(&logs.0.lock().unwrap()).into_owned();
+    assert!(logged.contains("a forget was refused"), "not logged: {logged}");
+    assert!(!logged.contains(&token), "a session token reached the log: {logged}");
+    assert!(logged.contains("hnry_session_<redacted>"), "{logged}");
+}
