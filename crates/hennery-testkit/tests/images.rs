@@ -97,6 +97,8 @@ impl ScriptedHost {
             workspace_roots: vec![],
             attached_sessions: vec![],
             mcp_isolation: Default::default(),
+            agents: Default::default(),
+            runtime: Default::default(),
         })
         .await;
         assert!(matches!(host.next().await, CollectorFrame::HelloAck { .. }));

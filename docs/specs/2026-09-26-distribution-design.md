@@ -450,6 +450,10 @@ are never printed (only "logged in" and the method).
 
 The host runs checks 3–4, 9, 12 and 13 on demand (`probe_agents`) and reports
 them to the collector, so the Hosts view shows them without a terminal.
+*Built so far (plan 4d-B1-i):* checks 3 and 4, in the host's own guarded
+groups and environment, never doctor's (ACP core §6); check 12 as
+`runtime.pinned`. Check 4 asks the CLI only. Checks 9 and 13 come with the
+doctor report (plan 4d-B1-ii).
 
 ---
 

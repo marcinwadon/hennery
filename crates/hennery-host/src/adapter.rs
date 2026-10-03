@@ -185,40 +185,11 @@ impl Adapter {
         let limit = fd_limit();
         let mut guard = spawn_guard(limit)?;
         let pgid = guard.id().expect("a just-spawned child has a pid") as i32;
-        let mut command = tokio::process::Command::new(&agent.program);
-        // Before `envs`: inherited, these are dropped; set by the agent's
-        // own configuration, they pass.
-        for var in INHERITED_OVERRIDE_VARS {
-            command.env_remove(var);
-        }
+        let mut command = guarded_command(agent, cwd, strip, limit, pgid);
         command
-            .args(&agent.args)
-            .envs(agent.env.iter().cloned())
-            .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .process_group(pgid)
-            .kill_on_drop(true);
-        // After `envs`: a secret is stripped even if the agent's own
-        // configuration names it.
-        for var in NESTING_VARS
-            .iter()
-            .chain(HOST_SECRET_VARS)
-            .chain(HOST_LOG_VARS)
-            .chain(strip)
-        {
-            command.env_remove(var);
-        }
-        // SAFETY: the closure runs in the forked child before `exec` and
-        // calls only `syscall(close_range)` (Linux), `fcntl` and `close`,
-        // which are async-signal-safe; it allocates nothing.
-        unsafe {
-            command.pre_exec(move || {
-                close_inherited(limit);
-                Ok(())
-            });
-        }
+            .stderr(Stdio::piped());
         let spawned = command.spawn();
         if spawned.is_err() {
             let _ = guard.start_kill();
@@ -373,6 +344,116 @@ impl Adapter {
             Some(idx) => clean(&bytes[idx + 1..]),
             None => "[stderr truncated]".to_string(),
         }
+    }
+}
+
+/// `agent` as `Adapter::spawn` starts it, in the group `pgid` that its
+/// guard leads: the inherited override variables dropped before the
+/// agent's own variables, the host's secrets, log choice, nesting
+/// variables and `strip` after them, every inherited descriptor closed.
+fn guarded_command(
+    agent: &AgentCommand,
+    cwd: &Path,
+    strip: &[&str],
+    limit: libc::c_int,
+    pgid: i32,
+) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(&agent.program);
+    // Before `envs`: inherited, these are dropped; set by the agent's
+    // own configuration, they pass.
+    for var in INHERITED_OVERRIDE_VARS {
+        command.env_remove(var);
+    }
+    command
+        .args(&agent.args)
+        .envs(agent.env.iter().cloned())
+        .current_dir(cwd)
+        .process_group(pgid)
+        .kill_on_drop(true);
+    // After `envs`: a secret is stripped even if the agent's own
+    // configuration names it.
+    for var in NESTING_VARS
+        .iter()
+        .chain(HOST_SECRET_VARS)
+        .chain(HOST_LOG_VARS)
+        .chain(strip)
+    {
+        command.env_remove(var);
+    }
+    // SAFETY: the closure runs in the forked child before `exec` and
+    // calls only `syscall(close_range)` (Linux), `fcntl` and `close`,
+    // which are async-signal-safe; it allocates nothing.
+    unsafe {
+        command.pre_exec(move || {
+            close_inherited(limit);
+            Ok(())
+        });
+    }
+    command
+}
+
+/// Run `command` to its end, or for at most `limit`, started as
+/// `Adapter::spawn` starts an adapter (a guarded group of its own, the same
+/// environment), with its standard input, output and error on `/dev/null`:
+/// only how it ended is kept, never a byte it wrote (plan 4d-B1-i, a CLI's
+/// login status). `Ok(None)`: it ran out of time. Its whole group is
+/// SIGKILLed afterwards, however it ended, and also if this future is
+/// dropped before it ends (the review's A1).
+pub async fn exit_status(command: &AgentCommand, cwd: &Path, limit: Duration) -> std::io::Result<Option<ExitInfo>> {
+    let fds = fd_limit();
+    let mut guard = spawn_guard(fds)?;
+    let pgid = guard.id().expect("a just-spawned child has a pid") as i32;
+    let mut cmd = guarded_command(command, cwd, &[], fds, pgid);
+    cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let spawned = cmd.spawn();
+    if spawned.is_err() {
+        let _ = guard.start_kill();
+    }
+    tokio::spawn(async move {
+        let _ = guard.wait().await;
+    });
+    let mut child = spawned?;
+    // Only now: on a failed spawn the guard is killed above and may be
+    // reaped, after which its id could be another process's.
+    let mut group = GroupKill { pgid, done: false };
+    let ended = tokio::time::timeout(limit, child.wait()).await;
+    group.kill();
+    match ended {
+        Ok(status) => {
+            let status = status?;
+            Ok(Some(ExitInfo {
+                code: status.code(),
+                signal: status.signal(),
+            }))
+        }
+        Err(_) => {
+            let _ = child.wait().await;
+            Ok(None)
+        }
+    }
+}
+
+/// SIGKILLs the group `exit_status` started, once: when it ends, or when
+/// its future is dropped first. The guard leads the group until the
+/// group's first SIGKILL, which is this one: its id cannot have been
+/// recycled.
+struct GroupKill {
+    pgid: i32,
+    done: bool,
+}
+
+impl GroupKill {
+    fn kill(&mut self) {
+        if !self.done {
+            signal_group(self.pgid, libc::SIGKILL);
+            self.done = true;
+        }
+    }
+}
+
+impl Drop for GroupKill {
+    fn drop(&mut self) {
+        self.kill();
     }
 }
 

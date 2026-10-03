@@ -1,5 +1,6 @@
 //! Collector-side session module (ACP core spec §4, §8, §9).
 
+pub mod agents;
 pub mod api;
 pub mod attachments;
 pub mod content;
@@ -58,6 +59,10 @@ pub struct AppState {
     pub sweep_interval: Duration,
     /// The host removals with an attempt in flight (plan 9d B7).
     pub forgets: Arc<forget::InFlight>,
+    /// The probes of hosts' agents under way (plan 4d-B1-i).
+    pub agent_refreshes: Arc<agents::Refreshes>,
+    /// How long a probe of a host's agents waits for its answer.
+    pub agents_probe_timeout: Duration,
 }
 
 impl AppState {
@@ -76,6 +81,8 @@ impl AppState {
             push: Push::detached(),
             sweep_interval: sweep::INTERVAL,
             forgets: Arc::new(forget::InFlight::default()),
+            agent_refreshes: Arc::new(agents::Refreshes::default()),
+            agents_probe_timeout: agents::AGENTS_PROBE_TIMEOUT,
         }
     }
 }

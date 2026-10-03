@@ -89,7 +89,10 @@ is the signed-in session that subscribed (`auth_sessions.id_hash`); a
 subscription's `endpoint` is unique across owners, like a credential id.
 
 *Built so far:* `hosts` lacks `default_hat_id` (hats), `agents`,
-`workspace_roots` (`probe_agents`) and `last_doctor`. `push_subscriptions` and
+`workspace_roots` (`probe_agents`) and `last_doctor`. Kernel migration 12
+(plan 4d-B1-i) adds `agents` (the latest report, `{agents, runtime?}`),
+`agents_reported_at` (the collector's clock) and `agents_source` (`none`,
+`hello` or `probe`). `push_subscriptions` and
 `hat_push_policies` are kernel migration 9 (plan 10a); `purged_hats` is kernel
 migration 10 (plan 9c).
 
@@ -488,6 +491,10 @@ that speaks the socket protocol directly (§10).
   `probe_agents`. *Built so far:* an accepted `hello` updates `host_version`
   (only if it has enrollment's shape), `capabilities` and `last_seen_at`, which
   is the last accepted `hello`, not liveness; no rename or default hat yet.
+  A reconciled connection's `hello` from a host with the `probe_agents`
+  capability, and each `probe_agents` answer, replace the host's agent
+  report, bounded again by the collector whatever the host sent (plan
+  4d-B1-i); a revoked host's is not stored.
 - One live connection per host (ACP core §3.5).
 
 ## 5. Hats
@@ -830,6 +837,7 @@ frontend spec §6.4) this makes agent output unable to run script in the UI.
 | `POST /api/hosts/enroll` | Host enrollment (code-authenticated, §4.1) → 201 `{host_id}` |
 | `GET /api/hosts`, `PATCH/DELETE /api/hosts/{id}` | List, rename/default hat, revoke (step-up) |
 | `GET /api/hosts/ws` | Host WebSocket (ACP core) |
+| `GET /api/hosts/{id}/agents[?refresh=1]` | The host's latest agent report; with `refresh=1`, after one probe (ACP core §6) |
 | `GET/POST /api/hats`, `PATCH /api/hats/{id}` | Hats |
 | `GET/PUT/DELETE /api/hats/{id}/logo` | The hat's logo: served as a re-encoded PNG; set from a PNG `{data}` in base64; removed (§5.1; PUT and DELETE: step-up) |
 | `POST /api/hats/{id}/purge` | Purge a hat (step-up, §5.5) |
@@ -846,6 +854,18 @@ as `HostItem {host_id, name, platform, host_version, capabilities, connected,
 created_at, last_seen_at?, revoked_at?}`; `connected` means connected,
 reconciled and not being kicked. `DELETE /api/hosts/{id}` answers 200
 `HostItem`, or 404.
+
+`GET /api/hosts/{id}/agents` answers `HostAgents {host_id, agents[],
+runtime?, reported_at?, source: none | hello | probe, live}` from the store,
+whatever the report's age, `no-store`: `source: none` until the host reports,
+and `live` when it is connected and reconciled now. With `refresh=1` it first
+sends one `probe_agents` to a connected host that has the capability and
+waits for it, at most 20 s; concurrent refreshes of a host share that probe,
+and an answer that arrives after its caller left is stored all the same. A
+probe that fails leaves the last report. No step-up: the probe is a fixed
+set of read-only checks. 404 `not_found` for a host that is not the
+owner's, decided before anything is probed; 400 `invalid` for a `refresh`
+other than `0` or `1`.
 
 *Built so far:* the auth, passkey, host, push and health routes,
 `/api/settings` (its `PATCH` taking `public_url` since plan 4d-B4),

@@ -3,6 +3,7 @@
 
 pub mod adapter;
 pub mod agent_home;
+pub mod availability;
 pub mod connection;
 pub mod forget;
 pub mod forget_codex;

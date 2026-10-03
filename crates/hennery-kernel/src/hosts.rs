@@ -12,7 +12,9 @@ use crate::db;
 use crate::secret::{random_bytes, sha256_hex};
 use anyhow::Result;
 use ed25519_dalek::{Signature, VerifyingKey};
+use hennery_proto::agents::{AgentInfo, RuntimeInfo, bound_agents};
 use hennery_proto::frames::Capabilities;
+use hennery_proto::rest::AgentsSource;
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::Mutex;
@@ -159,6 +161,34 @@ pub struct HostRecord {
     pub revoked_at: Option<i64>,
 }
 
+/// What a host's agents report came in (plan 4d-B1-i).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportedIn {
+    /// A reconciled connection's `hello`.
+    Hello,
+    /// The answer to a `probe_agents`.
+    Probe,
+}
+
+/// A host's latest report of its agents (plan 4d-B1-i), as stored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentsRecord {
+    pub agents: Vec<AgentInfo>,
+    pub runtime: Option<RuntimeInfo>,
+    /// When the collector stored it (its own clock); `None` with `source:
+    /// none`.
+    pub reported_at: Option<i64>,
+    pub source: AgentsSource,
+}
+
+/// The stored JSON of a report.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct StoredAgents {
+    agents: Vec<AgentInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime: Option<RuntimeInfo>,
+}
+
 /// Whether text a host sent can be shown (the review's A6): at most `max`
 /// bytes, with no control or invisible format character.
 pub fn is_displayable_text(text: &str, max: usize) -> bool {
@@ -172,14 +202,10 @@ pub fn is_displayable_path(path: &str) -> bool {
     path.starts_with('/') && is_displayable_text(path, MAX_PATH)
 }
 
-/// Invisible Unicode format characters (bidi overrides and isolates,
-/// zero-width characters, the byte-order mark): a host name holding one can
-/// display as another host's name.
-pub(crate) fn is_format_char(c: char) -> bool {
-    matches!(c,
-        '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
-        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}' | '\u{FFF9}'..='\u{FFFB}')
-}
+// Invisible Unicode format characters (bidi overrides and isolates,
+// zero-width characters, the byte-order mark): a host name holding one can
+// display as another host's name. One list with the agents' reports.
+pub(crate) use hennery_proto::agents::is_format_char;
 
 /// A pairing code as typed, reduced to its eight canonical characters:
 /// case, dashes and spaces ignored, `O` read as `0`, `I` and `L` as `1`.
@@ -476,6 +502,70 @@ impl Hosts {
             params![host_id, serde_json::to_string(&kept)?, self.owner],
         )?;
         Ok(())
+    }
+
+    /// Store a report of `host_id`'s agents (plan 4d-B1-i), bounded again
+    /// here whatever the host claims (`bound_agents`, `RuntimeInfo::bounded`):
+    /// a host may lie, but only about itself. Not for a revoked host.
+    pub fn record_agents(
+        &self,
+        host_id: &str,
+        reported_in: ReportedIn,
+        agents: Vec<AgentInfo>,
+        runtime: Option<RuntimeInfo>,
+        now: i64,
+    ) -> Result<()> {
+        let stored = StoredAgents {
+            agents: bound_agents(agents),
+            runtime: runtime.map(RuntimeInfo::bounded),
+        };
+        let source = match reported_in {
+            ReportedIn::Hello => "hello",
+            ReportedIn::Probe => "probe",
+        };
+        self.conn().execute(
+            "UPDATE hosts SET agents = ?2, agents_reported_at = ?3, agents_source = ?4
+             WHERE id = ?1 AND revoked_at IS NULL AND owner_id = ?5",
+            params![host_id, serde_json::to_string(&stored)?, now, source, self.owner],
+        )?;
+        Ok(())
+    }
+
+    /// The latest report of `host_id`'s agents; `None` for an unknown host.
+    /// A host that never reported, or whose report cannot be read, has
+    /// `source: none`.
+    pub fn agents(&self, host_id: &str) -> Result<Option<AgentsRecord>> {
+        let row: Option<(Option<String>, Option<i64>, String)> = self
+            .conn()
+            .query_row(
+                "SELECT agents, agents_reported_at, agents_source FROM hosts WHERE id = ?1 AND owner_id = ?2",
+                [host_id, &self.owner],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((json, reported_at, source)) = row else {
+            return Ok(None);
+        };
+        let source = match source.as_str() {
+            "hello" => AgentsSource::Hello,
+            "probe" => AgentsSource::Probe,
+            _ => AgentsSource::None,
+        };
+        let stored = json.and_then(|json| serde_json::from_str::<StoredAgents>(&json).ok());
+        Ok(Some(match (stored, reported_at, source) {
+            (Some(stored), Some(at), AgentsSource::Hello | AgentsSource::Probe) => AgentsRecord {
+                agents: stored.agents,
+                runtime: stored.runtime,
+                reported_at: Some(at),
+                source,
+            },
+            _ => AgentsRecord {
+                agents: Vec::new(),
+                runtime: None,
+                reported_at: None,
+                source: AgentsSource::None,
+            },
+        }))
     }
 
     pub fn is_revoked(&self, host_id: &str) -> Result<bool> {

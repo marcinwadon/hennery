@@ -382,7 +382,7 @@ host.)*
 | `list_projects` | — (roots come from the host's config, §7) | `projects{items[], partial}` |
 | `browse_directory` | path | `directory{entries[]}` \| `error` |
 | `resolve_path` | path | `resolved_path{canonical, exists, is_dir}` \| `error` (kernel spec §5.4) |
-| `probe_agents` | — | `agents{…}` (same shape as in `hello`) |
+| `probe_agents` | — | `agents{agents[], runtime?}` (the shape of `hello`'s) \| `error{busy}`. Only to a host with the `probe_agents` capability; it names nothing: the host runs fixed read-only checks on its own agents (§6, plan 4d-B1-i). |
 | `forget_session` | agent, agent_session_id, agent_home, fallback? | `session_forgotten{outcome: complete \| partial, removed[{what, count}], remaining[{what, count, reason, retry}]}` \| `error`. Only to a host with the `forget_session` capability; kinds and reason codes are fixed, never paths (§4.10, plan 9d-i). `fallback` (optional, absent when false, plan 9d-ii): for Codex, spawn no app-server and run the fallback at once, after the same checks; set by the collector after three `app_server_timed_out` answers in a row; other agents ignore it. It only ever downgrades that session's own removal. |
 
 **Collector → host, not requests:**
@@ -456,12 +456,15 @@ host.)*
 `hello.agents[]` and `workspace_roots[]`; the projects probes and their
 responses; `forget_hat`. `resolve_path` / `resolved_path` are on the wire
 since plan 5b: probes, answered only by the connection they went out on.
+`hello.agents[]`, `hello.runtime` and `probe_agents` / `agents` are on the
+wire since plan 4d-B1-i.
 
 `hello` fields:
 
 - `capabilities`: `projects` (project enumeration and browsing), `images`
   (image content blocks in prompts), `park` (explicit park), `resolve_path`
-  (resolving typed paths, kernel spec §5.4). The collector
+  (resolving typed paths, kernel spec §5.4), `probe_agents` (checking its
+  agents live, §6; such a host reports them in `hello` too). The collector
   never sends a frame, or a prompt containing images, to a host that lacks the
   capability, as the host's current connection announces it (a host that
   reconnects on an older build between the check and the send is the one
@@ -491,6 +494,12 @@ since plan 5b: probes, answered only by the connection they went out on.
 - `agents[]`: per agent `{id, version, available, auth, catalog}` where
   `catalog` is the profile's **static default catalogue** (§6), so the
   New-session pickers work before the first session on a host exists.
+  *Built so far (plan 4d-B1-i):* per agent `{agent, available, auth, cli,
+  adapter_version?, images?, note?}`, with `runtime?` beside the list (§6);
+  no `catalog` yet. Read leniently, as `capabilities` are: an entry this
+  build cannot read is skipped, a runtime it cannot read is absent, and an
+  older host sends neither. The collector stores them only from a
+  reconciled connection of a host with the `probe_agents` capability.
 - `workspace_roots[]`: from the host's config (§7).
 
 Unknown frame types and unknown body kinds in either direction are logged
@@ -1455,6 +1464,27 @@ These are accidental cross-hat channels outside hennery's control in v1
 
 **Agent availability** in `hello.agents[]` and `probe_agents`:
 `available` = the adapter can be launched; `auth` = `ok | missing | unknown`.
+*Built so far (plan 4d-B1-i):* `hello` gives the static view: `available`
+means launchable as configured, `auth` is `unknown` and `images` absent. A
+`probe_agents` gives the live one, within 15 s for every check at once:
+each adapter is started exactly as a session's is (its own guarded group,
+the host's environment) and sent `initialize` alone, then killed;
+`available` means it answered, `adapter_version` is its `agentInfo.version`
+when readable, and `images` its `promptCapabilities.image`. A client hides
+images only when `images` is `false`; absent, it allows them, and
+`error{images_unsupported}` stays the guard. `auth` comes from the CLI
+alone, as doctor's check 4 asks it (exit 0 `ok`, another exit code
+`missing`; ended by a signal, no answer, or no known CLI `unknown`); only the
+exit status is kept, never
+a byte the CLI wrote, and the `_auth/status_update` notification is not
+read yet. `cli` says which CLI the agent runs: `bundled` (the set's),
+`override` (`--use-cli`) or `given` (`host run --agent`, of which hennery
+manages nothing). `runtime` says where the agents come from: `managed`
+(with `set_id`, `pinned` and `held`) or `given`. `note` is the host's own
+words, never an agent's. Both ends bound a report (16 agents, names of 64
+bytes of printable ASCII, versions of 64 bytes of `[0-9A-Za-z.+-]`, notes
+of 512 bytes with control and format characters replaced). One probe runs
+at a time on a host; another is answered `error{busy}`.
 Auth is taken, in order, from the adapter's `_auth/status_update` notification
 sent right after `initialize` (an underscore-prefixed extension both pinned
 adapters emit: `kind: "account"` or `kind: "none"`), then from the bundled CLI

@@ -151,6 +151,8 @@ impl ScriptedHost {
             workspace_roots: vec![],
             attached_sessions: attached,
             mcp_isolation: Default::default(),
+            agents: Default::default(),
+            runtime: Default::default(),
         })
         .await;
         let ack = host.next().await;
@@ -180,6 +182,8 @@ impl ScriptedHost {
             workspace_roots: vec![],
             attached_sessions: vec![],
             mcp_isolation: Default::default(),
+            agents: Default::default(),
+            runtime: Default::default(),
         })
         .await;
         host.next().await

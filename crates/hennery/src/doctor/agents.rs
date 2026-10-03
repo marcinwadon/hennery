@@ -51,7 +51,8 @@ pub struct Agent {
 
 /// `agent`'s bundled CLI in `set`, unless the set left it out, where 7b
 /// puts it: Claude's binary in its platform package, Codex's script run by
-/// the set's Node.
+/// the set's Node. Also called by `crate::host_agents`'s probe (plan
+/// 4d-B1-i), which keeps only its `program` and `args`.
 pub fn bundled_cli(set: &InstalledSet, agent: &str) -> Option<Cli> {
     let record = set.record.adapters.get(agent)?;
     if record.cli_skipped {
@@ -174,7 +175,8 @@ pub fn adapters_start(doctor: &Doctor) -> Finding {
 }
 
 /// How `agent`'s CLI says whether it is logged in, and how to log in.
-fn status_of(agent: &str) -> Option<(&'static [&'static str], &'static str)> {
+/// Also called by `crate::host_agents`'s probe (plan 4d-B1-i).
+pub(crate) fn status_of(agent: &str) -> Option<(&'static [&'static str], &'static str)> {
     match agent {
         "claude" => Some((
             &["auth", "status"],

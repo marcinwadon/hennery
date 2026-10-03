@@ -213,6 +213,10 @@ fn a_3b_ii_database_keeps_its_owner_or_gets_one() {
                 expected.insert("default_hat_id".into(), Value::Text(default_hat.clone()));
                 // Plan 6c's migration: no roots until a host reports some.
                 expected.insert("workspace_roots".into(), Value::Text("[]".into()));
+                // Plan 4d-B1-i's: no agents until a host reports them.
+                expected.insert("agents".into(), Value::Null);
+                expected.insert("agents_reported_at".into(), Value::Null);
+                expected.insert("agents_source".into(), Value::Text("none".into()));
             }
             assert_eq!(named_rows(&conn, table), vec![expected], "{table}");
         }
@@ -509,6 +513,16 @@ fn another_owners_hosts_and_codes_are_invisible_to_the_registry() {
         .record_hello("host-b2", "9.9.9", &Capabilities::default(), NOW + 5)
         .unwrap();
     hosts.record_workspace_roots("host-b2", &["/theirs".into()]).unwrap();
+    hosts
+        .record_agents(
+            "host-b2",
+            hennery_kernel::hosts::ReportedIn::Probe,
+            Vec::new(),
+            None,
+            NOW,
+        )
+        .unwrap();
+    assert_eq!(hosts.agents("host-b2").unwrap(), None);
     assert_eq!(
         hosts.enroll("BBBB-BBBB", &enrollment(3), NOW).unwrap(),
         EnrollOutcome::InvalidCode

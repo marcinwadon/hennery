@@ -17,6 +17,7 @@ pub const NO_RUNTIME: &str = "no managed runtime on this platform";
 
 /// Whether a user other than `uid` (and root) can write to `path`: its
 /// group or others may, or someone else owns it. Agents run what is there.
+/// Also called by `crate::host_agents`'s probe (plan 4d-B1-i).
 pub fn writable_by_others(path: &Path, uid: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(path).is_ok_and(|m| m.mode() & 0o022 != 0 || (m.uid() != uid && m.uid() != 0))

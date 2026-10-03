@@ -4,11 +4,9 @@
 
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
-use hennery_host::AgentCommand;
 use hennery_host::runtime::agents::{self, UseCli};
 use hennery_host::runtime::download::Sources;
 use hennery_host::runtime::install::{self, Installed, InstalledSet, Layout, Selection};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 #[derive(Subcommand)]
@@ -185,17 +183,11 @@ pub async fn after_join(data_dir: &Path, host_id: &str, choices: &[UseCli], mirr
 
 /// `host run`'s agents with no `--agent`: from the installed set, after
 /// installing the pinned one if it is not current, with their profiles and
-/// the Codex CLI a forget runs `app-server` from (plan 9d decision 9). The
-/// file returned holds that set in use for as long as it is kept.
-pub async fn default_agents(
-    data_dir: &Path,
-    mirrors: &MirrorArgs,
-) -> (
-    HashMap<String, AgentCommand>,
-    HashMap<String, hennery_host::profile::Profile>,
-    Option<AgentCommand>,
-    Option<std::fs::File>,
-) {
+/// the Codex CLI a forget runs `app-server` from (plan 9d decision 9). Its
+/// `in_use` holds that set in use for as long as it is kept; its `set`,
+/// `agents.infos` and `runtime` are what the host reports of them (plan
+/// 4d-B1-i).
+pub async fn default_agents(data_dir: &Path, mirrors: &MirrorArgs) -> agents::Prepared {
     // A bad mirror skips the install, and never falls back to the public
     // registry; it does not stop the host either.
     let sources = mirrors
@@ -210,12 +202,7 @@ pub async fn default_agents(
     if let Some(set) = &prepared.set {
         tracing::info!(set = %set.id, "agents from the adapter set: {}", versions(set));
     }
-    (
-        prepared.agents.agents,
-        prepared.agents.profiles,
-        prepared.agents.codex_app_server,
-        prepared.in_use,
-    )
+    prepared
 }
 
 fn versions(set: &InstalledSet) -> String {

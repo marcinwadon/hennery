@@ -9,6 +9,7 @@ use crate::adapter::AgentCommand;
 use crate::identity::{CONFIG_FILE, read_table, write_private};
 use crate::profile::Profile;
 use anyhow::{Context, Result, bail};
+use hennery_proto::agents::{AgentAuth, AgentCli, AgentInfo, RuntimeInfo, RuntimeSource};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
@@ -151,6 +152,23 @@ pub struct Agents {
     pub codex_app_server: Option<AgentCommand>,
     /// One line per agent left out, or launched with a caveat.
     pub notes: Vec<String>,
+    /// Every agent of the set, those left out too, as `hello` reports them
+    /// (plan 4d-B1-i): its CLI, the version the set records, and the note
+    /// that concerns it. In the set's order.
+    pub infos: Vec<AgentInfo>,
+}
+
+/// An agent of a set, as `hello` reports it before any probe.
+fn info(name: &str, version: &str, cli: AgentCli, available: bool, note: Option<&String>) -> AgentInfo {
+    AgentInfo {
+        agent: name.to_string(),
+        available,
+        auth: AgentAuth::Unknown,
+        cli,
+        adapter_version: Some(version.to_string()),
+        images: None,
+        note: note.cloned(),
+    }
 }
 
 /// Each adapter of `set`, started as `<node> <set>/<agent>/<entry>`, with
@@ -166,8 +184,11 @@ pub fn from_set(set: &InstalledSet, overrides: &BTreeMap<String, PathBuf>) -> Ag
             args: vec![entry.to_string_lossy().into_owned()],
             env: Vec::new(),
         };
+        let version = &adapter.version;
         let mut own_cli = false;
-        match (overrides.get(name), cli_var(name)) {
+        let mut cli = AgentCli::Bundled;
+        // This agent's note, if any: in `notes` and in its `infos` entry.
+        let note = match (overrides.get(name), cli_var(name)) {
             (Some(path), Some(var)) => match check_cli(path) {
                 Ok(path) => {
                     own_cli = true;
@@ -179,40 +200,46 @@ pub fn from_set(set: &InstalledSet, overrides: &BTreeMap<String, PathBuf>) -> Ag
                         });
                     }
                     command.env.push((var.to_string(), path.to_string_lossy().into_owned()));
-                    if !adapter.cli_skipped {
-                        out.notes.push(format!(
-                            "{name}: using {} rather than the set's bundled CLI",
-                            path.display()
-                        ));
-                    }
+                    cli = AgentCli::Override;
+                    (!adapter.cli_skipped)
+                        .then(|| format!("{name}: using {} rather than the set's bundled CLI", path.display()))
                 }
                 Err(err) => {
-                    out.notes
-                        .push(format!("{name} is unavailable: its --use-cli CLI: {err:#}"));
+                    let note = format!("{name} is unavailable: its --use-cli CLI: {err:#}");
+                    out.infos
+                        .push(info(name, version, AgentCli::Override, false, Some(&note)));
+                    out.notes.push(note);
                     continue;
                 }
             },
             (Some(_), None) => {
-                out.notes
-                    .push(format!("{name}: no CLI override is possible; host.toml's is ignored"));
+                let note = format!("{name}: no CLI override is possible; host.toml's is ignored");
                 if adapter.cli_skipped {
+                    out.infos.push(info(name, version, cli, false, Some(&note)));
+                    out.notes.push(note);
                     continue;
                 }
+                Some(note)
             }
             (None, _) if adapter.cli_skipped => {
-                out.notes.push(format!(
+                let note = format!(
                     "{name} is unavailable: its set has no bundled CLI and host.toml names none; \
                      run `hennery host adapters update`"
-                ));
+                );
+                out.infos.push(info(name, version, cli, false, Some(&note)));
+                out.notes.push(note);
                 continue;
             }
             (None, _) => {
                 if name == crate::agent_home::CODEX {
                     out.codex_app_server = bundled_codex(set);
                 }
+                None
             }
-        }
+        };
         out.profiles.insert(name.clone(), Profile::of_installed(name, own_cli));
+        out.infos.push(info(name, version, cli, true, note.as_ref()));
+        out.notes.extend(note);
         out.agents.insert(name.clone(), command);
     }
     out
@@ -238,6 +265,20 @@ pub struct Prepared {
     /// collection removes it.
     pub in_use: Option<std::fs::File>,
     pub set: Option<InstalledSet>,
+    /// The runtime as `hello` reports it (plan 4d-B1-i): the set, whether
+    /// it is the pinned one, and whether a rollback holds the host on it.
+    /// `None` only when the host's data directory has no layout at all.
+    pub runtime: Option<RuntimeInfo>,
+}
+
+/// A managed runtime running `set`, if any.
+fn managed(set: Option<&InstalledSet>, selection: Option<&Selection>, layout: &Layout) -> RuntimeInfo {
+    RuntimeInfo {
+        source: RuntimeSource::Managed,
+        set_id: set.map(|set| set.id.clone()),
+        pinned: set.zip(selection).map(|(set, selection)| set.id == selection.set_id()),
+        held: Some(layout.held()),
+    }
 }
 
 /// `host run` without `--agent` (decisions 11–13): install `selection` from
@@ -328,18 +369,28 @@ pub async fn prepare(
                 selection.set_id()
             ));
         }
+        let runtime = Some(managed(Some(&set), selection, &layout));
         if !set.node.is_file() {
             notes.push(format!(
                 "the adapter set's Node ({}) is missing: no agents run; `hennery host adapters update` installs it again",
                 set.node.display()
             ));
+            // Every agent of the set, none launchable.
+            let infos = set
+                .record
+                .adapters
+                .iter()
+                .map(|(name, adapter)| info(name, &adapter.version, AgentCli::Bundled, false, notes.last()))
+                .collect();
             return Prepared {
                 agents: Agents {
                     notes,
+                    infos,
                     ..Agents::default()
                 },
                 in_use: Some(in_use),
                 set: Some(set),
+                runtime,
             };
         }
         let mut agents = from_set(&set, &overrides);
@@ -349,6 +400,7 @@ pub async fn prepare(
             agents,
             in_use: Some(in_use),
             set: Some(set),
+            runtime,
         };
     }
     if let Some(err) = lost {
@@ -361,6 +413,7 @@ pub async fn prepare(
             notes,
             ..Agents::default()
         },
+        runtime: Some(managed(None, selection, &layout)),
         ..Prepared::default()
     }
 }

@@ -23,6 +23,12 @@ mod spawn;
 #[cfg(test)]
 mod tests;
 
+// What `probe_agents` takes of doctor's knowledge (plan 4d-B1-i,
+// `crate::host_agents`): check 4's CLI and question. `pub(crate)` only;
+// `Cli` is not re-exported, so the host never holds one to `run`.
+pub(crate) use agents::{bundled_cli, status_of};
+pub(crate) use runtime::writable_by_others;
+
 use crate::service::{Context, Ran, System};
 use anyhow::Result;
 use clap::Args;

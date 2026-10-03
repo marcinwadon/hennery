@@ -1053,3 +1053,205 @@ async fn a_first_run_that_fails_or_hangs_is_only_noted() {
     );
     assert!(ran.exists(), "{lines}");
 }
+
+// Plan 4d-B1-i: what a host start reports of its agents and its runtime.
+
+fn info_of<'a>(prepared: &'a agents::Prepared, name: &str) -> &'a hennery_proto::agents::AgentInfo {
+    prepared
+        .agents
+        .infos
+        .iter()
+        .find(|a| a.agent == name)
+        .unwrap_or_else(|| panic!("no {name} in {:?}", prepared.agents.infos))
+}
+
+/// The pinned set, current: each agent bundled, launchable, with the
+/// version the set records; the runtime pinned and not held.
+#[tokio::test]
+async fn a_start_reports_each_agent_with_its_cli_and_version_and_the_pinned_set() {
+    use hennery_proto::agents::{AgentAuth, AgentCli, RuntimeInfo, RuntimeSource};
+    let server = Server::start().await;
+    let fixture = Fixture::new("1.0.0");
+    fixture.serve(&server);
+    let (_dir, layout) = data_dir();
+    let selection = selection(&fixture, &[]);
+    let prepared = agents::prepare(&host_dir(&layout), Some(&selection), Some(&server.sources()), &quiet).await;
+    let names: Vec<&str> = prepared.agents.infos.iter().map(|a| a.agent.as_str()).collect();
+    assert_eq!(names, ["claude", "codex"]);
+    for name in ["claude", "codex"] {
+        let info = info_of(&prepared, name);
+        assert!(info.available, "{info:?}");
+        assert_eq!((info.cli, info.auth), (AgentCli::Bundled, AgentAuth::Unknown));
+        assert_eq!(info.adapter_version.as_deref(), Some("1.0.0"));
+        assert_eq!((info.images, info.note.as_deref()), (None, None));
+    }
+    assert_eq!(
+        prepared.runtime,
+        Some(RuntimeInfo {
+            source: RuntimeSource::Managed,
+            set_id: Some(selection.set_id()),
+            pinned: Some(true),
+            held: Some(false),
+        })
+    );
+}
+
+/// An older set runs while offline: not the pinned one. Rolled back to it:
+/// held too.
+#[tokio::test]
+async fn a_start_on_another_set_says_it_is_not_pinned_and_a_rollback_says_it_holds() {
+    let server = Server::start().await;
+    let (one, two) = (Fixture::new("1.0.0"), Fixture::new("2.0.0"));
+    one.serve(&server);
+    let (_dir, layout) = data_dir();
+    install::install(&layout, &selection(&one, &[]), &server.sources(), &quiet)
+        .await
+        .unwrap();
+    let prepared = agents::prepare(
+        &host_dir(&layout),
+        Some(&selection(&two, &[])),
+        Some(&offline()),
+        &quiet,
+    )
+    .await;
+    let runtime = prepared.runtime.unwrap();
+    assert_eq!(runtime.set_id, Some(selection(&one, &[]).set_id()));
+    assert_eq!((runtime.pinned, runtime.held), (Some(false), Some(false)));
+    two.serve(&server);
+    install::install(&layout, &selection(&two, &[]), &server.sources(), &quiet)
+        .await
+        .unwrap();
+    install::rollback(&layout, &quiet).await.unwrap();
+    let prepared = agents::prepare(
+        &host_dir(&layout),
+        Some(&selection(&two, &[])),
+        Some(&server.sources()),
+        &quiet,
+    )
+    .await;
+    let runtime = prepared.runtime.unwrap();
+    assert_eq!((runtime.pinned, runtime.held), (Some(false), Some(true)));
+    // With no pin on this platform, whether the set is pinned is not known.
+    let prepared = agents::prepare(&host_dir(&layout), None, None, &quiet).await;
+    assert_eq!(prepared.runtime.unwrap().pinned, None);
+}
+
+/// Every agent of the set is reported, those left out too, with why.
+#[tokio::test]
+async fn an_agent_left_out_is_reported_unavailable_with_its_note() {
+    use hennery_proto::agents::AgentCli;
+    let server = Server::start().await;
+    let fixture = Fixture::new("1.0.0");
+    fixture.serve(&server);
+    let (_dir, layout) = data_dir();
+    let dir = host_dir(&layout);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("host.toml"), "[cli]\nclaude = \"/bin/sh\"\n").unwrap();
+    let selection = selection(&fixture, &["claude"]);
+    // A valid override: launchable, and its CLI is the operator's.
+    let prepared = agents::prepare(&dir, Some(&selection), Some(&server.sources()), &quiet).await;
+    let claude = info_of(&prepared, "claude");
+    assert!(claude.available);
+    assert_eq!(claude.cli, AgentCli::Override);
+    assert_eq!(claude.note, None, "the set skipped the bundled CLI: nothing to say");
+    assert_eq!(info_of(&prepared, "codex").cli, AgentCli::Bundled);
+    // The override gone: no CLI at all.
+    std::fs::write(dir.join("host.toml"), "").unwrap();
+    let prepared = agents::prepare(&dir, Some(&selection), Some(&server.sources()), &quiet).await;
+    let claude = info_of(&prepared, "claude");
+    assert!(!claude.available);
+    assert_eq!(claude.cli, AgentCli::Bundled);
+    assert!(
+        claude.note.as_deref().unwrap().contains("claude is unavailable"),
+        "{claude:?}"
+    );
+    assert_eq!(claude.adapter_version.as_deref(), Some("1.0.0"));
+    // An override that does not run: unavailable, and it says which.
+    std::fs::write(dir.join("host.toml"), "[cli]\nclaude = \"/nonexistent/claude\"\n").unwrap();
+    let prepared = agents::prepare(&dir, Some(&selection), Some(&server.sources()), &quiet).await;
+    let claude = info_of(&prepared, "claude");
+    assert!(!claude.available);
+    assert_eq!(claude.cli, AgentCli::Override);
+    assert!(
+        claude.note.as_deref().unwrap().contains("/nonexistent/claude"),
+        "{claude:?}"
+    );
+    assert!(prepared.agents.infos.iter().filter(|a| a.available).count() == 1);
+}
+
+/// An override beside the set's bundled CLI is launchable, and its note
+/// says so.
+#[tokio::test]
+async fn an_override_beside_a_bundled_cli_is_reported_with_its_note() {
+    use hennery_proto::agents::AgentCli;
+    let server = Server::start().await;
+    let fixture = Fixture::new("1.0.0");
+    fixture.serve(&server);
+    let (_dir, layout) = data_dir();
+    let dir = host_dir(&layout);
+    install::install(&layout, &selection(&fixture, &[]), &server.sources(), &quiet)
+        .await
+        .unwrap();
+    std::fs::write(dir.join("host.toml"), "[cli]\nclaude = \"/bin/sh\"\n").unwrap();
+    let prepared = agents::prepare(&dir, Some(&selection(&fixture, &[])), None, &quiet).await;
+    let claude = info_of(&prepared, "claude");
+    assert!(claude.available);
+    assert_eq!(claude.cli, AgentCli::Override);
+    assert!(
+        claude
+            .note
+            .as_deref()
+            .unwrap()
+            .contains("rather than the set's bundled CLI"),
+        "{claude:?}"
+    );
+    assert_eq!(info_of(&prepared, "codex").note, None);
+}
+
+/// No set at all: a managed runtime with nothing in it.
+#[tokio::test]
+async fn with_no_set_the_runtime_is_managed_and_empty() {
+    use hennery_proto::agents::{RuntimeInfo, RuntimeSource};
+    let fixture = Fixture::new("1.0.0");
+    let (_dir, layout) = data_dir();
+    let prepared = agents::prepare(
+        &host_dir(&layout),
+        Some(&selection(&fixture, &[])),
+        Some(&offline()),
+        &quiet,
+    )
+    .await;
+    assert!(prepared.agents.infos.is_empty());
+    assert_eq!(
+        prepared.runtime,
+        Some(RuntimeInfo {
+            source: RuntimeSource::Managed,
+            set_id: None,
+            pinned: None,
+            held: Some(false),
+        })
+    );
+}
+
+/// A set whose Node is gone: each of its agents, none launchable.
+#[tokio::test]
+async fn a_set_without_its_node_reports_every_agent_unavailable() {
+    let server = Server::start().await;
+    let fixture = Fixture::new("1.0.0");
+    fixture.serve(&server);
+    let (_dir, layout) = data_dir();
+    let selection = selection(&fixture, &[]);
+    let set = install::install(&layout, &selection, &server.sources(), &quiet)
+        .await
+        .unwrap()
+        .set()
+        .clone();
+    std::fs::remove_file(&set.node).unwrap();
+    let prepared = agents::prepare(&host_dir(&layout), Some(&selection), Some(&offline()), &quiet).await;
+    assert_eq!(prepared.agents.infos.len(), 2);
+    for info in &prepared.agents.infos {
+        assert!(!info.available, "{info:?}");
+        assert!(info.note.as_deref().unwrap().contains("is missing"), "{info:?}");
+    }
+    assert_eq!(prepared.runtime.unwrap().set_id, Some(set.id));
+}

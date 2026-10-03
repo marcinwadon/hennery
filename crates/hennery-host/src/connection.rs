@@ -5,6 +5,7 @@
 //! writing to the outbox, which is resent on the next connection.
 
 use crate::agent_home::Registry;
+use crate::availability::{self, AgentChecks, NoChecks, OneProbe};
 use crate::forget::{Forget, ForgetContext};
 use crate::identity::HostKey;
 use crate::outbox::Outbox;
@@ -16,6 +17,7 @@ use crate::session::{
 use crate::uplink::Uplink;
 use anyhow::{Context, Result, bail};
 use futures::{SinkExt, StreamExt};
+use hennery_proto::agents::{AgentInfo, AgentList, MaybeRuntime, RuntimeInfo};
 use hennery_proto::frames::{
     AgentIsolation, AttachedSession, Capabilities, Capability, CollectorFrame, ForgetReason, HostFrame, McpDelivery,
     SessionConfig,
@@ -74,6 +76,17 @@ pub struct HostConfig {
     /// `git` for the sessions' git probe (ACP core §7), found on `PATH` once,
     /// when the host starts; `None`: no `git_state`.
     pub git: Option<PathBuf>,
+    /// The managed runtime's agents as `hello` reports them (plan
+    /// 4d-B1-i), those left out of `agents` too. An agent of `agents` not
+    /// in it is reported as given by `--agent`.
+    pub agent_infos: Vec<AgentInfo>,
+    /// Where the agents come from, as `hello` and `probe_agents` report it.
+    pub runtime: Option<RuntimeInfo>,
+    /// Doctor's knowledge for `probe_agents` (the binary's): none unless
+    /// set.
+    pub checks: Arc<dyn AgentChecks>,
+    /// How long one `probe_agents` takes at most.
+    pub probe_budget: Duration,
 }
 
 impl HostConfig {
@@ -96,7 +109,21 @@ impl HostConfig {
             workspace_roots: Vec::new(),
             home: None,
             git: crate::git::find_git(),
+            agent_infos: Vec::new(),
+            runtime: None,
+            checks: Arc::new(NoChecks),
+            probe_budget: availability::PROBE_BUDGET,
         }
+    }
+
+    /// `hello.agents`: the static view (plan 4d-B1-i).
+    pub fn static_agents(&self) -> Vec<AgentInfo> {
+        availability::static_agents(&self.agents, &self.agent_infos)
+    }
+
+    /// `hello.runtime` and the probe's, bounded.
+    pub fn reported_runtime(&self) -> Option<RuntimeInfo> {
+        self.runtime.clone().map(RuntimeInfo::bounded)
     }
 
     /// `hello.workspace_roots`: the roots as configured.
@@ -167,14 +194,15 @@ pub async fn run_until(cfg: HostConfig, shutdown: impl Future<Output = ()>) -> R
         &cfg.data_dir.join(crate::agent_home::FILE),
     )?);
     let sessions: Sessions = Arc::new(Mutex::new(SessionMap::default()));
-    // Outlives each connection, so its bounds hold across reconnects.
+    // Outlive each connection, so their bounds hold across reconnects.
     let probes = Probes::default();
+    let one_probe = OneProbe::default();
     // Ends only when the collector says this host is revoked.
     let serve = async {
         let mut backoff = cfg.reconnect_min;
         loop {
-            if let Err(err) = connect_once(&cfg, &uplink, &sessions, &probes, &homes, &mut replies, &mut backoff).await
-            {
+            let probes = (&probes, &one_probe);
+            if let Err(err) = connect_once(&cfg, &uplink, &sessions, probes, &homes, &mut replies, &mut backoff).await {
                 if revoked(&err) {
                     return err;
                 }
@@ -287,17 +315,19 @@ type WsStream = futures::stream::SplitStream<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
 >;
 
-/// Connect, send a `hello` signed over this connection's nonce (ACP core
-/// §3.5), and read the collector's answer. `attached` is read once the
-/// socket is up, right before the `hello` goes out.
 /// What a `hello` reports of the host's configuration: nothing for a
-/// probe.
+/// probe of the pairing (`probe`).
 #[derive(Default)]
 struct Announce {
     workspace_roots: Vec<String>,
     mcp_isolation: AgentIsolation,
+    agents: Vec<AgentInfo>,
+    runtime: Option<RuntimeInfo>,
 }
 
+/// Connect, send a `hello` signed over this connection's nonce (ACP core
+/// §3.5), and read the collector's answer. `attached` is read once the
+/// socket is up, right before the `hello` goes out.
 async fn handshake(
     collector_url: &str,
     host_id: &str,
@@ -345,10 +375,13 @@ async fn handshake(
                 Capability::ResolvePath,
                 Capability::ForgetSession,
                 Capability::McpServers,
+                Capability::ProbeAgents,
             ]),
             mcp_isolation: announce.mcp_isolation,
             workspace_roots: announce.workspace_roots,
             attached_sessions: attached()?,
+            agents: AgentList(announce.agents),
+            runtime: MaybeRuntime(announce.runtime),
         },
     )
     .await?;
@@ -384,19 +417,22 @@ async fn connect_once(
     cfg: &HostConfig,
     uplink: &Uplink,
     sessions: &Sessions,
-    probes: &Probes,
+    probes: (&Probes, &OneProbe),
     homes: &Arc<Registry>,
     replies: &mut mpsc::UnboundedReceiver<HostFrame>,
     backoff: &mut Duration,
 ) -> Result<()> {
+    let announce = Announce {
+        workspace_roots: cfg.reported_roots(),
+        mcp_isolation: cfg.mcp_isolation(),
+        agents: cfg.static_agents(),
+        runtime: cfg.reported_runtime(),
+    };
     let (mut sink, mut stream, answer) = handshake(
         &cfg.collector_url,
         &cfg.host_id,
         &cfg.key,
-        Announce {
-            workspace_roots: cfg.reported_roots(),
-            mcp_isolation: cfg.mcp_isolation(),
-        },
+        announce,
         || attached_sessions(uplink, sessions),
         cfg.connect_timeout,
         cfg.read_timeout,
@@ -687,7 +723,7 @@ fn handle(
     cfg: &HostConfig,
     uplink: &Uplink,
     sessions: &Sessions,
-    probes: &Probes,
+    (probes, one_probe): (&Probes, &OneProbe),
     homes: &Arc<Registry>,
     frame: CollectorFrame,
 ) -> Result<()> {
@@ -863,9 +899,41 @@ fn handle(
                 fallback,
             },
         ),
+        CollectorFrame::ProbeAgents { request_id } => probe_agents(cfg, uplink, one_probe, request_id),
         CollectorFrame::HelloAck { .. } | CollectorFrame::HelloError { .. } => {}
     }
     Ok(())
+}
+
+/// `probe_agents` (plan 4d-B1-i): the fixed checks on this host's own
+/// agents, in a task of its own, answered on the reply channel. One at a
+/// time: another is answered `busy`.
+fn probe_agents(cfg: &HostConfig, uplink: &Uplink, one_probe: &OneProbe, request_id: String) {
+    let Some(slot) = one_probe.try_start() else {
+        return uplink.reply(HostFrame::Error {
+            request_id,
+            code: "busy".into(),
+            message: "a probe of the agents is running".into(),
+        });
+    };
+    let report = cfg.static_agents();
+    let runtime = cfg.reported_runtime();
+    let agents = cfg.agents.clone();
+    let checks = cfg.checks.clone();
+    // The home directory, never the host's own working directory: a
+    // repository there could configure an agent with code of its own.
+    let cwd = cfg.home.clone().unwrap_or_else(|| PathBuf::from("/"));
+    let budget = cfg.probe_budget;
+    let uplink = uplink.clone();
+    tokio::spawn(async move {
+        let agents = availability::probe(&report, &agents, checks, &cwd, budget).await;
+        uplink.reply(HostFrame::Agents {
+            request_id,
+            agents: AgentList(agents),
+            runtime: MaybeRuntime(runtime),
+        });
+        drop(slot);
+    });
 }
 
 /// `forget_session` (plan 9d decision 8): the id first, then the registry

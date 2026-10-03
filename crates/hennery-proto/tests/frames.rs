@@ -410,6 +410,8 @@ fn hello_capabilities_skip_unknown_entries_and_default_to_none() {
         workspace_roots: vec![],
         attached_sessions: vec![],
         mcp_isolation: Default::default(),
+        agents: Default::default(),
+        runtime: Default::default(),
     };
     assert_eq!(serde_json::to_value(&sent).unwrap()["capabilities"], json!(["park"]));
 }
