@@ -108,7 +108,8 @@ pub const DECODERS: &[Decoder] = &[
     Decoder::CJson,
 ];
 
-fn cut_at_nul(s: &str) -> &str {
+/// A string cut at its first NUL, as a C reader hands it on.
+pub fn cut_at_nul(s: &str) -> &str {
     s.split('\0').next().unwrap_or_default()
 }
 
@@ -129,7 +130,7 @@ impl Decoder {
     }
 
     /// The member `name` of `node`, as this decoder finds it.
-    fn get<'a>(self, node: &'a Node, name: &str) -> Option<&'a Node> {
+    pub fn get<'a>(self, node: &'a Node, name: &str) -> Option<&'a Node> {
         let Node::Obj(entries) = node else {
             return None;
         };

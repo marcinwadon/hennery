@@ -3,13 +3,13 @@
 //! `internal_network`, as every test connection must (lane L7): there is
 //! no test-only bypass.
 
-use super::World;
+use super::{Recorder, World, test_egress};
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode, header};
 use axum::response::Response;
 use hennery_gateway::proxy::{Limits, ProxyState, router};
-use hennery_kernel::egress::{Egress, Timeouts};
+use hennery_gateway::runtime::Runtime;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -182,6 +182,10 @@ pub struct Harness {
     pub world: World,
     pub addr: SocketAddr,
     pub client: reqwest::Client,
+    /// The proxy's runtime (plan 8f): its refresh locks and flows.
+    pub runtime: Arc<Runtime>,
+    /// What the `Notifier` was told.
+    pub alerts: Arc<Recorder>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -205,19 +209,19 @@ impl Harness {
     }
 
     pub async fn with_limits(limits: Limits) -> Self {
+        Self::with(limits, |runtime| runtime).await
+    }
+
+    /// The proxy on a runtime `adjust` may change (a shorter refresh bound).
+    pub async fn with(limits: Limits, adjust: impl FnOnce(Runtime) -> Runtime) -> Self {
         let world = World::new();
-        let egress = Egress::new(Timeouts {
-            connect: Duration::from_secs(2),
-            request: Duration::from_secs(10),
-        })
-        .unwrap();
-        let app = router(ProxyState::full(
-            world.proxy_store.clone(),
-            world.store.clone(),
-            world.key.clone(),
-            egress,
-            limits,
+        let alerts = Arc::new(Recorder::default());
+        let runtime = Arc::new(adjust(
+            Arc::try_unwrap(world.runtime(test_egress(), alerts.clone()))
+                .ok()
+                .unwrap(),
         ));
+        let app = router(ProxyState::for_sessions(runtime.clone(), limits));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let task = tokio::spawn(async move {
@@ -228,6 +232,8 @@ impl Harness {
             world,
             addr,
             client,
+            runtime,
+            alerts,
             task,
         }
     }

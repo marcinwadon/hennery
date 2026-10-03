@@ -77,16 +77,17 @@ const READ_METHODS: &[&str] = &["tools/call", "tools/list", "initialize"];
 
 /// A key as such a decoder compares it with the names the gateway reads:
 /// up to its first NUL, as json-c and cJSON keep keys and strings in C
-/// strings; ASCII case, and `ſ` as `s`. Unicode folds only one other letter
-/// to an ASCII one, the Kelvin sign to `k`, and no name read here has a
-/// `k`. Go's `encoding/json/v2`, matching names case-insensitively, ignores
-/// `_` and `-` as well (the re-confirmation's F1).
+/// strings; ASCII case, `ſ` as `s`, and the Kelvin sign as `k`, the two
+/// letters Unicode folds to ASCII ones (plan 8f: `token_endpoint` has a
+/// `k`). Go's `encoding/json/v2`, matching names case-insensitively,
+/// ignores `_` and `-` as well (the re-confirmation's F1).
 fn folded(key: &str) -> String {
     key.chars()
         .take_while(|c| *c != '\0')
         .filter(|c| !matches!(c, '_' | '-'))
         .map(|c| match c {
             '\u{17f}' => 's',
+            '\u{212a}' => 'k',
             c => c.to_ascii_lowercase(),
         })
         .collect()
@@ -99,7 +100,7 @@ fn respelt_word(word: &str, names: &[&str]) -> bool {
 }
 
 /// Whether `object` has a key that folds to one of `names` without being it.
-fn respelt(object: &serde_json::Map<String, Value>, names: &[&str]) -> bool {
+pub(crate) fn respelt(object: &serde_json::Map<String, Value>, names: &[&str]) -> bool {
     object.keys().any(|key| respelt_word(key, names))
 }
 
@@ -393,6 +394,13 @@ pub fn read(bytes: &[u8]) -> Option<Value> {
     serde_json::from_slice::<Unique>(bytes).ok()?;
     let value = serde_json::from_slice::<Value>(bytes).ok()?;
     (!ambiguous(&value)).then_some(value)
+}
+
+/// Whether `bytes` is JSON with no key twice in one object at any depth:
+/// what a parser keeping the first of two keys and one keeping the last
+/// read alike (plan 8d; plan 8f reads OAuth documents only so).
+pub(crate) fn unique_keys(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<Unique>(bytes).is_ok()
 }
 
 /// Any JSON, refusing a key twice in one object at any depth.

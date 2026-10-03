@@ -335,6 +335,63 @@ pub fn check_url(url: &Url, allowance: Allowance) -> Result<(), Refused> {
     Ok(())
 }
 
+/// `https`, or plain `http` to loopback: the scheme rule for OAuth's URLs
+/// (gateway spec §4, §5.7), which stays this even for a connection marked
+/// "internal network", whose client [`check_url`] lets send plain `http`
+/// to internal addresses (plan 8b-ii). The OAuth caller checks it itself
+/// before sending (plan 8f).
+pub fn is_https_or_loopback(url: &Url) -> bool {
+    match url.scheme() {
+        "https" => true,
+        "http" => is_loopback_host(url),
+        _ => false,
+    }
+}
+
+/// Why [`read_capped`] did not return a body.
+#[derive(Debug)]
+pub enum BodyError {
+    /// Longer than the cap, declared or as read.
+    TooLarge,
+    /// It failed while it was read (its deadline included), without the
+    /// URL.
+    Failed(reqwest::Error),
+}
+
+impl fmt::Display for BodyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BodyError::TooLarge => f.write_str("the response body is over its limit"),
+            BodyError::Failed(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for BodyError {}
+
+/// `response`'s body, refused past `max` bytes: a declared length over it
+/// is refused before anything is read, and the read stops at the first
+/// chunk past it. [`EgressClient::send`] bounds a request's time, not its
+/// size; this is the size (the egress plan's O3), for every caller that
+/// reads a whole body (OAuth's documents and token responses, plan 8f).
+pub async fn read_capped(mut response: Response, max: usize) -> Result<Vec<u8>, BodyError> {
+    if response.content_length().is_some_and(|len| len > max as u64) {
+        return Err(BodyError::TooLarge);
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|err| BodyError::Failed(err.without_url()))?
+    {
+        if out.len() + chunk.len() > max {
+            return Err(BodyError::TooLarge);
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
 fn is_loopback_host(url: &Url) -> bool {
     match url.host() {
         Some(Host::Domain(name)) => is_localhost(name),

@@ -1,8 +1,8 @@
 //! The gateway's tables in `hennery.db` (gateway spec §2), migrated as a
 //! component of their own (`db::migrate_component`), beside the kernel's
 //! and the sessions store's. Plan 8a makes the first three, plan 8d the
-//! session tokens; later plans add standalone clients, OAuth clients and
-//! stdio servers.
+//! session tokens, plan 8f the OAuth clients; later plans add standalone
+//! clients and stdio servers.
 //!
 //! Every table carries `owner_id` (lane L6). A connection's hat and a
 //! mount's host are the owner's by composite foreign keys (plan 5a decision
@@ -79,5 +79,46 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         FOREIGN KEY (hat_id, owner_id) REFERENCES hats(id, owner_id));
     CREATE INDEX gw_session_tokens_by_host ON gw_session_tokens(owner_id, host_id);
     CREATE INDEX gw_session_tokens_by_hat ON gw_session_tokens(owner_id, hat_id);
+    ",
+    // Plan 8f: OAuth (gateway spec §4, §7). A connection learns when it was
+    // last checked, why its latest Connect failed, and the protected-resource
+    // document's `resource` when it is not the URL (found, or accepted). Its
+    // OAuth client is one row: the client its grant was made with (or, with
+    // no grant yet, the one the next Connect uses), pinned to the
+    // authorization server it was first used with, and a pre-registered
+    // client saved while a grant is live, which replaces it only when a
+    // Connect with it completes (G-7). Secrets are sealed (`crypto`), each
+    // under a field of its own; whether one is stored is a column apart, so
+    // a list never reads a ciphertext (plan 8a decision 3).
+    "
+    ALTER TABLE gw_connections ADD COLUMN checked_at INTEGER;
+    ALTER TABLE gw_connections ADD COLUMN oauth_error_code TEXT;
+    ALTER TABLE gw_connections ADD COLUMN oauth_error_message TEXT;
+    ALTER TABLE gw_connections ADD COLUMN oauth_error_at INTEGER;
+    ALTER TABLE gw_connections ADD COLUMN resource_mismatch TEXT;
+    ALTER TABLE gw_connections ADD COLUMN accepted_resource TEXT;
+    CREATE TABLE gw_oauth_clients (
+        connection_id TEXT PRIMARY KEY,
+        owner_id TEXT NOT NULL,
+        client_id TEXT NOT NULL,
+        has_client_secret INTEGER NOT NULL CHECK (has_client_secret IN (0, 1)),
+        client_secret_ciphertext BLOB,
+        key_version INTEGER,
+        token_endpoint_auth_method TEXT
+            CHECK (token_endpoint_auth_method IN ('none', 'client_secret_basic', 'client_secret_post')),
+        issuer TEXT,
+        authorization_endpoint TEXT,
+        token_endpoint TEXT,
+        redirect_uri TEXT,
+        scopes TEXT,
+        resource TEXT,
+        resource_param_accepted INTEGER NOT NULL DEFAULT 1 CHECK (resource_param_accepted IN (0, 1)),
+        registered_at INTEGER NOT NULL,
+        pending_client_id TEXT,
+        pending_has_secret INTEGER NOT NULL DEFAULT 0 CHECK (pending_has_secret IN (0, 1)),
+        pending_secret_ciphertext BLOB,
+        pending_issuer TEXT,
+        pending_token_endpoint TEXT,
+        FOREIGN KEY (connection_id, owner_id) REFERENCES gw_connections(id, owner_id));
     ",
 ];

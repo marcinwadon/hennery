@@ -43,7 +43,8 @@ const KEY_LEN: usize = 32;
 /// collector does not start until the key is back, or the credentials only
 /// it opens are given up. Each is then set again.
 pub const GIVE_UP: &str = "To give the stored gateway credentials up instead, stop the collector and run \
-     `sqlite3 <data>/hennery.db 'DELETE FROM gw_credentials'`, then set each connection's credential again.";
+     `sqlite3 <data>/hennery.db 'DELETE FROM gw_credentials; DELETE FROM gw_oauth_clients'`, then set each \
+     connection's credential (and OAuth client) again.";
 
 /// The master key, wiped from memory when dropped.
 pub struct MasterKey {

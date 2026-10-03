@@ -22,6 +22,8 @@ enum Answer {
     Silent,
     /// Headers and a first chunk at once, the last chunk after the delay.
     SlowBody(Duration),
+    /// Headers declaring a long body, then nothing (plan 8f).
+    DeclaredOnly,
 }
 
 /// A listener on 127.0.0.1 counting the connections it accepted and keeping
@@ -93,6 +95,14 @@ async fn serve(mut stream: TcpStream, answer: Answer, heads: Arc<Mutex<Vec<Strin
                 }
             }
             Answer::Silent => {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+                return;
+            }
+            Answer::DeclaredOnly => {
+                let head = b"HTTP/1.1 200 OK\r\ncontent-length: 1000000\r\n\r\n";
+                if stream.write_all(head).await.is_err() {
+                    return;
+                }
                 tokio::time::sleep(Duration::from_secs(3600)).await;
                 return;
             }
@@ -415,4 +425,57 @@ async fn clones_share_the_policy() {
     assert_eq!(response.text().await.unwrap(), "ok");
     assert_eq!(server.accepted(), 1, "the clone reused the original's connection");
     assert_eq!(clone.client(Allowance::PublicOnly).allowance(), Allowance::PublicOnly);
+}
+
+/// Plan 8f (the egress plan's O3): a whole body is read up to its cap;
+/// a declared length over it is refused before reading, and a body that
+/// grows past it as read is refused too.
+#[tokio::test]
+async fn a_body_is_read_up_to_its_cap() {
+    use hennery_kernel::egress::{BodyError, read_capped};
+    let ok = Server::start(Answer::Ok).await;
+    let client = egress().client(Allowance::InternalNetwork);
+    let response = within(client.send(get(ok.url("127.0.0.1")))).await.unwrap();
+    assert_eq!(read_capped(response, 2).await.unwrap(), b"ok");
+    let response = within(client.send(get(ok.url("127.0.0.1")))).await.unwrap();
+    assert!(matches!(read_capped(response, 1).await, Err(BodyError::TooLarge)));
+    // A declared length over the cap is refused before anything is read:
+    // this body never comes.
+    let declared = Server::start(Answer::DeclaredOnly).await;
+    let response = within(client.send_streaming(get(declared.url("127.0.0.1"))))
+        .await
+        .unwrap();
+    assert!(matches!(
+        within(read_capped(response, 10)).await,
+        Err(BodyError::TooLarge)
+    ));
+    // Chunked, no declared length: "first" then "last", 9 bytes.
+    let slow = Server::start(Answer::SlowBody(Duration::from_millis(10))).await;
+    let response = within(client.send_streaming(get(slow.url("127.0.0.1")))).await.unwrap();
+    assert!(matches!(
+        within(read_capped(response, 6)).await,
+        Err(BodyError::TooLarge)
+    ));
+    let response = within(client.send_streaming(get(slow.url("127.0.0.1")))).await.unwrap();
+    assert_eq!(within(read_capped(response, 9)).await.unwrap(), b"firstlast");
+}
+
+/// Plan 8f (plan 8b-ii's hand-off): OAuth's scheme rule, `https` or plain
+/// `http` to loopback, whatever the allowance.
+#[test]
+fn oauth_urls_are_https_or_loopback_http() {
+    use hennery_kernel::egress::is_https_or_loopback;
+    for (url, expected) in [
+        ("https://as.example/token", true),
+        ("https://10.0.0.1/token", true),
+        ("http://127.0.0.1:8080/token", true),
+        ("http://[::1]/token", true),
+        ("http://localhost/token", true),
+        ("http://10.0.0.1/token", false),
+        ("http://192.168.1.1/token", false),
+        ("http://as.example/token", false),
+        ("ftp://as.example/token", false),
+    ] {
+        assert_eq!(is_https_or_loopback(&Url::parse(url).unwrap()), expected, "{url}");
+    }
 }

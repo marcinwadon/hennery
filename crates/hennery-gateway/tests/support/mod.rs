@@ -6,14 +6,18 @@
 #![allow(dead_code)]
 
 pub mod differential;
+pub mod oauth;
 pub mod upstream;
 
 use ed25519_dalek::SigningKey;
 use hennery_gateway::key::MasterKey;
 use hennery_gateway::model::{Change, CredKind, CredentialChange, NewConnection};
+use hennery_gateway::notify::{Alert, ConnectionAlert, Notifier};
+use hennery_gateway::runtime::Runtime;
 use hennery_gateway::scope::ProxyStore;
 use hennery_gateway::store::GatewayStore;
 use hennery_gateway::tokens;
+use hennery_kernel::egress::{Egress, Timeouts};
 use hennery_kernel::hats::HatChange;
 use hennery_kernel::hosts::{Enrollment, Hosts};
 use hennery_kernel::secret::unix_now;
@@ -150,5 +154,47 @@ impl World {
 
     pub fn status(&self, id: &str) -> String {
         self.store.connection(id).unwrap().unwrap().status
+    }
+
+    /// The runtime on this world's stores and key, sending through
+    /// `egress`, telling `notifier` (plan 8f).
+    pub fn runtime(&self, egress: Egress, notifier: Arc<dyn Notifier>) -> Arc<Runtime> {
+        Arc::new(Runtime::new(
+            self.store.clone(),
+            self.proxy_store.clone(),
+            self.key.clone(),
+            egress,
+            notifier,
+        ))
+    }
+}
+
+/// An egress policy for loopback tests: short timeouts.
+pub fn test_egress() -> Egress {
+    Egress::new(Timeouts {
+        connect: std::time::Duration::from_secs(2),
+        request: std::time::Duration::from_secs(10),
+    })
+    .unwrap()
+}
+
+/// A `Notifier` that keeps what it is told.
+#[derive(Default)]
+pub struct Recorder(pub std::sync::Mutex<Vec<ConnectionAlert>>);
+
+impl Notifier for Recorder {
+    fn notify(&self, alert: &ConnectionAlert) {
+        self.0.lock().unwrap().push(alert.clone());
+    }
+}
+
+impl Recorder {
+    pub fn alerts(&self) -> Vec<(String, Alert)> {
+        self.0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|a| (a.connection_id.clone(), a.alert))
+            .collect()
     }
 }

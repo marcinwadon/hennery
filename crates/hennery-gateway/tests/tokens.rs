@@ -5,7 +5,7 @@
 
 mod support;
 
-use hennery_gateway::model::CredKind;
+use hennery_gateway::model::{CredKind, Status};
 use hennery_gateway::scope::{ClientIdentity, LAST_USED_EVERY, MountPolicy, Principal, PrincipalKind};
 use hennery_gateway::tokens::{self, SESSION_TOKEN_PREFIX, is_session_token};
 use hennery_kernel::secret::unix_now;
@@ -326,22 +326,48 @@ fn a_hat_purge_takes_its_tokens_and_then_the_hat_can_go() {
 fn live_status_is_only_for_the_connection_as_it_was() {
     let h = World::new();
     let url = "http://127.0.0.1:9/mcp";
+    let note = "refused";
     let id = h.connection("linear", url, CredKind::Static);
-    assert!(!h.proxy_store.mark_ok(&id, url, 1).unwrap(), "no token: not ok");
-    h.set_token(&id, "tok");
-    assert!(!h.proxy_store.mark_ok(&id, "http://127.0.0.1:9/other", 1).unwrap());
     assert!(
-        !h.proxy_store
-            .mark_needs_auth(&id, "http://127.0.0.1:9/other", 1)
-            .unwrap()
+        h.proxy_store.record_traffic_ok(&id, url, 1).unwrap().is_none(),
+        "no token: not ok"
     );
+    assert_eq!(h.store.connection(&id).unwrap().unwrap().checked_at, None);
+    h.set_token(&id, "tok");
+    let other = "http://127.0.0.1:9/other";
+    assert!(h.proxy_store.record_traffic_ok(&id, other, 1).unwrap().is_none());
+    assert!(h.proxy_store.mark_needs_auth(&id, other, note, 1).unwrap().is_none());
     assert_eq!(h.status(&id), "not_connected");
-    assert!(h.proxy_store.mark_needs_auth(&id, url, 2).unwrap());
-    assert!(!h.proxy_store.mark_needs_auth(&id, url, 3).unwrap(), "already");
+    let change = h.proxy_store.mark_needs_auth(&id, url, note, 2).unwrap().unwrap();
+    assert_eq!((change.from, change.to), (Status::NotConnected, Status::NeedsAuth));
+    assert!(
+        h.proxy_store.mark_needs_auth(&id, url, note, 3).unwrap().is_none(),
+        "already"
+    );
     assert_eq!(h.status(&id), "needs_auth");
-    assert!(h.proxy_store.mark_ok(&id, url, 4).unwrap());
-    assert!(!h.proxy_store.mark_ok(&id, url, 5).unwrap(), "already");
+    let change = h.proxy_store.record_traffic_ok(&id, url, 4).unwrap().unwrap();
+    assert_eq!((change.from, change.to), (Status::NeedsAuth, Status::Ok));
+    assert!(
+        h.proxy_store.record_traffic_ok(&id, url, 5).unwrap().is_none(),
+        "already"
+    );
     assert_eq!(h.status(&id), "ok");
     let none = h.connection("public", url, CredKind::None);
-    assert!(h.proxy_store.mark_ok(&none, url, 1).unwrap());
+    assert!(h.proxy_store.record_traffic_ok(&none, url, 1).unwrap().is_some());
+}
+
+/// Plan 8d's hand-off: live traffic moves `checked_at` at most once a
+/// minute, not on every request.
+#[test]
+fn live_traffic_moves_checked_at_once_a_minute() {
+    let h = World::new();
+    let url = "http://127.0.0.1:9/mcp";
+    let id = h.connection("public", url, CredKind::None);
+    let checked = || h.store.connection(&id).unwrap().unwrap().checked_at;
+    h.proxy_store.record_traffic_ok(&id, url, 1000).unwrap();
+    assert_eq!(checked(), Some(1000));
+    h.proxy_store.record_traffic_ok(&id, url, 1059).unwrap();
+    assert_eq!(checked(), Some(1000));
+    h.proxy_store.record_traffic_ok(&id, url, 1060).unwrap();
+    assert_eq!(checked(), Some(1060));
 }
