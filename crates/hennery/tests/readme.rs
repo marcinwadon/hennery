@@ -336,21 +336,47 @@ impl Group {
         address
     }
 
-    /// SIGTERM to the group, as Ctrl-C's SIGINT would be: the whole group
-    /// must be gone within 20 s.
+    /// Every process started under this group's shell, as far down as they
+    /// go: `up` starts its children in process groups of their own.
+    fn processes(&self) -> Vec<i32> {
+        let mut all = vec![self.pgid()];
+        let mut next = 0;
+        while next < all.len() {
+            let out = Command::new("pgrep").args(["-P", &all[next].to_string()]).output();
+            if let Ok(out) = out {
+                all.extend(
+                    String::from_utf8_lossy(&out.stdout)
+                        .lines()
+                        .filter_map(|line| line.trim().parse::<i32>().ok()),
+                );
+            }
+            next += 1;
+        }
+        all
+    }
+
+    /// Whether any of `pids` is still running.
+    fn any_alive(pids: &[i32]) -> bool {
+        // SAFETY: kill(2) with signal 0 only checks the process exists.
+        pids.iter().any(|&pid| unsafe { libc::kill(pid, 0) } == 0)
+    }
+
+    /// SIGTERM to the group, as Ctrl-C's SIGINT would be: it and every
+    /// process under it must be gone within 20 s.
     fn stop(&mut self) {
+        let pids = self.processes();
+        assert!(pids.len() > 1, "nothing ran under the shell:\n{}", self.output());
         // SAFETY: kill(2) on this test's own process group.
         unsafe { libc::kill(-self.pgid(), libc::SIGTERM) };
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let _ = self.child.try_wait();
-            // SAFETY: kill(2) with signal 0 only checks the group exists.
-            if unsafe { libc::kill(-self.pgid(), 0) } != 0 {
+            if !Self::any_alive(&pids) {
                 return;
             }
             assert!(
                 Instant::now() < deadline,
-                "the group outlived SIGTERM by 20 s:\n{}",
+                "still running 20 s after SIGTERM:\n{}",
                 self.output()
             );
             std::thread::sleep(Duration::from_millis(100));
@@ -359,10 +385,19 @@ impl Group {
 }
 
 impl Drop for Group {
+    /// Kill everything under the shell, and wait until it is gone, so that
+    /// nothing writes into the machine's home after it is removed.
     fn drop(&mut self) {
-        // SAFETY: kill(2) on this test's own process group.
-        unsafe { libc::kill(-self.pgid(), libc::SIGKILL) };
+        let pids = self.processes();
+        for &pid in &pids {
+            // SAFETY: kill(2) on processes this test started.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
         let _ = self.child.wait();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Self::any_alive(&pids) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
