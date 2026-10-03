@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { json, routed } from '../test-stream'
-import { cancel, prompt, resume, setConfig } from './turns'
+import { cancel, close, deleteSession, park, prompt, resume, setConfig } from './turns'
 
 describe('turn routes', () => {
   it('posts the prompt, cancel, config and resume of a session, its id encoded', async () => {
@@ -17,5 +17,17 @@ describe('turn routes', () => {
       'POST /api/sessions/a%2Fb%3Fc/resume',
     ])
     expect(bodies).toEqual([{ content: [{ type: 'text', text: 'hi' }] }, undefined, { config_id: 'model', value: 'fast' }, undefined])
+  })
+
+  it('parks, closes and deletes a session, its id encoded', async () => {
+    const t = routed(() => json({ session_id: 'a/b?c', lifecycle: 'parked' }, 202))
+    await park(t.client, 'a/b?c')
+    await close(t.client, 'a/b?c')
+    await deleteSession(t.client, 'a/b?c')
+    expect(t.calls.map((c) => `${c.method} ${c.path}`)).toEqual([
+      'POST /api/sessions/a%2Fb%3Fc/park',
+      'POST /api/sessions/a%2Fb%3Fc/close',
+      'DELETE /api/sessions/a%2Fb%3Fc',
+    ])
   })
 })

@@ -11,7 +11,8 @@
 //   new anchor. "Resynced" shows for a moment. A resync that follows
 //   another waits before refetching, longer each time (`ResyncBackoff`).
 // - `session_removed`, or a 404 from the page or the stream: the stream
-//   closes and the session is marked removed.
+//   closes and the session is marked removed. So does `markRemoved`, for
+//   a delete this view made (its answer may come before the stream's).
 // - A page that fails otherwise is fetched again, waiting longer each time.
 import { useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
 import { useClient } from '../app-client'
@@ -207,6 +208,9 @@ export class SessionItemsController {
     }
   }
 
+  /** The session was deleted from here: as a `session_removed`. */
+  markRemoved = (): void => this.gone()
+
   /** A catalogue from a config answer (202) replaces the one held. */
   setCatalog = (catalog: SessionCatalog): void => {
     this.catalogSeq++
@@ -351,6 +355,7 @@ export interface SessionItems extends Omit<SessionItemsSnapshot, 'store'> {
   older: boolean
   loadOlder: () => Promise<void>
   setCatalog: (catalog: SessionCatalog) => void
+  markRemoved: () => void
 }
 
 export function useSessionItems(id: string, timing?: Partial<Timing>): SessionItems {
@@ -371,5 +376,5 @@ export function useSessionItems(id: string, timing?: Partial<Timing>): SessionIt
   }, [controller])
   const snapshot = useSyncExternalStore(controller.subscribe, controller.getSnapshot)
   const { store, ...rest } = snapshot
-  return { ...rest, items: store.items, older: store.older, loadOlder: controller.loadOlder, setCatalog: controller.setCatalog }
+  return { ...rest, items: store.items, older: store.older, loadOlder: controller.loadOlder, setCatalog: controller.setCatalog, markRemoved: controller.markRemoved }
 }

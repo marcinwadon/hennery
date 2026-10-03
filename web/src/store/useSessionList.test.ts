@@ -109,6 +109,19 @@ describe('useSessionList', () => {
     expect(result.current.all.has('a')).toBe(false)
   })
 
+  it('remove (a session the view found gone) takes it away, with no fetch', async () => {
+    const s = server([page([summary('a'), summary('b')], 10)])
+    const { result } = render(s, { hideClosed: false })
+    await waitFor(() => expect(s.streams).toHaveLength(1))
+    const fetched = s.calls.length
+    act(() => result.current.remove('a'))
+    await waitFor(() => expect(ids(result.current.shown)).toEqual(['b']))
+    expect(result.current.all.has('a')).toBe(false)
+    act(() => result.current.remove('a'))
+    expect(ids(result.current.shown)).toEqual(['b'])
+    expect(s.calls).toHaveLength(fetched)
+  })
+
   it('on resync_required: closes at once, refetches the first page with the current query, replaces and reopens', async () => {
     const s = server([page([summary('a')], 10, 'c1'), page([summary('z')], 40)], { c1: page([summary('b', { last_event_at: '2026-10-01T00:00:00.000Z' })], 15) })
     const { result } = render(s, { hat: 'hat-a', hideClosed: false })

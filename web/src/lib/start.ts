@@ -1,7 +1,8 @@
 // Starting a session (frontend spec §7, ACP core §9 `POST /api/sessions`):
 // what a refused start says, and how the New Session screen hands the
 // session view a notice about a start or a first prompt that did not
-// fully go through.
+// fully go through; and the `/new?host=…&cwd=…` link that opens New Session
+// on a project (a failed session's "Start a new session in this project").
 import { ApiFailure, messageOf } from '../api/errors'
 
 /** A refused `POST /api/sessions`, in words. Nothing was started, except
@@ -94,4 +95,16 @@ export function startNoticeText(notice: StartNotice): string {
     return notice.kept ? `${started} A first prompt was not sent: it waits as this session’s draft.` : started
   }
   return `${notice.message} It waits as this session’s draft.`
+}
+
+/** `/new?host=<host>&cwd=<cwd>`: New Session with the host and the project
+ *  filled in. Both are encoded; `readNewSessionPrefill` reads them back. */
+export function newSessionHref(host: string, cwd: string): string {
+  return `/new?${new URLSearchParams({ host, cwd }).toString()}`
+}
+
+/** The host and the project a `/new` link names (`newSessionHref`). */
+export function readNewSessionPrefill(search: string): { host?: string; cwd?: string } {
+  const query = new URLSearchParams(search)
+  return { host: query.get('host') ?? undefined, cwd: query.get('cwd') ?? undefined }
 }

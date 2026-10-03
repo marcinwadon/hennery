@@ -29,8 +29,8 @@ import type {
 import { agentLabel } from '../lib/agent'
 import { agentOptions, agentsFor, type HostAgentChoices } from '../lib/agents'
 import { saveDraft } from '../lib/drafts'
-import { projectEntries } from '../lib/projects'
-import { sessionHref, startRefusal } from '../lib/start'
+import { isLiteralPath, projectEntries } from '../lib/projects'
+import { readNewSessionPrefill, sessionHref, startRefusal } from '../lib/start'
 import { Icon } from '../lib/ui'
 import { Link, navigate, useLocation } from '../router'
 
@@ -53,16 +53,11 @@ type Resolved =
   | { state: 'ok'; resolution: HatResolution }
   | { state: 'failed'; error: string }
 
-function readPrefill(search: string): { host?: string; cwd?: string } {
-  const query = new URLSearchParams(search)
-  return { host: query.get('host') ?? undefined, cwd: query.get('cwd') ?? undefined }
-}
-
 export default function NewSession() {
   const client = useClient()
   const { search } = useLocation()
   // Read once: the form owns its fields after that.
-  const [prefill] = useState(() => readPrefill(search))
+  const [prefill] = useState(() => readNewSessionPrefill(search))
   const ids = { host: useId(), agent: useId(), project: useId(), prompt: useId() }
 
   const [hosts, setHosts] = useState<HostItem[] | null>(null)
@@ -103,7 +98,9 @@ export default function NewSession() {
           if (wanted?.connected) {
             setHostId(wanted.host_id)
             if (prefill.cwd) {
-              setCwd(prefill.cwd)
+              // Only a path is taken as one: other text is a search, no
+              // path until a project is picked (as typed).
+              if (isLiteralPath(prefill.cwd)) setCwd(prefill.cwd)
               setInitialText(prefill.cwd)
             }
             return

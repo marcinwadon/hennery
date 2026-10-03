@@ -1,6 +1,6 @@
 // A small router for real links (frontend spec §2): a push or a reload opens
 // the view its URL names (F-19). History API only; no dependency.
-import { useSyncExternalStore, type AnchorHTMLAttributes, type MouseEvent } from 'react'
+import { useSyncExternalStore, type AnchorHTMLAttributes, type MouseEvent, type Ref } from 'react'
 
 export type RouteName =
   | 'setup'
@@ -76,7 +76,7 @@ export function useLocation(): { pathname: string; search: string } {
   return at < 0 ? { pathname: href, search: '' } : { pathname: href.slice(0, at), search: href.slice(at) }
 }
 
-type LinkProps = Omit<AnchorHTMLAttributes<HTMLAnchorElement>, 'href'> & { to: string }
+type LinkProps = Omit<AnchorHTMLAttributes<HTMLAnchorElement>, 'href'> & { to: string; ref?: Ref<HTMLAnchorElement> }
 
 /** An `<a>` that navigates inside the app, leaving modified clicks (new
  *  tab, new window) to the browser. */

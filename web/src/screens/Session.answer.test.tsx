@@ -317,6 +317,24 @@ describe('SessionView: a new question never steals typing', () => {
     expect(s.posted('/answer')).toEqual([])
   })
 
+  it('leaves the focus in the Delete dialog over the page: no answer is sent while it is open', async () => {
+    // The page behind the dialog is not inert (as on Hosts and Hats): only
+    // the card's focus guard keeps a question opened behind it from taking
+    // the focus, and a digit from answering it.
+    const s = server([message('m1', 't1')])
+    await shown(s)
+    fireEvent.click(screen.getByRole('button', { name: 'Session actions' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Delete session' }))
+    const dialog = await screen.findByRole('dialog', { name: 'Delete this session?' })
+    expect(dialog).toContainElement(document.activeElement as HTMLElement)
+    await open(s)
+    expect(dialog).toContainElement(document.activeElement as HTMLElement)
+    typeOne()
+    await settle(s)
+    expect(s.posted('/answer')).toEqual([])
+    expect(screen.getByRole('dialog', { name: 'Delete this session?' })).toBeInTheDocument()
+  })
+
   it('moves from a control in the transcript that takes no typing', async () => {
     const other = question({
       id: 'question:p2',

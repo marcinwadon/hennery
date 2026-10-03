@@ -1,10 +1,12 @@
-// What the composer asks of a session (ACP core §9): a prompt, a cancel, a
-// config switch, and the resume behind "Resume and send". Every id in a path
-// is encoded: ids are server data, never trusted to be path-safe.
+// What the session view asks of a session (ACP core §9): a prompt, a
+// cancel, a config switch, a resume (the footer's, and the composer's
+// "Resume and send"), and the header menu's park, close and delete. Every id
+// in a path is encoded: ids are server data, never trusted to be path-safe.
 import type { Client } from './client'
 import type {
   CancelResponse,
   ConfigValue,
+  DeleteResult,
   LifecycleResponse,
   PromptResponse,
   SessionCatalog,
@@ -35,4 +37,20 @@ export function setConfig(client: Client, id: string, configId: string, value: C
 /** `POST /api/sessions/{id}/resume` → 202 once the session has started again. */
 export function resume(client: Client, id: string): Promise<LifecycleResponse> {
   return client.request<LifecycleResponse>('POST', `/api/sessions/${enc(id)}/resume`)
+}
+
+/** `POST /api/sessions/{id}/park` → 202 once the session is parked. */
+export function park(client: Client, id: string): Promise<LifecycleResponse> {
+  return client.request<LifecycleResponse>('POST', `/api/sessions/${enc(id)}/park`)
+}
+
+/** `POST /api/sessions/{id}/close` → 202 once the session is closed. */
+export function close(client: Client, id: string): Promise<LifecycleResponse> {
+  return client.request<LifecycleResponse>('POST', `/api/sessions/${enc(id)}/close`)
+}
+
+/** `DELETE /api/sessions/{id}` → 200 `DeleteResult` (a server from before
+ *  it answers 204: `undefined`). Step-up: the client asks for it. */
+export function deleteSession(client: Client, id: string): Promise<DeleteResult | undefined> {
+  return client.request<DeleteResult | undefined>('DELETE', `/api/sessions/${enc(id)}`)
 }
