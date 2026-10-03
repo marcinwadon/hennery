@@ -143,6 +143,8 @@ pub async fn run(args: AdminArgs) -> Result<()> {
         }
         AdminResponse::Refused { message } => bail!("refused: {message}"),
         AdminResponse::Failed { message } => bail!("the collector failed: {message}"),
+        // Doctor's question (plan 4d-B3): no command here asks it.
+        AdminResponse::Deployment { .. } => bail!("the collector answered another command"),
     }
     Ok(())
 }

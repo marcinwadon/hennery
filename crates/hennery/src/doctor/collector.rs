@@ -31,7 +31,7 @@ const NOT_PAIRED: &str = "the host is not paired";
 const NO_ANSWER: &str = "the collector did not answer (check 7)";
 
 /// `text` cut to `MAX_QUOTE` characters: words that come from the network.
-fn quoted(text: &str) -> String {
+pub(super) fn quoted(text: &str) -> String {
     let mut out: String = text.chars().take(MAX_QUOTE).collect();
     if text.chars().count() > MAX_QUOTE {
         out.push('…');
@@ -60,7 +60,7 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// `future` run to its end on a runtime of its own, on a thread of its own:
 /// doctor runs inside `main`'s runtime, which cannot be blocked on.
-fn block_on<T: Send + 'static>(future: impl std::future::Future<Output = T> + Send + 'static) -> T {
+pub(super) fn block_on<T: Send + 'static>(future: impl std::future::Future<Output = T> + Send + 'static) -> T {
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -430,7 +430,7 @@ pub fn skew(date: Option<i64>, now: i64) -> super::Check {
 }
 
 /// Whether the one installed service runs the collector in `dir`.
-fn served(doctor: &Doctor, dir: &std::path::Path) -> bool {
+pub(super) fn served(doctor: &Doctor, dir: &std::path::Path) -> bool {
     use crate::service::unit::Role;
     let cx = doctor.cx;
     let [role] = cx.installed()[..] else {

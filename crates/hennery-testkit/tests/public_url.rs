@@ -285,6 +285,7 @@ async fn naming_public_url_needs_a_fresh_step_up_and_a_contact_alone_does_not() 
         SettingsUpdateResponse {
             public_url: PUBLIC_URL.into(),
             contact: Some("you@example.com".into()),
+            deployment_warning: false,
             public_url_changed: None,
         }
     );
@@ -334,6 +335,7 @@ async fn a_change_ends_every_session_stream_subscription_and_ceremony() {
         SettingsUpdateResponse {
             public_url: "https://moved.example".into(),
             contact: None,
+            deployment_warning: false,
             public_url_changed: Some(PublicUrlChanged {
                 sessions_ended: 2,
                 passkeys_removed: 1,
@@ -730,6 +732,7 @@ async fn the_api_and_the_admin_socket_leave_the_same_state() {
                 hosts: admin.state.hosts.clone(),
                 dir: admin_dir.clone(),
                 base_url: PUBLIC_URL.into(),
+                deployment: admin.state.deployment.clone(),
             },
             async move {
                 let _ = stopped.await;

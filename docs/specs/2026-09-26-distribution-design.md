@@ -269,7 +269,9 @@ collector.
 
 At start `hennery up` checks whether gateway credentials exist for more than one
 hat while the collector shares its OS user with the host child, and warns if so
-(kernel spec §10).
+(kernel spec §10). The check is the collector child's, told by `--beside-host`
+that it runs beside the host child (plan 4d-B3): its `warn` line is in `up`'s
+output on a terminal, and in `collector.log` under a service.
 
 Before its first child, `hennery up` makes one more pipe, the parent pipe, and
 holds its write end for as long as it runs; every child it starts, restarts
@@ -443,7 +445,7 @@ are never printed (only "logged in" and the method).
 | 12 | Adapter set: installed set differs from the one pinned by this binary (warn, with `hennery host adapters update`) |
 | 13 | Bundled vs terminal CLI: the pinned bundled `claude`/`codex` version compared with the one on the user's PATH; warn on a large gap (sessions resumed from the terminal may meet an unexpected format) |
 | 14 | Single instance: no other host process holds `host.lock` in this data directory |
-| 15 | Collector isolation: gateway credentials for more than one hat while the collector shares its OS user with agents (warn, kernel spec §10) |
+| 15 | Collector isolation: gateway credentials for more than one hat while the collector shares its OS user with agents (warn, kernel spec §10). Asked of the running collector over its admin socket (kernel §4.2's `deployment`), never read from the database: not run without a collector directory or with no collector running; any other way of getting no answer warns with its fix (a running service whose socket is silent, a socket not this user's: run doctor as the collector's user, an older collector: restart it); ok names what is not detected (a host run by hand as the collector's user) |
 | 16 | Collector listeners: every configured address bound; `public_url` reaches one of them or a reverse proxy (warn, kernel spec §7) |
 | 17 | CLI overrides (`--use-cli`): the operator's CLI version against the pinned one (warn on a gap, §13) |
 | 18 | The collector's secret files, `vapid.key` and `master.key`, judged by their metadata alone, never read, as the collector takes them and in its order: a regular file, not a symlink; no group or other bits; owned by the collector directory's owner and readable by it; for `master.key`, one name only; 32 bytes. Each way the collector would refuse one fails, with its fix. A file not made yet is fine, but once `hennery.db` exists a missing one warns: a new `vapid.key` breaks every push subscription, and a missing `master.key` stops a collector with stored gateway credentials. One that can't be looked at warns (run doctor as the collector's user). `hennery backup` carries both (kernel §9) |
