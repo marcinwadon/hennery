@@ -609,7 +609,7 @@ fn a_delete_revokes_a_token_left_live_on_a_closed_session() {
 }
 
 /// The kernel's purge hook (`LifecycleHooks::on_hat_purged`, lane L6):
-/// the sessions' part, then the gateway's, so the hat's row can go.
+/// the gateway's part, then the sessions', so the hat's row can go.
 #[test]
 fn the_purge_hook_runs_the_gateways_part_too() {
     use hennery_kernel::lifecycle::LifecycleHooks;
