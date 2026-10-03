@@ -2,7 +2,9 @@
 //! and a working hennery, one check at a time, each `ok`, `warn` or `fail`
 //! with a one-sentence fix. Doctor only reads (decision 2): it never
 //! repairs, pairs, logs in or installs; it opens no database and takes no
-//! lock a host, an install or `up` takes. The one program of the user's it
+//! lock a host, an install or `up` takes; what only the collector's database
+//! holds, it asks the running collector over its admin socket, read-only
+//! (check 15, plan 4d-B3). The one program of the user's it
 //! runs is the login shell, to compare its PATH with the service's (check
 //! 5), as `service install` does. Everything it reads of the machine comes
 //! through the service commands' `Context` and a `Runner`, which the tests
@@ -13,6 +15,7 @@ mod collector;
 pub(crate) mod dirs;
 mod disk;
 mod env;
+mod isolation;
 mod platform;
 mod process;
 mod runtime;
@@ -201,6 +204,7 @@ pub fn checks(doctor: &Doctor) -> Vec<Finding> {
         runtime::adapter_set(doctor),
         agents::bundled_and_terminal(doctor),
         service::host_directory(doctor),
+        isolation::isolation(doctor),
         collector::listeners(doctor),
         runtime::cli_overrides(doctor),
         secrets::secret_files(doctor),
