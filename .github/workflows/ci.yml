@@ -47,8 +47,8 @@ jobs:
         run: nix develop -c pnpm --dir web test
       - name: Build
         run: nix develop -c pnpm --dir web build
-      - name: The binary, with the UI embedded
-        run: nix develop -c cargo build -p hennery --locked
+      - name: The binary, with the UI embedded, and the fake agent
+        run: nix develop -c cargo build -p hennery -p hennery-testkit --bins --locked
       - name: Browser checks
         run: nix develop -c pnpm --dir web e2e
         env:
