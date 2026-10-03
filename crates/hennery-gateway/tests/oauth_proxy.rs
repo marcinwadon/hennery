@@ -314,7 +314,7 @@ async fn a_grant_without_a_refresh_token_is_needs_auth_on_401() {
     assert_eq!(h.status(&id), "needs_auth");
 }
 
-/// The review's decision 9 (G-13, G-14): a refresh that finishes after an
+/// Plan 8f decision 9 (G-13, G-14): a refresh that finishes after an
 /// edit deleted the grant never writes it back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_late_refresh_never_resurrects_a_deleted_grant() {
@@ -407,7 +407,7 @@ async fn a_refresh_is_retried_once_without_resource() {
     );
 }
 
-/// The review's decision 9 (G-13): a refresh that finishes after a newer
+/// Plan 8f decision 9 (G-13): a refresh that finishes after a newer
 /// grant was stored leaves the newer one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_late_refresh_never_overwrites_a_newer_grant() {
