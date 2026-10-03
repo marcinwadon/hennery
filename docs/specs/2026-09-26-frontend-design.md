@@ -373,7 +373,12 @@ One form, one request (`POST /api/sessions`):
   revoke with step-up; `user_agent` rendered as escaped, bidi-isolated text),
   push devices (subscribe/unsubscribe per device), `public_url` (with a warning
   that OAuth registrations must be redone, and passkeys too if the host name
-  changes), optional owner contact for push (kernel spec
+  changes; that every device signs out, this one included; and that a wrong
+  value locks every browser out until `hennery admin reset-public-url` is run
+  on the collector's machine. The new value is shown as an origin and typed
+  twice, sent only when it changed, behind step-up; after the 200 the page
+  goes to the new origin to sign in, kernel spec §3.2), optional owner
+  contact for push (kernel spec
   §6), attachment store disk usage (ACP core §15), per-hat push policy (mute,
   include details, generic title), and the deployment warning when the collector shares its OS
   user with agents while holding credentials for several hats (kernel spec

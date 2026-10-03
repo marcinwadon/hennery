@@ -345,10 +345,8 @@ async fn the_push_contact_is_set_in_the_settings() {
         .await
         .unwrap();
     assert_eq!(code_of(resp).await, (400, "invalid".into()));
-    // `public_url` is not changed here (`hennery admin reset-public-url`).
-    let resp = patch(serde_json::json!({ "public_url": "https://moved.example" }))
-        .await
-        .unwrap();
+    // Anything else is refused (`public_url` is `public_url.rs`'s).
+    let resp = patch(serde_json::json!({ "name": "x" })).await.unwrap();
     assert_eq!(code_of(resp).await, (422, "invalid_body".into()));
     // Nothing in the body changes nothing.
     assert_eq!(patch(serde_json::json!({})).await.unwrap().status(), 200);

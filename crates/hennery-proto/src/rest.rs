@@ -896,7 +896,7 @@ pub struct PushPolicyItem {
     pub generic_title: bool,
 }
 
-/// `GET /api/settings` (kernel spec §8), and the answer to its `PATCH`.
+/// `GET /api/settings` (kernel spec §8).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct SettingsResponse {
     pub public_url: String,
@@ -908,15 +908,52 @@ pub struct SettingsResponse {
     pub contact: Option<String>,
 }
 
-/// `PATCH /api/settings`: absent fields stay as they are. `contact` is an
-/// e-mail address, trimmed, or empty (or blank) to clear it. `public_url` is not changed here
-/// yet: `hennery admin reset-public-url` does that (kernel spec §4.2).
+/// `PATCH /api/settings`: absent fields stay as they are, and so does a
+/// `null` one. `contact` is an e-mail address, trimmed, or empty (or blank)
+/// to clear it.
+///
+/// `public_url` moves the collector (kernel spec §3.2), as
+/// `hennery admin reset-public-url` does (§4.2), and needs a fresh step-up
+/// (§3.4). It ends every signed-in session, this one included (its cookie
+/// is cleared), and so every stream and push subscription; it removes
+/// every passkey when the host name changes. The browser must then sign in
+/// at the new origin: requests from the old one are refused. A typo is
+/// recovered on the collector's machine, with `hennery admin
+/// reset-public-url`. A body with both fields changes both or neither.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsUpdateRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "string | undefined", optional)]
     pub contact: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub public_url: Option<String>,
+}
+
+/// The answer to `PATCH /api/settings`: the settings as they are now and,
+/// when `public_url` was changed, what the change ended. Without
+/// `public_url_changed` it is exactly `SettingsResponse`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct SettingsUpdateResponse {
+    pub public_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub contact: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "PublicUrlChanged | undefined", optional)]
+    pub public_url_changed: Option<PublicUrlChanged>,
+}
+
+/// What a `public_url` change ended, as `hennery admin reset-public-url`
+/// reports it: every signed-in session (the caller's own among them), and
+/// the passkeys of a host name `public_url` no longer has.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct PublicUrlChanged {
+    #[ts(type = "number")]
+    pub sessions_ended: u64,
+    #[ts(type = "number")]
+    pub passkeys_removed: u64,
 }
 
 /// What a push carries to the browser's service worker (kernel spec §6;

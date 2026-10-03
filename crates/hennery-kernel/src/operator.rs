@@ -143,6 +143,28 @@ pub enum Reset {
     Invalid(String),
 }
 
+/// The outcome of `Operator::change_public_url`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublicUrlChange {
+    /// Done, as `Reset::Done`; `from` and `to` were read and written under
+    /// the lock that orders every change (plan 4d-B4's review, A2).
+    Done {
+        from: Option<PublicUrl>,
+        to: PublicUrl,
+        sessions_ended: usize,
+        passkeys_removed: usize,
+    },
+    /// The owner is not set up yet.
+    NotSetUp,
+    /// The new `public_url` or contact is not acceptable (why); nothing
+    /// changed.
+    Invalid(String),
+    /// The caller's session ended before the write; nothing changed.
+    SignedOut,
+    /// The caller's step-up lapsed before the write; nothing changed.
+    StepUpRequired,
+}
+
 struct SetupToken {
     hash: String,
     expires_at: i64,
@@ -566,16 +588,80 @@ impl Operator {
     /// decision 9). Every passkey ceremony begun before it ends too, a
     /// finish re-checking under the lock in any case.
     pub fn reset_public_url(&self, input: &str) -> Result<Reset> {
+        Ok(match self.change_public_url(input, None, None)? {
+            PublicUrlChange::Done {
+                sessions_ended,
+                passkeys_removed,
+                ..
+            } => Reset::Done {
+                sessions_ended,
+                passkeys_removed,
+            },
+            PublicUrlChange::NotSetUp => Reset::NotSetUp,
+            PublicUrlChange::Invalid(problem) => Reset::Invalid(problem),
+            // Only a caller's session is re-checked, and the admin socket
+            // names none.
+            PublicUrlChange::SignedOut | PublicUrlChange::StepUpRequired => {
+                anyhow::bail!("the admin socket's reset re-checked a session")
+            }
+        })
+    }
+
+    /// What `reset_public_url` does, the one way `public_url` changes after
+    /// setup: the admin socket's reset and `PATCH /api/settings` (plan 4d-B4
+    /// decision 1) both call it.
+    /// - With `contact`, the push contact is set too (`Some(None)` clears
+    ///   it), in the same transaction: a body that names both changes both
+    ///   or neither. Both are checked before anything is written; either
+    ///   one refused is `Invalid`, nothing changed.
+    /// - With `caller`, the session that asked and the time it asked: the
+    ///   transaction's first statement re-checks that session, live and
+    ///   stepped up, as a passkey registration's write does (plan 3c A2;
+    ///   4d-B4's review, A1). One ended or stepped down since the request's
+    ///   checks (a password reset, a revoke, a slow body) changes nothing.
+    pub fn change_public_url(
+        &self,
+        input: &str,
+        contact: Option<Option<&str>>,
+        caller: Option<(&str, i64)>,
+    ) -> Result<PublicUrlChange> {
         let public_url = match PublicUrl::parse(input) {
             Ok(url) => url,
-            Err(problem) => return Ok(Reset::Invalid(problem)),
+            Err(problem) => return Ok(PublicUrlChange::Invalid(problem)),
         };
-        if !self.is_set_up()? {
-            return Ok(Reset::NotSetUp);
+        if let Some(problem) = contact.flatten().and_then(crate::push::contact_problem) {
+            return Ok(PublicUrlChange::Invalid(problem));
         }
-        let (ended, passkeys_removed) = {
+        if !self.is_set_up()? {
+            return Ok(PublicUrlChange::NotSetUp);
+        }
+        let (from, ended, passkeys_removed) = {
             let mut conn = self.conn();
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if let Some((session_id, now)) = caller {
+                let stepped_up_at: Option<Option<i64>> = tx
+                    .query_row(
+                        "SELECT last_step_up_at FROM auth_sessions
+                         WHERE id_hash = ?1 AND owner_id = ?2 AND expires_at > ?3",
+                        params![session_id, self.owner, now],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                match stepped_up_at {
+                    None => return Ok(PublicUrlChange::SignedOut),
+                    // `Authenticated::stepped_up`'s window.
+                    Some(at) if !at.is_some_and(|at| now - at < STEP_UP_SECS) => {
+                        return Ok(PublicUrlChange::StepUpRequired);
+                    }
+                    Some(_) => {}
+                }
+            }
+            if let Some(contact) = contact {
+                tx.execute(
+                    "UPDATE owners SET contact = ?2 WHERE id = ?1",
+                    params![self.owner, contact],
+                )?;
+            }
             tx.execute(
                 "INSERT INTO settings(owner_id, key, value) VALUES (?1, ?2, ?3)
                  ON CONFLICT(owner_id, key) DO UPDATE SET value = excluded.value",
@@ -585,7 +671,9 @@ impl Operator {
             // Every subscription goes with its session (plan 10a decision
             // 4), and each was made by a service worker of the old origin.
             tx.execute("DELETE FROM push_subscriptions WHERE owner_id = ?1", [&self.owner])?;
-            let same_host = self.public_url().as_ref().and_then(PublicUrl::rp_id) == public_url.rp_id();
+            // Read under the lock, which every writer of the cache holds.
+            let from = self.public_url();
+            let same_host = from.as_ref().and_then(PublicUrl::rp_id) == public_url.rp_id();
             let passkeys_removed = if same_host {
                 0
             } else {
@@ -594,12 +682,14 @@ impl Operator {
             tx.commit()?;
             // Still under the connection's lock: no other reset lands
             // between the row and the cache.
-            *self.public_url.write().expect("public_url lock") = Some(public_url);
+            *self.public_url.write().expect("public_url lock") = Some(public_url.clone());
             self.ceremonies.clear();
-            (ended, passkeys_removed)
+            (from, ended, passkeys_removed)
         };
         self.sessions_ended();
-        Ok(Reset::Done {
+        Ok(PublicUrlChange::Done {
+            from,
+            to: public_url,
             sessions_ended: ended,
             passkeys_removed,
         })

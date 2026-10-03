@@ -583,9 +583,10 @@ product others install.
   and origin) and push notification links are built from it. Changing it
   invalidates OAuth client registrations, and removes the passkeys when the
   host name changes (a port or scheme move keeps them; kernel §3.2); Settings
-  warns before saving. A collector moved after setup is re-pointed without a
-  browser by `hennery admin reset-public-url` (kernel §4.2), which ends every
-  session.
+  warns before saving, needs step-up, and ends every session with the
+  change. A collector moved after setup, or a wrong value saved in Settings,
+  is re-pointed without a browser by `hennery admin reset-public-url` (kernel
+  §4.2), which does the same.
 - Web Push on iOS works only from an installed PWA over HTTPS, and push is core,
   so **v1 requires TLS** for anything but `localhost`.
 - Supported topologies, all documented:
