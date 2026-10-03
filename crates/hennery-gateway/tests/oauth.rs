@@ -1893,6 +1893,18 @@ async fn an_exchange_refused_by_egress_or_unreachable_has_its_code() {
         (page.status, page.result()),
         (StatusCode::BAD_GATEWAY, "egress_refused".into())
     );
+    // api-8e-8f B5: the page names no address; the operator's item keeps
+    // the egress policy's reason, by origin only (lane L11).
+    assert!(!page.html.contains("127.0.0.1"), "{}", page.html);
+    let error = &h.item(&id).await["oauth_error"];
+    assert_eq!(error["code"], "egress_refused");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("refused by the egress policy"),
+        "{error}"
+    );
     let h = Harness::new();
     let fake = FakeAs::start(Config::default()).await;
     let closed = std::net::TcpListener::bind("127.0.0.1:0")

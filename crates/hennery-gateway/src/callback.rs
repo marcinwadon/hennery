@@ -123,6 +123,9 @@ struct Outcome {
     result: &'static str,
     connection_id: Option<String>,
     message: String,
+    /// What the operator's item records instead of `message`, when the
+    /// page must not show it (api-8e-8f B5: the page names no address).
+    detail: Option<String>,
 }
 
 impl Outcome {
@@ -132,7 +135,13 @@ impl Outcome {
             result,
             connection_id: None,
             message: message.into(),
+            detail: None,
         }
+    }
+
+    fn recording(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
     }
 
     fn of(mut self, connection_id: &str) -> Self {
@@ -257,7 +266,11 @@ async fn callback(State(state): State<GatewayState>, RawQuery(query): RawQuery, 
         tracing::info!(connection_id = %id, "gateway: a Connect completed");
     } else {
         tracing::info!(connection_id = %id, code, "gateway: a Connect failed");
-        if let Err(err) = runtime.store.set_oauth_error(&id, Some((code, &outcome.message)), now) {
+        if let Err(err) = runtime.store.set_oauth_error(
+            &id,
+            Some((code, outcome.detail.as_ref().unwrap_or(&outcome.message))),
+            now,
+        ) {
             tracing::error!(connection_id = %id, error = %err, "gateway: a Connect's failure not recorded");
         }
     }
@@ -352,7 +365,12 @@ async fn finish(
             );
         }
         Err(TokenError::EgressRefused(why)) => {
-            return Outcome::failed(StatusCode::BAD_GATEWAY, "egress_refused", why);
+            return Outcome::failed(
+                StatusCode::BAD_GATEWAY,
+                "egress_refused",
+                "The authorization server's address is refused by hennery's egress policy.",
+            )
+            .recording(why);
         }
         Err(err) => {
             return Outcome::failed(StatusCode::BAD_GATEWAY, "exchange_failed", err.message());
@@ -395,6 +413,7 @@ async fn finish(
                 result: "connected",
                 connection_id: None,
                 message: "Connected. You may close this window.".into(),
+                detail: None,
             }
         }
         Ok(GrantStored::ConnectionChanged) => Outcome::failed(
