@@ -242,9 +242,11 @@ authentication (kernel §3.4), since they are commands the host will execute.
 
 ## 4. OAuth
 
-Built on `rmcp`'s `auth` module (discovery, registration, PKCE, refresh), with
-hennery supplying the credential store, the flow state, the HTTP client and the
-policies below. Every discovery, registration and token request goes through
+Hand-written on the kernel's egress clients (plan 8f decision 1), not on
+`rmcp`'s `auth` module: that one tries the authorization server's metadata in
+another order than §4.1, follows redirects during discovery itself, and brings
+a second `reqwest` into the tree. hennery owns the credential store, the flow
+state, the HTTP client and the policies below. Every discovery, registration and token request goes through
 the egress policy (§5.7): no redirects are followed, non-public addresses are
 refused unless the connection is marked "internal network", and every
 authorization-server metadata and endpoint URL must be `https` (loopback
@@ -277,6 +279,38 @@ rejected — a grant that "refreshes fine and never works".)*
 - `scopes_supported` from the PR document is requested at consent. *(G-5: one
   vendor issued tokens without product scopes unless they were requested.)*
 
+**As built (plan 8f).**
+
+- **The order:** the PR document from the challenge, then path-inserted, then
+  origin-level; for each authorization server it names (at most 4, else the
+  resource's origin), RFC 8414 inserted, RFC 8414 appended, OpenID
+  configuration appended, then inserted. The first metadata with both
+  endpoints and the `issuer` it was fetched for (RFC 8414 §3.3; equal but for
+  one final `/`, plan 8f decision 6) wins; another `issuer` is 502
+  `discovery_failed`.
+- **What counts as "not here", so the next candidate is tried** (plan 8f
+  decisions 5, 7, 8): any status but 200 (a 3xx included: redirects are
+  never followed), a body over 1 MiB, a body that is not one JSON object, a PR document without
+  `resource` (RFC 9728 §3.2), and a document that names one of its keys twice
+  or spells one otherwise (a duplicate's value depends on the parser, lane
+  L16). A 5xx at every candidate is 502 `upstream_unreachable`, not
+  `discovery_failed`; an address the egress policy refuses ends discovery at
+  once (502 `egress_refused`).
+- **Every metadata URL, endpoint and the consent URL** is `https`, or plain
+  `http` to loopback, even on a connection marked "internal network" (502
+  `insecure_metadata`; `hennery_kernel::egress::is_https_or_loopback`).
+- **The `resource` check:** same origin and the connection path starts with
+  the resource path. A mismatch is 409 `resource_mismatch` on authorize, the
+  value kept on the connection (`oauth.resource_mismatch`, shown whole only
+  in the list item; an error names origins only, §5.8). The operator accepts
+  it by sending it back exactly (`accept_resource`); it is accepted only if
+  it equals what discovery finds at that moment, and a stale one is 409
+  `resource_mismatch` again with the new value (plan 8f decision 14). An
+  acceptance is kept (`oauth.accepted_resource`) for every later authorize
+  and refresh, and any URL change, a path's too, clears it. A `resource` on
+  another origin, or not `https`, or over 2048 bytes, is 502
+  `resource_foreign` and cannot be accepted.
+
 ### 4.2 Registration
 
 - `oauth_dcr`: RFC 7591 registration as a public client
@@ -296,6 +330,24 @@ rejected — a grant that "refreshes fine and never works".)*
   of the existing grant, permanently if the consent was abandoned.)*
 - The redirect URI must be HTTPS or loopback HTTP; `public_url` enforcement in
   the umbrella §7.5 guarantees this for supported topologies.
+
+**As built (plan 8f).**
+
+- **One client row per connection** (`gw_oauth_clients`): the client the
+  grant was made with (or, with no grant yet, the one the next Connect
+  uses). A client registered at authorize is held by the flow until its
+  callback stores it with the grant, and the latest unconsumed registration
+  is reused by the next authorize of the same connection, so repeated clicks
+  do not register again.
+- **A pre-registered client is pinned** to the issuer and token endpoint its
+  first Connect found; its secret only ever goes to that token endpoint. A
+  later discovery that finds another is 409 `issuer_changed`: `PUT
+  …/oauth-client` again (the API design's R2). A client `PUT` while a grant
+  is live is stored as pending, under a field of its own, and replaces the
+  client only when a Connect with it completes (G-7).
+- A refusal is 502 `registration_refused`, its `error` and
+  `error_description` with control and bidi characters stripped, cut to 300
+  characters and prefixed "The vendor said: ".
 
 ### 4.3 Consent and exchange
 
@@ -324,6 +376,51 @@ rejected — a grant that "refreshes fine and never works".)*
 - Vendor error text shown to the operator is truncated to 300 characters and
   rendered as text.
 
+**As built (plan 8f).**
+
+- **`resource` is the connection URL or nothing**, never another value: an
+  accepted mismatching `resource` (§4.1) lets the Connect go on, and the
+  `resource` sent stays the connection URL. The API design's B4 says so too;
+  where it also reads "accepted or not", this section's retry without the
+  parameter wins (plan 8f decision 15).
+- **Where `invalid_target` is answered** (plan 8f decision 11): at consent,
+  the authorization server's redirect carries the error, and the flow is
+  over; the callback records it in memory for that (connection, URL), and
+  the next Connect omits `resource`. At the token endpoint (exchange and
+  refresh) the request is sent once more without it, server-side. Either way
+  `resource_param_accepted = false` is stored with the grant.
+- **The flow:** one live flow per connection (a new authorize supersedes the
+  previous one, whose callback then answers `flow_unknown`), at most 16 per
+  owner (429 `too_many_flows`), 15 minutes. A URL or kind edit, a client
+  `PUT` or a delete drops the connection's flows (the API design's R1), and
+  the callback compares the connection with the flow's snapshot again under
+  the refresh lock before it stores anything (400 `connection_changed`).
+- **The flow cookie** is `hennery_mcp_flow_<16 hex of sha256(state)>`, 256
+  random bits, `HttpOnly`, `SameSite=Lax`, `Secure` as the kernel's
+  `secure_cookies`, `Path=/api/mcp/oauth/callback`, `Max-Age=900`; every
+  outcome from the cookie check on clears it. The flow is consumed by the
+  cookie check whatever its result.
+- **The callback's order** (`callback.rs`): `state` (before any storage,
+  400 `flow_unknown`); the cookie, constant-time (400 `flow_mismatch`); the
+  operator's session that started the flow still live (400
+  `session_ended`); `iss` (RFC 9207: present and not the flow's issuer, or
+  absent where the metadata advertises it, 400 `issuer_mismatch`); the
+  vendor's `error` (400 `consent_denied`); the exchange (502
+  `exchange_failed`, naming only a fixed RFC 6749 `error`;
+  `upstream_unreachable`; `egress_refused`); under the lock, the connection
+  unchanged; then the grant, status `ok` (`status_at` moves even if it was
+  `ok`). Every failure from the flow on is kept in the connection's
+  `oauth_error`; the first two name no connection, so they write nothing.
+- **The page** is static HTML with no inline script and no external resource,
+  naming no label, URL, account, client id, token or code; its one script
+  (`/api/mcp/oauth/callback.js`) strips the query from the URL and history,
+  tells the opener's origin on `BroadcastChannel("hennery-mcp-oauth")`, and
+  closes the window on success. It answers `Cache-Control: no-store`,
+  `Referrer-Policy: no-referrer`, `nosniff` and the kernel's CSP, layered on
+  its own router.
+- **`account_label`:** v1 learns none (no standard place reports one); the
+  column stays `NULL`.
+
 ### 4.4 Tokens
 
 - `expires_at = now + expires_in − 60 s`; absent `expires_in` means unknown,
@@ -335,6 +432,11 @@ rejected — a grant that "refreshes fine and never works".)*
 - A refresh response without `refresh_token` keeps the old one.
 - Refresh sends `resource` and the original scopes. *(G-10: the predecessor
   omitted both on refresh.)*
+- As built (plan 8f): a proactive refresh is done only for a grant with a
+  refresh token, so a request never waits for the lock of a grant that
+  cannot be refreshed; after it, the URL and the token are read again, in one
+  statement (plan 8f decision 13). A refresh that fails leaves the token
+  there is: a 401 then has its own refresh and retry.
 
 ### 4.5 Single-flight refresh
 
@@ -350,6 +452,31 @@ rejected — a grant that "refreshes fine and never works".)*
   failure → 502 without `needs_auth` (a click cannot fix a disk error).
 - Every credential write (grant storage, credential clear) takes the same lock.
   *(G-13: a late refresh of an old grant overwrote a freshly stored new one.)*
+
+**As built (plan 8f).** One `Runtime` per collector holds the locks, shared
+by the API, the proxy and the probe (plan 8f decision 3). A refresh runs as a
+task of its own that the caller awaits. Its outcomes (`Refreshed`):
+
+| Outcome | When | The proxy answers | Status |
+|---|---|---|---|
+| `Retry` | a token to send: refreshed, or one another refresh or a Connect stored meanwhile (then nothing is sent to the vendor) | the retry's answer; a second 401 is 502 `upstream_auth` | `needs_auth` on the second 401 |
+| `NotRefreshable` | no grant, or one without a refresh token | 502 `upstream_auth` | `needs_auth` |
+| `Refused` | the vendor refused the refresh (`invalid_grant` and the like, `invalid_target` without `resource` too) | 502 `upstream_auth` | `needs_auth` |
+| `Unavailable` | timeout, transport failure, an egress refusal or an unreadable answer | 502 `upstream_unreachable` | unchanged |
+| `Unsaved` | the grant could not be read, or the result could not be stored | 502 `credential_unsaved` | unchanged |
+
+- **The write is a compare-and-swap** on the sealed blob, URL and kind it
+  read (plan 8f decision 9): an edit that deleted the grant meanwhile, or a
+  newer grant a Connect stored, is never overwritten by a late refresh; the
+  refresh then uses what is stored. A writer that cannot take the lock (a
+  hat purge from the kernel's hook) is safe for the same reason.
+- **A token comes with where it goes** (plan 8f decision 13): `Retry`
+  carries the URL and the internal-network allowance read with its token.
+  The retry is sent only if both equal what the first attempt was sent to;
+  otherwise nothing more is sent and the answer is 502 `upstream_changed`
+  ("send again"), without `needs_auth`. (A URL edit and a new Connect while a
+  401 waited for the lock would otherwise send the new upstream's token to
+  the old one.)
 
 ### 4.6 Credential invalidation on edit
 
@@ -500,6 +627,11 @@ and nothing goes up.
 - A `static` connection without a token, or of a kind the proxy does not take
   yet, sends nothing: 502 `upstream_auth`.
 - A 401 for a static or `none` connection sets it `needs_auth` (§7).
+- As built (plan 8f): an OAuth 401 goes through §4.5's single-flight refresh
+  and its outcomes table: 502 `upstream_auth` (with `needs_auth`),
+  `upstream_unreachable`, `credential_unsaved` or `upstream_changed` (neither
+  of the last three sets `needs_auth`). The proxy and the probe share one
+  forwarding path, `proxy::send_through`.
 
 ### 5.5 Tool allowlist
 
@@ -713,6 +845,29 @@ documented, never logged whole).
     disabled (its routes 503, sessions without gateway servers). Switching
     is `run_collector` matching `KeyUnavailable`.
 
+**As built (plan 8f).**
+
+- **Fields:** an OAuth grant (its access and refresh tokens, one JSON object)
+  is sealed in `gw_credentials` as `gw_credentials.oauth_tokens`, taken from
+  the connection's kind as the static token's field is; a client secret in
+  `gw_oauth_clients` as `gw_oauth_clients.client_secret`, and a pending
+  client's (§4.2) as `gw_oauth_clients.pending_client_secret`, so neither
+  opens as the other. The key check at start opens each kind with its own
+  field, and counts a stored client secret as ciphertext.
+- **`gw_oauth_clients`** holds one row per connection: the client id, whether
+  a secret is stored (a column apart, so a list never reads a ciphertext),
+  the sealed secret, its `key_version`, the authentication method, the
+  pinned issuer and endpoints, the redirect URI, scopes, `resource` and
+  `resource_param_accepted`, and the pending client's id, secret, issuer and
+  token endpoint. **One `key_version` covers both secrets of the row**: a
+  pending `PUT` re-seals it, so `rotate-key` (plan 8g) must re-seal the
+  active and the pending secret together.
+- **What a grant counts as:** a grant is a credential (`has_credential`, and
+  lane L20's hats with credentials when that lands); a client secret alone
+  is not.
+- A §4.6 change of origin or kind deletes the OAuth client with the
+  credential, in the same transaction; so do a delete and a hat purge.
+
 **Stated plainly in the docs:** the collector holding the gateway is a single
 point of compromise for every integration it holds. Hats limit what one
 session's token reaches; they do not protect against compromise of the
@@ -756,6 +911,33 @@ Docker image); `hennery up` warns in that situation (kernel §10). In v1
   reconnect. *(G-22: re-posting every tick trains people to ignore it; first
   implementation told the operator to click "Connect" during an outage.)*
 - Every background loop has panic isolation and a per-tick timeout.
+
+**As built (plan 8f).**
+
+- **The probe** (`probe.rs`) goes through `proxy::send_through` with the
+  connection's own credential and allowance: every step 2xx → `ok`; a 401
+  after one refresh → `needs_auth`; a 5xx, a 3xx or a transport failure →
+  `error`, with a note; any other 4xx → no change. The `DELETE`'s answer is
+  not read (many servers take none). Each probe moves `checked_at`, and each
+  is bounded at 30 s. Only the probe sets `error`; live traffic never does.
+- **The loop** runs every 15 minutes over the OAuth connections with a grant;
+  each tick is a task of its own bounded at 10 minutes, so a panic or a hang
+  ends that tick, not the loop.
+- **Probe now** (`POST …/probe`, §9): single-flight per connection; within
+  10 s of a completed probe its result stands without a new request; static
+  and `none` connections can be probed this way too (409 `no_credential`
+  for a `static` or OAuth connection without one).
+- **Live traffic's `ok`** moves `checked_at` too, at most once a minute when
+  nothing else changes (the throttle of `last_used_at`).
+- **Every status write is guarded by the URL** the request or probe went to,
+  so an answer about an old URL changes nothing.
+- **The Notifier** is told of a move into `needs_auth` or `error`, and out of
+  either into `ok`, by the store that made it, in the statement that made
+  it; a problem already there at start is announced once. Full mode: Web
+  Push (`hennery_kernel::push::Push`), the title the connection's label, the
+  generic title "An MCP connection needs attention", the body "needs sign-in
+  again", "is failing" or "is working again", the URL `/mcp`, the tag
+  `mcp-<connection id>`, urgency normal; the hat's push policy applies.
 
 ---
 
@@ -818,21 +1000,25 @@ read.
 | Method & path | Purpose |
 |---|---|
 | `GET /api/mcp/connections` | List: 200, an array of `McpConnectionItem`, oldest first (no secrets; `has_credential`, status, `account_label`, mounts on unrevoked hosts, sorted). |
-| `POST /api/mcp/connections` | Create (**step-up**): `CreateMcpConnectionRequest` → 201 `McpConnectionItem`, `not_connected`, no credential, no mounts. 400 `invalid` (a field refused, or a hat that is not the owner's); 400 `unsupported_cred_kind` (an OAuth kind, until plan 8f); 409 `slug_taken`; 409 `too_many_connections`. |
+| `POST /api/mcp/connections` | Create (**step-up**): `CreateMcpConnectionRequest` → 201 `McpConnectionItem`, `not_connected`, no credential, no mounts. 400 `invalid` (a field refused, or a hat that is not the owner's); 409 `slug_taken`; 409 `too_many_connections`. |
 | `PATCH /api/mcp/connections/{id}` | Update: `UpdateMcpConnectionRequest` → 200 `McpConnectionItem`. **Step-up** when the body names `url`, `cred_kind`, `internal_network`, `static_header` or `static_prefix`, even with the stored value (a `null` reads as absent); the label and the allowlist need none. Origin or kind change clears the credential (§4.6). The slug and hat cannot change (an unknown field, 422). 400 `invalid`; 400 `unsupported_cred_kind`. A refused change changes nothing. |
-| `DELETE /api/mcp/connections/{id}` | Delete (**step-up**: it destroys a grant that may need a consent to get back, as revoking a host does) with mounts and credential (and, from plan 8f, OAuth client): 204. |
+| `DELETE /api/mcp/connections/{id}` | Delete (**step-up**: it destroys a grant that may need a consent to get back, as revoking a host does) with mounts, credential and OAuth client, and its OAuth flows dropped: 204. |
 | `PUT /api/mcp/connections/{id}/mounts` | Replace the host set (full set, never a delta): `McpMountsRequest {host_ids}` → 200 `McpConnectionItem`. No step-up: a mount reaches only a host the owner paired, and pairing needs it. 400 `invalid` (a host not the owner's or revoked, more than 1024 hosts, an id over 64 bytes). |
 | `PUT /api/mcp/connections/{id}/credential` | Set a static token (write-only, **step-up**): `McpCredentialRequest {token}` → 204, sealed, replacing any before it. 409 `wrong_cred_kind` (not `static`); 400 `invalid` (the token is never quoted). No route reads a credential back or clears one: changing the origin or kind, or deleting the connection, does. |
-| `PUT /api/mcp/connections/{id}/oauth-client` | Set a pre-registered client (**step-up**). *Later: plan 8f.* |
-| `POST /api/mcp/connections/{id}/authorize` | Start OAuth; sets the flow cookie, returns the consent URL. *Later: plan 8f.* |
-| `GET /api/mcp/oauth/callback` | OAuth redirect target (`state` plus flow cookie). *Later: plan 8f.* |
+| `GET /api/mcp/oauth/redirect-uri` | The redirect URI to register at a vendor for `oauth_client` (plan 8f). |
+| `PUT /api/mcp/connections/{id}/oauth-client` | Set a pre-registered client (**step-up**): `McpOauthClientRequest` → 200 `McpConnectionItem`; a secret left out keeps the stored one only for the same client id; pending while a grant is live (§4.2). 409 `wrong_cred_kind`; 400 `invalid`. Drops the connection's flows. |
+| `POST /api/mcp/connections/{id}/authorize` | Start OAuth (**step-up**: kernel §3.4 lists gateway credentials and pre-registered clients, the broader rule over this table's first draft; the API design's F2): `McpAuthorizeRequest` (`{}` or `{accept_resource}`) → 200 `McpAuthorizeResponse` `{consent_url, expires_at}`, setting the flow cookie (§4.3). Its codes are on `McpAuthorizeRequest` in `hennery-proto`; among them 409 `resource_mismatch` (also for a stale `accept_resource`), 400 `invalid` (an `accept_resource` where no PR document names one), 409 `no_oauth_client`, `no_registration_endpoint`, `issuer_changed`, `wrong_cred_kind`, 429 `too_many_flows`, 502 `discovery_failed`, `insecure_metadata`, `pkce_unsupported`, `registration_refused`, `resource_foreign`, `egress_refused`, `upstream_unreachable`. Each failure after the connection was found is kept in `oauth_error`, and a failed Connect never changes the status. |
+| `GET /api/mcp/oauth/callback` | OAuth redirect target (`state` plus flow cookie, §4.3), outside the operator's session and the browser rules; renders the page. Its script is `GET /api/mcp/oauth/callback.js`. |
+| `POST /api/mcp/connections/{id}/probe` | Probe now (§7): `{}` → 200 `McpConnectionItem` after the probe. 409 `no_credential`. No step-up: it changes no credential and no destination. |
 | `GET/PUT /api/mcp/stdio-servers?host_id&hat_id` | Local stdio servers for one (host, hat), full set (§3.4; **step-up** on `PUT`). *Later.* |
 | `GET /api/mcp/clients` / `POST` / `DELETE /{id}` | Standalone clients. `POST {label, hat_id, connection_ids[]}` creates the client and its pins; the token is shown once. *Later: plan 8g.* |
 | `PUT /api/mcp/clients/{id}/pins` | Replace a client's pinned connections (`{connection_ids[]}`). *Later: plan 8g.* |
 | `GET /api/mcp/manifest` | Manifest for the presenting standalone client token (renderers). *Later: plan 8g.* |
 
 The collector merges the gateway's router beside the sessions module's; the
-kernel's CSP layer does not cover these routes, which answer only JSON.
+kernel's CSP layer does not cover a router merged beside it. The JSON routes
+need none; the callback, the one gateway route that answers HTML, layers the
+kernel's `csp::on_html` itself (plan 8f).
 
 No endpoint returns a session token, and no endpoint lets one host read another
 host's tokens. *(G-25: the predecessor's pull endpoint took the target machine
