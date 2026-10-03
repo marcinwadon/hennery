@@ -438,14 +438,18 @@ impl Group {
         let mut all = vec![self.pgid()];
         let mut next = 0;
         while next < all.len() {
-            let out = Command::new("pgrep").args(["-P", &all[next].to_string()]).output();
-            if let Ok(out) = out {
-                all.extend(
-                    String::from_utf8_lossy(&out.stdout)
-                        .lines()
-                        .filter_map(|line| line.trim().parse::<i32>().ok()),
-                );
-            }
+            // pgrep: 0 found, 1 none; anything else, or no pgrep at all,
+            // must not pass as "none" (the children would be left behind).
+            let out = Command::new("pgrep")
+                .args(["-P", &all[next].to_string()])
+                .output()
+                .expect("run pgrep");
+            assert!(matches!(out.status.code(), Some(0 | 1)), "pgrep failed: {out:?}");
+            all.extend(
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter_map(|line| line.trim().parse::<i32>().ok()),
+            );
             next += 1;
         }
         all
@@ -460,12 +464,15 @@ impl Group {
     /// SIGTERM to the group, as Ctrl-C's SIGINT would be: it and every
     /// process under it must be gone within 20 s.
     fn stop(&mut self) {
-        let pids = self.processes();
+        let mut pids = self.processes();
         // SAFETY: kill(2) on this test's own process group.
         unsafe { libc::kill(-self.pgid(), libc::SIGTERM) };
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
-            let _ = self.child.try_wait();
+            // Once the shell is reaped its id may be another's: stop asking.
+            if let Ok(Some(_)) = self.child.try_wait() {
+                pids.retain(|&pid| pid != self.pgid());
+            }
             if !Self::any_alive(&pids) {
                 return;
             }
@@ -480,9 +487,14 @@ impl Group {
 }
 
 impl Drop for Group {
-    /// Kill everything under the shell, and wait until it is gone, so that
-    /// nothing writes into the machine's home after it is removed.
+    /// Kill everything under the shell while it runs, and wait until it is
+    /// gone, so that nothing writes into the machine's home after it is
+    /// removed. A shell already reaped (after `stop`, or one that exited)
+    /// is left alone: its id may be another's.
     fn drop(&mut self) {
+        if !matches!(self.child.try_wait(), Ok(None)) {
+            return;
+        }
         let pids = self.processes();
         for &pid in &pids {
             // SAFETY: kill(2) on processes this test started.
@@ -490,7 +502,7 @@ impl Drop for Group {
         }
         let _ = self.child.wait();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while Self::any_alive(&pids) && Instant::now() < deadline {
+        while Self::any_alive(&pids[1..]) && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -590,6 +602,29 @@ fn setup_url(group: &mut Group, machine: &Machine) -> String {
         url.contains('#')
     });
     url.trim_end().to_string()
+}
+
+/// `cmd`'s output, failing the test if it runs longer than `limit`.
+fn output_within(cmd: &mut Command, limit: Duration) -> std::process::Output {
+    let child = cmd
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id() as i32;
+    let (done, waited) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(child.wait_with_output());
+    });
+    match waited.recv_timeout(limit) {
+        Ok(out) => out.unwrap(),
+        Err(_) => {
+            // SAFETY: kill(2) on this test's own process group, still running.
+            unsafe { libc::kill(-pid, libc::SIGKILL) };
+            panic!("still running after {limit:?}");
+        }
+    }
 }
 
 /// A command on a terminal, its process group killed on drop: a test that
@@ -780,7 +815,7 @@ fn pairing_another_machine_works_as_the_readme_says() {
     let join = join
         .replace(EXAMPLE_URL, &format!("http://{listen}"))
         .replace(EXAMPLE_CODE, &code);
-    let out = other.sh(&join).stdin(Stdio::null()).output().unwrap();
+    let out = output_within(other.sh(&join).stdin(Stdio::null()), Duration::from_secs(60));
     let (stdout, stderr) = (
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr),

@@ -91,9 +91,8 @@ two. It listens on `http://127.0.0.1:7117` and keeps its data in
 by default `~/.local/share/hennery` (Linux). The first start downloads the
 agents' adapters, about 272 MB.
 
-On its first start it prints a one-time setup link, valid for an hour (when
-its output is not a terminal, the link is in `collector/setup-url` in the
-data directory). Open it, choose a password, and you are signed in. Back up
+On its first start it prints a one-time setup link, valid for an hour, and
+keeps it in `collector/setup-url` in the data directory until setup. Open it, choose a password, and you are signed in. Back up
 `collector/master.key` together with `collector/hennery.db`: the gateway's
 credentials cannot be read without it.
 
@@ -115,8 +114,9 @@ then on open hennery at the new address, since the old one is refused.
 
 In the web UI, **Hosts → Add host** shows a pairing code, valid for ten
 minutes, and the command that uses it. Build hennery on the other machine,
-run that command there (it too downloads the adapters), then start the
-host:
+run that command there (it too downloads the adapters; leave the code out
+to type it instead, which keeps it out of your shell history), then start
+the host:
 
 <!-- check: join -->
 ```sh
@@ -139,7 +139,7 @@ MCP servers are connected, and given to hosts, on the **MCP** screen.
 
 Run these on the collector's machine while hennery runs, as the user that
 runs it; each asks for confirmation on the terminal. For a collector not in
-the default place, add `--data-dir`.
+the default place, give `--data-dir <dir>` right after `admin`.
 
 - **A forgotten password:** set a new one. It signs out every session and
   removes every passkey.
