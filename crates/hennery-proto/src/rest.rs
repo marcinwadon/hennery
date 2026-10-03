@@ -644,6 +644,32 @@ pub struct HatItem {
     /// frozen, so nothing starts, resumes or moves in or out of it, and a
     /// `POST /api/hats/{id}/purge` again resumes the purge.
     pub purging: bool,
+    /// The hat's logo's `ETag`, without its quotes, when it has a logo
+    /// (plan 4d-B2); absent when it has none. `GET /api/hats/{id}/logo`
+    /// serves it; a client may add `?v=<logo>` to that URL so a new logo is
+    /// a new URL to its cache.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub logo: Option<String>,
+}
+
+/// `PUT /api/hats/{id}/logo` (kernel spec §5.1, §8; plan 4d-B2): a PNG, at
+/// most 64 KiB, as standard base64 with its padding and nothing around it
+/// (no `data:` prefix, no whitespace). The body is at most 96 KiB. Step-up.
+/// The collector decodes it and writes it afresh, so what is served is
+/// never the upload's bytes. 200 with the `HatItem`.
+///
+/// Its own codes: 400 `invalid_logo` (not base64; not a readable PNG; over
+/// 1024 pixels either way); 413 `logo_too_large` (over 64 KiB, or over 256
+/// KiB once re-encoded); 413 `body_too_large`; 415 `unsupported_logo` (not
+/// a PNG: the web UI turns an SVG, a WebP or a JPEG into one first); 404
+/// `not_found`; 409 `hat_purging` (a hat frozen for its purge takes no new
+/// logo). `DELETE /api/hats/{id}/logo` (step-up) removes it: 200 with the
+/// `HatItem`, a frozen hat's too, or 404.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct SetHatLogoRequest {
+    pub data: String,
 }
 
 /// `GET /api/hats/{id}/purge` (kernel spec §5.5; plan 9c decision 11, A13):

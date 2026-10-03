@@ -12,6 +12,11 @@ use axum::response::Response;
 pub const POLICY: &str = "script-src 'self'; default-src 'self'; connect-src 'self'; img-src 'self' data: blob:; \
      object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
 
+/// The policy of a hat's logo (plan 4d-B2; the security review's A9): it
+/// is served from this origin, so opened as a page it must still run
+/// nothing, load nothing and be framed nowhere, whatever it holds.
+pub const LOGO_POLICY: &str = "default-src 'none'; sandbox; frame-ancestors 'none'";
+
 /// Set `POLICY` on a `text/html` response. Use as
 /// `axum::middleware::map_response(csp::on_html)`, outermost.
 pub async fn on_html(mut response: Response) -> Response {

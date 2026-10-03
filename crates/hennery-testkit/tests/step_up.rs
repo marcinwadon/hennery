@@ -113,6 +113,10 @@ async fn minting_changing_revoking_a_host_and_revoking_a_session_need_a_fresh_pa
         ("PATCH", "/api/hats/hat-9".to_string(), Some(r#"{"name":"x"}"#), 404),
         // Refused before anything is read: 403, not 404, for an unknown hat.
         ("POST", "/api/hats/hat-9/purge".to_string(), None, 404),
+        // A hat's logo (plan 4d-B2): an unknown hat is 404 before the
+        // upload is decoded, so this body, which is no image, never is.
+        ("PUT", "/api/hats/hat-9/logo".to_string(), Some(r#"{"data":""}"#), 404),
+        ("DELETE", "/api/hats/hat-9/logo".to_string(), None, 404),
         (
             "PATCH",
             "/api/sessions/s-9".to_string(),
@@ -159,6 +163,9 @@ async fn minting_changing_revoking_a_host_and_revoking_a_session_need_a_fresh_pa
     let resp = send(&stale, "GET", "/api/sessions/s-9", None).await.unwrap();
     assert_eq!(resp.status(), 404);
     let resp = send(&stale, "GET", "/api/hats/hat-9/purge", None).await.unwrap();
+    assert_eq!(code_of(resp).await, (404, "not_found".into()));
+    // Nor does a hat's logo: it is every `<img>` of the hat (the review's A5).
+    let resp = send(&stale, "GET", "/api/hats/hat-9/logo", None).await.unwrap();
     assert_eq!(code_of(resp).await, (404, "not_found".into()));
     let resp = send(&stale, "GET", "/api/settings/host-removals", None).await.unwrap();
     assert_eq!(resp.status(), 200);
