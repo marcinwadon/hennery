@@ -268,8 +268,10 @@ fn codex_rollouts(root: &Path) -> (PathBuf, PathBuf) {
     (own, other)
 }
 
-/// The fake app-server (Codex 0.155.1), logging to `log`.
+/// The fake app-server (Codex 0.155.1), logging to `log`, run once first
+/// so that macOS's check of it is not timed as the forget's.
 fn fake_codex(log: &Path) -> AgentCommand {
+    hennery_testkit::first_exec(env!("CARGO_BIN_EXE_hennery-fake-codex"));
     let script = hennery_testkit::FakeCodex {
         version: "0.155.1".into(),
         log: log.to_str().unwrap().into(),

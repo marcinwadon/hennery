@@ -329,8 +329,9 @@ async fn a_home_the_host_could_not_register_is_not_reported() {
     setup.start_host();
     let (mut collector, _) = Collector::accept(&setup.listener).await;
     collector.send(&setup.start()).await;
-    let SessionBody::SessionStarted { agent_home, .. } = collector.fact().await else {
-        panic!("expected session_started");
+    let fact = collector.fact().await;
+    let SessionBody::SessionStarted { agent_home, .. } = fact else {
+        panic!("expected session_started: {fact:?}");
     };
     assert_eq!(agent_home, None);
 }
