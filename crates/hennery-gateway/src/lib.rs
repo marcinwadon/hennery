@@ -6,9 +6,11 @@
 
 pub mod api;
 pub mod crypto;
+pub mod flows;
 mod jsonrpc;
 pub mod key;
 pub mod model;
+pub mod oauth;
 pub mod proxy;
 mod schema;
 pub mod scope;
