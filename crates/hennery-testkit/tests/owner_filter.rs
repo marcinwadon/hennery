@@ -94,9 +94,10 @@ const SOURCES: &[(&str, &str, usize)] = &[
     ),
 ];
 
-/// The gateway store's statements (plan 8a), apart from the list above so
-/// that other lanes' changes to it stay apart from this one.
-const GATEWAY_STATEMENTS: usize = 23;
+/// The gateway store's statements (plan 8a; plan 4d-B3's hats with a
+/// credential), apart from the list above so that other lanes' changes to
+/// it stay apart from this one.
+const GATEWAY_STATEMENTS: usize = 24;
 
 /// Files under `crates/*/src` with SQL that the audit does not read, and
 /// why (3b-iii review, A3). Any other such file fails

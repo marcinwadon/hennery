@@ -660,3 +660,90 @@ fn a_connections_debug_shows_only_its_urls_origin() {
     );
     assert_eq!(hennery_gateway::model::url_for_logs("not a url"), "<not a url>");
 }
+
+/// Plan 4d-B3 (kernel spec §10, lane L20): the hats whose connections hold a
+/// stored credential, each once. A connection without one counts for
+/// nothing; every kind counts, an OAuth grant (plan 8f stores it in the same
+/// table) as much as a static token; a purged hat's go with it.
+#[test]
+fn the_hats_with_credentials_are_those_a_credential_is_stored_for() {
+    let w = World::new();
+    let work = w.hat("Work");
+    let granted = w.hat("Granted");
+    let hats = || w.store.hats_with_credentials().unwrap();
+    assert!(hats().is_empty());
+
+    // Connections, but no credential yet: no hat.
+    let first = w.create("first");
+    let second = w.create("second");
+    let mut in_work = w.new_connection("work-linear");
+    in_work.hat_id = work.clone();
+    let third = done(w.store.create(&in_work, NOW).unwrap()).id;
+    assert!(hats().is_empty());
+
+    // Two credentials in one hat: that hat, once.
+    for connection in [&first, &second] {
+        w.store.set_static_credential(connection, TOKEN, &w.key, NOW).unwrap();
+    }
+    assert_eq!(hats(), [w.hat.clone()].into());
+    w.store.set_static_credential(&third, TOKEN, &w.key, NOW).unwrap();
+    assert_eq!(hats(), [w.hat.clone(), work.clone()].into());
+
+    // A grant of an OAuth connection, written as plan 8f will write one:
+    // counted, whatever its kind.
+    let sql = w.sql();
+    sql.execute(
+        "INSERT INTO gw_connections(id, owner_id, slug, label, url, hat_id, cred_kind, internal_network, status_at,
+                                    created_at, updated_at)
+         VALUES ('conn-00000000000000a1', ?1, 'granted', 'Granted', 'https://mcp.granted.example/', ?2, 'oauth_dcr',
+                 0, 0, 0, 0)",
+        [w.store.owner_id(), granted.as_str()],
+    )
+    .unwrap();
+    sql.execute(
+        "INSERT INTO gw_credentials(connection_id, owner_id, key_version, ciphertext, updated_at)
+         VALUES ('conn-00000000000000a1', ?1, 1, x'00', 0)",
+        [w.store.owner_id()],
+    )
+    .unwrap();
+    assert_eq!(hats(), [w.hat.clone(), work.clone(), granted.clone()].into());
+
+    // A purged hat's credentials go with it.
+    w.store.purge_hat(&work).unwrap();
+    assert_eq!(hats(), [w.hat.clone(), granted].into());
+}
+
+/// Plan 4d-B3, the gateway lane's review: a change that deletes a
+/// connection's credential (another origin, or another kind; gateway spec
+/// §4.6) takes its hat out of the hats with credentials when it was that
+/// hat's only one.
+#[test]
+fn a_credential_deleted_by_an_update_takes_its_hat_out() {
+    let w = World::new();
+    let work = w.hat("Work");
+    let mut in_work = w.new_connection("work-linear");
+    in_work.hat_id = work.clone();
+    let moved = done(w.store.create(&in_work, NOW).unwrap()).id;
+    let rekinded = w.create("personal-linear");
+    for connection in [&moved, &rekinded] {
+        w.store.set_static_credential(connection, TOKEN, &w.key, NOW).unwrap();
+    }
+    assert_eq!(
+        w.store.hats_with_credentials().unwrap(),
+        [w.hat.clone(), work.clone()].into()
+    );
+
+    let patch = ConnectionPatch {
+        url: Some("https://elsewhere.example/mcp".into()),
+        ..ConnectionPatch::default()
+    };
+    assert!(!done(w.store.update(&moved, &patch, NOW + 1).unwrap()).has_credential);
+    assert_eq!(w.store.hats_with_credentials().unwrap(), [w.hat.clone()].into());
+
+    let patch = ConnectionPatch {
+        cred_kind: Some(CredKind::None),
+        ..ConnectionPatch::default()
+    };
+    assert!(!done(w.store.update(&rekinded, &patch, NOW + 1).unwrap()).has_credential);
+    assert!(w.store.hats_with_credentials().unwrap().is_empty());
+}
