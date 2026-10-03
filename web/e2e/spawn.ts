@@ -9,12 +9,18 @@ export type { ChildProcess }
 
 export const BIN = process.env.HENNERY_BIN ?? resolve(process.cwd(), '../target/debug/hennery')
 
-/** The runner's environment without any `HENNERY_*` variable (a data or
- *  log directory, a service flag: each would send the binary to the
- *  runner's own files), with its home and XDG directories under `dir`. */
+/** What a child may take from the runner's environment: where programs
+ *  are, the locale and time zone, and the temporary directory. */
+export const INHERITED = ['PATH', 'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ', 'TMPDIR'] as const
+
+/** A child's environment, built from an allowlist: `INHERITED` from the
+ *  runner, and its home and XDG directories under `dir`. Nothing else of the
+ *  runner's reaches it: no `HENNERY_*` variable (a data or log directory, a
+ *  service flag), no `CODEX_HOME`, no token. A test adds what it needs
+ *  through `extra`. */
 export function scratchEnv(dir: string): NodeJS.ProcessEnv {
-  const env = { ...process.env }
-  for (const key of Object.keys(env)) if (/^HENNERY_/.test(key)) delete env[key]
+  const env: NodeJS.ProcessEnv = {}
+  for (const key of INHERITED) if (process.env[key] !== undefined) env[key] = process.env[key]
   return {
     ...env,
     HOME: dir,
