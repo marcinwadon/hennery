@@ -295,7 +295,14 @@ async fn attempt_once(state: &AppState, record: &ForgetRecord, wait: Duration) -
             (final_result(ForgetReason::InvalidId), true, true)
         }
         Err(RequestError::Rejected { code, message }) => {
-            tracing::warn!(host_id = %record.host_id, %code, %message, "a forget was refused; it stays pending");
+            // The host's words, which can quote a session token (plan 8e
+            // decision 11).
+            tracing::warn!(
+                host_id = %record.host_id,
+                %code,
+                message = %crate::redact::shown(&message),
+                "a forget was refused; it stays pending"
+            );
             (pending(RemovalPending::NoReply), true, false)
         }
     };
