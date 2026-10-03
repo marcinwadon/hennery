@@ -457,6 +457,10 @@ async fn a_tools_list_without_an_id_is_filtered_as_null() {
 #[tokio::test]
 async fn a_get_stream_and_its_replay_are_filtered() {
     let s = setup().await;
+    // A replay's cursor goes up only with a bound session id (plan 8e).
+    let session =
+        s.h.session_id(&s.upstream, "linear", &s.token, "upstream-session-1")
+            .await;
     let replayed = "id: 9\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"search\"},{\"name\":\"delete\"}]}}\n\n";
     s.upstream.reply(move |_, _| {
         Response::builder()
@@ -469,6 +473,7 @@ async fn a_get_stream_and_its_replay_are_filtered() {
             s.h.client
                 .get(s.h.url("linear"))
                 .bearer_auth(&s.token)
+                .header("mcp-session-id", &session)
                 .header(header::ACCEPT, "text/event-stream");
         if let Some(id) = last_event_id {
             get = get.header("last-event-id", id);
@@ -484,7 +489,7 @@ async fn a_get_stream_and_its_replay_are_filtered() {
         );
     }
     let seen = s.upstream.seen();
-    assert_eq!(seen[1].header("last-event-id"), Some("8"));
+    assert_eq!(seen[2].header("last-event-id"), Some("8"));
 }
 
 /// An answer on another stream (accepted, gateway spec §5.5): the proxy

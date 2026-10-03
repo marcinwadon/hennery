@@ -11,7 +11,9 @@ use axum::response::Response;
 use futures::StreamExt;
 use hennery_gateway::model::CredKind;
 use hennery_gateway::proxy::Limits;
+use hennery_gateway::scope::{ClientIdentity, Principal};
 use hennery_gateway::session::{GatewayMcp, SessionMcp};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use support::upstream::{FakeUpstream, Harness};
 use tokio::sync::watch;
@@ -152,6 +154,111 @@ async fn a_revoke_ends_a_request_not_yet_answered() {
     let response = tokio::time::timeout(BOUND, request).await.unwrap().unwrap().unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     assert!(upstream.seen().is_empty(), "nothing went upstream");
+}
+
+/// A resolve that read the token live, then saw a revoke commit and cut
+/// before it returned, as a revoke in flight can: it answers what it read,
+/// once and again.
+struct RevokedDuringResolve {
+    inner: Arc<dyn ClientIdentity>,
+    revoke: Box<dyn Fn() + Send + Sync>,
+    read: Mutex<Option<Principal>>,
+}
+
+impl ClientIdentity for RevokedDuringResolve {
+    fn resolve(&self, token: &str, now: i64) -> anyhow::Result<Option<Principal>> {
+        let mut read = self.read.lock().unwrap();
+        if read.is_none() {
+            *read = self.inner.resolve(token, now)?;
+            (self.revoke)();
+        }
+        Ok(read.clone())
+    }
+}
+
+/// The race decision 12's order closes (the security review's finding 1):
+/// a revoke that commits and cuts while the proxy resolves the token finds
+/// its watch already registered, so the request ends with the same 404,
+/// however live the token read.
+#[tokio::test]
+async fn a_revoke_committed_during_the_resolve_ends_the_request() {
+    let upstream = FakeUpstream::start().await;
+    let mut h = Harness::new().await;
+    mounted(&h, &upstream);
+    let token = h.mint("s1", "host-a", &h.hat());
+    let mcp = GatewayMcp::new(&h.gateway());
+    let db = h.db.clone();
+    h.restart_with(move |state| {
+        state.identity = Arc::new(RevokedDuringResolve {
+            inner: state.identity.clone(),
+            revoke: Box::new(move || {
+                let mut conn = hennery_kernel::db::open(&db).unwrap();
+                let tx = conn.transaction().unwrap();
+                let cut = mcp.revoke_in(&tx, "s1").unwrap();
+                tx.commit().unwrap();
+                mcp.cut(cut);
+            }),
+            read: Mutex::new(None),
+        });
+    })
+    .await;
+    let response = tokio::time::timeout(BOUND, h.post("linear", &token, &support::upstream::list(1)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+/// Decision 12's "the JSON read included" (the security review's finding
+/// 3): a revoke while a JSON answer is still being read whole ends the
+/// request with the same 404, before the answer's deadline.
+#[tokio::test]
+async fn a_revoke_while_a_json_answer_is_read_ends_the_request() {
+    let upstream = FakeUpstream::start().await;
+    let h = Harness::with_limits(
+        Limits::new(8, 8, Duration::from_secs(60), Duration::from_secs(60))
+            .with_answer_timeout(Duration::from_secs(60)),
+    )
+    .await;
+    mounted(&h, &upstream);
+    // A JSON answer whose body never ends.
+    upstream.reply(|_, hold| {
+        let hold = hold.clone();
+        let body = futures::stream::once(async { Ok::<_, std::io::Error>(Bytes::from_static(b"{")) }).chain(
+            futures::stream::unfold(hold, |mut hold| async move {
+                while hold.changed().await.is_ok() {}
+                None
+            }),
+        );
+        Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from_stream(body))
+            .unwrap()
+    });
+    let token = h.mint("s1", "host-a", &h.hat());
+    let request = {
+        let client = h.client.clone();
+        let url = h.url("linear");
+        let token = token.clone();
+        tokio::spawn(async move {
+            client
+                .post(url)
+                .bearer_auth(token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(support::upstream::list(1).to_string())
+                .send()
+                .await
+        })
+    };
+    // Positive signal: the upstream got the request, so its answer is
+    // being read.
+    let deadline = tokio::time::Instant::now() + BOUND;
+    while upstream.seen().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "the request never went up");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    revoke(&h, "s1");
+    let response = tokio::time::timeout(BOUND, request).await.unwrap().unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
 /// The watch goes when the request does: nothing is kept per token once
