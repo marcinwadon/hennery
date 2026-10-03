@@ -81,7 +81,7 @@ for (const width of [1280, 390]) {
       expect(await host.join(command, ['--name', 'e2e host', '--no-runtime'])).toBe(0)
       await expect(page.getByText('Paired: e2e host')).toBeVisible({ timeout: 15_000 })
       const card = page.getByRole('listitem', { name: 'e2e host' })
-      await expect(card.getByText('Offline')).toBeVisible()
+      await expect(card.getByText('Offline', { exact: true })).toBeVisible()
       // The code is spent, and gone from the page, its storage and its URL.
       expect(await page.content()).not.toContain(code)
       expect(await page.evaluate(() => JSON.stringify({ ...localStorage, ...sessionStorage }))).not.toContain(code)
@@ -89,7 +89,7 @@ for (const width of [1280, 390]) {
       host.run()
       await expect(async () => {
         await page.reload()
-        await expect(page.getByRole('listitem', { name: 'e2e host' }).getByText('Online')).toBeVisible({ timeout: 1000 })
+        await expect(page.getByRole('listitem', { name: 'e2e host' }).getByText('Online', { exact: true })).toBeVisible({ timeout: 1000 })
       }).toPass({ timeout: 20_000 })
     })
 
@@ -110,7 +110,9 @@ for (const width of [1280, 390]) {
       await page.getByLabel('Path 1').fill(join(project, 'work'))
       await page.getByLabel('Hat 1').selectOption({ label: 'Work' })
       await page.getByRole('button', { name: 'Save rules' }).click()
-      await expect(page.getByText('Saved.')).toBeVisible()
+      // By role and exact text: the resolution hint ("…under the rules as
+      // saved.") also contains "saved.", and getByText matches substrings.
+      await expect(page.getByRole('status').filter({ hasText: /^Saved\.$/ })).toBeVisible()
       await tester.fill(join(project, 'work', 'app'))
       await expect(resolution).toContainText(join(project, 'work', 'app'))
       await expect(resolution).toContainText('Work')
