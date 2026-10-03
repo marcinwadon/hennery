@@ -55,6 +55,8 @@ export interface Opts {
   turn?: () => Response | Promise<Response>
   /** `GET /api/attachments/{sha256}`. */
   attachment?: () => Response
+  /** `POST …/prompt`; 202 by default. */
+  prompt?: () => Response | Promise<Response>
   /** `POST …/config`. */
   config?: (id: string) => Response
   /** `GET /api/view/sessions/{id}`, before `items`. */
@@ -85,6 +87,7 @@ export function sessionServer(opts: Opts = {}) {
     let m: RegExpMatchArray | null
     if (path === '/api/hosts') return opts.hosts?.() ?? json([{ host_id: 'h1', name: 'build-box', capabilities: ['images'] }])
     if (path.startsWith('/api/attachments/')) return opts.attachment?.() ?? json({ code: 'not_found', message: 'no' }, 404)
+    if (opts.prompt && /^\/api\/sessions\/[^/]+\/prompt$/.test(path)) return opts.prompt()
     if ((m = path.match(/^\/api\/view\/sessions\/([^/]+)\/turns\/[^/]+$/))) {
       return opts.turn?.() ?? json({ code: 'not_found', message: 'no' }, 404)
     }

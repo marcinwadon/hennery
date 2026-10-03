@@ -2,7 +2,9 @@ import '@testing-library/jest-dom/vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { Item } from '../generated/view'
+import { STILL_SENDING } from '../components/Composer'
 import { forgetAllAttachments, heldFor, hold } from '../lib/attachments'
+import { forgetAllSends } from '../lib/sending'
 import { json } from '../test-stream'
 import SessionView from './Session'
 import { FAST, UNDELIVERED, catalogOf, message, sessionServer } from './test-session'
@@ -28,6 +30,7 @@ const base64 = (s: string) => Buffer.from(s).toString('base64')
 beforeEach(() => {
   sessionStorage.clear()
   forgetAllAttachments()
+  forgetAllSends()
   URL.createObjectURL = vi.fn(() => 'blob:u')
   URL.revokeObjectURL = vi.fn()
 })
@@ -143,6 +146,109 @@ describe('SessionView: the composer', () => {
     expect(screen.queryByLabelText('Prompt')).toBeNull()
     await waitFor(() => expect(sessionStorage.getItem('hennery.draft.s1')).toBeNull(), WAIT)
     expect(heldFor('s1').attachments).toEqual([])
+  })
+})
+
+describe('SessionView: a send in flight when the composer is mounted again', () => {
+  /** A response held until `answer` is called. */
+  function held() {
+    let answer!: (r: Response) => void
+    const promise = new Promise<Response>((resolve) => (answer = resolve))
+    return { respond: () => promise, answer: (r: Response) => act(async () => answer(r)) }
+  }
+
+  /** Away to s2 and back to s1, the composer mounted again. */
+  async function awayAndBack(r: ReturnType<typeof render>) {
+    r.rerender(view('s2'))
+    await screen.findByText('s2-m')
+    r.rerender(view('s1'))
+    await screen.findByText('s1-m')
+  }
+
+  const items = (id: string) => [message(`${id}-m`, 't1')]
+
+  it('stays read-only with Send disabled until the 202, which clears the draft it shows', async () => {
+    const answer = held()
+    const s = sessionServer({ items, prompt: answer.respond })
+    const r = render(view('s1'), { wrapper: s.wrapper })
+    await screen.findByText('s1-m')
+    type('sent once')
+    send()
+    await waitFor(() => expect(s.posted('/prompt')).toHaveLength(1), WAIT)
+    await awayAndBack(r)
+    expect(textarea().value).toBe('sent once')
+    expect(textarea().readOnly).toBe(true)
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    // Work added meanwhile is refused, as in the composer that sent.
+    paste(png('late.png'))
+    expect(screen.getByRole('alert').textContent).toBe(STILL_SENDING)
+    expect(screen.queryByRole('list', { name: 'Images' })).toBeNull()
+
+    await answer.answer(json({ turn_id: 'new' }, 202))
+    await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+    expect(sessionStorage.getItem('hennery.draft.s1')).toBeNull()
+    expect(textarea().readOnly).toBe(false)
+    type('next')
+    expect(sessionStorage.getItem('hennery.draft.s1')).toBe('next')
+    expect(s.posted('/prompt')).toHaveLength(1)
+  })
+
+  it('a refusal after the composer was mounted again keeps the draft, editable, and says why', async () => {
+    const answer = held()
+    const s = sessionServer({ items, prompt: answer.respond })
+    const r = render(view('s1'), { wrapper: s.wrapper })
+    await screen.findByText('s1-m')
+    type('kept')
+    send()
+    await waitFor(() => expect(s.posted('/prompt')).toHaveLength(1), WAIT)
+    await awayAndBack(r)
+    await answer.answer(json({ code: 'not_attached', message: 'srv-x' }, 409))
+    expect(await screen.findByText('The session is not running: resume it to send this.', undefined, WAIT)).toBeInTheDocument()
+    expect(textarea().readOnly).toBe(false)
+    expect(textarea().value).toBe('kept')
+    expect(sessionStorage.getItem('hennery.draft.s1')).toBe('kept')
+    expect(screen.getByRole('button', { name: 'Send' })).not.toBeDisabled()
+  })
+
+  it('once the send has ended, a composer mounted again is not held', async () => {
+    const s = sessionServer({ items })
+    const r = render(view('s1'), { wrapper: s.wrapper })
+    await screen.findByText('s1-m')
+    type('first')
+    send()
+    await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+    type('second')
+    await awayAndBack(r)
+    expect(textarea().readOnly).toBe(false)
+    await act(() => new Promise((resolve) => setTimeout(resolve, 50)))
+    expect(textarea().value).toBe('second')
+    expect(screen.getByRole('button', { name: 'Send' })).not.toBeDisabled()
+  })
+
+  it('a composer mounted again while Resume and send waits on the resume waits for the send too', async () => {
+    const resumed = held()
+    let attached = false
+    const s = sessionServer({
+      items,
+      prompt: () => (attached ? json({ turn_id: 'new' }, 202) : json({ code: 'not_attached', message: 'srv-x' }, 409)),
+      resume: () => resumed.respond().then((res) => ((attached = true), res)),
+    })
+    const r = render(view('s1'), { wrapper: s.wrapper })
+    await screen.findByText('s1-m')
+    type('later')
+    send()
+    fireEvent.click(await screen.findByRole('button', { name: 'Resume and send' }, WAIT))
+    await waitFor(() => expect(s.of('/api/sessions/s1/resume')).toHaveLength(1), WAIT)
+    await awayAndBack(r)
+    expect(textarea().readOnly).toBe(true)
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    await resumed.answer(json({ session_id: 's1', lifecycle: 'active' }, 202))
+    await waitFor(() => expect(textarea().value).toBe(''), WAIT)
+    expect(textarea().readOnly).toBe(false)
+    expect(s.posted('/prompt').map((p) => p.body)).toEqual([
+      { content: [{ type: 'text', text: 'later' }] },
+      { content: [{ type: 'text', text: 'later' }] },
+    ])
   })
 })
 

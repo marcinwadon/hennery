@@ -5,7 +5,9 @@
 // session id, so each session gets its own instance, and nothing typed or
 // attached for one session is ever shown in, or sent to, another (F-17).
 // The draft lives in `sessionStorage` (`hennery.draft.<id>`), the images in
-// memory (lib/attachments.ts); both come back when the session does.
+// memory (lib/attachments.ts); both come back when the session does. So
+// does a send still in flight (lib/sending.ts): the composer mounted again
+// stays read-only until it ends, and a 202 clears the draft it shows.
 //
 // A `handle` lets the session screen put words in the draft: a question's
 // "Answer as a new message", a turn that was not delivered ("Send again").
@@ -42,6 +44,7 @@ import {
 } from '../lib/attachments'
 import { commands, configOptions, matchCommands, type Choice, type Command, type ConfigOption } from '../lib/catalog'
 import { loadDraft, saveDraft } from '../lib/drafts'
+import { sendingFor, track } from '../lib/sending'
 import { undeliveredDraft, type DraftPart } from '../lib/sendAgain'
 import { Icon } from '../lib/ui'
 import { CANCEL_OUTCOME, SEND_AGAIN_LABEL, cancelRefusal, configRefusal, promptRefusal } from './composerWords'
@@ -102,6 +105,9 @@ interface Notice {
   resume?: boolean
 }
 
+/** How a send ended: sent (a 202), or refused, saying why. */
+type Outcome = { sent: true } | { sent: false; notice: Notice }
+
 function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog, onResume, handle }: ComposerProps) {
   const client = useClient()
   const ids = useId()
@@ -111,10 +117,12 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
   // past any marker a restored draft still holds.
   const nextN = useRef(0)
   if (nextN.current === 0) nextN.current = Math.max(heldFor(sessionId).nextN, highestMarker(text) + 1)
-  const [sending, setSending] = useState(false)
+  // A send in flight, this composer's or one made before it was mounted
+  // again (lib/sending.ts).
+  const [sending, setSending] = useState(() => sendingFor(sessionId) !== undefined)
   // The same, read synchronously: a refill answering later, or a paste in
   // the render a send started from, sees it at once.
-  const sendingNow = useRef(false)
+  const sendingNow = useRef(sending)
   const setSendingBoth = (on: boolean) => {
     sendingNow.current = on
     setSending(on)
@@ -167,7 +175,11 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
   useEffect(() => {
     const controller = new AbortController()
     alive.current = controller
+    // A send made before this composer was mounted again ends here.
+    const pending = sendingFor<Outcome>(sessionId)
+    if (pending) void follow(pending)
     return () => controller.abort()
+    // Once per composer: its session never changes (see Composer).
   }, [])
 
   const options = configOptions(catalog)
@@ -286,48 +298,63 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
     edit(withoutMarker(text, n))
   }
 
-  /** Send the draft as it stands. Kept on any refusal. */
-  async function deliver() {
-    if (blank) return
-    setSendingBoth(true)
-    setNotice(null)
-    setDraftError(null)
+  /** POST `draft` with `images`. Kept on any refusal; a 202 clears the
+   *  draft at its source, as this may answer after the composer went. */
+  async function deliver(draft: string, images: Attachment[]): Promise<Outcome> {
     try {
-      await prompt(client, sessionId, await promptBlocks(text, atts))
-      // Cleared at the source as well: this may answer after a switch to
-      // another session unmounted this composer.
-      saveDraft(sessionId, '')
-      forgetAttachments(sessionId)
+      await prompt(client, sessionId, await promptBlocks(draft, images))
+    } catch (err) {
+      return {
+        sent: false,
+        notice: { text: promptRefusal(err), resume: err instanceof ApiFailure && err.code === 'not_attached' },
+      }
+    }
+    saveDraft(sessionId, '')
+    forgetAttachments(sessionId)
+    return { sent: true }
+  }
+
+  /** A send's outcome, taken by the composer shown when it ends (one that
+   *  went takes nothing: React drops its updates). */
+  async function follow(pending: Promise<Outcome>) {
+    const outcome = await pending
+    if (outcome.sent) {
       nextN.current = 1
       setAtts([])
       setText('')
       setLabel(null)
-    } catch (err) {
-      setNotice({
-        text: promptRefusal(err),
-        resume: err instanceof ApiFailure && err.code === 'not_attached',
-      })
-    } finally {
-      setSendingBoth(false)
+    } else {
+      setNotice(outcome.notice)
     }
+    // Whatever came of it, the draft is the operator's again.
+    setSendingBoth(false)
+  }
+
+  /** Start `work` as this session's send, the draft as it stands. */
+  function begin(work: (draft: string, images: Attachment[]) => Promise<Outcome>) {
+    setSendingBoth(true)
+    setNotice(null)
+    setDraftError(null)
+    const draft = text
+    const images = atts
+    void follow(track(sessionId, () => work(draft, images)))
   }
 
   function send() {
-    if (canSend) void deliver()
+    if (canSend) begin(deliver)
   }
 
-  async function resumeAndSend() {
-    setSendingBoth(true)
-    setNotice(null)
-    try {
-      await (onResume ? onResume() : resume(client, sessionId))
-      await deliver()
-    } catch (err) {
-      setNotice({ text: messageOf(err) })
-    } finally {
-      // Whatever came of it, the draft is the operator's again.
-      setSendingBoth(false)
-    }
+  /** Resume, then send; tracked as one send, so a composer mounted again
+   *  while the resume is answered waits for both. */
+  function resumeAndSend() {
+    begin(async (draft, images) => {
+      try {
+        await (onResume ? onResume() : resume(client, sessionId))
+      } catch (err) {
+        return { sent: false, notice: { text: messageOf(err) } }
+      }
+      return deliver(draft, images)
+    })
   }
 
   async function stop() {
@@ -564,7 +591,7 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
               <bdi>{notice.resume && !canResume ? STILL_STARTING : notice.text}</bdi>
             </span>
             {notice.resume && canResume && (
-              <button className="btn btn-primary btn-sm" type="button" disabled={sending || blank} onClick={() => void resumeAndSend()}>
+              <button className="btn btn-primary btn-sm" type="button" disabled={sending || blank} onClick={resumeAndSend}>
                 Resume and send
               </button>
             )}

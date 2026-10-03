@@ -6,6 +6,7 @@ import { Client } from '../api/client'
 import { ClientContext } from '../app-client'
 import type { Capabilities, SessionCatalog } from '../generated/protocol'
 import { forgetAllAttachments, heldFor } from '../lib/attachments'
+import { forgetAllSends } from '../lib/sending'
 import { Composer, STILL_SENDING, type ComposerHandle, type ComposerProps } from './Composer'
 
 const WAIT = { timeout: 3000 }
@@ -115,6 +116,7 @@ beforeEach(() => {
   urls = 0
   sessionStorage.clear()
   forgetAllAttachments()
+  forgetAllSends()
   URL.createObjectURL = vi.fn(() => `blob:u${++urls}`)
   URL.revokeObjectURL = vi.fn()
 })
