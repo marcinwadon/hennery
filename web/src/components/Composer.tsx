@@ -152,7 +152,9 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
   const hostImages = capabilities === null || capabilities.includes('images')
   // A session still starting refuses a resume too: it runs soon on its own.
   const canResume = session?.lifecycle !== 'starting'
-  const canSend = !sending && !inFlight && text.trim() !== ''
+  // Nothing to send: Send and "Resume and send" both wait for words.
+  const blank = text.trim() === ''
+  const canSend = !sending && !inFlight && !blank
 
   // The draft as last rendered, for the handle and for a refill that
   // answers later.
@@ -286,7 +288,7 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
 
   /** Send the draft as it stands. Kept on any refusal. */
   async function deliver() {
-    if (text.trim() === '') return
+    if (blank) return
     setSendingBoth(true)
     setNotice(null)
     setDraftError(null)
@@ -319,12 +321,13 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
     setNotice(null)
     try {
       await (onResume ? onResume() : resume(client, sessionId))
+      await deliver()
     } catch (err) {
       setNotice({ text: messageOf(err) })
+    } finally {
+      // Whatever came of it, the draft is the operator's again.
       setSendingBoth(false)
-      return
     }
-    await deliver()
   }
 
   async function stop() {
@@ -561,7 +564,7 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
               <bdi>{notice.resume && !canResume ? STILL_STARTING : notice.text}</bdi>
             </span>
             {notice.resume && canResume && (
-              <button className="btn btn-primary btn-sm" type="button" disabled={sending} onClick={() => void resumeAndSend()}>
+              <button className="btn btn-primary btn-sm" type="button" disabled={sending || blank} onClick={() => void resumeAndSend()}>
                 Resume and send
               </button>
             )}

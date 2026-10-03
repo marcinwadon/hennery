@@ -262,6 +262,27 @@ describe('Composer: prompt refusals keep the draft', () => {
     expect(await screen.findByText('The session is not running: resume it to send this.', undefined, WAIT)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Resume and send' })).toBeInTheDocument()
     expect(textarea().value).toBe('later')
+    expect(textarea().readOnly).toBe(false)
+  })
+
+  it.each([
+    ['empty', ''],
+    ['only blanks', '   \n '],
+  ])('Resume and send waits for words: a draft %s resumes nothing and stays editable', async (_what, words) => {
+    const c = mount(() => json({ code: 'not_attached', message: 'srv-x' }, 409))
+    type('later')
+    fireEvent.click(sendButton())
+    const button = await screen.findByRole('button', { name: 'Resume and send' }, WAIT)
+    type(words)
+    expect(button).toBeDisabled()
+    fireEvent.click(button)
+    await act(() => new Promise((resolve) => setTimeout(resolve, 200)))
+    expect(textarea().readOnly).toBe(false)
+    expect(c.posts.map((p) => p.path)).toEqual(['/api/sessions/s1/prompt'])
+    // Words again: the draft sends as before.
+    type('later again')
+    expect(button).not.toBeDisabled()
+    expect(sendButton()).not.toBeDisabled()
   })
 
   it('Resume and send resumes the session, then sends the draft', async () => {
@@ -296,6 +317,23 @@ describe('Composer: prompt refusals keep the draft', () => {
     expect(await screen.findByText('This directory now belongs to another hat than the session’s.', undefined, WAIT)).toBeInTheDocument()
     expect(c.prompts()).toHaveLength(1)
     expect(textarea().value).toBe('later')
+    expect(textarea().readOnly).toBe(false)
+    expect(sendButton()).not.toBeDisabled()
+  })
+
+  it('Resume and send refused at the prompt leaves the draft editable', async () => {
+    const c = mount((_m, path) =>
+      path.endsWith('/resume')
+        ? json({ session_id: 's1', lifecycle: 'active' }, 202)
+        : json({ code: 'not_attached', message: 'srv-x' }, 409),
+    )
+    type('later')
+    fireEvent.click(sendButton())
+    fireEvent.click(await screen.findByRole('button', { name: 'Resume and send' }, WAIT))
+    await waitFor(() => expect(c.prompts()).toHaveLength(2), WAIT)
+    await waitFor(() => expect(textarea().readOnly).toBe(false), WAIT)
+    expect(textarea().value).toBe('later')
+    expect(sendButton()).not.toBeDisabled()
   })
 
   it('Resume and send goes through the onResume it is given', async () => {
