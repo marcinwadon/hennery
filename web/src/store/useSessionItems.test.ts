@@ -171,6 +171,18 @@ describe('useSessionItems', () => {
     expect(s.of(STREAM_PATH)).toHaveLength(1)
   })
 
+  it('markRemoved (a delete made here) marks the session removed and closes the stream', async () => {
+    const s = server([page([message('a', 't1')], 10)])
+    const { result } = renderHook(() => useSessionItems(ID, FAST), { wrapper: s.wrapper })
+    await waitFor(() => expect(result.current.stream).toBe('open'))
+    act(() => result.current.markRemoved())
+    await waitFor(() => expect(result.current.removed).toBe(true))
+    expect(result.current.stream).toBe('closed')
+    expect(s.streams[0].cancelled).toBe(true)
+    await new Promise((r) => setTimeout(r, 30))
+    expect(s.of(STREAM_PATH)).toHaveLength(1)
+  })
+
   it('a 404 from the page marks the session removed and opens no stream', async () => {
     const s = server([404])
     const { result } = renderHook(() => useSessionItems(ID, FAST), { wrapper: s.wrapper })

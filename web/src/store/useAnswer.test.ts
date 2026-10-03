@@ -1,8 +1,8 @@
-import { renderHook, waitFor } from '@testing-library/react'
+import { act, renderHook, waitFor } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
 import type { Item } from '../generated/view'
 import { json, routed } from '../test-stream'
-import { useAnswering } from './useAnswer'
+import { AnswerBook, useAnswering, useHostAway } from './useAnswer'
 
 const TS = '2026-10-02T10:00:00.000Z'
 const msg = (id: string): Item => ({ id, version: 1, ts: TS, turn_id: 't1', kind: 'message', text: id }) as Item
@@ -136,5 +136,18 @@ describe('useAnswering', () => {
     h.rerender({ items: [msg('a'), question('q')], loading: true })
     h.rerender({ items: [msg('a'), question('q')], loading: false })
     expect(h.result.current.claimFocus('q')).toBe(false)
+  })
+})
+
+describe('useHostAway', () => {
+  it('renders again when the book says the host is away, and back', () => {
+    const t = hosts([])
+    const book = new AnswerBook(t.client, 's1')
+    const h = renderHook(() => useHostAway(book))
+    expect(h.result.current).toBe(false)
+    act(() => book.setHostAway(true))
+    expect(h.result.current).toBe(true)
+    act(() => book.setHostAway(false))
+    expect(h.result.current).toBe(false)
   })
 })

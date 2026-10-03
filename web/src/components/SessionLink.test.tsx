@@ -75,6 +75,7 @@ function detailOf(id: string): SessionDetail {
 function server({ list = hatPage }: { list?: (params: URLSearchParams) => Response | Promise<Response> } = {}) {
   const calls: URL[] = []
   const listStreams: LiveStream[] = []
+  const itemStreams: LiveStream[] = []
   const fetch = vi.fn(async (input: RequestInfo | URL) => {
     const url = new URL(String(input), 'http://h')
     calls.push(url)
@@ -93,7 +94,11 @@ function server({ list = hatPage }: { list?: (params: URLSearchParams) => Respon
       const id = decodeURIComponent(view[1])
       return json({ items: [item(`${id} says hello`, 't1')], older: false, epoch: 'e1', revision: 1 })
     }
-    if (/^\/api\/stream\/view\/sessions\/[^/]+$/.test(path)) return liveStream().response
+    if (/^\/api\/stream\/view\/sessions\/[^/]+$/.test(path)) {
+      const live = liveStream()
+      itemStreams.push(live)
+      return live.response
+    }
     const catalog = /^\/api\/sessions\/([^/]+)\/catalog$/.exec(path)
     if (catalog) return json({ session_id: decodeURIComponent(catalog[1]), config_options: [], commands: [] })
     const detail = /^\/api\/sessions\/([^/]+)$/.exec(path)
@@ -101,7 +106,7 @@ function server({ list = hatPage }: { list?: (params: URLSearchParams) => Respon
     return json({ code: 'not_found', message: 'no' }, 404)
   })
   const of = (path: string) => calls.filter((u) => u.pathname === path)
-  return { fetch: fetch as unknown as typeof globalThis.fetch, calls, listStreams, of }
+  return { fetch: fetch as unknown as typeof globalThis.fetch, calls, listStreams, itemStreams, of }
 }
 
 /** Both of the app's media queries answer as one width would. */
@@ -155,6 +160,21 @@ describe('the session’s header, from the list (F-4)', () => {
     expect(within(main()).getByText('Running')).toBeInTheDocument()
     // The view opened before the list's first page came: it waited for it.
     expect(s.of('/api/sessions/a')).toHaveLength(0)
+  })
+
+  it('a session the view finds removed leaves the list at once', async () => {
+    at('/sessions/a')
+    const s = server()
+    render(<App fetchImpl={s.fetch} />)
+    await titled('Task a')
+    const list = await screen.findByRole('complementary', { name: 'Views' })
+    expect(within(list).getByText('Task a', { exact: true })).toBeInTheDocument()
+    await waitFor(() => expect(s.itemStreams).toHaveLength(1))
+    // The item stream says so; the list stream has not yet.
+    act(() => s.itemStreams[0].event('session_removed', { session_id: 'a' }))
+    expect(await within(main()).findByRole('heading', { name: 'This session was deleted' })).toBeInTheDocument()
+    await waitFor(() => expect(within(list).queryByText('Task a', { exact: true })).toBeNull())
+    expect(within(list).getByText('Task a-old', { exact: true })).toBeInTheDocument()
   })
 
   it('fetches the detail only for a session the list does not hold', async () => {
