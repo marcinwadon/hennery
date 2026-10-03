@@ -10,5 +10,8 @@ export default defineConfig({
   forbidOnly: !!process.env.CI,
   reporter: process.env.CI ? 'list' : 'line',
   timeout: 60_000,
+  // Each wait is a round trip through the collector, the host and the agent:
+  // 10 s, not the default 5, on a 2-4 vCPU runner.
+  expect: { timeout: 10_000 },
   use: { ...devices['Desktop Chrome'], headless: true },
 })
