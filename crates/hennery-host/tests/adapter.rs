@@ -564,3 +564,97 @@ async fn an_adapters_exit_takes_its_guard_with_it() {
     adapter.exited().await;
     wait_dead(guard).await;
 }
+
+/// Set for the copy of this test binary that
+/// `host_sigkill_kills_a_cli_s_whole_group` runs as a host: the directory
+/// its CLI writes its pids to.
+const STATUS_HOST_DIR_VAR: &str = "HENNERY_TEST_SIGKILLED_STATUS_HOST_DIR";
+
+/// Not a test of its own: a host that asks a CLI for its exit status
+/// (`exit_status`, plan 4d-B1-i), and waits to be killed. The CLI and its
+/// grandchild ignore SIGTERM and never end.
+#[tokio::test]
+async fn sigkilled_status_host() {
+    let Some(dir) = std::env::var_os(STATUS_HOST_DIR_VAR) else {
+        return;
+    };
+    let dir = Path::new(&dir);
+    let cli = sh(&format!(
+        "trap '' TERM; sleep 600 & echo $! > {g}.tmp; mv {g}.tmp {g}; echo $(ps -o pgid= -p $$) > {p}.tmp; mv {p}.tmp {p}; echo $$ > {l}; wait",
+        g = dir.join("grandchild").display(),
+        p = dir.join("pgid").display(),
+        l = dir.join("leader").display(),
+    ));
+    let _ = hennery_host::adapter::exit_status(&cli, dir, Duration::from_secs(600)).await;
+    std::future::pending::<()>().await;
+}
+
+/// Hazard (b): a CLI asked for its login status has the host's guard, as
+/// an adapter does: a host that dies uncleanly leaves no process of its
+/// group behind.
+#[tokio::test]
+async fn host_sigkill_kills_a_cli_s_whole_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "sigkilled_status_host", "--nocapture"])
+        .env(STATUS_HOST_DIR_VAR, dir.path())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut copy = HostCopy {
+        host: command.spawn().unwrap(),
+        pgid: None,
+    };
+    let pgid = read_pid(&dir.path().join("pgid")).await;
+    copy.pgid = Some(pgid);
+    let grandchild = read_pid(&dir.path().join("grandchild")).await;
+    let leader = read_pid(&dir.path().join("leader")).await;
+    assert_ne!(pgid, leader, "the CLI leads its own group: no guard");
+    // SAFETY: kill(2) on the host this test started.
+    assert_eq!(unsafe { libc::kill(copy.host.id() as i32, libc::SIGKILL) }, 0);
+    copy.host.wait().unwrap();
+    for pid in [grandchild, leader, pgid] {
+        wait_dead(pid).await;
+    }
+    copy.pgid = None;
+}
+
+/// A CLI that ends by itself takes its guard with it: `exit_status` kills
+/// the group whatever way it ended.
+#[tokio::test]
+async fn a_cli_s_exit_takes_its_guard_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let pgid_file = dir.path().join("pgid");
+    let cli = sh(&format!("echo $(ps -o pgid= -p $$) > {}; exit 0", pgid_file.display()));
+    let ended = hennery_host::adapter::exit_status(&cli, dir.path(), Duration::from_secs(10))
+        .await
+        .unwrap();
+    assert_eq!(ended.map(|e| e.code), Some(Some(0)));
+    wait_dead(read_pid(&pgid_file).await).await;
+}
+
+/// The review's A1: a caller that stops waiting (a task aborted, or a
+/// deadline of its own) still has the CLI's whole group killed, a
+/// grandchild that ignores SIGTERM included.
+#[tokio::test]
+async fn a_dropped_status_check_kills_its_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let grandchild_file = dir.path().join("grandchild");
+    let cli = sh(&format!(
+        "trap '' TERM; sleep 600 & echo $! > {g}.tmp; mv {g}.tmp {g}; wait",
+        g = grandchild_file.display()
+    ));
+    // Boxed, so that `drop` drops the future itself, not a pin of it.
+    let mut check = Box::pin(hennery_host::adapter::exit_status(
+        &cli,
+        dir.path(),
+        Duration::from_secs(600),
+    ));
+    // Polled until the grandchild runs, then dropped.
+    let grandchild = tokio::select! {
+        _ = &mut check => panic!("the check ended by itself"),
+        pid = read_pid(&grandchild_file) => pid,
+    };
+    drop(check);
+    wait_dead(grandchild).await;
+}

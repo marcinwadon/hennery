@@ -1,5 +1,46 @@
 {
   "$defs": {
+    "AgentAuth": {
+      "description": "Whether an agent's CLI says it is logged in (ACP core §6): only the\nverdict, never the account. `unknown` until a probe asked, and when the\nhost knows no CLI to ask, or it did not answer (in time, or at all: a CLI\nended by a signal said nothing). A host fact: agent logins\nare per OS user in v1, every hat's included. If plan 8h ever makes\n`auth.json` private per hat, `auth` must become per (host, hat).",
+      "oneOf": [
+        {
+          "enum": [
+            "unknown"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "ok",
+          "description": "The CLI's status command exited 0.",
+          "type": "string"
+        },
+        {
+          "const": "missing",
+          "description": "It exited non-zero.",
+          "type": "string"
+        }
+      ]
+    },
+    "AgentCli": {
+      "description": "Which CLI an agent runs (distribution spec §3.2, §13 decision 5).",
+      "oneOf": [
+        {
+          "const": "bundled",
+          "description": "The CLI bundled in the host's adapter set.",
+          "type": "string"
+        },
+        {
+          "const": "override",
+          "description": "The operator's own CLI (`--use-cli`, recorded in `host.toml`).",
+          "type": "string"
+        },
+        {
+          "const": "given",
+          "description": "A command given to `host run --agent` (e.g. Nix-provided adapters):\nhennery manages nothing of it.",
+          "type": "string"
+        }
+      ]
+    },
     "AgentHome": {
       "description": "Where an agent keeps its own data for a session, as its host resolved\nit from the adapter's environment (plan 9d decision 1): `root` is\nClaude's `CLAUDE_CONFIG_DIR` or `~/.claude`, Codex's `CODEX_HOME` or\n`~/.codex`; `sqlite_root` is Codex's `CODEX_SQLITE_HOME` if set.\nCanonical, its bytes as the filesystem gave them (O11). A host's report\nis not verified by the collector beyond its shape (`is_well_formed`).",
       "properties": {
@@ -18,12 +59,86 @@
       ],
       "type": "object"
     },
+    "AgentInfo": {
+      "description": "One agent of a host (ACP core §6).",
+      "properties": {
+        "adapter_version": {
+          "description": "In `hello`: the version the adapter set records. After a probe: the\nversion the adapter's `initialize` answered with (`agentInfo`), if\nit gave a readable one. Absent for a `given` agent until a probe.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "agent": {
+          "description": "The profile name: what `StartSessionRequest.agent` takes.",
+          "type": "string"
+        },
+        "auth": {
+          "$ref": "#/$defs/AgentAuth",
+          "default": "unknown"
+        },
+        "available": {
+          "description": "In `hello`: launchable as configured. After a probe: its adapter\nstarted and answered `initialize`.",
+          "type": "boolean"
+        },
+        "cli": {
+          "$ref": "#/$defs/AgentCli"
+        },
+        "images": {
+          "description": "Whether the agent takes images in prompts (its `initialize`'s\n`promptCapabilities.image`). Clients hide images only when this is\n`false`. Absent means no probe answered (none has run, or the\nadapter did not answer): a client then allows images, and the\nserver's 409 `images_unsupported` remains the guard.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "note": {
+          "description": "Why the agent is unavailable, or a caveat, in the host's words: never\nanything an agent or its CLI printed.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "agent",
+        "available",
+        "cli"
+      ],
+      "type": "object"
+    },
     "AgentIsolation": {
       "additionalProperties": {
         "$ref": "#/$defs/McpIsolation"
       },
       "description": "`hello.mcp_isolation`: per agent id, how the host isolates its MCP\nservers. An agent left out is not isolated. Deserialized leniently, like\n`Capabilities`: an unknown mechanism counts as `none`, never as isolated\nand never a reason to refuse the `hello`.",
       "type": "object"
+    },
+    "AgentList": {
+      "description": "A report's agents, read leniently, as `Capabilities` is: an entry this\nbuild cannot read (a newer host's value, a missing field) is skipped,\nnever a reason to refuse the whole frame. An absent field is an empty\nlist.",
+      "items": {
+        "$ref": "#/$defs/AgentInfo"
+      },
+      "type": "array"
+    },
+    "AgentsSource": {
+      "description": "Where `HostAgents` comes from.",
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "The host never reported its agents: an older host, or one not\nreconciled since it was paired.",
+          "type": "string"
+        },
+        {
+          "const": "hello",
+          "description": "Its latest reconciled connection's `hello`: the static view.",
+          "type": "string"
+        },
+        {
+          "const": "probe",
+          "description": "A `probe_agents`: the live view.",
+          "type": "string"
+        }
+      ]
     },
     "AnswerRequest": {
       "anyOf": [
@@ -246,6 +361,11 @@
         {
           "const": "mcp_servers",
           "description": "A session's MCP servers (plan 8c): the host passes a start's or\nresume's `mcp_servers` into `session/new` / `session/load` with the\nagent's isolation, as `hello.mcp_isolation` reports it, and refuses\nservers it cannot isolate unless the collector waived that\n(`mcp_isolation_unavailable`). A host without it gets no servers.",
+          "type": "string"
+        },
+        {
+          "const": "probe_agents",
+          "description": "Checking its agents live (`probe_agents`, plan 4d-B1-i); such a host\nreports its agents in `hello` too.",
           "type": "string"
         }
       ]
@@ -759,6 +879,23 @@
             "agent",
             "agent_session_id",
             "agent_home"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Check the host's own agents live (plan 4d-B1-i): only to a host with\nthe `probe_agents` capability. It names nothing: the host runs a\nfixed set of read-only checks on the agents it is configured with.\nAnswered by `agents` | `error{busy}`.",
+          "properties": {
+            "request_id": {
+              "type": "string"
+            },
+            "type": {
+              "const": "probe_agents",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id"
           ],
           "type": "object"
         }
@@ -1311,11 +1448,61 @@
       ],
       "type": "object"
     },
+    "HostAgents": {
+      "description": "`GET /api/hosts/{id}/agents[?refresh=1]` (plan 4d-B1-i): the host's\nlatest report of its agents, whatever its age; with `refresh=1`, after\none probe of a connected host that can be probed (or the probe's\nbudget, 20 s).",
+      "properties": {
+        "agents": {
+          "items": {
+            "$ref": "#/$defs/AgentInfo"
+          },
+          "type": "array"
+        },
+        "host_id": {
+          "type": "string"
+        },
+        "live": {
+          "description": "The host is connected and reconciled now.",
+          "type": "boolean"
+        },
+        "reported_at": {
+          "description": "When the collector received the report, RFC 3339; absent with\n`source: none`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "runtime": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RuntimeInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/AgentsSource"
+        }
+      },
+      "required": [
+        "host_id",
+        "agents",
+        "source",
+        "live"
+      ],
+      "type": "object"
+    },
     "HostFrame": {
       "description": "Host -> collector.",
       "oneOf": [
         {
           "properties": {
+            "agents": {
+              "$ref": "#/$defs/AgentList",
+              "default": [],
+              "description": "Its agents, as configured (plan 4d-B1-i): `available` says each\ncan be launched, `auth` is `unknown`, `images` absent. Read\nleniently: an entry this build cannot read is skipped. Absent\nfrom an older host."
+            },
             "attached_sessions": {
               "items": {
                 "$ref": "#/$defs/AttachedSession"
@@ -1344,6 +1531,10 @@
             },
             "protocol_version": {
               "type": "string"
+            },
+            "runtime": {
+              "$ref": "#/$defs/MaybeRuntime",
+              "description": "Where its agents come from. Absent from an older host, or one\nthis build cannot read."
             },
             "type": {
               "const": "hello",
@@ -1530,6 +1721,30 @@
             "outcome",
             "removed",
             "remaining"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The answer to `probe_agents` (plan 4d-B1-i): each agent started as\nthe host starts it and asked `initialize`, and its CLI asked whether\nit is logged in. A probe reply, like `projects`; read leniently, like\n`hello`'s agents.",
+          "properties": {
+            "agents": {
+              "$ref": "#/$defs/AgentList",
+              "default": []
+            },
+            "request_id": {
+              "type": "string"
+            },
+            "runtime": {
+              "$ref": "#/$defs/MaybeRuntime"
+            },
+            "type": {
+              "const": "agents",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "request_id"
           ],
           "type": "object"
         },
@@ -1878,6 +2093,17 @@
         "password"
       ],
       "type": "object"
+    },
+    "MaybeRuntime": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/RuntimeInfo"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "A report's runtime, read leniently: one this build cannot read is\nabsent."
     },
     "McpConnectionItem": {
       "description": "One MCP gateway connection (gateway spec §2, §9): an entry of\n`GET /api/mcp/connections` (200, an array, oldest first), and the answer\nto `POST` (201), `PATCH` (200) and `PUT …/{id}/mounts` (200). Never its\nsecret: `has_credential` says whether one is stored.\n\nEvery `/api/mcp/*` route is the operator's and answers\n`Cache-Control: no-store`. An error is an `ApiError`; the codes every\nroute may answer:\n- 401 `unauthenticated`: no live session: sign in.\n- 403 `setup_required`, `origin_mismatch` or `cross_site`: the browser\n  rules refused the request (kernel spec §3.2).\n- 415 `unsupported_media_type`: a body that is not `application/json`.\n- 400 `invalid_body`: a body that is not JSON; 422 `invalid_body`: one\n  that is not the route's shape, an unknown field included. The body is\n  never quoted back.\n- 413 `body_too_large`: a body over 256 KiB.\n- 405, with no body: a method the path does not take.\n- 500 `internal`.\n\nEach request type names the codes of its own route. A 403\n`step_up_required` asks for a password or passkey check\n(`POST /api/auth/step-up/…`); retry after it.\n\n`DELETE /api/mcp/connections/{id}` (step-up) takes no body: 204, its\nmounts and credential deleted with it; 403 `step_up_required`, 404\n`not_found`.",
@@ -2939,6 +3165,54 @@
         {
           "const": "none",
           "description": "The session had no agent record: nothing on the host.",
+          "type": "string"
+        }
+      ]
+    },
+    "RuntimeInfo": {
+      "description": "The host's adapter runtime. `set_id`, `pinned` and `held` are a managed\nruntime's only.",
+      "properties": {
+        "held": {
+          "description": "A rollback holds the host on its set (`hennery host adapters\nrollback`).",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "pinned": {
+          "description": "That set is the one this host's binary pins.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "set_id": {
+          "description": "The adapter set the agents launch from; absent when none is\ninstalled.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/RuntimeSource"
+        }
+      },
+      "required": [
+        "source"
+      ],
+      "type": "object"
+    },
+    "RuntimeSource": {
+      "description": "Where a host's agents come from (distribution spec §3.2).",
+      "oneOf": [
+        {
+          "const": "managed",
+          "description": "An adapter set hennery installed and pins.",
+          "type": "string"
+        },
+        {
+          "const": "given",
+          "description": "`host run --agent` commands.",
           "type": "string"
         }
       ]

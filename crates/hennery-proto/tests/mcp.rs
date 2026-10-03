@@ -276,6 +276,8 @@ fn a_hello_announces_per_agent_isolation_read_leniently() {
         ),
         workspace_roots: vec![],
         attached_sessions: vec![],
+        agents: Default::default(),
+        runtime: Default::default(),
     };
     let value = serde_json::to_value(&sent).unwrap();
     assert_eq!(value["capabilities"], json!(["mcp_servers"]));

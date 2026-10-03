@@ -1,3 +1,4 @@
+use crate::agents::{AgentList, MaybeRuntime};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -37,6 +38,9 @@ pub enum Capability {
     /// servers it cannot isolate unless the collector waived that
     /// (`mcp_isolation_unavailable`). A host without it gets no servers.
     McpServers,
+    /// Checking its agents live (`probe_agents`, plan 4d-B1-i); such a host
+    /// reports its agents in `hello` too.
+    ProbeAgents,
 }
 
 /// The longest agent data root a host may report (plan 9d, O12's shape
@@ -815,6 +819,18 @@ pub enum HostFrame {
         #[serde(default)]
         workspace_roots: Vec<String>,
         attached_sessions: Vec<AttachedSession>,
+        /// Its agents, as configured (plan 4d-B1-i): `available` says each
+        /// can be launched, `auth` is `unknown`, `images` absent. Read
+        /// leniently: an entry this build cannot read is skipped. Absent
+        /// from an older host.
+        #[serde(default)]
+        #[ts(as = "Vec<crate::agents::AgentInfo>")]
+        agents: AgentList,
+        /// Where its agents come from. Absent from an older host, or one
+        /// this build cannot read.
+        #[serde(default, skip_serializing_if = "MaybeRuntime::is_none")]
+        #[ts(type = "RuntimeInfo | undefined", optional)]
+        runtime: MaybeRuntime,
     },
     /// Every state-bearing fact is a sequenced frame: it goes through the host
     /// outbox and is acked (ACP core §3.3).
@@ -870,6 +886,19 @@ pub enum HostFrame {
         removed: Vec<ForgetWhat>,
         remaining: Vec<ForgetRemaining>,
     },
+    /// The answer to `probe_agents` (plan 4d-B1-i): each agent started as
+    /// the host starts it and asked `initialize`, and its CLI asked whether
+    /// it is logged in. A probe reply, like `projects`; read leniently, like
+    /// `hello`'s agents.
+    Agents {
+        request_id: String,
+        #[serde(default)]
+        #[ts(as = "Vec<crate::agents::AgentInfo>")]
+        agents: AgentList,
+        #[serde(default, skip_serializing_if = "MaybeRuntime::is_none")]
+        #[ts(type = "RuntimeInfo | undefined", optional)]
+        runtime: MaybeRuntime,
+    },
     /// The answer to `browse_directory` (ACP core §3.3, §7): the
     /// subdirectories of `path`. A probe reply, like `projects`.
     Directory {
@@ -901,6 +930,7 @@ impl CollectorFrame {
             Self::ResolvePath { .. } => Ok(Some(Capability::ResolvePath)),
             // Not a probe of state, but carried as one (`session_forgotten`).
             Self::ForgetSession { .. } => Ok(Some(Capability::ForgetSession)),
+            Self::ProbeAgents { .. } => Ok(Some(Capability::ProbeAgents)),
             Self::HelloAck { .. }
             | Self::HelloError { .. }
             | Self::StartSession { .. }
@@ -938,7 +968,8 @@ impl CollectorFrame {
             | Self::ListProjects { .. }
             | Self::BrowseDirectory { .. }
             | Self::ForgetHat { .. }
-            | Self::ForgetSession { .. } => None,
+            | Self::ForgetSession { .. }
+            | Self::ProbeAgents { .. } => None,
         }
     }
 
@@ -960,7 +991,8 @@ impl HostFrame {
             Self::Projects { request_id, .. }
             | Self::Directory { request_id, .. }
             | Self::ResolvedPath { request_id, .. }
-            | Self::SessionForgotten { request_id, .. } => Some(request_id),
+            | Self::SessionForgotten { request_id, .. }
+            | Self::Agents { request_id, .. } => Some(request_id),
             Self::Hello { .. } | Self::Session { .. } | Self::Error { .. } | Self::ResendComplete => None,
         }
     }
@@ -1137,5 +1169,12 @@ pub enum CollectorFrame {
         /// Absent when false.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         fallback: bool,
+    },
+    /// Check the host's own agents live (plan 4d-B1-i): only to a host with
+    /// the `probe_agents` capability. It names nothing: the host runs a
+    /// fixed set of read-only checks on the agents it is configured with.
+    /// Answered by `agents` | `error{busy}`.
+    ProbeAgents {
+        request_id: String,
     },
 }

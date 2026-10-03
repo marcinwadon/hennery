@@ -3828,6 +3828,117 @@ fn a_host_without_agent_flags_runs_the_installed_set() {
     assert!(logged.contains("agents from the adapter set"), "{logged}");
 }
 
+/// Plan 4d-B1-i through the binary: a host on the set it pins reports its
+/// agents in `hello`, and a refresh checks them live: each adapter as a
+/// session's is started, asked `initialize`, and each bundled CLI asked
+/// whether it is logged in, by its exit status alone.
+#[test]
+fn a_hosts_agents_are_reported_and_checked_through_the_binary() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch_dir("agents");
+    let _cleanup = RemoveDir(dir.clone());
+    let data = dir.join("data");
+    let host = data.join("host");
+    let selection = hennery_host::runtime::install::Selection::pinned(&Default::default()).unwrap();
+    let entries: Vec<(&str, &str)> = selection
+        .adapters
+        .iter()
+        .map(|a| (a.name.as_str(), a.entry.as_str()))
+        .collect();
+    // The runtime's `node`: an adapter answers `initialize`; Codex's
+    // bundled CLI (`node codex.js login status`) is logged out.
+    let node = r#"case "$2" in login) exit 1;; esac
+read line
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"agentInfo":{"version":"9.9.9"},"agentCapabilities":{"promptCapabilities":{"image":true}}}}'
+exec sleep 30"#;
+    let set = fabricate_set(&host, &selection.set_id(), &selection.runtime_name(), node, &entries);
+    link_set(&host, "current", &selection.set_id());
+    // Claude's bundled CLI is logged in.
+    let platform = hennery_host::runtime::manifest::Platform::current()
+        .unwrap()
+        .key()
+        .to_string();
+    let claude = set.join(format!(
+        "claude/node_modules/@anthropic-ai/claude-agent-sdk-{platform}/claude"
+    ));
+    std::fs::create_dir_all(claude.parent().unwrap()).unwrap();
+    std::fs::write(&claude, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let codex = set.join("codex/node_modules/@openai/codex/bin/codex.js");
+    std::fs::create_dir_all(codex.parent().unwrap()).unwrap();
+    std::fs::write(&codex, "// codex\n").unwrap();
+
+    // The probe runs each CLI in the host's home (the review's A5): a
+    // scratch one that exists, never the account of whoever runs the tests.
+    let home = dir.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut command = hennery();
+    command.env("HOME", &home);
+
+    let log = dir.join("up.log");
+    let mut up = up_logging_to_with(command, &data, &log, &[]);
+    let listen = up.listening();
+    let session = sign_in(&mut up, &listen, &data.join("collector"));
+    let mut host_id = String::new();
+    up.wait_until("the host connected", || {
+        let Some(serde_json::Value::Array(hosts)) = get_json(&listen, "/api/hosts", &session) else {
+            return false;
+        };
+        match hosts.first() {
+            Some(h) if h["connected"] == true => {
+                host_id = h["host_id"].as_str().unwrap().to_string();
+                true
+            }
+            _ => false,
+        }
+    });
+    let path = format!("/api/hosts/{host_id}/agents");
+    let hello = get_json(&listen, &path, &session).expect("the agents");
+    assert_eq!(hello["source"], "hello", "{hello}");
+    assert_eq!(hello["live"], true, "{hello}");
+    assert_eq!(
+        hello["runtime"],
+        serde_json::json!({"source": "managed", "set_id": selection.set_id(), "pinned": true, "held": false}),
+        "{hello}"
+    );
+    let agent = |report: &serde_json::Value, name: &str| {
+        report["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["agent"] == name)
+            .unwrap_or_else(|| panic!("no {name} in {report}"))
+            .clone()
+    };
+    for name in ["claude", "codex"] {
+        assert_eq!(
+            agent(&hello, name),
+            serde_json::json!({"agent": name, "available": true, "auth": "unknown", "cli": "bundled", "adapter_version": "9.9.9"}),
+        );
+    }
+    let mut live = serde_json::Value::Null;
+    up.wait_until("a probe's report", || {
+        live = get_json(&listen, &format!("{path}?refresh=1"), &session).unwrap_or_default();
+        live["source"] == "probe"
+    });
+    let claude = agent(&live, "claude");
+    assert_eq!(
+        (&claude["available"], &claude["auth"], &claude["images"]),
+        (
+            &serde_json::json!(true),
+            &serde_json::json!("ok"),
+            &serde_json::json!(true)
+        ),
+        "{live}"
+    );
+    let codex = agent(&live, "codex");
+    assert_eq!(
+        (&codex["available"], &codex["auth"]),
+        (&serde_json::json!(true), &serde_json::json!("missing")),
+        "{live}"
+    );
+}
+
 /// `path`'s text, or nothing while it is not there.
 fn text_of(path: &std::path::Path) -> String {
     std::fs::read_to_string(path).unwrap_or_default()

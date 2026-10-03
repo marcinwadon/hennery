@@ -337,7 +337,9 @@ pub fn far_apart(a: (u64, u64, u64), b: (u64, u64, u64)) -> bool {
 }
 
 /// A CLI as a host's agent runs it: a program, and the arguments before
-/// its own (`node <set>/codex/…/codex.js`).
+/// its own (`node <set>/codex/…/codex.js`). `crate::host_agents`'s probe
+/// (plan 4d-B1-i) reads the fields of the one `bundled_cli` returns and
+/// never calls `run`, which starts it in doctor's own groups.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cli {
     pub program: std::path::PathBuf,

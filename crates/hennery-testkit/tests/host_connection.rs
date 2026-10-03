@@ -822,6 +822,7 @@ async fn a_host_announces_that_it_can_park_take_images_and_serve_projects() {
             Capability::ResolvePath,
             Capability::ForgetSession,
             Capability::McpServers,
+            Capability::ProbeAgents,
         ])
     );
 }
@@ -1534,4 +1535,151 @@ async fn a_delivered_start_reaches_the_adapter_with_its_servers_and_profile() {
         logged[1].1
     );
     assert_eq!(logged[2].1["_meta"], strict, "{}", logged[2].1);
+}
+
+// Plan 4d-B1-i: the host's agents, in `hello` and live.
+
+/// `hello` reports the agents as configured: the runtime's infos as they
+/// are, every other agent as given; and the runtime, bounded.
+#[tokio::test]
+async fn a_host_reports_its_agents_and_runtime_in_hello() {
+    use hennery_proto::agents::{AgentAuth, AgentCli, AgentInfo, RuntimeInfo, RuntimeSource};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut cfg = host_with_fake(addr, "hello-agents", slow_fake());
+    let codex = AgentInfo {
+        agent: "codex".into(),
+        available: false,
+        auth: AgentAuth::Unknown,
+        cli: AgentCli::Bundled,
+        adapter_version: Some("1.0.0".into()),
+        images: None,
+        note: Some("codex is unavailable".into()),
+    };
+    cfg.agent_infos = vec![codex.clone()];
+    cfg.runtime = Some(RuntimeInfo {
+        source: RuntimeSource::Managed,
+        set_id: Some("not a set id".into()),
+        pinned: Some(true),
+        held: Some(false),
+    });
+    tokio::spawn(run(cfg));
+    let (tcp, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+        .await
+        .expect("host connects")
+        .unwrap();
+    let (_sink, mut stream) = accept(tcp).await.unwrap().split();
+    let HostFrame::Hello { agents, runtime, .. } = read_host_frame(&mut stream).await else {
+        panic!("expected hello");
+    };
+    let fake = AgentInfo {
+        agent: "fake".into(),
+        available: true,
+        auth: AgentAuth::Unknown,
+        cli: AgentCli::Given,
+        adapter_version: None,
+        images: None,
+        note: None,
+    };
+    assert_eq!(agents.0, [codex, fake]);
+    assert_eq!(
+        runtime.0,
+        Some(RuntimeInfo {
+            source: RuntimeSource::Managed,
+            set_id: None,
+            pinned: Some(true),
+            held: Some(false),
+        })
+    );
+}
+
+/// A login check the test releases: the probe holds its slot until then.
+/// It writes the directory it runs in to `<release>.cwd` first.
+#[derive(Debug)]
+struct HeldLogin(std::path::PathBuf);
+
+impl hennery_host::availability::AgentChecks for HeldLogin {
+    fn login(&self, agent: &str) -> hennery_host::availability::LoginCheck {
+        use hennery_host::availability::LoginCheck;
+        if agent != "fake" {
+            return LoginCheck::NotAsked(None);
+        }
+        LoginCheck::Ask(hennery_host::AgentCommand {
+            program: "sh".into(),
+            args: vec![
+                "-c".into(),
+                format!(
+                    "pwd > {r}.cwd; while [ ! -e {r} ]; do sleep 0.05; done; exit 0",
+                    r = self.0.display()
+                ),
+            ],
+            env: Vec::new(),
+        })
+    }
+}
+
+/// `probe_agents` checks each agent live and answers on the connection;
+/// another probe while one runs is answered `busy`, and once the first is
+/// answered a new one runs. Its programs run in the host's home directory,
+/// never the host's own working directory (the review's A5).
+#[tokio::test]
+async fn a_host_probes_its_agents_one_probe_at_a_time() {
+    use hennery_proto::agents::{AgentAuth, AgentCli};
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let release = dir.path().join("release");
+    let mut cfg = host_with_fake(addr, "probe-agents", slow_fake());
+    cfg.agents.insert(
+        "gone".into(),
+        hennery_host::AgentCommand {
+            program: "/nonexistent/adapter".into(),
+            args: Vec::new(),
+            env: Vec::new(),
+        },
+    );
+    cfg.checks = std::sync::Arc::new(HeldLogin(release.clone()));
+    cfg.probe_budget = Duration::from_secs(10);
+    // A host given `--agent` commands: the answer carries its runtime.
+    cfg.runtime = Some(hennery_host::availability::given_runtime());
+    let home = tempfile::tempdir().unwrap();
+    let home = std::fs::canonicalize(home.path()).unwrap();
+    cfg.home = Some(home.clone());
+    tokio::spawn(run(cfg));
+    let (mut sink, mut stream, _) = accept_host(&listener).await;
+    let probe = |request_id: &str| CollectorFrame::ProbeAgents {
+        request_id: request_id.into(),
+    };
+    send_frame(&mut sink, &probe("p1")).await;
+    send_frame(&mut sink, &probe("p2")).await;
+    let busy = read_until(&mut stream, error_for("p2")).await;
+    assert!(
+        matches!(&busy, HostFrame::Error { code, .. } if code == "busy"),
+        "{busy:?}"
+    );
+    std::fs::write(&release, "").unwrap();
+    let reply = read_until(&mut stream, |f| f.probe_request_id() == Some("p1")).await;
+    let HostFrame::Agents { agents, runtime, .. } = reply else {
+        panic!("expected agents, got {reply:?}");
+    };
+    assert_eq!(runtime.0, Some(hennery_host::availability::given_runtime()));
+    let names: Vec<&str> = agents.0.iter().map(|a| a.agent.as_str()).collect();
+    assert_eq!(names, ["fake", "gone"]);
+    let (fake, gone) = (&agents.0[0], &agents.0[1]);
+    assert!(fake.available, "{fake:?}");
+    assert_eq!(
+        (fake.cli, fake.auth, fake.images),
+        (AgentCli::Given, AgentAuth::Ok, Some(true))
+    );
+    assert!(!gone.available);
+    assert!(gone.note.as_deref().unwrap().contains("cannot be started"), "{gone:?}");
+    let cwd = std::fs::read_to_string(release.with_extension("cwd")).unwrap();
+    assert_eq!(cwd.trim_end(), home.to_str().unwrap());
+    // The first answered: the slot is free again.
+    send_frame(&mut sink, &probe("p3")).await;
+    let reply = read_until(&mut stream, |f| {
+        f.probe_request_id() == Some("p3") || error_for("p3")(f)
+    })
+    .await;
+    assert!(matches!(reply, HostFrame::Agents { .. }), "{reply:?}");
 }

@@ -110,6 +110,8 @@ async fn hello(ws: &mut Ws, host_id: &str, proof: String) -> CollectorFrame {
             workspace_roots: vec![],
             attached_sessions: vec![],
             mcp_isolation: Default::default(),
+            agents: Default::default(),
+            runtime: Default::default(),
         })
         .unwrap(),
     ))
@@ -132,6 +134,7 @@ fn hello_error(frame: &CollectorFrame) -> &str {
 /// here is a route nobody checked.
 const OPERATOR_ROUTES: &[(&str, &str)] = &[
     ("GET", "/api/hosts"),
+    ("GET", "/api/hosts/host-9/agents"),
     ("POST", "/api/hosts/pairing-codes"),
     ("DELETE", "/api/hosts/host-9"),
     ("POST", "/api/sessions"),

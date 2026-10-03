@@ -169,6 +169,11 @@ async fn minting_changing_revoking_a_host_and_revoking_a_session_need_a_fresh_pa
     assert_eq!(code_of(resp).await, (404, "not_found".into()));
     let resp = send(&stale, "GET", "/api/settings/host-removals", None).await.unwrap();
     assert_eq!(resp.status(), 200);
+    // A host's agents are read, a refresh included (plan 4d-B1-i).
+    let resp = send(&stale, "GET", "/api/hosts/host-9/agents?refresh=1", None)
+        .await
+        .unwrap();
+    assert_eq!(code_of(resp).await, (404, "not_found".into()));
     assert!(c.state.operator.authenticate(&other, unix_now()).unwrap().is_some());
     // A wrong password does not step up.
     assert_eq!(

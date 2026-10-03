@@ -30,6 +30,9 @@ pub fn router(state: AppState) -> Router {
     let operator = hennery_kernel::auth::operator_only(
         Router::new()
             .route("/api/hosts", get(list_hosts))
+            // Reads only, so no step-up: the probe a refresh runs is a
+            // fixed set of read-only checks (plan 4d-B1-i).
+            .route("/api/hosts/{id}/agents", get(crate::agents::get_agents))
             .route(
                 "/api/hosts/pairing-codes",
                 post(mint_pairing_code).route_layer(middleware::from_fn(hennery_kernel::auth::require_step_up)),

@@ -10,10 +10,10 @@ use axum::http::HeaderValue;
 use axum::response::Response;
 use axum::routing::get;
 use futures::{SinkExt, StreamExt};
-use hennery_kernel::hosts::HelloCheck;
+use hennery_kernel::hosts::{HelloCheck, ReportedIn};
 use hennery_kernel::lifecycle::LifecycleHooks;
 use hennery_kernel::secret::{random_bytes, unix_now};
-use hennery_proto::frames::{AttachedSession, CollectorFrame, HostFrame, SessionBody};
+use hennery_proto::frames::{AttachedSession, Capability, CollectorFrame, HostFrame, SessionBody};
 use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION, protocol_major};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
@@ -65,6 +65,8 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
         mcp_isolation,
         workspace_roots,
         attached_sessions,
+        agents,
+        runtime,
     }) = hello
     else {
         return;
@@ -385,6 +387,21 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                     Ok(done) => {
                         let closed =
                             after_reconcile(&state, &host_id, &workspace_roots, done, &tx, &mut reconcile_closes);
+                        // Like the roots, only a reconciled connection's
+                        // agents are stored, before the host is listed as
+                        // connected; and only from a host that reports them
+                        // (plan 4d-B1-i): an older one sends none.
+                        if capabilities.has(Capability::ProbeAgents)
+                            && let Err(err) = state.hosts.record_agents(
+                                &host_id,
+                                ReportedIn::Hello,
+                                agents.0.clone(),
+                                runtime.0.clone(),
+                                unix_now(),
+                            )
+                        {
+                            tracing::warn!(%host_id, error = %err, "recording the host's agents failed");
+                        }
                         reconciled = true;
                         if let Err(err) = ready(
                             &state,
@@ -432,7 +449,8 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
             frame @ (HostFrame::Projects { .. }
             | HostFrame::Directory { .. }
             | HostFrame::ResolvedPath { .. }
-            | HostFrame::SessionForgotten { .. }) => {
+            | HostFrame::SessionForgotten { .. }
+            | HostFrame::Agents { .. }) => {
                 state.hub.probe_reply(&host_id, conn_id, frame);
             }
             HostFrame::Hello { .. } => tracing::warn!(%host_id, "ignoring repeated hello"),

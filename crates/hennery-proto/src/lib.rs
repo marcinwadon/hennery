@@ -4,6 +4,7 @@
 //! Schema and TypeScript are generated from these types by the `gen` binary;
 //! ACP payloads travel inside them as raw JSON and are never modelled here.
 
+pub mod agents;
 pub mod frames;
 pub mod paths;
 pub mod rest;

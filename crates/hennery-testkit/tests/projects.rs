@@ -85,6 +85,8 @@ impl ScriptedHost {
             workspace_roots,
             attached_sessions: vec![],
             mcp_isolation: Default::default(),
+            agents: Default::default(),
+            runtime: Default::default(),
         })
         .await;
         let ack = host.next().await;
@@ -115,6 +117,8 @@ impl ScriptedHost {
             workspace_roots,
             attached_sessions: vec![],
             mcp_isolation: Default::default(),
+            agents: Default::default(),
+            runtime: Default::default(),
         })
         .await;
         assert!(matches!(host.next().await, CollectorFrame::HelloAck { .. }));
