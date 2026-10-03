@@ -248,7 +248,7 @@ export default function NewSession() {
       return
     }
     // Images are not part of the first prompt yet: the composer's image
-    // rules (Task 7) take them once it is shared with this form.
+    // rules (Task 6) take them once it is shared with this form.
     if (prompt.trim() !== '') {
       try {
         await client.request('POST', `/api/sessions/${encodeURIComponent(sessionId)}/prompt`, {
