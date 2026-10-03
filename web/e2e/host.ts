@@ -3,10 +3,19 @@
 // options a hermetic run needs), then run with one stand-in agent, so no
 // adapter is ever downloaded. Its directory is fresh, and every process is
 // stopped by its own id.
-import { mkdtempSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { BIN, spawnHennery, type ChildProcess } from './spawn'
+import { isAbsolute, join } from 'node:path'
+import { BIN, scratchEnv, spawnHennery, type ChildProcess } from './spawn'
+
+/** Where `host join` and `host run`, given no data directory, keep a
+ *  host's files in `scratchEnv(home)`: the platform's default (distribution
+ *  spec §8), under the scratch home, never the runner's. */
+export function defaultHostDir(home: string): string {
+  return process.platform === 'darwin'
+    ? join(home, 'Library', 'Application Support', 'hennery')
+    : join(scratchEnv(home).XDG_DATA_HOME as string, 'hennery')
+}
 
 /** SIGTERM, then SIGKILL if it has not gone within 5 s. One that never
  *  started (no pid) has nothing to stop. */
@@ -31,8 +40,12 @@ export interface TestHost {
 
 export function testHost(): TestHost {
   const dir = mkdtempSync(join(tmpdir(), 'hennery-e2e-host-'))
-  // Its home is the fresh directory too: the host reads $HOME (for `~`).
-  const env = { HENNERY_HOST_DATA_DIR: dir, RUST_LOG: 'warn' }
+  // A relative HOME is not taken: the binary would use the account's own.
+  if (!isAbsolute(dir)) throw new Error(`the scratch home is not absolute: ${dir}`)
+  // Its home is the fresh directory too: the host reads $HOME (for `~`),
+  // and its data directory is the default under that home, as for anyone
+  // who runs the command as the page shows it.
+  const env = { RUST_LOG: 'warn' }
   const children: ChildProcess[] = []
   return {
     dir,
@@ -47,6 +60,13 @@ export function testHost(): TestHost {
         child.once('error', fail)
         child.once('exit', (code) => {
           if (code !== 0) console.error(`host join exited ${code}: ${stderr}`)
+          // A pairing anywhere but the scratch default is a failure, even
+          // with exit 0: it would be in a directory the test does not own.
+          const pairing = join(defaultHostDir(dir), 'host.toml')
+          if (code === 0 && !existsSync(pairing)) {
+            fail(new Error(`host join exited 0 but left no ${pairing}: ${stderr}`))
+            return
+          }
           done(code ?? -1)
         })
       })
@@ -54,7 +74,7 @@ export function testHost(): TestHost {
     run() {
       // The stand-in agent is never started (no session runs here); any
       // path that exists will do, and the binary's own does everywhere.
-      const runner = spawnHennery(['host', 'run', '--data-dir', dir, '--agent', `stand-in=${BIN}`], dir, env)
+      const runner = spawnHennery(['host', 'run', '--agent', `stand-in=${BIN}`], dir, env)
       let stderr = ''
       runner.stderr?.on('data', (chunk: Buffer) => (stderr += chunk.toString()))
       runner.once('error', (err) => console.error(`host run failed to start: ${err}`))

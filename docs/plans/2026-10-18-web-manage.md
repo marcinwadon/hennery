@@ -4209,7 +4209,7 @@ Create `web/src/e2e-spawn.test.ts`:
 - **4d-B3:** the deployment warning's signal (kernel §10), for 4d-iv.
 - **4d-B4:** `PATCH /api/settings {public_url}`, for 4d-iv.
 - **The count of parked sessions no rule covers** (5a's hand-off), for the default-hat warning: no route gives it.
-- **`hennery host join` without `--data-dir`:** the command the page shows (frontend §8) needs `--data-dir` or `HENNERY_HOST_DATA_DIR` today. The distribution lane takes a default host data dir; then the page drops its hint, and the browser check runs the command with no variable set.
+- **`hennery host join` without `--data-dir`:** the command the page shows (frontend §8) needs `--data-dir` or `HENNERY_HOST_DATA_DIR` today. The distribution lane takes a default host data dir; then the page drops its hint, and the browser check runs the command with no variable set. Done 2026-10-03, after #102: the hint is gone, and the browser check runs `host join` as shown and `host run` with neither, in its scratch home.
 - **Revoking a pairing code** before it expires: no route; closing the panel only hides it.
 
 **Deferred** (owner named):
@@ -4221,7 +4221,7 @@ Create `web/src/e2e-spawn.test.ts`:
 - A real 403 `step_up_required` in the browser: see decision 15.
 - The countdown across a laptop's sleep: `performance.now()` stops in some browsers while asleep, so the code can look valid after it expired; the server refuses it then (`invalid_code`), and `host join` says so.
 
-**Spec amendments** (to write back): frontend §8: the pairing panel's hint about `--data-dir` and standard input; a host's default hat changed from the host card with a confirmation; purge's result shown as listed.
+**Spec amendments** (to write back): frontend §8: the pairing panel's hint about standard input (the one about `--data-dir` was dropped after #102); a host's default hat changed from the host card with a confirmation; purge's result shown as listed.
 
 **The security review's answers** (2026-10-02, on the maintainer's behalf):
 1. **Step-up:** the server's layer covers exactly the actions this plan steps up; creating a hat, the purge preview and the tester rightly need none. Every action goes through the client's one retry, and each has a test of two identical sends (A6 completed the path rules' one).

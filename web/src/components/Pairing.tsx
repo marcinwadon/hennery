@@ -123,8 +123,8 @@ export default function Pairing({ minted, onPaired, onSpent, onClose }: Props) {
             , and once only.
           </p>
           <p className="hint">
-            The host keeps its pairing in <code>--data-dir</code> (or <code>HENNERY_HOST_DATA_DIR</code>). Leave the
-            code out and <code>host join</code> asks for it instead, which keeps it out of your shell history.
+            Leave the code out and <code>host join</code> asks for it instead, which keeps it out of your shell
+            history.
           </p>
           <p role="status" className="hint">
             Waiting for the host… Closing this hides the code; it stays valid until it expires.
