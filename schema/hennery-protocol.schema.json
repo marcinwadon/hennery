@@ -18,6 +18,13 @@
       ],
       "type": "object"
     },
+    "AgentIsolation": {
+      "additionalProperties": {
+        "$ref": "#/$defs/McpIsolation"
+      },
+      "description": "`hello.mcp_isolation`: per agent id, how the host isolates its MCP\nservers. An agent left out is not isolated. Deserialized leniently, like\n`Capabilities`: an unknown mechanism counts as `none`, never as isolated\nand never a reason to refuse the `hello`.",
+      "type": "object"
+    },
     "AnswerRequest": {
       "anyOf": [
         {
@@ -235,6 +242,11 @@
           "const": "forget_session",
           "description": "Removing a deleted session's transcript from the agent's own data\n(`forget_session`, plan 9d decision 4).",
           "type": "string"
+        },
+        {
+          "const": "mcp_servers",
+          "description": "A session's MCP servers (plan 8c): the host passes a start's or\nresume's `mcp_servers` into `session/new` / `session/load` with the\nagent's isolation, as `hello.mcp_isolation` reports it, and refuses\nservers it cannot isolate unless the collector waived that\n(`mcp_isolation_unavailable`). A host without it gets no servers.",
+          "type": "string"
         }
       ]
     },
@@ -312,6 +324,21 @@
             "cwd": {
               "type": "string"
             },
+            "hat_id": {
+              "description": "The session's hat (`sessions.hat_id`); empty for a session from\nbefore hats. Carried, not yet used by the host (plan 8c).",
+              "type": "string"
+            },
+            "isolation_waived": {
+              "description": "The collector knowingly delivers to an agent the host cannot isolate\n(the mixed-host fallback's default hat, or a single-hat host,\numbrella §8.5). Absent, the host refuses servers for such an agent\n(`mcp_isolation_unavailable`): isolation is never lost by omission.",
+              "type": "boolean"
+            },
+            "mcp_servers": {
+              "description": "Passed in `session/new` / `session/load`. Only to a host that\nannounced `mcp_servers`.",
+              "items": {
+                "$ref": "#/$defs/McpServer"
+              },
+              "type": "array"
+            },
             "mode": {
               "type": [
                 "string",
@@ -369,6 +396,21 @@
             },
             "cwd": {
               "type": "string"
+            },
+            "hat_id": {
+              "description": "As on `start_session`.",
+              "type": "string"
+            },
+            "isolation_waived": {
+              "description": "The collector knowingly delivers to an agent the host cannot isolate\n(the mixed-host fallback's default hat, or a single-hat host,\numbrella §8.5). Absent, the host refuses servers for such an agent\n(`mcp_isolation_unavailable`): isolation is never lost by omission.",
+              "type": "boolean"
+            },
+            "mcp_servers": {
+              "description": "Passed in `session/new` / `session/load`. Only to a host that\nannounced `mcp_servers`.",
+              "items": {
+                "$ref": "#/$defs/McpServer"
+              },
+              "type": "array"
             },
             "mode": {
               "type": [
@@ -699,6 +741,10 @@
             "agent_session_id": {
               "type": "string"
             },
+            "fallback": {
+              "description": "Plan 9d-ii, B5 as ruled (the hybrid): the record's last\n`APP_SERVER_TIMEOUTS_BEFORE_FALLBACK` answers were all\n`app_server_timed_out`, so a Codex host spawns no Codex and runs\nthe fallback at once, after the same checks. Only ever a\ndowngrade of this session's own removal; other agents ignore it.\nAbsent when false.",
+              "type": "boolean"
+            },
             "request_id": {
               "type": "string"
             },
@@ -1000,7 +1046,7 @@
         },
         {
           "const": "transcript",
-          "description": "The transcript and its family in each project directory (B9).",
+          "description": "The transcript and its family in each project directory (B9); for\nCodex, its rollout files in `sessions/` and `archived_sessions/`\n(plan 9d-ii).",
           "type": "string"
         },
         {
@@ -1088,7 +1134,12 @@
         },
         {
           "const": "timed_out",
-          "description": "The forget's deadline passed before the removal was done (B6).",
+          "description": "The forget's deadline passed before the removal was done (B6). For\nCodex: after `thread/delete` was written, so it may have run.",
+          "type": "string"
+        },
+        {
+          "const": "app_server_timed_out",
+          "description": "Codex's app-server did not answer in time before `thread/delete`\nwas written (`--version`, its start, `initialize`): retried, and\ncounted by the collector, which flags the record's next forget\n`fallback` after `APP_SERVER_TIMEOUTS_BEFORE_FALLBACK` in a row\n(plan 9d-ii, B5 as ruled).",
           "type": "string"
         },
         {
@@ -1099,6 +1150,26 @@
         {
           "const": "io_error",
           "description": "The removal failed midway (B3).",
+          "type": "string"
+        },
+        {
+          "const": "forked_history",
+          "description": "Codex's `thread/delete` refused: forked history in another thread\nstill references the rollout (plan 9d-ii, decision 9). Final, and\nnever followed by the fallback (B5).",
+          "type": "string"
+        },
+        {
+          "const": "ephemeral",
+          "description": "Codex's `thread/delete` refused: the thread was never persisted\n(plan 9d-ii, decision 9). Final.",
+          "type": "string"
+        },
+        {
+          "const": "home_mismatch",
+          "description": "The app-server named another `CODEX_HOME` than the session's\nrecorded one in its `initialize` answer: nothing was asked of it, and\nno fallback ran (plan 9d-ii, the parent's rule).",
+          "type": "string"
+        },
+        {
+          "const": "fallback_only",
+          "description": "Only the fallback ran (plan 9d-ii, decision 10): Codex's own database\nmay still hold copies of the conversation. Final.",
           "type": "string"
         },
         {
@@ -1168,6 +1239,13 @@
         },
         "id": {
           "type": "string"
+        },
+        "logo": {
+          "description": "The hat's logo's `ETag`, without its quotes, when it has a logo\n(plan 4d-B2); absent when it has none. `GET /api/hats/{id}/logo`\nserves it; a client may add `?v=<logo>` to that URL so a new logo is\na new URL to its cache.",
+          "type": [
+            "string",
+            "null"
+          ]
         },
         "name": {
           "type": "string"
@@ -1254,6 +1332,11 @@
             },
             "host_version": {
               "type": "string"
+            },
+            "mcp_isolation": {
+              "$ref": "#/$defs/AgentIsolation",
+              "default": {},
+              "description": "Per agent, how this host isolates its MCP servers (plan 8c).\nAbsent means none is isolated (an older host)."
             },
             "proof": {
               "description": "Proof of possession of the host's key (ACP core §3.5): its\nEd25519 signature, hex, over `hello_proof_message(nonce, host_id,\nprotocol_version)`, where the nonce is the one the collector sent\nin the upgrade response's `hennery-hello-nonce` header.",
@@ -2031,6 +2114,21 @@
       ],
       "type": "object"
     },
+    "McpIsolation": {
+      "description": "How a host keeps an agent's sessions to the servers hennery passes (ACP\ncore §6). Lenient: a mechanism this build does not know reads as `none`.",
+      "oneOf": [
+        {
+          "const": "claude_strict",
+          "description": "`--strict-mcp-config` through `_meta` on every `session/new` and\n`session/load` (the pinned Claude adapter, its own CLI).",
+          "type": "string"
+        },
+        {
+          "const": "none",
+          "description": "None: the agent also loads the user's own MCP configuration.",
+          "type": "string"
+        }
+      ]
+    },
     "McpMountsRequest": {
       "additionalProperties": false,
       "description": "`PUT /api/mcp/connections/{id}/mounts`: the whole set of hosts the\nconnection is mounted on, replacing the one before, never a delta\n(gateway spec §9). No step-up: a mount reaches only a host the owner\npaired. 200 with the `McpConnectionItem`.\n\nIts own codes, beyond every route's (see `McpConnectionItem`): 404\n`not_found`; 400 `invalid` (a host that is not one of the owner's\npaired, unrevoked hosts; more than 1024 hosts; an id over 64 bytes,\nwhich is not quoted back). The limits count the ids as sent, and are\nchecked before the connection is looked up. A refused set changes\nnothing.",
@@ -2170,6 +2268,90 @@
       "required": [
         "redirect_uri",
         "has_client_secret"
+      ],
+      "type": "object"
+    },
+    "McpServer": {
+      "description": "One MCP server for a session (gateway spec §3.2, §3.4): an entry of ACP\n`session/new` / `session/load` `mcpServers`, tagged by `type` here (ACP\nitself leaves stdio entries untagged; the host builds those). A new\nserver type or a new required field needs a new capability: a host that\ncannot decode a start drops it unanswered, and the collector's timeout\nthen drops the connection.",
+      "oneOf": [
+        {
+          "description": "A streamable-HTTP server: the gateway's `/mcp/<slug>`, with the\nsession's token in `Authorization`.",
+          "properties": {
+            "headers": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/NameValue"
+              },
+              "type": "array"
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "const": "http",
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "url"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A local server the agent runs as its own child.",
+          "properties": {
+            "args": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "command": {
+              "type": "string"
+            },
+            "env": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/NameValue"
+              },
+              "type": "array"
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "const": "stdio",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "name",
+            "command"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "NameValue": {
+      "description": "A name and a value: an HTTP header of an MCP server, or an environment\nvariable of a stdio one. The value can be a secret (a gateway session\ntoken, a stdio server's key), so `Debug` never shows it (ACP core §8).",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "value": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "value"
       ],
       "type": "object"
     },
@@ -2540,6 +2722,26 @@
       },
       "required": [
         "turn_id"
+      ],
+      "type": "object"
+    },
+    "PublicUrlChanged": {
+      "description": "What a `public_url` change ended, as `hennery admin reset-public-url`\nreports it: every signed-in session (the caller's own among them), and\nthe passkeys of a host name `public_url` no longer has.",
+      "properties": {
+        "passkeys_removed": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sessions_ended": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sessions_ended",
+        "passkeys_removed"
       ],
       "type": "object"
     },
@@ -3563,8 +3765,21 @@
       ],
       "type": "object"
     },
+    "SetHatLogoRequest": {
+      "additionalProperties": false,
+      "description": "`PUT /api/hats/{id}/logo` (kernel spec §5.1, §8; plan 4d-B2): a PNG, at\nmost 64 KiB, as standard base64 with its padding and nothing around it\n(no `data:` prefix, no whitespace). The body is at most 96 KiB. Step-up.\nThe collector decodes it and writes it afresh, so what is served is\nnever the upload's bytes. 200 with the `HatItem`.\n\nIts own codes: 400 `invalid_logo` (not base64; not a readable PNG; over\n1024 pixels either way); 413 `logo_too_large` (over 64 KiB, or over 256\nKiB once re-encoded); 413 `body_too_large`; 415 `unsupported_logo` (not\na PNG: the web UI turns an SVG, a WebP or a JPEG into one first); 404\n`not_found`; 409 `hat_purging` (a hat frozen for its purge takes no new\nlogo). `DELETE /api/hats/{id}/logo` (step-up) removes it: 200 with the\n`HatItem`, a frozen hat's too, or 404.",
+      "properties": {
+        "data": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "data"
+      ],
+      "type": "object"
+    },
     "SettingsResponse": {
-      "description": "`GET /api/settings` (kernel spec §8), and the answer to its `PATCH`.",
+      "description": "`GET /api/settings` (kernel spec §8).",
       "properties": {
         "contact": {
           "description": "The owner's push contact (kernel spec §6): an e-mail address the\npush services may write to. Absent: they are given an `https`\n`public_url`, and nothing for an `http` one, which Apple refuses.",
@@ -3584,15 +3799,49 @@
     },
     "SettingsUpdateRequest": {
       "additionalProperties": false,
-      "description": "`PATCH /api/settings`: absent fields stay as they are. `contact` is an\ne-mail address, trimmed, or empty (or blank) to clear it. `public_url` is not changed here\nyet: `hennery admin reset-public-url` does that (kernel spec §4.2).",
+      "description": "`PATCH /api/settings`: absent fields stay as they are, and so does a\n`null` one. `contact` is an e-mail address, trimmed, or empty (or blank)\nto clear it.\n\n`public_url` moves the collector (kernel spec §3.2), as\n`hennery admin reset-public-url` does (§4.2), and needs a fresh step-up\n(§3.4). It ends every signed-in session, this one included (its cookie\nis cleared), and so every stream and push subscription; it removes\nevery passkey when the host name changes. The browser must then sign in\nat the new origin: requests from the old one are refused. A typo is\nrecovered on the collector's machine, with `hennery admin\nreset-public-url`. A body with both fields changes both or neither.",
       "properties": {
         "contact": {
           "type": [
             "string",
             "null"
           ]
+        },
+        "public_url": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
+      "type": "object"
+    },
+    "SettingsUpdateResponse": {
+      "description": "The answer to `PATCH /api/settings`: the settings as they are now and,\nwhen `public_url` was changed, what the change ended. Without\n`public_url_changed` it is exactly `SettingsResponse`.",
+      "properties": {
+        "contact": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "public_url": {
+          "type": "string"
+        },
+        "public_url_changed": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublicUrlChanged"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "public_url"
+      ],
       "type": "object"
     },
     "SetupRequest": {
