@@ -16,6 +16,10 @@
 //!   `Content-Type` is the gateway's both ways: a `POST` goes up as
 //!   `application/json`, which it checked, and an answer comes down as the
 //!   one type the gateway judged it by (the review's B1).
+//! - **`Mcp-Session-Id`** is bound to the token and the connection (plan 8e
+//!   decision 13, `session_id`): it comes down wrapped and goes up bare;
+//!   one not this token's on this connection, or two, is the 404 above,
+//!   and an answer with two is 502 `upstream_invalid`.
 //! - **Streaming** (§5.3): a JSON answer is read whole (8 MiB at most) and
 //!   judged before any of it goes on: a client can use none of it before its
 //!   end, and a server request may be in it (plan 2026-10-15 "gateway JSON
@@ -25,7 +29,9 @@
 //! - **401** (§5.4) is never passed on: `502 upstream_auth`. The one place
 //!   an OAuth refresh and retry goes is `refreshed` (plan 8f).
 //! - **Limits** (§5.7): per connection, the requests in flight and the open
-//!   `GET` streams; past either, 503. A request body has 30 s to arrive.
+//!   `GET` streams; past either, 503. A request body has 30 s to arrive,
+//!   and a JSON answer 60 s from its head to arrive whole (plan 8e decision
+//!   14), else 502 `upstream_unreachable`.
 //! - **Errors** the proxy answers itself are `ApiError` (`{code, message}`),
 //!   as every other route's: 404 `not_found`; 400 `invalid_request`; 408
 //!   `request_timeout`; 413 `body_too_large`; 503 `busy`; 502
@@ -35,13 +41,17 @@
 //! - **Logs** name the connection and its slug, never the token, the
 //!   credential or more of the upstream URL than its origin (lane L11).
 
+use crate::api::GatewayState;
 use crate::jsonrpc::{self, Answered, BOM, EventOutcome, Inspected};
 use crate::key::MasterKey;
 use crate::model::{CredKind, url_for_logs};
+use crate::revocation::{Revocations, Watch};
 use crate::scope::{ClientIdentity, MountPolicy, Principal, ProxyStore, ScopedConnection};
+use crate::session_id::SessionIds;
 use crate::store::GatewayStore;
+use crate::tokens::{is_session_token, token_hash};
 use axum::Router;
-use axum::body::{Body, Bytes};
+use axum::body::{Body, Bytes, HttpBody};
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
@@ -68,14 +78,22 @@ pub const MAX_FILTERED_BODY: usize = 8 * 1024 * 1024;
 const DEFAULT_ACCEPT: &str = "application/json, text/event-stream";
 
 /// The request headers passed upstream as they came (gateway spec §5.2).
-/// `Content-Type` is the gateway's own (the review's O6).
-const FORWARDED_REQUEST_HEADERS: &[&str] = &["accept", "mcp-session-id", "mcp-protocol-version", "last-event-id"];
+/// `Content-Type` is the gateway's own (the review's O6); `Mcp-Session-Id`
+/// goes up unwrapped (`SessionIds`, plan 8e decision 13), and
+/// `Last-Event-ID` only beside it (`LAST_EVENT_ID`).
+const FORWARDED_REQUEST_HEADERS: &[&str] = &["accept", "mcp-protocol-version"];
 
-/// The response headers passed downstream as they came (gateway spec
-/// §5.2). `Content-Type` is set from what the gateway judged the body to be
-/// (the review's B1), and `Cache-Control` is always `no-store` (plan 8d
-/// decision 19).
-const FORWARDED_RESPONSE_HEADERS: &[&str] = &["mcp-session-id"];
+/// A replay's cursor, passed up only with a session id this token may use
+/// (plan 8e, the security review's finding 4): an upstream that replays by
+/// event id alone would otherwise replay another session's stream to any
+/// token on the connection.
+const LAST_EVENT_ID: &str = "last-event-id";
+
+/// The one response header passed downstream, wrapped (`SessionIds`, plan
+/// 8e decision 13; gateway spec §5.2). `Content-Type` is set from what the
+/// gateway judged the body to be (the review's B1), and `Cache-Control` is
+/// always `no-store` (plan 8d decision 19).
+const SESSION_ID: &str = "mcp-session-id";
 
 /// The proxy's limits (gateway spec §5.7; plan 8d decision 10).
 #[derive(Clone, Debug)]
@@ -91,6 +109,11 @@ pub struct Limits {
     /// How long a client may take to send its request body (the review's
     /// O3): a slow body holds a request permit.
     pub body_timeout: Duration,
+    /// How long a JSON answer may take to arrive whole, from its head (plan
+    /// 8e decision 14): it is read whole before any of it goes down, so a
+    /// trickling upstream would otherwise hold the request's permit, and
+    /// the client wait with no head, for as long as it trickles.
+    pub answer_timeout: Duration,
 }
 
 impl Limits {
@@ -98,14 +121,23 @@ impl Limits {
     pub const MAX_STREAMS: usize = 32;
     pub const HEAD_TIMEOUT: Duration = Duration::from_secs(300);
     pub const BODY_TIMEOUT: Duration = Duration::from_secs(30);
+    pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(60);
 
+    /// `answer_timeout` is `ANSWER_TIMEOUT`; `with_answer_timeout` sets
+    /// another.
     pub fn new(max_requests: usize, max_streams: usize, head_timeout: Duration, body_timeout: Duration) -> Self {
         Self {
             requests: Limiter::new(max_requests),
             streams: Limiter::new(max_streams),
             head_timeout,
             body_timeout,
+            answer_timeout: Self::ANSWER_TIMEOUT,
         }
+    }
+
+    pub fn with_answer_timeout(mut self, answer_timeout: Duration) -> Self {
+        self.answer_timeout = answer_timeout;
+        self
     }
 }
 
@@ -134,26 +166,29 @@ pub struct ProxyState {
     pub key: Arc<MasterKey>,
     pub egress: Egress,
     pub limits: Limits,
+    /// What a revoke cuts (plan 8e decision 12): the same one the sessions'
+    /// side revokes through (`session::GatewayMcp`).
+    pub revocations: Revocations,
+    /// What binds an upstream's `Mcp-Session-Id` to its token (plan 8e
+    /// decision 13): a key of this process's own.
+    pub session_ids: SessionIds,
 }
 
 impl ProxyState {
     /// Full mode (umbrella §10.2): session tokens and host mounts, both from
-    /// `store`.
-    pub fn full(
-        store: Arc<ProxyStore>,
-        credentials: Arc<GatewayStore>,
-        key: Arc<MasterKey>,
-        egress: Egress,
-        limits: Limits,
-    ) -> Self {
+    /// `store`; requests watched in `gateway`'s `Revocations`, with its
+    /// store and key.
+    pub fn full(store: Arc<ProxyStore>, gateway: &GatewayState, egress: Egress, limits: Limits) -> Self {
         Self {
             identity: store.clone(),
             mounts: store.clone(),
-            credentials,
+            credentials: gateway.store.clone(),
             statuses: store,
-            key,
+            key: gateway.key.clone(),
             egress,
             limits,
+            revocations: gateway.revocations.clone(),
+            session_ids: SessionIds::new(),
         }
     }
 }
@@ -320,7 +355,12 @@ async fn refreshed(_state: &ProxyState, _connection: &ScopedConnection, auth: &U
 /// compression, `Content-Type: application/json` with a body (the gateway
 /// checked it is JSON), and the credential, never the client's
 /// `Authorization`.
-fn upstream_headers(downstream: &HeaderMap, auth: &UpstreamAuth, json_body: bool) -> HeaderMap {
+fn upstream_headers(
+    downstream: &HeaderMap,
+    session: Option<&HeaderValue>,
+    auth: &UpstreamAuth,
+    json_body: bool,
+) -> HeaderMap {
     let mut out = HeaderMap::new();
     if json_body {
         out.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -328,6 +368,12 @@ fn upstream_headers(downstream: &HeaderMap, auth: &UpstreamAuth, json_body: bool
     for name in FORWARDED_REQUEST_HEADERS {
         for value in downstream.get_all(*name) {
             out.append(HeaderName::from_static(name), value.clone());
+        }
+    }
+    if let Some(session) = session {
+        out.insert(SESSION_ID, session.clone());
+        for value in downstream.get_all(LAST_EVENT_ID) {
+            out.append(LAST_EVENT_ID, value.clone());
         }
     }
     if !out.contains_key(header::ACCEPT) {
@@ -361,9 +407,72 @@ enum ReadError {
     Failed,
 }
 
-/// `POST|GET|DELETE /mcp/{slug}`.
+/// `POST|GET|DELETE /mcp/{slug}`. A session token is watched from before
+/// it is resolved until the answer's body ends (plan 8e decision 12): a
+/// revoke that commits meanwhile ends the request, a 404 if no answer has
+/// begun, else its body cut short with an error. Bodies already whole in
+/// memory are left as they are.
 async fn proxy(
     State(state): State<ProxyState>,
+    slug: Result<Path<String>, PathRejection>,
+    method: Method,
+    headers: HeaderMap,
+    body: Body,
+) -> Response {
+    let watch = bearer(&headers)
+        .filter(|token| is_session_token(token))
+        .map(|token| state.revocations.watch(&token_hash(token)));
+    let Some(watch) = watch else {
+        // Never resolves: answered as for any unknown token.
+        return forward(state, slug, method, headers, body).await;
+    };
+    let revoked = watch.token();
+    let answer = tokio::select! {
+        biased;
+        () = revoked.cancelled() => {
+            tracing::info!("gateway proxy: the session token was revoked before the answer");
+            return not_found();
+        }
+        answer = forward(state, slug, method, headers, body) => answer,
+    };
+    if answer.body().size_hint().exact().is_some() {
+        return answer;
+    }
+    let (parts, body) = answer.into_parts();
+    Response::from_parts(parts, Body::from_stream(cut_off(body.into_data_stream(), watch)))
+}
+
+/// `body` until its token is cut, then an error, which ends the response
+/// mid-body (the client sees a broken stream, never a complete one), and
+/// drops the upstream's.
+fn cut_off<S>(body: S, watch: Watch) -> impl Stream<Item = Result<Bytes, std::io::Error>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, axum::Error>> + Send + 'static,
+{
+    let revoked = watch.token();
+    futures::stream::unfold(
+        (Box::pin(body), Some(watch), revoked),
+        |(mut body, watch, revoked)| async move {
+            let watch = watch?;
+            tokio::select! {
+                biased;
+                () = revoked.cancelled() => {
+                    tracing::info!("gateway proxy: the session token was revoked, its stream cut");
+                    Some((Err(std::io::Error::other("the session token was revoked")), (body, None, revoked)))
+                }
+                next = body.next() => match next {
+                    Some(Ok(bytes)) => Some((Ok(bytes), (body, Some(watch), revoked))),
+                    Some(Err(err)) => Some((Err(std::io::Error::other(err)), (body, None, revoked))),
+                    None => None,
+                },
+            }
+        },
+    )
+}
+
+/// The proxy's work for one request, once its token is watched.
+async fn forward(
+    state: ProxyState,
     slug: Result<Path<String>, PathRejection>,
     method: Method,
     headers: HeaderMap,
@@ -387,6 +496,24 @@ async fn proxy(
         Ok(Some(connection)) => connection,
         Ok(None) => return not_found(),
         Err(err) => return internal(err),
+    };
+    // The client's session id, unwrapped (plan 8e decision 13): one that is
+    // not this token's on this connection, or more than one, is the same
+    // 404 as an unknown token, and nothing goes up.
+    let mut sent = headers.get_all(SESSION_ID).iter();
+    let session = match (sent.next(), sent.next()) {
+        (None, _) => None,
+        (Some(id), None) => match state.session_ids.unwrap(token, &connection.id, id) {
+            Some(upstream) => Some(upstream),
+            None => {
+                tracing::info!(connection_id = %connection.id, slug = %connection.slug, "gateway proxy: a session id not bound to this token refused");
+                return not_found();
+            }
+        },
+        (Some(_), Some(_)) => {
+            tracing::info!(connection_id = %connection.id, slug = %connection.slug, "gateway proxy: more than one session id refused");
+            return not_found();
+        }
     };
     let permit = if method == Method::GET {
         state.limits.streams.try_acquire(&connection.id)
@@ -447,7 +574,7 @@ async fn proxy(
     let client = egress_client(&state.egress, upstream.internal_network);
     let send = |auth: &UpstreamAuth| {
         let mut request = reqwest::Request::new(method.clone(), upstream.url.clone());
-        *request.headers_mut() = upstream_headers(&headers, auth, body.is_some());
+        *request.headers_mut() = upstream_headers(&headers, session.as_ref(), auth, body.is_some());
         *request.body_mut() = body.clone().map(reqwest::Body::from);
         *request.timeout_mut() = Some(state.limits.head_timeout);
         client.send_streaming(request)
@@ -517,11 +644,23 @@ async fn proxy(
     {
         tracing::error!(connection_id = %connection.id, error = %err, "gateway proxy: status not recorded");
     }
-    let mut out = HeaderMap::new();
-    for name in FORWARDED_RESPONSE_HEADERS {
-        for value in response.headers().get_all(*name) {
-            out.append(HeaderName::from_static(name), value.clone());
+    // The upstream's session id goes down wrapped for this token and
+    // connection (plan 8e decision 13); two are no answer to pass on.
+    let mut answered = response.headers().get_all(SESSION_ID).iter();
+    let answered_session = match (answered.next(), answered.next()) {
+        (_, Some(_)) => {
+            tracing::warn!(connection_id = %connection.id, slug = %connection.slug, "gateway proxy: an answer with more than one session id refused");
+            return refuse(
+                StatusCode::BAD_GATEWAY,
+                "upstream_invalid",
+                format!("connection {} answered with more than one session id", connection.label),
+            );
         }
+        (id, None) => id.cloned(),
+    };
+    let mut out = HeaderMap::new();
+    if let Some(id) = &answered_session {
+        out.insert(SESSION_ID, state.session_ids.wrap(token, &connection.id, id));
     }
     match kind {
         BodyKind::Empty => {}
@@ -532,11 +671,8 @@ async fn proxy(
             out.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
         }
     }
-    let session_id = response
-        .headers()
-        .get("mcp-session-id")
-        .or_else(|| headers.get("mcp-session-id"))
-        .cloned();
+    // The Answerer answers on the upstream's own id, never the wrapped one.
+    let session_id = answered_session.or(session);
     let permits = Permits(permit);
     let allowlist = connection.tool_allowlist.clone();
     let body = match kind {
@@ -545,18 +681,27 @@ async fn proxy(
             Body::empty()
         }
         BodyKind::Json => {
-            let read = read_capped(response.bytes_stream(), MAX_FILTERED_BODY).await;
+            let read = read_capped(response.bytes_stream(), MAX_FILTERED_BODY);
+            let read = tokio::time::timeout(state.limits.answer_timeout, read).await;
             drop(permits);
             let bytes = match read {
-                Ok(bytes) => bytes,
-                Err(ReadError::TooLarge) => {
+                Ok(Ok(bytes)) => bytes,
+                Err(_) => {
+                    tracing::warn!(connection_id = %connection.id, slug = %connection.slug, "gateway proxy: a JSON answer did not arrive whole in time");
+                    return refuse(
+                        StatusCode::BAD_GATEWAY,
+                        "upstream_unreachable",
+                        format!("connection {} did not finish its answer in time", connection.label),
+                    );
+                }
+                Ok(Err(ReadError::TooLarge)) => {
                     return refuse(
                         StatusCode::BAD_GATEWAY,
                         "upstream_too_large",
                         format!("connection {} answered with more than 8 MiB", connection.label),
                     );
                 }
-                Err(ReadError::Failed) => {
+                Ok(Err(ReadError::Failed)) => {
                     tracing::debug!(connection_id = %connection.id, "gateway proxy: the upstream body failed");
                     return refuse(
                         StatusCode::BAD_GATEWAY,

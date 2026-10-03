@@ -12,7 +12,7 @@ use crate::db;
 use crate::secret::{random_bytes, sha256_hex};
 use anyhow::Result;
 use ed25519_dalek::{Signature, VerifyingKey};
-use hennery_proto::frames::Capabilities;
+use hennery_proto::frames::{AgentIsolation, Capabilities};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use std::sync::Mutex;
@@ -47,6 +47,9 @@ const MAX_FIELD: usize = 64;
 
 /// The most workspace roots stored per host (decision 7).
 pub const MAX_ROOTS: usize = 32;
+
+/// The most agents of a `hello.mcp_isolation` the registry keeps (plan 8e).
+pub const MAX_AGENTS: usize = 32;
 
 /// The longest path the collector stores or shows from a host, in bytes.
 pub const MAX_PATH: usize = 4096;
@@ -157,6 +160,9 @@ pub struct HostRecord {
     pub created_at: i64,
     pub last_seen_at: Option<i64>,
     pub revoked_at: Option<i64>,
+    /// Per agent, how it isolates MCP servers, from its latest accepted
+    /// `hello` (plan 8e decision E7); `None` until one is recorded.
+    pub mcp_isolation: Option<AgentIsolation>,
 }
 
 /// Whether text a host sent can be shown (the review's A6): at most `max`
@@ -453,6 +459,28 @@ impl Hosts {
         Ok(())
     }
 
+    /// Store the per-agent MCP isolation of an accepted `hello` (plan 8e
+    /// decision E7), for the host list while the host is away. The host's
+    /// own words, bounded as the other reported fields are: at most
+    /// `MAX_AGENTS` agents, each id displayable and at most 64 bytes;
+    /// others are left out.
+    pub fn record_mcp_isolation(&self, host_id: &str, isolation: &AgentIsolation) -> Result<()> {
+        let kept = AgentIsolation(
+            isolation
+                .0
+                .iter()
+                .filter(|(agent, _)| !agent.is_empty() && is_displayable_text(agent, 64))
+                .take(MAX_AGENTS)
+                .map(|(agent, how)| (agent.clone(), *how))
+                .collect(),
+        );
+        self.conn().execute(
+            "UPDATE hosts SET mcp_isolation = ?2 WHERE id = ?1 AND owner_id = ?3",
+            params![host_id, serde_json::to_string(&kept)?, self.owner],
+        )?;
+        Ok(())
+    }
+
     /// Store the workspace roots a reconciled connection of `host_id`
     /// reported (decision 7): the first `MAX_ROOTS` that
     /// `is_displayable_path` accepts. Only a reconciled connection's count:
@@ -542,11 +570,12 @@ impl Hosts {
     }
 }
 
-const HOST_COLUMNS: &str = "id, name, platform, host_version, capabilities, default_hat_id, created_at, last_seen_at, revoked_at, workspace_roots";
+const HOST_COLUMNS: &str = "id, name, platform, host_version, capabilities, default_hat_id, created_at, last_seen_at, revoked_at, workspace_roots, mcp_isolation";
 
 fn read_host(r: &rusqlite::Row<'_>) -> rusqlite::Result<HostRecord> {
     let capabilities: String = r.get(4)?;
     let workspace_roots: String = r.get(9)?;
+    let mcp_isolation: Option<String> = r.get(10)?;
     Ok(HostRecord {
         id: r.get(0)?,
         name: r.get(1)?,
@@ -558,6 +587,8 @@ fn read_host(r: &rusqlite::Row<'_>) -> rusqlite::Result<HostRecord> {
         last_seen_at: r.get(7)?,
         revoked_at: r.get(8)?,
         workspace_roots: serde_json::from_str(&workspace_roots).unwrap_or_default(),
+        // Lenient, as a `hello` is read: an unknown mechanism is `none`.
+        mcp_isolation: mcp_isolation.map(|json| serde_json::from_str(&json).unwrap_or_default()),
     })
 }
 

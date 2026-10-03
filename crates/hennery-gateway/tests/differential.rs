@@ -457,6 +457,10 @@ async fn a_tools_list_without_an_id_is_filtered_as_null() {
 #[tokio::test]
 async fn a_get_stream_and_its_replay_are_filtered() {
     let s = setup().await;
+    // A replay's cursor goes up only with a bound session id (plan 8e).
+    let session =
+        s.h.session_id(&s.upstream, "linear", &s.token, "upstream-session-1")
+            .await;
     let replayed = "id: 9\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"search\"},{\"name\":\"delete\"}]}}\n\n";
     s.upstream.reply(move |_, _| {
         Response::builder()
@@ -469,6 +473,7 @@ async fn a_get_stream_and_its_replay_are_filtered() {
             s.h.client
                 .get(s.h.url("linear"))
                 .bearer_auth(&s.token)
+                .header("mcp-session-id", &session)
                 .header(header::ACCEPT, "text/event-stream");
         if let Some(id) = last_event_id {
             get = get.header("last-event-id", id);
@@ -484,18 +489,22 @@ async fn a_get_stream_and_its_replay_are_filtered() {
         );
     }
     let seen = s.upstream.seen();
-    assert_eq!(seen[1].header("last-event-id"), Some("8"));
+    assert_eq!(seen[2].header("last-event-id"), Some("8"));
 }
 
 /// An answer on another stream (accepted, gateway spec §5.5): the proxy
 /// keeps nothing between requests, so one session's upstream stream never
 /// reaches another's. Two sessions on one connection, each with its own
 /// upstream session, open their streams at once; each sees only its own.
+/// Each gets its session id from a `POST`, wrapped for its token (plan 8e
+/// decision 13), and the upstream only ever sees the bare ids.
 #[tokio::test]
 async fn each_session_sees_only_its_own_upstream_stream() {
     let s = setup().await;
     let hat = s.h.hat();
     let other = s.h.mint("s2", "host-a", &hat);
+    let mine = s.h.session_id(&s.upstream, "linear", &s.token, "up-1").await;
+    let theirs = s.h.session_id(&s.upstream, "linear", &other, "up-2").await;
     // Each event its own chunk, a pause between them, so the two streams
     // interleave inside the proxy; the answer's session id is the
     // upstream's own (`srv-…`), not the one the client sent.
@@ -521,7 +530,7 @@ async fn each_session_sees_only_its_own_upstream_stream() {
             .body(Body::from_stream(events))
             .unwrap()
     });
-    let open = |token: String, upstream_session: &'static str| {
+    let open = |token: String, session: String, upstream_session: &'static str| {
         let client = s.h.client.clone();
         let url = s.h.url("linear");
         async move {
@@ -529,18 +538,29 @@ async fn each_session_sees_only_its_own_upstream_stream() {
                 .get(url)
                 .bearer_auth(token)
                 .header(header::ACCEPT, "text/event-stream")
-                .header("mcp-session-id", upstream_session)
+                .header("mcp-session-id", session)
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(
-                resp.headers()["mcp-session-id"],
-                format!("srv-{upstream_session}").as_str()
-            );
+            let id = resp.headers()["mcp-session-id"].to_str().unwrap().to_owned();
+            assert!(id.starts_with(&format!("srv-{upstream_session}.")), "{id}");
             resp.text().await.unwrap()
         }
     };
-    let (one, two) = tokio::join!(open(s.token.clone(), "up-1"), open(other, "up-2"));
+    let (one, two) = tokio::join!(open(s.token.clone(), mine, "up-1"), open(other, theirs, "up-2"));
+    let streams: Vec<_> = s
+        .upstream
+        .seen()
+        .into_iter()
+        .filter(|seen| seen.method == "GET")
+        .collect();
+    assert_eq!(streams.len(), 2);
+    let mut bare: Vec<_> = streams
+        .iter()
+        .map(|seen| seen.header("mcp-session-id").unwrap())
+        .collect();
+    bare.sort();
+    assert_eq!(bare, ["up-1", "up-2"], "the upstream sees the bare ids only");
     for (text, mine) in [(one, "up-1"), (two, "up-2")] {
         let events = support::differential::client_events(text.as_bytes());
         assert_eq!(events.len(), 20, "{mine}: {text}");
@@ -549,6 +569,39 @@ async fn each_session_sees_only_its_own_upstream_stream() {
             assert_eq!(message["params"]["for"], mine, "{event}");
         }
     }
+}
+
+/// Session ids as a client or an intermediary may spell them (plan 8e
+/// decision 13): another token's id, joined to this token's with a comma
+/// either way round (how a list header is folded), or wrapped once more.
+/// Each is the same 404, and nothing goes up.
+#[tokio::test]
+async fn no_spelling_of_another_tokens_session_id_goes_up() {
+    let s = setup().await;
+    let other = s.h.mint("s2", "host-a", &s.h.hat());
+    let mine = s.h.session_id(&s.upstream, "linear", &s.token, "up-1").await;
+    let theirs = s.h.session_id(&s.upstream, "linear", &other, "up-2").await;
+    let before = s.upstream.seen().len();
+    for spelling in [
+        theirs.clone(),
+        format!("{mine},{theirs}"),
+        format!("{theirs}, {mine}"),
+        format!("up-1.{mine}"),
+        format!("{theirs}.{}", &mine["up-1.".len()..]),
+    ] {
+        let resp =
+            s.h.client
+                .post(s.h.url("linear"))
+                .bearer_auth(&s.token)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("mcp-session-id", &spelling)
+                .body(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#)
+                .send()
+                .await
+                .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{spelling}");
+    }
+    assert_eq!(s.upstream.seen().len(), before, "nothing went up");
 }
 
 /// A server request inside a JSON answer (gateway spec §5.6, plan

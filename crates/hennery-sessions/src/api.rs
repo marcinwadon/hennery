@@ -6,7 +6,7 @@ use crate::hub::{RequestError, Undo};
 use crate::resolve::{NotResolved, OnHost, resolve_on_host};
 use crate::store::{
     AnswerSubmission, Cursor, Deletion, HostForgets, LIFECYCLES, LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT, ListQuery,
-    Reassign, ResumeRequest, SessionRow, Store, Unattached,
+    McpContext, Reassign, ResumeRequest, SessionRow, Store, Unattached,
 };
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, State};
 use axum::handler::Handler;
@@ -150,7 +150,9 @@ fn request_failed(err: RequestError) -> Response {
                 "invalid" => StatusCode::BAD_REQUEST,
                 _ => StatusCode::BAD_GATEWAY,
             };
-            error(status, &code, message)
+            // The host's words, which can quote what the agent printed
+            // (plan 8e decision 11).
+            error(status, &code, crate::redact::shown(&message))
         }
         RequestError::DeliveryUnknown => error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -177,7 +179,9 @@ fn request_failed(err: RequestError) -> Response {
 /// host and an unknown delivery answer as for any other request.
 fn resume_failed(err: RequestError) -> Response {
     match err {
-        RequestError::Rejected { code, message } => error(StatusCode::BAD_GATEWAY, &code, message),
+        RequestError::Rejected { code, message } => {
+            error(StatusCode::BAD_GATEWAY, &code, crate::redact::shown(&message))
+        }
         other => request_failed(other),
     }
 }
@@ -296,20 +300,25 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
         }
         Err(why) => return why.into_response(),
     };
+    let mcp_context = match mcp_context(&state, &req.host_id, &req.agent) {
+        Ok(context) => context,
+        Err(err) => return internal(err),
+    };
     let session_id = uuid::Uuid::now_v7().to_string();
-    match state.store.create_session(
+    let mcp = match state.store.create_session_with_mcp(
         &session_id,
         &req.host_id,
         &req.agent,
         &cwd,
         &hat.hat_id,
         hat.rule_id.as_deref(),
+        mcp_context,
     ) {
-        Ok(true) => {}
+        Ok(Some(mcp)) => mcp,
         // The hat resolved before its purge froze it (plan 9c decision 10c).
-        Ok(false) => return hat_purging(&state, &hat.hat_id),
+        Ok(None) => return hat_purging(&state, &hat.hat_id),
         Err(err) => return internal(err),
-    }
+    };
     let request_id = uuid::Uuid::now_v7().to_string();
     let frame = CollectorFrame::StartSession {
         request_id: request_id.clone(),
@@ -319,10 +328,9 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
         agent: req.agent,
         cwd,
         config: req.config,
-        // The hat just stored. No servers yet: minting and the delivery
-        // decision are plan 8e's.
+        // The hat just stored, and what it was given (plan 8e).
         hat_id: hat.hat_id.clone(),
-        mcp: Default::default(),
+        mcp: mcp.frame(),
     };
     let undo = Undo::Start {
         session_id: session_id.clone(),
@@ -342,18 +350,59 @@ async fn start_session(State(state): State<AppState>, ApiJson(req): ApiJson<Star
             session_id,
         ),
         // Never sent.
-        Err(RequestError::NotConnected) => {
-            if let Err(e) = state.store.mark_failed(&session_id, "host_offline") {
-                return internal(e);
-            }
-            request_failed(RequestError::NotConnected)
+        Err(err @ (RequestError::NotConnected | RequestError::McpUndeliverable)) => {
+            start_not_sent(&state, &session_id, err)
         }
         // The socket task has already failed the session with the host's
-        // code (`Undo::Start`); not for `McpUndeliverable`, which the hub
-        // refused before sending: that leaves the session `starting`, and
-        // plan 8e fails it (unreachable in 8c, which sends no servers).
+        // code (`Undo::Start`).
         Err(err) => request_failed(err),
     }
+}
+
+/// Why a start or resume the hub never sent fails: the host went away, or
+/// its connection no longer takes the servers the decision read (a
+/// reconnect in between; api-8e-8f A2).
+fn not_sent_reason(err: &RequestError) -> &'static str {
+    match err {
+        RequestError::McpUndeliverable => MCP_UNDELIVERABLE,
+        _ => "host_offline",
+    }
+}
+
+/// A start the hub never sent: failed with `not_sent_reason`, its token
+/// revoked (`Store::mark_failed`).
+fn start_not_sent(state: &AppState, session_id: &str, err: RequestError) -> Response {
+    if let Err(e) = state.store.mark_failed(session_id, not_sent_reason(&err)) {
+        return internal(e);
+    }
+    request_failed(err)
+}
+
+/// A resume the hub never sent, as for a start, if it is still `starting`.
+fn resume_not_sent(state: &AppState, session_id: &str, err: RequestError) -> Response {
+    if let Err(e) = state.store.mark_failed_if_starting(session_id, not_sent_reason(&err)) {
+        return internal(e);
+    }
+    resume_failed(err)
+}
+
+/// The code a start or resume the hub refused for its MCP servers fails
+/// with (plan 8c's `mcp_isolation_unavailable`).
+const MCP_UNDELIVERABLE: &str = "mcp_isolation_unavailable";
+
+/// What the delivery decision reads of `host_id` outside the store (lane
+/// L2): its live connection's capability and `agent`'s isolation, from the
+/// hub, and whether its rules name another hat, from the kernel. A host not
+/// connected takes nothing.
+fn mcp_context(state: &AppState, host_id: &str, agent: &str) -> anyhow::Result<McpContext> {
+    let Some((capable, isolation)) = state.hub.mcp_isolation(host_id, agent) else {
+        return Ok(McpContext::NONE);
+    };
+    Ok(McpContext {
+        capable,
+        isolation,
+        rules_name_other_hats: state.hosts.rules_name_other_hats(host_id)?,
+    })
 }
 
 /// The longest search the list takes, in characters (plan 6b decision 8).
@@ -466,10 +515,15 @@ async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -
         Ok(pending) => pending,
         Err(err) => return internal(err),
     };
+    let mcp_delivery = match state.store.mcp_delivery(&id) {
+        Ok(delivery) => delivery,
+        Err(err) => return internal(err),
+    };
     Json(SessionDetail {
         session: item,
         open_turn,
         pending,
+        mcp_delivery,
     })
     .into_response()
 }
@@ -593,17 +647,26 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         Ok(hat) => hat,
         Err(why) => return why.into_response(),
     };
-    let (agent_session_id, committed_seq, config) = match state.store.request_resume(&id, &hat.hat_id) {
+    let mcp_context = match mcp_context(&state, &session.host_id, &session.agent) {
+        Ok(context) => context,
+        Err(err) => return internal(err),
+    };
+    let (agent_session_id, committed_seq, config, mcp) = match state.store.request_resume_with_mcp(
+        &id,
+        &hat.hat_id,
+        mcp_context,
+    ) {
         Ok(ResumeRequest::Starting {
             events,
             agent_session_id,
             committed_seq,
             config,
+            mcp,
         }) => {
             for event in events {
                 state.hub.publish(event);
             }
-            (agent_session_id, committed_seq, config)
+            (agent_session_id, committed_seq, config, mcp)
         }
         // A concurrent resume got there first (ACP core §12 scenario 11).
         Ok(ResumeRequest::Busy(lifecycle)) => return busy(&lifecycle),
@@ -633,9 +696,10 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         agent_session_id,
         // Re-applied after the load (ACP core §4.3).
         config,
-        // The hat the resume just re-resolved, equal to the stored one.
+        // The hat the resume just re-resolved, equal to the stored one, and
+        // what it was given, with a fresh token (plan 8e).
         hat_id: hat.hat_id.clone(),
-        mcp: Default::default(),
+        mcp: mcp.frame(),
     };
     let undo = Undo::Start { session_id: id.clone() };
     match state
@@ -646,17 +710,11 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         Ok(_) => lifecycle_response(&state, &id),
         // Still `starting`: the next handshake reconciles it (ACP core §3.4).
         Err(RequestError::DeliveryUnknown) => request_failed(RequestError::DeliveryUnknown),
-        // Never sent: the host went away since the check above.
-        Err(RequestError::NotConnected) => {
-            if let Err(e) = state.store.mark_failed_if_starting(&id, "host_offline") {
-                return internal(e);
-            }
-            resume_failed(RequestError::NotConnected)
-        }
+        // Never sent: the host went away since the check above, or no
+        // longer takes the servers.
+        Err(err @ (RequestError::NotConnected | RequestError::McpUndeliverable)) => resume_not_sent(&state, &id, err),
         // The socket task has already failed the session with the host's
-        // code (`Undo::Start`); not for `McpUndeliverable`, which the hub
-        // refused before sending: that leaves the session `starting`, and
-        // plan 8e fails it (unreachable in 8c, which sends no servers).
+        // code (`Undo::Start`).
         Err(err) => resume_failed(err),
     }
 }
@@ -1792,5 +1850,103 @@ mod delete_race_tests {
         let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(body["code"], "starting", "{body}");
         assert_eq!(f.state.store.find_session("s1").unwrap().unwrap().lifecycle, "starting");
+    }
+}
+
+/// Plan 8e: a start or resume the hub refused to send (`McpUndeliverable`,
+/// a reconnect between the decision and the frame, with no await between
+/// them for a test to step into) fails the session with
+/// `mcp_isolation_unavailable` and answers 409 with it (api-8e-8f A2); one
+/// whose host went away fails `host_offline`, as before.
+#[cfg(test)]
+mod not_sent_tests {
+    use super::*;
+    use hennery_kernel::hosts::Hosts;
+    use hennery_kernel::operator::Operator;
+
+    fn state() -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("hennery.db");
+        let state = AppState::new(
+            Store::open(&db).unwrap(),
+            Hosts::open(&db).unwrap(),
+            Operator::open(&db).unwrap(),
+        );
+        (dir, state)
+    }
+
+    async fn answer(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    fn failure(state: &AppState, id: &str) -> (String, Option<String>) {
+        let row = state.store.find_session(id).unwrap().unwrap();
+        (row.lifecycle, row.failure_reason)
+    }
+
+    #[tokio::test]
+    async fn a_start_refused_for_its_servers_fails_mcp_isolation_unavailable() {
+        let (_dir, state) = state();
+        assert!(state.store.create_session("s1", "h", "a", "/p", "hat", None).unwrap());
+        let (status, body) = answer(start_not_sent(&state, "s1", RequestError::McpUndeliverable)).await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::CONFLICT, Some(MCP_UNDELIVERABLE))
+        );
+        assert_eq!(failure(&state, "s1"), ("failed".into(), Some(MCP_UNDELIVERABLE.into())));
+    }
+
+    #[tokio::test]
+    async fn a_start_never_sent_to_a_gone_host_fails_host_offline() {
+        let (_dir, state) = state();
+        assert!(state.store.create_session("s1", "h", "a", "/p", "hat", None).unwrap());
+        let (status, body) = answer(start_not_sent(&state, "s1", RequestError::NotConnected)).await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::CONFLICT, Some("host_offline"))
+        );
+        assert_eq!(failure(&state, "s1"), ("failed".into(), Some("host_offline".into())));
+    }
+
+    #[tokio::test]
+    async fn a_resume_refused_for_its_servers_fails_mcp_isolation_unavailable() {
+        let (_dir, state) = state();
+        assert!(state.store.create_session("s1", "h", "a", "/p", "hat", None).unwrap());
+        let (status, body) = answer(resume_not_sent(&state, "s1", RequestError::McpUndeliverable)).await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::CONFLICT, Some(MCP_UNDELIVERABLE))
+        );
+        assert_eq!(failure(&state, "s1"), ("failed".into(), Some(MCP_UNDELIVERABLE.into())));
+    }
+
+    #[tokio::test]
+    async fn a_resume_never_sent_to_a_gone_host_fails_host_offline() {
+        let (_dir, state) = state();
+        assert!(state.store.create_session("s1", "h", "a", "/p", "hat", None).unwrap());
+        let (status, body) = answer(resume_not_sent(&state, "s1", RequestError::NotConnected)).await;
+        assert_eq!(
+            (status, body["code"].as_str()),
+            (StatusCode::CONFLICT, Some("host_offline"))
+        );
+        assert_eq!(failure(&state, "s1"), ("failed".into(), Some("host_offline".into())));
+    }
+
+    /// The host's words in a refusal are answered with any token redacted
+    /// (decision 11).
+    #[tokio::test]
+    async fn a_refusals_message_is_answered_redacted() {
+        let token = format!("{}{}", hennery_gateway::tokens::SESSION_TOKEN_PREFIX, "0a".repeat(32));
+        let rejected = || RequestError::Rejected {
+            code: "start_failed".into(),
+            message: format!("the agent said {token}"),
+        };
+        for response in [request_failed(rejected()), resume_failed(rejected())] {
+            let (_, body) = answer(response).await;
+            let message = body["message"].as_str().unwrap();
+            assert!(!message.contains(&token) && message.contains("<redacted>"), "{message}");
+        }
     }
 }

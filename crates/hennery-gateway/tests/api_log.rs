@@ -67,6 +67,7 @@ async fn a_static_token_is_never_logged_answered_or_stored_in_clear() {
         store: store.clone(),
         key: key.clone(),
         operator,
+        revocations: Default::default(),
     });
     let send = |method: &str, path: &str, body: String| {
         Request::builder()
@@ -189,6 +190,7 @@ async fn an_upstream_url_is_logged_and_shown_only_as_its_origin() {
         store: Arc::new(GatewayStore::open(&db).unwrap()),
         key: Arc::new(MasterKey::from_bytes([5; 32])),
         operator,
+        revocations: Default::default(),
     });
     let url = format!("https://mcp.vendor.example:8443/s/{CANARY}/mcp?key={CANARY}");
     let mut refusals = Vec::new();

@@ -397,6 +397,9 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
              ALTER TABLE sessions DROP COLUMN git_worktree;
              ALTER TABLE sessions DROP COLUMN base_commit;
              ALTER TABLE sessions DROP COLUMN last_event_id;
+             ALTER TABLE sessions DROP COLUMN mcp_delivery_mode;
+             ALTER TABLE sessions DROP COLUMN mcp_delivery_servers;
+             ALTER TABLE sessions DROP COLUMN mcp_delivery_at;
              DROP TABLE event_attachments;
              DROP TABLE attachments;
              ALTER TABLE turns DROP COLUMN state;
@@ -2472,6 +2475,9 @@ fn the_hat_migration_gives_each_session_its_hosts_default_hat() {
          DROP INDEX sessions_by_hat;
          ALTER TABLE sessions DROP COLUMN hat_id;
          ALTER TABLE sessions DROP COLUMN hat_rule_id;
+         ALTER TABLE sessions DROP COLUMN mcp_delivery_mode;
+         ALTER TABLE sessions DROP COLUMN mcp_delivery_servers;
+         ALTER TABLE sessions DROP COLUMN mcp_delivery_at;
          PRAGMA user_version = 9;",
     )
     .unwrap();

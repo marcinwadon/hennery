@@ -29,6 +29,8 @@ tokio.workspace = true
 
 [dev-dependencies]
 anyhow.workspace = true
+# A fake MCP upstream for the gateway end to end (plan 8e).
+axum.workspace = true
 futures.workspace = true
 # The owner audit reads the gateway's store too (plan 8a).
 hennery-gateway.workspace = true

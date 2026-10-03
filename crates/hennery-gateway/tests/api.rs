@@ -3,6 +3,10 @@
 //! credential and changing where a token goes need a fresh step-up.
 //! Driven through the router in-process.
 
+// The differential harness (lane L16), for the stdio set's input.
+#[path = "support/differential.rs"]
+mod differential;
+
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -46,6 +50,7 @@ impl Api {
             store: store.clone(),
             key: key.clone(),
             operator: operator.clone(),
+            revocations: Default::default(),
         });
         Self {
             _dir: dir,
@@ -79,6 +84,22 @@ impl Api {
             platform: "macos-aarch64".into(),
         };
         self.hosts.register(id, &enrollment, unix_now()).unwrap();
+    }
+
+    /// `PUT` `body` as it is, byte for byte.
+    async fn put_raw(&self, session: &str, path: &str, body: &str) -> (StatusCode, Value) {
+        let req = Request::builder()
+            .method("PUT")
+            .uri(path)
+            .header("origin", ORIGIN)
+            .header("cookie", format!("hennery_session={session}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_owned()))
+            .unwrap();
+        let resp = self.app.clone().oneshot(req).await.unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
     }
 
     async fn send(&self, session: &str, method: &str, path: &str, body: Option<&Value>) -> (StatusCode, Value) {
@@ -607,4 +628,216 @@ async fn an_error_is_the_shared_api_error_and_nothing_more() {
         assert_eq!(answer["code"], expected, "{answer}");
         assert!(answer["message"].as_str().is_some_and(|m| !m.is_empty()), "{answer}");
     }
+}
+
+/// Plan 8e (api-8e-8f A1): a stdio set is read without step-up and
+/// replaced with it; its values are never answered, only their names.
+#[tokio::test]
+async fn a_stdio_set_is_read_freely_and_replaced_behind_step_up() {
+    let api = Api::new();
+    api.host("host-a", 1);
+    let hat = api.hat();
+    let path = format!("/api/mcp/stdio-servers?host_id=host-a&hat_id={hat}");
+    let fresh = api.session(0);
+    let stale = api.session(600);
+    let (status, set) = api.send(&stale, "GET", &path, None).await;
+    assert_eq!(status, StatusCode::OK, "{set}");
+    assert_eq!(set, json!({"host_id": "host-a", "hat_id": hat, "servers": []}));
+    let body = json!({"servers": [{
+        "name": "files", "command": "files-mcp", "args": ["--root", "/srv"],
+        "env": [{"name": "FILES_KEY", "value": "s3cr3t-stdio-value"}, {"name": "EMPTY", "value": ""}]
+    }]});
+    let (status, refused) = api.send(&stale, "PUT", &path, Some(&body)).await;
+    assert_eq!((status, code(&refused)), (StatusCode::FORBIDDEN, "step_up_required"));
+    let (status, _) = api.send(&stale, "GET", &path, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, set) = api.send(&fresh, "PUT", &path, Some(&body)).await;
+    assert_eq!(status, StatusCode::OK, "{set}");
+    let server = &set["servers"][0];
+    assert_eq!(server["name"], "files");
+    assert_eq!(server["args"], json!(["--root", "/srv"]));
+    assert_eq!(
+        server["env"],
+        json!([{"name": "FILES_KEY", "has_value": true}, {"name": "EMPTY", "has_value": true}])
+    );
+    assert!(server["created_at"].as_str().unwrap().ends_with('Z'), "{set}");
+    let (_, read) = api.send(&stale, "GET", &path, None).await;
+    assert_eq!(read, set);
+    assert!(!read.to_string().contains("s3cr3t-stdio-value"), "{read}");
+}
+
+/// One stdio server as `decoder` reads it in a raw `PUT` body: its name,
+/// command, args and env names, or `None` where it finds no string.
+fn server_as_read(decoder: differential::Decoder, server: &differential::Node) -> Option<Value> {
+    use differential::Node;
+    let strs = |node: Option<&Node>| -> Option<Vec<String>> {
+        match node {
+            None => Some(Vec::new()),
+            Some(Node::Arr(items)) => items.iter().map(|item| decoder.str(Some(item))).collect(),
+            Some(_) => None,
+        }
+    };
+    let env = match decoder.get(server, "env") {
+        None => Vec::new(),
+        Some(Node::Arr(items)) => items
+            .iter()
+            .map(|item| decoder.str(decoder.get(item, "name")))
+            .collect::<Option<Vec<_>>>()?,
+        Some(_) => return None,
+    };
+    Some(json!({
+        "name": decoder.str(decoder.get(server, "name"))?,
+        "command": decoder.str(decoder.get(server, "command"))?,
+        "args": strs(decoder.get(server, "args"))?,
+        "env": env,
+    }))
+}
+
+/// Lane L16: the stdio set is a filter on parsed input (names, command,
+/// args, env names, each validated) that a host and an agent read again
+/// later. Each raw body is either refused, changing nothing, or read by
+/// every one of the six decoders exactly as the gateway stored it: a key
+/// twice, a key in another case or with a NUL, a NUL in a value, escapes.
+#[tokio::test]
+async fn every_decoder_reads_an_accepted_stdio_set_as_it_was_stored() {
+    let api = Api::new();
+    api.host("host-a", 1);
+    let hat = api.hat();
+    let path = format!("/api/mcp/stdio-servers?host_id=host-a&hat_id={hat}");
+    let fresh = api.session(0);
+    let vectors: &[(&str, bool)] = &[
+        (
+            r#"{"servers":[{"name":"files","command":"files-mcp","args":["--root","/srv"],"env":[{"name":"K","value":"v"}]}]}"#,
+            true,
+        ),
+        (
+            r#"{"servers":[{"name":"\u0066iles","command":"files\u002dmcp"}]}"#,
+            true,
+        ),
+        (
+            r#"{"servers":[{"name":"files","command":"safe","command":"evil"}]}"#,
+            false,
+        ),
+        (r#"{"servers":[],"servers":[{"name":"files","command":"evil"}]}"#, false),
+        (
+            r#"{"servers":[{"name":"files","command":"safe","Command":"evil"}]}"#,
+            false,
+        ),
+        (
+            r#"{"servers":[{"name":"files","command":"safe","command\u0000x":"evil"}]}"#,
+            false,
+        ),
+        (r#"{"ſervers":[{"name":"files","command":"evil"}],"servers":[]}"#, false),
+        (r#"{"servers":[{"name":"files","command":"safe\u0000evil"}]}"#, false),
+        (r#"{"servers":[{"name":"files\u0000x","command":"safe"}]}"#, false),
+        (
+            r#"{"servers":[{"name":"files","command":"safe","args":["a\u0000b"]}]}"#,
+            false,
+        ),
+        (
+            r#"{"servers":[{"name":"files","command":"safe","env":[{"name":"K\u0000X","value":"v"}]}]}"#,
+            false,
+        ),
+        (
+            r#"{"servers":[{"name":"files","command":"safe","env":[{"name":"K","name":"X","value":"v"}]}]}"#,
+            false,
+        ),
+        (
+            r#"{"servers":[{"name":"files","command":"safe","env":[{"name":"K","Name":"X","value":"v"}]}]}"#,
+            false,
+        ),
+        (
+            r#"{"servers":[{"name":"files","command":"safe","env":[{"name":"K","value":"a\u0000b"}]}]}"#,
+            false,
+        ),
+    ];
+    for &(raw, accepted) in vectors {
+        // Each from an empty set: a refused one leaves it empty.
+        let (status, _) = api.send(&fresh, "PUT", &path, Some(&json!({"servers": []}))).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, answer) = api.put_raw(&fresh, &path, raw).await;
+        let (_, stored) = api.send(&fresh, "GET", &path, None).await;
+        if !accepted {
+            assert!(status.is_client_error(), "{raw}: {status} {answer}");
+            assert_eq!(stored["servers"], json!([]), "{raw}");
+            continue;
+        }
+        assert_eq!(status, StatusCode::OK, "{raw}: {answer}");
+        let as_stored: Vec<Value> = stored["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| {
+                let env: Vec<&Value> = s["env"].as_array().unwrap().iter().map(|e| &e["name"]).collect();
+                json!({"name": s["name"], "command": s["command"], "args": s["args"], "env": env})
+            })
+            .collect();
+        let node: differential::Node = serde_json::from_str(raw).unwrap();
+        for &decoder in differential::DECODERS {
+            let Some(differential::Node::Arr(servers)) = decoder.get(&node, "servers") else {
+                panic!("{decoder:?} finds no servers in {raw}");
+            };
+            let as_read: Vec<Value> = servers
+                .iter()
+                .map(|server| server_as_read(decoder, server).unwrap_or(Value::Null))
+                .collect();
+            assert_eq!(as_read, as_stored, "{decoder:?} reads {raw} otherwise");
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_stdio_routes_answer_their_codes() {
+    let api = Api::new();
+    api.host("host-a", 1);
+    api.host("host-gone", 2);
+    let hat = api.hat();
+    let s = api.session(0);
+    let at = |host: &str, hat: &str| format!("/api/mcp/stdio-servers?host_id={host}&hat_id={hat}");
+    let long = "h".repeat(65);
+    for path in [
+        "/api/mcp/stdio-servers".to_string(),
+        "/api/mcp/stdio-servers?host_id=host-a".to_string(),
+        format!("/api/mcp/stdio-servers?hat_id={hat}"),
+        at(&long, &hat),
+        at("host-a", &long),
+        at("", &hat),
+    ] {
+        let (status, body) = api.send(&s, "GET", &path, None).await;
+        assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "invalid"), "{path}");
+        assert!(!body.to_string().contains(&long), "{body}");
+    }
+    let (status, body) = api.send(&s, "GET", &at("host-x", &hat), None).await;
+    assert_eq!((status, code(&body)), (StatusCode::NOT_FOUND, "not_found"));
+    let (status, body) = api.send(&s, "GET", &at("host-a", "hat-x"), None).await;
+    assert_eq!((status, code(&body)), (StatusCode::NOT_FOUND, "not_found"));
+    let one = |name: &str, env: Value| json!({"servers": [{"name": name, "command": "c", "env": env}]});
+    let (api, s) = (&api, &s);
+    let put = |path: String, body: Value| async move { api.send(s, "PUT", &path, Some(&body)).await };
+    let (status, body) = put(at("host-a", &hat), one("Bad", json!([]))).await;
+    assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "invalid"));
+    let (status, body) = put(at("host-a", &hat), one("files", json!([{"name": "K"}]))).await;
+    assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "env_value_missing"));
+    api.create("linear").await;
+    let (status, body) = put(at("host-a", &hat), one("linear", json!([]))).await;
+    assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "slug_taken"));
+    let many: Vec<Value> = (0..33)
+        .map(|i| json!({"name": format!("s{i}"), "command": "c"}))
+        .collect();
+    let (status, body) = put(at("host-a", &hat), json!({ "servers": many })).await;
+    assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "too_many_stdio_servers"));
+    let (status, body) = put(at("host-a", &hat), json!({"servers": [], "extra": 1})).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    api.hosts.revoke("host-gone", unix_now()).unwrap();
+    let (status, body) = put(at("host-gone", &hat), json!({"servers": []})).await;
+    assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "host_revoked"));
+    let (status, body) = api.send(s, "GET", &at("host-gone", &hat), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // And the other way: a connection may not take a stdio server's name.
+    let (status, _) = put(at("host-a", &hat), one("files", json!([]))).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = api
+        .send(s, "POST", "/api/mcp/connections", Some(&api.new_body("files")))
+        .await;
+    assert_eq!((status, code(&body)), (StatusCode::CONFLICT, "slug_taken"));
 }

@@ -9,13 +9,16 @@ pub mod differential;
 pub mod upstream;
 
 use ed25519_dalek::SigningKey;
+use hennery_gateway::api::GatewayState;
 use hennery_gateway::key::MasterKey;
 use hennery_gateway::model::{Change, CredKind, CredentialChange, NewConnection};
+use hennery_gateway::revocation::Revocations;
 use hennery_gateway::scope::ProxyStore;
 use hennery_gateway::store::GatewayStore;
 use hennery_gateway::tokens;
 use hennery_kernel::hats::HatChange;
 use hennery_kernel::hosts::{Enrollment, Hosts};
+use hennery_kernel::operator::Operator;
 use hennery_kernel::secret::unix_now;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,6 +30,8 @@ pub struct World {
     pub proxy_store: Arc<ProxyStore>,
     pub key: Arc<MasterKey>,
     pub hosts: Hosts,
+    /// Shared by the proxy (`Harness`) and `gateway()` (plan 8e).
+    pub revocations: Revocations,
 }
 
 impl World {
@@ -43,6 +48,7 @@ impl World {
             proxy_store,
             key: Arc::new(MasterKey::from_bytes([7; 32])),
             hosts,
+            revocations: Revocations::new(),
         }
     }
 
@@ -89,6 +95,11 @@ impl World {
             tool_allowlist: allowlist.map(|tools| tools.iter().map(|t| t.to_string()).collect()),
             internal_network: true,
         })
+    }
+
+    /// A connection in `hat` to a loopback upstream, not yet created.
+    pub fn new_connection(&self, slug: &str, hat: &str) -> NewConnection {
+        new_connection(slug, hat)
     }
 
     pub fn connection_with(&self, new: NewConnection) -> String {
@@ -150,5 +161,56 @@ impl World {
 
     pub fn status(&self, id: &str) -> String {
         self.store.connection(id).unwrap().unwrap().status
+    }
+
+    /// The gateway on this database, as the collector builds it: its
+    /// store, key and `revocations`, the owner opened on the same file.
+    pub fn gateway(&self) -> GatewayState {
+        GatewayState {
+            store: self.store.clone(),
+            key: self.key.clone(),
+            operator: Arc::new(Operator::open(&self.db).unwrap()),
+            revocations: self.revocations.clone(),
+        }
+    }
+
+    /// What the proxy would resolve `token` to now.
+    pub fn proxy_store_resolve(&self, token: &str) -> Option<hennery_gateway::scope::Principal> {
+        use hennery_gateway::scope::ClientIdentity;
+        self.proxy_store.resolve(token, unix_now()).unwrap()
+    }
+
+    /// How many session token rows there are, live or not.
+    pub fn token_rows(&self) -> i64 {
+        self.raw()
+            .query_row("SELECT count(*) FROM gw_session_tokens", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Whether `token`'s row is revoked (not whether it resolves: a revoked
+    /// host's tokens stop resolving by the host's join alone).
+    pub fn token_revoked(&self, token: &str) -> bool {
+        self.raw()
+            .query_row(
+                "SELECT revoked_at IS NOT NULL FROM gw_session_tokens WHERE token_hash = ?1",
+                [hennery_kernel::secret::sha256_hex(token.as_bytes())],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+}
+
+/// A `none` connection in `hat` to a loopback upstream, not yet created.
+pub fn new_connection(slug: &str, hat: &str) -> NewConnection {
+    NewConnection {
+        slug: slug.into(),
+        label: format!("Label {slug}"),
+        url: "http://127.0.0.1:9/mcp".into(),
+        hat_id: hat.into(),
+        cred_kind: CredKind::None,
+        static_header: None,
+        static_prefix: None,
+        tool_allowlist: None,
+        internal_network: true,
     }
 }

@@ -69,6 +69,9 @@ async fn main() -> agent_client_protocol::Result<()> {
     let cancel = Arc::new(watch::channel(false).0);
     // The client advertised form elicitation in `initialize`.
     let forms = Arc::new(AtomicBool::new(false));
+    // The latest `session/new` or `session/load`'s `mcpServers`, as JSON, for
+    // `echo_servers`.
+    let servers: Arc<Mutex<String>> = Arc::default();
     Agent
         .builder()
         .name("hennery-fake-acp")
@@ -116,8 +119,10 @@ async fn main() -> agent_client_protocol::Result<()> {
             {
                 let script = script.clone();
                 let announced = announced.clone();
+                let servers = servers.clone();
                 async move |req: NewSessionRequest, responder, cx| {
                     log_session(&script, "session/new", &req);
+                    *servers.lock().unwrap() = serde_json::to_string(&req.mcp_servers).unwrap();
                     for line in &script.stdout_lines {
                         write_stdout_line(line);
                     }
@@ -151,8 +156,10 @@ async fn main() -> agent_client_protocol::Result<()> {
                 let script = script.clone();
                 let announced = announced.clone();
                 let forms = forms.clone();
+                let servers = servers.clone();
                 async move |req: LoadSessionRequest, responder, cx| {
                     log_session(&script, "session/load", &req);
+                    *servers.lock().unwrap() = serde_json::to_string(&req.mcp_servers).unwrap();
                     // Owned locals: the captured fields sit behind `&mut
                     // self` (this handler is called via a shared/mut
                     // reference, reused for every `session/load`), so
@@ -406,7 +413,12 @@ async fn main() -> agent_client_protocol::Result<()> {
             {
                 let script = script.clone();
                 let forms = forms.clone();
+                let servers = servers.clone();
                 async move |req: PromptRequest, responder, cx| {
+                    if script.echo_servers {
+                        let printed = format!("my servers: {}", servers.lock().unwrap());
+                        cx.send_notification(chunk(&req.session_id, printed))?;
+                    }
                     if let Some(message) = &script.prompt_error {
                         return responder
                             .respond_with_error(agent_client_protocol::Error::new(-32603, message.clone()));

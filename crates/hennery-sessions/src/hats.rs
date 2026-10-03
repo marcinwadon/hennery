@@ -577,16 +577,22 @@ async fn purge_hat(State(state): State<AppState>, Path(id): Path<String>) -> Res
         Err(err) => return internal(err),
     };
     tracing::info!(hat_id = %id, "hat frozen for its purge");
-    // plan 8: the gateway's `on_hat_purged` runs here, before the sessions'
-    // (A15), so a hat stuck frozen cannot reach MCP meanwhile.
     // One checkpoint for the whole purge, on every way out from here (plan
     // 9a A8): owed before the first delete, so a crash leaves it owed.
     state.store.owe_checkpoint();
-    let purged = purge_sessions(&state, &id).and_then(|purged| {
-        // `false`: a purge alongside got there first; it is done either way.
-        state.hosts.finish_purge(&id)?;
-        Ok(purged)
-    });
+    // The gateway's part first (plan 8e, lane L6): the hat's connections,
+    // stdio servers and session tokens, their open streams cut. Before the
+    // sessions' (A15), so a hat stuck frozen cannot reach MCP meanwhile;
+    // idempotent, so a purge posted again runs it again.
+    let purged = state
+        .store
+        .purge_gateway_hat(&id)
+        .and_then(|()| purge_sessions(&state, &id))
+        .and_then(|purged| {
+            // `false`: a purge alongside got there first; it is done either way.
+            state.hosts.finish_purge(&id)?;
+            Ok(purged)
+        });
     state.store.checkpoint();
     let purged = match purged {
         Ok(purged) => purged,
