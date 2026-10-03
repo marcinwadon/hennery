@@ -245,6 +245,12 @@ pub struct FakeScript {
     /// symlink to it in its place.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_archive_links_archived: Option<String>,
+    /// At the start of every prompt, print the `mcpServers` of the latest
+    /// `session/new` or `session/load` as an agent message chunk, their
+    /// headers' values included: an agent that prints its gateway token
+    /// (plan 8e decision 11).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub echo_servers: bool,
 }
 
 /// One question the fake asks its client during a prompt, and the chunk it
@@ -321,6 +327,7 @@ impl Default for FakeScript {
             codex_archive_log: None,
             codex_archive_replaces_home: false,
             codex_archive_links_archived: None,
+            echo_servers: false,
         }
     }
 }
