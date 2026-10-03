@@ -732,6 +732,7 @@ async fn the_api_and_the_admin_socket_leave_the_same_state() {
                 hosts: admin.state.hosts.clone(),
                 dir: admin_dir.clone(),
                 base_url: PUBLIC_URL.into(),
+                deployment: admin.state.deployment.clone(),
             },
             async move {
                 let _ = stopped.await;

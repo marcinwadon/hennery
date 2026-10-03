@@ -1427,6 +1427,31 @@ fn credentialled_connection(listen: &str, session: &str, slug: &str, hat: &str) 
     assert_eq!(status, 204);
 }
 
+/// `hennery doctor --data-dir <data>`'s report, with stand-ins for the
+/// service managers that only record that they ran (none may).
+fn doctor_report(dir: &std::path::Path, data: &std::path::Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let stubs = dir.join("stubs");
+    std::fs::create_dir_all(&stubs).unwrap();
+    for name in ["launchctl", "systemctl", "loginctl"] {
+        let stub = stubs.join(name);
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\necho {name} >> \"{}\"\nexit 1\n", dir.join("ran").display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let out = hennery()
+        .args(["doctor", "--data-dir"])
+        .arg(data)
+        .env("PATH", format!("{}:/usr/bin:/bin", stubs.display()))
+        .output()
+        .unwrap();
+    assert!(!dir.join("ran").exists(), "doctor asked a service manager");
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
 /// Plan 4d-B3 (kernel spec §10, distribution spec §5.1): under `hennery up`
 /// the collector shares its OS user with the host child, so gateway
 /// credentials for two hats are warned about. Settings says so as soon as
@@ -1475,13 +1500,32 @@ fn up_warns_when_its_collector_holds_credentials_for_several_hats() {
     for hat in [&first_hat, &second_hat] {
         assert!(!second.contains(hat.as_str()), "{hat}: {second}");
     }
+    // Doctor asks the running collector (check 15), and says so by count.
+    let report = doctor_report(&dir, &data);
+    assert!(
+        report.contains(
+            "\nwarn 15 collector isolation: the collector runs as the OS user of hennery up's agents and holds MCP \
+             gateway credentials for 2 hats"
+        ),
+        "{report}"
+    );
+    for hat in [&first_hat, &second_hat] {
+        assert!(!report.contains(hat.as_str()), "{hat}: {report}");
+    }
     stop(&mut again);
 
     let (mut alone, listen) = collector_on(&collector_dir, &dir.join("alone.log"));
     assert_eq!(warning(&listen), false);
     let log = std::fs::read_to_string(dir.join("alone.log")).unwrap();
     assert!(!log.contains("gateway credentials for"), "{log}");
+    let report = doctor_report(&dir, &collector_dir);
+    assert!(
+        report.contains("\nok   15 collector isolation: the collector was not started by hennery up"),
+        "{report}"
+    );
     stop(&mut alone);
+    let report = doctor_report(&dir, &collector_dir);
+    assert!(report.contains("15 (the collector is not running)"), "{report}");
 }
 
 /// Start a collector on `data` that must fail to start: its standard error.

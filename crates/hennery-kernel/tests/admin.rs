@@ -5,6 +5,7 @@
 use hennery_kernel::admin::{
     ADMIN_SOCKET, Admin, AdminRequest, AdminResponse, MAX_REQUEST_BYTES, bind, read_answer, request, serve,
 };
+use hennery_kernel::deployment::Deployment;
 use hennery_kernel::hosts::{Enrollment, Hosts};
 use hennery_kernel::operator::Operator;
 use hennery_kernel::secret::unix_now;
@@ -25,6 +26,7 @@ fn start(dir: &Path, operator: &Arc<Operator>, hosts: &Arc<Hosts>) -> tokio::syn
         hosts: hosts.clone(),
         dir: dir.to_path_buf(),
         base_url: BASE_URL.into(),
+        deployment: Deployment::alone(),
     };
     let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(serve(socket, admin, async move {
