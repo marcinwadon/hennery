@@ -660,3 +660,55 @@ fn a_connections_debug_shows_only_its_urls_origin() {
     );
     assert_eq!(hennery_gateway::model::url_for_logs("not a url"), "<not a url>");
 }
+
+/// Plan 4d-B3 (kernel spec §10, lane L20): the hats whose connections hold a
+/// stored credential, each once. A connection without one counts for
+/// nothing; every kind counts, an OAuth grant (plan 8f stores it in the same
+/// table) as much as a static token; a purged hat's go with it.
+#[test]
+fn the_hats_with_credentials_are_those_a_credential_is_stored_for() {
+    let w = World::new();
+    let work = w.hat("Work");
+    let granted = w.hat("Granted");
+    let hats = || w.store.hats_with_credentials().unwrap();
+    assert!(hats().is_empty());
+
+    // Connections, but no credential yet: no hat.
+    let first = w.create("first");
+    let second = w.create("second");
+    let mut in_work = w.new_connection("work-linear");
+    in_work.hat_id = work.clone();
+    let third = done(w.store.create(&in_work, NOW).unwrap()).id;
+    assert!(hats().is_empty());
+
+    // Two credentials in one hat: that hat, once.
+    for connection in [&first, &second] {
+        w.store.set_static_credential(connection, TOKEN, &w.key, NOW).unwrap();
+    }
+    assert_eq!(hats(), [w.hat.clone()].into());
+    w.store.set_static_credential(&third, TOKEN, &w.key, NOW).unwrap();
+    assert_eq!(hats(), [w.hat.clone(), work.clone()].into());
+
+    // A grant of an OAuth connection, written as plan 8f will write one:
+    // counted, whatever its kind.
+    let sql = w.sql();
+    sql.execute(
+        "INSERT INTO gw_connections(id, owner_id, slug, label, url, hat_id, cred_kind, internal_network, status_at,
+                                    created_at, updated_at)
+         VALUES ('conn-00000000000000a1', ?1, 'granted', 'Granted', 'https://mcp.granted.example/', ?2, 'oauth_dcr',
+                 0, 0, 0, 0)",
+        [w.store.owner_id(), granted.as_str()],
+    )
+    .unwrap();
+    sql.execute(
+        "INSERT INTO gw_credentials(connection_id, owner_id, key_version, ciphertext, updated_at)
+         VALUES ('conn-00000000000000a1', ?1, 1, x'00', 0)",
+        [w.store.owner_id()],
+    )
+    .unwrap();
+    assert_eq!(hats(), [w.hat.clone(), work.clone(), granted.clone()].into());
+
+    // A purged hat's credentials go with it.
+    w.store.purge_hat(&work).unwrap();
+    assert_eq!(hats(), [w.hat.clone(), granted].into());
+}
