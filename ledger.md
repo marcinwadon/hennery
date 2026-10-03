@@ -18,3 +18,7 @@
 - scoped re-confirmation (same opus reviewer) 2026-10-02: A1, A2, O1, O2, N1, N2 all CONFIRMED.
 - build branch rebuilt: 38d69d2a 795cb7b9 79588ebe 0f5f72f1 c8d0a2f9 (v1 kept as scratch/7e2a-build-v1); replay MATCH x5
 - #90 pushed 32480c7 (build + scratch probes job)
+- #90 run 37062042499 at 32480c7: flake ubuntu PASS 11m48s, macOS PASS 18m20s; probes job: 12 Linux probes, all failed their check;
+  2 expectation regexes were wrong (hm-doctor-dollar: new nix "Cannot build" wording; vm-doctor: assertion text not in output) -> fixed; vm-host-log/mode regexes tightened to observed output.
+  helper-cannot-start's status is in the 126-255 arm (check-cannot-start caught); the VM without the system-unit read: check 1 "no adapter set", check 2 FAIL nix-ld (confirms A1).
+- #90 run 37064429485 at f7df7d1: flake ubuntu+macOS SUCCESS; probes job SUCCESS (4 re-patterned Linux probes)

@@ -37,11 +37,20 @@ The earlier plans' obligations:
 
 Anchors are `main` at `ecc50cd` (PR #93), which includes #82 (frontend 4b: the `nixpkgs-web` input, `HENNERY_WEB_DIST`) and #86 (`--shell`: `SHELL` recorded in the plist and `service.env`).
 
-**Status:** {{status}}
+**Status:** not executed; amended after two security reviews, both binding on the maintainer's behalf.
+- **The first** (opus, 2026-10-02) approved with four amendments: A1, stricter unpacking; A2, the collector's hardening; A3, the pairing documented in `host.dataDir`; A4, doctor naming the system unit in check 1. All were taken, and its scoped re-confirmation (opus) said "confirmed".
+- **The second** (opus, 2026-10-02) reviewed what changed since: the maintainer's answers Q1 to Q4, the `service.env` without `SHELL=`, the `library-missing` case, and the offline environment of `home-manager-doctor`. It approved with A1 and A2 (the spec's wording on the checks the system unit feeds, and on caches), O1 (check 3's PATH, recorded), O2 (a missing loader is fatal in a patched adapter), N1 (`offline()` parity) and N2 (a comment). All were taken, and its scoped re-confirmation (the same reviewer) confirmed each, and that O2 is safe for the Claude adapter while CI stays green.
+- Decisions 1 to 13 stand as those reviews confirmed them.
+
+The code was built on `scratch/7e2a-build` (one commit per task) and its CI ran on draft PR #90:
+- run 37054209788, on `719c79e` (before the second review): both `flake` jobs passed, ubuntu in 10m20s and macOS in 12m37s;
+- run 37062042499, on `32480c7` (this plan's code, with a scratch job of Linux revert-probes): both `flake` jobs passed, ubuntu in 11m48s and macOS in 18m20s; the Claude adapter's step printed `2.1.280 (Claude Code)`.
+
+**Revert-probes:** the 36 marked "this Mac" were run here, each ending as written. The 12 marked "Linux, in CI" ran in #90's scratch job: each made its check fail. Four of their patterns were then corrected to the output observed (nix's "Cannot build" wording; the virtual machine's assertion text), and those four were run again in #90's next run. The plan was replayed from its own text onto `ecc50cd`, task by task (8, 6, 8, 6 and 2 blocks), and after each task the tree matched the build branch's commit byte for byte.
 
 ## Execution status
 
-{{execution}}
+Not executed yet.
 
 ## Scope
 
@@ -53,7 +62,7 @@ That is **5 tasks:** (1) the adapters and their checks; (2) doctor reads the sys
 
 **Cross-lane:**
 - **7e-ii-b (PR #104)** changes `flake.nix`'s outputs too. A trial merge gives adjacent-line conflicts there only (its `webUi` binding against `nixOutputs`, `packages.web` against `packages.codex-acp`); both resolve by keeping both sides. Whichever lands second merges them by hand. Its deferred `nix.yml` minor (the header and step name do not list `web-ui`) goes to whichever lands second too.
-- **#102 (default data directories)** and **#96 (doctor check 18)** touch `crates/hennery/src/doctor/mod.rs`. {{conflicts}}
+- **#102 (default data directories)** and **#96 (doctor check 18)** touch `crates/hennery/src/doctor/mod.rs`. Trial merges of this plan's branch with #102 at `c9c1b25` and #96 at `1c91215`, separately and together, are clean, and doctor's tests pass on the merge of all three (39).
 - **Frontend 4d** builds on `Doctor::given_agents` and a `cli: given` source for Nix adapters: see "After this plan".
 
 ## Maintainer decisions (2026-10-02, binding)

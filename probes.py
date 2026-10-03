@@ -146,16 +146,16 @@ probe("eval-fail-fails", "linux", "nix/tests/modules.nix",
 # --- Task 3: Linux builds of the modules' checks -----------------------
 HM = "home-manager-doctor"
 probe("hm-doctor-dollar", "linux", C, '[ "\\\\\\\\" "\\\\\\"" "%%" "$$" ]', '[ "\\\\\\\\" "\\\\\\"" "%%" "$" ]',
-      build(LINUX, HM), "fail", r"builder for .*hennery-home-manager-doctor.drv.* failed")
+      build(LINUX, HM), "fail", r"Cannot build '[^']*hennery-home-manager-doctor\.drv'")
 probe("hm-doctor-path", "linux", H, "PATH=${envQuoted path}", "PATHS=${envQuoted path}",
       build(LINUX, HM), "fail", r"5 .*PATH cannot be read")
 probe("vm-host-mode", "linux", N, 'user = cfg.host.user;\n        inherit (hostUser) group;\n        mode = "0700";',
-      'user = cfg.host.user;\n        inherit (hostUser) group;\n        mode = "0750";', build(LINUX, "nixos"), "fail", r"alice 700")
+      'user = cfg.host.user;\n        inherit (hostUser) group;\n        mode = "0750";', build(LINUX, "nixos"), "fail", r"= 'alice 700' \]` failed")
 probe("vm-host-log", "linux", N, 'HENNERY_LOG_DIR = "/var/log/hennery-host";', 'HENNERY_LOG_DIR = "/var/log/hennery-elsewhere";',
-      build(LINUX, "nixos"), "fail", r"connected to collector")
+      build(LINUX, "nixos"), "fail", r"action timed out after")
 probe("vm-doctor", "linux", S, "if cx.platform != Platform::Linux {\n        return None;\n    }\n    let text",
       "if cx.platform == Platform::Linux {\n        return None;\n    }\n    let text", build(LINUX, "nixos"), "fail",
-      r"the system unit /etc/systemd/system/hennery-host.service gives its agents")
+      r"ok +1 binary and adapter set: .*no adapter set is installed")
 
 
 def scratch_env(root):

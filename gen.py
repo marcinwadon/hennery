@@ -88,7 +88,7 @@ def probes(task, indent):
         if "--impure" in p["cmd"]:
             cmd = "NIXPKGS_ALLOW_UNFREE=1 " + cmd
         must = "fail" if p["ends"] == "fail" else "succeed"
-        where = "Linux (CI)" if p["where"] == "linux" else "this Mac"
+        where = "Linux, in CI" if p["where"] == "linux" else "this Mac"
         lines.append(f"{indent}- **{p['name']}** ({where}), in `{p['path']}`: {change}. Run {code(cmd)}: it must {must}, its output matching {code(p['expect'])}.\n")
     if not lines:
         raise SystemExit(f"no probes for task {task}")
