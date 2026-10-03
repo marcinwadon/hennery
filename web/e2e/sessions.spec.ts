@@ -2,7 +2,8 @@
 // spec §12): set up and sign in, pair a host whose agent is the scripted
 // `hennery-fake-acp`, start a session from New Session, answer the
 // permission it asks for, read its streamed Markdown, then crash the host
-// and see the session parked when it comes back. At 1280 px and at 390 px,
+// and see the session parked when it comes back, then resume it from its
+// footer and answer its second prompt's question. At 1280 px and at 390 px,
 // each width with a collector and a host of its own, and not one
 // Content-Security-Policy violation.
 //
@@ -209,12 +210,25 @@ for (const width of [1280, 390]) {
       await expect(page.locator('.session-head .badge')).toHaveText('Parked')
     })
 
-    // TODO(4c T8): the footer's Resume, once T8's footers land. Click
-    // `getByRole('button', { name: 'Resume', exact: true })` in the session's
-    // footer, see the badge go back to Idle and a "Resumed" marker. The fake
-    // asks for permission on EVERY prompt: a prompt sent after the resume
-    // raises a second permission card, to answer like the first.
-    test.fixme('the session resumes from its footer after the host restart', async () => {})
+    test('the footer’s Resume runs the session again, and it answers a second prompt', async () => {
+      const resume = page.getByRole('button', { name: 'Resume', exact: true })
+      await expect(resume).toBeVisible()
+      await resume.click()
+      await expect(page.locator('.session-head .badge')).toHaveText('Idle', { timeout: 20_000 })
+      await expect(resume).toHaveCount(0)
+      // The fake asks on every prompt: a second card, answered like the first.
+      await page.getByRole('textbox', { name: 'Prompt', exact: true }).fill('And the second part.')
+      await page.getByRole('button', { name: 'Send', exact: true }).click()
+      const cards = page.getByRole('region', { name: 'Question from Claude', exact: true })
+      await expect(cards).toHaveCount(2, { timeout: 15_000 })
+      const second = cards.nth(1)
+      await second.getByRole('button', { name: 'Reject', exact: true }).click()
+      await expect(second.getByText('Answered', { exact: true })).toBeVisible()
+      // The reply opens with what the agent got this time.
+      const reply = page.locator('.bubble', { has: page.getByText('permission:selected:reject', { exact: true }) })
+      await expect(reply.getByRole('listitem')).toHaveText(['first step', 'second step'])
+      await expect(page.locator('.session-head .badge')).toHaveText('Idle')
+    })
 
     test('broke no Content-Security-Policy rule', async () => {
       expect(violations).toEqual([])
