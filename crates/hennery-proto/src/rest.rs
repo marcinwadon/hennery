@@ -1284,10 +1284,12 @@ impl std::fmt::Debug for McpOauthClientRequest {
 ///   server offers no dynamic registration: switch to `oauth_client`;
 /// - 409 `resource_mismatch`: the protected-resource document names another
 ///   `resource` (in `oauth.resource_mismatch`); accept it with
-///   `accept_resource`, or fix the URL;
+///   `accept_resource`, or fix the URL. An `accept_resource` that is not
+///   the one found now is this answer too, with the new value;
 /// - 409 `issuer_changed`: an `oauth_client` whose pinned issuer differs
 ///   from what discovery finds now: `PUT …/oauth-client` again;
-/// - 400 `invalid`: an `accept_resource` that is not the one found now;
+/// - 400 `invalid`: an `accept_resource` where no protected-resource
+///   document names a resource to accept;
 /// - 502 `resource_foreign`: the protected-resource document names a
 ///   `resource` on another origin, or one that is not `https`; it cannot be
 ///   accepted;

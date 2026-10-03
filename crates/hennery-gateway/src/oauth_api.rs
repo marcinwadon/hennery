@@ -210,19 +210,14 @@ pub(crate) async fn authorize(
                     {
                         return internal(err);
                     }
-                    return if req.accept_resource.is_some() {
-                        fail(
-                            StatusCode::BAD_REQUEST,
-                            "invalid",
-                            "the accepted resource is not the one found now: compare them again".into(),
-                        )
+                    // A stale acceptance is a mismatch again, with the value
+                    // found now (api-8e-8f F3): the frontend refetches on 409.
+                    let message = if req.accept_resource.is_some() {
+                        "the accepted resource is not the one found now: compare them again"
                     } else {
-                        fail(
-                            StatusCode::CONFLICT,
-                            "resource_mismatch",
-                            "the protected-resource document names another resource than the URL: accept it, or fix the URL".into(),
-                        )
+                        "the protected-resource document names another resource than the URL: accept it, or fix the URL"
                     };
+                    return fail(StatusCode::CONFLICT, "resource_mismatch", message.into());
                 }
             }
         },

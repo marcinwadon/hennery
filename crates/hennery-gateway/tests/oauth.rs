@@ -870,14 +870,26 @@ async fn a_mismatching_resource_is_accepted_only_exactly() {
         "only origins in an error (L11)"
     );
     assert_eq!(h.item(&id).await["oauth"]["resource_mismatch"], other);
-    refused(
+    // A stale acceptance is a mismatch again, with the value found now
+    // (api-8e-8f F3: the frontend refetches the item only on 409).
+    let stale = other.clone();
+    let other = format!("{}/v3/mcp", fake.origin());
+    fake.configure(|c| c.resource = Some(other.clone()));
+    let answer = refused(
         &h,
         &id,
-        json!({ "accept_resource": format!("{}/v3/mcp", fake.origin()) }),
-        StatusCode::BAD_REQUEST,
-        "invalid",
+        json!({ "accept_resource": stale }),
+        StatusCode::CONFLICT,
+        "resource_mismatch",
     )
     .await;
+    assert!(
+        !answer["message"].as_str().unwrap().contains("v3"),
+        "only origins in an error (L11)"
+    );
+    let item = h.item(&id).await;
+    assert_eq!(item["oauth"]["resource_mismatch"], other);
+    assert!(item["oauth"].get("accepted_resource").is_none());
     let (status, _, _) = h.authorize(&id, json!({ "accept_resource": other })).await;
     assert_eq!(status, StatusCode::OK);
     let item = h.item(&id).await;
