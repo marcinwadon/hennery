@@ -548,6 +548,11 @@ mod tests {
         found
     }
 
+    /// How long a capture here may take: what is tested is the PATH it
+    /// returns, not `CAPTURE_TIMEOUT`, which a real login shell on a loaded
+    /// machine (several test binaries at once) can outlast.
+    const LOADED_CAPTURE: Duration = Duration::from_secs(120);
+
     /// Capture `name`'s login PATH with `files` (relative to a fresh HOME)
     /// as its startup files.
     fn capture(name: &str, files: &[(&str, &str)]) -> Option<(tempfile::TempDir, ServicePath)> {
@@ -564,7 +569,7 @@ mod tests {
         outer.insert("CLAUDECODE".to_string(), "1".to_string());
         let env = shell_environment(&outer, &shell, cfg!(target_os = "macos"));
         assert!(env.iter().all(|(k, _)| k != "CLAUDECODE"));
-        let captured = login_environment(&shell, &env, CAPTURE_TIMEOUT).unwrap();
+        let captured = login_environment(&shell, &env, LOADED_CAPTURE).unwrap();
         assert!(!captured.contains_key("CLAUDECODE"), "{captured:?}");
         let path = service_path(&captured, home.path(), cfg!(target_os = "macos")).unwrap();
         Some((home, path))
@@ -611,7 +616,9 @@ mod tests {
     }
 
     /// A login shell that never finishes is killed, with what it started,
-    /// after the timeout.
+    /// after the timeout. A shell killed before its profile wrote the
+    /// `sleep`'s pid (a loaded machine) proved only the timeout: it runs
+    /// again with the timeout doubled.
     #[test]
     fn a_shell_that_hangs_is_killed_after_the_timeout() {
         let Some(bash) = shell("bash") else {
@@ -626,11 +633,26 @@ mod tests {
         .unwrap();
         let outer = BTreeMap::from([("HOME".to_string(), home.path().display().to_string())]);
         let env = shell_environment(&outer, &bash, false);
-        let started = Instant::now();
-        let err = login_environment(&bash, &env, Duration::from_secs(2)).unwrap_err();
-        assert!(err.to_string().contains("did not finish within 2 s"), "{err}");
-        assert!(started.elapsed() < Duration::from_secs(10));
-        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let mut timeout = Duration::from_secs(2);
+        let pid = loop {
+            let _ = std::fs::remove_file(&pidfile);
+            let started = Instant::now();
+            let err = login_environment(&bash, &env, timeout).unwrap_err();
+            let within = format!("did not finish within {} s", timeout.as_secs());
+            assert!(err.to_string().contains(&within), "{err}");
+            assert!(started.elapsed() < timeout + Duration::from_secs(8));
+            // Missing, empty or cut short: killed before it got there.
+            let written = std::fs::read_to_string(&pidfile).unwrap_or_default();
+            if let Ok(pid) = written.trim().parse::<i32>() {
+                break pid;
+            }
+            assert!(
+                timeout < Duration::from_secs(16),
+                "bash never wrote its sleep's pid within {} s",
+                timeout.as_secs()
+            );
+            timeout *= 2;
+        };
         let deadline = Instant::now() + Duration::from_secs(5);
         // SAFETY: kill(2) with signal 0 only checks that the pid exists.
         while unsafe { libc::kill(pid, 0) } == 0 {
