@@ -1027,8 +1027,9 @@ fn commit_then_cut(tx: Transaction<'_>, mcp: &dyn SessionMcp, cut: Cut) -> Resul
 fn close_in(tx: &Transaction<'_>, owner: &str, mcp: &dyn SessionMcp, session_id: &str) -> Result<(Vec<EventDto>, Cut)> {
     let events = close_session_in(tx, owner, session_id)?;
     // Whether or not this closed it: a closed session's token is revoked
-    // already, so this is a no-op then, never a fresh token's revoke (a
-    // resume moves the row to `starting` first, in its own transaction).
+    // already, so this is a no-op then. A session this closes while
+    // `starting` (a resume racing the close) loses its fresh token with
+    // it: the session is closed, so that is the right outcome.
     let cut = mcp.revoke_in(tx, session_id)?;
     Ok((events, cut))
 }
