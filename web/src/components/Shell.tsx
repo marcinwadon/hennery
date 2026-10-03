@@ -12,6 +12,7 @@ import { Icon } from '../lib/ui'
 import { Link, type Route } from '../router'
 import Hats from '../screens/Hats'
 import Hosts from '../screens/Hosts'
+import Mcp from '../screens/Mcp'
 import Placeholder from '../screens/Placeholder'
 import SignOut from './SignOut'
 
@@ -120,6 +121,14 @@ export default function Shell({ route }: { route: Route }) {
             <Hosts />
           ) : route.name === 'hats' ? (
             <Hats />
+          ) : route.name === 'mcp' ? (
+            // The gateway's screen exists only where its API is served
+            // (4b: a screen behind a feature checks `features`).
+            caps.features.includes('mcp_connections') ? (
+              <Mcp />
+            ) : (
+              <Placeholder title={title} text="The MCP gateway is not part of this deployment." />
+            )
           ) : route.name === 'session' ? (
             <Placeholder title="Session" detail={route.id} text="The session view arrives with the transcript." />
           ) : (
