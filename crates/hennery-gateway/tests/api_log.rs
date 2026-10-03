@@ -339,3 +339,78 @@ async fn an_upstream_url_is_logged_and_shown_only_as_its_origin() {
         }
     }
 }
+
+/// Plan 8a's follow-up (8f's O6): a stored status the API does not know is
+/// shown as `not_connected` and logged, never silently taken for one. The
+/// schema's CHECK keeps any other out; the test steps around it.
+#[tokio::test]
+async fn an_unknown_stored_status_is_logged() {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::TRACE)
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("hennery.db");
+    let operator = Arc::new(Operator::open(&db).unwrap());
+    let now = unix_now();
+    let setup = operator.issue_setup_token(now).unwrap().unwrap();
+    let SetupOutcome::Done { phc, .. } = operator.set_up(&setup, "correct horse battery", ORIGIN, now).unwrap() else {
+        panic!("setup failed");
+    };
+    let session = operator.open_session("test", &phc, now).unwrap().unwrap();
+    let hat = Hosts::open(&db).unwrap().default_hat_for_new_hosts().unwrap();
+    let store = Arc::new(GatewayStore::open(&db).unwrap());
+    let key = Arc::new(MasterKey::from_bytes([5; 32]));
+    let hennery_gateway::model::Change::Done(record) = store
+        .create(
+            &hennery_gateway::model::NewConnection {
+                slug: "linear".into(),
+                label: "L".into(),
+                url: "https://mcp.example/".into(),
+                hat_id: hat,
+                cred_kind: hennery_gateway::model::CredKind::None,
+                static_header: None,
+                static_prefix: None,
+                tool_allowlist: None,
+                internal_network: false,
+            },
+            now,
+        )
+        .unwrap()
+    else {
+        panic!("not created");
+    };
+    let raw = rusqlite::Connection::open(&db).unwrap();
+    raw.execute_batch("PRAGMA ignore_check_constraints = ON;").unwrap();
+    raw.execute("UPDATE gw_connections SET status = 'weird' WHERE id = ?1", [&record.id])
+        .unwrap();
+    let app = router(GatewayState {
+        runtime: runtime(&db, store, key),
+        operator,
+    });
+    let resp = app
+        .oneshot(
+            Request::get("/api/mcp/connections")
+                .header("origin", ORIGIN)
+                .header("cookie", format!("hennery_session={session}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let list: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap()).unwrap();
+    assert_eq!(list[0]["status"], "not_connected");
+    let log = captured.0.lock().unwrap().clone();
+    assert!(
+        contains(&log, "a stored status the API does not know") && contains(&log, &record.id),
+        "{}",
+        String::from_utf8_lossy(&log)
+    );
+}

@@ -417,3 +417,22 @@ async fn startup_problems_are_the_needs_auth_and_error_connections_only() {
     expected.sort();
     assert_eq!(problems, expected);
 }
+
+/// Gateway spec §7: a probe that fails in the gateway itself (a refreshed
+/// grant it could not store) concludes nothing about the upstream: no
+/// status change.
+#[tokio::test]
+async fn a_probe_the_gateway_fails_changes_nothing() {
+    let (h, fake, id) = setup(Config::default()).await;
+    set_status(&h, &id, Status::Ok);
+    h.raw()
+        .execute_batch(
+            "CREATE TRIGGER no_refresh BEFORE UPDATE ON gw_credentials
+             BEGIN SELECT RAISE(ABORT, 'disk full'); END;",
+        )
+        .unwrap();
+    fake.expire_access();
+    assert_eq!(probe(&h, &id).await, Verdict::NoChange);
+    assert_eq!(h.status(&id), "ok");
+    assert!(h.alerts.alerts().is_empty());
+}

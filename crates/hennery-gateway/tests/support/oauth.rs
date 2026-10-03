@@ -115,7 +115,8 @@ pub struct Config {
     /// fake's own.
     pub challenge_url: Option<String>,
     /// The MCP endpoint is stateful: a request other than `initialize`
-    /// without the session's `Mcp-Session-Id` is 400 (G-21).
+    /// without the session's `Mcp-Session-Id`, or without the protocol
+    /// version `initialize` answered, is 400 (G-21).
     pub stateful: bool,
 }
 
@@ -475,10 +476,15 @@ async fn handle(State(shared): State<Shared>, request: Request) -> Response {
             mcp(&shared, &config, &parts.headers, &method, &body, &origin)
         }
         ("GET", "/prm-from-challenge") if config.pr_at == PrAt::Challenge => pr(),
+        // The redirect carries a document of its own, as hostile as the
+        // one it points to: a 3xx is never read.
         ("GET", "/.well-known/oauth-protected-resource/mcp") if config.pr_redirect => Response::builder()
             .status(StatusCode::FOUND)
             .header(header::LOCATION, format!("{origin}/elsewhere"))
-            .body(Body::empty())
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({ "resource": mcp_url, "authorization_servers": ["https://evil.example"] }).to_string(),
+            ))
             .unwrap(),
         ("GET", "/.well-known/oauth-protected-resource/mcp") if config.pr_status.is_some() => {
             StatusCode::from_u16(config.pr_status.unwrap()).unwrap().into_response()
@@ -573,9 +579,10 @@ fn mcp(shared: &Shared, config: &Config, headers: &HeaderMap, method: &str, body
         return StatusCode::OK.into_response();
     }
     let message: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
     if config.stateful
         && message["method"] != "initialize"
-        && headers.get("mcp-session-id").and_then(|v| v.to_str().ok()) != Some("fake-session")
+        && (header("mcp-session-id") != Some("fake-session") || header("mcp-protocol-version") != Some("2025-06-18"))
     {
         return StatusCode::BAD_REQUEST.into_response();
     }

@@ -1320,7 +1320,10 @@ mod tests {
         while notices.try_recv().is_some() {}
         drop((first, runtime));
         // The start this test is about.
-        let _started = start_gateway(&db, &keys, &state, &egress, std::time::Duration::from_millis(20)).unwrap();
+        let started = start_gateway(&db, &keys, &state, &egress, std::time::Duration::from_millis(20)).unwrap();
+        // One runtime for the API and the proxy: one refresh lock per
+        // connection (plan 8f decision 3).
+        assert!(std::sync::Arc::ptr_eq(&started.0.runtime, &started.1.runtime));
         let notice = notices.try_recv().expect("the problem is announced at startup");
         assert_eq!(notice.tag, format!("mcp-{}", record.id));
         assert_eq!(notice.body, "is failing");

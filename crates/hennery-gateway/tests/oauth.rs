@@ -1739,3 +1739,328 @@ async fn the_api_s_runtime_is_the_one_it_was_given() {
             .is_err()
     );
 }
+
+/// api-8e-8f B4: `accept_resource` with no protected-resource document to
+/// name one is refused, not ignored.
+#[tokio::test]
+async fn accepting_a_resource_no_document_names_is_invalid() {
+    let h = Harness::new();
+    let fake = FakeAs::start(Config {
+        pr_at: PrAt::Nowhere,
+        ..Config::default()
+    })
+    .await;
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+    refused(
+        &h,
+        &id,
+        json!({ "accept_resource": fake.mcp_url() }),
+        StatusCode::BAD_REQUEST,
+        "invalid",
+    )
+    .await;
+}
+
+/// The review's R2: a pinned client's secret goes only to the token
+/// endpoint it was pinned with, even under the same issuer.
+#[tokio::test]
+async fn a_pinned_client_refuses_another_token_endpoint() {
+    let h = Harness::new();
+    let fake = FakeAs::start(Config::default()).await;
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthClient);
+    let path = format!("/api/mcp/connections/{id}/oauth-client");
+    let put = json!({ "client_id": "pre-1", "client_secret": null });
+    assert_eq!(h.send(&h.session(0), "PUT", &path, Some(put)).await.0, StatusCode::OK);
+    assert_eq!(h.authorize(&id, json!({})).await.0, StatusCode::OK);
+    let moved = format!("{}/token2", fake.origin());
+    fake.configure(|c| c.token_endpoint = Some(moved));
+    refused(&h, &id, json!({}), StatusCode::CONFLICT, "issuer_changed").await;
+}
+
+/// Each `RegisterError` (gateway spec §4.2) has its code: the egress
+/// policy's refusal and an endpoint that fails (5xx) besides the vendor's
+/// refusal and an answer without a client, pinned above.
+#[tokio::test]
+async fn a_registration_refused_by_egress_or_failing_has_its_code() {
+    let h = Harness::new();
+    let fake = FakeAs::start(Config::default()).await;
+    let o = fake.origin();
+    // Credentials in a URL are refused by the egress policy, whatever the
+    // allowance.
+    let refused_at = format!("https://u:p@127.0.0.1:{}/register", fake.addr.port());
+    fake.configure(|c| {
+        c.raw_meta = Some(format!(
+            r#"{{"issuer":"{o}","authorization_endpoint":"{o}/authorize","token_endpoint":"{o}/token","registration_endpoint":"{refused_at}","code_challenge_methods_supported":["S256"]}}"#
+        ));
+    });
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+    refused(&h, &id, json!({}), StatusCode::BAD_GATEWAY, "egress_refused").await;
+    let h = Harness::new();
+    let fake = FakeAs::start(Config {
+        dcr_refusal: Some((503, json!({ "error": "temporarily_unavailable" }))),
+        ..Config::default()
+    })
+    .await;
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+    refused(&h, &id, json!({}), StatusCode::BAD_GATEWAY, "upstream_unreachable").await;
+}
+
+/// RFC 7591 answers are checked before use (lane L16): a client id that is
+/// not 1 to 512 visible characters is no client; a secret that is not a
+/// valid one is dropped (a public client); a `client_secret_post` client
+/// gets its secret in the form; a public client is stored as `none`.
+#[tokio::test]
+async fn a_registration_s_answer_is_checked_before_use() {
+    let registered = |body: Value| Config {
+        dcr_refusal: Some((201, body)),
+        ..Config::default()
+    };
+    let h = Harness::new();
+    let fake = FakeAs::start(registered(json!({ "client_id": "has space" }))).await;
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+    refused(&h, &id, json!({}), StatusCode::BAD_GATEWAY, "registration_refused").await;
+    // A secret with a space: dropped; the client is public.
+    let h = Harness::new();
+    let fake = FakeAs::start(registered(
+        json!({ "client_id": "pre-x", "client_secret": "two words" }),
+    ))
+    .await;
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+    assert_eq!(h.connect(&id, &fake).await.result(), "connected");
+    assert_eq!(h.item(&id).await["oauth"]["has_client_secret"], false);
+    assert!(fake.with(|r| r.basic.is_empty() && !r.posted_secret));
+    let method: String = h
+        .world
+        .raw()
+        .query_row(
+            "SELECT token_endpoint_auth_method FROM gw_oauth_clients WHERE connection_id = ?1",
+            [&id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(method, "none");
+    // `client_secret_post`, as the registration said.
+    let h = Harness::new();
+    let fake = FakeAs::start(Config {
+        confidential: Some(("pre-y".into(), "posted-secret".into())),
+        ..registered(json!({
+            "client_id": "pre-y",
+            "client_secret": "posted-secret",
+            "token_endpoint_auth_method": "client_secret_post",
+        }))
+    })
+    .await;
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+    assert_eq!(h.connect(&id, &fake).await.result(), "connected");
+    assert!(fake.with(|r| r.posted_secret && r.basic.is_empty()));
+}
+
+/// Each `TokenError` at the exchange has its code (api-8e-8f B5 step 7):
+/// the egress policy's refusal, and a transport failure (a closed port).
+#[tokio::test]
+async fn an_exchange_refused_by_egress_or_unreachable_has_its_code() {
+    let h = Harness::new();
+    let fake = FakeAs::start(Config::default()).await;
+    let port = fake.addr.port();
+    fake.configure(|c| c.token_endpoint = Some(format!("https://u:p@127.0.0.1:{port}/token")));
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+    let page = h.connect(&id, &fake).await;
+    assert_eq!(
+        (page.status, page.result()),
+        (StatusCode::BAD_GATEWAY, "egress_refused".into())
+    );
+    let h = Harness::new();
+    let fake = FakeAs::start(Config::default()).await;
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    fake.configure(|c| c.token_endpoint = Some(format!("http://127.0.0.1:{closed}/token")));
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+    let page = h.connect(&id, &fake).await;
+    assert_eq!(
+        (page.status, page.result()),
+        (StatusCode::BAD_GATEWAY, "upstream_unreachable".into())
+    );
+}
+
+/// api-8e-8f B5 step 7: an `error` that is not one of RFC 6749's fixed
+/// values is shown as the HTTP status only.
+#[tokio::test]
+async fn an_exchange_refusal_with_an_unknown_error_shows_only_its_status() {
+    let h = Harness::new();
+    let fake = FakeAs::start(Config {
+        refusal_body: Some(json!({ "error": "weird-canary-error" })),
+        ..Config::default()
+    })
+    .await;
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+    let (_, headers, answer) = h.authorize(&id, json!({})).await;
+    let location = fake.consent(answer["consent_url"].as_str().unwrap()).await;
+    let tampered = location.replace("code=code-", "code=codex-");
+    let page = h.callback(&tampered, Some(&flow_cookie(&headers)), &[]).await;
+    assert_eq!(page.result(), "exchange_failed");
+    assert!(page.html.contains("(HTTP 400)"), "{}", page.html);
+    assert!(!page.html.contains("weird-canary"));
+}
+
+/// Lane L16: a token response's tokens are checked: an access token that
+/// is not a valid token, or a refresh token that is not a string, is no
+/// token response.
+#[tokio::test]
+async fn a_token_response_s_tokens_are_checked() {
+    for raw in [
+        r#"{"access_token":"two words","token_type":"Bearer"}"#,
+        r#"{"access_token":"good-1","refresh_token":5}"#,
+    ] {
+        let h = Harness::new();
+        let fake = FakeAs::start(Config {
+            raw_token: Some(raw.into()),
+            ..Config::default()
+        })
+        .await;
+        let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+        assert_eq!(h.connect(&id, &fake).await.result(), "exchange_failed", "{raw}");
+        assert_eq!(h.item(&id).await["has_credential"], false, "{raw}");
+    }
+}
+
+/// Gateway spec §4.1: an endpoint with a fragment is no endpoint.
+#[tokio::test]
+async fn a_token_endpoint_with_a_fragment_is_no_endpoint() {
+    let h = Harness::new();
+    let fake = FakeAs::start(Config::default()).await;
+    let o = fake.origin();
+    fake.configure(|c| c.token_endpoint = Some(format!("{o}/token#x")));
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+    refused(&h, &id, json!({}), StatusCode::BAD_GATEWAY, "discovery_failed").await;
+}
+
+/// Plan 8f decision 5: an oversized document is "not here", not an
+/// outage; one candidate that fails (5xx) makes nothing found an outage.
+#[tokio::test]
+async fn an_oversized_document_is_not_here_and_a_failing_one_is_an_outage() {
+    let h = Harness::new();
+    let fake = FakeAs::start(Config {
+        pr_at: PrAt::Origin,
+        serve_metadata: false,
+        ..Config::default()
+    })
+    .await;
+    let huge = format!(
+        r#"{{"resource":"{}","pad":"{}"}}"#,
+        fake.mcp_url(),
+        "x".repeat(1024 * 1024)
+    );
+    fake.configure(|c| c.raw_pr = Some(huge));
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+    refused(&h, &id, json!({}), StatusCode::BAD_GATEWAY, "discovery_failed").await;
+    let h = Harness::new();
+    let fake = FakeAs::start(Config {
+        pr_at: PrAt::Nowhere,
+        pr_status: Some(503),
+        serve_metadata: false,
+        ..Config::default()
+    })
+    .await;
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+    refused(&h, &id, json!({}), StatusCode::BAD_GATEWAY, "upstream_unreachable").await;
+}
+
+/// The review's R1, gateway spec §4.6: an edit that drops the flows also
+/// forgets that the server refused `resource`: the next Connect sends it
+/// again.
+#[tokio::test]
+async fn an_edit_forgets_a_refused_resource() {
+    let h = Harness::new();
+    let fake = FakeAs::start(Config {
+        refuse_resource_at_consent: true,
+        ..Config::default()
+    })
+    .await;
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+    assert_eq!(h.connect(&id, &fake).await.result(), "consent_denied");
+    let s = h.session(0);
+    let path = format!("/api/mcp/connections/{id}");
+    for kind in ["oauth_client", "oauth_dcr"] {
+        let (status, _, _) = h.send(&s, "PATCH", &path, Some(json!({ "cred_kind": kind }))).await;
+        assert_eq!(status, StatusCode::OK, "{kind}");
+    }
+    fake.configure(|c| c.refuse_resource_at_consent = false);
+    assert_eq!(h.connect(&id, &fake).await.result(), "connected");
+    assert_eq!(
+        fake.with(|r| r.consent_resources.clone()),
+        [Some(fake.mcp_url()), Some(fake.mcp_url())]
+    );
+}
+
+/// Gateway spec §4.6: another origin clears the latest Connect's failure
+/// with the grant.
+#[tokio::test]
+async fn an_origin_change_clears_the_last_failure() {
+    let h = Harness::new();
+    let fake = FakeAs::start(Config {
+        s256: false,
+        ..Config::default()
+    })
+    .await;
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+    refused(&h, &id, json!({}), StatusCode::BAD_GATEWAY, "pkce_unsupported").await;
+    let (status, _, item) = h
+        .send(
+            &h.session(0),
+            "PATCH",
+            &format!("/api/mcp/connections/{id}"),
+            Some(json!({ "url": "https://elsewhere.example/mcp" })),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{item}");
+    assert!(item.get("oauth_error").is_none(), "{item}");
+}
+
+/// api-8e-8f B2: a client id and a secret are checked: 400 `invalid`.
+#[tokio::test]
+async fn a_pre_registered_client_s_id_and_secret_are_checked() {
+    let h = Harness::new();
+    let fake = FakeAs::start(Config::default()).await;
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthClient);
+    let path = format!("/api/mcp/connections/{id}/oauth-client");
+    for body in [
+        json!({ "client_id": "has space", "client_secret": null }),
+        json!({ "client_id": "", "client_secret": null }),
+        json!({ "client_id": "pre-1", "client_secret": "two words" }),
+    ] {
+        let (status, _, answer) = h.send(&h.session(0), "PUT", &path, Some(body.clone())).await;
+        assert_eq!(
+            (status, answer["code"].clone()),
+            (StatusCode::BAD_REQUEST, json!("invalid")),
+            "{body}"
+        );
+    }
+    assert_eq!(h.item(&id).await["oauth"]["client_id"], Value::Null);
+}
+
+/// Gateway spec §4.5: the callback stores the grant under the
+/// connection's refresh lock.
+#[tokio::test]
+async fn the_callback_stores_the_grant_under_the_lock() {
+    let h = Harness::new();
+    let fake = FakeAs::start(Config::default()).await;
+    let id = h.connection("linear", &fake.mcp_url(), CredKind::OauthDcr);
+    let (_, headers, answer) = h.authorize(&id, json!({})).await;
+    let location = fake.consent(answer["consent_url"].as_str().unwrap()).await;
+    let cookie = flow_cookie(&headers);
+    let held = h.runtime.lock(&id).await;
+    let callback = h.callback(&location, Some(&cookie), &[]);
+    tokio::pin!(callback);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), &mut callback)
+            .await
+            .is_err(),
+        "the callback did not wait"
+    );
+    assert_eq!(h.item(&id).await["has_credential"], false);
+    drop(held);
+    assert_eq!(callback.await.result(), "connected");
+}

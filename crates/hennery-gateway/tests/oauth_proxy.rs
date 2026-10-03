@@ -494,19 +494,22 @@ async fn a_refresh_across_a_path_edit_keeps_the_rotated_token() {
 /// refusal.
 #[tokio::test]
 async fn a_failing_token_endpoint_is_not_needs_auth() {
-    let (h, fake, id, token) = setup(
-        Config {
-            token_status: Some(503),
-            ..Config::default()
-        },
-        None,
-    )
-    .await;
-    fake.expire_access();
-    let response = h.post("linear", &token, &list(1)).await;
-    let body: serde_json::Value = response.json().await.unwrap();
-    assert_eq!(body["code"], "upstream_unreachable");
-    assert_ne!(h.status(&id), "needs_auth");
+    // A 5xx, and a 429 (rate limited: not the vendor refusing the grant).
+    for status in [503, 429] {
+        let (h, fake, id, token) = setup(
+            Config {
+                token_status: Some(status),
+                ..Config::default()
+            },
+            None,
+        )
+        .await;
+        fake.expire_access();
+        let response = h.post("linear", &token, &list(1)).await;
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["code"], "upstream_unreachable", "{status}");
+        assert_ne!(h.status(&id), "needs_auth", "{status}");
+    }
 }
 
 /// Move `id` to fake `b`'s origin behind the API (its grant is deleted:
@@ -701,4 +704,51 @@ async fn an_unrefreshable_grant_does_not_wait_for_the_lock() {
         .expect("the request waited for the lock");
     assert_eq!(response.status(), 200);
     assert_eq!(a.with(|r| r.refreshes), 0);
+}
+
+/// The same for the allowance (plan 8d decision 9): a connection unmarked
+/// "internal network" and connected again while its refresh ran is not
+/// retried with the internal network's client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_keeps_the_allowance_it_was_read_with() {
+    let (h, a, id, token) = setup(
+        Config {
+            gate_token: true,
+            ..Config::default()
+        },
+        None,
+    )
+    .await;
+    a.expire_access();
+    let request = tokio::spawn({
+        let client = h.client.clone();
+        let url = h.url("linear");
+        let token = token.clone();
+        async move {
+            client
+                .post(url)
+                .bearer_auth(token)
+                .header("content-type", "application/json")
+                .body(list(1).to_string())
+                .send()
+                .await
+                .unwrap()
+        }
+    });
+    until(|| token_requests(&a) == 1).await;
+    // The fake is on loopback, which the API keeps marked internal: the
+    // test steps around that rule, as an edit to a public URL would not.
+    let unmarked = h
+        .raw()
+        .execute("UPDATE gw_connections SET internal_network = 0 WHERE id = ?1", [&id])
+        .unwrap();
+    assert_eq!(unmarked, 1);
+    let (access, refresh) = a.issue();
+    seed_grant(&h, &id, &a, &access, Some(&refresh), None);
+    a.open_gate();
+    let response = request.await.unwrap();
+    assert_eq!(response.status(), 502);
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(body["code"], "upstream_changed", "{body}");
+    assert_eq!(a.with(|r| r.bearers.len()), 1, "no retry");
 }

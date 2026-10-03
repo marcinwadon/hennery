@@ -228,11 +228,9 @@ fn trusted_object(bytes: &[u8], keys: &[&str]) -> Option<Map<String, Value>> {
         return None;
     }
     match serde_json::from_slice::<Value>(bytes) {
-        // A key with a NUL (or any control character) is cut there by
-        // json-c and cJSON: `token_endpoint\u0000x` is `token_endpoint`.
-        Ok(Value::Object(object)) if !crate::jsonrpc::respelt(&object, keys) && object.keys().all(|key| clean(key)) => {
-            Some(object)
-        }
+        // `respelt` reads a key as json-c and cJSON do, cut at its first
+        // NUL: `token_endpoint\u0000x` is `token_endpoint` spelt otherwise.
+        Ok(Value::Object(object)) if !crate::jsonrpc::respelt(&object, keys) => Some(object),
         _ => None,
     }
 }
@@ -1020,6 +1018,25 @@ mod tests {
             assert!(matches!(err, TokenError::EgressRefused(_)), "{endpoint}: {err:?}");
             assert!(!err.message().contains("/token"), "origins only: {}", err.message());
         }
+    }
+
+    /// O13: a registration endpoint that is not `https` (or loopback
+    /// `http`) is refused before anything is sent, whatever discovery let
+    /// through.
+    #[tokio::test]
+    async fn a_plain_http_registration_endpoint_is_egress_refused() {
+        let egress = hennery_kernel::egress::Egress::new(hennery_kernel::egress::Timeouts::DEFAULT).unwrap();
+        let internal = egress.client(hennery_kernel::egress::Allowance::InternalNetwork);
+        let err = register(
+            &internal,
+            &url("http://as.example/register"),
+            "https://h.example/cb",
+            &[],
+        )
+        .await
+        .err()
+        .unwrap();
+        assert!(matches!(err, RegisterError::EgressRefused(_)), "{err:?}");
     }
 
     #[test]

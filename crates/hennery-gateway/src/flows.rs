@@ -388,6 +388,29 @@ mod tests {
         );
     }
 
+    /// An edit forgets that the server refused `resource` (the review's
+    /// R1): the next Connect sends it again.
+    #[test]
+    fn dropping_a_connection_forgets_its_refused_resource() {
+        let flows = Flows::default();
+        flows.refuse_resource("conn-a", "https://mcp.example/mcp");
+        flows.refuse_resource("conn-b", "https://mcp.example/mcp");
+        flows.drop_connection("conn-a");
+        assert!(!flows.resource_refused("conn-a", "https://mcp.example/mcp"));
+        assert!(flows.resource_refused("conn-b", "https://mcp.example/mcp"));
+    }
+
+    /// An expired flow does not count toward `MAX_FLOWS`.
+    #[test]
+    fn expired_flows_are_not_live() {
+        let flows = Flows::default();
+        for i in 0..3 {
+            flows.start(snapshot(&format!("conn-{i}")), 100).unwrap();
+        }
+        assert_eq!(flows.live("none", 100 + FLOW_TTL - 1), 3);
+        assert_eq!(flows.live("none", 100 + FLOW_TTL), 0);
+    }
+
     #[test]
     fn a_cookie_s_name_comes_from_its_state() {
         let name = cookie_name("abc");

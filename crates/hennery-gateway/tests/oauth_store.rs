@@ -356,3 +356,277 @@ fn a_client_is_pinned_once() {
     let slots = w.store.oauth_clients(&id, &w.key).unwrap().unwrap();
     assert_eq!(slots.active.unwrap().issuer.as_deref(), Some("https://as.example"));
 }
+
+/// A pre-registered client with a live grant: `pending`, its secret opened
+/// for the next authorize, and pinned once, for that client only (G-7, the
+/// review's R2).
+#[tokio::test]
+async fn a_pending_client_opens_its_secret_and_is_pinned_once() {
+    use hennery_gateway::store::Slot;
+    let w = World::new();
+    let fake = FakeAs::start(Config::default()).await;
+    let id = w.connection("linear", &fake.mcp_url(), CredKind::OauthClient);
+    w.store
+        .set_oauth_client(&id, "pre-1", SecretInput::Clear, &w.key, unix_now())
+        .unwrap();
+    let (access, refresh) = fake.issue();
+    seed_grant(&w, &id, &fake, &access, Some(&refresh), None);
+    w.store
+        .set_oauth_client(
+            &id,
+            "pre-2",
+            SecretInput::Set(Zeroizing::new("pending-secret".into())),
+            &w.key,
+            unix_now(),
+        )
+        .unwrap();
+    let slots = w.store.oauth_clients(&id, &w.key).unwrap().unwrap();
+    let pending = slots.pending.unwrap();
+    assert_eq!(pending.client_id, "pre-2");
+    assert_eq!(pending.secret.as_deref().map(String::as_str), Some("pending-secret"));
+    let pin = |client: &str, issuer: &str| {
+        w.store
+            .pin_client(&id, Slot::Pending, client, issuer, &format!("{issuer}/t"))
+            .unwrap()
+    };
+    assert!(!pin("other", "https://as.example"));
+    assert!(pin("pre-2", "https://as.example"));
+    assert!(!pin("pre-2", "https://evil.example"));
+    let slots = w.store.oauth_clients(&id, &w.key).unwrap().unwrap();
+    assert_eq!(slots.pending.unwrap().issuer.as_deref(), Some("https://as.example"));
+}
+
+/// The review's R1: a flow of a pending client stores its grant only while
+/// that client is still the pending one.
+#[test]
+fn a_grant_for_a_pending_client_needs_that_very_client() {
+    use hennery_gateway::model::{AuthMethod, GrantTokens, TokenClient};
+    use hennery_gateway::store::{ClientSource, GrantStored, GrantToStore};
+    let w = World::new();
+    let id = oauth(&w, "linear", CredKind::OauthClient);
+    let url = "https://mcp.vendor.example/mcp";
+    let tokens = GrantTokens::from_opened(br#"{"access_token":"a"}"#).unwrap();
+    let store = |source: ClientSource, client_id: &str| {
+        let client = TokenClient {
+            client_id: client_id.into(),
+            secret: None,
+            auth_method: AuthMethod::None,
+            token_endpoint: "https://as.example/token".into(),
+        };
+        w.store
+            .store_grant(
+                &GrantToStore {
+                    connection_id: &id,
+                    url,
+                    cred_kind: CredKind::OauthClient,
+                    internal_network: false,
+                    source,
+                    client: &client,
+                    issuer: "https://as.example",
+                    authorization_endpoint: "https://as.example/authorize",
+                    redirect_uri: "https://hennery.example/api/mcp/oauth/callback",
+                    scopes: &[],
+                    resource: url,
+                    resource_param_accepted: true,
+                    registered_at: 1,
+                    tokens: &tokens,
+                    expires_at: None,
+                },
+                &w.key,
+                unix_now(),
+            )
+            .unwrap()
+    };
+    w.store
+        .set_oauth_client(&id, "pre-1", SecretInput::Clear, &w.key, unix_now())
+        .unwrap();
+    assert!(matches!(store(ClientSource::Active, "pre-1"), GrantStored::Stored(_)));
+    w.store
+        .set_oauth_client(&id, "pre-2", SecretInput::Clear, &w.key, unix_now())
+        .unwrap();
+    assert_eq!(store(ClientSource::Pending, "pre-3"), GrantStored::ConnectionChanged);
+}
+
+/// What a completed Connect leaves in the row, beyond what the API shows:
+/// no time of a failure that is gone, no pins of a pending client that is
+/// gone; clearing a failure clears its time.
+#[tokio::test]
+async fn a_completed_connect_leaves_no_stale_columns() {
+    let w = World::new();
+    let fake = FakeAs::start(Config::default()).await;
+    let id = w.connection("linear", &fake.mcp_url(), CredKind::OauthClient);
+    w.store
+        .set_oauth_client(&id, "pre-1", SecretInput::Clear, &w.key, unix_now())
+        .unwrap();
+    let (access, refresh) = fake.issue();
+    seed_grant(&w, &id, &fake, &access, Some(&refresh), None);
+    w.store
+        .set_oauth_client(&id, "pre-2", SecretInput::Clear, &w.key, unix_now())
+        .unwrap();
+    w.store
+        .pin_client(
+            &id,
+            hennery_gateway::store::Slot::Pending,
+            "pre-2",
+            "https://as.example",
+            "https://as.example/t",
+        )
+        .unwrap();
+    w.store
+        .set_oauth_error(&id, Some(("consent_denied", "x")), unix_now())
+        .unwrap();
+    let columns = || -> (Option<i64>, Option<String>, Option<String>) {
+        w.raw()
+            .query_row(
+                "SELECT c.oauth_error_at, o.pending_issuer, o.pending_token_endpoint
+                 FROM gw_connections c JOIN gw_oauth_clients o ON o.connection_id = c.id WHERE c.id = ?1",
+                [&id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+    };
+    assert!(columns().0.is_some());
+    // The pending client's Connect completes.
+    let (access, refresh) = fake.issue();
+    let tokens = hennery_gateway::model::GrantTokens {
+        access_token: Zeroizing::new(access),
+        refresh_token: Some(Zeroizing::new(refresh)),
+    };
+    let client = hennery_gateway::model::TokenClient {
+        client_id: "pre-2".into(),
+        secret: None,
+        auth_method: hennery_gateway::model::AuthMethod::None,
+        token_endpoint: format!("{}/token", fake.origin()),
+    };
+    let record = w.store.connection(&id).unwrap().unwrap();
+    let stored = w
+        .store
+        .store_grant(
+            &hennery_gateway::store::GrantToStore {
+                connection_id: &id,
+                url: &record.url,
+                cred_kind: CredKind::OauthClient,
+                internal_network: record.internal_network,
+                source: hennery_gateway::store::ClientSource::Pending,
+                client: &client,
+                issuer: &fake.issuer(),
+                authorization_endpoint: &format!("{}/authorize", fake.origin()),
+                redirect_uri: "https://hennery.example/api/mcp/oauth/callback",
+                scopes: &[],
+                resource: &record.url,
+                resource_param_accepted: true,
+                registered_at: 1,
+                tokens: &tokens,
+                expires_at: None,
+            },
+            &w.key,
+            unix_now(),
+        )
+        .unwrap();
+    assert!(matches!(stored, hennery_gateway::store::GrantStored::Stored(_)));
+    assert_eq!(columns(), (None, None, None));
+    // Clearing a failure clears its time.
+    w.store
+        .set_oauth_error(&id, Some(("consent_denied", "x")), unix_now())
+        .unwrap();
+    w.store.set_oauth_error(&id, None, unix_now()).unwrap();
+    assert_eq!(columns().0, None);
+}
+
+/// Gateway spec §4.1 (G-4): a `resource` found or accepted for a URL is
+/// recorded only while the connection still has that URL.
+#[test]
+fn a_resource_is_recorded_only_for_the_url_it_was_found_for() {
+    let w = World::new();
+    let id = oauth(&w, "linear", CredKind::OauthDcr);
+    let stale = "https://mcp.vendor.example/old";
+    w.store
+        .set_resource_mismatch(&id, stale, Some("https://mcp.vendor.example/v2"))
+        .unwrap();
+    assert!(
+        !w.store
+            .accept_resource(&id, stale, "https://mcp.vendor.example/v2")
+            .unwrap()
+    );
+    let record = w.store.connection(&id).unwrap().unwrap();
+    assert_eq!((record.resource_mismatch, record.accepted_resource), (None, None));
+}
+
+/// Plan 8a's O4, for the key's sake: a pending client's secret alone (an
+/// operator who ran only half of `GIVE_UP`'s statement) is still
+/// ciphertext.
+#[test]
+fn a_pending_secret_alone_counts_as_ciphertext() {
+    let w = World::new();
+    let id = oauth(&w, "linear", CredKind::OauthClient);
+    w.store
+        .set_oauth_client(&id, "pre-1", SecretInput::Clear, &w.key, unix_now())
+        .unwrap();
+    w.raw()
+        .execute(
+            "UPDATE gw_oauth_clients SET pending_client_id = 'pre-2', pending_has_secret = 1,
+                 pending_secret_ciphertext = x'0102', key_version = 1 WHERE connection_id = ?1",
+            [&id],
+        )
+        .unwrap();
+    assert!(w.store.has_ciphertext().unwrap());
+}
+
+/// An OAuth grant is read only for an OAuth kind: a static connection's
+/// token is never opened as a grant.
+#[test]
+fn a_static_token_is_no_grant() {
+    let w = World::new();
+    let id = w.connection("fixed", "https://mcp.vendor.example/mcp", CredKind::Static);
+    w.set_token(&id, "tok");
+    w.store
+        .set_oauth_client(&id, "pre-1", SecretInput::Clear, &w.key, unix_now())
+        .unwrap();
+    w.raw()
+        .execute(
+            "INSERT INTO gw_oauth_clients(connection_id, owner_id, client_id, has_client_secret, registered_at,
+                                          token_endpoint_auth_method, token_endpoint)
+             SELECT id, owner_id, 'pre-1', 0, 1, 'none', 'https://as.example/token' FROM gw_connections WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+    assert!(w.store.oauth_credential(&id, &w.key).unwrap().is_none());
+}
+
+/// Gateway spec §7 and the 8d hand-off: what live traffic and the probe
+/// record is about the URL they reached, and only with a credential;
+/// `checked_at` moves at most every 60 seconds on traffic to an `ok`
+/// connection.
+#[test]
+fn traffic_and_checks_record_only_for_the_url_reached() {
+    use hennery_gateway::model::Status;
+    let w = World::new();
+    let url = "https://mcp.vendor.example/mcp";
+    let stale = "https://mcp.vendor.example/old";
+    let id = oauth(&w, "linear", CredKind::OauthDcr);
+    let checked = || w.store.connection(&id).unwrap().unwrap().checked_at;
+    // No credential: traffic's 2xx says nothing.
+    w.proxy_store
+        .record_status(&id, url, Status::Error, Some("down"), 100)
+        .unwrap();
+    assert!(w.proxy_store.record_traffic_ok(&id, url, 200).unwrap().is_none());
+    assert_eq!(w.status(&id), "error");
+    w.raw()
+        .execute(
+            "INSERT INTO gw_credentials(connection_id, owner_id, key_version, ciphertext, updated_at)
+             SELECT id, owner_id, 1, x'00', 1 FROM gw_connections WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+    // Another URL: nothing.
+    assert!(w.proxy_store.record_traffic_ok(&id, stale, 200).unwrap().is_none());
+    w.proxy_store.record_checked(&id, stale, 300).unwrap();
+    assert_eq!((w.status(&id), checked()), ("error".to_string(), Some(100)));
+    // This URL: ok, then `checked_at` throttled.
+    assert!(w.proxy_store.record_traffic_ok(&id, url, 400).unwrap().is_some());
+    assert_eq!(checked(), Some(400));
+    w.proxy_store.record_traffic_ok(&id, url, 459).unwrap();
+    assert_eq!(checked(), Some(400));
+    w.proxy_store.record_traffic_ok(&id, url, 460).unwrap();
+    assert_eq!(checked(), Some(460));
+}
