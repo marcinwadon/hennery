@@ -19,6 +19,7 @@ use crate::schema::{COMPONENT, MIGRATIONS};
 use anyhow::{Context, Result, anyhow};
 use hennery_kernel::db;
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 use zeroize::Zeroizing;
@@ -39,6 +40,14 @@ const SELECT_MOUNTS: &str = "SELECT m.connection_id, m.host_id
      FROM gw_mounts m JOIN hosts h ON h.id = m.host_id AND h.owner_id = ?1
      WHERE m.owner_id = ?1 AND h.revoked_at IS NULL AND (?2 IS NULL OR m.connection_id = ?2)
      ORDER BY m.connection_id, m.host_id";
+
+/// The hats with a stored credential (kernel spec §10, plan 4d-B3): `?1` is
+/// the owner. Whether a row is there, never what it holds; every kind
+/// counts, and so does a credential that no longer works: it is a secret
+/// the master key opens all the same.
+const SELECT_HATS_WITH_CREDENTIALS: &str = "SELECT DISTINCT c.hat_id
+     FROM gw_credentials k JOIN gw_connections c ON c.id = k.connection_id AND c.owner_id = k.owner_id
+     WHERE k.owner_id = ?1";
 
 pub struct GatewayStore {
     conn: Mutex<Connection>,
@@ -399,6 +408,18 @@ impl GatewayStore {
         )?)
     }
 
+    /// The hats whose connections hold a stored credential (kernel spec
+    /// §10's "gateway credentials for more than one hat"; plan 4d-B3). Reads
+    /// whether a credential is there, never the credential. Plan 8e extends
+    /// this to count a hat whose stdio servers hold a stored env value, since
+    /// the same master key opens it.
+    pub fn hats_with_credentials(&self) -> Result<BTreeSet<String>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(SELECT_HATS_WITH_CREDENTIALS)?;
+        let hats = stmt.query_map([&self.owner], |r| r.get(0))?;
+        Ok(hats.collect::<rusqlite::Result<_>>()?)
+    }
+
     /// That `key` opens the newest stored credential, so a wrong key stops
     /// the start instead of sealing new rows beside ones it cannot open
     /// (plan 8a decision 8). Only the newest: a damaged older row shows when
@@ -512,7 +533,6 @@ fn read(conn: &Connection, owner: &str, id: Option<&str>) -> Result<Vec<Connecti
 mod tests {
     use super::*;
     use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
-    use std::collections::BTreeSet;
     use std::sync::{Arc, Mutex};
 
     /// Every (table, column) `sql` reads, as SQLite's authorizer reports.
@@ -553,6 +573,22 @@ mod tests {
                 }
             }
         }
+        let expected: BTreeSet<String> = ["connection_id", "owner_id"].map(String::from).into();
+        assert_eq!(credentials, expected);
+    }
+
+    /// Plan 4d-B3 (lane L20): the hats with a credential are read from
+    /// whether a row is there, by its key and owner, and nothing of the
+    /// secret, as the lists are.
+    #[test]
+    fn the_hats_with_credentials_read_no_secret() {
+        let store = GatewayStore::open_in_memory().unwrap();
+        let conn = store.conn();
+        let credentials: BTreeSet<String> = reads(&conn, SELECT_HATS_WITH_CREDENTIALS)
+            .into_iter()
+            .filter(|(table, _)| table == "gw_credentials")
+            .map(|(_, column)| column)
+            .collect();
         let expected: BTreeSet<String> = ["connection_id", "owner_id"].map(String::from).into();
         assert_eq!(credentials, expected);
     }

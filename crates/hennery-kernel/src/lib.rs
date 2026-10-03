@@ -9,6 +9,7 @@ pub mod capabilities;
 pub mod csp;
 pub mod db;
 pub mod delivery;
+pub mod deployment;
 pub mod egress;
 pub mod hats;
 pub mod health;
