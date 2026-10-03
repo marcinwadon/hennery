@@ -406,3 +406,23 @@ fn a_hellos_mcp_isolation_is_bounded() {
     assert_eq!(kept.0.len(), MAX_AGENTS);
     assert!(kept.0.keys().all(|agent| agent.starts_with("agent-")), "{kept:?}");
 }
+
+/// A bidi-override agent id is dropped on its own, not merely outsorted by
+/// `take(MAX_AGENTS)`: recorded alongside a single valid id, far below the
+/// cap, only the valid one survives.
+#[test]
+fn a_bidi_override_agent_id_is_dropped_from_mcp_isolation() {
+    use hennery_proto::frames::{AgentIsolation, McpIsolation};
+    let hosts = Hosts::open_in_memory().unwrap();
+    hosts.register("host-1", &enrollment(&key(1)), NOW).unwrap();
+    let isolation = AgentIsolation(
+        [
+            ("claude".to_string(), McpIsolation::ClaudeStrict),
+            ("a\u{202e}".to_string(), McpIsolation::ClaudeStrict),
+        ]
+        .into(),
+    );
+    hosts.record_mcp_isolation("host-1", &isolation).unwrap();
+    let kept = hosts.host("host-1").unwrap().unwrap().mcp_isolation.unwrap();
+    assert_eq!(kept.0.keys().collect::<Vec<_>>(), vec!["claude"], "{kept:?}");
+}
