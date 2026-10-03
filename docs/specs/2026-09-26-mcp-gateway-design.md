@@ -63,8 +63,9 @@ gw_oauth_clients(                   -- registered or pre-registered OAuth client
   client_id, client_secret_ciphertext NULL, redirect_uri, scopes JSON,
   resource, resource_param_accepted BOOL, registered_at)
 gw_stdio_servers(                   -- §3.4
-  id TEXT PK, owner_id, host_id, hat_id, name, command, args JSON,
-  env_ciphertext NULL, created_at, updated_at)
+  id TEXT PK, owner_id, host_id, hat_id, name, position, command, args JSON,
+  env_names JSON, key_version NULL, env_ciphertext NULL, created_at, updated_at,
+  UNIQUE(owner_id, host_id, hat_id, name))
 ```
 
 `gw_mounts` has no hat column: the hat is the connection's. `gw_session_tokens`
@@ -163,8 +164,10 @@ included, since a table with children cannot be rebuilt later to widen one
   row: the previous token no longer resolves. A hat purge deletes its
   tokens, revoked ones too (`purge_hat_in`).
 - **One token per session.** It is revoked on park, close, adapter exit,
-  host revoke, re-assignment to another hat, a start or resume the route
-  fails, and delete (`SessionMcp::revoke_in`, `revoke_host_in`), each in
+  host revoke, re-assignment to another hat, a failed start or resume (the
+  route's, a host's `start_failed`, reconciliation's `start_not_delivered`),
+  reconciliation's park or close of a session its restarted host no longer
+  has, and delete (`SessionMcp::revoke_in`, `revoke_host_in`), each in
   the transition's own transaction; it is superseded by the token minted at
   the next resume, and a hat's purge deletes it. A presumed park while the
   host is merely offline does not revoke it (ACP core §4.8), nor does a
@@ -176,7 +179,8 @@ included, since a table with children cannot be rebuilt later to widen one
   token watches that token from before it is resolved until its answer's
   body ends; a revoke, a supersession and a purge, once their transaction
   has committed, cut every watch on the tokens they invalidated: a request
-  not yet answered ends, and a stream open on it is cut. Cutting before the
+  not yet answered ends (404, as for an unknown token), and a stream open on
+  it is cut. Cutting before the
   commit would race a rollback; registering the watch before the resolve
   closes the race with a revoke in flight. Another token's streams are
   untouched. The sessions module cuts in one place only, after the commit
@@ -200,7 +204,8 @@ included, since a table with children cannot be rebuilt later to widen one
   (plan 8e decision 11, the default of the maintainer's open question Q2 of
   plan 8c, reversible). A token split across two updates, or encoded
   otherwise, is not caught; it stops working at the session's next park.
-  Two object keys that redact alike are merged into one.
+  Two object keys that redact alike collapse into one: the later value
+  replaces the earlier.
 
 ### 3.2 Delivery to hennery sessions (primary path)
 
@@ -212,8 +217,9 @@ ACP**, not through agent config files:
    `hennery_proto::rest::mcp_session_delivery`, the one mapping the host list
    reads too, plan 8e decision E8) and, inside the start's or resume's own
    transaction, calls `SessionMcp::servers_in(tx, session, mode)`. For a
-   mode that delivers, it mints the session token (a failed mint rolls the
-   transition back) and returns every connection of the session's hat
+   mode that delivers, it mints the session token when a connection is
+   mounted there (a failed mint rolls the transition back; with none it mints
+   none; the session's previous token is revoked either way) and returns every connection of the session's hat
    mounted on the session's host, as
    `{type: "http", name: "hennery-<slug>", url: "<public_url>/mcp/<slug>",
    headers: [{name: "Authorization", value: "Bearer <session token>"}]}`,
@@ -502,7 +508,8 @@ and nothing goes up.
   presenting another session's id would get what the upstream serves for
   it. The key is per process: after a restart every id is refused and the
   client initializes again (a 404 on a request with a session id means so
-  in MCP's streamable HTTP). `DELETE` is forwarded so client terminations
+  in MCP's streamable HTTP). So after a resume: the ids were bound to the
+  old token, which is revoked. `DELETE` is forwarded so client terminations
   reach the upstream. *(G-16: the predecessor answered DELETE with 405, leaving
   upstream sessions until the vendor expired them.)*
 - `GET` (the optional server-to-client SSE channel) is forwarded and streamed.
@@ -886,7 +893,7 @@ read.
 | `PUT /api/mcp/connections/{id}/oauth-client` | Set a pre-registered client (**step-up**). *Later: plan 8f.* |
 | `POST /api/mcp/connections/{id}/authorize` | Start OAuth; sets the flow cookie, returns the consent URL. *Later: plan 8f.* |
 | `GET /api/mcp/oauth/callback` | OAuth redirect target (`state` plus flow cookie). *Later: plan 8f.* |
-| `GET/PUT /api/mcp/stdio-servers?host_id&hat_id` | Local stdio servers for one (host, hat), full set (§3.4; **step-up** on `PUT`). *Later.* |
+| `GET/PUT /api/mcp/stdio-servers?host_id&hat_id` | Local stdio servers for one (host, hat), full set (§3.4; plan 8e). `GET` → 200 `McpStdioServerSet {host_id, hat_id, servers[]}`, each env variable by name and `has_value`, never a value. `PUT` (**step-up**) `McpStdioServersRequest {servers[]}` replaces the set → 200 `McpStdioServerSet`; an env value left out is kept from the same server while its `command` is unchanged, else 400 `env_value_missing`. 400 `invalid` (a field refused, or ids missing or over 64 bytes; no value is quoted); 404 `not_found` (not the owner's host or hat); 409 `host_revoked` (readable, not changeable); 409 `slug_taken` (a name one of the owner's connections has as its slug); 409 `too_many_stdio_servers`. |
 | `GET /api/mcp/clients` / `POST` / `DELETE /{id}` | Standalone clients. `POST {label, hat_id, connection_ids[]}` creates the client and its pins; the token is shown once. *Later: plan 8g.* |
 | `PUT /api/mcp/clients/{id}/pins` | Replace a client's pinned connections (`{connection_ids[]}`). *Later: plan 8g.* |
 | `GET /api/mcp/manifest` | Manifest for the presenting standalone client token (renderers). *Later: plan 8g.* |

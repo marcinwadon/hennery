@@ -499,8 +499,10 @@ since plan 5b: probes, answered only by the connection they went out on.
 - `mcp_isolation` (plan 8c): per agent id, how the host keeps its sessions to
   the servers it is given: `claude_strict` (the strict flag, §6) or `none`.
   An agent left out is `none`. Deserialized leniently like `capabilities`:
-  an unknown value reads as `none`, never as isolated. The collector keeps
-  it with the live connection (the hub), not in the host registry.
+  an unknown value reads as `none`, never as isolated. The collector decides
+  delivery from what the live connection announced (the hub), and records
+  the latest accepted `hello`'s in the host registry for the host list
+  (`hosts.mcp_isolation`, plan 8e).
 - `agents[]`: per agent `{id, version, available, auth, catalog}` where
   `catalog` is the profile's **static default catalogue** (§6), so the
   New-session pickers work before the first session on a host exists.
@@ -1104,8 +1106,11 @@ is killed before the final fact.
   `close_session` followed at once by an operator's resume.
 - The session's gateway token is revoked on host-reported `session_parked`
   and `session_closed`, on adapter exit, on a close of an unattached session,
-  on host revoke, on re-assignment, on delete and on a start or resume the
-  route fails (`SessionMcp::revoke_in`, `revoke_host_in`), in the
+  on host revoke, on re-assignment, on delete, on a failed start or resume
+  (the route's, a host's `start_failed`, reconciliation's
+  `start_not_delivered`) and on reconciliation's park or close of a session
+  its restarted host no longer has (`SessionMcp::revoke_in`,
+  `revoke_host_in`), in the
   transition's transaction; what was open on it is cut once that commits
   (gateway spec §3.1). A presumed park
   (`presumed_parked{host_offline}`) does **not** revoke it: the host may still
@@ -1682,7 +1687,7 @@ All endpoints require an operator session (kernel spec §3). Types come from
 |---|---|
 | `GET /api/sessions?cursor&limit&q&hat&lifecycle` | Paginated list, newest `last_event_at` first. `q` searches title, cwd, branch, id across all sessions regardless of filters except hat. Each item carries `hat_id` (`''`: a session from before hats that got none). `hat=<id>` lists that hat's sessions (an unknown hat lists none); an empty `hat=` is 400 `invalid` (plan 5c). |
 | `POST /api/sessions` | Start: `{host_id, agent, cwd, model?, mode?, axes?, first_prompt?{content[]}}` → 202 `{session_id, turn_id?}` once `session_started` is ingested; 400 `unknown_host`; 400 `invalid_cwd`; 409 `hat_ambiguous`; 409 `host_offline` (no session is created, plan 5c); 502 with the host's code (`start_failed`, `unknown_agent`, …); 503 `delivery_unknown` **with `session_id`** (the session exists and may still start; the caller has no other way to learn its id). |
-| `GET /api/sessions/{id}` | Session detail `SessionDetail`: the list item (lifecycle, activity, failure reason, `presumed_parked`), the open turn `{turn_id, state: sent \| started}`, and `pending[]`: the open questions as `PendingItem {pending_id, session_id, kind, state, reason?, turn_id?, option_ids?, payload, answered, delivered?}`, oldest first (`answered`: an answer is queued; `delivered`: its verdict, absent until one comes). |
+| `GET /api/sessions/{id}` | Session detail `SessionDetail`: the list item (lifecycle, activity, failure reason, `presumed_parked`), the open turn `{turn_id, state: sent \| started}`, `mcp_delivery?` (what its latest start or resume was given, plan 8e: `McpSessionDelivery {mode: isolated \| unisolated \| fallback \| unsupported, servers, at}`, a mode and a count, never a token; absent for a session not started or resumed since), and `pending[]`: the open questions as `PendingItem {pending_id, session_id, kind, state, reason?, turn_id?, option_ids?, payload, answered, delivered?}`, oldest first (`answered`: an answer is queued; `delivered`: its verdict, absent until one comes). |
 | `GET /api/sessions/{id}/events?before=<event_id>&limit` | Timeline page ending before an event; without `before`, the tail. The frontend opens at the tail. |
 | `GET /api/sessions/{id}/events?after=<event_id>&limit` | Timeline page after an event (applied rows only, §8). |
 | `GET /api/sessions/{id}/catalog` | `SessionCatalog {session_id, config_options[], model?, mode?, axes{}}`; commands, plan and usage join it with the plans that produce them. |

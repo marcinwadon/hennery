@@ -474,8 +474,10 @@ that speaks the socket protocol directly (§10).
   hooks (§5.5): sessions are parked and their gateway tokens revoked. The
   host's adapters keep running until it next connects; it is then told it is
   revoked and stops them.
-- **Revoke order:** mark the host revoked; kick its connection and wait, at
-  most 10 s, until it is unregistered; then call the hooks; answer 200
+- **Revoke order:** mark the host revoked; revoke its gateway session tokens
+  and cut what is open on them at once (plan 8e; a failure is logged and the
+  revoke goes on: the hooks revoke them again); kick its connection and wait,
+  at most 10 s, until it is unregistered; then call the hooks; answer 200
   `HostItem`. The socket task re-checks revocation right after registering and
   never reconciles or marks a revoked host ready; when a revoked host's socket
   ends, the hooks run again, so a revoke whose wait timed out converges. A
@@ -847,7 +849,11 @@ frontend spec §6.4) this makes agent output unable to run script in the UI.
 
 `GET /api/hosts` lists every paired host, revoked ones included, oldest first,
 as `HostItem {host_id, name, platform, host_version, capabilities, connected,
-created_at, last_seen_at?, revoked_at?}`; `connected` means connected,
+created_at, last_seen_at?, revoked_at?, mcp_delivery?}`; `mcp_delivery` maps
+each agent id to `isolated` or `default_hat_only` (which hats' sessions get
+gateway MCP servers), from the `mcp_isolation` of the host's latest accepted
+`hello` (plan 8e), absent before one is recorded and for a host without the
+`mcp_servers` capability; `connected` means connected,
 reconciled and not being kicked. `DELETE /api/hosts/{id}` answers 200
 `HostItem`, or 404.
 
