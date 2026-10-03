@@ -176,7 +176,7 @@ impl GatewayStore {
     /// client first, in the same transaction, and its status starts over:
     /// the token was granted for the old upstream and the old kind (G-14).
     /// Any change of the URL, a path's too, clears a `resource` found or
-    /// accepted for the old one (plan 8f decision F1). The caller holds the
+    /// accepted for the old one (api-8e-8f F1). The caller holds the
     /// connection's refresh lock (gateway spec §4.5).
     pub fn update(&self, id: &str, patch: &ConnectionPatch, now: i64) -> Result<Change> {
         let mut conn = self.conn();

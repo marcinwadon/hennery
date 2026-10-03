@@ -1,7 +1,7 @@
 //! The OAuth routes behind the operator's session (gateway spec §4, §9;
 //! api-8e-8f B2, B3, B6): the redirect URI, a pre-registered client
 //! (step-up), authorize (step-up: kernel spec §3.4 lists gateway
-//! credentials and pre-registered clients; plan 8f decision F2), and a
+//! credentials and pre-registered clients; api-8e-8f F2), and a
 //! probe now. The callback is `callback.rs`, outside the session.
 //!
 //! Each authorize failure after the connection was found is also kept in

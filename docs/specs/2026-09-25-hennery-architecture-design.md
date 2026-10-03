@@ -789,8 +789,9 @@ Decided 2026-09-26. The reasons are specific to hennery, not general:
 - The rest is standard ground: `tokio` for subprocesses and I/O, `axum` for
   HTTP/SSE and the streaming proxy, a WebSocket crate, SQLite
   (`rusqlite`, bundled, one writer thread), `webauthn-rs`, `argon2`,
-  `chacha20poly1305`, `web-push-native`, `rmcp` (OAuth and the gateway's
-  liveness probe; the proxy itself is hand-written) and `rust-embed`.
+  `chacha20poly1305`, `web-push-native`, `rmcp` (planned for OAuth and the
+  gateway's liveness probe; as built, plan 8f hand-writes both on the
+  kernel's egress clients, gateway §4, as the proxy is) and `rust-embed`.
   Static binaries for Linux (musl) and macOS arm64 are routine.
 
 Costs accepted: slower compiles and a steeper start with async Rust
