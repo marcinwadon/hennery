@@ -22,9 +22,10 @@ pub fn mode() -> DeploymentMode {
 /// The one place features are switched on: each gateway part adds its name
 /// when its API lands (`mcp_connections`, `mcp_stdio`, `mcp_oauth`,
 /// `mcp_clients`). Plan 8a's connections API (`/api/mcp/connections`) is
-/// served.
+/// served, and plan 8f's OAuth (`…/authorize`, the callback, the
+/// pre-registered client, the probe).
 pub fn features() -> Vec<String> {
-    vec!["mcp_connections".to_owned()]
+    vec!["mcp_connections".to_owned(), "mcp_oauth".to_owned()]
 }
 
 /// What `GET /api/capabilities` answers.
@@ -51,7 +52,7 @@ mod tests {
     fn the_collector_is_the_whole_cockpit_with_the_gateways_connections() {
         assert_eq!(
             serde_json::to_value(current()).unwrap(),
-            serde_json::json!({"mode": "full", "features": ["mcp_connections"]})
+            serde_json::json!({"mode": "full", "features": ["mcp_connections", "mcp_oauth"]})
         );
     }
 

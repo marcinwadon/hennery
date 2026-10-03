@@ -353,8 +353,6 @@ pub enum Change {
     SlugTaken,
     /// The owner has `MAX_CONNECTIONS` already.
     TooMany,
-    /// A kind this plan does not take yet.
-    Unsupported(CredKind),
     /// Why it was refused; nothing was written.
     Invalid(String),
 }

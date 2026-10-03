@@ -5,6 +5,7 @@
 //! (umbrella §9).
 
 pub mod api;
+pub mod callback;
 pub mod crypto;
 pub mod flows;
 mod jsonrpc;
@@ -12,6 +13,7 @@ pub mod key;
 pub mod model;
 pub mod notify;
 pub mod oauth;
+mod oauth_api;
 pub mod probe;
 pub mod proxy;
 pub mod refresh;
