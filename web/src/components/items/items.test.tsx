@@ -65,7 +65,7 @@ describe('user_turn', () => {
 
   it('says when the prompt was cut, linking the raw events', () => {
     show(item('user_turn', { content: [{ type: 'text', text: 'x' }], truncated: true }))
-    expect(screen.getByText(/This prompt was cut/)).toBeInTheDocument()
+    expect(screen.getByText('This prompt was cut.')).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Raw events' })).toHaveAttribute('href', '/api/sessions/s%2F1/events')
   })
 })
@@ -434,7 +434,7 @@ describe('marker', () => {
 
   it('points an elided turn to the raw events', () => {
     show(item('marker', { marker: 'elided', reason: 'items' }))
-    expect(screen.getByText('This turn holds more than is shown here', { exact: false })).toBeInTheDocument()
+    expect(screen.getByText(/^This turn holds more than is shown here/)).toBeInTheDocument()
     expect(screen.getByRole('link', { name: 'Raw events' })).toBeInTheDocument()
   })
 
@@ -457,7 +457,7 @@ describe('unrecognised', () => {
     expect(details.querySelector('summary')?.textContent).toBe('Unsupported update (acp_update/new_thing)')
     expect(details.querySelector('pre')?.textContent).toBe('{"a":"<b>x</b>"}')
     expect(container.querySelector('pre b')).toBeNull()
-    expect(screen.getByText(/This update was cut/)).toBeInTheDocument()
+    expect(screen.getByText('This update was cut.')).toBeInTheDocument()
   })
 })
 

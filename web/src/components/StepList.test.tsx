@@ -27,7 +27,7 @@ describe('StepList', () => {
 
   it('counts finished steps over all', () => {
     render(<StepList entries={[{ content: 'a', status: 'completed' }, { content: 'b', status: 'pending' }]} />)
-    expect(screen.getByText(/1\s*\/\s*2/)).toBeTruthy()
+    expect(screen.getByText(/^1\s*\/\s*2$/)).toBeTruthy()
   })
 
   it('names the step in progress in the summary', () => {
@@ -56,6 +56,6 @@ describe('StepList', () => {
 
   it('says when steps were cut', () => {
     render(<StepList entries={[{ content: 'a' }]} truncated />)
-    expect(screen.getByText(/cut or left out/)).toBeTruthy()
+    expect(screen.getByText(/cut or left out\.$/)).toBeTruthy()
   })
 })
