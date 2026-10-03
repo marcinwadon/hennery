@@ -13,11 +13,15 @@
 //! - **The protocol:** one JSON `AdminRequest` on one line, at most
 //!   `MAX_REQUEST_BYTES`, within `REQUEST_TIMEOUT`; one JSON `AdminResponse`
 //!   on one line back; then the connection closes.
+//! - **Read-only questions:** `deployment` answers what kernel spec §10's
+//!   warning is drawn from, by count (plan 4d-B3): `hennery doctor` asks it
+//!   rather than open the database.
 //! - **One collector per data directory:** binding refuses a socket that
 //!   still answers, replaces one that refuses the connection (a collector
 //!   that was killed), and stops at any other error. The socket is removed
 //!   when its `AdminSocket` is dropped.
 
+use crate::deployment::Deployment;
 use crate::hosts::Hosts;
 use crate::operator::{Operator, Reset};
 use crate::secret::unix_now;
@@ -61,13 +65,16 @@ pub enum AdminRequest {
     ResetPublicUrl {
         public_url: String,
     },
+    /// What kernel spec §10's deployment warning is drawn from (plan 4d-B3),
+    /// for `hennery doctor`. Reads only.
+    Deployment,
 }
 
 impl AdminRequest {
     /// Whether it changes state or hands out a credential: logged at
     /// `warn`, with the peer's process id.
     pub fn changes_state(&self) -> bool {
-        !matches!(self, Self::SetupUrl | Self::ListHosts)
+        !matches!(self, Self::SetupUrl | Self::ListHosts | Self::Deployment)
     }
 
     /// The command's name, for the log: never its arguments.
@@ -78,6 +85,7 @@ impl AdminRequest {
             Self::ListHosts => "list_hosts",
             Self::MintPairingCode => "mint_pairing_code",
             Self::ResetPublicUrl { .. } => "reset_public_url",
+            Self::Deployment => "deployment",
         }
     }
 }
@@ -127,6 +135,12 @@ pub enum AdminResponse {
         code: String,
         expires_at: i64,
     },
+    /// `deployment`: started by `hennery up` beside its host child, and how
+    /// many hats have a gateway credential. A count, never a hat.
+    Deployment {
+        beside_host: bool,
+        hats: usize,
+    },
     /// The request is not acceptable (why); nothing changed.
     Refused {
         message: String,
@@ -170,6 +184,11 @@ impl std::fmt::Debug for AdminResponse {
                 .field("code", &redacted)
                 .field("expires_at", expires_at)
                 .finish(),
+            Self::Deployment { beside_host, hats } => f
+                .debug_struct("Deployment")
+                .field("beside_host", beside_host)
+                .field("hats", hats)
+                .finish(),
             Self::Refused { message } => f.debug_struct("Refused").field("message", message).finish(),
             Self::Failed { message } => f.debug_struct("Failed").field("message", message).finish(),
         }
@@ -200,6 +219,8 @@ pub struct Admin {
     pub dir: PathBuf,
     /// The setup link's base (kernel spec §3.1).
     pub base_url: String,
+    /// What `deployment` answers from (plan 4d-B3): the router's own.
+    pub deployment: Deployment,
 }
 
 /// A bound admin socket. Dropping it removes the socket file, however the
@@ -431,6 +452,10 @@ async fn carry_out(request: AdminRequest, admin: &Admin) -> AdminResponse {
                 code: code.code,
                 expires_at: code.expires_at,
             }),
+        AdminRequest::Deployment => admin.deployment.facts().map(|facts| AdminResponse::Deployment {
+            beside_host: facts.beside_host,
+            hats: facts.hats,
+        }),
         AdminRequest::ResetPublicUrl { public_url } => {
             admin.operator.reset_public_url(&public_url).map(|reset| match reset {
                 Reset::Done {
@@ -453,6 +478,54 @@ async fn carry_out(request: AdminRequest, admin: &Admin) -> AdminResponse {
     outcome.unwrap_or_else(|err| AdminResponse::Failed {
         message: format!("{err:#}"),
     })
+}
+
+/// Why the client got no answer, as the context of its error (plan 4d-B3,
+/// the review's A2): a caller tells the cases apart by this type, never by
+/// the text. Its text is the message `hennery admin` has always printed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreachable {
+    pub why: Why,
+    message: String,
+}
+
+/// The cases of `Unreachable`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Why {
+    /// The socket's path is too long for a Unix socket: the collector runs
+    /// without one.
+    PathTooLong,
+    /// No socket there.
+    NoSocket,
+    /// A socket nothing serves (refused): left by a collector that stopped.
+    Stale,
+    /// Not this user's to reach (`EACCES`, `EPERM`).
+    Denied,
+    /// Served by another user.
+    OtherUser,
+    /// No connection, or no whole answer, in time.
+    TimedOut,
+    /// Closed without a byte of answer.
+    Unanswered,
+}
+
+impl Unreachable {
+    pub fn new(why: Why, message: String) -> Self {
+        Self { why, message }
+    }
+}
+
+impl std::fmt::Display for Unreachable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Unreachable {}
+
+/// The `Why` of an admin client's error, if it has one.
+pub fn why(err: &anyhow::Error) -> Option<Why> {
+    err.downcast_ref::<Unreachable>().map(|u| u.why)
 }
 
 /// How long the client waits for the whole exchange: connecting, sending
@@ -485,10 +558,14 @@ pub async fn request_within(socket: &Path, request: &AdminRequest, timeout: Dura
     match tokio::time::timeout_at(deadline, exchange).await {
         Ok(answer) => answer,
         // Part of the request, or all of it, may have arrived.
-        Err(_) => bail!(
-            "the collector at {} did not answer within {timeout:?}; the command's outcome is unknown",
-            socket.display()
-        ),
+        Err(_) => Err(Unreachable::new(
+            Why::TimedOut,
+            format!(
+                "the collector at {} did not answer within {timeout:?}; the command's outcome is unknown",
+                socket.display()
+            ),
+        )
+        .into()),
     }
 }
 
@@ -509,23 +586,44 @@ async fn connect_by(
     timeout: Duration,
 ) -> Result<tokio::net::UnixStream> {
     if socket_path_too_long(socket) {
-        bail!(
-            "{} is {} bytes long, longer than a Unix socket path can be ({} bytes at most): \
-             the collector serving that data directory has no admin socket; \
-             move the data directory to a shorter path",
-            socket.display(),
-            socket.as_os_str().len(),
-            max_socket_path_bytes()
-        );
+        return Err(Unreachable::new(
+            Why::PathTooLong,
+            format!(
+                "{} is {} bytes long, longer than a Unix socket path can be ({} bytes at most): \
+                 the collector serving that data directory has no admin socket; \
+                 move the data directory to a shorter path",
+                socket.display(),
+                socket.as_os_str().len(),
+                max_socket_path_bytes()
+            ),
+        )
+        .into());
     }
     let stream = match tokio::time::timeout_at(deadline, tokio::net::UnixStream::connect(socket)).await {
-        Ok(connected) => {
-            connected.with_context(|| format!("connect to {} (is the collector running?)", socket.display()))?
+        Ok(Ok(stream)) => stream,
+        Ok(Err(err)) => {
+            let message = format!("connect to {} (is the collector running?)", socket.display());
+            let why = match err.kind() {
+                std::io::ErrorKind::NotFound => Some(Why::NoSocket),
+                std::io::ErrorKind::ConnectionRefused => Some(Why::Stale),
+                std::io::ErrorKind::PermissionDenied => Some(Why::Denied),
+                _ => None,
+            };
+            return Err(match why {
+                Some(why) => anyhow::Error::new(err).context(Unreachable::new(why, message)),
+                None => anyhow::Error::new(err).context(message),
+            });
         }
-        Err(_) => bail!(
-            "connecting to {} took over {timeout:?}; nothing was sent",
-            socket.display()
-        ),
+        Err(_) => {
+            return Err(Unreachable::new(
+                Why::TimedOut,
+                format!(
+                    "connecting to {} took over {timeout:?}; nothing was sent",
+                    socket.display()
+                ),
+            )
+            .into());
+        }
     };
     // The other way round too: a password is sent only to a collector of
     // this user's.
@@ -533,10 +631,14 @@ async fn connect_by(
     // SAFETY: geteuid(2) cannot fail.
     let own = unsafe { libc::geteuid() };
     if server != own {
-        bail!(
-            "{} is served by user id {server}, not by this user ({own}); nothing was sent",
-            socket.display()
-        );
+        return Err(Unreachable::new(
+            Why::OtherUser,
+            format!(
+                "{} is served by user id {server}, not by this user ({own}); nothing was sent",
+                socket.display()
+            ),
+        )
+        .into());
     }
     Ok(stream)
 }
@@ -553,10 +655,13 @@ pub async fn read_answer(stream: &mut tokio::net::UnixStream) -> Result<AdminRes
     // Serde's own message for an empty input ("EOF while parsing a value")
     // reads like a parse bug, not like what happened.
     if read == 0 {
-        bail!(
+        return Err(Unreachable::new(
+            Why::Unanswered,
             "the collector closed the connection without answering (it may have stopped); \
              the command's outcome is unknown"
-        );
+                .to_string(),
+        )
+        .into());
     }
     serde_json::from_str(&answer).context("the collector's answer")
 }

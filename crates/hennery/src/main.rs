@@ -515,6 +515,7 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
             hosts: state.hosts.clone(),
             dir: data_dir.clone(),
             base_url,
+            deployment: state.deployment.clone(),
         };
         tokio::spawn(hennery_kernel::admin::serve(
             socket,
