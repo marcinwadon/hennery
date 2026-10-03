@@ -290,7 +290,9 @@ fn scope_is_the_hat_s_connections_mounted_on_the_host() {
 
 /// Lane L6 and gateway spec §2: a hat's tokens go with its purge, revoked
 /// ones too, so the hat row can be deleted once the gateway's purge has
-/// run; without it, the tokens' foreign key keeps the hat.
+/// run; without it, the tokens' foreign key keeps the hat. Since plan 8e,
+/// `GatewayStore::purge_hat` takes them itself (plan 8d's hand-off), and
+/// names both for the cut.
 #[test]
 fn a_hat_purge_takes_its_tokens_and_then_the_hat_can_go() {
     let h = World::new();
@@ -307,16 +309,28 @@ fn a_hat_purge_takes_its_tokens_and_then_the_hat_can_go() {
             [&work, h.store.owner_id()],
         )
     };
-    h.store.purge_hat(&work).unwrap();
-    assert!(delete_hat(&h).is_err(), "the hat went with tokens left");
+    {
+        // Without the gateway's purge, the tokens keep the hat.
+        let mut conn = h.raw();
+        let tx = conn.transaction().unwrap();
+        assert!(
+            tx.execute(
+                "DELETE FROM hats WHERE id = ?1 AND owner_id = ?2",
+                [&work, h.store.owner_id()]
+            )
+            .is_err()
+        );
+    }
+    assert_eq!(h.store.purge_hat(&work).unwrap().len(), 2);
     let mut conn = h.raw();
     let tx = conn.transaction().unwrap();
-    assert_eq!(tokens::purge_hat_in(&tx, h.store.owner_id(), &work).unwrap(), 2);
     assert_eq!(tokens::purge_hat_in(&tx, h.store.owner_id(), &work).unwrap(), 0);
     tx.commit().unwrap();
     assert_eq!(h.proxy_store.resolve(&live, unix_now()).unwrap(), None);
     assert!(h.proxy_store.resolve(&kept, unix_now()).unwrap().is_some());
     assert_eq!(delete_hat(&h).unwrap(), 1);
+    // Idempotent: nothing left, nothing to cut.
+    assert!(h.store.purge_hat(&work).unwrap().is_empty());
 }
 
 /// Gateway spec §7: live traffic sets `ok`, and a 401 `needs_auth`, only for
