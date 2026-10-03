@@ -289,6 +289,29 @@ input,textarea { font-family:inherit; }
 /* Resume bar */
 .resume-bar { flex:none; border-top:1px solid var(--border); background:var(--bg); padding:16px 28px; display:flex; align-items:center; gap:14px; }
 .resume-bar .txt { font-size:13.5px; color:var(--fg-muted); }
+.resume-bar .txt { margin:0; }
+.session-footer { flex-wrap:wrap; }
+.session-footer-text { flex:1 1 260px; min-width:0; display:flex; flex-direction:column; gap:4px; }
+.session-footer-text .form-error p { margin:0; }
+.session-footer-offline { color:var(--st-attn) !important; }
+.spinner { width:16px; height:16px; flex:none; border-radius:50%; border:2px solid var(--border-strong); border-top-color:var(--accent); animation:spin .8s linear infinite; }
+@keyframes spin { to { transform:rotate(360deg); } }
+
+/* The session header's menu: a disclosure of plain buttons */
+.session-menu { position:relative; margin-left:auto; flex:none; }
+.session-menu-btn { width:34px; height:34px; display:flex; align-items:center; justify-content:center; border-radius:8px; border:1px solid var(--border); background:var(--surface); color:var(--fg-1); }
+.session-menu-btn:hover { background:var(--surface-2); }
+.session-menu-list { position:absolute; right:0; top:calc(100% + 6px); min-width:190px; display:flex; flex-direction:column; padding:6px; background:var(--surface); border:1.5px solid var(--border-strong); border-radius:var(--r-md); box-shadow:0 8px 28px rgba(0,0,0,.14); z-index:30; }
+.session-menu-list button { text-align:left; border:none; background:none; padding:9px 12px; border-radius:var(--r-sm); font-size:14px; color:var(--fg-1); }
+.session-menu-list button:hover:not(:disabled), .session-menu-list button:focus-visible { background:var(--surface-2); }
+.session-menu-list button.danger { color:var(--st-attn); }
+.session-menu-error { position:absolute; right:0; top:calc(100% + 6px); width:max-content; max-width:min(360px,80vw); background:var(--surface); padding:8px 10px; border-radius:var(--r-sm); box-shadow:var(--sh-sm); z-index:29; }
+.delete-note { font-size:14px !important; margin:0 0 12px !important; }
+/* Touch: every control of the footer and the menu is at least 44px. */
+@media (pointer: coarse), (max-width:767px) {
+  .session-menu-btn { width:44px; height:44px; }
+  .session-menu-list button, .session-footer .btn { min-height:44px; }
+}
 
 /* Interactive / permission card */
 .ask { background:var(--surface); border:1.5px solid var(--accent); border-radius:var(--r-md); padding:18px 20px; box-shadow:var(--sh-accent); }
@@ -411,7 +434,7 @@ input,textarea { font-family:inherit; }
 @keyframes td { 0%,60%,100%{ opacity:.3; transform:translateY(0);} 30%{ opacity:1; transform:translateY(-3px);} }
 .fade-in { opacity:1; animation:fadeUp .4s var(--ease); }
 @keyframes fadeUp { from{transform:translateY(8px);} to{transform:none;} }
-@media (prefers-reduced-motion: reduce) { .fade-in,.led-run,.td { animation:none; } }
+@media (prefers-reduced-motion: reduce) { .fade-in,.led-run,.td,.spinner { animation:none; } }
 
 /* ── Mobile bar and tab bar (hidden on desktop) ─────────────
    Both are part of the mobile layout; the desktop grid never shows them. */

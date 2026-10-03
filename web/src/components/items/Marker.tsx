@@ -46,6 +46,10 @@ const REASON: Partial<Record<MarkerKind, Record<string, string>>> = {
     agent_not_logged_in: 'the agent is not logged in on the host',
     load_unsupported: 'the agent cannot open an earlier session',
     start_failed: 'the agent could not start',
+    start_not_delivered: 'the start never reached the host',
+    host_offline: 'the host went offline before it started',
+    host_revoked: 'the host was revoked',
+    unknown_agent: 'the host does not know this agent',
   },
   host_note: {
     config_failed: 'a setting did not take',

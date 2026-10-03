@@ -1,7 +1,9 @@
 // A session's header (frontend spec §6.2): its title, agent, host, branch,
 // where it stands in words, model and mode, and the newest step list. On a
 // phone it carries the way back to the list, and the steps start closed.
+// The session's menu (Park, Close, Delete) sits at the end of its title row.
 import type { SessionItem } from '../generated/protocol'
+import type { ReactNode } from 'react'
 import type { PlanEntry } from '../generated/view'
 import { agentLabel } from '../lib/agent'
 import { statusOf } from '../lib/status'
@@ -9,6 +11,7 @@ import { basename } from '../lib/time'
 import { Icon } from '../lib/ui'
 import { Link } from '../router'
 import StepList from './StepList'
+import { reasonWords } from './items/Marker'
 
 /** What the header reads: a list summary or a session's detail. */
 export type HeaderInfo = SessionItem & { question_waits?: boolean }
@@ -24,9 +27,11 @@ interface Props {
   plan?: { entries: PlanEntry[]; truncated?: boolean }
   /** Under 768 px: the steps start closed. */
   narrow: boolean
+  /** The session's menu, at the end of the title row. */
+  menu?: ReactNode
 }
 
-export default function SessionHeader({ id, info, hostName, plan, narrow }: Props) {
+export default function SessionHeader({ id, info, hostName, plan, narrow, menu }: Props) {
   // The list's marker, word for word (plan 4c decision 8): the header and
   // the row never disagree.
   const status = info
@@ -53,6 +58,7 @@ export default function SessionHeader({ id, info, hostName, plan, narrow }: Prop
         <h1 className="conv-name">
           <bdi>{titleOf(info, id)}</bdi>
         </h1>
+        {menu}
       </div>
       {info && (
         <div className="conv-meta">
@@ -82,7 +88,7 @@ export default function SessionHeader({ id, info, hostName, plan, narrow }: Prop
           )}
           {info.lifecycle === 'failed' && info.failure_reason && (
             <span className="meta-item">
-              Reason: <bdi>{info.failure_reason}</bdi>
+              Reason: <bdi>{reasonWords('start_failed', info.failure_reason)}</bdi>
             </span>
           )}
         </div>
