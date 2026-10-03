@@ -459,6 +459,11 @@ impl<'a> ListFilter<'a> {
         })
     }
 
+    /// The hat the list is within, if one is named.
+    pub(crate) fn hat(&self) -> Option<&'a str> {
+        self.hat
+    }
+
     pub(crate) fn query(&self) -> ListQuery<'_> {
         ListQuery {
             after: self.cursor.as_ref(),
@@ -1308,7 +1313,7 @@ fn pending_in(store: &Store, e: &EventDto) -> Option<PendingItem> {
 /// Whether a stored host fact changed the catalogue: its extracts carry a
 /// config snapshot or the commands. Listed events only reach here, and a
 /// listed one with either changed the stored catalogue.
-fn changes_catalogue(e: &EventDto) -> bool {
+pub(crate) fn changes_catalogue(e: &EventDto) -> bool {
     if !matches!(e.kind.as_str(), "session_started" | "config_applied" | "acp_update") {
         return false;
     }

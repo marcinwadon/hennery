@@ -1586,6 +1586,7 @@ dependencies = [
  "futures",
  "hennery-kernel",
  "hennery-proto",
+ "hennery-view",
  "hex",
  "rusqlite",
  "serde",
