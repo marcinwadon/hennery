@@ -105,6 +105,13 @@ pub fn render_schema() -> String {
         rest::HostRemovalItem,
         rest::DeploymentMode,
         rest::CapabilitiesResponse,
+        rest::McpOauthState,
+        rest::McpOauthPendingClient,
+        rest::McpOauthError,
+        rest::McpOauthRedirect,
+        rest::McpOauthClientRequest,
+        rest::McpAuthorizeRequest,
+        rest::McpAuthorizeResponse,
     );
     // `serde_json::Map` is a `BTreeMap` (always iterates sorted) by default,
     // or an `IndexMap` (iterates in insertion order) when serde_json's
@@ -274,6 +281,13 @@ pub fn render_ts() -> String {
         rest::HostTranscripts,
         rest::DeploymentMode,
         rest::CapabilitiesResponse,
+        rest::McpOauthState,
+        rest::McpOauthPendingClient,
+        rest::McpOauthError,
+        rest::McpOauthRedirect,
+        rest::McpOauthClientRequest,
+        rest::McpAuthorizeRequest,
+        rest::McpAuthorizeResponse,
     );
     out
 }
