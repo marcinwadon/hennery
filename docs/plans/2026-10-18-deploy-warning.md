@@ -27,15 +27,15 @@
 - [Frontend](../specs/2026-09-26-frontend-design.md) §8, Settings: "the deployment warning when the collector shares its OS user with agents while holding credentials for several hats (kernel spec §10)".
 - [MCP gateway](../specs/2026-09-26-mcp-gateway-design.md) §2 (credentials read by key alone) and its "single point of compromise" paragraph; umbrella §8.4.
 
-It builds on the doctor plans [7d-i](2026-10-13-doctor.md) and [7d-ii](2026-10-14-doctor-ii.md), whose "After this plan" both leave "**Check 15** (gateway credentials per hat): with the gateway"; on [the gateway store (8a)](2026-10-13-gateway-store.md)'s rule that lists read `gw_credentials` by key alone; on [4d-B4](2026-10-18-public-url-api.md), whose `PATCH /api/settings` paths this plan extends; and on the frontend lane's 4d split, which hands "4d-B3: the deployment warning's signal (kernel §10), for 4d-iv" ([4d-i](2026-10-18-web-manage.md)'s "After this plan"). Every anchor below was taken from `main` at `b8cf8b3` (PR #108, plan 4d-B4).
+It builds on the doctor plans [7d-i](2026-10-13-doctor.md) and [7d-ii](2026-10-14-doctor-ii.md), whose "After this plan" both leave "**Check 15** (gateway credentials per hat): with the gateway"; on [the gateway store (8a)](2026-10-13-gateway-store.md)'s rule that lists read `gw_credentials` by key alone; on [4d-B4](2026-10-18-public-url-api.md), whose `PATCH /api/settings` paths this plan extends; and on the frontend lane's 4d split, which hands "4d-B3: the deployment warning's signal (kernel §10), for 4d-iv" ([4d-i](2026-10-18-web-manage.md)'s "After this plan"). Every anchor below was taken from `main` at `ac2a727` (PR #119).
 
 **Status:** not executed; amended after the security review. The security review of 2026-10-03 (a fresh opus reviewer on the maintainer's behalf, read-only) approved after amendments: A1–A10 required and done, O1 taken, O2 and O3 recorded (see "Decisions" and "What the review changed"). Its **scoped re-confirmation** (another fresh opus reviewer, 2026-10-03, read-only) confirmed every amendment with notes N1–N7, all applied: `Unanswered` advice moved beside `TimedOut` (N1); a catch-all for errors of no known kind (N2); `Unreachable` as the root error with today's text (N3); the closure returning a count (N4); the pre-read after the step-up check (N5); the task numbering (N6); the tests spelt out (N7). The review raised no product question.
 
 **The accessor** (`GatewayStore::hats_with_credentials`, lane L20): approved by the gateway lane, 2026-10-03, with the two additions taken (a credential deleted by a §4.6 update takes its hat out, `a_credential_deleted_by_an_update_takes_its_hat_out`, probe P10; the doc comment naming 8e's extension). Accessor reviewed by an opus review against the gateway lane's spec (substituting the gateway lane, whose session was unavailable; parent approved 2026-10-03): approved with no amendment; its optional note (kernel §10 names 8e's extension too) taken. The two owner predicates are probed apart: P3 (`k.owner_id = ?1`) and P11 (the join's `c.owner_id = k.owner_id`, which no result can show, as connection ids are global keys; the owner audit catches it).
 
-Every code block below was built and tested in the scratch branch `scratch/4d-b3` off `b8cf8b3` (draft PR #113 runs CI on ubuntu and macOS), two commits per code task (the tests alone, then the task), one per write-back; the blocks were generated from those commits. The plan was then replayed from its own text, task by task, onto a fresh detached worktree of `b8cf8b3`: after each code task's Step 1 the tree matched that task's tests commit, and after each task the task's commit, file for file (blocks applied: Task 1 4 and 11, Task 2 5 and 26, Task 3 6, Task 4 9 and 30, Task 5 4; the second number counts the whole task, Step 1 included), and the final tree equalled the scratch's. On the scratch: `cargo fmt --all --check`, both clippy runs, `gen -- --check` and the workspace's tests are clean. `gen-view` does not exist on `b8cf8b3`. The first CI run (draft PR #113) was green on ubuntu; on macOS it showed the test through `up` needed short scratch names, since `<data>/collector/admin.sock` under the runner's long `TMPDIR` passed a Unix socket's limit and check 15 rightly said it could not ask (the test now uses `dw/d`, rerun locally under a 56-byte `TMPDIR`). The same run's `the_collector_serves_the_mcp_proxy_outside_the_operator_s_routes` failure (a connection reset) is in code this plan does not touch.
+Every code block below was built and tested in the scratch branch `scratch/4d-b3` off `b8cf8b3` (draft PR #113 ran CI on ubuntu and macOS), then rebased onto `ac2a727`, where `doctor/tests.rs` and `docs/README.md` merged by keeping both sides (main's check-10 tests beside check 15's, and both plans' lines), two commits per code task (the tests alone, then the task), one per write-back; the blocks were generated from those commits. The plan was then replayed from its own text, task by task, onto a fresh detached worktree of `ac2a727`: after each code task's Step 1 the tree matched that task's tests commit, and after each task the task's commit, file for file (blocks applied: Task 1 4 and 11, Task 2 5 and 26, Task 3 6, Task 4 9 and 30, Task 5 4; the second number counts the whole task, Step 1 included), and the final tree equalled the scratch's. On the scratch: `cargo fmt --all --check`, both clippy runs, `gen -- --check` and the workspace's tests are clean. `gen-view` does not exist on `ac2a727`. The first CI run (draft PR #113) was green on ubuntu; on macOS it showed the test through `up` needed short scratch names, since `<data>/collector/admin.sock` under the runner's long `TMPDIR` passed a Unix socket's limit and check 15 rightly said it could not ask (the test now makes its directory under `/tmp` whatever `TMPDIR` is, with short names; it passes under a 95-byte `TMPDIR` and a short one, and the old directory under the 95-byte `TMPDIR` fails as CI did). The test also runs the binary once first (`hennery_testkit::first_exec`, #118): macOS checks a new binary at its first exec, which would otherwise land inside the test's deadlines. The same run's `the_collector_serves_the_mcp_proxy_outside_the_operator_s_routes` failure (a connection reset) is in code this plan does not touch.
 
-The workspace has 1498 tests at `b8cf8b3` and 1517 after Task 4: Task 1 1506 (+8), Task 2 1511 (+5), Task 4 1517 (+6). Every revert-probe below was run on the scratch tree and caught (Task 1: 11, Task 2: 15, Task 4: 25).
+The workspace has 1536 tests at `ac2a727` and 1555 after Task 4: Task 1 1544 (+8), Task 2 1549 (+5), Task 4 1555 (+6). Every revert-probe below was run on the scratch tree and caught (Task 1: 11, Task 2: 15, Task 4: 25).
 
 ## Execution status
 
@@ -702,7 +702,7 @@ Other "Run:" lines only check: `cargo run -p hennery-proto --bin gen -- --check`
 
 - [ ] **Step 6: Check and commit**
 
-  Run: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` (1506 tests).
+  Run: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked` (1544 tests).
 
   ```bash
   git add crates/hennery-gateway crates/hennery-kernel crates/hennery-testkit/tests/owner_filter.rs
@@ -1008,11 +1008,15 @@ Other "Run:" lines only check: `cargo run -p hennery-proto --bin gen -- --check`
   #[test]
   fn up_warns_when_its_collector_holds_credentials_for_several_hats() {
       const LINE: &str = "holds MCP gateway credentials for 2 hats";
-      // Short names: `<data>/collector/admin.sock` must fit a Unix socket's
-      // path under a long `TMPDIR` (macOS CI), or the collector runs without
-      // it and doctor rightly says it cannot ask.
-      let dir = scratch_dir("dw");
-      let _cleanup = RemoveDir(dir.clone());
+      // Under `/tmp`, whatever `TMPDIR` is, with short names:
+      // `<data>/collector/admin.sock` must fit a Unix socket's path (104
+      // bytes on macOS), or the collector runs without it and doctor rightly
+      // says it cannot ask.
+      let scratch = tempfile::Builder::new().prefix("hdw").tempdir_in("/tmp").unwrap();
+      let dir = scratch.path().to_path_buf();
+      // Ahead of the deadlines below: macOS checks a new binary at its first
+      // exec.
+      hennery_testkit::first_exec(env!("CARGO_BIN_EXE_hennery"));
       let data = dir.join("d");
       let collector_dir = data.join("collector");
       let mut up = up_logging_to(&data, &dir.join("first.log"));
@@ -1779,7 +1783,7 @@ Other "Run:" lines only check: `cargo run -p hennery-proto --bin gen -- --check`
 
 - [ ] **Step 6: Check and commit**
 
-  Run: `cargo fmt --all --check`, both clippy runs, `cargo test --workspace --locked` (1511 tests).
+  Run: `cargo fmt --all --check`, both clippy runs, `cargo test --workspace --locked` (1549 tests).
 
   ```bash
   git add crates schema web/src/generated
@@ -2266,16 +2270,16 @@ PR 1 ends here.
   In `crates/hennery/src/doctor/tests.rs`, replace:
 
   ```rust
-      };
-      assert!(matches!(secret_files(&doctor), Finding::NotRun { number: 18, .. }));
+      assert_eq!(check.status, Status::Fail, "{check:?}");
+      assert!(check.summary.contains("host was revoked by the collector"), "{check:?}");
   }
   ```
 
   with:
 
   ```rust
-      };
-      assert!(matches!(secret_files(&doctor), Finding::NotRun { number: 18, .. }));
+      assert_eq!(check.status, Status::Fail, "{check:?}");
+      assert!(check.summary.contains("host was revoked by the collector"), "{check:?}");
   }
 
   /// Check 15 (plan 4d-B3) on a collector directory, answered by `answer`
@@ -3377,7 +3381,7 @@ PR 1 ends here.
 
 - [ ] **Step 6: Check and commit**
 
-  Run: `cargo fmt --all --check`, both clippy runs, `cargo test --workspace --locked` (1517 tests).
+  Run: `cargo fmt --all --check`, both clippy runs, `cargo test --workspace --locked` (1555 tests).
 
   ```bash
   git add crates
@@ -3504,7 +3508,7 @@ PR 1 ends here.
 
 ## Final checks
 
-`cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; `cargo clippy -p hennery --locked -- -D warnings`; `cargo test --workspace --locked` (1517); `cargo run --locked -p hennery-proto --bin gen -- --check`. Before each push: `git log --format='%ae' origin/main..HEAD` shows only the gmail address.
+`cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings`; `cargo clippy -p hennery --locked -- -D warnings`; `cargo test --workspace --locked` (1555); `cargo run --locked -p hennery-proto --bin gen -- --check`. Before each push: `git log --format='%ae' origin/main..HEAD` shows only the gmail address.
 
 ## After this plan
 
