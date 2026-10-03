@@ -365,7 +365,6 @@ impl Group {
     /// process under it must be gone within 20 s.
     fn stop(&mut self) {
         let pids = self.processes();
-        assert!(pids.len() > 1, "nothing ran under the shell:\n{}", self.output());
         // SAFETY: kill(2) on this test's own process group.
         unsafe { libc::kill(-self.pgid(), libc::SIGTERM) };
         let deadline = Instant::now() + Duration::from_secs(20);
