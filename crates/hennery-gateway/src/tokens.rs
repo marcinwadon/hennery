@@ -16,7 +16,7 @@
 
 use anyhow::Result;
 use hennery_kernel::secret::{random_bytes, sha256_hex};
-use rusqlite::{Transaction, params};
+use rusqlite::{OptionalExtension, Transaction, params};
 use zeroize::Zeroizing;
 
 /// What every session token starts with (plan 8d decision 1).
@@ -119,6 +119,34 @@ pub fn purge_hat_in(tx: &Transaction<'_>, owner_id: &str, hat_id: &str) -> Resul
         "DELETE FROM gw_session_tokens WHERE hat_id = ?1 AND owner_id = ?2",
         params![hat_id, owner_id],
     )?)
+}
+
+/// The hash of `session_id`'s token, revoked or not: what a mint
+/// supersedes and a revoke ends (`revocation::Cut`).
+pub(crate) fn session_hash_in(tx: &Transaction<'_>, owner_id: &str, session_id: &str) -> Result<Option<String>> {
+    Ok(tx
+        .query_row(
+            "SELECT token_hash FROM gw_session_tokens WHERE session_id = ?1 AND owner_id = ?2",
+            params![session_id, owner_id],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+/// The hashes of `host_id`'s live tokens, before `revoke_host_in`.
+pub(crate) fn live_host_hashes_in(tx: &Transaction<'_>, owner_id: &str, host_id: &str) -> Result<Vec<String>> {
+    let mut stmt = tx.prepare(
+        "SELECT token_hash FROM gw_session_tokens WHERE host_id = ?1 AND owner_id = ?2 AND revoked_at IS NULL",
+    )?;
+    let rows = stmt.query_map(params![host_id, owner_id], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The hashes of `hat_id`'s tokens, before `purge_hat_in`.
+pub(crate) fn hat_hashes_in(tx: &Transaction<'_>, owner_id: &str, hat_id: &str) -> Result<Vec<String>> {
+    let mut stmt = tx.prepare("SELECT token_hash FROM gw_session_tokens WHERE hat_id = ?1 AND owner_id = ?2")?;
+    let rows = stmt.query_map(params![hat_id, owner_id], |r| r.get(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
 #[cfg(test)]
