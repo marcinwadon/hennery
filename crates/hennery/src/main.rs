@@ -436,18 +436,7 @@ async fn run_collector(args: CollectorArgs) -> Result<()> {
     // credentials are stored, or that does not open them, stops the start
     // (plan 8a decision 8; `KeyUnavailable` tells that case apart).
     let keys = hennery_gateway::key::KeySource::from_env(&data_dir)?;
-    let gateway = hennery_gateway::open(&db, &keys, state.operator.clone())?;
-    // The gateway's proxy (plan 8d), `/mcp/<slug>`: bearer tokens, beside
-    // the operator's routes and outside them (lane L8), sending only
-    // through the kernel's egress policy, the collector's one `Egress`
-    // above, shared with Web Push.
-    let proxy = hennery_gateway::proxy::ProxyState::full(
-        std::sync::Arc::new(hennery_gateway::scope::ProxyStore::open(&db)?),
-        gateway.store.clone(),
-        gateway.key.clone(),
-        egress.clone(),
-        hennery_gateway::proxy::Limits::default(),
-    );
+    let (gateway, proxy) = start_gateway(&db, &keys, &state, &egress, hennery_gateway::probe::EVERY)?;
     state.offline_threshold = std::time::Duration::from_secs(args.host_offline_secs);
     hennery_sessions::offline::after_startup(&state);
     hennery_sessions::sweep::after_startup(&state);
@@ -1199,6 +1188,43 @@ async fn run_up(args: UpArgs) -> Result<std::process::ExitCode> {
             Ok(std::process::ExitCode::FAILURE)
         }
     }
+}
+
+/// The gateway on `db` (plans 8a, 8d, 8f), with the proxy on the same
+/// runtime, so a connection's refresh lock is one:
+/// - its `Notifier` is Web Push (lane L9): a connection moving into or out
+///   of `needs_auth` or `error` is a notice under its hat's push policy;
+/// - its OAuth calls go through the collector's one `egress`, shared with
+///   Web Push;
+/// - a problem already there is announced once (gateway spec §7); from
+///   here on, only transitions;
+/// - the probe of OAuth connections runs every `every` until shutdown.
+fn start_gateway(
+    db: &std::path::Path,
+    keys: &hennery_gateway::key::KeySource,
+    state: &AppState,
+    egress: &hennery_kernel::egress::Egress,
+    every: std::time::Duration,
+) -> Result<(hennery_gateway::api::GatewayState, hennery_gateway::proxy::ProxyState)> {
+    let gateway = hennery_gateway::open(
+        db,
+        keys,
+        state.operator.clone(),
+        egress.clone(),
+        std::sync::Arc::new(state.push.clone()),
+    )?;
+    gateway.runtime.announce_startup()?;
+    let proxy = hennery_gateway::proxy::ProxyState::for_sessions(
+        gateway.runtime.clone(),
+        hennery_gateway::proxy::Limits::default(),
+    );
+    tokio::spawn(hennery_gateway::probe::run(
+        gateway.runtime.clone(),
+        every,
+        hennery_gateway::probe::TICK_TIMEOUT,
+        state.shutdown.clone().cancelled_owned(),
+    ));
+    Ok((gateway, proxy))
 }
 
 /// Web Push delivery (plan 10b-ii): the state's notices go to a task that

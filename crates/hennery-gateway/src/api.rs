@@ -5,11 +5,10 @@
 //! (kernel spec §3.4; plan 8a decision 4). A token is never logged, never
 //! answered, and stored only sealed.
 
-use crate::key::MasterKey;
 use crate::model::{
     Change, ConnectionPatch, ConnectionRecord, CredKind, CredentialChange, NewConnection, url_for_logs,
 };
-use crate::store::GatewayStore;
+use crate::runtime::Runtime;
 use axum::extract::{DefaultBodyLimit, Extension, Path, State};
 use axum::handler::Handler;
 use axum::http::{HeaderValue, StatusCode, header};
@@ -32,9 +31,9 @@ const BODY_LIMIT: usize = 256 * 1024;
 
 #[derive(Clone)]
 pub struct GatewayState {
-    pub store: Arc<GatewayStore>,
-    /// What credentials are sealed with (gateway spec §6).
-    pub key: Arc<MasterKey>,
+    /// The stores, the key, the egress policy, the flows and the refresh
+    /// locks, shared with the proxy (plan 8f decision 3).
+    pub runtime: Arc<Runtime>,
     /// The owner and their sessions (kernel spec §3).
     pub operator: Arc<Operator>,
 }
@@ -167,7 +166,7 @@ fn changed(change: Change, status: StatusCode) -> Response {
 /// `GET /api/mcp/connections`: every connection, oldest first, without a
 /// secret.
 async fn list(State(state): State<GatewayState>) -> Response {
-    match state.store.list() {
+    match state.runtime.store.list() {
         Ok(records) => Json(records.into_iter().map(item).collect::<Vec<_>>()).into_response(),
         Err(err) => internal(err),
     }
@@ -189,7 +188,7 @@ async fn create(State(state): State<GatewayState>, ApiJson(req): ApiJson<CreateM
     if new.cred_kind.is_oauth() {
         return changed(Change::Unsupported(new.cred_kind), StatusCode::CREATED);
     }
-    match state.store.create(&new, unix_now()) {
+    match state.runtime.store.create(&new, unix_now()) {
         Ok(change) => {
             if let Change::Done(record) = &change {
                 tracing::info!(
@@ -233,10 +232,14 @@ async fn update(
         tool_allowlist: req.tool_allowlist,
         internal_network: req.internal_network,
     };
+    // Every credential write takes the connection's refresh lock (gateway
+    // spec §4.5): an origin or kind change deletes the grant, which a
+    // refresh in flight must not write back (G-13).
+    let _lock = state.runtime.lock(&id).await;
     if let Some(kind) = patch.cred_kind.filter(|kind| kind.is_oauth()) {
         return changed(Change::Unsupported(kind), StatusCode::OK);
     }
-    match state.store.update(&id, &patch, unix_now()) {
+    match state.runtime.store.update(&id, &patch, unix_now()) {
         Ok(change) => {
             if let Change::Done(record) = &change {
                 tracing::info!(
@@ -255,7 +258,8 @@ async fn update(
 /// `DELETE /api/mcp/connections/{id}` (step-up): 204, with its mounts and
 /// credential gone.
 async fn delete(State(state): State<GatewayState>, Path(id): Path<String>) -> Response {
-    match state.store.delete(&id) {
+    let _lock = state.runtime.lock(&id).await;
+    match state.runtime.store.delete(&id) {
         Ok(true) => {
             tracing::info!(connection_id = %id, "gateway connection deleted");
             StatusCode::NO_CONTENT.into_response()
@@ -272,7 +276,7 @@ async fn mounts(
     Path(id): Path<String>,
     ApiJson(req): ApiJson<McpMountsRequest>,
 ) -> Response {
-    match state.store.replace_mounts(&id, &req.host_ids) {
+    match state.runtime.store.replace_mounts(&id, &req.host_ids) {
         Ok(change) => {
             if let Change::Done(record) = &change {
                 tracing::info!(connection_id = %record.id, hosts = ?record.mounts, "gateway connection mounted");
@@ -290,9 +294,11 @@ async fn credential(
     Path(id): Path<String>,
     ApiJson(req): ApiJson<McpCredentialRequest>,
 ) -> Response {
+    let _lock = state.runtime.lock(&id).await;
     match state
+        .runtime
         .store
-        .set_static_credential(&id, &req.token, &state.key, unix_now())
+        .set_static_credential(&id, &req.token, &state.runtime.key, unix_now())
     {
         Ok(CredentialChange::Done) => {
             tracing::info!(connection_id = %id, "gateway connection's static credential set");
