@@ -85,16 +85,9 @@ class ConsumerFixtures:
             result = git('-C', str(source), 'hash-object', '-t', 'tag', '-w', '--stdin', input=raw)
             object_sha = result.stdout.strip()
             git('-C', str(source), 'update-ref', 'refs/tags/'+tag, object_sha)
-        metadata = {'schema': 3, 'repository': 'marcinwadon/hennery', 'tag': tag, 'source_sha': sha, 'tag_object': object_sha}
-        if case == 'wrong-metadata-source': metadata['source_sha'] = '0'*40
-        if case == 'wrong-metadata-tag': metadata['tag'] = 'v9.9.9'
-        if case == 'wrong-metadata-object': metadata['tag_object'] = '0'*40
-        if case == 'wrong-metadata-repository': metadata['repository'] = 'another/repository'
-        if case == 'wrong-metadata-schema': metadata['schema'] = 1
         payload_name = 'hennery-test.tar.xz' if installer else 'hennery-installer.sh'
         payload = b'archive fixture' if installer else b'#!/bin/sh\nprintf executed > "$INSTALL_MARKER"\n'
         (release / payload_name).write_bytes(payload)
-        (release / 'release-metadata.json').write_text(json.dumps(metadata))
         checksums = ''.join(hashlib.sha256(p.read_bytes()).hexdigest()+'  '+p.name+'\n' for p in sorted(release.iterdir()))
         if case == 'duplicate-checksum': checksums += checksums.splitlines()[0]+'\n'
         if case == 'malformed-checksum': checksums = checksums.replace('  ', ' ', 1)
@@ -104,14 +97,12 @@ class ConsumerFixtures:
         if case == 'cyclic-checksum': checksums += '0'*64+'  SHA256SUMS\n'
         if case == 'no-final-newline': checksums = checksums.rstrip('\n')
         (release / 'SHA256SUMS').write_text(checksums)
-        (release / 'release.sigstore.jsonl').write_text('offline provenance fixture\n')
+        (release / 'release.sigstore.jsonl').write_text('{"fixture":true}\n')
         attested = root/'attested'; shutil.copytree(release, attested)
         if case == 'tampered-installer': (release/payload_name).write_bytes(payload+b'tampered')
         if case == 'tampered-checksums': (release/'SHA256SUMS').write_text(checksums+' ')
-        if case == 'tampered-metadata': (release/'release-metadata.json').write_text('{}')
         if case == 'missing-bundle': (release/'release.sigstore.jsonl').unlink()
         if case == 'missing-checksums': (release/'SHA256SUMS').unlink()
-        if case == 'missing-metadata': (release/'release-metadata.json').unlink()
         (release/'github.asc').write_text(self.other_public if case == 'wrong-github-key' else self.public+self.other_public)
         (release/'keyserver.asc').write_text(self.other_public if case == 'wrong-keyserver-key' else self.public)
         (release/'main-readme').write_text('Fingerprint: '+('0'*40 if case == 'wrong-main-pin' else self.keys[0])+'\n')
@@ -146,7 +137,12 @@ base='https://github.com/marcinwadon/hennery/releases/download/'+os.environ['FIX
 names={'https://raw.githubusercontent.com/marcinwadon/hennery/refs/heads/main/README.md':'main-readme',
        'https://github.com/marcinwadon.gpg':'github.asc',
        'https://keys.openpgp.org/vks/v1/by-fingerprint/'+os.environ['FIXTURE_FINGERPRINT']:'keyserver.asc'}
-names.update({base+name:name for name in ['SHA256SUMS','release-metadata.json','release.sigstore.jsonl','hennery-installer.sh']})
+names.update({base+name:name for name in ['SHA256SUMS','hennery-installer.sh']})
+if url.startswith('https://api.github.com/users/marcinwadon/attestations/sha256:'):
+    import json
+    Path(args[args.index('-o')+1]).write_text(json.dumps({'attestations':[{'bundle_url':'https://fixture.invalid/bundle'}]}))
+    sys.exit(0)
+if url=='https://fixture.invalid/bundle': names[url]='release.sigstore.jsonl'
 if url not in names: sys.exit(99)
 path=Path(os.environ['FIXTURE_RELEASE'])/names[url]
 if not path.is_file(): sys.exit(22)
@@ -159,7 +155,7 @@ assert '--signer-workflow' not in a
 for flag,expected in {'--repo':'marcinwadon/hennery','--source-ref':'refs/tags/'+os.environ['FIXTURE_TAG'],'--source-digest':os.environ['FIXTURE_SHA'],'--signer-digest':os.environ['FIXTURE_SHA'],'--cert-identity':'https://github.com/marcinwadon/hennery/.github/workflows/release.yml@refs/tags/'+os.environ['FIXTURE_TAG'],'--cert-oidc-issuer':'https://token.actions.githubusercontent.com','--predicate-type':'https://slsa.dev/provenance/v1'}.items():
     assert a.count(flag)==1 and a[a.index(flag)+1]==expected
 assert '--deny-self-hosted-runners' in a
-subject=Path(a[2]); bundle=Path(a[a.index('--bundle')+1]); assert bundle.read_text()=='offline provenance fixture\\n'
+subject=Path(a[2]); bundle=Path(a[a.index('--bundle')+1]); assert bundle.read_text()=='{"fixture":true}\\n'
 assert subject.read_bytes()==(Path(os.environ['FIXTURE_ATTESTED'])/subject.name).read_bytes()
 case=os.environ['FIXTURE_CASE']
 if case=='branch-signer': sys.exit(1)
@@ -189,7 +185,9 @@ if case=='failed-attestation-status': sys.exit(1)
         path=root/'check.sh';path.write_text(script)
         home=root/'home';home.mkdir()
         marker=root/'executed'
-        env=dict(self.environment, PATH=str(tools),HOME=str(home),GNUPGHOME=str(home/'unused'),TMPDIR=str(self.root),INSTALL_MARKER=str(marker),FIXTURE_RELEASE=str(release),FIXTURE_FINGERPRINT=self.keys[0],FIXTURE_SOURCE=str(source),FIXTURE_SHA=sha,FIXTURE_ATTESTED=str(attested),FIXTURE_CASE=case,TEST_ROOT=str(root),HENNERY_RELEASE_CHECKSUMS=str(release/'SHA256SUMS'),HENNERY_RELEASE_METADATA=str(release/'release-metadata.json'),HENNERY_ATTESTATION_BUNDLE=str(release/'release.sigstore.jsonl'))
+        env=dict(self.environment, PATH=str(tools),HOME=str(home),GNUPGHOME=str(home/'unused'),TMPDIR=str(self.root),INSTALL_MARKER=str(marker),FIXTURE_RELEASE=str(release),FIXTURE_FINGERPRINT=self.keys[0],FIXTURE_SOURCE=str(source),FIXTURE_SHA=sha,FIXTURE_ATTESTED=str(attested),FIXTURE_CASE=case,TEST_ROOT=str(root),HENNERY_RELEASE_CHECKSUMS=str(release/'SHA256SUMS'),HENNERY_ATTESTATION_BUNDLE=str(release/'release.sigstore.jsonl'))
+        if not installer:
+            env.pop('HENNERY_ATTESTATION_BUNDLE', None)
         env['FIXTURE_TAG']=tag
         (root/'install-work').mkdir()
         result=subprocess.run([str(tools/'sh'),str(path)],env=env,cwd=root,capture_output=True,text=True)
@@ -197,8 +195,7 @@ if case=='failed-attestation-status': sys.exit(1)
 
 
 REFUSALS = ('unsigned-tag','lightweight-tag','malformed-signature','wrong-key-signature','wrong-release-tag',
-            'tampered-installer','tampered-checksums','tampered-metadata','missing-bundle','missing-checksums','missing-metadata',
-            'wrong-metadata-source','wrong-metadata-tag','wrong-metadata-object','wrong-metadata-repository','wrong-metadata-schema',
+            'tampered-installer','tampered-checksums','missing-bundle','missing-checksums',
             'duplicate-checksum','malformed-checksum','missing-payload-checksum','wrong-payload-checksum',
             'unsafe-checksum','cyclic-checksum','branch-signer',
 

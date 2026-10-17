@@ -1,10 +1,11 @@
 """Standard gh release hosting of already qualified files; never builds or clobbers."""
 import os
 from pathlib import Path
-import re
+import shutil
 import subprocess
 import tempfile
 
+import assets
 import contract
 import gate
 import verifier_process
@@ -54,13 +55,11 @@ def files(root, signatures, metadata):
                              for kind in ('provenance', 'image-sbom', 'binary-sbom')}
     gate.require({p.name for p in signatures.iterdir()} == expected_sidecars,
                  'unexpected/missing attestation sidecars')
-    paths = [p for directory in (root, signatures) for p in directory.iterdir()]
-    gate.require(len({p.name.casefold() for p in paths}) == len(paths)
-                 and all(re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', p.name) for p in paths),
-                 'unsafe or colliding release names')
-    for path in paths:
+    # Sidecars are still checked and used to authorize publication, but users
+    # receive only the archives, installer, one source, one SBOM and checksums.
+    for path in signatures.iterdir():
         contract.regular(path)
-    return {p.name: p.absolute() for p in paths}
+    return assets.files(root, metadata['targets'])
 
 
 def hashes(paths):
@@ -97,6 +96,7 @@ def release(root, signatures, authorize):
     metadata = authorize()
     paths = files(root, signatures, metadata)
     expected = hashes(paths)
+    private_signatures = hashes({p.name: p for p in Path(signatures).iterdir()})
     tag = metadata['tag']
     remote = view(tag)
     missing = reconcile(tag, remote, expected)
@@ -104,13 +104,15 @@ def release(root, signatures, authorize):
                  'immutable release is incomplete; use a new signed version')
 
     def boundary():
-        gate.require(authorize() == metadata and hashes(paths) == expected,
+        gate.require(authorize() == metadata and hashes(paths) == expected
+                     and hashes({p.name: p for p in Path(signatures).iterdir()}) == private_signatures,
                      'release authority or bytes changed before write')
 
     if remote is None:
         boundary()
         notes = ('Source: https://github.com/' + gate.REPOSITORY + '/tree/' + metadata['source_sha']
-                 + '\nSHA256SUMS: ' + expected[contract.CHECKSUMS] + '\n')
+                 + '\nSHA256SUMS: ' + expected[contract.CHECKSUMS] + '\n\n'
+                 + contract.regular(Path(root) / 'release-notes.md').decode())
         with tempfile.TemporaryDirectory(prefix='hennery-notes-') as temporary:
             note_file = Path(temporary) / 'notes.txt'
             note_file.write_text(notes)
@@ -123,7 +125,15 @@ def release(root, signatures, authorize):
         boundary()
         # No --clobber: interrupted parallel uploads resume by remote digest on
         # the next approved attempt. One CLI batch, with no per-asset policy loop.
-        checked('upload', tag, *(paths[name] for name in missing))
+        # The public digest list is an attested file in the private payload;
+        # gh uploads the same bytes under the consumer's SHA256SUMS name.
+        with tempfile.TemporaryDirectory(prefix='hennery-public-assets-') as temporary:
+            staged = {}
+            for name in missing:
+                staged[name] = Path(temporary) / name
+                shutil.copyfile(paths[name], staged[name])
+            gate.require(hashes(staged) == {name: expected[name] for name in missing}, 'public upload bytes changed')
+            checked('upload', tag, *(staged[name] for name in missing))
     gate.require(not reconcile(tag, view(tag), expected), 'release asset set incomplete')
     boundary()
     if remote['isDraft']:

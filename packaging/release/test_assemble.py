@@ -11,8 +11,8 @@ import assemble
 import gate
 
 
-def candidates(root):
-    for target in sorted(gate.TARGETS):
+def candidates(root, targets=None):
+    for target in sorted(gate.TARGETS if targets is None else targets):
         directory = root / ('candidate-' + target)
         directory.mkdir(parents=True)
         base = 'hennery-' + target

@@ -153,14 +153,16 @@ The tag-only `release.yml` calls read-only reusable `packaging.yml`. Prepare
 requires successful main-push core CI for the exact signed commit, builds the UI
 and audits dependencies once. Native builders share their archives with image,
 installer and Homebrew acceptance; Linux qualifies all seven crate tarballs.
-Every local channel acceptance runs for packaging PRs and releases, regardless
-of publication selection. No restored project build cache is used in releases.
+PRs run Linux packaging only; main/release add macOS. Core macOS smoke runs on
+main, with full macOS/ARM suites weekly. Crate acceptance runs on tags and PRs
+changing package metadata/version, dist configuration or crate packaging scripts;
+dependency-only Cargo and unrelated packaging edits skip it. No restored project build cache is used in releases.
 Actions remain commit-pinned. Native YAML dependencies and actionlint replace
 custom job-name, DAG and command-order policing.
 
 Build/acceptance jobs have read-only contents and no publishing secrets. The
-separate `attest` job alone adds OIDC/attestation write. It attests `SHA256SUMS`
-and every payload, then writes a run summary showing every asset/hash, bundle
+separate `attest` job alone adds OIDC/attestation write. It attests the private
+checksum list, public checksum list and every payload, then writes a run summary showing every asset/hash, bundle
 hash, tag/source, channels/targets and immutable artifact IDs.
 The maintainer approves that summary. There is no draft before approval; this
 is the deliberate trade-off for keeping all authorized draft mutation protected.
@@ -190,6 +192,25 @@ receive only an explicit credential-free allow-list and fresh private Git/GPG,
 GitHub CLI and Docker/ORAS configuration, including no GitHub or Actions/OIDC
 tokens. The crates writer asks the parent to revalidate over private pipes; it
 does not spawn a verifier with its upload token.
+
+GitHub receives exactly seven assets: three native archives, installer,
+`SHA256SUMS`, `hennery-source.tar.xz` and `hennery.spdx.json`. The source archive
+includes deduplicated corresponding dependency sources, including the five
+shipped MPL WebAuthn crates; see the [licence inventory and source scope](../packaging/release/README.md#assets-and-verification).
+Notices remain inside every native archive. Formula, per-file sums, per-target
+SBOM/advisory/source/builder records, runtime/licence findings, metadata,
+identity, dist manifests and Sigstore bundles stay in Actions artifacts or
+attestation inputs. Cargo-dist's redundant source archive is private too.
+Release notes go in the body and the formula goes to the tap.
+
+Public `SHA256SUMS` covers the other six downloads. Its internal frozen name is
+`public-SHA256SUMS`; upload copies those attested bytes under `SHA256SUMS`.
+The private full-payload checksum closure is retained for publisher/channel
+verification and recovery. Consumers fetch bundles anonymously by digest from
+GitHub, then use official `gh attestation verify --bundle`; they require neither
+an account/token nor public metadata/bundle assets. The exact README block
+checks alpha.3 as well as the lean asset set. A cached offline bundle can be
+provided separately.
 
 Consumers independently verify the signed tag, the attested canonical
 `SHA256SUMS` and each consumed payload. The exact certificate identity is

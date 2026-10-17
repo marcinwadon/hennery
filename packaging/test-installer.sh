@@ -2,7 +2,7 @@
 # The hardened shell installer (distribution spec §2, §9), run against the
 # archives of this build, served from a directory (`file://`):
 #   - each executable archive is offered, with its SHA-256 embedded;
-#     application and third-party source bundles are separate release assets;
+#     one corresponding-source archive is a separate release asset;
 #   - it installs a binary that runs, with `sha256sum` or with `shasum`;
 #   - a checksum mismatch aborts, and installs nothing;
 #   - no SHA-256 tool, an empty checksum, no checksum at all, or a checksum
@@ -130,14 +130,11 @@ echo "ok: the installer embeds each of its $count archives' SHA-256"
 # SHA256SUMS is independent of the installer's embedded checksum.
 command -v jq >/dev/null || fail 'jq is required for provenance fixtures'
 ln -s "$(command -v jq)" "$scratch/verifier-tools/jq"
-jq -n --arg tag "v$fixture_version" '{schema:3,repository:"marcinwadon/hennery",tag:$tag,source_sha:"1111111111111111111111111111111111111111",tag_object:"2222222222222222222222222222222222222222"}' > "$scratch/release-metadata.json"
 : > "$scratch/SHA256SUMS"
 for archive in $arms; do
     want=$(cut -d ' ' -f 1 "$dist/$archive.sha256")
     printf '%s  %s\n' "$want" "$archive" >> "$scratch/SHA256SUMS"
 done
-metadata_sha=$(shasum -a 256 "$scratch/release-metadata.json" | awk '{print $1}')
-printf '%s  release-metadata.json\n' "$metadata_sha" >> "$scratch/SHA256SUMS"
 LC_ALL=C sort -k2 "$scratch/SHA256SUMS" > "$scratch/ordered-sums"
 mv "$scratch/ordered-sums" "$scratch/SHA256SUMS"
 
@@ -149,7 +146,6 @@ run_installer() {
         HOME="$scratch/home" XDG_CONFIG_HOME="$scratch/home/.config" \
         HENNERY_ATTESTATION_BUNDLE="$scratch/bundle.jsonl" \
         HENNERY_RELEASE_CHECKSUMS="${TEST_CHECKSUMS:-$scratch/SHA256SUMS}" \
-        HENNERY_RELEASE_METADATA="${TEST_METADATA:-$scratch/release-metadata.json}" \
         HENNERY_DOWNLOAD_URL="file://$1" HENNERY_UNMANAGED_INSTALL="$2" \
         sh "$1/hennery-installer.sh" >"$3" 2>&1 || status=$?
     return "$status"

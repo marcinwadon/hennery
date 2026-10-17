@@ -48,18 +48,21 @@ def freeze(root):
     return freeze_payload(root, value, os.environ['GITHUB_REF_NAME'], os.environ['GITHUB_SHA'])
 
 
-def freeze_payload(root, value, tag, source):
+def freeze_payload(root, value, tag, source, targets=None):
     """Shared byte construction. Only configuration() authenticates a release."""
+    targets = sorted(gate.TARGETS) if targets is None else sorted(targets)
     gate.require(not gate.strict_json((root/'licence-findings.json').read_bytes())['findings'],'unresolved licence findings')
-    supply.require_contract(root,value['channels'],sorted(gate.TARGETS),tag)
+    supply.require_contract(root,value['channels'],targets,tag)
     # cargo-dist's legacy global checksum output is replaced, not authorized
     # alongside SHA256SUMS as a second global digest authority.
     legacy=root/'sha256.sum'
     if legacy.exists():
         contract.regular(legacy);legacy.unlink()
     metadata={'schema':3,'repository':gate.REPOSITORY,'source_sha':source,'tag':tag,
-              'tag_object':value['tag_object'],'channels':value['channels'],'targets':sorted(gate.TARGETS),
-              'binaries':supply.binary_inventory(root,sorted(gate.TARGETS))}
+              'tag_object':value['tag_object'],'channels':value['channels'],'targets':targets,
+              'binaries':supply.binary_inventory(root,targets)}
+    import assets
+    assets.files(root, targets)  # public inventory is frozen and attested with private inputs
     print(contract.freeze(root,metadata))
 
 

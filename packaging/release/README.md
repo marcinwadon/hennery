@@ -8,21 +8,52 @@ not claim reproducible builds or a maintainer signature over final payloads.
 
 ## Assets and verification
 
-`SHA256SUMS` is the canonical sorted checksum closure of the flat payload.
-Missing, extra, duplicate, case-ambiguous or linked files refuse. Bundles are
-kept separately to avoid checksum cycles. Metadata binds repository, signed tag
-object, source SHA, channels/targets and executable inventories. New schema 3
-has no producing-run fields. Alpha.3 schema 2 remains readable; its `attesting`
-field is historical data and conveys no authority.
+GitHub Releases contain seven assets: the three native archives,
+`hennery-installer.sh`, `SHA256SUMS`, `hennery-source.tar.xz` and
+`hennery.spdx.json` (one combined SPDX document). Each native archive contains
+`THIRD-PARTY-NOTICES.txt`; it is not a separate download. The source archive
+contains this tagged tree and deduplicated dependency sources under
+`hennery-source/third-party/`. Cargo-dist's additional source archive, per-file
+checksum sidecars, formula, manifests, advisories and attestation bundles are
+not public release assets. Release notes are the release body; the formula
+is delivered to the tap.
 
-`contract.py` freshly authenticates the annotated signed tag and invokes the
-supported `gh attestation verify` for the checksum list and every payload. It
-requires repository, exact `release.yml@refs/tags/<tag>` certificate identity,
-source ref/digest, signer digest, GitHub OIDC issuer, SLSA predicate and hosted
-runners. The CLI validates subject digests and cryptography. No certificate JSON
-layout or `runInvocationURI` is parsed; another valid attestation of identical
-bytes from that signed source is acceptable. Standalone consumers no longer
-accept `--run-id` or `--attesting-attempt`.
+The five shipped MPL-2.0 crates at 0.5.5 are `base64urlsafedata`,
+`webauthn-attestation-ca`, `webauthn-rs`, `webauthn-rs-core` and
+`webauthn-rs-proto`. Their source must remain available even when unmodified
+([Mozilla's distribution guidance](https://www.mozilla.org/en-US/MPL/2.0/FAQ/)).
+`webauthn-authenticator-rs` is test-only. `r-efi` permits MIT or Apache-2.0 as
+alternatives to LGPL; the production frontend dependencies are MIT, ISC or
+BSD-3-Clause. No GPL/LGPL-only dependency was found. Hennery's own
+[AGPL corresponding-source obligations](../../LICENSE) also cover the linked
+work: do not discard permissively licensed linked source merely because the
+dependency's own licence permits binary-only distribution. Keep the shipped
+CLI's normal/build Cargo dependency closure and production frontend packages,
+with vendored native source and licence texts. Exclude unrelated workspace/test
+dependencies and frontend development tools. Identical files from the three
+native builders are stored once; conflicting source bytes refuse assembly.
+
+Public `SHA256SUMS` covers exactly the other six public files. Internally the
+same bytes are frozen and attested as `public-SHA256SUMS`, then copied under
+`SHA256SUMS` for upload. Official provenance verifies subject digests, independent
+of that filename. The full private qualification payload retains its own
+`SHA256SUMS`, metadata, sidecars and per-target materials as an immutable Actions
+artifact; publisher/channel acceptance still checks that complete closure.
+
+`verify.py` accepts the seven-file download directory. It freshly authenticates
+the annotated signed tag and invokes supported `gh attestation verify` for
+public checksums and every payload. README/installer authenticate checksums
+and each consumed payload before execution/extraction. They retrieve bundles
+by digest through GitHub's [anonymous public attestation endpoint](https://docs.github.com/en/rest/users/attestations#list-attestations),
+then use the CLI with `--bundle`; no login or token is required. An optional
+cached bundle may be supplied outside the public download directory. Bundle
+transport is untrusted: cryptography, repository, exact
+`release.yml@refs/tags/<tag>` certificate identity, source ref/digest, signer
+digest, GitHub OIDC issuer, SLSA predicate and hosted runners are all enforced.
+No certificate JSON layout or invocation URI is parsed. Another valid
+attestation of identical bytes from that signed source is acceptable. Legacy
+schema-2 alpha.3 and private schema-3 qualification directories remain readable;
+producing-run fields convey no authority.
 
 The real pinned-CLI test uses genuine alpha.3 checksums, metadata and bundle,
 with the existing Sigstore trust-root snapshot and no network or account.
@@ -39,18 +70,22 @@ verification bridge. Authenticate source before evaluating a release flake.
 
 ## Workflow and credentials
 
-Read-only `packaging.yml` runs the same nine packaging jobs for packaging-input
-PRs/main and tags. Prepare builds UI/audits once; three native builders reuse
-musl binaries for images. Linux qualifies all seven crates. Assembly reuses
-archives for installers/formula, then three native jobs accept installer and
-Homebrew, with one packaged CLI install on macOS. Required native YAML `needs`
-and failure propagation govern acceptance. Actionlint and a small static test
-cover syntax/dependencies, tag-only publication, permissions, one protected
-publisher and pinned actions. The channel/name registry, rehearsal compiler and
-bespoke workflow/DAG policy are removed.
+Read-only `packaging.yml` shares construction between packaging-input PRs,
+main and tags. PRs use Linux only, including the Nix and README recipes in core
+CI. Main retains macOS smoke and native packaging/recipes; scheduled maintenance
+runs the full macOS/ARM suites weekly. Prepare builds UI/audits once; native
+builders reuse musl binaries for images. The expensive seven-crate acceptance
+runs on release tags and PRs changing package metadata/version, dist configuration
+or crate packaging scripts. Dependency-only Cargo changes and unrelated
+`packaging/**` changes do not select it; there is no duplicate main-push crates
+acceptance. Assembly still accepts installers/formula and OCI using the archives
+that actually ran, with native installer/Homebrew checks for those platforms.
+Selected failures stop consumers; intentional crates skips permit assembly.
+Actionlint and a small static test cover tag-only publication, permissions,
+one protected publisher and pinned actions.
 
 Tags select channels directly: prereleases use GitHub only, stable uses all four.
-All channels receive local acceptance on packaging PRs. Unselected crate/OCI
+Local acceptance follows the platform/crate selection above. Unselected crate/OCI
 materials are removed from the publishable payload before freezing. PRs have no
 publication secrets, OIDC or attestation authority. Release prepare authenticates
 the signed tag/version/source and waits for main-push CI for the exact commit.
@@ -91,7 +126,7 @@ image digest and attaches these exact bundles with standard Skopeo/ORAS transpor
 
 The former standalone `release-tests` workflow is consolidated: the exact README
 bootstrap runs in `ci/checks`, while real cargo-dist staging/advisory regressions
-run on all three existing native archive builders. Native installer acceptance
+run on the selected native archive builders (Linux on PRs; all three on main/tags). Native installer acceptance
 already consumes the assembled archives on all three targets. There are four
 core workflows (`ci`, packaging, release, scheduled maintenance) plus `pins`.
 
@@ -99,9 +134,12 @@ core workflows (`ci`, packaging, release, scheduled maintenance) plus `pins`.
 
 Local provenance and image/binary SPDX bundles are checked against accepted
 index/platform manifests before registry login. Standard `oras attach` delivers
-bundles by immutable subject digest. Remote readback uses the supported verifier
+bundles by immutable subject digest. Publisher remote readback uses the supported verifier
 with `--bundle-from-oci`, exact source/tag/workflow identity and provenance/SPDX
-predicates. A deterministic seven-referrer layout and fixed timestamps are not
+predicates. Public `verify.py --image` instead retrieves provenance/SPDX
+bundles by image digest from GitHub, with the same signed-tag/source constraints;
+private qualification also binds the image to the accepted native binary inventory.
+A deterministic seven-referrer layout and fixed timestamps are not
 required; duplicate valid attachments on retry are acceptable.
 
 Retry only publication with renewed environment approval and original artifact

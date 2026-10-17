@@ -64,6 +64,23 @@ def rust_packages(cargo):
     return [p for p in cargo['packages'] if p['id'] in reachable]
 
 
+def corresponding_packages(cargo):
+    """The shipped CLI's normal/build closure; unrelated workspace/dev tools are excluded."""
+    if not cargo.get('resolve'):
+        return cargo['packages']
+    nodes = {node['id']: node for node in cargo['resolve']['nodes']}
+    roots = [p['id'] for p in cargo['packages'] if p['name'] == 'hennery' and p['id'] in cargo['workspace_members']]
+    gate.require(len(roots) == 1, 'corresponding source requires the shipped CLI root')
+    reachable, todo = set(), roots
+    while todo:
+        identifier = todo.pop()
+        if identifier not in reachable:
+            reachable.add(identifier)
+            todo.extend(dep['pkg'] for dep in nodes[identifier]['deps']
+                        if any(kind['kind'] in (None, 'build') for kind in dep['dep_kinds']))
+    return [p for p in cargo['packages'] if p['id'] in reachable]
+
+
 def supplemental(ecosystem, name, version):
     root = Path(__file__).resolve().parent / 'licences'
     path = root / 'manifest.json'
@@ -159,7 +176,7 @@ def freeze(root, metadata):
 def dependency_sources(cargo, frontend, destination, prepared_frontend=None):
     # Include registry source, native vendored source (OpenSSL, SQLite), web
     # packages and licence texts. No managed Node or agent downloads.
-    roots = [('cargo', p['name'], p['version'], Path(p['manifest_path']).parent) for p in rust_packages(cargo) if p.get('source')]
+    roots = [('cargo', p['name'], p['version'], Path(p['manifest_path']).parent) for p in corresponding_packages(cargo) if p.get('source')]
     roots += [(ecosystem, name, version, root) for name, version, _, root, ecosystem in frontend_sources(frontend)]
     seen = set()
     # Materialize filesystem hardlinks as regular bytes for the later merge.
