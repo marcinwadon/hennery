@@ -78,11 +78,10 @@ def freeze_proof(source, destination, tag, targets, source_sha):
     for name in ['hennery.rb', *['hennery-' + t + '.tar.xz' for t in targets]]:
         shutil.copyfile(Path(source) / name, destination / name)
     import contract
-    # This unsigned PR proof has no authority. The placeholder object and run
+    # This unsigned PR proof has no authority. The placeholder tag object
     # cannot satisfy the authenticated publishing context.
-    contract.freeze(destination, {'schema': 2, 'repository': gate.REPOSITORY, 'source_sha': source_sha,
-                    'tag': tag, 'tag_object': '0' * 40, 'channels': ['github'], 'targets': sorted(targets),
-                    'attesting': {'run_id': 1, 'run_attempt': 1}})
+    contract.freeze(destination, {'schema': 3, 'repository': gate.REPOSITORY, 'source_sha': source_sha,
+                    'tag': tag, 'tag_object': '0' * 40, 'channels': ['github'], 'targets': sorted(targets)})
 
 
 if __name__ == '__main__':

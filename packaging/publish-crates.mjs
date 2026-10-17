@@ -70,7 +70,7 @@ export function releaseCratesDigest(dir) {
  requireThat(names.join('\n')===[...entries.keys()].join('\n'),'global checksum closure differs');
  for(const name of names){const path=join(dir,name);requireThat(fs.lstatSync(path).isFile() && !fs.lstatSync(path).isSymbolicLink() && sha256(fs.readFileSync(path))===entries.get(name),'global payload differs: '+name);}
  const root=readJSON(join(dir,'release-metadata.json')),inventory=readJSON(join(dir,'crates-inventory.json'));
- requireThat(root.schema===2 && root.repository==='marcinwadon/hennery' && root.channels?.includes('crates') && root.channels.includes('github') && root.source_sha===inventory.source.sha && root.tag===`v${inventory.version}`,'release crate source/tag/channel differs');
+ requireThat([2,3].includes(root.schema) && root.repository==='marcinwadon/hennery' && root.channels?.includes('crates') && root.channels.includes('github') && root.source_sha===inventory.source.sha && root.tag===`v${inventory.version}`,'release crate source/tag/channel differs');
  requireThat(inventory.source.url===`https://github.com/marcinwadon/hennery/releases/download/${root.tag}/hennery-source-${root.source_sha}.tar.gz`,'release source URL differs');
  verifyCandidate(dir,inventory);
  return entries.get('crates-inventory.json');

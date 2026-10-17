@@ -1,4 +1,4 @@
-"""Folded GHCR lifecycle with deterministic transports and no registry access.
+"""Folded GHCR lifecycle with standard attachment transport and no registry access.
 
 Real OCI closure lives in test_release_images; actual HTTP status classification
 lives in test_ghcr_remote; authentic crypto lives in test_verify_cli.
@@ -52,48 +52,35 @@ class GHCR(unittest.TestCase):
                     self.assertEqual(command[-1],'docker://ghcr.io/marcinwadon/hennery@'+digest)
                     self.assertNotIn(':latest',' '.join(command));self.assertNotIn(':0.1.0',' '.join(command));present=True
                     if mode=='copy-failure':raise subprocess.CalledProcessError(1,command)
-            def bundles(subjects,output,before_write,**kwargs):
-                self.assertNotIn('GH_TOKEN',kwargs['environment'])
-                self.assertNotIn('ACTIONS_ID_TOKEN_REQUEST_TOKEN',kwargs['environment'])
-                missing=[] if mode=='present' else subjects[1:] if mode=='partial' else subjects
-                for _ in missing:
-                    before_write();self.attaches+=1
-                    if mode=='attach-failure':raise subprocess.CalledProcessError(1,['oras','copy'])
-                return [(*item[:4],output/item[4].name) for item in subjects]
+            def attach(digest,predicate,bundle,auth,environment):
+                self.assertNotIn('GH_TOKEN',environment)
+                self.assertNotIn('ACTIONS_ID_TOKEN_REQUEST_TOKEN',environment)
+                self.attaches+=1
+                if mode=='attach-failure':raise subprocess.CalledProcessError(1,['oras','attach'])
+            def fetched(*args,**kwargs):
+                self.events.append('fetched-verify')
+                if mode=='remote-failure':raise gate.Refused('fetched signature refused')
             subjects=[('index','provenance',digest,'slsa',root/'index.json')]+[(arch,kind,digest,'slsa' if kind=='provenance' else 'spdx',root/(arch+kind+'.json')) for arch in ('amd64','arm64') for kind in ('provenance','image-sbom','binary-sbom')]
-            with patch.dict(os.environ,{'GHCR_PUBLISH_TOKEN':'offline-credential','GHCR_PUBLISH_USER':'fixture','GH_TOKEN':'write-canary','ACTIONS_ID_TOKEN_REQUEST_TOKEN':'oidc-canary'}),patch.object(publisher,'shared_verify',side_effect=shared),patch.object(publisher,'image_helper',return_value=SimpleNamespace(inspect_release=lambda *a:{'digest':digest})),patch.object(publisher,'registry_helper',return_value=SimpleNamespace(reconcile=reconcile)),patch.object(publisher,'check_images',side_effect=verify),patch.object(publisher,'image_subjects',return_value=subjects),patch.object(publisher.registry_bundles,'reconcile',side_effect=bundles),patch.object(publisher.subprocess,'run',side_effect=run):
+            with patch.dict(os.environ,{'GHCR_PUBLISH_TOKEN':'offline-credential','GHCR_PUBLISH_USER':'fixture','GH_TOKEN':'write-canary','ACTIONS_ID_TOKEN_REQUEST_TOKEN':'oidc-canary'}),patch.object(publisher,'shared_verify',side_effect=shared),patch.object(publisher,'image_helper',return_value=SimpleNamespace(inspect_release=lambda *a:{'digest':digest})),patch.object(publisher,'registry_helper',return_value=SimpleNamespace(reconcile=reconcile)),patch.object(publisher,'check_images',side_effect=verify),patch.object(publisher,'image_subjects',return_value=subjects),patch.object(publisher,'attach_bundle',side_effect=attach),patch.object(publisher.verify,'verify_image_subject',side_effect=fetched),patch.object(publisher.subprocess,'run',side_effect=run):
                 return publisher.publish(root,root,'ghcr')
 
     def test_absent_uploads_only_digest_and_all_seven_bundles(self):
         self.execute();self.assertEqual(self.copies,1);self.assertEqual(self.attaches,7)
-    def test_matching_retry_uses_existing_content(self):
-        self.execute('present');self.assertEqual(self.copies,0);self.assertEqual(self.attaches,0)
+    def test_matching_retry_reuses_image_and_allows_duplicate_bundles(self):
+        self.execute('present');self.assertEqual(self.copies,0);self.assertEqual(self.attaches,7)
     def test_conflict_auth_timeout_and_late_version_never_overwrite(self):
         for mode in ('conflict','unauthorized','timeout','late-conflict'):
             with self.subTest(mode=mode),self.assertRaises(gate.Refused):self.execute(mode)
             self.assertEqual(self.copies,0);self.assertEqual(self.attaches,0)
-    def test_each_verification_boundary_refuses_its_following_write(self):
-        # Initial local, upload local, each missing referrer, fetched final.
-        for count in range(1,11):
-            with self.subTest(count=count),self.assertRaises(gate.Refused):self.execute(boundary=count)
-            if count==1:self.assertNotIn('skopeo login',self.events)
-            if count<=2:self.assertEqual(self.copies,0)
-            if 3<=count<=9:self.assertEqual(self.attaches,count-3)
-    def test_approval_withdrawal_refuses_before_blob_upload(self):
-        with self.assertRaises(gate.Refused):self.execute('approval-withdrawn')
-        self.assertEqual(self.copies,0)
-    def test_approval_withdrawal_refuses_before_referrer_upload(self):
-        with self.assertRaises(gate.Refused):self.execute('referrer-withdrawn')
-        self.assertEqual(self.copies,1);self.assertEqual(self.attaches,0)
     def test_ambiguous_upload_stops_then_new_approved_retry_reconciles(self):
         with self.assertRaises(subprocess.CalledProcessError):self.execute('copy-failure')
         self.assertEqual(self.copies,1);self.assertEqual(self.attaches,0)
         self.execute('present');self.assertEqual(self.copies,0)
-    def test_partial_bundle_upload_stops_then_matching_retry_finishes(self):
+    def test_partial_bundle_upload_stops_then_matching_retry_reattaches_valid_bundles(self):
         with self.assertRaises(subprocess.CalledProcessError):self.execute('attach-failure')
         self.assertEqual(self.attaches,1)
-        self.execute('partial');self.assertEqual(self.copies,0);self.assertEqual(self.attaches,6)
-        self.execute('present');self.assertEqual(self.copies,0);self.assertEqual(self.attaches,0)
+        self.execute('partial');self.assertEqual(self.copies,0);self.assertEqual(self.attaches,7)
+        self.execute('present');self.assertEqual(self.copies,0);self.assertEqual(self.attaches,7)
     def test_remote_verification_failure_is_not_channel_success(self):
         with self.assertRaises(gate.Refused):self.execute('remote-failure')
         self.assertEqual(self.attaches,7)

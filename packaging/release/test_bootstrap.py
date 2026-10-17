@@ -51,7 +51,7 @@ class Bootstrap(ConsumerFixtures,unittest.TestCase):
 
     def test_refusals_do_not_depend_on_shell_errexit(self):
         for tool in ('sha256sum','shasum'):
-            for case in ('unsigned-tag','tampered-checksums','tampered-installer','wrong-run','wrong-attempt','duplicate-checksum'):
+            for case in ('unsigned-tag','tampered-checksums','tampered-installer','duplicate-checksum'):
                 with self.subTest(case=case,tool=tool):
                     result,marker=self.fixture(case,documented_script(),hash_tool=tool,conditional=True)
                     self.assertNotEqual(result.returncode,0,'conditional accepted '+case)

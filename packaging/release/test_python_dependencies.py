@@ -40,22 +40,3 @@ assert importlib.util.find_spec('yaml') is None, 'fixture must have no PyYAML'
                 assert len(list(output.glob('*.tar.xz')))==2*len(gate.TARGETS)+1
         ''')
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
-
-    def test_missing_parser_refuses_runtime_binding_instead_of_skipping_it(self):
-        result=self.bare("""
-            import workflow_policy
-            try: workflow_policy.load_workflow(b'jobs: {crates: {name: crates}}')
-            except ValueError as error: assert 'workflow parser unavailable' in str(error),str(error)
-            else: raise AssertionError('missing parser authorized workflow')
-        """)
-        self.assertEqual(result.returncode,0,result.stdout+result.stderr)
-
-    def test_workflow_policy_cannot_pass_without_parser(self):
-        result=self.bare('''
-            from pathlib import Path
-            import workflow_policy
-            try: workflow_policy.check_repository(Path(sys.path[0]).parents[1])
-            except ValueError as error: assert 'workflow parser unavailable' in str(error),str(error)
-            else: raise AssertionError('CI workflow policy must refuse without its parser')
-        ''')
-        self.assertEqual(result.returncode,0,result.stdout+result.stderr)

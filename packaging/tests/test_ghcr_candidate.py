@@ -73,24 +73,15 @@ class ReleaseFixture(CandidateFixtures):
     def freeze(self, changes=None):
         for name in (contract.METADATA, contract.CHECKSUMS):
             (self.candidate / name).unlink(missing_ok=True)
-        value = {'schema': 2, 'repository': gate.REPOSITORY, 'source_sha': self.revision,
+        value = {'schema': 3, 'repository': gate.REPOSITORY, 'source_sha': self.revision,
                  'tag': 'v' + self.version, 'tag_object': 'b' * 40, 'channels': ['ghcr','github'],
-                 'targets': sorted(TARGETS.values()), 'attesting': {'run_id':10,'run_attempt':1},
+                 'targets': sorted(TARGETS.values()),
                  'binaries': supply.binary_inventory(self.candidate, sorted(TARGETS.values()))}
         contract.freeze(self.candidate, value | (changes or {}))
         self.inventory = contract.load(self.candidate)
 
     def crypto(self, command, **kwargs):
-        # Structural fields use the real gh 2.101.0 flattened certificate shape;
-        # authentic pinned-CLI cryptography is tested in test_verify_cli.py.
-        certificate = {'sourceRepositoryURI':'https://github.com/' + gate.REPOSITORY,
-                       'buildSignerURI':'https://github.com/' + gate.REPOSITORY + '/' + contract.WORKFLOW + '@refs/tags/v0.1.0',
-                       'sourceRepositoryRef':'refs/tags/v0.1.0', 'sourceRepositoryDigest':self.revision,
-                       'buildSignerDigest':self.revision, 'runnerEnvironment':'github-hosted',
-                       'issuer':'https://token.actions.githubusercontent.com',
-                       'runInvocationURI':'https://github.com/' + gate.REPOSITORY + '/actions/runs/10/attempts/1'}
-        return subprocess.CompletedProcess(command, 0, gate.canonical([{
-            'verificationResult':{'signature':{'certificate':certificate}}}]).decode(), '')
+        return subprocess.CompletedProcess(command, 0, 'verified', '')
 
     def assembled(self):
         helper = load_helper(self)
@@ -141,7 +132,7 @@ class Candidate(ReleaseFixture, unittest.TestCase):
 
     def test_stale_metadata_and_missing_ghcr_or_linux_target_refuse(self):
         helper = self.assembled()
-        stale = copy.deepcopy(self.inventory); stale['attesting']['run_id'] = 11
+        stale = copy.deepcopy(self.inventory); stale['source_sha'] = 'b' * 40
         with self.assertRaisesRegex(gate.Refused,'metadata changed'):
             helper.inspect_release(self.candidate,self.work,stale)
         for changes in ({'channels':['github']},{'targets':[TARGETS['amd64']]}):
@@ -253,7 +244,7 @@ class Consumer(ReleaseFixture, unittest.TestCase):
     def call(self,digest,**kwargs):
         return release_verify.verify_image('ghcr.io/marcinwadon/hennery@'+digest,'v0.1.0',
             release_directory=self.candidate,release_bundle=self.root/'bundle',source_sha=self.revision,
-            run_id=10,attesting_attempt=1,**kwargs)
+            **kwargs)
 
     def test_tag_authentication_precedes_sigstore(self):
         with patch('tag_signature.verify',side_effect=gate.Refused('bad tag')),patch.object(release_verify.subprocess,'run') as external:
@@ -277,7 +268,7 @@ class Consumer(ReleaseFixture, unittest.TestCase):
             with self.subTest(field=field,value=value),patch.object(release_verify.subprocess,'run') as external,self.assertRaises(gate.Refused):self.call(self.index['digest'])
             external.assert_not_called()
 
-    def test_every_authenticated_platform_and_index_has_exact_tag_source_and_run(self):
+    def test_every_authenticated_platform_and_index_has_exact_tag_and_source(self):
         for digest in [self.index['digest'],*self.index['platforms'].values()]:
             calls=[]
             def crypto(command,**kwargs):
@@ -289,7 +280,7 @@ class Consumer(ReleaseFixture, unittest.TestCase):
                 'https://github.com/'+gate.REPOSITORY+'/'+contract.WORKFLOW+'@refs/tags/v0.1.0')
 
     def test_source_metadata_cannot_change_between_root_and_image_authentication(self):
-        changed=copy.deepcopy(self.inventory);changed['attesting']['run_attempt']=2
+        changed=copy.deepcopy(self.inventory);changed['source_sha']='b'*40
         with patch.object(release_verify,'verify',return_value=changed),patch.object(release_verify,'verify_image_subject'),self.assertRaisesRegex(gate.Refused,'changed before'):
             self.call(self.index['digest'])
 

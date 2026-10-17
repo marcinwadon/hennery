@@ -1,9 +1,4 @@
 {
-  "maintainer_touch": {
-    "confirmed": false,
-    "fingerprint": "F26C7F594DFE84D131703AFC23E5A318AE8D2861",
-    "policy": "on"
-  },
   "homebrew": {
     "repository": "marcinwadon/homebrew-tap",
     "branch": "main",

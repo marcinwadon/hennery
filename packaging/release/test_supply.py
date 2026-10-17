@@ -146,9 +146,9 @@ class Supply(unittest.TestCase):
             (root / 'dist-manifest.json').write_text('{}')
             findings = root / 'licence-findings.json'
             findings.write_bytes(gate.canonical({'findings': ['unresolved']}))
-            metadata = {'schema': 2, 'repository': gate.REPOSITORY, 'source_sha': 'a' * 40,
+            metadata = {'schema': 3, 'repository': gate.REPOSITORY, 'source_sha': 'a' * 40,
                         'tag': 'v0.1.0-alpha.1', 'tag_object': 'b' * 40, 'channels': ['github'],
-                        'targets': targets, 'attesting': {'run_id': 10, 'run_attempt': 1}}
+                        'targets': targets}
             with self.assertRaisesRegex(gate.Refused, 'unresolved licence'):
                 supply.freeze(root, metadata)
             findings.write_bytes(gate.canonical({'findings': []}))

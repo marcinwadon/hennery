@@ -12,7 +12,6 @@ import unittest
 import assemble
 import gate
 import test_assemble
-import workflow_policy
 
 ROOT = Path(__file__).resolve().parents[2]
 

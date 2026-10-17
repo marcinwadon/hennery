@@ -1,30 +1,28 @@
 # Release process
 
-The operator's 2026-10-16 decision replaces the former candidate/storage and
-inventory-signature process. Publication remains disabled until the maintainer
-explicitly qualifies and enables it. The latest operator decision (2026-10-16)
-enables all channels for the first release without waiting for a first-release
-positive fixture. The crates bootstrap token is set in `release`, the Homebrew
-tap exists, and the operator supplies the Homebrew/GHCR tokens. Building or
-fixing this pipeline performs no publication or external settings change.
+The operator approved the CI/release simplification on 2026-10-17. Alpha.3 has
+shipped through the previous pipeline; its genuine offline attestation fixture
+is retained under `packaging/release/fixtures/alpha3`. Stable releases publish
+all four channels; prereleases publish GitHub only. Merging pipeline changes
+never authorizes a tag, publication, credential or settings change. The operator
+separately authorizes hosted prerelease qualification before retiring the old
+publisher in the final migration step.
 
 ## Trust and maintainer setup
 
 The maintainer reviews the source and `.github/workflows/release.yml`, then
 creates a YubiKey-signed annotated `v<version>` tag. The signing fingerprint is
-`F26C7F594DFE84D131703AFC23E5A318AE8D2861`. Require a physical touch for signing;
-prefer the YubiKey signing-slot touch policy `on`. The optional `cached-fixed`
-policy permits a short reuse window and has different custody implications.
-Confirm that an accessible software copy cannot defeat this expectation. A
-remote test cannot prove touch configuration. `tag_signature.py` verifies the
-freshly fetched annotated object, its direct commit target and the pinned key
-in an isolated public-only keyring.
+`F26C7F594DFE84D131703AFC23E5A318AE8D2861`. A physical touch is not a release
+requirement. `tag_signature.py` verifies a freshly fetched annotated object,
+its direct commit target and the pinned key in an isolated public-only keyring.
+The signing key's custody remains the maintainer's responsibility.
 
-The source signature authorizes source. GitHub/Sigstore provenance binds the
-built bytes to the exact tagged workflow, source SHA and original run/attempt.
-Runners, compiler/dependencies, GitHub/OIDC/Sigstore and installed verifier tools
-remain trusted. This process does not claim reproducible builds or a later
-hardware signature over bytes.
+The source signature authorizes source. GitHub/Sigstore provenance binds payload
+digests to the exact tag/workflow and source SHA, without binding a unique run or
+attempt. Another valid attestation of identical bytes from that signed source is
+accepted. Runners, compiler/dependencies, GitHub/OIDC/Sigstore and installed
+verifier tools remain trusted. This does not claim reproducible builds or a
+later hardware signature over bytes.
 
 The `release` environment, tag rulesets and immutable-release setting are
 already configured, according to the parent. The maintainer verifies their
@@ -62,9 +60,9 @@ Switches default off; only the operator changes their platform values:
 `RELEASE_PUBLICATION_ENABLED`, `RELEASE_GITHUB_ENABLED`,
 `RELEASE_HOMEBREW_ENABLED`, `RELEASE_CRATES_ENABLED`, `RELEASE_GHCR_ENABLED`
 and the temporary `RELEASE_CRATES_BOOTSTRAP_ENABLED`.
-The reviewed `packaging/release/channels.json` initially selects only `github`.
-A channel needs both signed-source selection and its switch; additional channels
-also need successful immutable GitHub publication. Prereleases are GitHub-only.
+Channel selection is fixed by tag: prereleases use GitHub only; stable uses
+GitHub, Homebrew, crates.io and GHCR. The corresponding switches must also permit
+publication. Additional channels require complete immutable GitHub publication.
 
 Long-lived channel credentials exist only as `release` environment secrets and
 are passed only to their final channel step, after verification. Homebrew uses
@@ -88,34 +86,24 @@ can write if setup is wrong; it was not run during implementation.
 
 `settings_audit.py` is a maintainer-local inspection helper, never called by a
 publisher. It checks the signed tag before using the maintainer's own settings
-access and records API settings plus explicitly confirmed registry/touch
+access and records API settings plus explicitly confirmed registry
 observations. Its `--payload`, `--observations` and create-only `--output` inputs
 produce a local acceptance record. This report is neither publication authority
 nor an approval digest. Start from
 `packaging/release/example-observations.json`; replace observations with verified
 facts, never merely copy them. No CI administration credential is needed.
 
-The latest operator decision supersedes the earlier pre-enablement fixture
-requirement. The maintainer authorizes the first release's public-log disclosure.
-After that release, preserve its original payload, genuine Hennery attestation
-bundle and trusted-root fixture as the authentic positive Hennery verifier fixture. Verify
-it with the pinned CLI and production policy as follow-up evidence, without
-delaying channel enablement. The checked-in upstream `sigstore/sigstore-js`
-fixture proves real cryptography/JSON shape and production Hennery rejection; substituted Hennery
-fields prove structure only. They do not replace authentic Hennery evidence.
+The offline verifier test runs the pinned CLI against genuine alpha.3 checksums,
+metadata and provenance, with network access disabled by proxy. Altered bytes,
+wrong source, repository, workflow, tag, issuer or predicate must fail. It creates
+no signatures or transparency-log entries. The fixture does not prove the new
+workflow's hosted OIDC issuance, approval handling or remote publication.
 
-Current code still restricts prereleases to GitHub and defaults signed-source
-`packaging/release/channels.json` to `["github"]`. The first all-channel run
-requires the appropriate stable tag and reviewed channel selection. This CI
-fixture fix changes neither those guards nor platform switches.
-
-Maintainer platform acceptance also records first-run and publish-only retry
-approval behavior: exactly one `release` approval per publishing attempt, no
-channel re-prompts because channel steps are folded into that same job, and a
-renewed retry approval with comment `publish-run:<run-id>:attempt:<current-attempt>`.
-The original attesting attempt and artifact IDs remain unchanged. Confirm those
-observed review-history semantics before enabling publication; no live approval
-experiment was performed during implementation.
+GitHub's protected environment supplies one approval per publishing attempt,
+including publish-only retries. Self-approval is permitted for the sole
+maintainer. No API review-history interpretation, special comment, age limit or
+rerun count grants authority. Confirm actual first-run and retry behavior during
+the separately authorized hosted qualification.
 
 ## crates.io bootstrap, then trusted publishing
 
@@ -132,7 +120,7 @@ For the first claim of unregistered crate names, the maintainer:
    for this exact seven-crate closure, without owner/admin/yank privileges.
    Stores it only as `RELEASE_CRATES_BOOTSTRAP_TOKEN` in `release` and records
    the expiry/revocation owner locally. No token is committed or printed.
-2. Reviews selection of `crates` in the signed source and separately enables the
+2. Reviews the stable all-channel release and separately enables the
    global/GitHub/crates switches and temporary bootstrap switch only after the
    relevant acceptance above. Approves the same protected `publish` job. The
    explicit bootstrap mode uses the existing frozen-byte API uploader; it never
@@ -155,24 +143,25 @@ For the first claim of unregistered crate names, the maintainer:
    token. Then qualifies normal OIDC publication; no stale secret fallback.
 
 If bootstrap stops after some crates, keep the dependency order and reconcile
-already-existing identical versions under renewed approval within the retry
-window. If abandoning, revoke immediately. Restart later with a new explicitly
+already-existing identical versions under renewed approval while the original artifacts remain available. If abandoning, revoke immediately. Restart later with a new explicitly
 scoped bootstrap token and, when required, a new signed version. Never replace a
 published crate or treat a registry error as absence.
 
 ## One tagged run, one protected publisher
 
-The tag-only `release.yml` verifies the tag, builds the native archives,
-installer, source, notices/SBOMs and selected channel payloads, and runs Rust,
-web, packaging, image, Homebrew and installer acceptance. PR/main CI remains
-ordinary CI. Registered channel jobs retain their literal owned names;
-selected jobs must succeed, and only unselected owning aggregates may skip.
-No reusable jobs, restored release caches or unpinned actions are accepted.
+The tag-only `release.yml` calls read-only reusable `packaging.yml`. Prepare
+requires successful main-push core CI for the exact signed commit, builds the UI
+and audits dependencies once. Native builders share their archives with image,
+installer and Homebrew acceptance; Linux qualifies all seven crate tarballs.
+Every local channel acceptance runs for packaging PRs and releases, regardless
+of publication selection. No restored project build cache is used in releases.
+Actions remain commit-pinned. Native YAML dependencies and actionlint replace
+custom job-name, DAG and command-order policing.
 
 Build/acceptance jobs have read-only contents and no publishing secrets. The
 separate `attest` job alone adds OIDC/attestation write. It attests `SHA256SUMS`
 and every payload, then writes a run summary showing every asset/hash, bundle
-hash, tag/source, channels/targets and original run/attempt/artifact identity.
+hash, tag/source, channels/targets and immutable artifact IDs.
 The maintainer approves that summary. There is no draft before approval; this
 is the deliberate trade-off for keeping all authorized draft mutation protected.
 
@@ -197,12 +186,11 @@ Consumers independently verify the signed tag, the attested canonical
 `https://github.com/marcinwadon/hennery/.github/workflows/release.yml@refs/tags/<exact-tag>`.
 Use exact `--cert-identity`, source ref and source/signer digest constraints,
 GitHub's OIDC issuer and hosted-runner requirement. Do not combine the mutually
-exclusive `--cert-identity` and `--signer-workflow` options. Publishers additionally
-compare pinned `gh 2.101.0`'s real JSON field
-`verificationResult.signature.certificate.runInvocationURI` exactly with
-`https://github.com/marcinwadon/hennery/actions/runs/<id>/attempts/<original-attempt>`.
-No `.extensions` fallback or asset-supplied run claim is accepted. The pinned
-binary/field contract fails loudly on change.
+exclusive `--cert-identity` and `--signer-workflow` options. No certificate JSON field parsing or invocation-URI matching is
+required. The
+supported CLI enforces these identity and digest constraints. New schema-3
+metadata omits producing-run identity; legacy schema-2 alpha.3 metadata remains
+readable, with its historical `attesting` field ignored as authority.
 
 Use independently trusted installed verification tools/key and reviewed source;
 never execute a downloaded installer/verifier to authenticate itself. Native
@@ -212,18 +200,14 @@ commit SHA. Preserve corresponding source, licence notices and rollback backups.
 
 ## Failure and recovery
 
-Within 30 days of the initial run and at most 50 reruns, retry **only `publish`**
-with renewed environment approval and the exact retry comment above. Keep the
-original artifacts, checksum list, bundles, artifact IDs and attesting attempt
-fixed while the publishing attempt changes. Never use “rerun all” to recover
-publication or rebuild under the old version. Missing/deleted/expired original
-inputs refuse. After the window, document the incomplete old release, withhold
-moving aliases and roll forward to a new signed version.
-
-The producer and attester are fixed to attempt 1. If that attempt never produced
-a complete accepted artifact/bundle set, there is no publish-only recovery input:
-diagnose without publishing and use a new signed version. A later publishing
-attempt never becomes a new producing or attesting attempt.
+Retry **only `publish`**, with renewed environment approval and the original
+immutable artifact IDs, accepted payloads, checksum list and bundles. No special
+approval comment, recovery-age limit or retry-count budget applies. Never rerun
+all or rebuild under an old version. Producers/attesters refuse attempts beyond
+the initial build; a later publisher is not a new producer. Missing, deleted or
+expired originals, conflicting remote bytes or an incomplete immutable release
+require a new signed version. Withhold aliases and document the incomplete
+release until recovery is verified.
 
 - Before immutable GitHub publication, reconcile the draft's exact asset set.
   Upload only verified missing assets; extra/different bytes refuse. If the
@@ -237,16 +221,13 @@ attempt never becomes a new producing or attesting attempt.
   A partial graph resumes only with identical bytes; wrong digests/ambiguous
   authentication stop. Apply bootstrap revocation on abandonment even if some
   names/versions already exist. Published crates cannot be replaced.
-- After GHCR, verify the index/platform digests and required provenance/SBOM
-  referrers. Login follows local verification. Push content by digest with
-  preserved digests, refuse conflicts and reconcile after ambiguous upload or
-  referrer responses. Referrer manifests are canonical and use a fixed creation
-  timestamp: discover and fetch existing manifests/blobs, refuse differing bytes
-  and upload only missing ones. Complete retries write nothing; partial retries
-  fill the missing set. Before success, cryptographically verify every bundle
-  fetched back from the registry against the frozen OCI subject and original
-  run. Checking the original local sidecars is insufficient. Do not move aliases
-  until all selected channels/public paths pass.
+- After GHCR, preserve and reconcile the accepted index/platform digests. Attach
+  preverified provenance and SBOM bundles with standard ORAS transport, then use
+  `gh attestation verify --bundle-from-oci` on fetched immutable subjects with the
+  same tag/source/workflow policy. No canonical seven-referrer manifest set or
+  fixed creation timestamp is required. Duplicate valid attachments on retry are
+  acceptable; different image digests, invalid provenance and ambiguous writes
+  stop publication. Do not move aliases until every selected channel succeeds.
 
 Public install, Homebrew service/PATH, crate UI/source and image runtime
 acceptance remain maintainer-owned after authorized publication. Stop services,

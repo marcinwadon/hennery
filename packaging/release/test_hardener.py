@@ -27,10 +27,10 @@ APP_VERSION=0.1.0-alpha.1
         result=hardener.harden('\n'.join(old for old,_ in hardener.REPLACEMENTS))
         for removed in ('release-inventory','--signer-workflow','release-publish.yml'):
             self.assertNotIn(removed,result)
-        for required in ('verify-tag','SHA256SUMS','--source-digest','--signer-digest','certificate.runInvocationURI'):
+        for required in ('verify-tag','SHA256SUMS','--source-digest','--signer-digest'):
             self.assertIn(required,result)
 
-    def test_signed_source_and_exact_run_verification_precedes_extraction(self):
+    def test_signed_source_and_digest_verification_precedes_extraction(self):
         for case in ('valid',)+REFUSALS:
             with self.subTest(case=case):
                 result,marker=self.fixture(case,self.script(),installer=True)

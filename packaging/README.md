@@ -138,7 +138,7 @@ Native cargo-binstall is disabled. Pinned 1.24.0 refusal tests offer real loopba
 archives, but all seven attempts must refuse without fetching or installing an
 archive. All native strategies (`crate-meta-data`, `quick-install`, `compile`)
 are disabled in the final CLI metadata. Native binstall cannot enforce the
-required signed-source and exact-run Sigstore policy. The `hennery-release` metadata namespace
+required signed-source and digest Sigstore policy. The `hennery-release` metadata namespace
 records the maintainer fingerprint and concrete version's exact tagged workflow
 identity for an external verifier. A native bridge needs separate review;
 archive URL mappings remain dormant data for that future integration.
@@ -147,8 +147,8 @@ Before running any release-contained installer or verifier, follow the
 [verify-then-run bootstrap](../README.md#verify-a-release-installer-before-running-it).
 Installed GnuPG authenticates the exact annotated tag from the pinned signing
 fingerprint. Installed `gh` authenticates `SHA256SUMS` and the installer against
-`release.yml@refs/tags/<exact-tag>`, with source/signer digest and original
-run/attempt binding. Verify hashes before executing downloaded code. A trusted
+`release.yml@refs/tags/<exact-tag>`, with source/signer digest binding. Verify hashes before executing downloaded
+code. A trusted
 checkout's [common verifier](release/verify.py) applies the same policy to all
 payloads and checks archive executable metadata. There is no inventory signature.
 Bare Cargo installation waits for stable publication and public-path qualification;
@@ -157,14 +157,14 @@ the first alpha remains GitHub-only.
 ### Crates integration and maintainer bootstrap
 
 The crate step is folded into the single `release` environment job, after
-immutable GitHub publication. Selection in signed `packaging/release/channels.json`,
+immutable GitHub publication. The stable all-channel tag policy,
 `RELEASE_PUBLICATION_ENABLED`, `RELEASE_GITHUB_ENABLED` and `RELEASE_CRATES_ENABLED`
-must all permit it. These switches remain disabled. All seven frozen `.crate`
+must all permit it. Their values remain operator-controlled. All seven frozen `.crate`
 files, `crates-inventory.json` and `hennery-source-<sha>.tar.gz` are release payloads
-bound by `SHA256SUMS`, source/tag and original-run attestations. The publisher
+bound by `SHA256SUMS`, source/tag attestations. The publisher
 never invokes Cargo to rebuild/repackage accepted tarballs.
 
-The shared gate verifies run/approval/artifact evidence, signed tag, checksums,
+Native environment approval protects the publisher; its verifier checks signed tag, checksums,
 attestations and complete immutable public release bytes before any channel
 credential. Node repeats frozen-byte checks at every upload/index boundary and
 fetches the corresponding-source URL without credentials, requiring its expected
@@ -173,13 +173,14 @@ originals cause refusal. A matching registry digest is reused; differing, yanked
 auth-failed or ambiguous remote state stops, with no aliases or announcement.
 After each crate, the index must resolve the exact version/checksum before any
 consumer uploads. Partial or ambiguously successful publication is recovered by
-a newly approved publish-only retry of the same run/artifacts/attestations, within
-30 days and 50 reruns. Reconcile completed work, never rebuild. Otherwise document
+a newly approved publish-only retry with the same artifacts/attestations, while
+the original artifacts remain available. Reconcile completed work, never
+rebuild. Otherwise document
 the incomplete version, withhold aliases and roll forward to a new signed version.
 
 Maintainer steps (never performed by builders):
 
-1. Confirm release controls and YubiKey touch policy, source/licence/advisory,
+1. Confirm release controls and signed-tag verification, source/licence/advisory,
    all platform/MSRV gates and the public immutable source URL. Before **any**
    channel switch is enabled, obtain an explicitly authorized genuine Hennery
    tagged attestation as the authentic positive fixture and verify the full policy
@@ -221,8 +222,9 @@ are the implementation contracts to recheck on changes.
 ## Publishing is the operator's
 
 - `release` environment, owner-only `v*` tag rulesets (updates/deletes blocked),
-  and immutable releases are configured. Maintainer signing requires a YubiKey
-  touch. Merging a workflow does not authorize publication; every switch remains
+  and immutable releases are configured. Signed source must authenticate the
+  pinned maintainer key; touch is not required. Merging a workflow does not
+  authorize publication; every switch remains
   disabled pending independent review and platform acceptance.
 - The maintainer signs source, while exact tagged-workflow attestations bind
   bytes. Runners/toolchains/GitHub/Sigstore remain trusted. One approval in this
@@ -234,10 +236,10 @@ are the implementation contracts to recheck on changes.
   no environment or publication secrets. The separate `attest` job has OIDC and
   attestation write authority and does not upload to registries. No AWS, upload
   App, held-storage stage or maintainer byte-inventory signature remains.
-- The latest operator decision (2026-10-16) enables all channels for the first
-  release without waiting for a positive fixture. Retain and verify the first
-  genuine Hennery attestation afterwards. Builders never create transparency-log
-  entries. Existing stable-tag and reviewed channel-selection constraints remain.
+- The 2026-10-17 decision selects GitHub only for prereleases and all four
+  channels for stable. The genuine alpha.3 attestation is the offline positive
+  fixture. Consumer verification binds digest/source/tag, not a unique run.
+  Builders never create transparency-log entries during tests.
 - Homebrew uses `RELEASE_HOMEBREW_TOKEN`; GHCR uses `GHCR_PUBLISH_TOKEN` plus
   `GHCR_PUBLISH_USER`, all only in `release`, after verification. Configure tap
   permissions, GHCR namespace/linkage/visibility/retention and package Actions

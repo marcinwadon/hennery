@@ -18,7 +18,6 @@ import contract
 import crates_delivery
 import gate
 import release_run
-import run_policy
 import supply
 import tag_signature
 
@@ -38,18 +37,17 @@ class CratesIntegration(unittest.TestCase):
             filename=name+'-'+version+'.crate';data=name.encode();(payload/filename).write_bytes(data)
             crates.append({'name':name,'file':filename,'size':len(data),'sha256':gate.digest(data),'upload':{'name':name,'vers':version}})
         (payload/'crates-inventory.json').write_bytes(gate.canonical({'schema':1,'version':version,'source':source,'crates':crates}))
-        metadata={'schema':2,'repository':gate.REPOSITORY,'source_sha':source['sha'],'tag':'v'+version,'tag_object':'b'*40,
-                  'channels':['crates','github'],'targets':sorted(gate.TARGETS),'attesting':{'run_id':42,'run_attempt':1}}
+        metadata={'schema':3,'repository':gate.REPOSITORY,'source_sha':source['sha'],'tag':'v'+version,'tag_object':'b'*40,
+                  'channels':sorted(gate.CHANNELS),'targets':sorted(gate.TARGETS)}
         contract.freeze(payload,metadata)
         signatures=root/'signatures';signatures.mkdir();(signatures/contract.BUNDLE).write_text('{}')
         (root/'.github/workflows').mkdir(parents=True)
         shutil.copyfile(self.repo/contract.WORKFLOW,root/contract.WORKFLOW)
         (root/'packaging/release').mkdir(parents=True)
-        (root/'packaging/release/channels.json').write_bytes(gate.canonical(metadata['channels']))
         if kind=='changed-crate':(payload/crates[0]['file']).write_bytes(b'altered')
         environment=dict(os.environ,GITHUB_ACTIONS='true',GITHUB_REPOSITORY=gate.REPOSITORY,GITHUB_REF='refs/tags/v0.1.0',GITHUB_SHA='a'*40,
             GITHUB_WORKFLOW_REF=gate.REPOSITORY+'/'+contract.WORKFLOW+'@refs/tags/v0.1.0',GITHUB_EVENT_NAME='push',GITHUB_RUN_ID='42',GITHUB_RUN_ATTEMPT='2',
-            RELEASE_ARTIFACT_ID='77',RELEASE_ATTESTING_ATTEMPT='1',GH_TOKEN='offline-parent-only',RELEASE_PUBLICATION_ENABLED='true',RELEASE_GITHUB_ENABLED='true',RELEASE_CRATES_ENABLED='true',
+            RELEASE_ARTIFACT_ID='77',GH_TOKEN='offline-parent-only',RELEASE_PUBLICATION_ENABLED='true',RELEASE_GITHUB_ENABLED='true',RELEASE_CRATES_ENABLED='true',RELEASE_HOMEBREW_ENABLED='true',RELEASE_GHCR_ENABLED='true',
             ACTIONS_ID_TOKEN_REQUEST_TOKEN='offline-parent-only',ACTIONS_ID_TOKEN_REQUEST_URL='offline-parent-only')
         return root,payload,signatures,environment
 
@@ -67,27 +65,10 @@ if(error)process.exitCode=1;'''
         calls=[]
         def tag(*args,**kwargs):
             gate.require(kind!='bad-tag','fixture signed tag refused');return {}
-        def evidence(api,metadata,env):
-            self.assertEqual(os.environ.get('GH_TOKEN'),'offline-parent-only')
-            names=['tag-signature','web-ui','assemble','attest','crates',
-                   'archive (x86_64-unknown-linux-musl, ubuntu-24.04, amd64)',
-                   'archive (aarch64-unknown-linux-musl, ubuntu-24.04-arm, arm64)',
-                   'archive (aarch64-apple-darwin, macos-15)']
-            names += [f'{job} ({runner})' for job in ('qualification','installer','homebrew-native')
-                      for runner in ('ubuntu-24.04','ubuntu-24.04-arm','macos-15')]
-            jobs=[{'name':name,'status':'completed','conclusion':'success'} for name in names]
-            jobs += [{'name':name,'status':'completed','conclusion':'skipped'} for name in ('ghcr','homebrew')]
-            return {'original':{'id':42,'run_attempt':1,'head_sha':'a'*40,'head_branch':'v0.1.0','event':'push','path':contract.WORKFLOW,'repository':{'full_name':gate.REPOSITORY},'created_at':(datetime.now(timezone.utc)-timedelta(hours=1)).isoformat()},
-                'jobs':jobs,'artifact':{'id':77,'name':'attested-release-42-1','expired':False,'workflow_run':{'id':42,'head_sha':'a'*40}},
-                'owner':{'login':'marcinwadon','id':9},'reviews':[{'state':'rejected' if kind=='approval-rejected' else 'approved','comment':'publish-run:42:attempt:2','user':{'id':9},'environments':[{'name':'release'}]}]}
         def crypto(command,**kwargs):
             self.assertEqual(command[:3],['gh','attestation','verify'])
             if kind=='crypto-refused':raise subprocess.CalledProcessError(1,command)
-            certificate={'sourceRepositoryURI':'https://github.com/'+gate.REPOSITORY,'buildSignerURI':'https://github.com/'+gate.REPOSITORY+'/'+contract.WORKFLOW+'@refs/tags/v0.1.0','sourceRepositoryRef':'refs/tags/v0.1.0','sourceRepositoryDigest':'a'*40,'buildSignerDigest':'a'*40,'runnerEnvironment':'github-hosted','issuer':'https://token.actions.githubusercontent.com','runInvocationURI':'https://github.com/'+gate.REPOSITORY+'/actions/runs/42/attempts/1'}
-            if kind=='wrong-run':certificate['runInvocationURI']=certificate['runInvocationURI'].replace('/42/','/43/')
-            if kind=='wrong-attempt':certificate['runInvocationURI']=certificate['runInvocationURI'].replace('attempts/1','attempts/2')
-            if kind=='branch':certificate['buildSignerURI']=certificate['buildSignerURI'].replace('refs/tags/v0.1.0','refs/heads/main')
-            return subprocess.CompletedProcess(command,0,gate.canonical([{'verificationResult':{'signature':{'certificate':certificate}}}]).decode(),'')
+            return subprocess.CompletedProcess(command,0,'verified','')
         def authorize():
             calls.append('verify')
             gate.require(kind!='missing-gate','fixture gate unavailable')
@@ -101,12 +82,11 @@ if(error)process.exitCode=1;'''
         with ExitStack() as stack:
             stack.enter_context(patch.dict(os.environ,environment,clear=True))
             stack.enter_context(patch.object(release_run,'ROOT',root))
-            stack.enter_context(patch.object(run_policy,'ROOT',root))
             stack.enter_context(patch.object(tag_signature,'verify',side_effect=tag))
+            stack.enter_context(patch('channel_publish.verify_images'))
             stack.enter_context(patch.object(supply,'require_contract',return_value=None))
             stack.enter_context(patch.object(supply,'verify_binary_inventory',return_value=None))
             stack.enter_context(patch.object(release_run,'require_public',side_effect=lambda *a:(root/'public-checked').touch()))
-            stack.enter_context(patch.object(run_policy,'evidence',side_effect=evidence))
             stack.enter_context(patch.object(contract.subprocess,'run',side_effect=crypto))
             try:
                 authorize()  # root channel entry point verifies before choosing a token/spawning.
@@ -129,7 +109,7 @@ if(error)process.exitCode=1;'''
         self.assertEqual(len(calls),33)
 
     def test_each_authority_failure_prevents_credentials_and_uploads(self):
-        for kind in ('missing-gate','bad-tag','crypto-refused','branch','wrong-run','wrong-attempt','approval-rejected','changed-crate','changed-after-gate','metadata-after-gate','wrong-broker-digest'):
+        for kind in ('missing-gate','bad-tag','crypto-refused','changed-crate','changed-after-gate','metadata-after-gate','wrong-broker-digest'):
             result,_,_=self.run_publish(kind)
             with self.subTest(kind=kind):
                 self.assertEqual((result['credentials'],result['uploads']),(0,0));self.assertTrue(result['error'])

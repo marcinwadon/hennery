@@ -25,7 +25,7 @@ class Bundles(ReleaseFixture,unittest.TestCase):
         self.calls.append(command);return self.crypto(command,**kwargs)
 
     def check(self,**kwargs):
-        return helper.check(self.candidate,self.work,self.signatures,self.revision,'v0.1.0',10,1,**kwargs)
+        return helper.check(self.candidate,self.work,self.signatures,self.revision,'v0.1.0',**kwargs)
 
     def test_authenticates_all_release_payloads_and_seven_exact_local_oci_subjects(self):
         with patch('tag_signature.verify'),patch.object(helper.verify.subprocess,'run',side_effect=self.transport):self.check()
@@ -65,9 +65,9 @@ class Bundles(ReleaseFixture,unittest.TestCase):
         path=self.work/'verified.json';changed=json.loads(path.read_bytes());changed['platforms']={};path.write_text(json.dumps(changed))
         with patch('tag_signature.verify'),patch.object(helper.verify.subprocess,'run',side_effect=self.transport),self.assertRaisesRegex(gate.Refused,'release descriptor'):self.check()
 
-    def test_branch_source_run_attempt_or_changed_bytes_refuse(self):
-        for source,tag,run,attempt in [('b'*40,'v0.1.0',10,1),(self.revision,'v9.9.9',10,1),(self.revision,'v0.1.0',11,1),(self.revision,'v0.1.0',10,2)]:
-            with self.subTest(tag=tag,run=run,attempt=attempt),patch.object(helper.verify.subprocess,'run') as crypto,self.assertRaises(gate.Refused):helper.check(self.candidate,self.work,self.signatures,source,tag,run,attempt)
+    def test_source_tag_or_changed_bytes_refuse(self):
+        for source,tag in [('b'*40,'v0.1.0'),(self.revision,'v9.9.9')]:
+            with self.subTest(tag=tag),patch.object(helper.verify.subprocess,'run') as crypto,self.assertRaises(gate.Refused):helper.check(self.candidate,self.work,self.signatures,source,tag)
             crypto.assert_not_called()
         def changed(command,**kwargs):
             result=self.transport(command,**kwargs)

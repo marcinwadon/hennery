@@ -42,7 +42,7 @@ def main():
             print(key + '=' + data)
     else:
         gate.require(args.root is not None, 'payload directory required')
-        release_run.freeze_payload(args.root, value, value['tag'], value['source'], int(os.environ['GITHUB_RUN_ID']))
+        release_run.freeze_payload(args.root, value, value['tag'], value['source'])
 
 
 if __name__ == '__main__':

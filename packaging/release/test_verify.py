@@ -17,35 +17,29 @@ class Verification(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(); self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
         (self.root / 'installer.sh').write_bytes(b'fixture installer')
-        self.metadata = {'schema': 2, 'repository': gate.REPOSITORY, 'source_sha': 'a' * 40,
+        self.metadata = {'schema': 3, 'repository': gate.REPOSITORY, 'source_sha': 'a' * 40,
                          'tag': 'v0.1.0', 'tag_object': 'b' * 40, 'channels': ['github'],
-                         'targets': sorted(gate.TARGETS), 'attesting': {'run_id': 42, 'run_attempt': 1}}
+                         'targets': sorted(gate.TARGETS)}
         contract.freeze(self.root, self.metadata)
-        self.certificate = {'runInvocationURI': 'https://github.com/' + gate.REPOSITORY + '/actions/runs/42/attempts/1',
-                            'sourceRepositoryURI': 'https://github.com/' + gate.REPOSITORY,
-                            'buildSignerURI': 'https://github.com/' + gate.REPOSITORY + '/' + contract.WORKFLOW + '@refs/tags/v0.1.0',
-                            'sourceRepositoryRef': 'refs/tags/v0.1.0', 'sourceRepositoryDigest': 'a' * 40,
-                            'buildSignerDigest': 'a' * 40, 'runnerEnvironment': 'github-hosted',
-                            'issuer': 'https://token.actions.githubusercontent.com'}
+        self.identity = 'https://github.com/' + gate.REPOSITORY + '/' + contract.WORKFLOW + '@refs/tags/v0.1.0'
         self.calls = []
 
     def crypto(self, command, **kwargs):
         self.calls.append(command)
-        return subprocess.CompletedProcess(command, 0, gate.canonical([{
-            'verificationResult': {'signature': {'certificate': self.certificate}}}]).decode(), '')
+        return subprocess.CompletedProcess(command, 0, 'verified', '')
 
     def run_verify(self, **kwargs):
         return verify.verify(self.root, Path('bundle'), 'a' * 40, 'v0.1.0', **kwargs)
 
     def test_signed_tag_precedes_checksum_and_all_payload_verification(self):
         with patch('tag_signature.verify') as tag, patch.object(verify.subprocess, 'run', side_effect=self.crypto), patch.object(verify.supply, 'verify_binary_inventory') as binaries:
-            actual = self.run_verify(run_id=42, attesting_attempt=1)
+            actual = self.run_verify()
         tag.assert_called_once_with('v0.1.0', 'a' * 40, 'b' * 40)
         binaries.assert_called_once_with(actual, self.root)
         self.assertEqual([Path(c[3]).name for c in self.calls], ['SHA256SUMS', 'installer.sh', 'release-metadata.json'])
         for command in self.calls:
             self.assertNotIn('--signer-workflow', command)
-            self.assertEqual(command[command.index('--cert-identity') + 1], self.certificate['buildSignerURI'])
+            self.assertEqual(command[command.index('--cert-identity') + 1], self.identity)
             self.assertEqual(command[command.index('--source-digest') + 1], 'a' * 40)
             self.assertEqual(command[command.index('--signer-digest') + 1], 'a' * 40)
 
@@ -56,31 +50,22 @@ class Verification(unittest.TestCase):
         with patch('tag_signature.verify'), patch.object(verify.subprocess, 'run', side_effect=subprocess.CalledProcessError(1, 'gh')):
             with self.assertRaises(subprocess.CalledProcessError): self.run_verify()
 
-    def test_source_tag_and_original_run_bindings_cannot_change(self):
-        for source, tag, run, attempt in [('c' * 40, 'v0.1.0',42,1), ('a' * 40,'v0.2.0',42,1), ('a' * 40,'v0.1.0',43,1), ('a' * 40,'v0.1.0',42,2)]:
-            with self.subTest(source=source, tag=tag, run=run, attempt=attempt), patch.object(verify.subprocess, 'run') as crypto, self.assertRaises(gate.Refused):
-                verify.verify(self.root, Path('bundle'), source, tag, run_id=run, attesting_attempt=attempt)
+    def test_source_and_tag_bindings_cannot_change(self):
+        for source, tag in [('c' * 40, 'v0.1.0'), ('a' * 40, 'v0.2.0')]:
+            with self.subTest(source=source, tag=tag), patch.object(verify.subprocess, 'run') as crypto, self.assertRaises(gate.Refused):
+                verify.verify(self.root, Path('bundle'), source, tag)
             crypto.assert_not_called()
-
-    def test_structural_branch_other_tag_workflow_or_run_certificate_refuses(self):
-        original = dict(self.certificate)
-        for field, value in [('buildSignerURI', original['buildSignerURI'].replace('@refs/tags/v0.1.0', '@refs/heads/main')),
-                             ('buildSignerURI', original['buildSignerURI'].replace('release.yml', 'other.yml')),
-                             ('sourceRepositoryRef', 'refs/tags/v9.9.9'), ('buildSignerDigest', 'b' * 40),
-                             ('runInvocationURI', original['runInvocationURI'].replace('/42/', '/43/')),
-                             ('runInvocationURI', original['runInvocationURI'].replace('/1', '/2'))]:
-            self.certificate = original | {field: value}
-            with self.subTest(field=field, value=value), patch('tag_signature.verify'), patch.object(verify.subprocess, 'run', side_effect=self.crypto), self.assertRaises(gate.Refused): self.run_verify()
 
     def test_byte_change_during_binary_check_refuses(self):
         def mutate(value, root):
             (root / 'installer.sh').write_bytes(b'changed after attestation')
         with patch('tag_signature.verify'), patch.object(verify.subprocess, 'run', side_effect=self.crypto), patch.object(verify.supply, 'verify_binary_inventory', side_effect=mutate), self.assertRaises(gate.Refused): self.run_verify()
 
-    def test_cli_parser_requires_release_source_tag_and_original_attempt_options(self):
+    def test_cli_parser_requires_release_source_and_tag(self):
         args = verify.arguments(['--release-directory', str(self.root), '--bundle', 'bundle', '--source-sha', 'a' * 40,
-                                 '--tag', 'v0.1.0', '--run-id', '42', '--attesting-attempt', '1'])
-        self.assertEqual((args.run_id, args.attesting_attempt), (42, 1))
+                                 '--tag', 'v0.1.0'])
+        self.assertEqual(args.tag, 'v0.1.0')
+        self.assertFalse(hasattr(args, 'run_id'))
 
 
 class BinstallMetadata(unittest.TestCase):

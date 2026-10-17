@@ -16,7 +16,6 @@ def settings():
         'rulesets': settings_audit.tag_rulesets(123),
         'repository_secrets': [], 'release_secrets': ['GHCR_PUBLISH_TOKEN'],
         'immutable_releases': True,
-        'maintainer_touch': {'confirmed': True, 'fingerprint': 'F26C7F594DFE84D131703AFC23E5A318AE8D2861', 'policy': 'on'},
         'release_vars': {'GHCR_PUBLISH_USER': 'marcinwadon'},
         'ghcr': {'repository': gate.REPOSITORY, 'actions_access': 'read', 'dedicated_credential': 'GHCR_PUBLISH_TOKEN',
                  'negative_push': {'read_status': 200, 'push_status': 403, 'credential': 'GITHUB_TOKEN'}},
@@ -70,12 +69,6 @@ class Settings(unittest.TestCase):
         for obsolete in ('candidate', 'inventory_sha256', 'settings_audit_sha256'):
             self.assertNotIn(obsolete, value)
 
-    def test_runtime_policy_reader_never_requests_private_settings(self):
-        import inspect
-        import run_policy
-        code = inspect.getsource(run_policy.evidence)
-        for forbidden in ['/rulesets', '/environments/release', 'settings_audit']:
-            self.assertNotIn(forbidden, code)
 
     def test_github_needs_no_uploaded_app_or_stored_write_token(self):
         valid = settings(); valid['release_secrets'] = []
@@ -115,9 +108,8 @@ class Settings(unittest.TestCase):
         import contract
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)/'payload'; root.mkdir(); (root/'example').write_bytes(b'bytes')
-            metadata={'schema':2,'repository':gate.REPOSITORY,'source_sha':'a'*40,'tag':'v0.1.0',
-                      'tag_object':'b'*40,'channels':['github'],'targets':sorted(gate.TARGETS),
-                      'attesting':{'run_id':42,'run_attempt':1}}
+            metadata={'schema':3,'repository':gate.REPOSITORY,'source_sha':'a'*40,'tag':'v0.1.0',
+                      'tag_object':'b'*40,'channels':['github'],'targets':sorted(gate.TARGETS)}
             contract.freeze(root, metadata)
             observations=Path(tmp)/'observations.json';observations.write_text('{}')
             argv=['settings_audit.py','--payload',str(root),'--observations',str(observations),'--output',str(Path(tmp)/'acceptance.json')]
@@ -133,13 +125,6 @@ class Settings(unittest.TestCase):
             with self.subTest(change=change),self.assertRaises(gate.Refused):
                 settings_audit.validate_settings(data,['github'])
 
-    def test_touch_is_a_personal_confirmation_of_the_pinned_key(self):
-        for change in ({'confirmed':False},{'fingerprint':'A'*40},{'policy':'off'}):
-            data=settings();data['maintainer_touch'].update(change)
-            with self.subTest(change=change),self.assertRaises(gate.Refused):
-                settings_audit.validate_settings(data,['github'])
-        data=settings();data['maintainer_touch']['policy']='cached-fixed'
-        settings_audit.validate_settings(data,['github'])
 
     def test_settings_access_is_local_only_and_wrong_account_refuses(self):
         from unittest.mock import patch
@@ -177,9 +162,8 @@ class Settings(unittest.TestCase):
         import contract
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)/'payload';root.mkdir();(root/'example').write_bytes(b'bytes')
-            metadata={'schema':2,'repository':gate.REPOSITORY,'source_sha':'a'*40,'tag':'v0.1.0',
-                      'tag_object':'b'*40,'channels':['github'],'targets':sorted(gate.TARGETS),
-                      'attesting':{'run_id':42,'run_attempt':1}}
+            metadata={'schema':3,'repository':gate.REPOSITORY,'source_sha':'a'*40,'tag':'v0.1.0',
+                      'tag_object':'b'*40,'channels':['github'],'targets':sorted(gate.TARGETS)}
             contract.freeze(root,metadata)
             observations=Path(tmp)/'observations.json';observations.write_text('{}')
             output=Path(tmp)/'acceptance.json'
@@ -195,7 +179,6 @@ class Settings(unittest.TestCase):
     def test_observation_template_does_not_claim_unperformed_acceptance(self):
         from pathlib import Path
         data=gate.strict_json((Path(__file__).with_name('example-observations.json')).read_bytes())
-        self.assertIs(data['maintainer_touch']['confirmed'],False)
         self.assertIs(data['homebrew']['scope_confirmed'],False)
         self.assertIsNone(data['ghcr']['negative_push']['read_status'])
         self.assertIsNone(data['ghcr']['negative_push']['push_status'])

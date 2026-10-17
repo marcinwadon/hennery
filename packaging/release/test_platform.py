@@ -6,32 +6,12 @@ from unittest.mock import patch
 
 import gate
 import post_setup
-import run_policy
 import settings_audit
-import workflow_policy
-import test_run_policy
 from test_settings import settings
 
 
 class Platform(unittest.TestCase):
-    def setUp(self):
-        self.fixture = test_run_policy.RunPolicy()
-        self.fixture.setUp()
 
-    def test_original_evidence_is_read_only_and_keeps_original_attempt(self):
-        calls=[]
-        fixture=self.fixture
-        class API:
-            def get(self, path):
-                calls.append(('get',path))
-                return {'/actions/runs/42/attempts/1':fixture.evidence['original'],
-                        '/actions/artifacts/77':fixture.evidence['artifact'],
-                        '/':{'owner':fixture.evidence['owner']},
-                        '/actions/runs/42/approvals':fixture.evidence['reviews']}[path]
-        evidence=run_policy.evidence(API(),fixture.metadata,fixture.env)
-        self.assertEqual(evidence,fixture.evidence)
-        self.assertEqual(len(calls),4)
-        self.assertFalse(any('/rulesets' in str(call) or '/environments/' in str(call) for call in calls))
 
     def test_checked_in_platform_examples_match_policy(self):
         root=Path(__file__).resolve().parents[2]
@@ -44,10 +24,6 @@ class Platform(unittest.TestCase):
         self.assertEqual(environment['reviewers'],[{'type':'User','id':0}])
         self.assertEqual(gate.strict_json((root/'.github/release-branch-policy.json').read_bytes()),{'name':'v*','type':'tag'})
 
-    def test_workflow_parser_rejects_missing_mapping_and_duplicate_keys(self):
-        for raw in ('[]','jobs: {archive: {}, archive: {}}','jobs: {archive: {}, "\\u0061rchive": {}}',
-                    '\ufeffjobs: {archive: {}, archive: {}}'):
-            with self.subTest(raw=raw),self.assertRaises(ValueError):workflow_policy.load_workflow(raw)
     def test_environment_bypass_must_be_explicit_false(self):
         for value in (None,True,'false'):
             data=settings();data['environment']['can_admins_bypass']=value

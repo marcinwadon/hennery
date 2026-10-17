@@ -194,7 +194,7 @@ release_attest() {
         --cert-identity "https://github.com/marcinwadon/hennery/.github/workflows/release.yml@refs/tags/$release_tag" \
         --source-ref "refs/tags/$release_tag" --source-digest "$release_source" --signer-digest "$release_source" \
         --cert-oidc-issuer https://token.actions.githubusercontent.com --predicate-type https://slsa.dev/provenance/v1 \
-        --deny-self-hosted-runners --format json > "$2" || return 1
+        --deny-self-hosted-runners >/dev/null || return 1
 }
 release_check_hash() {
     release_expected=$(awk -v name="$2" '$2 == name { count++; sha=$1 } END { if (count != 1) exit 1; print sha }' "$release_checksums") || return 1
@@ -210,7 +210,7 @@ release_check_hash() {
 }
 release_verify_payload() {
     [ -s "$release_checksums" ] && [ -s "$release_metadata" ] && [ -s "$release_bundle" ] || return 1
-    release_attest "$release_checksums" "$release_dir/checksums.verified.json" || return 1
+    release_attest "$release_checksums" || return 1
     release_last=$(tail -c 1 "$release_checksums") || return 1
     [ -z "$release_last" ] || return 1
     LC_ALL=C awk '
@@ -221,21 +221,13 @@ release_verify_payload() {
         END { exit !(NR > 0 && !bad) }
     ' "$release_checksums" || return 1
     release_check_hash "$release_metadata" release-metadata.json || return 1
-    release_attest "$release_metadata" "$release_dir/metadata.verified.json" || return 1
-    release_run=$(jq -er --arg tag "$release_tag" --arg sha "$release_source" --arg object "$release_object" '
-        if .schema == 2 and .repository == "marcinwadon/hennery" and .tag == $tag and .source_sha == $sha and .tag_object == $object
-            and (.attesting.run_id | type == "number" and . > 0 and floor == .)
-            and (.attesting.run_attempt | type == "number" and . > 0 and floor == .)
-        then "https://github.com/marcinwadon/hennery/actions/runs/\(.attesting.run_id)/attempts/\(.attesting.run_attempt)"
-        else error("release metadata source/tag/run mismatch") end
-    ' "$release_metadata") || return 1
+    release_attest "$release_metadata" || return 1
+    jq -e --arg tag "$release_tag" --arg sha "$release_source" --arg object "$release_object" '
+        (.schema == 2 or .schema == 3) and .repository == "marcinwadon/hennery"
+        and .tag == $tag and .source_sha == $sha and .tag_object == $object
+    ' "$release_metadata" >/dev/null || return 1
     release_check_hash "$1" "$2" || return 1
-    release_attest "$1" "$release_dir/payload.verified.json" || return 1
-    for release_result in checksums metadata payload; do
-        jq -e --arg run "$release_run" '
-            type == "array" and length > 0 and all(.[]; .verificationResult.signature.certificate.runInvocationURI == $run)
-        ' "$release_dir/$release_result.verified.json" >/dev/null || return 1
-    done
+    release_attest "$1" || return 1
 }
 release_fetch https://raw.githubusercontent.com/marcinwadon/hennery/refs/heads/main/README.md "$release_dir/main-readme"
 grep -F -- "$release_fingerprint" "$release_dir/main-readme" >/dev/null || exit 1
@@ -261,8 +253,8 @@ sh "$release_dir/hennery-installer.sh"
 
 ## Installing
 
-**Until the first release (0.1.0), build from source with the quickstart
-below. Nothing is published yet.** The following channels are prepared for
+**Stable 0.1.0 is not published yet. Alpha.3 is available on GitHub Releases;
+use the verification procedure above.** The following channels are prepared for
 that release; these are descriptions of future installation, not executable
 quickstart steps:
 
@@ -275,7 +267,7 @@ quickstart steps:
 
 For a downloaded archive, apply the same signed-tag and exact-workflow
 attestation checks to `SHA256SUMS`, `release-metadata.json` and the archive,
-require their common attesting run/attempt, then compare the archive's SHA-256
+then compare the archive's SHA-256
 with its single entry in the authenticated checksum list before extraction.
 The [release contract](packaging/release/README.md#assets-and-verification)
 describes these checks. Package-manager installs use their own channel trust;

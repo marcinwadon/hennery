@@ -23,7 +23,21 @@ class Orchestrator(unittest.TestCase):
             for field,value in [('GITHUB_RUN_ATTEMPT','2'),('GITHUB_REF','refs/heads/main'),('GITHUB_REPOSITORY','other/repo'),('GITHUB_EVENT_NAME','workflow_dispatch'),('GITHUB_REF_NAME','v9.9.9')]:
                 with self.subTest(field=field),patch.dict(os.environ,{field:value}),self.assertRaises(gate.Refused):release_run.configuration()
 
-    def test_summary_lists_every_asset_and_original_attempt_without_draft(self):
+    def test_actual_release_metadata_has_fixed_channels_and_native_publisher_context(self):
+        value = gate.strict_json((Path(__file__).with_name('fixtures') / 'alpha3' / contract.METADATA).read_bytes())
+        self.assertEqual(release_run.channels(value['tag']), ['github'])
+        self.assertEqual(release_run.channels(value['tag'].split('-')[0]), ['crates', 'ghcr', 'github', 'homebrew'])
+        env = {'GITHUB_REPOSITORY': gate.REPOSITORY, 'GITHUB_EVENT_NAME': 'push',
+               'GITHUB_REF': 'refs/tags/' + value['tag'], 'GITHUB_SHA': value['source_sha'],
+               'GITHUB_WORKFLOW_REF': gate.REPOSITORY + '/' + contract.WORKFLOW + '@refs/tags/' + value['tag'],
+               'RELEASE_PUBLICATION_ENABLED': 'true', 'RELEASE_GITHUB_ENABLED': 'true'}
+        with patch.dict(os.environ, env, clear=True):
+            release_run.publication_context(value)
+            for field in env:
+                with self.subTest(field=field), patch.dict(os.environ, {field: 'untrusted'}), self.assertRaises(gate.Refused):
+                    release_run.publication_context(value)
+
+    def test_summary_lists_every_asset_without_draft(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp)/'payload';root.mkdir();test_contract.Contract().fixture(root)
             signatures=Path(tmp)/'signatures';signatures.mkdir();(signatures/contract.BUNDLE).write_bytes(b'bundle')
@@ -33,7 +47,7 @@ class Orchestrator(unittest.TestCase):
             for directory in (root,signatures):
                 for p in directory.iterdir():self.assertIn(p.name,output.getvalue());self.assertIn(gate.digest(p.read_bytes()),output.getvalue())
             self.assertIn('No draft exists',output.getvalue())
-            with patch.dict(os.environ,{'GITHUB_RUN_ID':'42','GITHUB_RUN_ATTEMPT':'2'}),self.assertRaises(gate.Refused):release_run.summary(root,signatures)
+
 
     def test_attestation_check_refuses_rerun_before_signing(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -41,17 +55,6 @@ class Orchestrator(unittest.TestCase):
             with patch.dict(os.environ,{'GITHUB_RUN_ID':'42','GITHUB_RUN_ATTEMPT':'2'}),self.assertRaises(gate.Refused):
                 release_run.check_original(root)
 
-    def test_every_optional_channel_needs_selection_and_its_explicit_switch(self):
-        for channel in ('homebrew','crates','ghcr'):
-            with tempfile.TemporaryDirectory() as tmp:
-                root=Path(tmp);test_contract.Contract().fixture(root)
-                value=contract.load(root)
-                with patch.dict(os.environ,{'GH_TOKEN':'offline'}),patch.object(release_run.run_policy,'evidence',return_value={}),patch.object(release_run.run_policy,'validate'),patch.object(release_run.contract,'load',return_value=value),self.assertRaises(gate.Refused):
-                    release_run.verify(root,root,channel)
-                value['channels']=sorted(['github',channel])
-                for flag in ('','false'):
-                    with self.subTest(channel=channel,flag=flag),patch.dict(os.environ,{'GH_TOKEN':'offline','RELEASE_'+channel.upper()+'_ENABLED':flag}),patch.object(release_run.run_policy,'evidence',return_value={}),patch.object(release_run.run_policy,'validate'),patch.object(release_run.contract,'load',return_value=value),self.assertRaises(gate.Refused):
-                        release_run.verify(root,root,channel)
 
     def test_channels_require_all_public_immutable_bytes_including_sidecars(self):
         with tempfile.TemporaryDirectory() as tmp:

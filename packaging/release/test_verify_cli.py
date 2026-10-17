@@ -1,8 +1,5 @@
-"""Actual pinned-gh crypto contract; substituted certificates test structure only."""
-import copy
+"""The pinned CLI verifies genuine alpha.3 bytes offline, under production flags."""
 import hashlib
-import json
-import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -12,85 +9,71 @@ import contract
 import gate
 import verifier_process
 
-FIXTURES = Path(__file__).with_name('fixtures') / 'attestation'
-SOURCE = '26d16513386ffaa790b1c32f927544f1322e4194'
-UPSTREAM = 'https://github.com/sigstore/sigstore-js'
-URI = UPSTREAM + '/actions/runs/6014488666/attempts/1'
-HASHES = {'sigstore-js-2.1.0.tgz': 'f0c641fce0310cb43208f4272dc1423153630e44ba8cdc0b5ce8466f724e0eed',
-          'sigstore-js-2.1.0-bundle.json': 'cfadddd579b9fb45947530cd0e860986ec610a28f7fa6de3ef31cc051f07f761',
-          'trusted_root.json': '455b3fe53e2678889f093d66ebbfda5f12ebb9d682b146c3535fa04e97689787'}
+FIXTURES = Path(__file__).with_name('fixtures')
+ALPHA = FIXTURES / 'alpha3'
+TRUST = FIXTURES / 'attestation/trusted_root.json'
+HASHES = {'SHA256SUMS': '044729948b43f415d4ebf71cbe4469d8521c68ad14c2d663907a34a52c3bb08b', 'release-metadata.json': '10c3ff9e53b31b95dae543ddbd08d6a86d8b97363e6a1508e0d4f527216feb64', 'release.sigstore.jsonl': 'a3f768af3af38ef2655bde54891dbdefa60d5b9e96a0e39454d947fd54d41f31'}
 
 
 class PinnedCLI(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.tmp = tempfile.TemporaryDirectory(prefix='release-cli-')
-        cls.addClassCleanup(cls.tmp.cleanup)
+        if hashlib.sha256(TRUST.read_bytes()).hexdigest() != '455b3fe53e2678889f093d66ebbfda5f12ebb9d682b146c3535fa04e97689787':
+            raise AssertionError('offline Sigstore trust-root fixture changed')
+        for name, digest in HASHES.items():
+            if hashlib.sha256((ALPHA / name).read_bytes()).hexdigest() != digest:
+                raise AssertionError('genuine alpha.3 fixture changed: ' + name)
+        cls.metadata = gate.strict_json((ALPHA / contract.METADATA).read_bytes())
         isolated = verifier_process.environment()
         cls.env = isolated.__enter__()
         cls.addClassCleanup(isolated.__exit__, None, None, None)
+        # Any accidental fetch must fail; no account, token or network gh call.
         cls.env.update(HTTPS_PROXY='http://127.0.0.1:9', HTTP_PROXY='http://127.0.0.1:9',
                        ALL_PROXY='http://127.0.0.1:9', NO_PROXY='')
-        for name, digest in HASHES.items():
-            if hashlib.sha256((FIXTURES / name).read_bytes()).hexdigest() != digest:
-                raise AssertionError('authentic fixture bytes changed: ' + name)
         version = subprocess.check_output(['gh', '--version'], env=cls.env, text=True)
         if not version.startswith('gh version 2.101.0 '):
-            raise AssertionError('CLI contract requires pinned gh 2.101.0; requalify before updating this pin: ' + version)
-        cls.command = ['gh', 'attestation', 'verify', str(FIXTURES / 'sigstore-js-2.1.0.tgz'),
-                       '--repo', 'sigstore/sigstore-js', '--digest-alg', 'sha512',
-                       '--bundle', str(FIXTURES / 'sigstore-js-2.1.0-bundle.json'),
-                       '--custom-trusted-root', str(FIXTURES / 'trusted_root.json'),
-                       '--cert-identity', UPSTREAM + '/.github/workflows/release.yml@refs/heads/main',
-                       '--source-ref', 'refs/heads/main', '--source-digest', SOURCE, '--signer-digest', SOURCE,
-                       '--cert-oidc-issuer', 'https://token.actions.githubusercontent.com',
-                       '--deny-self-hosted-runners', '--format', 'json']
-        result = subprocess.run(cls.command, env=cls.env, capture_output=True, text=True, timeout=30)
-        if result.returncode:
-            raise AssertionError('authentic offline crypto verification failed: ' + result.stderr)
-        cls.verified = json.loads(result.stdout)
+            raise AssertionError('requalify the real consumer boundary before changing gh: ' + version)
 
-    def test_authentic_crypto_success_and_exact_flattened_certificate_shape(self):
-        certificate = self.verified[0]['verificationResult']['signature']['certificate']
-        self.assertNotIn('extensions', certificate, 'pinned CLI schema changed; do not add a fallback')
-        self.assertEqual(certificate['runInvocationURI'], URI)
-        for wrong in [URI.replace('/6014488666/', '/6014488667/'), URI.replace('/attempts/1', '/attempts/2')]:
-            self.assertNotEqual(certificate['runInvocationURI'], wrong)
+    def command(self, subject=contract.CHECKSUMS):
+        return contract.attestation_command(ALPHA / subject, self.metadata['tag'], self.metadata['source_sha'],
+                                            ALPHA / contract.BUNDLE, TRUST)
 
-    def test_altered_payload_fails_real_cryptographic_verification(self):
-        altered = Path(self.tmp.name) / 'altered.tgz'
-        altered.write_bytes((FIXTURES / 'sigstore-js-2.1.0.tgz').read_bytes() + b'changed')
-        command = list(self.command); command[3] = str(altered)
-        result = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=30)
-        self.assertNotEqual(result.returncode, 0)
+    def invoke(self, command):
+        return subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=30)
 
-    def test_production_hennery_cli_policy_rejects_authentic_upstream_identity(self):
-        command = contract.attestation_command(FIXTURES / 'sigstore-js-2.1.0.tgz', 'v0.1.0', SOURCE,
-                                               FIXTURES / 'sigstore-js-2.1.0-bundle.json', FIXTURES / 'trusted_root.json')
-        command += ['--digest-alg', 'sha512']
-        result = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=30)
-        self.assertNotEqual(result.returncode, 0)
+    def test_genuine_hennery_release_passes_supported_digest_source_tag_policy(self):
+        contract.validate_metadata(self.metadata)  # Legacy schema 2 remains consumable.
+        checksums = contract.parse_checksums((ALPHA / contract.CHECKSUMS).read_bytes())
+        self.assertEqual(checksums[contract.METADATA], gate.digest((ALPHA / contract.METADATA).read_bytes()))
+        for subject in (contract.CHECKSUMS, contract.METADATA):
+            with self.subTest(subject=subject):
+                result = self.invoke(self.command(subject))
+                self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_structural_hennery_identity_and_run_policy_using_real_json_shape(self):
-        # Substitution is structural policy coverage, NOT a Hennery crypto proof.
-        rows = copy.deepcopy(self.verified)
-        cert = rows[0]['verificationResult']['signature']['certificate']
-        cert.update(sourceRepositoryURI='https://github.com/marcinwadon/hennery',
-                    buildSignerURI='https://github.com/marcinwadon/hennery/.github/workflows/release.yml@refs/tags/v0.1.0',
-                    sourceRepositoryRef='refs/tags/v0.1.0',
-                    runInvocationURI='https://github.com/marcinwadon/hennery/actions/runs/42/attempts/1')
-        contract.require_identity(rows, 'v0.1.0', SOURCE)
-        try:
-            contract.require_run(rows, 42, 1)
-        except gate.Refused as error:
-            self.fail('real pinned CLI certificate shape was refused: ' + str(error))
-        for key, value in [('sourceRepositoryURI', UPSTREAM), ('buildSignerURI', cert['buildSignerURI'].replace('release.yml','other.yml')),
-                           ('sourceRepositoryRef','refs/heads/main'), ('buildSignerURI',cert['buildSignerURI'].replace('refs/tags/v0.1.0','refs/heads/main')),
-                           ('sourceRepositoryDigest','b'*40), ('buildSignerDigest','b'*40)]:
-            bad=copy.deepcopy(rows);bad[0]['verificationResult']['signature']['certificate'][key]=value
-            with self.subTest(key=key), self.assertRaises(gate.Refused):contract.require_identity(bad,'v0.1.0',SOURCE)
-        for run, attempt in [(43,1),(42,2)]:
-            with self.subTest(run=run,attempt=attempt),self.assertRaises(gate.Refused):contract.require_run(rows,run,attempt)
-        nested=copy.deepcopy(rows);certificate=nested[0]['verificationResult']['signature']['certificate']
-        certificate['extensions']={'runInvocationURI':certificate.pop('runInvocationURI')}
-        with self.assertRaises(gate.Refused):contract.require_run(nested,42,1)
+    def test_tampered_real_payload_fails_before_use(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / contract.CHECKSUMS
+            path.write_bytes((ALPHA / contract.CHECKSUMS).read_bytes() + b'changed')
+            command = self.command(); command[3] = str(path)
+            self.assertNotEqual(self.invoke(command).returncode, 0)
+
+    def test_wrong_requested_source_or_tag_cannot_accept_the_real_release(self):
+        for tag, source in [(self.metadata['tag'], 'b' * 40),
+                            ('v0.1.0-alpha.2', self.metadata['source_sha'])]:
+            with self.subTest(tag=tag, source=source):
+                command = contract.attestation_command(ALPHA / contract.CHECKSUMS, tag, source,
+                                                        ALPHA / contract.BUNDLE, TRUST)
+                self.assertNotEqual(self.invoke(command).returncode, 0)
+
+    def test_wrong_identity_source_tag_or_predicate_fails_real_crypto_policy(self):
+        mutations = {'--repo': 'another/repository', '--source-ref': 'refs/heads/main',
+                     '--source-digest': 'b' * 40, '--signer-digest': 'b' * 40,
+                     '--cert-identity': 'https://github.com/marcinwadon/hennery/.github/workflows/other.yml@refs/tags/v0.1.0-alpha.3',
+                     '--cert-oidc-issuer': 'https://invalid.example', '--predicate-type': 'https://spdx.dev/Document'}
+        for flag, value in mutations.items():
+            with self.subTest(flag=flag):
+                command = self.command(); command[command.index(flag) + 1] = value
+                self.assertNotEqual(self.invoke(command).returncode, 0)
+        command = self.command()
+        command[command.index('--cert-identity') + 1] = 'https://github.com/marcinwadon/hennery/.github/workflows/release.yml@refs/tags/v0.1.0-alpha.2'
+        self.assertNotEqual(self.invoke(command).returncode, 0)

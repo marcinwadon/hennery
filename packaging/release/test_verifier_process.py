@@ -21,12 +21,6 @@ class VerifierChildren(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(prefix='verifier-child-test-');self.addCleanup(self.tmp.cleanup)
         self.root=Path(self.tmp.name);self.tools=self.root/'tools';self.tools.mkdir();self.log=self.root/'children.jsonl'
-        self.certificate={'runInvocationURI':'https://github.com/'+gate.REPOSITORY+'/actions/runs/42/attempts/1',
-            'sourceRepositoryURI':'https://github.com/'+gate.REPOSITORY,
-            'buildSignerURI':'https://github.com/'+gate.REPOSITORY+'/'+contract.WORKFLOW+'@refs/tags/v0.1.0',
-            'sourceRepositoryRef':'refs/tags/v0.1.0','sourceRepositoryDigest':'a'*40,'buildSignerDigest':'a'*40,
-            'runnerEnvironment':'github-hosted','issuer':'https://token.actions.githubusercontent.com'}
-        self.rows=[{'verificationResult':{'signature':{'certificate':self.certificate}}}]
         self.dirty=self.root/'operator-config';self.dirty.mkdir()
         (self.dirty/'hosts.yml').write_text('credential-canary')
         for filename in ['config.json','config','credentials','.git-credentials','.gitconfig']:(self.dirty/filename).write_text('credential-canary')
@@ -45,7 +39,7 @@ class VerifierChildren(unittest.TestCase):
 from pathlib import Path
 name=Path(sys.argv[0]).name
 with open({str(self.log)!r},'a') as out:out.write(json.dumps({{'tool':name,'args':sys.argv[1:],'env':dict(os.environ)}})+'\\n')
-if name=='gh': print({json.dumps(self.rows)!r})
+if name=='gh': print('verified')
 elif 'rev-parse' in sys.argv: print({'b'*40!r})
 elif 'cat-file' in sys.argv: print({'object '+'a'*40+chr(10)+'type commit'+chr(10)+'tag v0.1.0'+chr(10)+'tagger Test'+chr(10)+chr(10)+'message'+chr(10)!r})
 elif 'verify-tag' in sys.argv: print({'[GNUPG:] VALIDSIG '+tag_signature.FINGERPRINT+' 2026 1 0'+chr(10)!r},file=sys.stderr)
@@ -83,12 +77,12 @@ elif 'verify-tag' in sys.argv: print({'[GNUPG:] VALIDSIG '+tag_signature.FINGERP
     def test_release_crypto_children_receive_only_explicit_credential_free_environment(self):
         payload=self.root/'payload';payload.mkdir();test_contract.Contract().fixture(payload)
         with patch.dict(os.environ,self.bad),patch.object(tag_signature,'verify'):
-            contract.verify(payload,'v0.1.0','a'*40,self.root/'bundle',42,1)
+            contract.verify(payload,'v0.1.0','a'*40,self.root/'bundle')
             self.assertEqual(len(self.children()),3);self.assert_clean()
 
     def test_standalone_image_consumer_child_is_also_credential_free(self):
         manifest=self.root/'manifest';manifest.write_bytes(b'OCI manifest')
-        value={'tag':'v0.1.0','source_sha':'a'*40,'attesting':{'run_id':42,'run_attempt':1}}
+        value={'tag':'v0.1.0','source_sha':'a'*40}
         with patch.dict(os.environ,self.bad):
             verify.verify_image_subject('ghcr.io/'+gate.REPOSITORY+'@sha256:'+gate.digest(manifest.read_bytes()),value,
                                        self.root/'bundle',manifest=manifest)
@@ -110,7 +104,7 @@ elif 'verify-tag' in sys.argv: print({'[GNUPG:] VALIDSIG '+tag_signature.FINGERP
         payload=self.root/'payload';payload.mkdir();test_contract.Contract().fixture(payload)
         def parent(*args):
             self.assertEqual(os.environ['GH_TOKEN'],'write-canary')
-            contract.verify(payload,'v0.1.0','a'*40,self.root/'bundle',42,1)
+            contract.verify(payload,'v0.1.0','a'*40,self.root/'bundle')
         with patch.dict(os.environ,self.bad),patch.object(tag_signature,'verify'),patch('release_run.verify',side_effect=parent):
             channel_publish.shared_verify(payload,self.root,'github');self.assert_clean()
 
@@ -121,12 +115,6 @@ elif 'verify-tag' in sys.argv: print({'[GNUPG:] VALIDSIG '+tag_signature.FINGERP
         (self.root/'ghcr-index.json').write_bytes(gate.canonical(expected))
         (work/'verified.json').write_bytes(gate.canonical(expected))
         (self.root/'ghcr-index-provenance.json').write_text('local bundle')
-        value={'tag':'v0.1.0','source_sha':'a'*40,'attesting':{'run_id':42,'run_attempt':1}}
+        value={'tag':'v0.1.0','source_sha':'a'*40}
         with patch.dict(os.environ,self.bad),patch.object(channel_publish,'image_helper',return_value=SimpleNamespace(inspect_release=lambda *a:expected)):
             channel_publish.check_images(self.root,self.root,value,work);self.assert_clean()
-
-    def test_denied_verification_already_excludes_write_authority(self):
-        payload=self.root/'payload';payload.mkdir();test_contract.Contract().fixture(payload)
-        with patch.dict(os.environ,self.bad),patch.object(tag_signature,'verify'),patch.object(contract,'require_run',side_effect=gate.Refused('wrong run')):
-            with self.assertRaises(gate.Refused):contract.verify(payload,'v0.1.0','a'*40,self.root/'bundle',42,1)
-            self.assertEqual(len(self.children()),1);self.assert_clean()

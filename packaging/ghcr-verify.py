@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read-only verification of release and seven exact OCI provenance/SPDX subjects."""
+"""Read-only verification of release and OCI provenance/SPDX subjects."""
 import argparse
 from pathlib import Path
 import sys
@@ -20,8 +20,8 @@ def subjects(work,bundles):
             yield subject,kind,digest,PROVENANCE if kind=='provenance' else SPDX,bundles/f'ghcr-{subject}-{kind}.json'
 
 
-def check(root,work,signatures,source_sha,tag,run_id,attesting_attempt,remote=False):
-    value=verify.verify(root,signatures/contract.BUNDLE,source_sha,tag,run_id,attesting_attempt)
+def check(root,work,signatures,source_sha,tag,remote=False):
+    value=verify.verify(root,signatures/contract.BUNDLE,source_sha,tag)
     gate.require(gate.strict_json(contract.regular(work/'verified.json'))==verify.image_descriptor(root,value),
                  'working image must match the release descriptor')
     for _,_,digest,predicate,bundle in subjects(work,signatures):
@@ -39,11 +39,9 @@ def main():
     parser.add_argument('--signatures',required=True,type=Path)
     parser.add_argument('--source-sha',required=True)
     parser.add_argument('--tag',required=True)
-    parser.add_argument('--run-id',required=True,type=int)
-    parser.add_argument('--attesting-attempt',required=True,type=int)
     parser.add_argument('--remote',action='store_true')
     args=parser.parse_args()
-    check(args.release_directory,args.work,args.signatures,args.source_sha,args.tag,args.run_id,args.attesting_attempt,args.remote)
+    check(args.release_directory,args.work,args.signatures,args.source_sha,args.tag,args.remote)
 
 
 if __name__=='__main__':main()

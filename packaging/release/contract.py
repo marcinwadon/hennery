@@ -1,10 +1,9 @@
-"""Signed-source, checksums and exact-run provenance for final release bytes."""
+"""Signed-source, checksums and provenance for final release bytes."""
 import re
 from pathlib import Path
 import subprocess
 
 import gate
-import workflow_policy
 import verifier_process
 
 CHECKSUMS = 'SHA256SUMS'
@@ -36,14 +35,6 @@ def parse_checksums(raw):
     return entries
 
 
-def selected_channels(raw, workflow):
-    channels = gate.strict_json(raw)
-    gate.require(isinstance(channels, list) and channels and all(isinstance(c, str) for c in channels), 'invalid channel selection')
-    gate.require(channels == sorted(set(channels)) and set(channels) <= gate.CHANNELS and 'github' in channels,
-                 'channel selection must be unique, known, sorted and include github')
-    return channels
-
-
 def attestation_command(subject, tag, source_sha, bundle, trusted_root=None):
     gate.require(isinstance(tag, str) and re.fullmatch(TAG, tag) and isinstance(source_sha, str)
                  and re.fullmatch(SHA, source_sha), 'invalid attestation tag/source binding')
@@ -51,43 +42,12 @@ def attestation_command(subject, tag, source_sha, bundle, trusted_root=None):
                '--cert-identity', f'https://github.com/{gate.REPOSITORY}/{WORKFLOW}@refs/tags/{tag}',
                '--source-ref', 'refs/tags/' + tag, '--source-digest', source_sha, '--signer-digest', source_sha,
                '--cert-oidc-issuer', 'https://token.actions.githubusercontent.com',
-               '--predicate-type', 'https://slsa.dev/provenance/v1', '--deny-self-hosted-runners', '--format', 'json']
+               '--predicate-type', 'https://slsa.dev/provenance/v1', '--deny-self-hosted-runners']
     if bundle is not None:
         command += ['--bundle', str(bundle)]
     if trusted_root is not None:
         command += ['--custom-trusted-root', str(trusted_root)]
     return command
-
-
-def require_run(results, run_id, attesting_attempt):
-    gate.require(type(run_id) is int and run_id > 0 and type(attesting_attempt) is int and attesting_attempt > 0,
-                 'invalid attesting run/attempt')
-    expected = f'https://github.com/{gate.REPOSITORY}/actions/runs/{run_id}/attempts/{attesting_attempt}'
-    gate.require(isinstance(results, list) and results, 'no verified attestation results')
-    for result in results:
-        try:
-            actual = result['verificationResult']['signature']['certificate']['runInvocationURI']
-        except (KeyError, TypeError) as error:
-            raise gate.Refused('verified certificate run invocation missing') from error
-        gate.require(actual == expected, 'verified certificate belongs to another run/attesting attempt')
-    return expected
-
-
-def require_identity(results, tag, source_sha):
-    # These fields come from the verified certificate, never the predicate.
-    # The real pinned-CLI test must fail if upstream changes its JSON layout.
-    expected = {'sourceRepositoryURI': 'https://github.com/' + gate.REPOSITORY,
-                'buildSignerURI': f'https://github.com/{gate.REPOSITORY}/{WORKFLOW}@refs/tags/{tag}',
-                'sourceRepositoryRef': 'refs/tags/' + tag, 'sourceRepositoryDigest': source_sha,
-                'buildSignerDigest': source_sha, 'runnerEnvironment': 'github-hosted',
-                'issuer': 'https://token.actions.githubusercontent.com'}
-    gate.require(isinstance(results, list) and results, 'no verified identity results')
-    for result in results:
-        try:
-            certificate = result['verificationResult']['signature']['certificate']
-            gate.require(all(certificate.get(key) == value for key, value in expected.items()), 'verified certificate identity differs')
-        except (KeyError, TypeError, AttributeError) as error:
-            raise gate.Refused('verified certificate identity missing') from error
 
 
 def regular(path):
@@ -110,10 +70,12 @@ def verify_files(root):
 
 
 def validate_metadata(value):
-    gate.require(isinstance(value, dict) and value.get('schema') == 2 and value.get('repository') == gate.REPOSITORY,
+    gate.require(isinstance(value, dict) and value.get('schema') in (2, 3) and value.get('repository') == gate.REPOSITORY,
                  'invalid release metadata repository/schema')
-    required = {'schema', 'repository', 'source_sha', 'tag', 'tag_object', 'channels', 'targets', 'attesting'}
-    gate.require(required <= set(value) <= required | {'binaries'}, 'unexpected release metadata fields')
+    # Schema 2 is retained for alpha.3; its attesting field is historical data,
+    # never an authorization input. New releases write schema 3 without it.
+    required = {'schema', 'repository', 'source_sha', 'tag', 'tag_object', 'channels', 'targets'}
+    gate.require(required <= set(value) <= required | {'binaries'} | ({'attesting'} if value['schema'] == 2 else set()), 'unexpected release metadata fields')
     gate.require(isinstance(value.get('tag'), str) and re.fullmatch(TAG, value['tag']), 'invalid release metadata tag')
     for field in ('source_sha', 'tag_object'):
         gate.require(isinstance(value.get(field), str) and re.fullmatch(SHA, value[field]), 'invalid release metadata ' + field)
@@ -123,9 +85,6 @@ def validate_metadata(value):
                      and items == sorted(set(items)) and set(items) <= allowed, 'invalid release metadata ' + field)
     gate.require('github' in value['channels'] and ('-' not in value['tag'] or value['channels'] == ['github']),
                  'prerelease channels must remain GitHub only')
-    run = value.get('attesting')
-    gate.require(isinstance(run, dict) and set(run) == {'run_id', 'run_attempt'}
-                 and all(type(n) is int and n > 0 for n in run.values()), 'invalid attesting run metadata')
     return value
 
 
@@ -153,24 +112,15 @@ def load(root):
                                   for name, digest in entries.items()]}
 
 
-def verify(root, tag, source_sha, bundle, run_id=None, attesting_attempt=None, trusted_root=None):
+def verify(root, tag, source_sha, bundle, trusted_root=None):
     import tag_signature
     root = Path(root)
     value = load(root)
     gate.require(value['tag'] == tag and value['source_sha'] == source_sha, 'release tag/source binding differs')
-    run = value['attesting']
-    if run_id is None:
-        run_id = run['run_id']
-    if attesting_attempt is None:
-        attesting_attempt = run['run_attempt']
-    gate.require(run == {'run_id': run_id, 'run_attempt': attesting_attempt}, 'release attesting run differs')
     tag_signature.verify(tag, source_sha, value['tag_object'])
     subjects = [CHECKSUMS] + [item['name'] for item in value['artifacts']]
     for subject in subjects:
         command = attestation_command(root / subject, tag, source_sha, bundle, trusted_root)
-        result = verifier_process.run(command, check=True, capture_output=True, text=True)
-        results = gate.strict_json(result.stdout)
-        require_identity(results, tag, source_sha)
-        require_run(results, run_id, attesting_attempt)
+        verifier_process.run(command, check=True, capture_output=True, text=True)
     gate.require(load(root) == value, 'release bytes changed during verification')
     return value

@@ -13,8 +13,8 @@ import crates_delivery
 import gate
 import homebrew
 import homebrew_publish as tap
-import registry_bundles
 import verifier_process
+import verify
 
 ROOT=Path(__file__).resolve().parents[2]
 SECRETS=('HOMEBREW_TAP_TOKEN','GHCR_PUBLISH_TOKEN','CARGO_REGISTRY_TOKEN','RELEASE_CRATES_BOOTSTRAP_TOKEN')
@@ -70,29 +70,23 @@ def image_subjects(work,signatures):
             yield subject,kind,digest,('https://slsa.dev/provenance/v1' if kind=='provenance' else 'https://spdx.dev/Document'),signatures/f'ghcr-{subject}-{kind}.json'
 
 
-def check_images(root,signatures,value,work,subjects=None):
+def check_images(root,signatures,value,work):
     image_helper().inspect_release(root,work,value)
     expected=gate.strict_json(contract.regular(root/'ghcr-index.json'))
     gate.require(gate.strict_json(contract.regular(work/'verified.json'))==expected,'working OCI descriptor differs')
-    frozen=list(image_subjects(work,signatures))
-    subjects=frozen if subjects is None else list(subjects)
-    gate.require([item[:4] for item in subjects]==[item[:4] for item in frozen],
-                 'registry read-back subjects differ from frozen set')
-    for _,_,digest,predicate,bundle in subjects:
+    for _,_,digest,predicate,bundle in image_subjects(work,signatures):
         contract.regular(bundle)
         manifest=work/'layout/blobs/sha256'/digest.removeprefix('sha256:')
         gate.require('sha256:'+gate.digest(contract.regular(manifest))==digest,'local OCI manifest differs')
         command=contract.attestation_command(manifest,value['tag'],value['source_sha'],bundle)
         command[command.index('--predicate-type')+1]=predicate
-        result=verifier_process.run(command,check=True,capture_output=True,text=True)
-        rows=gate.strict_json(result.stdout);contract.require_identity(rows,value['tag'],value['source_sha'])
-        contract.require_run(rows,value['attesting']['run_id'],value['attesting']['run_attempt'])
+        verifier_process.run(command,check=True,capture_output=True,text=True)
     return expected
 
 
 def verify_images(root,signatures,value):
     with tempfile.TemporaryDirectory(prefix='release-oci-check-') as tmp:
-        work=Path(tmp)/'image';image_helper().inspect_release(root,work,value)
+        work=Path(tmp)/'image'
         return check_images(root,signatures,value,work)
 
 
@@ -101,7 +95,7 @@ def ghcr_upload(root,signatures,value):
         work=Path(tmp)/'image';index=image_helper().inspect_release(root,work,value)
         check_images(root,signatures,value,work)
         # No credential is read or registry contacted before all local subjects
-        # and their exact-tag/original-run provenance have verified.
+        # and their exact-tag/source provenance have verified.
         token=os.environ.get('GHCR_PUBLISH_TOKEN');user=os.environ.get('GHCR_PUBLISH_USER','')
         gate.require(token and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9-]*',user),'dedicated GHCR credential/user missing')
         auth=Path(tmp)/'config.json'
@@ -122,12 +116,29 @@ def ghcr_upload(root,signatures,value):
                 subprocess.run(['skopeo','copy','--all','--preserve-digests','--authfile',str(auth),
                                 'oci:'+str(work/'layout'),'docker://ghcr.io/marcinwadon/hennery@'+digest],check=True,env=registry_env)
             gate.require(remote.reconcile(digest,digest,auth)==0,'GHCR upload ambiguous; stop and reconcile')
-        def before_referrer_write():
-            shared_verify(root,signatures,'ghcr');check_images(root,signatures,value,work)
-        fetched=registry_bundles.reconcile(list(image_subjects(work,signatures)),Path(tmp)/'fetched',
-                                          before_referrer_write,environment=registry_env,auth=auth)
-        check_images(root,signatures,value,work,subjects=fetched)
+        # Standard OCI attachments may duplicate valid bundles on retry. Their
+        # content-addressed image subjects must still match the accepted digest.
+        for _, _, subject, predicate, bundle in image_subjects(work, signatures):
+            shared_verify(root, signatures, 'ghcr')
+            attach_bundle(subject, predicate, bundle, auth, registry_env)
+        # Fetch through the supported verifier, rather than matching a canonical
+        # seven-referrer layout. Crypto children never inherit registry authority.
+        for subject, predicate in {(s[2], s[3]) for s in image_subjects(work, signatures)}:
+            verify.verify_image_subject('ghcr.io/marcinwadon/hennery@' + subject, value,
+                                        predicate_type=predicate)
         return {'state':'published','digest':digest}
+
+
+def attach_bundle(digest, predicate, bundle, auth, environment):
+    media = 'application/vnd.dev.sigstore.bundle.v0.3+json'
+    bundle = Path(bundle).resolve()
+    contract.regular(bundle)
+    subprocess.run(['oras', 'attach', '--registry-config', str(auth),
+                    '--artifact-type', media,
+                    '--annotation', 'dev.sigstore.bundle.predicateType=' + predicate,
+                    '--annotation', 'dev.sigstore.bundle.content=dsse-envelope',
+                    'ghcr.io/marcinwadon/hennery@' + digest, bundle.name + ':' + media],
+                   cwd=bundle.parent, env=environment, check=True, capture_output=True)
 
 
 def registry_helper():

@@ -312,7 +312,7 @@ jobs:
     - id: payload
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:
-        name: release-payload-${{ github.run_id }}-1
+        name: release-payload-${{ github.run_id }}
         path: target/distrib/
         retention-days: 90
         if-no-files-found: error

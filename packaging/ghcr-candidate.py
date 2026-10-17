@@ -87,7 +87,7 @@ def metadata(path, raw):
 
 def inspect_release(candidate, work, inventory):
     # Unprivileged data acceptance confers no publishing authority. Credentialed
-    # callers authenticate the signed tag and exact-run attestations separately.
+    # callers authenticate the signed tag and tag/source attestations separately.
     gate.require(not work.resolve().is_relative_to(candidate.resolve()), 'OCI working directory must be outside immutable release')
     current = contract.load(candidate)
     gate.require(current == inventory, "release OCI metadata changed")

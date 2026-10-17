@@ -19,9 +19,9 @@ def attestation_command(subject, tag, source_sha, bundle=None, trusted_root=None
     return contract.attestation_command(subject, tag, source_sha, bundle, trusted_root)
 
 
-def verify(root, bundle, source_sha, tag, run_id=None, attesting_attempt=None, trusted_root=None):
+def verify(root, bundle, source_sha, tag, trusted_root=None):
     root = Path(root)
-    value = contract.verify(root, tag, source_sha, bundle, run_id, attesting_attempt, trusted_root)
+    value = contract.verify(root, tag, source_sha, bundle, trusted_root)
     supply.verify_binary_inventory(value, root)
     gate.require(contract.load(root) == value, 'release bytes changed during binary verification')
     return value
@@ -52,15 +52,11 @@ def verify_image_subject(image, value, bundle=None, predicate_type=PROVENANCE, m
     command = attestation_command(subject, value['tag'], value['source_sha'], bundle, trusted_root)
     command[command.index('--predicate-type') + 1] = predicate_type
     if bundle is None: command += ['--bundle-from-oci']
-    result = verifier_process.run(command, check=True, capture_output=True, text=True)
-    verified = gate.strict_json(result.stdout)
-    contract.require_identity(verified, value['tag'], value['source_sha'])
-    contract.require_run(verified, value['attesting']['run_id'], value['attesting']['run_attempt'])
+    verifier_process.run(command, check=True, capture_output=True, text=True)
 
 
 def verify_image(image, tag, bundle=None, predicate_type=PROVENANCE, release_directory=None,
-                 release_bundle=None, manifest=None, source_sha=None, run_id=None,
-                 attesting_attempt=None, trusted_root=None):
+                 release_bundle=None, manifest=None, source_sha=None, trusted_root=None):
     gate.require(re.fullmatch(r'ghcr\.io/marcinwadon/hennery@sha256:[0-9a-f]{64}', image), 'verification requires an immutable image digest')
     gate.require(release_directory is not None and release_bundle is not None and source_sha is not None,
                  'image requires checksum-authenticated release and source binding')
@@ -68,7 +64,7 @@ def verify_image(image, tag, bundle=None, predicate_type=PROVENANCE, release_dir
     value = contract.load(root)
     index = image_descriptor(root, value)
     gate.require(image.split('@',1)[1] in [index['digest'], *index['platforms'].values()], 'image digest is not in release descriptor')
-    verified = verify(root, release_bundle, source_sha, tag, run_id, attesting_attempt, trusted_root)
+    verified = verify(root, release_bundle, source_sha, tag, trusted_root)
     gate.require(verified == value, 'release changed before image verification')
     verify_image_subject(image, value, bundle, predicate_type, manifest, trusted_root)
     gate.require(contract.load(root) == value, 'release bytes changed during image verification')
@@ -76,7 +72,7 @@ def verify_image(image, tag, bundle=None, predicate_type=PROVENANCE, release_dir
 
 
 def require_binstall_metadata(metadata, tag):
-    # Native binstall has no exact workflow/source/run verifier. These mappings
+    # Native binstall has no exact workflow/source verifier. These mappings
     # are dormant until a separately reviewed bridge implements this contract.
     disabled = metadata.get('binstall', {}).get('disabled-strategies')
     gate.require(isinstance(disabled, list) and sorted(disabled) == ['compile','crate-meta-data','quick-install'],
@@ -95,8 +91,6 @@ def arguments(argv=None):
     parser.add_argument('--bundle', type=Path, required=True, help='release SHA256SUMS and payload provenance bundle')
     parser.add_argument('--source-sha', required=True)
     parser.add_argument('--tag', required=True)
-    parser.add_argument('--run-id', required=True, type=int)
-    parser.add_argument('--attesting-attempt', required=True, type=int)
     parser.add_argument('--trusted-root', type=Path)
     parser.add_argument('--image')
     parser.add_argument('--image-bundle', type=Path)
@@ -109,9 +103,9 @@ def main():
     args = arguments()
     if args.image:
         verify_image(args.image, args.tag, args.image_bundle, args.predicate_type, args.release_directory,
-                     args.bundle, args.manifest, args.source_sha, args.run_id, args.attesting_attempt, args.trusted_root)
+                     args.bundle, args.manifest, args.source_sha, args.trusted_root)
     else:
-        verify(args.release_directory, args.bundle, args.source_sha, args.tag, args.run_id, args.attesting_attempt, args.trusted_root)
+        verify(args.release_directory, args.bundle, args.source_sha, args.tag, args.trusted_root)
 
 
 if __name__ == '__main__':

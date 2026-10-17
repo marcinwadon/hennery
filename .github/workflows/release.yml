@@ -29,7 +29,6 @@ jobs:
       attestations: write
     outputs:
       artifact_id: ${{ steps.frozen.outputs.artifact-id }}
-      attesting_attempt: '1'
     steps:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       with:
@@ -159,7 +158,7 @@ jobs:
     - id: frozen
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:
-        name: attested-release-${{ github.run_id }}-1
+        name: attested-release-${{ github.run_id }}
         retention-days: 90
         if-no-files-found: error
         path: |-
@@ -192,11 +191,10 @@ jobs:
         path: original
         github-token: ${{ github.token }}
     - id: verified
-      name: Verify this original run and every byte before publication
+      name: Verify signed source and every byte before publication
       env: &id001
         GH_TOKEN: ${{ github.token }}
         RELEASE_ARTIFACT_ID: ${{ needs.attest.outputs.artifact_id }}
-        RELEASE_ATTESTING_ATTEMPT: ${{ needs.attest.outputs.attesting_attempt }}
         RELEASE_PUBLICATION_ENABLED: ${{ vars.RELEASE_PUBLICATION_ENABLED }}
         RELEASE_GITHUB_ENABLED: ${{ vars.RELEASE_GITHUB_ENABLED }}
         RELEASE_HOMEBREW_ENABLED: ${{ vars.RELEASE_HOMEBREW_ENABLED }}
@@ -217,7 +215,6 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
         RELEASE_ARTIFACT_ID: ${{ needs.attest.outputs.artifact_id }}
-        RELEASE_ATTESTING_ATTEMPT: ${{ needs.attest.outputs.attesting_attempt }}
         RELEASE_PUBLICATION_ENABLED: ${{ vars.RELEASE_PUBLICATION_ENABLED }}
         RELEASE_GITHUB_ENABLED: ${{ vars.RELEASE_GITHUB_ENABLED }}
         RELEASE_HOMEBREW_ENABLED: ${{ vars.RELEASE_HOMEBREW_ENABLED }}
@@ -237,7 +234,6 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
         RELEASE_ARTIFACT_ID: ${{ needs.attest.outputs.artifact_id }}
-        RELEASE_ATTESTING_ATTEMPT: ${{ needs.attest.outputs.attesting_attempt }}
         RELEASE_PUBLICATION_ENABLED: ${{ vars.RELEASE_PUBLICATION_ENABLED }}
         RELEASE_GITHUB_ENABLED: ${{ vars.RELEASE_GITHUB_ENABLED }}
         RELEASE_CRATES_ENABLED: ${{ vars.RELEASE_CRATES_ENABLED }}
@@ -255,7 +251,6 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
         RELEASE_ARTIFACT_ID: ${{ needs.attest.outputs.artifact_id }}
-        RELEASE_ATTESTING_ATTEMPT: ${{ needs.attest.outputs.attesting_attempt }}
         RELEASE_PUBLICATION_ENABLED: ${{ vars.RELEASE_PUBLICATION_ENABLED }}
         RELEASE_GITHUB_ENABLED: ${{ vars.RELEASE_GITHUB_ENABLED }}
         RELEASE_GHCR_ENABLED: ${{ vars.RELEASE_GHCR_ENABLED }}
@@ -269,4 +264,6 @@ jobs:
         and disable bootstrap before retries with trusted publishing.' >> "$GITHUB_STEP_SUMMARY"
     - name: Retain publication result
       if: always()
-      run: echo "Publication attempt $GITHUB_RUN_ATTEMPT; original attesting attempt 1" >> "$GITHUB_STEP_SUMMARY"
+      env:
+        RELEASE_ARTIFACT_ID: ${{ needs.attest.outputs.artifact_id }}
+      run: echo "Publication attempt $GITHUB_RUN_ATTEMPT; original artifact $RELEASE_ARTIFACT_ID" >> "$GITHUB_STEP_SUMMARY"

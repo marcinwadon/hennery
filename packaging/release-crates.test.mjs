@@ -11,7 +11,7 @@ function fixture(){
  fs.writeFileSync(join(dir,`hennery-source-${source.sha}.tar.gz`),'source');
  const crates=ORDER.map(name=>{const bytes=Buffer.from(name),file=`${name}-0.1.0.crate`;fs.writeFileSync(join(dir,file),bytes);return {name,file,sha256:sha256(bytes),size:bytes.length,upload:{name,vers:'0.1.0'}};});
  fs.writeFileSync(join(dir,'crates-inventory.json'),JSON.stringify({schema:1,version:'0.1.0',source,crates}));
- fs.writeFileSync(join(dir,'release-metadata.json'),JSON.stringify({schema:2,repository:'marcinwadon/hennery',source_sha:source.sha,tag:'v0.1.0',channels:['crates','github']}));
+ fs.writeFileSync(join(dir,'release-metadata.json'),JSON.stringify({schema:3,repository:'marcinwadon/hennery',source_sha:source.sha,tag:'v0.1.0',channels:['crates','github']}));
  const sums=()=>fs.readdirSync(dir).filter(n=>n!=='SHA256SUMS').sort().map(n=>sha256(fs.readFileSync(join(dir,n)))+'  '+n+'\n').join('');
  fs.writeFileSync(join(dir,'SHA256SUMS'),sums());return {dir,crates,sums};
 }

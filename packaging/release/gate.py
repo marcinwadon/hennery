@@ -5,11 +5,9 @@ import json
 import urllib.error
 import urllib.request
 
-import workflow_policy
 
 REPOSITORY = 'marcinwadon/hennery'
 CHANNELS = {'github', 'crates', 'ghcr', 'homebrew'}
-CHANNEL_JOB_IDS = workflow_policy.CHANNEL_JOB_IDS
 TARGETS = {'aarch64-apple-darwin', 'aarch64-unknown-linux-musl', 'x86_64-unknown-linux-musl'}
 
 

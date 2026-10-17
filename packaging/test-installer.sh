@@ -56,7 +56,7 @@ while [ "\$#" -gt 0 ]; do
 done
 [ "\$identity\$source\$source_digest\$signer_digest" = 1111 ] || exit 1
 printf verified > '$scratch/signature-verified'
-printf '%s\n' '{"verificationResult":{"signature":{"certificate":{"runInvocationURI":"https://github.com/marcinwadon/hennery/actions/runs/10/attempts/'"\${HENNERY_TEST_ATTESTING_ATTEMPT:-1}"'"}}}}' | sed 's/^/[/;s/\$/]/'
+printf '%s\n' 'verified'
 TOOL
 chmod +x "$scratch/verifier-tools/gh"
 cat > "$scratch/verifier-tools/gpg" <<'TOOL'
@@ -130,7 +130,7 @@ echo "ok: the installer embeds each of its $count archives' SHA-256"
 # SHA256SUMS is independent of the installer's embedded checksum.
 command -v jq >/dev/null || fail 'jq is required for provenance fixtures'
 ln -s "$(command -v jq)" "$scratch/verifier-tools/jq"
-jq -n --arg tag "v$fixture_version" '{schema:2,repository:"marcinwadon/hennery",tag:$tag,source_sha:"1111111111111111111111111111111111111111",tag_object:"2222222222222222222222222222222222222222",attesting:{run_id:10,run_attempt:1}}' > "$scratch/release-metadata.json"
+jq -n --arg tag "v$fixture_version" '{schema:3,repository:"marcinwadon/hennery",tag:$tag,source_sha:"1111111111111111111111111111111111111111",tag_object:"2222222222222222222222222222222222222222"}' > "$scratch/release-metadata.json"
 : > "$scratch/SHA256SUMS"
 for archive in $arms; do
     want=$(cut -d ' ' -f 1 "$dist/$archive.sha256")
@@ -352,7 +352,7 @@ chmod +x "$scratch/raced-tools/ln"
 [ "$(cat "$scratch/raced/hennery")" = raced ] || fail 'concurrent destination changed'
 echo 'ok: staging is invisible and concurrent destinations survive'
 
-# Signed source, attested checksums and matching invocation are mandatory.
+# Signed source and attested checksums are mandatory.
 for kind in unsigned malformed wrong-key; do
     (export HENNERY_TEST_TAG_SIGNATURE="$kind"; refused "tag-$kind" "$dist" 'valid pinned signed release tag')
 done
@@ -362,9 +362,6 @@ echo 'ok: missing SHA256SUMS aborts'
 sed 's/[0-9a-f]/0/g' "$scratch/SHA256SUMS" > "$scratch/wrong-sums"
 (TEST_CHECKSUMS="$scratch/wrong-sums"; export TEST_CHECKSUMS; refused other-digest "$dist" 'release-tag provenance')
 echo 'ok: SHA256SUMS must authorize the exact archive bytes'
-(export HENNERY_TEST_ATTESTING_ATTEMPT=2; refused wrong-attempt "$dist" 'release-tag provenance')
-echo 'ok: provenance from another attempt aborts'
-
 (export HENNERY_TEST_SIGNER_REF=refs/heads/main; refused branch-signer "$dist" 'refusing an archive without valid release-tag provenance')
 echo 'ok: branch signer identity cannot authorize installation'
 tools "$scratch/no-gh-tools" gh gpg jq git

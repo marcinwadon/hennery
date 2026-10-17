@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Single tagged-run orchestration. No operation publishes without live gates."""
 import argparse
-from datetime import datetime, timezone
 import importlib.util
 import os
 from pathlib import Path
@@ -12,12 +11,25 @@ import contract
 import gate
 import publication
 import publish
-import run_policy
 import supply
 import tag_signature
-import workflow_policy
 
 ROOT=Path(__file__).resolve().parents[2]
+
+
+def channels(tag):
+    """Alpha publishes GitHub only; stable publishes every supported channel."""
+    return ['github'] if '-' in tag else sorted(gate.CHANNELS)
+
+
+def publication_context(value):
+    expected = {'GITHUB_REPOSITORY': gate.REPOSITORY, 'GITHUB_EVENT_NAME': 'push',
+                'GITHUB_REF': 'refs/tags/' + value['tag'], 'GITHUB_SHA': value['source_sha'],
+                'GITHUB_WORKFLOW_REF': gate.REPOSITORY + '/' + contract.WORKFLOW + '@refs/tags/' + value['tag'],
+                'RELEASE_PUBLICATION_ENABLED': 'true', 'RELEASE_GITHUB_ENABLED': 'true'}
+    gate.require(all(os.environ.get(k) == v for k, v in expected.items()), 'untrusted or disabled publication context')
+    gate.require(value['targets'] == sorted(gate.TARGETS), 'publication requires every qualified target')
+    gate.require(value['channels'] == channels(value['tag']), 'publication channels differ from tag policy')
 
 
 def configuration():
@@ -29,18 +41,15 @@ def configuration():
     import tomllib
     version=tomllib.loads((ROOT/'Cargo.toml').read_text())['workspace']['package']['version']
     gate.require(tag=='v'+version,'tag/workspace version differs')
-    workflow=workflow_policy.load_workflow((ROOT/contract.WORKFLOW).read_bytes())
-    workflow_policy.check(workflow,'release.yml')
-    channels=contract.selected_channels((ROOT/'packaging/release/channels.json').read_bytes(),workflow)
-    return {'channels':channels,'tag_object':proof['object_sha']}
+    return {'channels':channels(tag),'tag_object':proof['object_sha']}
 
 
 def freeze(root):
     value=configuration()
-    return freeze_payload(root, value, os.environ['GITHUB_REF_NAME'], os.environ['GITHUB_SHA'], int(os.environ['GITHUB_RUN_ID']))
+    return freeze_payload(root, value, os.environ['GITHUB_REF_NAME'], os.environ['GITHUB_SHA'])
 
 
-def freeze_payload(root, value, tag, source, run_id):
+def freeze_payload(root, value, tag, source):
     """Shared byte construction. Only configuration() authenticates a release."""
     gate.require(not gate.strict_json((root/'licence-findings.json').read_bytes())['findings'],'unresolved licence findings')
     supply.require_contract(root,value['channels'],sorted(gate.TARGETS),tag)
@@ -49,9 +58,8 @@ def freeze_payload(root, value, tag, source, run_id):
     legacy=root/'sha256.sum'
     if legacy.exists():
         contract.regular(legacy);legacy.unlink()
-    metadata={'schema':2,'repository':gate.REPOSITORY,'source_sha':source,'tag':tag,
+    metadata={'schema':3,'repository':gate.REPOSITORY,'source_sha':source,'tag':tag,
               'tag_object':value['tag_object'],'channels':value['channels'],'targets':sorted(gate.TARGETS),
-              'attesting':{'run_id':run_id,'run_attempt':1},
               'binaries':supply.binary_inventory(root,sorted(gate.TARGETS))}
     print(contract.freeze(root,metadata))
 
@@ -67,8 +75,7 @@ def image_inputs(root,work):
 
 def check_original(root):
     value=contract.load(root)
-    gate.require(os.environ.get('GITHUB_RUN_ATTEMPT')=='1'
-                 and value['attesting']=={'run_id':int(os.environ['GITHUB_RUN_ID']),'run_attempt':1},
+    gate.require(os.environ.get('GITHUB_RUN_ATTEMPT')=='1',
                  'attestation may only use original run inputs; publish-only retry must not re-attest')
     supply.require_contract(root,value['channels'],value['targets'],value['tag'])
     supply.verify_binary_inventory(value,root)
@@ -85,19 +92,14 @@ def require_public(root,signatures,metadata):
 
 def verify(root,signatures,channel='github',public=False):
     value=contract.load(root)
-    api=gate.GitHub(os.environ['GH_TOKEN'])
-    run_policy.validate(value,run_policy.evidence(api,value,os.environ),os.environ,datetime.now(timezone.utc))
+    publication_context(value)
+    if channel == 'github':
+        gate.require(all(os.environ.get('RELEASE_' + c.upper() + '_ENABLED') == 'true'
+                         for c in value['channels']), 'a selected publication channel is disabled')
     gate.require(channel in value['channels'],'channel is not selected')
     if channel!='github':
         gate.require(os.environ.get('RELEASE_'+channel.upper()+'_ENABLED')=='true','channel publication is disabled')
-    # Validate ownership against the checked-out, signature-verified source,
-    # not a name supplied by the run artifact.
-    workflow=workflow_policy.load_workflow((ROOT/contract.WORKFLOW).read_bytes())
-    workflow_policy.check(workflow,'release.yml')
-    gate.require(contract.selected_channels((ROOT/'packaging/release/channels.json').read_bytes(),workflow)==value['channels'],
-                 'artifact channel selection differs from signed source')
-    contract.verify(root,value['tag'],os.environ['GITHUB_SHA'],signatures/contract.BUNDLE,
-                    int(os.environ['GITHUB_RUN_ID']),int(os.environ['RELEASE_ATTESTING_ATTEMPT']))
+    contract.verify(root,value['tag'],os.environ['GITHUB_SHA'],signatures/contract.BUNDLE)
     supply.require_contract(root,value['channels'],value['targets'],value['tag'])
     supply.verify_binary_inventory(value,root)
     if 'ghcr' in value['channels']:
@@ -109,16 +111,14 @@ def verify(root,signatures,channel='github',public=False):
 
 def summary(root,signatures):
     value=contract.load(root)
-    gate.require(value['attesting']=={'run_id':int(os.environ['GITHUB_RUN_ID']),'run_attempt':1}
-                 and os.environ['GITHUB_RUN_ATTEMPT']=='1','attesting attempt changed; never rerun all for recovery')
     print('# Release approval inputs\n')
-    print('Source: `'+value['source_sha']+'`; tag: `'+value['tag']+'`; original run: `'+str(value['attesting']['run_id'])+'`, attesting attempt: `1`.\n')
+    print('Source: `'+value['source_sha']+'`; tag: `'+value['tag']+'`.\n')
     print('Channels: `'+','.join(value['channels'])+'`; targets: `'+','.join(value['targets'])+'`.\n')
     print('| Asset | SHA-256 |\n|---|---|')
     for directory in (root,signatures):
         for path in sorted(directory.iterdir()):print('| `'+path.name+'` | `'+gate.digest(contract.regular(path))+'` |')
-    print('\nNo draft exists before approval. A publish-only retry reuses these bytes and the original attesting attempt.')
-    print('For a retry, approve with comment `publish-run:'+str(value['attesting']['run_id'])+':attempt:<current publishing attempt>`. Never rerun all.')
+    print('\nNo draft exists before approval. Retry only publication with renewed environment approval and the original artifact ID; never rebuild.')
+
 
 
 def main():

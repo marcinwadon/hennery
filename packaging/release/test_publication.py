@@ -16,8 +16,8 @@ class Publication(unittest.TestCase):
         self.root=Path(self.tmp.name)/'payload';self.root.mkdir()
         self.signatures=Path(self.tmp.name)/'signatures';self.signatures.mkdir()
         (self.root/'installer.sh').write_bytes(b'exit 0\n')
-        contract.freeze(self.root,{'schema':2,'repository':gate.REPOSITORY,'source_sha':'a'*40,'tag':'v0.1.0',
-            'tag_object':'b'*40,'channels':['github'],'targets':sorted(gate.TARGETS),'attesting':{'run_id':42,'run_attempt':1}})
+        contract.freeze(self.root,{'schema':3,'repository':gate.REPOSITORY,'source_sha':'a'*40,'tag':'v0.1.0',
+            'tag_object':'b'*40,'channels':['github'],'targets':sorted(gate.TARGETS)})
         (self.signatures/contract.BUNDLE).write_bytes(b'authentic bundle doubled here')
         self.remote=None;self.assets={};self.events=[];self.fault=None
 

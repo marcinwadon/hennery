@@ -86,43 +86,6 @@ class ChannelDelivery(unittest.TestCase):
             with self.assertRaises(gate.Refused):channel_publish.publish(Path('unused'),Path('unused'),'crates')
             self.assertTrue(any('revoke' in str(call) for call in notice.call_args_list))
 
-    def test_ghcr_frozen_digest_retry_and_late_failure(self):
-        # Transport lifecycle only: authentic OCI/crypto contracts have their
-        # own fixtures. No network or registry credentials are used here.
-        for mode in ['new','present','conflict','attach-failure','verify-failure']:
-            with self.subTest(mode=mode),tempfile.TemporaryDirectory() as tmp:
-                root=Path(tmp);events=[];uploaded=mode=='present';digest='sha256:'+'a'*64
-                def inspect(*args):events.append('inspect');return {'digest':digest}
-                def checks(*args,**kwargs):
-                    events.append('fetched-verify' if kwargs.get('subjects') else 'verify')
-                    if mode=='verify-failure':raise gate.Refused('wrong signature')
-                def reconcile(*args):
-                    events.append('reconcile')
-                    if mode=='conflict':raise gate.Refused('different bytes')
-                    return 0 if uploaded else 1
-                def run(command,**kwargs):
-                    nonlocal uploaded
-                    events.append(command[:2])
-                    if command[:2]==['skopeo','login']:
-                        self.assertIn('verify',events[:-1]);self.assertEqual(kwargs['input'],'offline-secret')
-                        Path(command[command.index('--authfile')+1]).write_text('{}')
-                    if command[:2]==['skopeo','copy']:
-                        self.assertIn('--preserve-digests',command);self.assertTrue(command[-1].endswith('@'+digest));uploaded=True
-                def bundles(subjects,output,before_write,**kwargs):
-                    if mode!='present':
-                        for _ in subjects:
-                            before_write();events.append('referrer-write')
-                            if mode=='attach-failure':raise RuntimeError('ambiguous referrer copy')
-                    return [(*item[:4],output/item[4].name) for item in subjects]
-                fixture=SimpleNamespace(inspect_release=inspect)
-                with patch.dict(os.environ,{'GHCR_PUBLISH_TOKEN':'offline-secret','GHCR_PUBLISH_USER':'fixture'}),patch.object(channel_publish,'shared_verify',return_value={'tag':'v0.1.0'}),patch.object(channel_publish,'image_helper',return_value=fixture),patch.object(channel_publish,'registry_helper',return_value=SimpleNamespace(reconcile=reconcile)),patch.object(channel_publish,'check_images',side_effect=checks),patch.object(channel_publish,'image_subjects',return_value=[('index','provenance',digest,'slsa',root/'bundle')]),patch.object(channel_publish.registry_bundles,'reconcile',side_effect=bundles),patch('subprocess.run',side_effect=run):
-                    if mode in ('conflict','attach-failure','verify-failure'):
-                        with self.assertRaises((gate.Refused,RuntimeError)):channel_publish.ghcr_upload(root,root,{'tag':'v0.1.0'})
-                    else:self.assertEqual(channel_publish.ghcr_upload(root,root,{'tag':'v0.1.0'})['digest'],digest)
-                if mode in ('present','conflict','verify-failure'):self.assertNotIn(['skopeo','copy'],events)
-                if mode=='verify-failure':self.assertNotIn(['skopeo','login'],events)
-                if mode in ('new','present'):self.assertEqual(events[-1],'fetched-verify')
-                if mode=='present':self.assertNotIn('referrer-write',events)
 
     def test_homebrew_cas_and_all_remote_conflicts(self):
         fixture=test_homebrew.Formula();fixture.setUp();self.addCleanup(fixture.tmp.cleanup);fixture.prepare()

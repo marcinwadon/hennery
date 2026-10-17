@@ -85,13 +85,12 @@ class ConsumerFixtures:
             result = git('-C', str(source), 'hash-object', '-t', 'tag', '-w', '--stdin', input=raw)
             object_sha = result.stdout.strip()
             git('-C', str(source), 'update-ref', 'refs/tags/'+tag, object_sha)
-        metadata = {'schema': 2, 'repository': 'marcinwadon/hennery', 'tag': tag, 'source_sha': sha, 'tag_object': object_sha, 'attesting': {'run_id': 10, 'run_attempt': 1}}
+        metadata = {'schema': 3, 'repository': 'marcinwadon/hennery', 'tag': tag, 'source_sha': sha, 'tag_object': object_sha}
         if case == 'wrong-metadata-source': metadata['source_sha'] = '0'*40
         if case == 'wrong-metadata-tag': metadata['tag'] = 'v9.9.9'
         if case == 'wrong-metadata-object': metadata['tag_object'] = '0'*40
         if case == 'wrong-metadata-repository': metadata['repository'] = 'another/repository'
         if case == 'wrong-metadata-schema': metadata['schema'] = 1
-        if case == 'invalid-run': metadata['attesting']['run_id'] = 0
         payload_name = 'hennery-test.tar.xz' if installer else 'hennery-installer.sh'
         payload = b'archive fixture' if installer else b'#!/bin/sh\nprintf executed > "$INSTALL_MARKER"\n'
         (release / payload_name).write_bytes(payload)
@@ -157,26 +156,14 @@ Path(args[args.index('-o')+1]).write_bytes(path.read_bytes())
 from pathlib import Path
 a=sys.argv[1:]; assert a[:2]==['attestation','verify']
 assert '--signer-workflow' not in a
-for flag,expected in {'--repo':'marcinwadon/hennery','--source-ref':'refs/tags/'+os.environ['FIXTURE_TAG'],'--source-digest':os.environ['FIXTURE_SHA'],'--signer-digest':os.environ['FIXTURE_SHA'],'--cert-identity':'https://github.com/marcinwadon/hennery/.github/workflows/release.yml@refs/tags/'+os.environ['FIXTURE_TAG'],'--format':'json','--cert-oidc-issuer':'https://token.actions.githubusercontent.com','--predicate-type':'https://slsa.dev/provenance/v1'}.items():
+for flag,expected in {'--repo':'marcinwadon/hennery','--source-ref':'refs/tags/'+os.environ['FIXTURE_TAG'],'--source-digest':os.environ['FIXTURE_SHA'],'--signer-digest':os.environ['FIXTURE_SHA'],'--cert-identity':'https://github.com/marcinwadon/hennery/.github/workflows/release.yml@refs/tags/'+os.environ['FIXTURE_TAG'],'--cert-oidc-issuer':'https://token.actions.githubusercontent.com','--predicate-type':'https://slsa.dev/provenance/v1'}.items():
     assert a.count(flag)==1 and a[a.index(flag)+1]==expected
 assert '--deny-self-hosted-runners' in a
 subject=Path(a[2]); bundle=Path(a[a.index('--bundle')+1]); assert bundle.read_text()=='offline provenance fixture\\n'
 assert subject.read_bytes()==(Path(os.environ['FIXTURE_ATTESTED'])/subject.name).read_bytes()
 case=os.environ['FIXTURE_CASE']
 if case=='branch-signer': sys.exit(1)
-run='https://github.com/marcinwadon/hennery/actions/runs/10/attempts/1'
-if case=='wrong-run': run=run.replace('/10/','/11/')
-if case=='invalid-run': run=run.replace('/10/','/0/')
-if case=='wrong-attempt': run=run[:-1]+'2'
-if case=='wrong-run-repository': run=run.replace('marcinwadon/hennery','other/repo')
-certificate={'runInvocationURI':run}
-if case=='missing-run': certificate={}
-if case=='predicate-only-run': certificate={}
-if case=='nested-run': certificate={'extensions':certificate}
-result=[{'verificationResult':{'signature':{'certificate':certificate},'statement':{'predicate':{'runInvocationURI':run}}}}]
-if case=='empty-results': result=[]
-if case=='extra-unbound-result': result.append({'verificationResult':{'signature':{'certificate':{}}}})
-print(json.dumps(result))
+print('verified')
 if case=='failed-attestation-status': sys.exit(1)
 ''')
         for tool in tools.iterdir(): tool.chmod(0o755)
@@ -212,8 +199,8 @@ if case=='failed-attestation-status': sys.exit(1)
 REFUSALS = ('unsigned-tag','lightweight-tag','malformed-signature','wrong-key-signature','wrong-release-tag',
             'tampered-installer','tampered-checksums','tampered-metadata','missing-bundle','missing-checksums','missing-metadata',
             'wrong-metadata-source','wrong-metadata-tag','wrong-metadata-object','wrong-metadata-repository','wrong-metadata-schema',
-            'invalid-run','duplicate-checksum','malformed-checksum','missing-payload-checksum','wrong-payload-checksum',
-            'unsafe-checksum','cyclic-checksum','branch-signer','wrong-run','wrong-attempt','wrong-run-repository',
-            'missing-run','predicate-only-run','nested-run','empty-results','extra-unbound-result',
+            'duplicate-checksum','malformed-checksum','missing-payload-checksum','wrong-payload-checksum',
+            'unsafe-checksum','cyclic-checksum','branch-signer',
+
             'expired-status','revoked-status','duplicate-status','empty-status','failed-valid-status',
             'failed-attestation-status','failed-hash-status','missing-gh','missing-git','missing-gpg','missing-jq','missing-hash','no-final-newline')
