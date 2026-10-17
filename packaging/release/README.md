@@ -74,6 +74,27 @@ tarballs and dependency order. Revoke bootstrap authority on success or
 abandonment. Verifier children receive isolated configuration and no publication
 or OIDC credentials; the crates writer revalidates through private parent pipes.
 
+`hosting.py` wraps the pinned `gh release` commands. It creates a draft with
+`--verify-tag` and `--latest=false`, uploads missing frozen files without
+`--clobber`, downloads all existing assets and compares actual byte hashes,
+then publishes and requires `isImmutable` in the CLI's JSON. A failed command
+stops; only an explicitly missing release permits draft creation. The wrapper
+does not implement HTTP routing, redirect authentication or pagination. Each
+write command revalidates authority and local bytes; uploads use one CLI batch.
+An interrupted batch can leave a partial draft that the next approved attempt
+reconciles. No moving GitHub/image aliases are written.
+
+Official pinned provenance/SBOM actions sign final files and OCI digests. The
+attester receives no registry credential and never pushes there; it materializes
+the accepted OCI layout once. The protected publisher later copies the accepted
+image digest and attaches these exact bundles with standard Skopeo/ORAS transport.
+
+The former standalone `release-tests` workflow is consolidated: the exact README
+bootstrap runs in `ci/checks`, while real cargo-dist staging/advisory regressions
+run on all three existing native archive builders. Native installer acceptance
+already consumes the assembled archives on all three targets. There are four
+core workflows (`ci`, packaging, release, scheduled maintenance) plus `pins`.
+
 ## OCI and recovery
 
 Local provenance and image/binary SPDX bundles are checked against accepted
@@ -94,5 +115,10 @@ settings or remote transport. An operator-authorized hosted qualification remain
 necessary before retiring the old publisher. A repository writer may publish
 genuine attested bytes early or freeze an incomplete release: the accepted
 availability risk is handled by a new signed version, without adding a service.
+`publication.py` and `publish.py` are retained only for that proof-gated cleanup;
+the active runtime does not import them and has no fallback to them. Their mock
+transport tests are replaced by real pinned-CLI hosting tests using genuine
+alpha.3 assets and a loopback TLS service. That service proves client integration,
+never GitHub's hosted authorization or immutability behavior.
 
 Generated with Claude AI — please review before distribution.

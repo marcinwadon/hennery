@@ -1,6 +1,6 @@
 """Exercise the production assembly command with the real pinned cargo-dist.
 
-The release-tests workflow supplies HENNERY_TEST_DIST after checksum installation.
+The packaging archive job supplies HENNERY_TEST_DIST after checksum installation.
 """
 import json
 import os
@@ -16,7 +16,7 @@ import test_assemble
 ROOT = Path(__file__).resolve().parents[2]
 
 
-@unittest.skipUnless(os.environ.get('HENNERY_TEST_DIST'), 'requires pinned cargo-dist (release-tests CI)')
+@unittest.skipUnless(os.environ.get('HENNERY_TEST_DIST'), 'requires pinned cargo-dist (packaging CI)')
 class DistAssembly(unittest.TestCase):
     def test_production_global_build_imports_all_native_manifests(self):
         dist = Path(os.environ['HENNERY_TEST_DIST']).resolve()

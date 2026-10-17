@@ -48,6 +48,10 @@ jobs:
         nix develop .#release -c shellcheck packaging/ci-*.sh packaging/image-build.sh packaging/image-ci.sh packaging/test-image-registry.sh packaging/smoke-image.sh
     - name: Git path classification regressions
       run: nix develop .#release -c python3 -m unittest discover -s packaging -p test_ci_paths.py
+    - name: Execute the exact README bootstrap against signed offline releases
+      run: |
+        sh packaging/readme-blocks.sh README.md release-bootstrap > "$RUNNER_TEMP/release-bootstrap.sh"
+        nix develop .#release -c python3 packaging/release/test_bootstrap.py --script "$RUNNER_TEMP/release-bootstrap.sh"
     - name: Portable release and image regressions
       run: |
         nix develop .#release -c python3 -m unittest discover -s packaging/release -p 'test_*.py'

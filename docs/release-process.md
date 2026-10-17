@@ -175,6 +175,16 @@ The job has contents write, Actions/attestations read and OIDC write; other
 permissions are absent. Job permissions exist at job start; scripts do not mint
 the built-in token only after verification.
 
+The active GitHub host is the pinned standard `gh release` client. The wrapper
+uses `create --draft --verify-tag --latest=false`, `upload` without `--clobber`,
+`download` into a fresh directory for byte-hash comparison, and
+`edit --draft=false --verify-tag --latest=false`. It checks the CLI's
+`isImmutable` field after publication; `create` alone does not enable repository
+immutability. It refuses unapproved/duplicate assets, mismatching bytes, wrong
+tag/prerelease state and any ambiguous command failure. The standard client owns
+HTTP authentication, redirects and pagination. Uploads form one CLI batch after
+fresh verification; a partial upload is reconciled on the next approved attempt.
+
 Authenticated GitHub transport stays in the publisher parent. Verifier children
 receive only an explicit credential-free allow-list and fresh private Git/GPG,
 GitHub CLI and Docker/ORAS configuration, including no GitHub or Actions/OIDC
@@ -209,6 +219,16 @@ expired originals, conflicting remote bytes or an incomplete immutable release
 require a new signed version. Withhold aliases and document the incomplete
 release until recovery is verified.
 
+In the original tag run, use GitHub's failed-job rerun only when `publish` was
+the failed job and `attest` completed successfully. Confirm the original attested
+artifact ID against the attester's summary before approving again. Never choose
+the all-jobs rerun. If a producer/attester failed, or an original artifact is
+unavailable, repair the cause and use a new signed version. The final publishing
+summary records each channel step's outcome and original artifact ID even after
+failure. A failed/cancelled channel may already have written remotely; its step
+outcome is diagnostic, not proof of absence. Verify its remote state before
+retrying. The workflow deliberately writes no moving GitHub/image aliases.
+
 - Before immutable GitHub publication, reconcile the draft's exact asset set.
   Upload only verified missing assets; extra/different bytes refuse. If the
   publish response is lost or ambiguous, first inspect/re-verify the public
@@ -234,5 +254,23 @@ acceptance remain maintainer-owned after authorized publication. Stop services,
 back up complete data/config/keys and check schema compatibility before rollback.
 Restore a compatible backup or ship a forward fix rather than overwriting
 immutable versions. Retain corresponding source and document remediation.
+
+## Qualification before legacy cleanup
+
+The operator separately authorizes a new prerelease through this simplified
+workflow. Confirm genuine official-action OIDC attestations, the protected
+environment's approval and renewed publish-only approval, unchanged original
+artifact IDs on retry, exact downloaded public hashes and GitHub's immutable
+state. Confirm a publish-only retry of already published matching bytes performs
+no uploads. Preserve the run URL, artifact IDs, hashes and acceptance observations.
+Local TLS/CLI and genuine alpha.3 fixture tests cannot certify these hosted
+services. Alpha success covers GitHub only; stable four-channel acceptance and
+crates trusted-publishing/GHCR access checks still require their own authorization.
+
+Until that evidence exists, `publication.py` and `publish.py` remain as inactive
+legacy source. They are not imported by the active runtime, selected by any
+workflow or available as an automatic fallback. After successful hosted proof,
+delete those two modules in a small cleanup PR. Implementation and merge do not
+authorize this qualification, new tags, credentials, settings or publication.
 
 Generated with Claude AI — please review before distribution.

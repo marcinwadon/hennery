@@ -37,10 +37,7 @@ const EXAMPLE_PORT: u16 = 7117;
 
 /// Every block name in the README, in order, with what runs it.
 const BLOCKS: [(&str, Runner); 12] = [
-    (
-        "release-bootstrap",
-        Runner::Workflow("release-tests.yml", "refusal-tests"),
-    ),
+    ("release-bootstrap", Runner::Workflow("ci.yml", "checks")),
     ("clone", Runner::Workflow("ci.yml", "readme")),
     ("build", Runner::Workflow("ci.yml", "readme")),
     ("nix", Runner::Workflow("nix.yml", "flake")),

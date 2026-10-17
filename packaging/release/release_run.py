@@ -9,8 +9,7 @@ import sys
 
 import contract
 import gate
-import publication
-import publish
+import hosting
 import supply
 import tag_signature
 
@@ -83,11 +82,7 @@ def check_original(root):
 
 
 def require_public(root,signatures,metadata):
-    remote=publish.api(f'/repos/{gate.REPOSITORY}/releases/tags/{metadata["tag"]}')
-    gate.require(isinstance(remote,dict) and remote.get('tag_name')==metadata['tag'] and remote.get('draft') is False
-                 and remote.get('immutable') is True,'channel requires public immutable GitHub release')
-    expected={p.name:gate.digest(contract.regular(p)) for directory in (root,signatures) for p in directory.iterdir()}
-    gate.require(not publish.plan(expected,publish.release_assets(remote))['missing'],'immutable public release is incomplete')
+    hosting.require_public(root,signatures,metadata)
 
 
 def verify(root,signatures,channel='github',public=False):
@@ -140,7 +135,7 @@ def main():
         if args.outputs:
             with args.outputs.open('a') as output:output.write('channels='+gate.canonical(value['channels']).decode())
     elif args.operation=='publish':
-        result=publication.release(args.root,args.other,lambda:verify(args.root,args.other))
+        result=hosting.release(args.root,args.other,lambda:verify(args.root,args.other))
         print(gate.canonical(result).decode(),end='')
     else:
         import channel_publish

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """GitHub channel reconciliation/upload. Never overwrites or rebuilds payloads.
 
-Only called by the protected manual workflow after live validation. This module
-has no side effects on import; offline tests replace the transport entirely.
+Inactive legacy transport, retained with publication.py until operator-authorized
+hosted qualification. The active publisher uses hosting.py and standard gh release.
 """
 import os
 import urllib.error

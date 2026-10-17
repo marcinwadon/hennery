@@ -1,4 +1,9 @@
-"""Draft creation through immutable publication; transport is separately doubled."""
+"""Inactive pre-migration publisher; not imported by the release runtime.
+
+Retained until operator-authorized hosted qualification of hosting.py proves
+OIDC, approval, original artifacts and immutable remote readback. Do not wire
+this back into the workflow as a fallback; then delete with publish.py.
+"""
 from pathlib import Path
 import urllib.parse
 

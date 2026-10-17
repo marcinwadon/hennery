@@ -139,10 +139,10 @@ The attestation command uses `--cert-identity` for the exact
 GitHub Actions issuer, SLSA provenance predicate and hosted runners. The tag
 must be annotated, point directly to that source commit and have a valid
 signature from the full pinned maintainer fingerprint above.
-The block authenticates `SHA256SUMS`, release metadata and the installer, checks
-their common attesting run, and only then runs the installer. The installer repeats
-these checks for its archive before extraction. Keep the printed directory for
-inspection. Only the authenticated installer is executed.
+The block authenticates `SHA256SUMS`, release metadata and the installer against
+the signed tag, exact tagged workflow and source digest, then runs the installer.
+The installer repeats these checks for its archive before extraction. Keep the
+printed directory for inspection. Only the authenticated installer is executed.
 
 <!-- check: release-bootstrap -->
 ```sh

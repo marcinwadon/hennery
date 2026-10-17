@@ -74,7 +74,6 @@ jobs:
       if: ${{ contains(fromJSON(needs.packaging.outputs.channels), 'ghcr') }}
       name: Retained OCI inputs amd64
       run: |-
-        nix develop .#release -c python3 packaging/release/release_run.py image-inputs payload image-signing
         python3 packaging/image-signing-inputs.py image-signing/layout amd64 signing-amd64 >> "$GITHUB_OUTPUT"
     - id: amd64-provenance
       if: ${{ contains(fromJSON(needs.packaging.outputs.channels), 'ghcr') }}
@@ -115,7 +114,6 @@ jobs:
       if: ${{ contains(fromJSON(needs.packaging.outputs.channels), 'ghcr') }}
       name: Retained OCI inputs arm64
       run: |-
-        nix develop .#release -c python3 packaging/release/release_run.py image-inputs payload image-signing
         python3 packaging/image-signing-inputs.py image-signing/layout arm64 signing-arm64 >> "$GITHUB_OUTPUT"
     - id: arm64-provenance
       if: ${{ contains(fromJSON(needs.packaging.outputs.channels), 'ghcr') }}
@@ -203,7 +201,7 @@ jobs:
       run: nix develop .#release -c python3 packaging/release/release_run.py verify original/payload original/signatures github
         --outputs "$GITHUB_OUTPUT"
     - id: github-publish
-      name: Create draft, read-back verify, publish immutable
+      name: gh release draft, frozen uploads, readback and immutable publication
       env: *id001
       run: nix develop .#release -c python3 packaging/release/release_run.py publish original/payload original/signatures
     - id: homebrew-verify
@@ -266,4 +264,14 @@ jobs:
       if: always()
       env:
         RELEASE_ARTIFACT_ID: ${{ needs.attest.outputs.artifact_id }}
-      run: echo "Publication attempt $GITHUB_RUN_ATTEMPT; original artifact $RELEASE_ARTIFACT_ID" >> "$GITHUB_STEP_SUMMARY"
+        GITHUB_RESULT: ${{ steps.github-publish.outcome }}
+        HOMEBREW_RESULT: ${{ steps.homebrew-publish.outcome }}
+        CRATES_RESULT: ${{ steps.crates-publish.outcome }}
+        GHCR_RESULT: ${{ steps.ghcr-publish.outcome }}
+      run: |
+        {
+          echo "Publication attempt $GITHUB_RUN_ATTEMPT; original artifact $RELEASE_ARTIFACT_ID"
+          echo "GitHub: $GITHUB_RESULT; Homebrew: $HOMEBREW_RESULT; crates: $CRATES_RESULT; GHCR: $GHCR_RESULT"
+          echo 'On failure, reconcile remote bytes first: a failed step may already have written. Retry only publish with renewed approval and this original artifact ID. Never rebuild, clobber assets or move a signed tag. See docs/release-process.md.'
+          echo 'No moving release/image aliases are published by this workflow.'
+        } >> "$GITHUB_STEP_SUMMARY"

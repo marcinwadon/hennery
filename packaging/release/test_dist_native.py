@@ -16,7 +16,7 @@ import test_assemble
 ROOT = Path(__file__).resolve().parents[2]
 
 
-@unittest.skipUnless(os.environ.get('HENNERY_TEST_DIST'), 'requires pinned cargo-dist (release-tests CI)')
+@unittest.skipUnless(os.environ.get('HENNERY_TEST_DIST'), 'requires pinned cargo-dist (packaging CI)')
 class NativeDist(unittest.TestCase):
     def run_archive(self, root, missing=None, *, host_only=False):
         native_target = {('Darwin', 'arm64'): 'aarch64-apple-darwin',

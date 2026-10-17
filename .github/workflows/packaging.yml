@@ -169,6 +169,8 @@ jobs:
         cp -R inputs/ui/. web/dist/
         cargo metadata --locked --all-features --filter-platform '${{ matrix.target }}' --format-version=1 > cargo-metadata.json
         TARGET='${{ matrix.target }}' nix develop .#release -c sh packaging/release/native-materials.sh
+    - name: Real cargo-dist transport and advisory regressions
+      run: HENNERY_TEST_DIST="$RUNNER_TEMP/dist-bin/dist" nix develop .#release -c python3 -m unittest discover -s packaging/release -p 'test_dist_*.py'
     - name: Archive and content acceptance
       env:
         HENNERY_WEB_REQUIRE: '1'
