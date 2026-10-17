@@ -1,4 +1,4 @@
-# Shared read-only packaging. PRs exercise every local channel; only release.yml can attest or publish.
+# Shared read-only packaging. PRs qualify Linux; main and tags add macOS; only release.yml can attest or publish.
 name: packaging
 'on':
   workflow_call:
@@ -81,6 +81,10 @@ jobs:
       source: ${{ steps.context.outputs.source }}
       channels: ${{ steps.context.outputs.channels }}
       extended: ${{ steps.context.outputs.extended }}
+      crates: ${{ steps.context.outputs.crates }}
+      targets: ${{ steps.context.outputs.targets }}
+      archive_matrix: ${{ steps.context.outputs.archive_matrix }}
+      native_matrix: ${{ steps.context.outputs.native_matrix }}
     steps:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       with:
@@ -110,7 +114,7 @@ jobs:
         nix develop .#web -c pnpm --dir web build
         mkdir -p "$RUNNER_TEMP/package-inputs/ui" release-materials
         cp -R web/dist/. "$RUNNER_TEMP/package-inputs/ui/"
-        nix develop .#web -c pnpm --dir web licenses list --json > "$RUNNER_TEMP/frontend-licences.json"
+        nix develop .#web -c pnpm --dir web licenses list --prod --json > "$RUNNER_TEMP/frontend-licences.json"
         nix develop .#release -c python3 packaging/release/supply.py frontend \
           --frontend-licences "$RUNNER_TEMP/frontend-licences.json" --output "$RUNNER_TEMP/package-inputs/frontend"
     - name: Audit dependencies once; findings stop packaging
@@ -129,16 +133,7 @@ jobs:
     - prepare
     strategy:
       fail-fast: false
-      matrix:
-        include:
-        - target: x86_64-unknown-linux-musl
-          runner: ubuntu-24.04
-          image: amd64
-        - target: aarch64-unknown-linux-musl
-          runner: ubuntu-24.04-arm
-          image: arm64
-        - target: aarch64-apple-darwin
-          runner: macos-15
+      matrix: ${{ fromJSON(needs.prepare.outputs.archive_matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     steps:
@@ -221,6 +216,7 @@ jobs:
     env:
       RELEASE_SOURCE_SHA: ${{ github.sha }}
   crates:
+    if: needs.prepare.outputs.crates == 'true'
     needs:
     - prepare
     runs-on: ubuntu-24.04
@@ -275,6 +271,7 @@ jobs:
     permissions:
       contents: read
   assemble:
+    if: ${{ !cancelled() && needs.prepare.result == 'success' && needs.archive.result == 'success' && (needs.crates.result == 'success' || needs.crates.result == 'skipped') }}
     needs:
     - prepare
     - archive
@@ -298,6 +295,7 @@ jobs:
         path: candidates
         merge-multiple: false
     - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      if: needs.crates.result == 'success'
       with:
         name: release-crates
         path: crates-flat
@@ -310,6 +308,8 @@ jobs:
         RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         RELEASE_CHANNELS: ${{ needs.prepare.outputs.channels }}
         PACKAGING_RELEASE: ${{ inputs.release || false }}
+        PACKAGING_TARGETS: ${{ needs.prepare.outputs.targets }}
+        PACKAGING_CRATES: ${{ needs.prepare.outputs.crates }}
       run: nix develop .#release -c sh packaging/release/assemble-package.sh
     - id: payload
       uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -321,18 +321,16 @@ jobs:
     permissions:
       contents: read
   native:
+    if: ${{ !cancelled() && needs.assemble.result == 'success' }}
     needs:
+    - prepare
     - assemble
     - crates
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      matrix:
-        runner:
-        - ubuntu-24.04
-        - ubuntu-24.04-arm
-        - macos-15
+      matrix: ${{ fromJSON(needs.prepare.outputs.native_matrix) }}
     steps:
     - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
       with:
@@ -352,12 +350,12 @@ jobs:
     - name: Install, smoke, upgrade, test and uninstall the existing archives through Homebrew
       run: nix develop .#release -c python3 packaging/release/homebrew_accept.py candidate "$RUNNER_TEMP/homebrew-proof"
     - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
-      if: runner.os == 'macOS'
+      if: runner.os == 'macOS' && needs.crates.result == 'success'
       with:
         name: release-crates
         path: crates-flat
     - name: One native packaged CLI install on macOS
-      if: runner.os == 'macOS'
+      if: runner.os == 'macOS' && needs.crates.result == 'success'
       run: nix develop -c node packaging/check-native-crate.mjs crates-flat "$RUNNER_TEMP/native-crate"
     - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
       with:

@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import parse_qs, unquote, urlsplit
 
+import assets
 import contract
 import gate
 import hosting
@@ -67,6 +68,14 @@ class Hosting(unittest.TestCase):
             shutil.copyfile(ALPHA / name, self.root / name)
         shutil.copyfile(ALPHA / contract.BUNDLE, self.signatures / contract.BUNDLE)
         self.metadata = gate.strict_json((self.root / contract.METADATA).read_bytes())
+        # Keep the genuine private authorization fixture, while exercising the
+        # new public projection and actual gh upload filenames separately.
+        for name in assets.names(self.metadata['targets']):
+            shutil.copyfile(ALPHA / contract.METADATA, self.root / name)
+        (self.root / 'release-notes.md').write_text('Release body fixture')
+        (self.root / assets.PUBLIC_CHECKSUMS).write_text(''.join(
+            gate.digest((self.root / name).read_bytes()) + '  ' + name + '\n'
+            for name in assets.names(self.metadata['targets'])))
         self.remote, self.assets, self.writes, self.fault = None, {}, [], None
         self.server.case = self
         self.real_run = subprocess.run
@@ -119,8 +128,11 @@ class Hosting(unittest.TestCase):
         result = self.publish()
         self.assertEqual(result['state'], 'immutable')
         self.assertTrue(self.remote['immutable'])
-        expected = {p.name: p.read_bytes() for folder in (self.root, self.signatures) for p in folder.iterdir()}
+        expected = {name: path.read_bytes() for name, path in hosting.files(self.root, self.signatures, self.metadata).items()}
         self.assertEqual(self.assets, expected)
+        self.assertEqual(set(self.assets), set(assets.names(self.metadata['targets'])) | {'SHA256SUMS'})
+        self.assertEqual(len(self.assets), 7)
+        self.assertIn('Release body fixture', self.writes[0][1]['body'])
         self.assertTrue(self.writes[0][1]['draft'])
         self.assertEqual(self.writes[0][1]['make_latest'], 'false')
         self.assertEqual(self.writes[-1][1]['make_latest'], 'false')
@@ -131,17 +143,17 @@ class Hosting(unittest.TestCase):
 
     def test_partial_draft_uploads_only_missing_identical_bytes(self):
         self.remote = self.record()
-        self.assets[contract.CHECKSUMS] = (self.root / contract.CHECKSUMS).read_bytes()
+        self.assets[contract.CHECKSUMS] = (self.root / assets.PUBLIC_CHECKSUMS).read_bytes()
         self.publish()
         uploads = [body for method, body in self.writes if method == 'upload']
-        self.assertEqual(set(uploads), {contract.METADATA, contract.BUNDLE})
+        self.assertEqual(set(uploads), set(assets.names(self.metadata['targets'])))
 
     def test_remote_conflicts_and_incomplete_immutable_release_never_write(self):
         for fault in ('wrong-bytes', 'extra', 'duplicate', 'missing-immutable', 'mutable', 'wrong-tag', 'wrong-prerelease'):
             with self.subTest(fault=fault):
                 self.remote = self.record(draft=fault not in ('missing-immutable', 'mutable'),
                                           immutable=fault == 'missing-immutable')
-                self.assets = {contract.CHECKSUMS: (self.root / contract.CHECKSUMS).read_bytes()}
+                self.assets = {contract.CHECKSUMS: (self.root / assets.PUBLIC_CHECKSUMS).read_bytes()}
                 self.writes.clear(); self.fault = fault
                 if fault == 'wrong-bytes': self.assets[contract.CHECKSUMS] = b'conflict'
                 if fault == 'extra': self.assets['unapproved'] = b'extra'
@@ -212,14 +224,14 @@ class Hosting(unittest.TestCase):
                 path.unlink()
                 self.assertEqual(self.writes, [])
 
-    def test_channel_requires_complete_immutable_public_bytes_including_bundles(self):
+    def test_channel_requires_complete_immutable_public_user_assets(self):
         for draft, immutable in ((True, False), (False, True)):
             self.remote = self.record(draft=draft, immutable=immutable)
-            self.assets = {contract.CHECKSUMS: (self.root / contract.CHECKSUMS).read_bytes()}
+            self.assets = {contract.CHECKSUMS: (self.root / assets.PUBLIC_CHECKSUMS).read_bytes()}
             with self.subTest(draft=draft), self.assertRaises(gate.Refused):
                 release_run.require_public(self.root, self.signatures, self.metadata)
-        self.assets = {p.name: p.read_bytes() for folder in (self.root, self.signatures) for p in folder.iterdir()}
-        self.assets[contract.BUNDLE] += b'changed'
+        self.assets = {name: path.read_bytes() for name, path in hosting.files(self.root, self.signatures, self.metadata).items()}
+        self.assets[assets.SOURCE] += b'changed'
         with self.assertRaises(gate.Refused):
             release_run.require_public(self.root, self.signatures, self.metadata)
         self.assertEqual(self.writes, [])

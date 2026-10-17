@@ -36,9 +36,9 @@ class ChangedPaths(unittest.TestCase):
         self.git('add', '--all')
         self.git('-c', 'commit.gpgsign=false', 'commit', '-qm', 'fixture')
 
-    def select(self, base=None):
+    def select(self, base=None, event="push"):
         result = subprocess.run([sys.executable, str(SCRIPT), '--base', self.base if base is None else base],
-                                cwd=self.root, env=self.env, capture_output=True, text=True)
+                                cwd=self.root, env=self.env | {'GITHUB_EVENT_NAME': event}, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         return dict(line.split('=', 1) for line in result.stdout.splitlines())
 
@@ -57,25 +57,14 @@ class ChangedPaths(unittest.TestCase):
         outputs = self.select()
         for key in ('rust', 'macos', 'web', 'nix'):
             self.assertEqual(outputs[key], 'true', key)
-        self.assertEqual(outputs['macos_full'], 'false')
         self.assertEqual(outputs['recipes'], 'false')
         self.assertEqual(len(json.loads(outputs['nix_matrix'])['include']), 1)
-
-    def test_platform_changes_escalate_native_tests(self):
-        for path in ('crates/hennery/src/service/path.rs', 'crates/hennery-proto/src/paths.rs',
-                     'crates/hennery-kernel/src/admin.rs'):
-            base = self.git('rev-parse', 'HEAD').strip()
-            self.write(path)
-            self.commit()
-            with self.subTest(path=path):
-                self.assertEqual(self.select(base)['macos_full'], 'true')
 
     def test_nix_changes_select_all_supported_platforms_and_recipes(self):
         self.write('nix/package.nix')
         self.commit()
         outputs = self.select()
         self.assertEqual(outputs['recipes'], 'true')
-        self.assertEqual(outputs['macos_full'], 'true')
         self.assertEqual({x['system'] for x in json.loads(outputs['nix_matrix'])['include']},
                          {'x86_64-linux', 'aarch64-linux', 'aarch64-darwin'})
 
@@ -114,3 +103,64 @@ class ChangedPaths(unittest.TestCase):
                                 env=self.env, capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn('rust=false', result.stdout)
+
+    def test_pull_request_selects_only_linux_even_for_platform_and_recipe_changes(self):
+        self.write('nix/package.nix')
+        self.commit()
+        outputs = self.select(event='pull_request')
+        self.assertEqual(outputs['macos'], 'false')
+        self.assertTrue(all(item['system'].endswith('-linux') for item in json.loads(outputs['nix_matrix'])['include']))
+        self.assertEqual(json.loads(outputs['recipe_matrix']), ['ubuntu-latest'])
+
+    def test_main_keeps_macos_smoke_and_both_readme_platforms(self):
+        self.write('crates/hennery/src/main.rs')
+        self.commit()
+        outputs = self.select()
+        self.assertEqual(outputs['macos'], 'true')
+        self.assertEqual(set(json.loads(outputs['recipe_matrix'])), {'ubuntu-latest', 'macos-latest'})
+
+
+class PackagingSelection(unittest.TestCase):
+    git = ChangedPaths.git
+    write = ChangedPaths.write
+    commit = ChangedPaths.commit
+    def setUp(self):
+        ChangedPaths.setUp(self)
+        (self.root / 'Cargo.toml').write_text('[workspace.package]\nversion="0.1.0"\n[workspace.dependencies]\na="1"\n')
+        self.commit()
+        self.base = self.git('rev-parse', 'HEAD').strip()
+
+    def select(self, base=None, event='pull_request'):
+        result = subprocess.run([sys.executable, str(SCRIPT.parent / 'release/package_context.py'),
+                                 'prepare', '--base', self.base if base is None else base],
+                                cwd=self.root, env=self.env | {'GITHUB_EVENT_NAME': event,
+                                'GITHUB_SHA': self.git('rev-parse', 'HEAD').strip()}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return dict(line.split('=', 1) for line in result.stdout.splitlines())
+
+    # These test the packaging selector through actual commits, independently
+    # of the core selector's deliberately broader work selection.
+    def test_package_version_or_metadata_and_crate_scripts_select_crates(self):
+        for path in ('dist-workspace.toml', 'packaging/prepare-crates.mjs', 'packaging/ci-crates.sh'):
+            self.write(path)
+        self.commit()
+        self.assertEqual(self.select()['crates'], 'true')
+        base = self.git('rev-parse', 'HEAD').strip()
+        (self.root / 'Cargo.toml').write_text('[workspace.package]\nversion="0.2.0"\n')
+        self.commit()
+        self.assertEqual(self.select(base)['crates'], 'true')
+
+    def test_other_packaging_and_dependency_only_changes_skip_crates(self):
+        self.write('packaging/release/hosting.py')
+        self.write('Cargo.lock')
+        (self.root / 'Cargo.toml').write_text('[workspace.package]\nversion="0.1.0"\n[workspace.dependencies]\na="2"\n')
+        self.commit()
+        self.assertEqual(self.select()['crates'], 'false')
+
+    def test_pr_native_matrices_are_linux_only_and_main_keeps_three_targets(self):
+        pr = self.select()
+        self.assertEqual(set(json.loads(pr['native_matrix'])['runner']), {'ubuntu-24.04', 'ubuntu-24.04-arm'})
+        self.assertTrue(all('linux' in item['target'] for item in json.loads(pr['archive_matrix'])['include']))
+        main = self.select(event='push')
+        self.assertEqual(len(json.loads(main['archive_matrix'])['include']), 3)
+        self.assertIn('aarch64-apple-darwin', main['targets'])

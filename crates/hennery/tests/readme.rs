@@ -395,10 +395,20 @@ fn every_readme_block_is_run() {
 }
 
 #[test]
-fn the_non_nix_build_runs_on_both_platforms_without_nix() {
+fn the_non_nix_build_runs_on_linux_prs_and_both_weekly_platforms_without_nix() {
     let workflow = std::fs::read_to_string(repo().join(".github/workflows/ci.yml")).unwrap();
     let job = workflow_job(&workflow, "readme-without-nix");
-    assert!(job.contains("os: [ubuntu-latest, macos-latest]"), "{job}");
+    assert!(
+        job.contains("os: ${{ fromJSON(needs.checks.outputs.recipe_matrix) }}"),
+        "{job}"
+    );
+    let maintenance = std::fs::read_to_string(repo().join(".github/workflows/nix.yml")).unwrap();
+    let weekly = workflow_job(&maintenance, "readme-without-nix");
+    assert!(
+        weekly.contains("- ubuntu-latest") && weekly.contains("- macos-latest"),
+        "{weekly}"
+    );
+    assert!(weekly.contains("build-without-nix"), "{weekly}");
     assert!(job.contains("runs-on: ${{ matrix.os }}"), "{job}");
     assert!(job.contains("timeout-minutes: 60"), "{job}");
     assert!(job.contains("toolchain: stable"), "{job}");

@@ -46,7 +46,35 @@ release_verify_tag() {
         END { if (objects != 1 || types != 1 || tags != 1 || bad) exit 1; print sha }
     ' "$release_dir/tag-object") || return 1
 }
+release_hash() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        release_actual=$(sha256sum -b "$1") || return 1
+    elif command -v shasum >/dev/null 2>&1; then
+        release_actual=$(shasum -a 256 -b "$1") || return 1
+    else
+        return 1
+    fi
+    release_digest=$(printf '%s\n' "$release_actual" | awk '{ print $1 }') || return 1
+    printf '%s\n' "$release_digest" | LC_ALL=C grep -Eq '^[0-9a-f]{64}$' || return 1
+}
 release_attest() {
+    release_bundle="${HENNERY_ATTESTATION_BUNDLE:-}"
+    if [ -z "$release_bundle" ]; then
+        release_hash "$1" || return 1
+        release_bundle="$release_dir/sha256-$release_digest.jsonl"
+        curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
+            --url "https://api.github.com/users/marcinwadon/attestations/sha256:$release_digest?per_page=100&predicate_type=provenance" \
+            -o "$release_dir/attestations.json" || return 1
+        jq -er '.attestations | select(type == "array" and length > 0) | .[].bundle_url | select(type == "string")' \
+            "$release_dir/attestations.json" > "$release_dir/bundle-urls" || return 1
+        : > "$release_bundle" || return 1
+        while IFS= read -r release_bundle_url; do
+            curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL --url "$release_bundle_url" \
+                -o "$release_dir/attestation.json" || return 1
+            jq -c . "$release_dir/attestation.json" >> "$release_bundle" || return 1
+        done < "$release_dir/bundle-urls"
+    fi
+    [ -s "$release_bundle" ] || return 1
     gh attestation verify "$1" --bundle "$release_bundle" --repo marcinwadon/hennery \
         --cert-identity "https://github.com/marcinwadon/hennery/.github/workflows/release.yml@refs/tags/$release_tag" \
         --source-ref "refs/tags/$release_tag" --source-digest "$release_source" --signer-digest "$release_source" \
@@ -55,18 +83,11 @@ release_attest() {
 }
 release_check_hash() {
     release_expected=$(awk -v name="$2" '$2 == name { count++; sha=$1 } END { if (count != 1) exit 1; print sha }' "$release_checksums") || return 1
-    if command -v sha256sum >/dev/null 2>&1; then
-        release_actual=$(sha256sum -b "$1") || return 1
-    elif command -v shasum >/dev/null 2>&1; then
-        release_actual=$(shasum -a 256 -b "$1") || return 1
-    else
-        return 1
-    fi
-    release_actual=$(printf '%s\n' "$release_actual" | awk '{ print $1 }') || return 1
-    [ "$release_actual" = "$release_expected" ] || return 1
+    release_hash "$1" || return 1
+    [ "$release_digest" = "$release_expected" ] || return 1
 }
 release_verify_payload() {
-    [ -s "$release_checksums" ] && [ -s "$release_metadata" ] && [ -s "$release_bundle" ] || return 1
+    [ -s "$release_checksums" ] || return 1
     release_attest "$release_checksums" || return 1
     release_last=$(tail -c 1 "$release_checksums") || return 1
     [ -z "$release_last" ] || return 1
@@ -77,12 +98,6 @@ release_verify_payload() {
         { previous=name }
         END { exit !(NR > 0 && !bad) }
     ' "$release_checksums" || return 1
-    release_check_hash "$release_metadata" release-metadata.json || return 1
-    release_attest "$release_metadata" || return 1
-    jq -e --arg tag "$release_tag" --arg sha "$release_source" --arg object "$release_object" '
-        (.schema == 2 or .schema == 3) and .repository == "marcinwadon/hennery"
-        and .tag == $tag and .source_sha == $sha and .tag_object == $object
-    ' "$release_metadata" >/dev/null || return 1
     release_check_hash "$1" "$2" || return 1
     release_attest "$1" || return 1
 }
@@ -91,6 +106,7 @@ release_verify_payload() {
 MAINTAINER_VERIFICATION = r'''    # Verify signed source, the attested digest list and this archive before extraction.
     check_cmd git || err "git is required for signed release tag verification"
     check_cmd gpg || err "gpg is required for signed release tag verification"
+    check_cmd curl || err "curl is required for public attestation lookup"
     check_cmd jq || err "jq is required for release provenance verification"
     check_cmd gh || err "GitHub CLI is required for release signature verification"
     release_dir=$(mktemp -d "${TMPDIR:-/tmp}/hennery-verify.XXXXXXXX") || err "cannot isolate release verification"
@@ -103,16 +119,8 @@ MAINTAINER_VERIFICATION = r'''    # Verify signed source, the attested digest li
     gpg --batch --no-options --homedir "$release_dir/keyring" --no-autostart --no-auto-key-retrieve \
         --import "$release_dir/keyring/key.asc" >/dev/null 2>&1 || err "cannot import pinned maintainer public key"
     release_checksums="${HENNERY_RELEASE_CHECKSUMS:-$release_dir/SHA256SUMS}"
-    release_metadata="${HENNERY_RELEASE_METADATA:-$release_dir/release-metadata.json}"
-    release_bundle="${HENNERY_ATTESTATION_BUNDLE:-$release_dir/release.sigstore.jsonl}"
     if [ -z "${HENNERY_RELEASE_CHECKSUMS:-}" ]; then
         downloader "$ARTIFACT_DOWNLOAD_URL/SHA256SUMS" "$release_checksums" || err "cannot download release checksums"
-    fi
-    if [ -z "${HENNERY_RELEASE_METADATA:-}" ]; then
-        downloader "$ARTIFACT_DOWNLOAD_URL/release-metadata.json" "$release_metadata" || err "cannot download release metadata"
-    fi
-    if [ -z "${HENNERY_ATTESTATION_BUNDLE:-}" ]; then
-        downloader "$ARTIFACT_DOWNLOAD_URL/release.sigstore.jsonl" "$release_bundle" || err "cannot download release attestation bundle"
     fi
     release_verify_tag || err "refusing an archive without a valid pinned signed release tag"
     release_verify_payload "$_file" "$_artifact_name" || err "refusing an archive without valid release-tag provenance and SHA256SUMS"

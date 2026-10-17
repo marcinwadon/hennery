@@ -44,13 +44,15 @@ def check_native(directory, target):
                          'native staging differs from archive')
 
 
-def assemble(candidates, output):
+def assemble(candidates, output, targets=None):
+    targets = sorted(gate.TARGETS) if targets is None else targets
+    gate.require(targets and set(targets) <= gate.TARGETS, "unqualified assembly targets")
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     notices, findings = [], []
     candidates = Path(candidates)
     gate.require(candidates.is_dir() and not candidates.is_symlink(), 'nonregular candidates directory')
-    expected = {'candidate-' + t for t in gate.TARGETS}
+    expected = {'candidate-' + t for t in targets}
     gate.require({p.name for p in Path(candidates).iterdir()} == expected, 'native candidate target set incomplete')
     for directory in sorted(Path(candidates).iterdir()):
         target = directory.name.removeprefix('candidate-')
@@ -79,6 +81,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('candidates', type=Path)
     parser.add_argument('output', type=Path, nargs='?')
+    parser.add_argument('--targets', default=','.join(sorted(gate.TARGETS)))
     parser.add_argument('--check-native', choices=sorted(gate.TARGETS))
     args = parser.parse_args()
     if args.check_native:
@@ -86,4 +89,4 @@ if __name__ == '__main__':
     else:
         if args.output is None:
             parser.error('output is required for assembly')
-        assemble(args.candidates, args.output)
+        assemble(args.candidates, args.output, args.targets.split(','))

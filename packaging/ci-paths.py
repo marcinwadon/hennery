@@ -3,6 +3,7 @@
 import argparse
 import fnmatch
 import json
+import os
 import subprocess
 
 
@@ -10,7 +11,7 @@ def matches(path, patterns):
     return any(fnmatch.fnmatchcase(path, pattern) for pattern in patterns)
 
 
-def classify(paths):
+def classify(paths, event="push"):
     recipes = any(matches(path, (
         'README.md', 'packaging/readme-blocks.sh', 'packaging/check-web-ui.sh',
         'Cargo.*', 'flake.*', 'nix/*', '.cargo/*', 'rust-toolchain*',
@@ -22,20 +23,13 @@ def classify(paths):
                 or path.endswith('.md') and ('/' not in path or path.startswith('docs/'))
                 or matches(path, ('docs/*.svg', 'docs/*.png')))
     code = any(not documentation(path) for path in paths)
-    full_macos = code and any(matches(path, (
-        'crates/hennery/*', 'crates/hennery-host/*', 'crates/hennery-testkit/*',
-        'crates/hennery-proto/src/paths.rs', 'crates/hennery-kernel/src/admin.rs',
-        'crates/hennery-kernel/src/coordination.rs', 'crates/hennery-kernel/src/db.rs',
-        'Cargo.*', 'flake.*', 'nix/*', '.cargo/*', 'rust-toolchain*',
-        '.github/*', 'packaging/ci-*', 'packaging/readme-blocks.sh',
-    )) for path in paths)
     platforms = any(matches(path, (
         'flake.*', 'nix/*', '.cargo/*', 'rust-toolchain*',
         '.github/workflows/ci.yml', '.github/workflows/nix.yml',
     )) for path in paths)
     result = {name: str(value).lower() for name, value in {
-        'rust': code, 'macos': code, 'web': code, 'nix': code or recipes,
-        'macos_full': full_macos, 'recipes': recipes,
+        'rust': code, 'macos': code and event != 'pull_request', 'web': code, 'nix': code or recipes,
+        'recipes': recipes,
         'audit_rust': any(path == 'Cargo.lock' for path in paths),
         'audit_web': any(path == 'web/pnpm-lock.yaml' for path in paths),
     }.items()}
@@ -43,6 +37,9 @@ def classify(paths):
     if platforms:
         matrix += [{'os': 'ubuntu-24.04-arm', 'system': 'aarch64-linux'},
                    {'os': 'macos-15', 'system': 'aarch64-darwin'}]
+    if event == 'pull_request':
+        matrix = [item for item in matrix if item['system'].endswith('-linux')]
+    result['recipe_matrix'] = json.dumps(['ubuntu-latest'] if event == 'pull_request' else ['ubuntu-latest', 'macos-latest'])
     result['nix_matrix'] = json.dumps({'include': matrix}, separators=(',', ':'))
     return result
 
@@ -59,7 +56,7 @@ def main():
     else:
         command = ['git', 'ls-tree', '--full-tree', '--name-only', '-r', '-z', args.head]
     paths = subprocess.check_output(command).decode('utf-8', errors='surrogateescape').split('\0')
-    for name, value in classify([path for path in paths if path]).items():
+    for name, value in classify([path for path in paths if path], os.environ["GITHUB_EVENT_NAME"]).items():
         print(f'{name}={value}')
 
 

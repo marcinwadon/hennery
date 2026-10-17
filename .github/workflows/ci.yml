@@ -19,7 +19,7 @@ jobs:
       macos: ${{ steps.paths.outputs.macos }}
       web: ${{ steps.paths.outputs.web }}
       nix: ${{ steps.paths.outputs.nix }}
-      macos_full: ${{ steps.paths.outputs.macos_full }}
+      recipe_matrix: ${{ steps.paths.outputs.recipe_matrix }}
       recipes: ${{ steps.paths.outputs.recipes }}
       audit_rust: ${{ steps.paths.outputs.audit_rust }}
       audit_web: ${{ steps.paths.outputs.audit_web }}
@@ -161,11 +161,7 @@ jobs:
         brew list openssl@3 > /dev/null 2>&1 || brew install openssl@3
         echo "OPENSSL_DIR=$(brew --prefix openssl@3)" >> "$GITHUB_ENV"
     - name: Native process, service, path and CLI smoke
-      if: needs.checks.outputs.macos_full != 'true'
       run: sh packaging/ci-macos-smoke.sh
-    - name: Full suite for platform-sensitive changes
-      if: needs.checks.outputs.macos_full == 'true'
-      run: sh packaging/ci-rust-tests.sh
     needs: checks
     if: needs.checks.outputs.macos == 'true'
     timeout-minutes: 60
@@ -254,7 +250,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(needs.checks.outputs.recipe_matrix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:
@@ -293,7 +289,7 @@ jobs:
           sh -eux "$RUNNER_TEMP/build.sh"
 
   # The alternative README build: no Nix, no global pnpm install and no
-  # system OpenSSL. Run the documented block on both supported OSes.
+  # system OpenSSL. Main and weekly runs cover both supported OSes.
 
   readme-without-nix:
     needs: checks
@@ -301,7 +297,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ fromJSON(needs.checks.outputs.recipe_matrix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     steps:

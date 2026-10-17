@@ -5,6 +5,8 @@ from pathlib import Path
 import re
 import subprocess
 
+import assets
+import attestations
 import contract
 import verifier_process
 import gate
@@ -25,6 +27,20 @@ def verify(root, bundle, source_sha, tag, trusted_root=None):
     supply.verify_binary_inventory(value, root)
     gate.require(contract.load(root) == value, 'release bytes changed during binary verification')
     return value
+
+
+def verify_public(root, bundle, source_sha, tag, trusted_root=None):
+    root = Path(root)
+    entries = contract.verify_files(root)
+    gate.require(set(entries) == set(assets.names(sorted(gate.TARGETS))), 'public release asset inventory differs')
+    tag_signature.verify(tag, source_sha)
+    for name in [contract.CHECKSUMS, *entries]:
+        subject = root / name
+        with attestations.bundle(gate.digest(contract.regular(subject)), bundle) as proof:
+            verifier_process.run(attestation_command(subject, tag, source_sha, proof, trusted_root),
+                                 check=True, capture_output=True, text=True)
+    gate.require(contract.verify_files(root) == entries, 'public release bytes changed during verification')
+    return {'tag': tag, 'source_sha': source_sha, 'targets': sorted(gate.TARGETS)}
 
 
 def image_descriptor(root, value):
@@ -58,9 +74,14 @@ def verify_image_subject(image, value, bundle=None, predicate_type=PROVENANCE, m
 def verify_image(image, tag, bundle=None, predicate_type=PROVENANCE, release_directory=None,
                  release_bundle=None, manifest=None, source_sha=None, trusted_root=None):
     gate.require(re.fullmatch(r'ghcr\.io/marcinwadon/hennery@sha256:[0-9a-f]{64}', image), 'verification requires an immutable image digest')
-    gate.require(release_directory is not None and release_bundle is not None and source_sha is not None,
+    gate.require(release_directory is not None and source_sha is not None,
                  'image requires checksum-authenticated release and source binding')
     root = Path(release_directory)
+    if not (root / contract.METADATA).exists():
+        value = verify_public(root, release_bundle, source_sha, tag, trusted_root)
+        with attestations.bundle(image.split('@sha256:')[1], bundle) as proof:
+            verify_image_subject(image, value, proof, predicate_type, manifest, trusted_root)
+        return value
     value = contract.load(root)
     index = image_descriptor(root, value)
     gate.require(image.split('@',1)[1] in [index['digest'], *index['platforms'].values()], 'image digest is not in release descriptor')
@@ -88,7 +109,7 @@ def require_binstall_metadata(metadata, tag):
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument('--release-directory', type=Path, required=True)
-    parser.add_argument('--bundle', type=Path, required=True, help='release SHA256SUMS and payload provenance bundle')
+    parser.add_argument('--bundle', type=Path, help='optional cached provenance bundle; otherwise fetch public GitHub attestations by digest')
     parser.add_argument('--source-sha', required=True)
     parser.add_argument('--tag', required=True)
     parser.add_argument('--trusted-root', type=Path)
@@ -105,7 +126,10 @@ def main():
         verify_image(args.image, args.tag, args.image_bundle, args.predicate_type, args.release_directory,
                      args.bundle, args.manifest, args.source_sha, args.trusted_root)
     else:
-        verify(args.release_directory, args.bundle, args.source_sha, args.tag, args.trusted_root)
+        if (args.release_directory / contract.METADATA).exists():
+            verify(args.release_directory, args.bundle, args.source_sha, args.tag, args.trusted_root)
+        else:
+            verify_public(args.release_directory, args.bundle, args.source_sha, args.tag, args.trusted_root)
 
 
 if __name__ == '__main__':

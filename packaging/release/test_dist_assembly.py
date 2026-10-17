@@ -19,6 +19,12 @@ ROOT = Path(__file__).resolve().parents[2]
 @unittest.skipUnless(os.environ.get('HENNERY_TEST_DIST'), 'requires pinned cargo-dist (packaging CI)')
 class DistAssembly(unittest.TestCase):
     def test_production_global_build_imports_all_native_manifests(self):
+        self.build(sorted(gate.TARGETS))
+
+    def test_pr_global_build_offers_only_transported_linux_archives(self):
+        self.build(sorted(t for t in gate.TARGETS if 'linux' in t))
+
+    def build(self, targets):
         dist = Path(os.environ['HENNERY_TEST_DIST']).resolve()
         version = subprocess.check_output([str(dist), '--version'], text=True).strip()
         self.assertEqual(version, 'cargo-dist 0.30.4')
@@ -29,7 +35,7 @@ class DistAssembly(unittest.TestCase):
                        RUSTUP_HOME=os.environ.get('RUSTUP_HOME', str(Path.home() / '.rustup')),
                        XDG_CONFIG_HOME=str(root / 'home/config'), XDG_CACHE_HOME=str(root / 'home/cache'),
                        GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
-                       RUNNER_TEMP=str(root / 'scratch'))
+                       RUNNER_TEMP=str(root / 'scratch'), PACKAGING_TARGETS=','.join(targets))
             (root / 'scratch/dist-bin').mkdir()
             (root / 'scratch/dist-bin/dist').symlink_to(dist)
             (root / 'src').mkdir()
@@ -48,9 +54,9 @@ class DistAssembly(unittest.TestCase):
                          ['-c', 'commit.gpgsign=false', '-c', 'user.name=Release Fixture',
                           '-c', 'user.email=release@example.invalid', 'commit', '-qm', 'fixture']):
                 subprocess.run(['git', *args], cwd=root, env=env, check=True, capture_output=True)
-            source = test_assemble.candidates(root / 'candidates')
+            source = test_assemble.candidates(root / 'candidates', targets)
             checksums, systems = {}, {}
-            for target in sorted(gate.TARGETS):
+            for target in targets:
                 result = subprocess.run([str(dist), 'manifest', '--artifacts=local', '--target=' + target,
                                          '--output-format=json'], cwd=root, env=env, capture_output=True, text=True)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -62,11 +68,11 @@ class DistAssembly(unittest.TestCase):
                 manifest['artifacts'][archive]['checksums'] = {'sha256': checksum}
                 checksums[archive] = checksum
                 (source / ('candidate-' + target) / (target + '-dist-manifest.json')).write_text(json.dumps(manifest))
-            assemble.assemble(source, root / 'target/distrib')
+            assemble.assemble(source, root / 'target/distrib', targets)
             # Execute the checked-in production shell, including stdout redirection
             # and any final move. PR and tag packaging both execute this same script.
             script = (ROOT / 'packaging/release/assemble-package.sh').read_text()
-            command = script[script.index('"$RUNNER_TEMP/dist-bin/dist" build'):]
+            command = script[script.index("# A PR has Linux inputs"):]
             command = command[:command.index('python3 packaging/harden-installer.py')]
             result = subprocess.run(['sh', '-eu', '-c', command], cwd=root, env=env, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -77,6 +83,8 @@ class DistAssembly(unittest.TestCase):
             # recreate the local builders' system records without these inputs.
             for system, details in systems.items():
                 self.assertEqual(manifest['systems'][system], details)
+            self.assertEqual(set(checksums), {name for name in manifest['artifacts'] if name.endswith('.tar.xz')})
+            subprocess.run(['sh', str(ROOT / 'packaging/check-formula.sh'), str(root / 'target/distrib')], check=True, capture_output=True)
             for name in ('hennery-installer.sh', 'hennery.rb'):
                 self.assertGreater((root / 'target/distrib' / name).stat().st_size, 0)
 

@@ -50,6 +50,16 @@ class PinnedCLI(unittest.TestCase):
                 result = self.invoke(self.command(subject))
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_attested_checksum_bytes_verify_under_the_public_filename(self):
+        # Official provenance binds bytes by digest. Assembly's private
+        # public-SHA256SUMS is served under the consumer name SHA256SUMS.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'public-SHA256SUMS'
+            path.write_bytes((ALPHA / contract.CHECKSUMS).read_bytes())
+            command = self.command(); command[3] = str(path)
+            result = self.invoke(command)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_tampered_real_payload_fails_before_use(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / contract.CHECKSUMS

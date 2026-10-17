@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import assemble
 import gate
+import supply
 import test_assemble
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -75,6 +76,20 @@ class NativeDist(unittest.TestCase):
             assemble.check_native(root / 'target/distrib', target)
             self.assertEqual({p.name for p in (root / 'target/distrib').iterdir()},
                              assemble.native_files(target) | {'hennery-' + target})
+
+    def test_corresponding_source_uses_real_cargo_normal_and_build_closure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'src').mkdir(); (root / 'src/main.rs').write_text('fn main() {}')
+            (root / 'Cargo.toml').write_text('[package]\nname="hennery"\nversion="0.1.0"\nedition="2024"\n'
+                '[dependencies]\nruntime={path="runtime"}\n[build-dependencies]\nbuilder={path="builder"}\n'
+                '[dev-dependencies]\ntesttool={path="testtool"}\n')
+            for name in ('runtime', 'builder', 'testtool'):
+                (root / name / 'src').mkdir(parents=True)
+                (root / name / 'src/lib.rs').write_text('pub fn fixture() {}')
+                (root / name / 'Cargo.toml').write_text('[package]\nname="' + name + '"\nversion="0.1.0"\nedition="2024"\n')
+            cargo = json.loads(subprocess.check_output(['cargo', 'metadata', '--offline', '--format-version=1'], cwd=root))
+            self.assertEqual({p['name'] for p in supply.corresponding_packages(cargo)}, {'hennery', 'runtime', 'builder'})
 
     def test_missing_advisory_input_stops_before_any_archive_can_reach_homebrew(self):
         for name in ('rust-advisories.json', 'rust-advisory-revision.txt', 'web-advisories.json'):

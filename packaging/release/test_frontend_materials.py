@@ -14,6 +14,7 @@ import tempfile
 import threading
 import unittest
 
+import assets
 import gate
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -131,6 +132,46 @@ class FrontendMaterials(unittest.TestCase):
                                  b'export const fixture = true;\n')
                 self.assertEqual(sources.extractfile('npm/frontend-fixture@1.2.3/LICENSE').read(),
                                  b'frontend fixture licence text\n')
+            # The public source and combined SBOM consume these actual pnpm
+            # producer outputs, without recovering the original node_modules.
+            source = root / 'source'; source.mkdir()
+            (source / 'LICENSE').write_text('own licence')
+            (source / 'Cargo.lock').write_text('frozen lock')
+            git_env = env | {'GIT_AUTHOR_NAME': 'Release Fixture', 'GIT_COMMITTER_NAME': 'Release Fixture',
+                             'GIT_AUTHOR_EMAIL': 'fixture@example.invalid', 'GIT_COMMITTER_EMAIL': 'fixture@example.invalid'}
+            for args in (['init', '-q'], ['add', '.'], ['-c', 'commit.gpgsign=false', 'commit', '-qm', 'source']):
+                subprocess.run(['git', *args], cwd=source, env=git_env, check=True, capture_output=True)
+            sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=source, env=git_env, text=True).strip()
+            public = source / 'payload'; public.mkdir()
+            for target in sorted(gate.TARGETS):
+                shutil.copyfile(materials / 'third-party-source.tar.xz', public / (target + '-third-party-source.tar.xz'))
+                shutil.copyfile(materials / 'hennery-aarch64-apple-darwin.spdx.json', public / ('hennery-' + target + '.spdx.json'))
+                (public / ('hennery-' + target + '.tar.xz')).write_bytes(b'native archive input')
+            (public / 'hennery-installer.sh').write_text('installer input')
+            result = subprocess.run([sys.executable, str(ROOT / 'packaging/release/assets.py'), str(public), sha,
+                                     '--targets', ','.join(sorted(gate.TARGETS))], cwd=source, env=git_env,
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            files = assets.files(public, sorted(gate.TARGETS))
+            self.assertEqual(len(files), 7)
+            self.assertEqual(files['SHA256SUMS'].read_bytes(), (public / assets.PUBLIC_CHECKSUMS).read_bytes())
+            self.assertEqual([p['name'] for p in gate.strict_json((public / assets.SBOM).read_bytes())['packages']], ['frontend-fixture'])
+            with tarfile.open(public / assets.SOURCE) as combined:
+                names = combined.getnames()
+                self.assertEqual(len(names), len(set(names)))
+                self.assertEqual(combined.extractfile('hennery-source/Cargo.lock').read(), b'frozen lock')
+                self.assertEqual(combined.extractfile('hennery-source/third-party/npm/frontend-fixture@1.2.3/index.js').read(),
+                                 b'export const fixture = true;\n')
+            # Same package/version with different native bytes must not silently dedupe.
+            changed = public / (sorted(gate.TARGETS)[0] + '-third-party-source.tar.xz')
+            with tarfile.open(changed, 'w:xz') as tar:
+                entry = tarfile.TarInfo('npm/frontend-fixture@1.2.3/index.js'); entry.size = 7
+                tar.addfile(entry, io.BytesIO(b'changed'))
+            result = subprocess.run([sys.executable, str(ROOT / 'packaging/release/assets.py'), str(public), sha,
+                                     '--targets', ','.join(sorted(gate.TARGETS))], cwd=source, env=git_env,
+                                    capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('conflicting corresponding source', result.stderr)
             shutil.copytree(archive / 'missing-frontend', archive / 'inputs/frontend', dirs_exist_ok=True)
             result = subprocess.run(['sh', str(ROOT / 'packaging/release/native-materials.sh')],
                 cwd=archive, env=env | {'RELEASE_SOURCE_SHA': 'a' * 40, 'TARGET': 'aarch64-apple-darwin'},
