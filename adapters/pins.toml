@@ -11,7 +11,7 @@
 # and so is the checklist in packaging/README.md ("Pin bumps").
 
 # npm resolves the lockfiles as of this instant, so `lock` is reproducible.
-npm_before = "2026-10-19T12:40:07Z"
+npm_before = "2026-10-19T23:41:10Z"
 
 [node]
 # Operator confirmed the current pins on 2026-10-19 (plan 7b).
@@ -22,7 +22,7 @@ version = "24.22.1"
 # Operator confirmed on 2026-10-19; measured in the per-session MCP
 # spike (docs/spikes/2026-09-25-per-session-mcp.md).
 package = "@agentclientprotocol/claude-agent-acp"
-version = "0.93.0"
+version = "0.94.0"
 entry = "dist/index.js"
 # The bundled Claude CLI: the SDK's platform packages. Proprietary, so never
 # redistributed (distribution §3.3); skipped by `--use-cli claude=…`.
