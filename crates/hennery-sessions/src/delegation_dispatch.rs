@@ -448,7 +448,7 @@ impl Store {
                     WHERE session_attach_evidence.owner_id = ?1",params![self.owner_id(),session,serde_json::to_string(&evidence.actual)?])?;
             }
             let changed=tx.execute("UPDATE session_attach_evidence SET config_revision = ?4,evidence = ?5,config_updated_at=?6,config_checked=0 WHERE owner_id = ?1 AND session_id = ?2 AND attach_generation = ?3 AND config_revision < ?4
-                AND EXISTS (SELECT 1 FROM sessions WHERE owner_id = ?1 AND id = ?2 AND lifecycle = 'active' AND close_requested = 0 AND presumed_parked = 0)",params![self.owner_id(),session,i64::try_from(evidence.attach_generation)?,i64::try_from(evidence.config_revision)?,serde_json::to_string(evidence)?,hennery_kernel::secret::unix_now()])?;
+                AND EXISTS (SELECT 1 FROM sessions WHERE owner_id = ?1 AND id = ?2 AND lifecycle IN ('active', 'parked') AND close_requested = 0)",params![self.owner_id(),session,i64::try_from(evidence.attach_generation)?,i64::try_from(evidence.config_revision)?,serde_json::to_string(evidence)?,hennery_kernel::secret::unix_now()])?;
             if changed > 0 {
                 let wanted: String = tx.query_row(
                     "SELECT requested_config FROM session_attach_evidence WHERE owner_id = ?1 AND session_id=?2",

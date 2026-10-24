@@ -75,6 +75,7 @@
             clippy
             rustfmt
             rust-analyzer
+            git
             # R3: pinned binstall acceptance and an isolated MSRV toolchain.
             actionlint
             cargo-binstall
