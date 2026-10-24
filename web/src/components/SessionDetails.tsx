@@ -73,6 +73,7 @@ function SheetFocus({ dialog: ref, keys, onClose, trigger }: { dialog: RefObject
 function Details({ info, hostName, hatName, delivery }: Props) {
   return <>
     {info && <dl className="session-facts">
+      <dt>Session ID</dt><dd><bdi><code>{info.session_id}</code></bdi></dd>
       <dt>Host</dt><dd><bdi>{hostName ?? info.host_id}</bdi></dd>
       <dt>Project</dt><dd><bdi>{info.cwd}</bdi></dd>
       {hatName && <><dt>Hat</dt><dd><bdi>{hatName}</bdi></dd></>}
