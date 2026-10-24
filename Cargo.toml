@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 license = "AGPL-3.0-only"
 rust-version = "1.88"
@@ -76,12 +76,12 @@ webauthn-authenticator-rs = { version = "=0.5.5", features = ["softpasskey"] }
 # The release build only (plan 7a): `webauthn-rs-core` links OpenSSL, built
 # from source and linked statically there (distribution spec §1.1).
 openssl = "=0.10.81"
-hennery-proto = { path = "crates/hennery-proto", version = "=0.3.3" }
-hennery-kernel = { path = "crates/hennery-kernel", version = "=0.3.3" }
-hennery-sessions = { path = "crates/hennery-sessions", version = "=0.3.3" }
-hennery-host = { path = "crates/hennery-host", version = "=0.3.3" }
-hennery-gateway = { path = "crates/hennery-gateway", version = "=0.3.3" }
-hennery-view = { path = "crates/hennery-view", version = "=0.3.3" }
+hennery-proto = { path = "crates/hennery-proto", version = "=0.3.4" }
+hennery-kernel = { path = "crates/hennery-kernel", version = "=0.3.4" }
+hennery-sessions = { path = "crates/hennery-sessions", version = "=0.3.4" }
+hennery-host = { path = "crates/hennery-host", version = "=0.3.4" }
+hennery-gateway = { path = "crates/hennery-gateway", version = "=0.3.4" }
+hennery-view = { path = "crates/hennery-view", version = "=0.3.4" }
 
 # Argon2 is unusably slow unoptimised; every test that logs in pays for it.
 [profile.dev.package.argon2]

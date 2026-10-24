@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.3.4
+
+- Show the full session ID as selectable text in the session details panel,
+  on desktop and mobile (#262).
+
 ## 0.3.3
 
 - Fix the managed Claude adapter's body-parser and fast-uri security advisories (#258)
