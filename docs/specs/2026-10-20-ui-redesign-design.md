@@ -629,7 +629,7 @@ the honest replacement instead of quietly adding another backend feature.
 | Parent/current/sibling cards, connection line, selected border, Open/Take over | Restyle; own session links, current routing, bounded family paging | `FamilyPanel.tsx` |
 | Family plan fractions and progress bars | Show only actual known plan; omit unsupported sibling/parent progress | `FamilyPanel.tsx` |
 | Right panel Plan list: done/current/todo icons and strike-through | Restyle actual latest plan; show truncation/empty state | `SessionDetails.tsx`, `StepList.tsx` |
-| Right panel Details: host, project, hat/rule, agent, model, MCP, started | Restyle; omit unknown rule/version/config-source claims; actual delivered MCP snapshot | `SessionDetails.tsx`, `McpDelivery.tsx` |
+| Right panel Details: session ID, host, project, hat/rule, agent, model, MCP, started | Show the full Hennery `session_id` as selectable text on desktop and mobile; omit unknown rule/version/config-source claims; actual delivered MCP snapshot | `SessionDetails.tsx`, `McpDelivery.tsx` |
 | Family status-only attention, fallback reason, acknowledgement/rearm | Restyle existing real controls; preserve prerequisites and pending links | `StatusAttention.tsx`, `FamilyPanel.tsx` |
 | Composer textarea, attachment button, Model, mode, effort radios, Send hint/button | Restyle all actual catalog options; local send shortcut, preserve cancel/resume/draft behavior | `Composer.tsx`, `components/SessionConfig.tsx` (new) |
 | Composer slash-command menu and “@ for files” placeholder | Restyle real slash commands; drop unsupported @-file promise | `Composer.tsx`, `lib/catalog.ts` |
