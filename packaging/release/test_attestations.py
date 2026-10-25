@@ -34,8 +34,9 @@ class PublicAPI(BaseHTTPRequestHandler):
     def do_GET(self):
         self.server.requests.append(self.path)
         self.server.case.assertIsNone(self.headers.get('Authorization'))
-        if urlsplit(self.path).path.startswith('/users/marcinwadon/attestations/sha256:'):
-            value = {'attestations': [{'bundle_url': self.server.case.origin + '/bundle'}]}
+        if urlsplit(self.path).path.startswith('/repos/marcinwadon/hennery/attestations/sha256:'):
+            bundle = {} if self.server.case.tamper else json.loads((ALPHA / contract.BUNDLE).read_text())
+            value = {'attestations': [{'bundle': bundle}]}
             raw = json.dumps(value).encode()
         else:
             raw = (ALPHA / contract.BUNDLE).read_bytes()
