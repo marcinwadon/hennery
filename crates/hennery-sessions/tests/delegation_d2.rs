@@ -2725,7 +2725,15 @@ async fn configuration_mismatch_expires_visibly_after_a_bounded_wait() {
     queue(&w, &p, "brief");
     let (hub, mut rx) = connected();
     assert!(!w.store.dispatch_delegated("child", &catalog(), &hub).unwrap());
-    let now = unix_now();
+    // The deadline starts at the persisted evidence, not at a later wall-clock
+    // read: a loaded runner can cross a whole second while preparing dispatch.
+    let now: i64 = raw(&w)
+        .query_row(
+            "SELECT config_updated_at FROM session_attach_evidence WHERE owner_id=?1 AND session_id='child'",
+            [w.store.owner_id()],
+            |r| r.get(0),
+        )
+        .unwrap();
     let started = tokio::time::Instant::now();
     tokio::time::advance(std::time::Duration::from_secs(29)).await;
     w.store
