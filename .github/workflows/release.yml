@@ -219,7 +219,7 @@ jobs:
     - id: cratesio
       if: ${{ vars.RELEASE_CRATES_ENABLED == 'true' && contains(fromJSON(steps.verified.outputs.channels), 'crates') && vars.RELEASE_CRATES_BOOTSTRAP_ENABLED
         != 'true' }}
-      uses: rust-lang/crates-io-auth-action@9c067fc5d5c254b33978fed918cb50c032549d0e
+      uses: rust-lang/crates-io-auth-action@22f31735a55cd45813f26e2edc31c7531e1fb4ed
     - id: crates-publish
       if: ${{ vars.RELEASE_CRATES_ENABLED == 'true' && contains(fromJSON(steps.verified.outputs.channels), 'crates') }}
       env:

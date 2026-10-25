@@ -79,7 +79,7 @@ jobs:
     - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
       with:
         github_access_token: ${{ github.token }}
-    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       with:
         # Each job saves its own artifacts: a faster web job must not win the
         # immutable cache key with a target directory missing tests and clippy.
@@ -121,7 +121,7 @@ jobs:
       with:
         toolchain: stable
         components: clippy, rustfmt
-    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       with:
         shared-key: native-debug-macos
         # Runner image env drifts; the flake pins the toolchain.
@@ -162,7 +162,7 @@ jobs:
     - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
       with:
         github_access_token: ${{ github.token }}
-    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       with:
         shared-key: native-debug-web
         # Runner image env drifts; the flake pins the toolchain.
@@ -237,7 +237,7 @@ jobs:
       - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
         with:
           github_access_token: ${{ github.token }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: native-release
           # Runner image env drifts; the flake pins the toolchain.
@@ -284,7 +284,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '>=24.22.1 <25'
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: native-release-vendored
           # Runner image env drifts; the flake pins the toolchain.
