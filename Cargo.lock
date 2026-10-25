@@ -1444,7 +1444,7 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
 name = "hennery"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -1470,7 +1470,7 @@ dependencies = [
 
 [[package]]
 name = "hennery-gateway"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -1502,7 +1502,7 @@ dependencies = [
 
 [[package]]
 name = "hennery-host"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -1540,7 +1540,7 @@ dependencies = [
 
 [[package]]
 name = "hennery-kernel"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -1575,7 +1575,7 @@ dependencies = [
 
 [[package]]
 name = "hennery-memory"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -1607,7 +1607,7 @@ dependencies = [
 
 [[package]]
 name = "hennery-pins"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -1628,7 +1628,7 @@ dependencies = [
 
 [[package]]
 name = "hennery-proto"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "schemars 1.2.3",
  "serde",
@@ -1639,7 +1639,7 @@ dependencies = [
 
 [[package]]
 name = "hennery-sessions"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -1665,7 +1665,7 @@ dependencies = [
 
 [[package]]
 name = "hennery-testkit"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "hennery-view"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "hennery-proto",
  "schemars 1.2.3",

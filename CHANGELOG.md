@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.3.5
+
+- Fix stale configuration errors after changing the model in an existing
+  operator session, including when the new model no longer reports an option.
+- Save queued-message edits with Cmd+Enter or Ctrl+Enter, preserving edits
+  when a save is refused or delivery has already started.
+
 ## 0.3.4
 
 - Show the full session ID as selectable text in the session details panel,

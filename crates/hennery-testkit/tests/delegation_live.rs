@@ -1586,6 +1586,45 @@ async fn pinned_runtime_provider_authentication() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires pinned Claude adapter and copied provider credentials; performs one inference"]
+async fn live_operator_model_switch_allows_queued_and_subsequent_prompts() -> Result<()> {
+    let h = Harness::new_with_worker("claude", None, false).await?;
+    let result = async {
+        let before = h.state.store.catalog(&h.parent)?.context("initial catalog")?;
+        let model = before.config_options.iter()
+            .find(|option| option["category"] == "model").context("model option")?;
+        let id = model["id"].as_str().context("model option id")?;
+        let target = model["options"].as_array().context("model choices")?.iter()
+            .filter_map(|option| option["value"].as_str())
+            .find(|value| Some(*value) != before.current.model.as_deref() && matches!(*value, "haiku" | "sonnet"))
+            .context("an alternative supported low-cost model")?;
+        let response = h.client.post(format!("{}/api/sessions/{}/config", h.url, h.parent))
+            .json(&json!({"config_id":id,"value":target})).send().await?;
+        ensure!(response.status() == reqwest::StatusCode::ACCEPTED, "model switch HTTP {}", response.status());
+        let after = h.state.store.catalog(&h.parent)?.context("switched catalog")?;
+        ensure!(after.current.model.as_deref() == Some(target), "adapter did not confirm selected model");
+        let checked = hennery_sessions::content::check(vec![json!({"type":"text","text":"queued model-switch probe"})])
+            .map_err(|_| anyhow::anyhow!("invalid synthetic queue probe"))?;
+        let queue = h.state.store.enqueue_operator_prompt(&h.parent, &checked)?;
+        h.state.store.refresh_delegation_attention(&h.state.hub, hennery_kernel::secret::unix_now() + 31)?;
+        ensure!(h.state.store.find_session(&h.parent)?.context("session")?.configuration_error.is_none(), "live switch left a stale configuration mismatch");
+        ensure!(h.state.store.operator_prompt_queue(&h.parent)?[0].state == "queued", "queued prompt failed after model switch");
+        ensure!(h.state.store.remove_operator_prompt(&h.parent, &queue)?, "remove inference-free queue probe");
+        let turn = h.prompt(&h.parent, "Reply with exactly HENNERY_MODEL_SWITCH_OK. Do not call tools.").await?;
+        let outcome = h.wait("model-switch provider turn", || h.state.store.ended_turn_outcome(&turn).ok().flatten()).await?;
+        ensure!(outcome == hennery_proto::frames::TurnOutcome::Completed, "provider turn failed");
+        ensure!(assistant_text(&h.state.store.events(&h.parent, 0, 1000)?).contains("HENNERY_MODEL_SWITCH_OK"), "provider did not return the marker");
+        println!("{}", json!({"case":"operator_model_switch","before":before.current,"after":after.current,"queue_preserved":true,"provider_turn_completed":true}));
+        Ok(())
+    }.await;
+    if result.is_err() {
+        h.diagnostics("operator model switch failed")?;
+    }
+    let cleanup = h.finish().await;
+    result.and(cleanup)
+}
+
+#[tokio::test]
 #[ignore = "requires explicit pinned adapter and staged auth; starts no provider turn"]
 async fn pinned_runtime_process_token_exposure_without_inference() -> Result<()> {
     let runtime = runtime("HENNERY_D4_PARENT")?;

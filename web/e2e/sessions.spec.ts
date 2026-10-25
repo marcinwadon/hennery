@@ -386,7 +386,7 @@ for (const width of [1280, 390]) {
         await expect(remote.getByRole('listitem')).toHaveCount(2)
         await queue.getByRole('button', { name: 'Edit queued message 1', exact: true }).click()
         await queue.getByRole('textbox', { name: 'Edit queued message 1', exact: true }).fill('Then focus on the tests.')
-        await queue.getByRole('button', { name: 'Save', exact: true }).click()
+        await queue.getByRole('textbox', { name: 'Edit queued message 1', exact: true }).press('Meta+Enter')
         await expect(remote.getByText('Then focus on the tests.', { exact: true })).toBeVisible()
         await queue.getByRole('button', { name: 'Remove queued message 2', exact: true }).click()
         await expect(remote.getByRole('listitem')).toHaveCount(1)
