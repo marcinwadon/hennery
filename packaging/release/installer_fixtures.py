@@ -138,9 +138,11 @@ names={'https://raw.githubusercontent.com/marcinwadon/hennery/refs/heads/main/RE
        'https://github.com/marcinwadon.gpg':'github.asc',
        'https://keys.openpgp.org/vks/v1/by-fingerprint/'+os.environ['FIXTURE_FINGERPRINT']:'keyserver.asc'}
 names.update({base+name:name for name in ['SHA256SUMS','hennery-installer.sh']})
-if url.startswith('https://api.github.com/users/marcinwadon/attestations/sha256:'):
+if url.startswith('https://api.github.com/repos/marcinwadon/hennery/attestations/sha256:'):
     import json
-    Path(args[args.index('-o')+1]).write_text(json.dumps({'attestations':[{'bundle_url':'https://fixture.invalid/bundle'}]}))
+    bundle=Path(os.environ['FIXTURE_RELEASE'])/'release.sigstore.jsonl'
+    if not bundle.is_file(): sys.exit(22)
+    Path(args[args.index('-o')+1]).write_text(json.dumps({'attestations':[{'bundle':json.loads(bundle.read_text())}]}))
     sys.exit(0)
 if url=='https://fixture.invalid/bundle': names[url]='release.sigstore.jsonl'
 if url not in names: sys.exit(99)

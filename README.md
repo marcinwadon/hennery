@@ -210,16 +210,10 @@ release_attest() {
         release_hash "$1" || return 1
         release_bundle="$release_dir/sha256-$release_digest.jsonl"
         curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL \
-            --url "https://api.github.com/users/marcinwadon/attestations/sha256:$release_digest?per_page=100&predicate_type=provenance" \
+            --url "https://api.github.com/repos/marcinwadon/hennery/attestations/sha256:$release_digest?per_page=100&predicate_type=provenance" \
             -o "$release_dir/attestations.json" || return 1
-        jq -er '.attestations | select(type == "array" and length > 0) | .[].bundle_url | select(type == "string")' \
-            "$release_dir/attestations.json" > "$release_dir/bundle-urls" || return 1
-        : > "$release_bundle" || return 1
-        while IFS= read -r release_bundle_url; do
-            curl -q --proto '=https' --proto-redir '=https' --tlsv1.2 -fsSL --url "$release_bundle_url" \
-                -o "$release_dir/attestation.json" || return 1
-            jq -c . "$release_dir/attestation.json" >> "$release_bundle" || return 1
-        done < "$release_dir/bundle-urls"
+        jq -ec '.attestations | select(type == "array" and length > 0) | .[] | .bundle | select(type == "object")' \
+            "$release_dir/attestations.json" > "$release_bundle" || return 1
     fi
     [ -s "$release_bundle" ] || return 1
     gh attestation verify "$1" --bundle "$release_bundle" --repo marcinwadon/hennery \
@@ -264,7 +258,8 @@ for release_file in SHA256SUMS hennery-installer.sh; do
 done
 release_checksums="$release_dir/SHA256SUMS"
 release_verify_payload "$release_dir/hennery-installer.sh" hennery-installer.sh || exit 1
-sh "$release_dir/hennery-installer.sh"
+HENNERY_RELEASE_CHECKSUMS="$release_checksums" HENNERY_ATTESTATION_BUNDLE="$release_bundle" \
+    sh "$release_dir/hennery-installer.sh"
 )
 ```
 
