@@ -16,6 +16,54 @@ function mount(items: QueuedPrompt[], status = 200) {
   return { fetch, changed, rerender: (next: QueuedPrompt[]) => rendered.rerender(view(next)) }
 }
 describe('durable prompt queue', () => {
+  it.each(['metaKey', 'ctrlKey'])('saves the edited queue item once with %s+Enter', async modifier => {
+    const m = mount([item])
+    fireEvent.click(screen.getByRole('button', { name: 'Edit queued message 1' }))
+    const editor = screen.getByRole('textbox', { name: 'Edit queued message 1' })
+    fireEvent.change(editor, { target: { value: 'Updated queued text' } })
+    fireEvent.keyDown(editor, { key: 'Enter', [modifier]: true })
+    fireEvent.keyDown(editor, { key: 'Enter', [modifier]: true, repeat: true })
+    await waitFor(() => expect(m.changed).toHaveBeenCalledOnce())
+    expect(m.fetch).toHaveBeenCalledExactlyOnceWith('/api/sessions/s%2F1/queue/q%2F1', expect.objectContaining({ method: 'PATCH', body: JSON.stringify({ text: 'Updated queued text' }) }))
+    expect(screen.queryByRole('textbox', { name: 'Edit queued message 1' })).toBeNull()
+  })
+  it.each([{}, { metaKey: true, isComposing: true }, { ctrlKey: true, keyCode: 229 }, { metaKey: true, repeat: true }, { ctrlKey: true, altKey: true }, { metaKey: true, shiftKey: true }])('ignores Enter without a save shortcut: %j', modifiers => {
+    const m = mount([item])
+    fireEvent.click(screen.getByRole('button', { name: 'Edit queued message 1' }))
+    fireEvent.keyDown(screen.getByRole('textbox', { name: 'Edit queued message 1' }), { key: 'Enter', ...modifiers })
+    expect(m.fetch).not.toHaveBeenCalled()
+  })
+  it('does not save an interrupted edit with the shortcut', () => {
+    const m = mount([item])
+    fireEvent.click(screen.getByRole('button', { name: 'Edit queued message 1' }))
+    m.rerender([{ ...item, state: 'delivering' }])
+    fireEvent.keyDown(screen.getByRole('textbox', { name: 'Edit queued message 1' }), { key: 'Enter', metaKey: true })
+    expect(m.fetch).not.toHaveBeenCalled()
+  })
+  it('does not submit again while the shortcut save is pending', async () => {
+    const m = mount([item])
+    let resolve!: (response: Response) => void
+    m.fetch.mockImplementationOnce(() => new Promise<Response>(done => { resolve = done }))
+    fireEvent.click(screen.getByRole('button', { name: 'Edit queued message 1' }))
+    const editor = screen.getByRole('textbox', { name: 'Edit queued message 1' })
+    fireEvent.keyDown(editor, { key: 'Enter', metaKey: true })
+    expect(editor).toBeDisabled()
+    fireEvent.keyDown(editor, { key: 'Enter', ctrlKey: true })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    expect(m.fetch).toHaveBeenCalledOnce()
+    resolve(new Response('[]', { headers: { 'Content-Type': 'application/json' } }))
+    await waitFor(() => expect(m.changed).toHaveBeenCalledOnce())
+  })
+  it('preserves a refused shortcut edit', async () => {
+    const m = mount([item], 409)
+    fireEvent.click(screen.getByRole('button', { name: 'Edit queued message 1' }))
+    const editor = screen.getByRole('textbox', { name: 'Edit queued message 1' })
+    fireEvent.change(editor, { target: { value: 'Keep this edit' } })
+    fireEvent.keyDown(editor, { key: 'Enter', metaKey: true })
+    await waitFor(() => expect(m.changed).toHaveBeenCalledOnce())
+    expect(editor).toHaveValue('Keep this edit')
+    expect(screen.getByRole('alert')).toHaveTextContent('Already delivering')
+  })
   it.each([true, false])('preserves an interrupted edit through delivery and disappearance, clipboard available: %s', async clipboardAvailable => {
     const writeText = vi.fn(async () => {})
     Object.defineProperty(navigator, 'clipboard', { configurable: true, value: clipboardAvailable ? { writeText } : undefined })

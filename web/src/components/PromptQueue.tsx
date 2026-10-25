@@ -23,6 +23,7 @@ export default function PromptQueue({ sessionId, items, changed }: { sessionId: 
   const [copied, setCopied] = useState<string | null>(null)
   const [manualCopy, setManualCopy] = useState<string | null>(null)
   const editors = useRef(new Map<string, HTMLTextAreaElement>())
+  const mutationPending = useRef(false)
 
   useEffect(() => {
     // An SSE delivery/removal cannot discard a local edit. Once interrupted,
@@ -64,6 +65,8 @@ export default function PromptQueue({ sessionId, items, changed }: { sessionId: 
   if (!items.length && !Object.keys(drafts).length) return null
 
   async function mutate(work: () => Promise<unknown>, discardEdit?: string) {
+    if (mutationPending.current) return
+    mutationPending.current = true
     setBusy(true)
     setError(null)
     try {
@@ -73,8 +76,12 @@ export default function PromptQueue({ sessionId, items, changed }: { sessionId: 
       setError(messageOf(err))
     } finally {
       // Refresh after refusals too: another window or the worker may have won.
-      await changed?.()
-      setBusy(false)
+      try {
+        await changed?.()
+      } finally {
+        mutationPending.current = false
+        setBusy(false)
+      }
     }
   }
 
@@ -89,11 +96,20 @@ export default function PromptQueue({ sessionId, items, changed }: { sessionId: 
         const draft = drafts[id]
         const interrupted = !!draft && (draft.interrupted || item?.state !== 'queued')
         const editNumber = draft?.number ?? number
+        const saveEdit = () => {
+          if (draft && !interrupted && !busy) void mutate(() => editQueuedPrompt(client, sessionId, id, draft.text), id)
+        }
         return <li key={id} className={item?.state === 'failed' ? 'queue-failed' : undefined}>
           <div className="queue-copy">
             <span className="queue-number">{number}</span>
             <div>
-              {draft ? <textarea ref={element => { if (element) editors.current.set(id, element); else editors.current.delete(id) }} aria-label={`Edit queued message ${editNumber}`} value={draft.text} onChange={event => { const text = event.target.value; setDrafts(previous => ({ ...previous, [id]: { ...previous[id], text } })); setCopied(null) }} disabled={busy} /> : <p><bdi>{preview.length > 240 ? `${preview.slice(0, 240)}…` : preview || 'Image message'}</bdi></p>}
+              {draft ? <textarea ref={element => { if (element) editors.current.set(id, element); else editors.current.delete(id) }} aria-label={`Edit queued message ${editNumber}`} value={draft.text} onChange={event => { const text = event.target.value; setDrafts(previous => ({ ...previous, [id]: { ...previous[id], text } })); setCopied(null) }} onKeyDown={event => {
+                if (event.defaultPrevented || event.repeat || event.nativeEvent.isComposing || event.keyCode === 229 || event.altKey || event.shiftKey) return
+                if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+                  event.preventDefault()
+                  saveEdit()
+                }
+              }} disabled={busy} /> : <p><bdi>{preview.length > 240 ? `${preview.slice(0, 240)}…` : preview || 'Image message'}</bdi></p>}
               {interrupted && <p className="queue-reason" role="status">Already sending; your edit wasn’t applied.</p>}
               {images > 0 && <small>{images} {images === 1 ? 'image' : 'images'}</small>}
               {item?.state === 'delivering' && <small role="status">Delivering…</small>}
@@ -106,7 +122,7 @@ export default function PromptQueue({ sessionId, items, changed }: { sessionId: 
               <button className="btn btn-ghost btn-sm" onClick={() => void copy(id, draft.text, true)}>{copied === id ? 'Copied' : 'Copy edit'}</button>
               <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => dismissEdit(id)}>Dismiss edit</button>
             </> : <>
-              <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => void mutate(() => editQueuedPrompt(client, sessionId, id, draft.text), id)}>Save</button>
+              <button className="btn btn-ghost btn-sm" disabled={busy} onClick={saveEdit}>Save</button>
               <button className="btn btn-ghost btn-sm" disabled={busy} onClick={() => dismissEdit(id)}>Cancel edit</button>
             </> : item?.state === 'queued' && <button className="btn btn-ghost btn-sm" disabled={busy} aria-label={`Edit queued message ${number}`} onClick={() => { setDrafts(previous => ({ ...previous, [id]: { text: preview, number, interrupted: false } })); setError(null); setCopied(null) }}>Edit</button>}
             {item?.state === 'failed' && <button className="btn btn-ghost btn-sm" onClick={() => void copy(id, preview)}>{copied === id ? 'Copied' : 'Copy'}</button>}
