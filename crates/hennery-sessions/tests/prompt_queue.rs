@@ -137,6 +137,138 @@ fn prompt(rx: &mut tokio::sync::mpsc::UnboundedReceiver<CollectorFrame>) -> (Str
     (request_id, turn_id, content)
 }
 
+fn config_snapshot(
+    actual: &SessionConfig,
+    generation: u64,
+    revision: u64,
+    completeness: ConfigCompleteness,
+) -> Indexed {
+    Indexed {
+        config_options: Some(vec![json!({"id":"model","currentValue":actual.model})]),
+        current_model: actual.model.clone(),
+        current_mode: actual.mode.clone(),
+        current_axes: Some(actual.axes.clone()),
+        config_evidence: Some(Box::new(ConfigEvidence {
+            attach_generation: generation,
+            config_revision: revision,
+            completeness,
+            actual: actual.clone(),
+        })),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn operator_model_switch_replaces_launch_expectations_and_repairs_a_stale_mismatch() {
+    for expire_first in [false, true] {
+        let w = World::new();
+        let (hub, mut rx) = host(vec![]);
+        let wanted = SessionConfig {
+            model: Some("model-a".into()),
+            mode: Some("default".into()),
+            axes: [("fast".into(), hennery_proto::frames::ConfigValue::Bool(false))].into(),
+        };
+        w.store.expect_initial_configuration("session", &wanted).unwrap();
+        w.emit(SessionBody::AcpUpdate {
+            indexed: config_snapshot(&wanted, 0, 1, ConfigCompleteness::Complete),
+            payload: json!({}),
+        });
+        assert!(w.store.open_prompt("session", "first", &checked("first")).unwrap());
+        w.start("first", "first");
+        let mut queued = w.queue("follow up after switching models");
+        let actual = SessionConfig {
+            model: Some("model-b".into()),
+            mode: wanted.mode.clone(),
+            ..Default::default()
+        };
+        // A model change can also remove an axis from the adapter's catalogue.
+        w.emit(SessionBody::AcpUpdate {
+            indexed: config_snapshot(&actual, 0, 2, ConfigCompleteness::Complete),
+            payload: json!({}),
+        });
+        if expire_first {
+            w.store
+                .refresh_delegation_attention(&hub, hennery_kernel::secret::unix_now() + 31)
+                .unwrap();
+            assert!(
+                w.store
+                    .find_session("session")
+                    .unwrap()
+                    .unwrap()
+                    .configuration_error
+                    .is_some()
+            );
+        }
+        w.emit(SessionBody::ConfigApplied {
+            request_id: "model-switch".into(),
+            indexed: config_snapshot(&actual, 0, 3, ConfigCompleteness::Complete),
+        });
+        w.store
+            .refresh_delegation_attention(&hub, hennery_kernel::secret::unix_now() + 31)
+            .unwrap();
+        let session = w.store.find_session("session").unwrap().unwrap();
+        assert_eq!(session.config.model.as_deref(), Some("model-b"));
+        assert!(session.configuration_error.is_none(), "{session:?}");
+        let expected: String = w
+            .conn()
+            .query_row(
+                "SELECT requested_config FROM session_attach_evidence WHERE session_id='session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(serde_json::from_str::<SessionConfig>(&expected).unwrap(), actual);
+        if expire_first {
+            // A failed queued message stays visible; repair must not resend it.
+            let failed = w.store.operator_prompt_queue("session").unwrap();
+            assert_eq!(failed[0].state, "failed");
+            queued = w.queue("resubmitted after configuration repair");
+        }
+        w.end("first", TurnOutcome::Completed);
+        assert!(w.dispatch(&hub));
+        assert_eq!(w.operation(&prompt(&mut rx).0), queued);
+        assert!(rx.try_recv().is_err());
+    }
+}
+
+#[test]
+fn unconfirmed_or_stale_operator_switch_does_not_replace_launch_expectations() {
+    for (generation, revision, completeness) in [
+        (0, 2, ConfigCompleteness::Unknown),
+        (0, 2, ConfigCompleteness::Partial),
+        (1, 2, ConfigCompleteness::Complete),
+        (0, 1, ConfigCompleteness::Complete),
+    ] {
+        let w = World::new();
+        let wanted = SessionConfig {
+            model: Some("model-a".into()),
+            ..Default::default()
+        };
+        w.store.expect_initial_configuration("session", &wanted).unwrap();
+        w.emit(SessionBody::AcpUpdate {
+            indexed: config_snapshot(&wanted, 0, 1, ConfigCompleteness::Complete),
+            payload: json!({}),
+        });
+        let actual = SessionConfig {
+            model: Some("model-b".into()),
+            ..Default::default()
+        };
+        w.emit(SessionBody::ConfigApplied {
+            request_id: "unconfirmed-switch".into(),
+            indexed: config_snapshot(&actual, generation, revision, completeness),
+        });
+        let expected: String = w
+            .conn()
+            .query_row(
+                "SELECT requested_config FROM session_attach_evidence WHERE session_id='session'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(serde_json::from_str::<SessionConfig>(&expected).unwrap(), wanted);
+    }
+}
+
 #[test]
 fn queue_waits_for_turn_end_and_delivers_fifo_as_operator() {
     let w = World::new();

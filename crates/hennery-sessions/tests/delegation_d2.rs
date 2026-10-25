@@ -2788,6 +2788,49 @@ async fn configuration_mismatch_expires_visibly_after_a_bounded_wait() {
             .any(|a| a.child_id == "child")
     );
 }
+
+#[test]
+fn live_switch_readback_does_not_replace_a_delegated_childs_required_configuration() {
+    let (w, p) = pair();
+    ready(&w);
+    queue(&w, &p, "followup");
+    let wrong = config("other");
+    w.store
+        .ingest(
+            "child",
+            3,
+            &SessionBody::ConfigApplied {
+                request_id: "switch".into(),
+                indexed: Indexed {
+                    config_options: Some(vec![json!({"id":"model","currentValue":"other"})]),
+                    current_model: wrong.model.clone(),
+                    current_axes: Some(wrong.axes.clone()),
+                    config_evidence: Some(Box::new(ConfigEvidence {
+                        attach_generation: 5,
+                        config_revision: 11,
+                        completeness: ConfigCompleteness::Complete,
+                        actual: wrong,
+                    })),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+    let (hub, mut rx) = connected();
+    assert!(!w.store.dispatch_delegated("child", &catalog(), &hub).unwrap());
+    w.store.refresh_delegation_attention(&hub, unix_now() + 31).unwrap();
+    assert_eq!(
+        w.store.child_status(&p, 1, "child", None).unwrap().requested,
+        config("wanted")
+    );
+    assert_eq!(
+        receipt(&w, &p, "followup").state,
+        OperationState::Failed {
+            code: "configuration_mismatch".into()
+        }
+    );
+    assert!(rx.try_recv().is_err());
+}
 #[test]
 fn stale_config_evidence_cannot_overwrite_current_proof_and_config_changes_clear_it() {
     let (w, p) = pair();

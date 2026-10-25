@@ -818,6 +818,12 @@ each value a select's value id or a boolean.
 
 **Live `set_config`** on an attached session is one more switch:
 
+- For an ordinary operator session, a fresh complete `config_applied`
+  read-back replaces the launch configuration expected by the collector,
+  including axes no longer reported after a model change. It resolves an
+  earlier launch-configuration mismatch. An unknown, partial, old-generation
+  or old-revision read-back cannot do this. Delegated children retain their
+  required configuration and queued delegation inputs retain their fences.
 - One `session/set_config_option` at a time per session. Requests queue on
   the host and are answered in the order they came; they may run during a
   turn. Each one's deadline is its receipt plus 15 s: one still queued then is
