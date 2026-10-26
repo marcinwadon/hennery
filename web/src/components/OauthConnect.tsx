@@ -12,6 +12,7 @@ export default function OauthConnect({ connection: c, refresh, waiting }: {
   const [local, setLocal] = useState(false)
   const [redirect, setRedirect] = useState(DEFAULT_LOCAL_CALLBACK)
   const command = callbackCommand(c.oauth?.redirect_uri ?? '', redirect)
+  const httpsLocal = command !== null && /^https:/i.test(redirect)
   const start = (resource?: string) => {
     if (local) { if (command) connect(resource, redirect) }
     else if (resource === undefined) connect()
@@ -28,9 +29,11 @@ export default function OauthConnect({ connection: c, refresh, waiting }: {
     </select></label>
     {local && <div className="notice">
       <label className="field"><span className="field-label">Local redirect URI</span><input className="text-input mono" value={redirect} maxLength={2048} disabled={busy} onChange={e => setRedirect(e.target.value)} autoComplete="off" spellCheck={false} /></label>
-      <p>1. Choose the exact localhost host, port and path the vendor permits.</p>
-      <p>2. Run this command on the computer running this browser. Keep the terminal open, then click Connect (or Reconnect).</p>
-      {command ? <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }} aria-label="Local callback command">{command}</pre> : <p role="alert">Enter a valid http loopback callback. The collector address must be available.</p>}
+      <p>1. Choose the exact scheme, localhost host, port and path the vendor permits.</p>
+      <p>2. Run this command on the computer running this browser. Keep the terminal open.</p>
+      {command ? <pre style={{ whiteSpace: 'pre-wrap', overflowWrap: 'anywhere' }} aria-label="Local callback command">{command}</pre> : <p role="alert">Enter a valid http or https loopback callback. The collector address must be available.</p>}
+      {httpsLocal && <p>3. <a href={redirect} target="_blank" rel="noopener noreferrer">Prepare HTTPS callback</a> in this browser profile. Accept the receiver’s temporary self-signed certificate for this local address and check that the page says the receiver is ready. Repeat after restarting the receiver.</p>}
+      <p>{httpsLocal ? '4' : '3'}. Click Connect (or Reconnect).</p>
       <p className="hint">The receiver stops after 15 minutes; restart it if it times out. If the port is busy, stop the other receiver or choose another permitted port in both places. If sign-in cannot return, restart the receiver and Connect again. Stop waiting ends only the UI wait.</p>
       <p className="hint">The vendor must accept this exact redirect URI. A pre-registered client must already permit it; localhost does not bypass the vendor’s client policy. PKCE and tokens stay on the collector.</p>
     </div>}

@@ -1,8 +1,18 @@
 import { describe, expect, it } from 'vitest'
 import { connection } from '../test-fixtures'
-import { clientRequest, completion, consentTimeout, consentUrl, oauthAction, oauthGuidance, oauthHint } from './mcpOauth'
+import { callbackCommand, clientRequest, completion, consentTimeout, consentUrl, localCallback, oauthAction, oauthGuidance, oauthHint } from './mcpOauth'
 
 const item = connection({ cred_kind: 'oauth_dcr', status: 'ok', has_credential: true })
+describe('local callbacks', () => {
+  it.each(['http://localhost:8976/callback', 'https://127.0.0.1:9882/callback', 'https://localhost:443/callback', 'https://[::1]:9882/callback'])('keeps the exact permitted URI %s', uri => {
+    expect(localCallback(uri)).toBe(true)
+    expect(callbackCommand('https://collector.example/api/mcp/oauth/callback', uri)).toContain(`--redirect-uri '${uri}'`)
+  })
+  it.each(['https://localhost.evil/callback', 'https://192.168.1.1/callback', 'https://0.0.0.0/callback', 'https://localhost:0/callback', 'https://localhost/callback?code=x', 'https://localhost/callback#x', 'https://user:secret@localhost/callback', 'ftp://localhost/callback'])('refuses %s', uri => {
+    expect(localCallback(uri)).toBe(false)
+    expect(callbackCommand('https://collector.example/api/mcp/oauth/callback', uri)).toBeNull()
+  })
+})
 describe('consent destinations', () => {
   it.each(['https://vendor.example/consent?state=x', 'http://localhost:123/a', 'http://localhost.:123/a', 'http://127.1.2.3:123/a', 'http://[::1]:123/a'])('takes %s', url => expect(consentUrl(url)).toBe(new URL(url).href))
   it.each(['http://vendor.example/a', 'http://localhost.evil/a', 'http://evil.localhost/a', 'http://192.168.1.2/a', 'javascript:alert(1)', '//vendor.example/a', 'bad', 'https://user:secret@vendor.example/a', 'http://[::2]/a'])('refuses %s', url => expect(consentUrl(url)).toBeNull())

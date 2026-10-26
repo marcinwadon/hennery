@@ -37,7 +37,12 @@ async fn local_callback_uses_exact_redirect_for_dcr_consent_exchange_and_reuse()
         .unwrap()
         .router(ORIGIN)
         .unwrap();
-    for (redirect, registrations) in [(local, 1), (local, 1), ("http://localhost:8977/other", 2)] {
+    for (redirect, registrations) in [
+        (local, 1),
+        (local, 1),
+        ("http://localhost:8977/other", 2),
+        ("https://localhost:443/custom/callback", 3),
+    ] {
         let (status, headers, answer) = h.authorize(&id, json!({ "local_redirect_uri": redirect })).await;
         assert_eq!(status, StatusCode::OK, "{answer}");
         let consent = answer["consent_url"].as_str().unwrap();
@@ -84,11 +89,11 @@ async fn local_callback_uses_exact_redirect_for_dcr_consent_exchange_and_reuse()
             "the collector callback stays fixed"
         );
     }
-    assert_eq!(fake.with(|r| r.exchanges), 3);
+    assert_eq!(fake.with(|r| r.exchanges), 4);
     assert_eq!(h.connect(&id, &fake).await.result(), "connected");
     assert_eq!(
         fake.with(|r| r.registered.len()),
-        3,
+        4,
         "switching back to the collector requires another DCR client"
     );
 }
@@ -194,7 +199,7 @@ async fn local_callback_keeps_manual_client_and_surfaces_provider_policy_refusal
             fake.configure(|c| c.deny = None);
         }
         let (status, headers, answer) = h
-            .authorize(&id, json!({"local_redirect_uri": "http://localhost:8976/callback"}))
+            .authorize(&id, json!({"local_redirect_uri": "https://127.0.0.1:9882/callback"}))
             .await;
         assert_eq!(status, StatusCode::OK);
         let consent = answer["consent_url"].as_str().unwrap();

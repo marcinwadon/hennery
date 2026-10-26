@@ -1433,8 +1433,8 @@ impl std::fmt::Debug for McpOauthClientRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]
 pub struct McpAuthorizeRequest {
-    /// Optional local browser relay, `http://localhost:<port>/<path>` or
-    /// an HTTP loopback IP. The collector callback and public URL stay fixed.
+    /// Optional local browser relay using HTTP or HTTPS on localhost or a
+    /// loopback IP. The collector callback and public URL stay fixed.
     /// The vendor must permit this exact URI for the selected client.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "string | undefined", optional)]

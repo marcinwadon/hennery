@@ -385,7 +385,7 @@ rejected — a grant that "refreshes fine and never works".)*
 ### 4.2 Registration
 
 - **Optional local callback (2026-10-22):** authorize accepts
-  `local_redirect_uri`, an HTTP URL on `localhost` or a loopback IP, without
+  `local_redirect_uri`, an HTTP or HTTPS URL on `localhost` or a loopback IP, without
   credentials, query or fragment. Omission keeps the collector callback.
   The exact input is the provider redirect in DCR, consent, the flow snapshot
   and code exchange. Both the active and pending DCR registration must match
@@ -407,6 +407,17 @@ rejected — a grant that "refreshes fine and never works".)*
   for repeated Connect attempts for 900 seconds (configurable), or until
   Ctrl+C. Occupied ports and timeout fail with actionable terminal messages;
   authorization refusal is rendered by the collector's existing callback.
+  HTTPS support (2026-10-26) preserves existing provider-registered loopback
+  redirects. The CLI generates a self-signed certificate for the exact parsed
+  host, keeps its key in memory for that invocation, and never changes OS trust.
+  Before Connect, the UI links to the query-free local callback: the operator
+  accepts the local certificate exception in the same browser profile and sees
+  a ready page. A request with no query returns that page without forwarding to
+  the collector or creating a flow. Callback queries still receive the fixed
+  collector redirect unchanged; no response parameters are logged. TLS
+  handshakes are concurrent, capped at sixteen and bounded to five seconds,
+  so an idle connection does not block the browser. HTTP behavior, the fixed
+  collector, cookie/PKCE checks and provider redirect permission remain intact.
 
 - `oauth_dcr`: RFC 7591 registration as a public client
   (`token_endpoint_auth_method: none`, grant types `authorization_code` and

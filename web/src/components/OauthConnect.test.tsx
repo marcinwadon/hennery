@@ -19,6 +19,17 @@ it('shows the exact local callback and shell-safe receiver command before connec
 })
 vi.mock('../hooks/useMcpOauth', () => ({ useMcpOauth: () => control }))
 afterEach(() => { cleanup(); control.state = { phase: 'idle' }; vi.clearAllMocks() })
+it('prepares an HTTPS localhost callback before sending its exact URI to Connect', () => {
+  render(<OauthConnect connection={connection({ cred_kind: 'oauth_client', oauth: { client_id: 'manual', redirect_uri: 'https://collector.example/api/mcp/oauth/callback', has_client_secret: true } })} refresh={vi.fn()} />)
+  fireEvent.change(screen.getByRole('combobox', { name: 'OAuth callback' }), { target: { value: 'local' } })
+  const redirect = 'https://127.0.0.1:9882/callback'
+  fireEvent.change(screen.getByRole('textbox', { name: 'Local redirect URI' }), { target: { value: redirect } })
+  expect(screen.getByLabelText('Local callback command', { exact: true })).toHaveTextContent(`--redirect-uri '${redirect}'`)
+  expect(screen.getByRole('link', { name: 'Prepare HTTPS callback' })).toHaveAttribute('href', redirect)
+  expect(screen.getByRole('link', { name: 'Prepare HTTPS callback' })).toHaveAttribute('rel', 'noopener noreferrer')
+  fireEvent.click(screen.getByRole('button', { name: 'Connect' }))
+  expect(control.connect).toHaveBeenCalledWith(undefined, redirect)
+})
 it('a recovered gateway report does not assert sign-in completion', () => {
   control.state.phase = 'working'
   render(<OauthConnect connection={connection({ cred_kind: 'oauth_dcr', status: 'needs_auth', has_credential: true })} refresh={vi.fn()} />)

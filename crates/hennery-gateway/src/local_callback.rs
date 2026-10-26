@@ -25,7 +25,7 @@ impl LocalCallback {
             Some(Host::Ipv6(ip)) => ip.is_loopback(),
             _ => false,
         };
-        if url.scheme() != "http"
+        if !matches!(url.scheme(), "http" | "https")
             || !loopback
             || !url.username().is_empty()
             || url.password().is_some()
@@ -34,15 +34,30 @@ impl LocalCallback {
             || url.port_or_known_default() == Some(0)
             || input.contains('\\')
         {
-            bail!("local callback must be http on localhost or a loopback IP, without credentials, query or fragment");
+            bail!(
+                "local callback must be http or https on localhost or a loopback IP, without credentials, query or fragment"
+            );
         }
         Ok(Self { url })
+    }
+
+    pub fn is_https(&self) -> bool {
+        self.url.scheme() == "https"
+    }
+
+    /// The parsed loopback host, without IPv6 brackets, for the TLS SAN.
+    pub fn certificate_host(&self) -> String {
+        match self.url.host().expect("validated host") {
+            Host::Domain(host) => host.to_string(),
+            Host::Ipv4(ip) => ip.to_string(),
+            Host::Ipv6(ip) => ip.to_string(),
+        }
     }
 
     /// Bind literals only: localhost never goes through DNS or /etc/hosts.
     /// Both localhost families are served when IPv6 is available.
     pub async fn bind(&self) -> Result<Vec<tokio::net::TcpListener>> {
-        let port = self.url.port_or_known_default().expect("http has a port");
+        let port = self.url.port_or_known_default().expect("http and https have ports");
         let ips = match self.url.host().expect("validated host") {
             Host::Domain(_) => vec![IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)],
             Host::Ipv4(ip) => vec![IpAddr::V4(ip)],
@@ -95,6 +110,14 @@ async fn relay(State(relay): State<Relay>, request: Request) -> Response {
             "OAuth callback requires browser GET navigation.",
         )
             .into_response()
+    } else if request.uri().query().is_none() {
+        // A certificate exception can be accepted before OAuth puts a code
+        // in this URL. This page neither starts nor completes an OAuth flow.
+        (
+            StatusCode::OK,
+            "Local OAuth callback ready. Return to Hennery and click Connect (or Reconnect).",
+        )
+            .into_response()
     } else {
         let query = request.uri().query().unwrap_or_default();
         // Copy bytes, including duplicates, unknown keys and encoding. Only
@@ -143,7 +166,25 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_local_http_without_response_parameters() {
+    fn https_callbacks_select_tls_for_the_loopback_certificate_host() {
+        for (input, host) in [
+            ("https://127.0.0.1:9882/callback", "127.0.0.1"),
+            ("https://localhost:443/result", "localhost"),
+            ("https://[::1]:9882/callback", "::1"),
+        ] {
+            let local = LocalCallback::parse(input).unwrap();
+            assert!(local.is_https());
+            assert_eq!(local.certificate_host(), host);
+        }
+        assert!(
+            !LocalCallback::parse("http://localhost:8976/callback")
+                .unwrap()
+                .is_https()
+        );
+    }
+
+    #[test]
+    fn accepts_only_local_http_or_https_without_response_parameters() {
         for input in [
             "http://localhost:8999/result",
             "http://127.0.0.2:8999/result",
@@ -153,7 +194,7 @@ mod tests {
             assert!(LocalCallback::parse(input).is_ok(), "{input}");
         }
         for input in [
-            "https://localhost:8999/result",
+            "https://localhost.evil:8999/result",
             "http://localhost.evil:8999/result",
             "http://0.0.0.0:8999/result",
             "http://[::]:8999/result",
@@ -162,6 +203,11 @@ mod tests {
             "http://localhost:8999/result?",
             "http://localhost:8999/result#",
             "http://localhost:0/result",
+            "https://localhost:0/result",
+            "ftp://localhost/result",
+            "https://user@localhost/result",
+            "https://127.0.0.1/result?code=secret",
+            "https://127.0.0.1/result#fragment",
             "http://localhost:8999/\nresult",
             "http://localhost\\@evil.example/result",
         ] {

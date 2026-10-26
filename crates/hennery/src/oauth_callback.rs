@@ -3,6 +3,8 @@ use clap::Args;
 use hennery_gateway::local_callback::LocalCallback;
 use std::time::Duration;
 
+mod tls;
+
 #[derive(Args)]
 pub struct CallbackArgs {
     /// Fixed collector origin. No destination is read from callback parameters.
@@ -21,11 +23,29 @@ pub async fn run(args: CallbackArgs) -> Result<()> {
     let app = local.router(&args.collector)?;
     let listeners = local.bind().await?;
     let mut servers = tokio::task::JoinSet::new();
+    // Each invocation keeps its self-signed key in memory only. Never install
+    // a CA, write a private key or weaken the collector's TLS verification.
+    let tls = local
+        .is_https()
+        .then(|| tls::configuration(&local.certificate_host()))
+        .transpose()?;
     for listener in listeners {
         let app = app.clone();
-        servers.spawn(async move { axum::serve(listener, app).await });
+        let tls = tls.clone();
+        servers.spawn(async move {
+            match tls {
+                Some(config) => axum::serve(tls::Listener::new(listener, config), app).await,
+                None => axum::serve(listener, app).await,
+            }
+        });
     }
     eprintln!("Local OAuth callback ready at {}", args.redirect_uri);
+    if local.is_https() {
+        eprintln!(
+            "Before Connect, open {} in this browser profile and accept its temporary self-signed certificate for this local address. Repeat after restarting this receiver.",
+            args.redirect_uri
+        );
+    }
     eprintln!("Now click Connect in Hennery in this browser. Keep this terminal open. Ctrl+C stops the receiver.");
     // Dropping JoinSet aborts every listener on timeout, signal or error.
     tokio::select! {

@@ -7,7 +7,7 @@ export function localCallback(input: string): boolean {
   try {
     if (input.length > 2048 || /[\s\\]/u.test(input) || /[\u0000-\u001f\u007f]/u.test(input)) return false
     const u = new URL(input)
-    return u.protocol === 'http:' && !u.username && !u.password && !input.includes('?') && !input.includes('#') && u.port !== '0' &&
+    return (u.protocol === 'http:' || u.protocol === 'https:') && !u.username && !u.password && !input.includes('?') && !input.includes('#') && u.port !== '0' &&
       (u.hostname === 'localhost' || u.hostname === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(u.hostname))
   } catch { return false }
 }
@@ -73,7 +73,7 @@ export function oauthAction(item: McpConnectionItem): 'connect' | 'reconnect' | 
 /** Code only: vendor text never selects a recovery action. */
 export function oauthGuidance(code: string): string {
   const words: Record<string, string> = {
-    invalid_local_redirect_uri: 'Enter an http callback on localhost or a loopback IP, without credentials, query or fragment.',
+    invalid_local_redirect_uri: 'Enter an http or https callback on localhost or a loopback IP, without credentials, query or fragment.',
     issuer_changed: 'The authorization server changed. Review and save the vendor client again before connecting.',
     resource_mismatch: 'Compare the server URL with the advertised resource before accepting it.',
     resource_foreign: 'The advertised resource cannot be accepted. Check the server URL.',

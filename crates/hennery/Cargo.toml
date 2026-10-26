@@ -26,6 +26,8 @@ libc = "0.2"
 openssl = { workspace = true, optional = true }
 # `doctor`'s requests to the collector (plan 7d-ii): the host's own client.
 reqwest.workspace = true
+rcgen = "=0.14.10"
+rustls.workspace = true
 hennery-gateway.workspace = true
 hennery-host.workspace = true
 hennery-kernel.workspace = true
@@ -33,6 +35,7 @@ hennery-sessions.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -64,7 +67,7 @@ disabled-strategies = ["crate-meta-data", "quick-install", "compile"]
 [package.metadata.hennery-release]
 verification = "external-signed-tag-sigstore"
 maintainer-fingerprint = "F26C7F594DFE84D131703AFC23E5A318AE8D2861"
-signer-identity = "https://github.com/marcinwadon/hennery/.github/workflows/release.yml@refs/tags/v0.3.5"
+signer-identity = "https://github.com/marcinwadon/hennery/.github/workflows/release.yml@refs/tags/v0.3.6"
 
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
 pkg-url = "{ repo }/releases/download/v{ version }/hennery-x86_64-unknown-linux-musl.tar.xz"
