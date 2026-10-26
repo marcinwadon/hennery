@@ -141,7 +141,7 @@ pub(crate) async fn authorize(
                 return error(
                     StatusCode::BAD_REQUEST,
                     "invalid_local_redirect_uri",
-                    "Use an http callback on localhost or a loopback IP, without credentials, query or fragment.",
+                    "Use an http or https callback on localhost or a loopback IP, without credentials, query or fragment.",
                 );
             }
         },

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.3.6
+
+- Support existing HTTPS loopback OAuth callbacks with a temporary local TLS
+  receiver and a browser preparation step, preserving the provider's exact
+  registered redirect URI without changing the shared OAuth app.
+- Correct the public attestation-bundle fetch instructions used to verify
+  release downloads.
+
 ## 0.3.5
 
 - Fix stale configuration errors after changing the model in an existing

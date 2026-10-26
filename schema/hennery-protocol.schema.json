@@ -2925,7 +2925,7 @@
           ]
         },
         "local_redirect_uri": {
-          "description": "Optional local browser relay, `http://localhost:<port>/<path>` or\nan HTTP loopback IP. The collector callback and public URL stay fixed.\nThe vendor must permit this exact URI for the selected client.",
+          "description": "Optional local browser relay using HTTP or HTTPS on localhost or a\nloopback IP. The collector callback and public URL stay fixed.\nThe vendor must permit this exact URI for the selected client.",
           "type": [
             "string",
             "null"

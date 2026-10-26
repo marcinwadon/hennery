@@ -11,7 +11,7 @@ import { startVendor } from './oauth-vendor'
 
 test.use({ launchOptions: { args: ['--host-resolver-rules=MAP collector.example 127.0.0.1', '--no-proxy-server'] } })
 
-for (const width of [1280, 390]) test(`local OAuth returns to collector domain with its own cookie at ${width}px`, async ({ browser }) => {
+for (const scheme of ['http', 'https']) for (const width of [1280, 390]) test(`${scheme} local OAuth returns to collector domain with its own cookie at ${width}px`, async ({ browser }) => {
   const collector = await startCollector(), vendor = await startVendor()
   // Public test-only key/cert; no OS trust changes. A real TLS forwarder is
   // needed: Playwright routing does not intercept later hops of a redirect.
@@ -36,7 +36,7 @@ for (const width of [1280, 390]) test(`local OAuth returns to collector domain w
   const reserve = createServer()
   await new Promise<void>(resolve => reserve.listen(0, '127.0.0.1', resolve))
   const address = reserve.address(); if (!address || typeof address === 'string') throw new Error('no port')
-  const local = `http://127.0.0.1:${address.port}/vendor/return`
+  const local = `${scheme}://127.0.0.1:${address.port}/vendor/return`
   await new Promise<void>(resolve => reserve.close(() => resolve()))
   const helper = spawnHennery(['oauth-callback', '--collector', origin, '--redirect-uri', local], dir, { RUST_LOG: 'off' })
   let diagnostic = ''
@@ -62,6 +62,15 @@ for (const width of [1280, 390]) test(`local OAuth returns to collector domain w
     await card.getByRole('textbox', { name: 'Local redirect URI', exact: true }).fill(local)
     const command = await card.getByLabel('Local callback command', { exact: true }).textContent()
     expect(command).toBe(`hennery oauth-callback --collector '${origin}' --redirect-uri '${local}'`)
+    if (scheme === 'https') {
+      const opened = context.waitForEvent('page')
+      await card.getByRole('link', { name: 'Prepare HTTPS callback', exact: true }).click()
+      const ready = await opened
+      await expect(ready.getByText('Local OAuth callback ready. Return to Hennery and click Connect (or Reconnect).', { exact: true })).toBeVisible()
+      expect(ready.url()).toBe(local)
+      expect(vendor.counts.exchanges).toBe(0)
+      await ready.close()
+    }
     await page.screenshot({ path: test.info().outputPath('local-callback.png'), fullPage: true })
     const connect = async (button: string) => {
       const opened = context.waitForEvent('page')

@@ -119,7 +119,7 @@ permission requests still require the operator's answer in hennery.
 
 ## Verify a release installer before running it
 
-This procedure targets the 0.3.5 stable release. You need trusted, already installed
+This procedure targets the 0.3.6 stable release. You need trusted, already installed
 `curl`, Git, GnuPG, `jq`, `gh`, and either `sha256sum` or `shasum`.
 
 The release signing subkey's **full fingerprint** is
@@ -153,7 +153,7 @@ printed directory for inspection. Only the authenticated installer is executed.
 (
 set -eu
 release_fingerprint=F26C7F594DFE84D131703AFC23E5A318AE8D2861
-release_tag=v0.3.5
+release_tag=v0.3.6
 release_dir=$(mktemp -d "${TMPDIR:-/tmp}/hennery-release.XXXXXXXX") || exit 1
 printf 'Release verification directory: %s\n' "$release_dir"
 mkdir "$release_dir/keyring" || exit 1
@@ -265,14 +265,14 @@ HENNERY_RELEASE_CHECKSUMS="$release_checksums" HENNERY_ATTESTATION_BUNDLE="$rele
 
 ## Installing
 
-**Stable releases use all four channels below.** The examples target v0.3.5.
+**Stable releases use all four channels below.** The examples target v0.3.6.
 Use the verification procedure above for GitHub downloads:
 
 | Channel | Install |
 |---|---|
-| Homebrew | `brew install marcinwadon/tap/hennery` (0.3.5) from the project's tap. |
-| crates.io | `cargo install hennery --version 0.3.5`; the `hennery` crate installs the binary with its embedded UI. |
-| GHCR | `docker pull ghcr.io/marcinwadon/hennery:0.3.5`; the collector-only image. Agent hosts run separately on your machines. |
+| Homebrew | `brew install marcinwadon/tap/hennery` (0.3.6) from the project's tap. |
+| crates.io | `cargo install hennery --version 0.3.6`; the `hennery` crate installs the binary with its embedded UI. |
+| GHCR | `docker pull ghcr.io/marcinwadon/hennery:0.3.6`; the collector-only image. Agent hosts run separately on your machines. |
 | GitHub Releases | Platform archives and `hennery-installer.sh` on the [Releases page](https://github.com/marcinwadon/hennery/releases), with `SHA256SUMS`, one combined SBOM. Attestations are stored on GitHub. Use the verification procedure above before running the installer. |
 
 Stable releases receive their version tag and `latest`
@@ -669,12 +669,20 @@ automatically.
 
 If the vendor permits only a local redirect, select **Localhost callback on
 this computer** under **OAuth callback** in the connection's settings.
-Enter the exact **Local redirect URI** the vendor permits, including host,
-port and path (default `http://localhost:8976/callback`). Run the displayed
+Enter the exact **Local redirect URI** the vendor permits, including scheme,
+host, port and path (default `http://localhost:8976/callback`). HTTP and
+HTTPS loopback callbacks are supported. Run the displayed
 command on the computer running the browser, then click **Connect** or
 **Reconnect**. For example, for collector `https://hennery.example`, the
 command is `hennery oauth-callback --collector 'https://hennery.example'
 --redirect-uri 'http://localhost:8976/callback'` (one line).
+For an existing HTTPS redirect such as `https://127.0.0.1:9882/callback`,
+enter that exact URI instead. The receiver generates a temporary self-signed
+certificate in memory. After starting it, open **Prepare HTTPS callback** in
+the same browser profile, accept the certificate exception for that local
+address, and check that the receiver's ready page appears before clicking
+**Connect**. Repeat the preparation after restarting the receiver. No key or
+certificate is written to disk and no system trust settings are changed.
 Use the same browser profile that started Connect. The receiver sends the
 browser back to the collector, where its flow cookie, PKCE, exchange and
 grant storage are checked as usual. Login, passkeys and MCP URLs still use
