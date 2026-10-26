@@ -61,10 +61,10 @@
           },
           {
             "path": "node_modules/@anthropic-ai/sdk",
-            "url": "https://registry.npmjs.org/@anthropic-ai/sdk/-/sdk-0.135.0.tgz",
-            "integrity": "sha512-WWrdL57JhU5KoynpTjt9GXK6k7ud9nPw2uw/Trn+oBXh6s0KpjhAccWZm2Qxw08ARYG1UDQj5iC+JO42j1rt/g==",
-            "archive_size": 2412322,
-            "unpacked_size": 14570310
+            "url": "https://registry.npmjs.org/@anthropic-ai/sdk/-/sdk-1.3.0.tgz",
+            "integrity": "sha512-k7z9BlLLPxfZH+ov7dS6EnaN/wiZeV8YNT1LZfrpAHIy7oY7pHr4UzirF9f2OlHtFEnRBOX+AZQ91Y5fK+TPTw==",
+            "archive_size": 2605339,
+            "unpacked_size": 15740193
           },
           {
             "path": "node_modules/@babel/runtime",
@@ -82,17 +82,17 @@
           },
           {
             "path": "node_modules/@modelcontextprotocol/sdk",
-            "url": "https://registry.npmjs.org/@modelcontextprotocol/sdk/-/sdk-1.32.1.tgz",
-            "integrity": "sha512-2DdE+SJDtzLEEWzY1ZjY7Q+VcPhcV1KisD3zI4u0XZyktsjHum1mwbMI+JaulUBi2OZk+KJAi2uPXzxichPkdw==",
-            "archive_size": 615784,
-            "unpacked_size": 4490363
+            "url": "https://registry.npmjs.org/@modelcontextprotocol/sdk/-/sdk-1.32.2.tgz",
+            "integrity": "sha512-SWsVtH/0vULSQStoZ6xxH2K09Li8fXYTMC64ZeogCdpZ3XSi1eCPOByV1OpuJxuI3OcmHhosDWYyii07tpPsLw==",
+            "archive_size": 616330,
+            "unpacked_size": 4492221
           },
           {
             "path": "node_modules/@opentelemetry/api",
-            "url": "https://registry.npmjs.org/@opentelemetry/api/-/api-1.9.1.tgz",
-            "integrity": "sha512-gLyJlPHPZYdAk1JENA9LeHejZe1Ti77/pTeFm/nMXmQH/HFZlcS/O2XJB+L8fkbrNSqhdtlvjBVjxwUYanNH5Q==",
-            "archive_size": 116186,
-            "unpacked_size": 1001329
+            "url": "https://registry.npmjs.org/@opentelemetry/api/-/api-1.10.0.tgz",
+            "integrity": "sha512-lMkyes8iHrG+mk6WH7X70MdCLI2RS0FwNBY1PyQ8UemaijE2m5mv5A0Niy3HtbYTFrgkUEQjFMXmSAk2hQDuPQ==",
+            "archive_size": 130716,
+            "unpacked_size": 622898
           },
           {
             "path": "node_modules/@stablelib/base64",
@@ -397,10 +397,10 @@
           },
           {
             "path": "node_modules/hono",
-            "url": "https://registry.npmjs.org/hono/-/hono-4.13.13.tgz",
-            "integrity": "sha512-CQ46U0ZkAGmbT/4UxdzzGJpacP2IeKgY4a5/tOI9AABbpOMfK739wfDXmv1usCk+3RkKj1hQy4/fjhiwa2xlrA==",
-            "archive_size": 245272,
-            "unpacked_size": 1294526
+            "url": "https://registry.npmjs.org/hono/-/hono-4.13.14.tgz",
+            "integrity": "sha512-yhRLQ21U6qa9Hsu2N7Qcbh8tE+WKEcoErjIo56LeSGiGXGp9sA7UpE86Ui9uexb61KakiGwuHMn2QdV7w6i6kQ==",
+            "archive_size": 245823,
+            "unpacked_size": 1296954
           },
           {
             "path": "node_modules/http-errors",
@@ -425,10 +425,10 @@
           },
           {
             "path": "node_modules/ip-address",
-            "url": "https://registry.npmjs.org/ip-address/-/ip-address-10.7.4.tgz",
-            "integrity": "sha512-DWBMKyeM25D70nrIiTkgQth59/G+naKOTep6huF9j+GmeK3DMD60Zvxg5d5qQnz+38AHgou6ean2LECX+lrKDg==",
-            "archive_size": 85495,
-            "unpacked_size": 368767
+            "url": "https://registry.npmjs.org/ip-address/-/ip-address-10.7.5.tgz",
+            "integrity": "sha512-t2v0rkILYv9WXmSL7TpAaU3HXgaFYOPUcH3QHgwQ++gpJuH3bqyMy4Fvt/DJCTKwzH3Cf+bAp5W/mFL39KPLzA==",
+            "archive_size": 85503,
+            "unpacked_size": 368787
           },
           {
             "path": "node_modules/ipaddr.js",
@@ -453,10 +453,10 @@
           },
           {
             "path": "node_modules/jose",
-            "url": "https://registry.npmjs.org/jose/-/jose-6.2.12.tgz",
-            "integrity": "sha512-9NiFmJEex0sy2Dk58j2UGBSHgUs2ypF9eZSu4L6vjOX3Dp96Sw1F3uL+H+D1sx02jZZdzUT0HgvCy59CuvXcWw==",
-            "archive_size": 48946,
-            "unpacked_size": 210660
+            "url": "https://registry.npmjs.org/jose/-/jose-6.2.13.tgz",
+            "integrity": "sha512-7TIg10ZE1x82YediN+lcrPNvGMKge9yFHQD+Qho/b8y2adfugU3AsvvHfxV0fzyFllT6l9xCjf4RWY9g/Z9PJQ==",
+            "archive_size": 49879,
+            "unpacked_size": 218445
           },
           {
             "path": "node_modules/json-schema-to-ts",
@@ -551,10 +551,10 @@
           },
           {
             "path": "node_modules/on-finished",
-            "url": "https://registry.npmjs.org/on-finished/-/on-finished-2.4.1.tgz",
-            "integrity": "sha512-oVlzkg3ENAhCk2zdv7IJwd/QUD4z2RxRwpkcGY8psCVcCYZNq4wYnVWALHM+brtuJjePWiYF/ClmuDr8Ch5+kg==",
-            "archive_size": 5052,
-            "unpacked_size": 13679
+            "url": "https://registry.npmjs.org/on-finished/-/on-finished-2.4.2.tgz",
+            "integrity": "sha512-ATWUv387i+nLD49EiDoOft5scf32Vsdz3ktrQJG9bi7jRFmaXTssvyvj1EmeKVVgvesbqUtvQQvaS2TpTukAZQ==",
+            "archive_size": 4534,
+            "unpacked_size": 12172
           },
           {
             "path": "node_modules/once",
@@ -820,10 +820,10 @@
           },
           {
             "path": "node_modules/@anthropic-ai/sdk",
-            "url": "https://registry.npmjs.org/@anthropic-ai/sdk/-/sdk-0.135.0.tgz",
-            "integrity": "sha512-WWrdL57JhU5KoynpTjt9GXK6k7ud9nPw2uw/Trn+oBXh6s0KpjhAccWZm2Qxw08ARYG1UDQj5iC+JO42j1rt/g==",
-            "archive_size": 2412322,
-            "unpacked_size": 14570310
+            "url": "https://registry.npmjs.org/@anthropic-ai/sdk/-/sdk-1.3.0.tgz",
+            "integrity": "sha512-k7z9BlLLPxfZH+ov7dS6EnaN/wiZeV8YNT1LZfrpAHIy7oY7pHr4UzirF9f2OlHtFEnRBOX+AZQ91Y5fK+TPTw==",
+            "archive_size": 2605339,
+            "unpacked_size": 15740193
           },
           {
             "path": "node_modules/@babel/runtime",
@@ -841,17 +841,17 @@
           },
           {
             "path": "node_modules/@modelcontextprotocol/sdk",
-            "url": "https://registry.npmjs.org/@modelcontextprotocol/sdk/-/sdk-1.32.1.tgz",
-            "integrity": "sha512-2DdE+SJDtzLEEWzY1ZjY7Q+VcPhcV1KisD3zI4u0XZyktsjHum1mwbMI+JaulUBi2OZk+KJAi2uPXzxichPkdw==",
-            "archive_size": 615784,
-            "unpacked_size": 4490363
+            "url": "https://registry.npmjs.org/@modelcontextprotocol/sdk/-/sdk-1.32.2.tgz",
+            "integrity": "sha512-SWsVtH/0vULSQStoZ6xxH2K09Li8fXYTMC64ZeogCdpZ3XSi1eCPOByV1OpuJxuI3OcmHhosDWYyii07tpPsLw==",
+            "archive_size": 616330,
+            "unpacked_size": 4492221
           },
           {
             "path": "node_modules/@opentelemetry/api",
-            "url": "https://registry.npmjs.org/@opentelemetry/api/-/api-1.9.1.tgz",
-            "integrity": "sha512-gLyJlPHPZYdAk1JENA9LeHejZe1Ti77/pTeFm/nMXmQH/HFZlcS/O2XJB+L8fkbrNSqhdtlvjBVjxwUYanNH5Q==",
-            "archive_size": 116186,
-            "unpacked_size": 1001329
+            "url": "https://registry.npmjs.org/@opentelemetry/api/-/api-1.10.0.tgz",
+            "integrity": "sha512-lMkyes8iHrG+mk6WH7X70MdCLI2RS0FwNBY1PyQ8UemaijE2m5mv5A0Niy3HtbYTFrgkUEQjFMXmSAk2hQDuPQ==",
+            "archive_size": 130716,
+            "unpacked_size": 622898
           },
           {
             "path": "node_modules/@stablelib/base64",
@@ -1156,10 +1156,10 @@
           },
           {
             "path": "node_modules/hono",
-            "url": "https://registry.npmjs.org/hono/-/hono-4.13.13.tgz",
-            "integrity": "sha512-CQ46U0ZkAGmbT/4UxdzzGJpacP2IeKgY4a5/tOI9AABbpOMfK739wfDXmv1usCk+3RkKj1hQy4/fjhiwa2xlrA==",
-            "archive_size": 245272,
-            "unpacked_size": 1294526
+            "url": "https://registry.npmjs.org/hono/-/hono-4.13.14.tgz",
+            "integrity": "sha512-yhRLQ21U6qa9Hsu2N7Qcbh8tE+WKEcoErjIo56LeSGiGXGp9sA7UpE86Ui9uexb61KakiGwuHMn2QdV7w6i6kQ==",
+            "archive_size": 245823,
+            "unpacked_size": 1296954
           },
           {
             "path": "node_modules/http-errors",
@@ -1184,10 +1184,10 @@
           },
           {
             "path": "node_modules/ip-address",
-            "url": "https://registry.npmjs.org/ip-address/-/ip-address-10.7.4.tgz",
-            "integrity": "sha512-DWBMKyeM25D70nrIiTkgQth59/G+naKOTep6huF9j+GmeK3DMD60Zvxg5d5qQnz+38AHgou6ean2LECX+lrKDg==",
-            "archive_size": 85495,
-            "unpacked_size": 368767
+            "url": "https://registry.npmjs.org/ip-address/-/ip-address-10.7.5.tgz",
+            "integrity": "sha512-t2v0rkILYv9WXmSL7TpAaU3HXgaFYOPUcH3QHgwQ++gpJuH3bqyMy4Fvt/DJCTKwzH3Cf+bAp5W/mFL39KPLzA==",
+            "archive_size": 85503,
+            "unpacked_size": 368787
           },
           {
             "path": "node_modules/ipaddr.js",
@@ -1212,10 +1212,10 @@
           },
           {
             "path": "node_modules/jose",
-            "url": "https://registry.npmjs.org/jose/-/jose-6.2.12.tgz",
-            "integrity": "sha512-9NiFmJEex0sy2Dk58j2UGBSHgUs2ypF9eZSu4L6vjOX3Dp96Sw1F3uL+H+D1sx02jZZdzUT0HgvCy59CuvXcWw==",
-            "archive_size": 48946,
-            "unpacked_size": 210660
+            "url": "https://registry.npmjs.org/jose/-/jose-6.2.13.tgz",
+            "integrity": "sha512-7TIg10ZE1x82YediN+lcrPNvGMKge9yFHQD+Qho/b8y2adfugU3AsvvHfxV0fzyFllT6l9xCjf4RWY9g/Z9PJQ==",
+            "archive_size": 49879,
+            "unpacked_size": 218445
           },
           {
             "path": "node_modules/json-schema-to-ts",
@@ -1310,10 +1310,10 @@
           },
           {
             "path": "node_modules/on-finished",
-            "url": "https://registry.npmjs.org/on-finished/-/on-finished-2.4.1.tgz",
-            "integrity": "sha512-oVlzkg3ENAhCk2zdv7IJwd/QUD4z2RxRwpkcGY8psCVcCYZNq4wYnVWALHM+brtuJjePWiYF/ClmuDr8Ch5+kg==",
-            "archive_size": 5052,
-            "unpacked_size": 13679
+            "url": "https://registry.npmjs.org/on-finished/-/on-finished-2.4.2.tgz",
+            "integrity": "sha512-ATWUv387i+nLD49EiDoOft5scf32Vsdz3ktrQJG9bi7jRFmaXTssvyvj1EmeKVVgvesbqUtvQQvaS2TpTukAZQ==",
+            "archive_size": 4534,
+            "unpacked_size": 12172
           },
           {
             "path": "node_modules/once",
@@ -1579,10 +1579,10 @@
           },
           {
             "path": "node_modules/@anthropic-ai/sdk",
-            "url": "https://registry.npmjs.org/@anthropic-ai/sdk/-/sdk-0.135.0.tgz",
-            "integrity": "sha512-WWrdL57JhU5KoynpTjt9GXK6k7ud9nPw2uw/Trn+oBXh6s0KpjhAccWZm2Qxw08ARYG1UDQj5iC+JO42j1rt/g==",
-            "archive_size": 2412322,
-            "unpacked_size": 14570310
+            "url": "https://registry.npmjs.org/@anthropic-ai/sdk/-/sdk-1.3.0.tgz",
+            "integrity": "sha512-k7z9BlLLPxfZH+ov7dS6EnaN/wiZeV8YNT1LZfrpAHIy7oY7pHr4UzirF9f2OlHtFEnRBOX+AZQ91Y5fK+TPTw==",
+            "archive_size": 2605339,
+            "unpacked_size": 15740193
           },
           {
             "path": "node_modules/@babel/runtime",
@@ -1600,17 +1600,17 @@
           },
           {
             "path": "node_modules/@modelcontextprotocol/sdk",
-            "url": "https://registry.npmjs.org/@modelcontextprotocol/sdk/-/sdk-1.32.1.tgz",
-            "integrity": "sha512-2DdE+SJDtzLEEWzY1ZjY7Q+VcPhcV1KisD3zI4u0XZyktsjHum1mwbMI+JaulUBi2OZk+KJAi2uPXzxichPkdw==",
-            "archive_size": 615784,
-            "unpacked_size": 4490363
+            "url": "https://registry.npmjs.org/@modelcontextprotocol/sdk/-/sdk-1.32.2.tgz",
+            "integrity": "sha512-SWsVtH/0vULSQStoZ6xxH2K09Li8fXYTMC64ZeogCdpZ3XSi1eCPOByV1OpuJxuI3OcmHhosDWYyii07tpPsLw==",
+            "archive_size": 616330,
+            "unpacked_size": 4492221
           },
           {
             "path": "node_modules/@opentelemetry/api",
-            "url": "https://registry.npmjs.org/@opentelemetry/api/-/api-1.9.1.tgz",
-            "integrity": "sha512-gLyJlPHPZYdAk1JENA9LeHejZe1Ti77/pTeFm/nMXmQH/HFZlcS/O2XJB+L8fkbrNSqhdtlvjBVjxwUYanNH5Q==",
-            "archive_size": 116186,
-            "unpacked_size": 1001329
+            "url": "https://registry.npmjs.org/@opentelemetry/api/-/api-1.10.0.tgz",
+            "integrity": "sha512-lMkyes8iHrG+mk6WH7X70MdCLI2RS0FwNBY1PyQ8UemaijE2m5mv5A0Niy3HtbYTFrgkUEQjFMXmSAk2hQDuPQ==",
+            "archive_size": 130716,
+            "unpacked_size": 622898
           },
           {
             "path": "node_modules/@stablelib/base64",
@@ -1915,10 +1915,10 @@
           },
           {
             "path": "node_modules/hono",
-            "url": "https://registry.npmjs.org/hono/-/hono-4.13.13.tgz",
-            "integrity": "sha512-CQ46U0ZkAGmbT/4UxdzzGJpacP2IeKgY4a5/tOI9AABbpOMfK739wfDXmv1usCk+3RkKj1hQy4/fjhiwa2xlrA==",
-            "archive_size": 245272,
-            "unpacked_size": 1294526
+            "url": "https://registry.npmjs.org/hono/-/hono-4.13.14.tgz",
+            "integrity": "sha512-yhRLQ21U6qa9Hsu2N7Qcbh8tE+WKEcoErjIo56LeSGiGXGp9sA7UpE86Ui9uexb61KakiGwuHMn2QdV7w6i6kQ==",
+            "archive_size": 245823,
+            "unpacked_size": 1296954
           },
           {
             "path": "node_modules/http-errors",
@@ -1943,10 +1943,10 @@
           },
           {
             "path": "node_modules/ip-address",
-            "url": "https://registry.npmjs.org/ip-address/-/ip-address-10.7.4.tgz",
-            "integrity": "sha512-DWBMKyeM25D70nrIiTkgQth59/G+naKOTep6huF9j+GmeK3DMD60Zvxg5d5qQnz+38AHgou6ean2LECX+lrKDg==",
-            "archive_size": 85495,
-            "unpacked_size": 368767
+            "url": "https://registry.npmjs.org/ip-address/-/ip-address-10.7.5.tgz",
+            "integrity": "sha512-t2v0rkILYv9WXmSL7TpAaU3HXgaFYOPUcH3QHgwQ++gpJuH3bqyMy4Fvt/DJCTKwzH3Cf+bAp5W/mFL39KPLzA==",
+            "archive_size": 85503,
+            "unpacked_size": 368787
           },
           {
             "path": "node_modules/ipaddr.js",
@@ -1971,10 +1971,10 @@
           },
           {
             "path": "node_modules/jose",
-            "url": "https://registry.npmjs.org/jose/-/jose-6.2.12.tgz",
-            "integrity": "sha512-9NiFmJEex0sy2Dk58j2UGBSHgUs2ypF9eZSu4L6vjOX3Dp96Sw1F3uL+H+D1sx02jZZdzUT0HgvCy59CuvXcWw==",
-            "archive_size": 48946,
-            "unpacked_size": 210660
+            "url": "https://registry.npmjs.org/jose/-/jose-6.2.13.tgz",
+            "integrity": "sha512-7TIg10ZE1x82YediN+lcrPNvGMKge9yFHQD+Qho/b8y2adfugU3AsvvHfxV0fzyFllT6l9xCjf4RWY9g/Z9PJQ==",
+            "archive_size": 49879,
+            "unpacked_size": 218445
           },
           {
             "path": "node_modules/json-schema-to-ts",
@@ -2069,10 +2069,10 @@
           },
           {
             "path": "node_modules/on-finished",
-            "url": "https://registry.npmjs.org/on-finished/-/on-finished-2.4.1.tgz",
-            "integrity": "sha512-oVlzkg3ENAhCk2zdv7IJwd/QUD4z2RxRwpkcGY8psCVcCYZNq4wYnVWALHM+brtuJjePWiYF/ClmuDr8Ch5+kg==",
-            "archive_size": 5052,
-            "unpacked_size": 13679
+            "url": "https://registry.npmjs.org/on-finished/-/on-finished-2.4.2.tgz",
+            "integrity": "sha512-ATWUv387i+nLD49EiDoOft5scf32Vsdz3ktrQJG9bi7jRFmaXTssvyvj1EmeKVVgvesbqUtvQQvaS2TpTukAZQ==",
+            "archive_size": 4534,
+            "unpacked_size": 12172
           },
           {
             "path": "node_modules/once",
@@ -2310,37 +2310,37 @@
     },
     "codex": {
       "package": "@agentclientprotocol/codex-acp",
-      "version": "2.2.2",
+      "version": "2.3.0",
       "entry": "node_modules/@agentclientprotocol/codex-acp/dist/index.js",
       "platforms": {
         "darwin-arm64": [
           {
             "path": "node_modules/@agentclientprotocol/codex-acp",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.2.2.tgz",
-            "integrity": "sha512-vNdeNV3jxbqaH7MYvVWzyB6cMOz+YGIV9W1xyBDsQfoii92DulZLM+ahCL2T2G6uohlaB1Yma347p2kLfAab2w==",
-            "archive_size": 322375,
-            "unpacked_size": 1748544
+            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.3.0.tgz",
+            "integrity": "sha512-VdTYaOGXqLh/aVuAKIgFG7BIzbeq537FHGo28kgBhybDbeOdFVFTtc43k/tCpScFhZyqPQWHuWf8w/QQd0qtXQ==",
+            "archive_size": 374004,
+            "unpacked_size": 2005353
           },
           {
             "path": "node_modules/@agentclientprotocol/sdk",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-1.9.0.tgz",
-            "integrity": "sha512-saCOTPYBK1iqWqJFAYHXbg3+zCoFXyZZFoqQAwdTWkbrZZPpAETr80QOnYr2l+dzPwL0jpNhn3eDY8MoEIDbUA==",
-            "archive_size": 613980,
-            "unpacked_size": 6071735
+            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-2.0.2.tgz",
+            "integrity": "sha512-jLywRB42hZMRMc4aUgt0uRjkY9FQnMdybv4XgLl+ddi75QuJn8Vbl0+CHcVHJDC0+WDfi1KQXRWtHaR5vp6gHw==",
+            "archive_size": 695680,
+            "unpacked_size": 7938833
           },
           {
             "path": "node_modules/@openai/codex",
-            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.160.1.tgz",
-            "integrity": "sha512-f1yrJhwgimKQI1kYQlxdPJcFwkNZxZrbz7Hf89EAcnLqkQ7TiESzr2FgSZn13Ga5RuHjlVUfurzwq10wk9zw2g==",
-            "archive_size": 4904,
+            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.164.0.tgz",
+            "integrity": "sha512-TWj7UGyPRe3Pj/A3ddNAxs1te3a/W/xAd+J0LHrrFTmsSfahGMOLF/vn88D3QCIgAT3B1rm1y/Z3NYE0rx6cZQ==",
+            "archive_size": 4902,
             "unpacked_size": 13206
           },
           {
             "path": "node_modules/@openai/codex-darwin-arm64",
-            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.160.1-darwin-arm64.tgz",
-            "integrity": "sha512-6Znu97O7+Ie/cnUpsWLx6NlcPc7DNuj6sAs58xpt0/tKRgx4+xgE9zca1YrwqQUBjUQO1HexudyimmhpZjdWlA==",
-            "archive_size": 134323627,
-            "unpacked_size": 332940366,
+            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.164.0-darwin-arm64.tgz",
+            "integrity": "sha512-pDizgOUAtq3/k3AbUFHbaU19WpYKCja+oFpNSTLKrDQj4lTUNSDuTPJip4uQVn2/1EipQdpQrGMOQBVuI1znAA==",
+            "archive_size": 140709294,
+            "unpacked_size": 354454270,
             "cli": true
           },
           {
@@ -2494,31 +2494,31 @@
         "linux-arm64": [
           {
             "path": "node_modules/@agentclientprotocol/codex-acp",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.2.2.tgz",
-            "integrity": "sha512-vNdeNV3jxbqaH7MYvVWzyB6cMOz+YGIV9W1xyBDsQfoii92DulZLM+ahCL2T2G6uohlaB1Yma347p2kLfAab2w==",
-            "archive_size": 322375,
-            "unpacked_size": 1748544
+            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.3.0.tgz",
+            "integrity": "sha512-VdTYaOGXqLh/aVuAKIgFG7BIzbeq537FHGo28kgBhybDbeOdFVFTtc43k/tCpScFhZyqPQWHuWf8w/QQd0qtXQ==",
+            "archive_size": 374004,
+            "unpacked_size": 2005353
           },
           {
             "path": "node_modules/@agentclientprotocol/sdk",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-1.9.0.tgz",
-            "integrity": "sha512-saCOTPYBK1iqWqJFAYHXbg3+zCoFXyZZFoqQAwdTWkbrZZPpAETr80QOnYr2l+dzPwL0jpNhn3eDY8MoEIDbUA==",
-            "archive_size": 613980,
-            "unpacked_size": 6071735
+            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-2.0.2.tgz",
+            "integrity": "sha512-jLywRB42hZMRMc4aUgt0uRjkY9FQnMdybv4XgLl+ddi75QuJn8Vbl0+CHcVHJDC0+WDfi1KQXRWtHaR5vp6gHw==",
+            "archive_size": 695680,
+            "unpacked_size": 7938833
           },
           {
             "path": "node_modules/@openai/codex",
-            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.160.1.tgz",
-            "integrity": "sha512-f1yrJhwgimKQI1kYQlxdPJcFwkNZxZrbz7Hf89EAcnLqkQ7TiESzr2FgSZn13Ga5RuHjlVUfurzwq10wk9zw2g==",
-            "archive_size": 4904,
+            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.164.0.tgz",
+            "integrity": "sha512-TWj7UGyPRe3Pj/A3ddNAxs1te3a/W/xAd+J0LHrrFTmsSfahGMOLF/vn88D3QCIgAT3B1rm1y/Z3NYE0rx6cZQ==",
+            "archive_size": 4902,
             "unpacked_size": 13206
           },
           {
             "path": "node_modules/@openai/codex-linux-arm64",
-            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.160.1-linux-arm64.tgz",
-            "integrity": "sha512-JLyjBlmjPvwTaicHemw+y5xQSz3Uja2r7F/xkvS8gFufTA2g132Ak+0fo35xnJ/k2uc9fTtjm0LrsEGI78L6Ng==",
-            "archive_size": 155715063,
-            "unpacked_size": 401682212,
+            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.164.0-linux-arm64.tgz",
+            "integrity": "sha512-LL5iTQjyDL4YRX44EWqhIfEQ5uGnmgxkQBJSxjZSeJ8L1Og83pdlzUJW/PRJ76oaVwOVgh6HXwuPEiBNEHU4lg==",
+            "archive_size": 157521698,
+            "unpacked_size": 399068556,
             "cli": true
           },
           {
@@ -2672,31 +2672,31 @@
         "linux-x64": [
           {
             "path": "node_modules/@agentclientprotocol/codex-acp",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.2.2.tgz",
-            "integrity": "sha512-vNdeNV3jxbqaH7MYvVWzyB6cMOz+YGIV9W1xyBDsQfoii92DulZLM+ahCL2T2G6uohlaB1Yma347p2kLfAab2w==",
-            "archive_size": 322375,
-            "unpacked_size": 1748544
+            "url": "https://registry.npmjs.org/@agentclientprotocol/codex-acp/-/codex-acp-2.3.0.tgz",
+            "integrity": "sha512-VdTYaOGXqLh/aVuAKIgFG7BIzbeq537FHGo28kgBhybDbeOdFVFTtc43k/tCpScFhZyqPQWHuWf8w/QQd0qtXQ==",
+            "archive_size": 374004,
+            "unpacked_size": 2005353
           },
           {
             "path": "node_modules/@agentclientprotocol/sdk",
-            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-1.9.0.tgz",
-            "integrity": "sha512-saCOTPYBK1iqWqJFAYHXbg3+zCoFXyZZFoqQAwdTWkbrZZPpAETr80QOnYr2l+dzPwL0jpNhn3eDY8MoEIDbUA==",
-            "archive_size": 613980,
-            "unpacked_size": 6071735
+            "url": "https://registry.npmjs.org/@agentclientprotocol/sdk/-/sdk-2.0.2.tgz",
+            "integrity": "sha512-jLywRB42hZMRMc4aUgt0uRjkY9FQnMdybv4XgLl+ddi75QuJn8Vbl0+CHcVHJDC0+WDfi1KQXRWtHaR5vp6gHw==",
+            "archive_size": 695680,
+            "unpacked_size": 7938833
           },
           {
             "path": "node_modules/@openai/codex",
-            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.160.1.tgz",
-            "integrity": "sha512-f1yrJhwgimKQI1kYQlxdPJcFwkNZxZrbz7Hf89EAcnLqkQ7TiESzr2FgSZn13Ga5RuHjlVUfurzwq10wk9zw2g==",
-            "archive_size": 4904,
+            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.164.0.tgz",
+            "integrity": "sha512-TWj7UGyPRe3Pj/A3ddNAxs1te3a/W/xAd+J0LHrrFTmsSfahGMOLF/vn88D3QCIgAT3B1rm1y/Z3NYE0rx6cZQ==",
+            "archive_size": 4902,
             "unpacked_size": 13206
           },
           {
             "path": "node_modules/@openai/codex-linux-x64",
-            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.160.1-linux-x64.tgz",
-            "integrity": "sha512-sIDhqV+bsZKKVaVFVY5iB+pAzyOz2XRm3H1KXCsSJwGj5p98qnrT0Fweo1Hfe7WnyTp8mfBNdbVzUeO+mHYugA==",
-            "archive_size": 163294814,
-            "unpacked_size": 446758666,
+            "url": "https://registry.npmjs.org/@openai/codex/-/codex-0.164.0-linux-x64.tgz",
+            "integrity": "sha512-XLAoaWsGOT2khzl+P4FYDPTkzAr9W0VFXFaVkqlFdkM0soa1gH/4S0wSD57Ek3HHwkirAEGz2/Mwehseh+l5Mg==",
+            "archive_size": 165142849,
+            "unpacked_size": 444349626,
             "cli": true
           },
           {
@@ -2851,7 +2851,7 @@
     }
   },
   "codex_app_server": {
-    "codex_version": "0.160.1",
+    "codex_version": "0.164.0",
     "bin": "node_modules/@openai/codex/bin/codex.js",
     "initialize": {
       "clientInfo": {

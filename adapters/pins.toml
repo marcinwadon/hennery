@@ -12,7 +12,7 @@
 
 # npm resolves the lockfiles as of this instant, so `lock` is reproducible.
 # Committed locks may include targeted security refreshes (packaging/README.md).
-npm_before = "2026-10-19T12:40:07Z"
+npm_before = "2026-10-26T19:20:01Z"
 
 [node]
 # Operator confirmed the current pins on 2026-10-19 (plan 7b).
@@ -34,7 +34,7 @@ cli = ["node_modules/@anthropic-ai/claude-agent-sdk-"]
 # `@zed-industries/codex-acp` is deprecated in its favour; the unscoped
 # `codex-acp` is an unrelated third party.
 package = "@agentclientprotocol/codex-acp"
-version = "2.2.2"
+version = "2.3.0"
 entry = "dist/index.js"
 # The bundled Codex CLI: `@openai/codex`'s platform packages (npm aliases of
 # `@openai/codex@<version>-<platform>`); skipped by `--use-cli codex=…`.
@@ -47,7 +47,7 @@ cli = ["node_modules/@openai/codex-"]
 # lockfile bundles exactly `codex_version`; a bump re-reads the shape, and
 # the live check in packaging/README.md ("Pin bumps") is the operator's.
 [codex_app_server]
-codex_version = "0.160.1"
+codex_version = "0.164.0"
 bin = "node_modules/@openai/codex/bin/codex.js"
 delete_method = "thread/delete"
 params_shape = { threadId = "{thread_id}" }
