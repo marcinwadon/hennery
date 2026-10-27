@@ -12,7 +12,7 @@
 
 # npm resolves the lockfiles as of this instant, so `lock` is reproducible.
 # Committed locks may include targeted security refreshes (packaging/README.md).
-npm_before = "2026-10-19T12:40:07Z"
+npm_before = "2026-10-27T23:48:59Z"
 
 [node]
 # Operator confirmed the current pins on 2026-10-19 (plan 7b).
@@ -23,7 +23,7 @@ version = "24.22.1"
 # Operator confirmed on 2026-10-19; measured in the per-session MCP
 # spike (docs/spikes/2026-09-25-per-session-mcp.md).
 package = "@agentclientprotocol/claude-agent-acp"
-version = "0.93.0"
+version = "0.98.0"
 entry = "dist/index.js"
 # The bundled Claude CLI: the SDK's platform packages. Proprietary, so never
 # redistributed (distribution §3.3); skipped by `--use-cli claude=…`.
