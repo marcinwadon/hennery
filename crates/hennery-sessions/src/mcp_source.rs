@@ -3,8 +3,11 @@
 use crate::store::{McpContext, Store};
 use anyhow::Result;
 use hennery_proto::frames::{Capabilities, Capability, McpIsolation, SessionBody};
-use hennery_proto::mcp_source::{McpSourcePolicy, McpSourceSnapshot, McpSourceState};
+use hennery_proto::mcp_source::{
+    McpSourceOverride, McpSourcePolicy, McpSourceSnapshot, McpSourceState, source_policy_for,
+};
 use rusqlite::{OptionalExtension, Transaction, params};
+use std::collections::BTreeMap;
 
 pub const UNSUPPORTED: &str = "mcp_source_policy_unsupported";
 
@@ -51,16 +54,16 @@ pub(crate) fn requested_in(
     hat: &str,
     context: McpContext,
 ) -> Result<Option<McpSourceSnapshot>> {
-    let (policy, revision) = policy_in(tx, owner, hat, context)?;
     // Preserve correlation if an API client returns an explicit session to
     // compatibility mode. A late failure from its previous attach must not
     // fail this one. Never require an explicit policy echo from an old host.
-    let tracked: bool = tx.query_row(
-        "SELECT mcp_source_requested IS NOT NULL OR mcp_source_applied IS NOT NULL
+    let (tracked, agent): (bool, String) = tx.query_row(
+        "SELECT mcp_source_requested IS NOT NULL OR mcp_source_applied IS NOT NULL, agent
          FROM sessions WHERE owner_id = ?1 AND id = ?2",
         params![owner, session],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    let (policy, revision) = policy_in(tx, owner, hat, &agent, context)?;
     let snapshot = (policy != McpSourcePolicy::Legacy || tracked).then(|| McpSourceSnapshot {
         policy,
         revision,
@@ -77,21 +80,33 @@ pub(crate) fn requested_in(
     Ok(snapshot)
 }
 
+pub(crate) fn selected_in(
+    conn: &rusqlite::Connection,
+    owner: &str,
+    hat: &str,
+    agent: &str,
+) -> Result<(McpSourcePolicy, u64)> {
+    let row: Option<(String, u64, String)> = conn
+        .query_row(
+            "SELECT mcp_source_policy, mcp_policy_revision, mcp_source_overrides FROM hats WHERE owner_id = ?1 AND id = ?2",
+            params![owner, hat],
+            |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?)),
+        )
+        .optional()?;
+    let (text, revision, overrides) = row.unwrap_or(("legacy".into(), 0, "{}".into()));
+    let fallback = McpSourcePolicy::parse(&text).ok_or_else(|| anyhow::anyhow!("invalid stored MCP source policy"))?;
+    let overrides: BTreeMap<String, McpSourceOverride> = serde_json::from_str(&overrides)?;
+    Ok(source_policy_for(fallback, revision, &overrides, agent))
+}
+
 fn policy_in(
     conn: &rusqlite::Connection,
     owner: &str,
     hat: &str,
+    agent: &str,
     context: McpContext,
 ) -> Result<(McpSourcePolicy, u64)> {
-    let row: Option<(String, u64)> = conn
-        .query_row(
-            "SELECT mcp_source_policy, mcp_policy_revision FROM hats WHERE owner_id = ?1 AND id = ?2",
-            params![owner, hat],
-            |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)),
-        )
-        .optional()?;
-    let (text, revision) = row.unwrap_or(("legacy".into(), 0));
-    let policy = McpSourcePolicy::parse(&text).ok_or_else(|| anyhow::anyhow!("invalid stored MCP source policy"))?;
+    let (policy, revision) = selected_in(conn, owner, hat, agent)?;
     let mut caps = Vec::new();
     if context.capable {
         caps.push(Capability::McpServers);
@@ -162,25 +177,27 @@ pub(crate) fn fact_matches(tx: &Transaction<'_>, owner: &str, session: &str, bod
 impl Store {
     /// Preflight before a disposable runtime probe. Actual attach repeats this
     /// under its transaction, so a concurrent hat edit cannot bypass admission.
-    pub fn check_mcp_source_policy(&self, hat: &str, context: McpContext) -> Result<()> {
-        policy_in(&self.conn(), self.owner_id(), hat, context).map(|_| ())
+    pub fn check_mcp_source_policy(&self, hat: &str, agent: &str, context: McpContext) -> Result<()> {
+        policy_in(&self.conn(), self.owner_id(), hat, agent, context).map(|_| ())
     }
 
     pub fn mcp_source_state(&self, session: &str) -> Result<Option<McpSourceState>> {
-        let row: Option<(String, u64, Option<String>, Option<String>)> = self
+        let row: Option<(String, u64, Option<String>, Option<String>, String, String)> = self
             .conn()
             .query_row(
-                "SELECT h.mcp_source_policy, h.mcp_policy_revision, s.mcp_source_requested, s.mcp_source_applied
+                "SELECT h.mcp_source_policy, h.mcp_policy_revision, s.mcp_source_requested, s.mcp_source_applied, h.mcp_source_overrides, s.agent
                  FROM sessions s JOIN hats h ON h.owner_id = s.owner_id AND h.id = s.hat_id
                  WHERE s.owner_id = ?1 AND s.id = ?2 AND s.lifecycle <> 'deleted'",
                 params![self.owner_id(), session],
-                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )
             .optional()?;
-        row.map(|(policy, revision, requested, applied)| {
+        row.map(|(policy, revision, requested, applied, overrides, agent)| {
+            let fallback =
+                McpSourcePolicy::parse(&policy).ok_or_else(|| anyhow::anyhow!("invalid stored MCP source policy"))?;
+            let (policy, revision) = source_policy_for(fallback, revision, &serde_json::from_str(&overrides)?, &agent);
             Ok(McpSourceState {
-                policy: McpSourcePolicy::parse(&policy)
-                    .ok_or_else(|| anyhow::anyhow!("invalid stored MCP source policy"))?,
+                policy,
                 revision,
                 requested: requested.map(|v| serde_json::from_str(&v)).transpose()?,
                 applied: applied.map(|v| serde_json::from_str(&v)).transpose()?,

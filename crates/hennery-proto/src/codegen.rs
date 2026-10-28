@@ -305,6 +305,7 @@ pub fn render_ts() -> String {
         frames::McpServer,
         frames::McpDelivery,
         crate::mcp_source::McpSourcePolicy,
+        crate::mcp_source::McpSourceOverride,
         crate::mcp_source::McpSourceSnapshot,
         crate::mcp_source::McpSourceState,
         frames::McpIsolation,

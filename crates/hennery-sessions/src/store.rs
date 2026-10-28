@@ -3628,14 +3628,17 @@ impl Store {
         if !matches!(lifecycle.as_str(), "parked" | "closed" | "failed") {
             return Ok(ResumeRequest::Busy(lifecycle));
         }
-        let policy_presumed: bool = tx.query_row(
-            "SELECT presumed_parked = 1 AND (mcp_source_requested IS NOT NULL OR EXISTS
-             (SELECT 1 FROM hats h WHERE h.owner_id = ?2 AND h.id = sessions.hat_id AND h.mcp_source_policy <> 'legacy'))
+        let (presumed, tracked, agent): (bool, bool, String) = tx.query_row(
+            "SELECT presumed_parked, mcp_source_requested IS NOT NULL, agent
              FROM sessions WHERE id = ?1 AND owner_id = ?2",
             params![session_id, self.owner],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )?;
-        if policy_presumed {
+        if presumed
+            && (tracked
+                || crate::mcp_source::selected_in(&tx, &self.owner, &stored_hat, &agent)?.0
+                    != hennery_proto::mcp_source::McpSourcePolicy::Legacy)
+        {
             return Ok(ResumeRequest::Busy("presumed_parked".into()));
         }
         let Some(agent_session_id) = agent_session_id else {

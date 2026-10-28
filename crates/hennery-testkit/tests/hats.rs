@@ -76,6 +76,7 @@ impl Collector {
         self.client()
             .post(self.url("/api/hats"))
             .json(&CreateHatRequest {
+                mcp_source_overrides: None,
                 mcp_source_policy: None,
                 name: name.into(),
                 colour: colour.map(Into::into),
@@ -157,6 +158,7 @@ async fn hats_are_listed_created_and_changed() {
     let resp = patch(
         &acme.id,
         UpdateHatRequest {
+            mcp_source_overrides: None,
             mcp_source_policy: None,
             name: Some("Acme Corp".into()),
             colour: None,
@@ -188,6 +190,7 @@ async fn hats_are_listed_created_and_changed() {
     let resp = patch(
         "hat-nope",
         UpdateHatRequest {
+            mcp_source_overrides: None,
             mcp_source_policy: None,
             name: Some("x".into()),
             colour: None,

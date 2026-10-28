@@ -764,8 +764,13 @@ default hat's mounts; sessions in other hats run without gateway MCP servers,
 and the UI says so on the mount grid and at session start. Isolation is never
 silently weakened to make a feature work.
 
-**Explicit per-hat source policy (2026-10-28).** A hat can request
-`managed_only` or `managed_plus_native`. The latter intentionally permits
+**Explicit per-hat, per-ACP source policy (2026-10-28).** A hat can request
+`managed_only`, `managed_plus_native`, or existing adapter behavior (`legacy`)
+independently for each actual agent/ACP ID, never a model or binary path.
+New hats created in the UI select Claude `managed_only`, while Codex and
+unqualified agents retain `legacy`. Existing hat/scalar configuration remains
+a compatible fallback. Each pair has its own revision; editing one agent
+does not change another agent's pending/applied state. The combined mode intentionally permits
 runtime-native MCP; those sources and their credentials are outside Hennery's
 per-hat filtering. Hennery's managed gateway, stdio and built-in entries retain
 their owner, host, hat, token and family scopes in both modes. Unsupported

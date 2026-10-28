@@ -15,8 +15,9 @@
 use crate::hosts::{Hosts, is_format_char, is_valid_display_field};
 use crate::secret::random_bytes;
 use anyhow::Result;
+use hennery_proto::mcp_source::{McpSourceOverride, McpSourcePolicy, source_policy_for};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// The colour a hat gets when none is given: slate, neither a warning nor
 /// a brand.
@@ -32,9 +33,45 @@ pub const MAX_PATH: usize = 4096;
 /// decision 2).
 pub(crate) const DEFAULT_HAT_KEY: &str = "default_hat_id";
 
+fn valid_source_patch(patch: Option<&BTreeMap<String, Option<McpSourcePolicy>>>) -> bool {
+    patch.is_none_or(|patch| {
+        patch.len() <= 128 && patch.keys().all(|agent| crate::session_defaults::valid_id(agent, 128))
+    })
+}
+
+fn next_source_revision(previous: u64) -> Result<u64> {
+    let next = previous
+        .checked_add(1)
+        .filter(|n| *n <= crate::session_defaults::MAX_REVISION as u64);
+    next.ok_or_else(|| anyhow::anyhow!("MCP source revision exhausted"))
+}
+
+fn apply_source_patch(
+    settings: &mut BTreeMap<String, McpSourceOverride>,
+    fallback: McpSourcePolicy,
+    fallback_revision: u64,
+    patch: Option<&BTreeMap<String, Option<McpSourcePolicy>>>,
+) -> Result<()> {
+    for (agent, policy) in patch.into_iter().flatten() {
+        if settings.get(agent).and_then(|setting| setting.policy) == *policy {
+            continue;
+        }
+        let (_, previous) = source_policy_for(fallback, fallback_revision, settings, agent);
+        settings.insert(
+            agent.clone(),
+            McpSourceOverride {
+                policy: *policy,
+                revision: next_source_revision(previous.max(fallback_revision))?,
+            },
+        );
+    }
+    Ok(())
+}
+
 /// One hat, as `GET /api/hats` lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HatRecord {
+    pub mcp_source_overrides: BTreeMap<String, McpSourceOverride>,
     pub mcp_source_policy: hennery_proto::mcp_source::McpSourcePolicy,
     pub mcp_policy_revision: u64,
     pub id: String,
@@ -298,7 +335,7 @@ fn is_default(conn: &rusqlite::Connection, owner: &str, hat_id: &str) -> Result<
 fn hats_of(conn: &rusqlite::Connection, owner: &str) -> Result<Vec<HatRecord>> {
     let mut stmt = conn.prepare(
         "SELECT h.id, h.name, h.colour, h.created_at, h.id = s.value,
-                EXISTS (SELECT 1 FROM purged_hats p WHERE p.hat_id = h.id AND p.owner_id = ?1), h.logo_etag, h.mcp_source_policy, h.mcp_policy_revision
+                EXISTS (SELECT 1 FROM purged_hats p WHERE p.hat_id = h.id AND p.owner_id = ?1), h.logo_etag, h.mcp_source_policy, h.mcp_policy_revision, h.mcp_source_overrides
          FROM hats h
          LEFT JOIN settings s ON s.owner_id = h.owner_id AND s.key = ?2
          WHERE h.owner_id = ?1 ORDER BY h.created_at, h.id",
@@ -315,6 +352,8 @@ fn hats_of(conn: &rusqlite::Connection, owner: &str) -> Result<Vec<HatRecord>> {
             mcp_source_policy: hennery_proto::mcp_source::McpSourcePolicy::parse(&r.get::<_, String>(7)?)
                 .ok_or(rusqlite::Error::InvalidQuery)?,
             mcp_policy_revision: r.get::<_, i64>(8)? as u64,
+            mcp_source_overrides: serde_json::from_str(&r.get::<_, String>(9)?)
+                .map_err(|_| rusqlite::Error::InvalidQuery)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -364,6 +403,22 @@ impl Hosts {
         now: i64,
         policy: Option<hennery_proto::mcp_source::McpSourcePolicy>,
     ) -> Result<HatChange> {
+        self.create_hat_with_sources(name, colour, now, policy, None)
+    }
+
+    pub fn create_hat_with_sources(
+        &self,
+        name: &str,
+        colour: Option<&str>,
+        now: i64,
+        policy: Option<McpSourcePolicy>,
+        overrides: Option<&BTreeMap<String, Option<McpSourcePolicy>>>,
+    ) -> Result<HatChange> {
+        if !valid_source_patch(overrides) {
+            return Ok(HatChange::Invalid(
+                "invalid MCP source agent IDs or too many overrides".into(),
+            ));
+        }
         if let Some(problem) = hat_name_problem(name) {
             return Ok(HatChange::Invalid(problem));
         }
@@ -376,9 +431,11 @@ impl Hosts {
             return Ok(HatChange::NameTaken);
         }
         let id = new_id("hat");
+        let mut settings = BTreeMap::new();
+        apply_source_patch(&mut settings, policy.unwrap_or_default(), 0, overrides)?;
         tx.execute(
-            "INSERT INTO hats(id, owner_id, name, colour, created_at, mcp_source_policy) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, self.owner_id(), name.trim(), colour, now, policy.unwrap_or_default().as_str()],
+            "INSERT INTO hats(id, owner_id, name, colour, created_at, mcp_source_policy, mcp_source_overrides) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, self.owner_id(), name.trim(), colour, now, policy.unwrap_or_default().as_str(), serde_json::to_string(&settings)?],
         )?;
         let created = hats_of(&tx, self.owner_id())?.into_iter().find(|hat| hat.id == id);
         tx.commit()?;
@@ -406,6 +463,23 @@ impl Hosts {
         default_for_new_hosts: Option<bool>,
         policy: Option<hennery_proto::mcp_source::McpSourcePolicy>,
     ) -> Result<HatChange> {
+        self.update_hat_with_sources(hat_id, name, colour, default_for_new_hosts, policy, None)
+    }
+
+    pub fn update_hat_with_sources(
+        &self,
+        hat_id: &str,
+        name: Option<&str>,
+        colour: Option<&str>,
+        default_for_new_hosts: Option<bool>,
+        policy: Option<McpSourcePolicy>,
+        overrides: Option<&BTreeMap<String, Option<McpSourcePolicy>>>,
+    ) -> Result<HatChange> {
+        if !valid_source_patch(overrides) {
+            return Ok(HatChange::Invalid(
+                "invalid MCP source agent IDs or too many overrides".into(),
+            ));
+        }
         if let Some(problem) = name.and_then(hat_name_problem) {
             return Ok(HatChange::Invalid(problem));
         }
@@ -426,7 +500,9 @@ impl Hosts {
             return Ok(HatChange::NotFound);
         };
         // Its name and colour still change; it is still listed (A12).
-        if (default_for_new_hosts == Some(true) || policy.is_some()) && hat.purging {
+        if (default_for_new_hosts == Some(true) || policy.is_some() || overrides.is_some_and(|p| !p.is_empty()))
+            && hat.purging
+        {
             return Ok(HatChange::Purging);
         }
         if let Some(name) = name {
@@ -453,11 +529,35 @@ impl Hosts {
             )?;
             anyhow::ensure!(moved == 1, "the owner has no default hat setting to move");
         }
-        if let Some(policy) = policy {
+        let mut settings = hat.mcp_source_overrides.clone();
+        let fallback = policy.unwrap_or(hat.mcp_source_policy);
+        let fallback_revision = if fallback != hat.mcp_source_policy {
+            next_source_revision(
+                settings
+                    .values()
+                    .map(|s| s.revision)
+                    .max()
+                    .unwrap_or(0)
+                    .max(hat.mcp_policy_revision),
+            )?
+        } else {
+            hat.mcp_policy_revision
+        };
+        apply_source_patch(&mut settings, fallback, fallback_revision, overrides)?;
+        if settings.len() > 128 {
+            return Ok(HatChange::Invalid("too many MCP source overrides".into()));
+        }
+        if fallback != hat.mcp_source_policy || settings != hat.mcp_source_overrides {
             tx.execute(
-                "UPDATE hats SET mcp_source_policy = ?3, mcp_policy_revision = mcp_policy_revision + 1
-                 WHERE owner_id = ?1 AND id = ?2 AND mcp_source_policy <> ?3",
-                params![self.owner_id(), hat_id, policy.as_str()],
+                "UPDATE hats SET mcp_source_policy = ?3, mcp_policy_revision = ?4, mcp_source_overrides = ?5
+                 WHERE owner_id = ?1 AND id = ?2",
+                params![
+                    self.owner_id(),
+                    hat_id,
+                    fallback.as_str(),
+                    i64::try_from(fallback_revision)?,
+                    serde_json::to_string(&settings)?
+                ],
             )?;
         }
         let updated = hats_of(&tx, self.owner_id())?.into_iter().find(|hat| hat.id == hat_id);
@@ -745,6 +845,127 @@ pub(crate) fn host_default_hat(conn: &rusqlite::Connection, owner: &str, host_id
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_source_overrides_have_independent_revisions_and_monotonic_reset() {
+        use McpSourcePolicy::{Legacy, ManagedOnly, ManagedPlusNative};
+        let hosts = Hosts::open_in_memory().unwrap();
+        let patch = BTreeMap::from([("claude".into(), Some(ManagedOnly)), ("codex".into(), Some(Legacy))]);
+        let HatChange::Done(hat) = hosts
+            .create_hat_with_sources("Work", None, 1, None, Some(&patch))
+            .unwrap()
+        else {
+            panic!("created")
+        };
+        let select = |hat: &HatRecord, agent: &str| {
+            source_policy_for(
+                hat.mcp_source_policy,
+                hat.mcp_policy_revision,
+                &hat.mcp_source_overrides,
+                agent,
+            )
+        };
+        assert_eq!(select(&hat, "claude"), (ManagedOnly, 1));
+        assert_eq!(select(&hat, "codex"), (Legacy, 1));
+        assert_eq!(select(&hat, "unknown"), (Legacy, 0));
+        let edit = |agent: &str, policy| {
+            hosts
+                .update_hat_with_sources(
+                    &hat.id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&BTreeMap::from([(agent.into(), policy)])),
+                )
+                .unwrap()
+        };
+        let HatChange::Done(changed) = edit("claude", Some(ManagedPlusNative)) else {
+            panic!("edited")
+        };
+        assert_eq!(select(&changed, "claude"), (ManagedPlusNative, 2));
+        assert_eq!(select(&changed, "codex"), (Legacy, 1));
+        let HatChange::Done(unchanged) = edit("claude", Some(ManagedPlusNative)) else {
+            panic!("no-op")
+        };
+        assert_eq!(changed, unchanged);
+        let HatChange::Done(fallback) = hosts
+            .update_hat_with_policy(&hat.id, None, None, None, Some(ManagedOnly))
+            .unwrap()
+        else {
+            panic!("fallback")
+        };
+        assert_eq!(select(&fallback, "claude"), (ManagedPlusNative, 2));
+        assert_eq!(select(&fallback, "codex"), (Legacy, 1));
+        let HatChange::Done(reset) = edit("codex", None) else {
+            panic!("reset")
+        };
+        let (policy, revision) = select(&reset, "codex");
+        assert_eq!(policy, ManagedOnly);
+        assert!(revision > fallback.mcp_policy_revision);
+        assert_eq!(reset.mcp_source_overrides["codex"].policy, None);
+        let HatChange::Done(noop_reset) = edit("codex", None) else {
+            panic!("reset no-op")
+        };
+        assert_eq!(reset, noop_reset);
+        let HatChange::Done(legacy) = edit("codex", Some(Legacy)) else {
+            panic!("explicit defaults")
+        };
+        assert_eq!(select(&legacy, "codex"), (Legacy, revision + 1));
+        assert_eq!(select(&legacy, "claude"), (ManagedPlusNative, 2));
+    }
+
+    #[test]
+    fn agent_source_overrides_preserve_owner_purge_and_invalid_id_guards() {
+        let hosts = Hosts::open_in_memory().unwrap();
+        let HatChange::Done(hat) = hosts.create_hat("Work", None, 1).unwrap() else {
+            panic!("created")
+        };
+        let patch = BTreeMap::from([("claude".into(), Some(McpSourcePolicy::ManagedOnly))]);
+        hosts.conn().execute_batch("INSERT INTO owners(id,created_at) VALUES ('foreign',1); INSERT INTO hats(id,owner_id,name,colour,created_at) VALUES ('foreign-hat','foreign','Foreign','#000000',1);").unwrap();
+        assert!(matches!(
+            hosts
+                .update_hat_with_sources("foreign-hat", None, None, None, None, Some(&patch))
+                .unwrap(),
+            HatChange::NotFound
+        ));
+        assert!(hosts.hat("foreign-hat").unwrap().is_none());
+        for id in ["", "invalid\nagent"] {
+            assert!(matches!(
+                hosts
+                    .update_hat_with_sources(
+                        &hat.id,
+                        None,
+                        None,
+                        None,
+                        None,
+                        Some(&BTreeMap::from([(id.into(), Some(McpSourcePolicy::Legacy))]))
+                    )
+                    .unwrap(),
+                HatChange::Invalid(_)
+            ));
+        }
+        let oversized = (0..129)
+            .map(|n| (format!("agent-{n}"), Some(McpSourcePolicy::Legacy)))
+            .collect();
+        assert!(matches!(
+            hosts
+                .update_hat_with_sources(&hat.id, None, None, None, None, Some(&oversized))
+                .unwrap(),
+            HatChange::Invalid(_)
+        ));
+        assert!(matches!(
+            hosts.begin_purge(&hat.id, 2).unwrap(),
+            PurgeStart::Frozen { .. }
+        ));
+        assert!(matches!(
+            hosts
+                .update_hat_with_sources(&hat.id, None, None, None, None, Some(&patch))
+                .unwrap(),
+            HatChange::Purging
+        ));
+        assert!(hosts.hat(&hat.id).unwrap().unwrap().mcp_source_overrides.is_empty());
+    }
 
     fn rule(id: &str, prefix: &str, hat: &str) -> PathRule {
         PathRule {

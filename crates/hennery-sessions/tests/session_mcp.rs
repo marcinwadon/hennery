@@ -29,6 +29,144 @@ const ORIGIN: &str = "https://hennery.example";
 const HOST: &str = "h1";
 
 #[test]
+fn per_agent_source_selection_keeps_codex_legacy_and_other_agent_edits_do_not_invalidate_ack() {
+    use hennery_proto::mcp_source::McpSourcePolicy::{Legacy, ManagedOnly, ManagedPlusNative};
+    let w = World::new();
+    let hosts = Hosts::open(&w.db).unwrap();
+    let patch = [("claude".into(), Some(ManagedOnly))].into_iter().collect();
+    hosts
+        .update_hat_with_sources(&w.hat, None, None, None, None, Some(&patch))
+        .unwrap();
+    let context = McpContext {
+        source_policy: true,
+        native_sources: true,
+        ..CLAUDE
+    };
+    let given = w
+        .store
+        .create_session_with_mcp("claude", HOST, "claude", "/p", &w.hat, None, context)
+        .unwrap()
+        .unwrap();
+    let snapshot = given.source_policy.unwrap();
+    assert_eq!(snapshot.policy, ManagedOnly);
+    let codex = w
+        .store
+        .create_session_with_mcp("codex", HOST, "codex", "/p", &w.hat, None, CODEX)
+        .unwrap()
+        .unwrap();
+    assert!(codex.source_policy.is_none());
+    let codex_state = w.store.mcp_source_state("codex").unwrap().unwrap();
+    assert_eq!((codex_state.policy, codex_state.revision), (Legacy, 0));
+    assert!(w.store.check_mcp_source_policy(&w.hat, "codex", CODEX).is_ok());
+    assert!(w.store.check_mcp_source_policy(&w.hat, "claude", CODEX).is_err());
+    // Editing Codex changes neither Claude's selected revision nor its pending ACK.
+    let patch = [("codex".into(), Some(ManagedOnly))].into_iter().collect();
+    hosts
+        .update_hat_with_sources(&w.hat, None, None, None, None, Some(&patch))
+        .unwrap();
+    let current = w.store.mcp_source_state("claude").unwrap().unwrap();
+    assert_eq!((current.policy, current.revision), (snapshot.policy, snapshot.revision));
+    let mut ack = SessionBody::session_started(&snapshot.request_id, "saved-claude");
+    if let SessionBody::SessionStarted { indexed, .. } = &mut ack {
+        indexed.mcp_source_policy = Some(snapshot.clone());
+    }
+    assert!(!w.store.ingest("claude", 1, &ack).unwrap().is_empty());
+    assert_eq!(
+        w.store.mcp_source_state("claude").unwrap().unwrap().applied,
+        Some(snapshot)
+    );
+    let patch = [("codex".into(), Some(Legacy))].into_iter().collect();
+    hosts
+        .update_hat_with_sources(&w.hat, None, None, None, None, Some(&patch))
+        .unwrap();
+    let codex_state = w.store.mcp_source_state("codex").unwrap().unwrap();
+    let patch = [("claude".into(), Some(ManagedPlusNative))].into_iter().collect();
+    hosts
+        .update_hat_with_sources(&w.hat, None, None, None, None, Some(&patch))
+        .unwrap();
+    assert_eq!(w.store.mcp_source_state("codex").unwrap().unwrap(), codex_state);
+    assert!(w.store.check_mcp_source_policy(&w.hat, "codex", CODEX).is_ok());
+    assert!(
+        w.store
+            .check_mcp_source_policy(&w.hat, "unknown", McpContext::NONE)
+            .is_ok()
+    );
+    let patch = [("unknown".into(), Some(ManagedOnly))].into_iter().collect();
+    hosts
+        .update_hat_with_sources(&w.hat, None, None, None, None, Some(&patch))
+        .unwrap();
+    assert!(
+        w.store
+            .create_session_with_mcp("unsupported", HOST, "unknown", "/p", &w.hat, None, McpContext::NONE)
+            .unwrap_err()
+            .is::<hennery_sessions::mcp_source::Unsupported>()
+    );
+    assert!(w.store.find_session("unsupported").unwrap().is_none());
+}
+
+#[test]
+fn per_agent_source_reassignment_load_resolves_the_actual_agent_and_fences_old_hat_ack() {
+    use hennery_proto::mcp_source::McpSourcePolicy::{Legacy, ManagedOnly, ManagedPlusNative};
+    let w = World::new();
+    let hosts = Hosts::open(&w.db).unwrap();
+    for (hat, policy) in [(&w.hat, ManagedOnly), (&w.work, ManagedPlusNative)] {
+        let patch = [("claude".into(), Some(policy)), ("codex".into(), Some(Legacy))]
+            .into_iter()
+            .collect();
+        hosts
+            .update_hat_with_sources(hat, None, None, None, None, Some(&patch))
+            .unwrap();
+    }
+    let context = McpContext {
+        source_policy: true,
+        native_sources: true,
+        ..CLAUDE
+    };
+    let given = w
+        .store
+        .create_session_with_mcp("actual", HOST, "claude", "/p", &w.hat, None, context)
+        .unwrap()
+        .unwrap();
+    let source = given.source_policy.unwrap();
+    let mut ack = SessionBody::session_started(&source.request_id, "saved");
+    if let SessionBody::SessionStarted { indexed, .. } = &mut ack {
+        indexed.mcp_source_policy = Some(source);
+    }
+    w.store.ingest("actual", 1, &ack).unwrap();
+    w.store
+        .ingest(
+            "actual",
+            2,
+            &SessionBody::SessionParked {
+                reason: ParkReason::Operator,
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        w.store.reassign_hat("actual", &w.work).unwrap(),
+        Reassign::Done(_)
+    ));
+    assert!(w.store.ingest("actual", 3, &ack).unwrap().is_empty());
+    let ResumeRequest::Starting { mcp, .. } = w.store.request_resume_with_mcp("actual", &w.work, context).unwrap()
+    else {
+        panic!("resume")
+    };
+    let source = mcp.source_policy.unwrap();
+    assert_eq!(source.policy, ManagedPlusNative);
+    assert!(w.store.ingest("actual", 4, &ack).unwrap().is_empty());
+    let mut current = SessionBody::session_started(&source.request_id, "saved");
+    if let SessionBody::SessionStarted { indexed, .. } = &mut current {
+        indexed.mcp_source_policy = Some(source.clone());
+    }
+    w.store.ingest("actual", 5, &current).unwrap();
+    assert_eq!(w.lifecycle("actual"), "active");
+    assert_eq!(
+        w.store.mcp_source_state("actual").unwrap().unwrap().applied,
+        Some(source)
+    );
+}
+
+#[test]
 fn explicit_source_policy_refuses_old_hosts_and_unverified_profiles_without_creating_a_session() {
     use hennery_proto::mcp_source::McpSourcePolicy::ManagedOnly;
     let w = World::new();

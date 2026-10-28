@@ -263,6 +263,57 @@ fn family_storage_is_immutable_direct_scoped_and_terminally_detached() {
 }
 
 #[test]
+fn delegated_new_sessions_resolve_source_overrides_for_the_child_agent() {
+    use hennery_proto::mcp_source::McpSourcePolicy::{Legacy, ManagedOnly};
+    let w = World::new();
+    let parent = w.start("parent", &w.hat, McpIsolation::ClaudeStrict).unwrap();
+    w.active("parent");
+    let hosts = Hosts::open(&w.db).unwrap();
+    let patch = [("claude".into(), Some(ManagedOnly)), ("codex".into(), Some(Legacy))]
+        .into_iter()
+        .collect();
+    hosts
+        .update_hat_with_sources(&w.hat, None, None, None, None, Some(&patch))
+        .unwrap();
+    let context = McpContext {
+        capable: true,
+        source_policy: true,
+        native_sources: true,
+        isolation: McpIsolation::ClaudeStrict,
+        rules_name_other_hats: false,
+    };
+    assert!(
+        w.store
+            .create_delegated_session(&parent, 1, "claude-child", "claude", "/child", context, 0)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        w.store
+            .mcp_source_state("claude-child")
+            .unwrap()
+            .unwrap()
+            .requested
+            .unwrap()
+            .policy,
+        ManagedOnly
+    );
+    let codex = McpContext {
+        isolation: McpIsolation::None,
+        ..context
+    };
+    assert!(
+        w.store
+            .create_delegated_session(&parent, 1, "codex-child", "codex", "/child", codex, 0)
+            .unwrap()
+            .is_some()
+    );
+    let state = w.store.mcp_source_state("codex-child").unwrap().unwrap();
+    assert_eq!(state.policy, Legacy);
+    assert!(state.requested.is_none());
+}
+
+#[test]
 fn delegated_allocation_commits_session_family_token_together_and_rolls_back_all_three() {
     let w = World::new();
     let parent = w.start("parent", &w.hat, McpIsolation::ClaudeStrict).unwrap();

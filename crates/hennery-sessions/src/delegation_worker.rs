@@ -180,6 +180,7 @@ async fn drain_target(state: &AppState, target: &str) -> anyhow::Result<()> {
         if session.lifecycle != "active" {
             state.store.check_mcp_source_policy(
                 &session.hat_id,
+                &session.agent,
                 crate::api::mcp_context(state, &session.host_id, &session.agent)?,
             )?;
         }

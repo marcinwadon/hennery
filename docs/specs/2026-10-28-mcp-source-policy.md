@@ -1,21 +1,44 @@
-# Per-hat MCP sources
+# Per-hat, per-ACP MCP sources
 
-The operator selected two modes: `managed_only` and `managed_plus_native`.
+The operator selected modes per `(hat, actual agent/ACP ID)`:
+`managed_only` and `managed_plus_native`, with `legacy` (existing adapter
+behavior) always selectable. The same hat can use Claude managed-only and
+Codex legacy/native without one agent blocking the other. Agent identity is
+the stored/configured ID, not the selected model, profile alias or executable.
 The internal `legacy` value preserves existing behavior; it is not an implicit
 choice of either new mode. Managed MCP includes gateway connections, built-in
 session tools and Hennery-registered stdio servers running on the host.
 
 ## Persistence and migration
 
-Existing hats and a Create request without the new field use `legacy`.
-The new-hat form explicitly selects `managed_only`. PATCH omission preserves
-the setting; unknown values are refused. Changes increment the hat policy
-revision and require the existing operator step-up. Purging hats cannot change
-their source policy. Owner filters apply to every read and write.
+Existing hats and Create requests without new fields preserve their scalar
+policy/revision (`legacy` before source-policy configuration). Sparse overrides
+are stored in `hats.mcp_source_overrides`; migration adds an empty JSON map
+without backfilling or changing runtime behavior. New-hat UI sends only a
+Claude `managed_only` override; Codex and other agents retain legacy defaults.
+
+Create/PATCH accept `mcp_source_overrides: {agent_id: policy | null}`. Omitted
+field/keys and an empty map preserve settings. `null` resets that agent to the
+scalar fallback; explicit `legacy` overrides even an explicit scalar fallback.
+Unknown policy values, invalid IDs and more than 128 stored agent entries are
+refused. GET returns an optional map of `{policy: policy | null, revision}`.
+Reset retains its per-agent revision tombstone; repeated save/reset is a no-op.
+Edits increment only that pair's revision. Legacy scalar updates advance the
+fallback above stored revisions and affect only agents inheriting that fallback;
+an explicit override keeps its revision. A reset resolves to the fallback with
+the greater of its reset revision and the fallback revision. This avoids both
+cross-agent pending changes and revision rollback on reset. Changes require
+the existing operator step-up; purging hats cannot change settings. Owner
+filters apply to every read and write. No update restarts a running process.
 
 ## Attach contract
 
-The collector reads the hat policy and revision in the start/resume transaction.
+The collector resolves policy and revision from the hat and the session's
+stored actual agent ID in the start/resume transaction. Probes use their
+actual requested agent ID. Manual, queued and delegated new/load paths use
+the same selection; reassignment invalidates the old attach and the next
+attach resolves this session's agent in the new hat. Editing another agent
+neither invalidates its ACK nor changes its requested/applied/pending state.
 Every actual attach, including delegated and queued resume, carries that
 snapshot even when there are no managed servers. A live host capability and
 the agent's verified profile must support the request; otherwise admission

@@ -1953,8 +1953,11 @@ fn source_policy_review_ordinary_resume_after_real_operator_queue_attach() {
     let w = World::new();
     let hosts = Hosts::open(&w.dir.path().join("hennery.db")).unwrap();
     let hat = hosts.host("host").unwrap().unwrap().default_hat_id;
+    let patch = [("fake".into(), Some(McpSourcePolicy::ManagedOnly))]
+        .into_iter()
+        .collect();
     hosts
-        .update_hat_with_policy(&hat, None, None, None, Some(McpSourcePolicy::ManagedOnly))
+        .update_hat_with_sources(&hat, None, None, None, None, Some(&patch))
         .unwrap();
     w.emit(SessionBody::SessionParked {
         reason: ParkReason::Idle,
@@ -1997,6 +2000,11 @@ fn source_policy_review_ordinary_resume_after_real_operator_queue_attach() {
     assert!(attach_generation > 0);
     assert!(!w.store.operator_dispatch_ready("session").unwrap());
     let mut first = SessionBody::session_started(request_id, "agent-session");
+    // Another ACP's edit during this attach cannot change its source proof.
+    let patch = [("codex".into(), Some(McpSourcePolicy::Legacy))].into_iter().collect();
+    hosts
+        .update_hat_with_sources(&hat, None, None, None, None, Some(&patch))
+        .unwrap();
     if let SessionBody::SessionStarted { indexed, .. } = &mut first {
         indexed.mcp_source_policy = mcp.source_policy;
         indexed.config_evidence = Some(Box::new(ConfigEvidence {

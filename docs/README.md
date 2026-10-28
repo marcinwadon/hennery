@@ -19,8 +19,9 @@ state stays outside Git; public issues are separate approved projections.
      auth, pairing, hats, push, HTTP security.
    - [MCP gateway](specs/2026-09-26-mcp-gateway-design.md) — connections,
      OAuth, per-session tokens, streaming proxy, renderers.
-   - [Per-hat MCP sources](specs/2026-10-28-mcp-source-policy.md) — explicit
-     managed-only/native permission, legacy migration and attach acknowledgement.
+   - [Per-hat, per-ACP MCP sources](specs/2026-10-28-mcp-source-policy.md) —
+     independent agent source permissions, compatible fallback/reset revisions
+     and attach acknowledgement.
    - [Delegation](specs/2026-10-14-delegation-design.md) — proposed opt-in parent/child sessions, shared session-bound MCP delivery for optional plug-ins, durable reports/questions, operator fallback and family UI; two operator questions remain.
    - [Optional memory plug-in](specs/2026-10-14-memory-design.md) — proposed generic opt-in activity/startup contract, separate reference service, scoped vault import and purge; scope amendment dated 2026-10-14.
    - [Client view](specs/2026-10-02-client-view-design.md) — the display fold

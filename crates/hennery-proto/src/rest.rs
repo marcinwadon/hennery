@@ -741,6 +741,9 @@ pub struct UpdateHostRequest {
 /// to its creation and its changes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct HatItem {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mcp_source_overrides: Option<std::collections::BTreeMap<String, crate::mcp_source::McpSourceOverride>>,
     #[serde(default)]
     pub mcp_source_policy: crate::mcp_source::McpSourcePolicy,
     #[serde(default)]
@@ -858,6 +861,10 @@ pub struct HostTranscripts {
 /// case, and a `#rrggbb` colour (slate when absent).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct CreateHatRequest {
+    /// Sparse per-agent patch; null resets that agent to the scalar fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mcp_source_overrides: Option<std::collections::BTreeMap<String, Option<crate::mcp_source::McpSourcePolicy>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub mcp_source_policy: Option<crate::mcp_source::McpSourcePolicy>,
@@ -873,6 +880,10 @@ pub struct CreateHatRequest {
 /// default when another takes its place.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct UpdateHatRequest {
+    /// Omitted keys stay unchanged; null resets an override, not its revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mcp_source_overrides: Option<std::collections::BTreeMap<String, Option<crate::mcp_source::McpSourcePolicy>>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub mcp_source_policy: Option<crate::mcp_source::McpSourcePolicy>,

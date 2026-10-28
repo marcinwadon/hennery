@@ -82,6 +82,7 @@ pub fn router(state: AppState) -> Router {
 
 pub(crate) fn hat_item(record: HatRecord) -> HatItem {
     HatItem {
+        mcp_source_overrides: (!record.mcp_source_overrides.is_empty()).then_some(record.mcp_source_overrides),
         mcp_source_policy: record.mcp_source_policy,
         mcp_policy_revision: record.mcp_policy_revision,
         id: record.id,
@@ -123,10 +124,13 @@ async fn list_hats(State(state): State<AppState>) -> Response {
 
 /// `POST /api/hats`: 201 with the new hat.
 async fn create_hat(State(state): State<AppState>, ApiJson(req): ApiJson<CreateHatRequest>) -> Response {
-    match state
-        .hosts
-        .create_hat_with_policy(&req.name, req.colour.as_deref(), unix_now(), req.mcp_source_policy)
-    {
+    match state.hosts.create_hat_with_sources(
+        &req.name,
+        req.colour.as_deref(),
+        unix_now(),
+        req.mcp_source_policy,
+        req.mcp_source_overrides.as_ref(),
+    ) {
         Ok(change) => hat_changed(change, StatusCode::CREATED),
         Err(err) => internal(err),
     }
@@ -138,12 +142,13 @@ async fn update_hat(
     Path(id): Path<String>,
     ApiJson(req): ApiJson<UpdateHatRequest>,
 ) -> Response {
-    match state.hosts.update_hat_with_policy(
+    match state.hosts.update_hat_with_sources(
         &id,
         req.name.as_deref(),
         req.colour.as_deref(),
         req.default_for_new_hosts,
         req.mcp_source_policy,
+        req.mcp_source_overrides.as_ref(),
     ) {
         Ok(change) => hat_changed(change, StatusCode::OK),
         Err(err) => internal(err),
