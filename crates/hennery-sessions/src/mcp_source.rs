@@ -29,7 +29,7 @@ struct SourceRequest {
 
 pub(crate) fn invalidate_in(tx: &Transaction<'_>, owner: &str, session: &str) -> Result<()> {
     let requested: Option<String> = tx.query_row(
-        "SELECT mcp_source_requested FROM sessions WHERE owner_id=?1 AND id=?2",
+        "SELECT mcp_source_requested FROM sessions WHERE owner_id = ?1 AND id = ?2",
         params![owner, session],
         |r| r.get(0),
     )?;
@@ -37,7 +37,7 @@ pub(crate) fn invalidate_in(tx: &Transaction<'_>, owner: &str, session: &str) ->
         let mut requested: SourceRequest = serde_json::from_str(&requested)?;
         requested.invalidated = true;
         tx.execute(
-            "UPDATE sessions SET mcp_source_requested=?3 WHERE owner_id=?1 AND id=?2",
+            "UPDATE sessions SET mcp_source_requested = ?3 WHERE owner_id = ?1 AND id = ?2",
             params![owner, session, serde_json::to_string(&requested)?],
         )?;
     }
@@ -57,7 +57,7 @@ pub(crate) fn requested_in(
     // fail this one. Never require an explicit policy echo from an old host.
     let tracked: bool = tx.query_row(
         "SELECT mcp_source_requested IS NOT NULL OR mcp_source_applied IS NOT NULL
-         FROM sessions WHERE owner_id=?1 AND id=?2",
+         FROM sessions WHERE owner_id = ?1 AND id = ?2",
         params![owner, session],
         |r| r.get(0),
     )?;
@@ -67,7 +67,7 @@ pub(crate) fn requested_in(
         request_id: uuid::Uuid::now_v7().to_string(),
     });
     tx.execute(
-        "UPDATE sessions SET mcp_source_requested=?3 WHERE owner_id=?1 AND id=?2",
+        "UPDATE sessions SET mcp_source_requested = ?3 WHERE owner_id = ?1 AND id = ?2",
         params![
             owner,
             session,
@@ -85,7 +85,7 @@ fn policy_in(
 ) -> Result<(McpSourcePolicy, u64)> {
     let row: Option<(String, u64)> = conn
         .query_row(
-            "SELECT mcp_source_policy,mcp_policy_revision FROM hats WHERE owner_id=?1 AND id=?2",
+            "SELECT mcp_source_policy, mcp_policy_revision FROM hats WHERE owner_id = ?1 AND id = ?2",
             params![owner, hat],
             |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)),
         )
@@ -118,7 +118,7 @@ pub(crate) fn fact_matches(tx: &Transaction<'_>, owner: &str, session: &str, bod
         _ => return Ok(true),
     };
     let expected: Option<String> = tx.query_row(
-        "SELECT mcp_source_requested FROM sessions WHERE owner_id=?1 AND id=?2",
+        "SELECT mcp_source_requested FROM sessions WHERE owner_id = ?1 AND id = ?2",
         params![owner, session],
         |r| r.get(0),
     )?;
@@ -141,7 +141,7 @@ pub(crate) fn fact_matches(tx: &Transaction<'_>, owner: &str, session: &str, bod
     }
     let attach: Option<(u64, Option<String>)> = tx
         .query_row(
-            "SELECT attach_generation,request_id FROM session_attach_evidence WHERE owner_id=?1 AND session_id=?2",
+            "SELECT attach_generation, request_id FROM session_attach_evidence WHERE owner_id = ?1 AND session_id = ?2",
             params![owner, session],
             |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)),
         )
@@ -170,9 +170,9 @@ impl Store {
         let row: Option<(String, u64, Option<String>, Option<String>)> = self
             .conn()
             .query_row(
-                "SELECT h.mcp_source_policy,h.mcp_policy_revision,s.mcp_source_requested,s.mcp_source_applied
-             FROM sessions s JOIN hats h ON h.owner_id=s.owner_id AND h.id=s.hat_id
-             WHERE s.owner_id=?1 AND s.id=?2 AND s.lifecycle<>'deleted'",
+                "SELECT h.mcp_source_policy, h.mcp_policy_revision, s.mcp_source_requested, s.mcp_source_applied
+                 FROM sessions s JOIN hats h ON h.owner_id = s.owner_id AND h.id = s.hat_id
+                 WHERE s.owner_id = ?1 AND s.id = ?2 AND s.lifecycle <> 'deleted'",
                 params![self.owner_id(), session],
                 |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?, r.get(3)?)),
             )

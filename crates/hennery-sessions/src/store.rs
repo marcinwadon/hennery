@@ -3629,9 +3629,9 @@ impl Store {
             return Ok(ResumeRequest::Busy(lifecycle));
         }
         let policy_presumed: bool = tx.query_row(
-            "SELECT presumed_parked=1 AND (mcp_source_requested IS NOT NULL OR EXISTS
-             (SELECT 1 FROM hats h WHERE h.owner_id=?2 AND h.id=sessions.hat_id AND h.mcp_source_policy<>'legacy'))
-             FROM sessions WHERE id=?1 AND owner_id=?2",
+            "SELECT presumed_parked = 1 AND (mcp_source_requested IS NOT NULL OR EXISTS
+             (SELECT 1 FROM hats h WHERE h.owner_id = ?2 AND h.id = sessions.hat_id AND h.mcp_source_policy <> 'legacy'))
+             FROM sessions WHERE id = ?1 AND owner_id = ?2",
             params![session_id, self.owner],
             |r| r.get(0),
         )?;
@@ -4087,8 +4087,8 @@ impl Store {
                     mark_unapplied(&tx, &self.owner, fact_id)?;
                 } else {
                     tx.execute(
-                        "UPDATE sessions SET mcp_source_applied=mcp_source_requested
-                        WHERE owner_id=?1 AND id=?2",
+                        "UPDATE sessions SET mcp_source_applied = mcp_source_requested
+                         WHERE owner_id = ?1 AND id = ?2",
                         params![self.owner, session_id],
                     )?;
                     // The catalogue after the start's switches (P-13).

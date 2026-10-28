@@ -455,8 +455,8 @@ impl Hosts {
         }
         if let Some(policy) = policy {
             tx.execute(
-                "UPDATE hats SET mcp_source_policy=?3,mcp_policy_revision=mcp_policy_revision+1
-                WHERE owner_id=?1 AND id=?2 AND mcp_source_policy<>?3",
+                "UPDATE hats SET mcp_source_policy = ?3, mcp_policy_revision = mcp_policy_revision + 1
+                 WHERE owner_id = ?1 AND id = ?2 AND mcp_source_policy <> ?3",
                 params![self.owner_id(), hat_id, policy.as_str()],
             )?;
         }

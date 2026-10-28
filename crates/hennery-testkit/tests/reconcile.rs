@@ -1196,6 +1196,7 @@ async fn the_session_detail_shows_the_open_turn() {
             "lifecycle": "active", "activity": "running", "presumed_parked": false,
             "created_at": item.created_at, "last_event_at": item.last_event_at,
             "open_turn": { "turn_id": turn, "state": "started" }, "pending": [],
+            "mcp_source_policy": { "policy": "legacy", "revision": 0 },
             // Plan 8e: this scripted host announces no `mcp_servers`.
             "mcp_delivery": { "mode": "unsupported", "servers": 0, "at": item.created_at }
         })
