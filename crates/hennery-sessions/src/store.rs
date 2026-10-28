@@ -3743,6 +3743,9 @@ impl Store {
         // The checks above read the same row in this transaction; an event
         // without the change it records would be worse than an error.
         anyhow::ensure!(changed == 1, "re-assigning {session_id} changed {changed} rows");
+        // Retain the historical source snapshot for display, but its old attach
+        // must never become eligible again, even after changing back to its hat.
+        crate::mcp_source::invalidate_in(&tx, &self.owner, session_id)?;
         let event = collector_event(
             &tx,
             &self.owner,

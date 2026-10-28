@@ -1073,3 +1073,126 @@ fn every_body_reads_back_as_it_was_written() {
     }
     assert_eq!(kinds.len(), 14, "one of each kind");
 }
+
+#[test]
+fn source_policy_review_reassignment_invalidates_the_previous_attach() {
+    use hennery_proto::mcp_source::McpSourcePolicy::{ManagedOnly, ManagedPlusNative};
+    let w = World::new();
+    let hosts = Hosts::open(&w.db).unwrap();
+    hosts
+        .update_hat_with_policy(&w.work, None, None, None, Some(ManagedPlusNative))
+        .unwrap();
+    hosts
+        .update_hat_with_policy(&w.hat, None, None, None, Some(ManagedOnly))
+        .unwrap();
+    let context = McpContext {
+        source_policy: true,
+        native_sources: true,
+        ..CLAUDE
+    };
+    let given = w.start("late-reassigned", &w.work, context);
+    let snapshot = given.source_policy.unwrap();
+    w.store.mark_failed("late-reassigned", "start_not_delivered").unwrap();
+    assert!(matches!(
+        w.store.reassign_hat("late-reassigned", &w.hat).unwrap(),
+        Reassign::Done(_)
+    ));
+    let mut ack = SessionBody::session_started(&snapshot.request_id, "old-process-in-old-hat");
+    if let SessionBody::SessionStarted { indexed, .. } = &mut ack {
+        indexed.mcp_source_policy = Some(snapshot.clone());
+    }
+    let events = w.store.ingest("late-reassigned", 1, &ack).unwrap();
+    let state = w.store.mcp_source_state("late-reassigned").unwrap().unwrap();
+    assert!(
+        events.is_empty(),
+        "previous-hat source ack must not reactivate reassigned session"
+    );
+    assert_eq!(w.lifecycle("late-reassigned"), "failed");
+    assert!(state.applied.is_none());
+    assert_eq!(state.requested, Some(snapshot));
+    // Returning to the same hat cannot revive an invalidated request.
+    assert!(matches!(
+        w.store.reassign_hat("late-reassigned", &w.work).unwrap(),
+        Reassign::Done(_)
+    ));
+    let reopened = Store::open(&w.db).unwrap();
+    assert!(reopened.ingest("late-reassigned", 2, &ack).unwrap().is_empty());
+    assert_eq!(w.lifecycle("late-reassigned"), "failed");
+}
+
+#[test]
+fn source_policy_review_reassigned_failed_resume_accepts_only_a_fresh_attach() {
+    use hennery_proto::mcp_source::McpSourcePolicy::{ManagedOnly, ManagedPlusNative};
+    let w = World::new();
+    w.active("saved");
+    w.store
+        .ingest(
+            "saved",
+            2,
+            &SessionBody::SessionParked {
+                reason: ParkReason::Operator,
+            },
+        )
+        .unwrap();
+    let hosts = Hosts::open(&w.db).unwrap();
+    hosts
+        .update_hat_with_policy(&w.work, None, None, None, Some(ManagedPlusNative))
+        .unwrap();
+    hosts
+        .update_hat_with_policy(&w.hat, None, None, None, Some(ManagedOnly))
+        .unwrap();
+    assert!(matches!(
+        w.store.reassign_hat("saved", &w.work).unwrap(),
+        Reassign::Done(_)
+    ));
+    let context = McpContext {
+        source_policy: true,
+        native_sources: true,
+        ..CLAUDE
+    };
+    let ResumeRequest::Starting { mcp: old, .. } = w.store.request_resume_with_mcp("saved", &w.work, context).unwrap()
+    else {
+        panic!("old resume")
+    };
+    let old_source = old.source_policy.unwrap();
+    let mut old_ack = SessionBody::session_started(&old_source.request_id, "agent-saved");
+    if let SessionBody::SessionStarted { indexed, .. } = &mut old_ack {
+        indexed.mcp_source_policy = Some(old_source.clone());
+    }
+    w.store.mark_failed("saved", "start_not_delivered").unwrap();
+    assert!(matches!(
+        w.store.reassign_hat("saved", &w.hat).unwrap(),
+        Reassign::Done(_)
+    ));
+    let old_failure = SessionBody::StartFailed {
+        request_id: old_source.request_id,
+        code: "late".into(),
+        message: "old hat".into(),
+    };
+    assert!(w.store.ingest("saved", 3, &old_ack).unwrap().is_empty());
+    assert!(w.store.ingest("saved", 4, &old_failure).unwrap().is_empty());
+    assert_eq!(w.lifecycle("saved"), "failed");
+    let ResumeRequest::Starting { mcp: fresh, .. } = w.store.request_resume_with_mcp("saved", &w.hat, context).unwrap()
+    else {
+        panic!("fresh resume")
+    };
+    let fresh_token = token(&fresh);
+    let watch = w.watch(&fresh_token);
+    let fresh_source = fresh.source_policy.unwrap();
+    assert_eq!(fresh_source.policy, ManagedOnly);
+    assert!(w.store.ingest("saved", 5, &old_ack).unwrap().is_empty());
+    assert_eq!(w.lifecycle("saved"), "starting");
+    let mut fresh_ack = SessionBody::session_started(&fresh_source.request_id, "agent-saved");
+    if let SessionBody::SessionStarted { indexed, .. } = &mut fresh_ack {
+        indexed.mcp_source_policy = Some(fresh_source.clone());
+    }
+    w.store.ingest("saved", 6, &fresh_ack).unwrap();
+    assert!(w.store.ingest("saved", 7, &old_failure).unwrap().is_empty());
+    assert!(w.store.ingest("saved", 8, &old_ack).unwrap().is_empty());
+    assert_eq!(w.lifecycle("saved"), "active");
+    assert_eq!(
+        w.store.mcp_source_state("saved").unwrap().unwrap().applied,
+        Some(fresh_source)
+    );
+    w.assert_live(&fresh_token, &watch, "late facts from the previous hat");
+}

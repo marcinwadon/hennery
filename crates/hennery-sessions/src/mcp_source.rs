@@ -17,6 +17,33 @@ impl std::fmt::Display for Unsupported {
 }
 impl std::error::Error for Unsupported {}
 
+// Collector-only eligibility metadata. Old stored snapshots deserialize with
+// their original eligibility; public snapshots retain their historical fields.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct SourceRequest {
+    #[serde(flatten)]
+    snapshot: McpSourceSnapshot,
+    #[serde(default)]
+    invalidated: bool,
+}
+
+pub(crate) fn invalidate_in(tx: &Transaction<'_>, owner: &str, session: &str) -> Result<()> {
+    let requested: Option<String> = tx.query_row(
+        "SELECT mcp_source_requested FROM sessions WHERE owner_id=?1 AND id=?2",
+        params![owner, session],
+        |r| r.get(0),
+    )?;
+    if let Some(requested) = requested {
+        let mut requested: SourceRequest = serde_json::from_str(&requested)?;
+        requested.invalidated = true;
+        tx.execute(
+            "UPDATE sessions SET mcp_source_requested=?3 WHERE owner_id=?1 AND id=?2",
+            params![owner, session, serde_json::to_string(&requested)?],
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn requested_in(
     tx: &Transaction<'_>,
     owner: &str,
@@ -98,7 +125,11 @@ pub(crate) fn fact_matches(tx: &Transaction<'_>, owner: &str, session: &str, bod
     let Some(expected) = expected else {
         return Ok(report.is_none());
     };
-    let expected: McpSourceSnapshot = serde_json::from_str(&expected)?;
+    let stored: SourceRequest = serde_json::from_str(&expected)?;
+    if stored.invalidated {
+        return Ok(false);
+    }
+    let expected = stored.snapshot;
     if request != &expected.request_id {
         return Ok(false);
     }
@@ -108,19 +139,23 @@ pub(crate) fn fact_matches(tx: &Transaction<'_>, owner: &str, session: &str, bod
     if !(report == Some(&expected) || (expected.policy == McpSourcePolicy::Legacy && report.is_none())) {
         return Ok(false);
     }
-    let generation: Option<u64> = tx
+    let attach: Option<(u64, Option<String>)> = tx
         .query_row(
-            "SELECT attach_generation FROM session_attach_evidence WHERE owner_id=?1 AND session_id=?2",
+            "SELECT attach_generation,request_id FROM session_attach_evidence WHERE owner_id=?1 AND session_id=?2",
             params![owner, session],
-            |r| Ok(r.get::<_, i64>(0)? as u64),
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get(1)?)),
         )
         .optional()?;
+    // Only a delegated request owns its stored generation. A later ordinary
+    // resume uses generation zero; ingest_delegation_in resets the old evidence
+    // after this admission check. The source request above still fences lateness.
+    let generation = attach
+        .filter(|(_, attach_request)| attach_request.as_deref() == Some(request))
+        .map_or(0, |(generation, _)| generation);
     let evidence = indexed.and_then(|i| i.config_evidence.as_deref());
-    Ok(match (generation, evidence) {
-        (Some(generation), Some(evidence)) => evidence.attach_generation == generation,
-        (Some(generation), None) => generation == 0,
-        (None, Some(evidence)) => evidence.attach_generation == 0,
-        (None, None) => true,
+    Ok(match evidence {
+        Some(evidence) => evidence.attach_generation == generation,
+        None => generation == 0,
     })
 }
 

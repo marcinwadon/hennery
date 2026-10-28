@@ -24,7 +24,9 @@ cached prediction. An older collector's omitted field means legacy behavior.
 
 The sequenced `SessionStarted` acknowledgement identifies the request and
 echoes the applied snapshot. A stale request, revision or delegated generation
-cannot confirm a newer launch. Pending startup MCP discovery remains available
+cannot confirm a newer launch. Generation belongs to its request: a later
+ordinary resume uses generation zero instead of inheriting the previous queued
+or delegated attach's generation. Pending startup MCP discovery remains available
 under the committed session identity; it does not authorize mutation by an
 unattached session. A policy acknowledgement describes the mechanism used,
 not the health or complete inventory of native servers.
@@ -35,9 +37,11 @@ omitted, so an old host can acknowledge the correlated request without claiming
 an explicit source guarantee. Previously legacy-only sessions keep their
 existing wire behavior.
 
-Reassignment keeps the historical source snapshot for correlation; it grants
-no access to the previous hat. The existing reassignment transaction revokes
-the old token, and the next attach resolves delivery and policy in the new hat.
+Reassignment keeps the historical source snapshot for correlation and invalidates
+its acknowledgement eligibility, including after returning to the previous hat.
+Only the next real attach creates a fresh eligible request. The existing
+reassignment transaction revokes the old token, and the next attach resolves
+delivery and policy in the new hat.
 
 Saving a setting does not restart an active/starting process. Its applied
 snapshot remains visible. The next real attach reads the new setting;
