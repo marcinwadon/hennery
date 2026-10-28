@@ -419,7 +419,7 @@ opening a background tab, previews and reading older content do not.
 Stale acknowledgements never consume newer updates, change ordering or
 answer questions. State is shared across devices.
 
-Completed and failed turns of non-delegated sessions also retain durable
+Completed and failed turns of sessions also retain durable
 result review metadata. The session offers "Mark as read" without requiring
 a reply; results alone never enter Needs you or its count. The server
 acknowledges a specific completion event monotonically; stale clients cannot
@@ -441,12 +441,16 @@ completed turn in the session transcript, not below the session header.
 Automatic reading retains the focused, visible,
 loaded-final-content requirements above.
 
-Delegated children never produce operator review work, even after their
-parent or family edge disappears. Their ordinary completion pushes remain
-suppressed. Existing explicit operator-required questions and escalation
-records remain authoritative; this amendment does not grant parents approval
-authority. No version bump, tag, publication or deployment belongs to this
-feature branch.
+**Operator amendment, 2026-10-28:** delegated children also offer the existing
+"Mark as read" result action, even after their parent or family edge
+disappears. Reading acknowledges the displayed result and its unseen activity,
+without adding to Needs you, answering a pending question or acknowledging a
+delivery incident. Migration 35 restores the latest applied completed/failed
+child result, preserves previous transcript reads and skips deleted/frozen
+sessions. Their ordinary completion pushes remain suppressed. Existing
+explicit operator-required questions and escalation records remain
+authoritative; this amendment does not grant parents approval authority.
+No version bump, tag, publication or deployment belongs to this feature branch.
 
 Preserve
 `parent_handled_questions` and answer-pending-delivery distinctions; neither

@@ -314,6 +314,14 @@ fn attention_push_keeps_provisional_prompt_titles_private() {
     w.store
         .enqueue_delegation_attention(&push, "operator", "", 1000)
         .unwrap();
+    assert!(
+        notices.try_recv().is_none(),
+        "renaming does not repeat an existing alert"
+    );
+    pending(&w, "child", 4, "next-permission", PendingKind::Permission);
+    w.store
+        .enqueue_delegation_attention(&push, "operator", "", 1001)
+        .unwrap();
     assert_eq!(notices.try_recv().unwrap().title, "Operator title");
 }
 
@@ -5367,6 +5375,166 @@ fn d3b_delivered_unanswered_question_escalation_is_sticky() {
     assert!(rx.try_recv().is_err(), "rearm must not duplicate a delivered question");
 }
 #[test]
+fn completed_report_waits_for_busy_parent_without_operator_attention() {
+    let (w, _) = pair();
+    ready_parent(&w);
+    assert!(w.store.open_turn("parent", "busy", &[]).unwrap());
+    start_child_report(&w);
+    ended(&w, "child", 3, "report");
+    let (hub, mut rx) = connected();
+    assert!(!w.store.dispatch_child_notice("parent", &catalog(), &hub).unwrap());
+    let due = deadline(&w);
+    let reopened = Store::open(&w.db).unwrap();
+    let offline = Hub::new();
+    for (now, current_hub) in [(due, hub.as_ref()), (due + 3600, &offline)] {
+        reopened.refresh_delegation_attention(current_hub, now).unwrap();
+        assert!(attention(&w).is_empty(), "completion is not a question");
+        assert_eq!(notices(&w)[0].1, "parent_queued");
+        assert_eq!(w.store.family_summary("child").unwrap().unwrap().operator_attention, 0);
+    }
+    let (push, mut notifications) = hennery_kernel::push::Push::new();
+    reopened
+        .enqueue_delegation_attention(&push, "test", "", due + 3600)
+        .unwrap();
+    assert!(notifications.try_recv().is_none());
+    w.store
+        .ingest(
+            "parent",
+            3,
+            &SessionBody::TurnStarted {
+                request_id: "busy".into(),
+                turn_id: "busy".into(),
+            },
+        )
+        .unwrap();
+    ended(&w, "parent", 4, "busy");
+    assert!(w.store.dispatch_child_notice("parent", &catalog(), &hub).unwrap());
+    let (request, turn) = take_prompt(&mut rx);
+    w.store
+        .ingest(
+            "parent",
+            5,
+            &SessionBody::TurnStarted {
+                request_id: request,
+                turn_id: turn,
+            },
+        )
+        .unwrap();
+    reopened.refresh_delegation_attention(&hub, due + 3601).unwrap();
+    assert_eq!(notices(&w)[0].1, "parent_delivered");
+    assert!(attention(&w).is_empty());
+    assert!(!w.store.dispatch_child_notice("parent", &catalog(), &hub).unwrap());
+    assert!(rx.try_recv().is_err(), "delivered reports must not be replayed");
+}
+
+#[test]
+fn completed_report_repairs_legacy_deadline_attention_and_resumes_delivery() {
+    let (w, _) = pair();
+    ready_parent(&w);
+    start_child_report(&w);
+    ended(&w, "child", 3, "report");
+    raw(&w)
+        .execute(
+            "UPDATE delegation_notices SET state='operator_required',reason='handling_deadline' WHERE owner_id=?1",
+            [w.store.owner_id()],
+        )
+        .unwrap();
+    assert_eq!(attention(&w).len(), 1);
+    let (push, mut notifications) = hennery_kernel::push::Push::new();
+    w.store
+        .enqueue_delegation_attention(&push, "old", "", deadline(&w))
+        .unwrap();
+    let old_notification = notifications.try_recv().unwrap();
+    assert!(w.store.delegation_push_current(&old_notification).unwrap());
+    w.store.flush_family_changes(&Hub::new()).unwrap();
+    let before = w.store.max_event_id().unwrap();
+    let reopened = Store::open(&w.db).unwrap();
+    let (hub, mut rx) = connected();
+    reopened
+        .refresh_delegation_attention(&hub, deadline(&w) + 3600)
+        .unwrap();
+    assert!(attention(&w).is_empty());
+    assert!(!w.store.delegation_push_current(&old_notification).unwrap());
+    assert_eq!(notices(&w)[0].1, "parent_queued");
+    let changed = w.store.family_changed_after(before).unwrap();
+    assert!(changed.contains(&"child".to_string()) && changed.contains(&"parent".to_string()));
+    assert_eq!(w.store.family_summary("child").unwrap().unwrap().operator_attention, 0);
+    assert!(w.store.dispatch_child_notice("parent", &catalog(), &hub).unwrap());
+    take_prompt(&mut rx);
+}
+
+#[test]
+fn completed_report_does_not_retry_uncertain_delivery_or_other_refusals() {
+    for reason in [
+        "handling_deadline",
+        "not_delivered",
+        "wake_budget",
+        "configuration_unavailable",
+    ] {
+        let (w, _) = pair();
+        start_child_report(&w);
+        ended(&w, "child", 3, "report");
+        raw(&w)
+            .execute(
+                "UPDATE delegation_notices SET state='operator_required',reason=?2,
+                target_turn=CASE WHEN ?2='handling_deadline' THEN 'uncertain' END WHERE owner_id=?1",
+                params![w.store.owner_id(), reason],
+            )
+            .unwrap();
+        w.store
+            .refresh_delegation_attention(&Hub::new(), deadline(&w) + 3600)
+            .unwrap();
+        assert_eq!(attention(&w).len(), 1, "{reason}");
+        assert_eq!(attention(&w)[0].reason, reason);
+        assert_eq!(notices(&w)[0].1, "operator_required");
+    }
+}
+
+#[test]
+fn failed_report_still_escalates_after_deadline() {
+    let (w, _) = pair();
+    start_child_report(&w);
+    w.store
+        .ingest(
+            "child",
+            3,
+            &SessionBody::TurnEnded {
+                turn_id: "report".into(),
+                outcome: TurnOutcome::Failed,
+                stop_reason: None,
+                error: None,
+            },
+        )
+        .unwrap();
+    w.store.refresh_delegation_attention(&Hub::new(), deadline(&w)).unwrap();
+    assert_eq!(attention(&w).len(), 1);
+    assert_eq!(attention(&w)[0].reason, "handling_deadline");
+}
+
+#[test]
+fn reading_a_child_result_does_not_answer_its_permission_or_consume_parent_delivery() {
+    let (w, _) = pair();
+    ready_parent(&w);
+    start_child_report(&w);
+    ended(&w, "child", 3, "report");
+    let result = w.store.family_summary("child").unwrap().unwrap().review.unwrap();
+    pending(&w, "child", 4, "permission", PendingKind::Permission);
+    assert_eq!(
+        w.store.mark_result_read("child", result.event_id, &Hub::new()).unwrap(),
+        Some(true)
+    );
+    let summary = w.store.family_summary("child").unwrap().unwrap();
+    assert!(summary.review.is_none());
+    assert!(summary.unseen.is_some(), "the later permission remains unseen");
+    assert_eq!(summary.operator_attention, 1);
+    assert!(w.store.still_open("child", "permission").unwrap());
+    assert_eq!(notices(&w)[0].1, "parent_queued");
+    let (hub, mut rx) = connected();
+    assert!(w.store.dispatch_child_notice("parent", &catalog(), &hub).unwrap());
+    take_prompt(&mut rx);
+}
+
+#[test]
 fn d3b_delivered_report_needs_no_answer_or_deadline_fallback() {
     let (w, _) = pair();
     ready_parent(&w);
@@ -5431,7 +5599,7 @@ fn d3b_attention_write_failure_rolls_back_permission_source() {
     assert!(!w.store.still_open("child", "permission").unwrap());
 }
 #[test]
-fn d3b_push_reconciliation_reuses_tags_and_never_resolves_attention() {
+fn d3b_open_attention_pushes_once_across_restart_and_elapsed_time() {
     let (w, _) = pair();
     pending(&w, "child", 2, "permission", PendingKind::Permission);
     let (push, mut notices) = hennery_kernel::push::Push::new();
@@ -5443,14 +5611,17 @@ fn d3b_push_reconciliation_reuses_tags_and_never_resolves_attention() {
         .unwrap()
         .enqueue_delegation_attention(&push, "restart", "", 1001)
         .unwrap();
-    assert_eq!(notices.try_recv().unwrap(), first);
+    assert!(notices.try_recv().is_none(), "restart must not repeat the alert");
     w.store
         .enqueue_delegation_attention(&push, "restart", "", 1301)
         .unwrap();
-    assert_eq!(
-        notices.try_recv().unwrap(),
-        first,
-        "bounded retry after in-memory queue loss"
+    assert!(notices.try_recv().is_none(), "elapsed time must not repeat the alert");
+    w.store
+        .enqueue_delegation_attention(&push, "another-restart", "", 100_000)
+        .unwrap();
+    assert!(
+        notices.try_recv().is_none(),
+        "even later restarts keep the single attempt"
     );
     assert_eq!(attention(&w).len(), 1);
     assert!(w.store.delegation_push_current(&first).unwrap());
@@ -5746,7 +5917,7 @@ fn d3b_reassignment_racing_enqueue_rejects_old_hat_payloads() {
     );
 }
 #[test]
-fn d3b_muted_and_dropped_pushes_leave_durable_work_for_reconciliation() {
+fn d3b_muted_and_dropped_pushes_leave_durable_dashboard_attention() {
     let (w, _) = pair();
     pending(&w, "child", 2, "permission", PendingKind::Permission);
     w.store
@@ -5757,7 +5928,20 @@ fn d3b_muted_and_dropped_pushes_leave_durable_work_for_reconciliation() {
     w.store
         .enqueue_delegation_attention(&push, "restart", "", 1001)
         .unwrap();
-    let template = notices.try_recv().unwrap();
+    assert!(
+        notices.try_recv().is_none(),
+        "a lost first attempt is not resent forever"
+    );
+    let template = hennery_kernel::push::Notice {
+        hat_id: w.hat.clone(),
+        urgency: hennery_kernel::push::Urgency::High,
+        title: "Session needs attention".into(),
+        generic_title: "Session needs attention".into(),
+        body: "needs your attention".into(),
+        detail: None,
+        url: "/sessions/child".into(),
+        tag: "filler".into(),
+    };
     assert!(
         hennery_kernel::delivery::payload_for(
             &template,
@@ -5773,17 +5957,21 @@ fn d3b_muted_and_dropped_pushes_leave_durable_work_for_reconciliation() {
         notice.tag = format!("fill-{i}");
         push.notify(notice);
     }
+    pending(&w, "child", 3, "another-permission", PendingKind::Permission);
     w.store
         .enqueue_delegation_attention(&push, "overflow", "", 1002)
         .unwrap();
     assert_eq!(notices.dropped(), 1);
-    assert_eq!(attention(&w).len(), 1);
+    assert_eq!(attention(&w).len(), 2);
     while notices.try_recv().is_some() {}
     w.store
         .enqueue_delegation_attention(&push, "overflow", "", 1302)
         .unwrap();
-    assert_eq!(notices.try_recv().unwrap(), template);
-    assert_eq!(attention(&w).len(), 1);
+    assert!(
+        notices.try_recv().is_none(),
+        "queue loss cannot become periodic notification spam"
+    );
+    assert_eq!(attention(&w).len(), 2);
 }
 #[test]
 fn d3b_parent_delete_removes_inert_attention_metadata_for_delivered_reports() {
@@ -5846,7 +6034,7 @@ fn d3b_attention_pages_and_push_pages_are_bounded_and_advance() {
 }
 
 #[tokio::test]
-async fn d3b_repeated_drains_share_one_notification_run_but_restart_reconciles() {
+async fn d3b_repeated_drains_and_restart_keep_one_notification_attempt() {
     let (w, _) = pair();
     pending(&w, "child", 2, "permission", PendingKind::Permission);
     let (push, mut notices) = hennery_kernel::push::Push::new();
@@ -5872,7 +6060,8 @@ async fn d3b_repeated_drains_share_one_notification_run_but_restart_reconciles()
     );
     restarted.push = push;
     hennery_sessions::delegation_worker::drain(&restarted).await.unwrap();
-    assert_eq!(notices.try_recv().unwrap(), first);
+    assert!(notices.try_recv().is_none());
+    assert!(w.store.delegation_push_current(&first).unwrap());
 }
 
 #[test]

@@ -77,7 +77,11 @@ impl Store {
                 AND h.revoked_at IS NULL
                 AND (p.mcp_delivery_mode IN ('isolated','managed_plus_native') OR (p.mcp_delivery_mode = 'unisolated' AND p.hat_id = h.default_hat_id))
                 AND NOT EXISTS(SELECT 1 FROM purged_hats x WHERE x.owner_id = ?1 AND x.hat_id = n.hat_id)
-                AND g.delegation_enabled = 1 AND g.revision = n.accepted_revision
+                AND g.delegation_enabled = 1 AND g.revision = n.accepted_revision,
+                n.kind = 'turn_ended' AND n.target_turn IS NULL AND EXISTS(
+                    SELECT 1 FROM events e WHERE e.owner_id = ?1 AND e.session_id = n.child_id
+                    AND e.event_id = n.source_event_id AND e.applied = 1 AND e.kind = 'turn_ended'
+                    AND json_extract(e.body,'$.outcome') = 'completed')
                 FROM delegation_notices n JOIN session_families f ON f.owner_id = ?1 AND f.child_id = n.child_id
                 JOIN sessions p ON p.owner_id = ?1 AND p.id = n.parent_id
                 JOIN sessions c ON c.owner_id = ?1 AND c.id = n.child_id
@@ -85,7 +89,9 @@ impl Store {
                 JOIN hat_session_tools g ON g.owner_id = ?1 AND g.hat_id = n.hat_id
                 WHERE n.owner_id = ?1 AND n.delivery_id > ?2
                 AND (n.state IN ('parent_queued','waiting_config','awaiting_reconciliation')
-                    OR (n.state = 'parent_delivered' AND n.kind = 'question'))
+                    OR (n.state = 'parent_delivered' AND n.kind = 'question')
+                    OR (n.state = 'operator_required' AND n.reason = 'handling_deadline'
+                        AND n.kind = 'turn_ended' AND n.target_turn IS NULL))
                 ORDER BY n.delivery_id LIMIT 128",
             )?;
             statement
@@ -95,17 +101,18 @@ impl Store {
                         r.get::<_, i64>(1)?,
                         r.get::<_, String>(2)?,
                         r.get::<_, bool>(3)?,
+                        r.get::<_, bool>(4)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
         let cursor = rows.last().map(|r| r.0.clone()).unwrap_or_default();
-        for (id, deadline, host, eligible) in rows {
+        for (id, deadline, host, eligible, completed_report) in rows {
             let reason = if !eligible {
                 Some("parent_unavailable")
             } else if hub.is_ready(&host) && !hub.has_capability(&host, Capability::DelegationConfig) {
                 Some("unsupported_delivery")
-            } else if now >= deadline {
+            } else if now >= deadline && !completed_report {
                 Some("handling_deadline")
             } else {
                 None
@@ -116,6 +123,23 @@ impl Store {
                     WHERE owner_id = ?1 AND delivery_id = ?2",
                     params![self.owner_id(), id, reason],
                 )?;
+            } else if completed_report {
+                // A successful result needs no operator answer. Keep it queued
+                // while the parent is busy/offline, including old deadline
+                // fallbacks. Never retry a reserved, possibly executed turn.
+                let repaired = tx.execute(
+                    "UPDATE delegation_notices SET state = 'parent_queued',reason = NULL
+                    WHERE owner_id = ?1 AND delivery_id = ?2 AND state = 'operator_required'
+                    AND reason = 'handling_deadline' AND target_turn IS NULL",
+                    params![self.owner_id(), id],
+                )?;
+                if repaired > 0 {
+                    tx.execute(
+                        "UPDATE delegation_attention SET state = 'standby',push_run = '',push_at = 0
+                        WHERE owner_id = ?1 AND delivery_id = ?2 AND state = 'open'",
+                        params![self.owner_id(), id],
+                    )?;
+                }
             }
         }
         reconcile_closed_attention(&tx, self.owner_id())?;
@@ -146,8 +170,9 @@ impl Store {
             })?
             .collect::<rusqlite::Result<_>>()?)
     }
-    /// Requeue at startup, then at most once per five minutes. A kernel queue
-    /// drop or failed network request never changes the attention disposition.
+    /// Try push once per attention episode, including across collector restarts.
+    /// A kernel queue drop or failed network request never changes the durable
+    /// attention disposition; without a delivery receipt, retrying would spam.
     pub fn enqueue_delegation_attention(&self, push: &Push, run: &str, after: &str, now: i64) -> Result<String> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -159,10 +184,10 @@ impl Store {
                 LEFT JOIN pending p ON p.owner_id = ?1 AND p.session_id = c.id AND p.pending_id = a.pending_id
                 LEFT JOIN events e ON e.owner_id = ?1 AND e.session_id = c.id AND e.event_id = p.opened_event_id
                 WHERE a.owner_id = ?1 AND a.state = 'open' AND c.lifecycle <> 'deleted' AND a.attention_id > ?2
-                AND (a.push_run <> ?3 OR a.push_at <= ?4 - 300)
+                AND a.push_at = 0
                 AND NOT EXISTS(SELECT 1 FROM purged_hats h WHERE h.owner_id = ?1 AND h.hat_id = a.hat_id)
                 ORDER BY a.attention_id LIMIT 128")?;
-            stmt.query_map(params![self.owner_id(), after, run, now], |r| {
+            stmt.query_map(params![self.owner_id(), after], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     EdgeSession {

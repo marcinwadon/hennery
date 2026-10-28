@@ -152,7 +152,7 @@ fn read_state_survives_restart_and_deleted_results_cannot_be_reopened() {
 }
 
 #[test]
-fn child_results_stay_with_the_parent_even_when_family_links_are_gone() {
+fn child_results_can_be_read_even_when_family_links_are_gone_without_operator_attention() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("test.db");
     let store = Store::open(&db).unwrap();
@@ -167,9 +167,67 @@ fn child_results_stay_with_the_parent_even_when_family_links_are_gone() {
     store
         .ingest("child", 1, &SessionBody::session_started("start", "agent"))
         .unwrap();
-    finish(&store, "child", "t1", 2, TurnOutcome::Completed);
-    assert!(store.family_summary("child").unwrap().unwrap().review.is_none());
+    let event = finish(&store, "child", "t1", 2, TurnOutcome::Completed);
+    let summary = store.family_summary("child").unwrap().unwrap();
+    assert_eq!(summary.review.unwrap().event_id, event);
+    assert!(summary.unseen.is_some());
+    assert_eq!(store.mark_result_read("child", event, &Hub::new()).unwrap(), Some(true));
+    let summary = store.family_summary("child").unwrap().unwrap();
+    assert!(summary.review.is_none());
+    assert!(summary.unseen.is_none());
     assert_eq!(store.operator_waiting_count(None).unwrap(), 0);
+}
+
+#[test]
+fn upgrading_restores_existing_child_reviews_and_preserves_already_seen_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("test.db");
+    let store = Store::open(&db).unwrap();
+    let mut completed = Vec::new();
+    for id in ["unread", "seen", "deleted"] {
+        start(&store, id);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("UPDATE sessions SET delegated_child=1 WHERE id=?1", [id])
+            .unwrap();
+        let event = finish(&store, id, &format!("{id}-turn"), 2, TurnOutcome::Completed);
+        completed.push(event);
+    }
+    store.mark_session_seen("seen", completed[1], &Hub::new()).unwrap();
+    store.close_now("deleted").unwrap();
+    store.delete_session("deleted", None).unwrap();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    // Reproduce v34, which did not record results for delegated children.
+    conn.execute("DELETE FROM session_reviews WHERE owner_id=?1", [store.owner_id()])
+        .unwrap();
+    conn.execute_batch("PRAGMA user_version=34;").unwrap();
+    drop(store);
+    let upgraded = Store::open(&db).unwrap();
+    assert_eq!(
+        upgraded
+            .family_summary("unread")
+            .unwrap()
+            .unwrap()
+            .review
+            .unwrap()
+            .event_id,
+        completed[0]
+    );
+    assert!(upgraded.family_summary("seen").unwrap().unwrap().review.is_none());
+    assert_eq!(
+        conn.query_row(
+            "SELECT count(*) FROM session_reviews WHERE session_id='deleted'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        upgraded.mark_result_read("unread", completed[0], &Hub::new()).unwrap(),
+        Some(true)
+    );
+    assert!(upgraded.family_summary("unread").unwrap().unwrap().review.is_none());
+    assert_eq!(upgraded.operator_waiting_count(None).unwrap(), 0);
 }
 
 #[test]
