@@ -333,6 +333,7 @@ async fn live_claude_haiku_plan_configuration_survives_late_updates() -> Result<
     let handle = session::launch_delegated_in(
         uplink.clone(),
         Launch {
+            mcp_source_policy: None,
             request_id: "live-config".into(),
             session_id: "live-config".into(),
             attach: Attach::New,
@@ -1827,7 +1828,13 @@ async fn claude_child_configuration_without_inference(explicit_fast: bool) -> Re
         let identity = h.wait("parent discovery identity", || h.identities.lock().unwrap().get(&h.parent).cloned()).await?;
         let mcp = || -> Result<hennery_sessions::store::McpContext> {
             let (capable,isolation) = h.state.hub.mcp_isolation(HOST,"claude").context("Claude isolation")?;
-            Ok(hennery_sessions::store::McpContext { capable,isolation,rules_name_other_hats:h.state.hosts.rules_name_other_hats(HOST)? })
+            Ok(hennery_sessions::store::McpContext {
+                source_policy: false,
+                native_sources: false,
+                capable,
+                isolation,
+                rules_name_other_hats: h.state.hosts.rules_name_other_hats(HOST)?,
+            })
         };
         let receipt: hennery_proto::delegation::OperationReceipt = serde_json::from_value(
             hennery_sessions::session_tools::execute(&h.state,&identity,identity.delivered_delegation_revision().context("delivered grant")?,"session_spawn",

@@ -182,6 +182,26 @@ pub(crate) fn host_item(state: &AppState, record: HostRecord) -> HostItem {
     // Plan 8e decision E7: per agent, from the latest accepted `hello`, and
     // only for a host that takes servers at all (one without says so by
     // its capabilities). The one mapping, `McpAgentDelivery::of`.
+    let mcp_source_policies = record
+        .mcp_isolation
+        .as_ref()
+        .map(|isolation| {
+            isolation
+                .0
+                .iter()
+                .map(|(agent, how)| {
+                    let modes = [
+                        hennery_proto::mcp_source::McpSourcePolicy::ManagedOnly,
+                        hennery_proto::mcp_source::McpSourcePolicy::ManagedPlusNative,
+                    ]
+                    .into_iter()
+                    .filter(|policy| policy.supported(&record.capabilities, *how))
+                    .collect();
+                    (agent.clone(), modes)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let mcp_delivery = record
         .mcp_isolation
         .filter(|_| record.capabilities.has(Capability::McpServers))
@@ -193,6 +213,7 @@ pub(crate) fn host_item(state: &AppState, record: HostRecord) -> HostItem {
                 .collect()
         });
     HostItem {
+        mcp_source_policies: Some(mcp_source_policies),
         mcp_delivery,
         connected: state.hub.is_ready(&record.id),
         host_id: record.id,

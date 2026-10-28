@@ -355,6 +355,16 @@
           "type": "string"
         },
         {
+          "const": "mcp_source_policy",
+          "description": "Explicit per-hat source policy, including empty managed lists.",
+          "type": "string"
+        },
+        {
+          "const": "mcp_native_sources",
+          "description": "Qualified native-source composition for the bundled Claude profile.",
+          "type": "string"
+        },
+        {
           "const": "catalog_probe",
           "description": "Disposable runtime catalog discovery without a user prompt.",
           "type": "string"
@@ -727,6 +737,16 @@
             "session_id": {
               "type": "string"
             },
+            "source_policy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/McpSourceSnapshot"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "const": "delegated_attach",
               "type": "string"
@@ -881,6 +901,16 @@
             "session_id": {
               "type": "string"
             },
+            "source_policy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/McpSourceSnapshot"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
             "type": {
               "const": "start_session",
               "type": "string"
@@ -953,6 +983,16 @@
             },
             "session_id": {
               "type": "string"
+            },
+            "source_policy": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/McpSourceSnapshot"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             },
             "type": {
               "const": "resume_session",
@@ -1440,6 +1480,33 @@
           "type": [
             "string",
             "null"
+          ]
+        },
+        "mcp_source_overrides": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/McpSourcePolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "description": "Sparse per-agent patch; null resets that agent to the scalar fallback.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "mcp_source_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpSourcePolicy"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "name": {
@@ -1995,6 +2062,25 @@
             "null"
           ]
         },
+        "mcp_policy_revision": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mcp_source_overrides": {
+          "additionalProperties": {
+            "$ref": "#/$defs/McpSourceOverride"
+          },
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "mcp_source_policy": {
+          "$ref": "#/$defs/McpSourcePolicy",
+          "default": "legacy"
+        },
         "name": {
           "type": "string"
         },
@@ -2478,6 +2564,19 @@
             "null"
           ]
         },
+        "mcp_source_policies": {
+          "additionalProperties": {
+            "items": {
+              "$ref": "#/$defs/McpSourcePolicy"
+            },
+            "type": "array"
+          },
+          "description": "Supported policies per verified profile, from the last accepted hello.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
         "name": {
           "type": "string"
         },
@@ -2740,6 +2839,17 @@
         "early": {
           "description": "On an update the adapter sent before the session was announced:\nreplayed by `session/load`, or sent while the start ran (ACP core\n§4.5). What it says may be older than what the collector holds, so\nits title only fills an empty one (plan 6b decision 2).",
           "type": "boolean"
+        },
+        "mcp_source_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpSourceSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Host-owned acknowledgement, used only on SessionStarted."
         },
         "pending": {
           "anyOf": [
@@ -3409,6 +3519,11 @@
       "description": "What a session's latest start or resume was given (plan 8e decision\nE10).",
       "oneOf": [
         {
+          "const": "managed_plus_native",
+          "description": "Scoped managed entries plus intentionally permitted native sources.",
+          "type": "string"
+        },
+        {
           "const": "isolated",
           "description": "Its hat's servers, the agent kept to them.",
           "type": "string"
@@ -3429,6 +3544,97 @@
           "type": "string"
         }
       ]
+    },
+    "McpSourceOverride": {
+      "description": "Sparse per-ACP setting. A reset retains its revision with a null policy.",
+      "properties": {
+        "policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpSourcePolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision"
+      ],
+      "type": "object"
+    },
+    "McpSourcePolicy": {
+      "enum": [
+        "legacy",
+        "managed_only",
+        "managed_plus_native"
+      ],
+      "type": "string"
+    },
+    "McpSourceSnapshot": {
+      "description": "Echoed only after new/load used this snapshot. Request identity is the\nexisting start request, not a second lifecycle or proof namespace.",
+      "properties": {
+        "policy": {
+          "$ref": "#/$defs/McpSourcePolicy"
+        },
+        "request_id": {
+          "type": "string"
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "policy",
+        "revision",
+        "request_id"
+      ],
+      "type": "object"
+    },
+    "McpSourceState": {
+      "properties": {
+        "applied": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpSourceSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "policy": {
+          "$ref": "#/$defs/McpSourcePolicy"
+        },
+        "requested": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpSourceSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "policy",
+        "revision"
+      ],
+      "type": "object"
     },
     "McpStdioEnvInput": {
       "additionalProperties": false,
@@ -5789,6 +5995,16 @@
           ],
           "description": "What its latest start or resume was given (plan 8e decision E10);\nabsent for a session not started or resumed since plan 8e."
         },
+        "mcp_source_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpSourceState"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "mode": {
           "type": [
             "string",
@@ -6537,6 +6753,33 @@
           "type": [
             "boolean",
             "null"
+          ]
+        },
+        "mcp_source_overrides": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/McpSourcePolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "description": "Omitted keys stay unchanged; null resets an override, not its revision.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "mcp_source_policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpSourcePolicy"
+            },
+            {
+              "type": "null"
+            }
           ]
         },
         "name": {

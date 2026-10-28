@@ -156,3 +156,6 @@ ALTER TABLE sessions DROP COLUMN delegated_child;
 ALTER TABLE turns DROP COLUMN input_origin;
 ALTER TABLE answer_queue DROP COLUMN input_origin;
 ALTER TABLE answer_queue DROP COLUMN delegation_handoff;
+-- Test-only rollback of sessions migration 34: source-policy attach snapshots.
+ALTER TABLE sessions DROP COLUMN mcp_source_requested;
+ALTER TABLE sessions DROP COLUMN mcp_source_applied;

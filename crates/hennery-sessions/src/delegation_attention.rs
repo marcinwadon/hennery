@@ -75,7 +75,7 @@ impl Store {
                 AND p.close_requested = 0 AND p.lifecycle IN ('starting','active','parked')
                 AND c.close_requested = 0 AND c.lifecycle IN ('starting','active','parked','failed')
                 AND h.revoked_at IS NULL
-                AND (p.mcp_delivery_mode = 'isolated' OR (p.mcp_delivery_mode = 'unisolated' AND p.hat_id = h.default_hat_id))
+                AND (p.mcp_delivery_mode IN ('isolated','managed_plus_native') OR (p.mcp_delivery_mode = 'unisolated' AND p.hat_id = h.default_hat_id))
                 AND NOT EXISTS(SELECT 1 FROM purged_hats x WHERE x.owner_id = ?1 AND x.hat_id = n.hat_id)
                 AND g.delegation_enabled = 1 AND g.revision = n.accepted_revision
                 FROM delegation_notices n JOIN session_families f ON f.owner_id = ?1 AND f.child_id = n.child_id

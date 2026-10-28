@@ -62,12 +62,13 @@ import { takeOver } from '../api/view'
 import { QuestionPresentationContext } from '../components/QuestionActions'
 import { Text } from '../lib/text'
 import { useMcpDelivery } from '../hooks/useMcpDelivery'
+import { sourcePolicyFor } from '../lib/mcpSourcePolicy'
 import { useSessionConfig } from '../hooks/useSessionConfig'
 import SessionMenu from '../components/SessionMenu'
 import { deleteNotes } from '../components/sessionWords'
 import Transcript from '../components/Transcript'
 import type { ItemEnv } from '../components/items/types'
-import type { Capabilities, DeleteResult, SessionDetail } from '../generated/protocol'
+import type { Capabilities, DeleteResult, HatItem, SessionDetail } from '../generated/protocol'
 import type { FamilyPage, SessionSummary } from '../generated/view'
 import type { Item } from '../generated/view'
 import { useAnnouncement } from '../hooks/useAnnouncement'
@@ -269,10 +270,10 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
   const [answerNotice, setAnswerNotice] = useState<string | null>(null)
   const s = useSessionItems(id, timing)
   const configuration = useSessionConfig(id, s.setCatalog)
-  const mcp = useMcpDelivery(id, summary?.lifecycle, Math.max(0, s.loads - 1))
   const [familyRead, setFamilyRead] = useState<{ id: string; page: FamilyPage } | null>(null)
   const onFamilyPage = useCallback((page: FamilyPage) => setFamilyRead({ id, page }), [id])
   const family = familyRead?.id === id && (!summary || (summary.hat_id === familyRead.page.summary.hat_id && summary.family?.revision === familyRead.page.summary.family?.revision)) ? familyRead.page : null
+  const mcp = useMcpDelivery(id, summary?.lifecycle, Math.max(0, s.loads - 1), s.catalogChanges, (summary ?? family?.summary)?.hat_id)
   const unseen = (summary ?? family?.summary)?.unseen
   const info = useHeaderInfo(id, summary ?? family?.summary, awaitSummary, mcp.detail)
   const { read: acknowledgeResult } = useReadResult(id, info?.review)
@@ -331,7 +332,15 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
   const hosts = useMemo(() => namesOf(hostItems, 'host_id'), [hostItems])
   const hatItems = useList('hats', scope === null)
   const hats = useMemo(() => scope?.hats ? new Map(scope.hats.map(h => [h.id, h.name])) : namesOf(hatItems, 'id'), [scope?.hats, hatItems])
-  const actualHat = (scope?.hats ?? (Array.isArray(hatItems) ? hatItems as { id: string; colour: string; name: string }[] : [])).find(h => h.id === info?.hat_id)
+  const actualHat = (scope?.hats ?? (Array.isArray(hatItems) ? hatItems as HatItem[] : [])).find(h => h.id === info?.hat_id)
+  const reportedSource = mcp.detail?.mcp_source_policy
+  const selectedSource = sourcePolicyFor(actualHat, info?.agent ?? '')
+  // Revisions are local to a hat/ACP pair. A detail read from the previous hat cannot
+  // override the current hat, regardless of their revision numbers. Within one
+  // hat, retain the newer source setting when a stale GET/list arrives.
+  const sourcePolicy = reportedSource && actualHat && (mcp.detail?.hat_id !== actualHat.id || selectedSource.revision > reportedSource.revision)
+    ? { ...reportedSource, ...selectedSource }
+    : reportedSource
   const accent = useAccentStyle(actualHat?.colour)
   useEffect(() => {
     if (!actualHat) return
@@ -571,7 +580,7 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
       />
       {info?.lifecycle !== 'parked' && sessionFooter}
       </div>
-      <SessionDetails open={detailsOpen} tab={detailsTab} onTab={setDetailsTab} onClose={closeDetails} trigger={detailsReturn} settingsFocus={settingsFocus} configuration={configuration} catalog={s.catalog} info={info} hostName={info ? hosts.get(info.host_id) : undefined} hatName={actualHat?.name} plan={plan} delivery={mcp.detail?.mcp_delivery}>
+      <SessionDetails open={detailsOpen} tab={detailsTab} onTab={setDetailsTab} onClose={closeDetails} trigger={detailsReturn} settingsFocus={settingsFocus} configuration={configuration} catalog={s.catalog} info={info} hostName={info ? hosts.get(info.host_id) : undefined} hatName={actualHat?.name} plan={plan} delivery={mcp.detail?.mcp_delivery} sourcePolicy={sourcePolicy}>
         <FamilyPanel key={id} id={id} summary={summary} hosts={hosts} resync={Math.max(0, s.loads - 1) + familyRefresh} onPage={onFamilyPage} />
       </SessionDetails>
       </div>

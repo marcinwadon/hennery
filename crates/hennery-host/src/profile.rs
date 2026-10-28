@@ -25,6 +25,36 @@ pub enum Profile {
 }
 
 impl Profile {
+    /// Native composition is enabled only after the pinned runtime's collision
+    /// contract has been qualified. Never infer it from an executable name.
+    pub fn source_capabilities() -> hennery_proto::frames::Capabilities {
+        hennery_proto::frames::Capabilities(vec![
+            hennery_proto::frames::Capability::McpServers,
+            hennery_proto::frames::Capability::McpSourcePolicy,
+            hennery_proto::frames::Capability::McpNativeSources,
+        ])
+    }
+
+    pub fn supports_source(self, policy: hennery_proto::mcp_source::McpSourcePolicy) -> bool {
+        policy.supported(&Self::source_capabilities(), self.mcp_isolation())
+    }
+
+    pub fn session_meta_for(
+        self,
+        source: Option<&hennery_proto::mcp_source::McpSourceSnapshot>,
+    ) -> Option<Map<String, Value>> {
+        if self == Self::Claude
+            && source.is_some_and(|s| s.policy == hennery_proto::mcp_source::McpSourcePolicy::ManagedPlusNative)
+        {
+            Some(
+                serde_json::from_value(serde_json::json!({"claudeCode":{"options":{"strictMcpConfig":false}}}))
+                    .expect("static meta"),
+            )
+        } else {
+            self.session_meta()
+        }
+    }
+
     /// Installed identity announced in this connection's runtime metadata.
     pub fn runtime_profile(self) -> hennery_proto::delegation_host::RuntimeProfile {
         use hennery_proto::delegation_host::RuntimeProfile;
@@ -55,7 +85,9 @@ impl Profile {
         }
     }
 
-    /// `_meta` for `session/new` and `session/load`. Claude's strict flag
+    /// Legacy/default `_meta`, also used by the side-effect-free catalog probe.
+    /// Explicit session source policy is applied by `session_meta_for`.
+    /// Claude's strict flag
     /// goes on every one, with servers or without (umbrella §8.5, the
     /// spike's conclusion 2): the adapter does not keep it across a load,
     /// and without it the user's own MCP servers and claude.ai connectors

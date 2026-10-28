@@ -5,6 +5,7 @@ import type { HatItem, HostItem, McpConnectionItem, PurgePreview } from './gener
 
 export function host(over: Partial<HostItem> = {}): HostItem {
   return {
+    mcp_source_policies: {},
     host_id: 'host-1',
     name: 'laptop',
     platform: 'linux-x64',
@@ -27,6 +28,8 @@ export function hat(over: Partial<HatItem> = {}): HatItem {
     created_at: '2026-10-01T10:00:00Z',
     default_for_new_hosts: false,
     purging: false,
+    mcp_source_policy: 'legacy',
+    mcp_policy_revision: 0,
     ...over,
   }
 }

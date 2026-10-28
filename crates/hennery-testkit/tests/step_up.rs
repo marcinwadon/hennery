@@ -17,6 +17,103 @@ use hennery_testkit::{OWNER_PASSWORD, PUBLIC_URL};
 use std::net::SocketAddr;
 use std::time::Duration;
 
+#[tokio::test]
+async fn mcp_source_policy_changes_require_step_up_and_omit_preserves_the_setting() {
+    let c = Collector::start().await;
+    let hat = c.state.hosts.default_hat_for_new_hosts().unwrap();
+    let path = format!("/api/hats/{hat}");
+    let stale = c.session(301);
+    assert_eq!(
+        code_of(
+            c.request(&stale, "PATCH", &path)
+                .json(&serde_json::json!({"mcp_source_policy":"managed_only"}))
+                .send()
+                .await
+                .unwrap()
+        )
+        .await,
+        (403, "step_up_required".into())
+    );
+    let fresh = c.session(0);
+    let response = c
+        .request(&fresh, "PATCH", &path)
+        .json(&serde_json::json!({"mcp_source_policy":"managed_only"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let value: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(value["mcp_source_policy"], "managed_only");
+    assert_eq!(value["mcp_policy_revision"], 1);
+    let response = c
+        .request(&fresh, "PATCH", &path)
+        .json(&serde_json::json!({"name":"Renamed"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let value: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(value["mcp_source_policy"], "managed_only");
+    assert_eq!(value["mcp_policy_revision"], 1);
+    assert_eq!(
+        c.request(&fresh, "PATCH", &path)
+            .json(&serde_json::json!({"mcp_source_policy":"future"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        422
+    );
+}
+#[tokio::test]
+async fn per_agent_source_overrides_require_step_up_and_reset_preserves_revision() {
+    let c = Collector::start().await;
+    let hat = c.state.hosts.default_hat_for_new_hosts().unwrap();
+    let path = format!("/api/hats/{hat}");
+    let stale = c.session(301);
+    let patch = serde_json::json!({"mcp_source_overrides":{"claude":"managed_only","codex":"legacy"}});
+    assert_eq!(
+        code_of(c.request(&stale, "PATCH", &path).json(&patch).send().await.unwrap()).await,
+        (403, "step_up_required".into())
+    );
+    let fresh = c.session(0);
+    let response = c.request(&fresh, "PATCH", &path).json(&patch).send().await.unwrap();
+    assert_eq!(response.status(), 200);
+    let saved: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(saved["mcp_source_overrides"]["claude"]["policy"], "managed_only");
+    assert_eq!(saved["mcp_source_overrides"]["codex"]["policy"], "legacy");
+    let response = c
+        .request(&fresh, "PATCH", &path)
+        .json(&serde_json::json!({"name":"Renamed"}))
+        .send()
+        .await
+        .unwrap();
+    let unchanged: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(saved["mcp_source_overrides"], unchanged["mcp_source_overrides"]);
+    let response = c
+        .request(&fresh, "PATCH", &path)
+        .json(&serde_json::json!({"mcp_source_overrides":{"claude":null}}))
+        .send()
+        .await
+        .unwrap();
+    let reset: serde_json::Value = response.json().await.unwrap();
+    assert!(reset["mcp_source_overrides"]["claude"]["policy"].is_null());
+    assert_eq!(reset["mcp_source_overrides"]["claude"]["revision"], 2);
+    assert_eq!(
+        reset["mcp_source_overrides"]["codex"],
+        saved["mcp_source_overrides"]["codex"]
+    );
+    assert_eq!(
+        c.request(&fresh, "PATCH", &path)
+            .json(&serde_json::json!({"mcp_source_overrides":{"claude":"unknown"}}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        422
+    );
+}
+
 struct Collector {
     addr: SocketAddr,
     state: AppState,

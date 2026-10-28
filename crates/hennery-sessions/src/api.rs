@@ -196,7 +196,7 @@ fn request_failed_for_session(err: RequestError, session_id: Option<String>) -> 
                 // The host's own refusal of the servers answers as the
                 // hub's does (`McpUndeliverable` below): one status for
                 // the code on every path (api-8e-8f, item 14).
-                MCP_UNDELIVERABLE => StatusCode::CONFLICT,
+                MCP_UNDELIVERABLE | crate::mcp_source::UNSUPPORTED => StatusCode::CONFLICT,
                 "unknown_agent" | "start_failed" => StatusCode::BAD_GATEWAY,
                 "invalid" => StatusCode::BAD_REQUEST,
                 _ => StatusCode::BAD_GATEWAY,
@@ -216,6 +216,11 @@ fn request_failed_for_session(err: RequestError, session_id: Option<String>) -> 
         RequestError::Busy => refuse(StatusCode::SERVICE_UNAVAILABLE, "busy", "the host is busy; try again"),
         // The hub refused to send a start or resume its servers; the
         // route has failed the session it left `starting` (plan 8e).
+        RequestError::McpSourceUnsupported => refuse(
+            StatusCode::CONFLICT,
+            crate::mcp_source::UNSUPPORTED,
+            "this host/profile cannot honor the hat's MCP source policy",
+        ),
         RequestError::McpUndeliverable => refuse(
             StatusCode::CONFLICT,
             "mcp_isolation_unavailable",
@@ -233,7 +238,7 @@ fn request_failed_for_session(err: RequestError, session_id: Option<String>) -> 
 fn resume_failed(err: RequestError) -> Response {
     match err {
         RequestError::Rejected { code, message } => {
-            let status = if code == MCP_UNDELIVERABLE {
+            let status = if code == MCP_UNDELIVERABLE || code == crate::mcp_source::UNSUPPORTED {
                 StatusCode::CONFLICT
             } else {
                 StatusCode::BAD_GATEWAY
@@ -414,9 +419,16 @@ async fn start_in_hat(state: AppState, req: StartSessionRequest, expected_hat: O
         Ok(Some(mcp)) => mcp,
         // The hat resolved before its purge froze it (plan 9c decision 10c).
         Ok(None) => return hat_purging(&state, &hat.hat_id),
+        Err(err) if err.is::<crate::mcp_source::Unsupported>() => {
+            return error(
+                StatusCode::CONFLICT,
+                crate::mcp_source::UNSUPPORTED,
+                "this host/profile cannot honor the hat's MCP source policy",
+            );
+        }
         Err(err) => return internal(err),
     };
-    let request_id = uuid::Uuid::now_v7().to_string();
+    let request_id = mcp.request_id();
     if let Err(err) = state.store.expect_initial_configuration(&session_id, &req.config) {
         return internal(err);
     }
@@ -462,7 +474,9 @@ async fn start_in_hat(state: AppState, req: StartSessionRequest, expected_hat: O
             session_id,
         ),
         // Never sent.
-        Err(err @ (RequestError::NotConnected | RequestError::McpUndeliverable)) => {
+        Err(
+            err @ (RequestError::NotConnected | RequestError::McpUndeliverable | RequestError::McpSourceUnsupported),
+        ) => {
             if expected_hat.is_some() {
                 if let Err(e) = state.store.mark_failed(&session_id, not_sent_reason(&err)) {
                     return internal(e);
@@ -483,6 +497,7 @@ async fn start_in_hat(state: AppState, req: StartSessionRequest, expected_hat: O
 /// reconnect in between; api-8e-8f A2).
 fn not_sent_reason(err: &RequestError) -> &'static str {
     match err {
+        RequestError::McpSourceUnsupported => crate::mcp_source::UNSUPPORTED,
         RequestError::McpUndeliverable => MCP_UNDELIVERABLE,
         _ => "host_offline",
     }
@@ -518,6 +533,12 @@ pub(crate) fn mcp_context(state: &AppState, host_id: &str, agent: &str) -> anyho
         return Ok(McpContext::NONE);
     };
     Ok(McpContext {
+        source_policy: state
+            .hub
+            .has_capability(host_id, hennery_proto::frames::Capability::McpSourcePolicy),
+        native_sources: state
+            .hub
+            .has_capability(host_id, hennery_proto::frames::Capability::McpNativeSources),
         capable,
         isolation,
         rules_name_other_hats: state.hosts.rules_name_other_hats(host_id)?,
@@ -683,7 +704,12 @@ async fn session_detail(State(state): State<AppState>, Path(id): Path<String>) -
         Ok(delivery) => delivery,
         Err(err) => return internal(err),
     };
+    let mcp_source_policy = match state.store.mcp_source_state(&id) {
+        Ok(policy) => policy,
+        Err(err) => return internal(err),
+    };
     Json(SessionDetail {
+        mcp_source_policy,
         configuration_error: session.configuration_error,
         session: item,
         open_turn,
@@ -868,6 +894,13 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
             (agent_session_id, committed_seq, config, mcp)
         }
         // A concurrent resume got there first (ACP core §12 scenario 11).
+        Ok(ResumeRequest::Busy(lifecycle)) if lifecycle == "presumed_parked" => {
+            return error(
+                StatusCode::CONFLICT,
+                "presumed_parked",
+                "the host may still run this process; reconcile or close it before a new attach",
+            );
+        }
         Ok(ResumeRequest::Busy(lifecycle)) => return busy(&lifecycle),
         Ok(ResumeRequest::NoRecord) => return no_record(),
         Ok(ResumeRequest::HatMismatch(stored)) => {
@@ -883,9 +916,16 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         }
         Ok(ResumeRequest::HatPurging) => return hat_purging(&state, &session.hat_id),
         Ok(ResumeRequest::NotFound) => return error(StatusCode::NOT_FOUND, "not_found", "no such session"),
+        Err(err) if err.is::<crate::mcp_source::Unsupported>() => {
+            return error(
+                StatusCode::CONFLICT,
+                crate::mcp_source::UNSUPPORTED,
+                "this host/profile cannot honor the hat's MCP source policy",
+            );
+        }
         Err(err) => return internal(err),
     };
-    let request_id = uuid::Uuid::now_v7().to_string();
+    let request_id = mcp.request_id();
     let frame = CollectorFrame::ResumeSession {
         request_id: request_id.clone(),
         session_id: id.clone(),
@@ -911,7 +951,9 @@ async fn resume(State(state): State<AppState>, Path(id): Path<String>) -> Respon
         Err(RequestError::DeliveryUnknown) => request_failed(RequestError::DeliveryUnknown),
         // Never sent: the host went away since the check above, or no
         // longer takes the servers.
-        Err(err @ (RequestError::NotConnected | RequestError::McpUndeliverable)) => resume_not_sent(&state, &id, err),
+        Err(
+            err @ (RequestError::NotConnected | RequestError::McpUndeliverable | RequestError::McpSourceUnsupported),
+        ) => resume_not_sent(&state, &id, err),
         // The socket task has already failed the session with the host's
         // code (`Undo::Start`).
         Err(err) => resume_failed(err),
@@ -1701,8 +1743,9 @@ pub(crate) fn changes_catalogue(e: &EventDto) -> bool {
     let Some(indexed) = e.body.get("indexed") else {
         return false;
     };
-    serde_json::from_value::<Indexed>(indexed.clone())
-        .is_ok_and(|indexed| indexed.current_config().is_some() || indexed.commands.is_some())
+    serde_json::from_value::<Indexed>(indexed.clone()).is_ok_and(|indexed| {
+        indexed.current_config().is_some() || indexed.commands.is_some() || indexed.mcp_source_policy.is_some()
+    })
 }
 
 /// Events one page of a stream's replay reads (smoke test #1, F2): the

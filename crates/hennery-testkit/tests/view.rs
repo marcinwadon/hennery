@@ -2381,8 +2381,33 @@ async fn a_catalogue_change_is_sent_live_as_catalog_changed() {
     assert_eq!(message.id, Some(format!("{}:{}", epoch_of(&anchor), changed.event_id)));
 }
 
-/// A resume whose events changed the catalogue sends one
-/// `catalog_changed`, after the items, as it stands.
+/// A source-only attach acknowledgement must also reach the bounded detail
+/// reader through the existing catalogue invalidation stream.
+#[tokio::test]
+async fn a_source_policy_ack_invalidates_details_even_without_config_or_lifecycle_delta() {
+    let collector = Collector::start().await;
+    let anchor = opened(&collector, "s").await;
+    let mut stream = collector.stream(&format!("{ITEMS}?after={anchor}"), None).await;
+    live(&collector, &mut stream).await;
+    let changed = collector.write(
+        &collector.owner(),
+        "s",
+        "session_started",
+        &json!({
+            "kind": "session_started", "request_id": "attach", "agent_session_id": "saved",
+            "indexed": { "mcp_source_policy": {
+                "policy": "managed_plus_native", "revision": 2, "request_id": "attach"
+            } }
+        }),
+    );
+    collector.state.hub.publish(changed.clone());
+    let message = stream.message().await;
+    assert_eq!(message.event, "catalog_changed");
+    assert_eq!(message.id, Some(format!("{}:{}", epoch_of(&anchor), changed.event_id)));
+    assert_eq!(serde_json::from_str::<Value>(&message.data).unwrap()["session_id"], "s");
+}
+
+/// A resume whose events changed the catalogue sends one complete snapshot.
 #[tokio::test]
 async fn a_resume_over_catalogue_changes_sends_one_catalog_changed() {
     let collector = Collector::start().await;

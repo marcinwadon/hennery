@@ -44,6 +44,10 @@ pub enum Capability {
     /// servers it cannot isolate unless the collector waived that
     /// (`mcp_isolation_unavailable`). A host without it gets no servers.
     McpServers,
+    /// Explicit per-hat source policy, including empty managed lists.
+    McpSourcePolicy,
+    /// Qualified native-source composition for the bundled Claude profile.
+    McpNativeSources,
     /// Disposable runtime catalog discovery without a user prompt.
     CatalogProbe,
     /// Early cancellation of a disposable catalog probe by request id.
@@ -416,6 +420,9 @@ impl std::fmt::Debug for McpServer {
 /// a frame without servers is what an older host expects.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct McpDelivery {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub source_policy: Option<crate::mcp_source::McpSourceSnapshot>,
     /// Passed in `session/new` / `session/load`. Only to a host that
     /// announced `mcp_servers`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -596,6 +603,10 @@ impl SessionConfig {
 /// mode deltas are ignored.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct Indexed {
+    /// Host-owned acknowledgement, used only on SessionStarted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mcp_source_policy: Option<crate::mcp_source::McpSourceSnapshot>,
     /// Host-owned adapter identity for authoritative start/resume snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]

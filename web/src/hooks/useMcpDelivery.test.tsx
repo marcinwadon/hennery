@@ -22,11 +22,41 @@ describe('bounded session delivery reads', () => {
     rerender({ lifecycle: 'starting', resync: 0 })
     await waitFor(() => expect(t.calls).toHaveLength(2))
     rerender({ lifecycle: 'active', resync: 0 })
-    expect(t.calls).toHaveLength(2)
-    rerender({ lifecycle: 'active', resync: 1 })
     await waitFor(() => expect(t.calls).toHaveLength(3))
-    act(() => result.current.refresh())
+    rerender({ lifecycle: 'active', resync: 1 })
     await waitFor(() => expect(t.calls).toHaveLength(4))
+    act(() => result.current.refresh())
+    await waitFor(() => expect(t.calls).toHaveLength(5))
+  })
+
+  it('reads the applied source snapshot after the host confirms a pending attach', async () => {
+    const source = { policy: 'managed_only', revision: 1, request_id: 'attach' }
+    let applied = false
+    const t = routed(() => json({ mcp_source_policy: { policy: 'managed_only', revision: 1,
+      requested: source, ...(applied ? { applied: source } : {}) } }))
+    const { result, rerender } = renderHook(({ lifecycle }) => useMcpDelivery('s1', lifecycle, 0),
+      { wrapper: t.wrapper, initialProps: { lifecycle: 'starting' } })
+    await waitFor(() => expect(result.current.detail?.mcp_source_policy?.requested).toEqual(source))
+    expect(result.current.detail?.mcp_source_policy?.applied).toBeUndefined()
+    applied = true
+    rerender({ lifecycle: 'active' })
+    await waitFor(() => expect(result.current.detail?.mcp_source_policy?.applied).toEqual(source))
+    expect(t.calls).toHaveLength(2)
+  })
+
+  it('observes attach confirmation even when lifecycle transitions coalesce', async () => {
+    const source = { policy: 'managed_plus_native', revision: 2, request_id: 'new-attach' }
+    let applied = false
+    const t = routed(() => json({ mcp_source_policy: { policy: 'managed_plus_native', revision: 2,
+      ...(applied ? { applied: source } : {}) } }))
+    const { result, rerender } = renderHook(({ changes }) => useMcpDelivery('s1', 'active', 0, changes),
+      { wrapper: t.wrapper, initialProps: { changes: 0 } })
+    await waitFor(() => expect(result.current.detail?.mcp_source_policy).toBeDefined())
+    expect(result.current.detail?.mcp_source_policy?.applied).toBeUndefined()
+    applied = true
+    rerender({ changes: 1 })
+    await waitFor(() => expect(result.current.detail?.mcp_source_policy?.applied).toEqual(source))
+    expect(t.calls).toHaveLength(2)
   })
 
   it('coalesces overlapping invalidations and discards the older answer', async () => {
@@ -41,6 +71,72 @@ describe('bounded session delivery reads', () => {
     expect(result.current.detail).toBeNull()
     await act(async () => releases[1](report(3)))
     await waitFor(() => expect(result.current.detail?.mcp_delivery?.servers).toBe(3))
+    expect(t.calls).toHaveLength(2)
+  })
+
+  it('refreshes on hat reassignment, retaining confirmed history and discarding an old-hat in-flight GET', async () => {
+    const releases: Array<(response: Response) => void> = []
+    const source = { policy: 'managed_plus_native', revision: 9, request_id: 'confirmed' }
+    const answer = (hat: string, revision: number) => json({ hat_id: hat, mcp_source_policy: {
+      policy: hat === 'hat1' ? 'managed_plus_native' : 'managed_only', revision, applied: source,
+    } })
+    const t = routed(() => new Promise<Response>(done => releases.push(done)))
+    const { result, rerender } = renderHook(({ hat }) => useMcpDelivery('s1', 'parked', 0, 0, hat),
+      { wrapper: t.wrapper, initialProps: { hat: 'hat1' } })
+    await act(async () => releases[0](answer('hat1', 9)))
+    await waitFor(() => expect(result.current.detail?.hat_id).toBe('hat1'))
+    act(() => result.current.refresh())
+    rerender({ hat: 'hat2' })
+    expect(result.current.detail?.mcp_source_policy?.applied).toEqual(source)
+    await act(async () => releases[1](answer('hat1', 10)))
+    await waitFor(() => expect(t.calls).toHaveLength(3))
+    expect(result.current.detail?.mcp_source_policy?.revision).toBe(9)
+    await act(async () => releases[2](answer('hat2', 1)))
+    await waitFor(() => expect(result.current.detail?.hat_id).toBe('hat2'))
+    expect(result.current.detail?.mcp_source_policy?.revision).toBe(1)
+    expect(result.current.detail?.mcp_source_policy?.applied).toEqual(source)
+    rerender({ hat: 'hat2' })
+    expect(t.calls).toHaveLength(3)
+  })
+
+  it('learns the first summary hat during the initial GET without adding a read', async () => {
+    const releases: Array<(response: Response) => void> = []
+    const t = routed(() => new Promise<Response>(done => releases.push(done)))
+    const { result, rerender } = renderHook(({ hat }) => useMcpDelivery('s1', 'active', 0, 0, hat),
+      { wrapper: t.wrapper, initialProps: { hat: undefined as string | undefined } })
+    rerender({ hat: 'hat1' })
+    rerender({ hat: 'hat1' })
+    await act(async () => releases[0](json({ hat_id: 'hat1' })))
+    expect(t.calls).toHaveLength(1)
+    expect(result.current.detail?.hat_id).toBe('hat1')
+  })
+
+  it('fences a reassignment after the first summary but before the initial GET returns', async () => {
+    const releases: Array<(response: Response) => void> = []
+    const t = routed(() => new Promise<Response>(done => releases.push(done)))
+    const { result, rerender } = renderHook(({ hat }) => useMcpDelivery('s1', 'active', 0, 0, hat),
+      { wrapper: t.wrapper, initialProps: { hat: undefined as string | undefined } })
+    rerender({ hat: 'hat1' })
+    rerender({ hat: 'hat2' })
+    await act(async () => releases[0](json({ hat_id: 'hat1' })))
+    expect(result.current.detail).toBeNull()
+    expect(t.calls).toHaveLength(2)
+    await act(async () => releases[1](json({ hat_id: 'hat2' })))
+    expect(result.current.detail?.hat_id).toBe('hat2')
+    expect(t.calls).toHaveLength(2)
+  })
+
+  it('rechecks an initial GET from an unknown hat only when its response contradicts the first summary', async () => {
+    const releases: Array<(response: Response) => void> = []
+    const t = routed(() => new Promise<Response>(done => releases.push(done)))
+    const { result, rerender } = renderHook(({ hat }) => useMcpDelivery('s1', 'active', 0, 0, hat),
+      { wrapper: t.wrapper, initialProps: { hat: undefined as string | undefined } })
+    rerender({ hat: 'hat2' })
+    await act(async () => releases[0](json({ hat_id: 'hat1' })))
+    expect(result.current.detail).toBeNull()
+    expect(t.calls).toHaveLength(2)
+    await act(async () => releases[1](json({ hat_id: 'hat2' })))
+    expect(result.current.detail?.hat_id).toBe('hat2')
     expect(t.calls).toHaveLength(2)
   })
 

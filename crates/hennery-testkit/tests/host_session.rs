@@ -1436,6 +1436,7 @@ fn launching(
     options: SessionOptions,
 ) -> SessionHandle {
     let launch = Launch {
+        mcp_source_policy: None,
         request_id: "r0".into(),
         session_id: "s1".into(),
         attach,
@@ -1500,6 +1501,7 @@ async fn plan_mode_model_reset_is_repaired_for_operator_and_delegated_starts() {
             ],
         );
         let launch = Launch {
+            mcp_source_policy: None,
             request_id: "r0".into(),
             session_id: "s1".into(),
             attach: Attach::New,

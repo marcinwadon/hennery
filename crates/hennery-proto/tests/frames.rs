@@ -285,6 +285,7 @@ fn project_root_is_bounded_without_truncating_its_identity() {
 fn session_detail_leaves_out_absent_optionals() {
     use hennery_proto::rest::{OpenTurn, SessionDetail};
     let detail = SessionDetail {
+        mcp_source_policy: None,
         configuration_error: None,
         session: bare_item(),
         open_turn: Some(OpenTurn {

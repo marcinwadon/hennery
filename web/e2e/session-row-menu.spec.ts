@@ -33,7 +33,7 @@ async function setup(page: Page, collector: Collector, host: TestHost) {
 for (const width of [390, 1280]) {
   test(`list actions match the header and retain dialogs across row removal at ${width}px`, async ({ browser }) => {
     test.setTimeout(120_000)
-    const collector = await startCollector(), host = testHost(fakeAgent('claude', { chunks: ['Ready.'] }))
+    const collector = await startCollector(), host = testHost(fakeAgent('claude', { asks: ['permission'], chunks: ['Ready.'] }))
     const context = await browser.newContext({ baseURL: collector.origin, viewport: { width, height: 844 }, reducedMotion: 'reduce' })
     const page = await context.newPage(), request = context.request
     const errors: string[] = []
@@ -99,13 +99,22 @@ for (const width of [390, 1280]) {
       await expect(page.getByRole('alert')).toContainText('there is nothing to park')
       await expect(page.getByRole('alert')).toBeInViewport({ ratio: 1 })
       await page.unroute('**' + path + '/park')
-      await trigger.click(); await menu.getByRole('button', { name: 'Park', exact: true }).click()
-      await expect(async () => expect((await (await request.get(path)).json()).lifecycle).toBe('parked')).toPass()
+      // Queue behind a blocked turn before parking. A new prompt after Park
+      // intentionally releases the hold and resumes, racing Close with starting.
+      const running = await request.post(`${path}/prompt`, { headers, data: { content: [{ type: 'text', text: 'Wait for permission before continuing.' }] } })
+      expect(running.status()).toBe(202)
+      await expect(async () => expect((await (await request.get(path)).json()).activity).toBe('blocked')).toPass()
       const queued = await request.post(`${path}/prompt`, { headers, data: { content: [{ type: 'text', text: 'Retained queued message' }] } })
       expect(queued.status()).toBe(202)
+      const queueId = (await queued.json()).queue_id
+      expect(typeof queueId).toBe('string')
+      await trigger.click(); await menu.getByRole('button', { name: 'Park', exact: true }).click()
+      await expect(async () => expect((await (await request.get(path)).json()).lifecycle).toBe('parked')).toPass()
+      expect(await (await request.get(`${path}/queue`)).json()).toEqual([expect.objectContaining({ id: queueId, state: 'queued' })])
       await trigger.click(); await menu.getByRole('button', { name: 'Close', exact: true }).click()
       await expect(row).toHaveCount(0)
       expect((await (await request.get(path)).json()).lifecycle).toBe('closed')
+      expect(await (await request.get(`${path}/queue`)).json()).toEqual([expect.objectContaining({ id: queueId, state: 'failed', content: [{ type: 'text', text: 'Retained queued message' }] })])
       // Include the closed source again; Close kept the session and its queue.
       await page.evaluate(() => localStorage.setItem('hennery.hideClosed', 'false'))
       await page.reload(); await expect(row).toBeVisible()

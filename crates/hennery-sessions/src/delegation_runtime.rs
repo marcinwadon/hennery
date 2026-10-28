@@ -161,6 +161,9 @@ impl Catalogs {
             .hub
             .routable_conn(host)
             .ok_or_else(|| anyhow::anyhow!("host_offline"))?;
+        state
+            .store
+            .check_mcp_source_policy(hat, agent, crate::api::mcp_context(state, host, agent)?)?;
         ensure!(
             state.hub.has_capability(host, Capability::CatalogProbe),
             "catalog_unavailable"

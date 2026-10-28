@@ -148,6 +148,14 @@ gets neither. The launcher/status explains `session_tools_unavailable`; an
 agent launch cannot waive isolation. Until plan 8h proves Codex isolation,
 this is a real deployment constraint, including for memory. The design never
 restricts model selection merely to make isolation appear to work.
+
+Explicit [per-hat source policies](2026-10-28-mcp-source-policy.md) extend this
+legacy decision: a qualified combined attach intentionally permits native MCP
+while retaining scoped managed delivery, including built-in session identity.
+It is neither `isolated` nor the legacy `unisolated` waiver. Admission checks
+current host/profile support even for an empty managed list. Children and
+automatic resumes use their hat's current policy at the next real attach;
+active and presumed-reconnected processes retain their acknowledged snapshot.
 Built-in authorization also rechecks the current delivery eligibility. In
 particular, a host default-hat change cannot leave an old unisolated token
 authorized for delegation after its hat becomes non-default. Plan 8e's wider

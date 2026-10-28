@@ -1,5 +1,8 @@
 // Delivery metadata has no SSE delta. Only explicit lifecycle/resync
-// boundaries trigger a read; streamed messages and focus never do.
+// and hat boundaries trigger a read; starting → active also reads the host's source
+// acknowledgement. A catalog snapshot also marks an attach when list updates
+// coalesce parked/starting/active into one render. Text chunks and focus never
+// trigger a read.
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useClient } from '../app-client'
 import { sessionDetail } from '../api/view'
@@ -9,11 +12,11 @@ import { runningLifecycle } from '../lib/mcpDelivery'
 
 interface ReadState { id: string; detail: SessionDetail | null; error: string | null }
 
-export function useMcpDelivery(id: string, lifecycle: string | undefined, resync: number) {
+export function useMcpDelivery(id: string, lifecycle: string | undefined, resync: number, catalogChanges = 0, hatId?: string) {
   const client = useClient()
   const [state, setState] = useState<ReadState>({ id, detail: null, error: null })
   const request = useRef<(() => void) | null>(null)
-  const previous = useRef<{ id: string; lifecycle: string | undefined; resync: number } | null>(null)
+  const previous = useRef<{ id: string; lifecycle: string | undefined; resync: number; catalogChanges: number; hatId?: string } | null>(null)
   const refresh = useCallback(() => request.current?.(), [])
 
   useEffect(() => {
@@ -26,9 +29,17 @@ export function useMcpDelivery(id: string, lifecycle: string | undefined, resync
       busy = true
       while (live) {
         const generation = wanted
+        const hatAtRead = previous.current?.id === id ? previous.current.hatId : undefined
         try {
           const detail = await sessionDetail(client, id)
-          if (live && generation === wanted) setState({ id, detail, error: null })
+          if (live && generation === wanted) {
+            const knownHat = previous.current?.id === id ? previous.current.hatId : undefined
+            // Learning the first summary does not invalidate a pending read.
+            // If that read actually predates reassignment, its returned hat
+            // proves the mismatch: discard it and queue one correlated read.
+            if (hatAtRead === undefined && knownHat !== undefined && detail.hat_id !== undefined && detail.hat_id !== knownHat) wanted++
+            else setState({ id, detail, error: null })
+          }
         } catch (err) {
           if (live && generation === wanted) setState({ id, detail: null, error: messageOf(err) })
         }
@@ -43,11 +54,15 @@ export function useMcpDelivery(id: string, lifecycle: string | undefined, resync
 
   useEffect(() => {
     const before = previous.current
-    previous.current = { id, lifecycle, resync }
+    const previousHat = before?.id === id ? before.hatId ?? state.detail?.hat_id : undefined
+    previous.current = { id, lifecycle, resync, catalogChanges, hatId: hatId ?? previousHat }
     if (!before || before.id !== id) return
     const resumed = before.lifecycle !== undefined && !runningLifecycle(before.lifecycle) && runningLifecycle(lifecycle)
-    if (resync !== before.resync || resumed) refresh()
-  }, [id, lifecycle, resync, refresh])
+    const confirmed = before.lifecycle === 'starting' && lifecycle === 'active'
+    const catalogChanged = catalogChanges !== before.catalogChanges
+    const hatChanged = previousHat !== undefined && hatId !== undefined && hatId !== previousHat
+    if (resync !== before.resync || resumed || confirmed || catalogChanged || hatChanged) refresh()
+  }, [id, lifecycle, resync, catalogChanges, hatId, state.detail?.hat_id, refresh])
 
   return {
     detail: state.id === id ? state.detail : null,

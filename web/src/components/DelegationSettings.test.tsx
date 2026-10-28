@@ -9,7 +9,7 @@ import type { HatItem } from '../generated/protocol'
 import { host } from '../test-fixtures'
 import DelegationSettings from './DelegationSettings'
 
-const HAT: HatItem = { id: 'hat', name: 'Personal', colour: '#64748b', default_for_new_hosts: true, created_at: '2026-10-20T09:00:00Z', purging: false }
+const HAT: HatItem = { id: 'hat', name: 'Personal', colour: '#64748b', default_for_new_hosts: true, created_at: '2026-10-20T09:00:00Z', purging: false, mcp_source_policy: 'legacy' as const, mcp_policy_revision: 0 }
 function open(routes: Record<string, Answer | Answer[]> = {}, stepUp = vi.fn(async () => {}), hat = HAT) {
   const server = stubServer({
     'GET /api/hats/hat/session-tools': json(200, { delegation_enabled: false, revision: 1 }),

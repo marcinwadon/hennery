@@ -103,6 +103,9 @@ export interface SessionItemsSnapshot {
   /** A resync replaced the items a moment ago. */
   resynced: boolean
   catalog: SessionCatalog | null
+  /** Catalog snapshots received from the stream/config answers. Unlike the
+   *  initial GET, these also mark a confirmed attach after a rapid resume. */
+  catalogChanges: number
   queue: QueuedPrompt[]
   /** First pages taken: bumped by the first load and by every resync (the
    *  items were replaced). */
@@ -119,6 +122,7 @@ const INITIAL: SessionItemsSnapshot = {
   stream: 'connecting',
   resynced: false,
   catalog: null,
+  catalogChanges: 0,
   queue: [],
   loads: 0,
   questionError: null,
@@ -246,7 +250,7 @@ export class SessionItemsController {
   /** A catalogue from a config answer (202) replaces the one held. */
   setCatalog = (catalog: SessionCatalog): void => {
     this.catalogSeq++
-    this.update({ catalog })
+    this.update({ catalog, catalogChanges: this.snapshot.catalogChanges + 1 })
   }
 
   private notify(): void {

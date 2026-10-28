@@ -67,6 +67,8 @@ async fn answer_objects_and_encoded_objects_share_strict_validation_and_retry_re
             &h.hat,
             None,
             McpContext {
+                source_policy: false,
+                native_sources: false,
                 capable: true,
                 isolation: McpIsolation::ClaudeStrict,
                 rules_name_other_hats: false,
@@ -276,6 +278,8 @@ impl Harness {
                 &hat,
                 None,
                 McpContext {
+                    source_policy: false,
+                    native_sources: false,
                     capable: true,
                     isolation: McpIsolation::ClaudeStrict,
                     rules_name_other_hats: false,

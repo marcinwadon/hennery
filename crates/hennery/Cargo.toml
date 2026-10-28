@@ -67,7 +67,7 @@ disabled-strategies = ["crate-meta-data", "quick-install", "compile"]
 [package.metadata.hennery-release]
 verification = "external-signed-tag-sigstore"
 maintainer-fingerprint = "F26C7F594DFE84D131703AFC23E5A318AE8D2861"
-signer-identity = "https://github.com/marcinwadon/hennery/.github/workflows/release.yml@refs/tags/v0.3.6"
+signer-identity = "https://github.com/marcinwadon/hennery/.github/workflows/release.yml@refs/tags/v0.3.7"
 
 [package.metadata.binstall.overrides.x86_64-unknown-linux-gnu]
 pkg-url = "{ repo }/releases/download/v{ version }/hennery-x86_64-unknown-linux-musl.tar.xz"

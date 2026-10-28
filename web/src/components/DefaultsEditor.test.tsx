@@ -6,7 +6,7 @@ import { json, stubServer } from '../test-server'
 import { catalog } from '../test-launch-catalog'
 import type { HatSessionDefaults, HostCatalog } from '../generated/protocol'
 import DefaultsEditor from './DefaultsEditor'
-const hat = { id: 'hat-a', name: 'Research', colour: '#64748b', created_at: '', default_for_new_hosts: false, purging: false }
+const hat = { id: 'hat-a', name: 'Research', colour: '#64748b', created_at: '', default_for_new_hosts: false, purging: false, mcp_source_policy: 'legacy' as const, mcp_policy_revision: 0 }
 function mount(config: HatSessionDefaults['config'], preview: HostCatalog | null = catalog, status = 200) {
   const server = stubServer({ 'PUT /api/hats/hat-a/session-defaults?agent=claude': json(status, status === 200 ? { hat_id: 'hat-a', agent: 'claude', revision: 2, config: {} } : { code: 'defaults_changed', message: 'Reload required' }) })
   const client = new Client({ fetch: server.fetch, navigate: vi.fn(), here: () => ({ pathname: '/defaults', search: '' }), stepUp: vi.fn() })

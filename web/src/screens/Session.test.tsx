@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
-import type { SessionDetail } from '../generated/protocol'
+import type { McpSourceSnapshot, SessionDetail } from '../generated/protocol'
 import type { Item, ItemPage, SessionSummary } from '../generated/view'
 import { json, liveStream, routed, type Call, type LiveStream } from '../test-stream'
 import SessionView, { TAIL } from './Session'
@@ -131,6 +131,73 @@ function scrollTo(top: number) {
 const rows = (n: number, turn: string, prefix = turn) => Array.from({ length: n }, (_, i) => message(`${prefix}-${i}`, turn))
 
 describe('SessionView', () => {
+  it('does not show Codex pending when the same hat has a newer Claude override', async () => {
+    const source: McpSourceSnapshot = { policy: 'legacy', revision: 1, request_id: 'codex-attach' }
+    const s = server({ pages: [() => json(page([]))], hats: () => json([
+      { id: 'hat1', name: 'Work', colour: '#123456', mcp_source_policy: 'legacy', mcp_policy_revision: 0,
+        mcp_source_overrides: { claude: { policy: 'managed_only', revision: 9 }, codex: { policy: 'legacy', revision: 1 } } },
+    ]), detail: () => json(detail('codex', { mcp_source_policy: { policy: 'legacy', revision: 1, requested: source, applied: source } })) })
+    render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+    await showDetailsTab('Details')
+    const policy = await screen.findByRole('region', { name: 'MCP sources' })
+    expect(policy).toHaveTextContent('Hat setting: Existing / adapter defaults')
+    expect(policy).toHaveTextContent('Last confirmed attach: Existing / adapter defaults')
+    expect(policy).not.toHaveTextContent('next start or resume')
+    expect(policy).not.toHaveTextContent('Only MCP configured in Hennery')
+  })
+
+  it.each([1, 9])('shows the new hat policy after reassignment to revision %s', async revision => {
+    const source: McpSourceSnapshot = { policy: 'managed_plus_native', revision: 9, request_id: 'old-hat' }
+    const s = server({
+      pages: [() => json(page([]))],
+      hats: () => json([
+        { id: 'hat1', name: 'Old hat', colour: '#123456', mcp_source_policy: 'managed_plus_native', mcp_policy_revision: 9 },
+        { id: 'hat2', name: 'New hat', colour: '#654321', mcp_source_policy: 'managed_only', mcp_policy_revision: revision },
+      ]),
+      detail: () => json(detail('claude', { lifecycle: 'parked', mcp_source_policy: {
+        policy: 'managed_plus_native', revision: 9, requested: source, applied: source,
+      } })),
+    })
+    const summary = { ...detail('claude', { lifecycle: 'parked' }), pending: undefined } as unknown as SessionSummary
+    const view = render(<SessionView id={ID} summary={summary} timing={FAST} />, { wrapper: s.wrapper })
+    await showDetailsTab('Details')
+    await waitFor(() => expect(screen.getByRole('region', { name: 'MCP sources' }))
+      .toHaveTextContent('Hat setting: Hennery and runtime-native MCP'))
+    view.rerender(<SessionView id={ID} summary={{ ...summary, hat_id: 'hat2' }} timing={FAST} />)
+    await waitFor(() => expect(screen.getByRole('region', { name: 'MCP sources' }))
+      .toHaveTextContent('Hat setting: Only MCP configured in Hennery'))
+    expect(screen.getByRole('region', { name: 'MCP sources' }))
+      .toHaveTextContent('Last confirmed attach: Hennery and runtime-native MCP')
+    expect(screen.getByRole('region', { name: 'MCP sources' })).toHaveTextContent('next start or resume')
+    await waitFor(() => expect(s.of(DETAIL)).toHaveLength(2))
+  })
+
+  it('keeps a newer same-hat setting when a refreshed GET reports an older revision', async () => {
+    const source: McpSourceSnapshot = { policy: 'managed_only', revision: 1, request_id: 'confirmed' }
+    let stale = false
+    const s = server({
+      pages: [() => json(page([]))],
+      hats: () => json([{ id: 'hat1', name: 'Work', colour: '#123456',
+        mcp_source_policy: 'managed_plus_native', mcp_policy_revision: 9 }]),
+      detail: () => json(detail('claude', { mcp_source_policy: {
+        policy: stale ? 'managed_only' : 'managed_plus_native', revision: stale ? 1 : 9,
+        requested: source, applied: source,
+      } })),
+    })
+    render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+    await showDetailsTab('Details')
+    await waitFor(() => expect(screen.getByRole('region', { name: 'MCP sources' }))
+      .toHaveTextContent('Hat setting: Hennery and runtime-native MCP'))
+    stale = true
+    await act(async () => s.streams[0].event('catalog_changed', { session_id: ID, config_options: [], commands: [] }))
+    await waitFor(() => expect(s.of(DETAIL)).toHaveLength(2))
+    expect(screen.getByRole('region', { name: 'MCP sources' }))
+      .toHaveTextContent('Hat setting: Hennery and runtime-native MCP')
+    expect(screen.getByRole('region', { name: 'MCP sources' }))
+      .toHaveTextContent('Last confirmed attach: Only MCP configured in Hennery')
+    expect(screen.getByRole('region', { name: 'MCP sources' })).toHaveTextContent('next start or resume')
+  })
+
   it('opens at the end of the transcript', async () => {
     const s = server({ pages: [() => json(page(rows(10, 't5')))] })
     render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
@@ -268,6 +335,29 @@ describe('SessionView', () => {
     await waitFor(() => expect(screen.getByRole('region', { name: 'MCP delivery' })).toHaveTextContent('2 MCP servers.'))
     expect(s.of(DETAIL)).toHaveLength(2)
   })
+  it('refreshes confirmed MCP policy after a rapid resume without a rendered lifecycle change', async () => {
+    let source: McpSourceSnapshot = { policy: 'managed_only', revision: 1, request_id: 'old' }
+    const s = server({
+      pages: [() => json(page([]))],
+      hats: () => json([{ id: 'hat1', name: 'Work', colour: '#123456',
+        mcp_source_policy: 'legacy', mcp_policy_revision: 0 }]),
+      detail: () => json(detail('claude', { mcp_source_policy: {
+        policy: 'managed_plus_native', revision: 2, requested: source, applied: source,
+      } })),
+    })
+    render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+    await showDetailsTab('Details')
+    await waitFor(() => expect(screen.getByRole('region', { name: 'MCP sources' }))
+      .toHaveTextContent('Last confirmed attach: Only MCP configured in Hennery'))
+    expect(screen.getByRole('region', { name: 'MCP sources' }))
+      .toHaveTextContent('Hat setting: Hennery and runtime-native MCP')
+    source = { policy: 'managed_plus_native', revision: 2, request_id: 'resumed' }
+    act(() => s.streams[0].event('catalog_changed', { session_id: ID, config_options: [], commands: [] }))
+    await waitFor(() => expect(screen.getByRole('region', { name: 'MCP sources' }))
+      .toHaveTextContent('Last confirmed attach: Hennery and runtime-native MCP'))
+    expect(s.of(DETAIL)).toHaveLength(2)
+  })
+
   it('shows a delivery-read error as escaped and visibly isolated text', async () => {
     const s = server({ pages: [() => json(page([]))], detail: () => json({ code: 'failed', message: '<i>cannot\u202Eread' }, 500) })
     render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })

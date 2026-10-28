@@ -11,6 +11,52 @@ use hennery_sessions::hub::{Hub, RequestError};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+#[tokio::test]
+async fn explicit_empty_delivery_requires_the_live_source_capability_and_verified_profile() {
+    use hennery_proto::mcp_source::{McpSourcePolicy, McpSourceSnapshot};
+    for policy in [McpSourcePolicy::ManagedOnly, McpSourcePolicy::ManagedPlusNative] {
+        for (agent, capabilities, expected) in [
+            ("claude", vec![Capability::McpServers], false),
+            (
+                "claude",
+                vec![Capability::McpServers, Capability::McpSourcePolicy],
+                policy == McpSourcePolicy::ManagedOnly,
+            ),
+            (
+                "claude",
+                vec![
+                    Capability::McpServers,
+                    Capability::McpSourcePolicy,
+                    Capability::McpNativeSources,
+                ],
+                true,
+            ),
+            (
+                "codex",
+                vec![Capability::McpServers, Capability::McpSourcePolicy],
+                false,
+            ),
+        ] {
+            let hub = Hub::default();
+            let mut rx = connect(&hub, Capabilities(capabilities));
+            let mut frame = start(agent, false, false);
+            if let CollectorFrame::StartSession { mcp, .. } = &mut frame {
+                mcp.source_policy = Some(McpSourceSnapshot {
+                    policy,
+                    revision: 1,
+                    request_id: "r1".into(),
+                });
+            }
+            let result = send(&hub, &mut rx, frame).await;
+            if expected {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(RequestError::McpSourceUnsupported)));
+            }
+        }
+    }
+}
+
 fn start(agent: &str, servers: bool, waived: bool) -> CollectorFrame {
     CollectorFrame::StartSession {
         request_id: "r1".into(),
@@ -21,6 +67,7 @@ fn start(agent: &str, servers: bool, waived: bool) -> CollectorFrame {
         config: Default::default(),
         hat_id: "hat-1".into(),
         mcp: McpDelivery {
+            source_policy: None,
             mcp_servers: if servers {
                 vec![McpServer::Http {
                     name: "hennery-notes".into(),

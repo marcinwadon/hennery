@@ -69,6 +69,7 @@ fn with_nonce(
 
 fn servers() -> McpDelivery {
     McpDelivery {
+        source_policy: None,
         mcp_servers: vec![McpServer::Http {
             name: "hennery-notes".into(),
             url: format!("https://hennery.example/mcp/notes/{URL_KEY}"),

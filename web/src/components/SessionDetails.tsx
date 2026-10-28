@@ -8,6 +8,8 @@ import { agentLabel } from '../lib/agent'
 import { useMediaQuery } from '../hooks/useMediaQuery'
 import { useModalLayer } from './ui'
 import McpDelivery from './McpDelivery'
+import McpSourcePolicy from './McpSourcePolicy'
+import type { McpSourceState } from '../generated/protocol'
 import StepList from './StepList'
 import { WaitingBadge } from './SessionScope'
 
@@ -28,6 +30,7 @@ interface Props {
   configuration?: SessionConfigState
   catalog?: SessionCatalog | null
   settingsFocus?: number
+  sourcePolicy?: McpSourceState
   children: ReactNode
 }
 
@@ -87,7 +90,7 @@ function SheetFocus({ dialog: ref, keys, onClose, trigger }: { dialog: RefObject
   return null
 }
 
-function Details({ info, hostName, hatName, delivery, configuration, catalog }: Props) {
+function Details({ info, hostName, hatName, delivery, configuration, catalog, sourcePolicy }: Props) {
   return <>
     {configuration && <SessionSettings catalog={catalog ?? null} config={configuration} />}
     {info && <dl className="session-facts">
@@ -100,6 +103,7 @@ function Details({ info, hostName, hatName, delivery, configuration, catalog }: 
       {!configuration && info.mode && <><dt>Mode</dt><dd><bdi>{info.mode}</bdi></dd></>}
       <dt>Started</dt><dd><time dateTime={info.created_at}>{new Date(info.created_at).toLocaleString()}</time></dd>
     </dl>}
+    <McpSourcePolicy state={sourcePolicy} />
     <McpDelivery agent={info?.agent} delivery={delivery} />
   </>
 }

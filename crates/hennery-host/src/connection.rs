@@ -389,6 +389,8 @@ async fn handshake(
                 Capability::ResolvePath,
                 Capability::ForgetSession,
                 Capability::McpServers,
+                Capability::McpSourcePolicy,
+                Capability::McpNativeSources,
                 Capability::CatalogProbe,
                 Capability::CatalogProbeCancel,
                 Capability::DelegationConfig,
@@ -634,6 +636,19 @@ fn attach(
     // waived that, are refused before anything is spawned: never dropped,
     // never passed (plan 8c, the lane's L3).
     let profile = cfg.profile(&req.agent);
+    if let Some(source) = &req.mcp.source_policy
+        && (req.mcp.isolation_waived
+            || source.request_id != req.request_id
+            || source.policy == hennery_proto::mcp_source::McpSourcePolicy::Legacy
+            || !profile.supports_source(source.policy))
+    {
+        uplink.reply(HostFrame::Error {
+            request_id: req.request_id,
+            code: "mcp_source_policy_unsupported".into(),
+            message: "this profile cannot honor the requested MCP source policy".into(),
+        });
+        return Ok(());
+    }
     if let Some(problem) =
         crate::profile::mcp_refusal(&req.agent, profile, &req.mcp.mcp_servers, req.mcp.isolation_waived)
     {
@@ -742,6 +757,16 @@ fn spawn_or_restart(
         return;
     }
     if let Some(handle) = map.handles.get(&req.session_id).filter(|h| !h.is_ended())
+        && handle.mcp_source_policy() != req.mcp.source_policy.as_ref()
+    {
+        uplink.reply(HostFrame::Error {
+            request_id: req.request_id,
+            code: "mcp_source_policy_conflict".into(),
+            message: "the running process retains its original MCP source policy snapshot".into(),
+        });
+        return;
+    }
+    if let Some(handle) = map.handles.get(&req.session_id).filter(|h| !h.is_ended())
         && handle.send(SessionCmd::Restart {
             request_id: req.request_id.clone(),
         })
@@ -759,6 +784,7 @@ fn spawn_or_restart(
         agent: command,
         cwd: PathBuf::from(req.cwd),
         profile,
+        mcp_source_policy: req.mcp.source_policy,
         mcp_servers: req.mcp.mcp_servers,
     };
     let handle = match req.generation {
@@ -1233,6 +1259,73 @@ where
 mod tests {
     use super::*;
     use hennery_proto::frames::{ParkReason, SessionBody};
+
+    #[tokio::test]
+    async fn a_live_actor_cannot_acknowledge_a_different_source_snapshot() {
+        use hennery_proto::mcp_source::{McpSourcePolicy, McpSourceSnapshot};
+        for initial in [
+            None,
+            Some(McpSourceSnapshot {
+                policy: McpSourcePolicy::ManagedOnly,
+                revision: 1,
+                request_id: "original".into(),
+            }),
+        ] {
+            let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+            let command = AgentCommand::parse("unused-source-policy-test-adapter").unwrap();
+            // No await before the assertion: the actor cannot spawn a process.
+            let handle = session::launch(
+                uplink.clone(),
+                Launch {
+                    mcp_source_policy: initial.clone(),
+                    request_id: "original".into(),
+                    session_id: "s1".into(),
+                    attach: Attach::New,
+                    config: SessionConfig::default(),
+                    agent: command.clone(),
+                    cwd: "/tmp".into(),
+                    profile: Profile::Claude,
+                    mcp_servers: vec![],
+                },
+                SessionOptions::default(),
+            );
+            let sessions = Arc::new(Mutex::new(SessionMap::default()));
+            sessions.lock().unwrap().handles.insert("s1".into(), handle.clone());
+            spawn_or_restart(
+                &uplink,
+                &sessions,
+                AttachRequest {
+                    generation: None,
+                    roots: vec![],
+                    request_id: "later".into(),
+                    session_id: "s1".into(),
+                    committed_seq: 0,
+                    agent: "claude".into(),
+                    cwd: "/tmp".into(),
+                    attach: Attach::Load {
+                        agent_session_id: "saved".into(),
+                    },
+                    config: SessionConfig::default(),
+                    mcp: McpDelivery {
+                        source_policy: Some(McpSourceSnapshot {
+                            policy: McpSourcePolicy::ManagedPlusNative,
+                            revision: 2,
+                            request_id: "later".into(),
+                        }),
+                        ..Default::default()
+                    },
+                },
+                command,
+                Profile::Claude,
+                SessionOptions::default(),
+            );
+            assert!(
+                matches!(replies.try_recv().unwrap(), HostFrame::Error { code, request_id, .. }
+                if code == "mcp_source_policy_conflict" && request_id == "later")
+            );
+            assert_eq!(handle.mcp_source_policy(), initial.as_ref());
+        }
+    }
 
     #[tokio::test]
     async fn attached_snapshots_report_a_park_queued_before_the_actor_reads_it() {

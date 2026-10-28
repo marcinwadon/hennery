@@ -60,7 +60,7 @@ fn eligible_in(tx: &Transaction<'_>, owner: &str, n: &Notice) -> Result<bool> {
         AND p.close_requested = 0 AND c.close_requested = 0 AND p.presumed_parked = 0
         AND p.lifecycle IN ('active','parked') AND c.lifecycle IN ('starting','active','parked','failed')
         AND h.revoked_at IS NULL AND g.delegation_enabled = 1 AND g.revision = ?4
-        AND (p.mcp_delivery_mode = 'isolated' OR (p.mcp_delivery_mode = 'unisolated' AND p.hat_id = h.default_hat_id))
+        AND (p.mcp_delivery_mode IN ('isolated','managed_plus_native') OR (p.mcp_delivery_mode = 'unisolated' AND p.hat_id = h.default_hat_id))
         AND NOT EXISTS(SELECT 1 FROM purged_hats x WHERE x.owner_id = ?1 AND x.hat_id = f.hat_id)
         AND (?5 <> 'question' OR EXISTS(SELECT 1 FROM pending q WHERE q.owner_id = ?1 AND q.session_id = c.id
             AND q.pending_id = ?6 AND q.kind = 'elicitation' AND q.state = 'open'
@@ -109,6 +109,10 @@ impl Store {
     pub(crate) fn fail_notice_configuration(&self, parent: &str, expected: &str, now: i64) -> Result<()> {
         self.fail_notice_catalog_for(parent, "configuration_unavailable", now, Some(expected))
     }
+
+    pub(crate) fn fail_notice_source_policy(&self, parent: &str, expected: &str, now: i64) -> Result<()> {
+        self.fail_notice_catalog_for(parent, crate::mcp_source::UNSUPPORTED, now, Some(expected))
+    }
     fn fail_notice_catalog_for(&self, parent: &str, code: &str, now: i64, expected: Option<&str>) -> Result<()> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -126,7 +130,7 @@ impl Store {
                 tx.execute(
                     "UPDATE delegation_notices SET state='operator_required',reason=?3
                     WHERE owner_id = ?1 AND delivery_id=?2 AND (
-                    ?3 IN ('auth_required','runtime_unavailable','cwd_unavailable','configuration_unavailable','agent_has_no_record') OR (?3 IN ('adapter_failed','catalog_unavailable','busy','timeout') AND deadline<=?4))",
+                    ?3 IN ('auth_required','runtime_unavailable','cwd_unavailable','configuration_unavailable','agent_has_no_record','mcp_source_policy_unsupported') OR (?3 IN ('adapter_failed','catalog_unavailable','busy','timeout') AND deadline<=?4))",
                     params![self.owner_id(), n.id, code, now],
                 )?;
             }
@@ -176,7 +180,8 @@ impl Store {
         if changed != 1 {
             return Ok(false);
         }
-        let request = uuid::Uuid::now_v7().to_string();
+        let (given, cut) = self.deliver_in(&tx, parent, &host, &n.hat, mcp, &crate::store::now())?;
+        let request = given.request_id();
         tx.execute("INSERT INTO session_attach_evidence(owner_id,session_id,attach_generation,requested_config,launch_sent,request_id)
             VALUES (?1,?2,?3,?4,1,?5) ON CONFLICT(owner_id,session_id) DO UPDATE SET attach_generation = excluded.attach_generation,
             requested_config = excluded.requested_config,config_revision = 0,evidence = NULL,launch_sent = 1,request_id = excluded.request_id
@@ -187,7 +192,7 @@ impl Store {
             params![self.owner_id(), parent],
             |r| r.get(0),
         )?;
-        let (given, cut) = self.deliver_in(&tx, parent, &host, &n.hat, mcp, &crate::store::now())?;
+
         let frame = CollectorFrame::DelegatedAttach {
             operator_initiated: false,
             request_id: request,

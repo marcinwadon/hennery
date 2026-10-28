@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.3.7
+
+- Give the prompt field the full composer width and move model, mode and other
+  session settings into Details, with a compact action bar on mobile.
+- Share session actions between the session list and the session header,
+  including rename, sidebar pin, idle parking hold and lifecycle actions.
+- Select sessions from the list and close them together, with confirmation,
+  individual results and fresh state checks before retrying uncertain requests.
+- Configure MCP sources separately for each ACP in each hat. The bundled Claude
+  adapter supports Hennery-only or Hennery plus native sources; Codex retains
+  its existing adapter behavior independently. Settings apply on the next real
+  start or resume, and session details distinguish requested and applied policy.
+
 ## 0.3.6
 
 - Support existing HTTPS loopback OAuth callbacks with a temporary local TLS

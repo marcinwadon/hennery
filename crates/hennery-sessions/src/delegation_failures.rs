@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 fn terminal(code: &str, operation: &str, now: i64, failures: &mut BTreeMap<String, i64>) -> bool {
     match code {
         "auth_required"
+        | crate::mcp_source::UNSUPPORTED
         | "runtime_unavailable"
         | "configuration_unavailable"
         | "cwd_unavailable"
@@ -65,6 +66,10 @@ impl Store {
     /// a later queue head must receive its own configuration check.
     pub fn fail_delegation_configuration(&self, target: &str, expected_operation: &str, now: i64) -> Result<()> {
         self.fail_delegation_catalog_for(target, "configuration_unavailable", now, Some(expected_operation))
+    }
+
+    pub fn fail_delegation_source_policy(&self, target: &str, expected_operation: &str, now: i64) -> Result<()> {
+        self.fail_delegation_catalog_for(target, crate::mcp_source::UNSUPPORTED, now, Some(expected_operation))
     }
 
     fn fail_delegation_catalog_for(

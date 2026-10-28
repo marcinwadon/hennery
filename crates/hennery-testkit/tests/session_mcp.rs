@@ -66,6 +66,7 @@ fn fake(script: &FakeScript) -> AgentCommand {
 async fn attach(script: &FakeScript, attach: Attach, profile: Profile, mcp_servers: Vec<McpServer>) -> Uplink {
     let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
     let launch = Launch {
+        mcp_source_policy: None,
         request_id: "r0".into(),
         session_id: "s1".into(),
         attach,
@@ -201,6 +202,7 @@ async fn the_sessions_secret_values_never_reach_what_it_reports() {
     };
     let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
     let launch = Launch {
+        mcp_source_policy: None,
         request_id: "r0".into(),
         session_id: "s1".into(),
         attach: Attach::New,
@@ -251,6 +253,7 @@ async fn an_adapters_errors_quoting_its_secrets_are_redacted_in_every_answer_and
     };
     let (uplink, mut replies) = Uplink::new(Outbox::open_in_memory().unwrap());
     let launch = Launch {
+        mcp_source_policy: None,
         request_id: "r0".into(),
         session_id: "s1".into(),
         attach: Attach::New,

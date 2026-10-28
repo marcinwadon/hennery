@@ -12,7 +12,11 @@ fn main() {
     cfg.home = Some(PathBuf::from(&args[2]));
     cfg.workspace_roots = vec![PathBuf::from(&args[2])];
     cfg.git = None;
-    for (name, profile) in [("claude", Profile::Claude), ("custom", Profile::Generic)] {
+    for (name, profile) in [
+        ("claude", Profile::Claude),
+        ("codex", Profile::Codex),
+        ("custom", Profile::Generic),
+    ] {
         cfg.agents.insert(
             name.into(),
             AgentCommand {

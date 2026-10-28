@@ -13,6 +13,43 @@ use hennery_kernel::operator::{Operator, SetupOutcome};
 const NOW: i64 = 4_000_000_000;
 const PASSWORD: &str = "correct horse battery";
 
+#[test]
+fn source_policy_preserves_legacy_and_changes_revision_only_for_a_changed_policy() {
+    use hennery_proto::mcp_source::McpSourcePolicy::{Legacy, ManagedOnly, ManagedPlusNative};
+    let hosts = Hosts::open_in_memory().unwrap();
+    let old = hat_id(hosts.create_hat("Legacy", None, NOW).unwrap());
+    assert_eq!(hosts.hat(&old).unwrap().unwrap().mcp_source_policy, Legacy);
+    let id = hat_id(
+        hosts
+            .create_hat_with_policy("Explicit", None, NOW, Some(ManagedOnly))
+            .unwrap(),
+    );
+    assert_eq!(hosts.hat(&id).unwrap().unwrap().mcp_policy_revision, 0);
+    hosts
+        .update_hat_with_policy(&id, None, None, None, Some(ManagedPlusNative))
+        .unwrap();
+    hosts
+        .update_hat_with_policy(&id, None, None, None, Some(ManagedPlusNative))
+        .unwrap();
+    hosts.update_hat(&id, Some("Renamed"), None, None).unwrap();
+    let hat = hosts.hat(&id).unwrap().unwrap();
+    assert_eq!((hat.mcp_source_policy, hat.mcp_policy_revision), (ManagedPlusNative, 1));
+    assert!(matches!(
+        hosts
+            .update_hat_with_policy("foreign-hat", None, None, None, Some(ManagedOnly))
+            .unwrap(),
+        HatChange::NotFound
+    ));
+    hosts.begin_purge(&id, NOW).unwrap();
+    assert!(matches!(
+        hosts
+            .update_hat_with_policy(&id, None, None, None, Some(ManagedOnly))
+            .unwrap(),
+        HatChange::Purging
+    ));
+    assert_eq!(hosts.hat(&id).unwrap().unwrap().mcp_source_policy, ManagedPlusNative);
+}
+
 fn enrollment(seed: u8) -> Enrollment {
     Enrollment {
         public_key: hex::encode(SigningKey::from_bytes(&[seed; 32]).verifying_key().as_bytes()),
@@ -409,6 +446,18 @@ fn another_owners_hats_and_rules_are_invisible_and_unusable() {
     let db = dir.path().join("hennery.db");
     let hosts = Hosts::open(&db).unwrap();
     write_other_owner(&db);
+    assert!(matches!(
+        hosts
+            .update_hat_with_policy(
+                OTHER_HAT,
+                None,
+                None,
+                None,
+                Some(hennery_proto::mcp_source::McpSourcePolicy::ManagedOnly)
+            )
+            .unwrap(),
+        HatChange::NotFound
+    ));
     host(&hosts, "host-1", 1);
 
     let names: Vec<String> = hosts.hats().unwrap().into_iter().map(|h| h.name).collect();

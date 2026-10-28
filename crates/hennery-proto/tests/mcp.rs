@@ -73,6 +73,7 @@ fn servers_use_the_acp_entry_shapes_with_a_type_tag() {
 #[test]
 fn start_and_resume_carry_the_hat_and_the_servers() {
     let mcp = McpDelivery {
+        source_policy: None,
         mcp_servers: vec![http(), stdio()],
         isolation_waived: false,
     };
@@ -92,6 +93,7 @@ fn start_and_resume_carry_the_hat_and_the_servers() {
         config: Default::default(),
         hat_id: "hat-1".into(),
         mcp: McpDelivery {
+            source_policy: None,
             isolation_waived: true,
             ..mcp
         },
@@ -139,6 +141,7 @@ fn debug_never_shows_header_or_env_values_or_arguments() {
     let frame = start(
         "hat-1",
         McpDelivery {
+            source_policy: None,
             mcp_servers: vec![http(), stdio()],
             isolation_waived: false,
         },
@@ -299,6 +302,7 @@ fn only_starts_and_resumes_carry_a_delivery() {
     let frame = start(
         "",
         McpDelivery {
+            source_policy: None,
             mcp_servers: vec![http()],
             isolation_waived: false,
         },

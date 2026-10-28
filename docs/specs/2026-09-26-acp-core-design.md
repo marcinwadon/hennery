@@ -1545,10 +1545,12 @@ Plan 8c builds the profiles' MCP column only, chosen by where the agent came
 from, never by its name alone:
 - the installed set's `claude` (the pinned `claude-agent-acp`): the strict
   flag in `_meta` on every `session/new` and `session/load`, with servers or
-  without; `hello.mcp_isolation` reports `claude_strict`. **Every Claude
-  session hennery runs therefore loses the user's own MCP servers and
-  claude.ai connectors**: the gateway is the one place MCP is managed
-  (umbrella §8.5; the spike's conclusion 2);
+  without, for legacy and managed-only; `hello.mcp_isolation` reports
+  `claude_strict`. Explicit combined sessions instead permit runtime-native
+  MCP through the controlled session option. Source capabilities, attach
+  acknowledgement and migration follow the
+  [source-policy contract](2026-10-28-mcp-source-policy.md), authoritative over
+  the historical legacy profile descriptions here;
 - the same with the operator's CLI (`--use-cli`, `CLAUDE_CODE_EXECUTABLE`):
   the strict flag is still sent, but the override is unverified, so it
   reports `none`;
@@ -1568,7 +1570,7 @@ isolation for an override is not built.
 | `terminal` | yes | yes | yes |
 | `elicitation` | `{"form": {}}` | `{"form": {}}` | `{"form": {}}` |
 | Extra capabilities | — | `_meta.jetbrains.air = {version: 1, capabilities: ["sessionFailure"]}` inside `clientCapabilities` | — |
-| Per-session MCP isolation | `_meta.claudeCode.options.extraArgs["strict-mcp-config"] = ""` on **every** `session/new` and `session/load` | composed `CODEX_HOME` (below); on a mixed host, fallback until measured | none; fallback |
+| Per-session MCP isolation | strict on every legacy/managed-only new/load; explicit combined permits native sources | none implemented; legacy fallback | none; legacy fallback |
 | MCP transport | `http` | `http` (no SSE) | from `initialize` |
 | Default catalogue | static, shipped with the profile | static | from config or empty |
 | Extra env | `MAX_THINKING_TOKENS` when set | — | from config |
@@ -1578,7 +1580,7 @@ non-default hat gets no gateway MCP servers, and sessions in the default hat
 get only default-hat mounts; the UI says so at session start and on the mount
 grid.
 
-**Composed `CODEX_HOME`** (spike): the host builds
+**Composed `CODEX_HOME`** (spike proposal, not implemented): the host would build
 `<host-data>/codex-home/<hat>/` from an **allowlist** of shared entries,
 symlinked to the user's `CODEX_HOME`: `auth.json`, `AGENTS.md`, `skills/`, and
 `sessions/` (so a session can be resumed from the terminal). `config.toml` is

@@ -182,6 +182,7 @@ async fn startup_context_does_not_leak_to_owned_child_or_bypass_config_and_close
     let h = session::launch_delegated(
         up.clone(),
         Launch {
+            mcp_source_policy: None,
             request_id: "start".into(),
             session_id: "child".into(),
             attach: Attach::New,

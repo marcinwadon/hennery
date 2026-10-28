@@ -1945,3 +1945,126 @@ fn randomized_dispatch_drop_reconcile_edit_remove_preserves_a_unique_delivery_pr
         }
     }
 }
+
+#[test]
+fn source_policy_review_ordinary_resume_after_real_operator_queue_attach() {
+    use hennery_proto::{frames::McpIsolation, mcp_source::McpSourcePolicy};
+    use hennery_sessions::store::ResumeRequest;
+    let w = World::new();
+    let hosts = Hosts::open(&w.dir.path().join("hennery.db")).unwrap();
+    let hat = hosts.host("host").unwrap().unwrap().default_hat_id;
+    let patch = [("fake".into(), Some(McpSourcePolicy::ManagedOnly))]
+        .into_iter()
+        .collect();
+    hosts
+        .update_hat_with_sources(&hat, None, None, None, None, Some(&patch))
+        .unwrap();
+    w.emit(SessionBody::SessionParked {
+        reason: ParkReason::Idle,
+    });
+    w.queue("resume in queue, then later resume manually");
+    let hub = Hub::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let reg = hub
+        .register(
+            "host",
+            tx,
+            Capabilities(vec![
+                Capability::McpServers,
+                Capability::McpSourcePolicy,
+                Capability::DelegationConfig,
+                Capability::OperatorResume,
+            ]),
+            AgentIsolation([("fake".into(), McpIsolation::ClaudeStrict)].into_iter().collect()),
+        )
+        .unwrap();
+    hub.mark_ready("host", reg.conn_id);
+    let context = McpContext {
+        source_policy: true,
+        native_sources: false,
+        capable: true,
+        isolation: McpIsolation::ClaudeStrict,
+        rules_name_other_hats: false,
+    };
+    let catalog = operator_catalog();
+    assert!(w.store.attach_delegated("session", context, &catalog, &hub).unwrap());
+    let CollectorFrame::DelegatedAttach {
+        request_id,
+        attach_generation,
+        mcp,
+        ..
+    } = rx.try_recv().unwrap()
+    else {
+        panic!("expected actual operator queue attach")
+    };
+    assert!(attach_generation > 0);
+    assert!(!w.store.operator_dispatch_ready("session").unwrap());
+    let mut first = SessionBody::session_started(request_id, "agent-session");
+    // Another ACP's edit during this attach cannot change its source proof.
+    let patch = [("codex".into(), Some(McpSourcePolicy::Legacy))].into_iter().collect();
+    hosts
+        .update_hat_with_sources(&hat, None, None, None, None, Some(&patch))
+        .unwrap();
+    if let SessionBody::SessionStarted { indexed, .. } = &mut first {
+        indexed.mcp_source_policy = mcp.source_policy;
+        indexed.config_evidence = Some(Box::new(ConfigEvidence {
+            attach_generation,
+            config_revision: 1,
+            completeness: ConfigCompleteness::Complete,
+            actual: Default::default(),
+        }));
+    }
+    let mut wrong_generation = first.clone();
+    if let SessionBody::SessionStarted { indexed, .. } = &mut wrong_generation {
+        indexed.config_evidence.as_mut().unwrap().attach_generation = 0;
+    }
+    w.emit(wrong_generation);
+    assert_eq!(w.store.find_session("session").unwrap().unwrap().lifecycle, "starting");
+    assert!(!w.store.operator_dispatch_ready("session").unwrap());
+    w.emit(first.clone());
+    assert_eq!(w.store.find_session("session").unwrap().unwrap().lifecycle, "active");
+    assert!(
+        w.store
+            .dispatch_operator_prompt("session", &hub, &mut None, Some(&catalog))
+            .unwrap()
+    );
+    let (request, turn, _) = prompt(&mut rx);
+    w.start(&request, &turn);
+    w.end(&turn, TurnOutcome::Completed);
+    w.emit(SessionBody::SessionParked {
+        reason: ParkReason::Operator,
+    });
+    let ResumeRequest::Starting { mcp, .. } = w.store.request_resume_with_mcp("session", &hat, context).unwrap() else {
+        panic!("manual resume")
+    };
+    let source = mcp.source_policy.unwrap();
+    let mut started = SessionBody::session_started(&source.request_id, "agent-session");
+    if let SessionBody::SessionStarted { indexed, .. } = &mut started {
+        indexed.mcp_source_policy = Some(source.clone());
+        indexed.config_evidence = Some(Box::new(ConfigEvidence {
+            attach_generation: 0,
+            config_revision: 1,
+            completeness: ConfigCompleteness::Complete,
+            actual: Default::default(),
+        }));
+    }
+    w.emit(first.clone());
+    assert_eq!(w.store.find_session("session").unwrap().unwrap().lifecycle, "starting");
+    let mut wrong_generation = started.clone();
+    if let SessionBody::SessionStarted { indexed, .. } = &mut wrong_generation {
+        indexed.config_evidence.as_mut().unwrap().attach_generation = attach_generation;
+    }
+    w.emit(wrong_generation);
+    assert_eq!(w.store.find_session("session").unwrap().unwrap().lifecycle, "starting");
+    w.emit(started);
+    let actual = w.store.find_session("session").unwrap().unwrap().lifecycle;
+    assert_eq!(
+        actual, "active",
+        "current ordinary Resume after successful real queue attach must not be ignored"
+    );
+    w.emit(first);
+    assert_eq!(
+        w.store.mcp_source_state("session").unwrap().unwrap().applied,
+        Some(source)
+    );
+}

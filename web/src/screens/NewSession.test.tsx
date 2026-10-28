@@ -31,6 +31,7 @@ vi.mock('../lib/agents', async (importOriginal) => {
 
 function host(id: string, name: string, patch: Partial<HostItem> = {}): HostItem {
   return {
+    mcp_source_policies: {},
     host_id: id,
     name,
     platform: 'linux',
@@ -54,7 +55,7 @@ const HOSTS = [
 ]
 
 function hat(id: string, name: string): HatItem {
-  return { id, name, colour: '#112233', created_at: '2026-10-01T00:00:00Z', default_for_new_hosts: false, purging: false }
+  return { id, name, colour: '#112233', created_at: '2026-10-01T00:00:00Z', default_for_new_hosts: false, purging: false, mcp_source_policy: 'legacy' as const, mcp_policy_revision: 0 }
 }
 const HATS = [hat('hat-a', 'Work'), hat('hat-b', 'Home')]
 
@@ -215,6 +216,20 @@ afterEach(() => {
 })
 
 describe('hosts', () => {
+  it('predicts source policy for the chosen ACP within the same resolved hat', async () => {
+    mount({ 'GET /api/hats': json(200, [{ ...HATS[0], mcp_source_overrides: {
+      claude: { policy: 'managed_only', revision: 2 }, codex: { policy: 'legacy', revision: 1 },
+    } }]), 'GET /api/hosts': json(200, [host('h1', 'laptop', {
+      mcp_source_policies: { claude: ['managed_only', 'managed_plus_native'] },
+    })]) })
+    const user = await fill()
+    await waitFor(() => expect(screen.getByRole('region', { name: 'MCP sources prediction' })).toHaveTextContent('Only MCP configured in Hennery'))
+    await user.click(screen.getByRole('radio', { name: 'Codex' }))
+    expect(screen.getByRole('region', { name: 'MCP sources prediction' })).toHaveTextContent('Existing / adapter defaults')
+    expect(screen.getByRole('region', { name: 'MCP sources prediction' })).not.toHaveTextContent('Starting will be refused')
+    await user.click(screen.getByRole('radio', { name: 'Claude' }))
+    expect(screen.getByRole('region', { name: 'MCP sources prediction' })).toHaveTextContent('Only MCP configured in Hennery')
+  })
   it('lists connected hosts first and offline ones disabled, never a revoked one', async () => {
     mount()
     await screen.findByRole('radio', { name: /^laptop/ })

@@ -42,7 +42,7 @@ const page = (sessions: SessionSummary[], next?: string, waiting?: number): Summ
   ({ sessions, next_cursor: next, epoch: 'e1', revision: 1, ...(waiting === undefined ? {} : { waiting }) }) as SummaryPage
 
 function hat(id: string, name: string, colour: string): HatItem {
-  return { id, name, colour, created_at: '2026-10-01T00:00:00Z', default_for_new_hosts: false, purging: false }
+  return { id, name, colour, created_at: '2026-10-01T00:00:00Z', default_for_new_hosts: false, purging: false, mcp_source_policy: 'legacy' as const, mcp_policy_revision: 0 }
 }
 
 const HATS = [hat('hat-a', 'Work', '#112233'), hat('hat-b', 'Home', 'not-a-colour')]

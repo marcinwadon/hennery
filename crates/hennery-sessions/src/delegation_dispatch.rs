@@ -154,7 +154,7 @@ const TRANSFER: &str = "SELECT EXISTS(SELECT 1 FROM session_families f
     AND p.lifecycle IN ('active','parked') AND p.presumed_parked = 0
     AND c.lifecycle IN ('starting','active','parked') AND c.presumed_parked = 0
     AND g.delegation_enabled = 1 AND g.revision = ?4
-    AND (p.mcp_delivery_mode = 'isolated' OR (p.mcp_delivery_mode = 'unisolated' AND p.hat_id = h.default_hat_id))
+    AND (p.mcp_delivery_mode IN ('isolated','managed_plus_native') OR (p.mcp_delivery_mode = 'unisolated' AND p.hat_id = h.default_hat_id))
     AND NOT EXISTS (SELECT 1 FROM purged_hats x WHERE x.owner_id = ?1 AND x.hat_id = f.hat_id))";
 impl Store {
     pub(crate) fn transfer_in(&self, tx: &Transaction<'_>, source: &str, target: &str, revision: i64) -> Result<bool> {
@@ -167,12 +167,16 @@ impl Store {
         let (capabilities,isolation,agent,mode):(String,Option<String>,String,String)=tx.query_row(
             "SELECT h.capabilities,h.mcp_isolation,p.agent,p.mcp_delivery_mode FROM sessions p JOIN hosts h ON h.owner_id = ?1 AND h.id = p.host_id WHERE p.owner_id = ?1 AND p.id = ?2",
             params![self.owner_id(),source],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
-        let capable = serde_json::from_str::<hennery_proto::frames::Capabilities>(&capabilities)
-            .is_ok_and(|c| c.has(Capability::McpServers));
-        let isolated = isolation
+        let capabilities =
+            serde_json::from_str::<hennery_proto::frames::Capabilities>(&capabilities).unwrap_or_default();
+        let isolation = isolation
             .and_then(|s| serde_json::from_str::<hennery_proto::frames::AgentIsolation>(&s).ok())
-            .is_some_and(|i| i.isolates(&agent));
-        Ok(capable && (mode != "isolated" || isolated))
+            .unwrap_or_default();
+        Ok(crate::mcp_source::delivery_supported(
+            &mode,
+            &capabilities,
+            isolation.get(&agent),
+        ))
     }
     pub fn delegation_targets(&self) -> Result<Vec<String>> {
         self.delegation_targets_after("")
@@ -271,7 +275,7 @@ impl Store {
             |r| r.get(0),
         )?;
         let (given, cut) = self.deliver_in(&tx, target, &host, &hat, mcp, &crate::store::now())?;
-        let request_id = uuid::Uuid::now_v7().to_string();
+        let request_id = given.request_id();
         tx.execute(
             "UPDATE session_attach_evidence SET request_id = ?3 WHERE owner_id = ?1 AND session_id = ?2",
             params![self.owner_id(), target, request_id],
@@ -598,12 +602,12 @@ impl Store {
             tracing::warn!(%error, "delegated handoff deferred by idle hold flush");
             return Ok(false);
         }
-        let (agent, isolated): (String, bool) = conn.query_row(
-            "SELECT agent,mcp_delivery_mode = 'isolated' FROM sessions WHERE owner_id = ?1 AND id = ?2",
+        let (agent, mode): (String, String) = conn.query_row(
+            "SELECT agent,mcp_delivery_mode FROM sessions WHERE owner_id = ?1 AND id = ?2",
             params![self.owner_id(), source],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
-        Ok(hub.notify_parent_transfer(host, &agent, isolated, frame))
+        Ok(hub.notify_parent_transfer(host, &agent, &mode, frame))
     }
 }
 

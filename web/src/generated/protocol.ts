@@ -243,7 +243,7 @@ export type SessionConfig = { model?: string | null, mode?: string | null, axes?
  * collector never sends a frame that needs a capability to a host that
  * lacks it.
  */
-export type Capability = "plugin_context" | "projects" | "images" | "park" | "idle_hold" | "resolve_path" | "forget_session" | "mcp_servers" | "catalog_probe" | "catalog_probe_cancel" | "delegation_config" | "operator_resume" | "prompt_mailbox_snapshot";
+export type Capability = "plugin_context" | "projects" | "images" | "park" | "idle_hold" | "resolve_path" | "forget_session" | "mcp_servers" | "mcp_source_policy" | "mcp_native_sources" | "catalog_probe" | "catalog_probe_cancel" | "delegation_config" | "operator_resume" | "prompt_mailbox_snapshot";
 
 /**
  * `hello.capabilities`. Deserialized leniently: a capability this build
@@ -279,7 +279,7 @@ export type McpServer = { "type": "http", name: string, url: string, headers: Ar
  * §4.3; plan 8c). Flattened into the frame; empty fields are left out, so
  * a frame without servers is what an older host expects.
  */
-export type McpDelivery = {
+export type McpDelivery = { source_policy?: McpSourceSnapshot,
 /**
  * Passed in `session/new` / `session/load`. Only to a host that
  * announced `mcp_servers`.
@@ -292,6 +292,21 @@ mcp_servers?: Array<McpServer>,
  * (`mcp_isolation_unavailable`): isolation is never lost by omission.
  */
 isolation_waived?: boolean, };
+
+export type McpSourcePolicy = "legacy" | "managed_only" | "managed_plus_native";
+
+/**
+ * Sparse per-ACP setting. A reset retains its revision with a null policy.
+ */
+export type McpSourceOverride = { policy: McpSourcePolicy | null, revision: number, };
+
+/**
+ * Echoed only after new/load used this snapshot. Request identity is the
+ * existing start request, not a second lifecycle or proof namespace.
+ */
+export type McpSourceSnapshot = { policy: McpSourcePolicy, revision: number, request_id: string, };
+
+export type McpSourceState = { policy: McpSourcePolicy, revision: number, requested?: McpSourceSnapshot, applied?: McpSourceSnapshot, };
 
 /**
  * How a host keeps an agent's sessions to the servers hennery passes (ACP
@@ -376,6 +391,10 @@ title?: string | null, };
  * mode deltas are ignored.
  */
 export type Indexed = {
+/**
+ * Host-owned acknowledgement, used only on SessionStarted.
+ */
+mcp_source_policy?: McpSourceSnapshot,
 /**
  * Host-owned adapter identity for authoritative start/resume snapshots.
  */
@@ -589,7 +608,7 @@ operator_initiated: boolean, } | { "type": "delegated_attach",
  * A collector-accepted operator queue resume uses ordinary operator
  * path authorization, while retaining the attach/configuration fence.
  */
-operator_initiated?: boolean, request_id: string, session_id: string, committed_seq: number, agent: string, cwd: string, hat_id: string, attach_generation: number, agent_session_id: string | null, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue },
+operator_initiated?: boolean, request_id: string, session_id: string, committed_seq: number, agent: string, cwd: string, hat_id: string, attach_generation: number, agent_session_id: string | null, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, source_policy?: McpSourceSnapshot,
 /**
  * Passed in `session/new` / `session/load`. Only to a host that
  * announced `mcp_servers`.
@@ -616,7 +635,7 @@ committed_seq: number, agent: string, cwd: string,
  * The session's hat (`sessions.hat_id`); empty for a session from
  * before hats. Carried, not yet used by the host (plan 8c).
  */
-hat_id?: string, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue },
+hat_id?: string, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, source_policy?: McpSourceSnapshot,
 /**
  * Passed in `session/new` / `session/load`. Only to a host that
  * announced `mcp_servers`.
@@ -641,7 +660,7 @@ agent_session_id: string,
 /**
  * As on `start_session`.
  */
-hat_id?: string, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue },
+hat_id?: string, model?: string | null, mode?: string | null, axes?: { [key in string]: ConfigValue }, source_policy?: McpSourceSnapshot,
 /**
  * Passed in `session/new` / `session/load`. Only to a host that
  * announced `mcp_servers`.
@@ -836,7 +855,7 @@ next_cursor?: string | undefined, };
  * `GET /api/sessions/{id}` (ACP core §9): the list item, as stored, the
  * open turn and the pending requests still open.
  */
-export type SessionDetail = {
+export type SessionDetail = { mcp_source_policy?: McpSourceState,
 /**
  * A bounded, readable requested-versus-actual configuration failure.
  */
@@ -1020,7 +1039,11 @@ export type EnrollResponse = { host_id: string, };
  * One entry of `GET /api/hosts` (kernel spec §8): a paired host, revoked
  * ones included.
  */
-export type HostItem = { host_id: string, name: string, platform: string, host_version: string,
+export type HostItem = {
+/**
+ * Supported policies per verified profile, from the last accepted hello.
+ */
+mcp_source_policies?: { [key in string]: Array<McpSourcePolicy> }, host_id: string, name: string, platform: string, host_version: string,
 /**
  * From its latest accepted `hello`.
  */
@@ -1202,7 +1225,7 @@ export type UpdateHostRequest = { name?: string | undefined, default_hat_id?: st
  * One hat (kernel spec §5.1): an entry of `GET /api/hats`, and the answer
  * to its creation and its changes.
  */
-export type HatItem = { id: string, name: string,
+export type HatItem = { mcp_source_overrides?: { [key in string]: McpSourceOverride }, mcp_source_policy: McpSourcePolicy, mcp_policy_revision: number, id: string, name: string,
 /**
  * `#rrggbb`, lowercase.
  */
@@ -1297,14 +1320,22 @@ host_transcripts: HostTranscripts, };
  * `POST /api/hats`: a name, 1 to 64 printable characters, unique in any
  * case, and a `#rrggbb` colour (slate when absent).
  */
-export type CreateHatRequest = { name: string, colour?: string | undefined, };
+export type CreateHatRequest = {
+/**
+ * Sparse per-agent patch; null resets that agent to the scalar fallback.
+ */
+mcp_source_overrides?: { [key in string]: McpSourcePolicy | null }, mcp_source_policy?: McpSourcePolicy, name: string, colour?: string | undefined, };
 
 /**
  * `PATCH /api/hats/{id}`: absent fields stay as they are.
  * `default_for_new_hosts` can only be `true`: a hat stops being that
  * default when another takes its place.
  */
-export type UpdateHatRequest = { name?: string | undefined, colour?: string | undefined, default_for_new_hosts?: boolean | undefined, };
+export type UpdateHatRequest = {
+/**
+ * Omitted keys stay unchanged; null resets an override, not its revision.
+ */
+mcp_source_overrides?: { [key in string]: McpSourcePolicy | null }, mcp_source_policy?: McpSourcePolicy, name?: string | undefined, colour?: string | undefined, default_for_new_hosts?: boolean | undefined, };
 
 /**
  * `PUT /api/hats/{id}/logo` (kernel spec §5.1, §8; plan 4d-B2): a PNG, at
@@ -1911,7 +1942,7 @@ export type McpAgentDelivery = "isolated" | "default_hat_only";
  * What a session's latest start or resume was given (plan 8e decision
  * E10).
  */
-export type McpSessionDeliveryMode = "isolated" | "unisolated" | "fallback" | "unsupported";
+export type McpSessionDeliveryMode = "managed_plus_native" | "isolated" | "unisolated" | "fallback" | "unsupported";
 
 /**
  * On `SessionDetail` (plan 8e decision E10): never a server, a header or a
