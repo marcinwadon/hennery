@@ -67,6 +67,26 @@ sh packaging/check-linkage.sh target/dist/hennery
 
 ## Pin bumps
 
+`adapters/pins.toml` pins the adapters and their CLI/SDK dependencies separately.
+Each adapter's `overrides` table becomes npm's exact-version `overrides`; the
+generator rejects missing or differently resolved runtime packages, including
+nested copies. This permits a CLI/SDK update when its adapter has not released,
+even outside the adapter's dependency range. Compatibility still requires the
+live checks below; a version override is not evidence of compatibility.
+
+The hourly `pins-watch` checks both adapters, Claude Agent SDK, Codex CLI and
+stable Node releases within the pinned major. It proposes one PR for the entire
+set, with a fresh `npm_before` cutoff on every proposal, including CLI-only
+changes. Its branch identifies the proposed versions, so unchanged upstream
+versions do not open a new PR each hour. It never downgrades pins or selects
+prereleases. `nix develop .#release -c python3 packaging/pins_watch.py discover`
+prints a read-only proposal without creating branches or contacting GitHub.
+Pins CI also qualifies the actual Claude adapter/CLI MCP source isolation and
+collision contract on Linux x64 with a synthetic local model provider and the
+pinned Node version. This needs no account credentials.
+The workflow updates the candidate Codex version automatically; its source and
+deletion contract must still be reviewed before merging.
+
 For security fixes confined to compatible transitive dependencies, update only
 the affected names in the committed adapter lockfile with `npm update --package-lock-only
 --ignore-scripts --no-audit --no-fund <names>`, then run `hennery-pins generate`.
@@ -81,6 +101,8 @@ then the pin-bump job (`.github/workflows/pins.yml`). These checks are
 live, with logged-in agents, and the operator's to run before it merges:
 
 - the live e2e gate (umbrella spec §14) on every platform;
+- all four parent/child delegation matrix rows and the required lifecycle
+  scenarios (D4), after the no-inference schema discovery probe;
 - **Codex's `thread/delete` still removes everything** (plan 9d
   decision 14). After a turn in a scratch `CODEX_HOME`, delete the session
   from hennery and check that nothing of the thread is left: its rollout
@@ -101,6 +123,21 @@ live, with logged-in agents, and the operator's to run before it merges:
     prefixes);
   - the `codexHome` field of `initialize`'s answer, canonical;
   - `--version`'s `codex-cli X.Y.Z` line.
+
+The opt-in `pinned_codex_delete_removes_rollouts_and_private_database_rows`
+test in `hennery-testkit/tests/forget_codex.rs` automates the deletion check on
+the current platform. Set `HENNERY_PIN_CODEX` to the installed set's native
+Codex binary and `HENNERY_D4_CODEX_AUTH` to a source credential file, then run:
+
+```sh
+nix develop -c cargo test -p hennery-testkit --test forget_codex --locked \
+  pinned_codex_delete_removes_rollouts_and_private_database_rows -- \
+  --ignored --exact --nocapture
+```
+
+It copies credentials into a disposable home, makes one real provider turn,
+calls the host's forget implementation and checks rollouts, state/history
+databases and the session index. It never hands the source home to Codex.
 
 ## Crates.io and cargo-binstall (R3)
 

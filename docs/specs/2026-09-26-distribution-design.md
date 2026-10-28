@@ -126,6 +126,14 @@ CI and read by both the host and the Nix flake:
   using the registry's `os`, `cpu` **and `libc`** fields (npm lockfiles drop
   `libc`; a naive installer would download both glibc and musl variants of the
   Claude CLI, ~230 MB extra).
+- Adapter releases and their underlying CLI/SDK are pinned independently in
+  `adapters/pins.toml`. Exact npm overrides permit runtime-only updates, including
+  candidates outside an adapter's declared dependency range; the generator
+  checks the resolved versions, including nested copies. The hourly watcher
+  monitors both layers and stable Node releases within the pinned major,
+  advances the npm resolution cutoff and proposes one PR for the complete set.
+  These are compatibility candidates until the live gates pass; the Codex
+  app-server contract must be re-read before merging a new CLI version.
 - **Pin-bump CI job** (on a manifest change only):
   1. resolve an exact-version lockfile for each adapter;
   2. `npm audit signatures` (registry signatures; provenance where published);

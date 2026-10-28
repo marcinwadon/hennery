@@ -482,7 +482,7 @@ mod tests {
     fn the_embedded_manifest_pins_codexs_delete_for_its_bundled_version() {
         let manifest = Manifest::embedded();
         let pin = manifest.codex_app_server.as_ref().expect("pinned");
-        assert_eq!(pin.codex_version, "0.160.1");
+        assert!(!pin.codex_version.is_empty());
         assert_eq!(pin.bin, "node_modules/@openai/codex/bin/codex.js");
         assert_eq!(pin.delete_method, "thread/delete");
         assert_eq!(
@@ -496,11 +496,9 @@ mod tests {
         // The bundled launcher is a file of the pinned `@openai/codex`.
         for platform in Platform::ALL {
             let files = &manifest.adapters["codex"].platforms[platform.key()];
-            assert!(
-                files
-                    .iter()
-                    .any(|f| pin.bin.starts_with(&format!("{}/", f.path)) && f.path == "node_modules/@openai/codex")
-            );
+            assert!(files.iter().any(|f| pin.bin.starts_with(&format!("{}/", f.path))
+                && f.path == "node_modules/@openai/codex"
+                && f.url.ends_with(&format!("/codex-{}.tgz", pin.codex_version))));
         }
     }
 

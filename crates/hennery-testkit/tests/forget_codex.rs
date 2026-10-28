@@ -1,6 +1,6 @@
 //! The Codex path of a forget on the host (plan 9d decisions 9, 10, 12;
 //! B4–B6), run directly against roots of the test's own. The fake
-//! app-server (`hennery-fake-codex`) stands in for Codex 0.160.1's CLI and
+//! app-server (`hennery-fake-codex`) stands in for the pinned Codex CLI and
 //! the fake adapter for codex-acp: the contract test checks the exact frames
 //! the host sends, and every answer maps to its outcome. These run on Linux
 //! CI as on macOS (R4).
@@ -52,6 +52,185 @@ const NEIGHBOURS: [&str; 12] = [
     "session_index.jsonl",
 ];
 
+/// Pin-bump acceptance uses only copied auth and disposable agent data. A
+/// successful host result alone cannot prove Codex removed its private DB rows.
+#[tokio::test]
+#[ignore = "requires HENNERY_PIN_CODEX and HENNERY_D4_CODEX_AUTH; performs one inference"]
+async fn pinned_codex_delete_removes_rollouts_and_private_database_rows() -> anyhow::Result<()> {
+    use anyhow::{Context, ensure};
+    use serde_json::{Value, json};
+    use std::os::unix::fs::PermissionsExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let root = Root::new();
+    let binary = std::env::var("HENNERY_PIN_CODEX").context("supply the pinned native Codex binary")?;
+    hennery_testkit::first_exec(&binary);
+    let pin = Manifest::embedded().codex_app_server.context("Codex app-server pin")?;
+    let output = std::process::Command::new(&binary).arg("--version").output()?;
+    ensure!(
+        output.status.success()
+            && String::from_utf8(output.stdout)?.trim() == format!("codex-cli {}", pin.codex_version),
+        "native Codex version differs from the embedded pin"
+    );
+    std::fs::set_permissions(root.root(), std::fs::Permissions::from_mode(0o700))?;
+    let auth = std::env::var("HENNERY_D4_CODEX_AUTH").context("supply a source credential file")?;
+    std::fs::copy(auth, root.at("auth.json"))?;
+    std::fs::set_permissions(root.at("auth.json"), std::fs::Permissions::from_mode(0o600))?;
+    let mut process = tokio::process::Command::new(&binary)
+        .arg("app-server")
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", root.base.join("home"))
+        .env("CODEX_HOME", root.root())
+        .env("CODEX_SQLITE_HOME", root.base.join("sqlite"))
+        .current_dir(root.outside())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()?;
+    let mut input = process.stdin.take().context("Codex stdin")?;
+    let mut lines = BufReader::new(process.stdout.take().context("Codex stdout")?).lines();
+    let thread_id = tokio::time::timeout(Duration::from_secs(240), async {
+        let mut thread_id = None;
+        for (id, method, params) in [
+            (1, "initialize", serde_json::to_value(&pin.initialize)?),
+            (2, "thread/start", json!({"cwd":root.outside(),"model":"gpt-6-sol","approvalPolicy":"never","sandbox":"read-only"})),
+            (3, "turn/start", Value::Null),
+        ] {
+            let params = if id == 3 {
+                json!({"threadId":thread_id,"effort":"low","input":[{"type":"text","text":"Reply exactly PIN_DELETE_OK. Do not use tools."}]})
+            } else { params };
+            input.write_all(format!("{}\n", json!({"id":id,"method":method,"params":params})).as_bytes()).await?;
+            loop {
+                let line = lines.next_line().await?.context("Codex closed before its response")?;
+                let value: Value = serde_json::from_str(&line)?;
+                if value["id"] != id { continue; }
+                ensure!(value.get("error").is_none(), "Codex refused {method}");
+                if id == 1 {
+                    ensure!(value["result"]["codexHome"] == root.root().to_str().unwrap(), "initialize reported another home");
+                    input.write_all(b"{\"method\":\"initialized\",\"params\":{}}\n").await?;
+                }
+                if id == 2 {
+                    thread_id = Some(value["result"]["thread"]["id"].as_str().context("thread id")?.to_string());
+                }
+                break;
+            }
+        }
+        loop {
+            let line = lines.next_line().await?.context("Codex closed during its turn")?;
+            let value: Value = serde_json::from_str(&line)?;
+            if value["method"] == "turn/completed" {
+                ensure!(value["params"]["turn"]["status"] == "completed", "provider turn did not complete");
+                break;
+            }
+        }
+        input.write_all(format!("{}\n", json!({"id":4,"method":"thread/name/set","params":{"threadId":thread_id,"name":"pin deletion acceptance"}})).as_bytes()).await?;
+        loop {
+            let line = lines.next_line().await?.context("Codex closed before naming the thread")?;
+            let value: Value = serde_json::from_str(&line)?;
+            if value["id"] == 4 {
+                ensure!(value.get("error").is_none(), "Codex refused thread/name/set");
+                break;
+            }
+        }
+        thread_id.context("thread id")
+    }).await??;
+    process.kill().await?;
+    process.wait().await?;
+
+    fn rollouts(directory: &Path, id: &str) -> std::io::Result<usize> {
+        if !directory.exists() {
+            return Ok(0);
+        }
+        let mut count = 0;
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() {
+                count += rollouts(&entry.path(), id)?;
+            } else if entry.file_name().to_string_lossy().contains(id) {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+    let state_path = root.base.join("sqlite/state_5.sqlite");
+    let history_path = root.base.join("sqlite/thread_history_1.sqlite");
+    let state = rusqlite::Connection::open_with_flags(&state_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    ensure!(
+        state.query_row("SELECT COUNT(*) FROM threads WHERE id=?1", [&thread_id], |r| r
+            .get::<_, i64>(0))?
+            > 0,
+        "acceptance must create real state rows before deletion"
+    );
+    drop(state);
+    let history = rusqlite::Connection::open_with_flags(&history_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    for table in ["thread_items", "thread_turns"] {
+        ensure!(
+            history.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE thread_id=?1"),
+                [&thread_id],
+                |r| r.get::<_, i64>(0)
+            )? > 0,
+            "acceptance must create real history rows in {table}"
+        );
+    }
+    drop(history);
+    ensure!(
+        std::fs::read_to_string(root.at("session_index.jsonl"))?.contains(&thread_id),
+        "acceptance must create an index entry"
+    );
+    ensure!(
+        rollouts(&root.at("sessions"), &thread_id)? > 0,
+        "acceptance must create a real rollout"
+    );
+    let mut ctx = root.ctx(root.fake(FakeDelete::Delete));
+    ctx.codex_app_server = Some(AgentCommand::parse(&binary).context("parse pinned Codex command")?);
+    let mut request = root.forget_at(&root.root(), Some(&root.base.join("sqlite")));
+    request.agent_session_id = thread_id.clone();
+    let forgotten = forget(&ctx, &request).await;
+    ensure!(
+        forgotten.remaining.is_empty(),
+        "host reported incomplete deletion: {forgotten:?}"
+    );
+    ensure!(
+        root.archived().is_none(),
+        "live deletion must not fall back to fake archival"
+    );
+    for name in ["sessions", "archived_sessions"] {
+        ensure!(rollouts(&root.at(name), &thread_id)? == 0, "rollouts remain in {name}");
+    }
+    let state = rusqlite::Connection::open_with_flags(state_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    ensure!(
+        state.query_row("SELECT COUNT(*) FROM threads WHERE id=?1", [&thread_id], |r| r
+            .get::<_, i64>(0))?
+            == 0,
+        "state rows remain"
+    );
+    let history = rusqlite::Connection::open_with_flags(history_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    for table in ["thread_items", "thread_turns", "thread_realtime_items"] {
+        ensure!(
+            history.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE thread_id=?1"),
+                [&thread_id],
+                |r| r.get::<_, i64>(0)
+            )? == 0,
+            "history rows remain in {table}"
+        );
+    }
+    let index = match std::fs::read_to_string(root.at("session_index.jsonl")) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(!index.contains(&thread_id), "session index retains thread");
+    println!(
+        "Pinned Codex {}: host deletion removed rollouts, state, history and index entries",
+        pin.codex_version
+    );
+    Ok(())
+}
+
 /// The umask these tests assume (B3), as `forget_claude.rs` sets it.
 fn usual_umask() {
     // SAFETY: umask(2) cannot fail.
@@ -94,10 +273,10 @@ impl Root {
         self.base.join("archive.log")
     }
 
-    /// The fake app-server answering as `delete` says, version 0.160.1.
+    /// The fake app-server answering as `delete` says, at the embedded pin.
     fn fake(&self, delete: FakeDelete) -> FakeCodex {
         FakeCodex {
-            version: "0.160.1".into(),
+            version: Manifest::embedded().codex_app_server.unwrap().codex_version,
             log: self.codex_log().to_str().unwrap().into(),
             delete,
             ..FakeCodex::default()

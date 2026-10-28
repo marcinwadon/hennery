@@ -1,6 +1,6 @@
 //! Opt-in D4 provider acceptance. Normal tests never use credentials or infer.
 //!
-//! Supply HENNERY_D4_PINNED_ADAPTER_ROOT (the existing node_modules),
+//! Supply HENNERY_D4_PINNED_ADAPTER_ROOT (a managed set or node_modules),
 //! HENNERY_D4_CLAUDE_AUTH and HENNERY_D4_CODEX_AUTH (explicit source files),
 //! HENNERY_D4_PARENT and HENNERY_D4_CHILD (claude/codex). Source credentials
 //! are copied with mode 0600 into disposable homes; source homes are never
@@ -204,6 +204,14 @@ fn command(root: &Path, runtime: &str, native_probe: bool) -> Result<(AgentComma
     std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700))?;
     let adapters =
         PathBuf::from(std::env::var("HENNERY_D4_PINNED_ADAPTER_ROOT").context("supply pinned node_modules")?);
+    let managed_modules = adapters.join(runtime).join("node_modules");
+    let adapters = if managed_modules.is_dir() {
+        managed_modules
+    } else {
+        adapters
+    };
+    let manifest = hennery_host::runtime::manifest::Manifest::embedded();
+    let adapter_pin = manifest.adapters.get(runtime).context("runtime is not pinned")?;
     let node = std::env::split_paths(&std::env::var_os("PATH").context("PATH missing")?)
         .map(|directory| directory.join("node"))
         .find(|file| file.is_file())
@@ -242,22 +250,35 @@ fn command(root: &Path, runtime: &str, native_probe: bool) -> Result<(AgentComma
     ] {
         env.push((variable.into(), String::new()));
     }
-    let (package, version, profile) = if runtime == "claude" {
+    let profile = if runtime == "claude" {
         stage_auth("HENNERY_D4_CLAUDE_AUTH", &home.join("claude/.credentials.json"))?;
         std::fs::write(home.join("claude.json"), br#"{"hasCompletedOnboarding":true}"#)?;
-        ("claude-agent-acp", "0.93.0", Profile::Claude)
+        Profile::Claude
     } else {
         stage_auth("HENNERY_D4_CODEX_AUTH", &home.join("codex/auth.json"))?;
-        let arch = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
-            "darwin-arm64/node_modules/@openai/codex/vendor/aarch64-apple-darwin"
+        let (platform, arch) = if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+            ("darwin-arm64", "aarch64-apple-darwin")
         } else if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-            "linux-x64/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl"
+            ("linux-x64", "x86_64-unknown-linux-musl")
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            ("linux-arm64", "aarch64-unknown-linux-musl")
         } else {
             bail!("supply the supported pinned native Codex platform")
         };
-        let binary = adapters.join(format!(".pnpm/@openai+codex@0.155.1-{arch}/bin/codex"));
-        ensure!(binary.is_file(), "pinned native Codex 0.155.1 is missing");
+        let binary = adapters.join(format!("@openai/codex-{platform}/vendor/{arch}/bin/codex"));
+        ensure!(binary.is_file(), "pinned native Codex is missing");
         hennery_testkit::first_exec(binary.to_str().context("Codex path encoding")?);
+        let output = std::process::Command::new(&binary).arg("--version").output()?;
+        let expected_version = &manifest
+            .codex_app_server
+            .as_ref()
+            .context("Codex app-server pin missing")?
+            .codex_version;
+        ensure!(
+            output.status.success()
+                && String::from_utf8(output.stdout)?.trim() == format!("codex-cli {expected_version}"),
+            "native Codex version differs from the manifest"
+        );
         let program = if native_probe {
             let script = root.join("native-mcp-probe.mjs");
             std::fs::write(&script, include_str!("support/codex_mcp_probe.mjs"))?;
@@ -279,12 +300,12 @@ fn command(root: &Path, runtime: &str, native_probe: bool) -> Result<(AgentComma
             binary
         };
         env.push(("CODEX_PATH".into(), program.display().to_string()));
-        ("codex-acp", "1.13.0", Profile::Codex)
+        Profile::Codex
     };
-    let entry = adapters.join(format!("@agentclientprotocol/{package}"));
+    let entry = adapters.join(&adapter_pin.package);
     let metadata: Value = serde_json::from_slice(&std::fs::read(entry.join("package.json"))?)?;
     ensure!(
-        metadata["version"] == version,
+        metadata["version"] == adapter_pin.version,
         "adapter version differs from accepted pin"
     );
     Ok((
@@ -392,7 +413,7 @@ async fn live_claude_haiku_plan_configuration_survives_late_updates() -> Result<
             }
         }
         ensure!(count > 0, "no configuration evidence");
-        println!("Claude 0.93.0: haiku + plan confirmed across {count} configuration updates");
+        println!("Pinned Claude: haiku + plan confirmed across {count} configuration updates");
         Ok::<(), anyhow::Error>(())
     })
     .await;
@@ -1582,6 +1603,36 @@ async fn pinned_runtime_provider_authentication() -> Result<()> {
         Ok(())
     }
     .await;
+    let cleanup = h.finish().await;
+    result.and(cleanup)
+}
+
+#[tokio::test]
+#[ignore = "requires explicit pinned adapter and copied credentials; performs one inference"]
+async fn pinned_runtime_shell_executes_after_operator_approval() -> Result<()> {
+    let runtime = runtime("HENNERY_D4_PARENT")?;
+    let h = Harness::new(&runtime, None).await?;
+    let result = async {
+        let path = h.dir.path().canonicalize()?.join("shell-acceptance.txt");
+        let command = format!("printf HENNERY_SHELL_OK > '{}'", path.display());
+        let (tool, arguments) = if runtime == "claude" {
+            ("Bash", json!({"command":command}))
+        } else {
+            ("exec_command", json!({"cmd":command,"sandbox_permissions":"require_escalated","justification":"Pin-bump scratch shell acceptance"}))
+        };
+        let after = h.state.store.max_event_id()?;
+        let turn = h.prompt(&h.parent, &format!("Call {tool} exactly once with these arguments: {arguments}. Request real operator approval; the operator will accept. After the tool succeeds reply HENNERY_SHELL_OK. Do not use another tool or simulate execution.")).await?;
+        let permission = h.question_for_turn(&h.parent, &turn, after, hennery_proto::frames::PendingKind::Permission, "real shell permission").await?;
+        h.answer_permission(&h.parent, &permission, true).await?;
+        let outcome = h.wait("approved shell turn", || h.state.store.ended_turn_outcome(&turn).ok().flatten()).await?;
+        ensure!(outcome == hennery_proto::frames::TurnOutcome::Completed, "shell turn failed");
+        ensure!(std::fs::read_to_string(path)? == "HENNERY_SHELL_OK", "native tool did not write the scratch file");
+        println!("{}", json!({"case":"approved_native_shell","runtime":runtime,"file_created":true,"operator_approval_delivered":true}));
+        Ok(())
+    }.await;
+    if result.is_err() {
+        h.diagnostics("approved shell failed")?;
+    }
     let cleanup = h.finish().await;
     result.and(cleanup)
 }

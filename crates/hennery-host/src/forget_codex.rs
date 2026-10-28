@@ -145,9 +145,9 @@ const NOT_UNDERSTOOD: [&str; 3] = [
     "Invalid request: invalid type",
 ];
 
-/// `thread/delete`'s answer, as Codex 0.160.1 gives it (its
-/// `thread_delete.rs`, `delete_thread.rs`, `thread_manager.rs` and
-/// `message_processor.rs` at `rust-v0.160.1`). The text only picks the
+/// `thread/delete`'s answer, rechecked against Codex 0.165.0
+/// (`thread_delete.rs`, `local/delete_thread.rs` and `thread_manager.rs`
+/// at `rust-v0.165.0`). The text only picks the
 /// reason: what is left is decided by the check afterwards (B4).
 fn classify_delete(answer: &Answer) -> Verdict {
     let (code, message) = match answer {
