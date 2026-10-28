@@ -29,9 +29,17 @@ export function useMcpDelivery(id: string, lifecycle: string | undefined, resync
       busy = true
       while (live) {
         const generation = wanted
+        const hatAtRead = previous.current?.id === id ? previous.current.hatId : undefined
         try {
           const detail = await sessionDetail(client, id)
-          if (live && generation === wanted) setState({ id, detail, error: null })
+          if (live && generation === wanted) {
+            const knownHat = previous.current?.id === id ? previous.current.hatId : undefined
+            // Learning the first summary does not invalidate a pending read.
+            // If that read actually predates reassignment, its returned hat
+            // proves the mismatch: discard it and queue one correlated read.
+            if (hatAtRead === undefined && knownHat !== undefined && detail.hat_id !== undefined && detail.hat_id !== knownHat) wanted++
+            else setState({ id, detail, error: null })
+          }
         } catch (err) {
           if (live && generation === wanted) setState({ id, detail: null, error: messageOf(err) })
         }
@@ -52,7 +60,7 @@ export function useMcpDelivery(id: string, lifecycle: string | undefined, resync
     const resumed = before.lifecycle !== undefined && !runningLifecycle(before.lifecycle) && runningLifecycle(lifecycle)
     const confirmed = before.lifecycle === 'starting' && lifecycle === 'active'
     const catalogChanged = catalogChanges !== before.catalogChanges
-    const hatChanged = hatId !== undefined && hatId !== previousHat
+    const hatChanged = previousHat !== undefined && hatId !== undefined && hatId !== previousHat
     if (resync !== before.resync || resumed || confirmed || catalogChanged || hatChanged) refresh()
   }, [id, lifecycle, resync, catalogChanges, hatId, state.detail?.hat_id, refresh])
 

@@ -99,6 +99,47 @@ describe('bounded session delivery reads', () => {
     expect(t.calls).toHaveLength(3)
   })
 
+  it('learns the first summary hat during the initial GET without adding a read', async () => {
+    const releases: Array<(response: Response) => void> = []
+    const t = routed(() => new Promise<Response>(done => releases.push(done)))
+    const { result, rerender } = renderHook(({ hat }) => useMcpDelivery('s1', 'active', 0, 0, hat),
+      { wrapper: t.wrapper, initialProps: { hat: undefined as string | undefined } })
+    rerender({ hat: 'hat1' })
+    rerender({ hat: 'hat1' })
+    await act(async () => releases[0](json({ hat_id: 'hat1' })))
+    expect(t.calls).toHaveLength(1)
+    expect(result.current.detail?.hat_id).toBe('hat1')
+  })
+
+  it('fences a reassignment after the first summary but before the initial GET returns', async () => {
+    const releases: Array<(response: Response) => void> = []
+    const t = routed(() => new Promise<Response>(done => releases.push(done)))
+    const { result, rerender } = renderHook(({ hat }) => useMcpDelivery('s1', 'active', 0, 0, hat),
+      { wrapper: t.wrapper, initialProps: { hat: undefined as string | undefined } })
+    rerender({ hat: 'hat1' })
+    rerender({ hat: 'hat2' })
+    await act(async () => releases[0](json({ hat_id: 'hat1' })))
+    expect(result.current.detail).toBeNull()
+    expect(t.calls).toHaveLength(2)
+    await act(async () => releases[1](json({ hat_id: 'hat2' })))
+    expect(result.current.detail?.hat_id).toBe('hat2')
+    expect(t.calls).toHaveLength(2)
+  })
+
+  it('rechecks an initial GET from an unknown hat only when its response contradicts the first summary', async () => {
+    const releases: Array<(response: Response) => void> = []
+    const t = routed(() => new Promise<Response>(done => releases.push(done)))
+    const { result, rerender } = renderHook(({ hat }) => useMcpDelivery('s1', 'active', 0, 0, hat),
+      { wrapper: t.wrapper, initialProps: { hat: undefined as string | undefined } })
+    rerender({ hat: 'hat2' })
+    await act(async () => releases[0](json({ hat_id: 'hat1' })))
+    expect(result.current.detail).toBeNull()
+    expect(t.calls).toHaveLength(2)
+    await act(async () => releases[1](json({ hat_id: 'hat2' })))
+    expect(result.current.detail?.hat_id).toBe('hat2')
+    expect(t.calls).toHaveLength(2)
+  })
+
   it('never shows the previous session and does not continue an unmounted queue', async () => {
     const releases: Array<(response: Response) => void> = []
     const t = routed(() => new Promise<Response>((done) => releases.push(done)))
