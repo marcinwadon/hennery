@@ -25,6 +25,7 @@ let
       ../crates/hennery-sessions/src/runtime_catalog.sql
       ../crates/hennery-sessions/src/prompt_queue.sql
       ../crates/hennery-sessions/src/review.sql
+      ../crates/hennery-sessions/src/review_child_backfill.sql
       ../crates/hennery-sessions/tests/fixtures/undo_family.sql
       ../crates/hennery-sessions/tests/fixtures/session_tool_contract.json
       ../crates/hennery-memory/src/schema.sql

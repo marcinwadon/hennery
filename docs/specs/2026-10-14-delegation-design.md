@@ -745,17 +745,30 @@ Q1's default. A disconnected/busy parent gets a **five-minute handling grace**
 from the notice's creation, persisted across restarts. An unresolved question
 falls back even if its notification was delivered but its parent never answered.
 This is an attention deadline, not a pending-request timeout: the question
-stays open indefinitely. A report delivered to the parent needs no answer;
-only undelivered reports use this deadline.
+stays open indefinitely. A report delivered to the parent needs no answer.
+**Operator amendment, 2026-10-28:** an unreserved report of a successfully
+completed child turn also needs no operator answer: it stays queued while its
+parent is busy or offline, without a handling deadline escalation. Reconcile
+older `handling_deadline` fallbacks for these reports back to the queue,
+clearing their attention and invalidating the family summaries. This repair
+requires current routing eligibility, no reserved target turn and an applied
+`completed` source event; it must not replay uncertain delivery, clear an
+explicit delivery/configuration/budget refusal or suppress a failed turn.
+Other undelivered notices and unanswered questions retain the deadline.
 
 Fallback commits an operator attention record before asking the existing push
 service to notify. The kernel push queue is bounded and in memory today; do not
-claim guaranteed push delivery. Reconcile durable attention on startup and
-re-enqueue with a stable tag, subject to hat policy and current question state.
-The dashboard is the durable source even with push muted, no subscription or
-an exhausted delivery retry. Recovered parents do not automatically inject
-items already escalated; an explicit operator prompt can re-arm unresolved
-items. An operator answer always obsoletes a queued question delivery.
+claim guaranteed push delivery. **Operator amendment, 2026-10-28:** try push
+only once per open attention episode, including across collector restarts.
+The previous five-minute retry sent the same alert indefinitely and could
+produce over 100 notifications for a few unresolved child sessions. A new
+operator rearm, cancelled answer or reassignment may create a new episode;
+the existing stable tag and current-state guard still apply. A dropped queue,
+muted hat or failed push may leave no device notification. The dashboard is
+the durable source in those cases and remains visible until resolution.
+Recovered parents do not automatically inject items already escalated; an
+explicit operator prompt can re-arm unresolved items. An operator answer
+always obsoletes a queued question delivery.
 
 ## 6. Storage, migrations and provenance
 

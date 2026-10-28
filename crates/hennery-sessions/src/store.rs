@@ -460,6 +460,9 @@ END;",
      CREATE INDEX sessions_sidebar_pinned ON sessions(owner_id, sidebar_pinned) WHERE lifecycle <> 'deleted';",
     "ALTER TABLE sessions ADD COLUMN mcp_source_requested TEXT;
      ALTER TABLE sessions ADD COLUMN mcp_source_applied TEXT;",
+    // Child results (35): allow the operator to read existing child results
+    // without creating attention or forgetting a prior transcript read.
+    include_str!("review_child_backfill.sql"),
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records

@@ -30,7 +30,7 @@ export default function NeedsYouQueue({ embedded = false }: { embedded?: boolean
   const total = list.counts.waiting
   const complete = !list.loading && !list.hasMore && !list.error
   return <section className={'needs-queue' + (embedded ? ' queue-embedded' : '')} aria-label="Attention queue" onKeyDown={moveListFocus}>
-    {embedded && <h2 className="queue-title">Needs you <span>Questions and permissions waiting for your response</span></h2>}
+    {embedded && <h2 className="queue-title">Needs you <span>Requests and alerts that need your attention</span></h2>}
     <div className="queue-heading"><span>{list.loading ? 'Checking attention…' : complete ? `${total} ${total === 1 ? 'session needs' : 'sessions need'} you` : `${total} sessions needing you shown`}</span><span>Most recent first</span></div>
     {list.error && <p role="alert" className="form-error"><bdi>{list.error}</bdi></p>}
     {list.stream === 'reconnecting' && <p role="status">Reconnecting…</p>}

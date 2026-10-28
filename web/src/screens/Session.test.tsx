@@ -61,6 +61,7 @@ function server(opts: {
       streams.push(live)
       return live.response
     }
+    if (url.pathname === PAGE + '/read') return new Response(null, { status: 204 })
     if (url.pathname === DETAIL) return opts.detail?.() ?? json(detail('claude'))
     if (url.pathname === DETAIL + '/resume') return opts.resume?.() ?? json({ session_id: ID, lifecycle: 'active' }, 202)
     if (url.pathname === `${DETAIL}/catalog`) return json({ session_id: ID, config_options: [], commands: [] })
@@ -196,6 +197,22 @@ describe('SessionView', () => {
     expect(screen.getByRole('region', { name: 'MCP sources' }))
       .toHaveTextContent('Last confirmed attach: Only MCP configured in Hennery')
     expect(screen.getByRole('region', { name: 'MCP sources' })).toHaveTextContent('next start or resume')
+  })
+
+  it('lets the operator mark a completed child result read without sending a prompt or acknowledging attention', async () => {
+    const s = server({ pages: [() => json(page([message('child-result', 'child-turn', 'Child work completed')]))] })
+    const summary: SessionSummary = { ...detail('codex'), question_waits: false, operator_attention: 0, parent_handled_questions: 0,
+      review: { event_id: 10, turn_id: 'child-turn', outcome: 'completed' },
+      family: { revision: 1, parent: { session_id: 'parent1', title: 'Parent', agent: 'claude' }, children: [],
+        child_counts: { total: 0, active: 0, waiting: 0 }, attention: 0 } }
+    render(<SessionView id={ID} summary={summary} timing={FAST} />, { wrapper: s.wrapper })
+    const action = await screen.findByRole('button', { name: 'Mark as read' })
+    fireEvent.click(action)
+    await screen.findByRole('button', { name: 'Read' })
+    const posts = s.calls.filter(call => call.method === 'POST')
+    expect(posts.map(call => call.path)).toEqual([PAGE + '/read'])
+    const request = s.fetch.mock.calls.find(([, options]) => options?.method === 'POST')
+    expect(JSON.parse(String(request?.[1]?.body))).toEqual({ event_id: 10 })
   })
 
   it('opens at the end of the transcript', async () => {
