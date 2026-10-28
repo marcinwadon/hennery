@@ -220,7 +220,8 @@ fn upgrade_preserves_explicit_unread_results_without_backfilling_old_activity() 
     rusqlite::Connection::open(&path)
         .unwrap()
         .execute_batch(
-            "DROP INDEX sessions_sidebar_pinned; ALTER TABLE sessions DROP COLUMN sidebar_pinned;
+            "ALTER TABLE sessions DROP COLUMN mcp_source_requested; ALTER TABLE sessions DROP COLUMN mcp_source_applied;
+             DROP INDEX sessions_sidebar_pinned; ALTER TABLE sessions DROP COLUMN sidebar_pinned;
          ALTER TABLE sessions DROP COLUMN unseen_event_id;
          ALTER TABLE sessions DROP COLUMN seen_event_id; PRAGMA user_version=31;",
         )
