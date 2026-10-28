@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## 0.3.8
+
+- Update managed Claude Code to 2.1.312 (ACP 0.99.0, Agent SDK 0.3.312),
+  Codex to 0.165.0 (ACP 2.3.0) and Node to 24.22.2.
+- Detect new CLI and SDK releases independently of ACP adapter releases,
+  refresh the dependency cutoff, and check MCP source behavior in pin CI.
+- Keep successful child results queued for a busy or offline parent instead
+  of escalating them into a response-deadline alert.
+- Attempt push once per attention episode, including across collector
+  restarts, to prevent repeated notifications for the same unresolved item.
+- Enable transcript result review for delegated children and restore existing
+  results while preserving earlier reads.
+
 ## 0.3.7
 
 - Give the prompt field the full composer width and move model, mode and other
