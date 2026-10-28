@@ -89,7 +89,10 @@ Managed delivery and native-source permission are separate. Combined is never
 reported as isolated or implemented by widening the legacy `isolation_waived`
 path. Scope and token revocation remain unchanged. The UI distinguishes the
 current hat setting, the last requested snapshot and its actual acknowledgement,
-including a setting waiting for the next attach.
+including a setting waiting for the next attach. Source revisions are compared
+only within the same hat; reassignment refreshes the detail and shows the new
+hat's setting even if its revision is lower or equal. The last confirmed attach
+remains historical until a fresh attach is acknowledged.
 
 ## Acceptance
 

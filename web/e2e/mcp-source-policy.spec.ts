@@ -117,6 +117,29 @@ for (const width of [1280, 390]) test(`MCP source setting and confirmed attach s
     const records = readFileSync(receipt, 'utf8').trim().split('\n').map(line => JSON.parse(line))
     expect(records.some(row => row.method === 'session/load' && row.params._meta?.claudeCode.options.strictMcpConfig === false)).toBe(true)
     expect(hatId).not.toBe(restricted.id)
+
+    // Revisions are local to each hat: exercise both a lower and an equal
+    // destination revision without navigating away from the selected session.
+    if (width === 390) {
+      for (const policy of ['managed_plus_native', 'managed_only']) {
+        expect((await page.request.patch(`/api/hats/${restricted.id}`, { headers, data: { mcp_source_policy: policy } })).status()).toBe(200)
+      }
+    }
+    const destination = (await (await page.request.get('/api/hats')).json()).find((hat: { id: string }) => hat.id === restricted.id)
+    expect(width === 390 ? destination.mcp_policy_revision === detail.mcp_source_policy.revision
+      : destination.mcp_policy_revision < detail.mcp_source_policy.revision).toBe(true)
+    await page.goto(`/sessions/${id}`)
+    const reassigned = await report(page, width)
+    await expect(reassigned).toContainText('Hat setting: Hennery and runtime-native MCP')
+    expect((await page.request.post(`/api/sessions/${id}/park`, { headers })).status()).toBe(202)
+    await expect(async () => {
+      expect((await (await page.request.get(`/api/sessions/${id}`)).json()).lifecycle).toBe('parked')
+    }).toPass()
+    const changed = await page.request.patch(`/api/sessions/${id}`, { headers, data: { hat_id: restricted.id } })
+    expect(changed.status()).toBe(200)
+    await expect(reassigned).toContainText('Hat setting: Only MCP configured in Hennery')
+    await expect(reassigned).toContainText('Last confirmed attach: Hennery and runtime-native MCP')
+    await expect(reassigned).toContainText('next start or resume')
   } finally {
     await Promise.allSettled([end(runner), host.stop(), collector.stop(), context.close()])
     rmSync(scratch, { recursive: true, force: true })

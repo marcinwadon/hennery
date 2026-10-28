@@ -74,6 +74,31 @@ describe('bounded session delivery reads', () => {
     expect(t.calls).toHaveLength(2)
   })
 
+  it('refreshes on hat reassignment, retaining confirmed history and discarding an old-hat in-flight GET', async () => {
+    const releases: Array<(response: Response) => void> = []
+    const source = { policy: 'managed_plus_native', revision: 9, request_id: 'confirmed' }
+    const answer = (hat: string, revision: number) => json({ hat_id: hat, mcp_source_policy: {
+      policy: hat === 'hat1' ? 'managed_plus_native' : 'managed_only', revision, applied: source,
+    } })
+    const t = routed(() => new Promise<Response>(done => releases.push(done)))
+    const { result, rerender } = renderHook(({ hat }) => useMcpDelivery('s1', 'parked', 0, 0, hat),
+      { wrapper: t.wrapper, initialProps: { hat: 'hat1' } })
+    await act(async () => releases[0](answer('hat1', 9)))
+    await waitFor(() => expect(result.current.detail?.hat_id).toBe('hat1'))
+    act(() => result.current.refresh())
+    rerender({ hat: 'hat2' })
+    expect(result.current.detail?.mcp_source_policy?.applied).toEqual(source)
+    await act(async () => releases[1](answer('hat1', 10)))
+    await waitFor(() => expect(t.calls).toHaveLength(3))
+    expect(result.current.detail?.mcp_source_policy?.revision).toBe(9)
+    await act(async () => releases[2](answer('hat2', 1)))
+    await waitFor(() => expect(result.current.detail?.hat_id).toBe('hat2'))
+    expect(result.current.detail?.mcp_source_policy?.revision).toBe(1)
+    expect(result.current.detail?.mcp_source_policy?.applied).toEqual(source)
+    rerender({ hat: 'hat2' })
+    expect(t.calls).toHaveLength(3)
+  })
+
   it('never shows the previous session and does not continue an unmounted queue', async () => {
     const releases: Array<(response: Response) => void> = []
     const t = routed(() => new Promise<Response>((done) => releases.push(done)))

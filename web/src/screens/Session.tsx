@@ -269,10 +269,10 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
   const [answerNotice, setAnswerNotice] = useState<string | null>(null)
   const s = useSessionItems(id, timing)
   const configuration = useSessionConfig(id, s.setCatalog)
-  const mcp = useMcpDelivery(id, summary?.lifecycle, Math.max(0, s.loads - 1), s.catalogChanges)
   const [familyRead, setFamilyRead] = useState<{ id: string; page: FamilyPage } | null>(null)
   const onFamilyPage = useCallback((page: FamilyPage) => setFamilyRead({ id, page }), [id])
   const family = familyRead?.id === id && (!summary || (summary.hat_id === familyRead.page.summary.hat_id && summary.family?.revision === familyRead.page.summary.family?.revision)) ? familyRead.page : null
+  const mcp = useMcpDelivery(id, summary?.lifecycle, Math.max(0, s.loads - 1), s.catalogChanges, (summary ?? family?.summary)?.hat_id)
   const unseen = (summary ?? family?.summary)?.unseen
   const info = useHeaderInfo(id, summary ?? family?.summary, awaitSummary, mcp.detail)
   const { read: acknowledgeResult } = useReadResult(id, info?.review)
@@ -333,7 +333,10 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
   const hats = useMemo(() => scope?.hats ? new Map(scope.hats.map(h => [h.id, h.name])) : namesOf(hatItems, 'id'), [scope?.hats, hatItems])
   const actualHat = (scope?.hats ?? (Array.isArray(hatItems) ? hatItems as HatItem[] : [])).find(h => h.id === info?.hat_id)
   const reportedSource = mcp.detail?.mcp_source_policy
-  const sourcePolicy = reportedSource && actualHat && actualHat.mcp_policy_revision > reportedSource.revision
+  // Revisions are local to a hat. A detail read from the previous hat cannot
+  // override the current hat, regardless of their revision numbers. Within one
+  // hat, retain the newer source setting when a stale GET/list arrives.
+  const sourcePolicy = reportedSource && actualHat && (mcp.detail?.hat_id !== actualHat.id || actualHat.mcp_policy_revision > reportedSource.revision)
     ? { ...reportedSource, policy: actualHat.mcp_source_policy, revision: actualHat.mcp_policy_revision }
     : reportedSource
   const accent = useAccentStyle(actualHat?.colour)
