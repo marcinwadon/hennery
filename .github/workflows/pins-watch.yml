@@ -25,77 +25,29 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          sparse-checkout: adapters/pins.toml
+          sparse-checkout: |
+            adapters/pins.toml
+            adapters/claude/package-lock.json
+            adapters/codex/package-lock.json
+            packaging/pins_watch.py
           sparse-checkout-cone-mode: false
-      - name: Compare upstream releases with the pins
+      - name: Compare upstream adapter, CLI/SDK and Node releases with the pins
         id: latest
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          # Only the simple string fields in our pins.toml are needed here.
-          pin() {
-            awk -F '"' -v section="$1" -v key="$2" '
-              $0 == "[" section "]" { active=1; next }
-              /^\[/ { active=0 }
-              active && $1 ~ "^" key " *=[ ]*$" { print $2; exit }
-            ' adapters/pins.toml
-          }
-          scratch=$(mktemp -d)
-          claude_pkg=$(pin adapters.claude package)
-          codex_pkg=$(pin adapters.codex package)
-          curl -fsS --max-time 10 "https://registry.npmjs.org/$claude_pkg/latest" > "$scratch/claude.json" &
-          claude_pid=$!
-          curl -fsS --max-time 10 "https://registry.npmjs.org/$codex_pkg/latest" > "$scratch/codex.json" &
-          codex_pid=$!
-          curl -fsS --max-time 10 https://nodejs.org/dist/index.json > "$scratch/node.json" &
-          node_pid=$!
-          wait "$claude_pid"
-          wait "$codex_pid"
-          wait "$node_pid"
-          updates='[]'
-          for pkg in node claude-agent-acp codex-acp; do
-            case $pkg in
-              node)
-                section=node
-                current=$(pin "$section" version)
-                latest=$(jq -er --arg major "${current%%.*}" '
-                  [.[] | select(.version | test("^v" + $major + "\\.[0-9]+\\.[0-9]+$"))] as $releases
-                  | ($releases | map(select(.lts != false))) as $lts
-                  | (if ($lts | length) > 0 then $lts else $releases end)
-                  | sort_by(.version | ltrimstr("v") | split(".") | map(tonumber))
-                  | last.version | ltrimstr("v")' "$scratch/node.json")
-                ;;
-              claude-agent-acp) section=adapters.claude; latest=$(jq -er .version "$scratch/claude.json") ;;
-              codex-acp) section=adapters.codex; latest=$(jq -er .version "$scratch/codex.json") ;;
-            esac
-            current=$(pin "$section" version)
-            # Stable numeric versions only; never downgrade a pin.
-            if ! jq -en --arg latest "$latest" --arg current "$current" '
-              ($latest | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")) and
-              (($latest | split(".") | map(tonumber)) > ($current | split(".") | map(tonumber)))' > /dev/null; then
-              echo "$pkg: pinned $current, upstream $latest; no bump"
-              continue
+          updates=$(python3 packaging/pins_watch.py discover)
+          if [ "$updates" != '[]' ] && [ "${DRY_RUN:-0}" != 1 ]; then
+            branch=$(jq -er '.[0].branch' <<< "$updates")
+            refs=$(gh api "repos/$GH_REPO/git/matching-refs/heads/$branch")
+            prs=$(gh pr list --head "$branch" --state open --json number --jq length)
+            if jq -e --arg ref "refs/heads/$branch" 'any(.[]; .ref == $ref)' <<< "$refs" > /dev/null || [ "$prs" != 0 ]; then
+              echo "$branch already exists or has an open PR"
+              updates='[]'
             fi
-            branch="pins/$pkg-$latest"
-            echo "$pkg: would bump $current to $latest on $branch"
-            # Local verification makes no GitHub requests and writes no branches.
-            if [ "${DRY_RUN:-0}" != 1 ]; then
-              refs=$(gh api "repos/$GH_REPO/git/matching-refs/heads/$branch")
-              if jq -e --arg ref "refs/heads/$branch" 'any(.[]; .ref == $ref)' <<< "$refs" > /dev/null; then
-                echo "$branch already exists"
-                continue
-              fi
-              prs=$(gh pr list --head "$branch" --state open --json number --jq length)
-              if [ "$prs" != 0 ]; then
-                echo "$branch already has an open PR"
-                continue
-              fi
-            fi
-            updates=$(jq -c --arg pkg "$pkg" --arg section "$section" --arg version "$latest" --arg branch "$branch" \
-              '. + [{pkg: $pkg, section: $section, version: $version, branch: $branch}]' <<< "$updates")
-          done
+          fi
           echo "updates=$updates" >> "$GITHUB_OUTPUT"
 
   bump:
@@ -114,9 +66,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
-      PKG: ${{ matrix.update.pkg }}
-      SECTION: ${{ matrix.update.section }}
-      VERSION: ${{ matrix.update.version }}
+      PIN_UPDATE: ${{ toJSON(matrix.update) }}
       BRANCH: ${{ matrix.update.branch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -127,52 +77,30 @@ jobs:
         shell: bash
         run: |
           git switch -c "$BRANCH"
-          python3 - <<'PY'
-          import os, pathlib, re
-          path = pathlib.Path('adapters/pins.toml')
-          text = path.read_text()
-          section = re.escape(os.environ['SECTION'])
-          text, count = re.subn(r'(\[' + section + r'\]\n(?:(?!\[)[^\n]*\n)*?version = ")[^"]+',
-                               lambda m: m[1] + os.environ['VERSION'], text, count=1)
-          assert count == 1, 'pin section missing'
-          path.write_text(text)
-          PY
-          freeze_note='npm_before unchanged.'
-          if ! nix develop -c cargo run -p hennery-pins --locked -- lock > "$RUNNER_TEMP/lock.log" 2>&1; then
-            cat "$RUNNER_TEMP/lock.log"
-            # Retry only npm resolution failures caused by unavailable versions.
-            grep -Eq 'ETARGET|ENOVERSIONS' "$RUNNER_TEMP/lock.log"
-            now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-            sed -i "s/^npm_before = .*/npm_before = \"$now\"/" adapters/pins.toml
-            freeze_note="Advanced npm_before to $now after the frozen resolution failed."
-            nix develop -c cargo run -p hennery-pins --locked -- lock
-          fi
-          cat "$RUNNER_TEMP/lock.log"
-          # The Codex CLI follows the adapter's resolved dependency, not /latest.
-          codex=$(jq -er '.packages["node_modules/@openai/codex"].version' adapters/codex/package-lock.json)
-          sed -i "s/^codex_version = .*/codex_version = \"$codex\"/" adapters/pins.toml
+          # Always advance the cutoff, including for CLI-only releases.
+          python3 packaging/pins_watch.py apply
+          nix develop -c cargo run -p hennery-pins --locked -- lock
           nix develop -c cargo run -p hennery-pins --locked -- generate
-          printf '%s\n' "$freeze_note" > "$RUNNER_TEMP/freeze-note"
       - name: Commit and open the pin bump PR
         shell: bash
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          title="chore(pins): bump $PKG to $VERSION"
+          title='chore(pins): update the managed agent runtime set'
           git add adapters/pins.toml adapters/claude/package.json adapters/claude/package-lock.json \
             adapters/codex/package.json adapters/codex/package-lock.json crates/hennery-host/manifest.json
           git diff --cached --stat
           git -c commit.gpgsign=false commit -m "$title"
           git push origin "$BRANCH"
           {
-            printf 'Bump %s to %s and regenerate the adapter locks and manifest.\n\n' "$PKG" "$VERSION"
-            cat "$RUNNER_TEMP/freeze-note"
+            printf 'Update the managed runtime pins and regenerate the adapter locks and manifest.\n\n'
+            jq '.pins, {npm_before}' <<< "$PIN_UPDATE"
             cat <<'BODY'
 
-          The live end-to-end gate with logged-in agents is **pending**. The parent must run the `packaging/README.md` “Pin bumps” checklist before merging, including the bundled Codex source and deletion-contract checks.
+          CLI/SDK versions are pinned explicitly, so this may override the adapter's declared dependency range. These are compatibility candidates, pending live acceptance.
 
+          Before merging, run the `packaging/README.md` “Pin bumps” checklist, including all delegation matrix rows and lifecycle scenarios, and re-read the bundled Codex source and deletion contract. The generated `codex_app_server.codex_version` is a candidate version, not evidence that its contract has been verified.
           BODY
-            printf 'Generated with Claude AI — please review before distribution.\n'
           } > "$RUNNER_TEMP/pr-body"
           gh pr create --base main --head "$BRANCH" --title "$title" --body-file "$RUNNER_TEMP/pr-body"
       # GITHUB_TOKEN-created PRs need explicit workflow dispatches.

@@ -12,9 +12,11 @@ assert(process.argv[2], 'supply node_modules installed from adapters/claude/pack
 const modules = resolve(process.argv[2])
 const output = resolve(process.argv[3] ?? '.superpowers/mcp-source-acceptance')
 mkdirSync(output, { recursive: true })
+const manifest = JSON.parse(readFileSync(new URL('../crates/hennery-host/manifest.json', import.meta.url), 'utf8'))
+const lock = JSON.parse(readFileSync(new URL('../adapters/claude/package-lock.json', import.meta.url), 'utf8'))
 for (const [name, version] of [
-  ['@agentclientprotocol/claude-agent-acp', '0.93.0'],
-  ['@anthropic-ai/claude-agent-sdk', '0.3.300'],
+  [manifest.adapters.claude.package, manifest.adapters.claude.version],
+  ['@anthropic-ai/claude-agent-sdk', lock.packages['node_modules/@anthropic-ai/claude-agent-sdk'].version],
 ]) {
   assert.equal(JSON.parse(readFileSync(join(modules, name, 'package.json'), 'utf8')).version, version)
 }

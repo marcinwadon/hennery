@@ -43,6 +43,9 @@ pub struct AdapterPin {
     /// Lockfile path prefixes of the agent CLI's packages (skipped by
     /// `--use-cli`).
     pub cli: Vec<String>,
+    /// Exact transitive runtime pins, independent of the adapter's release cadence.
+    #[serde(default)]
+    pub overrides: BTreeMap<String, String>,
 }
 
 impl Pins {
@@ -64,6 +67,18 @@ impl Pins {
             if adapter.cli.is_empty() {
                 bail!("{name}: no CLI package prefix");
             }
+            for (package, version) in &adapter.overrides {
+                if package.is_empty() || package == &adapter.package {
+                    bail!("{name}: overrides must name a transitive package");
+                }
+                if version.split('.').count() != 3
+                    || version
+                        .split('.')
+                        .any(|part| part.is_empty() || !part.bytes().all(|c| c.is_ascii_digit()))
+                {
+                    bail!("{name}: override {package} must pin an exact stable version");
+                }
+            }
         }
         if let Some(app_server) = &pins.codex_app_server {
             app_server.validate()?;
@@ -74,11 +89,14 @@ impl Pins {
     /// The `package.json` `hennery-pins lock` writes for one adapter.
     pub fn package_json(&self, name: &str) -> Result<String> {
         let adapter = self.adapters.get(name).with_context(|| format!("no adapter {name}"))?;
-        let value = serde_json::json!({
+        let mut value = serde_json::json!({
             "name": format!("hennery-adapter-{name}"),
             "private": true,
             "dependencies": { adapter.package.clone(): adapter.version.clone() },
         });
+        if !adapter.overrides.is_empty() {
+            value["overrides"] = serde_json::to_value(&adapter.overrides)?;
+        }
         let mut text = serde_json::to_string_pretty(&value)?;
         text.push('\n');
         Ok(text)
@@ -316,6 +334,25 @@ fn build_adapter(pin: &AdapterPin, lock: &Lock, registry: &Registry) -> Result<A
             "the lockfile's root depends on {:?}, pins.toml on {expected:?}: run `hennery-pins lock`",
             root.dependencies
         );
+    }
+    for (package, version) in &pin.overrides {
+        let mut found = false;
+        for (path, entry) in &lock.packages {
+            // npm aliases (Codex's platform packages) have the same registry
+            // name but deliberately carry a platform-suffixed version.
+            if path
+                .rsplit_once("node_modules/")
+                .is_some_and(|(_, name)| name == package)
+            {
+                found = true;
+                if entry.version.as_deref() != Some(version) {
+                    bail!("{path}: lockfile does not match runtime override {package}@{version}");
+                }
+            }
+        }
+        if !found {
+            bail!("lockfile is missing runtime override {package}@{version}");
+        }
     }
     let package_path = format!("node_modules/{}", pin.package);
     let mut platforms: BTreeMap<String, Vec<File>> = Platform::ALL
@@ -614,6 +651,68 @@ cli = ["node_modules/@vendor/cli-"]
                 &self.registry,
                 &node,
             )
+        }
+    }
+
+    #[test]
+    fn runtime_overrides_are_exact_and_enforced_against_every_lock_entry() {
+        let text = format!("{PINS}\n[adapters.claude.overrides]\n\"@vendor/cli\" = \"2.0.0\"\n");
+        let pins = Pins::parse(&text).unwrap();
+        let package: serde_json::Value = serde_json::from_str(&pins.package_json("claude").unwrap()).unwrap();
+        assert_eq!(package["overrides"]["@vendor/cli"], "2.0.0");
+        let pin = &pins.adapters["claude"];
+        let mut fixture = Fixture::new();
+        fixture.add(
+            "node_modules/@vendor/cli-alias",
+            "@vendor/cli",
+            "2.0.0-linux-x64",
+            &[],
+            &[],
+            &[],
+            false,
+        );
+        fixture
+            .lock
+            .packages
+            .get_mut("node_modules/@vendor/cli-alias")
+            .unwrap()
+            .name = Some("@vendor/cli".into());
+        assert!(build_adapter(pin, &fixture.lock, &fixture.registry).is_ok());
+        fixture
+            .lock
+            .packages
+            .get_mut("node_modules/@vendor/cli")
+            .unwrap()
+            .version = Some("2.0.1".into());
+        assert!(
+            build_adapter(pin, &fixture.lock, &fixture.registry)
+                .unwrap_err()
+                .to_string()
+                .contains("runtime override")
+        );
+        fixture.lock.packages.remove("node_modules/@vendor/cli");
+        assert!(
+            build_adapter(pin, &fixture.lock, &fixture.registry)
+                .unwrap_err()
+                .to_string()
+                .contains("missing runtime override")
+        );
+        fixture
+            .lock
+            .packages
+            .insert("node_modules/@vendor/cli".into(), entry(None, "2.0.0", "unused"));
+        fixture.lock.packages.insert(
+            "node_modules/@acp/claude/node_modules/@vendor/cli".into(),
+            entry(None, "1.0.0", "unused"),
+        );
+        assert!(
+            build_adapter(pin, &fixture.lock, &fixture.registry)
+                .unwrap_err()
+                .to_string()
+                .contains("runtime override")
+        );
+        for value in ["^2.0.0", "latest", "2.0.0-beta.1", "https://example.org/runtime.tgz"] {
+            assert!(Pins::parse(&text.replace("\"2.0.0\"", &format!("\"{value}\""))).is_err());
         }
     }
 

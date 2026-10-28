@@ -119,8 +119,8 @@ remains historical until a fresh attach is acknowledged.
 
 ## Acceptance
 
-**Qualified Claude composition.** ACP 0.93.0 with bundled SDK/CLI package
-0.3.300 was exercised against real local MCP endpoints through the actual ACP
+**Qualified Claude composition.** ACP 0.99.0 with bundled SDK/CLI package
+0.3.312 was exercised against real local MCP endpoints through the actual ACP
 adapter. Hennery's explicit definition wins over colliding user and project
 HTTP definitions; their endpoints receive no connection and their extra headers
 do not reach the managed endpoint. Eight cases cover new and fresh-process
@@ -133,7 +133,10 @@ contract: Hennery applies policy only at a new process attach.
 Run `nix develop -c node packaging/test-mcp-source-policy.mjs <node_modules>
 <scratch-output>` with modules installed from the committed Claude adapter
 lockfile in a scratch directory. The fixture rejects different adapter/SDK
-versions and builds a fresh HOME/XDG/config tree. Repeat it for pin changes;
+versions against the manifest/lockfile and builds a fresh HOME/XDG/config tree.
+Pins CI runs the eight cases on its native Linux x64 installation using the
+pinned Node version; macOS arm64 qualification also passed on Node 24.22.2.
+Repeat it for pin changes;
 do not replace it with CLI argument snapshots or model prose.
 
 Use two hats concurrently, synthetic managed HTTP/stdio and native servers with

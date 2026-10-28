@@ -12,29 +12,28 @@
 
 # npm resolves the lockfiles as of this instant, so `lock` is reproducible.
 # Committed locks may include targeted security refreshes (packaging/README.md).
-npm_before = "2026-10-19T12:40:07Z"
+npm_before = "2026-10-28T21:55:39Z"
 
 [node]
-# Operator confirmed the current pins on 2026-10-19 (plan 7b).
+# Stable Node 24 runtime; refreshed with the agent set on 2026-10-28.
 # Security update 2026-10-22: CVE-2026-111497.
-version = "24.22.1"
+version = "24.22.2"
 
 [adapters.claude]
-# Operator confirmed on 2026-10-19; measured in the per-session MCP
-# spike (docs/spikes/2026-09-25-per-session-mcp.md).
+# Adapter and SDK are pinned independently; see packaging/README.md.
 package = "@agentclientprotocol/claude-agent-acp"
-version = "0.93.0"
+version = "0.99.0"
 entry = "dist/index.js"
 # The bundled Claude CLI: the SDK's platform packages. Proprietary, so never
 # redistributed (distribution §3.3); skipped by `--use-cli claude=…`.
 cli = ["node_modules/@anthropic-ai/claude-agent-sdk-"]
 
 [adapters.codex]
-# Operator confirmed on 2026-10-19; the version the spike measured.
+# Adapter and CLI are pinned independently; see packaging/README.md.
 # `@zed-industries/codex-acp` is deprecated in its favour; the unscoped
 # `codex-acp` is an unrelated third party.
 package = "@agentclientprotocol/codex-acp"
-version = "2.2.2"
+version = "2.3.0"
 entry = "dist/index.js"
 # The bundled Codex CLI: `@openai/codex`'s platform packages (npm aliases of
 # `@openai/codex@<version>-<platform>`); skipped by `--use-cli codex=…`.
@@ -42,12 +41,12 @@ cli = ["node_modules/@openai/codex-"]
 
 # How a forget deletes a Codex session's thread (plan 9d decision 9):
 # `<node> <bin> app-server`, `initialize`, then `thread/delete`, with the
-# call shape read from this Codex version's source (`rust-v0.160.1`,
+# call shape read from this Codex version's source (`rust-v0.165.0`,
 # `app-server-protocol`). The generator refuses it unless the codex
 # lockfile bundles exactly `codex_version`; a bump re-reads the shape, and
 # the live check in packaging/README.md ("Pin bumps") is the operator's.
 [codex_app_server]
-codex_version = "0.160.1"
+codex_version = "0.165.0"
 bin = "node_modules/@openai/codex/bin/codex.js"
 delete_method = "thread/delete"
 params_shape = { threadId = "{thread_id}" }
@@ -56,3 +55,9 @@ params_shape = { threadId = "{thread_id}" }
 name = "hennery"
 title = "hennery"
 version = "1"
+
+[adapters.claude.overrides]
+"@anthropic-ai/claude-agent-sdk" = "0.3.312"
+
+[adapters.codex.overrides]
+"@openai/codex" = "0.165.0"
