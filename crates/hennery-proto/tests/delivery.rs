@@ -119,6 +119,7 @@ fn a_session_delivery_is_a_mode_a_count_and_a_time() {
 #[test]
 fn a_host_without_a_recorded_delivery_leaves_it_out() {
     let item = HostItem {
+        mcp_source_policies: Default::default(),
         host_id: "h".into(),
         name: "h".into(),
         platform: "linux".into(),
@@ -135,6 +136,7 @@ fn a_host_without_a_recorded_delivery_leaves_it_out() {
     let value = serde_json::to_value(&item).unwrap();
     assert!(value.get("mcp_delivery").is_none(), "{value}");
     let item = HostItem {
+        mcp_source_policies: Default::default(),
         mcp_delivery: Some([("claude".to_string(), McpAgentDelivery::Isolated)].into()),
         ..item
     };

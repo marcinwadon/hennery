@@ -100,6 +100,8 @@ impl World {
                 hat,
                 None,
                 McpContext {
+                    source_policy: false,
+                    native_sources: false,
                     capable: true,
                     isolation,
                     rules_name_other_hats: false,
@@ -2467,6 +2469,8 @@ fn d3_automatic_parent_resume_requires_genuine_park_and_fresh_proof() {
         .unwrap();
     let (h, mut rx) = connected();
     let mcp = McpContext {
+        source_policy: false,
+        native_sources: false,
         capable: true,
         isolation: McpIsolation::ClaudeStrict,
         rules_name_other_hats: false,

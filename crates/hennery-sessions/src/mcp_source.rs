@@ -1,0 +1,175 @@
+//! Attach-bound source-policy admission and acknowledgement. Managed mount
+//! selection and token lifetime remain in the existing delivery transaction.
+use crate::store::{McpContext, Store};
+use anyhow::Result;
+use hennery_proto::frames::{Capabilities, Capability, McpIsolation, SessionBody};
+use hennery_proto::mcp_source::{McpSourcePolicy, McpSourceSnapshot, McpSourceState};
+use rusqlite::{OptionalExtension, Transaction, params};
+
+pub const UNSUPPORTED: &str = "mcp_source_policy_unsupported";
+
+#[derive(Debug)]
+pub struct Unsupported;
+impl std::fmt::Display for Unsupported {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(UNSUPPORTED)
+    }
+}
+impl std::error::Error for Unsupported {}
+
+pub(crate) fn requested_in(
+    tx: &Transaction<'_>,
+    owner: &str,
+    session: &str,
+    hat: &str,
+    context: McpContext,
+) -> Result<Option<McpSourceSnapshot>> {
+    let (policy, revision) = policy_in(tx, owner, hat, context)?;
+    // Preserve correlation if an API client returns an explicit session to
+    // compatibility mode. A late failure from its previous attach must not
+    // fail this one. Never require an explicit policy echo from an old host.
+    let tracked: bool = tx.query_row(
+        "SELECT mcp_source_requested IS NOT NULL OR mcp_source_applied IS NOT NULL
+         FROM sessions WHERE owner_id=?1 AND id=?2",
+        params![owner, session],
+        |r| r.get(0),
+    )?;
+    let snapshot = (policy != McpSourcePolicy::Legacy || tracked).then(|| McpSourceSnapshot {
+        policy,
+        revision,
+        request_id: uuid::Uuid::now_v7().to_string(),
+    });
+    tx.execute(
+        "UPDATE sessions SET mcp_source_requested=?3 WHERE owner_id=?1 AND id=?2",
+        params![
+            owner,
+            session,
+            snapshot.as_ref().map(serde_json::to_string).transpose()?
+        ],
+    )?;
+    Ok(snapshot)
+}
+
+fn policy_in(
+    conn: &rusqlite::Connection,
+    owner: &str,
+    hat: &str,
+    context: McpContext,
+) -> Result<(McpSourcePolicy, u64)> {
+    let row: Option<(String, u64)> = conn
+        .query_row(
+            "SELECT mcp_source_policy,mcp_policy_revision FROM hats WHERE owner_id=?1 AND id=?2",
+            params![owner, hat],
+            |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)),
+        )
+        .optional()?;
+    let (text, revision) = row.unwrap_or(("legacy".into(), 0));
+    let policy = McpSourcePolicy::parse(&text).ok_or_else(|| anyhow::anyhow!("invalid stored MCP source policy"))?;
+    let mut caps = Vec::new();
+    if context.capable {
+        caps.push(Capability::McpServers);
+    }
+    if context.source_policy {
+        caps.push(Capability::McpSourcePolicy);
+    }
+    if context.native_sources {
+        caps.push(Capability::McpNativeSources);
+    }
+    if !policy.supported(&Capabilities(caps), context.isolation) {
+        return Err(Unsupported.into());
+    }
+    Ok((policy, revision))
+}
+
+/// Validate before lifecycle/configuration can be changed by a late fact.
+pub(crate) fn fact_matches(tx: &Transaction<'_>, owner: &str, session: &str, body: &SessionBody) -> Result<bool> {
+    let (request, report, indexed) = match body {
+        SessionBody::SessionStarted {
+            request_id, indexed, ..
+        } => (request_id, indexed.mcp_source_policy.as_ref(), Some(indexed)),
+        SessionBody::StartFailed { request_id, .. } => (request_id, None, None),
+        _ => return Ok(true),
+    };
+    let expected: Option<String> = tx.query_row(
+        "SELECT mcp_source_requested FROM sessions WHERE owner_id=?1 AND id=?2",
+        params![owner, session],
+        |r| r.get(0),
+    )?;
+    let Some(expected) = expected else {
+        return Ok(report.is_none());
+    };
+    let expected: McpSourceSnapshot = serde_json::from_str(&expected)?;
+    if request != &expected.request_id {
+        return Ok(false);
+    }
+    if indexed.is_none() {
+        return Ok(true);
+    }
+    if !(report == Some(&expected) || (expected.policy == McpSourcePolicy::Legacy && report.is_none())) {
+        return Ok(false);
+    }
+    let generation: Option<u64> = tx
+        .query_row(
+            "SELECT attach_generation FROM session_attach_evidence WHERE owner_id=?1 AND session_id=?2",
+            params![owner, session],
+            |r| Ok(r.get::<_, i64>(0)? as u64),
+        )
+        .optional()?;
+    let evidence = indexed.and_then(|i| i.config_evidence.as_deref());
+    Ok(match (generation, evidence) {
+        (Some(generation), Some(evidence)) => evidence.attach_generation == generation,
+        (Some(generation), None) => generation == 0,
+        (None, Some(evidence)) => evidence.attach_generation == 0,
+        (None, None) => true,
+    })
+}
+
+impl Store {
+    /// Preflight before a disposable runtime probe. Actual attach repeats this
+    /// under its transaction, so a concurrent hat edit cannot bypass admission.
+    pub fn check_mcp_source_policy(&self, hat: &str, context: McpContext) -> Result<()> {
+        policy_in(&self.conn(), self.owner_id(), hat, context).map(|_| ())
+    }
+
+    pub fn mcp_source_state(&self, session: &str) -> Result<Option<McpSourceState>> {
+        let row: Option<(String, u64, Option<String>, Option<String>)> = self
+            .conn()
+            .query_row(
+                "SELECT h.mcp_source_policy,h.mcp_policy_revision,s.mcp_source_requested,s.mcp_source_applied
+             FROM sessions s JOIN hats h ON h.owner_id=s.owner_id AND h.id=s.hat_id
+             WHERE s.owner_id=?1 AND s.id=?2 AND s.lifecycle<>'deleted'",
+                params![self.owner_id(), session],
+                |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        row.map(|(policy, revision, requested, applied)| {
+            Ok(McpSourceState {
+                policy: McpSourcePolicy::parse(&policy)
+                    .ok_or_else(|| anyhow::anyhow!("invalid stored MCP source policy"))?,
+                revision,
+                requested: requested.map(|v| serde_json::from_str(&v)).transpose()?,
+                applied: applied.map(|v| serde_json::from_str(&v)).transpose()?,
+            })
+        })
+        .transpose()
+    }
+}
+
+/// Current-profile eligibility for explicit combined sessions. This does not
+/// grant mounts or replace any owner/hat/host/family check.
+pub fn combined_supported(caps: &Capabilities, isolation: McpIsolation) -> bool {
+    McpSourcePolicy::ManagedPlusNative.supported(caps, isolation)
+}
+
+pub fn delivery_supported(mode: &str, caps: &Capabilities, isolation: McpIsolation) -> bool {
+    if !caps.has(Capability::McpServers) {
+        return false;
+    }
+    match mode {
+        "isolated" => isolation != McpIsolation::None,
+        "managed_plus_native" => combined_supported(caps, isolation),
+        // SQL predicates separately require the current default hat.
+        "unisolated" => true,
+        _ => false,
+    }
+}

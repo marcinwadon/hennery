@@ -15,7 +15,10 @@ pub enum RequestError {
     /// The host is not connected, or is connected but not yet reconciled.
     NotConnected,
     /// The host rejected the request; nothing happened.
-    Rejected { code: String, message: String },
+    Rejected {
+        code: String,
+        message: String,
+    },
     /// The connection dropped or the timeout passed: the request may or may
     /// not have been delivered. Reconciled after the host's next handshake.
     DeliveryUnknown,
@@ -27,6 +30,7 @@ pub enum RequestError {
     /// `mcp_servers`, or does not isolate the agent and isolation was not
     /// waived. Nothing was sent.
     McpUndeliverable,
+    McpSourceUnsupported,
     /// The connection has `MAX_PROBES` probes in flight already; nothing
     /// was sent.
     Busy,
@@ -139,6 +143,15 @@ impl HostConn {
         let Some(mcp) = frame.mcp_delivery() else {
             return true;
         };
+        if let Some(source) = &mcp.source_policy {
+            return !mcp.isolation_waived
+                && source.policy != hennery_proto::mcp_source::McpSourcePolicy::Legacy
+                && frame.agent().is_some_and(|agent| {
+                    source
+                        .policy
+                        .supported(&self.capabilities, self.mcp_isolation.get(agent))
+                });
+        }
         mcp.mcp_servers.is_empty()
             || (self.capabilities.has(Capability::McpServers)
                 && (mcp.isolation_waived || frame.agent().is_some_and(|agent| self.mcp_isolation.isolates(agent))))
@@ -412,6 +425,15 @@ impl Hub {
         })
     }
 
+    pub fn delivery_supported(&self, host: &str, agent: &str, mode: &str) -> bool {
+        self.hosts
+            .lock()
+            .expect("hosts lock")
+            .get(host)
+            .filter(|h| h.routable())
+            .is_some_and(|h| crate::mcp_source::delivery_supported(mode, &h.capabilities, h.mcp_isolation.get(agent)))
+    }
+
     /// Send a frame nobody waits for (an answer: its verdict arrives as a
     /// fact, ACP core §4.6) to a host that is connected and reconciled.
     /// `false` if it is not: the frame then goes after its next handshake.
@@ -429,13 +451,7 @@ impl Hub {
     }
 
     /// Final transfer check uses the same hello and lock as frame handoff.
-    pub fn notify_parent_transfer(
-        &self,
-        host_id: &str,
-        source_agent: &str,
-        isolated: bool,
-        frame: CollectorFrame,
-    ) -> bool {
+    pub fn notify_parent_transfer(&self, host_id: &str, source_agent: &str, mode: &str, frame: CollectorFrame) -> bool {
         self.hosts
             .lock()
             .expect("hosts lock")
@@ -443,7 +459,7 @@ impl Hub {
             .filter(|h| {
                 h.routable()
                     && h.capabilities.has(Capability::McpServers)
-                    && (!isolated || h.mcp_isolation.isolates(source_agent))
+                    && crate::mcp_source::delivery_supported(mode, &h.capabilities, h.mcp_isolation.get(source_agent))
                     && h.takes(&frame)
             })
             .is_some_and(|h| h.tx.send(frame).is_ok())
@@ -557,7 +573,11 @@ impl Hub {
             };
             host.adapt_context(&mut frame);
             if !host.takes(&frame) {
-                return Err(RequestError::McpUndeliverable);
+                return Err(if frame.mcp_delivery().is_some_and(|mcp| mcp.source_policy.is_some()) {
+                    RequestError::McpSourceUnsupported
+                } else {
+                    RequestError::McpUndeliverable
+                });
             }
             self.waiters.lock().expect("waiters lock").insert(
                 request_id.to_string(),

@@ -43,7 +43,7 @@ const hat = (id: string, name: string): HatItem => ({
   colour: '#112233',
   created_at: '2026-10-01T00:00:00Z',
   default_for_new_hosts: false,
-  purging: false,
+  purging: false, mcp_source_policy: 'legacy' as const, mcp_policy_revision: 0,
 })
 
 const ROWS = [

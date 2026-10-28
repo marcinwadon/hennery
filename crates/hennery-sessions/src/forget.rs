@@ -284,7 +284,7 @@ async fn attempt_once(state: &AppState, record: &ForgetRecord, wait: Duration) -
         }
         Err(RequestError::NotConnected) => (pending(RemovalPending::HostOffline), false, false),
         // A probe carries no servers: `McpUndeliverable` cannot happen.
-        Err(RequestError::Unsupported | RequestError::McpUndeliverable) => {
+        Err(RequestError::Unsupported | RequestError::McpUndeliverable | RequestError::McpSourceUnsupported) => {
             (pending(RemovalPending::HostNeedsUpdate), false, false)
         }
         Err(RequestError::Busy) => (pending(RemovalPending::NoReply), false, false),

@@ -1,10 +1,12 @@
 // Delivery is a last-start/resume decision, never a live health check.
 import type { HostItem } from '../generated/protocol'
 
-export type DeliveryMode = 'unknown' | 'isolated' | 'unisolated' | 'fallback' | 'unsupported'
+export type DeliveryMode = 'unknown' | 'isolated' | 'managed_plus_native' | 'unisolated' | 'fallback' | 'unsupported'
 
 export function deliveryWords(mode: unknown): string {
   switch (mode) {
+    case 'managed_plus_native':
+      return 'This hat’s managed MCP servers were offered alongside runtime-native MCP sources.'
     case 'isolated':
       return "This agent was given only this hat's MCP servers."
     case 'unisolated':

@@ -90,7 +90,7 @@ describe('the hats', () => {
     await userEvent.click(await screen.findByRole('button', { name: '+ New hat' })); await userEvent.type(await screen.findByRole('textbox', { name: 'Name' }), 'Clients')
     await userEvent.click(screen.getByRole('button', { name: 'Create' }))
     expect(await screen.findByRole('listitem', { name: 'Clients' })).toBeInTheDocument()
-    expect(sent(server, 'POST', '/api/hats')[0].body).toEqual({ name: 'Clients', colour: '#64748b' })
+    expect(sent(server, 'POST', '/api/hats')[0].body).toEqual({ name: 'Clients', colour: '#64748b', mcp_source_policy: 'managed_only' })
   })
 
   it('asks for another name when it is taken', async () => {

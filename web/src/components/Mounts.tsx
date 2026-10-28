@@ -7,7 +7,7 @@ import { useRef, useState } from 'react'
 import { messageOf } from '../api/errors'
 import { replaceMounts } from '../api/mcp'
 import { useClient } from '../app-client'
-import type { HostItem, McpConnectionItem } from '../generated/protocol'
+import type { HostItem, McpConnectionItem, McpSourcePolicy } from '../generated/protocol'
 import { mountsWith } from '../lib/mcp'
 import { Text } from '../lib/text'
 import McpPrediction from './McpPrediction'
@@ -18,9 +18,10 @@ interface Props {
   hosts: HostItem[] | null
   onChanged: (connection: McpConnectionItem) => void
   compact?: boolean
+  policy?: McpSourcePolicy
 }
 
-export default function Mounts({ connection, hosts, onChanged, compact = false }: Props) {
+export default function Mounts({ connection, hosts, onChanged, compact = false, policy }: Props) {
   const client = useClient()
   // A ref, not state: two ticks in one frame both see the first.
   const running = useRef(false)
@@ -63,7 +64,7 @@ export default function Mounts({ connection, hosts, onChanged, compact = false }
         {Object.keys(host.mcp_delivery ?? {}).length === 0
           ? <p className="hint">MCP delivery is unknown for this host’s agents.</p>
           : Object.keys(host.mcp_delivery ?? {}).map((agent) => (
-            <McpPrediction key={agent} host={host} agent={agent} hatId={connection.hat_id} />
+            <McpPrediction key={agent} host={host} agent={agent} hatId={connection.hat_id} policy={policy} />
           ))}</details>
         </div>
       ))}

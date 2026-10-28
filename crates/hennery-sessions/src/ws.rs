@@ -294,8 +294,20 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                             remember_project(&state, &host_id, &session_id);
                         }
                         match &body {
-                            SessionBody::SessionStarted { request_id, .. }
-                            | SessionBody::TurnStarted { request_id, .. }
+                            SessionBody::SessionStarted {
+                                request_id, indexed, ..
+                            } => {
+                                // A policy fact rejected by ingest must not resolve
+                                // the start waiter and release its first prompt.
+                                let legacy = state
+                                    .store
+                                    .mcp_source_state(&session_id)
+                                    .is_ok_and(|state| state.is_none_or(|s| s.requested.is_none()));
+                                if started || (legacy && indexed.mcp_source_policy.is_none()) {
+                                    state.hub.resolve(request_id, body.clone());
+                                }
+                            }
+                            SessionBody::TurnStarted { request_id, .. }
                             | SessionBody::ConfigApplied { request_id, .. } => {
                                 state.hub.resolve(request_id, body.clone());
                             }

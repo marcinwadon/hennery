@@ -361,6 +361,9 @@ pub struct SessionPage {
 /// open turn and the pending requests still open.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct SessionDetail {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mcp_source_policy: Option<crate::mcp_source::McpSourceState>,
     #[serde(flatten)]
     pub session: SessionItem,
     /// A bounded, readable requested-versus-actual configuration failure.
@@ -518,6 +521,10 @@ pub struct EnrollResponse {
 /// ones included.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct HostItem {
+    /// Supported policies per verified profile, from the last accepted hello.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mcp_source_policies: Option<std::collections::BTreeMap<String, Vec<crate::mcp_source::McpSourcePolicy>>>,
     pub host_id: String,
     pub name: String,
     pub platform: String,
@@ -734,6 +741,11 @@ pub struct UpdateHostRequest {
 /// to its creation and its changes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct HatItem {
+    #[serde(default)]
+    pub mcp_source_policy: crate::mcp_source::McpSourcePolicy,
+    #[serde(default)]
+    #[ts(type = "number")]
+    pub mcp_policy_revision: u64,
     pub id: String,
     pub name: String,
     /// `#rrggbb`, lowercase.
@@ -846,6 +858,10 @@ pub struct HostTranscripts {
 /// case, and a `#rrggbb` colour (slate when absent).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct CreateHatRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mcp_source_policy: Option<crate::mcp_source::McpSourcePolicy>,
+
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "string | undefined", optional)]
@@ -857,6 +873,10 @@ pub struct CreateHatRequest {
 /// default when another takes its place.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct UpdateHatRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub mcp_source_policy: Option<crate::mcp_source::McpSourcePolicy>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(type = "string | undefined", optional)]
     pub name: Option<String>,
@@ -1817,6 +1837,8 @@ impl McpAgentDelivery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(rename_all = "snake_case")]
 pub enum McpSessionDeliveryMode {
+    /// Scoped managed entries plus intentionally permitted native sources.
+    ManagedPlusNative,
     /// Its hat's servers, the agent kept to them.
     Isolated,
     /// Its hat's servers, isolation waived: the host's default hat on a host
@@ -1834,12 +1856,13 @@ pub enum McpSessionDeliveryMode {
 impl McpSessionDeliveryMode {
     /// Whether the session gets its hat's servers (and a gateway token).
     pub fn delivers(self) -> bool {
-        matches!(self, Self::Isolated | Self::Unisolated)
+        matches!(self, Self::Isolated | Self::Unisolated | Self::ManagedPlusNative)
     }
 
     /// The column value (`sessions.mcp_delivery_mode`), as on the wire.
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::ManagedPlusNative => "managed_plus_native",
             Self::Isolated => "isolated",
             Self::Unisolated => "unisolated",
             Self::Fallback => "fallback",
@@ -1849,9 +1872,15 @@ impl McpSessionDeliveryMode {
 
     /// The mode a column value names; `None` for anything else.
     pub fn parse(text: &str) -> Option<Self> {
-        [Self::Isolated, Self::Unisolated, Self::Fallback, Self::Unsupported]
-            .into_iter()
-            .find(|mode| mode.as_str() == text)
+        [
+            Self::Isolated,
+            Self::Unisolated,
+            Self::Fallback,
+            Self::Unsupported,
+            Self::ManagedPlusNative,
+        ]
+        .into_iter()
+        .find(|mode| mode.as_str() == text)
     }
 }
 

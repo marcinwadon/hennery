@@ -8,6 +8,7 @@ pub mod delegation_host;
 pub mod delegation_status;
 pub mod form_schema;
 pub mod frames;
+pub mod mcp_source;
 pub mod paths;
 pub mod plugin;
 pub mod rest;

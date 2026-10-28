@@ -84,3 +84,6 @@ BEGIN
       AND (child_id = NEW.id OR parent_id = NEW.id) AND NEW.lifecycle = 'deleted';
     DELETE FROM delegation_budgets WHERE owner_id = NEW.owner_id AND root_id = NEW.id AND NEW.lifecycle = 'deleted';
 END;
+-- Test-only rollback of sessions migration 34: source-policy attach snapshots.
+ALTER TABLE sessions DROP COLUMN mcp_source_requested;
+ALTER TABLE sessions DROP COLUMN mcp_source_applied;

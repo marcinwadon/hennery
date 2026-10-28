@@ -22,11 +22,41 @@ describe('bounded session delivery reads', () => {
     rerender({ lifecycle: 'starting', resync: 0 })
     await waitFor(() => expect(t.calls).toHaveLength(2))
     rerender({ lifecycle: 'active', resync: 0 })
-    expect(t.calls).toHaveLength(2)
-    rerender({ lifecycle: 'active', resync: 1 })
     await waitFor(() => expect(t.calls).toHaveLength(3))
-    act(() => result.current.refresh())
+    rerender({ lifecycle: 'active', resync: 1 })
     await waitFor(() => expect(t.calls).toHaveLength(4))
+    act(() => result.current.refresh())
+    await waitFor(() => expect(t.calls).toHaveLength(5))
+  })
+
+  it('reads the applied source snapshot after the host confirms a pending attach', async () => {
+    const source = { policy: 'managed_only', revision: 1, request_id: 'attach' }
+    let applied = false
+    const t = routed(() => json({ mcp_source_policy: { policy: 'managed_only', revision: 1,
+      requested: source, ...(applied ? { applied: source } : {}) } }))
+    const { result, rerender } = renderHook(({ lifecycle }) => useMcpDelivery('s1', lifecycle, 0),
+      { wrapper: t.wrapper, initialProps: { lifecycle: 'starting' } })
+    await waitFor(() => expect(result.current.detail?.mcp_source_policy?.requested).toEqual(source))
+    expect(result.current.detail?.mcp_source_policy?.applied).toBeUndefined()
+    applied = true
+    rerender({ lifecycle: 'active' })
+    await waitFor(() => expect(result.current.detail?.mcp_source_policy?.applied).toEqual(source))
+    expect(t.calls).toHaveLength(2)
+  })
+
+  it('observes attach confirmation even when lifecycle transitions coalesce', async () => {
+    const source = { policy: 'managed_plus_native', revision: 2, request_id: 'new-attach' }
+    let applied = false
+    const t = routed(() => json({ mcp_source_policy: { policy: 'managed_plus_native', revision: 2,
+      ...(applied ? { applied: source } : {}) } }))
+    const { result, rerender } = renderHook(({ changes }) => useMcpDelivery('s1', 'active', 0, changes),
+      { wrapper: t.wrapper, initialProps: { changes: 0 } })
+    await waitFor(() => expect(result.current.detail?.mcp_source_policy).toBeDefined())
+    expect(result.current.detail?.mcp_source_policy?.applied).toBeUndefined()
+    applied = true
+    rerender({ changes: 1 })
+    await waitFor(() => expect(result.current.detail?.mcp_source_policy?.applied).toEqual(source))
+    expect(t.calls).toHaveLength(2)
   })
 
   it('coalesces overlapping invalidations and discards the older answer', async () => {

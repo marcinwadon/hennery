@@ -5,7 +5,7 @@ import { ClientContext } from '../app-client'
 import { json, stubServer } from '../test-server'
 import { catalog } from '../test-launch-catalog'
 import DefaultsMatrix from './DefaultsMatrix'
-const hat = { id: 'hat-a', name: 'Research', colour: '#64748b', created_at: '', default_for_new_hosts: false, purging: false }
+const hat = { id: 'hat-a', name: 'Research', colour: '#64748b', created_at: '', default_for_new_hosts: false, purging: false, mcp_source_policy: 'legacy' as const, mcp_policy_revision: 0 }
 it('edits a matrix cell through the revisioned API and preserves unrelated overrides', async () => {
   const server = stubServer({ 'PUT /api/hats/hat-a/session-defaults?agent=claude': json(200, { hat_id: hat.id, agent: 'claude', revision: 8, config: { model: 'sonnet', axes: { fast: false } } }) })
   const stepUp = vi.fn(), saved = vi.fn()

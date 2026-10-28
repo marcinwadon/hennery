@@ -67,6 +67,7 @@ fn evidence(f: &[HostFrame]) -> hennery_proto::delegation_host::ConfigEvidence {
 }
 fn launch(root: &Path, script: FakeScript, attach: Attach) -> Launch {
     Launch {
+        mcp_source_policy: None,
         request_id: "start".into(),
         session_id: "s".into(),
         attach,

@@ -1,4 +1,6 @@
 import SessionName from '../components/SessionNames'
+import { SourcePolicySelect, sourcePolicyLabel } from '../components/McpSourcePolicy'
+import type { McpSourcePolicy } from '../generated/protocol'
 // Hats (frontend spec §8, kernel spec §5): create, rename and recolour hats,
 // pick the default for new hosts, edit each host's path rules with a live
 // "this path resolves to" tester, and purge a hat after seeing what goes.
@@ -165,6 +167,7 @@ function HatCard({
 }) {
   const client = useClient()
   const [editing, setEditing] = useState(false)
+  const [sourcePolicy, setSourcePolicy] = useState<McpSourcePolicy>(hat.mcp_source_policy ?? 'legacy')
   const [name, setName] = useState(hat.name)
   const [colour, setColour] = useState(safeColour(hat.colour) ?? NEW_COLOUR)
   const [busy, setBusy] = useState(false)
@@ -206,6 +209,7 @@ function HatCard({
     const body: Parameters<typeof updateHat>[2] = {}
     if (name.trim() !== hat.name) body.name = name.trim()
     if (colour !== hat.colour) body.colour = colour
+    if (sourcePolicy !== (hat.mcp_source_policy ?? 'legacy')) body.mcp_source_policy = sourcePolicy
     if (Object.keys(body).length === 0) closeForm()
     else change(body, 'edit')
   }
@@ -226,6 +230,7 @@ function HatCard({
         <dt>Default on</dt><dd>{defaultOn === null ? 'Not loaded' : defaultOn.length ? <Text>{defaultOn.join(', ')}</Text> : 'No hosts'}</dd>
         <dt>Gateway servers</dt><dd>{servers === null ? 'Not loaded' : servers.length ? <Text>{servers.join(', ')}</Text> : 'None'}</dd>
       </dl>
+      <p>MCP sources: {sourcePolicyLabel(hat.mcp_source_policy)}</p>
       <HatDefaultsSummary hatId={hat.id} agents={agents} compact />
       {editing ? (
         <form className="inline-form" onSubmit={save}>
@@ -237,6 +242,7 @@ function HatCard({
             <span className="field-label">Colour</span>
             <input type="color" className="colour-input" value={colour} onChange={(e) => setColour(e.target.value.toLowerCase())} />
           </label>
+          <SourcePolicySelect value={sourcePolicy} onChange={setSourcePolicy} />
           <button type="submit" className="btn btn-primary btn-sm" disabled={busy || name.trim() === ''}>
             Save
           </button>
@@ -251,6 +257,7 @@ function HatCard({
             className="btn btn-ghost btn-sm"
             ref={editButton}
             onClick={() => {
+              setSourcePolicy(hat.mcp_source_policy ?? 'legacy')
               setName(hat.name)
               setColour(safeColour(hat.colour) ?? NEW_COLOUR)
               setEditing(true)
@@ -290,6 +297,7 @@ function HatCard({
 function NewHat({ onCreated }: { onCreated: (hat: HatItem) => void }) {
   const client = useClient()
   const [name, setName] = useState('')
+  const [sourcePolicy, setSourcePolicy] = useState<McpSourcePolicy>('managed_only')
   const [colour, setColour] = useState(NEW_COLOUR)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -300,7 +308,7 @@ function NewHat({ onCreated }: { onCreated: (hat: HatItem) => void }) {
     setBusy(true)
     setError(null)
     try {
-      onCreated(await createHat(client, { name: name.trim(), colour }))
+      onCreated(await createHat(client, { name: name.trim(), colour, mcp_source_policy: sourcePolicy }))
       setName('')
       // "Create" is disabled with the name empty: focus goes to the name,
       // ready for the next hat.
@@ -318,6 +326,7 @@ function NewHat({ onCreated }: { onCreated: (hat: HatItem) => void }) {
         New hat
       </h2>
       <form className="inline-form" onSubmit={submit}>
+        <SourcePolicySelect value={sourcePolicy} onChange={setSourcePolicy} />
         <label className="field">
           <span className="field-label">Name</span>
           <input

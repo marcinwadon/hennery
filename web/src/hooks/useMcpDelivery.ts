@@ -1,5 +1,8 @@
 // Delivery metadata has no SSE delta. Only explicit lifecycle/resync
-// boundaries trigger a read; streamed messages and focus never do.
+// boundaries trigger a read; starting → active also reads the host's source
+// acknowledgement. A catalog snapshot also marks an attach when list updates
+// coalesce parked/starting/active into one render. Text chunks and focus never
+// trigger a read.
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useClient } from '../app-client'
 import { sessionDetail } from '../api/view'
@@ -9,11 +12,11 @@ import { runningLifecycle } from '../lib/mcpDelivery'
 
 interface ReadState { id: string; detail: SessionDetail | null; error: string | null }
 
-export function useMcpDelivery(id: string, lifecycle: string | undefined, resync: number) {
+export function useMcpDelivery(id: string, lifecycle: string | undefined, resync: number, catalogChanges = 0) {
   const client = useClient()
   const [state, setState] = useState<ReadState>({ id, detail: null, error: null })
   const request = useRef<(() => void) | null>(null)
-  const previous = useRef<{ id: string; lifecycle: string | undefined; resync: number } | null>(null)
+  const previous = useRef<{ id: string; lifecycle: string | undefined; resync: number; catalogChanges: number } | null>(null)
   const refresh = useCallback(() => request.current?.(), [])
 
   useEffect(() => {
@@ -43,11 +46,13 @@ export function useMcpDelivery(id: string, lifecycle: string | undefined, resync
 
   useEffect(() => {
     const before = previous.current
-    previous.current = { id, lifecycle, resync }
+    previous.current = { id, lifecycle, resync, catalogChanges }
     if (!before || before.id !== id) return
     const resumed = before.lifecycle !== undefined && !runningLifecycle(before.lifecycle) && runningLifecycle(lifecycle)
-    if (resync !== before.resync || resumed) refresh()
-  }, [id, lifecycle, resync, refresh])
+    const confirmed = before.lifecycle === 'starting' && lifecycle === 'active'
+    const catalogChanged = catalogChanges !== before.catalogChanges
+    if (resync !== before.resync || resumed || confirmed || catalogChanged) refresh()
+  }, [id, lifecycle, resync, catalogChanges, refresh])
 
   return {
     detail: state.id === id ? state.detail : null,

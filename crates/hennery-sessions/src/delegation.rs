@@ -81,19 +81,19 @@ impl Store {
              WHERE s.owner_id = ?1 AND s.id = ?2 AND s.host_id = ?3 AND s.hat_id = ?4
                AND s.close_requested = 0 AND s.lifecycle IN ('starting', 'active') AND s.presumed_parked = 0
                AND (?5 = 0 OR s.lifecycle = 'active') AND h.revoked_at IS NULL
-               AND (s.mcp_delivery_mode = 'isolated' OR (s.mcp_delivery_mode = 'unisolated' AND s.hat_id = h.default_hat_id))
+               AND (s.mcp_delivery_mode IN ('isolated','managed_plus_native') OR (s.mcp_delivery_mode = 'unisolated' AND s.hat_id = h.default_hat_id))
                AND NOT EXISTS (SELECT 1 FROM purged_hats p WHERE p.owner_id = ?1 AND p.hat_id = s.hat_id)",
              params![self.owner_id(), session_id, host_id, identity.principal.hat_id, mutation],
              |r| Ok(CallerRow { cwd: r.get(0)?, agent: r.get(1)?, capabilities: r.get(2)?, isolation: r.get(3)?, mode: r.get(4)? })).optional()?;
         let Some(row) = row else { return Ok(None) };
-        let capable = serde_json::from_str::<hennery_proto::frames::Capabilities>(&row.capabilities)
-            .is_ok_and(|c| c.has(hennery_proto::frames::Capability::McpServers));
+        let capabilities =
+            serde_json::from_str::<hennery_proto::frames::Capabilities>(&row.capabilities).unwrap_or_default();
         let isolation = row
             .isolation
             .as_deref()
             .and_then(|value| serde_json::from_str::<hennery_proto::frames::AgentIsolation>(value).ok())
             .unwrap_or_default();
-        if !capable || (row.mode == "isolated" && !isolation.isolates(&row.agent)) {
+        if !crate::mcp_source::delivery_supported(&row.mode, &capabilities, isolation.get(&row.agent)) {
             return Ok(None);
         }
         let (cwd, agent) = (row.cwd, row.agent);

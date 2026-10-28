@@ -2450,6 +2450,8 @@ async fn background_worker_advances_past_offline_page_and_wraps_to_repaired_earl
             "worker",
             earlier_cwd.to_str().unwrap(),
             McpContext {
+                source_policy: false,
+                native_sources: false,
                 capable: true,
                 isolation: McpIsolation::ClaudeStrict,
                 rules_name_other_hats: false,

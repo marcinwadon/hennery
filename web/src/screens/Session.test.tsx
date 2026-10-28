@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest'
-import type { SessionDetail } from '../generated/protocol'
+import type { McpSourceSnapshot, SessionDetail } from '../generated/protocol'
 import type { Item, ItemPage, SessionSummary } from '../generated/view'
 import { json, liveStream, routed, type Call, type LiveStream } from '../test-stream'
 import SessionView, { TAIL } from './Session'
@@ -268,6 +268,29 @@ describe('SessionView', () => {
     await waitFor(() => expect(screen.getByRole('region', { name: 'MCP delivery' })).toHaveTextContent('2 MCP servers.'))
     expect(s.of(DETAIL)).toHaveLength(2)
   })
+  it('refreshes confirmed MCP policy after a rapid resume without a rendered lifecycle change', async () => {
+    let source: McpSourceSnapshot = { policy: 'managed_only', revision: 1, request_id: 'old' }
+    const s = server({
+      pages: [() => json(page([]))],
+      hats: () => json([{ id: 'hat1', name: 'Work', colour: '#123456',
+        mcp_source_policy: 'legacy', mcp_policy_revision: 0 }]),
+      detail: () => json(detail('claude', { mcp_source_policy: {
+        policy: 'managed_plus_native', revision: 2, requested: source, applied: source,
+      } })),
+    })
+    render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+    await showDetailsTab('Details')
+    await waitFor(() => expect(screen.getByRole('region', { name: 'MCP sources' }))
+      .toHaveTextContent('Last confirmed attach: Only MCP configured in Hennery'))
+    expect(screen.getByRole('region', { name: 'MCP sources' }))
+      .toHaveTextContent('Hat setting: Hennery and runtime-native MCP')
+    source = { policy: 'managed_plus_native', revision: 2, request_id: 'resumed' }
+    act(() => s.streams[0].event('catalog_changed', { session_id: ID, config_options: [], commands: [] }))
+    await waitFor(() => expect(screen.getByRole('region', { name: 'MCP sources' }))
+      .toHaveTextContent('Last confirmed attach: Hennery and runtime-native MCP'))
+    expect(s.of(DETAIL)).toHaveLength(2)
+  })
+
   it('shows a delivery-read error as escaped and visibly isolated text', async () => {
     const s = server({ pages: [() => json(page([]))], detail: () => json({ code: 'failed', message: '<i>cannot\u202Eread' }, 500) })
     render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })

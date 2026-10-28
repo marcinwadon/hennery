@@ -275,6 +275,10 @@ pub(crate) const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (owner_id, hat_id, agent),
         FOREIGN KEY (hat_id, owner_id) REFERENCES hats(id, owner_id) ON DELETE CASCADE);
     ",
+    // Existing hats preserve all runtime-specific legacy behavior.
+    "ALTER TABLE hats ADD COLUMN mcp_source_policy TEXT NOT NULL DEFAULT 'legacy'
+       CHECK(mcp_source_policy IN ('legacy','managed_only','managed_plus_native'));
+     ALTER TABLE hats ADD COLUMN mcp_policy_revision INTEGER NOT NULL DEFAULT 0 CHECK(mcp_policy_revision >= 0);",
 ];
 
 #[cfg(test)]
@@ -284,6 +288,24 @@ mod tests {
     use crate::operator::Operator;
     use crate::secret::sha256_hex;
     use rusqlite::{Connection, OptionalExtension};
+
+    #[test]
+    fn source_policy_migration_preserves_existing_hats_as_legacy() {
+        let added = MIGRATIONS
+            .iter()
+            .position(|m| m.contains("ADD COLUMN mcp_source_policy"))
+            .unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate_component(&mut conn, COMPONENT, &MIGRATIONS[..added]).unwrap();
+        conn.execute("UPDATE hats SET name='Before migration'", []).unwrap();
+        crate::db::migrate_component(&mut conn, COMPONENT, MIGRATIONS).unwrap();
+        let row: (String, String, i64) = conn
+            .query_row("SELECT name,mcp_source_policy,mcp_policy_revision FROM hats", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(row, ("Before migration".into(), "legacy".into(), 0));
+    }
 
     const NOW: i64 = 1_800_000_000;
     const PASSWORD: &str = "correct horse battery";

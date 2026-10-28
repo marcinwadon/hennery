@@ -35,6 +35,8 @@ pub(crate) const DEFAULT_HAT_KEY: &str = "default_hat_id";
 /// One hat, as `GET /api/hats` lists it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HatRecord {
+    pub mcp_source_policy: hennery_proto::mcp_source::McpSourcePolicy,
+    pub mcp_policy_revision: u64,
     pub id: String,
     pub name: String,
     /// `#rrggbb`, lowercase.
@@ -296,7 +298,7 @@ fn is_default(conn: &rusqlite::Connection, owner: &str, hat_id: &str) -> Result<
 fn hats_of(conn: &rusqlite::Connection, owner: &str) -> Result<Vec<HatRecord>> {
     let mut stmt = conn.prepare(
         "SELECT h.id, h.name, h.colour, h.created_at, h.id = s.value,
-                EXISTS (SELECT 1 FROM purged_hats p WHERE p.hat_id = h.id AND p.owner_id = ?1), h.logo_etag
+                EXISTS (SELECT 1 FROM purged_hats p WHERE p.hat_id = h.id AND p.owner_id = ?1), h.logo_etag, h.mcp_source_policy, h.mcp_policy_revision
          FROM hats h
          LEFT JOIN settings s ON s.owner_id = h.owner_id AND s.key = ?2
          WHERE h.owner_id = ?1 ORDER BY h.created_at, h.id",
@@ -310,6 +312,9 @@ fn hats_of(conn: &rusqlite::Connection, owner: &str) -> Result<Vec<HatRecord>> {
             default_for_new_hosts: r.get::<_, Option<bool>>(4)?.unwrap_or(false),
             purging: r.get(5)?,
             logo: r.get(6)?,
+            mcp_source_policy: hennery_proto::mcp_source::McpSourcePolicy::parse(&r.get::<_, String>(7)?)
+                .ok_or(rusqlite::Error::InvalidQuery)?,
+            mcp_policy_revision: r.get::<_, i64>(8)? as u64,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -349,6 +354,16 @@ impl Hosts {
 
     /// A new hat, `colour` defaulting to `DEFAULT_COLOUR`.
     pub fn create_hat(&self, name: &str, colour: Option<&str>, now: i64) -> Result<HatChange> {
+        self.create_hat_with_policy(name, colour, now, None)
+    }
+
+    pub fn create_hat_with_policy(
+        &self,
+        name: &str,
+        colour: Option<&str>,
+        now: i64,
+        policy: Option<hennery_proto::mcp_source::McpSourcePolicy>,
+    ) -> Result<HatChange> {
         if let Some(problem) = hat_name_problem(name) {
             return Ok(HatChange::Invalid(problem));
         }
@@ -362,8 +377,8 @@ impl Hosts {
         }
         let id = new_id("hat");
         tx.execute(
-            "INSERT INTO hats(id, owner_id, name, colour, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, self.owner_id(), name.trim(), colour, now],
+            "INSERT INTO hats(id, owner_id, name, colour, created_at, mcp_source_policy) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, self.owner_id(), name.trim(), colour, now, policy.unwrap_or_default().as_str()],
         )?;
         let created = hats_of(&tx, self.owner_id())?.into_iter().find(|hat| hat.id == id);
         tx.commit()?;
@@ -379,6 +394,17 @@ impl Hosts {
         name: Option<&str>,
         colour: Option<&str>,
         default_for_new_hosts: Option<bool>,
+    ) -> Result<HatChange> {
+        self.update_hat_with_policy(hat_id, name, colour, default_for_new_hosts, None)
+    }
+
+    pub fn update_hat_with_policy(
+        &self,
+        hat_id: &str,
+        name: Option<&str>,
+        colour: Option<&str>,
+        default_for_new_hosts: Option<bool>,
+        policy: Option<hennery_proto::mcp_source::McpSourcePolicy>,
     ) -> Result<HatChange> {
         if let Some(problem) = name.and_then(hat_name_problem) {
             return Ok(HatChange::Invalid(problem));
@@ -400,7 +426,7 @@ impl Hosts {
             return Ok(HatChange::NotFound);
         };
         // Its name and colour still change; it is still listed (A12).
-        if default_for_new_hosts == Some(true) && hat.purging {
+        if (default_for_new_hosts == Some(true) || policy.is_some()) && hat.purging {
             return Ok(HatChange::Purging);
         }
         if let Some(name) = name {
@@ -426,6 +452,13 @@ impl Hosts {
                 params![hat_id, self.owner_id(), DEFAULT_HAT_KEY],
             )?;
             anyhow::ensure!(moved == 1, "the owner has no default hat setting to move");
+        }
+        if let Some(policy) = policy {
+            tx.execute(
+                "UPDATE hats SET mcp_source_policy=?3,mcp_policy_revision=mcp_policy_revision+1
+                WHERE owner_id=?1 AND id=?2 AND mcp_source_policy<>?3",
+                params![self.owner_id(), hat_id, policy.as_str()],
+            )?;
         }
         let updated = hats_of(&tx, self.owner_id())?.into_iter().find(|hat| hat.id == hat_id);
         tx.commit()?;

@@ -23,6 +23,7 @@ pub mod hats;
 pub mod hosts;
 pub mod hub;
 pub mod idle_hold;
+pub mod mcp_source;
 pub mod notify;
 pub mod offline;
 pub mod plugin;

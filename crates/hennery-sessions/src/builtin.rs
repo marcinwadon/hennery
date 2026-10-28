@@ -19,10 +19,7 @@ use hennery_gateway::{
     revocation::Watch,
 };
 use hennery_kernel::json::ApiJson;
-use hennery_proto::{
-    delegation::{HatSessionTools, SetSessionTools},
-    frames::McpIsolation,
-};
+use hennery_proto::delegation::{HatSessionTools, SetSessionTools};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -259,21 +256,13 @@ async fn handle(
         .ok()
         .flatten();
     let Some(context) = context else { return no_scope() };
-    // Current hello eligibility, not a stale delivery flag. Unisolated is
-    // restricted to the host's current default hat by the store predicate.
-    let Some((capable, isolation)) = state.app.hub.mcp_isolation(context.host_id(), context.agent()) else {
-        return no_scope();
-    };
-    if !capable
-        || (isolation == McpIsolation::None
-            && state
-                .app
-                .store
-                .mcp_delivery(context.session_id())
-                .ok()
-                .flatten()
-                .is_none_or(|d| d.mode != hennery_proto::rest::McpSessionDeliveryMode::Unisolated))
-    {
+    let delivery = state.app.store.mcp_delivery(context.session_id()).ok().flatten();
+    if !delivery.is_some_and(|d| {
+        state
+            .app
+            .hub
+            .delivery_supported(context.host_id(), context.agent(), d.mode.as_str())
+    }) {
         return no_scope();
     }
     if method != Method::POST {

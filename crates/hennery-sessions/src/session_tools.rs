@@ -216,6 +216,7 @@ pub async fn execute(
 }
 pub fn error_code(error: &anyhow::Error) -> &'static str {
     const CODES: &[&str] = &[
+        crate::mcp_source::UNSUPPORTED,
         "not_found",
         "operation_conflict",
         "operator_required",

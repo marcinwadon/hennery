@@ -458,6 +458,8 @@ END;",
     // Navigation shortcuts (33) are independent of the operator's idle hold.
     "ALTER TABLE sessions ADD COLUMN sidebar_pinned INTEGER NOT NULL DEFAULT 0 CHECK(sidebar_pinned IN (0,1));
      CREATE INDEX sessions_sidebar_pinned ON sessions(owner_id, sidebar_pinned) WHERE lifecycle <> 'deleted';",
+    "ALTER TABLE sessions ADD COLUMN mcp_source_requested TEXT;
+     ALTER TABLE sessions ADD COLUMN mcp_source_applied TEXT;",
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records
@@ -866,6 +868,8 @@ pub struct Store {
 /// in the transition's own transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct McpContext {
+    pub source_policy: bool,
+    pub native_sources: bool,
     /// The connection announced `mcp_servers`.
     pub capable: bool,
     /// How it isolates the session's agent.
@@ -878,6 +882,8 @@ impl McpContext {
     /// A host that takes no servers: what a store without a gateway, or a
     /// host that is not connected, decides.
     pub const NONE: Self = Self {
+        source_policy: false,
+        native_sources: false,
         capable: false,
         isolation: McpIsolation::None,
         rules_name_other_hats: false,
@@ -888,15 +894,27 @@ impl McpContext {
 /// and nowhere else, and the mode, for `isolation_waived`.
 #[derive(Clone, PartialEq)]
 pub struct McpGiven {
+    pub source_policy: Option<hennery_proto::mcp_source::McpSourceSnapshot>,
     pub mode: McpSessionDeliveryMode,
     pub servers: Vec<McpServer>,
 }
 
 impl McpGiven {
+    pub fn request_id(&self) -> String {
+        self.source_policy
+            .as_ref()
+            .map(|s| s.request_id.clone())
+            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string())
+    }
     /// The frame's MCP part: `isolation_waived` only for the default hat of
     /// a host that cannot isolate the agent (plan 8c's hand-off).
     pub fn frame(self) -> hennery_proto::frames::McpDelivery {
         hennery_proto::frames::McpDelivery {
+            // Compatibility mode has no new wire requirement; its internal
+            // correlation snapshot still fences facts after an explicit attach.
+            source_policy: self
+                .source_policy
+                .filter(|s| s.policy != hennery_proto::mcp_source::McpSourcePolicy::Legacy),
             isolation_waived: self.mode == McpSessionDeliveryMode::Unisolated,
             mcp_servers: self.servers,
         }
@@ -2234,7 +2252,14 @@ impl Store {
             |r| r.get(0),
         )?;
         let mixed = mcp.rules_name_other_hats || other_hat_live;
-        let mode = mcp_session_delivery(mcp.capable, mcp.isolation, mixed, hat_id == default_hat);
+        let source_policy = crate::mcp_source::requested_in(tx, &self.owner, session_id, hat_id, mcp)?;
+        let mode = match source_policy.as_ref().map(|s| s.policy) {
+            Some(hennery_proto::mcp_source::McpSourcePolicy::ManagedOnly) => McpSessionDeliveryMode::Isolated,
+            Some(hennery_proto::mcp_source::McpSourcePolicy::ManagedPlusNative) => {
+                McpSessionDeliveryMode::ManagedPlusNative
+            }
+            _ => mcp_session_delivery(mcp.capable, mcp.isolation, mixed, hat_id == default_hat),
+        };
         let delivered = self.mcp().servers_in(
             tx,
             SessionRef {
@@ -2257,6 +2282,7 @@ impl Store {
         )?;
         Ok((
             McpGiven {
+                source_policy,
                 mode,
                 servers: delivered.servers,
             },
@@ -3346,6 +3372,7 @@ impl Store {
                  config_axes = NULL, agent_session_id = NULL, failure_reason = NULL, hat_rule_id = NULL,
                  open_turn_id = NULL, activity = NULL, presumed_parked = 0, close_requested = 0, agent_home = NULL,
                  mcp_delivery_mode = NULL, mcp_delivery_servers = NULL, mcp_delivery_at = NULL,
+                 mcp_source_requested = NULL, mcp_source_applied = NULL,
                  idle_pinned = 0, idle_hold_dirty = 0, prompt_queue_dirty = 0, prompt_queue_held = 0, sidebar_pinned = 0
              WHERE id = ?1 AND owner_id = ?2",
             [session_id, &self.owner],
@@ -3600,6 +3627,16 @@ impl Store {
         };
         if !matches!(lifecycle.as_str(), "parked" | "closed" | "failed") {
             return Ok(ResumeRequest::Busy(lifecycle));
+        }
+        let policy_presumed: bool = tx.query_row(
+            "SELECT presumed_parked=1 AND (mcp_source_requested IS NOT NULL OR EXISTS
+             (SELECT 1 FROM hats h WHERE h.owner_id=?2 AND h.id=sessions.hat_id AND h.mcp_source_policy<>'legacy'))
+             FROM sessions WHERE id=?1 AND owner_id=?2",
+            params![session_id, self.owner],
+            |r| r.get(0),
+        )?;
+        if policy_presumed {
+            return Ok(ResumeRequest::Busy("presumed_parked".into()));
         }
         let Some(agent_session_id) = agent_session_id else {
             return Ok(ResumeRequest::NoRecord);
@@ -4016,6 +4053,14 @@ impl Store {
             body: received,
             ts: ts.clone(),
         }];
+        if !crate::mcp_source::fact_matches(&tx, &self.owner, session_id, body)? {
+            mark_unapplied(&tx, &self.owner, fact_id)?;
+            tx.commit()?;
+            return Ok(Ingested {
+                events: Vec::new(),
+                edge: None,
+            });
+        }
         match body {
             SessionBody::SessionStarted {
                 agent_session_id,
@@ -4038,6 +4083,11 @@ impl Store {
                     created.clear();
                     mark_unapplied(&tx, &self.owner, fact_id)?;
                 } else {
+                    tx.execute(
+                        "UPDATE sessions SET mcp_source_applied=mcp_source_requested
+                        WHERE owner_id=?1 AND id=?2",
+                        params![self.owner, session_id],
+                    )?;
                     // The catalogue after the start's switches (P-13).
                     store_catalogue(&tx, &self.owner, session_id, indexed, &ts)?;
                     // Where the agent keeps this session's data (plan 9d
@@ -6096,6 +6146,8 @@ mod tests {
                 &hat,
                 None,
                 McpContext {
+                    source_policy: false,
+                    native_sources: false,
                     capable: true,
                     isolation: McpIsolation::ClaudeStrict,
                     rules_name_other_hats: false,
@@ -6132,6 +6184,8 @@ mod tests {
                         ..Default::default()
                     },
                     mcp: McpContext {
+                        source_policy: false,
+                        native_sources: false,
                         capable: true,
                         isolation: McpIsolation::ClaudeStrict,
                         rules_name_other_hats: false,

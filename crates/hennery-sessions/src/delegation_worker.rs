@@ -175,6 +175,14 @@ async fn drain_target(state: &AppState, target: &str) -> anyhow::Result<()> {
         Some(head)
     };
     let work = async {
+        // A hat edit applies only at a real attach. Already attached queues
+        // continue under their original delivery/source snapshot.
+        if session.lifecycle != "active" {
+            state.store.check_mcp_source_policy(
+                &session.hat_id,
+                crate::api::mcp_context(state, &session.host_id, &session.agent)?,
+            )?;
+        }
         let cwd = checked_cwd(state, &session.host_id, &session.hat_id, &session.cwd).await?;
         anyhow::ensure!(cwd == session.cwd, "invalid_cwd");
         let catalog = if session.lifecycle == "active" {
@@ -288,7 +296,22 @@ async fn drain_target(state: &AppState, target: &str) -> anyhow::Result<()> {
         }
         Ok::<_, anyhow::Error>(())
     };
-    work.await
+    match work.await {
+        Err(error) if error.is::<crate::mcp_source::Unsupported>() => {
+            let now = hennery_kernel::secret::unix_now();
+            if let Some(head) = &candidate {
+                state
+                    .store
+                    .fail_delegation_source_policy(target, &head.operation, now)?;
+                state.store.fail_notice_source_policy(target, &head.operation, now)?;
+            }
+            state
+                .store
+                .fail_unavailable_operator_queue(target, crate::mcp_source::UNSUPPORTED)?;
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 fn refuse_configuration(state: &AppState, target: &str, operation: &str, now: i64) -> anyhow::Result<()> {

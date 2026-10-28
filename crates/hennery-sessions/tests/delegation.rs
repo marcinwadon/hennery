@@ -98,6 +98,8 @@ impl World {
                 hat,
                 None,
                 McpContext {
+                    source_policy: false,
+                    native_sources: false,
                     capable: true,
                     isolation,
                     rules_name_other_hats: false,
@@ -119,6 +121,70 @@ impl World {
             .unwrap();
     }
 }
+#[test]
+fn explicit_combined_keeps_builtin_scope_on_a_nondefault_hat_and_rechecks_live_support() {
+    use hennery_proto::{
+        frames::{Capabilities, Capability},
+        mcp_source::McpSourcePolicy,
+    };
+    let w = World::new();
+    let hosts = Hosts::open(&w.db).unwrap();
+    hosts
+        .update_hat_with_policy(&w.other, None, None, None, Some(McpSourcePolicy::ManagedPlusNative))
+        .unwrap();
+    let caps = Capabilities(vec![
+        Capability::McpServers,
+        Capability::McpSourcePolicy,
+        Capability::McpNativeSources,
+    ]);
+    hosts.record_hello("host", "0", &caps, unix_now()).unwrap();
+    let given = w
+        .store
+        .create_session_with_mcp(
+            "combined",
+            "host",
+            "claude",
+            "/project",
+            &w.other,
+            None,
+            McpContext {
+                capable: true,
+                source_policy: true,
+                native_sources: true,
+                isolation: McpIsolation::ClaudeStrict,
+                rules_name_other_hats: true,
+            },
+        )
+        .unwrap()
+        .unwrap();
+    let token = given
+        .servers
+        .iter()
+        .find_map(|server| match server {
+            McpServer::Http { name, headers, .. } if name == "hennery" => headers[0].value.strip_prefix("Bearer "),
+            _ => None,
+        })
+        .unwrap();
+    let identity = w.gateway.authenticate_session(token).unwrap().unwrap();
+    assert_eq!(identity.principal.hat_id, w.other);
+    assert!(w.store.session_tool_context(&identity, 1, false).unwrap().is_some());
+    assert!(w.store.session_tool_context(&identity, 1, true).unwrap().is_none());
+    let source = given.source_policy.unwrap();
+    let mut ack = SessionBody::session_started(&source.request_id, "agent-combined");
+    if let SessionBody::SessionStarted { indexed, .. } = &mut ack {
+        indexed.mcp_source_policy = Some(source);
+    }
+    w.store.ingest("combined", 1, &ack).unwrap();
+    assert!(w.store.session_tool_context(&identity, 1, true).unwrap().is_some());
+    let mut forged = identity.clone();
+    forged.principal.hat_id = w.hat.clone();
+    assert!(w.store.session_tool_context(&forged, 1, true).unwrap().is_none());
+    hosts
+        .record_hello("host", "old", &Capabilities(vec![Capability::McpServers]), unix_now())
+        .unwrap();
+    assert!(w.store.session_tool_context(&identity, 1, false).unwrap().is_none());
+}
+
 #[test]
 fn verified_context_checks_generation_session_owner_hat_cwd_and_live_isolation() {
     let w = World::new();
@@ -202,6 +268,8 @@ fn delegated_allocation_commits_session_family_token_together_and_rolls_back_all
     let parent = w.start("parent", &w.hat, McpIsolation::ClaudeStrict).unwrap();
     w.active("parent");
     let mcp = McpContext {
+        source_policy: false,
+        native_sources: false,
         capable: true,
         isolation: McpIsolation::ClaudeStrict,
         rules_name_other_hats: false,
@@ -385,6 +453,8 @@ fn allocation_rejects_noncanonical_child_input_without_storing_a_row() {
     let parent = w.start("parent", &w.hat, McpIsolation::ClaudeStrict).unwrap();
     w.active("parent");
     let mode = McpContext {
+        source_policy: false,
+        native_sources: false,
         capable: true,
         isolation: McpIsolation::ClaudeStrict,
         rules_name_other_hats: false,

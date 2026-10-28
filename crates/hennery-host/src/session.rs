@@ -247,6 +247,7 @@ impl Default for SessionOptions {
 /// Everything a session actor needs to attach its session.
 #[derive(Debug, Clone)]
 pub struct Launch {
+    pub mcp_source_policy: Option<hennery_proto::mcp_source::McpSourceSnapshot>,
     pub request_id: String,
     pub session_id: String,
     pub attach: Attach,
@@ -265,6 +266,7 @@ pub struct Launch {
 /// The connection task's handle on a session actor.
 #[derive(Clone)]
 pub struct SessionHandle {
+    mcp_source_policy: Option<hennery_proto::mcp_source::McpSourceSnapshot>,
     attach_generation: Option<u64>,
     commands: mpsc::UnboundedSender<SessionCmd>,
     turns: Arc<Mutex<PromptTurns>>,
@@ -339,6 +341,10 @@ impl Drop for PendingPromptGuard {
 }
 
 impl SessionHandle {
+    pub fn mcp_source_policy(&self) -> Option<&hennery_proto::mcp_source::McpSourceSnapshot> {
+        self.mcp_source_policy.as_ref()
+    }
+
     pub fn attach_generation(&self) -> Option<u64> {
         self.attach_generation
     }
@@ -435,6 +441,7 @@ pub fn spawn(
     options: SessionOptions,
 ) -> SessionHandle {
     let launch = Launch {
+        mcp_source_policy: None,
         request_id,
         session_id,
         attach: Attach::New,
@@ -460,6 +467,7 @@ pub fn resume(
     options: SessionOptions,
 ) -> SessionHandle {
     let launch = Launch {
+        mcp_source_policy: None,
         request_id,
         session_id,
         attach: Attach::Load { agent_session_id },
@@ -517,6 +525,7 @@ fn launch_inner(
         Attach::New => None,
     }));
     let actor = Actor {
+        mcp_source_policy: launch.mcp_source_policy.clone(),
         catalog_identity: crate::delegation::catalog_identity(&launch.agent, launch.profile),
         workspace_roots,
         attach_generation,
@@ -536,12 +545,14 @@ fn launch_inner(
         secrets: Secrets::of(&launch.mcp_servers),
     };
     let done = CancellationToken::new();
+    let mcp_source_policy = launch.mcp_source_policy.clone();
     let finished = done.clone().drop_guard();
     tokio::spawn(async move {
         let _finished = finished;
         actor.run(launch, rx).await;
     });
     SessionHandle {
+        mcp_source_policy,
         attach_generation,
         commands: tx,
         turns,
@@ -913,6 +924,7 @@ impl Drop for AcpTask {
 }
 
 struct Actor {
+    mcp_source_policy: Option<hennery_proto::mcp_source::McpSourceSnapshot>,
     catalog_identity: hennery_proto::delegation_host::CatalogIdentity,
     workspace_roots: Option<Vec<PathBuf>>,
     attach_generation: Option<u64>,
@@ -1034,6 +1046,7 @@ impl Actor {
             }
         });
         let mut indexed = self.catalogue_extracts();
+        indexed.mcp_source_policy = self.mcp_source_policy.clone();
         if indexed.current_config().is_some() {
             let mut identity = self.catalog_identity.clone();
             identity.agent_defaults = agent_defaults.cloned();
@@ -1155,7 +1168,7 @@ impl Actor {
         } = launch;
         let mcp = SessionMcp {
             servers: crate::profile::acp_servers(&mcp_servers),
-            meta: profile.session_meta(),
+            meta: profile.session_meta_for(self.mcp_source_policy.as_ref()),
         };
         // For the git probe: `cwd` goes to the adapter's start.
         let probe_cwd = cwd.clone();
@@ -1173,6 +1186,17 @@ impl Actor {
                 StartError {
                     code: "cwd_unavailable",
                     message: "delegated workspace unavailable".into(),
+                },
+            );
+        }
+        if let Some(source) = &self.mcp_source_policy
+            && (source.request_id != request_id || !profile.supports_source(source.policy))
+        {
+            return self.start_failed(
+                request_id,
+                StartError {
+                    code: "mcp_source_policy_unsupported",
+                    message: "this profile cannot honor the requested MCP source policy".into(),
                 },
             );
         }
@@ -3031,6 +3055,7 @@ mod tests {
         let (commands, receiver) = mpsc::unbounded_channel();
         (
             SessionHandle {
+                mcp_source_policy: None,
                 attach_generation: Some(1),
                 commands,
                 turns: Arc::new(Mutex::new(PromptTurns::default())),
@@ -3127,6 +3152,7 @@ mod tests {
         let handle = launch_delegated_in(
             uplink.clone(),
             Launch {
+                mcp_source_policy: None,
                 request_id: "start".into(),
                 session_id: "snapshot-test".into(),
                 attach: Attach::New,

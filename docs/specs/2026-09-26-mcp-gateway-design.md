@@ -212,6 +212,13 @@ included, since a table with children cannot be rebuilt later to widen one
 Per the spike, hennery-driven sessions get their MCP servers **per session over
 ACP**, not through agent config files:
 
+Explicit per-hat source policy supersedes the legacy fallback decision below:
+see [MCP source policy](2026-10-28-mcp-source-policy.md). `managed_only` requires
+qualified isolation; `managed_plus_native` deliberately permits native sources
+and records that mode independently of `isolation_waived`. Both retain the same
+managed mount, owner, host, hat, token and family admission boundaries. Native
+sources never become gateway mounts and are outside this filtering.
+
 1. When the collector prepares `start_session` / `resume_session` (ACP core
    §3.3) it decides the delivery (umbrella §8.5;
    `hennery_proto::rest::mcp_session_delivery`, the one mapping the host list
@@ -229,7 +236,7 @@ ACP**, not through agent config files:
    is recorded on the session, `SessionDetail.mcp_delivery`: the mode and a
    count, never a server, header or token (plan 8e decision E10).
 2. The host passes them in `session/new` / `session/load`, with the agent's
-   isolation mechanism (Claude strict flag, Codex composed home; ACP core §6),
+   isolation mechanism (currently Claude strict; ACP core §6),
    or applies the fallback (umbrella §8.5). The collector decides the
    fallback; a frame that delivers to an agent the host cannot isolate says
    so (`isolation_waived`), and without it the host refuses the servers
@@ -282,7 +289,7 @@ Hosts never render MCP entries into agent config in v1. Renderer rules (§8).
 
 ### 3.4 Local stdio servers
 
-hennery's per-session isolation strips the user's own locally configured MCP
+hennery's `managed_only` isolation strips the user's own locally configured MCP
 servers from hennery sessions, and the gateway proxies only HTTP. So the MCP view
 also holds, per **(host, hat)**, a list of local stdio servers
 (`name`, `command`, `args`, `env`; names follow the slug rules and share
