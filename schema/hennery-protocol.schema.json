@@ -1482,6 +1482,23 @@
             "null"
           ]
         },
+        "mcp_source_overrides": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/McpSourcePolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "description": "Sparse per-agent patch; null resets that agent to the scalar fallback.",
+          "type": [
+            "object",
+            "null"
+          ]
+        },
         "mcp_source_policy": {
           "anyOf": [
             {
@@ -2050,6 +2067,15 @@
           "format": "uint64",
           "minimum": 0,
           "type": "integer"
+        },
+        "mcp_source_overrides": {
+          "additionalProperties": {
+            "$ref": "#/$defs/McpSourceOverride"
+          },
+          "type": [
+            "object",
+            "null"
+          ]
         },
         "mcp_source_policy": {
           "$ref": "#/$defs/McpSourcePolicy",
@@ -3518,6 +3544,30 @@
           "type": "string"
         }
       ]
+    },
+    "McpSourceOverride": {
+      "description": "Sparse per-ACP setting. A reset retains its revision with a null policy.",
+      "properties": {
+        "policy": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/McpSourcePolicy"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "revision": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "revision"
+      ],
+      "type": "object"
     },
     "McpSourcePolicy": {
       "enum": [
@@ -6702,6 +6752,23 @@
         "default_for_new_hosts": {
           "type": [
             "boolean",
+            "null"
+          ]
+        },
+        "mcp_source_overrides": {
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/McpSourcePolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "description": "Omitted keys stay unchanged; null resets an override, not its revision.",
+          "type": [
+            "object",
             "null"
           ]
         },

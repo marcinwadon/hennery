@@ -296,6 +296,11 @@ isolation_waived?: boolean, };
 export type McpSourcePolicy = "legacy" | "managed_only" | "managed_plus_native";
 
 /**
+ * Sparse per-ACP setting. A reset retains its revision with a null policy.
+ */
+export type McpSourceOverride = { policy: McpSourcePolicy | null, revision: number, };
+
+/**
  * Echoed only after new/load used this snapshot. Request identity is the
  * existing start request, not a second lifecycle or proof namespace.
  */
@@ -1220,7 +1225,7 @@ export type UpdateHostRequest = { name?: string | undefined, default_hat_id?: st
  * One hat (kernel spec §5.1): an entry of `GET /api/hats`, and the answer
  * to its creation and its changes.
  */
-export type HatItem = { mcp_source_policy: McpSourcePolicy, mcp_policy_revision: number, id: string, name: string,
+export type HatItem = { mcp_source_overrides?: { [key in string]: McpSourceOverride }, mcp_source_policy: McpSourcePolicy, mcp_policy_revision: number, id: string, name: string,
 /**
  * `#rrggbb`, lowercase.
  */
@@ -1315,14 +1320,22 @@ host_transcripts: HostTranscripts, };
  * `POST /api/hats`: a name, 1 to 64 printable characters, unique in any
  * case, and a `#rrggbb` colour (slate when absent).
  */
-export type CreateHatRequest = { mcp_source_policy?: McpSourcePolicy, name: string, colour?: string | undefined, };
+export type CreateHatRequest = {
+/**
+ * Sparse per-agent patch; null resets that agent to the scalar fallback.
+ */
+mcp_source_overrides?: { [key in string]: McpSourcePolicy | null }, mcp_source_policy?: McpSourcePolicy, name: string, colour?: string | undefined, };
 
 /**
  * `PATCH /api/hats/{id}`: absent fields stay as they are.
  * `default_for_new_hosts` can only be `true`: a hat stops being that
  * default when another takes its place.
  */
-export type UpdateHatRequest = { mcp_source_policy?: McpSourcePolicy, name?: string | undefined, colour?: string | undefined, default_for_new_hosts?: boolean | undefined, };
+export type UpdateHatRequest = {
+/**
+ * Omitted keys stay unchanged; null resets an override, not its revision.
+ */
+mcp_source_overrides?: { [key in string]: McpSourcePolicy | null }, mcp_source_policy?: McpSourcePolicy, name?: string | undefined, colour?: string | undefined, default_for_new_hosts?: boolean | undefined, };
 
 /**
  * `PUT /api/hats/{id}/logo` (kernel spec §5.1, §8; plan 4d-B2): a PNG, at
