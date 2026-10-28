@@ -184,6 +184,11 @@ async fn configuration_error_is_visible_and_refused_prompt_remains_a_draft() {
             .unwrap(),
         0
     );
+    conn.execute(
+        "UPDATE sessions SET lifecycle = 'parked', presumed_parked = 1 WHERE id = 's'",
+        [],
+    )
+    .unwrap();
     state
         .store
         .ingest(
@@ -195,6 +200,15 @@ async fn configuration_error_is_visible_and_refused_prompt_remains_a_draft() {
             },
         )
         .unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT config_revision FROM session_attach_evidence WHERE session_id = 's'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        2
+    );
     assert!(
         state
             .store
