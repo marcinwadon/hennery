@@ -1,10 +1,19 @@
 import { render, screen } from '@testing-library/react'
 import { describe, expect, it } from 'vitest'
-import { host } from '../test-fixtures'
+import { host, hat } from '../test-fixtures'
 import McpPrediction from './McpPrediction'
 import { predictionHat } from '../lib/mcpDelivery'
 
 describe('delivery prediction', () => {
+  it('uses the correct ACP override when a hat mixes Claude-only and Codex defaults', () => {
+    const h = host({ capabilities: ['mcp_servers'], mcp_delivery: { codex: 'default_hat_only', claude: 'isolated' }, mcp_source_policies: { claude: ['managed_only', 'managed_plus_native'] } })
+    const selected = hat({ id: 'hat-a', mcp_source_overrides: { claude: { policy: 'managed_only', revision: 2 }, codex: { policy: 'legacy', revision: 1 } } })
+    const view = render(<McpPrediction host={h} agent="claude" hatId="hat-a" hat={selected} />)
+    expect(screen.getByRole('region', { name: 'MCP prediction' })).toHaveTextContent('Only MCP configured in Hennery')
+    view.rerender(<McpPrediction host={h} agent="codex" hatId="hat-a" hat={selected} />)
+    expect(screen.getByRole('region', { name: 'MCP prediction' })).toHaveTextContent('Codex also loads your own ~/.codex MCP servers.')
+    expect(screen.getByRole('region', { name: 'MCP prediction' })).not.toHaveTextContent('Starting will be refused')
+  })
   const h = host({ capabilities: ['mcp_servers'], mcp_delivery: { codex: 'default_hat_only', claude: 'isolated' } })
   it('shows default-hat Codex as not isolated, including its own configuration', () => {
     render(<McpPrediction host={h} agent="codex" hatId="hat-a" />)

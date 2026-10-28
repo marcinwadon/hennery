@@ -49,6 +49,25 @@ const card = async (name: string) => {
   return item
 }
 
+it('passes each connection hat to delivery predictions for the actual ACP', async () => {
+  open({
+    'GET /api/hats': json(200, [hat({ id: 'hat-a', mcp_source_overrides: {
+      claude: { policy: 'managed_plus_native', revision: 3 }, codex: { policy: 'legacy', revision: 1 },
+    } })]),
+    'GET /api/mcp/connections': json(200, [connection({ hat_id: 'hat-a' })]),
+    'GET /api/hosts': json(200, [host({ capabilities: ['mcp_servers'], default_hat_id: 'hat-a',
+      mcp_delivery: { claude: 'isolated', codex: 'default_hat_only' },
+      mcp_source_policies: { claude: ['managed_only', 'managed_plus_native'] },
+    })]),
+  })
+  const docs = await card('Docs')
+  const predictions = within(docs).getAllByRole('region', { name: 'MCP prediction' })
+  expect(predictions).toHaveLength(2)
+  expect(predictions[0]).toHaveTextContent('Hennery and runtime-native MCP')
+  expect(predictions[1]).toHaveTextContent('Codex also loads your own ~/.codex MCP servers.')
+  expect(predictions[1]).not.toHaveTextContent('Hennery and runtime-native MCP')
+})
+
 const OAUTH_CAPS = { mode: 'full', features: ['mcp_connections', 'mcp_oauth'] }
 const OAUTH_REDIRECT = json(200, { redirect_uri: 'https://hennery.example/api/mcp/oauth/callback' })
 it('confirms losing client settings even without a grant', async () => {

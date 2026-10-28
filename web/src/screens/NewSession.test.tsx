@@ -216,6 +216,20 @@ afterEach(() => {
 })
 
 describe('hosts', () => {
+  it('predicts source policy for the chosen ACP within the same resolved hat', async () => {
+    mount({ 'GET /api/hats': json(200, [{ ...HATS[0], mcp_source_overrides: {
+      claude: { policy: 'managed_only', revision: 2 }, codex: { policy: 'legacy', revision: 1 },
+    } }]), 'GET /api/hosts': json(200, [host('h1', 'laptop', {
+      mcp_source_policies: { claude: ['managed_only', 'managed_plus_native'] },
+    })]) })
+    const user = await fill()
+    await waitFor(() => expect(screen.getByRole('region', { name: 'MCP sources prediction' })).toHaveTextContent('Only MCP configured in Hennery'))
+    await user.click(screen.getByRole('radio', { name: 'Codex' }))
+    expect(screen.getByRole('region', { name: 'MCP sources prediction' })).toHaveTextContent('Existing / adapter defaults')
+    expect(screen.getByRole('region', { name: 'MCP sources prediction' })).not.toHaveTextContent('Starting will be refused')
+    await user.click(screen.getByRole('radio', { name: 'Claude' }))
+    expect(screen.getByRole('region', { name: 'MCP sources prediction' })).toHaveTextContent('Only MCP configured in Hennery')
+  })
   it('lists connected hosts first and offline ones disabled, never a revoked one', async () => {
     mount()
     await screen.findByRole('radio', { name: /^laptop/ })

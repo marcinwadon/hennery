@@ -1,6 +1,7 @@
 import '../styles/launch.css'
 import LaunchConfig, { requestFor } from '../components/LaunchConfig'
 import { SourcePolicyPrediction } from '../components/McpSourcePolicy'
+import { sourcePolicyFor } from '../lib/mcpSourcePolicy'
 import { useLaunchContext } from '../components/CatalogContext'
 import { sessionDefaults } from '../api/defaults'
 import { runtimeCatalog } from '../api/delegation'
@@ -590,7 +591,7 @@ export default function NewSession() {
                 </div>
               )}
               <HatPreview resolved={resolved} hatName={hatName} />
-              {current && <SourcePolicyPrediction policy={hats.find(h => h.id === current.hat_id)?.mcp_source_policy} host={host} agent={agentName} />}
+              {current && <SourcePolicyPrediction policy={sourcePolicyFor(hats.find(h => h.id === current.hat_id), agentName).policy} host={host} agent={agentName} />}
             </div>
 
             {current && <LaunchConfig context={context} picks={picks} onPicks={setPicks} expanded={expanded} onExpanded={setExpanded} />}

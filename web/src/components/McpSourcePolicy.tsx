@@ -4,24 +4,24 @@ export const sourcePolicyLabel = (policy: Policy | undefined): string => {
   switch (policy) {
     case 'managed_only': return 'Only MCP configured in Hennery'
     case 'managed_plus_native': return 'Hennery and runtime-native MCP'
-    default: return 'Existing behavior — choose a policy'
+    default: return 'Existing / adapter defaults'
   }
 }
 
-export function SourcePolicySelect({ value, onChange }: { value: Policy; onChange: (policy: Policy) => void }) {
+export function SourcePolicySelect({ value, onChange, label = 'MCP sources', allowed = ['managed_only', 'managed_plus_native'] }: { value: Policy; onChange: (policy: Policy) => void; label?: string; allowed?: Policy[] }) {
   return <label className="field">
-    <span className="field-label">MCP sources</span>
-    <select aria-label="MCP sources" className="text-input" value={value} onChange={event => onChange(event.target.value as Policy)}>
-      {value === 'legacy' && <option value="legacy">Existing behavior — choose a policy</option>}
-      <option value="managed_only">Only MCP configured in Hennery</option>
-      <option value="managed_plus_native">Hennery and runtime-native MCP</option>
+    <span className="field-label">{label}</span>
+    <select aria-label={label} className="text-input" value={value} onChange={event => onChange(event.target.value as Policy)}>
+      <option value="legacy">{sourcePolicyLabel('legacy')}</option>
+      {(['managed_only', 'managed_plus_native'] as const).filter(policy => policy === value || allowed.includes(policy)).map(policy =>
+        <option key={policy} value={policy} disabled={!allowed.includes(policy)}>{sourcePolicyLabel(policy)}</option>)}
     </select>
-    <span className="hint">Applies on the next start or resume. Runtime-native MCP can include project, plug-in and account sources shared across hats.</span>
+    <span className="hint">Applies on the next start or resume for this ACP. Adapter defaults preserve its existing behavior. Runtime-native MCP can include project, plug-in and account sources shared across hats.</span>
   </label>
 }
 
 export function SourcePolicyPrediction({ policy = 'legacy', host, agent }: { policy?: Policy; host?: HostItem; agent: string }) {
-  const supported = policy === 'legacy' || host?.mcp_source_policies?.[agent]?.includes(policy)
+  const supported = policy === 'legacy' || (Object.hasOwn(host?.mcp_source_policies ?? {}, agent) && host?.mcp_source_policies?.[agent]?.includes(policy))
   return <section aria-label="MCP sources prediction">
     <p>{sourcePolicyLabel(policy)}</p>
     {!supported && <p role="status">This host and agent do not report support for this MCP source policy. Starting will be refused.</p>}

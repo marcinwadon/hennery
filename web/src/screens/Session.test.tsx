@@ -131,6 +131,21 @@ function scrollTo(top: number) {
 const rows = (n: number, turn: string, prefix = turn) => Array.from({ length: n }, (_, i) => message(`${prefix}-${i}`, turn))
 
 describe('SessionView', () => {
+  it('does not show Codex pending when the same hat has a newer Claude override', async () => {
+    const source: McpSourceSnapshot = { policy: 'legacy', revision: 1, request_id: 'codex-attach' }
+    const s = server({ pages: [() => json(page([]))], hats: () => json([
+      { id: 'hat1', name: 'Work', colour: '#123456', mcp_source_policy: 'legacy', mcp_policy_revision: 0,
+        mcp_source_overrides: { claude: { policy: 'managed_only', revision: 9 }, codex: { policy: 'legacy', revision: 1 } } },
+    ]), detail: () => json(detail('codex', { mcp_source_policy: { policy: 'legacy', revision: 1, requested: source, applied: source } })) })
+    render(<SessionView id={ID} timing={FAST} />, { wrapper: s.wrapper })
+    await showDetailsTab('Details')
+    const policy = await screen.findByRole('region', { name: 'MCP sources' })
+    expect(policy).toHaveTextContent('Hat setting: Existing / adapter defaults')
+    expect(policy).toHaveTextContent('Last confirmed attach: Existing / adapter defaults')
+    expect(policy).not.toHaveTextContent('next start or resume')
+    expect(policy).not.toHaveTextContent('Only MCP configured in Hennery')
+  })
+
   it.each([1, 9])('shows the new hat policy after reassignment to revision %s', async revision => {
     const source: McpSourceSnapshot = { policy: 'managed_plus_native', revision: 9, request_id: 'old-hat' }
     const s = server({

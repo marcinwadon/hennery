@@ -205,7 +205,7 @@ export default function Mcp({ stdio = false, oauth = false }: { stdio?: boolean;
             key={connection.id}
             connection={connection}
             hatName={hatName(connection.hat_id)}
-            policy={hats.data?.find(h=>h.id===connection.hat_id)?.mcp_source_policy}
+            hat={hats.data?.find(h => h.id === connection.hat_id)}
             hosts={hosts.data}
             editing={editing?.id === connection.id ? editing : null}
             editBusy={editing?.id === connection.id && editBusy}
@@ -278,7 +278,7 @@ interface CardProps {
   refresh: () => Promise<McpConnectionItem[]>
   waiting?: (id: string, active: boolean) => void
   connection: McpConnectionItem
-  policy?: import('../generated/protocol').McpSourcePolicy
+  hat?: HatItem
   hatName?: string
   hosts: HostItem[] | null
   /** The connection as its form opened, while it is edited. */
@@ -313,7 +313,7 @@ function ConnectionCard(props: CardProps) {
         <span className="connection-auth">{c.cred_kind === 'none' ? 'No auth' : kindLabel(c.cred_kind)}</span>
         <span className={`state mcp-${c.status}`}>{props.oauth && c.oauth && c.status === 'needs_auth' ? 'May need sign-in' : props.oauth && c.status === 'not_connected' && c.oauth ? 'Not connected' : statusLabel(c.status)}</span>
         <span className="connection-hat"><Text>{hatName ?? c.hat_id}</Text></span>
-        <Mounts policy={props.policy} connection={c} hosts={hosts} onChanged={props.onChanged} compact />
+        <Mounts hat={props.hat} connection={c} hosts={hosts} onChanged={props.onChanged} compact />
       </div>
       {c.status_note && (
         <p className="hint">

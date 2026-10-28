@@ -62,6 +62,7 @@ import { takeOver } from '../api/view'
 import { QuestionPresentationContext } from '../components/QuestionActions'
 import { Text } from '../lib/text'
 import { useMcpDelivery } from '../hooks/useMcpDelivery'
+import { sourcePolicyFor } from '../lib/mcpSourcePolicy'
 import { useSessionConfig } from '../hooks/useSessionConfig'
 import SessionMenu from '../components/SessionMenu'
 import { deleteNotes } from '../components/sessionWords'
@@ -333,11 +334,12 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
   const hats = useMemo(() => scope?.hats ? new Map(scope.hats.map(h => [h.id, h.name])) : namesOf(hatItems, 'id'), [scope?.hats, hatItems])
   const actualHat = (scope?.hats ?? (Array.isArray(hatItems) ? hatItems as HatItem[] : [])).find(h => h.id === info?.hat_id)
   const reportedSource = mcp.detail?.mcp_source_policy
-  // Revisions are local to a hat. A detail read from the previous hat cannot
+  const selectedSource = sourcePolicyFor(actualHat, info?.agent ?? '')
+  // Revisions are local to a hat/ACP pair. A detail read from the previous hat cannot
   // override the current hat, regardless of their revision numbers. Within one
   // hat, retain the newer source setting when a stale GET/list arrives.
-  const sourcePolicy = reportedSource && actualHat && (mcp.detail?.hat_id !== actualHat.id || actualHat.mcp_policy_revision > reportedSource.revision)
-    ? { ...reportedSource, policy: actualHat.mcp_source_policy, revision: actualHat.mcp_policy_revision }
+  const sourcePolicy = reportedSource && actualHat && (mcp.detail?.hat_id !== actualHat.id || selectedSource.revision > reportedSource.revision)
+    ? { ...reportedSource, ...selectedSource }
     : reportedSource
   const accent = useAccentStyle(actualHat?.colour)
   useEffect(() => {

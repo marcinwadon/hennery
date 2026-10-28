@@ -45,7 +45,7 @@ async function report(page: Page, width: number) {
   return page.getByRole('region', { name: 'MCP sources', exact: true })
 }
 
-for (const width of [1280, 390]) test(`MCP source setting and confirmed attach stay distinct at ${width}px`, async ({ browser }) => {
+for (const width of [1280, 390]) test(`MCP source setting and confirmed attach stay distinct at ${width}px`, async ({ browser }, testInfo) => {
   test.setTimeout(180_000)
   const scratch = mkdtempSync(join(tmpdir(), 'hennery-source-policy-ui-'))
   const collector = await startCollector(), host = testHost()
@@ -67,20 +67,31 @@ for (const width of [1280, 390]) test(`MCP source setting and confirmed attach s
     }).toPass({ timeout: 30_000 })
     await page.goto('/hats')
     const personal = page.getByRole('listitem', { name: 'Personal', exact: true })
-    await expect(personal).toContainText('Existing behavior — choose a policy')
+    await expect(personal).toContainText('Existing / adapter defaults')
     await personal.getByRole('button', { name: 'Edit', exact: true }).click()
-    await personal.getByRole('combobox', { name: 'MCP sources', exact: true }).selectOption('managed_only')
+    await personal.getByRole('combobox', { name: 'Claude MCP sources', exact: true }).selectOption('managed_only')
+    await expect(personal.getByRole('combobox', { name: 'Codex MCP sources', exact: true })).toHaveValue('legacy')
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true)
+    await page.screenshot({ path: testInfo.outputPath('per-acp-hat-form.png'), fullPage: true })
     await personal.getByRole('button', { name: 'Save', exact: true }).click()
     await expect(personal).toContainText('Only MCP configured in Hennery')
     const created = await page.request.post('/api/sessions', { headers, data: { host_id: hostId, agent: 'claude', cwd: project } })
     expect(created.status()).toBe(202)
     const { session_id: id } = await created.json()
+    const codex = await page.request.post('/api/sessions', { headers, data: { host_id: hostId, agent: 'codex', cwd: project } })
+    expect(codex.status()).toBe(202)
+    const codexId = (await codex.json()).session_id
+    await expect(async () => {
+      const state = (await (await page.request.get(`/api/sessions/${codexId}`)).json()).mcp_source_policy
+      expect(state.policy).toBe('legacy')
+      expect(state.revision).toBe(0)
+    }).toPass()
     await page.goto(`/sessions/${id}`)
     await expect(await report(page, width)).toContainText('Last confirmed attach: Only MCP configured in Hennery')
 
     await page.goto('/hats')
     await personal.getByRole('button', { name: 'Edit', exact: true }).click()
-    await personal.getByRole('combobox', { name: 'MCP sources', exact: true }).selectOption('managed_plus_native')
+    await personal.getByRole('combobox', { name: 'Claude MCP sources', exact: true }).selectOption('managed_plus_native')
     await personal.getByRole('button', { name: 'Save', exact: true }).click()
     await expect(personal).toContainText('Hennery and runtime-native MCP')
     await page.goto(`/sessions/${id}`)
@@ -88,6 +99,12 @@ for (const width of [1280, 390]) test(`MCP source setting and confirmed attach s
     await expect(pending).toContainText('Hat setting: Hennery and runtime-native MCP')
     await expect(pending).toContainText('Last confirmed attach: Only MCP configured in Hennery')
     await expect(pending).toContainText('next start or resume')
+    await page.goto(`/sessions/${codexId}`)
+    const codexReport = await report(page, width)
+    await expect(codexReport).toContainText('Hat setting: Existing / adapter defaults')
+    await expect(codexReport).not.toContainText('next start or resume')
+    await page.goto(`/sessions/${id}`)
+    await report(page, width)
     expect((await page.request.post(`/api/sessions/${id}/park`, { headers })).status()).toBe(202)
     expect((await page.request.post(`/api/sessions/${id}/resume`, { headers })).status()).toBe(202)
     await expect(pending).toContainText('Last confirmed attach: Hennery and runtime-native MCP')
@@ -100,17 +117,33 @@ for (const width of [1280, 390]) test(`MCP source setting and confirmed attach s
     await page.goto('/hats')
     await page.getByRole('button', { name: '+ New hat', exact: true }).click()
     await page.getByRole('textbox', { name: 'Name', exact: true }).fill('Restricted')
-    await expect(page.getByRole('combobox', { name: 'MCP sources', exact: true })).toHaveValue('managed_only')
+    await expect(page.getByRole('combobox', { name: 'Claude MCP sources', exact: true })).toHaveValue('managed_only')
+    await expect(page.getByRole('combobox', { name: 'Codex MCP sources', exact: true })).toHaveValue('legacy')
+    // Build an equal-revision destination through public API transitions below.
+    if (width === 390) await page.getByRole('combobox', { name: 'Claude MCP sources', exact: true }).selectOption('legacy')
     await page.getByRole('button', { name: 'Create', exact: true }).click()
     const hats = await (await page.request.get('/api/hats')).json()
-    const restricted = hats.find((hat: { name: string }) => hat.name === 'Restricted')
-    expect(restricted.mcp_source_policy).toBe('managed_only')
+    let restricted = hats.find((hat: { name: string }) => hat.name === 'Restricted')
+    expect(restricted.mcp_source_policy).toBe('legacy')
+    expect(restricted.mcp_source_overrides.claude.policy).toBe(width === 390 ? 'legacy' : 'managed_only')
+    expect(restricted.mcp_source_overrides.codex).toBeUndefined()
+    if (width === 390) {
+      const changed = await page.request.patch(`/api/hats/${restricted.id}`, { headers, data: { mcp_source_overrides: { claude: 'managed_only' } } })
+      expect(changed.status()).toBe(200)
+      restricted = await changed.json()
+    }
     const other = join(project, 'restricted'); mkdirSync(other)
     expect((await page.request.put(`/api/hosts/${hostId}/path-rules`, { headers, data: { rules: [{ prefix: other, hat_id: restricted.id }] } })).status()).toBe(200)
     const second = await page.request.post('/api/sessions', { headers, data: { host_id: hostId, agent: 'claude', cwd: other } })
     expect(second.status()).toBe(202)
     const secondId = (await second.json()).session_id
     expect((await (await page.request.get(`/api/sessions/${secondId}`)).json()).mcp_source_policy.applied.policy).toBe('managed_only')
+    const otherCodex = await page.request.post('/api/sessions', { headers, data: { host_id: hostId, agent: 'codex', cwd: other } })
+    expect(otherCodex.status()).toBe(202)
+    const otherCodexId = (await otherCodex.json()).session_id
+    expect((await (await page.request.get(`/api/sessions/${otherCodexId}`)).json()).mcp_source_policy.policy).toBe('legacy')
+    // Unqualified adapters inherit legacy until explicitly configured otherwise.
+    expect((await page.request.patch(`/api/hats/${restricted.id}`, { headers, data: { mcp_source_overrides: { custom: 'managed_only' } } })).status()).toBe(200)
     const refused = await page.request.post('/api/sessions', { headers, data: { host_id: hostId, agent: 'custom', cwd: other } })
     expect(refused.status()).toBe(409)
     expect((await refused.json()).code).toBe('mcp_source_policy_unsupported')
@@ -118,16 +151,11 @@ for (const width of [1280, 390]) test(`MCP source setting and confirmed attach s
     expect(records.some(row => row.method === 'session/load' && row.params._meta?.claudeCode.options.strictMcpConfig === false)).toBe(true)
     expect(hatId).not.toBe(restricted.id)
 
-    // Revisions are local to each hat: exercise both a lower and an equal
+    // Revisions are local to each hat/ACP: exercise both a lower and an equal
     // destination revision without navigating away from the selected session.
-    if (width === 390) {
-      for (const policy of ['managed_plus_native', 'managed_only']) {
-        expect((await page.request.patch(`/api/hats/${restricted.id}`, { headers, data: { mcp_source_policy: policy } })).status()).toBe(200)
-      }
-    }
     const destination = (await (await page.request.get('/api/hats')).json()).find((hat: { id: string }) => hat.id === restricted.id)
-    expect(width === 390 ? destination.mcp_policy_revision === detail.mcp_source_policy.revision
-      : destination.mcp_policy_revision < detail.mcp_source_policy.revision).toBe(true)
+    expect(width === 390 ? destination.mcp_source_overrides.claude.revision === detail.mcp_source_policy.revision
+      : destination.mcp_source_overrides.claude.revision < detail.mcp_source_policy.revision).toBe(true)
     await page.goto(`/sessions/${id}`)
     const reassigned = await report(page, width)
     await expect(reassigned).toContainText('Hat setting: Hennery and runtime-native MCP')

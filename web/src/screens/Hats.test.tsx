@@ -37,6 +37,41 @@ const sent = (server: ReturnType<typeof stubServer>, method: string, path: strin
   server.sent.filter((s) => s.method === method && s.path === path)
 
 describe('the hats', () => {
+  it('saves only the changed ACP, cancels drafts, and resets with a null patch', async () => {
+    const initial = hat({ ...WORK, mcp_source_overrides: { claude: { policy: 'managed_only', revision: 1 } } })
+    const changed = hat({ ...WORK, mcp_source_overrides: { claude: { policy: 'managed_plus_native', revision: 2 } } })
+    const defaults = hat({ ...WORK, mcp_source_overrides: { claude: { policy: 'legacy', revision: 3 } } })
+    const reset = hat({ ...WORK, mcp_source_overrides: { claude: { policy: null, revision: 4 } } })
+    const server = open({ 'GET /api/hats': json(200, [PERSONAL, initial]),
+      'GET /api/hosts': json(200, [host({ mcp_source_policies: { claude: ['managed_only', 'managed_plus_native'] } })]),
+      'PATCH /api/hats/hat-b': [json(200, changed), json(200, defaults), json(200, reset)],
+    })
+    const card = await screen.findByRole('listitem', { name: 'Work' })
+    const ui = within(card)
+    await userEvent.click(ui.getByRole('button', { name: 'Edit' }))
+    await userEvent.selectOptions(ui.getByRole('combobox', { name: 'Claude MCP sources' }), 'managed_plus_native')
+    await userEvent.click(ui.getByRole('button', { name: 'Cancel' }))
+    expect(sent(server, 'PATCH', '/api/hats/hat-b')).toHaveLength(0)
+    await userEvent.click(ui.getByRole('button', { name: 'Edit' }))
+    expect(ui.getByRole('combobox', { name: 'Claude MCP sources' })).toHaveValue('managed_only')
+    expect(ui.getByRole('combobox', { name: 'Codex MCP sources' })).toHaveValue('legacy')
+    await userEvent.selectOptions(ui.getByRole('combobox', { name: 'Claude MCP sources' }), 'managed_plus_native')
+    await userEvent.click(ui.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(sent(server, 'PATCH', '/api/hats/hat-b')).toHaveLength(1))
+    expect(sent(server, 'PATCH', '/api/hats/hat-b')[0].body).toEqual({ mcp_source_overrides: { claude: 'managed_plus_native' } })
+    await waitFor(() => expect(ui.queryByRole('button', { name: 'Save' })).toBeNull())
+    await userEvent.click(ui.getByRole('button', { name: 'Edit' }))
+    await userEvent.selectOptions(ui.getByRole('combobox', { name: 'Claude MCP sources' }), 'legacy')
+    await userEvent.click(ui.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(sent(server, 'PATCH', '/api/hats/hat-b')).toHaveLength(2))
+    expect(sent(server, 'PATCH', '/api/hats/hat-b')[1].body).toEqual({ mcp_source_overrides: { claude: 'legacy' } })
+    await waitFor(() => expect(ui.queryByRole('button', { name: 'Save' })).toBeNull())
+    await userEvent.click(ui.getByRole('button', { name: 'Edit' }))
+    await userEvent.click(ui.getByRole('button', { name: 'Reset Claude MCP sources' }))
+    await userEvent.click(ui.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(sent(server, 'PATCH', '/api/hats/hat-b')).toHaveLength(3))
+    expect(sent(server, 'PATCH', '/api/hats/hat-b')[2].body).toEqual({ mcp_source_overrides: { claude: null } })
+  })
   it('shows saved overrides from the defaults API for configured agents on active hosts', async () => {
     const server = open({
       'GET /api/hosts': json(200, [host({ mcp_delivery: { custom: 'isolated' } }), host({ host_id: 'revoked', revoked_at: 'today', mcp_delivery: { removed: 'isolated' } })]),
@@ -90,7 +125,7 @@ describe('the hats', () => {
     await userEvent.click(await screen.findByRole('button', { name: '+ New hat' })); await userEvent.type(await screen.findByRole('textbox', { name: 'Name' }), 'Clients')
     await userEvent.click(screen.getByRole('button', { name: 'Create' }))
     expect(await screen.findByRole('listitem', { name: 'Clients' })).toBeInTheDocument()
-    expect(sent(server, 'POST', '/api/hats')[0].body).toEqual({ name: 'Clients', colour: '#64748b', mcp_source_policy: 'managed_only' })
+    expect(sent(server, 'POST', '/api/hats')[0].body).toEqual({ name: 'Clients', colour: '#64748b', mcp_source_overrides: { claude: 'managed_only' } })
   })
 
   it('asks for another name when it is taken', async () => {

@@ -31,6 +31,10 @@
 
 .inline-form { display:flex; align-items:flex-end; gap:10px; flex-wrap:wrap; margin-top:8px; }
 .inline-form .field { margin:0; flex:1; min-width:180px; }
+.agent-source-policies { display:grid; gap:12px; flex-basis:100%; width:100%; min-width:0; }
+.agent-source-policies fieldset { min-width:0; margin:0; padding:0; border:0; overflow-wrap:anywhere; }
+.agent-source-policies legend { font-weight:500; margin-bottom:6px; }
+.agent-source-policies select { width:100%; }
 .select-field { display:inline-flex; flex-direction:column; gap:4px; }
 .select-field .field-label { margin:0; font-size:12px; }
 .select-field select { min-height:36px; border:1.5px solid var(--border-strong); border-radius:var(--r-sm); background:var(--surface-2); color:var(--fg-1); padding:6px 8px; font:inherit; font-family:var(--font-data); max-width:100%; }

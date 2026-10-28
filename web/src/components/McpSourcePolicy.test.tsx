@@ -1,6 +1,12 @@
 import { render, screen } from '@testing-library/react'
 import { expect, it } from 'vitest'
 import McpSourcePolicy, { SourcePolicyPrediction } from './McpSourcePolicy'
+import { host } from '../test-fixtures'
+
+it('requires an own support entry for a valid adapter ID matching an object property', () => {
+  render(<SourcePolicyPrediction policy="managed_only" agent="constructor" host={host()} />)
+  expect(screen.getByRole('status')).toHaveTextContent('Starting will be refused')
+})
 
 it('keeps an active applied setting distinct from the changed hat policy', () => {
   render(<McpSourcePolicy state={{ policy: 'managed_only', revision: 3,

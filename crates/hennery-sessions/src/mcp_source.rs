@@ -182,7 +182,8 @@ impl Store {
     }
 
     pub fn mcp_source_state(&self, session: &str) -> Result<Option<McpSourceState>> {
-        let row: Option<(String, u64, Option<String>, Option<String>, String, String)> = self
+        type SourceStateRow = (String, u64, Option<String>, Option<String>, String, String);
+        let row: Option<SourceStateRow> = self
             .conn()
             .query_row(
                 "SELECT h.mcp_source_policy, h.mcp_policy_revision, s.mcp_source_requested, s.mcp_source_applied, h.mcp_source_overrides, s.agent
