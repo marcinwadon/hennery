@@ -437,7 +437,7 @@ li.q-opt-reject { border-color:var(--st-attn); color:var(--st-attn); }
   .parent-banner button { min-height:44px; }
   .session .transcript { padding:16px 16px 8px; }
   .bubble { font-size:15px; }
-  .composer { padding:8px 16px max(12px,env(safe-area-inset-bottom)); }
+  .composer { padding:8px 16px 12px; }
   .composer-controls { max-height:112px; overflow-y:auto; }
   .switcher { min-height:44px; }
   .switcher select { min-height:44px; max-width:150px; font-size:16px; }
@@ -468,7 +468,7 @@ li.q-opt-reject { border-color:var(--st-attn); color:var(--st-attn); }
   .has-question-actions .composer { display:none; }
   .has-question-actions .transcript { padding-bottom:240px; }
   .ask:has(.question-actions-selected) { animation:none; }
-  .question-actions-selected { position:absolute; left:0; right:0; bottom:0; z-index:24; padding:12px 16px max(12px,env(safe-area-inset-bottom)); background:var(--hn-panel); border-top:1px solid var(--hn-line); box-shadow:0 -4px 16px #0000000a; }
+  .question-actions-selected { position:absolute; left:0; right:0; bottom:0; z-index:24; padding:12px 16px 12px; background:var(--hn-panel); border-top:1px solid var(--hn-line); box-shadow:0 -4px 16px #0000000a; }
   .question-actions-selected .q-opts { display:grid; grid-template-columns:repeat(auto-fit,minmax(100px,1fr)); }
   .question-actions-selected .ask-actions { margin-top:0; justify-content:stretch; }
   .question-actions-selected .ask-actions > button { flex:1; }
@@ -491,11 +491,10 @@ li.q-opt-reject { border-color:var(--st-attn); color:var(--st-attn); }
 .session-details-heading { margin-bottom:0; }.session-details-heading h2 { font-size:12px; color:var(--hn-fg-3); }
 .session-mobile-hat { display:none; }
 .composer-inner { display:flex; flex-direction:column; border:1px solid var(--hn-control-strong); border-radius:12px; padding:8px; background:var(--hn-surface); }
-.composer-box { order:1; border:0; background:transparent; box-shadow:none; padding:0 4px; }
+.composer-box { border:0; background:transparent; box-shadow:none; padding:0 4px; }
 .composer-box:focus-within { box-shadow:none; }
 .composer-inner:focus-within { border-color:var(--hn-accent); }
-.composer-controls { order:2; margin:8px 4px 0; }.composer-hint { order:3; margin:6px 4px 0; }
-.composer-inner > .form-error,.composer-inner > .config-pending { order:0; }
+.composer-controls { margin:8px 4px 0; }.composer-hint { margin:6px 4px 0; }
 .session .ask-eyebrow { margin:-16px -16px 12px; padding:8px 14px; border-radius:11px 11px 0 0; background:var(--st-wait-bg); }
 .session .ask-q { font-size:14px; }.session .q-state { color:var(--hn-fg-3); font-weight:400; }
 .session .transcript { padding-top:20px; }
@@ -507,7 +506,7 @@ li.q-opt-reject { border-color:var(--st-attn); color:var(--st-attn); }
   .session-mobile-hat { display:inline; }.session-mobile-hat::after { content:' ·'; }
   .session-head .badge { padding:0; background:transparent; font-size:10px; }
   .session .transcript { padding-top:12px; }
-  .composer { padding:8px 12px max(12px,env(safe-area-inset-bottom)); }
+  .composer { padding:8px 12px 12px; }
   .composer-controls { max-height:100px; }.composer-box textarea { min-height:42px; }
   .question-actions-selected .q-opts { grid-template-columns:1fr 1fr; gap:8px; }
   .question-actions-selected .q-opt:first-child { grid-column:1 / -1; }
@@ -532,10 +531,31 @@ li.q-opt-reject { border-color:var(--st-attn); color:var(--st-attn); }
 .turn-complete { color:var(--hn-fg-3); font:400 11px var(--font-body); margin:12px 0 20px; }.turn-complete::before,.turn-complete::after { background:var(--hn-line); }
 .tool-line { min-height:36px; padding:7px 10px; background:var(--hn-sunken); }
 .tool-name { min-width:0; flex:0 1 auto; max-width:35%; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
-.composer { padding:8px 16px max(8px,env(safe-area-inset-bottom)); }
+/* shell.css owns the mobile conversation's bottom safe-area inset. */
+.composer { padding:8px 16px; }
 .composer-inner { padding:4px; }
-.composer-box { gap:6px; align-items:flex-end; }
-.composer-box textarea { min-height:32px; max-height:min(160px,28dvh); padding:6px 0; line-height:20px; }
+.composer-box { display:flex; flex-direction:column; align-items:stretch; gap:4px; min-width:0; }
+.composer-actions { display:flex; align-items:center; gap:6px; min-width:0; }
+.composer-actions > button { flex:none; }
+.composer-actions-space { flex:1; }
+.composer-config-status { display:flex; align-items:center; flex-wrap:wrap; gap:4px 8px; padding:4px; color:var(--hn-fg-3); font-size:12px; }
+.composer-config-status .btn { min-height:32px; }
+.composer-hint { flex-wrap:wrap; overflow-wrap:anywhere; }
+.composer .att-strip { flex-wrap:nowrap; min-width:0; overflow-x:auto; max-height:64px; margin-top:4px; }
+.composer .att-chip { flex:none; }
+.composer-inner:has(.att-strip) .composer-box textarea { max-height:min(160px,20dvh); }
+.session-settings { min-width:0; margin-bottom:20px; }
+.session-settings h3 { margin:0 0 12px; font-size:13px; }
+.session-settings .composer-controls { flex-direction:column; align-items:stretch; gap:12px; margin:0; max-height:none; overflow:visible; }
+.session-settings .switcher { display:flex; flex-wrap:wrap; align-items:center; gap:6px; min-width:0; }
+.session-settings .switcher > bdi { flex:1 1 100%; overflow-wrap:anywhere; }
+.session-settings .switcher:has(input[type=checkbox]) { flex-wrap:nowrap; }
+.session-settings .switcher:has(input[type=checkbox]) > bdi { flex:1; }
+.session-settings .switcher select { width:100%; min-width:0; max-width:100%; }
+.session-settings .session-effort { display:flex; flex-wrap:wrap; gap:4px; min-width:0; }
+.session-settings .config-readback,.session-settings .form-error { overflow-wrap:anywhere; }
+
+.composer-box textarea { flex:none; width:100%; min-height:32px; max-height:min(160px,28dvh); padding:6px 0; line-height:20px; }
 .composer-settings-trigger { display:flex; align-items:center; gap:5px; align-self:center; max-width:40%; min-height:30px; border:1px solid var(--hn-line); border-radius:6px; padding:4px 7px; color:var(--hn-fg-3); background:var(--hn-sunken); font:400 11px var(--font-body); white-space:nowrap; }
 .composer-settings-trigger bdi { overflow:hidden; text-overflow:ellipsis; }
 .config-chip-badge { flex:none; font-size:10px; color:var(--hn-accent-fg); }
@@ -555,7 +575,7 @@ li.q-opt-reject { border-color:var(--st-attn); color:var(--st-attn); }
 @media(max-width:767px) {
   .session .transcript { padding:12px 10px 8px; }.bubble,.bubble.user { padding:10px 12px; }
   .msg { gap:8px; }.tool-line { min-height:44px; }.tool-name { max-width:42%; }
-  .composer { padding:6px 8px max(6px,env(safe-area-inset-bottom)); }.composer-inner { padding:2px; }
+  .composer { padding:6px 8px 6px; }.composer-inner { padding:2px; }
   .composer-box textarea { min-height:40px; padding:10px 0; }
   .composer-settings-trigger { max-width:110px; min-height:44px; padding:4px; gap:3px; }.composer-settings-trigger:has(.config-chip-badge) bdi { display:none; }
   .composer-settings-layer { background:var(--hn-scrim); }
@@ -570,11 +590,11 @@ li.q-opt-reject { border-color:var(--st-attn); color:var(--st-attn); }
   .session-rename-form button[aria-label="Cancel rename"] { min-width:44px; }
 }
 
-/* Durable pending prompts sit below the input in both composer layouts. */
-.prompt-queue { order: 4; width: 100%; min-width: 0; }
+/* The queue keeps its own edit state above the full-width input. */
+.prompt-queue { width: 100%; min-width: 0; }
 .prompt-queue h3 { display: flex; gap: 8px; align-items: center; margin: 8px 0; font-size: 12px; color: var(--fg-muted); }
 .prompt-queue h3 span { font-variant-numeric: tabular-nums; }
-.prompt-queue ol { list-style: none; margin: 0; padding: 0; max-height: min(240px, 28dvh); overflow-y: auto; overscroll-behavior: contain; }
+.prompt-queue ol { list-style: none; margin: 0; padding: 0; max-height: min(144px, 16dvh); overflow-y: auto; overscroll-behavior: contain; }
 .prompt-queue li { padding: 10px 0; border-top: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: 6px; align-items: flex-start; }
 .queue-copy { display: flex; gap: 10px; flex: 1 1 200px; min-width: 0; }
 .queue-copy > div { min-width: 0; flex: 1; }
@@ -584,4 +604,22 @@ li.q-opt-reject { border-color:var(--st-attn); color:var(--st-attn); }
 .queue-actions { display: flex; gap: 4px; margin-left: auto; }
 .queue-copy textarea { width: 100%; min-height: 72px; resize: vertical; font: inherit; background: var(--bg); color: var(--fg-1); border: 1px solid var(--border); border-radius: 6px; padding: 8px; }
 .queue-copy .queue-reason { color: var(--fg-muted); font-size: 12px; margin-top: 4px; }
-@media (max-width: 767px) { .queue-actions .btn { min-height: 44px; } }
+@media (max-width: 767px) {
+  .queue-actions .btn,.composer-actions .btn,.composer-config-status .btn { min-height:44px; min-width:44px; }
+  .session-settings .session-effort label { min-height:44px; display:inline-flex; align-items:center; }
+}
+/* A phone in landscape still needs touch targets. Bound the optional content
+   in short viewports so thumbnails cannot push the action row off screen. */
+@media (max-width:1023px) {
+  .composer-actions > button,.composer-config-status .btn { min-width:44px; min-height:44px; }
+  .composer-box textarea { font-size:16px; }
+  .composer .att-x { width:44px; height:44px; top:0; right:0; }
+  .session-settings .switcher select { min-height:44px; font-size:16px; }
+  .session-settings .switcher,.session-settings .session-effort label { min-height:44px; }
+}
+@media (max-height:500px) and (max-width:1023px) {
+  .composer-inner:has(.att-strip) .composer-box textarea { min-height:32px; max-height:32px; padding:6px 0; }
+  .composer-inner:has(.att-strip) .prompt-queue ol { max-height:32px; }
+  .composer .att-strip { max-height:44px; }
+  .composer .att-chip { width:44px; height:44px; }
+}

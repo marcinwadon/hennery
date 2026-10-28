@@ -7,9 +7,23 @@ import * as lifecycle from './lifecycle'
 import { Journal, type PushRecord, type PushStore } from './journal'
 import { deferred, testLocks } from '../test-locks'
 import { SESSION_HISTORY_KEY, visitSession } from '../lib/sessionHistory'
+import { changeConfig, configuringFor } from '../lib/configuring'
 
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); sessionStorage.clear(); forgetAllAttachments(); history.replaceState(null, '', '/') })
 const client = () => new Client({ fetch: vi.fn(), here: () => ({ pathname: '/settings', search: '' }), navigate: vi.fn(), stepUp: vi.fn() })
+it('invalidates a pending configuration on logout so its late answer cannot restore session state', async () => {
+  let finish!: (response: Response) => void
+  const changingClient = new Client({ fetch: vi.fn(() => new Promise<Response>(resolve => { finish = resolve })), here: () => ({ pathname: '/sessions/s1', search: '' }), navigate: vi.fn(), stepUp: vi.fn() })
+  const change = changeConfig(changingClient, 's1', { id: 'model', name: 'Model', kind: 'select', current: 'a', choices: [{ value: 'b', name: 'B' }] }, 'b')
+  expect(configuringFor('s1')).toBe(change)
+  Object.defineProperty(navigator, 'serviceWorker', { configurable: true, value: undefined })
+  await completeLogout(client(), false)
+  expect(configuringFor('s1')).toBeUndefined()
+  expect(change.valid).toBe(false)
+  finish(new Response(JSON.stringify({ session_id: 's1', commands: [], config_options: [] }), { headers: { 'Content-Type': 'application/json' } }))
+  await change.result
+  expect(configuringFor('s1')).toBeUndefined()
+})
 it('a successful cleanup wins over a delayed outer timeout report', async () => {
   Object.defineProperty(navigator, 'locks', { configurable: true, value: testLocks() })
   const row: PushRecord = { generation: 1, enabled: true, id: 'id' }

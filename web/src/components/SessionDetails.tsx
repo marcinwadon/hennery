@@ -1,7 +1,9 @@
 import { useEffect, useId, useRef, type ReactNode, type RefObject, type KeyboardEvent } from 'react'
 import type { HeaderInfo } from './SessionHeader'
 import type { Item } from '../generated/view'
-import type { McpSessionDelivery } from '../generated/protocol'
+import type { McpSessionDelivery, SessionCatalog } from '../generated/protocol'
+import type { SessionConfigState } from '../hooks/useSessionConfig'
+import SessionSettings from './SessionSettings'
 import { agentLabel } from '../lib/agent'
 import { useMediaQuery } from '../hooks/useMediaQuery'
 import { useModalLayer } from './ui'
@@ -23,6 +25,9 @@ interface Props {
   hatName?: string
   plan?: Extract<Item, { kind: 'plan' }>
   delivery?: McpSessionDelivery
+  configuration?: SessionConfigState
+  catalog?: SessionCatalog | null
+  settingsFocus?: number
   children: ReactNode
 }
 
@@ -32,6 +37,16 @@ export default function SessionDetails(props: Props) {
   const { open, onClose, trigger, tab, onTab: setTab } = props
   const sheet = useMediaQuery('(max-width: 1023px)')
   const prefix = useId()
+  const wrapper = useRef<HTMLDivElement>(null)
+  // Runs after SheetFocus: a settings shortcut targets the settings themselves,
+  // while the ordinary Details/Family button keeps the selected-tab focus.
+  useEffect(() => {
+    if (!open || !props.settingsFocus) return
+    const section = wrapper.current?.querySelector<HTMLElement>('.session-settings')
+    const target = section?.querySelector<HTMLElement>('select:not([disabled]), input:not([disabled])') ?? section
+    target?.focus()
+    target?.scrollIntoView?.({ block: 'nearest' })
+  }, [open, props.settingsFocus, sheet])
   const body = <>
     <div className="session-details-heading"><h2>Session details</h2>{sheet && <WaitingBadge />}<button type="button" className="btn btn-ghost btn-sm" onClick={onClose} aria-label="Close session details">×</button></div>
     {sheet && <div className="session-detail-tabs" role="tablist" aria-label="Session information">
@@ -47,8 +62,10 @@ export default function SessionDetails(props: Props) {
       {name === 'Family' ? props.children : !open || (sheet && tab !== name) ? null : name === 'Plan' ? props.plan?.entries.length ? <StepList entries={props.plan.entries} truncated={props.plan.truncated} open /> : <p className="item-note">No plan has been shared.</p> : <Details {...props} />}
     </div>)}
   </>
-  return <div className={'session-details-wrap' + (sheet ? ' is-sheet' : '')} hidden={!open}>
-    {sheet ? <Sheet open={open} onClose={onClose} trigger={trigger}>{body}</Sheet> : <aside className="session-details" aria-label="Session details">{body}</aside>}
+  return <div ref={wrapper} className={'session-details-wrap' + (sheet ? ' is-sheet' : '')} hidden={!open}>
+    {sheet ? <Sheet open={open} onClose={onClose} trigger={trigger}>{body}</Sheet> : <aside className="session-details" aria-label="Session details" onKeyDown={event => {
+      if (event.key === 'Escape' && !event.defaultPrevented) { event.preventDefault(); event.stopPropagation(); onClose() }
+    }}>{body}</aside>}
   </div>
 }
 
@@ -70,16 +87,17 @@ function SheetFocus({ dialog: ref, keys, onClose, trigger }: { dialog: RefObject
   return null
 }
 
-function Details({ info, hostName, hatName, delivery }: Props) {
+function Details({ info, hostName, hatName, delivery, configuration, catalog }: Props) {
   return <>
+    {configuration && <SessionSettings catalog={catalog ?? null} config={configuration} />}
     {info && <dl className="session-facts">
       <dt>Session ID</dt><dd><bdi><code>{info.session_id}</code></bdi></dd>
       <dt>Host</dt><dd><bdi>{hostName ?? info.host_id}</bdi></dd>
       <dt>Project</dt><dd><bdi>{info.cwd}</bdi></dd>
       {hatName && <><dt>Hat</dt><dd><bdi>{hatName}</bdi></dd></>}
       <dt>Agent</dt><dd>{agentLabel(info.agent)}</dd>
-      {info.model && <><dt>Model</dt><dd><bdi>{info.model}</bdi></dd></>}
-      {info.mode && <><dt>Mode</dt><dd><bdi>{info.mode}</bdi></dd></>}
+      {!configuration && info.model && <><dt>Model</dt><dd><bdi>{info.model}</bdi></dd></>}
+      {!configuration && info.mode && <><dt>Mode</dt><dd><bdi>{info.mode}</bdi></dd></>}
       <dt>Started</dt><dd><time dateTime={info.created_at}>{new Date(info.created_at).toLocaleString()}</time></dd>
     </dl>}
     <McpDelivery agent={info?.agent} delivery={delivery} />
