@@ -13,7 +13,7 @@ import { Link } from '../router'
 import ConfirmDialog from './ConfirmDialog'
 import { useListSessionActions } from './SessionListActions'
 
-type Confirmation = { scope: string; targets: readonly BulkCloseTarget[]; retry?: CloseRetryPlan }
+type Confirmation = { scope: string; targets: readonly BulkCloseTarget[]; retry?: CloseRetryPlan; reads?: ReadonlyMap<string, SessionSummary | undefined> }
 interface Controls {
   selectButton: ReactNode
   panel: ReactNode
@@ -46,6 +46,9 @@ export default function SessionBulkActions({ enabled, scopeKey, sessions, hosts,
   liveScope.current = scopeKey; latest.current = sessions
   const previous = useRef(sessions), previousScope = useRef(scopeKey)
   const previousResults = useRef(new Map<string, string>())
+  // A later batch replaces the result panel, but cannot erase the need to
+  // check a previously submitted ID before closing its current run again.
+  const submittedIds = useRef(new Set<string>())
   useEffect(() => {
     const changed = new Map([...sessions].filter(([id, summary]) => previous.current.get(id) !== summary))
     previous.current = sessions
@@ -73,18 +76,31 @@ export default function SessionBulkActions({ enabled, scopeKey, sessions, hosts,
   const prepare = async () => {
     if (pending.current || busy || !selection.targets.length || cooldown) return
     const abort = new AbortController(), captured = closeTargets(selection.targets), notes: string[] = [], targets: BulkCloseTarget[] = []
+    const reads = new Map<string, SessionSummary | undefined>()
     pending.current = abort; setPreparing(true); setPreflightNotes([])
     try {
       for (const chosen of captured) {
-        let current = latest.current.get(chosen.id)
-        if (current) { targets.push({ ...chosen, lifecycle: current.lifecycle }); continue }
+        const current = latest.current.get(chosen.id)
+        if (current && !submittedIds.current.has(chosen.id)) { targets.push({ ...chosen, lifecycle: current.lifecycle }); continue }
+        // A list summary cannot settle an unknown Close. Repeated submissions
+        // always need a new GET and confirmation, even after another batch.
         // A missing cursor row or resync baseline cannot establish deletion.
+        const beforeRead = current
         try {
           const read = await client.request<{ session_id: string; lifecycle: string }>('GET', `/api/sessions/${encodeURIComponent(chosen.id)}`, undefined, { signal: abort.signal, timeoutMs: 15_000 })
           if (abort.signal.aborted || liveScope.current !== scopeKey) return
-          current = latest.current.get(chosen.id)
+          if (beforeRead !== latest.current.get(chosen.id)) {
+            notes.push(`${chosen.label}: State changed while checking; review selection again. No Close sent.`)
+            continue
+          }
           if (read.session_id !== chosen.id || !['starting', 'active', 'parked', 'closed', 'failed'].includes(read.lifecycle)) throw new Error('State unavailable')
-          targets.push({ ...chosen, lifecycle: current?.lifecycle ?? read.lifecycle })
+          if (read.lifecycle === 'closed') {
+            notes.push(`${chosen.label}: Already closed in Hennery; no Close sent.`)
+            selection.setChecked(chosen, false)
+            continue
+          }
+          reads.set(chosen.id, beforeRead)
+          targets.push({ ...chosen, lifecycle: read.lifecycle })
         } catch (err) {
           if (abort.signal.aborted || liveScope.current !== scopeKey) return
           notes.push(`${chosen.label}: ${err instanceof ApiFailure && err.status === 404 ? 'Unavailable; no Close sent.' : 'Current state could not be read; no Close sent.'}`)
@@ -96,8 +112,13 @@ export default function SessionBulkActions({ enabled, scopeKey, sessions, hosts,
         }
       }
       if (!abort.signal.aborted && liveScope.current === scopeKey) {
+        const ready = targets.filter(target => {
+          if (!reads.has(target.id) || reads.get(target.id) === latest.current.get(target.id)) return true
+          notes.push(`${target.label}: State changed while checking; review selection again. No Close sent.`)
+          return false
+        })
         setPreflightNotes(notes)
-        if (targets.length) setConfirmation({ scope: scopeKey, targets: closeTargets(targets) })
+        if (ready.length) setConfirmation({ scope: scopeKey, targets: closeTargets(ready), reads })
       }
     } finally {
       if (pending.current === abort) { pending.current = null; setPreparing(false) }
@@ -112,10 +133,11 @@ export default function SessionBulkActions({ enabled, scopeKey, sessions, hosts,
   }
   const selectedOutside = selection.targets.filter(target => !visibleIds.has(target.id)).length
   const currentConfirmation = confirmation?.scope === scopeKey ? confirmation : null
-  const confirmInvalid = !!currentConfirmation?.retry && bulk.retryPlan !== currentConfirmation.retry
+  const confirmInvalid = !!currentConfirmation && (!!currentConfirmation.retry && bulk.retryPlan !== currentConfirmation.retry
+    || currentConfirmation.targets.some(target => currentConfirmation.reads?.has(target.id) && currentConfirmation.reads.get(target.id) !== sessions.get(target.id)))
   const confirmTargets = currentConfirmation?.targets.map(target => {
     const current = sessions.get(target.id)
-    return currentConfirmation.retry || !current ? target : { ...target, lifecycle: current.lifecycle }
+    return currentConfirmation.retry || currentConfirmation.reads?.has(target.id) || !current ? target : { ...target, lifecycle: current.lifecycle }
   }) ?? []
   const running = confirmTargets.filter(target => sessions.get(target.id)?.activity === 'running' || sessions.get(target.id)?.activity === 'blocked').length
   const offline = confirmTargets.filter(target => hosts?.find(host => host.host_id === sessions.get(target.id)?.host_id)?.connected === false).length
@@ -149,6 +171,7 @@ export default function SessionBulkActions({ enabled, scopeKey, sessions, hosts,
   return <>{children(controls)}{enabled && currentConfirmation && createPortal(<ConfirmDialog title={`Close ${confirmTargets.length} selected ${confirmTargets.length === 1 ? 'session' : 'sessions'}?`} confirm="Close sessions" disabled={confirmInvalid || busy} onClose={() => setConfirmation(null)} returnFocus={() => closeButton.current && !closeButton.current.disabled ? closeButton.current : region.current}
     action={async () => {
       if (confirmInvalid) return
+      for (const target of confirmTargets) submittedIds.current.add(target.id)
       if (currentConfirmation.retry) void bulk.confirmRetry(currentConfirmation.retry)
       else void bulk.start(closeTargets(confirmTargets))
     }}>
@@ -156,6 +179,6 @@ export default function SessionBulkActions({ enabled, scopeKey, sessions, hosts,
     <p>Related sessions are kept unless separately selected. Offline hosts may still run a session until they reconnect.</p>
     <p>{running} running or blocked · {confirmTargets.filter(target => target.lifecycle === 'starting').length} starting · {offline} known offline</p>
     <ul aria-label="Sessions to close">{confirmTargets.map(target => <li key={target.id}><bdi>{target.label}</bdi> · <bdi>{target.id}</bdi> · {target.lifecycle}</li>)}</ul>
-    {confirmInvalid && <p role="alert">Session state changed. Cancel and review retry again.</p>}
+    {confirmInvalid && <p role="alert">Session state changed. Cancel and review the selected sessions again.</p>}
   </ConfirmDialog>, document.body)}</>
 }

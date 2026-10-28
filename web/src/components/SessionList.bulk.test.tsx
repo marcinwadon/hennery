@@ -11,7 +11,7 @@ function fixture(initial = [summary('A'), summary('B'), summary('C')]) {
   let rows = initial
   const streams: LiveStream[] = [], calls: { method: string; path: string }[] = []
   let close = (id: string) => json({ session_id: id, lifecycle: 'closed' }, 202)
-  let read = (id: string) => json(summary(id))
+  let read: (id: string) => Response | Promise<Response> = id => json(summary(id))
   const fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'http://test'), path = url.pathname, method = init?.method ?? 'GET'
     calls.push({ method, path })
@@ -37,6 +37,87 @@ beforeEach(() => {
   localStorage.clear(); sessionStorage.clear(); history.replaceState(null, '', '/sessions')
   localStorage.setItem('hennery.subgroup', 'none'); localStorage.setItem('hennery.sort', 'started')
   window.matchMedia = ((query: string) => ({ matches: query.includes('min-width: 768'), media: query, addEventListener: () => {}, removeEventListener: () => {} })) as unknown as typeof matchMedia
+})
+
+async function unknownSelected() {
+  const f = fixture(); f.close(() => json({ code: 'delivery_unknown' }, 503))
+  await open(f); await userEvent.click(checked('C'))
+  await userEvent.click(screen.getByRole('button', { name: 'Close selected' }))
+  await userEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Close sessions' }))
+  await waitFor(() => expect(screen.getByRole('region', { name: 'Close results' })).toHaveTextContent('Confirmation pending'))
+  return f
+}
+
+it('requires a fresh state check and new confirmation before Close selected can close an unknown result again', async () => {
+  const f = await unknownSelected(); f.read(id => json(summary(id, { lifecycle: 'parked' })))
+  await userEvent.click(screen.getByRole('button', { name: 'Close selected' }))
+  const dialog = await screen.findByRole('dialog')
+  expect(f.calls.filter(call => call.path === '/api/sessions/C')).toHaveLength(1)
+  expect(within(dialog).getByRole('list', { name: 'Sessions to close' })).toHaveTextContent('parked')
+  expect(f.calls.filter(call => call.method === 'POST')).toHaveLength(1)
+  await userEvent.click(within(dialog).getByRole('button', { name: 'Close sessions' }))
+  await waitFor(() => expect(f.calls.filter(call => call.method === 'POST')).toHaveLength(2))
+})
+
+it.each(['closed', 'missing', 'error'])('sends no second Close for unknown selection when GET is %s', async outcome => {
+  const f = await unknownSelected()
+  f.read(id => outcome === 'closed' ? json(summary(id, { lifecycle: 'closed' })) : json({ code: outcome === 'missing' ? 'not_found' : 'unavailable' }, outcome === 'missing' ? 404 : 503))
+  await userEvent.click(screen.getByRole('button', { name: 'Close selected' }))
+  await screen.findByRole('list', { name: 'Selection check results' })
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  expect(f.calls.filter(call => call.path === '/api/sessions/C')).toHaveLength(1)
+  expect(f.calls.filter(call => call.method === 'POST')).toHaveLength(1)
+})
+
+it('cannot confirm or dispatch another Close while the unknown selection GET is pending', async () => {
+  const f = await unknownSelected()
+  let resolve!: (response: Response) => void
+  f.read(() => new Promise<Response>(done => { resolve = done }))
+  await userEvent.click(screen.getByRole('button', { name: 'Close selected' }))
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  expect(screen.getByRole('button', { name: 'Close selected' })).toBeDisabled()
+  expect(f.calls.filter(call => call.method === 'POST')).toHaveLength(1)
+  expect(f.calls.filter(call => call.path === '/api/sessions/C')).toHaveLength(1)
+  await act(async () => resolve(json(summary('C', { lifecycle: 'closed' }))))
+  await screen.findByRole('list', { name: 'Selection check results' })
+  expect(f.calls.filter(call => call.method === 'POST')).toHaveLength(1)
+})
+
+it('does not forget an unknown ID when another selected batch replaces the results', async () => {
+  const f = await unknownSelected()
+  await userEvent.click(checked('C')); await userEvent.click(checked('B'))
+  f.close(id => json({ session_id: id, lifecycle: 'closed' }, 202))
+  await userEvent.click(screen.getByRole('button', { name: 'Close selected' }))
+  await userEvent.click(within(await screen.findByRole('dialog')).getByRole('button', { name: 'Close sessions' }))
+  await waitFor(() => expect(screen.getByRole('group', { name: 'Selected session actions' })).toHaveTextContent('0 selected'))
+  await userEvent.click(checked('C'))
+  await userEvent.click(screen.getByRole('button', { name: 'Close selected' }))
+  await screen.findByRole('dialog')
+  expect(f.calls.filter(call => call.path === '/api/sessions/C')).toHaveLength(1)
+  expect(f.calls.filter(call => call.path === '/api/sessions/C/close')).toHaveLength(1)
+})
+
+it('rejects an unknown selection GET overtaken by SSE instead of confirming the older run', async () => {
+  const f = await unknownSelected()
+  let resolve!: (response: Response) => void
+  f.read(() => new Promise<Response>(done => { resolve = done }))
+  await userEvent.click(screen.getByRole('button', { name: 'Close selected' }))
+  act(() => f.streams[0].event('session_upsert', summary('C', { activity: 'running', last_event_at: '2026-10-03T00:00:00Z' }), 'list:2'))
+  await act(async () => resolve(json(summary('C', { lifecycle: 'parked' }))))
+  expect(await screen.findByRole('list', { name: 'Selection check results' })).toHaveTextContent('State changed')
+  expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+  expect(f.calls.filter(call => call.method === 'POST')).toHaveLength(1)
+})
+
+it('invalidates the new unknown confirmation when a newer SSE arrives after its GET', async () => {
+  const f = await unknownSelected(); f.read(id => json(summary(id, { lifecycle: 'parked' })))
+  await userEvent.click(screen.getByRole('button', { name: 'Close selected' }))
+  const dialog = await screen.findByRole('dialog')
+  expect(dialog).toHaveTextContent('parked')
+  act(() => f.streams[0].event('session_upsert', summary('C', { activity: 'running', last_event_at: '2026-10-03T00:00:00Z' }), 'list:2'))
+  const confirm = within(dialog).getByRole('button', { name: 'Close sessions' })
+  await waitFor(() => expect(confirm).toBeDisabled()); await userEvent.click(confirm)
+  expect(f.calls.filter(call => call.method === 'POST')).toHaveLength(1)
 })
 
 it('checkboxes are outside links; exact confirmation/Cancel/focus never closes an unchecked row', async () => {

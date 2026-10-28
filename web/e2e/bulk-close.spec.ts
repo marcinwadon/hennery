@@ -41,10 +41,11 @@ for (const width of [390, 1280]) test(`bulk Close exact IDs, resync, partial ret
   const collector = await startCollector(), host = testHost(fakeAgent('claude', { chunks: ['Retained bulk history.'] }))
   const context = await browser.newContext({ baseURL: collector.origin, viewport: { width, height: 844 }, reducedMotion: 'reduce' })
   const page = await context.newPage(), request = context.request
-  const errors: string[] = [], closes: string[] = []
+  const errors: string[] = [], closes: string[] = [], reads: string[] = []
   page.on('pageerror', error => errors.push(error.message))
   page.on('request', r => { if (r.method() === 'POST' && r.url().endsWith('/close')) closes.push(new URL(r.url()).pathname.split('/')[3]) })
-  let firstStream: Route | undefined
+  page.on('request', r => { if (r.method() === 'GET' && /^\/api\/sessions\/[^/]+$/.test(new URL(r.url()).pathname)) reads.push(new URL(r.url()).pathname.split('/')[3]) })
+  let firstStream: Route | undefined, heldRead: Route | undefined
   try {
     const { ids } = await setup(page, collector, host)
     await context.addInitScript(() => { localStorage.setItem('hennery.subgroup', 'none'); localStorage.setItem('hennery.sort', 'started') })
@@ -115,9 +116,31 @@ for (const width of [390, 1280]) test(`bulk Close exact IDs, resync, partial ret
     expect(closes.filter(id => id === ids.Parent)).toHaveLength(1)
     expect(closes.filter(id => id === ids.Unknown)).toHaveLength(1)
     await page.screenshot({ path: join(artifact, `results-${width}.png`) })
+    // The toolbar must not bypass GET-only resolution of a delivery_unknown,
+    // even though that session remains checked and has a live list summary.
+    const beforeRead = reads.filter(id => id === ids.Unknown).length
+    await selectedClose.click()
+    const unknownConfirm = page.getByRole('dialog', { name: 'Close 1 selected session?', exact: true })
+    await expect(unknownConfirm).toBeVisible()
+    expect(reads.filter(id => id === ids.Unknown)).toHaveLength(beforeRead + 1)
+    await expect(unknownConfirm.getByRole('list', { name: 'Sessions to close', exact: true })).toContainText('Unknown')
+    expect(closes.filter(id => id === ids.Unknown)).toHaveLength(1)
+    await unknownConfirm.getByRole('button', { name: 'Cancel', exact: true }).click()
+    await expect(selectedClose).toBeFocused()
+    // A held detail read followed by closed must never offer or send a POST.
+    await page.route(`**/api/sessions/${ids.Unknown}`, route => { heldRead = route })
+    await selectedClose.click()
+    await expect.poll(() => !!heldRead).toBe(true)
+    await expect(selectedClose).toBeDisabled()
+    await expect(page.getByRole('dialog')).toHaveCount(0)
+    expect(closes.filter(id => id === ids.Unknown)).toHaveLength(1)
+    await heldRead!.fulfill({ json: { session_id: ids.Unknown, lifecycle: 'closed' } }); heldRead = undefined
+    await expect(page.getByRole('list', { name: 'Selection check results', exact: true })).toContainText('Already closed in Hennery; no Close sent.')
+    await expect(page.getByRole('dialog')).toHaveCount(0)
+    expect(closes.filter(id => id === ids.Unknown)).toHaveLength(1)
     await page.getByRole('button', { name: 'Done', exact: true }).click()
     await expect(page.getByRole('button', { name: 'Select sessions', exact: true })).toBeFocused()
     await expect(page.getByRole('checkbox', { name: /^Select / })).toHaveCount(0)
     expect(errors).toEqual([])
-  } finally { await firstStream?.abort().catch(() => {}); await context.close(); await host.stop(); await collector.stop() }
+  } finally { await heldRead?.abort().catch(() => {}); await firstStream?.abort().catch(() => {}); await context.close(); await host.stop(); await collector.stop() }
 })
