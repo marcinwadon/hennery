@@ -2,6 +2,6 @@
   "name": "hennery-adapter-claude",
   "private": true,
   "dependencies": {
-    "@agentclientprotocol/claude-agent-acp": "0.93.0"
+    "@agentclientprotocol/claude-agent-acp": "0.99.0"
   }
 }
