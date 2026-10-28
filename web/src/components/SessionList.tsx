@@ -9,6 +9,8 @@ import { useMediaQuery } from '../hooks/useMediaQuery'
 import { Icon, useModalLayer } from './ui'
 import { useRegisterAction } from '../app-actions'
 import SessionRow from './SessionRow'
+import SessionListActions from './SessionListActions'
+import SessionBulkActions from './SessionBulkActions'
 import HatSwitch from './HatSwitch'
 import SessionFilters from './SessionFilters'
 import { useSessionScope } from './SessionScope'
@@ -23,6 +25,9 @@ function rememberedSet(key: string): Set<string> {
   try { const value: unknown = JSON.parse(sessionStorage.getItem(key) ?? '[]'); return new Set(Array.isArray(value) ? value.filter((id): id is string => typeof id === 'string') : []) } catch { return new Set() }
 }
 function childPriority(s: SessionSummary) { return needsOperator(s) ? 0 : s.activity === 'running' ? 1 : 2 }
+function childPreview(children: SessionSummary[], sort: string) {
+  return [...children].sort((a, b) => (sort === 'attention' ? childPriority(a) - childPriority(b) : 0) || (sort !== 'started' ? (Date.parse(b.last_event_at) || 0) - (Date.parse(a.last_event_at) || 0) : 0) || compareStarted(a, b)).slice(0, 5)
+}
 // Retained for consumers of the old calendar helper; overview uses hats/hosts.
 export function byDay(rows: readonly SessionSummary[], now: number): [Bucket, SessionSummary[]][] {
   const days = new Map<Bucket, SessionSummary[]>()
@@ -104,10 +109,14 @@ export default function SessionList({ screen = false, attentionOnly = false }: {
   }).filter(project => project.families.length || collapsedProjects.has(project.id)) })).filter(g => g.projects.length)
   const rootCount = allGroups.reduce((n, g) => n + g.projects.reduce((n, project) => n + (collapsedProjects.has(project.id) ? 0 : project.families.length), 0), 0)
   const more = rootCount > limit || list.hasMore
-  return <section className={'slist overview' + (screen ? ' slist-screen' : '')} aria-label="Session list" onKeyDown={moveListFocus}>
-    <header className="overview-head"><h1 aria-label={attentionOnly ? 'Needs you' : 'Sessions'}>{attentionOnly ? 'Needs you' : desktop ? 'All sessions' : 'Sessions'}</h1><span className="overview-counter" title={`${matching.length}${list.hasMore ? ' shown' : ' sessions'} · ${scope.hosts?.filter(h => h.revoked_at == null).length ?? 0} hosts`}>{matching.length}{list.hasMore ? ' shown' : ' sessions'} · {scope.hosts?.filter(h => h.revoked_at == null).length ?? 0} hosts</span>{desktop && !attentionOnly && <SessionGroupingControls />}{attentionOnly && <button type="button" className="btn btn-ghost" onClick={() => document.querySelector<HTMLInputElement>('[aria-label="Search sessions"]')?.focus()}>Search</button>}<button type="button" className="btn btn-ghost filter-trigger" onClick={() => setFilters(!filters)} aria-expanded={filters}>Filters</button><Link to="/new" className="btn btn-primary">New session</Link></header>
-    <HatSwitch hats={hats} hat={hat} onHat={chooseHat} />
+  const visibleIds = new Set(list.loading ? [] : groups.flatMap(group => group.projects.flatMap(project => project.families.flatMap(family => [family.root.session_id, ...(expanded.has(family.root.session_id) ? childPreview(family.members.filter(child => child.family?.parent?.session_id === family.root.session_id), sort).map(child => child.session_id) : [])]))))
+  const selectionScope = JSON.stringify([scope.query, hat, scope.host, scope.status, scope.lifecycle, scope.hideClosed])
+  return <SessionListActions sessions={list.all} hosts={scope.hosts} onRemoved={list.remove}><SessionBulkActions enabled={!attentionOnly && pathname === '/sessions'} scopeKey={selectionScope} sessions={list.all} hosts={scope.hosts} visibleIds={visibleIds}>{bulk => <section className={'slist overview' + (screen ? ' slist-screen' : '')} aria-label="Session list" onKeyDown={moveListFocus}>
+    <header className="overview-head"><h1 tabIndex={-1} aria-label={attentionOnly ? 'Needs you' : 'Sessions'}>{attentionOnly ? 'Needs you' : desktop ? 'All sessions' : 'Sessions'}</h1><span className="overview-counter" title={`${matching.length}${list.hasMore ? ' shown' : ' sessions'} · ${scope.hosts?.filter(h => h.revoked_at == null).length ?? 0} hosts`}>{matching.length}{list.hasMore ? ' shown' : ' sessions'} · {scope.hosts?.filter(h => h.revoked_at == null).length ?? 0} hosts</span>{desktop && !attentionOnly && <SessionGroupingControls />}{attentionOnly && <button type="button" className="btn btn-ghost" onClick={() => document.querySelector<HTMLInputElement>('[aria-label="Search sessions"]')?.focus()}>Search</button>}<button type="button" className="btn btn-ghost filter-trigger" onClick={() => setFilters(!filters)} aria-expanded={filters}>Filters</button>{bulk.selectButton}<Link to="/new" className="btn btn-primary">New session</Link></header>
+    <fieldset className="bulk-filter-controls" disabled={bulk.busy}><HatSwitch hats={hats} hat={hat} onHat={chooseHat} />
     {!desktop && filters ? <FilterDialog close={() => setFilters(false)}><SessionFilters grouping /></FilterDialog> : <div className="filters-default"><SessionFilters grouping={!desktop} /></div>}
+    </fieldset>
+    {bulk.panel}
     {desktop && !list.searching && <NeedsYouQueue embedded />}
     {list.error && <p role="alert" className="form-error list-note"><bdi>{list.error}</bdi></p>}
     {!list.loading && (list.stream === 'reconnecting' || list.resynced) && <p className="list-note" role="status">{list.stream === 'reconnecting' ? 'Reconnecting…' : 'Resynced'}</p>}
@@ -116,7 +125,7 @@ export default function SessionList({ screen = false, attentionOnly = false }: {
     {groups.map(g => <div className="grp" key={g.id}>
       <h2 className="grp-head"><span className="grp-title"><bdi>{group === 'hat' ? hats?.find(h => h.id === g.id)?.name ?? 'Unknown hat' : hostNames.get(g.id) ?? 'Unknown host'}</bdi></span><span className="grp-count">{[g.waiting && `${g.waiting} need you`, g.running && `${g.running} running`, `${g.count} total${list.hasMore ? ' shown' : ''}`].filter(Boolean).join(' · ')}</span></h2>
       {g.projects.map(project => <div className="project-group" key={project.id}>
-        {project.path !== null && <h3 className="project-heading"><button type="button" className="project-toggle" aria-expanded={!collapsedProjects.has(project.id)} onClick={() => toggleProject(project.id)}>
+        {project.path !== null && <h3 className="project-heading"><button type="button" className="project-toggle" disabled={bulk.busy} aria-expanded={!collapsedProjects.has(project.id)} onClick={() => toggleProject(project.id)}>
           <span className="project-chevron" aria-hidden="true"><Icon name={collapsedProjects.has(project.id) ? 'chevron-right' : 'chevron-down'} size={12} /></span><Icon name="folder" size={14} /><bdi className="project-name">{projectLabel(project.path)}</bdi><bdi className="grp-path" title={project.path}>{basename(project.path) ? project.path.slice(0, -basename(project.path).length) : project.path}</bdi>
           {project.waiting > 0 && <span className="project-waiting" aria-label={`${project.waiting} ${project.waiting === 1 ? 'session needs' : 'sessions need'} you`}>{project.waiting} {project.waiting === 1 ? 'needs' : 'need'} you</span>}
           <span className="project-summary">{project.running > 0 && `${project.running} running · `}{project.count}{list.hasMore ? ' shown' : ''} {project.count === 1 ? 'session' : 'sessions'}</span><span className="grp-host" title={project.hosts.map(id => hostNames.get(id) ?? 'Unknown host').join(', ')}><bdi>{project.hosts.map(id => hostNames.get(id) ?? 'Unknown host').join(', ')}</bdi></span>
@@ -130,15 +139,15 @@ export default function SessionList({ screen = false, attentionOnly = false }: {
         const idle = children.filter(c => c.lifecycle === 'active' && c.activity === 'idle' && !needsOperator(c)).length
         const states = [[attention, 'need you'], [children.filter(c => c.unseen).length, 'unseen'], [running, 'running'], [done, 'done'], [idle, 'idle'], [children.filter(c => c.lifecycle === 'failed').length, 'failed']] as const
         const summary = states.filter(([count]) => count).slice(0, 3).map(([count, label]) => `${count} ${label}`).join(' · ') + (children.length < total && states.some(([count]) => count) ? ' shown' : '')
-        const preview = [...children].sort((a, b) => (sort === 'attention' ? childPriority(a) - childPriority(b) : 0) || (sort !== 'started' ? (Date.parse(b.last_event_at) || 0) - (Date.parse(a.last_event_at) || 0) : 0) || compareStarted(a, b)).slice(0, 5)
+        const preview = childPreview(children, sort)
         return <Fragment key={s.session_id}>
-          <SessionRow session={s} selected={s.session_id === selectedId} hostName={hostNames.get(s.host_id)} now={now} table childrenCount={total} childrenStatus={summary} expanded={expanded.has(s.session_id)} onToggleChildren={toggleFamily} />
-          {expanded.has(s.session_id) && <>{preview.map(child => <SessionRow key={child.session_id} session={child} selected={child.session_id === selectedId} hostName={hostNames.get(child.host_id)} now={now} table indent />)}
+          <SessionRow session={s} selected={s.session_id === selectedId} selection={bulk.selectionFor(s)} hostName={hostNames.get(s.host_id)} now={now} table childrenCount={total} childrenStatus={summary} expanded={expanded.has(s.session_id)} onToggleChildren={toggleFamily} />
+          {expanded.has(s.session_id) && <>{preview.map(child => <SessionRow key={child.session_id} session={child} selected={child.session_id === selectedId} selection={bulk.selectionFor(child)} hostName={hostNames.get(child.host_id)} now={now} table indent />)}
             <tr className="family-show-all"><td colSpan={5}><Link to={`/sessions/${encodeURIComponent(s.session_id)}?family=1`}>Show all {total} {total === 1 ? 'child' : 'children'}</Link></td></tr></>}
         </Fragment>
       })}</tbody></table>}
       </div>)}
     </div>)}</>)}
-    {!list.loading && more && <button type="button" className="btn btn-ghost list-more" disabled={list.loadingMore} onClick={() => { setShownRows({ query: list.queryKey, n: limit + PAGE_ROWS }); if (rootCount <= limit) void list.loadMore() }}>{list.loadingMore ? 'Loading…' : 'Load more'}</button>}
-  </section>
+    {!list.loading && more && <button type="button" className="btn btn-ghost list-more" disabled={list.loadingMore || bulk.busy} onClick={() => { setShownRows({ query: list.queryKey, n: limit + PAGE_ROWS }); if (rootCount <= limit) void list.loadMore() }}>{list.loadingMore ? 'Loading…' : 'Load more'}</button>}
+  </section>}</SessionBulkActions></SessionListActions>
 }

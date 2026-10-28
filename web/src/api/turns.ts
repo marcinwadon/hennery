@@ -2,7 +2,7 @@
 // cancel, a config switch, a resume (the footer's, and the composer's
 // "Resume and send"), and the header menu's park, close and delete. Every id
 // in a path is encoded: ids are server data, never trusted to be path-safe.
-import type { Client } from './client'
+import type { Client, RequestOptions } from './client'
 import type {
   CancelResponse,
   ConfigValue,
@@ -47,8 +47,8 @@ export function park(client: Client, id: string): Promise<LifecycleResponse> {
 }
 
 /** `POST /api/sessions/{id}/close` → 202 once the session is closed. */
-export function close(client: Client, id: string): Promise<LifecycleResponse> {
-  return client.request<LifecycleResponse>('POST', `/api/sessions/${enc(id)}/close`)
+export function close(client: Client, id: string, options?: RequestOptions): Promise<LifecycleResponse> {
+  return client.request<LifecycleResponse>('POST', `/api/sessions/${enc(id)}/close`, undefined, options)
 }
 
 /** `DELETE /api/sessions/{id}` → 200 `DeleteResult` (a server from before

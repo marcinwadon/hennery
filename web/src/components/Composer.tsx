@@ -1,5 +1,5 @@
 // The composer (frontend spec §6.5): a prompt with images, slash commands,
-// the config bar, and Send beside Cancel while a turn runs.
+// a settings shortcut, and Send beside Cancel while a turn runs.
 //
 // Mount it as `<Composer sessionId=… />`: the export is keyed by the
 // session id, so each session gets its own instance, and nothing typed or
@@ -25,8 +25,8 @@ import {
 } from 'react'
 import { useClient } from '../app-client'
 import { ApiFailure, messageOf } from '../api/errors'
-import { cancel, prompt, setConfig } from '../api/turns'
-import type { Capabilities, ConfigValue, QueuedPrompt, SessionCatalog } from '../generated/protocol'
+import { cancel, prompt } from '../api/turns'
+import type { Capabilities, QueuedPrompt, SessionCatalog } from '../generated/protocol'
 import type { SessionSummary } from '../generated/view'
 import {
   admit,
@@ -42,17 +42,16 @@ import {
   withoutMarker,
   type Attachment,
 } from '../lib/attachments'
-import { commands, configOptions, matchCommands, type Command, type ConfigOption } from '../lib/catalog'
+import { commands, matchCommands, type Command } from '../lib/catalog'
 import { clearDraftSending, draftMayHaveBeenSent, draftSendingRequestKey, loadDraft, markDraftConflicted, markDraftSending, saveDraft } from '../lib/drafts'
 import { sendingFor, track } from '../lib/sending'
 import { navigationGate } from '../pwa/navigation'
 import { undeliveredDraft, type DraftPart } from '../lib/sendAgain'
 import { Icon } from '../lib/ui'
-import SessionConfig from './SessionConfig'
+import type { SessionConfigState } from '../hooks/useSessionConfig'
+import { Icon as Glyph } from './ui'
 import PromptQueue from './PromptQueue'
-import ComposerSettings, { SettingsSummary } from './ComposerSettings'
-import { modelLabel } from '../lib/agent'
-import { CANCEL_OUTCOME, SEND_AGAIN_LABEL, cancelRefusal, configRefusal, isBusyTurn, promptRefusal } from './composerWords'
+import { CANCEL_OUTCOME, SEND_AGAIN_LABEL, cancelRefusal, isBusyTurn, promptRefusal } from './composerWords'
 
 /** What the session screen may ask of its composer. */
 export interface ComposerHandle {
@@ -83,9 +82,10 @@ export interface ComposerProps {
   /** The session's catalogue (config options, slash commands); null while
    *  it loads. */
   catalog: SessionCatalog | null
-  /** A config switch answered with the catalogue the agent now reports:
-   *  it replaces the one held (useSessionItems' `setCatalog`). */
-  onCatalog: (catalog: SessionCatalog) => void
+  /** Shared with Details; the synchronous guard covers picks before rerender. */
+  configuration: Pick<SessionConfigState, 'pending' | 'error' | 'isPending'>
+  onSettings: (trigger: HTMLButtonElement) => void
+  settingsExpanded?: boolean
   /** "Resume and send" resumes through this, then sends the draft; it
    *  rejects with the refusal to show. The view passes its one resume, the
    *  one its footer's Resume goes through. */
@@ -121,7 +121,7 @@ interface Notice {
 /** How a send ended: sent (a 202), or refused, saying why. */
 type Outcome = { sent: true } | { sent: false; notice: Notice }
 
-function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog, onResume, onJumpToQuestion, onSent, handle, queue = [], onQueueChange }: ComposerProps) {
+function SessionComposer({ sessionId, session, capabilities, catalog, configuration, onSettings, settingsExpanded = false, onResume, onJumpToQuestion, onSent, handle, queue = [], onQueueChange }: ComposerProps) {
   const client = useClient()
   const ids = useId()
   const [text, setText] = useState(() => loadDraft(sessionId))
@@ -149,11 +149,6 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
   // until the next such action or the next send, never cleared by a send's
   // answer (a refusal made while it was in flight would vanish with it).
   const [draftError, setDraftError] = useState<string | null>(null)
-  const configNow = useRef(false)
-  const [pendingConfig, setPendingConfig] = useState<Record<string, ConfigValue>>({})
-  const [configError, setConfigError] = useState<string | null>(null)
-  const [settingsOpen, setSettingsOpen] = useState(false)
-  const settingsTrigger = useRef<HTMLButtonElement>(null)
   const [sel, setSel] = useState(0)
   const [dismissed, setDismissed] = useState(false)
   const [dragging, setDragging] = useState(false)
@@ -190,7 +185,7 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
   const canResume = session?.lifecycle !== 'starting'
   // Nothing to send: Send and "Resume and send" both wait for words.
   const blank = text.trim() === ''
-  const canSend = !sending && !blank && Object.keys(pendingConfig).length === 0
+  const canSend = !sending && !blank && !configuration.pending
 
   // The draft as last rendered, for the handle and for a refill that
   // answers later.
@@ -209,10 +204,6 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
     // Once per composer: its session never changes (see Composer).
   }, [])
 
-  const options = configOptions(catalog)
-  const actualValue = (option: ConfigOption) => option.kind === 'boolean' ? `${option.name} ${option.current === true ? 'on' : 'off'}` : option.choices.find(choice => choice.value === option.current)?.name || String(option.current)
-  const summaryOptions = options.filter(option => ['model', 'mode', 'thought_level'].includes(option.category ?? '') || ['model', 'mode', 'effort', 'reasoning_effort'].includes(option.id))
-  const configSummary = summaryOptions.map(option => modelLabel(actualValue(option))).join(' · ') || 'Session settings'
   const cmds = commands(catalog)
   // The slash menu: the text starts with `/` and has no space yet.
   const query = !dismissed && /^\/\S*$/.test(text) ? text.slice(1) : null
@@ -375,7 +366,7 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
   function begin(work: (draft: string, images: Attachment[], requestKey: string) => Promise<Outcome>) {
     // One send at a time: a second click before the composer renders again
     // finds the first one here.
-    if (sendingNow.current) return
+    if (sendingNow.current || configuration.isPending()) return
     setSendingBoth(true)
     setNotice(null)
     setDraftError(null)
@@ -390,12 +381,13 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
   }
 
   function send() {
-    if (canSend && !configNow.current) begin(deliver)
+    if (canSend && !configuration.isPending()) begin(deliver)
   }
 
   /** Resume, then send; tracked as one send, so a composer mounted again
    *  while the resume is answered waits for both. */
   function resumeAndSend() {
+    if (!canSend || configuration.isPending()) return
     begin(async (draft, images, requestKey) => {
       try {
         await onResume()
@@ -421,37 +413,6 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
     } finally {
       setCancelling(false)
     }
-  }
-
-  /** Show the pick at once; the agent's answer replaces it, a refusal
-   *  takes it back. */
-  async function switchConfig(option: ConfigOption, value: ConfigValue) {
-    if (configNow.current) return
-    configNow.current = true
-    const settle = () => {
-      configNow.current = false
-      setPendingConfig((p) => {
-        const rest = { ...p }
-        delete rest[option.id]
-        return rest
-      })
-    }
-    setPendingConfig((p) => ({ ...p, [option.id]: value }))
-    setConfigError(null)
-    let answer: SessionCatalog
-    try {
-      answer = await setConfig(client, sessionId, option.id, value)
-    } catch (err) {
-      // Taken back: the catalogue held still says what the agent runs.
-      settle()
-      setConfigError(`${option.name}: ${configRefusal(err)}`)
-      return
-    }
-    // Replaced by what the agent now reports, which may differ from the pick.
-    onCatalog(answer)
-    const actual = configOptions(answer).find(candidate => candidate.id === option.id)
-    if (!actual || actual.current !== value) setConfigError(actual ? `${option.name}: the agent kept ${String(actual.current)} instead of ${String(value)}. Review its current setting before sending.` : `${option.name}: the agent did not confirm this setting. Review the current settings before sending.`)
-    settle()
   }
 
   function onKeyDown(e: KeyboardEvent<HTMLTextAreaElement>) {
@@ -501,12 +462,10 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
             {label}
           </p>
         )}
-        {settingsOpen && <ComposerSettings trigger={settingsTrigger} close={() => setSettingsOpen(false)}>
-          <div className="composer-controls" role="group" aria-label="Session settings">{options.map(option => <SessionConfig key={option.id} option={option} value={Object.hasOwn(pendingConfig, option.id) ? pendingConfig[option.id] : option.current} busy={Object.keys(pendingConfig).length > 0} onPick={value => void switchConfig(option, value)} />)}</div>
-          <p className="config-readback">Agent reports: <bdi>{options.map(option => `${option.name}: ${actualValue(option)}`).join(' · ') || 'No settings reported'}</bdi></p>
-          {Object.keys(pendingConfig).length > 0 && <p className="config-pending" role="status">Applying session settings…</p>}
-          {configError && <p className="form-error" role="alert"><bdi>{configError}</bdi></p>}
-        </ComposerSettings>}
+        <PromptQueue sessionId={sessionId} items={queue} changed={onQueueChange} />
+        {(configuration.pending || configuration.error) && <div className="composer-config-status" role="status">
+          {configuration.pending ? 'Applying session settings…' : <><span>Settings need attention.</span><button type="button" className="btn btn-ghost btn-sm" onClick={e => onSettings(e.currentTarget)}>Check settings</button></>}
+        </div>}
         <div
           className={'composer-box' + (dragging ? ' dragging' : '')}
           onDragOver={(e) => {
@@ -568,43 +527,46 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
             onKeyDown={onKeyDown}
             onPaste={onPaste}
           />
-          {(options.length > 0 || configError || Object.keys(pendingConfig).length > 0) && <SettingsSummary trigger={settingsTrigger} summary={configSummary} expanded={settingsOpen} open={() => setSettingsOpen(true)} pending={Object.keys(pendingConfig).length > 0} warning={!!configError} />}
-          {hostImages && (
-            <>
-              <input
-                ref={fileRef}
-                type="file"
-                accept="image/png,image/jpeg,image/gif,image/webp"
-                multiple
-                hidden
-                aria-hidden="true"
-                tabIndex={-1}
-                data-testid="image-input"
-                onChange={(e) => {
-                  attach(Array.from(e.target.files ?? []))
-                  e.target.value = ''
-                }}
-              />
-              <button className="attach-btn" type="button" aria-label="Attach images" onClick={() => fileRef.current?.click()}>
-                <Icon.Paperclip size={18} />
+          <div className="composer-actions">
+            {hostImages && (
+              <>
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/gif,image/webp"
+                  multiple
+                  hidden
+                  aria-hidden="true"
+                  tabIndex={-1}
+                  data-testid="image-input"
+                  onChange={(e) => {
+                    attach(Array.from(e.target.files ?? []))
+                    e.target.value = ''
+                  }}
+                />
+                <button className="attach-btn" type="button" aria-label="Attach images" onClick={() => fileRef.current?.click()}>
+                  <Icon.Paperclip size={18} />
+                </button>
+              </>
+            )}
+            <button className="attach-btn composer-settings-button" type="button" aria-label="Session settings" title="Session settings" aria-expanded={settingsExpanded} onClick={e => onSettings(e.currentTarget)}><Glyph name="adjustments-horizontal" size={18} /></button>
+            <span className="composer-actions-space" />
+            {inFlight && (
+              <button
+                className="btn btn-danger btn-sm"
+                type="button"
+                disabled={cancelling}
+                onClick={() => void stop()}
+              >
+                {cancelling ? 'Stopping…' : 'Cancel'}
               </button>
-            </>
-          )}
-          {inFlight && (
-            <button
-              className="btn btn-danger btn-sm"
-              type="button"
-              disabled={cancelling}
-              onClick={() => void stop()}
-            >
-              {cancelling ? 'Stopping…' : 'Cancel'}
-            </button>
-          )}
-          {
-            <button className="send-btn" type="button" aria-label={session?.lifecycle === 'parked' ? 'Resume and send' : 'Send'} title={session?.lifecycle === 'parked' ? 'Resume and send' : 'Send'} disabled={!canSend} onClick={send}>
-              <Icon.ArrowUp size={18} />
-            </button>
-          }
+            )}
+            {
+              <button className="send-btn" type="button" aria-label={session?.lifecycle === 'parked' ? 'Resume and send' : 'Send'} title={session?.lifecycle === 'parked' ? 'Resume and send' : 'Send'} disabled={!canSend} onClick={send}>
+                <Icon.ArrowUp size={18} />
+              </button>
+            }
+          </div>
         </div>
         {atts.length > 0 && (
           <ul className="att-strip" aria-label="Images">
@@ -623,7 +585,6 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
             ))}
           </ul>
         )}
-        <PromptQueue sessionId={sessionId} items={queue} changed={onQueueChange} />
         {draftError && (
           <p className="form-error" role="alert">
             <bdi>{draftError}</bdi>
@@ -638,7 +599,7 @@ function SessionComposer({ sessionId, session, capabilities, catalog, onCatalog,
               <bdi>{notice.resume && !canResume ? STILL_STARTING : notice.text}</bdi>
             </span>
             {notice.resume && canResume && (
-              <button className="btn btn-primary btn-sm" type="button" disabled={sending || blank} onClick={resumeAndSend}>
+              <button className="btn btn-primary btn-sm" type="button" disabled={!canSend} onClick={resumeAndSend}>
                 Resume and send
               </button>
             )}

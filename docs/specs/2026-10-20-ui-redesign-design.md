@@ -631,7 +631,8 @@ the honest replacement instead of quietly adding another backend feature.
 | Right panel Plan list: done/current/todo icons and strike-through | Restyle actual latest plan; show truncation/empty state | `SessionDetails.tsx`, `StepList.tsx` |
 | Right panel Details: session ID, host, project, hat/rule, agent, model, MCP, started | Show the full Hennery `session_id` as selectable text on desktop and mobile; omit unknown rule/version/config-source claims; actual delivered MCP snapshot | `SessionDetails.tsx`, `McpDelivery.tsx` |
 | Family status-only attention, fallback reason, acknowledgement/rearm | Restyle existing real controls; preserve prerequisites and pending links | `StatusAttention.tsx`, `FamilyPanel.tsx` |
-| Composer textarea, attachment button, Model, mode, effort radios, Send hint/button | Restyle all actual catalog options; local send shortcut, preserve cancel/resume/draft behavior | `Composer.tsx`, `components/SessionConfig.tsx` (new) |
+| Composer textarea, attachment button, Settings shortcut, Send and Cancel | Full-width textarea above a separate action row; Settings opens the existing Details panel/sheet; preserve local shortcuts and cancel/resume/draft behavior | `Composer.tsx`, `SessionDetails.tsx` |
+| Session settings in Details: Model, mode, effort and other catalog axes | One session-owned pending/error state above the unmountable panel; optimistic picks followed by whole-catalog agent read-back; pending blocks all prompt submission paths, errors remain reachable from the composer | `SessionSettings.tsx`, `SessionConfig.tsx`, `hooks/useSessionConfig.ts` |
 | Composer slash-command menu and “@ for files” placeholder | Restyle real slash commands; drop unsupported @-file promise | `Composer.tsx`, `lib/catalog.ts` |
 | Attachment thumbnails/remove, drag/paste, unsupported/error states | Restyle existing capability/size/marker rules | `Composer.tsx` |
 | Parked/closed/failed/starting/offline footer, Resume/send-again/new-project flow | Restyle existing behavior; still reachable without the panel | `SessionFooter.tsx`, `items/Marker.tsx`, `Composer.tsx` |
@@ -646,7 +647,7 @@ sent when you resume" when applicable. Explicit Park holds existing queued
 work; Resume or a new Send releases it. Ctrl+Enter and Cmd+Enter use the same
 submission handler in every state; ignore IME composition/keyCode 229 and
 autorepeat. Plain Enter retains its existing newline behavior. Accepted messages appear in a bounded
-"Queued" list under the composer, with a text preview, image count, Edit and
+"Queued" list above the input, bounded separately from the textarea, with a text preview, image count, Edit and
 Remove. Editing uses a separate inline draft and retains images; FIFO order
 cannot be changed. Once delivering, an item is immutable. If delivery wins
 while editing, keep the textarea visible with "Already sending; your edit
@@ -1039,8 +1040,21 @@ session id and draft and never retries Start automatically. Tests must
 exercise a real clamped/failed adapter config before the first prompt,
 not just mock a successful POST response.
 
-The session composer's config bar remains on
+The running session's Details settings remain on
 `POST /api/sessions/{id}/config` and its returned `SessionCatalog`.
+The Settings shortcut opens Details on both phone and desktop and restores
+focus to its invoking button on close. Closing or changing a sheet tab does
+not clear a pending configuration or its error. A pending request survives
+navigation away and back to the same session; it never blocks another
+session. A refusal restores the held values; clamped or missing read-back is
+a visible warning, not success or an automatic send. Keep the existing
+manual-send behavior after settlement, without a new acknowledgement gate.
+The launcher's separate `ComposerSettings` dialog remains unchanged.
+The mobile shell owns the conversation's bottom safe-area inset; do not add
+it again in the composer or question action region. Fixed sheets own their
+own inset. Attachments occupy one bounded strip. Actual iOS/Android keyboard
+and installed-PWA acceptance remains a device check; Chromium viewport
+emulation alone does not establish it.
 Show optimistic pending state then actual adapter state; rollback and
 explain refusal. It never writes hat defaults. No “save as default” gesture
 is implied by changing the session's mode or effort.

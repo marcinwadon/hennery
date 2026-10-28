@@ -84,6 +84,15 @@ async fn rename_is_operator_only_and_null_restores_agent_title_without_step_up()
 
 #[tokio::test(start_paused = true)]
 async fn configuration_error_is_visible_and_refused_prompt_remains_a_draft() {
+    configuration_error_case(false).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn matching_evidence_does_not_clear_a_presumed_parked_configuration_error() {
+    configuration_error_case(true).await;
+}
+
+async fn configuration_error_case(presume_parked: bool) {
     use hennery_proto::{
         delegation_host::{ConfigCompleteness, ConfigEvidence},
         frames::SessionConfig,
@@ -141,6 +150,9 @@ async fn configuration_error_is_visible_and_refused_prompt_remains_a_draft() {
         .store
         .refresh_delegation_attention(&state.hub, at + started.elapsed().as_secs() as i64)
         .unwrap();
+    // Only the configuration deadline needs virtual time. HTTP I/O with a
+    // paused clock can auto-advance the offline watcher and park this session.
+    tokio::time::resume();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let server = tokio::spawn(hennery_sessions::serve(listener, state.clone()));
@@ -184,6 +196,19 @@ async fn configuration_error_is_visible_and_refused_prompt_remains_a_draft() {
             .unwrap(),
         0
     );
+    let before_evidence = state.store.find_session("s").unwrap().unwrap();
+    assert_eq!(
+        before_evidence.lifecycle, "active",
+        "presumed_parked={}",
+        before_evidence.presumed_parked
+    );
+    assert!(!before_evidence.presumed_parked);
+    if presume_parked {
+        assert_eq!(state.store.presume_parked("h").unwrap().len(), 1);
+        let parked = state.store.find_session("s").unwrap().unwrap();
+        assert_eq!(parked.lifecycle, "parked");
+        assert!(parked.presumed_parked);
+    }
     state
         .store
         .ingest(
@@ -195,15 +220,14 @@ async fn configuration_error_is_visible_and_refused_prompt_remains_a_draft() {
             },
         )
         .unwrap();
-    assert!(
-        state
-            .store
-            .find_session("s")
-            .unwrap()
-            .unwrap()
-            .configuration_error
-            .is_none()
-    );
-    assert!(state.store.operator_attention(None, "").unwrap().is_empty());
+    let after_evidence = state.store.find_session("s").unwrap().unwrap();
+    if presume_parked {
+        assert_eq!(after_evidence.configuration_error.as_deref(), Some(reason));
+        assert_eq!(after_evidence.lifecycle, "parked");
+        assert!(after_evidence.presumed_parked);
+    } else {
+        assert!(after_evidence.configuration_error.is_none());
+        assert!(state.store.operator_attention(None, "").unwrap().is_empty());
+    }
     server.abort();
 }

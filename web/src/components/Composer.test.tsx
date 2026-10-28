@@ -1,7 +1,10 @@
 import '@testing-library/jest-dom/vitest'
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
-import { createRef, useState } from 'react'
+import { createRef, useRef, useState } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import SessionDetails, { type SessionDetailsTab } from './SessionDetails'
+import { useSessionConfig } from '../hooks/useSessionConfig'
+import { forgetAllConfigChanges } from '../lib/configuring'
 import { Client } from '../api/client'
 import { resume } from '../api/turns'
 import { ClientContext } from '../app-client'
@@ -54,13 +57,19 @@ function catalogOf(model = 'a', mode = 'plan', cmds: unknown[] = []): SessionCat
   } as SessionCatalog
 }
 
-type HostProps = Omit<ComposerProps, 'catalog' | 'onCatalog'> & { initialCatalog?: SessionCatalog | null }
+type HostProps = Omit<ComposerProps, 'catalog' | 'configuration' | 'onSettings' | 'settingsExpanded'> & { initialCatalog?: SessionCatalog | null }
 
 /** The composer as the session screen holds it: the catalogue in state,
  *  replaced by what `onCatalog` hands back. */
 function Host({ initialCatalog = null, ...rest }: HostProps) {
   const [catalog, setCatalog] = useState<SessionCatalog | null>(initialCatalog)
-  return <Composer {...rest} catalog={catalog} onCatalog={setCatalog} />
+  const configuration = useSessionConfig(rest.sessionId, setCatalog)
+  const [open, setOpen] = useState(false)
+  const [tab, setTab] = useState<SessionDetailsTab>('Details')
+  const [settingsFocus, setSettingsFocus] = useState(0)
+  const trigger = useRef<HTMLButtonElement>(null)
+  return <><Composer {...rest} catalog={catalog} configuration={configuration} settingsExpanded={open && tab === 'Details'} onSettings={button => { trigger.current = button; setTab('Details'); setOpen(true); setSettingsFocus(n => n + 1) }} />
+    <SessionDetails open={open} tab={tab} onTab={setTab} onClose={() => { setOpen(false); trigger.current?.focus() }} trigger={trigger} configuration={configuration} catalog={catalog} settingsFocus={settingsFocus}>{null}</SessionDetails></>
 }
 
 function mount(handler: Handler = accepted, props: Partial<HostProps> = {}) {
@@ -87,13 +96,13 @@ function mount(handler: Handler = accepted, props: Partial<HostProps> = {}) {
   }
   const view = render(
     <ClientContext.Provider value={client}>
-      <Host {...base} />
+      <Host key={base.sessionId} {...base} />
     </ClientContext.Provider>,
   )
   const rerender = (next: Partial<HostProps>) =>
     view.rerender(
       <ClientContext.Provider value={client}>
-        <Host {...base} {...next} />
+        <Host key={next.sessionId ?? base.sessionId} {...base} {...next} />
       </ClientContext.Provider>,
     )
   const prompts = () => posts.filter((p) => p.path.endsWith('/prompt'))
@@ -138,6 +147,7 @@ function paste(...files: File[]) {
 
 let urls = 0
 beforeEach(() => {
+  forgetAllConfigChanges()
   urls = 0
   sessionStorage.clear()
   forgetAllAttachments()
@@ -147,6 +157,7 @@ beforeEach(() => {
 })
 
 afterEach(() => {
+  vi.unstubAllGlobals()
   vi.restoreAllMocks()
 })
 
@@ -757,7 +768,7 @@ describe('Composer: slash commands', () => {
   })
 })
 
-describe('Composer: config bar', () => {
+describe('Composer and Details: shared config', () => {
   function deferred() {
     let resolve!: (r: Response) => void
     const promise = new Promise<Response>((r) => (resolve = r))
@@ -1039,7 +1050,7 @@ it('keeps Send disabled while configuration is pending and explains a missing ad
   fireEvent.click(screen.getByRole('button', { name: 'Session settings' }))
   fireEvent.change(screen.getByRole('textbox', { name: 'Prompt' }), { target: { value: 'Keep this draft' } })
   fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), { target: { value: 'b' } })
-  expect(screen.getByText('Applying session settings…', { exact: true })).toBeInTheDocument()
+  expect(within(screen.getByRole('region', { name: 'Session settings' })).getByText('Applying session settings…', { exact: true })).toBeInTheDocument()
   expect(screen.getByRole('combobox', { name: 'Mode' })).toBeDisabled()
   expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
   fireEvent.keyDown(screen.getByRole('textbox', { name: 'Prompt' }), { key: 'Enter', ctrlKey: true })
@@ -1047,12 +1058,121 @@ it('keeps Send disabled while configuration is pending and explains a missing ad
   await act(async () => { finish(json({ session_id: 's1', config_options: [], commands: [] }, 202)); await result })
   expect(screen.getByRole('alert')).toHaveTextContent('the agent did not confirm this setting')
   expect(screen.getByRole('textbox', { name: 'Prompt' })).toHaveValue('Keep this draft')
-  fireEvent.click(screen.getByRole('button', { name: 'Close session settings' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Close session details' }))
   const trigger = screen.getByRole('button', { name: 'Session settings' })
   expect(trigger).toHaveAttribute('aria-expanded', 'false')
-  expect(within(trigger).getByRole('status')).toHaveTextContent('Check settings')
-  expect(screen.queryByRole('dialog', { name: 'Session settings' })).toBeNull()
+  expect(screen.getByRole('button', { name: 'Check settings' })).toBeVisible()
+  expect(screen.queryByRole('dialog', { name: 'Session details' })).toBeNull()
   expect(trigger).toHaveFocus()
+})
+
+it('keeps a config operation above phone tabs and the closed sheet, with the draft and Cancel available', async () => {
+  vi.stubGlobal('matchMedia', vi.fn((query: string) => ({ matches: query === '(max-width: 1023px)', addEventListener() {}, removeEventListener() {} })))
+  let finish!: (response: Response) => void
+  const c = mount((_, path) => path.endsWith('/config') ? new Promise<Response>(resolve => { finish = resolve }) : json({ outcome: 'cancelled' }, 202), { initialCatalog: catalogOf(), session: { lifecycle: 'active', activity: 'running' } })
+  type('My next prompt')
+  const trigger = screen.getByRole('button', { name: 'Session settings' })
+  fireEvent.click(trigger)
+  expect(screen.getByRole('combobox', { name: 'Model' })).toHaveFocus()
+  fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), { target: { value: 'b' } })
+  fireEvent.click(screen.getByRole('tab', { name: 'Plan' }))
+  expect(screen.queryByRole('combobox', { name: 'Model' })).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'Close session details' }))
+  expect(trigger).toHaveFocus()
+  expect(sendButton()).toBeDisabled()
+  expect(screen.getByRole('button', { name: /^Cancel$/ })).toBeEnabled()
+  type('Still editable')
+  fireEvent.click(trigger)
+  expect(screen.getByRole('tab', { name: 'Details' })).toHaveAttribute('aria-selected', 'true')
+  expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue('b')
+  expect(screen.getByRole('combobox', { name: 'Model' })).toBeDisabled()
+  await act(async () => { finish(json(catalogOf('b', 'edit'), 202)) })
+  expect(screen.getByRole('combobox', { name: 'Mode' })).toHaveValue('edit')
+  fireEvent.keyDown(screen.getByRole('dialog', { name: 'Session details' }), { key: 'Escape' })
+  expect(trigger).toHaveFocus()
+  expect(textarea()).toHaveValue('Still editable')
+  expect(sendButton()).toBeEnabled()
+  expect(c.prompts()).toHaveLength(0)
+})
+
+it('returns focus from desktop settings on Escape as it does from the phone sheet', () => {
+  mount(accepted, { initialCatalog: catalogOf() })
+  const trigger = screen.getByRole('button', { name: 'Session settings' })
+  fireEvent.click(trigger)
+  const model = screen.getByRole('combobox', { name: 'Model' })
+  expect(model).toHaveFocus()
+  fireEvent.keyDown(model, { key: 'Escape' })
+  expect(screen.queryByRole('combobox', { name: 'Model' })).toBeNull()
+  expect(trigger).toHaveFocus()
+})
+
+it('guards submit synchronously when a config pick and keyboard/button events share one render', async () => {
+  let finish!: (response: Response) => void
+  const c = mount(() => new Promise<Response>(resolve => { finish = resolve }), { initialCatalog: catalogOf() })
+  type('Keep this draft')
+  fireEvent.click(screen.getByRole('button', { name: 'Session settings' }))
+  act(() => {
+    fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), { target: { value: 'b' } })
+    fireEvent.keyDown(textarea(), { key: 'Enter', metaKey: true })
+    fireEvent.click(sendButton())
+    fireEvent.change(screen.getByRole('combobox', { name: 'Mode' }), { target: { value: 'edit' } })
+  })
+  expect(c.posts).toHaveLength(1)
+  expect(c.posts[0].path).toMatch(/\/config$/)
+  await act(async () => { finish(json(catalogOf('b'), 202)) })
+  expect(c.prompts()).toHaveLength(0)
+})
+
+it('also guards the refused-prompt Resume and send path while applying settings', async () => {
+  let finish!: (response: Response) => void
+  const resume = vi.fn(async () => {})
+  const c = mount((_, path) => path.endsWith('/config') ? new Promise<Response>(resolve => { finish = resolve }) : json({ code: 'not_attached', message: 'Resume first' }, 409), { initialCatalog: catalogOf(), onResume: resume })
+  type('Retained after refusal')
+  fireEvent.click(sendButton())
+  const retry = await screen.findByRole('button', { name: 'Resume and send' })
+  fireEvent.click(screen.getByRole('button', { name: 'Session settings' }))
+  fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), { target: { value: 'b' } })
+  fireEvent.click(screen.getByRole('button', { name: 'Close session details' }))
+  expect(retry).toBeDisabled()
+  fireEvent.click(retry)
+  expect(resume).not.toHaveBeenCalled()
+  expect(c.prompts()).toHaveLength(1)
+  await act(async () => { finish(json(catalogOf('b'), 202)) })
+  expect(retry).toBeEnabled()
+  expect(textarea()).toHaveValue('Retained after refusal')
+})
+
+it('follows the same pending config after navigating A to B to A without blocking B or leaking A values', async () => {
+  let finish!: (response: Response) => void
+  const c = mount((_, path) => path.endsWith('/config') ? new Promise<Response>(resolve => { finish = resolve }) : json({ queue_id: 'q1' }, 202), { initialCatalog: catalogOf() })
+  type('Draft A')
+  fireEvent.click(screen.getByRole('button', { name: 'Session settings' }))
+  fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), { target: { value: 'b' } })
+  c.rerender({ sessionId: 's2' })
+  type('Draft B')
+  expect(sendButton()).toBeEnabled()
+  fireEvent.click(screen.getByRole('button', { name: 'Session settings' }))
+  expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue('a')
+  expect(screen.getByRole('combobox', { name: 'Model' })).toBeEnabled()
+  c.rerender({ sessionId: 's1' })
+  expect(textarea()).toHaveValue('Draft A')
+  expect(sendButton()).toBeDisabled()
+  fireEvent.click(screen.getByRole('button', { name: 'Session settings' }))
+  expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue('b')
+  await act(async () => { finish(json(catalogOf('c', 'edit'), 202)) })
+  expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue('c')
+  expect(screen.getByRole('alert')).toHaveTextContent('the agent kept c instead of b')
+  expect(c.posts).toHaveLength(1)
+  expect(c.prompts()).toHaveLength(0)
+})
+
+it('rejects another session’s read-back instead of displaying its settings', async () => {
+  const c = mount(() => json({ ...catalogOf('b'), session_id: 's2' }, 202), { initialCatalog: catalogOf() })
+  fireEvent.click(screen.getByRole('button', { name: 'Session settings' }))
+  fireEvent.change(screen.getByRole('combobox', { name: 'Model' }), { target: { value: 'b' } })
+  expect(await screen.findByRole('alert')).toHaveTextContent('another session')
+  expect(screen.getByRole('combobox', { name: 'Model' })).toHaveValue('a')
+  expect(c.posts).toHaveLength(1)
 })
 
 it('renders every catalog effort choice as a native radio and sends its exact axis/value', async () => {

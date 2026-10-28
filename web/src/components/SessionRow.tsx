@@ -15,6 +15,7 @@ import { Link } from '../router'
 import { Icon } from './ui'
 import { useSessionName } from './SessionNames'
 import SessionRowMenu from './SessionRowMenu'
+import { useListSessionActions } from './SessionListActions'
 
 export function sessionPath(id: string): string {
   return `/sessions/${encodeURIComponent(id)}`
@@ -28,9 +29,11 @@ export function rowText(s: SessionSummary): { title: string; where: string } {
   return { title, where: where === title ? '' : where }
 }
 
+export interface RowSelection { checked: boolean; disabled: boolean; onCheckedChange: (checked: boolean) => void }
 interface Props {
   session: SessionSummary
   selected: boolean
+  selection?: RowSelection
   hostName?: string
   /** The list's clock (`useNow`): the relative time moves with it. */
   now: number
@@ -42,9 +45,9 @@ interface Props {
   onToggleChildren?: (id: string) => void
 }
 
-function SessionRow({ session, selected, hostName, now, table, indent, childrenCount = 0, childrenStatus, expanded = false, onToggleChildren }: Props) {
+function SessionRow({ session, selected, selection, hostName, now, table, indent, childrenCount = 0, childrenStatus, expanded = false, onToggleChildren }: Props) {
   const [why, setWhy] = useState(false)
-  const [menuOpen, setMenuOpen] = useState(false)
+  const actions = useListSessionActions()
   const status = statusOf(session)
   const name = useSessionName(session)
   const title = name.text, place = session.git_branch || basename(session.cwd)
@@ -52,7 +55,11 @@ function SessionRow({ session, selected, hostName, now, table, indent, childrenC
   const reason = status.tone === 'fail' ? session.failure_reason : undefined
   const markerTitle = reason ? `${status.label}: ${reason}` : status.label
   const content = (
-    <div className={'sess-item' + (indent ? ' sess-child' : '')} onContextMenu={event => { event.preventDefault(); setMenuOpen(true) }}>
+    <div className={'sess-item' + (indent ? ' sess-child' : '') + (selection ? ' sess-selecting' : '')} onContextMenu={event => {
+      const trigger = event.currentTarget.querySelector<HTMLButtonElement>('.session-row-actions button')
+      if (actions && trigger) { event.preventDefault(); actions.show(session, trigger) }
+    }}>
+      {selection && <label className="session-checkbox"><input type="checkbox" aria-label={`Select ${title}`} checked={selection.checked} disabled={selection.disabled || session.lifecycle === 'closed'} onChange={event => selection.onCheckedChange(event.target.checked)} /></label>}
       <Link
         to={sessionPath(session.session_id)}
         data-session-link
@@ -86,8 +93,8 @@ function SessionRow({ session, selected, hostName, now, table, indent, childrenC
           {status.resume && <span className="sess-resume">Resume</span>}
         </div>
       </Link>
-      <SessionRowMenu key={session.session_id} id={session.session_id} open={menuOpen} setOpen={setMenuOpen} />
-      {childrenCount > 0 && <button type="button" className="sess-children" aria-expanded={expanded} aria-label={`↳ ${childrenCount} ${childrenCount === 1 ? 'child' : 'children'}`} aria-description={childrenStatus || undefined} title={childrenStatus || 'Open the family to review child sessions'} onClick={() => onToggleChildren?.(session.session_id)}><span>↳ {childrenCount} {childrenCount === 1 ? 'child' : 'children'}</span>{childrenStatus && <span className="sess-children-status">{childrenStatus}</span>}</button>}
+      {!selection && <SessionRowMenu session={session} />}
+      {childrenCount > 0 && <button type="button" className="sess-children" disabled={selection?.disabled} aria-expanded={expanded} aria-label={`↳ ${childrenCount} ${childrenCount === 1 ? 'child' : 'children'}`} aria-description={childrenStatus || undefined} title={childrenStatus || 'Open the family to review child sessions'} onClick={() => onToggleChildren?.(session.session_id)}><span>↳ {childrenCount} {childrenCount === 1 ? 'child' : 'children'}</span>{childrenStatus && <span className="sess-children-status">{childrenStatus}</span>}</button>}
       {reason && (
         <>
           <button type="button" className="sess-why" aria-expanded={why} onClick={() => setWhy((open) => !open)}>

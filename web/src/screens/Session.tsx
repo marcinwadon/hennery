@@ -62,6 +62,7 @@ import { takeOver } from '../api/view'
 import { QuestionPresentationContext } from '../components/QuestionActions'
 import { Text } from '../lib/text'
 import { useMcpDelivery } from '../hooks/useMcpDelivery'
+import { useSessionConfig } from '../hooks/useSessionConfig'
 import SessionMenu from '../components/SessionMenu'
 import { deleteNotes } from '../components/sessionWords'
 import Transcript from '../components/Transcript'
@@ -252,9 +253,14 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
   const [detailsOpen, setDetailsOpen] = useState(wide)
   const [detailsTab, setDetailsTab] = useState<SessionDetailsTab>('Family')
   const detailsTrigger = useRef<HTMLButtonElement>(null)
-  const toggleDetails = useCallback(() => setDetailsOpen(open => !open), [])
-  const openFamily = useCallback(() => { setDetailsTab('Family'); setDetailsOpen(true) }, [])
-  const closeDetails = useCallback(() => { setDetailsOpen(false); detailsTrigger.current?.focus() }, [])
+  const detailsReturn = useRef<HTMLButtonElement>(null)
+  const [settingsFocus, setSettingsFocus] = useState(0)
+  const toggleDetails = useCallback(() => { detailsReturn.current = detailsTrigger.current; setDetailsOpen(open => !open) }, [])
+  const openFamily = useCallback(() => { detailsReturn.current = detailsTrigger.current; setDetailsTab('Family'); setDetailsOpen(true) }, [])
+  const openSettings = useCallback((trigger: HTMLButtonElement) => {
+    detailsReturn.current = trigger; setDetailsTab('Details'); setDetailsOpen(true); setSettingsFocus(n => n + 1)
+  }, [])
+  const closeDetails = useCallback(() => { setDetailsOpen(false); (detailsReturn.current ?? detailsTrigger.current)?.focus() }, [])
   const [familyRefresh, setFamilyRefresh] = useState(0)
   const [taking, setTaking] = useState(false)
   const [takeError, setTakeError] = useState<string | null>(null)
@@ -262,6 +268,7 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
   const [jumpPending, setJumpPending] = useState<string | null>(null)
   const [answerNotice, setAnswerNotice] = useState<string | null>(null)
   const s = useSessionItems(id, timing)
+  const configuration = useSessionConfig(id, s.setCatalog)
   const mcp = useMcpDelivery(id, summary?.lifecycle, Math.max(0, s.loads - 1))
   const [familyRead, setFamilyRead] = useState<{ id: string; page: FamilyPage } | null>(null)
   const onFamilyPage = useCallback((page: FamilyPage) => setFamilyRead({ id, page }), [id])
@@ -552,7 +559,9 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
         queue={s.queue}
         onQueueChange={s.refreshQueue}
         catalog={s.catalog}
-        onCatalog={s.setCatalog}
+        configuration={configuration}
+        onSettings={openSettings}
+        settingsExpanded={detailsOpen && detailsTab === 'Details'}
         onResume={onResume}
         onJumpToQuestion={openPending ? () => {
           setJumpPending(openPending)
@@ -562,7 +571,7 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
       />
       {info?.lifecycle !== 'parked' && sessionFooter}
       </div>
-      <SessionDetails open={detailsOpen} tab={detailsTab} onTab={setDetailsTab} onClose={closeDetails} trigger={detailsTrigger} info={info} hostName={info ? hosts.get(info.host_id) : undefined} hatName={actualHat?.name} plan={plan} delivery={mcp.detail?.mcp_delivery}>
+      <SessionDetails open={detailsOpen} tab={detailsTab} onTab={setDetailsTab} onClose={closeDetails} trigger={detailsReturn} settingsFocus={settingsFocus} configuration={configuration} catalog={s.catalog} info={info} hostName={info ? hosts.get(info.host_id) : undefined} hatName={actualHat?.name} plan={plan} delivery={mcp.detail?.mcp_delivery}>
         <FamilyPanel key={id} id={id} summary={summary} hosts={hosts} resync={Math.max(0, s.loads - 1) + familyRefresh} onPage={onFamilyPage} />
       </SessionDetails>
       </div>

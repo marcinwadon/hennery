@@ -192,8 +192,11 @@ for (const width of [1280, 390]) {
 
     test('the composer’s Send, and a phone’s way back, are on screen', async () => {
       const composer = page.locator('.composer')
-      expect((await composer.boundingBox())!.height).toBeLessThanOrEqual(88)
+      // Full-width input and a separate action row; the former one-row 88px
+      // bound squeezed the phone textarea between settings and buttons.
+      expect((await composer.boundingBox())!.height).toBeLessThanOrEqual(narrow ? 112 : 104)
       const prompt = page.getByRole('textbox', { name: 'Prompt', exact: true })
+      expect((await prompt.boundingBox())!.width).toBeGreaterThan((await page.locator('.composer-box').boundingBox())!.width * 0.85)
       const idleHeight = (await prompt.boundingBox())!.height
       await prompt.fill('A line of text\n'.repeat(40))
       expect((await prompt.boundingBox())!.height).toBeGreaterThan(idleHeight)
@@ -641,7 +644,7 @@ test.describe('redesigned session', () => {
         await expect(page.getByRole('alert')).toContainText('the agent kept model-a instead of model-b')
         await expect(page.getByRole('combobox', { name: 'Model', exact: true })).toHaveValue('model-a')
         await shot('composer')
-        await page.getByRole('button', { name: 'Close session settings', exact: true }).click()
+        await page.getByRole('button', { name: 'Close session details', exact: true }).click()
         await expect(prompt).toHaveValue('Keep this draft')
         await page.getByRole('button', { name: 'Session actions', exact: true }).click()
         const pin = page.getByRole('switch', { name: 'Do not park', exact: true })
