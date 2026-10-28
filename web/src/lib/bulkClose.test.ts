@@ -128,6 +128,73 @@ describe('explicit bulk Close', () => {
 })
 
 describe('manual retry and reconciliation', () => {
+  it('does not stamp a read result with the newer SSE generation at the await handoff', async () => {
+    const t = routed(call => call.method === 'POST' ? failure('starting') : json({ session_id: 'a', lifecycle: 'parked' }))
+    const runner = new BulkCloseController(t.client)
+    await runner.start([target('a')])
+    let queued = false
+    runner.subscribe(() => {
+      const snapshot = runner.getSnapshot()
+      if (!queued && snapshot.busy && snapshot.results[0]?.status === 'failed' && snapshot.results[0]?.target.lifecycle === 'parked') {
+        queued = true
+        queueMicrotask(() => runner.reconcile(new Map([['a', { lifecycle: 'active' }]])))
+      }
+    })
+    const plan = await runner.prepareRetry()
+    if (plan) await runner.confirmRetry(plan)
+    expect(queued).toBe(true)
+    expect(t.calls.filter(call => call.method === 'POST')).toHaveLength(1)
+    expect(plan?.targets.map(row => row.id) ?? []).not.toContain('a')
+    expect(runner.getSnapshot().results[0].target.lifecycle).toBe('active')
+  })
+
+  it.each(['parked', 'closed'])('does not let a %s unknown-status read overwrite active SSE at the await handoff', async lifecycle => {
+    const t = routed(call => call.method === 'POST' ? failure('delivery_unknown', 503) : json({ session_id: 'a', lifecycle }))
+    const runner = new BulkCloseController(t.client)
+    await runner.start([target('a')])
+    let queued = false
+    runner.subscribe(() => {
+      const snapshot = runner.getSnapshot()
+      if (!queued && snapshot.busy && snapshot.results[0]?.status === 'pending_unknown' && snapshot.results[0]?.target.lifecycle === lifecycle) {
+        queued = true
+        queueMicrotask(() => runner.reconcile(new Map([['a', { lifecycle: 'active' }]])))
+      }
+    })
+    await runner.checkUnknown()
+    expect(queued).toBe(true)
+    expect(runner.getSnapshot().results[0]).toMatchObject({ status: 'pending_unknown', target: { lifecycle: 'active' } })
+    expect(await runner.prepareRetry()).toBeNull()
+    expect(t.calls.map(call => call.method)).toEqual(['POST', 'GET'])
+  })
+
+  it('retains the latest nonclosed SSE when a status read fails', async () => {
+    const d = deferred<Response>(), t = routed(call => call.method === 'GET' ? d.promise : failure('delivery_unknown', 503))
+    const runner = new BulkCloseController(t.client)
+    await runner.start([target('a')]); const check = runner.checkUnknown(); await flush()
+    runner.reconcile(new Map([['a', { lifecycle: 'parked' }]]))
+    d.reject(new TypeError('Connection lost')); await check
+    expect(runner.getSnapshot().results[0]).toMatchObject({ status: 'pending_unknown', target: { lifecycle: 'parked' } })
+    expect(t.calls.map(call => call.method)).toEqual(['POST', 'GET'])
+  })
+
+  it('retains the latest nonclosed SSE when unmount cancels a status read', async () => {
+    const d = deferred<Response>(), t = routed(call => call.method === 'GET' ? d.promise : failure('delivery_unknown', 503))
+    const runner = new BulkCloseController(t.client)
+    await runner.start([target('a')]); const check = runner.checkUnknown(); await flush()
+    runner.reconcile(new Map([['a', { lifecycle: 'parked' }]])); runner.stop()
+    expect(runner.getSnapshot().results[0]).toMatchObject({ status: 'pending_unknown', target: { lifecycle: 'parked' } })
+    d.resolve(json({ session_id: 'a', lifecycle: 'active' })); await check
+    expect(runner.getSnapshot().results[0].target.lifecycle).toBe('parked')
+  })
+
+  it('does not restore pre-request lifecycle metadata over a newer SSE on a Close refusal', async () => {
+    const d = deferred<Response>(), t = routed(() => d.promise), runner = new BulkCloseController(t.client)
+    const run = runner.start([target('a')]); await flush()
+    runner.reconcile(new Map([['a', { lifecycle: 'parked' }]]))
+    d.resolve(failure('starting')); await run
+    expect(runner.getSnapshot().results[0]).toMatchObject({ status: 'failed', target: { lifecycle: 'parked' } })
+  })
+
   it('excludes a ready candidate changed by SSE while another retry read is pending', async () => {
     const b = deferred<Response>()
     const t = routed(call => call.method === 'POST' ? failure('starting') : call.path.endsWith('/a') ? json({ session_id: 'a', lifecycle: 'parked' }) : b.promise)

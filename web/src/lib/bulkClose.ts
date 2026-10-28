@@ -33,6 +33,7 @@ interface Operation {
   stopped: boolean
   readonly beforeRead: Map<string, CloseResult>
 }
+interface ReadResult { readonly target: BulkCloseTarget; readonly generation: number }
 const CLOSED = 'Closed in Hennery. An offline host may still run it until it reconnects.'
 const UNKNOWN = 'The close outcome is unknown. Check status before choosing a new close.'
 const ALREADY_CLOSED = 'Already closed in Hennery.'
@@ -74,7 +75,8 @@ export class BulkCloseController {
     this.update({ busy: false, retryPlan: null, results: this.snapshot.results.map(result => {
       if (result.status === 'queued') return { ...result, status: 'not_sent', message: 'Not sent: you left the session list.' }
       if (result.status === 'closing') return { ...result, status: 'pending_unknown', message: UNKNOWN }
-      return result.status === 'checking' ? op?.beforeRead.get(result.target.id) ?? result : result
+      const before = op?.beforeRead.get(result.target.id)
+      return result.status === 'checking' && before ? { ...before, target: result.target } : result
     }) })
   }
 
@@ -99,16 +101,18 @@ export class BulkCloseController {
     const candidates = this.snapshot.results.filter(retryable)
     if (!candidates.length) return null
     const op = this.begin()
-    const ready = new Map<string, { target: BulkCloseTarget; generation: number }>()
+    const ready = new Map<string, ReadResult>()
     await this.pool(op, candidates.map(result => result.target), async target => {
       const previous = this.result(target.id)!
       if (!retryable(previous)) return
       const fresh = await this.read(op, previous)
-      if (!this.current(op) || !fresh) return
-      if (fresh.lifecycle === 'closed') this.set({ target: fresh, status: 'already_closed', message: ALREADY_CLOSED })
+      // The read's generation travels with its target across this await.
+      // Never stamp old data with the generation observed by the caller.
+      if (!fresh || !this.currentRead(op, fresh)) return
+      if (fresh.target.lifecycle === 'closed') this.set({ target: fresh.target, status: 'already_closed', message: ALREADY_CLOSED })
       else if (!op.stopped) {
-        ready.set(target.id, { target: fresh, generation: this.observed.get(target.id)?.generation ?? 0 })
-        this.set({ target: fresh, status: previous.status, message: 'State refreshed. Confirm a new close of this session’s current run.' })
+        ready.set(target.id, fresh)
+        this.set({ target: fresh.target, status: previous.status, message: 'State refreshed. Confirm a new close of this session’s current run.' })
       }
     })
     if (!this.current(op)) return null
@@ -117,8 +121,7 @@ export class BulkCloseController {
       return candidate && candidate.generation === (this.observed.get(result.target.id)?.generation ?? 0) && retryable(this.result(result.target.id)!) ? [candidate.target] : []
     }))
     const plan = !op.stopped && targets.length ? Object.freeze({ targets }) : null
-    this.finish(op)
-    this.update({ retryPlan: plan })
+    this.finish(op, { retryPlan: plan })
     return plan
   }
 
@@ -143,9 +146,9 @@ export class BulkCloseController {
       const previous = this.result(target.id)!
       if (previous.status !== 'pending_unknown') return
       const fresh = await this.read(op, previous)
-      if (!this.current(op) || !fresh) return
-      this.set({ target: fresh, status: fresh.lifecycle === 'closed' ? 'closed' : 'pending_unknown', message: fresh.lifecycle === 'closed'
-        ? CLOSED : `Currently ${fresh.lifecycle}. Select it again to confirm a new close of its current run.` })
+      if (!fresh || !this.currentRead(op, fresh)) return
+      this.set({ target: fresh.target, status: fresh.target.lifecycle === 'closed' ? 'closed' : 'pending_unknown', message: fresh.target.lifecycle === 'closed'
+        ? CLOSED : `Currently ${fresh.target.lifecycle}. Select it again to confirm a new close of its current run.` })
     })
     this.finish(op)
     return true
@@ -179,7 +182,8 @@ export class BulkCloseController {
     return op
   }
   private current(op: Operation) { return this.active && this.operation === op }
-  private finish(op: Operation) { if (this.current(op)) { this.operation = null; this.update({ busy: false }) } }
+  private currentRead(op: Operation, read: ReadResult) { return this.current(op) && read.generation === (this.observed.get(read.target.id)?.generation ?? 0) }
+  private finish(op: Operation, patch: Partial<BulkCloseSnapshot> = {}) { if (this.current(op)) { this.operation = null; this.update({ ...patch, busy: false }) } }
   private update(patch: Partial<BulkCloseSnapshot>) {
     this.snapshot = Object.freeze({ ...this.snapshot, ...patch })
     for (const listener of this.listeners) listener()
@@ -213,28 +217,29 @@ export class BulkCloseController {
   private async send(op: Operation, targets: readonly BulkCloseTarget[]) {
     await this.pool(op, targets, async target => {
       if (this.result(target.id)?.status !== 'queued') return
-      this.set({ target, status: 'closing', message: 'Closing…' })
+      this.set({ target: this.result(target.id)!.target, status: 'closing', message: 'Closing…' })
       try {
         const response = await close(this.client, target.id, this.options(op, CLOSE_TIMEOUT_MS))
         if (!this.current(op)) return
         const closed = response?.session_id === target.id && response.lifecycle === 'closed'
         if (!closed && this.result(target.id)?.status === 'closed') return
-        this.set({ target, status: closed ? 'closed' : 'pending_unknown', message: closed ? CLOSED : UNKNOWN })
+        this.set({ target: this.result(target.id)!.target, status: closed ? 'closed' : 'pending_unknown', message: closed ? CLOSED : UNKNOWN })
       } catch (err) {
         if (!this.current(op)) return
         this.interruption(op, err)
         if (this.result(target.id)?.status === 'closed') return
-        if (err instanceof ApiFailure && err.status === 404) this.set(unavailable(target))
+        const latest = this.result(target.id)!.target
+        if (err instanceof ApiFailure && err.status === 404) this.set(unavailable(latest))
         else {
           const unknown = !(err instanceof ApiFailure || err instanceof Unauthenticated) || err instanceof ApiFailure && err.status >= 500
-          this.set({ target, status: unknown ? 'pending_unknown' : 'failed', message: unknown
+          this.set({ target: latest, status: unknown ? 'pending_unknown' : 'failed', message: unknown
             ? err instanceof ApiFailure && err.code === 'delivery_unknown' ? closeRefusal(err) : UNKNOWN
             : closeRefusal(err) })
         }
       }
     })
   }
-  private async read(op: Operation, previous: CloseResult): Promise<BulkCloseTarget | null> {
+  private async read(op: Operation, previous: CloseResult): Promise<ReadResult | null> {
     const target = previous.target
     const generation = this.observed.get(target.id)?.generation ?? 0
     op.beforeRead.set(target.id, previous)
@@ -251,12 +256,14 @@ export class BulkCloseController {
       if (!response || response.session_id !== target.id || !['starting', 'active', 'parked', 'closed', 'failed'].includes(response.lifecycle)) throw new Error('The current session state could not be read.')
       const fresh = Object.freeze({ ...target, lifecycle: response.lifecycle })
       this.set({ ...previous, target: fresh })
-      return fresh
+      return Object.freeze({ target: fresh, generation })
     } catch (err) {
       if (!this.current(op)) return null
       this.interruption(op, err)
       if (this.result(target.id)?.status === 'closed') return null
-      this.set(err instanceof ApiFailure && err.status === 404 ? unavailable(target) : { ...previous, message: `Status check failed: ${closeRefusal(err)}` })
+      const latest = this.result(target.id)!.target
+      const changed = generation !== (this.observed.get(target.id)?.generation ?? 0)
+      this.set(!changed && err instanceof ApiFailure && err.status === 404 ? unavailable(latest) : { ...previous, target: latest, message: `Status check failed: ${closeRefusal(err)}` })
       return null
     } finally { op.beforeRead.delete(target.id) }
   }
