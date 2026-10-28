@@ -88,7 +88,7 @@
 .sess-item { display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:center; gap:6px; }
 .sess-item:has(>.sess-children) { grid-template-columns:minmax(0,1fr) auto auto; }
 .session-row-actions { grid-column:-2; grid-row:1; position:relative; align-self:start; padding-top:6px; }
-.session-menu-list.session-row-menu { position:fixed; width:210px; right:auto; z-index:80; }
+.session-menu-list.session-row-menu { position:fixed; width:210px; right:auto; z-index:40; max-height:calc(100dvh - 16px); overflow-y:auto; overscroll-behavior:contain; }
 .session-row-error { max-width:240px; overflow-wrap:anywhere; font-size:12px; }
 .session-like-pending { display:block; font-size:11px; color:var(--hn-fg-3); }
 .sess-children { grid-column:2; grid-row:1; }
@@ -358,3 +358,10 @@
 .rail-foot .btn-icon { width:32px; height:32px; min-height:32px; padding:6px; flex:none; }
 @media (min-width:768px) and (max-width:1023px) { .rail .rail-foot .version-info { display:none; } }
 @media (min-width:768px) and (max-width:1023px) { .rail .recent-session { height:32px; justify-content:center; padding:0; }.rail .rail-recent { border-top:1px solid var(--hn-line); padding-top:8px; } }
+
+.session-list-actions { min-width:0; }
+.session-row-rename .session-rename-form { overflow:visible; white-space:normal; }
+.session-delete-result { overflow-wrap:anywhere; }
+
+.session-list-menu:not(:empty) { position:fixed; right:16px; bottom:calc(76px + env(safe-area-inset-bottom)); max-width:calc(100vw - 32px); padding:12px; background:var(--hn-surface); border:1px solid var(--hn-control-strong); border-radius:6px; box-shadow:var(--hn-pop-shadow); z-index:45; }
+.session-list-menu > .form-error { margin:0; }

@@ -9,7 +9,8 @@ import { subscribeNavigation } from '../router-events'
 // Like launcher drafts, sign-out clears this operation's browser lifetime.
 const LOGIN = 'hennery.draft.__new_like_this_login__'
 
-export function useNewLikeThis(id: string) {
+// A list owner may survive its source row; that must not revive navigation.
+export function useNewLikeThis(id: string, sourceIsCurrent?: () => boolean) {
   const client = useClient()
   const live = useRef(false), pending = useRef(false)
   const [busy, setBusy] = useState(false)
@@ -29,7 +30,7 @@ export function useNewLikeThis(id: string) {
     let navigated = false
     const unsubscribe = subscribeNavigation(() => { navigated = true })
     const current = () => {
-      if (!live.current || navigated || path !== location.pathname + location.search) return false
+      if (!live.current || sourceIsCurrent?.() === false || navigated || path !== location.pathname + location.search) return false
       if (token === null) return true
       try { return sessionStorage.getItem(LOGIN) === token } catch { return false }
     }

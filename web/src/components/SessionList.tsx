@@ -9,6 +9,7 @@ import { useMediaQuery } from '../hooks/useMediaQuery'
 import { Icon, useModalLayer } from './ui'
 import { useRegisterAction } from '../app-actions'
 import SessionRow from './SessionRow'
+import SessionListActions from './SessionListActions'
 import HatSwitch from './HatSwitch'
 import SessionFilters from './SessionFilters'
 import { useSessionScope } from './SessionScope'
@@ -104,8 +105,8 @@ export default function SessionList({ screen = false, attentionOnly = false }: {
   }).filter(project => project.families.length || collapsedProjects.has(project.id)) })).filter(g => g.projects.length)
   const rootCount = allGroups.reduce((n, g) => n + g.projects.reduce((n, project) => n + (collapsedProjects.has(project.id) ? 0 : project.families.length), 0), 0)
   const more = rootCount > limit || list.hasMore
-  return <section className={'slist overview' + (screen ? ' slist-screen' : '')} aria-label="Session list" onKeyDown={moveListFocus}>
-    <header className="overview-head"><h1 aria-label={attentionOnly ? 'Needs you' : 'Sessions'}>{attentionOnly ? 'Needs you' : desktop ? 'All sessions' : 'Sessions'}</h1><span className="overview-counter" title={`${matching.length}${list.hasMore ? ' shown' : ' sessions'} · ${scope.hosts?.filter(h => h.revoked_at == null).length ?? 0} hosts`}>{matching.length}{list.hasMore ? ' shown' : ' sessions'} · {scope.hosts?.filter(h => h.revoked_at == null).length ?? 0} hosts</span>{desktop && !attentionOnly && <SessionGroupingControls />}{attentionOnly && <button type="button" className="btn btn-ghost" onClick={() => document.querySelector<HTMLInputElement>('[aria-label="Search sessions"]')?.focus()}>Search</button>}<button type="button" className="btn btn-ghost filter-trigger" onClick={() => setFilters(!filters)} aria-expanded={filters}>Filters</button><Link to="/new" className="btn btn-primary">New session</Link></header>
+  return <SessionListActions sessions={list.all} hosts={scope.hosts} onRemoved={list.remove}><section className={'slist overview' + (screen ? ' slist-screen' : '')} aria-label="Session list" onKeyDown={moveListFocus}>
+    <header className="overview-head"><h1 tabIndex={-1} aria-label={attentionOnly ? 'Needs you' : 'Sessions'}>{attentionOnly ? 'Needs you' : desktop ? 'All sessions' : 'Sessions'}</h1><span className="overview-counter" title={`${matching.length}${list.hasMore ? ' shown' : ' sessions'} · ${scope.hosts?.filter(h => h.revoked_at == null).length ?? 0} hosts`}>{matching.length}{list.hasMore ? ' shown' : ' sessions'} · {scope.hosts?.filter(h => h.revoked_at == null).length ?? 0} hosts</span>{desktop && !attentionOnly && <SessionGroupingControls />}{attentionOnly && <button type="button" className="btn btn-ghost" onClick={() => document.querySelector<HTMLInputElement>('[aria-label="Search sessions"]')?.focus()}>Search</button>}<button type="button" className="btn btn-ghost filter-trigger" onClick={() => setFilters(!filters)} aria-expanded={filters}>Filters</button><Link to="/new" className="btn btn-primary">New session</Link></header>
     <HatSwitch hats={hats} hat={hat} onHat={chooseHat} />
     {!desktop && filters ? <FilterDialog close={() => setFilters(false)}><SessionFilters grouping /></FilterDialog> : <div className="filters-default"><SessionFilters grouping={!desktop} /></div>}
     {desktop && !list.searching && <NeedsYouQueue embedded />}
@@ -140,5 +141,5 @@ export default function SessionList({ screen = false, attentionOnly = false }: {
       </div>)}
     </div>)}</>)}
     {!list.loading && more && <button type="button" className="btn btn-ghost list-more" disabled={list.loadingMore} onClick={() => { setShownRows({ query: list.queryKey, n: limit + PAGE_ROWS }); if (rootCount <= limit) void list.loadMore() }}>{list.loadingMore ? 'Loading…' : 'Load more'}</button>}
-  </section>
+  </section></SessionListActions>
 }

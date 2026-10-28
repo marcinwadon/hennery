@@ -1,9 +1,11 @@
+import type { ComponentProps } from 'react'
 import { act, fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { json, routed } from '../test-stream'
 import { navigate } from '../router'
 import SessionMenu from './SessionMenu'
-import SessionRow from './SessionRow'
+import SessionRowView from './SessionRow'
+import SessionListActions from './SessionListActions'
 import { catalogOf } from '../screens/test-session'
 import SessionView from '../screens/Session'
 import { FAST, sessionServer } from '../screens/test-session'
@@ -14,6 +16,9 @@ import type { SessionSummary } from '../generated/view'
 
 const config = { model: 'b', mode: 'plan', axes: { effort: 'high', fast: false } }
 const source: SessionSummary = { session_id: 'source/a', host_id: 'host', agent: 'claude', cwd: '/work', hat_id: 'hat', lifecycle: 'closed', presumed_parked: false, created_at: '', last_event_at: '', question_waits: false, operator_attention: 0, parent_handled_questions: 0 }
+function SessionRow(props: ComponentProps<typeof SessionRowView>) {
+  return <SessionListActions sessions={new Map([[props.session.session_id, props.session]])} hosts={null} onRemoved={() => {}}><SessionRowView {...props} /></SessionListActions>
+}
 const options = [
   ...catalogOf('new').config_options.map(option => ({ ...option as object, currentValue: 'b' })),
   ...[['mode', 'plan'], ['effort', 'high']].map(([id, value]) => ({ id, category: id === 'mode' ? 'mode' : 'thought_level', type: 'select', name: id, currentValue: value, options: [{ value, name: value }] })),
@@ -47,7 +52,7 @@ describe('New like this', () => {
     const trigger = screen.getByRole('button', { name: 'Session actions' })
     expect(screen.getByRole('link')).not.toContainElement(trigger)
     fireEvent.click(trigger)
-    expect(screen.getByRole('button', { name: 'New like this' })).toHaveFocus()
+    expect(screen.getByRole('button', { name: 'Rename' })).toHaveFocus()
     fireEvent.keyDown(screen.getByRole('button', { name: 'New like this' }), { key: 'Escape' })
     expect(trigger).toHaveFocus()
     fireEvent.contextMenu(r.container.querySelector('.sess-item')!)
@@ -171,7 +176,7 @@ describe('New like this', () => {
     forgetAllDrafts()
     await act(async () => finish(json({ session_id: 'new/a', hat_id: 'hat', config }, 202)))
     expect(location.pathname).toBe('/sessions')
-    expect(s.calls.filter(c => c.method === 'GET')).toHaveLength(0)
+    expect(s.calls.filter(c => c.method === 'GET' && !c.path.endsWith('/idle-hold'))).toHaveLength(0)
   })
   it('opens a known failed start without retrying or claiming that a first prompt was kept', async () => {
     const s = server(() => json({ code: 'config_failed', message: 'Model removed', session_id: 'new/a' }, 502))

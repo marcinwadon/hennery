@@ -15,6 +15,7 @@ import { Link } from '../router'
 import { Icon } from './ui'
 import { useSessionName } from './SessionNames'
 import SessionRowMenu from './SessionRowMenu'
+import { useListSessionActions } from './SessionListActions'
 
 export function sessionPath(id: string): string {
   return `/sessions/${encodeURIComponent(id)}`
@@ -44,7 +45,7 @@ interface Props {
 
 function SessionRow({ session, selected, hostName, now, table, indent, childrenCount = 0, childrenStatus, expanded = false, onToggleChildren }: Props) {
   const [why, setWhy] = useState(false)
-  const [menuOpen, setMenuOpen] = useState(false)
+  const actions = useListSessionActions()
   const status = statusOf(session)
   const name = useSessionName(session)
   const title = name.text, place = session.git_branch || basename(session.cwd)
@@ -52,7 +53,10 @@ function SessionRow({ session, selected, hostName, now, table, indent, childrenC
   const reason = status.tone === 'fail' ? session.failure_reason : undefined
   const markerTitle = reason ? `${status.label}: ${reason}` : status.label
   const content = (
-    <div className={'sess-item' + (indent ? ' sess-child' : '')} onContextMenu={event => { event.preventDefault(); setMenuOpen(true) }}>
+    <div className={'sess-item' + (indent ? ' sess-child' : '')} onContextMenu={event => {
+      const trigger = event.currentTarget.querySelector<HTMLButtonElement>('.session-row-actions button')
+      if (actions && trigger) { event.preventDefault(); actions.show(session, trigger) }
+    }}>
       <Link
         to={sessionPath(session.session_id)}
         data-session-link
@@ -86,7 +90,7 @@ function SessionRow({ session, selected, hostName, now, table, indent, childrenC
           {status.resume && <span className="sess-resume">Resume</span>}
         </div>
       </Link>
-      <SessionRowMenu key={session.session_id} id={session.session_id} open={menuOpen} setOpen={setMenuOpen} />
+      <SessionRowMenu session={session} />
       {childrenCount > 0 && <button type="button" className="sess-children" aria-expanded={expanded} aria-label={`↳ ${childrenCount} ${childrenCount === 1 ? 'child' : 'children'}`} aria-description={childrenStatus || undefined} title={childrenStatus || 'Open the family to review child sessions'} onClick={() => onToggleChildren?.(session.session_id)}><span>↳ {childrenCount} {childrenCount === 1 ? 'child' : 'children'}</span>{childrenStatus && <span className="sess-children-status">{childrenStatus}</span>}</button>}
       {reason && (
         <>
