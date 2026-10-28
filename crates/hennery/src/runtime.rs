@@ -19,6 +19,59 @@ pub enum AdaptersCommand {
     /// Make the previous adapter set current again, and keep the host on it
     /// until the next `update`.
     Rollback(RollbackArgs),
+    /// Store external OMP configuration as preparation; OMP startup support
+    /// is not enabled yet.
+    Omp(OmpArgs),
+}
+
+#[derive(Args)]
+pub struct OmpArgs {
+    /// A paired host's data directory, else the installed host's directory
+    /// (or the host/ child of an installed Up service).
+    #[arg(long, env = "HENNERY_HOST_DATA_DIR", global = true)]
+    pub data_dir: Option<PathBuf>,
+    #[command(subcommand)]
+    pub command: OmpCommand,
+}
+
+#[derive(Subcommand)]
+pub enum OmpCommand {
+    /// Save preparation only. This does not enable OMP at host startup.
+    Set {
+        executable: PathBuf,
+        /// Existing private OMP agent-data directory owned by the host user.
+        #[arg(long)]
+        agent_data_dir: PathBuf,
+    },
+    /// Remove only the stored OMP configuration; keep all agent data.
+    Remove,
+}
+
+fn run_omp(args: OmpArgs) -> Result<()> {
+    let data_dir = crate::data_dir::host_or_installed(args.data_dir, crate::data_dir::HostUse::Adapters)?;
+    require_host_dir(&data_dir)?;
+    // The public configuration API also validates the complete pairing and
+    // its key before any write; mere host.toml existence is not sufficient.
+    match args.command {
+        OmpCommand::Set {
+            executable,
+            agent_data_dir,
+        } => {
+            hennery_host::set_omp_config(
+                &data_dir,
+                &hennery_host::OmpConfig {
+                    executable,
+                    agent_data_dir,
+                },
+            )?;
+            println!("OMP configuration saved as preparation; OMP startup support is not enabled yet.");
+        }
+        OmpCommand::Remove => {
+            hennery_host::remove_omp_config(&data_dir)?;
+            println!("OMP configuration removed; agent data was kept.");
+        }
+    }
+    Ok(())
 }
 
 /// Where the pinned packages and Node are fetched from (decision 7).
@@ -92,6 +145,7 @@ pub fn parse_use_cli(arg: &str) -> Result<UseCli, String> {
 
 pub async fn run(command: AdaptersCommand) -> Result<()> {
     match command {
+        AdaptersCommand::Omp(args) => run_omp(args),
         AdaptersCommand::Update(args) => {
             // Before anything is recorded: a bad mirror changes nothing.
             args.mirrors.sources()?;

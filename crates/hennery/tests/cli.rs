@@ -3824,6 +3824,257 @@ fn paired_host(dir: &std::path::Path) {
     .unwrap();
 }
 
+/// Scratch, literal paths containing spaces. Running the program would fail:
+/// the configuration commands must store it without probing or starting it.
+fn omp_fixture(dir: &std::path::Path) -> hennery_host::OmpConfig {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = dir.canonicalize().unwrap();
+    let executable = dir.join("external omp");
+    std::fs::write(&executable, "#!/bin/sh\nexit 97\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let agent_data_dir = dir.join("omp agent data");
+    std::fs::create_dir(&agent_data_dir).unwrap();
+    std::fs::set_permissions(&agent_data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    hennery_host::OmpConfig {
+        executable,
+        agent_data_dir,
+    }
+}
+
+fn omp_cli(dir: &std::path::Path) -> Command {
+    let mut command = hennery();
+    command
+        .args(["host", "adapters", "omp"])
+        .env("HOME", dir.join("home"))
+        .env("XDG_CONFIG_HOME", dir.join("config"))
+        .env("XDG_DATA_HOME", dir.join("data"))
+        .env("XDG_STATE_HOME", dir.join("state"))
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        // A config-only command must not even validate download sources.
+        .env("HENNERY_NPM_REGISTRY", "http://invalid.example/");
+    command
+}
+
+#[test]
+fn omp_adapter_set_remove_preserve_pairing_and_explicit_directory_wins() {
+    let dir = scratch_dir("omp-config-explicit");
+    let _cleanup = RemoveDir(dir.clone());
+    let host = dir.join("host");
+    let other = dir.join("other-host");
+    paired_host(&host);
+    paired_host(&other);
+    let other_before = std::fs::read(other.join("host.toml")).unwrap();
+    let config = omp_fixture(&dir);
+    let output = omp_cli(&dir)
+        .env("HENNERY_HOST_DATA_DIR", &other)
+        .args(["set"])
+        .arg(&config.executable)
+        .arg("--agent-data-dir")
+        .arg(&config.agent_data_dir)
+        .arg("--data-dir")
+        .arg(&host)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let message = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        message.contains("preparation") && message.contains("startup support is not enabled"),
+        "{message}"
+    );
+    assert!(!message.contains("restart"));
+    assert_eq!(
+        hennery_host::read_omp_config(&host).unwrap(),
+        hennery_host::OmpConfigStatus::Valid(config.clone())
+    );
+    assert_eq!(std::fs::read(other.join("host.toml")).unwrap(), other_before);
+    assert!(!host.join("adapters").exists());
+    for _ in 0..2 {
+        let output = omp_cli(&dir)
+            .arg("--data-dir")
+            .arg(&host)
+            .arg("remove")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(
+            hennery_host::read_omp_config(&host).unwrap(),
+            hennery_host::OmpConfigStatus::Missing
+        );
+        assert!(config.executable.exists() && config.agent_data_dir.exists());
+        hennery_host::identity::Paired::read(&host).unwrap().unwrap();
+    }
+}
+
+#[test]
+fn omp_adapter_refuses_missing_broken_and_interrupted_pairing_without_writes() {
+    let dir = scratch_dir("omp-config-pairing");
+    let _cleanup = RemoveDir(dir.clone());
+    let config = omp_fixture(&dir);
+    for scenario in ["missing", "key-missing", "key-mismatch", "pending", "malformed"] {
+        let host = dir.join(scenario);
+        if scenario != "missing" {
+            paired_host(&host);
+            match scenario {
+                "key-missing" => std::fs::remove_file(host.join("host.key")).unwrap(),
+                "key-mismatch" => hennery_host::identity::HostKey::generate()
+                    .save(&host.join("host.key"))
+                    .unwrap(),
+                "pending" => std::fs::write(host.join("host.toml.pending"), "not committed").unwrap(),
+                "malformed" => std::fs::write(host.join("host.toml"), "[broken").unwrap(),
+                _ => unreachable!(),
+            }
+        }
+        let before = std::fs::read(host.join("host.toml")).ok();
+        for action in ["set", "remove"] {
+            let mut command = omp_cli(&dir);
+            command.arg("--data-dir").arg(&host).arg(action);
+            if action == "set" {
+                command
+                    .arg(&config.executable)
+                    .arg("--agent-data-dir")
+                    .arg(&config.agent_data_dir);
+            }
+            let output = command.output().unwrap();
+            assert!(!output.status.success(), "{scenario} {action}");
+            assert_eq!(
+                std::fs::read(host.join("host.toml")).ok(),
+                before,
+                "{scenario} {action}"
+            );
+            assert!(!host.join("adapters").exists());
+        }
+    }
+}
+
+#[test]
+fn omp_adapter_explicit_up_root_is_refused_and_child_directory_is_accepted() {
+    let dir = scratch_dir("omp-config-up-explicit");
+    let _cleanup = RemoveDir(dir.clone());
+    let config = omp_fixture(&dir);
+    let up = dir.join("up-data");
+    let host = up.join("host");
+    paired_host(&host);
+    let before = std::fs::read(host.join("host.toml")).unwrap();
+    let output = omp_cli(&dir).arg("--data-dir").arg(&up).arg("remove").output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("`hennery up`'s data directory"));
+    assert_eq!(before, std::fs::read(host.join("host.toml")).unwrap());
+    let output = omp_cli(&dir)
+        .env("HENNERY_HOST_DATA_DIR", &host)
+        .arg("set")
+        .arg(&config.executable)
+        .arg("--agent-data-dir")
+        .arg(&config.agent_data_dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        hennery_host::read_omp_config(&host).unwrap(),
+        hennery_host::OmpConfigStatus::Valid(config)
+    );
+    assert!(!up.join("host.toml").exists());
+}
+
+#[test]
+fn omp_adapter_resolves_installed_host_and_up_without_running_the_manager() {
+    let dir = scratch_dir("omp-config-installed");
+    let _cleanup = RemoveDir(dir.clone());
+    let config = omp_fixture(&dir);
+    for role in ["host", "up"] {
+        let data = dir.join(format!("{role}-nondefault"));
+        let host = if role == "up" { data.join("host") } else { data.clone() };
+        paired_host(&host);
+        let file = service_file(&dir, role);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let args = if role == "host" {
+            vec!["host", "run"]
+        } else {
+            vec!["up"]
+        };
+        let mut argv = vec!["/not-executed/hennery".to_string()];
+        argv.extend(args.into_iter().map(str::to_string));
+        argv.extend(["--data-dir".into(), data.to_str().unwrap().into()]);
+        let text = if cfg!(target_os = "macos") {
+            format!(
+                "<plist><dict><key>ProgramArguments</key><array>{}</array></dict></plist>",
+                argv.iter()
+                    .map(|arg| format!("<string>{arg}</string>"))
+                    .collect::<String>()
+            )
+        } else {
+            format!(
+                "[Service]\nExecStart={}\n",
+                argv.iter()
+                    .map(|arg| format!("\"{arg}\""))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
+        std::fs::write(&file, text).unwrap();
+        // Any accidental manager call would fail; only service-file discovery
+        // is needed to locate the paired host, on either platform.
+        let output = omp_cli(&dir)
+            .env("PATH", "/nonexistent-omp-test-bin")
+            .arg("set")
+            .arg(&config.executable)
+            .arg("--agent-data-dir")
+            .arg(&config.agent_data_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{role}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            hennery_host::read_omp_config(&host).unwrap(),
+            hennery_host::OmpConfigStatus::Valid(config.clone())
+        );
+        std::fs::remove_file(file).unwrap();
+    }
+}
+
+#[test]
+fn omp_adapter_help_describes_configuration_preparation_only() {
+    for args in [
+        vec!["host", "adapters", "--help"],
+        vec!["host", "adapters", "omp", "--help"],
+        vec!["host", "adapters", "omp", "set", "--help"],
+    ] {
+        let output = hennery().args(&args).output().unwrap();
+        assert!(output.status.success());
+        let help = String::from_utf8(output.stdout).unwrap();
+        assert!(help.contains("preparation"), "{args:?}: {help}");
+    }
+}
+
+#[test]
+fn omp_adapter_resolves_default_up_child_without_an_installed_service() {
+    let dir = scratch_dir("omp-config-default-up");
+    let _cleanup = RemoveDir(dir.clone());
+    let config = omp_fixture(&dir);
+    let up = if cfg!(target_os = "macos") {
+        dir.join("home/Library/Application Support/hennery")
+    } else {
+        dir.join("data/hennery")
+    };
+    let host = up.join("host");
+    paired_host(&host);
+    let output = omp_cli(&dir)
+        .arg("set")
+        .arg(&config.executable)
+        .arg("--agent-data-dir")
+        .arg(&config.agent_data_dir)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        hennery_host::read_omp_config(&host).unwrap(),
+        hennery_host::OmpConfigStatus::Valid(config)
+    );
+    assert!(!up.join("host.toml").exists());
+}
+
 /// `host join` pairs, then installs the runtime (distribution §3.2). An
 /// install that fails (here: offline) exits non-zero but keeps the pairing,
 /// and says how to retry.

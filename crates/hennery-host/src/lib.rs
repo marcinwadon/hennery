@@ -11,6 +11,7 @@ pub mod forget_codex;
 pub mod git;
 pub mod identity;
 pub mod logging;
+pub mod omp;
 pub mod outbox;
 pub mod pairing;
 pub mod paths;
@@ -24,3 +25,4 @@ pub mod walk;
 
 pub use adapter::AgentCommand;
 pub use connection::{HostConfig, run, run_until};
+pub use omp::{OmpConfig, OmpConfigStatus, read_omp_config, remove_omp_config, set_omp_config};

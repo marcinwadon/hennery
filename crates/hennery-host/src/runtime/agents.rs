@@ -26,6 +26,29 @@ pub const START_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// What `--use-cli <agent>=bundled` means: back to the pinned CLI.
 pub const BUNDLED: &str = "bundled";
 
+/// Literal argv for a validated persisted OMP configuration. Not selected by
+/// default startup yet; constructing it never runs the external executable.
+pub fn omp_command(config: &crate::OmpConfig) -> Result<AgentCommand> {
+    crate::omp::validate(config)?;
+    Ok(AgentCommand {
+        program: config
+            .executable
+            .to_str()
+            .context("OMP executable must be UTF-8")?
+            .to_string(),
+        args: vec![
+            "--agent-dir".into(),
+            config
+                .agent_data_dir
+                .to_str()
+                .context("OMP agent-data root must be UTF-8")?
+                .to_string(),
+            "acp".into(),
+        ],
+        env: Vec::new(),
+    })
+}
+
 fn cli_var(agent: &str) -> Option<&'static str> {
     CLI_VARS.iter().find(|(a, _)| *a == agent).map(|(_, v)| *v)
 }
