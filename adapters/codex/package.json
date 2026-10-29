@@ -2,7 +2,7 @@
   "name": "hennery-adapter-codex",
   "private": true,
   "dependencies": {
-    "@agentclientprotocol/codex-acp": "2.3.0"
+    "@agentclientprotocol/codex-acp": "2.5.0"
   },
   "overrides": {
     "@openai/codex": "0.165.0"
