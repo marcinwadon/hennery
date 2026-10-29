@@ -401,7 +401,7 @@ host.)*
 
 | Type | Key fields | Notes |
 |---|---|---|
-| `hello_ack` | protocol_version, collector_version, server_time, committed{session_id: seq} | Reply to `hello`; `committed` holds the collector's highest committed seq for every session listed in `attached_sessions` (§5.1). |
+| `hello_ack` | protocol_version, collector_version, server_time, committed{session_id: seq} | Reply to `hello`; `committed` holds the collector's highest committed seq for each listed session belonging to the authenticated host (§5.1). Unknown or foreign sessions return zero, as do tombstones whose host events were deleted. |
 | `hello_error` | code (`incompatible` \| `revoked` \| `already_connected` \| `bad_proof`), message | Then the socket closes. `incompatible`: another protocol major; `bad_proof`: the credential does not verify. |
 | `ack` | session_id, ack_seq | Highest seq committed for that session (§3.6). |
 | `forget_hat` | hat_id | Sent after each reconciled handshake for every purged hat; the host deletes that hat's composed agent home once no process of the hat runs, for a `hat-<hex>` id only. Idempotent (kernel spec §5.5). A host that does not know it logs and ignores it. |
@@ -566,7 +566,14 @@ A host frame for a session that host does not own is logged and skipped.
 - A `starting` session found in SQLite after a **collector restart** is
   reconciled the same way when its host next connects.
 - Every rejection, including a failed resume, is correlated by `request_id`
-  alone and returns immediately. *(P-9: the predecessor's resume errors carried
+  within the authenticated connection the command was sent on, and returns
+  immediately. The connection is checked before removing the waiter or
+  applying its undo. Facts also match the command's session, expected kind,
+  and turn where applicable; `start_failed` rejects only a start or resume.
+  Ingestion also binds turn starts and ends to the named session before
+  reading prompt content or changing that turn's state.
+  A foreign or mismatched reply leaves the waiter and its watchdog untouched.
+  *(P-9: the predecessor's resume errors carried
   a session id that its waiter did not match, so every failed resume cost the
   full 30 s timeout.)*
 

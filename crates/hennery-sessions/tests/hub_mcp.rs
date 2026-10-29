@@ -38,7 +38,7 @@ async fn explicit_empty_delivery_requires_the_live_source_capability_and_verifie
             ),
         ] {
             let hub = Hub::default();
-            let mut rx = connect(&hub, Capabilities(capabilities));
+            let (conn_id, mut rx) = connect(&hub, Capabilities(capabilities));
             let mut frame = start(agent, false, false);
             if let CollectorFrame::StartSession { mcp, .. } = &mut frame {
                 mcp.source_policy = Some(McpSourceSnapshot {
@@ -47,7 +47,7 @@ async fn explicit_empty_delivery_requires_the_live_source_capability_and_verifie
                     request_id: "r1".into(),
                 });
             }
-            let result = send(&hub, &mut rx, frame).await;
+            let result = send(&hub, conn_id, &mut rx, frame).await;
             if expected {
                 assert!(result.is_ok());
             } else {
@@ -82,7 +82,7 @@ fn start(agent: &str, servers: bool, waived: bool) -> CollectorFrame {
     }
 }
 
-fn connect(hub: &Hub, capabilities: Capabilities) -> mpsc::UnboundedReceiver<CollectorFrame> {
+fn connect(hub: &Hub, capabilities: Capabilities) -> (u64, mpsc::UnboundedReceiver<CollectorFrame>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let isolation = AgentIsolation(
         [
@@ -94,12 +94,13 @@ fn connect(hub: &Hub, capabilities: Capabilities) -> mpsc::UnboundedReceiver<Col
     );
     let registration = hub.register("h", tx, capabilities, isolation).unwrap();
     hub.mark_ready("h", registration.conn_id);
-    rx
+    (registration.conn_id, rx)
 }
 
 /// Send `frame`; `Ok` once it went out (resolved by the test), or the error.
 async fn send(
     hub: &Hub,
+    conn_id: u64,
     rx: &mut mpsc::UnboundedReceiver<CollectorFrame>,
     frame: CollectorFrame,
 ) -> Result<(), RequestError> {
@@ -107,8 +108,12 @@ async fn send(
     tokio::pin!(request);
     tokio::select! {
         result = &mut request => result.map(|_| ()),
-        Some(_) = rx.recv() => {
-            hub.resolve("r1", SessionBody::session_started("r1", "a1"));
+        Some(frame) = rx.recv() => {
+            let fact = match frame {
+                CollectorFrame::Prompt { request_id, turn_id, .. } => SessionBody::TurnStarted { request_id, turn_id },
+                _ => SessionBody::session_started("r1", "a1"),
+            };
+            hub.resolve(conn_id, "s1", "r1", fact);
             request.await.map(|_| ())
         }
     }
@@ -130,8 +135,8 @@ async fn servers_go_only_where_they_are_announced_and_isolated_or_waived() {
     ];
     for (capabilities, agent, servers, waived, delivered) in cases {
         let hub = Hub::new();
-        let mut rx = connect(&hub, capabilities.clone());
-        let result = send(&hub, &mut rx, start(agent, servers, waived)).await;
+        let (conn_id, mut rx) = connect(&hub, capabilities.clone());
+        let result = send(&hub, conn_id, &mut rx, start(agent, servers, waived)).await;
         let case = format!("{capabilities:?} {agent} servers={servers} waived={waived}");
         if delivered {
             assert_eq!(result, Ok(()), "{case}");
@@ -163,8 +168,8 @@ async fn a_reconnect_without_the_capability_takes_no_servers() {
     let hub = Hub::new();
     let old = connect(&hub, Capabilities(vec![Capability::McpServers]));
     drop(old); // the old socket's writer is gone
-    let mut rx = connect(&hub, Capabilities::default());
-    let result = send(&hub, &mut rx, start("claude", true, false)).await;
+    let (conn_id, mut rx) = connect(&hub, Capabilities::default());
+    let result = send(&hub, conn_id, &mut rx, start("claude", true, false)).await;
     assert_eq!(result, Err(RequestError::McpUndeliverable));
     assert!(rx.try_recv().is_err(), "sent anyway");
     assert_eq!(hub.mcp_isolation("h", "claude"), Some((false, McpIsolation::None)));
@@ -174,7 +179,7 @@ async fn a_reconnect_without_the_capability_takes_no_servers() {
 #[test]
 fn notify_sends_no_servers_a_connection_cannot_take() {
     let hub = Hub::new();
-    let mut rx = connect(&hub, Capabilities::default());
+    let (_conn_id, mut rx) = connect(&hub, Capabilities::default());
     assert!(!hub.notify("h", start("claude", true, false)));
     assert!(rx.try_recv().is_err(), "sent anyway");
     assert!(hub.notify("h", start("claude", false, false)));
@@ -222,8 +227,8 @@ async fn a_resume_with_servers_is_checked_as_a_start_is() {
         (Capabilities::default(), "claude", true, false),
     ] {
         let hub = Hub::new();
-        let mut rx = connect(&hub, capabilities.clone());
-        let result = send(&hub, &mut rx, resume(agent, waived)).await;
+        let (conn_id, mut rx) = connect(&hub, capabilities.clone());
+        let result = send(&hub, conn_id, &mut rx, resume(agent, waived)).await;
         let case = format!("{capabilities:?} {agent} waived={waived}");
         if delivered {
             assert_eq!(result, Ok(()), "{case}");
@@ -239,7 +244,7 @@ async fn a_resume_with_servers_is_checked_as_a_start_is() {
 #[tokio::test]
 async fn a_frame_without_a_delivery_goes_out_on_any_connection() {
     let hub = Hub::new();
-    let mut rx = connect(&hub, Capabilities::default());
+    let (conn_id, mut rx) = connect(&hub, Capabilities::default());
     let prompt = CollectorFrame::Prompt {
         plugin_context: None,
         request_id: "r1".into(),
@@ -247,5 +252,5 @@ async fn a_frame_without_a_delivery_goes_out_on_any_connection() {
         turn_id: "t1".into(),
         content: vec![],
     };
-    assert_eq!(send(&hub, &mut rx, prompt).await, Ok(()));
+    assert_eq!(send(&hub, conn_id, &mut rx, prompt).await, Ok(()));
 }

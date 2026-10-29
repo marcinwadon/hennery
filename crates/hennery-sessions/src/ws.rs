@@ -143,7 +143,7 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
     for a in &attached_sessions {
         committed.insert(
             a.session_id.clone(),
-            state.store.committed_seq(&a.session_id).unwrap_or(0),
+            state.store.committed_seq_for_host(&host_id, &a.session_id).unwrap_or(0),
         );
     }
     let ack = CollectorFrame::HelloAck {
@@ -304,24 +304,26 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                                     .mcp_source_state(&session_id)
                                     .is_ok_and(|state| state.is_none_or(|s| s.requested.is_none()));
                                 if started || (legacy && indexed.mcp_source_policy.is_none()) {
-                                    state.hub.resolve(request_id, body.clone());
+                                    state.hub.resolve(conn_id, &session_id, request_id, body.clone());
                                 }
                             }
                             SessionBody::TurnStarted { request_id, .. }
                             | SessionBody::ConfigApplied { request_id, .. } => {
-                                state.hub.resolve(request_id, body.clone());
+                                state.hub.resolve(conn_id, &session_id, request_id, body.clone());
                             }
                             SessionBody::StartFailed {
                                 request_id,
                                 code,
                                 message,
                             } => {
-                                state.hub.reject(request_id, code.clone(), message.clone());
+                                state
+                                    .hub
+                                    .reject_start(conn_id, &session_id, request_id, code.clone(), message.clone());
                             }
                             // Park and close are completed by facts that
                             // name only the session (ACP core §3.2).
                             SessionBody::SessionParked { .. } | SessionBody::SessionClosed => {
-                                state.hub.resolve_session(&session_id, body.clone());
+                                state.hub.resolve_session(conn_id, &session_id, body.clone());
                                 // A deleted session's adapter is gone now:
                                 // what an `attached` answer left goes again
                                 // (plan 9d O10). Only a tombstone has records.
@@ -336,7 +338,7 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                             // not let it complete another session's waiter
                             // by naming that session's turn_id here.
                             SessionBody::TurnEnded { turn_id, .. } => {
-                                state.hub.resolve_turn(&session_id, turn_id, body.clone());
+                                state.hub.resolve_turn(conn_id, &session_id, turn_id, body.clone());
                             }
                             _ => {}
                         }
@@ -396,7 +398,7 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
                     // `Rejected`, and drop the connection so the next
                     // handshake's reconciliation settles it (final review
                     // F1) — never answer `Rejected` and then break.
-                    if let Some(rejection) = state.hub.take_rejected(&request_id) {
+                    if let Some(rejection) = state.hub.take_rejected(conn_id, &request_id) {
                         let undo_failed = match rejection.undo() {
                             Some(undo) => undo_rejected(&state.store, undo, &code)
                                 .err()
