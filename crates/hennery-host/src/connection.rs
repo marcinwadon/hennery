@@ -361,13 +361,24 @@ async fn handshake(
     let config = WebSocketConfig::default()
         .max_message_size(Some(MAX_FRAME))
         .max_frame_size(Some(MAX_FRAME));
-    let (ws, nonce) = tokio::time::timeout(connect_timeout, transport.websocket(config))
+    let (ws, nonce, authenticate_first) = tokio::time::timeout(connect_timeout, transport.websocket_negotiated(config))
         .await
         .map_err(|_| anyhow::anyhow!("no WebSocket handshake within {connect_timeout:?}"))?
         .context("connect to collector")?;
     // The proof is over this connection's nonce, so it cannot be replayed on
     // another one. Without one there is nothing to sign.
     let (mut sink, mut stream) = ws.split();
+    if authenticate_first {
+        send(
+            &mut sink,
+            &HostFrame::Authenticate {
+                protocol_version: PROTOCOL_VERSION.into(),
+                host_id: host_id.into(),
+                proof: key.sign_hello(&nonce, host_id, PROTOCOL_VERSION),
+            },
+        )
+        .await?;
+    }
     send(
         &mut sink,
         &HostFrame::Hello {

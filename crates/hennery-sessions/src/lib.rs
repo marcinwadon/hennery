@@ -54,19 +54,20 @@ pub mod tool_args;
 pub mod unseen;
 pub mod view;
 pub mod ws;
+mod ws_transport;
 
 use axum::Router;
 use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::Operator;
 use hennery_kernel::push::{Push, VapidKey};
 use hennery_kernel::ratelimit::{Limiter, Policy};
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone)]
 pub struct AppState {
+    pub handshakes: Arc<hennery_kernel::server::Admission>,
     #[cfg(feature = "test-hooks")]
     pub startup_dispatch: Arc<startup::DispatchHold>,
     pub store: Arc<store::Store>,
@@ -108,6 +109,7 @@ impl AppState {
         let hub = Arc::new(hub::Hub::new());
         store.set_idle_hub(&hub);
         Self {
+            handshakes: Arc::new(hennery_kernel::server::Admission::new(64, 4)),
             #[cfg(feature = "test-hooks")]
             startup_dispatch: Arc::default(),
             store: Arc::new(store),
@@ -181,26 +183,7 @@ pub async fn serve_all(
     app: Router,
     shutdown: CancellationToken,
 ) -> std::io::Result<()> {
-    let mut serving = tokio::task::JoinSet::new();
-    for listener in listeners {
-        let app = app.clone().into_make_service_with_connect_info::<SocketAddr>();
-        let shutdown = shutdown.clone();
-        serving.spawn(async move {
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown.cancelled_owned())
-                .await
-        });
-    }
-    let mut result = Ok(());
-    while let Some(done) = serving.join_next().await {
-        if let Err(err) = done.map_err(std::io::Error::other).and_then(|served| served) {
-            shutdown.cancel();
-            if result.is_ok() {
-                result = Err(err);
-            }
-        }
-    }
-    result
+    hennery_kernel::server::serve_all(listeners, app, shutdown, Default::default()).await
 }
 
 /// Every session, host and operator route, the health checks, the host

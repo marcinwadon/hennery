@@ -17,6 +17,8 @@ state stays outside Git; public issues are separate approved projections.
      host↔collector protocol, session state machine, storage, session API.
    - [Kernel](specs/2026-09-26-kernel-design.md) — storage, config, operator
      auth, pairing, hats, push, HTTP security.
+   - [Public ingress hardening](specs/2026-10-29-public-ingress-hardening.md) —
+     bounded admission, timed reads and negotiated small host authentication.
    - [MCP gateway](specs/2026-09-26-mcp-gateway-design.md) — connections,
      OAuth, per-session tokens, streaming proxy, renderers.
    - [Per-hat, per-ACP MCP sources](specs/2026-10-28-mcp-source-policy.md) —

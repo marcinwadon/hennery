@@ -15,7 +15,7 @@ pub mod rest;
 
 /// Version of the host<->collector protocol, `MAJOR.MINOR`. Sent only in
 /// `hello` / `hello_ack`; minor versions are additive (architecture spec §5.3).
-pub const PROTOCOL_VERSION: &str = "1.0";
+pub const PROTOCOL_VERSION: &str = "1.1";
 
 /// The major part of a `MAJOR.MINOR` version string, if well formed.
 pub fn protocol_major(version: &str) -> Option<u32> {
@@ -28,6 +28,9 @@ pub fn protocol_major(version: &str) -> Option<u32> {
 /// collector's nonce for `hello.proof` (ACP core §3.5): 32 random bytes,
 /// lowercase hex.
 pub const HELLO_NONCE_HEADER: &str = "hennery-hello-nonce";
+/// Offered only by collectors that accept a small signed Authenticate before
+/// the full hello, allowing large reconciliation state after authentication.
+pub const HELLO_AUTH_HEADER: &str = "hennery-hello-auth";
 
 /// The bytes a host signs for `hello.proof` (ACP core §3.5): the
 /// collector's nonce, the host id and the protocol version, behind a

@@ -544,7 +544,7 @@ export type ForgetOutcome = "complete" | "partial";
 /**
  * Host -> collector.
  */
-export type HostFrame = { "type": "catalog", request_id: string, catalog: HostCatalog, } | { "type": "hello", protocol_version: string, host_version: string, host_id: string,
+export type HostFrame = { "type": "authenticate", protocol_version: string, host_id: string, proof: string, } | { "type": "catalog", request_id: string, catalog: HostCatalog, } | { "type": "hello", protocol_version: string, host_version: string, host_id: string,
 /**
  * Proof of possession of the host's key (ACP core §3.5): its
  * Ed25519 signature, hex, over `hello_proof_message(nonce, host_id,

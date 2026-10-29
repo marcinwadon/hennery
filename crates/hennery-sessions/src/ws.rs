@@ -3,18 +3,18 @@
 use crate::AppState;
 use crate::hub::Undo;
 use crate::store::{Edge, Ingested, PushEdge, Reconciliation, Store};
+use crate::ws_transport::{HostUpgrade, Message, WebSocket};
 use axum::Router;
 use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::http::HeaderValue;
 use axum::response::Response;
 use axum::routing::get;
 use futures::{SinkExt, StreamExt};
-use hennery_kernel::hosts::HelloCheck;
 use hennery_kernel::lifecycle::LifecycleHooks;
 use hennery_kernel::secret::{random_bytes, unix_now};
+use hennery_kernel::{client_address::ClientAddress, hosts::HelloCheck, server::AdmissionPermit};
 use hennery_proto::frames::{AttachedSession, CollectorFrame, HostFrame, SessionBody};
-use hennery_proto::{HELLO_NONCE_HEADER, PROTOCOL_VERSION, protocol_major};
+use hennery_proto::{HELLO_AUTH_HEADER, HELLO_NONCE_HEADER, PROTOCOL_VERSION, protocol_major};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -31,12 +31,23 @@ pub fn router(state: AppState) -> Router {
 
 /// The upgrade response carries this connection's nonce: the host signs it
 /// in `hello` (ACP core §3.5), so a proof is good for one connection only.
-async fn upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+async fn upgrade(ws: HostUpgrade, State(state): State<AppState>, address: ClientAddress) -> Response {
+    let Some(permit) = state.handshakes.try_acquire(address.effective) else {
+        let mut response = crate::api::error(
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            "busy",
+            "host handshake capacity reached",
+        );
+        response
+            .headers_mut()
+            .insert("retry-after", HeaderValue::from_static("1"));
+        return response;
+    };
     let nonce = random_bytes::<32>();
-    let mut response = ws
-        .max_message_size(MAX_FRAME)
-        .max_frame_size(MAX_FRAME)
-        .on_upgrade(move |socket| serve(socket, state, nonce));
+    let mut response = ws.on_upgrade(move |socket| serve(socket, state, nonce, permit));
+    response
+        .headers_mut()
+        .insert(HELLO_AUTH_HEADER, HeaderValue::from_static("1"));
     response.headers_mut().insert(
         HELLO_NONCE_HEADER,
         HeaderValue::from_str(&hex::encode(nonce)).expect("hex is a valid header value"),
@@ -48,14 +59,70 @@ fn text(frame: &CollectorFrame) -> Message {
     Message::Text(serde_json::to_string(frame).expect("frame serializes").into())
 }
 
-async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
-    let (mut sink, mut stream) = socket.split();
-
+async fn serve(mut socket: WebSocket, state: AppState, nonce: [u8; 32], permit: AdmissionPermit) {
+    let deadline = tokio::time::Instant::now() + HELLO_TIMEOUT;
     // 1. hello: first frame, authenticated.
-    let hello = match tokio::time::timeout(HELLO_TIMEOUT, stream.next()).await {
+    let first = tokio::select! {
+        () = state.shutdown.cancelled() => return,
+        first = tokio::time::timeout_at(deadline, socket.next()) => first,
+    };
+    let mut hello = match first {
         Ok(Some(Ok(Message::Text(t)))) => serde_json::from_str::<HostFrame>(&t).ok(),
         _ => None,
     };
+    let mut authenticated_as = None;
+    if let Some(HostFrame::Authenticate {
+        protocol_version,
+        host_id,
+        proof,
+    }) = hello
+    {
+        if protocol_major(&protocol_version) != protocol_major(PROTOCOL_VERSION) {
+            let _ = socket
+                .send(text(&CollectorFrame::HelloError {
+                    code: "incompatible".into(),
+                    message: "unsupported protocol major".into(),
+                }))
+                .await;
+            return;
+        }
+        match state.hosts.check_hello(&host_id, &nonce, &protocol_version, &proof) {
+            Ok(HelloCheck::Accepted) => {}
+            Ok(HelloCheck::Revoked) => {
+                let _ = socket
+                    .send(text(&CollectorFrame::HelloError {
+                        code: "revoked".into(),
+                        message: "this host was revoked; pair it again".into(),
+                    }))
+                    .await;
+                return;
+            }
+            Ok(HelloCheck::BadProof) => {
+                tracing::debug!("host authentication refused");
+                let _ = socket
+                    .send(text(&CollectorFrame::HelloError {
+                        code: "bad_proof".into(),
+                        message: "unknown host or invalid proof".into(),
+                    }))
+                    .await;
+                return;
+            }
+            Err(error) => {
+                tracing::error!(%error,"checking host authentication failed");
+                return;
+            }
+        }
+        socket.get_mut().authenticated();
+        authenticated_as = Some((host_id, protocol_version));
+        let next = tokio::select! {
+            () = state.shutdown.cancelled()=>return,
+            next=tokio::time::timeout_at(deadline,socket.next())=>next,
+        };
+        hello = match next {
+            Ok(Some(Ok(Message::Text(t)))) => serde_json::from_str::<HostFrame>(&t).ok(),
+            _ => None,
+        };
+    }
     let Some(HostFrame::Hello {
         protocol_version,
         host_version,
@@ -70,24 +137,28 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
     else {
         return;
     };
+    if authenticated_as
+        .as_ref()
+        .is_some_and(|(id, version)| *id != host_id || *version != protocol_version)
+    {
+        return;
+    }
     let reject = |code: &str, message: &str| CollectorFrame::HelloError {
         code: code.into(),
         message: message.into(),
     };
     if protocol_major(&protocol_version) != protocol_major(PROTOCOL_VERSION) {
-        let _ = sink
+        let _ = socket
             .send(text(&reject("incompatible", "unsupported protocol major")))
             .await;
         return;
     }
-    // The host id is never taken on its word (ACP core §3.5). Until the
-    // proof checks out it is logged `Debug`-escaped (`?host_id`): an
-    // unauthenticated peer chose it.
+    // No peer-selected field is logged before its key is authenticated.
     match state.hosts.check_hello(&host_id, &nonce, &protocol_version, &proof) {
         Ok(HelloCheck::Accepted) => {}
         Ok(HelloCheck::Revoked) => {
             tracing::warn!(%host_id, "revoked host tried to connect");
-            let _ = sink
+            let _ = socket
                 .send(text(&reject(
                     "revoked",
                     "this host was revoked; pair it again with `hennery host join`",
@@ -96,17 +167,20 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
             return;
         }
         Ok(HelloCheck::BadProof) => {
-            tracing::warn!(?host_id, "hello with an unknown host id or an invalid proof");
-            let _ = sink
+            tracing::debug!("hello with an unknown host id or an invalid proof");
+            let _ = socket
                 .send(text(&reject("bad_proof", "unknown host or invalid proof")))
                 .await;
             return;
         }
         Err(err) => {
-            tracing::error!(?host_id, error = %err, "checking a hello failed");
+            tracing::error!(error = %err, "checking a hello failed");
             return;
         }
     }
+    socket.get_mut().authenticated();
+    drop(permit);
+    let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<CollectorFrame>();
     let Some(registration) = state.hub.register_with_profiles(
         &host_id,
@@ -489,7 +563,9 @@ async fn serve(socket: WebSocket, state: AppState, nonce: [u8; 32]) {
             | HostFrame::SessionForgotten { .. }) => {
                 state.hub.probe_reply(&host_id, conn_id, frame);
             }
-            HostFrame::Hello { .. } => tracing::warn!(%host_id, "ignoring repeated hello"),
+            HostFrame::Hello { .. } | HostFrame::Authenticate { .. } => {
+                tracing::warn!(%host_id, "ignoring repeated hello")
+            }
         }
     }
 

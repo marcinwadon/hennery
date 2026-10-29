@@ -84,6 +84,7 @@ impl CollectorTrust {
     }
 }
 fn ca_roots(pem: &str) -> Result<rustls::RootCertStore> {
+    use rustls::pki_types::pem::PemObject;
     if pem.len() > MAX_CA_BYTES {
         bail!("CA bundle exceeds 256 KiB");
     }
@@ -100,10 +101,8 @@ fn ca_roots(pem: &str) -> Result<rustls::RootCertStore> {
         };
         let block_len = "-----BEGIN CERTIFICATE-----".len() + end + "-----END CERTIFICATE-----".len();
         let block = &rest[..block_len];
-        let cert = rustls_pemfile::certs(&mut block.as_bytes())
-            .next()
-            .transpose()?
-            .ok_or_else(|| anyhow::anyhow!("empty CA certificate"))?;
+        let cert = rustls::pki_types::CertificateDer::from_pem_slice(block.as_bytes())
+            .map_err(|_| anyhow::anyhow!("malformed CA certificate"))?;
         let (tail, parsed) = x509_parser::parse_x509_certificate(cert.as_ref())
             .map_err(|_| anyhow::anyhow!("malformed CA certificate"))?;
         if !tail.is_empty()
@@ -410,11 +409,16 @@ impl CollectorTransport {
             .map_err(|error| failure(classify(&error)))
     }
     pub async fn websocket(&self, config: WebSocketConfig) -> Result<(Socket, Vec<u8>)> {
+        self.websocket_negotiated(config)
+            .await
+            .map(|(socket, nonce, _)| (socket, nonce))
+    }
+    pub(crate) async fn websocket_negotiated(&self, config: WebSocketConfig) -> Result<(Socket, Vec<u8>, bool)> {
         tokio::time::timeout(TIMEOUT, self.open(config))
             .await
             .map_err(|_| failure(Stage::Connect))?
     }
-    async fn open(&self, config: WebSocketConfig) -> Result<(Socket, Vec<u8>)> {
+    async fn open(&self, config: WebSocketConfig) -> Result<(Socket, Vec<u8>, bool)> {
         let addresses = self.endpoint.addresses().await?;
         let mut socket = None;
         for address in addresses {
@@ -456,7 +460,13 @@ impl CollectorTransport {
         if values.next().is_some() || nonce.is_none() {
             return Err(failure(Stage::MissingNonce));
         }
-        Ok((ws, nonce.expect("checked nonce")))
+        let auth_values: Vec<_> = response
+            .headers()
+            .get_all(hennery_proto::HELLO_AUTH_HEADER)
+            .iter()
+            .collect();
+        let authenticate_first = auth_values.len() == 1 && auth_values[0] == "1";
+        Ok((ws, nonce.expect("checked nonce"), authenticate_first))
     }
     pub async fn preflight(&self) -> Result<()> {
         let (mut ws, _) = self.websocket(WebSocketConfig::default()).await?;

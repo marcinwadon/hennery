@@ -2234,6 +2234,31 @@
       "description": "Host -> collector.",
       "oneOf": [
         {
+          "description": "Negotiated by HELLO_AUTH_HEADER=1; followed by the ordinary full Hello.",
+          "properties": {
+            "host_id": {
+              "type": "string"
+            },
+            "proof": {
+              "type": "string"
+            },
+            "protocol_version": {
+              "type": "string"
+            },
+            "type": {
+              "const": "authenticate",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "protocol_version",
+            "host_id",
+            "proof"
+          ],
+          "type": "object"
+        },
+        {
           "properties": {
             "catalog": {
               "$ref": "#/$defs/HostCatalog"
