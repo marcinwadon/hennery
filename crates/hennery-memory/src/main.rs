@@ -2,7 +2,7 @@
 use clap::{Parser, Subcommand};
 use hennery_memory::{
     consumer::{self, FeedConfig},
-    http, keys,
+    keys,
     store::Store,
     ui,
 };
@@ -90,6 +90,10 @@ enum Command {
     Serve {
         #[arg(long, default_value = "127.0.0.1:7332")]
         listen: std::net::SocketAddr,
+        /// Exact TCP peer (repeatable, at most eight) whose Hennery-Client-IP
+        /// header keys sign-in budgets. None: the header is ignored.
+        #[arg(long = "proxy-client-ip-peer", value_name = "IP")]
+        proxy_client_ip_peers: Vec<std::net::IpAddr>,
     },
 }
 #[tokio::main]
@@ -173,7 +177,11 @@ async fn run() -> anyhow::Result<()> {
                 serde_json::json!({"namespace":c.namespace,"tool_credential":c.tool,"lifecycle_credential":c.lifecycle,"mode":"standalone; no collector lease or automatic deletion guarantee"})
             );
         }
-        Command::Serve { listen } => {
+        Command::Serve {
+            listen,
+            proxy_client_ip_peers,
+        } => {
+            let policy = hennery_kernel::client_address::ProxyPolicy::new(proxy_client_ip_peers)?;
             let operator = if args.data_dir.join("memory-auth.db").try_exists()? {
                 let operator = Arc::new(hennery_kernel::operator::Operator::open(
                     &args.data_dir.join("memory-auth.db"),
@@ -195,10 +203,7 @@ async fn run() -> anyhow::Result<()> {
             } else {
                 None
             };
-            let mut router = http::router(store.clone());
-            if let Some(operator) = operator {
-                router = router.merge(ui::router(store, operator)?);
-            }
+            let router = hennery_memory::serve::app(store.clone(), operator, policy)?;
             axum::serve(
                 listener,
                 router.into_make_service_with_connect_info::<std::net::SocketAddr>(),

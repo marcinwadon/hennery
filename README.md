@@ -96,7 +96,7 @@ Cookies are not isolated by port, so another port on the same hostname is
 not enough. For local use, reserve `localhost` for the memory UI and use
 `127.0.0.1` for hennery's UI, with each configured public URL matching the
 address you open. The memory UI refuses IP-address origins; use HTTPS for
-remote access.
+remote access, through the [memory proxy recipe](packaging/proxy/memory.md).
 
 To import an existing vault, take a snapshot and preview it first. Review
 the proposed files and map each to exactly one hat or exclude it, then apply
