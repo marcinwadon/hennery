@@ -70,7 +70,7 @@ impl Collector {
             .request(method.parse().unwrap(), format!("http://{}{path}", self.addr))
             .header("origin", PUBLIC_URL);
         match session {
-            Some(session) => req.header("cookie", format!("hennery_session={session}")),
+            Some(session) => req.header("cookie", format!("__Host-hennery_session={session}")),
             None => req,
         }
     }
@@ -205,7 +205,7 @@ async fn code_of(resp: reqwest::Response) -> (u16, String) {
 fn session_token(resp: &reqwest::Response) -> String {
     let cookie = resp.headers()["set-cookie"].to_str().unwrap();
     cookie
-        .strip_prefix("hennery_session=")
+        .strip_prefix("__Host-hennery_session=")
         .unwrap()
         .split(';')
         .next()
@@ -377,7 +377,7 @@ async fn passkey_routes_follow_the_browser_rules() {
     assert_eq!(code_of(resp).await, (403, "origin_mismatch".into()));
     let resp = reqwest::Client::new()
         .delete(url(&format!("/api/auth/passkeys/{}", item.id)))
-        .header("cookie", format!("hennery_session={session}"))
+        .header("cookie", format!("__Host-hennery_session={session}"))
         .send()
         .await
         .unwrap();
@@ -417,7 +417,7 @@ async fn passkey_routes_follow_the_browser_rules() {
         assert_eq!(code_of(resp).await, (401, "unauthenticated".into()), "{path}");
         let resp = reqwest::Client::new()
             .post(url(path))
-            .header("cookie", format!("hennery_session={session}"))
+            .header("cookie", format!("__Host-hennery_session={session}"))
             .json(&serde_json::json!({}))
             .send()
             .await

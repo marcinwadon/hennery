@@ -68,7 +68,7 @@ impl Collector {
     }
     async fn password(&self, ip: &str, path: &str, cookie: &str, password: &str) -> u16 {
         self.post(Some(ip), path)
-            .header("cookie", format!("hennery_session={cookie}"))
+            .header("cookie", format!("__Host-hennery_session={cookie}"))
             .json(&json!({"password":password}))
             .send()
             .await
@@ -225,7 +225,7 @@ async fn passkey_start_and_success_use_the_effective_client() {
         .unwrap();
     let start: Value = c
         .post(Some(B), "/api/auth/passkeys/register/start")
-        .header("cookie", format!("hennery_session={session}"))
+        .header("cookie", format!("__Host-hennery_session={session}"))
         .json(&json!({"label":"fixture"}))
         .send()
         .await
@@ -239,7 +239,7 @@ async fn passkey_start_and_success_use_the_effective_client() {
         .unwrap();
     assert_eq!(
         c.post(Some(B), "/api/auth/passkeys/register/finish")
-            .header("cookie", format!("hennery_session={session}"))
+            .header("cookie", format!("__Host-hennery_session={session}"))
             .json(&json!({"ceremony_id":start["ceremony_id"],"credential":credential}))
             .send()
             .await

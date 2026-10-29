@@ -158,7 +158,7 @@ impl Collector {
         reqwest::Client::new()
             .request(method.parse().unwrap(), format!("http://{}{path}", self.addr))
             .header("origin", PUBLIC_URL)
-            .header("cookie", format!("hennery_session={session}"))
+            .header("cookie", format!("__Host-hennery_session={session}"))
     }
 
     async fn step_up(&self, session: &str, password: &str) -> reqwest::Response {
@@ -679,7 +679,7 @@ async fn the_session_list_marks_the_current_one_and_revoking_it_signs_out() {
     assert_eq!(own.status(), 204);
     let cookie = own.headers()["set-cookie"].to_str().unwrap();
     assert!(
-        cookie.starts_with("hennery_session=;") && cookie.contains("Max-Age=0"),
+        cookie.starts_with("__Host-hennery_session=;") && cookie.contains("Max-Age=0"),
         "{cookie}"
     );
     let after = c.request(&mine, "GET", "/api/auth/sessions").send().await.unwrap();
@@ -711,7 +711,7 @@ async fn revoking_the_own_session_on_a_sliding_request_sends_only_the_clearing_c
         .collect();
     assert_eq!(cookies.len(), 1, "{cookies:?}");
     assert!(
-        cookies[0].starts_with("hennery_session=;") && cookies[0].contains("Max-Age=0"),
+        cookies[0].starts_with("__Host-hennery_session=;") && cookies[0].contains("Max-Age=0"),
         "{cookies:?}"
     );
 }

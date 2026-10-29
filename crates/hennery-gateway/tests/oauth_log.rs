@@ -103,7 +103,10 @@ async fn no_url_secret_code_verifier_token_or_client_secret_is_logged_or_answere
             .method(method)
             .uri(path)
             .header("origin", ORIGIN)
-            .header("cookie", cookie.unwrap_or_else(|| format!("hennery_session={session}")));
+            .header(
+                "cookie",
+                cookie.unwrap_or_else(|| format!("__Host-hennery_session={session}")),
+            );
         if body.is_some() {
             req = req.header("content-type", "application/json");
         }

@@ -223,12 +223,16 @@ frontend), and `SetupRequest` has no default hat name; hats add it.
     writes nothing and logs a warning naming the passkey; the passkey is not
     disabled (that would hand a clone's holder a lever).
 - **Sessions:** server-side (`auth_sessions`: random 256-bit id hashed at
-  rest). Cookie `hennery_session`: `HttpOnly`, `Secure` (from `public_url`'s
+  rest). Cookie `__Host-hennery_session` on HTTPS, `hennery_session` on a
+  loopback `http://` `public_url`: `HttpOnly`, `Secure` (from `public_url`'s
   scheme, never from the peer address), `SameSite=Strict`, `Path=/`,
-  `Max-Age` 30 days. 30-day sliding expiry; use slides it at most once a
-  minute, and a slid response re-sends the cookie. Up to four
-  `hennery_session` cookies in a request are tried in order (a sibling
-  subdomain can plant a same-named one). Expired rows are pruned when a
+  `Max-Age` 30 days. Only the scheme's own name is read: on HTTPS an
+  unprefixed `hennery_session`, which a sibling subdomain can set for the
+  parent domain, is ignored, so a browser holding one from before the prefix
+  signs in again. 30-day sliding expiry; use slides it at most once a
+  minute, and a slid response re-sends the cookie. Up to four session
+  cookies in a request are tried in order (another service on the same
+  loopback host can plant a same-named one). Expired rows are pruned when a
   session opens; `User-Agent` is stored without control characters, at most
   256 characters. A login, password or passkey, opens a stepped-up session
   (§3.4), and only while the credential it checked is still current (the same

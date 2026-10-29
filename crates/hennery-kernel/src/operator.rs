@@ -851,8 +851,18 @@ pub const SESSION_SLIDE_SECS: i64 = 60;
 /// §3.4).
 pub const STEP_UP_SECS: i64 = 5 * 60;
 
-/// The session cookie's name (kernel spec §3.2).
+/// The session cookie's name on a loopback `http://` collector (kernel
+/// spec §3.2).
 pub const SESSION_COOKIE: &str = "hennery_session";
+
+/// The session cookie's name on HTTPS: a `__Host-` cookie must be `Secure`,
+/// `Path=/` and carry no `Domain`, so a sibling subdomain cannot set one.
+pub const SECURE_SESSION_COOKIE: &str = "__Host-hennery_session";
+
+/// The session cookie's name: `__Host-` prefixed when it is `Secure`.
+pub fn session_cookie_name(secure: bool) -> &'static str {
+    if secure { SECURE_SESSION_COOKIE } else { SESSION_COOKIE }
+}
 
 /// The longest `User-Agent` kept with a session, in characters.
 const MAX_USER_AGENT: usize = 256;
@@ -1056,15 +1066,17 @@ impl Operator {
             .optional()?)
     }
 
-    /// The first of the request's session cookies (`session_tokens`) that
-    /// authenticates, with its token; `None` when none does. Like
-    /// `authenticate`, it slides the session it finds.
+    /// The first of the request's session cookies (`session_tokens`, under
+    /// the name `public_url`'s scheme gives) that authenticates, with its
+    /// token; `None` when none does. Like `authenticate`, it slides the
+    /// session it finds.
     pub fn authenticate_cookies(
         &self,
         headers: &axum::http::HeaderMap,
         now: i64,
     ) -> Result<Option<(String, Authenticated)>> {
-        for token in session_tokens(headers) {
+        let secure = self.public_url().is_none_or(|u| u.is_https());
+        for token in session_tokens(headers, secure) {
             if let Some(session) = self.authenticate(token, now)? {
                 return Ok(Some((token.to_string(), session)));
             }
@@ -1074,28 +1086,34 @@ impl Operator {
 }
 
 /// `Set-Cookie` for a session (kernel spec §3.2): `HttpOnly`,
-/// `SameSite=Strict`, `Path=/`, for `SESSION_TTL_SECS`, and `Secure`
-/// unless `public_url` is loopback `http://`.
+/// `SameSite=Strict`, `Path=/`, for `SESSION_TTL_SECS`, and `Secure` and
+/// `__Host-` prefixed unless `public_url` is loopback `http://`.
 pub fn session_cookie(token: &str, secure: bool) -> String {
+    let name = session_cookie_name(secure);
     let secure = if secure { "; Secure" } else { "" };
-    format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}{secure}")
+    format!("{name}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}{secure}")
 }
 
 /// `Set-Cookie` that removes the session cookie.
 pub fn cleared_cookie(secure: bool) -> String {
+    let name = session_cookie_name(secure);
     let secure = if secure { "; Secure" } else { "" };
-    format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}")
+    format!("{name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}")
 }
 
-/// At most this many `hennery_session` cookies of a request are tried, so
-/// one request cannot cost many session lookups.
+/// At most this many session cookies of a request are tried, so one
+/// request cannot cost many session lookups.
 pub const MAX_SESSION_COOKIES: usize = 4;
 
-/// Every session token in a request's `Cookie` headers, in order, at most
-/// `MAX_SESSION_COOKIES`. There can be more than one: a sibling subdomain
-/// can set a cookie of the same name for the parent domain, and the browser
-/// may send it first. Taking only the first would let it sign the owner out.
-pub fn session_tokens(headers: &axum::http::HeaderMap) -> Vec<&str> {
+/// Every session token in a request's `Cookie` headers, under
+/// `session_cookie_name(secure)` only, in order, at most
+/// `MAX_SESSION_COOKIES`. On loopback there can be more than one: another
+/// local service can set a cookie of the same name, and the browser may
+/// send it first. Taking only the first would let it sign the owner out.
+/// On HTTPS the unprefixed name, which a sibling subdomain can set for the
+/// parent domain, is never read.
+pub fn session_tokens(headers: &axum::http::HeaderMap, secure: bool) -> Vec<&str> {
+    let wanted = session_cookie_name(secure);
     headers
         .get_all(axum::http::header::COOKIE)
         .iter()
@@ -1103,7 +1121,7 @@ pub fn session_tokens(headers: &axum::http::HeaderMap) -> Vec<&str> {
         .flat_map(|v| v.split(';'))
         .filter_map(|pair| {
             let (name, value) = pair.trim().split_once('=')?;
-            (name == SESSION_COOKIE).then_some(value)
+            (name == wanted).then_some(value)
         })
         .take(MAX_SESSION_COOKIES)
         .collect()

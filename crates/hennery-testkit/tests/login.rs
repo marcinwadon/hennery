@@ -61,7 +61,7 @@ async fn code_of(resp: reqwest::Response) -> (u16, String) {
 fn cookie_token(resp: &reqwest::Response) -> String {
     let cookie = resp.headers()["set-cookie"].to_str().unwrap();
     cookie
-        .strip_prefix("hennery_session=")
+        .strip_prefix("__Host-hennery_session=")
         .unwrap()
         .split(';')
         .next()
@@ -85,7 +85,7 @@ async fn the_owners_password_opens_a_session_and_logout_ends_it() {
 
     let out = c
         .post("/api/auth/logout")
-        .header("cookie", format!("hennery_session={token}"))
+        .header("cookie", format!("__Host-hennery_session={token}"))
         .send()
         .await
         .unwrap();
@@ -106,7 +106,10 @@ async fn logout_behind_a_tossed_cookie_ends_the_real_session() {
     let tossed = "0".repeat(64);
     let out = c
         .post("/api/auth/logout")
-        .header("cookie", format!("hennery_session={tossed}; hennery_session={token}"))
+        .header(
+            "cookie",
+            format!("__Host-hennery_session={tossed}; __Host-hennery_session={token}"),
+        )
         .send()
         .await
         .unwrap();
