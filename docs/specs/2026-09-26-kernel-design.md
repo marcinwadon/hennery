@@ -195,8 +195,11 @@ frontend), and `SetupRequest` has no default hat name; hats add it.
   budget, so rotating addresses gains at most (4096 + 1024 + 64 + 2) budgets
   a window. Loopback always keeps an entry of its own, and so do the last 64
   addresses that succeeded (known addresses): a flood cannot push the
-  owner's usual address into a budget it has locked. Known is no exemption:
-  the same budget applies, and the credential is checked as always.
+  owner's usual address into a budget it has locked. Password and passkey
+  login share their known addresses (a sign-in by either protects both),
+  each keeping its own counts, which the other's success never clears.
+  Known is no exemption: the same budget applies, and the credential is
+  checked as always.
   `X-Forwarded-For` is not trusted. Behind an unconfigured proxy every
   client shares its budget; §2's exact-peer, dedicated-header policy
   provides address-only attribution.

@@ -587,6 +587,85 @@ fn starts_racing_for_the_last_place_charge_only_the_one_that_began() {
     }
 }
 
+/// Fill `limiter`'s address table from another /48 and lock the /48 of
+/// `owner` through a neighbouring /64, as a flood would.
+fn flood_and_lock_the_prefix_of(limiter: &hennery_kernel::ratelimit::Limiter, policy: Policy, owner: IpAddr) {
+    let now = std::time::Instant::now();
+    for n in 0..hennery_kernel::ratelimit::DEFAULT_CAPACITY {
+        let key = IpAddr::from([0x2001, 0xdb8, 0xffff, n as u16, 0, 0, 0, 1]);
+        limiter.attempt(key, now).unwrap();
+    }
+    let IpAddr::V6(owner) = owner else {
+        panic!("an IPv6 owner")
+    };
+    let s = owner.segments();
+    let neighbour = IpAddr::from([s[0], s[1], s[2], s[3].wrapping_add(1), 0, 0, 0, 1]);
+    for _ in 0..=policy.free_failures {
+        let _ = limiter.attempt(neighbour, now);
+    }
+    assert!(
+        limiter.attempt(IpAddr::V6(owner), now).is_err(),
+        "the flood did not lock the prefix"
+    );
+}
+
+/// Final security review (P2): a password sign-in makes its address known
+/// to passkey login as well, so a flood that filled the passkey budget's
+/// table and locked the owner's /48 does not lock out the owner's first
+/// passkey login from there; before, only the ceremony place was kept.
+#[test]
+fn a_password_sign_in_keeps_passkey_login_out_of_a_floods_lockout() {
+    let op = Operator::open_in_memory().unwrap();
+    let session_id = set_up(&op, PUBLIC_URL);
+    register(&op, &session_id, &mut authenticator(), "laptop");
+    let owner: IpAddr = "2001:db8:1:1::1".parse().unwrap();
+    flood_and_lock_the_prefix_of(&op.passkey_limiter, Policy::PASSKEY_LOGIN, owner);
+    assert!(matches!(
+        op.start_passkey_login(owner, NOW).unwrap(),
+        Start::RateLimited(_)
+    ));
+    op.login_limiter.attempt(owner, std::time::Instant::now()).unwrap();
+    op.login_limiter.succeeded(owner);
+    assert!(matches!(
+        op.start_passkey_login(owner, NOW).unwrap(),
+        Start::Begun { .. }
+    ));
+}
+
+/// The other way round: a passkey sign-in makes its address known to
+/// password login, past a flood that locked its prefix there; and the
+/// wrong passwords already counted from it stay counted.
+#[test]
+fn a_passkey_sign_in_protects_password_login_and_keeps_its_count() {
+    let op = Operator::open_in_memory().unwrap();
+    let owner: IpAddr = "2001:db8:1:1::1".parse().unwrap();
+    let now = std::time::Instant::now();
+    for _ in 0..2 {
+        op.login_limiter.attempt(owner, now).unwrap();
+    }
+    op.passkey_limiter.attempt(owner, now).unwrap();
+    op.passkey_limiter.succeeded(owner);
+    for _ in 2..Policy::LOGIN.free_failures {
+        assert!(op.login_limiter.attempt(owner, now).is_ok());
+    }
+    assert!(
+        op.login_limiter.attempt(owner, now).is_err(),
+        "a passkey sign-in cleared the wrong passwords"
+    );
+
+    let op = Operator::open_in_memory().unwrap();
+    flood_and_lock_the_prefix_of(&op.login_limiter, Policy::LOGIN, owner);
+    op.passkey_limiter.attempt(owner, now).unwrap();
+    op.passkey_limiter.succeeded(owner);
+    for _ in 0..Policy::LOGIN.free_failures {
+        assert!(
+            op.login_limiter.attempt(owner, now).is_ok(),
+            "the owner shared the flood's lockout"
+        );
+    }
+    assert!(op.login_limiter.attempt(owner, now).is_err());
+}
+
 /// Kernel spec §3.4: a passkey check steps a session up, as a password
 /// check does.
 #[test]

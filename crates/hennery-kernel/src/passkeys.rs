@@ -669,7 +669,9 @@ impl Operator {
     /// places kept for known clients.
     pub fn start_passkey_login(&self, client: IpAddr, now: i64) -> Result<Start> {
         let client = crate::ratelimit::key(client);
-        let known = self.passkey_limiter.is_known(client) || self.login_limiter.is_known(client);
+        // Known after a password or a passkey login: the two limiters share
+        // their known addresses, so `attempt` below agrees.
+        let known = self.passkey_limiter.is_known(client);
         let Some(reservation) = self.ceremonies.reserve_login(client, known, now) else {
             return Ok(Start::Busy);
         };

@@ -21,7 +21,7 @@
 //! Every time is seconds since the Unix epoch, passed in by the caller.
 
 use crate::db;
-use crate::ratelimit::{Limiter, Policy};
+use crate::ratelimit::{KnownAddresses, Limiter, Policy};
 use crate::secret::{random_bytes, sha256_hex};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -249,6 +249,7 @@ pub struct Operator {
     step_up_hashing: HashPool,
     verifications: AtomicU64,
     /// Wrong passwords per client address at login (kernel spec §3.2).
+    /// Its known addresses are the passkey limiter's too.
     pub login_limiter: Limiter,
     /// Wrong passwords per client address at step-up, a budget of its own
     /// (3b decision 10): a login flood from a shared address does not stop
@@ -297,6 +298,9 @@ impl Operator {
     fn init(mut conn: crate::db::OwnedConnection) -> Result<Self> {
         let owner = db::kernel_owner(&mut conn)?;
         let public_url = load_public_url(&conn, &owner)?;
+        // A password or passkey login proves the same: either makes its
+        // address known to both limiters, whose counts stay their own.
+        let sign_ins = Arc::new(KnownAddresses::new(crate::ratelimit::DEFAULT_KNOWN));
         Ok(Self {
             conn: crate::db::CoordinatedConnection::new(conn),
             owner,
@@ -306,9 +310,9 @@ impl Operator {
             login_hashing: HashPool::new(),
             step_up_hashing: HashPool::new(),
             verifications: AtomicU64::new(0),
-            login_limiter: Limiter::new(Policy::LOGIN),
+            login_limiter: Limiter::with_shared_known(Policy::LOGIN, sign_ins.clone()),
             step_up_limiter: Limiter::new(Policy::LOGIN),
-            passkey_limiter: Limiter::new(Policy::PASSKEY_LOGIN),
+            passkey_limiter: Limiter::with_shared_known(Policy::PASSKEY_LOGIN, sign_ins),
             ended: tokio::sync::watch::Sender::new(0),
             ceremonies: Default::default(),
             #[cfg(test)]

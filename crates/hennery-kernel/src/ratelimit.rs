@@ -34,7 +34,10 @@
 //!   a prefix or overflow budget it has locked. It is no exemption: the
 //!   budget is the same as anyone's, and every credential is still
 //!   checked. Only a success, which needs the credential, makes an address
-//!   known.
+//!   known. Limiters whose successes prove the same thing (password and
+//!   passkey login: the owner signed in) share one set of known addresses
+//!   (`KnownAddresses`), so a sign-in by either method protects the other;
+//!   each keeps its own counts, which a success by the other never clears.
 //! - **In memory only:** a collector restart clears every count and
 //!   lockout, the prefix and overflow entries, and the known addresses.
 //!   Each *tracked* address still has its own separate budget; only
@@ -51,7 +54,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -160,22 +163,56 @@ pub fn aggregate(key: IpAddr) -> IpAddr {
     }
 }
 
+/// The last addresses (keys) that succeeded, at most `capacity`, most
+/// recent first (F3). Shared between limiters whose successes prove the
+/// same thing; it only recognises an address, and holds no counts.
+pub struct KnownAddresses {
+    capacity: usize,
+    recent: Mutex<VecDeque<IpAddr>>,
+}
+
+impl KnownAddresses {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            recent: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Whether `addr`'s key is one of them.
+    pub fn contains(&self, addr: IpAddr) -> bool {
+        self.recent.lock().expect("known lock").contains(&key(addr))
+    }
+
+    /// `addr`'s key succeeded: it is the most recent, and past `capacity`
+    /// the oldest is forgotten.
+    fn remember(&self, addr: IpAddr) {
+        let addr = key(addr);
+        let mut recent = self.recent.lock().expect("known lock");
+        recent.retain(|known| *known != addr);
+        if self.capacity > 0 {
+            recent.push_front(addr);
+            recent.truncate(self.capacity);
+        }
+    }
+}
+
 /// The per-address table, the per-prefix table new addresses fall back to
-/// once it is full of live entries, the one shared budget past both
-/// (amendment 2026-10-01, F3), and the addresses that last succeeded.
+/// once it is full of live entries, and the one shared budget past both
+/// (amendment 2026-10-01, F3).
 struct State {
     entries: HashMap<IpAddr, Entry>,
     aggregates: HashMap<IpAddr, Entry>,
     overflow: Option<Entry>,
-    /// Most recent first.
-    known: VecDeque<IpAddr>,
 }
 
 pub struct Limiter {
     policy: Policy,
     capacity: usize,
     aggregates: usize,
-    known: usize,
+    /// Its own, or shared (`with_shared_known`). Never locked while
+    /// `state` is.
+    known: Arc<KnownAddresses>,
     state: Mutex<State>,
 }
 
@@ -191,6 +228,19 @@ impl Limiter {
     /// `capacity` addresses, `aggregates` prefixes, `known` addresses that
     /// succeeded.
     pub fn with_capacities(policy: Policy, capacity: usize, aggregates: usize, known: usize) -> Self {
+        Self::sharing(policy, capacity, aggregates, Arc::new(KnownAddresses::new(known)))
+    }
+
+    /// The default capacities, recognising the addresses of `known`, which
+    /// other limiters share: a success here or there makes an address
+    /// known to both, and each keeps its own counts.
+    pub fn with_shared_known(policy: Policy, known: Arc<KnownAddresses>) -> Self {
+        Self::sharing(policy, DEFAULT_CAPACITY, DEFAULT_AGGREGATES, known)
+    }
+
+    /// `capacity` addresses and `aggregates` prefixes, recognising the
+    /// addresses of `known`.
+    pub fn sharing(policy: Policy, capacity: usize, aggregates: usize, known: Arc<KnownAddresses>) -> Self {
         Self {
             policy,
             capacity: capacity.max(1),
@@ -200,7 +250,6 @@ impl Limiter {
                 entries: HashMap::new(),
                 aggregates: HashMap::new(),
                 overflow: None,
-                known: VecDeque::new(),
             }),
         }
     }
@@ -211,6 +260,8 @@ impl Limiter {
     pub fn attempt(&self, addr: IpAddr, now: Instant) -> Result<(), Duration> {
         let policy = self.policy;
         let addr = key(addr);
+        // Before `state` is locked: the two locks are never held together.
+        let known = self.known.contains(addr);
         let mut state = self.state.lock().expect("limiter lock");
         if let Some(entry) = state.entries.get_mut(&addr) {
             return record_attempt(entry, &policy, now);
@@ -225,7 +276,7 @@ impl Limiter {
         // (3b decision 9) and a known address (F3) get their own entry
         // regardless.
         state.entries.retain(|_, e| !e.forgotten(&policy, now));
-        if state.entries.len() < self.capacity || addr.is_loopback() || state.known.contains(&addr) {
+        if state.entries.len() < self.capacity || addr.is_loopback() || known {
             let entry = state.entries.entry(addr).or_insert_with(fresh);
             return record_attempt(entry, &policy, now);
         }
@@ -244,19 +295,14 @@ impl Limiter {
         record_attempt(overflow, &policy, now)
     }
 
-    /// The attempt succeeded: `addr`'s own count and lockout are cleared,
-    /// and it becomes known (the oldest known address is forgotten past
-    /// `known`). A prefix or the overflow budget is shared, and not reset
-    /// by any one address's success.
+    /// The attempt succeeded: `addr`'s own count and lockout here are
+    /// cleared, and it becomes known, to every limiter sharing this one's
+    /// known addresses (whose own counts stay). A prefix or the overflow
+    /// budget is shared, and not reset by any one address's success.
     pub fn succeeded(&self, addr: IpAddr) {
         let addr = key(addr);
-        let mut state = self.state.lock().expect("limiter lock");
-        state.entries.remove(&addr);
-        state.known.retain(|known| *known != addr);
-        if self.known > 0 {
-            state.known.push_front(addr);
-            state.known.truncate(self.known);
-        }
+        self.state.lock().expect("limiter lock").entries.remove(&addr);
+        self.known.remember(addr);
     }
 
     /// Forget every address, prefix and the overflow budget: a lockout ends
@@ -268,9 +314,10 @@ impl Limiter {
         state.overflow = None;
     }
 
-    /// Whether `addr` is one of the addresses that last succeeded.
+    /// Whether `addr` is one of the addresses that last succeeded, here or
+    /// at a limiter sharing this one's known addresses.
     pub fn is_known(&self, addr: IpAddr) -> bool {
-        self.state.lock().expect("limiter lock").known.contains(&key(addr))
+        self.known.contains(addr)
     }
 
     /// Addresses currently tracked with their own entry (not counting the
@@ -627,5 +674,66 @@ mod tests {
         // `clear` ends lockouts, not what is known.
         limiter.clear();
         assert!(limiter.is_known(addr(2)));
+    }
+
+    /// Password and passkey login share known addresses, not counts: a
+    /// sign-in by one method gives the address its own entry at the other,
+    /// past a flood that filled that one's table and locked the address's
+    /// prefix and the overflow; and genuine failures counted by one method
+    /// are not cleared by a success of the other. Both ways round.
+    #[test]
+    fn known_addresses_are_shared_across_methods_and_counts_are_not() {
+        let t0 = Instant::now();
+        let owner = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let neighbour = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8));
+        let elsewhere = |n: u8| IpAddr::V4(Ipv4Addr::new(203, 0, n, 1));
+        for (first, second) in [
+            (Policy::LOGIN, Policy::PASSKEY_LOGIN),
+            (Policy::PASSKEY_LOGIN, Policy::LOGIN),
+        ] {
+            let known = Arc::new(KnownAddresses::new(4));
+            let signed_in = Limiter::sharing(first, 1, 1, known.clone());
+            let other = Limiter::sharing(second, 1, 1, known.clone());
+            // The other method's table, the owner's prefix and the
+            // overflow, all filled and locked by the flood.
+            other.attempt(elsewhere(0), t0).unwrap();
+            for _ in 0..=second.free_failures {
+                let _ = other.attempt(neighbour, t0);
+                let _ = other.attempt(elsewhere(1), t0);
+            }
+            assert!(
+                other.attempt(owner, t0).is_err(),
+                "the flood did not lock the owner's prefix"
+            );
+            signed_in.attempt(owner, t0).unwrap();
+            signed_in.succeeded(owner);
+            assert!(other.is_known(owner));
+            for n in 0..second.free_failures {
+                assert_eq!(
+                    other.attempt(owner, t0),
+                    Ok(()),
+                    "{n}: the owner shared the flood's lockout"
+                );
+            }
+            assert!(other.attempt(owner, t0).is_err(), "a known address is not exempt");
+
+            // Genuine failures at one method survive the other's success.
+            let known = Arc::new(KnownAddresses::new(4));
+            let failing = Limiter::sharing(first, 8, 8, known.clone());
+            let succeeding = Limiter::sharing(second, 8, 8, known.clone());
+            for _ in 0..2 {
+                failing.attempt(owner, t0).unwrap();
+            }
+            succeeding.attempt(owner, t0).unwrap();
+            succeeding.succeeded(owner);
+            assert!(failing.is_known(owner));
+            for _ in 2..first.free_failures {
+                assert_eq!(failing.attempt(owner, t0), Ok(()));
+            }
+            assert!(
+                failing.attempt(owner, t0).is_err(),
+                "the other method's success cleared the count"
+            );
+        }
     }
 }
