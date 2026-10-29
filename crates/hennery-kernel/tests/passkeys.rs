@@ -3,8 +3,11 @@
 
 use hennery_kernel::operator::{Operator, PublicUrl, Reset, STEP_UP_SECS, SetupOutcome};
 use hennery_kernel::passkeys::{
-    CEREMONY_TTL_SECS, MAX_LABEL_CHARS, PasskeyRecord, Refused, Start, counter_moves_on, relying_party, user_handle,
+    CEREMONY_TTL_SECS, KNOWN_LOGIN_CEREMONIES, MAX_LABEL_CHARS, MAX_LOGIN_CEREMONIES, PasskeyRecord, Refused, Start,
+    counter_moves_on, relying_party, user_handle,
 };
+use hennery_kernel::ratelimit::Policy;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use webauthn_authenticator_rs::WebauthnAuthenticator;
 use webauthn_authenticator_rs::softpasskey::SoftPasskey;
@@ -519,6 +522,68 @@ fn a_passkey_signs_in_stepped_up_and_is_marked_used() {
     );
     assert_eq!(op.passkeys().unwrap()[0].last_used_at, Some(later));
     assert_eq!(op.passkeys().unwrap()[0].id, record.id);
+}
+
+/// Security review of the audit fixes (P2): a login's place is reserved
+/// before its start is counted against the passkey budget, under the lock
+/// that checks there is one. Starts released together at the last place
+/// for unknown clients, from one key or from several: exactly one begins,
+/// its key is charged once, and every start refused busy is charged
+/// nothing.
+#[test]
+fn starts_racing_for_the_last_place_charge_only_the_one_that_began() {
+    for same_key in [true, false] {
+        let op = Operator::open_in_memory().unwrap();
+        let session_id = set_up(&op, PUBLIC_URL);
+        register(&op, &session_id, &mut authenticator(), "laptop");
+        let places = MAX_LOGIN_CEREMONIES - KNOWN_LOGIN_CEREMONIES;
+        for n in 0..places - 1 {
+            let client = IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + n as u32));
+            assert!(matches!(
+                op.start_passkey_login(client, NOW).unwrap(),
+                Start::Begun { .. }
+            ));
+        }
+        let racers: Vec<IpAddr> = (0..8u8)
+            .map(|n| IpAddr::V4(Ipv4Addr::new(198, 51, 100, if same_key { 1 } else { n })))
+            .collect();
+        let barrier = std::sync::Barrier::new(racers.len());
+        let outcomes: Vec<Start> = std::thread::scope(|scope| {
+            let racing: Vec<_> = racers
+                .iter()
+                .map(|client| {
+                    let (op, barrier) = (&op, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        op.start_passkey_login(*client, NOW).unwrap()
+                    })
+                })
+                .collect();
+            racing.into_iter().map(|racer| racer.join().unwrap()).collect()
+        });
+        let begun: Vec<usize> = (0..outcomes.len())
+            .filter(|&i| matches!(outcomes[i], Start::Begun { .. }))
+            .collect();
+        assert_eq!(begun.len(), 1, "same key {same_key}: {outcomes:?}");
+        assert!(
+            outcomes
+                .iter()
+                .enumerate()
+                .all(|(i, o)| i == begun[0] || *o == Start::Busy)
+        );
+        let mut probed = racers.clone();
+        probed.dedup();
+        for client in probed {
+            let charged = u32::from(client == racers[begun[0]]);
+            for n in 0..Policy::PASSKEY_LOGIN.free_failures - charged {
+                assert!(
+                    op.passkey_limiter.attempt(client, std::time::Instant::now()).is_ok(),
+                    "same key {same_key}: {client} was charged for a busy start ({n} left)"
+                );
+            }
+            assert!(op.passkey_limiter.attempt(client, std::time::Instant::now()).is_err());
+        }
+    }
 }
 
 /// Kernel spec §3.4: a passkey check steps a session up, as a password

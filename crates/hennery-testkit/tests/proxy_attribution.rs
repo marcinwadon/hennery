@@ -265,23 +265,13 @@ async fn passkey_start_and_success_use_the_effective_client() {
             .status(),
         429
     );
-    let start: Value = c
-        .post(Some(B), "/api/auth/passkeys/login/start")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    for _ in 0..Policy::PASSKEY_LOGIN.free_failures - 2 {
-        assert_eq!(
-            c.post(Some(B), "/api/auth/passkeys/login/start")
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            200
-        );
+    // B's starts are its own budget. Past `MAX_LOGIN_CEREMONIES_PER_CLIENT`
+    // each replaces B's oldest ceremony, so the login finishes B's last.
+    let mut start = Value::Null;
+    for _ in 0..Policy::PASSKEY_LOGIN.free_failures - 1 {
+        let resp = c.post(Some(B), "/api/auth/passkeys/login/start").send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        start = resp.json().await.unwrap();
     }
     let options: RequestChallengeResponse = serde_json::from_value(start["options"].clone()).unwrap();
     let credential = passkey

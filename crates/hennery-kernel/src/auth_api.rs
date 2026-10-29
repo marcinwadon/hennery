@@ -354,6 +354,10 @@ fn started(outcome: anyhow::Result<Start>) -> Response {
         Ok(Start::NoPasskeys) => error(StatusCode::CONFLICT, "no_passkeys", "there is no passkey to use"),
         Ok(Start::Invalid(why)) => error(StatusCode::BAD_REQUEST, "invalid", why),
         Ok(Start::Busy) => auth_busy(),
+        Ok(Start::RateLimited(retry_after)) => rate_limited(
+            retry_after,
+            "too many passkey logins begun from this address; try again later",
+        ),
         Err(err) => internal(err),
     }
 }
@@ -414,23 +418,12 @@ fn passkey_item(record: PasskeyRecord) -> PasskeyItem {
 /// `POST /api/auth/passkeys/login/start`: a login ceremony over the
 /// owner's passkeys. Every start counts against the client's address on
 /// the passkey budget until a login succeeds (plan 3c decision 8), unless
-/// it is refused busy first: too many young login ceremonies under way.
+/// it is refused busy first: its place is reserved before it is counted
+/// (`Operator::start_passkey_login`).
 async fn passkey_login_start(
     State(operator): State<Arc<Operator>>,
     address: crate::client_address::ClientAddress,
 ) -> Response {
-    if !operator
-        .ceremonies
-        .login_has_room(crate::ratelimit::key(address.effective), unix_now())
-    {
-        return auth_busy();
-    }
-    if let Err(retry_after) = operator.passkey_limiter.attempt(address.effective, Instant::now()) {
-        return rate_limited(
-            retry_after,
-            "too many passkey logins begun from this address; try again later",
-        );
-    }
     started(operator.start_passkey_login(address.effective, unix_now()))
 }
 

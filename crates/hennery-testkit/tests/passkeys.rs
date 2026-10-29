@@ -5,7 +5,7 @@
 use hennery_kernel::auth_api::MAX_BODY_BYTES;
 use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::Operator;
-use hennery_kernel::passkeys::{MAX_LOGIN_CEREMONIES, Start};
+use hennery_kernel::passkeys::{KNOWN_LOGIN_CEREMONIES, MAX_LOGIN_CEREMONIES, Start};
 use hennery_kernel::ratelimit::Policy;
 use hennery_kernel::secret::unix_now;
 use hennery_proto::rest::{
@@ -488,7 +488,10 @@ async fn a_login_flood_from_other_addresses_never_ends_the_owners_ceremony() {
             other => panic!("the start was {other:?}"),
         }
     }
-    assert_eq!(busy, 17, "the owner's ceremony was pushed out, or the pool overfilled");
+    // The owner's begun login holds one of the places unknown clients may
+    // use; the flood gets the rest, and is refused busy past them.
+    let places = (MAX_LOGIN_CEREMONIES - KNOWN_LOGIN_CEREMONIES) as u32;
+    assert_eq!(busy, MAX_LOGIN_CEREMONIES as u32 + 16 - (places - 1));
     for _ in 0..=Policy::PASSKEY_LOGIN.free_failures {
         assert_eq!(
             c.start_ceremony(None, "/api/auth/passkeys/login/start", None)
@@ -503,6 +506,11 @@ async fn a_login_flood_from_other_addresses_never_ends_the_owners_ceremony() {
             .status(),
         204
     );
+    // Signed in from here, the address is known: it may take the places
+    // kept for known clients, which the flood could not reach.
+    c.start_ceremony(None, "/api/auth/passkeys/login/start", None)
+        .await
+        .expect("a known address begins a login during the flood");
 }
 
 /// A successful passkey login gives its address its budget back.
