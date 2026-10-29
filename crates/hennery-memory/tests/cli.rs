@@ -324,3 +324,48 @@ async fn serving_standalone_memory_recovers_pending_cleanup_without_a_restart() 
         }
     }
 }
+#[test]
+fn serve_refuses_unsafe_proxy_peers_before_listening() {
+    let dir = tempfile::tempdir().unwrap();
+    let nine = (1..=9).map(|n| format!("192.0.2.{n}")).collect::<Vec<_>>();
+    for peers in [
+        vec!["0.0.0.0".to_string()],
+        vec!["::".into()],
+        vec!["224.0.0.1".into()],
+        vec!["127.0.0.1".into(), "::ffff:127.0.0.1".into()],
+        vec!["127.0.0.0/8".into()],
+        vec!["localhost".into()],
+        vec!["127.0.0.1:7332".into()],
+        nine,
+    ] {
+        let mut command = command(dir.path());
+        command
+            .arg("--data-dir")
+            .arg(dir.path().join("private"))
+            .args(["serve", "--listen", "127.0.0.1:0"]);
+        for peer in &peers {
+            command.args(["--proxy-client-ip-peer", peer]);
+        }
+        let mut child = command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        // A refusal exits; the bound is only a failure detector for a serve.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if std::time::Instant::now() > deadline {
+                child.kill().unwrap();
+                panic!("{peers:?} was served");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let mut stdout = String::new();
+        std::io::Read::read_to_string(&mut child.stdout.take().unwrap(), &mut stdout).unwrap();
+        assert!(!status.success(), "{peers:?}");
+        assert!(!stdout.contains("listening"), "{peers:?}: {stdout}");
+    }
+}

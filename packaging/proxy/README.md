@@ -64,6 +64,8 @@ Caddy core does not supply a per-client connection/request limiter: add and test
 firewall/ingress caps before public exposure. Backend rate limits do not bound
 TLS handshakes or unauthenticated open WebSockets. A second ingress hop requires
 its own tested trust chain; never take the leftmost user-supplied XFF address.
+The optional memory plug-in uses the same attribution through its own
+[recipe](memory.md).
 Tailscale Serve is separately qualified: if it cannot overwrite authenticated
 client addresses, retain the shared-budget warning and restrict ingress to a
 trusted VPN population.
