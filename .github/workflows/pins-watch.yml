@@ -50,7 +50,7 @@ jobs:
           fi
           echo "updates=$updates" >> "$GITHUB_OUTPUT"
 
-  bump:
+  generate:
     needs: check
     if: needs.check.outputs.updates != '[]'
     strategy:
@@ -60,30 +60,69 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
-      contents: write
-      pull-requests: write
-      actions: write
+      contents: read
     env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
       PIN_UPDATE: ${{ toJSON(matrix.update) }}
-      BRANCH: ${{ matrix.update.branch }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
         with:
-          github_access_token: ${{ github.token }}
+          persist-credentials: false
+      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
       - name: Update the pin and regenerate the adapter set
         shell: bash
         run: |
-          git switch -c "$BRANCH"
           # Always advance the cutoff, including for CLI-only releases.
           python3 packaging/pins_watch.py apply
           nix develop -c cargo run -p hennery-pins --locked -- lock
           nix develop -c cargo run -p hennery-pins --locked -- generate
+      - name: Transfer generated data to a fresh publisher runner
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: pin-update-${{ strategy.job-index }}
+          if-no-files-found: error
+          retention-days: 1
+          path: |
+            adapters/pins.toml
+            adapters/claude/package.json
+            adapters/claude/package-lock.json
+            adapters/codex/package.json
+            adapters/codex/package-lock.json
+            crates/hennery-host/manifest.json
+
+  bump:
+    needs: [check, generate]
+    if: needs.check.outputs.updates != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        update: ${{ fromJSON(needs.check.outputs.updates) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    env:
+      GH_REPO: ${{ github.repository }}
+      PIN_UPDATE: ${{ toJSON(matrix.update) }}
+      BRANCH: ${{ matrix.update.branch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          name: pin-update-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/pin-update
+      # Only generated data crosses the job boundary. Never execute it here.
+      - name: Copy only bounded pin data into the trusted checkout
+        run: python3 -I packaging/copy_pin_update.py "$RUNNER_TEMP/pin-update" "$GITHUB_WORKSPACE"
       - name: Commit and open the pin bump PR
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
+          git switch -c "$BRANCH"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           title='chore(pins): update the managed agent runtime set'
@@ -91,6 +130,9 @@ jobs:
             adapters/codex/package.json adapters/codex/package-lock.json crates/hennery-host/manifest.json
           git diff --cached --stat
           git -c commit.gpgsign=false commit -m "$title"
+          # The helper reads this step's token
+          # from the environment and does not store the bearer in git config.
+          gh auth setup-git
           git push origin "$BRANCH"
           {
             printf 'Update the managed runtime pins and regenerate the adapter locks and manifest.\n\n'
@@ -106,6 +148,8 @@ jobs:
       # GITHUB_TOKEN-created PRs need explicit workflow dispatches.
       - name: Run CI and pins on the PR head
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh workflow run ci.yml --ref "$BRANCH"
           gh workflow run pins.yml --ref "$BRANCH"

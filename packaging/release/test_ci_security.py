@@ -11,6 +11,41 @@ class CiSecurity(unittest.TestCase):
     def workflow(self, name):
         return yaml.safe_load((ROOT / '.github/workflows' / name).read_bytes())
 
+    def test_pin_generation_has_no_persisted_or_exported_write_token(self):
+        workflow = self.workflow('pins-watch.yml')
+        job = workflow['jobs']['generate']
+        self.assertEqual(job['permissions'], {'contents': 'read'})
+        self.assertNotIn('GH_TOKEN', job.get('env', {}))
+        self.assertNotIn('GITHUB_TOKEN', job.get('env', {}))
+        for step in job['steps']:
+            if step.get('uses', '').startswith('actions/checkout@'):
+                self.assertIs(step.get('with', {}).get('persist-credentials'), False)
+            if step.get('uses', '').startswith('cachix/install-nix-action@'):
+                self.assertNotIn('github_access_token', step.get('with', {}))
+            if 'hennery-pins' in step.get('run', ''):
+                self.assertNotIn('GH_TOKEN', step.get('env', {}))
+                self.assertNotIn('GITHUB_TOKEN', step.get('env', {}))
+        publisher = workflow['jobs']['bump']
+        self.assertEqual(set(publisher['needs']), {'check', 'generate'})
+        self.assertEqual(publisher['strategy']['matrix'], job['strategy']['matrix'])
+        upload, = [s for s in job['steps'] if s.get('uses', '').startswith('actions/upload-artifact@')]
+        download, = [s for s in publisher['steps'] if s.get('uses', '').startswith('actions/download-artifact@')]
+        self.assertEqual(upload['with']['name'], download['with']['name'])
+        self.assertEqual(download['with']['path'], '${{ runner.temp }}/pin-update')
+        self.assertEqual(set(upload['with']['path'].splitlines()), {
+            'adapters/pins.toml', 'adapters/claude/package.json', 'adapters/claude/package-lock.json',
+            'adapters/codex/package.json', 'adapters/codex/package-lock.json', 'crates/hennery-host/manifest.json'})
+        for step in publisher['steps']:
+            if step.get('uses', '').startswith('actions/checkout@'):
+                self.assertIs(step['with']['persist-credentials'], False)
+            run = step.get('run', '')
+            for executable in ['nix ', 'cargo ', 'npm ', 'node ']:
+                self.assertNotIn(executable, run)
+            if 'python' in run:
+                self.assertEqual(run, 'python3 -I packaging/copy_pin_update.py "$RUNNER_TEMP/pin-update" "$GITHUB_WORKSPACE"')
+            if 'git push ' in run or 'gh workflow run ' in run:
+                self.assertEqual(step['env']['GH_TOKEN'], '${{ github.token }}')
+
     def test_scheduled_audit_checks_both_managed_adapter_locks(self):
         workflow = self.workflow('nix.yml')
         steps = workflow['jobs']['audit']['steps']
