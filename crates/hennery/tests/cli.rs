@@ -4075,6 +4075,46 @@ fn omp_adapter_resolves_default_up_child_without_an_installed_service() {
     assert!(!up.join("host.toml").exists());
 }
 
+/// A stored configuration must not silently activate an unqualified external
+/// runtime. Exercise startup itself with a paired scratch host, offline.
+#[test]
+fn omp_adapter_configured_host_reports_preparation_without_starting_external_program() {
+    let dir = scratch_dir("omp-startup-preparation");
+    let _cleanup = RemoveDir(dir.clone());
+    let host = dir.join("host");
+    paired_host(&host);
+    let config = omp_fixture(&dir);
+    let marker = dir.join("external-was-started");
+    std::fs::write(
+        &config.executable,
+        format!("#!/bin/sh\nprintf started > '{}'\nexit 97\n", marker.display()),
+    )
+    .unwrap();
+    hennery_host::set_omp_config(&host, &config).unwrap();
+    assert!(hennery().arg("--version").status().unwrap().success());
+    let log = dir.join("host.log");
+    let mut command = hennery();
+    command
+        .args(["host", "run", "--data-dir"])
+        .arg(&host)
+        .env("HENNERY_NPM_REGISTRY", "invalid://offline")
+        .env("RUST_LOG", "info")
+        .stdout(std::fs::File::create(&log).unwrap())
+        .stderr(std::fs::File::create(log.with_extension("err")).unwrap());
+    let mut process = KillTree::new(command.spawn().unwrap(), &log);
+    process.wait_until("the OMP startup preparation warning", || {
+        let text = text_of(&log) + &text_of(&log.with_extension("err"));
+        text.contains("OMP is configured as preparation but is not offered by this binary")
+    });
+    drop(process);
+    assert!(!marker.exists(), "startup executed unqualified external OMP");
+    assert_eq!(std::fs::read_dir(&config.agent_data_dir).unwrap().count(), 0);
+    assert_eq!(
+        hennery_host::read_omp_config(&host).unwrap(),
+        hennery_host::OmpConfigStatus::Valid(config)
+    );
+}
+
 /// `host join` pairs, then installs the runtime (distribution §3.2). An
 /// install that fails (here: offline) exits non-zero but keeps the pairing,
 /// and says how to retry.

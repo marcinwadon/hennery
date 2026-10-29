@@ -1,11 +1,12 @@
-//! Persisted external OMP configuration. This is preparation only: no host
-//! startup, runtime profile, MCP delivery or transcript lifecycle uses it yet.
+//! Persisted external OMP configuration and checked storage contracts.
+//! Configuration alone never establishes runtime or MCP support.
 
 use crate::identity::{CONFIG_FILE, Paired, read_table, write_private};
 use anyhow::{Context, Result, bail};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
+pub mod probe;
 pub mod session;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

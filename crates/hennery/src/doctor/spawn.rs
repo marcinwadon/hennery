@@ -162,12 +162,13 @@ fn command(program: &Path, args: &[String], env: &[(String, String)]) -> Command
     cmd
 }
 
-/// Read at most `MAX_OUTPUT` bytes of `from` on a thread of its own.
+/// Read one byte past the output limit so a truncated JSON response cannot
+/// accidentally satisfy a versioned contract.
 fn reader(from: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = from.take(MAX_OUTPUT).read_to_end(&mut bytes);
+        let _ = from.take(MAX_OUTPUT + 1).read_to_end(&mut bytes);
         let _ = tx.send(bytes);
     });
     rx
@@ -177,8 +178,20 @@ fn reader(from: impl Read + Send + 'static) -> mpsc::Receiver<Vec<u8>> {
 /// `timeout`, and in any case once it has exited (so nothing it started is
 /// left holding its pipes). `output`: its standard output and error are
 /// read, at most `MAX_OUTPUT` bytes each; else they go nowhere. `None` when
-/// it could not be started or did not finish in time.
+/// it could not be started, did not finish in time, or exceeded the output limit.
 pub fn run(program: &Path, args: &[&str], env: &[(String, String)], timeout: Duration, output: bool) -> Option<Ran> {
+    run_with_exit(program, args, env, timeout, output).map(|(ran, _)| ran)
+}
+
+/// Like `run`, retaining the exact exit code for versioned external CLI
+/// contracts whose nonzero result distinguishes absence from other errors.
+pub fn run_with_exit(
+    program: &Path,
+    args: &[&str],
+    env: &[(String, String)],
+    timeout: Duration,
+    output: bool,
+) -> Option<(Ran, Option<i32>)> {
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     let mut cmd = command(program, &args, env);
     if output {
@@ -210,11 +223,17 @@ pub fn run(program: &Path, args: &[&str], env: &[(String, String)], timeout: Dur
         ),
         None => (Vec::new(), Vec::new()),
     };
-    Some(Ran {
-        ok: status.success(),
-        stdout: String::from_utf8_lossy(&stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&stderr).into_owned(),
-    })
+    if stdout.len() > MAX_OUTPUT as usize || stderr.len() > MAX_OUTPUT as usize {
+        return None;
+    }
+    Some((
+        Ran {
+            ok: status.success(),
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        },
+        status.code(),
+    ))
 }
 
 /// What an adapter answered `initialize` with.

@@ -33,6 +33,9 @@ state stays outside Git; public issues are separate approved projections.
    - [Phone, Web Push and PWA](specs/2026-10-14-phone-design.md) — proposed browser push/device controls, installed app shell, question deep links, mobile answers and iOS acceptance.
    - [Distribution](specs/2026-09-26-distribution-design.md) — binary,
      managed runtime and adapter manifest, release pipeline, services, doctor.
+   - [External OMP preparation](omp-runtime.md) — persisted configuration,
+     doctor contract checks, exact JSONL binding APIs and upstream prerequisites;
+     OMP session startup and forget remain unavailable.
    - [Distribution and releases](specs/2026-10-15-distribution-release-design.md) — proposed publication contract, crates.io with packaged UI, platform qualification, channel rollout and maintainer-only setup; six operator questions remain.
    - [Remote hosts over WSS](specs/2026-10-14-wss-design.md) — approved design per the fleet parent, including the three re-confirmed amendments; verified TLS/private-CA trust, tunnel migration and reconnect/doctor parity are W1; reverse-proxy attribution/public deployment remain W2.
 3. Evidence:

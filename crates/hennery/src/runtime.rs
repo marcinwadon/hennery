@@ -257,6 +257,20 @@ pub async fn default_agents(
         .inspect_err(|err| tracing::warn!("not installing the pinned adapter set: {err:#}"))
         .ok();
     let log = |line: &str| tracing::info!("{line}");
+    match hennery_host::read_omp_config(data_dir) {
+        Ok(hennery_host::OmpConfigStatus::Valid(_)) => {
+            tracing::warn!(
+                "OMP is configured as preparation but is not offered by this binary; external root and exact session/load identity contracts still require qualification; run `hennery doctor`"
+            );
+        }
+        Ok(hennery_host::OmpConfigStatus::Invalid(note)) => {
+            tracing::warn!("OMP configuration is invalid: {note}; repair it with `hennery host adapters omp set`");
+        }
+        Err(_) => {
+            tracing::warn!("OMP configuration cannot be read safely; repair the paired host configuration");
+        }
+        Ok(hennery_host::OmpConfigStatus::Missing) => {}
+    }
     let prepared = agents::prepare_pinned(data_dir, sources.as_ref(), &log).await;
     for note in &prepared.agents.notes {
         tracing::warn!("{note}");

@@ -1747,6 +1747,163 @@ fn all_gone(fake: &FakeAgents) {
     }
 }
 
+/// OMP is external configuration, independent of a managed set. A successful
+/// `--version` or an old CLI's help must not pass the root contract check.
+#[test]
+fn omp_doctor_refuses_missing_contract_without_starting_acp_or_exposing_output() {
+    let valid = r#"{"schemaVersion":1,"state":"error","code":"session_missing"}"#;
+    let truncated_prefix = format!("{valid}{}x", " ".repeat(spawn::MAX_OUTPUT as usize - valid.len()));
+    for body in [
+        "echo canary-omp-private-help; exit 0".to_string(),
+        "echo canary-omp-private-error >&2; exit 1".to_string(),
+        "printf '%s\\n' '{\"schemaVersion\":2,\"state\":\"error\",\"code\":\"session_missing\"}'; exit 1".to_string(),
+        format!("printf '%s' '{truncated_prefix}'; exit 1"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let fake = Fake::none();
+        let cx = machine(&root, Platform::Linux, &fake);
+        let host = paired(&root.join("host"));
+        let agent_root = root.join("external root");
+        std::fs::create_dir(&agent_root).unwrap();
+        std::fs::set_permissions(&agent_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let program = root.join("external omp");
+        script(
+            &program,
+            &format!(
+                "#!/bin/sh\ncase \"$1\" in --version) exit 0;; esac\ncase \"$3\" in acp) touch \"{}/unexpected-acp\"; exit 1;; esac\n{body}\n",
+                root.display()
+            ),
+        );
+        hennery_host::set_omp_config(
+            &host,
+            &hennery_host::OmpConfig {
+                executable: program,
+                agent_data_dir: agent_root.clone(),
+            },
+        )
+        .unwrap();
+        let doctor = Doctor {
+            collector_trust: Default::default(),
+            cx: &cx,
+            dirs: Dirs::by_contents(host.clone(), Found::Given),
+            run: &nothing,
+        };
+        let selected = agents::agents(&doctor).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].external_omp);
+        let before = snapshot(&host);
+        let root_before = snapshot(&agent_root);
+        let Finding::Checked(check) = agents::adapters_start(&doctor) else {
+            panic!("configured OMP was skipped")
+        };
+        assert_eq!(check.status, Status::Fail, "{check:?}");
+        assert!(check.fix.contains("external OMP"), "{check:?}");
+        assert!(!format!("{check:?}").contains("canary-omp"));
+        assert_eq!(snapshot(&host), before);
+        assert_eq!(snapshot(&agent_root), root_before);
+        assert!(!root.join("unexpected-acp").exists());
+    }
+}
+
+#[test]
+fn omp_doctor_uses_literal_root_and_service_environment_for_contract_and_acp() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let fake = Fake::none();
+    let mut cx = machine(&root, Platform::Linux, &fake);
+    cx.env.insert("OMP_PROFILE".into(), "canary-conflicting-profile".into());
+    cx.env
+        .insert("PI_CODING_AGENT_SESSION_DIR".into(), "canary-session-root".into());
+    let host = paired(&root.join("host"));
+    let agent_root = root.join("external root");
+    std::fs::create_dir(&agent_root).unwrap();
+    std::fs::set_permissions(&agent_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let program = root.join("external omp");
+    script(
+        &program,
+        &format!(
+            r#"#!/bin/sh
+case "$1" in --version) exit 0;; esac
+[ "$1" = --agent-dir ] && [ "$2" = '{agent_root}' ] || exit 9
+[ -z "$OMP_PROFILE$PI_PROFILE$PI_CODING_AGENT_SESSION_DIR$PI_CODING_AGENT_DIR" ] || exit 10
+[ "$HOME" = '{home}' ] && [ "$PWD" = "$HOME" ] || exit 11
+if [ "$3" = session ] && [ "$4" = lease ] && [ "$5" = hold ] && [ "$7" = --json ]; then
+  [ ! -e "$6" ] || exit 12
+  printf '%s\n' '{{"schemaVersion":1,"state":"error","code":"session_missing"}}'; exit 1
+fi
+[ "$3" = acp ] && [ "$#" = 3 ] || exit 13
+read line
+printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"protocolVersion":1,"agentCapabilities":{{}},"agentInfo":{{"name":"external","version":"18.14.0-local"}}}}}}'
+exec sleep 60
+"#,
+            agent_root = agent_root.display(),
+            home = cx.home.display()
+        ),
+    );
+    hennery_host::set_omp_config(
+        &host,
+        &hennery_host::OmpConfig {
+            executable: program,
+            agent_data_dir: agent_root.clone(),
+        },
+    )
+    .unwrap();
+    let doctor = Doctor {
+        collector_trust: Default::default(),
+        cx: &cx,
+        dirs: Dirs::by_contents(host, Found::Given),
+        run: &nothing,
+    };
+    let before = snapshot(&agent_root);
+    let Finding::Checked(check) = agents::adapters_start(&doctor) else {
+        panic!("configured OMP was skipped")
+    };
+    assert_eq!(check.status, Status::Warn, "{check:?}");
+    assert!(check.summary.contains("runtime integration is not enabled"));
+    assert_eq!(snapshot(&agent_root), before);
+}
+
+#[test]
+fn omp_doctor_reports_invalid_config_and_failed_version_without_managed_update_repair() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let fake = Fake::none();
+    let cx = machine(&root, Platform::Linux, &fake);
+    let host = paired(&root.join("host"));
+    let agent_root = root.join("omp");
+    std::fs::create_dir(&agent_root).unwrap();
+    std::fs::set_permissions(&agent_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let program = root.join("omp-program");
+    script(&program, "#!/bin/sh\nexit 1\n");
+    hennery_host::set_omp_config(
+        &host,
+        &hennery_host::OmpConfig {
+            executable: program,
+            agent_data_dir: agent_root.clone(),
+        },
+    )
+    .unwrap();
+    let doctor = Doctor {
+        collector_trust: Default::default(),
+        cx: &cx,
+        dirs: Dirs::by_contents(host, Found::Given),
+        run: &nothing,
+    };
+    let Finding::Checked(check) = agents::adapters_start(&doctor) else {
+        panic!("configured OMP was skipped")
+    };
+    assert_eq!(check.status, Status::Fail);
+    assert!(check.summary.contains("version command failed"));
+    assert!(!check.fix.contains("run `hennery host adapters update`"));
+    std::fs::set_permissions(&agent_root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let Finding::Checked(check) = agents::adapters_start(&doctor) else {
+        panic!("invalid OMP was skipped")
+    };
+    assert_eq!(check.status, Status::Fail);
+    assert!(check.summary.contains("configuration is invalid"));
+}
+
 /// Check 3: each adapter answers `initialize` with its pinned version; one
 /// that answers another warns; one that never answers fails within its
 /// budget, and on a Mac only warns. Each was started in the home directory, with an environment
@@ -2119,6 +2276,12 @@ fn a_services_agents_and_path_are_the_ones_used() {
         cx.env.insert(name.into(), "canary-7d-host".into());
     }
     let host = paired(&dir.path().join("host"));
+    // Even invalid persisted OMP preparation must not override --agent or
+    // cause doctor to execute a second, implicit external program.
+    let config_path = host.join("host.toml");
+    let mut config = std::fs::read_to_string(&config_path).unwrap();
+    config.push_str("\n[agents.omp]\nexecutable = '/nonexistent/omp'\nagent_data_dir = '/nonexistent/root'\n");
+    std::fs::write(config_path, config).unwrap();
     let adapter = dir.path().join("given-adapter");
     let env_out = dir.path().join("given-env");
     script(

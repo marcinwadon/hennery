@@ -16,7 +16,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// Why the agent checks did not run.
-const NO_AGENTS: &str = "no adapter set installed and no --agent";
+const NO_AGENTS: &str = "no adapter set installed, configured OMP or --agent";
 
 /// What a timeout on macOS may be: the first run of a program written
 /// since, which macOS checks online and waits for (decision 14).
@@ -47,6 +47,8 @@ pub struct Agent {
     /// The CLI it runs: the `--use-cli` override, else the set's bundled
     /// one, if any.
     pub cli: Option<Cli>,
+    /// Provenance from the persisted OMP configuration, never its name alone.
+    pub external_omp: bool,
 }
 
 /// `agent`'s bundled CLI in `set`, unless the set left it out, where 7b
@@ -77,10 +79,9 @@ pub fn bundled_cli(set: &InstalledSet, agent: &str) -> Option<Cli> {
     file.is_file().then_some(cli)
 }
 
-/// The agents a host on `doctor`'s directory would start, exactly as it
-/// would start them: the service's `--agent` commands when it gives them,
-/// else the current set's (`agents::from_set`). `Err`: why there are none
-/// to check.
+/// The host's explicit commands or managed set, plus persisted external OMP
+/// for readiness diagnostics. OMP preparation is not offered at startup;
+/// answering these checks does not enable it. `Err`: nothing to check.
 pub fn agents(doctor: &Doctor) -> Result<Vec<Agent>, &'static str> {
     let Some(host) = &doctor.dirs.host else {
         return Err(NO_HOST);
@@ -93,29 +94,55 @@ pub fn agents(doctor: &Doctor) -> Result<Vec<Agent>, &'static str> {
                 command,
                 pinned: None,
                 cli: None,
+                external_omp: false,
             })
             .collect());
     }
     let set = Layout::new(host)
         .ok()
         .and_then(|layout| layout.current().ok().flatten());
-    let Some(set) = set else {
-        return Err(NO_AGENTS);
+    let omp = match hennery_host::read_omp_config(host) {
+        Ok(hennery_host::OmpConfigStatus::Valid(config)) => agents::omp_command(&config).ok(),
+        _ => None,
     };
+    if set.is_none() && omp.is_none() {
+        return Err(NO_AGENTS);
+    }
     let overrides = agents::cli_overrides(host).unwrap_or_default();
-    let mut started = agents::from_set(&set, &overrides).agents;
+    let mut started = set
+        .as_ref()
+        .map(|set| agents::from_set(set, &overrides).agents)
+        .unwrap_or_default();
+    let configured_omp = omp.is_some();
+    if let Some(command) = omp {
+        started.insert("omp".into(), command);
+    }
     let mut names: Vec<String> = started.keys().cloned().collect();
     names.sort();
     Ok(names
         .into_iter()
-        .map(|name| Agent {
-            command: started.remove(&name).expect("listed"),
-            pinned: set.record.adapters.get(&name).map(|a| a.version.clone()),
-            cli: overrides
-                .get(&name)
-                .map(|path| Cli::plain(path.clone()))
-                .or_else(|| bundled_cli(&set, &name)),
-            name,
+        .map(|name| {
+            let external_omp = configured_omp && name == "omp";
+            Agent {
+                command: started.remove(&name).expect("listed"),
+                pinned: if external_omp {
+                    None
+                } else {
+                    set.as_ref()
+                        .and_then(|set| set.record.adapters.get(&name))
+                        .map(|a| a.version.clone())
+                },
+                cli: if external_omp {
+                    None
+                } else {
+                    overrides
+                        .get(&name)
+                        .map(|path| Cli::plain(path.clone()))
+                        .or_else(|| set.as_ref().and_then(|set| bundled_cli(set, &name)))
+                },
+                external_omp,
+                name,
+            }
         })
         .collect())
 }
@@ -124,15 +151,92 @@ pub fn agents(doctor: &Doctor) -> Result<Vec<Agent>, &'static str> {
 /// `initialize` within 20 s with the version its set pins (on macOS, a
 /// silence only warns: decision 15).
 pub fn adapters_start(doctor: &Doctor) -> Finding {
+    let mut verdict = Verdict::default();
+    let mut omp_configured = false;
+    if doctor.given_agents().is_none()
+        && let Some(host) = &doctor.dirs.host
+    {
+        match hennery_host::read_omp_config(host) {
+            Ok(hennery_host::OmpConfigStatus::Missing) => {}
+            Ok(hennery_host::OmpConfigStatus::Valid(_)) => omp_configured = true,
+            Ok(hennery_host::OmpConfigStatus::Invalid(note)) => {
+                omp_configured = true;
+                verdict.fail(
+                    format!("OMP configuration is invalid: {note}"),
+                    "repair the stored paths with `hennery host adapters omp set`, or remove the configuration",
+                );
+            }
+            Err(_) => {
+                omp_configured = true;
+                verdict.fail(
+                    "OMP configuration cannot be read safely",
+                    "repair the paired host configuration before probing OMP",
+                );
+            }
+        }
+    }
     let agents = match agents(doctor) {
         Ok(agents) => agents,
+        Err(_) if omp_configured => {
+            verdict.fail(
+                "no usable OMP command can be derived from the stored configuration",
+                "repair the OMP configuration and run doctor again",
+            );
+            return Finding::Checked(verdict.check(3, "adapters start"));
+        }
         Err(why) => return Finding::NotRun { number: 3, why },
     };
     let env = spawn::agent_env(doctor);
-    let mut verdict = Verdict::default();
     for agent in &agents {
         let name = &agent.name;
+        if agent.external_omp {
+            let Some(host) = &doctor.dirs.host else {
+                continue;
+            };
+            let Ok(hennery_host::OmpConfigStatus::Valid(config)) = hennery_host::read_omp_config(host) else {
+                verdict.fail(
+                    "OMP configuration changed during doctor",
+                    "run doctor again after repairing the OMP configuration",
+                );
+                continue;
+            };
+            let version = spawn::run(&config.executable, &["--version"], &env, spawn::CLI_TIMEOUT, false);
+            if !version.is_some_and(|result| result.ok) {
+                verdict.fail(
+                    "OMP CLI version command failed",
+                    "repair the configured external OMP executable; managed adapter updates do not install OMP",
+                );
+                continue;
+            }
+            let Ok(probe) = hennery_host::omp::probe::request(&config) else {
+                verdict.fail(
+                    "OMP configuration changed before its contract probe",
+                    "repair the OMP configuration and run doctor again",
+                );
+                continue;
+            };
+            let args: Vec<&str> = probe.command.args.iter().map(String::as_str).collect();
+            let recognized = spawn::run_with_exit(
+                Path::new(&probe.command.program),
+                &args,
+                &env,
+                hennery_host::omp::probe::TIMEOUT,
+                true,
+            )
+            .is_some_and(|(result, code)| hennery_host::omp::probe::recognized(code, result.stdout.as_bytes()));
+            if !recognized || !probe.untouched() {
+                verdict.fail(
+                    "OMP CLI answers, but the versioned missing-file handshake is unavailable",
+                    hennery_host::omp::probe::REPAIR,
+                );
+                continue;
+            }
+        }
         match (spawn::initialize(&agent.command, &env, spawn::INITIALIZE_TIMEOUT), &agent.pinned) {
+            (Started::Failed(why), _) if agent.external_omp => verdict.fail(
+                format!("OMP external program does not answer ACP: {why}{}", first_run_note(doctor)),
+                "repair the configured external OMP program and run doctor again; managed adapter updates do not install OMP",
+            ),
             // On macOS a silence may be the first run of a program the
             // adapter starts, waiting for the machine's online check: a
             // warning there, never a failure (decision 15).
@@ -158,6 +262,9 @@ pub fn adapters_start(doctor: &Doctor) -> Finding {
                 ),
                 "run `hennery host adapters update`",
             ),
+            (Started::Answered(version), None) if agent.external_omp => verdict.warn(format!(
+                "OMP external program answers ACP initialize ({}; unpinned); runtime integration is not enabled", version.as_deref().unwrap_or("no version")
+            ), "keep this configuration as preparation until root, exact load identity and lifecycle support are qualified"),
             (Started::Answered(version), None) => verdict.ok(format!(
                 "{name} answers ({}; given by --agent, no pin)",
                 version.as_deref().unwrap_or("no version")
