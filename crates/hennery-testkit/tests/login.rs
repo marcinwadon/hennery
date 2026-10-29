@@ -3,7 +3,7 @@
 //! check per attempt, and only from the `public_url`'s origin.
 
 use hennery_kernel::hosts::Hosts;
-use hennery_kernel::operator::Operator;
+use hennery_kernel::operator::{CheckPurpose, MAX_QUEUED_CHECKS, Operator};
 use hennery_kernel::secret::unix_now;
 use hennery_proto::rest::{ApiError, LoginRequest};
 use hennery_sessions::AppState;
@@ -138,6 +138,30 @@ async fn wrong_passwords_lock_the_address_out_and_each_attempt_checks_once() {
         5,
         "a locked-out attempt checked the password"
     );
+}
+
+/// A login past its pool's checks (one running, `MAX_QUEUED_CHECKS`
+/// waiting) is answered 503 `auth_busy` with `Retry-After` at once, rather
+/// than queued without bound, and before it is counted: the address keeps
+/// its free attempts, and nothing is checked.
+#[tokio::test]
+async fn a_full_login_pool_answers_busy_without_counting_the_attempt() {
+    let c = Collector::start(true).await;
+    let held: Vec<_> = std::iter::from_fn(|| c.state.operator.admit_check(CheckPurpose::Login)).collect();
+    assert_eq!(held.len(), 1 + MAX_QUEUED_CHECKS);
+    for _ in 0..8 {
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(10), c.login("wrong password"))
+            .await
+            .expect("a busy login answers at once");
+        assert_eq!(resp.headers()["retry-after"], "1");
+        assert_eq!(code_of(resp).await, (503, "auth_busy".into()));
+    }
+    assert_eq!(c.state.operator.verifications(), 0);
+    drop(held);
+    for _ in 0..4 {
+        assert_eq!(c.login("wrong password").await.status(), 401);
+    }
+    assert_eq!(c.login(PASSWORD).await.status(), 204);
 }
 
 #[tokio::test]

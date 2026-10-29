@@ -8,7 +8,7 @@
 //! without one, accepted within five minutes, and refused after.
 
 use hennery_kernel::hosts::Hosts;
-use hennery_kernel::operator::Operator;
+use hennery_kernel::operator::{CheckPurpose, MAX_QUEUED_CHECKS, Operator};
 use hennery_kernel::secret::unix_now;
 use hennery_proto::rest::{ApiError, AuthSessionItem, StepUpRequest};
 use hennery_sessions::AppState;
@@ -475,6 +475,39 @@ async fn a_locked_out_login_does_not_block_step_up() {
         (429, "rate_limited".into())
     );
     let session = c.session(0);
+    assert_eq!(c.step_up(&session, OWNER_PASSWORD).await.status(), 204);
+}
+
+/// Logins whose password checks fill their pool (a flood from many
+/// addresses) are answered busy, and leave a signed-in owner's step-up its
+/// own pool: it is checked at once, not queued behind them.
+#[tokio::test]
+async fn a_full_login_pool_does_not_block_step_up() {
+    let c = Collector::start().await;
+    let flood: Vec<_> = std::iter::from_fn(|| c.state.operator.admit_check(CheckPurpose::Login)).collect();
+    assert_eq!(flood.len(), 1 + MAX_QUEUED_CHECKS);
+    assert_eq!(code_of(c.login(OWNER_PASSWORD).await).await, (503, "auth_busy".into()));
+    let session = c.session(0);
+    assert_eq!(c.step_up(&session, OWNER_PASSWORD).await.status(), 204);
+}
+
+/// Step-ups past their own pool are answered busy too, uncounted against
+/// the address's step-up budget.
+#[tokio::test]
+async fn a_full_step_up_pool_answers_busy_without_counting() {
+    let c = Collector::start().await;
+    let session = c.session(0);
+    let held: Vec<_> = std::iter::from_fn(|| c.state.operator.admit_check(CheckPurpose::StepUp)).collect();
+    for _ in 0..8 {
+        assert_eq!(
+            code_of(c.step_up(&session, "wrong password").await).await,
+            (503, "auth_busy".into())
+        );
+    }
+    drop(held);
+    for _ in 0..4 {
+        assert_eq!(c.step_up(&session, "wrong password").await.status(), 401);
+    }
     assert_eq!(c.step_up(&session, OWNER_PASSWORD).await.status(), 204);
 }
 

@@ -20,6 +20,7 @@ const MESSAGES: Record<string, string> = {
   setup_required: 'hennery is not set up yet. Run `hennery admin setup-url` on the collector for the setup link.',
   invalid_password: 'Wrong password.',
   rate_limited: 'Too many attempts. Wait, then try again.',
+  auth_busy: 'Too many sign-in attempts are being checked. Try again in a moment.',
   no_passkeys: 'No passkey is registered.',
   passkeys_unavailable: 'Passkeys need a public URL with a host name, not an IP address.',
   passkey_refused: 'The passkey was not accepted.',

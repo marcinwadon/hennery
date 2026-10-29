@@ -17,7 +17,7 @@ use axum::{
 use futures::StreamExt;
 use hennery_kernel::{
     client_address::ClientAddress,
-    operator::{Authenticated, Operator, PublicUrl, SetupOutcome},
+    operator::{Authenticated, CheckPurpose, Operator, PublicUrl, SetupOutcome},
     secret::{rfc3339, unix_now},
 };
 use serde::Deserialize;
@@ -422,6 +422,9 @@ struct Password {
     password: String,
 }
 async fn login(State(ui): State<Ui>, address: ClientAddress, Form(input): Form<Password>) -> Response {
+    let Some(admitted) = ui.operator.admit_check(CheckPurpose::Login) else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "Busy; retry later.");
+    };
     if ui
         .operator
         .login_limiter
@@ -430,7 +433,7 @@ async fn login(State(ui): State<Ui>, address: ClientAddress, Form(input): Form<P
     {
         return error(StatusCode::TOO_MANY_REQUESTS, "Too many attempts; try later.");
     }
-    let Ok(Some(phc)) = ui.operator.check_password(input.password).await else {
+    let Ok(Some(phc)) = ui.operator.check_password(admitted, input.password).await else {
         return error(StatusCode::UNAUTHORIZED, "Sign in failed.");
     };
     let Ok(Some(token)) = ui.operator.open_session("Memory management browser", &phc, unix_now()) else {
@@ -450,6 +453,9 @@ async fn step_up(
     address: ClientAddress,
     Form(input): Form<Password>,
 ) -> Response {
+    let Some(admitted) = ui.operator.admit_check(CheckPurpose::StepUp) else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "Busy; retry later.");
+    };
     if ui
         .operator
         .step_up_limiter
@@ -458,7 +464,7 @@ async fn step_up(
     {
         return error(StatusCode::TOO_MANY_REQUESTS, "Too many attempts; try later.");
     }
-    let Ok(Some(_)) = ui.operator.check_password(input.password).await else {
+    let Ok(Some(_)) = ui.operator.check_password(admitted, input.password).await else {
         return error(StatusCode::UNAUTHORIZED, "Confirmation failed.");
     };
     if ui.operator.step_up(&session.session_id, unix_now()).is_ok_and(|ok| ok) {

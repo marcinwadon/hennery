@@ -174,13 +174,18 @@ frontend), and `SetupRequest` has no default hat name; hats add it.
 
 - **Password:** Argon2id (PHC string, `password-auth`), verification on a
   blocking thread; at least 12 characters, at most 1024 bytes; at most two
-  hashes or verifies at once. `POST /api/auth/login {password}` → 204 with
+  hashes or verifies at once, in two pools of one: logins, and step-ups with
+  the admin socket's reset, so a login flood never delays a signed-in owner's
+  step-up. Each pool lets four more checks wait; past that a check is refused
+  at once with 503 `auth_busy` and `Retry-After: 1`, before it is counted
+  against the address. A check's place stays taken until its verify ends,
+  even if the client goes away. `POST /api/auth/login {password}` → 204 with
   the cookie, or 401 `invalid_password`. Login attempts are rate limited per
   client address (5 wrong passwords per minute, then a 60 s lockout doubling
   up to 1 h: 429 `rate_limited` with `Retry-After`); only a success clears the
-  address. Constant-time failure path: an attempt that is not rate limited
-  runs exactly one Argon2 verify (against a dummy hash before setup); a
-  limited one runs none, so the right password gets 429 too.
+  address. Constant-time failure path: an attempt that is neither busy nor
+  rate limited runs exactly one Argon2 verify (against a dummy hash before
+  setup); a limited one runs none, so the right password gets 429 too.
 - **Rate limits** (here and §4.1) key on the canonical client address, IPv6
   per /64 and all of `127.0.0.0/8` as one; every attempt counts the moment it
   starts, so a parallel burst gets no more in than the budget. State is in
