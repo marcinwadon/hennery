@@ -3956,6 +3956,20 @@ impl Store {
         Ok(v.unwrap_or(0) as u64)
     }
 
+    /// Reconnect acknowledgement scoped to the authenticated host. Unknown
+    /// and foreign sessions both return zero. Tombstones retain their host
+    /// binding but no host events: late facts are discarded and acked by WS.
+    pub fn committed_seq_for_host(&self, host_id: &str, session_id: &str) -> Result<u64> {
+        let v: Option<i64> = self.conn().query_row(
+            "SELECT MAX(e.host_seq) FROM events e
+             JOIN sessions s ON s.id = e.session_id AND s.owner_id = e.owner_id
+             WHERE s.id = ?1 AND s.host_id = ?2 AND s.owner_id = ?3",
+            [session_id, host_id, &self.owner],
+            |r| r.get(0),
+        )?;
+        Ok(v.unwrap_or(0) as u64)
+    }
+
     /// Ingest one sequenced host frame (`ingest_fact`): the events it
     /// created, in order.
     pub fn ingest(&self, session_id: &str, seq: u64, body: &SessionBody) -> Result<Vec<EventDto>> {
@@ -4156,8 +4170,8 @@ impl Store {
                 // that has already `ended`.
                 let turn_state: Option<String> = tx
                     .query_row(
-                        "SELECT state FROM turns WHERE turn_id = ?1 AND owner_id = ?2",
-                        [turn_id, &self.owner],
+                        "SELECT state FROM turns WHERE turn_id = ?1 AND owner_id = ?2 AND session_id = ?3",
+                        [turn_id, &self.owner, session_id],
                         |r| r.get(0),
                     )
                     .optional()?;
@@ -4286,13 +4300,16 @@ impl Store {
                 )?;
                 // Only a `started` turn can be ended by a real `turn_ended`
                 // (fix round 1, ruling B): a stray end must not jump a
-                // `sent`/`not_delivered` turn straight to `ended`.
+                // `sent`/`not_delivered` turn straight to `ended`, nor end
+                // another session's turn by naming its ID under this one.
                 tx.execute(
-                    "UPDATE turns SET state = 'ended', outcome = ?2 WHERE turn_id = ?1 AND state = 'started' AND owner_id = ?3",
+                    "UPDATE turns SET state = 'ended', outcome = ?2
+                     WHERE turn_id = ?1 AND state = 'started' AND owner_id = ?3 AND session_id = ?4",
                     params![
                         turn_id,
                         serde_json::to_value(outcome)?.as_str().unwrap_or_default(),
-                        self.owner
+                        self.owner,
+                        session_id
                     ],
                 )?;
                 if applied == 0 {

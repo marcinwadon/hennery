@@ -49,19 +49,26 @@ async fn an_old_connections_unregister_fails_only_its_own_requests() {
     // The old socket's writer is gone; its reader has not noticed yet, so
     // the host's reconnect is accepted.
     drop(old_rx);
-    let (_new, mut new_rx) = connect(&hub);
+    let (new, mut new_rx) = connect(&hub);
     let on_new = tokio::spawn({
         let hub = hub.clone();
         async move { hub.request("h", "r2", prompt("r2"), Duration::from_secs(5)).await }
     });
     new_rx.recv().await.expect("r2 went out on the new connection");
 
+    // Even a correct session, turn and request ID cannot make the old
+    // socket answer a command sent on the replacement connection.
+    hub.resolve(old.conn_id, "s1", "r2", started("r2"));
+    hub.reject(old.conn_id, "r2", "forged".into(), "old connection".into());
+    assert!(hub.take_rejected(old.conn_id, "r2").is_none());
+    assert_eq!(hub.pending_requests(), 2);
+
     hub.unregister("h", old.conn_id); // the old reader finally ends
     assert_eq!(on_old.await.unwrap(), Err(RequestError::DeliveryUnknown));
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!on_new.is_finished(), "the new connection's request was failed");
     assert!(hub.is_ready("h"), "the old unregister dropped the new connection");
-    hub.resolve("r2", started("r2"));
+    hub.resolve(new.conn_id, "s1", "r2", started("r2"));
     assert_eq!(on_new.await.unwrap(), Ok(started("r2")));
 }
 
@@ -109,7 +116,7 @@ fn ended(turn_id: &str, outcome: TurnOutcome) -> SessionBody {
 #[tokio::test]
 async fn a_turn_waiter_resolves_only_on_that_sessions_turn_end() {
     let hub = Arc::new(Hub::new());
-    let (_conn, mut rx) = connect(&hub);
+    let (conn, mut rx) = connect(&hub);
     let call = tokio::spawn({
         let hub = hub.clone();
         async move {
@@ -118,10 +125,12 @@ async fn a_turn_waiter_resolves_only_on_that_sessions_turn_end() {
         }
     });
     rx.recv().await.expect("the cancel went out");
-    hub.resolve_turn("s1", "t0", ended("t0", TurnOutcome::Completed));
+    hub.resolve_turn(conn.conn_id + 1, "s1", "t1", ended("t1", TurnOutcome::Completed));
+    hub.resolve_turn(conn.conn_id, "s1", "t0", ended("t0", TurnOutcome::Completed));
     // Same turn_id, but a different session: must not complete `s1`'s waiter.
-    hub.resolve_turn("s-other", "t1", ended("t1", TurnOutcome::Completed));
+    hub.resolve_turn(conn.conn_id, "s-other", "t1", ended("t1", TurnOutcome::Completed));
     hub.resolve_session(
+        conn.conn_id,
         "s1",
         SessionBody::SessionParked {
             reason: ParkReason::Operator,
@@ -129,7 +138,7 @@ async fn a_turn_waiter_resolves_only_on_that_sessions_turn_end() {
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(!call.is_finished(), "completed by a fact about something else");
-    hub.resolve_turn("s1", "t1", ended("t1", TurnOutcome::Completed));
+    hub.resolve_turn(conn.conn_id, "s1", "t1", ended("t1", TurnOutcome::Completed));
     assert_eq!(call.await.unwrap(), Ok(ended("t1", TurnOutcome::Completed)));
 
     // A rejection still matches the request id.
@@ -141,7 +150,7 @@ async fn a_turn_waiter_resolves_only_on_that_sessions_turn_end() {
         }
     });
     rx.recv().await.expect("the second cancel went out");
-    hub.reject("rc2", "not_running".into(), "no".into());
+    hub.reject(conn.conn_id, "rc2", "not_running".into(), "no".into());
     assert_eq!(
         call.await.unwrap(),
         Err(RequestError::Rejected {

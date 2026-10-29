@@ -56,6 +56,59 @@ enum CompletedBy {
     Turn { session_id: String, turn_id: String },
 }
 
+/// The outbound command defines which session fact may answer its waiter.
+/// Correlation IDs alone do not authorize a host or a different command's fact.
+struct ExpectedReply {
+    session_id: String,
+    kind: ReplyKind,
+}
+
+enum ReplyKind {
+    Start,
+    Prompt(String),
+    Config,
+    Park,
+    Close,
+    Cancel(String),
+}
+
+impl ExpectedReply {
+    fn from_frame(frame: &CollectorFrame) -> Option<Self> {
+        let (session_id, kind) = match frame {
+            CollectorFrame::StartSession { session_id, .. } | CollectorFrame::ResumeSession { session_id, .. } => {
+                (session_id, ReplyKind::Start)
+            }
+            CollectorFrame::Prompt {
+                session_id, turn_id, ..
+            } => (session_id, ReplyKind::Prompt(turn_id.clone())),
+            CollectorFrame::SetConfig { session_id, .. } => (session_id, ReplyKind::Config),
+            CollectorFrame::ParkSession { session_id, .. } => (session_id, ReplyKind::Park),
+            CollectorFrame::CloseSession { session_id, .. } => (session_id, ReplyKind::Close),
+            CollectorFrame::CancelTurn {
+                session_id, turn_id, ..
+            } => (session_id, ReplyKind::Cancel(turn_id.clone())),
+            _ => return None,
+        };
+        Some(Self {
+            session_id: session_id.clone(),
+            kind,
+        })
+    }
+
+    fn matches(&self, session_id: &str, fact: &SessionBody) -> bool {
+        self.session_id == session_id
+            && match (&self.kind, fact) {
+                (ReplyKind::Start, SessionBody::SessionStarted { .. })
+                | (ReplyKind::Config, SessionBody::ConfigApplied { .. })
+                | (ReplyKind::Park, SessionBody::SessionParked { .. })
+                | (ReplyKind::Close, SessionBody::SessionClosed) => true,
+                (ReplyKind::Prompt(expected), SessionBody::TurnStarted { turn_id, .. })
+                | (ReplyKind::Cancel(expected), SessionBody::TurnEnded { turn_id, .. }) => expected == turn_id,
+                _ => false,
+            }
+    }
+}
+
 /// What a request changed in the store before it was sent. A rejection
 /// means nothing happened on the host, so the socket task undoes it when
 /// the rejection arrives: it sees every rejection, even when the HTTP
@@ -72,9 +125,10 @@ pub enum Undo {
 
 struct Waiter {
     /// The connection the request went out on: only its loss or its
-    /// timeout concerns this waiter.
+    /// timeout concerns this waiter, and only its replies may complete it.
     conn_id: u64,
     completed_by: CompletedBy,
+    expected: ExpectedReply,
     undo: Option<Undo>,
     tx: oneshot::Sender<Result<SessionBody, RequestError>>,
 }
@@ -562,6 +616,12 @@ impl Hub {
         mut frame: CollectorFrame,
         timeout: Duration,
     ) -> Result<SessionBody, RequestError> {
+        let Some(expected) = ExpectedReply::from_frame(&frame) else {
+            return Err(RequestError::Rejected {
+                code: "not_a_request".into(),
+                message: "not a session request".into(),
+            });
+        };
         let (tx, mut rx) = oneshot::channel();
         // Registered before the frame leaves, so a fast answer finds it; the
         // hosts lock is held throughout so the connection cannot change in
@@ -584,6 +644,7 @@ impl Hub {
                 Waiter {
                     conn_id: host.conn_id,
                     completed_by,
+                    expected,
                     undo,
                     tx,
                 },
@@ -756,34 +817,55 @@ impl Hub {
         self.probes.lock().expect("probes lock").len()
     }
 
-    pub fn resolve(&self, request_id: &str, fact: SessionBody) {
-        if let Some(w) = self.waiters.lock().expect("waiters lock").remove(request_id) {
+    pub fn resolve(&self, conn_id: u64, session_id: &str, request_id: &str, fact: SessionBody) {
+        let mut waiters = self.waiters.lock().expect("waiters lock");
+        if waiters.get(request_id).is_some_and(|w| {
+            w.conn_id == conn_id
+                && matches!(w.completed_by, CompletedBy::Request)
+                && w.expected.matches(session_id, &fact)
+        }) && let Some(w) = waiters.remove(request_id)
+        {
             let _ = w.tx.send(Ok(fact));
         }
     }
 
     /// Resolve every waiter registered with `request_for_session` for
     /// `session_id`.
-    pub fn resolve_session(&self, session_id: &str, fact: SessionBody) {
-        self.resolve_where(|by| matches!(by, CompletedBy::Session(s) if s == session_id), fact);
+    pub fn resolve_session(&self, conn_id: u64, session_id: &str, fact: SessionBody) {
+        self.resolve_where(
+            conn_id,
+            session_id,
+            |by| matches!(by, CompletedBy::Session(s) if s == session_id),
+            fact,
+        );
     }
 
     /// Resolve every waiter registered with `request_for_turn` for `turn_id`
     /// within `session_id`. A turn_id that matches under a different
     /// session (however that came to be) resolves nothing (final review
     /// M1).
-    pub fn resolve_turn(&self, session_id: &str, turn_id: &str, fact: SessionBody) {
+    pub fn resolve_turn(&self, conn_id: u64, session_id: &str, turn_id: &str, fact: SessionBody) {
         self.resolve_where(
+            conn_id,
+            session_id,
             |by| matches!(by, CompletedBy::Turn { session_id: s, turn_id: t } if s == session_id && t == turn_id),
             fact,
         );
     }
 
-    fn resolve_where(&self, completes: impl Fn(&CompletedBy) -> bool, fact: SessionBody) {
+    fn resolve_where(
+        &self,
+        conn_id: u64,
+        session_id: &str,
+        completes: impl Fn(&CompletedBy) -> bool,
+        fact: SessionBody,
+    ) {
         let mut waiters = self.waiters.lock().expect("waiters lock");
         let ids: Vec<String> = waiters
             .iter()
-            .filter(|(_, w)| completes(&w.completed_by))
+            .filter(|(_, w)| {
+                w.conn_id == conn_id && w.expected.matches(session_id, &fact) && completes(&w.completed_by)
+            })
             .map(|(k, _)| k.clone())
             .collect();
         for id in ids {
@@ -798,14 +880,34 @@ impl Hub {
     /// watchdog), so the caller applies the undo, then `answer`s, and the
     /// store and the HTTP answer always agree (decision 6). The waiter
     /// outlives an HTTP handler that was dropped mid-request.
-    pub fn take_rejected(&self, request_id: &str) -> Option<Rejection> {
-        let w = self.waiters.lock().expect("waiters lock").remove(request_id)?;
+    /// A foreign connection leaves it and its watchdog untouched.
+    pub fn take_rejected(&self, conn_id: u64, request_id: &str) -> Option<Rejection> {
+        let mut waiters = self.waiters.lock().expect("waiters lock");
+        if !waiters.get(request_id).is_some_and(|w| w.conn_id == conn_id) {
+            return None;
+        }
+        let w = waiters.remove(request_id)?;
         Some(Rejection { undo: w.undo, tx: w.tx })
     }
 
-    pub fn reject(&self, request_id: &str, code: String, message: String) {
-        if let Some(rejection) = self.take_rejected(request_id) {
+    pub fn reject(&self, conn_id: u64, request_id: &str, code: String, message: String) {
+        if let Some(rejection) = self.take_rejected(conn_id, request_id) {
             rejection.answer(code, message);
+        }
+    }
+
+    /// An outboxed failure answers only a start/resume on this connection
+    /// and session. A direct Error instead uses `take_rejected`.
+    pub fn reject_start(&self, conn_id: u64, session_id: &str, request_id: &str, code: String, message: String) {
+        let mut waiters = self.waiters.lock().expect("waiters lock");
+        if waiters.get(request_id).is_some_and(|w| {
+            w.conn_id == conn_id
+                && w.expected.session_id == session_id
+                && matches!(w.completed_by, CompletedBy::Request)
+                && matches!(w.expected.kind, ReplyKind::Start)
+        }) && let Some(w) = waiters.remove(request_id)
+        {
+            let _ = w.tx.send(Err(RequestError::Rejected { code, message }));
         }
     }
 
