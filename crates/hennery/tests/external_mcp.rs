@@ -207,7 +207,9 @@ async fn protocol_discovery_and_session_reads_keep_explicit_scope_and_no_mutatio
         .json()
         .await
         .unwrap();
-    assert_eq!(write["result"]["isError"], true);
+    assert_eq!(write["id"], 1);
+    assert_eq!(write["error"]["code"], -32602);
+    assert!(write.get("result").is_none());
     let default = c.issue(false).await;
     let empty: Value = c
         .rpc(
@@ -244,6 +246,145 @@ async fn protocol_discovery_and_session_reads_keep_explicit_scope_and_no_mutatio
         .unwrap();
     assert_eq!(metadata["result"]["isError"], false);
     assert_eq!(metadata["result"]["structuredContent"]["data"]["sessions"], json!([]));
+}
+#[tokio::test]
+async fn retained_grant_history_is_paginated_and_newest_active_credential_is_revocable() {
+    let c = Collector::new().await;
+    let input = serde_json::from_value(c.grant(false)).unwrap();
+    let mut expected = std::collections::BTreeSet::new();
+    for _ in 0..105 {
+        let (client, _) = c.state.store.issue_external_client(&input).unwrap();
+        assert!(c.state.store.revoke_external_client(&client.client_id).unwrap());
+        expected.insert(client.client_id);
+    }
+    let active = c.issue(false).await;
+    let active_id = active["client"]["client_id"].as_str().unwrap();
+    expected.insert(active_id.to_owned());
+    let mut after = String::new();
+    let mut discovered = std::collections::BTreeSet::new();
+    let mut pages = 0;
+    loop {
+        let response = c
+            .operator
+            .get(format!("{}/api/external-clients", c.url))
+            .query(&[("after", &after)])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let rows: Vec<Value> = response.json().await.unwrap();
+        assert!(rows.len() <= 100);
+        pages += 1;
+        for row in &rows {
+            let id = row["client_id"].as_str().unwrap();
+            assert!(id > after.as_str());
+            assert!(discovered.insert(id.to_owned()), "cursor repeated a credential");
+            assert_eq!(row["revoked"], id != active_id);
+            assert!(row.get("token").is_none());
+            assert!(row.get("token_hash").is_none());
+        }
+        if rows.len() < 100 {
+            break;
+        }
+        after = rows.last().unwrap()["client_id"].as_str().unwrap().to_owned();
+        assert!(pages < 3, "cursor did not terminate");
+    }
+    assert_eq!(pages, 2);
+    assert_eq!(discovered, expected);
+    assert_eq!(
+        c.operator
+            .delete(format!("{}/api/external-clients/{active_id}", c.url))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    assert_eq!(
+        c.rpc(active["token"].as_str().unwrap(), "tools/list", json!({}))
+            .await
+            .status(),
+        401
+    );
+}
+#[tokio::test]
+async fn unknown_tools_are_protocol_errors_preserving_string_and_numeric_request_ids() {
+    let c = Collector::new().await;
+    let issued = c.issue(true).await;
+    for id in [json!("lost-discovery-42"), json!(42)] {
+        let response = reqwest::Client::new().post(format!("{}/mcp/external/hennery", c.url))
+            .bearer_auth(issued["token"].as_str().unwrap())
+            .json(&json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"does_not_exist","arguments":{}}}))
+            .send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], id);
+        assert_eq!(body["error"]["code"], -32602);
+        assert_eq!(body["error"]["message"], "unknown_tool");
+        assert!(body.get("result").is_none());
+    }
+    let business: Value = c
+        .rpc(
+            issued["token"].as_str().unwrap(),
+            "tools/call",
+            json!({"name":"session_get","arguments":{"session_id":"missing"}}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(business["result"]["isError"], true);
+    assert!(business.get("error").is_none());
+}
+#[tokio::test]
+async fn every_supported_profile_negotiates_and_serves_individual_http_messages() {
+    assert_eq!(
+        hennery_sessions::external_mcp::PROTOCOL_VERSIONS,
+        &["2025-11-25", "2025-06-18"]
+    );
+    let c = Collector::new().await;
+    let issued = c.issue(false).await;
+    let token = issued["token"].as_str().unwrap();
+    let url = format!("{}/mcp/external/hennery", c.url);
+    let http = reqwest::Client::new();
+    for (offered, negotiated) in [
+        ("2025-11-25", "2025-11-25"),
+        ("2025-06-18", "2025-06-18"),
+        ("2025-03-26", "2025-11-25"),
+        ("unsupported", "2025-11-25"),
+    ] {
+        let init: Value = c.rpc(token, "initialize", json!({"protocolVersion":offered,"capabilities":{},"clientInfo":{"name":"profile-fixture","version":"1"}}))
+            .await.json().await.unwrap();
+        assert_eq!(init["result"]["protocolVersion"], negotiated);
+        for method in ["ping", "tools/list"] {
+            let response = http
+                .post(&url)
+                .bearer_auth(token)
+                .header("mcp-protocol-version", negotiated)
+                .header("accept", "application/json, text/event-stream")
+                .json(&json!({"jsonrpc":"2.0","id":method,"method":method,"params":{}}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["id"], method);
+            assert!(body.get("result").is_some());
+            assert!(body.get("error").is_none());
+        }
+    }
+    assert_eq!(
+        http.post(&url)
+            .bearer_auth(token)
+            .header("mcp-protocol-version", "2025-03-26")
+            .json(&json!({"jsonrpc":"2.0","id":2,"method":"ping"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
 }
 #[tokio::test]
 async fn bad_origin_version_body_limits_and_notification_semantics() {
@@ -310,6 +451,15 @@ async fn bad_origin_version_body_limits_and_notification_semantics() {
 }
 #[tokio::test]
 async fn stdio_bridge_exercises_real_http_without_desktop_or_real_config() {
+    for (offered, negotiated) in [
+        ("2025-11-25", "2025-11-25"),
+        ("2025-06-18", "2025-06-18"),
+        ("2025-03-26", "2025-11-25"),
+    ] {
+        bridge_profile(offered, negotiated).await;
+    }
+}
+async fn bridge_profile(offered: &str, negotiated: &str) {
     let c = Collector::new().await;
     let issued = c.issue(false).await;
     let token = issued["token"].as_str().unwrap();
@@ -339,7 +489,15 @@ async fn stdio_bridge_exercises_real_http_without_desktop_or_real_config() {
         .spawn()
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-11-25\"}}\n{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n").await.unwrap();
+    let messages = [
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":offered}}),
+        json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+        json!({"jsonrpc":"2.0","id":"unknown","method":"tools/call","params":{"name":"does_not_exist","arguments":{}}}),
+    ];
+    for message in messages {
+        stdin.write_all(format!("{message}\n").as_bytes()).await.unwrap();
+    }
     drop(stdin);
     let output = tokio::time::timeout(std::time::Duration::from_secs(30), child.wait_with_output())
         .await
@@ -348,8 +506,12 @@ async fn stdio_bridge_exercises_real_http_without_desktop_or_real_config() {
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
     let text = String::from_utf8(output.stdout).unwrap();
     let rows: Vec<Value> = text.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     assert_eq!(rows[0]["id"], 1);
+    assert_eq!(rows[0]["result"]["protocolVersion"], negotiated);
     assert_eq!(rows[1]["result"]["tools"].as_array().unwrap().len(), 5);
+    assert_eq!(rows[2]["id"], "unknown");
+    assert_eq!(rows[2]["error"]["code"], -32602);
+    assert!(rows[2].get("result").is_none());
     assert!(!text.contains(token));
 }

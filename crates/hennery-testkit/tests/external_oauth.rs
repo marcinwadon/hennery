@@ -375,15 +375,16 @@ async fn direct_remote_oauth_round_trip_over_real_tls_and_shipped_proxies() {
             f.rpc(access, "session_get", json!({"session_id":"outside"})).await["result"]["isError"],
             true
         );
-        assert_eq!(
-            f.rpc(
+        let write = f
+            .rpc(
                 access,
                 "session_prompt",
-                json!({"session_id":"allowed","content":"blocked"})
+                json!({"session_id":"allowed","content":"blocked"}),
             )
-            .await["result"]["isError"],
-            true
-        );
+            .await;
+        assert_eq!(write["id"], 1);
+        assert_eq!(write["error"]["code"], -32602);
+        assert!(write.get("result").is_none());
         assert_eq!(
             f.http
                 .get(format!("{}/api/sessions", f.base))

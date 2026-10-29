@@ -16,8 +16,9 @@ explicitly separate from automated isolated tests.
 Use `https://hennery.example/mcp/external/hennery`. The collector serves
 Streamable HTTP with single JSON responses, no required MCP session ID and no
 persistent GET stream (authenticated GET/DELETE return 405). It supports the
-negotiated `2025-11-25`, `2025-06-18` and `2025-03-26` profiles. It does not claim
-the newer 2026 transport's handshake-free metadata semantics. An unsupported
+negotiated `2025-11-25` and `2025-06-18` profiles. The March 2025 profile is
+not supported because it permits batches, which this adapter does not implement.
+It does not claim the newer 2026 transport's handshake-free metadata semantics. An unsupported
 offered version negotiates the supported profile; unsupported version headers
 are rejected. Present Origin must equal the configured collector origin.
 
@@ -137,6 +138,24 @@ or connection administration is exposed. A session listing is eventual metadata,
 not a transcript snapshot/delta cursor. Responses are no-store, bodies/results
 are bounded, and consent/management pages are excluded from PWA cache/reload
 navigation.
+
+Session metadata is authorized and collected under the same database gate,
+using the current stored session hat, host and root boundaries. That query is
+the authorization point: a reassignment or deletion afterwards does not retract
+an already-collected snapshot. The final grant/root check catches invalidated
+client authority, but does not lock sessions until HTTP delivery. Each later
+read checks current state again. Workspace discovery lists the explicitly
+granted paths; changing path rules or a host default hat does not rewrite those
+grants or historical session hats. Nested paths whose sessions belong to a
+different hat remain excluded.
+
+These read snapshots never authorize execution. Before adding execution tools,
+admission, dispatch and resume must resolve the current grant, host realpath,
+actual hat placement and per-(hat, actual ACP) source policy again.
+
+Unknown tool names return a JSON-RPC `-32602` error with the original request
+ID. Known tool input/business failures use `result.isError`; unexpected server
+failures use JSON-RPC `-32603`.
 
 ## Public HTTPS deployment recipe
 

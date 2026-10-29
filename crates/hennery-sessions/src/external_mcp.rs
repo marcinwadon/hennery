@@ -18,6 +18,9 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 const VERSION: &str = "2025-11-25";
+/// Single-message profiles shared with the optional stdio bridge. March 2025
+/// allowed batches, which this bounded adapter does not implement.
+pub const PROTOCOL_VERSIONS: &[&str] = &[VERSION, "2025-06-18"];
 const MAX_BODY: usize = 64 * 1024;
 fn private(response: impl IntoResponse) -> Response {
     let mut response = response.into_response();
@@ -198,7 +201,9 @@ fn invoke(state: &AppState, identity: &ExternalIdentity, call: Call) -> anyhow::
         }
         _ => anyhow::bail!("unknown_tool"),
     };
-    // Recheck revocation/purge after all collection, before publishing results.
+    // Metadata authorization linearizes at its Store query gate. This final
+    // check catches grant/root revocation, not session changes after collection;
+    // an already-authorized metadata snapshot may finish after reassignment.
     anyhow::ensure!(
         state.store.external_roots(identity)? == before_roots,
         "external_unauthenticated"
@@ -254,7 +259,7 @@ async fn endpoint(State(state): State<AppState>, req: Request) -> Response {
     }
     if headers
         .get("mcp-protocol-version")
-        .is_some_and(|v| !matches!(v.to_str(), Ok("2025-11-25" | "2025-06-18" | "2025-03-26")))
+        .is_some_and(|v| !v.to_str().is_ok_and(|version| PROTOCOL_VERSIONS.contains(&version)))
     {
         return private(StatusCode::BAD_REQUEST);
     }
@@ -288,7 +293,7 @@ async fn endpoint(State(state): State<AppState>, req: Request) -> Response {
                 .pointer("/params/protocolVersion")
                 .and_then(Value::as_str)
                 .unwrap_or(VERSION);
-            let version = if matches!(offered, "2025-11-25" | "2025-06-18" | "2025-03-26") {
+            let version = if PROTOCOL_VERSIONS.contains(&offered) {
                 offered
             } else {
                 VERSION
@@ -312,12 +317,13 @@ async fn endpoint(State(state): State<AppState>, req: Request) -> Response {
                 ),
                 Err(e) if e.to_string() == "external_unauthenticated" => crate::external_oauth::challenge(&state),
                 Err(e) if e.to_string() == "external_forbidden" => crate::external_oauth::insufficient_scope(&state),
+                Err(e) if e.to_string() == "unknown_tool" => rpc(id, -32602, "unknown_tool"),
                 Err(e) => {
                     let code = match e.to_string().as_str() {
                         "invalid_arguments" => "invalid_arguments",
                         "not_found" => "not_found",
-                        "unknown_tool" => "unknown_tool",
-                        _ => "internal_error",
+                        "result_too_large" => "result_too_large",
+                        _ => return rpc(id, -32603, "internal_error"),
                     };
                     result(id, json!({"content":[{"type":"text","text":code}],"isError":true}))
                 }

@@ -121,7 +121,7 @@ pub async fn run(args: BridgeArgs) -> Result<()> {
                 .pointer("/result/protocolVersion")
                 .and_then(serde_json::Value::as_str);
             ensure!(
-                matches!(negotiated, Some("2025-11-25" | "2025-06-18" | "2025-03-26")),
+                negotiated.is_some_and(|version| hennery_sessions::external_mcp::PROTOCOL_VERSIONS.contains(&version)),
                 "unsupported MCP negotiation"
             );
             version = negotiated.map(str::to_owned);

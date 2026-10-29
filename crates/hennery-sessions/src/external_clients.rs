@@ -185,6 +185,11 @@ impl Store {
             })?
             .collect::<rusqlite::Result<_>>()?)
     }
+    /// Authorization and collection share the coordinated database gate. The
+    /// returned metadata is a snapshot at that point: a later reassignment or
+    /// deletion does not retract bytes already collected. Execution must instead
+    /// resolve current authority, host realpath, hat and source policy on admission
+    /// and again at dispatch/resume; a metadata read never authorizes a command.
     pub fn external_sessions(
         &self,
         identity: &ExternalIdentity,
@@ -373,6 +378,7 @@ mod tests {
     #[test]
     fn credential_survives_reopen_but_never_revocation_or_expiry() {
         let w = World::new();
+        w.session("visible", "/project", &w.hat);
         let (client, token) = w.store.issue_external_client(&w.grant(true)).unwrap();
         let reopened = Store::open(&w.dir.path().join("test.db")).unwrap();
         let old = reopened.authenticate_external(&token).unwrap().unwrap();
@@ -385,8 +391,11 @@ mod tests {
         assert!(reopened.revoke_external_client(&client.client_id).unwrap());
         assert!(reopened.authenticate_external(&token).unwrap().is_none());
         assert!(reopened.external_roots(&old).is_err());
+        assert!(reopened.external_sessions(&old, "", None, 25).is_err());
         assert!(reopened.revoke_external_client(&client.client_id).unwrap());
         let (client, token) = w.store.issue_external_client(&w.grant(true)).unwrap();
+        let cached = w.store.authenticate_external(&token).unwrap().unwrap();
+        assert_eq!(w.store.external_sessions(&cached, "", None, 25).unwrap().len(), 1);
         reopened
             .conn()
             .execute(
@@ -395,6 +404,99 @@ mod tests {
             )
             .unwrap();
         assert!(w.store.authenticate_external(&token).unwrap().is_none());
+        assert!(w.store.external_roots(&cached).is_err());
+        assert!(w.store.external_sessions(&cached, "", Some("visible"), 1).is_err());
+    }
+    #[test]
+    fn metadata_uses_actual_hat_after_public_reassignment_and_keeps_authorized_snapshot() {
+        let w = World::new();
+        let HatChange::Done(other) = w.hosts.create_hat("Other", None, 0).unwrap() else {
+            panic!()
+        };
+        w.session("moved", "/project", &w.hat);
+        w.store.close_now("moved").unwrap();
+        let (_, token) = w.store.issue_external_client(&w.grant(true)).unwrap();
+        let identity = w.store.authenticate_external(&token).unwrap().unwrap();
+        let snapshot = w.store.external_sessions(&identity, "", None, 25).unwrap();
+        assert_eq!(snapshot.len(), 1);
+        assert!(matches!(
+            w.store.reassign_hat("moved", &other.id).unwrap(),
+            crate::store::Reassign::Done(_)
+        ));
+        assert!(
+            w.store
+                .external_sessions(&identity, "", Some("moved"), 1)
+                .unwrap()
+                .is_empty()
+        );
+        // The previous authorized snapshot does not change after collection.
+        assert_eq!(snapshot[0].hat_id, w.hat);
+        assert_eq!(snapshot[0].session_id, "moved");
+        assert!(matches!(
+            w.store.reassign_hat("moved", &w.hat).unwrap(),
+            crate::store::Reassign::Done(_)
+        ));
+        assert_eq!(w.store.external_sessions(&identity, "", None, 25).unwrap().len(), 1);
+    }
+    #[test]
+    fn nested_hat_rules_do_not_widen_explicit_discovery_or_historical_metadata() {
+        let w = World::new();
+        let HatChange::Done(other) = w.hosts.create_hat("Other", None, 0).unwrap() else {
+            panic!()
+        };
+        w.hosts
+            .replace_path_rules(
+                "h1",
+                &[NewRule {
+                    prefix: "/project/private".into(),
+                    hat_id: other.id.clone(),
+                    verified: true,
+                }],
+            )
+            .unwrap();
+        w.session("parent", "/project/public", &w.hat);
+        w.session("nested", "/project/private/sub", &other.id);
+        let (_, token) = w.store.issue_external_client(&w.grant(true)).unwrap();
+        let identity = w.store.authenticate_external(&token).unwrap().unwrap();
+        assert_eq!(
+            w.store.external_sessions(&identity, "", None, 25).unwrap()[0].session_id,
+            "parent"
+        );
+        assert!(
+            w.store
+                .external_sessions(&identity, "", Some("nested"), 1)
+                .unwrap()
+                .is_empty()
+        );
+        let mut nested = w.grant(true);
+        nested.roots[0].root = "/project/private".into();
+        assert!(w.store.issue_external_client(&nested).is_err());
+        nested.hat_id = other.id.clone();
+        let (_, nested_token) = w.store.issue_external_client(&nested).unwrap();
+        let nested_identity = w.store.authenticate_external(&nested_token).unwrap().unwrap();
+        assert_eq!(
+            w.store.external_sessions(&nested_identity, "", None, 25).unwrap()[0].session_id,
+            "nested"
+        );
+
+        w.hosts
+            .replace_path_rules(
+                "h1",
+                &[NewRule {
+                    prefix: "/project".into(),
+                    hat_id: other.id.clone(),
+                    verified: true,
+                }],
+            )
+            .unwrap();
+        w.hosts.update_host("h1", None, Some(&other.id)).unwrap();
+        // Discovery retains the grant's explicit root; historical hats are not
+        // rewritten by new path rules/defaults. Future execution must resolve anew.
+        assert_eq!(w.store.external_roots(&identity).unwrap(), w.grant(true).roots);
+        let rows = w.store.external_sessions(&identity, "", None, 25).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "parent");
+        assert!(w.store.issue_external_client(&w.grant(true)).is_err());
     }
     #[test]
     fn purge_revoked_host_and_cached_foreign_principal_cannot_read() {
