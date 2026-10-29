@@ -12,7 +12,7 @@
 
 # npm resolves the lockfiles as of this instant, so `lock` is reproducible.
 # Committed locks may include targeted security refreshes (packaging/README.md).
-npm_before = "2026-10-28T21:55:39Z"
+npm_before = "2026-10-29T16:55:16Z"
 
 [node]
 # Stable Node 24 runtime; refreshed with the agent set on 2026-10-28.
@@ -33,7 +33,7 @@ cli = ["node_modules/@anthropic-ai/claude-agent-sdk-"]
 # `@zed-industries/codex-acp` is deprecated in its favour; the unscoped
 # `codex-acp` is an unrelated third party.
 package = "@agentclientprotocol/codex-acp"
-version = "2.3.0"
+version = "2.5.0"
 entry = "dist/index.js"
 # The bundled Codex CLI: `@openai/codex`'s platform packages (npm aliases of
 # `@openai/codex@<version>-<platform>`); skipped by `--use-cli codex=…`.
