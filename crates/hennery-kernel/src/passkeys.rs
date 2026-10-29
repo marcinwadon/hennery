@@ -42,11 +42,11 @@ pub const CEREMONY_TTL_SECS: i64 = 5 * 60;
 pub const MAX_LOGIN_CEREMONIES: usize = 1024;
 pub const MAX_SESSION_CEREMONIES: usize = 1024;
 
-/// At most this many login ceremonies per client (`ratelimit::key`): its
-/// next start pushes out its own oldest, never anyone else's. Clients that
-/// share a key share its passkey budget already, so this takes nothing
-/// from them that a flood from that key could not. Loopback is exempt, as
-/// it may be every client behind a proxy that names none.
+/// At most this many live login ceremonies per client (`ratelimit::key`),
+/// reserved or begun: past it the client's next start is refused busy,
+/// and none of its own is pushed out either, since browsers behind one NAT
+/// or proxy share a key. Loopback is exempt, as it may be every client
+/// behind a proxy that names none.
 pub const MAX_LOGIN_CEREMONIES_PER_CLIENT: usize = 8;
 
 /// Of `MAX_LOGIN_CEREMONIES`, the places only a known client (one whose
@@ -262,42 +262,27 @@ impl Ceremonies {
     /// Reserve a place for a login from `client` (its `ratelimit::key`),
     /// under the same lock that checks there is one, so no concurrent
     /// start can take it: `None` when there is none, and then nothing
-    /// changed. Past `MAX_LOGIN_CEREMONIES_PER_CLIENT` the client's own
-    /// oldest begun login goes (loopback has no such cap); another
-    /// client's live login never does, for its whole `CEREMONY_TTL_SECS`.
-    /// A `known` client (one that signed in from there before) may also
-    /// use the places kept for known clients (`with_known`).
+    /// changed. No live login is ever pushed out for it, the client's own
+    /// included, for its whole `CEREMONY_TTL_SECS`: past
+    /// `MAX_LOGIN_CEREMONIES_PER_CLIENT` (loopback has no such cap) or the
+    /// pool's capacity the start is refused. A `known` client (one that
+    /// signed in from there before) may also use the places kept for known
+    /// clients (`with_known`).
     pub fn reserve_login(&self, client: IpAddr, known: bool, now: i64) -> Option<LoginReservation<'_>> {
         let mut table = self.table();
         table.live.retain(|_, live| live.expires_at > now);
-        let mut gone = Vec::new();
-        if !client.is_loopback() {
-            let mut own: Vec<(u64, &String, bool)> = table
-                .live
-                .iter()
-                .filter(|(_, live)| live.login_client == Some(client))
-                .map(|(id, live)| (live.seq, id, live.ceremony.is_some()))
-                .collect();
-            own.sort();
-            let excess = (own.len() + 1).saturating_sub(MAX_LOGIN_CEREMONIES_PER_CLIENT.max(1));
-            // Only a begun login goes: a reservation is another start's.
-            let begun: Vec<String> = own
-                .iter()
-                .filter(|(.., begun)| *begun)
-                .map(|(_, id, _)| (*id).clone())
-                .collect();
-            if begun.len() < excess {
-                return None;
-            }
-            gone.extend(begun.into_iter().take(excess));
+        let own = table
+            .live
+            .values()
+            .filter(|live| live.login_client == Some(client))
+            .count();
+        if !client.is_loopback() && own >= MAX_LOGIN_CEREMONIES_PER_CLIENT.max(1) {
+            return None;
         }
-        let logins = table.live.values().filter(|live| live.login_client.is_some()).count() - gone.len();
+        let logins = table.live.values().filter(|live| live.login_client.is_some()).count();
         let places = self.logins.max(1) - if known { 0 } else { self.known_logins };
         if logins >= places {
             return None;
-        }
-        for id in &gone {
-            table.live.remove(id);
         }
         let id = hex::encode(random_bytes::<32>());
         table.seq += 1;
@@ -952,24 +937,29 @@ mod tests {
         }
     }
 
-    /// A client past its own cap pushes out its own oldest login, never
-    /// another client's.
+    /// Browsers behind one NAT share a key: a start past the key's cap is
+    /// refused at every moment of a login's life rather than push out any
+    /// of the key's live logins, the owner's among them. Once one ends
+    /// (taken here), the key has a place again.
     #[test]
-    fn a_clients_logins_push_out_only_its_own() {
-        let ceremonies = Ceremonies::with_capacity(16, 16);
-        let owner = ceremonies.begin(login_from(1), NOW).unwrap();
-        let flood: Vec<String> = (0..MAX_LOGIN_CEREMONIES_PER_CLIENT + 2)
+    fn a_clients_own_live_logins_are_never_pushed_out_for_its_next() {
+        let ceremonies = Ceremonies::with_capacity(64, 1);
+        let owner = ceremonies.begin(login_from(2), NOW).unwrap();
+        let neighbours: Vec<String> = (1..MAX_LOGIN_CEREMONIES_PER_CLIENT)
             .map(|_| ceremonies.begin(login_from(2), NOW).unwrap())
             .collect();
-        assert!(
-            ceremonies.take(&owner, NOW).is_some(),
-            "another client's start pushed it out"
-        );
-        assert!(ceremonies.take(&flood[0], NOW).is_none());
-        assert!(ceremonies.take(&flood[1], NOW).is_none());
-        for id in &flood[2..] {
-            assert!(ceremonies.take(id, NOW).is_some());
+        for at in [NOW, NOW + 60, NOW + CEREMONY_TTL_SECS - 1] {
+            for _ in 0..4 {
+                assert!(ceremonies.begin(login_from(2), at).is_none());
+            }
         }
+        assert!(
+            ceremonies.begin(login_from(3), NOW).is_some(),
+            "another key was refused"
+        );
+        assert!(ceremonies.take(&neighbours[0], NOW).is_some());
+        assert!(ceremonies.begin(login_from(2), NOW).is_some());
+        assert!(ceremonies.take(&owner, NOW + CEREMONY_TTL_SECS - 1).is_some());
     }
 
     /// The owner's login, once begun, survives a full pool flooded from its

@@ -213,15 +213,15 @@ frontend), and `SetupRequest` has no default hat name; hats add it.
     login starts never pushes out a registration or a step-up. A login
     start first reserves its place, under the lock that checks there is
     one, and only then counts against the passkey budget: a start refused
-    busy is never counted, however many race for the last place. A client
-    (its rate-limit key) keeps at most eight logins, its next start
-    replacing its own oldest (clients sharing a key share its budget
-    already); loopback has no such cap, since behind a proxy that names no
-    client it is everyone. Another client's live login is never pushed out,
-    for its whole 5 minutes: with the pool full (1024, of which 64 only for
-    addresses that signed in before, §3.2's known addresses), a start
-    answers 503 `auth_busy` with `Retry-After: 1`. A flood can delay a new
-    login, not end one under way. A restart drops them. An unknown, used or
+    busy is never counted, however many race for the last place. No live
+    login is ever pushed out, for its whole 5 minutes, not even for a start
+    from its own rate-limit key (browsers behind one NAT share one): a
+    client keeps at most eight live logins (loopback has no such cap, since
+    behind a proxy that names no client it is everyone), and the pool 1024,
+    of which 64 only for addresses that signed in before (§3.2's known
+    addresses). Past either, a start answers 503 `auth_busy` with
+    `Retry-After: 1` until one ends. A flood can delay a new login, not end
+    one under way. A restart drops them. An unknown, used or
     expired
     ceremony answers 400 `invalid_ceremony`.
   - Several passkeys per owner, each with a label (1–64 characters, no control
