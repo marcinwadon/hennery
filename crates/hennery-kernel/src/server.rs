@@ -101,7 +101,10 @@ async fn admit_request(
     request: Request,
     next: Next,
 ) -> Response {
-    if matches!(request.uri().path(), "/healthz" | "/readyz")
+    if request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .is_some_and(|path| matches!(path.as_str(), "/healthz" | "/readyz"))
         && matches!(*request.method(), axum::http::Method::GET | axum::http::Method::HEAD)
     {
         // Liveness stays cheap; readiness has its own blocking-work permits.
@@ -274,6 +277,16 @@ mod tests {
                 .unwrap()
                 .status(),
             StatusCode::OK
+        );
+        // A raw health-looking URL must not exempt an application's fallback
+        // (memory's fallback authenticates cookies before taking UI permits).
+        assert_eq!(
+            app.clone()
+                .oneshot(request("192.0.2.1", "/readyz"))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
         assert_eq!(
             app.clone()
