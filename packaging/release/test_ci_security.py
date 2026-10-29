@@ -11,6 +11,18 @@ class CiSecurity(unittest.TestCase):
     def workflow(self, name):
         return yaml.safe_load((ROOT / '.github/workflows' / name).read_bytes())
 
+    def test_scheduled_audit_checks_both_managed_adapter_locks(self):
+        workflow = self.workflow('nix.yml')
+        steps = workflow['jobs']['audit']['steps']
+        audits = [step for step in steps
+                  if 'packaging/audit-adapters.sh' in step.get('run', '')]
+        self.assertEqual(len(audits), 1)
+        self.assertEqual(audits[0]['run'],
+                         'nix develop -c sh packaging/audit-adapters.sh')
+        self.assertNotIn('if', audits[0])
+        self.assertFalse(audits[0].get('continue-on-error', False))
+        self.assertEqual(workflow['permissions'], {'contents': 'read'})
+
     def test_audits_run_on_lock_changes_and_schedule_without_publication_authority(self):
         data = self.workflow('nix.yml')
         trigger = data.get('on', data.get(True))
