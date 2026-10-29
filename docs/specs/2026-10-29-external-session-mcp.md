@@ -10,19 +10,27 @@ activity credentials do not authenticate this endpoint.
 
 Claude Desktop is the first real acceptance client. A CLI or protocol fixture
 is not Desktop acceptance. The initial dependable path is a local stdio bridge
-using the same collector HTTP endpoint as other clients.
+using the same authenticated collector HTTP endpoint as other clients. The bridge
+connects from the user's machine and can reach a collector on its private LAN.
 
-Official documentation says remote connectors originate from Anthropic's cloud
-and require a publicly reachable server. Request-header authentication is beta
-and limited to some organizations; OAuth is the other authenticated remote
-path. We therefore do not assume a particular account has custom headers.
-Incoming OAuth is not implemented here. Where header auth is available, direct
-remote connection may use the same scoped bearer credential and endpoint.
+Official documentation says remote connectors originate from Anthropic's cloud,
+including when configured in Desktop. They require a publicly reachable server;
+being reachable from the user's machine is insufficient. This makes local stdio
+the initial private-LAN setup. The existing production collector does not need
+to become public for this setup.
+
+Current help documents fixed request headers (including API keys and bearer
+tokens) alongside OAuth. Direct remote HTTP remains an option for a separately
+provisioned publicly reachable deployment using the same scoped credential and
+endpoint. Incoming OAuth is not implemented or required for the local bridge.
+Check the installed client's available setup flow before claiming compatibility.
 
 Sources checked on 2026-10-29:
+
 - [Remote connector network requirements](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp).
-- [Authentication choices and request-header beta](https://claude.com/docs/connectors/custom/add-unlisted).
-- [Official Desktop local-server setup](https://modelcontextprotocol.io/docs/develop/connect-local-servers).
+- [Current connector authentication choices](https://support.claude.com/en/articles/11176164-use-connectors-to-extend-claude-s-capabilities).
+- [Desktop local servers, binary extensions and sensitive configuration](https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop).
+- [Manual Desktop local-server configuration](https://modelcontextprotocol.io/docs/develop/connect-local-servers).
 
 No real Desktop account, configuration or production service was changed during
 implementation. Follow the manual acceptance below in a deliberately provisioned
@@ -107,9 +115,12 @@ or connection administration is exposed. Session pagination is an eventual
 metadata listing, not a transcript snapshot/delta cursor.
 
 For a Desktop local MCP entry, merge an entry such as this into the existing
-configuration using Desktop's Developer / Edit Config flow. Use absolute paths;
-do not replace other entries. The example is a configuration template, not a
-command executed by this work:
+configuration using the manual local-server configuration flow supported by the
+installed Desktop version. Current help locates local server status/logs under
+Settings > Desktop app > Extensions > Manage > Local MCP servers; older layouts
+use Settings > Developer > This computer and Edit Config. Use absolute paths;
+do not replace other entries. Confirm the available configuration flow locally.
+The example is a configuration template, not a command executed by this work:
 
 ```json
 {
@@ -130,14 +141,19 @@ The bridge uses TLS and refuses redirects, URL credentials and arbitrary API
 paths. Plain HTTP is allowed only for loopback scratch tests. It emits only
 JSON-RPC lines on stdout; notifications do not produce fake responses. It reads
 no collector database and borrows no cookie. Other stdio clients can run the
-same command. Packaging as a Desktop extension can follow independently.
+same command. Packaging as a Desktop extension can follow independently. Current
+help supports binary extensions; a future extension manifest must mark secret
+configuration fields `sensitive: true` for OS secure storage. That packaging is
+not implemented here; this bridge uses the private token file described above.
 
 ## Acceptance and next slices
 
 Automated scope/protocol/bridge checks are separate from these **pending manual
 Desktop checks**:
 
-1. Use an isolated collector and a deliberately issued scratch credential.
+1. Record the installed Desktop version and verify its supported local-server
+   setup, organization policy and status/logs view. Use an isolated collector
+   reachable from that machine and a deliberately issued scratch credential.
    Start the bridge through Desktop; confirm its connection and tool schemas.
 2. Ask Desktop to list the authorized host/root and report the client's scope.
    Check that it explains execution is unavailable in this first slice.
