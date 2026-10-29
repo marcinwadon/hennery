@@ -295,7 +295,9 @@ each header/control, preventing duplicate hidden keyboard targets.
 ## 4. Routes, overview and navigation
 
 Navigation shortcuts (operator request, 2026-10-22): a session's actions offer
-“Pin to sidebar” / “Unpin from sidebar”. Pins are persisted by the collector
+“Pin to sidebar” as a switch with a stable label, On/Off state and active
+highlight, matching “Do not park” (operator request, 2026-10-29).
+Pins are persisted by the collector
 as `sidebar_pinned`, separately from the “Do not park” idle hold. The desktop
 rail shows a Pinned section above Hats, with session names, direct links and
 the current selection; compact navigation retains named icon links and tooltips.

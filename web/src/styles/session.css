@@ -344,7 +344,7 @@ li.q-opt-reject { border-color:var(--st-attn); color:var(--st-attn); }
 .session-menu-list { box-shadow:var(--hn-pop-shadow); border-color:var(--hn-control-strong); max-width:min(300px,90vw); }
 .session-menu-list [role=switch][aria-checked=true] { color:var(--hn-accent-fg); background:var(--hn-accent-wash); }
 .session-menu-list [role=switch] { display:flex; align-items:center; justify-content:space-between; gap:16px; }
-.idle-hold-state { font-size:11px; color:var(--hn-fg-3); }.session-menu-list [aria-checked=true] .idle-hold-state { color:var(--hn-accent-fg); }
+.session-toggle-state { font-size:11px; color:var(--hn-fg-3); }.session-menu-list [aria-checked=true] .session-toggle-state { color:var(--hn-accent-fg); }
 .session-title-button { display:block; max-width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; border:0; background:transparent; color:inherit; font:inherit; text-align:left; padding:0; cursor:text; }
 .session-title-button:hover { text-decoration:underline; text-decoration-color:var(--hn-fg-3); text-underline-offset:4px; }
 .session-rename-form { display:flex; align-items:center; flex-wrap:wrap; gap:6px; margin:0; }
