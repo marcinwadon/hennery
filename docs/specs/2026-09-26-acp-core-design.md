@@ -286,7 +286,8 @@ umbrella leaves to it.
 ### 3.1 Frames
 
 Every frame is a JSON object with a `type` discriminator. The protocol version
-appears only in `hello` / `hello_ack`, never per frame.
+appears only in the `authenticate` / `hello` / `hello_ack` handshake, never on
+normal session frames.
 
 - **Requests** (collector → host) carry a `request_id`, used for correlation
   only.
@@ -314,7 +315,10 @@ is resent until acknowledged.)*
 correlated reply, so a rejection never overtakes the fact that preceded it
 (e.g. a `turn_ended` written just before a `not_running`, §3.3).
 
-Maximum frame size **32 MiB**. A frame that would exceed it is rejected at the
+After authentication the maximum frame size is **32 MiB**. Before the first
+valid key proof, a cumulative **64 KiB wire budget** covers frame headers,
+declared payloads, fragments and control frames (§3.5). A frame that would
+exceed the authenticated limit is rejected at the
 sender with a visible error; it never closes the socket. *(P-7: an oversized
 update closed the predecessor's socket, which tore down every session on the
 host.)*
@@ -410,7 +414,8 @@ host.)*
 
 | Type | Key fields | Notes |
 |---|---|---|
-| `hello` | protocol_version, host_version, host_id, proof, capabilities[], agents[], workspace_roots[], attached_sessions[{session_id, last_seq, open_turn_id?, ending?}] | First frame. |
+| `authenticate` | protocol_version, host_id, proof | Small first frame only after explicit `Hennery-Hello-Auth: 1` advertisement (§3.5). |
+| `hello` | protocol_version, host_version, host_id, proof, capabilities[], agents[], workspace_roots[], attached_sessions[{session_id, last_seq, open_turn_id?, ending?}] | First frame for legacy handshakes; follows negotiated authentication otherwise. |
 | `resend_complete` | — | All unacknowledged outbox frames have been resent (§5.1). |
 | `session` | session_id, seq, body | Outboxed (§3.2). |
 | `error` | request_id, code, message | Rejection of a request. |
@@ -589,12 +594,24 @@ upgrade; the collector sends it, lowercase hex, in the `hennery-hello-nonce`
 upgrade response header before the first frame, and a host that gets none
 sends no `hello`. Keys are 32-byte Ed25519 in lowercase hex; small-order keys
 are refused and verification is strict. The connection is unauthenticated
-until a valid `hello` arrives. The host id is never self-asserted without the
+until a valid proof arrives. The host id is never self-asserted without the
 proof. A revoked host gets `hello_error{revoked}` and then stops all its
 adapters; until it connects, its adapters keep running (it cannot be reached).
 Pairing itself is in the kernel spec §4.
 
-- **Order of refusals:** the `hello` must arrive within 10 s. A different
+Protocol 1.1 advertises `Hennery-Hello-Auth: 1` in the upgrade response. Only
+then does a capable host send the small `authenticate` before its full hello,
+without another round trip. Both frames name the same host and protocol and
+use the proof above. The first valid signature lifts the cumulative 64 KiB
+wire budget; declared oversized payloads are refused before allocation,
+including bytes prefetched during the HTTP upgrade. The collector verifies
+the full hello's proof and revocation again before registration or session
+reconciliation. An older collector receives an ordinary hello; older hosts
+remain supported when that hello fits the pre-authentication budget. Update
+hosts before collectors when legacy hellos exceed it.
+
+- **Order of refusals:** the complete handshake has one 10 s deadline, including
+  both frames when authentication is negotiated. A different
   protocol major is answered `incompatible` before the proof is looked at. An
   unknown host id gets `bad_proof`, exactly like a wrong signature. The
   signature is verified before revocation, so only the key's holder is told
@@ -1415,8 +1432,9 @@ deletes every session of the hat the same way. As built (plan 9a):
 
 ### 5.1 Handshake
 
-1. The host sends `hello` as its first frame, with the proof and the list of
-   attached sessions.
+1. After the optional negotiated `authenticate` (§3.5), the host sends `hello`
+   with the proof and the list of attached sessions. Without negotiation it
+   sends `hello` first.
 2. The collector verifies the proof and replies `hello_ack`, whose
    `committed` map carries its highest committed seq for every session in
    `attached_sessions`.
@@ -1973,7 +1991,9 @@ transaction from what the fact changed (plans 10b-i, 10b-iii):
 
 | Limit | Default |
 |---|---|
-| WebSocket frame | 32 MiB |
+| WebSocket wire data before a valid host proof | 64 KiB cumulative |
+| Authenticated WebSocket frame/message | 32 MiB |
+| Pending host handshakes | 64 total, 4 per effective client (IPv6 /64), 10 s |
 | Prompt images | 20 × ≤ 5 MiB, ≤ 16 MiB decoded in total |
 | Prompt text | ≤ 2 MiB in total (6a) |
 | Prompt request body | 24 MiB; every other route 2 MB (6a) |
