@@ -5,7 +5,8 @@
 MCP clients reach it only through a TLS reverse proxy on the same machine.
 
 1. **Loopback backend.** Keep the default `--listen 127.0.0.1:7332`, or another
-   loopback address. Never publish the plaintext port, on a LAN or in a
+   loopback address; the command refuses non-loopback listeners. Never publish
+   the plaintext port, on a LAN or in a
    container port mapping. Run the service as its own OS user with a private
    `--data-dir`; agents must not be able to read its databases or keys.
 2. **Dedicated hostname.** Give the memory service its own DNS name and
@@ -35,7 +36,10 @@ MCP clients reach it only through a TLS reverse proxy on the same machine.
    own address. Trust is only as narrow as backend reachability: any local
    process that can reach the loopback port from a trusted address can choose
    its budget key. The address keys budgets only and never authenticates.
-5. **Limits.** The nginx template caps each address at 20 connections and
+5. **Limits.** The backend shares the collector's 512-connection cap,
+   ten-second header deadline, 16 KiB header buffer and ordinary-request
+   admission (512 global, 128 per resolved client). The nginx template caps
+   each address at 20 connections and
    100 requests/s (burst 200). Caddy has no per-client limiter: add firewall or
    ingress caps before public exposure. Backend limits do not bound TLS
    handshakes. The service refuses excess work with 503. MCP admits at most
