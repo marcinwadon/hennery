@@ -42,7 +42,7 @@ const memoryProxy=createServer(tls,(request,response)=>{
 });
 const collectorProxy=createServer(tls,(request,response)=>{
   deliveries.push({service:'collector',cookie:request.headers.cookie??''});
-  response.writeHead(200,{'content-type':'text/html','set-cookie':'hennery_session=synthetic-core-cookie; HttpOnly; SameSite=Strict; Path=/; Secure'});
+  response.writeHead(200,{'content-type':'text/html','set-cookie':'__Host-hennery_session=synthetic-core-cookie; HttpOnly; SameSite=Strict; Path=/; Secure'});
   response.end('<p>synthetic collector</p>');
 });
 for(const proxy of [memoryProxy,collectorProxy])await new Promise(resolve=>proxy.listen(0,'127.0.0.1',resolve));
@@ -82,7 +82,7 @@ try {
     assert.ok(cookies[0].secure && cookies[0].httpOnly && cookies[0].path==='/');
     assert.equal(cookies[0].domain,'memory.example.test');
     await corePage.reload();await page.reload();
-    assert.ok(deliveries.some(item=>item.service==='collector'&&item.cookie.includes('hennery_session=synthetic-core-cookie')));
+    assert.ok(deliveries.some(item=>item.service==='collector'&&item.cookie.includes('__Host-hennery_session=synthetic-core-cookie')));
     assert.ok(deliveries.some(item=>item.service==='memory'&&item.cookie.includes('__Host-hennery_memory_session=')));
     assert.ok(deliveries.filter(item=>item.service==='collector').every(item=>!item.cookie.includes('hennery_memory_session=')));
     assert.ok(deliveries.filter(item=>item.service==='memory').every(item=>!item.cookie.includes('hennery_session=')));
