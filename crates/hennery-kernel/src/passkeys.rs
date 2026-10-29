@@ -9,7 +9,10 @@
 //! - **Ceremonies live in memory** (decision 5, kernel spec §3.2), keyed by
 //!   a random id: each is taken once, whatever its finish then finds, and
 //!   lives at most `CEREMONY_TTL_SECS`. A restart drops them all; the
-//!   browser starts again.
+//!   browser starts again. Login ceremonies are counted per client (its
+//!   rate-limit key), and one younger than `PROTECTED_CEREMONY_SECS` is
+//!   never pushed out by another client's start: a flood of starts can make
+//!   new ones wait, not end the owner's under way.
 //! - **Passkeys add to the password** (decision 2): registering one needs
 //!   a stepped-up session (decision 7), and removing one always leaves the
 //!   password. Every query names the owner (kernel spec §1).
@@ -20,6 +23,7 @@ use anyhow::Result;
 use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Mutex;
 use webauthn_rs::prelude::{
     AuthenticationResult, Passkey, PasskeyAuthentication, PasskeyRegistration, PublicKeyCredential,
@@ -36,6 +40,17 @@ pub const CEREMONY_TTL_SECS: i64 = 5 * 60;
 /// 5; 3c review, O1).
 pub const MAX_LOGIN_CEREMONIES: usize = 1024;
 pub const MAX_SESSION_CEREMONIES: usize = 1024;
+
+/// At most this many login ceremonies per client (`ratelimit::key`): its
+/// next start pushes out its own oldest, not anyone else's. Loopback is
+/// exempt, as it may be every client behind a proxy that names none.
+pub const MAX_LOGIN_CEREMONIES_PER_CLIENT: usize = 8;
+
+/// A login ceremony this young is never pushed out, not even for its own
+/// client's next one (many clients can share a key behind a proxy): the
+/// time an owner takes at the authenticator. A start that would need to
+/// push one out is refused busy instead.
+pub const PROTECTED_CEREMONY_SECS: i64 = 60;
 
 /// The relying party's name, which an authenticator may show.
 const RP_NAME: &str = "hennery";
@@ -82,8 +97,11 @@ pub enum Ceremony {
         label: String,
         state: PasskeyRegistration,
     },
-    /// Signing in.
-    Login { state: PasskeyAuthentication },
+    /// Signing in, from `client` (its `ratelimit::key`).
+    Login {
+        client: IpAddr,
+        state: PasskeyAuthentication,
+    },
     /// Stepping up a signed-in session.
     StepUp {
         session_id: String,
@@ -99,6 +117,14 @@ impl Ceremony {
             Self::Register { session_id, .. } => Some((session_id, 0)),
             Self::StepUp { session_id, .. } => Some((session_id, 1)),
             Self::Login { .. } => None,
+        }
+    }
+
+    /// The client a login was begun from.
+    fn client(&self) -> Option<IpAddr> {
+        match self {
+            Self::Login { client, .. } => Some(*client),
+            _ => None,
         }
     }
 }
@@ -145,29 +171,24 @@ impl Ceremonies {
 
     /// Begin `ceremony` and return its id (64 hex characters). Expired
     /// ceremonies are dropped first, and the session's earlier ceremony of
-    /// the same kind; past its pool's capacity, the oldest live one of that
-    /// pool goes too.
-    pub fn begin(&self, ceremony: Ceremony, now: i64) -> String {
+    /// the same kind, or past `MAX_LOGIN_CEREMONIES_PER_CLIENT` the
+    /// client's oldest login; past its pool's capacity, the oldest live one
+    /// of that pool goes too, unless it is a login younger than
+    /// `PROTECTED_CEREMONY_SECS`: then `None`, and nothing is begun.
+    pub fn begin(&self, ceremony: Ceremony, now: i64) -> Option<String> {
         let id = hex::encode(random_bytes::<32>());
         let mut table = self.table();
         table.live.retain(|_, live| live.expires_at > now);
         if let Some(slot) = ceremony.slot() {
             table.live.retain(|_, live| live.ceremony.slot() != Some(slot));
         }
-        let login = ceremony.slot().is_none();
-        let capacity = if login { self.logins } else { self.sessions };
-        loop {
-            let pool = table
-                .live
-                .iter()
-                .filter(|(_, live)| live.ceremony.slot().is_none() == login);
-            if pool.clone().count() < capacity.max(1) {
-                break;
+        match ceremony.client() {
+            Some(client) => {
+                if !self.make_login_room(&mut table, client, now, true) {
+                    return None;
+                }
             }
-            let Some(oldest) = pool.min_by_key(|(_, live)| live.seq).map(|(id, _)| id.clone()) else {
-                break;
-            };
-            table.live.remove(&oldest);
+            None => self.make_session_room(&mut table),
         }
         table.seq += 1;
         let seq = table.seq;
@@ -179,7 +200,77 @@ impl Ceremonies {
                 seq,
             },
         );
-        id
+        Some(id)
+    }
+
+    /// Whether a login from `client` would begin now, or be refused busy.
+    pub fn login_has_room(&self, client: IpAddr, now: i64) -> bool {
+        let mut table = self.table();
+        table.live.retain(|_, live| live.expires_at > now);
+        self.make_login_room(&mut table, client, now, false)
+    }
+
+    /// Past the session pool's capacity, its oldest go.
+    fn make_session_room(&self, table: &mut Table) {
+        loop {
+            let pool = table.live.iter().filter(|(_, live)| live.ceremony.slot().is_some());
+            if pool.clone().count() < self.sessions.max(1) {
+                return;
+            }
+            let Some(oldest) = pool.min_by_key(|(_, live)| live.seq).map(|(id, _)| id.clone()) else {
+                return;
+            };
+            table.live.remove(&oldest);
+        }
+    }
+
+    /// Room for a login from `client`: its own oldest go first, past
+    /// `MAX_LOGIN_CEREMONIES_PER_CLIENT`, then the pool's oldest, each only
+    /// if begun at least `PROTECTED_CEREMONY_SECS` ago; `false` when that
+    /// is not enough, and then nothing goes. Only removes anything when
+    /// `evict`.
+    fn make_login_room(&self, table: &mut Table, client: IpAddr, now: i64, evict: bool) -> bool {
+        // Every live login, oldest first: its id, client and start.
+        let mut logins: Vec<(u64, String, IpAddr, i64)> = table
+            .live
+            .iter()
+            .filter_map(|(id, live)| {
+                let from = live.ceremony.client()?;
+                Some((live.seq, id.clone(), from, live.expires_at - CEREMONY_TTL_SECS))
+            })
+            .collect();
+        logins.sort_by_key(|(seq, ..)| *seq);
+        let mut gone = Vec::new();
+        if !client.is_loopback() {
+            let own: Vec<(String, i64)> = logins
+                .iter()
+                .filter(|(_, _, from, _)| *from == client)
+                .map(|(_, id, _, began)| (id.clone(), *began))
+                .collect();
+            let excess = (own.len() + 1).saturating_sub(MAX_LOGIN_CEREMONIES_PER_CLIENT.max(1));
+            for (id, began) in own.into_iter().take(excess) {
+                if began > now - PROTECTED_CEREMONY_SECS {
+                    return false;
+                }
+                gone.push(id);
+            }
+            logins.retain(|(_, id, ..)| !gone.contains(id));
+        }
+        let mut live = logins.len();
+        let mut oldest = logins.into_iter();
+        while live >= self.logins.max(1) {
+            match oldest.next() {
+                Some((_, id, _, began)) if began <= now - PROTECTED_CEREMONY_SECS => gone.push(id),
+                _ => return false,
+            }
+            live -= 1;
+        }
+        if evict {
+            for id in &gone {
+                table.live.remove(id);
+            }
+        }
+        true
     }
 
     /// Take the ceremony `id` names: it is gone whatever its finish then
@@ -237,6 +328,9 @@ pub enum Start {
     NoPasskeys,
     /// The label is not acceptable (why).
     Invalid(String),
+    /// Too many login ceremonies are under way, none old enough to push
+    /// out: try again shortly.
+    Busy,
 }
 
 /// Why a finish was refused. Nothing changed.
@@ -369,7 +463,10 @@ impl Operator {
             state,
         };
         Ok(Start::Begun {
-            ceremony_id: self.ceremonies.begin(ceremony, now),
+            ceremony_id: match self.ceremonies.begin(ceremony, now) {
+                Some(id) => id,
+                None => return Ok(Start::Busy),
+            },
             options: serde_json::to_value(options)?,
         })
     }
@@ -498,14 +595,19 @@ impl Operator {
         }
         let (options, state) = rp.start_passkey_authentication(&passkeys)?;
         Ok(Start::Begun {
-            ceremony_id: self.ceremonies.begin(ceremony(state), now),
+            ceremony_id: match self.ceremonies.begin(ceremony(state), now) {
+                Some(id) => id,
+                None => return Ok(Start::Busy),
+            },
             options: serde_json::to_value(options)?,
         })
     }
 
-    /// Begin signing in with a passkey (decision 8).
-    pub fn start_passkey_login(&self, now: i64) -> Result<Start> {
-        self.begin_authentication(|state| Ceremony::Login { state }, now)
+    /// Begin signing in with a passkey (decision 8), from `client`'s
+    /// address.
+    pub fn start_passkey_login(&self, client: IpAddr, now: i64) -> Result<Start> {
+        let client = crate::ratelimit::key(client);
+        self.begin_authentication(|state| Ceremony::Login { client, state }, now)
     }
 
     /// Finish the login `ceremony_id` names with the browser's
@@ -521,7 +623,7 @@ impl Operator {
         user_agent: &str,
         now: i64,
     ) -> Result<std::result::Result<String, Refused>> {
-        let Some(Ceremony::Login { state }) = self.ceremonies.take(ceremony_id, now) else {
+        let Some(Ceremony::Login { state, .. }) = self.ceremonies.take(ceremony_id, now) else {
             return Ok(Err(Refused::Ceremony));
         };
         // Held from the relying party's read to the commit (3c review, A4),
@@ -662,10 +764,21 @@ mod tests {
         relying_party(&PublicUrl::parse("https://hennery.example").unwrap()).unwrap()
     }
 
-    fn login() -> Ceremony {
+    /// A login from 192.0.2.`n`.
+    fn login_from(n: u8) -> Ceremony {
         let (_, state) = rp().start_passkey_authentication(&[]).unwrap();
-        Ceremony::Login { state }
+        Ceremony::Login {
+            client: IpAddr::from([192, 0, 2, n]),
+            state,
+        }
     }
+
+    fn login() -> Ceremony {
+        login_from(1)
+    }
+
+    /// Old enough to be pushed out for another client's login.
+    const OLD: i64 = NOW - PROTECTED_CEREMONY_SECS;
 
     fn step_up(session_id: &str) -> Ceremony {
         let (_, state) = rp().start_passkey_authentication(&[]).unwrap();
@@ -689,7 +802,7 @@ mod tests {
     #[test]
     fn a_ceremony_is_taken_once() {
         let ceremonies = Ceremonies::default();
-        let id = ceremonies.begin(login(), NOW);
+        let id = ceremonies.begin(login(), NOW).unwrap();
         assert_eq!(id.len(), 64);
         assert!(matches!(ceremonies.take(&id, NOW), Some(Ceremony::Login { .. })));
         assert!(ceremonies.take(&id, NOW).is_none());
@@ -699,8 +812,8 @@ mod tests {
     #[test]
     fn a_ceremony_expires_after_its_ttl() {
         let ceremonies = Ceremonies::default();
-        let live = ceremonies.begin(login(), NOW);
-        let expired = ceremonies.begin(login(), NOW);
+        let live = ceremonies.begin(login(), NOW).unwrap();
+        let expired = ceremonies.begin(login(), NOW).unwrap();
         assert!(ceremonies.take(&live, NOW + CEREMONY_TTL_SECS - 1).is_some());
         assert!(ceremonies.take(&expired, NOW + CEREMONY_TTL_SECS).is_none());
         // An expired ceremony is gone once taken, even at an earlier time.
@@ -710,12 +823,12 @@ mod tests {
     #[test]
     fn a_sessions_new_ceremony_replaces_its_last_of_that_kind() {
         let ceremonies = Ceremonies::default();
-        let first = ceremonies.begin(register("s1"), NOW);
-        let step_up_s1 = ceremonies.begin(step_up("s1"), NOW);
-        let other_session = ceremonies.begin(register("s2"), NOW);
-        let login_1 = ceremonies.begin(login(), NOW);
-        let login_2 = ceremonies.begin(login(), NOW);
-        let second = ceremonies.begin(register("s1"), NOW);
+        let first = ceremonies.begin(register("s1"), NOW).unwrap();
+        let step_up_s1 = ceremonies.begin(step_up("s1"), NOW).unwrap();
+        let other_session = ceremonies.begin(register("s2"), NOW).unwrap();
+        let login_1 = ceremonies.begin(login(), NOW).unwrap();
+        let login_2 = ceremonies.begin(login(), NOW).unwrap();
+        let second = ceremonies.begin(register("s1"), NOW).unwrap();
         assert!(ceremonies.take(&first, NOW).is_none());
         for id in [&step_up_s1, &other_session, &login_1, &login_2, &second] {
             assert!(ceremonies.take(id, NOW).is_some());
@@ -725,7 +838,8 @@ mod tests {
     #[test]
     fn past_capacity_the_oldest_ceremony_goes() {
         let ceremonies = Ceremonies::with_capacity(3, 3);
-        let ids: Vec<String> = (0..4).map(|_| ceremonies.begin(login(), NOW)).collect();
+        let mut ids: Vec<String> = (0..3).map(|n| ceremonies.begin(login_from(n), OLD).unwrap()).collect();
+        ids.push(ceremonies.begin(login_from(3), NOW).unwrap());
         assert_eq!(ceremonies.len(), 3);
         assert!(ceremonies.take(&ids[0], NOW).is_none());
         for id in &ids[1..] {
@@ -737,9 +851,9 @@ mod tests {
     #[test]
     fn expired_ceremonies_go_before_the_oldest_live_one() {
         let ceremonies = Ceremonies::with_capacity(2, 2);
-        let expiring = ceremonies.begin(login(), NOW - CEREMONY_TTL_SECS);
-        let live = ceremonies.begin(login(), NOW - 1);
-        let new = ceremonies.begin(login(), NOW);
+        let expiring = ceremonies.begin(login(), NOW - CEREMONY_TTL_SECS).unwrap();
+        let live = ceremonies.begin(login(), NOW - 1).unwrap();
+        let new = ceremonies.begin(login(), NOW).unwrap();
         assert_eq!(ceremonies.len(), 2);
         assert!(ceremonies.take(&expiring, NOW - CEREMONY_TTL_SECS).is_none());
         assert!(ceremonies.take(&live, NOW).is_some());
@@ -753,16 +867,22 @@ mod tests {
     #[test]
     fn a_login_flood_never_pushes_out_a_sessions_ceremony() {
         let ceremonies = Ceremonies::with_capacity(2, 2);
-        let registration = ceremonies.begin(register("s1"), NOW);
-        let step_up_s1 = ceremonies.begin(step_up("s1"), NOW);
-        let logins: Vec<String> = (0..5).map(|_| ceremonies.begin(login(), NOW)).collect();
+        let registration = ceremonies.begin(register("s1"), NOW).unwrap();
+        let step_up_s1 = ceremonies.begin(step_up("s1"), NOW).unwrap();
+        // A minute apart, so each is old enough to go for the next.
+        let logins: Vec<String> = (0..5)
+            .map(|n| {
+                let at = NOW - 4 * PROTECTED_CEREMONY_SECS + i64::from(n) * PROTECTED_CEREMONY_SECS;
+                ceremonies.begin(login_from(n), at).unwrap()
+            })
+            .collect();
         assert_eq!(ceremonies.len(), 4);
         assert!(ceremonies.take(&registration, NOW).is_some());
         assert!(ceremonies.take(&step_up_s1, NOW).is_some());
         assert!(ceremonies.take(&logins[2], NOW).is_none());
         assert!(ceremonies.take(&logins[4], NOW).is_some());
         let sessions: Vec<String> = (0..3)
-            .map(|n| ceremonies.begin(register(&format!("s{n}")), NOW))
+            .map(|n| ceremonies.begin(register(&format!("s{n}")), NOW).unwrap())
             .collect();
         assert!(ceremonies.take(&logins[3], NOW).is_some());
         assert!(ceremonies.take(&sessions[0], NOW).is_none());
@@ -775,9 +895,12 @@ mod tests {
     fn each_pool_has_the_capacity_given_for_it() {
         let ceremonies = Ceremonies::with_capacity(1, 3);
         let sessions: Vec<String> = (0..3)
-            .map(|n| ceremonies.begin(register(&format!("s{n}")), NOW))
+            .map(|n| ceremonies.begin(register(&format!("s{n}")), NOW).unwrap())
             .collect();
-        let logins: Vec<String> = (0..2).map(|_| ceremonies.begin(login(), NOW)).collect();
+        let logins = [
+            ceremonies.begin(login_from(0), OLD).unwrap(),
+            ceremonies.begin(login_from(1), NOW).unwrap(),
+        ];
         assert_eq!(ceremonies.len(), 4);
         assert!(ceremonies.take(&logins[0], NOW).is_none());
         assert!(ceremonies.take(&logins[1], NOW).is_some());
@@ -786,13 +909,108 @@ mod tests {
         }
     }
 
+    /// A client past its own cap pushes out its own oldest login, never
+    /// another client's.
+    #[test]
+    fn a_clients_logins_push_out_only_its_own() {
+        let ceremonies = Ceremonies::with_capacity(16, 16);
+        let owner = ceremonies.begin(login_from(1), OLD).unwrap();
+        let flood: Vec<String> = (0..MAX_LOGIN_CEREMONIES_PER_CLIENT + 2)
+            .map(|n| {
+                let at = if n < MAX_LOGIN_CEREMONIES_PER_CLIENT { OLD } else { NOW };
+                ceremonies.begin(login_from(2), at).unwrap()
+            })
+            .collect();
+        assert!(
+            ceremonies.take(&owner, NOW).is_some(),
+            "another client's start pushed it out"
+        );
+        assert!(ceremonies.take(&flood[0], NOW).is_none());
+        assert!(ceremonies.take(&flood[1], NOW).is_none());
+        for id in &flood[2..] {
+            assert!(ceremonies.take(id, NOW).is_some());
+        }
+    }
+
+    /// A full pool of young logins refuses a new one rather than end the
+    /// owner's under way, and the refusal changes nothing; once the oldest
+    /// is past `PROTECTED_CEREMONY_SECS` it goes for the next start.
+    #[test]
+    fn a_young_login_is_never_pushed_out_for_another_clients() {
+        let ceremonies = Ceremonies::with_capacity(3, 3);
+        let owner = ceremonies.begin(login_from(1), NOW).unwrap();
+        let flood: Vec<String> = (2..4).map(|n| ceremonies.begin(login_from(n), NOW).unwrap()).collect();
+        assert!(!ceremonies.login_has_room(IpAddr::from([192, 0, 2, 9]), NOW));
+        assert!(ceremonies.begin(login_from(9), NOW).is_none());
+        assert_eq!(ceremonies.len(), 3);
+        assert!(
+            ceremonies
+                .begin(login_from(9), NOW + PROTECTED_CEREMONY_SECS - 1)
+                .is_none()
+        );
+        // A pool full of one client's logins: neither it nor another has
+        // room while they are young, and both have once they are old.
+        let full = Ceremonies::with_capacity(MAX_LOGIN_CEREMONIES_PER_CLIENT, 1);
+        for _ in 0..MAX_LOGIN_CEREMONIES_PER_CLIENT {
+            full.begin(login_from(5), OLD).unwrap();
+        }
+        for n in [5, 6] {
+            assert!(!full.login_has_room(IpAddr::from([192, 0, 2, n]), OLD));
+            assert!(full.login_has_room(IpAddr::from([192, 0, 2, n]), NOW));
+        }
+
+        let later = NOW + PROTECTED_CEREMONY_SECS;
+        assert!(ceremonies.login_has_room(IpAddr::from([192, 0, 2, 9]), later));
+        let new = ceremonies.begin(login_from(9), later).unwrap();
+        assert!(ceremonies.take(&owner, later).is_none());
+        for id in flood.iter().chain([&new]) {
+            assert!(ceremonies.take(id, later).is_some());
+        }
+    }
+
+    /// Many clients can share one key (a proxy that names none, from a
+    /// container network): at its cap, the key's own young login is not
+    /// pushed out either. The start is refused, and changes nothing.
+    #[test]
+    fn a_young_login_is_not_pushed_out_for_its_own_clients_next_one() {
+        let ceremonies = Ceremonies::with_capacity(64, 1);
+        let owner = ceremonies.begin(login_from(7), NOW).unwrap();
+        for _ in 1..MAX_LOGIN_CEREMONIES_PER_CLIENT {
+            ceremonies.begin(login_from(7), NOW).unwrap();
+        }
+        assert!(!ceremonies.login_has_room(IpAddr::from([192, 0, 2, 7]), NOW));
+        assert!(ceremonies.begin(login_from(7), NOW).is_none());
+        assert_eq!(ceremonies.len(), MAX_LOGIN_CEREMONIES_PER_CLIENT);
+        let later = NOW + PROTECTED_CEREMONY_SECS;
+        ceremonies.begin(login_from(7), later).unwrap();
+        assert!(ceremonies.take(&owner, later).is_none());
+    }
+
+    /// Loopback may be every client behind a proxy that names none: it has
+    /// no cap of its own, so one client there cannot push out another's
+    /// login with a few starts.
+    #[test]
+    fn loopback_logins_have_no_cap_of_their_own() {
+        let ceremonies = Ceremonies::with_capacity(16, 1);
+        let loopback = |state| Ceremony::Login {
+            client: IpAddr::from([127, 0, 0, 1]),
+            state,
+        };
+        let state = || rp().start_passkey_authentication(&[]).unwrap().1;
+        let owner = ceremonies.begin(loopback(state()), NOW).unwrap();
+        for _ in 0..MAX_LOGIN_CEREMONIES_PER_CLIENT + 2 {
+            ceremonies.begin(loopback(state()), NOW).unwrap();
+        }
+        assert!(ceremonies.take(&owner, NOW).is_some());
+    }
+
     #[test]
     fn clear_drops_every_ceremony() {
         let ceremonies = Ceremonies::default();
         let ids = [
-            ceremonies.begin(login(), NOW),
-            ceremonies.begin(register("s1"), NOW),
-            ceremonies.begin(step_up("s1"), NOW),
+            ceremonies.begin(login(), NOW).unwrap(),
+            ceremonies.begin(register("s1"), NOW).unwrap(),
+            ceremonies.begin(step_up("s1"), NOW).unwrap(),
         ];
         ceremonies.clear();
         assert!(ceremonies.is_empty());

@@ -313,12 +313,18 @@ async fn a_change_ends_every_session_stream_subscription_and_ceremony() {
     c.subscribe(&other, "https://fcm.googleapis.com/fcm/send/other").await;
     let stream = c.stream(&other).await;
     assert!(matches!(
-        c.state.operator.start_passkey_login(unix_now()).unwrap(),
+        c.state
+            .operator
+            .start_passkey_login(std::net::Ipv4Addr::LOCALHOST.into(), unix_now())
+            .unwrap(),
         Start::NoPasskeys
     ));
     c.register(&other, "laptop");
     assert!(matches!(
-        c.state.operator.start_passkey_login(unix_now()).unwrap(),
+        c.state
+            .operator
+            .start_passkey_login(std::net::Ipv4Addr::LOCALHOST.into(), unix_now())
+            .unwrap(),
         Start::Begun { .. }
     ));
     assert!(!c.state.operator.ceremonies.is_empty());
@@ -710,7 +716,10 @@ async fn the_api_and_the_admin_socket_leave_the_same_state() {
         let mut announced = Vec::new();
         for c in [&api, &admin] {
             assert!(matches!(
-                c.state.operator.start_passkey_login(unix_now()).unwrap(),
+                c.state
+                    .operator
+                    .start_passkey_login(std::net::Ipv4Addr::LOCALHOST.into(), unix_now())
+                    .unwrap(),
                 Start::Begun { .. }
             ));
             let mut ends = c.state.operator.session_ends();

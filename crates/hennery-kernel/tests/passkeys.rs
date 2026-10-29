@@ -15,6 +15,8 @@ use webauthn_rs::prelude::{
 const NOW: i64 = 1_800_000_000;
 const PASSWORD: &str = "correct horse battery";
 const PUBLIC_URL: &str = "https://hennery.example";
+/// The address passkey logins start from.
+const CLIENT: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
 
 /// Another owner, written straight into the database (none exists in v1),
 /// created later than any real clock reaches (plan 3b-iii decision 3).
@@ -455,7 +457,7 @@ fn begin_login(
     origin: &str,
     now: i64,
 ) -> (String, serde_json::Value) {
-    let Start::Begun { ceremony_id, options } = op.start_passkey_login(now).unwrap() else {
+    let Start::Begun { ceremony_id, options } = op.start_passkey_login(CLIENT, now).unwrap() else {
         panic!("the login did not begin");
     };
     // 3c review, O2: user verification is required.
@@ -681,7 +683,7 @@ fn an_answer_without_user_verification_is_refused() {
     let Start::Begun {
         ceremony_id,
         mut options,
-    } = op.start_passkey_login(NOW).unwrap()
+    } = op.start_passkey_login(CLIENT, NOW).unwrap()
     else {
         panic!("the login did not begin");
     };
@@ -788,9 +790,9 @@ fn a_passkey_removed_during_its_ceremony_is_refused() {
 #[test]
 fn without_a_passkey_there_is_nothing_to_sign_in_with() {
     let op = Operator::open_in_memory().unwrap();
-    assert_eq!(op.start_passkey_login(NOW).unwrap(), Start::Unavailable);
+    assert_eq!(op.start_passkey_login(CLIENT, NOW).unwrap(), Start::Unavailable);
     let session_id = set_up(&op, PUBLIC_URL);
-    assert_eq!(op.start_passkey_login(NOW).unwrap(), Start::NoPasskeys);
+    assert_eq!(op.start_passkey_login(CLIENT, NOW).unwrap(), Start::NoPasskeys);
     assert_eq!(op.start_passkey_step_up(&session_id, NOW).unwrap(), Start::NoPasskeys);
     assert!(op.ceremonies.is_empty());
 }
@@ -822,7 +824,7 @@ fn another_owners_passkey_signs_nobody_in() {
         op.finish_passkey_login(&begun_before, &assertion, "", NOW).unwrap(),
         Err(Refused::Passkey)
     );
-    let Start::Begun { options, .. } = op.start_passkey_login(NOW).unwrap() else {
+    let Start::Begun { options, .. } = op.start_passkey_login(CLIENT, NOW).unwrap() else {
         panic!("the login did not begin");
     };
     assert_eq!(options["publicKey"]["allowCredentials"].as_array().unwrap().len(), 1);
@@ -853,7 +855,7 @@ fn moving_public_url_to_another_host_removes_the_passkeys() {
         op.finish_passkey_login(&ceremony_id, &assertion, "", NOW).unwrap(),
         Err(Refused::Ceremony)
     );
-    assert_eq!(op.start_passkey_login(NOW).unwrap(), Start::NoPasskeys);
+    assert_eq!(op.start_passkey_login(CLIENT, NOW).unwrap(), Start::NoPasskeys);
 }
 
 /// Decision 9 (an amendment to kernel spec §3.2): a move to another port
@@ -913,7 +915,7 @@ fn moving_public_url_to_an_ip_address_removes_the_passkeys() {
             passkeys_removed: 1
         }
     );
-    assert_eq!(op.start_passkey_login(NOW).unwrap(), Start::Unavailable);
+    assert_eq!(op.start_passkey_login(CLIENT, NOW).unwrap(), Start::Unavailable);
 }
 
 /// Decision 2 (3c review, A1): a password reset, the admin socket's
@@ -941,5 +943,5 @@ async fn a_password_reset_removes_the_passkeys() {
         op.finish_passkey_login(&ceremony_id, &assertion, "", NOW).unwrap(),
         Err(Refused::Ceremony)
     );
-    assert_eq!(op.start_passkey_login(NOW).unwrap(), Start::NoPasskeys);
+    assert_eq!(op.start_passkey_login(CLIENT, NOW).unwrap(), Start::NoPasskeys);
 }

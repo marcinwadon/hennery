@@ -204,9 +204,15 @@ frontend), and `SetupRequest` has no default hat name; hats add it.
     single use (a finish takes it, whatever it then finds), 5 minutes, bound
     to the session that began it (registration, step-up), at most one per
     session and kind. Login ceremonies have a pool of their own, so a flood of
-    login starts never pushes out a registration or a step-up. A restart
-    drops them. An unknown, used or expired ceremony answers 400
-    `invalid_ceremony`.
+    login starts never pushes out a registration or a step-up. Within it, a
+    client (its rate-limit key) keeps at most eight; its next start pushes
+    out its own oldest. Loopback has no such cap, since behind a proxy that
+    names no client it is everyone. Past either cap, a login goes only once
+    it is a minute old, even for its own client's next (clients can share a
+    key); while it is younger, a start answers 503 `auth_busy` with
+    `Retry-After: 1`, before it counts against the passkey budget, so a
+    flood can delay a new login but not end one under way. A restart drops them. An unknown, used or expired
+    ceremony answers 400 `invalid_ceremony`.
   - Several passkeys per owner, each with a label (1–64 characters, no control
     characters) and last-used time, listed in registration order. In v1
     passkeys add to the password and never replace it, so every passkey is
