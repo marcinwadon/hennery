@@ -1,180 +1,232 @@
-# External session MCP: scoped read foundation
+# Public external session MCP: OAuth read foundation
 
-This first implementation exposes external **discovery and session metadata**.
-It does not execute agents. Create/prompt, durable operation recovery, transcript
-reads/waits, targeted cancellation and lifecycle/ordinary-answer tools remain
-subsequent slices. Existing operator REST, delegated agent tokens and plug-in
-activity credentials do not authenticate this endpoint.
+The primary integration is a public HTTPS Streamable HTTP endpoint used directly
+by Claude Desktop and other remote MCP clients. A desktop bridge is optional.
+This first slice exposes discovery and session metadata. Create/prompt, durable
+operation recovery, transcript reads/waits, targeted cancellation and
+lifecycle/ordinary-answer tools remain subsequent slices.
 
-## Desktop connection decision (2026-10-29)
+Public deployment support does not mean this change exposes an existing
+collector. No live service, Desktop account/configuration, DNS or firewall was
+changed. The public deployment and real Desktop acceptance gates below remain
+explicitly separate from automated isolated tests.
 
-Claude Desktop is the first real acceptance client. A CLI or protocol fixture
-is not Desktop acceptance. The initial dependable path is a local stdio bridge
-using the same authenticated collector HTTP endpoint as other clients. The bridge
-connects from the user's machine and can reach a collector on its private LAN.
+## Transport and authorization
 
-Official documentation says remote connectors originate from Anthropic's cloud,
-including when configured in Desktop. They require a publicly reachable server;
-being reachable from the user's machine is insufficient. This makes local stdio
-the initial private-LAN setup. The existing production collector does not need
-to become public for this setup.
+Use `https://hennery.example/mcp/external/hennery`. The collector serves
+Streamable HTTP with single JSON responses, no required MCP session ID and no
+persistent GET stream (authenticated GET/DELETE return 405). It supports the
+negotiated `2025-11-25`, `2025-06-18` and `2025-03-26` profiles. It does not claim
+the newer 2026 transport's handshake-free metadata semantics. An unsupported
+offered version negotiates the supported profile; unsupported version headers
+are rejected. Present Origin must equal the configured collector origin.
 
-Current help documents fixed request headers (including API keys and bearer
-tokens) alongside OAuth. Direct remote HTTP remains an option for a separately
-provisioned publicly reachable deployment using the same scoped credential and
-endpoint. Incoming OAuth is not implemented or required for the local bridge.
-Check the installed client's available setup flow before claiming compatibility.
+Current MCP authorization guidance and Claude's remote OAuth requirements
+informed the authorization path:
+
+- Unauthenticated calls return 401 with a Bearer `resource_metadata` challenge.
+  Protected-resource metadata includes the exact MCP URL and one issuer.
+- The authorization server advertises S256 PKCE, public-client authentication
+  (`none`), authorization code and refresh grants, CIMD and a DCR fallback.
+- The canonical resource is mandatory at authorization and token exchange.
+  A token for another resource, an operator cookie or a delegation token cannot
+  authenticate an OAuth external call.
+- Invalid or expired authority returns 401. A read needing a scope the operator
+  withheld returns 403 with an insufficient-scope challenge; it does not widen
+  the grant.
+- Consent returns `iss` and the original `state` to the validated callback.
+  Codes are bound to the client, exact callback, resource and S256 verifier.
+- Refresh tokens rotate. Reuse of a spent code or refresh token revokes that
+  grant's family. Clients must serialize refresh; an uncertain refresh response
+  can require reconnecting through consent.
+
+The public metadata and OAuth paths are:
+
+| Path | Purpose |
+| --- | --- |
+| `/.well-known/oauth-protected-resource/mcp/external/hennery` | Resource discovery; root well-known is also served. |
+| `/.well-known/oauth-authorization-server` | Issuer and OAuth endpoint/capability discovery. |
+| `/oauth/external/register` | JSON DCR for public clients, with `token_endpoint_auth_method: "none"`. |
+| `/oauth/external/authorize` | Validate client, callback, scope, resource and PKCE; open Hennery consent. |
+| `/oauth/external/token` | Form-urlencoded authorization-code exchange or refresh. |
+| `/oauth/external/revoke` | Form-urlencoded token revocation; unknown tokens return success. |
+
+CIMD client IDs are HTTPS metadata-document URLs with a path. The document's
+`client_id` must match exactly and its declared callback must match the request.
+Only public clients using `none` are supported in this slice; client secrets and
+`private_key_jwt` are not advertised or silently downgraded. Metadata is fetched
+for each new authorization through the existing public-only egress policy:
+no redirects, environment proxy or private/mixed DNS results; five-second
+deadline and 32 KiB body cap. No logo or secondary metadata URL is fetched.
+CIMD caching is deferred. DCR provides compatibility for clients without CIMD.
+Unused registrations expire after ten minutes; explicit consent extends them to
+30 days, independently of already-consented grants. Anonymous registration
+cannot reserve the bounded registry for a month without user consent.
+
+Requests to the public OAuth flow are limited per attributed network address,
+with global concurrency and stored registration/pending-request caps. These
+application limits complement the reverse proxy's TLS/socket/request limits.
+Discovery is available without cookies. Consent and grant management require
+the existing operator login and same-origin browser rules.
 
 Sources checked on 2026-10-29:
 
+- [MCP authorization](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization).
+- [Client registration and CIMD](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/client-registration).
+- [Authorization discovery](https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization/authorization-server-discovery).
+- [Supported Streamable HTTP profile](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports).
+- [Claude's remote authentication requirements](https://claude.com/docs/connectors/building/authentication).
+- [Claude connector setup](https://support.claude.com/en/articles/11176164-use-connectors-to-extend-claude-s-capabilities).
 - [Remote connector network requirements](https://support.claude.com/en/articles/11175166-get-started-with-custom-connectors-using-remote-mcp).
-- [Current connector authentication choices](https://support.claude.com/en/articles/11176164-use-connectors-to-extend-claude-s-capabilities).
-- [Desktop local servers, binary extensions and sensitive configuration](https://support.claude.com/en/articles/10949351-getting-started-with-local-mcp-servers-on-claude-desktop).
-- [Manual Desktop local-server configuration](https://modelcontextprotocol.io/docs/develop/connect-local-servers).
 
-No real Desktop account, configuration or production service was changed during
-implementation. Follow the manual acceptance below in a deliberately provisioned
-scratch setup before claiming Desktop support verified.
+## Consent, identity and revocation
 
-## Identity and provisioning
+An OAuth application is distinct from both the operator and a delegated agent.
+It never receives the operator's cookie or an agent's delegation token.
+The browser uses Hennery's existing password/passkey login and step-up UI;
+the external client does not collect those credentials.
 
-The operator issues a separate external client through:
+Consent shows the untrusted application name, client ID, exact callback and
+callback host, with a loopback warning where relevant. Nothing is granted by
+visiting a link or by discovering/registering a client. The operator must choose
+a hat, host, canonical root and expiry, then explicitly allow. The current
+screen selects one host/root pair per connection; the operator API can issue
+multiple pairs. Existing-session access is unchecked by default and needs its
+own explicit choice within the selected boundaries. Denial issues no grant.
 
-- `GET /api/external-clients`: list grants, never credentials or credential hashes.
-- `POST /api/external-clients`: operator session and fresh step-up required.
-- `DELETE /api/external-clients/{id}`: operator session and fresh step-up required;
-  revocation is permanent for this credential and does not reopen old work.
+Issuance checks owner/hat/purge, paired non-revoked hosts and server path-rule
+resolution in the same transaction as code admission. It does not verify the
+remote filesystem's realpath: that is required before future execution tools.
+Filters and cursors only narrow access. Path segments are checked, so
+`/workspace/demo-other` is outside `/workspace/demo`.
 
-For example, after signing in and completing an existing password/passkey check,
-the operator can submit this JSON through the authenticated same-origin API:
+The default created-by-client scope returns no existing sessions. This slice has
+no create/adopt operation. Metadata permission is separate from discovery;
+a client cannot widen it through arguments, protocol metadata or a scope string.
+Permissions requested by agents remain operator UI decisions. No external
+permission-approval authority is introduced.
 
-```json
-{
-  "label": "Desktop scratch",
-  "hat_id": "HAT_ID",
-  "roots": [{ "host_id": "HOST_ID", "root": "/workspace/demo" }],
-  "read_metadata": true,
-  "existing_sessions": false,
-  "expires_in_days": 7
-}
-```
+Each consent creates an expiring, separately revocable external grant. The
+operator can list/revoke it at `/external-mcp`, linked from Settings. Management
+API `GET/POST /api/external-clients` and `DELETE /api/external-clients/{id}` also
+remain available; issuing/revoking needs fresh step-up. Manual static credentials
+are an optional alternative, not the primary Desktop setup.
+Grant management pages load at most 100 records at once, with an ID continuation
+cursor and an explicit Load more control; old grants remain reachable for revocation.
 
-The response contains `client` and a token shown once. Save the token to a
-same-user regular file with mode `0600`; do not put it into URLs, command-line
-arguments, shared Desktop settings or logs. The store keeps only its hash.
-Expiry is explicit, from one to 90 days. Issuance checks hat ownership/purge,
-paired active hosts, canonical root syntax and server path-rule resolution.
-Actual host realpath/workspace/source-policy checks are required again before
-execution tools can be introduced; this slice reads metadata, not files.
+The store keeps code/access/refresh hashes. Consent expires after ten minutes,
+a code after one minute, and an access token after at most fifteen minutes.
+The refresh family expires with the chosen one-to-90-day grant. Refresh replaces
+the previous access token too. Cached principals are revalidated at the database
+gate and before publishing collected results; expiration, grant revocation,
+hat purge and host revocation cannot be bypassed by reconnecting or replaying.
 
-A client is bound to one hat and explicit host/root pairs. Discovery is always
-available in those pairs. Metadata permission is separate, and existing-session
-access is an additional explicit grant. The default created-by-client selection
-returns no existing sessions; this first slice has no create/adopt operation.
-Filters and cursors can only narrow scope. Root checks use path segments, so
-`/workspace/demo-other` is outside `/workspace/demo`. Credentials cannot assert
-an owner, bypass source policy or impersonate an operator or delegated parent.
-
-Every request rechecks expiration/revocation and hat purge. Metadata queries
-also check host revocation and the current stored session hat. Cached principals
-are revalidated at the database gate and before publishing collected results.
-Token rotation, grant editing, quotas for execution and durable write admission
-are future work; revoke and issue a separately reviewed grant in this slice.
-
-## HTTP and stdio
-
-The endpoint is `POST /mcp/external/hennery`, with:
-
-```text
-Authorization: Bearer EXTERNAL_CLIENT_TOKEN
-Content-Type: application/json
-Accept: application/json, text/event-stream
-```
-
-It implements stateless MCP profiles `2025-11-25`, `2025-06-18` and `2025-03-26`,
-with JSON responses, no required MCP session ID and no persistent GET stream.
-An unsupported offered version receives the supported version during initialize;
-the client must accept that negotiated profile. Present Origin must match the
-collector's public origin. Cookies alone never authenticate this endpoint.
-Responses are private/no-store. Bodies, response sizes and concurrent requests
-are bounded. No incoming OAuth or claim of the latest protocol is made.
-
-Tools in this slice:
+## Read tools
 
 | Tool | Result |
 | --- | --- |
-| `hennery_capabilities` | Client scope/revision, expiry, limits and explicit execution=false. |
-| `host_list` | Granted host IDs/names, connectivity and currently connected runtime IDs. |
-| `workspace_list(host_id)` | Explicitly granted roots only; no arbitrary browsing or recents. |
-| `session_list(after?, limit?)` | Scoped metadata, at most 50 rows and an ID continuation cursor. |
-| `session_get(session_id)` | One authorized metadata record; out-of-scope and missing both report not_found. |
+| `hennery_capabilities` | Scope/revision/expiry/limits and explicit `execution=false`. |
+| `host_list` | Granted hosts, connectivity and currently connected runtime IDs. |
+| `workspace_list(host_id)` | Explicitly granted roots, no arbitrary browsing. |
+| `session_list(after?, limit?)` | Scoped metadata, at most 50 rows, ID continuation cursor. |
+| `session_get(session_id)` | One authorized metadata record; missing and out-of-scope both report not_found. |
 
 Session tools require metadata permission. Reads do not acknowledge unseen or
-needs-you state. No transcript, prompt content, permission options, credential
-or connection administration is exposed. Session pagination is an eventual
-metadata listing, not a transcript snapshot/delta cursor.
+needs-you state. No transcript, prompt content, permission options, credentials
+or connection administration is exposed. A session listing is eventual metadata,
+not a transcript snapshot/delta cursor. Responses are no-store, bodies/results
+are bounded, and consent/management pages are excluded from PWA cache/reload
+navigation.
 
-For a Desktop local MCP entry, merge an entry such as this into the existing
-configuration using the manual local-server configuration flow supported by the
-installed Desktop version. Current help locates local server status/logs under
-Settings > Desktop app > Extensions > Manage > Local MCP servers; older layouts
-use Settings > Developer > This computer and Edit Config. Use absolute paths;
-do not replace other entries. Confirm the available configuration flow locally.
-The example is a configuration template, not a command executed by this work:
+## Public HTTPS deployment recipe
 
-```json
-{
-  "mcpServers": {
-    "hennery": {
-      "command": "/absolute/path/to/hennery",
-      "args": [
-        "external-mcp",
-        "--url", "https://collector.example/mcp/external/hennery",
-        "--token-file", "/absolute/private/path/hennery-external.token"
-      ]
-    }
-  }
-}
+Provision a separate deployment deliberately. Reuse the tested
+[HTTPS/WSS proxy recipes](../../packaging/proxy/README.md) and the
+[collector-on-a-server setup](../../README.md#collector-on-a-vmserver-behind-caddy).
+Use a real public DNS name and publicly trusted TLS chain; a host's private CA
+does not configure Anthropic's cloud trust.
+
+For a new deployment, the collector's private backend configuration is:
+
+```toml
+listen = ["127.0.0.1:7117"]
+public_url = "https://hennery.example"
+proxy_client_ip_peers = ["127.0.0.1"]
 ```
 
-The bridge uses TLS and refuses redirects, URL credentials and arbitrary API
-paths. Plain HTTP is allowed only for loopback scratch tests. It emits only
-JSON-RPC lines on stdout; notifications do not produce fake responses. It reads
-no collector database and borrows no cookie. Other stdio clients can run the
-same command. Packaging as a Desktop extension can follow independently. Current
-help supports binary extensions; a future extension manifest must mark secret
-configuration fields `sensitive: true` for OS secure storage. That packaging is
-not implemented here; this bridge uses the private token file described above.
+Terminate TLS at the same-machine Caddy/nginx proxy, forwarding to that loopback
+listener. Replace all placeholders in the existing template with deployment
+values. The templates preserve Host/Origin/Authorization, forward all required
+paths, disable retries/caches and attribute the exact client address. Keep the
+backend and proxy administration listener private. Configure/test edge limits;
+Caddy core needs a separately qualified ingress limiter.
 
-## Acceptance and next slices
+Do not add proxy Basic authentication or an interactive WAF challenge in front
+of discovery, registration, authorization, token or MCP endpoints. Hennery's
+OAuth challenge and browser login must be reachable. Do not strip
+`WWW-Authenticate`, rewrite the issuer/resource host/path or log request bodies
+and token/code-bearing query strings. The supplied recipes disable access logs.
+The whole origin is served; path-prefix relocation is not supported.
 
-Automated scope/protocol/bridge checks are separate from these **pending manual
-Desktop checks**:
+First setup must store the final HTTPS `public_url`; passing a flag on an
+already-set-up collector does not migrate its identity. Follow the existing
+admin/public-URL change procedure deliberately for migrations. This work did
+not perform that procedure on any existing service.
 
-1. Record the installed Desktop version and verify its supported local-server
-   setup, organization policy and status/logs view. Use an isolated collector
-   reachable from that machine and a deliberately issued scratch credential.
-   Start the bridge through Desktop; confirm its connection and tool schemas.
-2. Ask Desktop to list the authorized host/root and report the client's scope.
-   Check that it explains execution is unavailable in this first slice.
-3. With the default grant, confirm existing sessions are absent. With a separate
-   explicit existing-session grant, read an allowed metadata record and verify
-   another hat/root/session remains inaccessible.
-4. Revoke the credential while Desktop remains connected. The next call must
-   fail; reconnecting or reinitializing must not restore access.
-5. Record Desktop version, offered/negotiated MCP version, observed tool calls
-   and result. Do not copy credentials or private transcript data into evidence.
+Check the deployment from outside its network: TLS verification, 401 challenge,
+both discovery documents, authorization/login, token refresh and scoped MCP.
+Claude remote connections originate from Anthropic's cloud even on Desktop.
+A private DNS name, localhost certificate or successful laptop request does not
+prove Anthropic reachability. Preserve the existing
+[public deployment gate](../../packaging/proxy/README.md#public-deployment-gate).
 
-The first execution acceptance remains pending until later slices provide:
+## Direct Claude Desktop acceptance
+
+In the installed client's custom connector setup, enter the public MCP HTTPS
+URL directly and choose OAuth sign-in. Use Claude's published identity when
+available (CIMD); the server advertises both required CIMD settings. Automatic
+registration (DCR) is a fallback. Do not require an installed bridge, shared
+static header or an inbound OAuth client secret.
+
+Acceptance remains pending until performed in an intentionally provisioned
+public scratch deployment:
+
+1. Record Desktop version, account/setup options, public origin, proxy version,
+   valid TLS chain and external reachability. No private account details or
+   credentials belong in evidence.
+2. Add the URL directly. Verify 401/discovery, browser login/passkey or password,
+   visible callback identity and explicit hat/host/root/expiry consent. Returning
+   to the client must succeed. Verify Deny creates no grant.
+3. Read the authorized host/root. Confirm created-only access excludes existing
+   sessions; a separate explicitly selected existing-session grant permits only
+   the chosen boundaries. Other hat/host/root/session IDs remain denied.
+4. Observe a refresh and a reconnect. Revoke in Hennery while the client is
+   connected; subsequent reads and refresh must fail. A new consent is required.
+5. Record offered/negotiated protocol versions, actual tool calls and results.
+   Protocol fixtures or inventory of an installed app are not Desktop acceptance.
+
+Automated tests exercise the real HTTP handlers, durable store/reopen,
+PKCE/audience/callback/scope/replay/expiry/revocation guards, actual TLS through
+both shipped reverse proxies, and browser login/consent/revocation in isolated
+HTTPS fixtures. Fixture CA trust is confined to test clients. These tests do
+not establish public Internet reachability or a live Claude connection.
+
+The existing `hennery external-mcp` stdio bridge remains optional and uses the
+same scoped HTTP adapter. Local extension packaging is deferred. The primary
+integration and acceptance above require no desktop binary.
+
+## Next execution slices
+
+Before exposing writes, add server-written ExternalClient provenance and durable
+request admission/operation recovery. Reuse the prompt receipt/status projection
+and current prompt dedupe/queue. Keep the original receipt immutable and derive
+queue-to-turn/outcome status from source data. An unknown receipt after retention
+expiry does not mean the request was never admitted. Then validate:
 create -> prompt -> lost response/disconnect -> operation_get -> wait/read of
-that same operation, without duplicate agent execution. Before exposing writes,
-add server-written ExternalClient provenance, durable client request admission
-and retained receipt/tombstone semantics, grant checks at dispatch/auto-resume,
-and server-resolved per-(hat, actual ACP) source policy with truthful applied
-attach evidence. Reconcile the accepted prompt-status foundation onto current
-main when this resolver is needed; do not add a second prompt dedupe queue.
+the same operation without duplicate execution.
 
-Then add exact-turn cancellation, explicit park/resume/close and ordinary
-elicitation answers. Permission requests remain operator UI actions, and reads
-never grant approval. Attachments, post-start configuration, incoming OAuth and
-additional protocol profiles are outside this first slice.
+Apply grants again at dispatch/auto-resume and resolve per-(hat, actual ACP)
+source policy on the server, with truthful applied attach evidence. Follow with
+exact-turn cancellation, explicit park/resume/close and ordinary elicitation
+answers. Permission approvals stay in Hennery's operator UI. Attachments and
+post-start configuration remain outside this first slice.

@@ -5,11 +5,11 @@ use crate::{
     external_clients::{ExternalIdentity, NewClient},
 };
 use axum::handler::Handler;
-use axum::http::{Method, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::{
     Json, Router,
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     middleware,
     routing::{any, delete, get},
 };
@@ -44,16 +44,29 @@ pub fn router(state: AppState) -> Router {
                 .with_state(state),
         )
 }
-async fn list(State(state): State<AppState>) -> Response {
-    match state.store.external_clients() {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GrantPage {
+    #[serde(default)]
+    after: String,
+}
+async fn list(State(state): State<AppState>, Query(page): Query<GrantPage>) -> Response {
+    match state.store.external_clients_after(&page.after) {
         Ok(rows) => private(Json(rows)),
+        Err(e) if e.to_string() == "invalid_arguments" => {
+            crate::api::error(StatusCode::BAD_REQUEST, "invalid_arguments", "invalid cursor")
+        }
         Err(e) => crate::api::internal(e),
     }
 }
 async fn issue(
     State(state): State<AppState>,
+    headers: HeaderMap,
     hennery_kernel::json::ApiJson(input): hennery_kernel::json::ApiJson<NewClient>,
 ) -> Response {
+    if let Err(response) = crate::external_oauth::fresh_operator(&state, &headers) {
+        return *response;
+    }
     match state.store.issue_external_client(&input) {
         Ok((client, token)) => private((StatusCode::CREATED, Json(json!({"client":client,"token":token})))),
         Err(e) if e.to_string() == "invalid_grant" => crate::api::error(
@@ -198,19 +211,6 @@ async fn endpoint(State(state): State<AppState>, req: Request) -> Response {
         return private(StatusCode::TOO_MANY_REQUESTS);
     };
     let headers = req.headers();
-    let mut auth = headers.get_all(header::AUTHORIZATION).iter();
-    let token = auth
-        .next()
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    if auth.next().is_some() {
-        return private(StatusCode::UNAUTHORIZED);
-    }
-    let identity = match token.map(|t| state.store.authenticate_external(t)) {
-        Some(Ok(Some(i))) => i,
-        Some(Err(e)) => return crate::api::internal(e),
-        _ => return private(StatusCode::UNAUTHORIZED),
-    };
     if let Some(origin) = headers.get(header::ORIGIN)
         && (headers.get_all(header::ORIGIN).iter().count() != 1
             || !state
@@ -220,8 +220,30 @@ async fn endpoint(State(state): State<AppState>, req: Request) -> Response {
     {
         return private(StatusCode::FORBIDDEN);
     }
+    let mut auth = headers.get_all(header::AUTHORIZATION).iter();
+    let token = auth
+        .next()
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "));
+    if auth.next().is_some() {
+        return crate::external_oauth::challenge(&state);
+    }
+    let resource = state
+        .operator
+        .public_url()
+        .map(|p| format!("{}/mcp/external/hennery", p.origin()))
+        .unwrap_or_default();
+    let identity = match token.map(|t| state.store.authenticate_external_resource(t, &resource)) {
+        Some(Ok(Some(i))) => i,
+        Some(Err(e)) => return crate::api::internal(e),
+        _ => return crate::external_oauth::challenge(&state),
+    };
     if req.method() != Method::POST {
-        return private(StatusCode::METHOD_NOT_ALLOWED);
+        let mut response = private(StatusCode::METHOD_NOT_ALLOWED);
+        response
+            .headers_mut()
+            .insert(header::ALLOW, header::HeaderValue::from_static("POST"));
+        return response;
     }
     if !headers
         .get(header::CONTENT_TYPE)
@@ -248,7 +270,7 @@ async fn endpoint(State(state): State<AppState>, req: Request) -> Response {
     };
     let id = request.get("id").cloned().unwrap_or(Value::Null);
     if state.store.external_roots(&identity).is_err() {
-        return private(StatusCode::UNAUTHORIZED);
+        return crate::external_oauth::challenge(&state);
     }
     if !request.is_object()
         || request.get("jsonrpc") != Some(&json!("2.0"))
@@ -288,11 +310,11 @@ async fn endpoint(State(state): State<AppState>, req: Request) -> Response {
                     id,
                     json!({"content":[{"type":"text","text":serde_json::to_string(&data).expect("JSON value")}],"structuredContent":data,"isError":false}),
                 ),
+                Err(e) if e.to_string() == "external_unauthenticated" => crate::external_oauth::challenge(&state),
+                Err(e) if e.to_string() == "external_forbidden" => crate::external_oauth::insufficient_scope(&state),
                 Err(e) => {
                     let code = match e.to_string().as_str() {
                         "invalid_arguments" => "invalid_arguments",
-                        "external_unauthenticated" => "unauthenticated",
-                        "external_forbidden" => "forbidden",
                         "not_found" => "not_found",
                         "unknown_tool" => "unknown_tool",
                         _ => "internal_error",

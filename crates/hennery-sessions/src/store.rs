@@ -464,6 +464,7 @@ END;",
     // without creating attention or forgetting a prior transcript read.
     include_str!("review_child_backfill.sql"),
     include_str!("external_clients.sql"),
+    include_str!("external_oauth.sql"),
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records

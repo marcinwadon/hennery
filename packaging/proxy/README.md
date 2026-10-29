@@ -70,6 +70,15 @@ trusted VPN population.
 
 ## Public deployment gate
 
+For the external session MCP endpoint, follow the [public OAuth setup and direct
+Desktop acceptance](../../docs/specs/2026-10-29-external-session-mcp.md). Forward
+the whole origin, including "/.well-known/", "/oauth/external/", operator consent
+and "/mcp/external/hennery". Keep OAuth discovery/challenges visible rather than
+adding proxy Basic authentication or an interactive WAF login. Preserve
+Authorization and WWW-Authenticate, and leave access/body logs disabled so
+codes and tokens are not recorded. These templates already forward the paths;
+no desktop bridge is required for a public deployment.
+
 Fixture gates run through plain `nix develop -c`: the `client_address` kernel
 suite, `proxy_attribution` and `reverse_proxy` testkit suites, and the binary's
 `deployment` and `readme` suites. CI exposes the flake's Caddy/nginx binaries to

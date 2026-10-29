@@ -1,6 +1,8 @@
 export type RouteName =
   | 'setup'
   | 'login'
+  | 'external_mcp'
+  | 'external_mcp_consent'
   | 'sessions'
   | 'needs-you'
   | 'more'
@@ -22,6 +24,8 @@ export interface Route {
 const STATIC: Record<string, RouteName> = {
   '/setup': 'setup',
   '/login': 'login',
+  '/external-mcp': 'external_mcp',
+  '/external-mcp/consent': 'external_mcp_consent',
   '/sessions': 'sessions',
   '/needs-you': 'needs-you',
   '/more': 'more',
@@ -53,5 +57,5 @@ export function match(pathname: string): Route {
 /** App documents only; API, auth and MCP proxy documents never get replaced. */
 export function updateRoute(pathname: string): boolean {
   if (pathname === '/api' || pathname.startsWith('/api/') || pathname.startsWith('/mcp/')) return false
-  return !['setup', 'login', 'not_found'].includes(match(pathname).name)
+  return !['setup', 'login', 'external_mcp', 'external_mcp_consent', 'not_found'].includes(match(pathname).name)
 }

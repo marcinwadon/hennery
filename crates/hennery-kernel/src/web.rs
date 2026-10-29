@@ -66,7 +66,7 @@ fn serve_assets(method: Method, uri: Uri, headers: HeaderMap, assets: &'static [
             .into_response();
     }
     let index = find("/index.html").expect("the build has an index.html");
-    if is_setup(path) {
+    if is_setup(path) || path == "/external-mcp" || path.starts_with("/external-mcp/") {
         file(index, "no-store", &HeaderMap::new())
     } else {
         file(index, "no-cache", &headers)
@@ -75,7 +75,11 @@ fn serve_assets(method: Method, uri: Uri, headers: HeaderMap, assets: &'static [
 
 /// Paths the app never answers: the API, and the gateway's proxy.
 fn is_reserved(path: &str) -> bool {
-    path == "/api" || path.starts_with("/api/") || path.starts_with("/mcp/")
+    path == "/api"
+        || path.starts_with("/api/")
+        || path.starts_with("/mcp/")
+        || path.starts_with("/oauth/")
+        || path.starts_with("/.well-known/")
 }
 
 /// The page a setup link opens: never cached (kernel spec §3.1).

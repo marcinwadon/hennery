@@ -45,6 +45,7 @@ pub struct ClientRecord {
 pub struct ExternalIdentity {
     owner: String,
     hash: String,
+    oauth_hash: Option<String>,
     pub(crate) client: ClientRecord,
 }
 #[derive(Debug, Clone, Serialize)]
@@ -97,67 +98,28 @@ fn live(conn: &rusqlite::Connection, owner: &str, identity: &ExternalIdentity) -
     }
     Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM external_clients c JOIN hats h ON h.owner_id = c.owner_id AND h.id = c.hat_id
       WHERE c.owner_id = ?1 AND c.id = ?2 AND c.token_hash = ?3 AND c.revision = ?4 AND c.revoked_at IS NULL AND c.expires_at > ?5
-      AND NOT EXISTS(SELECT 1 FROM purged_hats p WHERE p.owner_id = c.owner_id AND p.hat_id = c.hat_id))",
-      params![owner,identity.client.client_id,identity.hash,identity.client.revision,unix_now()], |r|r.get(0))?)
+      AND NOT EXISTS(SELECT 1 FROM purged_hats p WHERE p.owner_id = c.owner_id AND p.hat_id = c.hat_id)
+      AND (?6 IS NULL OR EXISTS(SELECT 1 FROM external_oauth_tokens t WHERE t.owner_id = c.owner_id AND t.grant_id=c.id AND t.access_hash=?6 AND t.access_expires_at>?5)))",
+      params![owner,identity.client.client_id,identity.hash,identity.client.revision,unix_now(),identity.oauth_hash], |r|r.get(0))?)
 }
 impl Store {
     pub fn issue_external_client(&self, input: &NewClient) -> Result<(ClientRecord, String)> {
-        ensure!(
-            !input.label.trim().is_empty() && input.label.len() <= 128 && !input.label.chars().any(char::is_control),
-            "invalid_grant"
-        );
-        ensure!(
-            (1..=90).contains(&input.expires_in_days) && !input.roots.is_empty() && input.roots.len() <= 32,
-            "invalid_grant"
-        );
-        ensure!(!input.existing_sessions || input.read_metadata, "invalid_grant");
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let owner = self.owner_id();
-        let allowed: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM hats h WHERE h.owner_id = ?1 AND h.id = ?2
-          AND NOT EXISTS(SELECT 1 FROM purged_hats p WHERE p.owner_id = h.owner_id AND p.hat_id = h.id))",
-            params![owner, input.hat_id],
-            |r| r.get(0),
-        )?;
-        ensure!(allowed, "invalid_grant");
-        for root in &input.roots {
-            ensure!(
-                root.root.len() <= 4096 && !root.root.chars().any(char::is_control) && is_canonical(&root.root),
-                "invalid_grant"
-            );
-            let known: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM hosts WHERE owner_id = ?1 AND id = ?2 AND revoked_at IS NULL)",
-                params![owner, root.host_id],
-                |r| r.get(0),
-            )?;
-            ensure!(known, "invalid_grant");
-            let resolved = hennery_kernel::hats::session_hat_in(&tx, owner, &root.host_id, &root.root)?;
-            ensure!(
-                matches!(resolved,Some(hennery_kernel::hats::SessionHat::Decided(hat)) if hat.hat_id==input.hat_id),
-                "invalid_grant"
-            );
-        }
-        let id = uuid::Uuid::now_v7().to_string();
-        let token = format!("{TOKEN_PREFIX}{}", hex::encode(random_bytes::<32>()));
-        let expires = unix_now() + i64::from(input.expires_in_days) * 86400;
-        tx.execute("INSERT INTO external_clients(owner_id,id,label,hat_id,token_hash,read_metadata,existing_sessions,revision,expires_at)
-          VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8)",params![owner,id,input.label.trim(),input.hat_id,sha256_hex(token.as_bytes()),input.read_metadata,input.existing_sessions,expires])?;
-        for root in &input.roots {
-            tx.execute(
-                "INSERT OR IGNORE INTO external_client_roots(owner_id,client_id,host_id,root) VALUES(?1,?2,?3,?4)",
-                params![owner, id, root.host_id, root.root],
-            )?;
-        }
-        let client = record(&tx, owner, &id)?.expect("inserted client");
+        let result = issue_in(&tx, self.owner_id(), input)?;
         tx.commit()?;
-        Ok((client, token))
+        Ok(result)
     }
     pub fn external_clients(&self) -> Result<Vec<ClientRecord>> {
+        self.external_clients_after("")
+    }
+    pub fn external_clients_after(&self, after: &str) -> Result<Vec<ClientRecord>> {
+        ensure!(after.len() <= 128, "invalid_arguments");
         let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT id FROM external_clients WHERE owner_id = ?1 ORDER BY id LIMIT 100")?;
+        let mut stmt =
+            conn.prepare("SELECT id FROM external_clients WHERE owner_id = ?1 AND id > ?2 ORDER BY id LIMIT 100")?;
         let ids = stmt
-            .query_map([self.owner_id()], |r| r.get::<_, String>(0))?
+            .query_map(params![self.owner_id(), after], |r| r.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         ids.into_iter()
             .map(|id| record(&conn, self.owner_id(), &id)?.ok_or_else(|| anyhow::anyhow!("missing client")))
@@ -183,7 +145,27 @@ impl Store {
         let identity = ExternalIdentity {
             owner: self.owner_id().into(),
             hash,
+            oauth_hash: None,
             client: record(&conn, self.owner_id(), &id)?.expect("found client"),
+        };
+        Ok(live(&conn, self.owner_id(), &identity)?.then_some(identity))
+    }
+    pub fn authenticate_external_resource(&self, token: &str, resource: &str) -> Result<Option<ExternalIdentity>> {
+        if let Some(identity) = self.authenticate_external(token)? {
+            return Ok(Some(identity));
+        }
+        if !valid_token(token) {
+            return Ok(None);
+        }
+        let conn = self.conn();
+        let hash = sha256_hex(token.as_bytes());
+        let row:Option<(String,String)>=conn.query_row("SELECT t.grant_id,c.token_hash FROM external_oauth_tokens t JOIN external_clients c ON c.owner_id = t.owner_id AND c.id=t.grant_id WHERE t.owner_id = ?1 AND t.access_hash=?2 AND t.resource=?3 AND t.access_expires_at>?4",params![self.owner_id(),hash,resource,unix_now()],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let Some((id, grant_hash)) = row else { return Ok(None) };
+        let identity = ExternalIdentity {
+            owner: self.owner_id().into(),
+            hash: grant_hash,
+            oauth_hash: Some(hash),
+            client: record(&conn, self.owner_id(), &id)?.expect("joined grant"),
         };
         Ok(live(&conn, self.owner_id(), &identity)?.then_some(identity))
     }
@@ -243,6 +225,59 @@ impl Store {
             )?
             .collect::<rusqlite::Result<_>>()?)
     }
+}
+
+pub(crate) fn issue_in(
+    tx: &rusqlite::Transaction<'_>,
+    owner: &str,
+    input: &NewClient,
+) -> Result<(ClientRecord, String)> {
+    ensure!(
+        !input.label.trim().is_empty() && input.label.len() <= 128 && !input.label.chars().any(char::is_control),
+        "invalid_grant"
+    );
+    ensure!(
+        (1..=90).contains(&input.expires_in_days) && !input.roots.is_empty() && input.roots.len() <= 32,
+        "invalid_grant"
+    );
+    ensure!(!input.existing_sessions || input.read_metadata, "invalid_grant");
+    let allowed: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM hats h WHERE h.owner_id = ?1 AND h.id = ?2
+          AND NOT EXISTS(SELECT 1 FROM purged_hats p WHERE p.owner_id = h.owner_id AND p.hat_id = h.id))",
+        params![owner, input.hat_id],
+        |r| r.get(0),
+    )?;
+    ensure!(allowed, "invalid_grant");
+    for root in &input.roots {
+        ensure!(
+            root.root.len() <= 4096 && !root.root.chars().any(char::is_control) && is_canonical(&root.root),
+            "invalid_grant"
+        );
+        let known: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM hosts WHERE owner_id = ?1 AND id = ?2 AND revoked_at IS NULL)",
+            params![owner, root.host_id],
+            |r| r.get(0),
+        )?;
+        ensure!(known, "invalid_grant");
+        let resolved = hennery_kernel::hats::session_hat_in(tx, owner, &root.host_id, &root.root)?;
+        ensure!(
+            matches!(resolved,Some(hennery_kernel::hats::SessionHat::Decided(hat)) if hat.hat_id==input.hat_id),
+            "invalid_grant"
+        );
+    }
+    let id = uuid::Uuid::now_v7().to_string();
+    let token = format!("{TOKEN_PREFIX}{}", hex::encode(random_bytes::<32>()));
+    let expires = unix_now() + i64::from(input.expires_in_days) * 86400;
+    tx.execute("INSERT INTO external_clients(owner_id,id,label,hat_id,token_hash,read_metadata,existing_sessions,revision,expires_at)
+          VALUES(?1,?2,?3,?4,?5,?6,?7,1,?8)",params![owner,id,input.label.trim(),input.hat_id,sha256_hex(token.as_bytes()),input.read_metadata,input.existing_sessions,expires])?;
+    for root in &input.roots {
+        tx.execute(
+            "INSERT OR IGNORE INTO external_client_roots(owner_id,client_id,host_id,root) VALUES(?1,?2,?3,?4)",
+            params![owner, id, root.host_id, root.root],
+        )?;
+    }
+    let client = record(tx, owner, &id)?.expect("inserted client");
+    Ok((client, token))
 }
 
 #[cfg(test)]
@@ -372,7 +407,7 @@ mod tests {
         w.store
             .conn()
             .execute(
-                "UPDATE hosts SET revoked_at=1 WHERE owner_id=?1 AND id='h1'",
+                "UPDATE hosts SET revoked_at=1 WHERE owner_id = ?1 AND id='h1'",
                 [w.store.owner_id()],
             )
             .unwrap();
@@ -450,5 +485,9 @@ mod tests {
         for wrong in ["hnry_session_deadbeef", "Bearer operator", "hnry_external_short"] {
             assert!(w.store.authenticate_external(wrong).unwrap().is_none());
         }
+        let grants = w.store.external_clients().unwrap();
+        assert_eq!(grants.len(), 2);
+        assert_eq!(w.store.external_clients_after(&grants[0].client_id).unwrap().len(), 1);
+        assert!(w.store.external_clients_after(&"x".repeat(129)).is_err());
     }
 }

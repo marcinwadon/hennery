@@ -8,7 +8,7 @@ const BY_MODE: Record<DeploymentMode, readonly View[]> = {
 export function viewsOf(mode: DeploymentMode): readonly View[] { return BY_MODE[mode] }
 export function viewOf(route: RouteName): View | null {
   if (route === 'session') return 'sessions'
-  return route === 'setup' || route === 'login' || route === 'not_found' ? null : route
+  return route === 'setup' || route === 'login' || route === 'external_mcp' || route === 'external_mcp_consent' || route === 'not_found' ? null : route
 }
 export const LABEL: Record<View, string> = { 'needs-you': 'Needs you', sessions: 'Sessions', new: 'New session', defaults: 'Defaults', hosts: 'Hosts', mcp: 'MCP', hats: 'Hats', settings: 'Settings', more: 'More' }
 export const PATH: Record<View, string> = { 'needs-you': '/needs-you', sessions: '/sessions', new: '/new', defaults: '/defaults', hosts: '/hosts', mcp: '/mcp', hats: '/hats', settings: '/settings', more: '/more' }

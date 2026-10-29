@@ -19,6 +19,8 @@ pub mod delegation_settings;
 pub mod delegation_worker;
 pub mod external_clients;
 pub mod external_mcp;
+pub mod external_oauth;
+mod external_oauth_store;
 pub mod family;
 pub mod forget;
 pub mod hats;
@@ -70,6 +72,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct AppState {
     pub(crate) external_permits: Arc<tokio::sync::Semaphore>,
+    pub(crate) external_oauth: Arc<external_oauth::Runtime>,
     #[cfg(feature = "test-hooks")]
     pub startup_dispatch: Arc<startup::DispatchHold>,
     pub store: Arc<store::Store>,
@@ -112,6 +115,7 @@ impl AppState {
         store.set_idle_hub(&hub);
         Self {
             external_permits: Arc::new(tokio::sync::Semaphore::new(16)),
+            external_oauth: Arc::new(external_oauth::Runtime::new()),
             #[cfg(feature = "test-hooks")]
             startup_dispatch: Arc::default(),
             store: Arc::new(store),
@@ -214,6 +218,7 @@ pub async fn serve_all(
 pub fn router(state: AppState) -> Router {
     api::router(state.clone())
         .merge(external_mcp::router(state.clone()))
+        .merge(external_oauth::router(state.clone()))
         .merge(delegation_api::router(state.clone()))
         .merge(builtin::policy_router(state.clone()))
         .merge(hosts::router(state.clone()))

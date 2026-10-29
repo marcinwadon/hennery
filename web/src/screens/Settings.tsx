@@ -9,6 +9,7 @@ import { DefaultsSettings } from '../components/HatDefaultsSummary'
 import { useResource } from '../hooks/useResource'
 import VersionInfo from '../components/VersionInfo'
 import '../manage.css'
+import { Link } from '../router'
 
 export default function Settings({ push, sessions }: { push: boolean; sessions: boolean }) {
   const client = useClient()
@@ -17,6 +18,7 @@ export default function Settings({ push, sessions }: { push: boolean; sessions: 
     <header className="manage-head"><h1>Settings</h1></header>
     <p className="manage-subtitle">Your account, browser and collector preferences.</p>
     <AccountSettings />
+    {sessions && <p><Link to="/external-mcp">Manage external MCP client access</Link></p>}
     {push && <NotificationSettings push={push} sessions={sessions} />}
     <CollectorSettings push={push} sessions={sessions} hats={hats.data} />
     {hats.error && <p role="alert">Unable to load hats. <button className="btn btn-ghost" onClick={hats.reload}>Retry hats</button></p>}

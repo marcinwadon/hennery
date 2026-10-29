@@ -13,6 +13,7 @@ import { completeLogout } from './pwa/logout'
 import NotificationNavigation from './components/NotificationNavigation'
 import { AppActionsProvider } from './app-actions'
 const CommandHost = lazy(() => import('./components/CommandHost'))
+const ExternalMcp = lazy(() => import('./screens/ExternalMcp'))
 
 interface Waiting {
   resolve: () => void
@@ -61,7 +62,10 @@ export default function App({ fetchImpl }: { fetchImpl?: typeof fetch }) {
       {/* While the step-up dialog is open, nothing under it can be focused
           or clicked. */}
       <div className="page" inert={waiting !== null} style={{ display: 'contents' }}>
-        {route.name === 'setup' ? <Setup /> : route.name === 'login' ? <Login /> : <Shell route={route} />}
+        {route.name === 'setup' ? <Setup /> : route.name === 'login' ? <Login />
+          : route.name === 'external_mcp' || route.name === 'external_mcp_consent'
+            ? <Suspense fallback={<p role="status">Loading…</p>}><ExternalMcp consent={route.name === 'external_mcp_consent'} /></Suspense>
+            : <Shell route={route} />}
       </div>
       {waiting && <StepUpDialog returnTo={focusBeforeStepUp.current} onDone={() => close('done')} onCancel={() => close('cancelled')} />}
       <Suspense fallback={null}><CommandHost /></Suspense>
