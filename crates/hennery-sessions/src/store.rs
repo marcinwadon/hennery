@@ -463,6 +463,7 @@ END;",
     // Child results (35): allow the operator to read existing child results
     // without creating attention or forgetting a prior transcript read.
     include_str!("review_child_backfill.sql"),
+    include_str!("external_clients.sql"),
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records
