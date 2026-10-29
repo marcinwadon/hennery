@@ -20,6 +20,7 @@ pub const FILE: &str = "agent-homes.db";
 /// The agents whose data the host knows how to find.
 pub const CLAUDE: &str = "claude";
 pub const CODEX: &str = "codex";
+pub const OMP: &str = "omp";
 
 /// `name`'s value for the adapter: the agent's own configuration
 /// (`agent.env`, the last setting wins), then the host's environment,
@@ -103,7 +104,13 @@ impl Registry {
                  root TEXT NOT NULL,
                  sqlite_root TEXT NOT NULL DEFAULT '',
                  recorded_at INTEGER NOT NULL,
-                 PRIMARY KEY (agent, agent_session_id, root, sqlite_root));",
+                 PRIMARY KEY (agent, agent_session_id, root, sqlite_root));
+             CREATE TABLE IF NOT EXISTS omp_sessions (
+                 agent_session_id TEXT PRIMARY KEY,
+                 executable TEXT NOT NULL,
+                 agent_data_dir TEXT NOT NULL,
+                 cwd TEXT NOT NULL,
+                 jsonl TEXT NOT NULL);",
         )?;
         Ok(Self { conn: Mutex::new(conn) })
     }
@@ -152,5 +159,87 @@ impl Registry {
             )
             .optional()?
             .is_some())
+    }
+
+    /// Persist the exact JSONL binding and home in one FULL-synchronous
+    /// transaction. An existing ID cannot silently move to another transcript.
+    pub fn record_omp(&self, binding: &crate::omp::session::Binding) -> Result<AgentHome> {
+        crate::omp::session::verify(
+            &crate::omp::OmpConfig {
+                executable: binding.executable.clone(),
+                agent_data_dir: binding.agent_data_dir.clone(),
+            },
+            binding,
+            &binding.agent_session_id,
+            &binding.cwd,
+        )?;
+        let text =
+            |path: &Path| -> Result<String> { Ok(path.to_str().context("OMP binding path is not UTF-8")?.into()) };
+        let home = AgentHome {
+            root: text(&binding.agent_data_dir.canonicalize()?)?,
+            sqlite_root: None,
+        };
+        let mut conn = self.conn.lock().expect("registry lock");
+        let tx = conn.transaction()?;
+        let values = [
+            text(&binding.executable)?,
+            text(&binding.agent_data_dir)?,
+            text(&binding.cwd)?,
+            text(&binding.jsonl)?,
+        ];
+        let existing: Option<(String, String, String, String)> = tx
+            .query_row(
+                "SELECT executable, agent_data_dir, cwd, jsonl FROM omp_sessions WHERE agent_session_id = ?1",
+                [&binding.agent_session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        if let Some((program, root, cwd, jsonl)) = existing {
+            anyhow::ensure!(
+                [program, root, cwd, jsonl] == values,
+                "OMP session already has another recorded binding"
+            );
+        }
+        tx.execute(
+            "INSERT INTO omp_sessions(agent_session_id, executable, agent_data_dir, cwd, jsonl)
+                    VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING",
+            params![binding.agent_session_id, values[0], values[1], values[2], values[3]],
+        )?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        tx.execute(
+            "INSERT INTO agent_homes(agent, agent_session_id, root, sqlite_root, recorded_at)
+                    VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING",
+            params![
+                OMP,
+                binding.agent_session_id,
+                home.root,
+                home.sqlite_root.as_deref().unwrap_or(""),
+                now
+            ],
+        )?;
+        tx.commit()?;
+        Ok(home)
+    }
+
+    pub fn omp_binding(&self, id: &str) -> Result<Option<crate::omp::session::Binding>> {
+        let conn = self.conn.lock().expect("registry lock");
+        Ok(conn
+            .query_row(
+                "SELECT executable, agent_data_dir, cwd, jsonl FROM omp_sessions WHERE agent_session_id = ?1",
+                [id],
+                |row| {
+                    Ok(crate::omp::session::Binding {
+                        agent_session_id: id.into(),
+                        executable: PathBuf::from(row.get::<_, String>(0)?),
+                        agent_data_dir: PathBuf::from(row.get::<_, String>(1)?),
+                        cwd: PathBuf::from(row.get::<_, String>(2)?),
+                        jsonl: PathBuf::from(row.get::<_, String>(3)?),
+                    })
+                },
+            )
+            .optional()?)
     }
 }

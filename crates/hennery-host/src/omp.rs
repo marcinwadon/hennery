@@ -6,6 +6,8 @@ use anyhow::{Context, Result, bail};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
+pub mod session;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OmpConfig {
     pub executable: PathBuf,
