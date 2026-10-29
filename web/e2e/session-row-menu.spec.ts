@@ -66,8 +66,11 @@ for (const width of [390, 1280]) {
       await expect(page).toHaveURL(`${collector.origin}/sessions`)
 
       await trigger.click()
-      await menu.getByRole('button', { name: 'Pin to sidebar', exact: true }).click()
-      await expect(menu.getByRole('button', { name: 'Unpin from sidebar', exact: true })).toBeVisible()
+      const pin = menu.getByRole('switch', { name: 'Pin to sidebar', exact: true })
+      await expect(pin).toHaveAttribute('aria-checked', 'false')
+      await pin.click()
+      await expect(pin).toHaveAttribute('aria-checked', 'true')
+      await expect(pin).toHaveText('Pin to sidebar✓ On')
       const parking = menu.getByRole('switch', { name: 'Do not park', exact: true })
       await expect(parking).toHaveAttribute('aria-checked', 'false')
       await parking.click(); await expect(parking).toHaveAttribute('aria-checked', 'true')

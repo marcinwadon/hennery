@@ -26,7 +26,7 @@ export default function PinSessionAction({ id, pinned, disabled }: { id: string;
     } finally { if (mounted.current) setBusy(false) }
   }
   return <>
-    <button ref={button} type="button" disabled={disabled || busy} onClick={() => void toggle()}>{pinned ? 'Unpin from sidebar' : 'Pin to sidebar'}</button>
+    <button ref={button} type="button" role="switch" aria-label="Pin to sidebar" aria-checked={pinned} disabled={disabled || busy} onClick={() => void toggle()}><span>Pin to sidebar</span><span className="session-toggle-state" aria-hidden="true">{pinned ? '✓ On' : 'Off'}</span></button>
     {error && <p className="form-error" role="alert"><bdi>{error}</bdi></p>}
   </>
 }
