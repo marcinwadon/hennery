@@ -538,7 +538,8 @@ fn starts_racing_for_the_last_place_charge_only_the_one_that_began() {
         register(&op, &session_id, &mut authenticator(), "laptop");
         let places = MAX_LOGIN_CEREMONIES - KNOWN_LOGIN_CEREMONIES;
         for n in 0..places - 1 {
-            let client = IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + n as u32));
+            // One address per /24, so no prefix quota is reached.
+            let client = IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + ((n as u32) << 8)));
             assert!(matches!(
                 op.start_passkey_login(client, NOW).unwrap(),
                 Start::Begun { .. }

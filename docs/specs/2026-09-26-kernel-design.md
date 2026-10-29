@@ -217,11 +217,17 @@ frontend), and `SetupRequest` has no default hat name; hats add it.
     login is ever pushed out, for its whole 5 minutes, not even for a start
     from its own rate-limit key (browsers behind one NAT share one): a
     client keeps at most eight live logins (loopback has no such cap, since
-    behind a proxy that names no client it is everyone), and the pool 1024,
-    of which 64 only for addresses that signed in before (§3.2's known
-    addresses). Past either, a start answers 503 `auth_busy` with
-    `Retry-After: 1` until one ends. A flood can delay a new login, not end
-    one under way. A restart drops them. An unknown, used or
+    behind a proxy that names no client it is everyone); unknown clients of
+    one prefix (an IPv4 /24, an IPv6 /48, as §3.2 aggregates them) at most
+    64 together, so one site's many keys cannot fill the pool; and the pool
+    1024, of which 64 only for addresses that signed in before (§3.2's known
+    addresses), whose logins no prefix quota counts or limits. Past any of
+    these, a start answers 503 `auth_busy` with `Retry-After: 1` until one
+    ends. A flood can delay a new login, not end one under way: a flood
+    spread over 15 or more prefixes can still keep unknown addresses from
+    starting a passkey login, while known addresses and password login go
+    on. A login start whose reserved place a reset or `public_url` change
+    cleared meanwhile was counted, and answers 409 `passkeys_unavailable`. A restart drops them. An unknown, used or
     expired
     ceremony answers 400 `invalid_ceremony`.
   - Several passkeys per owner, each with a label (1–64 characters, no control

@@ -49,6 +49,12 @@ pub const MAX_SESSION_CEREMONIES: usize = 1024;
 /// behind a proxy that names none.
 pub const MAX_LOGIN_CEREMONIES_PER_CLIENT: usize = 8;
 
+/// At most this many live login ceremonies of unknown clients per prefix
+/// (`ratelimit::aggregate`: an IPv4 /24, an IPv6 /48), so that one site's
+/// many keys (a /48 holds 65536 /64s) cannot fill the pool. A known
+/// client's are not counted, nor limited by it.
+pub const MAX_UNKNOWN_LOGIN_CEREMONIES_PER_PREFIX: usize = 64;
+
 /// Of `MAX_LOGIN_CEREMONIES`, the places only a known client (one whose
 /// address signed in before, `Limiter::is_known`) may take: a flood of
 /// starts from unknown addresses cannot fill them.
@@ -137,6 +143,8 @@ struct Live {
     ceremony: Option<Ceremony>,
     /// The client of a login, reserved or begun; `None` for a session's.
     login_client: Option<IpAddr>,
+    /// Whether that client was known when it reserved its place.
+    known: bool,
     expires_at: i64,
     /// The order ceremonies began in: the oldest goes first.
     seq: u64,
@@ -252,6 +260,7 @@ impl Ceremonies {
             Live {
                 ceremony: Some(ceremony),
                 login_client: None,
+                known: false,
                 expires_at: now + CEREMONY_TTL_SECS,
                 seq,
             },
@@ -264,8 +273,9 @@ impl Ceremonies {
     /// start can take it: `None` when there is none, and then nothing
     /// changed. No live login is ever pushed out for it, the client's own
     /// included, for its whole `CEREMONY_TTL_SECS`: past
-    /// `MAX_LOGIN_CEREMONIES_PER_CLIENT` (loopback has no such cap) or the
-    /// pool's capacity the start is refused. A `known` client (one that
+    /// `MAX_LOGIN_CEREMONIES_PER_CLIENT`, an unknown client past
+    /// `MAX_UNKNOWN_LOGIN_CEREMONIES_PER_PREFIX` (loopback has neither cap),
+    /// or past the pool's capacity, the start is refused. A `known` client (one that
     /// signed in from there before) may also use the places kept for known
     /// clients (`with_known`).
     pub fn reserve_login(&self, client: IpAddr, known: bool, now: i64) -> Option<LoginReservation<'_>> {
@@ -278,6 +288,17 @@ impl Ceremonies {
             .count();
         if !client.is_loopback() && own >= MAX_LOGIN_CEREMONIES_PER_CLIENT.max(1) {
             return None;
+        }
+        if !known && !client.is_loopback() {
+            let prefix = crate::ratelimit::aggregate(client);
+            let unknown_in_prefix = table
+                .live
+                .values()
+                .filter(|live| !live.known && live.login_client.map(crate::ratelimit::aggregate) == Some(prefix))
+                .count();
+            if unknown_in_prefix >= MAX_UNKNOWN_LOGIN_CEREMONIES_PER_PREFIX.max(1) {
+                return None;
+            }
         }
         let logins = table.live.values().filter(|live| live.login_client.is_some()).count();
         let places = self.logins.max(1) - if known { 0 } else { self.known_logins };
@@ -292,6 +313,7 @@ impl Ceremonies {
             Live {
                 ceremony: None,
                 login_client: Some(client),
+                known,
                 expires_at: now + CEREMONY_TTL_SECS,
                 seq,
             },
@@ -356,7 +378,8 @@ pub enum Start {
         options: serde_json::Value,
     },
     /// There is no `public_url` yet, or its host is an IP address
-    /// (decision 1).
+    /// (decision 1); or, for a login, the ceremonies were cleared while it
+    /// began (`public_url` moved, a reset).
     Unavailable,
     /// The owner has no passkey to sign in or step up with.
     NoPasskeys,
@@ -616,8 +639,13 @@ impl Operator {
         Ok(removed > 0)
     }
 
-    /// Begin an authentication over every passkey of the owner's.
-    fn begin_authentication(&self, place: impl FnOnce(PasskeyAuthentication) -> Option<String>) -> Result<Start> {
+    /// Begin an authentication over every passkey of the owner's, in the
+    /// place `place` gives it; without one, `unplaced`.
+    fn begin_authentication(
+        &self,
+        place: impl FnOnce(PasskeyAuthentication) -> Option<String>,
+        unplaced: Start,
+    ) -> Result<Start> {
         let Some(rp) = self.relying_party() else {
             return Ok(Start::Unavailable);
         };
@@ -629,7 +657,7 @@ impl Operator {
         let options = serde_json::to_value(options)?;
         Ok(match place(state) {
             Some(ceremony_id) => Start::Begun { ceremony_id, options },
-            None => Start::Busy,
+            None => unplaced,
         })
     }
 
@@ -648,7 +676,13 @@ impl Operator {
         if let Err(retry_after) = self.passkey_limiter.attempt(client, std::time::Instant::now()) {
             return Ok(Start::RateLimited(retry_after));
         }
-        self.begin_authentication(|state| reservation.fill(Ceremony::Login { client, state }))
+        // A reserved place is gone only if `clear` ran since (`public_url`
+        // moved, a reset): the start was counted, so it is not answered
+        // busy, which promises it was not.
+        self.begin_authentication(
+            |state| reservation.fill(Ceremony::Login { client, state }),
+            Start::Unavailable,
+        )
     }
 
     /// Finish the login `ceremony_id` names with the browser's
@@ -694,7 +728,10 @@ impl Operator {
     /// spec §3.4, decision 8).
     pub fn start_passkey_step_up(&self, session_id: &str, now: i64) -> Result<Start> {
         let session_id = session_id.to_string();
-        self.begin_authentication(|state| self.ceremonies.begin(Ceremony::StepUp { session_id, state }, now))
+        self.begin_authentication(
+            |state| self.ceremonies.begin(Ceremony::StepUp { session_id, state }, now),
+            Start::Busy,
+        )
     }
 
     /// Finish the step-up `ceremony_id` names, begun by `session_id`, and
@@ -1067,6 +1104,101 @@ mod tests {
             ceremonies.begin(loopback(state()), NOW).unwrap();
         }
         assert!(ceremonies.take(&owner, NOW).is_some());
+    }
+
+    /// The `n`th /64 of `2001:db8:1::/48`.
+    fn in_one_48(n: u16) -> IpAddr {
+        IpAddr::from([0x2001, 0xdb8, 1, n, 0, 0, 0, 1])
+    }
+
+    /// Hold every place a flood from `clients` gets, each as often as it
+    /// can at `now`.
+    fn flood<'a>(
+        ceremonies: &'a Ceremonies,
+        clients: impl Iterator<Item = IpAddr>,
+        now: i64,
+    ) -> Vec<LoginReservation<'a>> {
+        let mut held = Vec::new();
+        for client in clients {
+            while let Some(place) = ceremonies.reserve_login(client, false, now) {
+                held.push(place);
+            }
+        }
+        held
+    }
+
+    /// One site's many keys (a /48's /64s, a /24's addresses) cannot fill
+    /// the pool: unknown clients of a prefix hold at most
+    /// `MAX_UNKNOWN_LOGIN_CEREMONIES_PER_PREFIX` places together. Another
+    /// prefix still begins, and so does a known client inside the flooded
+    /// one, whose place the prefix's quota neither counts nor limits.
+    #[test]
+    fn one_prefix_cannot_fill_the_pool_and_others_still_begin() {
+        let ceremonies = Ceremonies::default();
+        let v6 = flood(&ceremonies, (0..200).map(in_one_48), NOW);
+        assert_eq!(v6.len(), MAX_UNKNOWN_LOGIN_CEREMONIES_PER_PREFIX);
+        let v4 = flood(&ceremonies, (0..=255).map(|n| IpAddr::from([198, 51, 100, n])), NOW);
+        assert_eq!(v4.len(), MAX_UNKNOWN_LOGIN_CEREMONIES_PER_PREFIX);
+        assert!(
+            ceremonies
+                .reserve_login(IpAddr::from([0x2001, 0xdb8, 2, 0, 0, 0, 0, 1]), false, NOW)
+                .is_some()
+        );
+        assert!(
+            ceremonies
+                .reserve_login(IpAddr::from([198, 51, 101, 1]), false, NOW)
+                .is_some()
+        );
+        let owner = ceremonies
+            .reserve_login(in_one_48(500), true, NOW)
+            .expect("a known client in the flooded /48");
+        assert!(owner.fill(login_from(1)).is_some());
+        // Its place does not count against the prefix's unknown quota either.
+        assert!(ceremonies.reserve_login(in_one_48(501), false, NOW).is_none());
+        drop(v6);
+        assert!(ceremonies.reserve_login(in_one_48(501), false, NOW).is_some());
+    }
+
+    /// A flood across many prefixes fills only the places unknown clients
+    /// may use, at every moment of a ceremony's life: the table never holds
+    /// more than `MAX_LOGIN_CEREMONIES`, a known client still has its
+    /// places, and once the flood's logins expire the places come back.
+    #[test]
+    fn a_flood_across_prefixes_stays_within_the_pool_for_the_whole_ttl() {
+        let ceremonies = Ceremonies::default();
+        let prefixes = |p: u16| (0..16).map(move |n| IpAddr::from([0x2001, 0xdb8, 0x100 + p, n, 0, 0, 0, 1]));
+        let mut held = Vec::new();
+        for (round, at) in [NOW, NOW + 60, NOW + CEREMONY_TTL_SECS - 1].into_iter().enumerate() {
+            held.extend(flood(
+                &ceremonies,
+                (0..32).flat_map(|p| prefixes(p + 32 * round as u16)),
+                at,
+            ));
+            assert_eq!(held.len(), MAX_LOGIN_CEREMONIES - KNOWN_LOGIN_CEREMONIES);
+            assert!(ceremonies.len() <= MAX_LOGIN_CEREMONIES);
+        }
+        let known: Vec<_> = (0..KNOWN_LOGIN_CEREMONIES)
+            .map(|n| {
+                ceremonies
+                    .reserve_login(IpAddr::from([192, 0, 2, n as u8]), true, NOW)
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(ceremonies.len(), MAX_LOGIN_CEREMONIES);
+        assert!(
+            ceremonies
+                .reserve_login(IpAddr::from([192, 0, 2, 200]), true, NOW)
+                .is_none()
+        );
+        drop(known);
+        let expired = NOW + CEREMONY_TTL_SECS;
+        assert!(
+            ceremonies
+                .reserve_login(IpAddr::from([203, 0, 113, 1]), false, expired)
+                .is_some()
+        );
+        assert!(ceremonies.len() <= 1, "the flood's places outlived their ttl");
+        drop(held);
     }
 
     #[test]

@@ -481,7 +481,8 @@ async fn a_login_flood_from_other_addresses_never_ends_the_owners_ceremony() {
     let (ceremony_id, assertion) = c.begin_login(&mut passkey, PUBLIC_URL).await;
     let mut busy = 0;
     for n in 0..MAX_LOGIN_CEREMONIES as u32 + 16 {
-        let client = IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + n));
+        // One address per /24, so no prefix quota is reached.
+        let client = IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + (n << 8)));
         match c.state.operator.start_passkey_login(client, unix_now()).unwrap() {
             Start::Begun { .. } => {}
             Start::Busy => busy += 1,
