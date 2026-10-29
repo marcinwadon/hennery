@@ -1,9 +1,10 @@
-// The operator's prompt, shown exactly as sent: plain text with its line
-// breaks (no Markdown), and its images from the attachment store when they
-// are of a type the page shows.
+// Prompts and family messages retain their plain text and attachments.
+// Parent instructions and child reports start collapsed, like tool calls.
+import { useState } from 'react'
 import { Link } from '../../router'
 import { sessionPath } from '../SessionRow'
 import { USER_LABEL } from '../../lib/agent'
+import { Icon } from '../../lib/ui'
 import { CutNote, Speaker } from './parts'
 import type { ItemEnv, ItemOf } from './types'
 
@@ -29,13 +30,21 @@ function Attachment({ mimeType, sha256 }: { mimeType: string; sha256: unknown })
 }
 
 export default function UserTurn({ item, env }: { item: ItemOf<'user_turn'>; env: ItemEnv }) {
+  const [open, setOpen] = useState(false)
   const origin = item.origin
+  const familyMessage = origin?.kind === 'parent' || origin?.kind === 'child_report'
   const source = origin?.kind === 'parent' ? origin.session_id : origin?.kind === 'child_report' ? origin.child_id : undefined
   const label = origin?.kind === 'parent' ? 'Parent instruction' : origin?.kind === 'child_report' ? 'Child report' : origin?.kind === 'plugin_context' ? 'Plug-in context' : USER_LABEL
   return (
     <Speaker who={source ? 'agent' : 'user'} label={label} ts={item.ts}>
       {source && <Link className="item-note" to={sessionPath(source)}>Source session</Link>}
-      <div className="bubble user">
+      {familyMessage && (
+        <button type="button" className="tool-line" aria-expanded={open} onClick={() => setOpen((o) => !o)}>
+          <Icon.Branch size={16} />
+          <span className="tool-name">{open ? 'Hide message' : 'Show message'}</span>
+        </button>
+      )}
+      {(!familyMessage || open) && <div className="bubble user">
         {item.content.map((block, i) =>
           block.type === 'text' ? (
             <p key={i} className="user-text">
@@ -49,7 +58,7 @@ export default function UserTurn({ item, env }: { item: ItemOf<'user_turn'>; env
             </p>
           ),
         )}
-      </div>
+      </div>}
       {item.truncated && <CutNote sessionId={env.sessionId}>{origin?.kind === 'child_report' ? 'This report was cut.' : origin?.kind === 'parent' ? 'This instruction was cut.' : 'This prompt was cut.'}</CutNote>}
     </Speaker>
   )
