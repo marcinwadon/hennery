@@ -189,11 +189,17 @@ frontend), and `SetupRequest` has no default hat name; hats add it.
 - **Rate limits** (here and §4.1) key on the canonical client address, IPv6
   per /64 and all of `127.0.0.0/8` as one; every attempt counts the moment it
   starts, so a parallel burst gets no more in than the budget. State is in
-  memory, bounded, and a restart clears it; past capacity a live entry is
-  never evicted (new addresses share one overflow budget), and loopback always
-  keeps an entry of its own. `X-Forwarded-For` is not trusted. Behind an
-  unconfigured proxy every client shares its budget; §2's exact-peer,
-  dedicated-header policy provides address-only attribution.
+  memory, bounded, and a restart clears it; past capacity (4096 addresses) a
+  live entry is never evicted: a new address shares its prefix's budget (an
+  IPv4 /24, an IPv6 /48; at most 1024 prefixes), and past those one overflow
+  budget, so rotating addresses gains at most (4096 + 1024 + 64 + 2) budgets
+  a window. Loopback always keeps an entry of its own, and so do the last 64
+  addresses that succeeded (known addresses): a flood cannot push the
+  owner's usual address into a budget it has locked. Known is no exemption:
+  the same budget applies, and the credential is checked as always.
+  `X-Forwarded-For` is not trusted. Behind an unconfigured proxy every
+  client shares its budget; §2's exact-peer, dedicated-header policy
+  provides address-only attribution.
 - **Passkeys:** `webauthn-rs` with RP id and origin derived from `public_url`;
   subdomains and arbitrary ports not allowed. The RP id is `public_url`'s host
   exactly (not a registrable parent) and its origin the only one accepted; a
@@ -442,7 +448,10 @@ minutes, then a 60 s lockout doubling up to 1 h; §3.2 for how addresses are
 keyed); wrong codes never invalidate other outstanding codes. Every attempt
 counts the moment it starts, and a success clears the address. A locked-out
 address gets 429 `rate_limited` with `Retry-After`, and its code is not
-checked, so not spent.
+checked, so not spent. A flood from any number of addresses gets at most
+(4096 + 1024 + 64 + 2) budgets in a 10-minute window (§3.2), about 8 guesses
+each with the lockout: some 41,500 guesses against at most 16 live 40-bit
+codes, a chance of about 6 × 10⁻⁷ a window.
 
 ### 4.2 All-in-one pairing and the admin socket
 
