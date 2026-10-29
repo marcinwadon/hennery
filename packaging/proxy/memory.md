@@ -16,19 +16,21 @@ MCP clients reach it only through a TLS reverse proxy on the same machine.
    carrying `Origin` or `Cookie`.
 3. **Proxy.** Start from [Caddyfile](Caddyfile) or [nginx.conf](nginx.conf)
    with `@BACKEND_PORT@` set to the memory port. Both overwrite every incoming
-   `Hennery-Client-IP` with the proxy's own TCP peer, including duplicates, and
-   ignore `Forwarded`/`X-Forwarded-For`. To serve the collector and memory on
-   one HTTPS port, give each hostname its own site (Caddy) or `server` block
-   with its own `server_name` and certificate (nginx), each keeping the
-   template's directives. The fixture tests run the single-site templates
-   against the collector, not this two-hostname variant: check the rendered
-   configuration on a disposable instance first.
+   `Hennery-Client-IP`, including duplicates, with the client's socket peer.
+   The memory service ignores `Forwarded` and `X-Forwarded-For`. To serve the
+   collector and memory on one HTTPS port, give each hostname its own site
+   (Caddy) or `server` block with its own `server_name` and certificate
+   (nginx), each keeping the template's directives. The fixture tests run
+   the single-site templates against the collector, not this two-hostname
+   variant: check the rendered configuration on a disposable instance first.
 4. **Trusted attribution.** Start with
    `serve --proxy-client-ip-peer 127.0.0.1`, naming only the proxy's exact
    backend peer: repeat the flag for at most eight unicast addresses; no CIDR,
    hostname or port. Without the flag the header is ignored, so every client
-   behind the proxy shares one password, passkey and step-up budget: still
-   safe, but one client's failures lock out the rest. A trusted peer that sends
+   behind the proxy shares one password, passkey and step-up budget. Password
+   guessing stays capped at five failures a minute before lockouts of one
+   minute up to an hour, but any one client's failures lock every client out,
+   the owner included, for that time. A trusted peer that sends
    a duplicate or malformed header gets 400; one that omits it is keyed by its
    own address. Trust is only as narrow as backend reachability: any local
    process that can reach the loopback port from a trusted address can choose
@@ -36,8 +38,9 @@ MCP clients reach it only through a TLS reverse proxy on the same machine.
 5. **Limits.** The nginx template caps each address at 20 connections and
    100 requests/s (burst 200). Caddy has no per-client limiter: add firewall or
    ingress caps before public exposure. Backend limits do not bound TLS
-   handshakes. The service itself bounds MCP bodies at 128 KiB read within
-   5 s, responses at 16 KiB, the management UI at four concurrent requests
-   per pool, and refuses excess work with 503.
+   handshakes. The service refuses excess work with 503. MCP admits at most
+   32 tool and 4 lifecycle credentials to authentication at once, before the
+   store is touched, then runs 32 tool and 4 lifecycle requests (4 and 1 per
+   namespace). Bodies are bounded at 128 KiB read within 5 s and responses at
+   16 KiB; the management UI allows four concurrent requests per pool.
 
-Generated with Claude AI — please review before distribution.
