@@ -64,7 +64,7 @@ jobs:
     - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
       with:
         github_access_token: ${{ github.token }}
-    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       with:
         shared-key: native-debug
         # Runner image env drifts; the flake pins the toolchain.
@@ -119,7 +119,7 @@ jobs:
     - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
       with:
         github_access_token: ${{ github.token }}
-    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       with:
         shared-key: native-release
         # Runner image env drifts; the flake pins the toolchain.
@@ -160,7 +160,7 @@ jobs:
     - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
       with:
         node-version: '>=24.22.1 <25'
-    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       with:
         shared-key: native-release-vendored
         # Runner image env drifts; the flake pins the toolchain.
@@ -203,7 +203,7 @@ jobs:
         for name in HOME CARGO_HOME RUSTUP_HOME XDG_CONFIG_HOME XDG_CACHE_HOME XDG_DATA_HOME npm_config_userconfig npm_config_cache; do
           echo "$name=$RUNNER_TEMP/crates-home/$name" >> "$GITHUB_ENV"
         done
-    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       with:
         shared-key: crates-acceptance
         # Runner image env drifts; the flake pins the toolchain.
