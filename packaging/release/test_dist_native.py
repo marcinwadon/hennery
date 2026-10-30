@@ -113,10 +113,15 @@ class NativeDist(unittest.TestCase):
             toolchain = root / 'toolchain'; (toolchain / 'bin').mkdir(parents=True)
             sysroot = Path(subprocess.check_output(['rustc', '--print', 'sysroot'], text=True).strip())
             for binary in ('cargo', 'rustc', 'rustdoc'):
-                installed = subprocess.run(['rustup', 'which', binary], capture_output=True, text=True,
-                                           env=dict(os.environ, RUSTUP_AUTO_INSTALL='0'))
-                (toolchain / 'bin' / binary).symlink_to(
-                    installed.stdout.strip() if installed.returncode == 0 else shutil.which(binary))
+                # Use the active compiler's binaries, not an ambient Rustup
+                # proxy that would dispatch back into this linked toolchain.
+                installed = sysroot / 'bin' / binary
+                if not installed.is_file():
+                    installed = Path(shutil.which(binary) or '')
+                self.assertTrue(installed.is_file(), 'active toolchain binary missing: ' + binary)
+                self.assertNotEqual(installed.resolve(), Path(shutil.which('rustup')).resolve(),
+                                    'linked toolchain must not contain a Rustup proxy: ' + binary)
+                (toolchain / 'bin' / binary).symlink_to(installed)
             (toolchain / 'lib').symlink_to(sysroot / 'lib', target_is_directory=True)
             setup = dict(os.environ, HOME=str(runner_home), RUSTUP_HOME=str(runner_home / '.rustup'),
                          CARGO_HOME=str(runner_home / '.cargo'))
