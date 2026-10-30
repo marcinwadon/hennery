@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-## 0.3.10
+## 0.3.11
 
 - Security: bound public HTTP connections, request bodies and WebSocket
   admission; apply deadlines and resource limits before expensive work.
@@ -19,13 +19,18 @@
 - Existing HTTPS browser sessions must sign in again. Update agent hosts before
   the collector if their legacy hello state exceeds 64 KiB; smaller legacy
   hellos remain compatible.
-- Fix the release test fixture to link the active compiler toolchain instead
-  of an ambient Rustup proxy.
+- Qualify releases with matching compiler toolchains and explicit Rustup proxy
+  roles, including Homebrew manager wrappers.
+
+## 0.3.10
+
+Not published: the cold macOS packaging test exposed a wrapped Rustup entrypoint.
+The signed tag is retained; its intended changes ship in 0.3.11.
 
 ## 0.3.9
 
 Not published: a macOS packaging regression test failed before publication.
-The signed tag is retained; its intended changes ship in 0.3.10.
+The signed tag is retained; its intended changes ship in 0.3.11.
 
 ## 0.3.8
 
