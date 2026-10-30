@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+## 0.3.9
+
+- Security: bound public HTTP connections, request bodies and WebSocket
+  admission; apply deadlines and resource limits before expensive work.
+- Security: bound queued password verification and passkey ceremonies, preserve
+  active sign-ins under load, and use host-scoped session cookies on HTTPS.
+- Security: accept host replies only for matching pending commands and their
+  owning sessions, preventing unsolicited replies from changing session state.
+- Security: bound memory MCP authentication and preserve individual client
+  budgets behind explicitly trusted reverse proxies.
+- Isolate automated pin generation from write credentials and audit both
+  managed adapter lockfiles on the daily security schedule.
+- Collapse parent instructions and child reports in the transcript, with
+  controls to expand them, and show sidebar pinning as a stateful switch.
+- Existing HTTPS browser sessions must sign in again. Update agent hosts before
+  the collector if their legacy hello state exceeds 64 KiB; smaller legacy
+  hellos remain compatible.
+
 ## 0.3.8
 
 - Update managed Claude Code to 2.1.312 (ACP 0.99.0, Agent SDK 0.3.312),
