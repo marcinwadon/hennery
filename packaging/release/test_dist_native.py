@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -106,7 +107,7 @@ class NativeDist(unittest.TestCase):
                 self.assertFalse((root / 'target/distrib' / ('hennery-' + target + '.tar.xz')).exists(),
                                  result.stdout + result.stderr)
 
-    def test_real_rustup_toolchain_survives_isolated_home_without_ambient_override(self):
+    def rustup_fixture(self, *, wrapped_manager):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             runner_home = root / 'runner-home'; runner_home.mkdir()
@@ -124,16 +125,36 @@ class NativeDist(unittest.TestCase):
                 (toolchain / 'bin' / binary).symlink_to(installed)
             (toolchain / 'lib').symlink_to(sysroot / 'lib', target_is_directory=True)
             setup = dict(os.environ, HOME=str(runner_home), RUSTUP_HOME=str(runner_home / '.rustup'),
-                         CARGO_HOME=str(runner_home / '.cargo'))
+                         CARGO_HOME=str(runner_home / '.cargo'), RUSTUP_AUTO_INSTALL='0')
             for command in (['toolchain', 'link', 'fixture-native', str(toolchain)], ['default', 'fixture-native']):
                 subprocess.run(['rustup', *command], env=setup, check=True, capture_output=True)
+            manager = Path(shutil.which('rustup'))
+            if wrapped_manager:
+                # Homebrew's entrypoint is an env script that execs rustup by
+                # its manager name, regardless of the symlink used to reach it.
+                wrapper = root / 'rustup-manager'
+                wrapper.write_text('#!/bin/sh\nexec ' + shlex.quote(str(manager)) + ' "$@"\n')
+                wrapper.chmod(0o755)
+                manager = wrapper
             shims = runner_home / '.cargo/bin'; shims.mkdir(parents=True)
             for binary in ('cargo', 'rustc', 'rustdoc'):
-                (shims / binary).symlink_to(shutil.which('rustup'))
+                proxy = shims / binary
+                proxy.write_text('#!/bin/sh\nRUSTUP_FORCE_ARG0=' + shlex.quote(binary)
+                                 + ' exec ' + shlex.quote(str(manager)) + ' "$@"\n')
+                proxy.chmod(0o755)
             environment = setup | {'PATH': str(shims) + os.pathsep + os.environ['PATH']}
-            environment.pop('RUSTUP_HOME'); environment.pop('RUSTUP_TOOLCHAIN', None)
+            for name in ('RUSTUP_HOME', 'RUSTUP_TOOLCHAIN', 'RUSTUP_FORCE_ARG0'):
+                environment.pop(name, None)
             project = root / 'project'; project.mkdir()
+            active = subprocess.check_output(['rustup', 'show', 'active-toolchain'], cwd=project,
+                                             env=environment, text=True)
+            self.assertEqual(active.split()[0], 'fixture-native')
             with patch.dict(os.environ, environment, clear=True):
                 result, target = self.run_archive(project, host_only=True)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertTrue((project / 'target/distrib' / ('hennery-' + target + '.tar.xz')).is_file())
+
+    def test_real_rustup_toolchain_survives_isolated_home_without_ambient_override(self):
+        for wrapped_manager in (False, True):
+            with self.subTest(wrapped_manager=wrapped_manager):
+                self.rustup_fixture(wrapped_manager=wrapped_manager)
