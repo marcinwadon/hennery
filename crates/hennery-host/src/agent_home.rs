@@ -164,6 +164,14 @@ impl Registry {
     /// Persist the exact JSONL binding and home in one FULL-synchronous
     /// transaction. An existing ID cannot silently move to another transcript.
     pub fn record_omp(&self, binding: &crate::omp::session::Binding) -> Result<AgentHome> {
+        self.record_omp_after_verify(binding, || {})
+    }
+
+    fn record_omp_after_verify(
+        &self,
+        binding: &crate::omp::session::Binding,
+        after_verify: impl FnOnce(),
+    ) -> Result<AgentHome> {
         crate::omp::session::verify(
             &crate::omp::OmpConfig {
                 executable: binding.executable.clone(),
@@ -173,10 +181,14 @@ impl Registry {
             &binding.agent_session_id,
             &binding.cwd,
         )?;
+        after_verify();
         let text =
             |path: &Path| -> Result<String> { Ok(path.to_str().context("OMP binding path is not UTF-8")?.into()) };
         let home = AgentHome {
-            root: text(&binding.agent_data_dir.canonicalize()?)?,
+            // Verification walked this normal absolute root without following
+            // symlinks. Carry the same checked spelling into both rows; a later
+            // canonicalize could substitute a newly installed symlink target.
+            root: text(&binding.agent_data_dir)?,
             sqlite_root: None,
         };
         let mut conn = self.conn.lock().expect("registry lock");
@@ -241,5 +253,63 @@ impl Registry {
                 },
             )
             .optional()?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn omp_record_root_swap_after_verification_never_records_an_unverified_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let root = base.join("agent");
+        let replacement = base.join("unverified-agent");
+        let project = root.join("sessions/project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir(&replacement).unwrap();
+        for private in [&root, &replacement] {
+            std::fs::set_permissions(private, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let executable = base.join("omp");
+        std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let jsonl = project.join("exact.jsonl");
+        std::fs::write(
+            &jsonl,
+            format!(
+                "{}\n",
+                serde_json::json!({"type":"session", "id":"exact-id", "cwd":base})
+            ),
+        )
+        .unwrap();
+        let binding = crate::omp::session::Binding {
+            agent_session_id: "exact-id".into(),
+            executable,
+            agent_data_dir: root.clone(),
+            cwd: base,
+            jsonl,
+        };
+        let registry = Registry::open_in_memory().unwrap();
+        let home = registry
+            .record_omp_after_verify(&binding, || {
+                std::fs::rename(&root, root.with_file_name("saved-agent")).unwrap();
+                symlink(&replacement, &root).unwrap();
+            })
+            .unwrap();
+        assert_eq!(home.root, root.to_str().unwrap());
+        assert!(registry.contains(OMP, "exact-id", &home).unwrap());
+        assert_eq!(registry.omp_binding("exact-id").unwrap(), Some(binding.clone()));
+        let unverified_home = AgentHome {
+            root: replacement.to_str().unwrap().into(),
+            sqlite_root: None,
+        };
+        assert!(!registry.contains(OMP, "exact-id", &unverified_home).unwrap());
+        assert!(
+            registry.record_omp(&binding).is_err(),
+            "later reads must refuse the symlink"
+        );
     }
 }

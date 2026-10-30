@@ -91,9 +91,19 @@ struct Header {
     cwd: String,
 }
 
-fn header(file: File) -> Result<Option<Header>> {
-    let mut lines = BufReader::new(file.take(HEADER_LIMIT)).split(b'\n');
-    let Some(first) = lines.next().transpose()? else {
+fn header(file: impl Read) -> Result<Option<Header>> {
+    // One lookahead byte distinguishes physical EOF from a capped prefix.
+    // The limit includes the title slot and relevant newline(s); a complete
+    // header ending at real EOF is also valid. Never read the whole transcript.
+    let mut reader = BufReader::new(file.take(HEADER_LIMIT + 1));
+    let mut consumed = 0u64;
+    let mut next_line = || -> Result<Option<Vec<u8>>> {
+        let mut line = Vec::new();
+        let count = reader.read_until(b'\n', &mut line)?;
+        consumed += count as u64;
+        Ok((count != 0 && consumed <= HEADER_LIMIT).then_some(line))
+    };
+    let Some(first) = next_line()? else {
         return Ok(None);
     };
     let Ok(first) = serde_json::from_slice::<serde_json::Value>(&first) else {
@@ -107,7 +117,7 @@ fn header(file: File) -> Result<Option<Header>> {
         && first["pad"].is_string()
         && (first.get("source").is_none() || first["source"] == "auto" || first["source"] == "user")
     {
-        let Some(line) = lines.next().transpose()? else {
+        let Some(line) = next_line()? else {
             return Ok(None);
         };
         let Ok(value) = serde_json::from_slice(&line) else {
@@ -325,6 +335,95 @@ mod tests {
             .unwrap();
             assert!(fixture.discover().is_err());
         }
+    }
+
+    fn assert_truncated_header_is_refused(title: bool) {
+        let fixture = Fixture::new();
+        let binding = fixture.discover().unwrap();
+        fixture.write("exact-id", title);
+        let original = std::fs::read_to_string(&fixture.file).unwrap();
+        let lines: Vec<_> = original.lines().collect();
+        let prefix = if title {
+            format!("{}\n{}", lines[0], lines[1])
+        } else {
+            lines[0].to_string()
+        };
+        let mut capped = prefix.into_bytes();
+        capped.resize(HEADER_LIMIT as usize, b' ');
+        capped.extend_from_slice(b"x\n");
+        std::fs::write(&fixture.file, &capped).unwrap();
+        let discovered = fixture.discover().is_ok();
+        let verified = verify(&fixture.config, &binding, "exact-id", &fixture.cwd).is_ok();
+        assert!(
+            !discovered && !verified,
+            "accepted truncated header, title={title}, discovered={discovered}, verified={verified}"
+        );
+        assert_eq!(std::fs::read(&fixture.file).unwrap(), capped);
+    }
+
+    #[test]
+    fn valid_prefix_at_cap_cannot_hide_invalid_plain_header_continuation() {
+        assert_truncated_header_is_refused(false);
+    }
+
+    #[test]
+    fn valid_prefix_at_cap_cannot_hide_invalid_title_slot_header_continuation() {
+        assert_truncated_header_is_refused(true);
+    }
+
+    #[test]
+    fn complete_header_boundary_at_limit_is_distinguished_from_overflow() {
+        let fixture = Fixture::new();
+        for title in [false, true] {
+            for newline in [false, true] {
+                for size in [HEADER_LIMIT - 1, HEADER_LIMIT, HEADER_LIMIT + 1] {
+                    fixture.write("exact-id", title);
+                    let original = std::fs::read_to_string(&fixture.file).unwrap();
+                    let lines: Vec<_> = original.lines().collect();
+                    let prefix = if title {
+                        format!("{}\n{}", lines[0], lines[1])
+                    } else {
+                        lines[0].to_string()
+                    };
+                    let mut bytes = prefix.into_bytes();
+                    bytes.resize(size as usize - usize::from(newline), b' ');
+                    if newline {
+                        bytes.extend_from_slice(b"\n{\"type\":\"message\"}\n");
+                    }
+                    std::fs::write(&fixture.file, bytes).unwrap();
+                    assert_eq!(
+                        fixture.discover().is_ok(),
+                        size <= HEADER_LIMIT,
+                        "size={size}, title={title}, newline={newline}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unterminated_header_read_is_bounded_to_limit_plus_one() {
+        struct Counted {
+            bytes: std::io::Repeat,
+            read: std::rc::Rc<std::cell::Cell<usize>>,
+        }
+        impl Read for Counted {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.bytes.read(buf)?;
+                self.read.set(self.read.get() + count);
+                Ok(count)
+            }
+        }
+        let read = std::rc::Rc::new(std::cell::Cell::new(0));
+        assert!(
+            header(Counted {
+                bytes: std::io::repeat(b' '),
+                read: read.clone(),
+            })
+            .unwrap()
+            .is_none()
+        );
+        assert!(read.get() > 0 && read.get() <= HEADER_LIMIT as usize + 1);
     }
 
     #[test]
