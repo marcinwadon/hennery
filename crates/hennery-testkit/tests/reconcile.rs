@@ -3203,6 +3203,122 @@ async fn a_delete_whose_close_is_answered_not_attached_deletes_it() {
     assert_eq!(collector.state.store.find_session(&session).unwrap(), None);
 }
 
+/// Wait for the collector's ack of the host's last frame: it is sent after
+/// the fact was ingested and every waiter it could answer was answered.
+async fn acked(host: &mut ScriptedHost) {
+    let seq = host.seq;
+    loop {
+        if let CollectorFrame::Ack { ack_seq, .. } = host.next_frame().await
+            && ack_seq == seq
+        {
+            return;
+        }
+    }
+}
+
+/// The ended actor's answer to a command still queued: what a real host
+/// sends after a park or close overtook it.
+fn ended(request_id: String) -> HostFrame {
+    HostFrame::Error {
+        request_id,
+        code: "not_attached".into(),
+        message: "the session has ended on this host".into(),
+    }
+}
+
+/// A park that overtakes an operator close (an idle reap, say) does not
+/// answer the close: ingest already turns it into `closed`, and the ended
+/// actor's `not_attached` for the queued close completes it without a
+/// second close.
+#[tokio::test]
+async fn a_close_overtaken_by_a_park_completes_on_the_ended_actors_not_attached() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let c = client(&collector);
+    let url = collector.url(&format!("/api/sessions/{session}/close"));
+    let call = tokio::spawn(async move { post(&c, url, json!({})).await });
+    let CollectorFrame::CloseSession { request_id, .. } = host.next().await else {
+        panic!("expected close_session");
+    };
+    host.emit(
+        &session,
+        SessionBody::SessionParked {
+            reason: hennery_proto::frames::ParkReason::Idle,
+        },
+    )
+    .await;
+    acked(&mut host).await;
+    assert_eq!(collector.lifecycle(&session), "closed");
+    assert_eq!(collector.state.hub.pending_requests(), 1, "a park answered the close");
+    host.send(&ended(request_id)).await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!((status, body["lifecycle"].as_str()), (202, Some("closed")), "{body}");
+    assert_eq!(collector.state.hub.pending_requests(), 0);
+    assert_eq!(
+        collector
+            .event_kinds(&session)
+            .iter()
+            .filter(|k| *k == "operator_closed")
+            .count(),
+        1
+    );
+}
+
+/// The same race under a delete: the session it judged active is closed by
+/// then, which a delete accepts as it is.
+#[tokio::test]
+async fn a_delete_whose_close_is_overtaken_by_a_park_deletes_it() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let c = client(&collector);
+    let url = session_url(&collector, &session);
+    let call = tokio::spawn(async move { delete(&c, url).await });
+    let CollectorFrame::CloseSession { request_id, .. } = host.next().await else {
+        panic!("expected close_session");
+    };
+    host.emit(
+        &session,
+        SessionBody::SessionParked {
+            reason: hennery_proto::frames::ParkReason::AdapterExited,
+        },
+    )
+    .await;
+    acked(&mut host).await;
+    assert_eq!(collector.lifecycle(&session), "closed");
+    assert_eq!(collector.state.hub.pending_requests(), 1, "a park answered the close");
+    host.send(&ended(request_id)).await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(collector.state.store.find_session(&session).unwrap(), None);
+}
+
+/// A close that overtakes an operator park does not answer the park: the
+/// session stays closed, and the park answers the ended actor's
+/// `not_attached` as 409.
+#[tokio::test]
+async fn a_park_overtaken_by_a_close_answers_not_attached_and_stays_closed() {
+    let collector = Collector::start().await;
+    let mut host = ScriptedHost::connect(&collector, vec![], 0).await;
+    let session = started_session(&collector, &mut host).await;
+    let c = client(&collector);
+    let url = collector.url(&format!("/api/sessions/{session}/park"));
+    let call = tokio::spawn(async move { post(&c, url, json!({})).await });
+    let CollectorFrame::ParkSession { request_id, .. } = host.next().await else {
+        panic!("expected park_session");
+    };
+    host.emit(&session, SessionBody::SessionClosed).await;
+    acked(&mut host).await;
+    assert_eq!(collector.lifecycle(&session), "closed");
+    assert_eq!(collector.state.hub.pending_requests(), 1, "a close answered the park");
+    host.send(&ended(request_id)).await;
+    let (status, body) = call.await.unwrap();
+    assert_eq!((status, body["code"].as_str()), (409, Some("not_attached")), "{body}");
+    assert_eq!(collector.lifecycle(&session), "closed");
+    assert_eq!(collector.state.hub.pending_requests(), 0);
+}
+
 /// Decision 5, 4: a session presumed parked while its host is away is
 /// closed collector-side and deleted; the host is told to close it on its
 /// return.

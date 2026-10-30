@@ -17,7 +17,7 @@ use axum::{
 use futures::StreamExt;
 use hennery_kernel::{
     client_address::ClientAddress,
-    operator::{Authenticated, Operator, PublicUrl, SetupOutcome},
+    operator::{Authenticated, CheckPurpose, Operator, PublicUrl, SetupOutcome},
     secret::{rfc3339, unix_now},
 };
 use serde::Deserialize;
@@ -129,14 +129,24 @@ pub fn router(store: Arc<Store>, operator: Arc<Operator>) -> Result<Router> {
         .layer(middleware::from_fn_with_state(state, boundary)))
 }
 fn cookie(token: &str, operator: &Operator) -> String {
-    hennery_kernel::operator::session_cookie(token, operator.public_url().is_none_or(|p| p.is_https())).replacen(
-        "hennery_session=",
-        &format!("{}=", cookie_name(operator)),
-        1,
+    own_cookie(
+        &hennery_kernel::operator::session_cookie(token, secure(operator)),
+        operator,
     )
 }
+fn secure(operator: &Operator) -> bool {
+    operator.public_url().is_none_or(|p| p.is_https())
+}
+/// The kernel's `Set-Cookie`, renamed to this plug-in's private cookie.
+fn own_cookie(kernel: &str, operator: &Operator) -> String {
+    let kernel_name = hennery_kernel::operator::session_cookie_name(secure(operator));
+    match kernel.strip_prefix(kernel_name).filter(|rest| rest.starts_with('=')) {
+        Some(rest) => format!("{}{rest}", cookie_name(operator)),
+        None => kernel.to_string(),
+    }
+}
 fn cookie_name(operator: &Operator) -> &'static str {
-    if operator.public_url().is_none_or(|p| p.is_https()) {
+    if secure(operator) {
         SESSION_COOKIE
     } else {
         "hennery_memory_session"
@@ -319,7 +329,12 @@ async fn boundary(State(ui): State<Ui>, mut request: Request, next: Next) -> Res
         if let Some(token) = token.as_ref() {
             request.headers_mut().insert(
                 header::COOKIE,
-                format!("hennery_session={token}").parse().expect("opaque cookie"),
+                format!(
+                    "{}={token}",
+                    hennery_kernel::operator::session_cookie_name(secure(&ui.operator))
+                )
+                .parse()
+                .expect("opaque cookie"),
             );
         }
     }
@@ -345,7 +360,7 @@ async fn boundary(State(ui): State<Ui>, mut request: Request, next: Next) -> Res
             .get_all(header::SET_COOKIE)
             .iter()
             .filter_map(|v| v.to_str().ok())
-            .map(|v| v.replacen("hennery_session=", &format!("{}=", cookie_name(&ui.operator)), 1))
+            .map(|v| own_cookie(v, &ui.operator))
             .collect::<Vec<_>>();
         response.headers_mut().remove(header::SET_COOKIE);
         for v in values {
@@ -422,6 +437,9 @@ struct Password {
     password: String,
 }
 async fn login(State(ui): State<Ui>, address: ClientAddress, Form(input): Form<Password>) -> Response {
+    let Some(admitted) = ui.operator.admit_check(CheckPurpose::Login) else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "Busy; retry later.");
+    };
     if ui
         .operator
         .login_limiter
@@ -430,7 +448,7 @@ async fn login(State(ui): State<Ui>, address: ClientAddress, Form(input): Form<P
     {
         return error(StatusCode::TOO_MANY_REQUESTS, "Too many attempts; try later.");
     }
-    let Ok(Some(phc)) = ui.operator.check_password(input.password).await else {
+    let Ok(Some(phc)) = ui.operator.check_password(admitted, input.password).await else {
         return error(StatusCode::UNAUTHORIZED, "Sign in failed.");
     };
     let Ok(Some(token)) = ui.operator.open_session("Memory management browser", &phc, unix_now()) else {
@@ -450,6 +468,9 @@ async fn step_up(
     address: ClientAddress,
     Form(input): Form<Password>,
 ) -> Response {
+    let Some(admitted) = ui.operator.admit_check(CheckPurpose::StepUp) else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "Busy; retry later.");
+    };
     if ui
         .operator
         .step_up_limiter
@@ -458,7 +479,7 @@ async fn step_up(
     {
         return error(StatusCode::TOO_MANY_REQUESTS, "Too many attempts; try later.");
     }
-    let Ok(Some(_)) = ui.operator.check_password(input.password).await else {
+    let Ok(Some(_)) = ui.operator.check_password(admitted, input.password).await else {
         return error(StatusCode::UNAUTHORIZED, "Confirmation failed.");
     };
     if ui.operator.step_up(&session.session_id, unix_now()).is_ok_and(|ok| ok) {
@@ -473,8 +494,10 @@ async fn logout(State(ui): State<Ui>, Extension(session): Extension<Authenticate
         return unavailable();
     }
     let mut response = Redirect::to("/login").into_response();
-    let cleared = hennery_kernel::operator::cleared_cookie(ui.operator.public_url().is_none_or(|p| p.is_https()))
-        .replacen("hennery_session=", &format!("{}=", cookie_name(&ui.operator)), 1);
+    let cleared = own_cookie(
+        &hennery_kernel::operator::cleared_cookie(secure(&ui.operator)),
+        &ui.operator,
+    );
     response
         .headers_mut()
         .insert(header::SET_COOKIE, cleared.parse().expect("cookie"));

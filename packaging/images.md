@@ -66,6 +66,13 @@ volume inherits the image's UID/GID and mode **0700**. A bind mount retains its
 host owner and permissions: prepare it for **65532:65532, 0700** before start.
 Never mount an agent home into the collector. Protect backups as credentials.
 
+Bound container stdout logs as well as storage. For Docker, use
+`--log-driver local --log-opt max-size=10m --log-opt max-file=5`, or equivalent
+explicit rotation in your deployment. The collector's service-file rotation
+does not apply to container stdout; Docker's default `json-file` driver does
+not rotate unless configured. Set memory and process limits appropriate to the
+deployment and keep the proxy's TLS admission limits in front of the backend.
+
 Change the listening address/port with `HENNERY_LISTEN`, keeping the container
 port mapping in sync. The image's healthcheck reads that environment variable;
 changing only a command-line `--listen` would break the healthcheck.

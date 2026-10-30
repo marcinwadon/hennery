@@ -267,6 +267,9 @@ async fn streaming_and_reload(kind: &str) {
             "{config}"
         );
     }
+    if kind == "caddy" {
+        assert!(config.contains("read_body 2s"), "{config}");
+    }
     for path in ["/api/stream/fixture", "/mcp/fixture"] {
         let req = client(&ca).request(
             if path.starts_with("/mcp") {
@@ -394,6 +397,9 @@ fn recipe_policy_disables_buffering_post_retries_and_access_logging() {
         "proxy_send_timeout 120s;",
         "limit_req_zone $binary_remote_addr zone=requests:10m rate=100r/s;",
         "limit_req zone=requests burst=200 nodelay;",
+        "client_header_timeout 10s;",
+        "client_body_timeout 10s;",
+        "limit_conn server_connections 256;",
     ] {
         assert_eq!(
             directives.iter().filter(|line| **line == required).count(),
@@ -403,7 +409,15 @@ fn recipe_policy_disables_buffering_post_retries_and_access_logging() {
     }
     let caddy = std::fs::read_to_string(root.join("Caddyfile")).unwrap();
     let directives: Vec<_> = caddy.lines().map(str::trim).collect();
-    for required in ["flush_interval -1", "lb_retries 0", "versions 1.1", "keepalive 120s"] {
+    for required in [
+        "flush_interval -1",
+        "lb_retries 0",
+        "versions 1.1",
+        "keepalive 120s",
+        "read_header 10s",
+        "read_body 30s",
+        "idle 30s",
+    ] {
         assert_eq!(
             directives.iter().filter(|line| **line == required).count(),
             1,

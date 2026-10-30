@@ -1,6 +1,13 @@
 {
     admin 127.0.0.1:@ADMIN_PORT@
     auto_https off
+    servers {
+        timeouts {
+            read_header 10s
+            read_body 30s
+            idle 30s
+        }
+    }
 }
 :@TLS_PORT@ {
     bind @BIND_V4@ @BIND_V6@

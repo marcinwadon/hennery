@@ -3,8 +3,8 @@
 //! the admin socket's recoveries (kernel spec §4.2).
 
 use hennery_kernel::operator::{
-    MAX_PASSWORD_BYTES, Operator, PublicUrl, PublicUrlChange, Reset, SETUP_TOKEN_TTL_SECS, SETUP_URL_FILE,
-    STEP_UP_SECS, SetupOutcome,
+    CheckPurpose, MAX_PASSWORD_BYTES, Operator, PublicUrl, PublicUrlChange, Reset, SETUP_TOKEN_TTL_SECS,
+    SETUP_URL_FILE, STEP_UP_SECS, SetupOutcome,
 };
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
@@ -153,7 +153,13 @@ async fn concurrent_checks_each_verify_once_and_answer_their_own_password() {
             } else {
                 "wrong".to_string()
             };
-            tokio::spawn(async move { op.check_password(password).await.unwrap() })
+            let purpose = if i < 2 {
+                CheckPurpose::Login
+            } else {
+                CheckPurpose::StepUp
+            };
+            let admitted = op.admit_check(purpose).expect("a place in the pool");
+            tokio::spawn(async move { op.check_password(admitted, password).await.unwrap() })
         })
         .collect();
     let mut results = Vec::new();
@@ -549,7 +555,7 @@ async fn a_login_checked_before_a_password_reset_opens_no_session_after_it() {
     let token = op.issue_setup_token(NOW).unwrap().unwrap();
     op.set_up(&token, PASSWORD, "https://hennery.example", NOW).unwrap();
     let stale = op
-        .check_password(PASSWORD.into())
+        .check_password(op.admit_check(CheckPurpose::Login).unwrap(), PASSWORD.into())
         .await
         .unwrap()
         .expect("the old password");
@@ -563,7 +569,10 @@ async fn a_login_checked_before_a_password_reset_opens_no_session_after_it() {
     assert_eq!(op.open_session("browser", &stale, NOW).unwrap(), None);
     assert!(op.sessions(NOW).unwrap().is_empty());
     let fresh = op
-        .check_password("a new long password".into())
+        .check_password(
+            op.admit_check(CheckPurpose::Login).unwrap(),
+            "a new long password".into(),
+        )
         .await
         .unwrap()
         .expect("the new password");

@@ -43,7 +43,7 @@ async fn rename_is_operator_only_and_null_restores_agent_title_without_step_up()
         client
             .patch(&url)
             .header("origin", PUBLIC_URL)
-            .header("cookie", format!("hennery_session={token}"))
+            .header("cookie", format!("__Host-hennery_session={token}"))
             .json(&body)
     };
     let response = patch(json!({"title":"Chosen"})).send().await.unwrap();
@@ -161,7 +161,7 @@ async fn configuration_error_case(presume_parked: bool) {
         client
             .request(method, format!("{url}{path}"))
             .header("origin", PUBLIC_URL)
-            .header("cookie", format!("hennery_session={token}"))
+            .header("cookie", format!("__Host-hennery_session={token}"))
     };
     let detail = request(reqwest::Method::GET, "/api/sessions/s")
         .send()

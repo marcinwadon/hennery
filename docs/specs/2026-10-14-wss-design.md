@@ -70,8 +70,8 @@ The existing invariants remain authoritative:
 - Pairing codes are 40-bit, single-use, expire after ten minutes and are
   consumed in the host-creation transaction (kernel §4.1). Minting needs
   operator step-up, or the local admin socket's existing authority.
-- The upgrade returns a fresh 32-byte `hennery-hello-nonce`. The first
-  `hello` signs the existing length-prefixed message, host id and protocol
+- The upgrade returns a fresh 32-byte `hennery-hello-nonce`. The negotiated
+  `authenticate` and full `hello` sign the existing length-prefixed message, host id and protocol
   version. No valid nonce means no hello. Refusal order, strict Ed25519
   verification and one live connection per host remain ACP core §3.5's.
 - Only `revoked` ends the host and stops its adapters (exit 78). Transport

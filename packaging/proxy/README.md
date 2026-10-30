@@ -14,8 +14,9 @@ Choose [Caddyfile](Caddyfile) or [nginx.conf](nginx.conf). These exact files
 are executed by `hennery-testkit/tests/reverse_proxy.rs` and the CLI deployment
 and README tests, using disposable CA/leaf certificates and loopback ports.
 Replacements use the explicit placeholders below. The heartbeat/renewal tests
-also scale only the fixture's idle durations from 120 s to 8 s, retaining nine
-ping/pong rounds past that duration. The recipe policy test pins the production
+also scale the fixture's idle durations from 120 s to 8 s and Caddy's body
+deadline from 30 s to 2 s, retaining nine ping/pong rounds past both durations.
+This checks that body deadlines do not leak into upgraded sockets. The recipe policy test pins the production
 durations. Caddy's `keepalive` governs idle upstream connections; nginx's
 read/send timeouts also cover upgraded WebSockets.
 
@@ -59,16 +60,36 @@ Keep backend access restricted. Local processes able to reach a trusted loopback
 peer can assert budget addresses; this grants no operator access.
 
 nginx caps connections per address at 20 and requests at 100/s with a burst of
-200, including unauthenticated upgrades. Tune deployment capacity deliberately.
+200, including unauthenticated upgrades, with 256 active requests across the
+server. Both recipes bound header reads to 10 seconds; Caddy bounds complete
+body reads to 30 seconds, and nginx bounds idle body reads to 10 seconds.
+Tune deployment capacity deliberately.
 Caddy core does not supply a per-client connection/request limiter: add and test
 firewall/ingress caps before public exposure. Backend rate limits do not bound
-TLS handshakes or unauthenticated open WebSockets. A second ingress hop requires
+TLS handshakes. The collector separately caps pending host handshakes at four
+per client and 64 total, with a ten-second deadline. HTTP requests keep their
+capacity reservation through the response body, including SSE. A second ingress hop requires
 its own tested trust chain; never take the leftmost user-supplied XFF address.
 The optional memory plug-in uses the same attribution through its own
 [recipe](memory.md).
 Tailscale Serve is separately qualified: if it cannot overwrite authenticated
 client addresses, retain the shared-budget warning and restrict ingress to a
 trusted VPN population.
+
+The collector's HTTP/1 listener caps connections at 512 and header buffers at
+16 KiB. Small auth/setup/enrollment JSON bodies have a five-second deadline;
+other browser JSON bodies have 30 seconds. These are request/read limits,
+not a timeout on a running agent or an SSE response.
+
+New collectors advertise `Hennery-Hello-Auth: 1` with the existing upgrade
+nonce. New hosts first send a small signed `authenticate`, then the full
+`hello`. Before the signature is verified, a 64 KiB total wire budget is
+enforced on frame headers before the WebSocket parser can reserve the declared
+payload. Fragmented frames share that budget. Authenticated messages retain
+the existing 32 MiB limit. Older collectors receive the ordinary hello; older
+hosts can send a hello that fits the new budget. Upgrade hosts before the
+collector if their large configuration/reconciliation state exceeds 64 KiB.
+No extra round trip or stored credential is introduced.
 
 ## Public deployment gate
 

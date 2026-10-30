@@ -174,21 +174,35 @@ frontend), and `SetupRequest` has no default hat name; hats add it.
 
 - **Password:** Argon2id (PHC string, `password-auth`), verification on a
   blocking thread; at least 12 characters, at most 1024 bytes; at most two
-  hashes or verifies at once. `POST /api/auth/login {password}` → 204 with
+  hashes or verifies at once, in two pools of one: logins, and step-ups with
+  the admin socket's reset, so a login flood never delays a signed-in owner's
+  step-up. Each pool lets four more checks wait; past that a check is refused
+  at once with 503 `auth_busy` and `Retry-After: 1`, before it is counted
+  against the address. A check's place stays taken until its verify ends,
+  even if the client goes away. `POST /api/auth/login {password}` → 204 with
   the cookie, or 401 `invalid_password`. Login attempts are rate limited per
   client address (5 wrong passwords per minute, then a 60 s lockout doubling
   up to 1 h: 429 `rate_limited` with `Retry-After`); only a success clears the
-  address. Constant-time failure path: an attempt that is not rate limited
-  runs exactly one Argon2 verify (against a dummy hash before setup); a
-  limited one runs none, so the right password gets 429 too.
+  address. Constant-time failure path: an attempt that is neither busy nor
+  rate limited runs exactly one Argon2 verify (against a dummy hash before
+  setup); a limited one runs none, so the right password gets 429 too.
 - **Rate limits** (here and §4.1) key on the canonical client address, IPv6
   per /64 and all of `127.0.0.0/8` as one; every attempt counts the moment it
   starts, so a parallel burst gets no more in than the budget. State is in
-  memory, bounded, and a restart clears it; past capacity a live entry is
-  never evicted (new addresses share one overflow budget), and loopback always
-  keeps an entry of its own. `X-Forwarded-For` is not trusted. Behind an
-  unconfigured proxy every client shares its budget; §2's exact-peer,
-  dedicated-header policy provides address-only attribution.
+  memory, bounded, and a restart clears it; past capacity (4096 addresses) a
+  live entry is never evicted: a new address shares its prefix's budget (an
+  IPv4 /24, an IPv6 /48; at most 1024 prefixes), and past those one overflow
+  budget, so rotating addresses gains at most (4096 + 1024 + 64 + 2) budgets
+  a window. Loopback always keeps an entry of its own, and so do the last 64
+  addresses that succeeded (known addresses): a flood cannot push the
+  owner's usual address into a budget it has locked. Password and passkey
+  login share their known addresses (a sign-in by either protects both),
+  each keeping its own counts, which the other's success never clears.
+  Known is no exemption: the same budget applies, and the credential is
+  checked as always.
+  `X-Forwarded-For` is not trusted. Behind an unconfigured proxy every
+  client shares its budget; §2's exact-peer, dedicated-header policy
+  provides address-only attribution.
 - **Passkeys:** `webauthn-rs` with RP id and origin derived from `public_url`;
   subdomains and arbitrary ports not allowed. The RP id is `public_url`'s host
   exactly (not a registrable parent) and its origin the only one accepted; a
@@ -199,9 +213,26 @@ frontend), and `SetupRequest` has no default hat name; hats add it.
     single use (a finish takes it, whatever it then finds), 5 minutes, bound
     to the session that began it (registration, step-up), at most one per
     session and kind. Login ceremonies have a pool of their own, so a flood of
-    login starts never pushes out a registration or a step-up. A restart
-    drops them. An unknown, used or expired ceremony answers 400
-    `invalid_ceremony`.
+    login starts never pushes out a registration or a step-up. A login
+    start first reserves its place, under the lock that checks there is
+    one, and only then counts against the passkey budget: a start refused
+    busy is never counted, however many race for the last place. No live
+    login is ever pushed out, for its whole 5 minutes, not even for a start
+    from its own rate-limit key (browsers behind one NAT share one): a
+    client keeps at most eight live logins (loopback has no such cap, since
+    behind a proxy that names no client it is everyone); unknown clients of
+    one prefix (an IPv4 /24, an IPv6 /48, as §3.2 aggregates them) at most
+    64 together, so one site's many keys cannot fill the pool; and the pool
+    1024, of which 64 only for addresses that signed in before (§3.2's known
+    addresses), whose logins no prefix quota counts or limits. Past any of
+    these, a start answers 503 `auth_busy` with `Retry-After: 1` until one
+    ends. A flood can delay a new login, not end one under way: a flood
+    spread over 15 or more prefixes can still keep unknown addresses from
+    starting a passkey login, while known addresses and password login go
+    on. A login start whose reserved place a reset or `public_url` change
+    cleared meanwhile was counted, and answers 409 `passkeys_unavailable`. A restart drops them. An unknown, used or
+    expired
+    ceremony answers 400 `invalid_ceremony`.
   - Several passkeys per owner, each with a label (1–64 characters, no control
     characters) and last-used time, listed in registration order. In v1
     passkeys add to the password and never replace it, so every passkey is
@@ -218,12 +249,16 @@ frontend), and `SetupRequest` has no default hat name; hats add it.
     writes nothing and logs a warning naming the passkey; the passkey is not
     disabled (that would hand a clone's holder a lever).
 - **Sessions:** server-side (`auth_sessions`: random 256-bit id hashed at
-  rest). Cookie `hennery_session`: `HttpOnly`, `Secure` (from `public_url`'s
+  rest). Cookie `__Host-hennery_session` on HTTPS, `hennery_session` on a
+  loopback `http://` `public_url`: `HttpOnly`, `Secure` (from `public_url`'s
   scheme, never from the peer address), `SameSite=Strict`, `Path=/`,
-  `Max-Age` 30 days. 30-day sliding expiry; use slides it at most once a
-  minute, and a slid response re-sends the cookie. Up to four
-  `hennery_session` cookies in a request are tried in order (a sibling
-  subdomain can plant a same-named one). Expired rows are pruned when a
+  `Max-Age` 30 days. Only the scheme's own name is read: on HTTPS an
+  unprefixed `hennery_session`, which a sibling subdomain can set for the
+  parent domain, is ignored, so a browser holding one from before the prefix
+  signs in again. 30-day sliding expiry; use slides it at most once a
+  minute, and a slid response re-sends the cookie. Up to four session
+  cookies in a request are tried in order (another service on the same
+  loopback host can plant a same-named one). Expired rows are pruned when a
   session opens; `User-Agent` is stored without control characters, at most
   256 characters. A login, password or passkey, opens a stepped-up session
   (§3.4), and only while the credential it checked is still current (the same
@@ -427,7 +462,10 @@ minutes, then a 60 s lockout doubling up to 1 h; §3.2 for how addresses are
 keyed); wrong codes never invalidate other outstanding codes. Every attempt
 counts the moment it starts, and a success clears the address. A locked-out
 address gets 429 `rate_limited` with `Retry-After`, and its code is not
-checked, so not spent.
+checked, so not spent. A flood from any number of addresses gets at most
+(4096 + 1024 + 64 + 2) budgets in a 10-minute window (§3.2), about 8 guesses
+each with the lockout: some 41,500 guesses against at most 16 live 40-bit
+codes, a chance of about 6 × 10⁻⁷ a window.
 
 ### 4.2 All-in-one pairing and the admin socket
 

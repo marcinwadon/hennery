@@ -389,7 +389,7 @@ pub fn operator_client(operator: &hennery_kernel::operator::Operator) -> reqwest
     let mut headers = reqwest::header::HeaderMap::new();
     headers.insert(
         reqwest::header::COOKIE,
-        format!("{}={token}", hennery_kernel::operator::SESSION_COOKIE)
+        format!("{}={token}", hennery_kernel::operator::SECURE_SESSION_COOKIE)
             .parse()
             .unwrap(),
     );

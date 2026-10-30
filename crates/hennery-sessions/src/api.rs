@@ -1421,7 +1421,9 @@ fn close_unattached(state: &AppState, id: &str) -> Response {
 }
 
 /// Explicit park of an attached session: 202 with the lifecycle once the
-/// host's `session_parked` is ingested.
+/// host's `session_parked` is ingested. Only that fact answers it: a close
+/// that overtakes the park ends the actor, whose `not_attached` answers
+/// 409 and leaves the session closed.
 async fn park(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let session = match state.store.find_session(&id) {
         Ok(Some(s)) => s,
@@ -1518,12 +1520,16 @@ pub(crate) async fn close_through_host(state: &AppState, session: &SessionRow) -
         .request_for_session(&session.host_id, &request_id, id, frame, TEARDOWN_TIMEOUT)
         .await
     {
-        // `session_closed`, or a `session_parked` that overtook the close
-        // (ingest turns that into `closed`, since a close was requested).
+        // Only `session_closed` answers a close. A `session_parked` that
+        // overtakes it (an idle reap or adapter exit) does not: ingest
+        // already turns that park into `closed`, since a close was
+        // requested, and the ended actor answers the queued close
+        // `not_attached`, below.
         Ok(_) => Closing::Closed,
         // The host no longer has it (or went away before the close was
         // sent): nothing left to stop, so closed collector-side, while it
-        // is still as read (A4; a close request changes neither).
+        // is still as read (A4; a close request changes neither). Closing
+        // an already closed session changes nothing, so a delete goes on.
         Err(RequestError::Rejected { code, .. }) if code == "not_attached" => Closing::Unattached(judged),
         Err(RequestError::NotConnected) => Closing::Unattached(judged),
         Err(err) => Closing::Answer(request_failed(err)),

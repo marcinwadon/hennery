@@ -5,6 +5,7 @@
 use hennery_kernel::auth_api::MAX_BODY_BYTES;
 use hennery_kernel::hosts::Hosts;
 use hennery_kernel::operator::Operator;
+use hennery_kernel::passkeys::{KNOWN_LOGIN_CEREMONIES, MAX_LOGIN_CEREMONIES, Start};
 use hennery_kernel::ratelimit::Policy;
 use hennery_kernel::secret::unix_now;
 use hennery_proto::rest::{
@@ -13,7 +14,7 @@ use hennery_proto::rest::{
 use hennery_sessions::AppState;
 use hennery_sessions::store::Store;
 use hennery_testkit::{OWNER_PASSWORD, PUBLIC_URL};
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use webauthn_authenticator_rs::WebauthnAuthenticator;
 use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 use webauthn_rs::prelude::{CreationChallengeResponse, RequestChallengeResponse, Url};
@@ -70,7 +71,7 @@ impl Collector {
             .request(method.parse().unwrap(), format!("http://{}{path}", self.addr))
             .header("origin", PUBLIC_URL);
         match session {
-            Some(session) => req.header("cookie", format!("hennery_session={session}")),
+            Some(session) => req.header("cookie", format!("__Host-hennery_session={session}")),
             None => req,
         }
     }
@@ -205,7 +206,7 @@ async fn code_of(resp: reqwest::Response) -> (u16, String) {
 fn session_token(resp: &reqwest::Response) -> String {
     let cookie = resp.headers()["set-cookie"].to_str().unwrap();
     cookie
-        .strip_prefix("hennery_session=")
+        .strip_prefix("__Host-hennery_session=")
         .unwrap()
         .split(';')
         .next()
@@ -377,7 +378,7 @@ async fn passkey_routes_follow_the_browser_rules() {
     assert_eq!(code_of(resp).await, (403, "origin_mismatch".into()));
     let resp = reqwest::Client::new()
         .delete(url(&format!("/api/auth/passkeys/{}", item.id)))
-        .header("cookie", format!("hennery_session={session}"))
+        .header("cookie", format!("__Host-hennery_session={session}"))
         .send()
         .await
         .unwrap();
@@ -417,7 +418,7 @@ async fn passkey_routes_follow_the_browser_rules() {
         assert_eq!(code_of(resp).await, (401, "unauthenticated".into()), "{path}");
         let resp = reqwest::Client::new()
             .post(url(path))
-            .header("cookie", format!("hennery_session={session}"))
+            .header("cookie", format!("__Host-hennery_session={session}"))
             .json(&serde_json::json!({}))
             .send()
             .await
@@ -466,6 +467,51 @@ async fn passkey_login_has_a_budget_of_its_own() {
         (429, "rate_limited".into())
     );
     assert_eq!(c.password_login(OWNER_PASSWORD).await.status(), 204);
+}
+
+/// A flood of passkey login starts from many other addresses fills the
+/// login pool but never pushes out the owner's ceremony under way: it
+/// still finishes. Further starts are refused 503 `auth_busy`, before they
+/// are counted against the address's passkey budget.
+#[tokio::test]
+async fn a_login_flood_from_other_addresses_never_ends_the_owners_ceremony() {
+    let c = Collector::start().await;
+    let mut passkey = authenticator();
+    c.register(&c.session(0), &mut passkey, "laptop").await;
+    let (ceremony_id, assertion) = c.begin_login(&mut passkey, PUBLIC_URL).await;
+    let mut busy = 0;
+    for n in 0..MAX_LOGIN_CEREMONIES as u32 + 16 {
+        // One address per /24, so no prefix quota is reached.
+        let client = IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + (n << 8)));
+        match c.state.operator.start_passkey_login(client, unix_now()).unwrap() {
+            Start::Begun { .. } => {}
+            Start::Busy => busy += 1,
+            other => panic!("the start was {other:?}"),
+        }
+    }
+    // The owner's begun login holds one of the places unknown clients may
+    // use; the flood gets the rest, and is refused busy past them.
+    let places = (MAX_LOGIN_CEREMONIES - KNOWN_LOGIN_CEREMONIES) as u32;
+    assert_eq!(busy, MAX_LOGIN_CEREMONIES as u32 + 16 - (places - 1));
+    for _ in 0..=Policy::PASSKEY_LOGIN.free_failures {
+        assert_eq!(
+            c.start_ceremony(None, "/api/auth/passkeys/login/start", None)
+                .await
+                .unwrap_err(),
+            (503, "auth_busy".into())
+        );
+    }
+    assert_eq!(
+        c.finish(None, "/api/auth/passkeys/login/finish", &ceremony_id, assertion)
+            .await
+            .status(),
+        204
+    );
+    // Signed in from here, the address is known: it may take the places
+    // kept for known clients, which the flood could not reach.
+    c.start_ceremony(None, "/api/auth/passkeys/login/start", None)
+        .await
+        .expect("a known address begins a login during the flood");
 }
 
 /// A successful passkey login gives its address its budget back.

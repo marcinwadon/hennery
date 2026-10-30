@@ -362,7 +362,7 @@ impl Harness {
             .method(method)
             .uri(path)
             .header("origin", ORIGIN)
-            .header("cookie", format!("hennery_session={session}"));
+            .header("cookie", format!("__Host-hennery_session={session}"));
         let body = match body {
             Some(body) => {
                 req = req.header("content-type", "application/json");

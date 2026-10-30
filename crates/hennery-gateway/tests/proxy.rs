@@ -77,7 +77,7 @@ async fn a_request_goes_up_with_the_credential_and_the_allowed_headers_only() {
             .header("mcp-session-id", &session)
             .header("mcp-protocol-version", "2025-06-18")
             .header("last-event-id", "41")
-            .header(header::COOKIE, "hennery_session=browser-cookie")
+            .header(header::COOKIE, "__Host-hennery_session=browser-cookie")
             .header(header::ORIGIN, "https://evil.example")
             .header("x-forwarded-for", "10.0.0.1")
             .header(header::ACCEPT_ENCODING, "gzip, br")

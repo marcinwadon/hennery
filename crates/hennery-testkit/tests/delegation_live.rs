@@ -481,7 +481,10 @@ impl Harness {
             .context("operator session")?;
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::ORIGIN, url.parse()?);
-        headers.insert(reqwest::header::COOKIE, format!("hennery_session={session}").parse()?);
+        headers.insert(
+            reqwest::header::COOKIE,
+            format!("__Host-hennery_session={session}").parse()?,
+        );
         let client = reqwest::Client::builder().no_proxy().default_headers(headers).build()?;
         let keys = KeySource::from_vars(&root, Some("23".repeat(32).into()), None)?;
         let gateway: GatewayState = hennery_gateway::open(

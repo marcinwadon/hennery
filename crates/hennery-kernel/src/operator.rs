@@ -10,14 +10,18 @@
 //!   spec §3.1). Only its SHA-256 is kept.
 //! - **Passwords are Argon2id PHC strings** (`password-auth`). Hashing and
 //!   verifying are CPU- and memory-heavy (about 19 MiB each), so they run
-//!   on a blocking thread and at most `MAX_CONCURRENT_HASHES` at once.
+//!   on a blocking thread and at most `MAX_CONCURRENT_HASHES` at once:
+//!   one for anonymous logins, one for a signed-in owner's step-ups and the
+//!   admin socket's resets, so a login flood cannot starve either. Each
+//!   pool lets at most `MAX_QUEUED_CHECKS` checks wait; past that a check
+//!   is refused busy at once instead of queueing without bound.
 //! - **Recovery** (the admin socket, kernel spec §4.2): a password reset
 //!   and a `public_url` reset each end every session, and so its streams.
 //!
 //! Every time is seconds since the Unix epoch, passed in by the caller.
 
 use crate::db;
-use crate::ratelimit::{Limiter, Policy};
+use crate::ratelimit::{KnownAddresses, Limiter, Policy};
 use crate::secret::{random_bytes, sha256_hex};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -36,8 +40,46 @@ pub const MIN_PASSWORD_CHARS: usize = 12;
 /// The longest password accepted, in bytes: hashing is bounded by it.
 pub const MAX_PASSWORD_BYTES: usize = 1024;
 
-/// Argon2 runs at most this many at once, whatever the number of clients.
+/// Argon2 runs at most this many at once, whatever the number of clients:
+/// one per `CheckPurpose` pool.
 pub const MAX_CONCURRENT_HASHES: usize = 2;
+
+/// Password checks that may wait behind a pool's running one; a check
+/// past them is refused busy (`Operator::admit_check`).
+pub const MAX_QUEUED_CHECKS: usize = 4;
+
+/// Whose password check it is, and so which pool it runs in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckPurpose {
+    /// A login: anyone can ask.
+    Login,
+    /// A signed-in session's step-up. The admin socket's reset hashes in
+    /// this pool too.
+    StepUp,
+}
+
+/// One pool of Argon2 runs: `running` slots, and `admitted` for those
+/// running or waiting for one.
+struct HashPool {
+    admitted: Arc<tokio::sync::Semaphore>,
+    running: Arc<tokio::sync::Semaphore>,
+}
+
+impl HashPool {
+    fn new() -> Self {
+        Self {
+            admitted: Arc::new(tokio::sync::Semaphore::new(1 + MAX_QUEUED_CHECKS)),
+            running: Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+}
+
+/// A password check let into its pool (`Operator::admit_check`): its place
+/// is held until it is dropped unused, or until its verify ends.
+pub struct Admitted {
+    admitted: tokio::sync::OwnedSemaphorePermit,
+    running: Arc<tokio::sync::Semaphore>,
+}
 
 /// The file in the data directory that holds the setup link until setup
 /// (kernel spec §1, §3.1).
@@ -201,10 +243,13 @@ pub struct Operator {
     /// The link last written to `setup-url` (and so the file), removed
     /// once setup is done.
     announced: Mutex<Option<SetupLink>>,
-    /// `check_password`'s slots, each held until its verify ends.
-    hashing: Arc<tokio::sync::Semaphore>,
+    /// `check_password`'s pools: logins apart from step-ups and resets,
+    /// each slot held until its verify ends.
+    login_hashing: HashPool,
+    step_up_hashing: HashPool,
     verifications: AtomicU64,
     /// Wrong passwords per client address at login (kernel spec §3.2).
+    /// Its known addresses are the passkey limiter's too.
     pub login_limiter: Limiter,
     /// Wrong passwords per client address at step-up, a budget of its own
     /// (3b decision 10): a login flood from a shared address does not stop
@@ -231,6 +276,12 @@ pub struct Operator {
     /// permit, pinned by the unit tests below).
     #[cfg(test)]
     reset_hashes: AtomicU64,
+    /// While `true`, every verify waits once counted in `verifications`
+    /// (`Operator::hold`).
+    #[cfg(test)]
+    held: Mutex<bool>,
+    #[cfg(test)]
+    released: std::sync::Condvar,
 }
 
 impl Operator {
@@ -247,17 +298,21 @@ impl Operator {
     fn init(mut conn: crate::db::OwnedConnection) -> Result<Self> {
         let owner = db::kernel_owner(&mut conn)?;
         let public_url = load_public_url(&conn, &owner)?;
+        // A password or passkey login proves the same: either makes its
+        // address known to both limiters, whose counts stay their own.
+        let sign_ins = Arc::new(KnownAddresses::new(crate::ratelimit::DEFAULT_KNOWN));
         Ok(Self {
             conn: crate::db::CoordinatedConnection::new(conn),
             owner,
             public_url: RwLock::new(public_url),
             setup: Mutex::new(None),
             announced: Mutex::new(None),
-            hashing: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HASHES)),
+            login_hashing: HashPool::new(),
+            step_up_hashing: HashPool::new(),
             verifications: AtomicU64::new(0),
-            login_limiter: Limiter::new(Policy::LOGIN),
+            login_limiter: Limiter::with_shared_known(Policy::LOGIN, sign_ins.clone()),
             step_up_limiter: Limiter::new(Policy::LOGIN),
-            passkey_limiter: Limiter::new(Policy::PASSKEY_LOGIN),
+            passkey_limiter: Limiter::with_shared_known(Policy::PASSKEY_LOGIN, sign_ins),
             ended: tokio::sync::watch::Sender::new(0),
             ceremonies: Default::default(),
             #[cfg(test)]
@@ -266,6 +321,10 @@ impl Operator {
             max_in_flight: Default::default(),
             #[cfg(test)]
             reset_hashes: Default::default(),
+            #[cfg(test)]
+            held: Default::default(),
+            #[cfg(test)]
+            released: Default::default(),
         })
     }
 
@@ -464,6 +523,13 @@ impl Operator {
         #[cfg(test)]
         let _gauge = InFlight::enter(self);
         self.verifications.fetch_add(1, Ordering::Relaxed);
+        #[cfg(test)]
+        {
+            let mut held = self.held.lock().expect("held lock");
+            while *held {
+                held = self.released.wait(held).expect("held lock");
+            }
+        }
         let phc: Option<String> = self
             .conn()
             .query_row(
@@ -486,20 +552,35 @@ impl Operator {
         Ok(password_auth::verify_password(password, &phc).is_ok().then_some(phc))
     }
 
-    /// `verify_password` on a blocking thread, at most
-    /// `MAX_CONCURRENT_HASHES` at once; others wait their turn. The slot
-    /// moves into the blocking closure: a caller that goes away (a client
-    /// disconnect, a timeout) cannot free it while its verify still runs.
-    pub async fn check_password(self: &Arc<Self>, password: String) -> Result<Option<String>> {
-        let permit = self
-            .hashing
+    /// A place for one password check in `purpose`'s pool, or `None` when
+    /// it is full (one running, `MAX_QUEUED_CHECKS` waiting): the caller
+    /// answers busy, before counting the attempt against any limiter.
+    pub fn admit_check(&self, purpose: CheckPurpose) -> Option<Admitted> {
+        let pool = match purpose {
+            CheckPurpose::Login => &self.login_hashing,
+            CheckPurpose::StepUp => &self.step_up_hashing,
+        };
+        let admitted = pool.admitted.clone().try_acquire_owned().ok()?;
+        Some(Admitted {
+            admitted,
+            running: pool.running.clone(),
+        })
+    }
+
+    /// `verify_password` on a blocking thread, once its pool's slot is
+    /// free (`admit_check`). Both the place and the slot move into the
+    /// blocking closure: a caller that goes away (a client disconnect, a
+    /// timeout) cannot free them while its verify still runs.
+    pub async fn check_password(self: &Arc<Self>, admitted: Admitted, password: String) -> Result<Option<String>> {
+        let running = admitted
+            .running
             .clone()
             .acquire_owned()
             .await
             .context("the hashing semaphore is closed")?;
         let this = self.clone();
         tokio::task::spawn_blocking(move || {
-            let _permit = permit;
+            let _held = (admitted.admitted, running);
             this.verify_password(&password)
         })
         .await?
@@ -514,9 +595,9 @@ impl Operator {
 
     /// Replace the owner's password (the admin socket's reset, kernel spec
     /// §4.2) and end every signed-in session, so their streams end too. The
-    /// hash runs on a blocking thread and takes a `check_password` slot like
-    /// any other, so a reset cannot add a third Argon2 run to a login
-    /// flood. The limiters are cleared: the operator proved local access.
+    /// hash runs on a blocking thread and takes the step-up pool's slot,
+    /// waiting behind at most `MAX_QUEUED_CHECKS` admitted step-ups and
+    /// never behind a login flood, and cannot add a third Argon2 run. The limiters are cleared: the operator proved local access.
     /// It fails, changing nothing, unless it replaced exactly one password
     /// (3b-ii's O9): an owner with none (a passkey-only owner, in 3c) has
     /// nothing to reset. Every passkey is removed and every passkey
@@ -533,7 +614,8 @@ impl Operator {
             return Ok(Reset::NotSetUp);
         }
         let permit = self
-            .hashing
+            .step_up_hashing
+            .running
             .clone()
             .acquire_owned()
             .await
@@ -773,8 +855,18 @@ pub const SESSION_SLIDE_SECS: i64 = 60;
 /// §3.4).
 pub const STEP_UP_SECS: i64 = 5 * 60;
 
-/// The session cookie's name (kernel spec §3.2).
+/// The session cookie's name on a loopback `http://` collector (kernel
+/// spec §3.2).
 pub const SESSION_COOKIE: &str = "hennery_session";
+
+/// The session cookie's name on HTTPS: a `__Host-` cookie must be `Secure`,
+/// `Path=/` and carry no `Domain`, so a sibling subdomain cannot set one.
+pub const SECURE_SESSION_COOKIE: &str = "__Host-hennery_session";
+
+/// The session cookie's name: `__Host-` prefixed when it is `Secure`.
+pub fn session_cookie_name(secure: bool) -> &'static str {
+    if secure { SECURE_SESSION_COOKIE } else { SESSION_COOKIE }
+}
 
 /// The longest `User-Agent` kept with a session, in characters.
 const MAX_USER_AGENT: usize = 256;
@@ -978,15 +1070,17 @@ impl Operator {
             .optional()?)
     }
 
-    /// The first of the request's session cookies (`session_tokens`) that
-    /// authenticates, with its token; `None` when none does. Like
-    /// `authenticate`, it slides the session it finds.
+    /// The first of the request's session cookies (`session_tokens`, under
+    /// the name `public_url`'s scheme gives) that authenticates, with its
+    /// token; `None` when none does. Like `authenticate`, it slides the
+    /// session it finds.
     pub fn authenticate_cookies(
         &self,
         headers: &axum::http::HeaderMap,
         now: i64,
     ) -> Result<Option<(String, Authenticated)>> {
-        for token in session_tokens(headers) {
+        let secure = self.public_url().is_none_or(|u| u.is_https());
+        for token in session_tokens(headers, secure) {
             if let Some(session) = self.authenticate(token, now)? {
                 return Ok(Some((token.to_string(), session)));
             }
@@ -996,28 +1090,34 @@ impl Operator {
 }
 
 /// `Set-Cookie` for a session (kernel spec §3.2): `HttpOnly`,
-/// `SameSite=Strict`, `Path=/`, for `SESSION_TTL_SECS`, and `Secure`
-/// unless `public_url` is loopback `http://`.
+/// `SameSite=Strict`, `Path=/`, for `SESSION_TTL_SECS`, and `Secure` and
+/// `__Host-` prefixed unless `public_url` is loopback `http://`.
 pub fn session_cookie(token: &str, secure: bool) -> String {
+    let name = session_cookie_name(secure);
     let secure = if secure { "; Secure" } else { "" };
-    format!("{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}{secure}")
+    format!("{name}={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={SESSION_TTL_SECS}{secure}")
 }
 
 /// `Set-Cookie` that removes the session cookie.
 pub fn cleared_cookie(secure: bool) -> String {
+    let name = session_cookie_name(secure);
     let secure = if secure { "; Secure" } else { "" };
-    format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}")
+    format!("{name}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0{secure}")
 }
 
-/// At most this many `hennery_session` cookies of a request are tried, so
-/// one request cannot cost many session lookups.
+/// At most this many session cookies of a request are tried, so one
+/// request cannot cost many session lookups.
 pub const MAX_SESSION_COOKIES: usize = 4;
 
-/// Every session token in a request's `Cookie` headers, in order, at most
-/// `MAX_SESSION_COOKIES`. There can be more than one: a sibling subdomain
-/// can set a cookie of the same name for the parent domain, and the browser
-/// may send it first. Taking only the first would let it sign the owner out.
-pub fn session_tokens(headers: &axum::http::HeaderMap) -> Vec<&str> {
+/// Every session token in a request's `Cookie` headers, under
+/// `session_cookie_name(secure)` only, in order, at most
+/// `MAX_SESSION_COOKIES`. On loopback there can be more than one: another
+/// local service can set a cookie of the same name, and the browser may
+/// send it first. Taking only the first would let it sign the owner out.
+/// On HTTPS the unprefixed name, which a sibling subdomain can set for the
+/// parent domain, is never read.
+pub fn session_tokens(headers: &axum::http::HeaderMap, secure: bool) -> Vec<&str> {
+    let wanted = session_cookie_name(secure);
     headers
         .get_all(axum::http::header::COOKIE)
         .iter()
@@ -1025,7 +1125,7 @@ pub fn session_tokens(headers: &axum::http::HeaderMap) -> Vec<&str> {
         .flat_map(|v| v.split(';'))
         .filter_map(|pair| {
             let (name, value) = pair.trim().split_once('=')?;
-            (name == SESSION_COOKIE).then_some(value)
+            (name == wanted).then_some(value)
         })
         .take(MAX_SESSION_COOKIES)
         .collect()
@@ -1075,34 +1175,107 @@ mod tests {
         }
     }
 
+    impl Operator {
+        /// Keep every verify from ending until `hold(false)`.
+        fn hold(&self, held: bool) {
+            *self.held.lock().unwrap() = held;
+            self.released.notify_all();
+        }
+    }
+
+    /// `check_password` once `purpose`'s pool lets it in.
+    async fn check(op: &Arc<Operator>, purpose: CheckPurpose, password: &str) -> Result<Option<String>> {
+        let admitted = op.admit_check(purpose).expect("a place in the pool");
+        op.check_password(admitted, password.to_string()).await
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn at_most_two_checks_verify_at_once() {
         let op = set_up();
-        let checks: Vec<_> = (0..8)
-            .map(|_| {
+        let checks: Vec<_> = (0..2 * (1 + MAX_QUEUED_CHECKS))
+            .map(|i| {
                 let op = op.clone();
-                tokio::spawn(async move { op.check_password(PASSWORD.to_string()).await.unwrap() })
+                let purpose = if i % 2 == 0 {
+                    CheckPurpose::Login
+                } else {
+                    CheckPurpose::StepUp
+                };
+                let admitted = op.admit_check(purpose).expect("a place in the pool");
+                tokio::spawn(async move { op.check_password(admitted, PASSWORD.to_string()).await.unwrap() })
             })
             .collect();
         for check in checks {
             assert!(check.await.unwrap().is_some());
         }
-        assert_eq!(op.verifications(), 8);
+        assert_eq!(op.verifications(), 2 * (1 + MAX_QUEUED_CHECKS) as u64);
         assert!(op.max_in_flight.load(Ordering::SeqCst) <= MAX_CONCURRENT_HASHES);
     }
 
-    /// A password reset hashes only once it holds a slot: with both taken
-    /// (two verifies of a login flood, say) it waits, and runs once one is
-    /// free.
+    /// One check running and `MAX_QUEUED_CHECKS` waiting fill a pool: the
+    /// next is refused at once rather than queued without bound, and a
+    /// place frees once a check ends.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_full_pool_refuses_the_next_check_at_once() {
+        let op = set_up();
+        op.hold(true);
+        let checks: Vec<_> = (0..1 + MAX_QUEUED_CHECKS)
+            .map(|_| {
+                let admitted = op.admit_check(CheckPurpose::Login).expect("a place in the pool");
+                let op = op.clone();
+                tokio::spawn(async move { op.check_password(admitted, PASSWORD.to_string()).await })
+            })
+            .collect();
+        until("the first check verifies", || op.verifications() == 1).await;
+        assert!(
+            op.admit_check(CheckPurpose::Login).is_none(),
+            "a full pool let a check in"
+        );
+        op.hold(false);
+        for check in checks {
+            assert!(check.await.unwrap().unwrap().is_some());
+        }
+        assert!(op.admit_check(CheckPurpose::Login).is_some());
+    }
+
+    /// A login flood that fills its pool, and its running slot, leaves the
+    /// step-up pool alone: a signed-in owner still steps up, and a reset
+    /// still hashes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_full_login_pool_leaves_step_up_and_reset_their_own() {
+        let op = set_up();
+        op.hold(true);
+        let flood: Vec<_> = (0..1 + MAX_QUEUED_CHECKS)
+            .map(|_| {
+                let admitted = op.admit_check(CheckPurpose::Login).expect("a place in the pool");
+                let op = op.clone();
+                tokio::spawn(async move { op.check_password(admitted, "wrong".to_string()).await })
+            })
+            .collect();
+        until("a login verifies", || op.verifications() == 1).await;
+        assert!(op.admit_check(CheckPurpose::Login).is_none());
+        // The login verify is still held; a step-up check gets its own slot,
+        // verifies (and waits on the same hold), and answers once released.
+        let step_up = {
+            let op = op.clone();
+            tokio::spawn(async move { check(&op, CheckPurpose::StepUp, PASSWORD).await })
+        };
+        until("the step-up verifies beside the login", || op.verifications() == 2).await;
+        op.hold(false);
+        assert!(step_up.await.unwrap().unwrap().is_some());
+        for check in flood {
+            assert!(check.await.unwrap().unwrap().is_none());
+        }
+        assert!(op.max_in_flight.load(Ordering::SeqCst) <= MAX_CONCURRENT_HASHES);
+    }
+
+    /// A password reset hashes only once it holds the step-up pool's slot:
+    /// with it taken (a step-up running, say) it waits, and runs once it is
+    /// free. Logins' slot is not its: never a third Argon2 run.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_password_reset_hashes_only_with_a_hashing_slot() {
         let op = set_up();
-        let held = op
-            .hashing
-            .clone()
-            .acquire_many_owned(MAX_CONCURRENT_HASHES as u32)
-            .await
-            .unwrap();
+        let held = op.step_up_hashing.running.clone().acquire_owned().await.unwrap();
+        let login_held = op.login_hashing.running.clone().acquire_owned().await.unwrap();
         let reset = {
             let op = op.clone();
             tokio::spawn(async move { op.reset_password("a new long password".into(), NOW).await })
@@ -1120,27 +1293,50 @@ mod tests {
             }
         );
         assert_eq!(op.reset_hashes.load(Ordering::SeqCst), 1);
+        drop(login_held);
     }
 
     /// A check whose caller goes away (a client disconnect, a timeout)
-    /// keeps its slot until its verify ends: the verify runs on regardless.
+    /// keeps its place and its slot until its verify ends: the verify runs
+    /// on regardless, and the pool does not let in a check more meanwhile.
+    /// One still waiting gives its place back at once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn an_abandoned_check_keeps_its_slot_until_its_verify_ends() {
+    async fn an_abandoned_check_keeps_its_place_until_its_verify_ends() {
         let op = set_up();
-        for round in 1..=8u64 {
-            let checks: Vec<_> = (0..2)
-                .map(|_| {
-                    let op = op.clone();
-                    tokio::spawn(async move { op.check_password(PASSWORD.to_string()).await })
-                })
-                .collect();
-            until("both checks of the round verify", || op.verifications() == 2 * round).await;
-            for check in &checks {
-                check.abort();
-            }
-        }
-        until("every verify ends", || op.in_flight.load(Ordering::SeqCst) == 0).await;
-        let max = op.max_in_flight.load(Ordering::SeqCst);
-        assert!(max <= MAX_CONCURRENT_HASHES, "{max} verifies ran at once");
+        op.hold(true);
+        let spawn = |op: &Arc<Operator>| {
+            let admitted = op.admit_check(CheckPurpose::Login).expect("a place in the pool");
+            let op = op.clone();
+            tokio::spawn(async move { op.check_password(admitted, PASSWORD.to_string()).await })
+        };
+        let running = spawn(&op);
+        until("the check verifies", || op.verifications() == 1).await;
+        let waiting = spawn(&op);
+        running.abort();
+        waiting.abort();
+        assert!(running.await.unwrap_err().is_cancelled());
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        // The waiting one's place is back; the running one's is not.
+        let places: Vec<_> = std::iter::from_fn(|| op.admit_check(CheckPurpose::Login)).collect();
+        assert_eq!(
+            places.len(),
+            MAX_QUEUED_CHECKS,
+            "the abandoned verify gave its place back"
+        );
+        assert_eq!(
+            op.login_hashing.running.available_permits(),
+            0,
+            "its slot came back mid-verify"
+        );
+        drop(places);
+        op.hold(false);
+        until("the verify ends", || op.in_flight.load(Ordering::SeqCst) == 0).await;
+        until("its slot comes back", || {
+            op.login_hashing.running.available_permits() == 1
+        })
+        .await;
+        let places: Vec<_> = std::iter::from_fn(|| op.admit_check(CheckPurpose::Login)).collect();
+        assert_eq!(places.len(), 1 + MAX_QUEUED_CHECKS);
+        assert_eq!(op.verifications(), 1);
     }
 }

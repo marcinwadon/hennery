@@ -403,6 +403,9 @@ impl Hosts {
     /// revocation is looked at, so `revoked` is only ever told to the
     /// holder of the key.
     pub fn check_hello(&self, host_id: &str, nonce: &[u8], protocol_version: &str, proof: &str) -> Result<HelloCheck> {
+        if host_id.len() > 128 || protocol_version.len() > 32 || proof.len() != 128 {
+            return Ok(HelloCheck::BadProof);
+        }
         let row: Option<(String, Option<i64>)> = self
             .conn()
             .query_row(

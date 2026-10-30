@@ -16,7 +16,7 @@ pub fn app(store: Arc<Store>, operator: Option<Arc<Operator>>, policy: ProxyPoli
     if let Some(operator) = operator {
         router = router.merge(ui::router(store, operator)?);
     }
-    Ok(router
+    Ok(hennery_kernel::server::request_limits(router)
         .layer(middleware::from_fn(resolve_request))
         .layer(Extension(policy)))
 }

@@ -14,23 +14,34 @@
 //! - **Bounded, and a live entry is never evicted (amendment 2026-10-01).**
 //!   At most `capacity` addresses are tracked. Past it, forgotten entries are
 //!   pruned first; if the table is still full of live ones, the new
-//!   address's attempt is instead counted against one shared "overflow"
-//!   entry with its own budget and lockout, rather than evicting an
-//!   unrelated address's real count. An earlier version evicted the oldest
+//!   address's attempt is instead counted against its prefix's entry (an
+//!   IPv4 /24, an IPv6 /48) in a second table of at most `aggregates`
+//!   prefixes, and only past that against one shared "overflow" entry, each
+//!   with the same budget and lockout, rather than evicting an unrelated
+//!   address's real count. An earlier version evicted the oldest
 //!   not-locked-out entry (then the oldest of all) to make room — but an
 //!   attacker holding more addresses than `capacity` (a `/52` of IPv6 is
 //!   4097 distinct `/64`s) could rotate through them so that no single
 //!   address ever accumulated enough failures to lock out, turning the
-//!   per-address budget into a throughput limit only. Sharing one overflow
-//!   budget instead means a flood from more addresses than the table holds
-//!   locks *itself* out together and slows pairing for everyone until that
-//!   shared window or lockout passes (or the collector restarts) — a
-//!   deliberate trade-off, not a bug: a single generous per-address budget
-//!   should not be defeatable by rotating addresses.
+//!   per-address budget into a throughput limit only. Past capacity, a
+//!   flood from one prefix locks that prefix out together; only a flood
+//!   spanning more prefixes than the second table holds reaches the shared
+//!   overflow budget (security audit 2026-10-29, F3), and a whole flood
+//!   gets at most (`capacity` + `aggregates` + known + 2) budgets a window.
+//! - **Addresses that succeeded are known (F3).** The last `known`
+//!   addresses that succeeded keep an entry of their own past capacity, as
+//!   loopback does, so a flood cannot push the owner's usual address into
+//!   a prefix or overflow budget it has locked. It is no exemption: the
+//!   budget is the same as anyone's, and every credential is still
+//!   checked. Only a success, which needs the credential, makes an address
+//!   known. Limiters whose successes prove the same thing (password and
+//!   passkey login: the owner signed in) share one set of known addresses
+//!   (`KnownAddresses`), so a sign-in by either method protects the other;
+//!   each keeps its own counts, which a success by the other never clears.
 //! - **In memory only:** a collector restart clears every count and
-//!   lockout, including the shared overflow entry. Each *tracked* address
-//!   still has its own separate budget; only addresses past capacity share
-//!   the overflow entry's.
+//!   lockout, the prefix and overflow entries, and the known addresses.
+//!   Each *tracked* address still has its own separate budget; only
+//!   addresses past capacity share their prefix's, or the overflow's.
 //! - **Loopback is one address with its own entry (3b decision 9).** Every
 //!   `127.0.0.0/8` address counts as `127.0.0.1` (on Linux the whole block
 //!   reaches `lo`, so per-address entries would give a local process
@@ -41,9 +52,9 @@
 //!
 //! Callers pass `now`, so the policy is testable without sleeping.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +104,12 @@ impl Policy {
 /// Addresses tracked by default.
 pub const DEFAULT_CAPACITY: usize = 4096;
 
+/// Prefixes tracked by default once the address table is full.
+pub const DEFAULT_AGGREGATES: usize = 1024;
+
+/// Addresses that succeeded, remembered by default.
+pub const DEFAULT_KNOWN: usize = 64;
+
 #[derive(Debug, Clone, Copy)]
 struct Entry {
     failures: u32,
@@ -131,16 +148,71 @@ pub fn key(addr: IpAddr) -> IpAddr {
     }
 }
 
-/// The per-address table plus the one shared budget new addresses fall back
-/// to once it is full of live entries (amendment 2026-10-01).
+/// The prefix a key past capacity is counted under: an IPv4 /24, an IPv6
+/// /48 (a site's usual allocation).
+pub fn aggregate(key: IpAddr) -> IpAddr {
+    match key {
+        IpAddr::V4(v4) => {
+            let [a, b, c, _] = v4.octets();
+            IpAddr::V4(Ipv4Addr::new(a, b, c, 0))
+        }
+        IpAddr::V6(v6) => {
+            let s = v6.segments();
+            IpAddr::V6(Ipv6Addr::new(s[0], s[1], s[2], 0, 0, 0, 0, 0))
+        }
+    }
+}
+
+/// The last addresses (keys) that succeeded, at most `capacity`, most
+/// recent first (F3). Shared between limiters whose successes prove the
+/// same thing; it only recognises an address, and holds no counts.
+pub struct KnownAddresses {
+    capacity: usize,
+    recent: Mutex<VecDeque<IpAddr>>,
+}
+
+impl KnownAddresses {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            recent: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    /// Whether `addr`'s key is one of them.
+    pub fn contains(&self, addr: IpAddr) -> bool {
+        self.recent.lock().expect("known lock").contains(&key(addr))
+    }
+
+    /// `addr`'s key succeeded: it is the most recent, and past `capacity`
+    /// the oldest is forgotten.
+    fn remember(&self, addr: IpAddr) {
+        let addr = key(addr);
+        let mut recent = self.recent.lock().expect("known lock");
+        recent.retain(|known| *known != addr);
+        if self.capacity > 0 {
+            recent.push_front(addr);
+            recent.truncate(self.capacity);
+        }
+    }
+}
+
+/// The per-address table, the per-prefix table new addresses fall back to
+/// once it is full of live entries, and the one shared budget past both
+/// (amendment 2026-10-01, F3).
 struct State {
     entries: HashMap<IpAddr, Entry>,
+    aggregates: HashMap<IpAddr, Entry>,
     overflow: Option<Entry>,
 }
 
 pub struct Limiter {
     policy: Policy,
     capacity: usize,
+    aggregates: usize,
+    /// Its own, or shared (`with_shared_known`). Never locked while
+    /// `state` is.
+    known: Arc<KnownAddresses>,
     state: Mutex<State>,
 }
 
@@ -150,61 +222,102 @@ impl Limiter {
     }
 
     pub fn with_capacity(policy: Policy, capacity: usize) -> Self {
+        Self::with_capacities(policy, capacity, DEFAULT_AGGREGATES, DEFAULT_KNOWN)
+    }
+
+    /// `capacity` addresses, `aggregates` prefixes, `known` addresses that
+    /// succeeded.
+    pub fn with_capacities(policy: Policy, capacity: usize, aggregates: usize, known: usize) -> Self {
+        Self::sharing(policy, capacity, aggregates, Arc::new(KnownAddresses::new(known)))
+    }
+
+    /// The default capacities, recognising the addresses of `known`, which
+    /// other limiters share: a success here or there makes an address
+    /// known to both, and each keeps its own counts.
+    pub fn with_shared_known(policy: Policy, known: Arc<KnownAddresses>) -> Self {
+        Self::sharing(policy, DEFAULT_CAPACITY, DEFAULT_AGGREGATES, known)
+    }
+
+    /// `capacity` addresses and `aggregates` prefixes, recognising the
+    /// addresses of `known`.
+    pub fn sharing(policy: Policy, capacity: usize, aggregates: usize, known: Arc<KnownAddresses>) -> Self {
         Self {
             policy,
             capacity: capacity.max(1),
+            aggregates: aggregates.max(1),
+            known,
             state: Mutex::new(State {
                 entries: HashMap::new(),
+                aggregates: HashMap::new(),
                 overflow: None,
             }),
         }
     }
 
     /// Start an attempt from `addr`: `Err(retry_after)` while it (or the
-    /// shared overflow budget it falls back to) is locked out, else the
+    /// prefix or overflow budget it falls back to) is locked out, else the
     /// attempt is counted as a failure until `succeeded`.
     pub fn attempt(&self, addr: IpAddr, now: Instant) -> Result<(), Duration> {
         let policy = self.policy;
         let addr = key(addr);
+        // Before `state` is locked: the two locks are never held together.
+        let known = self.known.contains(addr);
         let mut state = self.state.lock().expect("limiter lock");
         if let Some(entry) = state.entries.get_mut(&addr) {
             return record_attempt(entry, &policy, now);
         }
-        // A new address: forgotten entries are pruned to make room, but a
-        // live one is never evicted for it (amendment 2026-10-01). Loopback
-        // gets its own entry regardless (3b decision 9).
-        state.entries.retain(|_, e| !e.forgotten(&policy, now));
-        if state.entries.len() < self.capacity || addr.is_loopback() {
-            let entry = state.entries.entry(addr).or_insert(Entry {
-                failures: 0,
-                last_failure: now,
-                locked_until: None,
-            });
-            return record_attempt(entry, &policy, now);
-        }
-        // The table is still full of live entries: share the one overflow
-        // budget instead of evicting someone else's real count.
-        let overflow = state.overflow.get_or_insert(Entry {
+        let fresh = || Entry {
             failures: 0,
             last_failure: now,
             locked_until: None,
-        });
+        };
+        // A new address: forgotten entries are pruned to make room, but a
+        // live one is never evicted for it (amendment 2026-10-01). Loopback
+        // (3b decision 9) and a known address (F3) get their own entry
+        // regardless.
+        state.entries.retain(|_, e| !e.forgotten(&policy, now));
+        if state.entries.len() < self.capacity || addr.is_loopback() || known {
+            let entry = state.entries.entry(addr).or_insert_with(fresh);
+            return record_attempt(entry, &policy, now);
+        }
+        // The table is still full of live entries: share the prefix's budget
+        // instead of evicting someone else's real count, the same way.
+        let prefix = aggregate(addr);
+        if !state.aggregates.contains_key(&prefix) {
+            state.aggregates.retain(|_, e| !e.forgotten(&policy, now));
+        }
+        if state.aggregates.contains_key(&prefix) || state.aggregates.len() < self.aggregates {
+            let entry = state.aggregates.entry(prefix).or_insert_with(fresh);
+            return record_attempt(entry, &policy, now);
+        }
+        // Both tables are full of live entries: share the one overflow.
+        let overflow = state.overflow.get_or_insert_with(fresh);
         record_attempt(overflow, &policy, now)
     }
 
-    /// The attempt succeeded: `addr`'s own count and lockout are cleared.
-    /// (An address that was counted against the shared overflow budget
-    /// instead never had its own entry to clear; the overflow budget itself
-    /// is shared and is not reset by any one address's success.)
+    /// The attempt succeeded: `addr`'s own count and lockout here are
+    /// cleared, and it becomes known, to every limiter sharing this one's
+    /// known addresses (whose own counts stay). A prefix or the overflow
+    /// budget is shared, and not reset by any one address's success.
     pub fn succeeded(&self, addr: IpAddr) {
-        self.state.lock().expect("limiter lock").entries.remove(&key(addr));
+        let addr = key(addr);
+        self.state.lock().expect("limiter lock").entries.remove(&addr);
+        self.known.remember(addr);
     }
 
-    /// Forget every address and the overflow budget: a lockout ends now.
+    /// Forget every address, prefix and the overflow budget: a lockout ends
+    /// now. Known addresses stay known.
     pub fn clear(&self) {
         let mut state = self.state.lock().expect("limiter lock");
         state.entries.clear();
+        state.aggregates.clear();
         state.overflow = None;
+    }
+
+    /// Whether `addr` is one of the addresses that last succeeded, here or
+    /// at a limiter sharing this one's known addresses.
+    pub fn is_known(&self, addr: IpAddr) -> bool {
+        self.known.contains(addr)
     }
 
     /// Addresses currently tracked with their own entry (not counting the
@@ -217,8 +330,8 @@ impl Limiter {
 /// Check `entry`'s lockout first (an attempt while locked out is not
 /// counted again), else count this attempt as a failure — forgetting a
 /// stale count first — and set a fresh lockout if this failure reaches it.
-/// Shared between a per-address `Entry` and the overflow `Entry`: the same
-/// policy applies either way.
+/// Shared between a per-address, a prefix and the overflow `Entry`: the
+/// same policy applies either way.
 fn record_attempt(entry: &mut Entry, policy: &Policy, now: Instant) -> Result<(), Duration> {
     if let Some(until) = entry.locked_until
         && now < until
@@ -471,6 +584,156 @@ mod tests {
         // Both locked addresses are still locked, undisturbed by the flood.
         for n in 1..=2 {
             assert!(limiter.attempt(locked(n), t0).is_err(), "address {n} was reset");
+        }
+    }
+
+    /// The `n`th /64 of `2001:db8:1::/48`.
+    fn in_one_48(n: u16) -> IpAddr {
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, n, 0, 0, 0, 1))
+    }
+
+    /// Security audit 2026-10-29, F3: a flood from more /64s than the table
+    /// holds, all in one /48, locks that /48 out, not an owner address
+    /// elsewhere (once they shared one overflow budget). Rotating to
+    /// further /64s of the same /48 gains nothing.
+    #[test]
+    fn a_flood_from_one_prefix_past_capacity_locks_only_that_prefix() {
+        let limiter = Limiter::with_capacity(Policy::LOGIN, 3);
+        let t0 = Instant::now();
+        for n in 0..3 {
+            limiter.attempt(in_one_48(n), t0).unwrap();
+        }
+        for n in 3..8 {
+            assert_eq!(limiter.attempt(in_one_48(n), t0), Ok(()));
+        }
+        assert_eq!(limiter.attempt(in_one_48(9), t0), Err(secs(60)));
+        assert_eq!(limiter.attempt(in_one_48(500), t0), Err(secs(60)));
+        let owner = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 77));
+        assert_eq!(
+            limiter.attempt(owner, t0),
+            Ok(()),
+            "the owner shares the flood's lockout"
+        );
+        assert_eq!(limiter.tracked(), 3);
+    }
+
+    /// Past both tables, the shared overflow budget remains, so a flood
+    /// across more prefixes than the second table holds still locks itself
+    /// out rather than getting a budget per address.
+    #[test]
+    fn past_the_prefix_table_new_prefixes_share_the_overflow_budget() {
+        let limiter = Limiter::with_capacities(Policy::LOGIN, 1, 2, 0);
+        let t0 = Instant::now();
+        let net = |n: u8| IpAddr::V4(Ipv4Addr::new(198, 51, n, 1));
+        for n in 0..3 {
+            limiter.attempt(net(n), t0).unwrap();
+        }
+        for n in 3..8 {
+            assert_eq!(limiter.attempt(net(n), t0), Ok(()), "overflow attempt {n}");
+        }
+        assert_eq!(limiter.attempt(net(9), t0), Err(secs(60)));
+        // The prefixes already tracked keep their own budgets.
+        assert_eq!(limiter.attempt(net(1), t0), Ok(()));
+    }
+
+    /// F3: an address that succeeded keeps an entry of its own past both
+    /// tables, as loopback does, so a flood that locked the shared budgets
+    /// does not lock it out; its own budget is still the same as anyone's.
+    #[test]
+    fn a_known_address_keeps_its_own_budget_past_capacity() {
+        let limiter = Limiter::with_capacities(Policy::LOGIN, 1, 1, 2);
+        let t0 = Instant::now();
+        let owner = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 77));
+        limiter.attempt(owner, t0).unwrap();
+        limiter.succeeded(owner);
+        assert!(limiter.is_known(owner));
+        let net = |n: u8| IpAddr::V4(Ipv4Addr::new(198, 51, n, 1));
+        for n in 0..10 {
+            let _ = limiter.attempt(net(n), t0);
+        }
+        assert!(limiter.attempt(net(20), t0).is_err(), "the shared budgets are locked");
+        for _ in 0..Policy::LOGIN.free_failures {
+            assert_eq!(limiter.attempt(owner, t0), Ok(()));
+        }
+        assert!(limiter.attempt(owner, t0).is_err(), "a known address is not exempt");
+    }
+
+    #[test]
+    fn the_known_addresses_are_bounded_most_recent_first() {
+        let limiter = Limiter::with_capacities(Policy::LOGIN, 8, 8, 2);
+        let addr = |n: u8| IpAddr::V4(Ipv4Addr::new(192, 0, 2, n));
+        for n in 1..=3 {
+            limiter.succeeded(addr(n));
+        }
+        assert!(!limiter.is_known(addr(1)));
+        assert!(limiter.is_known(addr(2)) && limiter.is_known(addr(3)));
+        limiter.succeeded(addr(2));
+        limiter.succeeded(addr(4));
+        assert!(limiter.is_known(addr(2)) && limiter.is_known(addr(4)));
+        assert!(!limiter.is_known(addr(3)));
+        // `clear` ends lockouts, not what is known.
+        limiter.clear();
+        assert!(limiter.is_known(addr(2)));
+    }
+
+    /// Password and passkey login share known addresses, not counts: a
+    /// sign-in by one method gives the address its own entry at the other,
+    /// past a flood that filled that one's table and locked the address's
+    /// prefix and the overflow; and genuine failures counted by one method
+    /// are not cleared by a success of the other. Both ways round.
+    #[test]
+    fn known_addresses_are_shared_across_methods_and_counts_are_not() {
+        let t0 = Instant::now();
+        let owner = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 7));
+        let neighbour = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 8));
+        let elsewhere = |n: u8| IpAddr::V4(Ipv4Addr::new(203, 0, n, 1));
+        for (first, second) in [
+            (Policy::LOGIN, Policy::PASSKEY_LOGIN),
+            (Policy::PASSKEY_LOGIN, Policy::LOGIN),
+        ] {
+            let known = Arc::new(KnownAddresses::new(4));
+            let signed_in = Limiter::sharing(first, 1, 1, known.clone());
+            let other = Limiter::sharing(second, 1, 1, known.clone());
+            // The other method's table, the owner's prefix and the
+            // overflow, all filled and locked by the flood.
+            other.attempt(elsewhere(0), t0).unwrap();
+            for _ in 0..=second.free_failures {
+                let _ = other.attempt(neighbour, t0);
+                let _ = other.attempt(elsewhere(1), t0);
+            }
+            assert!(
+                other.attempt(owner, t0).is_err(),
+                "the flood did not lock the owner's prefix"
+            );
+            signed_in.attempt(owner, t0).unwrap();
+            signed_in.succeeded(owner);
+            assert!(other.is_known(owner));
+            for n in 0..second.free_failures {
+                assert_eq!(
+                    other.attempt(owner, t0),
+                    Ok(()),
+                    "{n}: the owner shared the flood's lockout"
+                );
+            }
+            assert!(other.attempt(owner, t0).is_err(), "a known address is not exempt");
+
+            // Genuine failures at one method survive the other's success.
+            let known = Arc::new(KnownAddresses::new(4));
+            let failing = Limiter::sharing(first, 8, 8, known.clone());
+            let succeeding = Limiter::sharing(second, 8, 8, known.clone());
+            for _ in 0..2 {
+                failing.attempt(owner, t0).unwrap();
+            }
+            succeeding.attempt(owner, t0).unwrap();
+            succeeding.succeeded(owner);
+            assert!(failing.is_known(owner));
+            for _ in 2..first.free_failures {
+                assert_eq!(failing.attempt(owner, t0), Ok(()));
+            }
+            assert!(
+                failing.attempt(owner, t0).is_err(),
+                "the other method's success cleared the count"
+            );
         }
     }
 }

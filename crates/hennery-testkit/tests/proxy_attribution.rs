@@ -1,6 +1,7 @@
 //! Dedicated proxy header changes abuse accounting only, across every limiter.
 use axum::{Extension, middleware};
 use hennery_kernel::client_address::{ProxyPolicy, resolve_request};
+use hennery_kernel::passkeys::MAX_LOGIN_CEREMONIES_PER_CLIENT;
 use hennery_kernel::{hosts::Hosts, operator::Operator, ratelimit::Policy, secret::unix_now};
 use hennery_sessions::{AppState, store::Store};
 use hennery_testkit::{OWNER_PASSWORD, PUBLIC_URL};
@@ -68,13 +69,35 @@ impl Collector {
     }
     async fn password(&self, ip: &str, path: &str, cookie: &str, password: &str) -> u16 {
         self.post(Some(ip), path)
-            .header("cookie", format!("hennery_session={cookie}"))
+            .header("cookie", format!("__Host-hennery_session={cookie}"))
             .json(&json!({"password":password}))
             .send()
             .await
             .unwrap()
             .status()
             .as_u16()
+    }
+    /// Begin a passkey login from `ip`: the status and the answer.
+    async fn passkey_start(&self, ip: &str) -> (u16, Value) {
+        let resp = self
+            .post(Some(ip), "/api/auth/passkeys/login/start")
+            .send()
+            .await
+            .unwrap();
+        (resp.status().as_u16(), resp.json().await.unwrap())
+    }
+    /// Begin a passkey login from `ip`, counted, and give it up with an
+    /// answer that does not verify: its place is free again.
+    async fn abandoned_passkey_start(&self, ip: &str) {
+        let (status, start) = self.passkey_start(ip).await;
+        assert_eq!(status, 200);
+        let refused = self
+            .post(Some(ip), "/api/auth/passkeys/login/finish")
+            .json(&json!({"ceremony_id": start["ceremony_id"], "credential": {}}))
+            .send()
+            .await
+            .unwrap();
+        assert!(refused.status().is_client_error(), "{}", refused.status());
     }
     async fn enroll(&self, ip: &str, code: &str, byte: u8) -> u16 {
         self.post(Some(ip),"/api/hosts/enroll").json(&json!({"code":code,"public_key":hennery_host::identity::HostKey::from_seed([byte;32]).public_key_hex(),"name":"fixture","host_version":"0","platform":"test"})).send().await.unwrap().status().as_u16()
@@ -205,8 +228,9 @@ async fn forwarded_ipv6_grouping_and_mapped_ipv4_keep_the_existing_budgets() {
     assert_eq!(c.enroll("::ffff:192.0.2.1", "wrong", 1).await, 429);
 }
 
-#[tokio::test]
-async fn passkey_start_and_success_use_the_effective_client() {
+/// A collector behind the trusted proxy with a passkey registered, and
+/// its authenticator.
+async fn with_passkey() -> (Collector, WebauthnAuthenticator<SoftPasskey>) {
     let c = Collector::start(true).await;
     let mut passkey = WebauthnAuthenticator::new(SoftPasskey::new(true));
     let session = c.session();
@@ -225,7 +249,7 @@ async fn passkey_start_and_success_use_the_effective_client() {
         .unwrap();
     let start: Value = c
         .post(Some(B), "/api/auth/passkeys/register/start")
-        .header("cookie", format!("hennery_session={session}"))
+        .header("cookie", format!("__Host-hennery_session={session}"))
         .json(&json!({"label":"fixture"}))
         .send()
         .await
@@ -239,7 +263,7 @@ async fn passkey_start_and_success_use_the_effective_client() {
         .unwrap();
     assert_eq!(
         c.post(Some(B), "/api/auth/passkeys/register/finish")
-            .header("cookie", format!("hennery_session={session}"))
+            .header("cookie", format!("__Host-hennery_session={session}"))
             .json(&json!({"ceremony_id":start["ceremony_id"],"credential":credential}))
             .send()
             .await
@@ -247,15 +271,16 @@ async fn passkey_start_and_success_use_the_effective_client() {
             .status(),
         201
     );
+    (c, passkey)
+}
+
+#[tokio::test]
+async fn passkey_start_and_success_use_the_effective_client() {
+    let (c, mut passkey) = with_passkey().await;
+    // Each start counts; giving its ceremony up keeps the key under its
+    // cap of live logins, so the budget is what runs out.
     for _ in 0..Policy::PASSKEY_LOGIN.free_failures {
-        assert_eq!(
-            c.post(Some(A), "/api/auth/passkeys/login/start")
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            200
-        );
+        c.abandoned_passkey_start(A).await;
     }
     assert_eq!(
         c.post(Some(A), "/api/auth/passkeys/login/start")
@@ -265,24 +290,12 @@ async fn passkey_start_and_success_use_the_effective_client() {
             .status(),
         429
     );
-    let start: Value = c
-        .post(Some(B), "/api/auth/passkeys/login/start")
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    // B's starts are its own budget.
     for _ in 0..Policy::PASSKEY_LOGIN.free_failures - 2 {
-        assert_eq!(
-            c.post(Some(B), "/api/auth/passkeys/login/start")
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            200
-        );
+        c.abandoned_passkey_start(B).await;
     }
+    let (status, start) = c.passkey_start(B).await;
+    assert_eq!(status, 200);
     let options: RequestChallengeResponse = serde_json::from_value(start["options"].clone()).unwrap();
     let credential = passkey
         .do_authentication(Url::parse(PUBLIC_URL).unwrap(), options)
@@ -297,14 +310,7 @@ async fn passkey_start_and_success_use_the_effective_client() {
         204
     );
     for _ in 0..Policy::PASSKEY_LOGIN.free_failures {
-        assert_eq!(
-            c.post(Some(B), "/api/auth/passkeys/login/start")
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            200
-        );
+        c.abandoned_passkey_start(B).await;
     }
     assert_eq!(
         c.post(Some(B), "/api/auth/passkeys/login/start")
@@ -321,5 +327,51 @@ async fn passkey_start_and_success_use_the_effective_client() {
             .unwrap()
             .status(),
         429
+    );
+}
+
+/// Browsers behind one NAT share a rate-limit key (here, two IPv6
+/// addresses of one /64). Another browser there starting logins past the
+/// key's cap of live ceremonies is refused 503 `auth_busy`, uncounted, and
+/// never pushes out the owner's challenge, which still signs in.
+#[tokio::test]
+async fn a_neighbour_behind_the_same_key_cannot_end_the_owners_passkey_login() {
+    let (c, mut passkey) = with_passkey().await;
+    const OWNER: &str = "2001:db8:5:1::10";
+    const NEIGHBOUR: &str = "2001:db8:5:1::20";
+    let (status, start) = c.passkey_start(OWNER).await;
+    assert_eq!(status, 200);
+    let mut begun = 1;
+    let mut busy = 0;
+    for _ in 0..MAX_LOGIN_CEREMONIES_PER_CLIENT + 8 {
+        let (status, answer) = c.passkey_start(NEIGHBOUR).await;
+        match status {
+            200 => begun += 1,
+            503 => {
+                assert_eq!(answer["code"], "auth_busy");
+                busy += 1;
+            }
+            other => panic!("a start answered {other}"),
+        }
+    }
+    assert_eq!((begun, busy), (MAX_LOGIN_CEREMONIES_PER_CLIENT, 9));
+    // Only the begun starts were counted against the shared key's budget.
+    let key: std::net::IpAddr = NEIGHBOUR.parse().unwrap();
+    for _ in 0..Policy::PASSKEY_LOGIN.free_failures - begun as u32 {
+        assert!(c.state.operator.passkey_limiter.attempt(key, Instant::now()).is_ok());
+    }
+    assert!(c.state.operator.passkey_limiter.attempt(key, Instant::now()).is_err());
+    let options: RequestChallengeResponse = serde_json::from_value(start["options"].clone()).unwrap();
+    let credential = passkey
+        .do_authentication(Url::parse(PUBLIC_URL).unwrap(), options)
+        .unwrap();
+    assert_eq!(
+        c.post(Some(OWNER), "/api/auth/passkeys/login/finish")
+            .json(&json!({"ceremony_id":start["ceremony_id"],"credential":credential}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
     );
 }

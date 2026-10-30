@@ -443,7 +443,7 @@ async fn authority_and_origin_are_header_only_and_uniformly_refused() {
     assert_eq!(
         Client::new()
             .post(&h.url)
-            .header("cookie", format!("hennery_session={}", h.token))
+            .header("cookie", format!("__Host-hennery_session={}", h.token))
             .body(body)
             .send()
             .await
@@ -686,7 +686,7 @@ async fn policy_management_requires_browser_auth_origin_and_fresh_step_up() {
     ] {
         let mut request = client.patch(&endpoint).json(&json!({"delegation_enabled":false}));
         if let Some(session) = session {
-            request = request.header("cookie", format!("hennery_session={session}"));
+            request = request.header("cookie", format!("__Host-hennery_session={session}"));
         }
         if let Some(origin) = origin {
             request = request.header("origin", origin);
@@ -695,7 +695,7 @@ async fn policy_management_requires_browser_auth_origin_and_fresh_step_up() {
     }
     let get = client
         .get(&endpoint)
-        .header("cookie", format!("hennery_session={stale}"))
+        .header("cookie", format!("__Host-hennery_session={stale}"))
         .send()
         .await
         .unwrap();
@@ -711,7 +711,7 @@ async fn policy_management_requires_browser_auth_origin_and_fresh_step_up() {
         assert!(
             !client
                 .patch(&endpoint)
-                .header("cookie", format!("hennery_session={fresh}"))
+                .header("cookie", format!("__Host-hennery_session={fresh}"))
                 .header("origin", ORIGIN)
                 .header("content-type", "application/json")
                 .body(body)
@@ -724,7 +724,7 @@ async fn policy_management_requires_browser_auth_origin_and_fresh_step_up() {
     }
     let changed = client
         .patch(&endpoint)
-        .header("cookie", format!("hennery_session={fresh}"))
+        .header("cookie", format!("__Host-hennery_session={fresh}"))
         .header("origin", ORIGIN)
         .json(&json!({"delegation_enabled":false}))
         .send()
@@ -1081,7 +1081,7 @@ async fn policy_parse_refusals_do_not_echo_first_party_tokens() {
     let raw = format!("{{\"{}\":true}}", h.token);
     let response = Client::new()
         .patch(endpoint)
-        .header("cookie", format!("hennery_session={session}"))
+        .header("cookie", format!("__Host-hennery_session={session}"))
         .header("origin", ORIGIN)
         .header("content-type", "application/json")
         .body(raw)
