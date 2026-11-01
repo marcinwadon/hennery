@@ -39,7 +39,7 @@ jobs:
       env:
         BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
       run: python3 packaging/ci-paths.py --base "$BASE_SHA" >> "$GITHUB_OUTPUT"
-    - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
+    - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
       with:
         github_access_token: ${{ github.token }}
     - name: Workflow and shell lint
@@ -76,10 +76,10 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         persist-credentials: false
-    - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
+    - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
       with:
         github_access_token: ${{ github.token }}
-    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       with:
         # Each job saves its own artifacts: a faster web job must not win the
         # immutable cache key with a target directory missing tests and clippy.
@@ -121,14 +121,14 @@ jobs:
       with:
         toolchain: stable
         components: clippy, rustfmt
-    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       with:
         shared-key: native-debug-macos
         # Runner image env drifts; the flake pins the toolchain.
         add-rust-environment-hash-key: false
         save-if: ${{ github.ref == 'refs/heads/main' }}
         cache-bin: false
-    - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
+    - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
       with:
         github_access_token: ${{ github.token }}
     - name: The web UI
@@ -159,10 +159,10 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         persist-credentials: false
-    - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
+    - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
       with:
         github_access_token: ${{ github.token }}
-    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
       with:
         shared-key: native-debug-web
         # Runner image env drifts; the flake pins the toolchain.
@@ -204,7 +204,7 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       with:
         persist-credentials: false
-    - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702
+    - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b
       with:
         github_access_token: ${{ github.token }}
     - name: Check rendered Cargo arguments
@@ -234,10 +234,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - uses: cachix/install-nix-action@448cde739abec1eaf0646249e3d25bb8d9bc7702 # v31.11.2
+      - uses: cachix/install-nix-action@75c75c31ebece974e48ebc36b4ad125bd97bd97b # v31.11.3
         with:
           github_access_token: ${{ github.token }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: native-release
           # Runner image env drifts; the flake pins the toolchain.
@@ -284,7 +284,7 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '>=24.22.1 <25'
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: native-release-vendored
           # Runner image env drifts; the flake pins the toolchain.
