@@ -469,6 +469,7 @@ async fn host(collector: &str, roots: &[PathBuf]) -> (HostTask, mpsc::UnboundedR
                                 &mut seqs,
                                 &session_id,
                                 SessionBody::TurnEnded {
+                                    usage: None,
                                     turn_id,
                                     outcome: TurnOutcome::Completed,
                                     stop_reason: None,

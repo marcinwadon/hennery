@@ -31,6 +31,7 @@ for (const width of [1280, 1024, 390]) for (const theme of ['light', 'dark'] as 
     if (path === '/api/delegation/attention' || path === '/api/push/subscriptions') return json([])
     const session = rows.find(row => path === `/api/sessions/${row.session_id}`)
     if (session) return json({ ...session, pending: [] })
+    if (rows.some(row => path === `/api/sessions/${row.session_id}/usage`)) return route.fulfill({ status: 404, body: '{"code":"not_found"}' })
     const catalog = rows.find(row => path === `/api/sessions/${row.session_id}/catalog`)
     if (catalog) return json({ session_id: catalog.session_id, config_options: [], commands: [] })
     const family = rows.find(row => path === `/api/view/sessions/${row.session_id}/family`)

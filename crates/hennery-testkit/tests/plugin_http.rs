@@ -981,6 +981,7 @@ async fn activity_and_inventory_http_use_committed_typed_projection_and_opaque_c
             "source",
             4,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "turn".into(),
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,

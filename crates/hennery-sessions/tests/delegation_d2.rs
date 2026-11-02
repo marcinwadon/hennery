@@ -258,8 +258,11 @@ fn closed_attention_migration_repairs_existing_closed_and_deleted_rows() {
             w.store.delete_session("child", None).unwrap();
         }
         let conn = raw(&w);
-        conn.execute_batch(include_str!("fixtures/undo_delegation_limits.sql"))
-            .unwrap();
+        conn.execute_batch(concat!(
+            include_str!("fixtures/undo_usage.sql"),
+            include_str!("fixtures/undo_delegation_limits.sql")
+        ))
+        .unwrap();
         conn.execute_batch("DROP TRIGGER attention_terminal_session; DROP TRIGGER attention_terminal_insert; DROP TRIGGER attention_terminal_update;
             PRAGMA user_version=24;").unwrap();
         conn.execute(
@@ -1172,6 +1175,7 @@ fn changed_model_does_not_inherit_another_models_nonsecurity_axes() {
     use hennery_sessions::delegation_runtime::launch_configuration;
     let mut c = catalog();
     c.defaults = SessionConfig {
+        cache_retention: Default::default(),
         model: Some("opus".into()),
         mode: Some("default".into()),
         axes: [
@@ -1315,6 +1319,7 @@ fn retained_operator_failures_do_not_consume_the_shared_delegated_capacity() {
             "child",
             4,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "failed-work".into(),
                 outcome: TurnOutcome::Failed,
                 stop_reason: None,
@@ -1353,6 +1358,7 @@ fn ended(w: &World, id: &str, seq: u64, turn: &str) {
             id,
             seq,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: turn.into(),
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,
@@ -2695,6 +2701,7 @@ fn required_model_mode_and_axes_hold_mismatch_then_current_repair_releases() {
     for field in ["model", "mode", "effort"] {
         let (w, p) = pair();
         let required = SessionConfig {
+            cache_retention: Default::default(),
             model: Some("wanted".into()),
             mode: Some("plan".into()),
             axes: BTreeMap::from([("effort".into(), ConfigValue::Id("high".into()))]),
@@ -2726,6 +2733,7 @@ fn required_model_mode_and_axes_hold_mismatch_then_current_repair_releases() {
 async fn configuration_mismatch_expires_visibly_after_a_bounded_wait() {
     let (w, p) = pair();
     let required = SessionConfig {
+        cache_retention: Default::default(),
         model: Some("wanted".into()),
         mode: Some("plan".into()),
         axes: BTreeMap::new(),
@@ -4328,6 +4336,7 @@ fn current_path_rule_blocks_cross_hat_allocation_and_queued_dispatch() {
 fn evidence_validator_requires_each_independent_proof_field() {
     use hennery_sessions::delegation_runtime::evidence_satisfies;
     let required = SessionConfig {
+        cache_retention: Default::default(),
         model: Some("wanted".into()),
         mode: Some("default".into()),
         axes: BTreeMap::from([("effort".into(), ConfigValue::Id("high".into()))]),
@@ -5069,6 +5078,7 @@ fn reviewer_actual_host_crash_has_one_parent_delivery() {
             "child",
             5,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id,
                 outcome: TurnOutcome::Interrupted,
                 stop_reason: None,
@@ -5190,6 +5200,7 @@ fn reviewer_host_crash_delivered_between_frames_never_wakes_twice_and_keeps_erro
         pending(&w, "child", 4, "crash-question", PendingKind::Elicitation);
         let frames = [
             SessionBody::TurnEnded {
+                usage: None,
                 turn_id: turn,
                 outcome: TurnOutcome::Interrupted,
                 stop_reason: None,
@@ -5499,6 +5510,7 @@ fn failed_report_still_escalates_after_deadline() {
             "child",
             3,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "report".into(),
                 outcome: TurnOutcome::Failed,
                 stop_reason: None,
@@ -6088,6 +6100,7 @@ fn d3b_automatic_report_completion_does_not_bypass_operator_push_routing() {
             "parent",
             4,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: turn,
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,
@@ -6122,6 +6135,7 @@ fn d3b_automatic_report_completion_does_not_bypass_operator_push_routing() {
             "parent",
             6,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "operator".into(),
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,
@@ -6158,6 +6172,7 @@ fn d3b_new_completion_after_parent_delete_is_status_only() {
             "child",
             3,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "ongoing".into(),
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,
@@ -6199,6 +6214,7 @@ fn d3b_orphan_host_crash_resolves_attention_as_soon_as_question_is_cancelled() {
     w.store.delete_session("parent", None).unwrap();
     let frames = [
         SessionBody::TurnEnded {
+            usage: None,
             turn_id: "ongoing".into(),
             outcome: TurnOutcome::Interrupted,
             stop_reason: None,
@@ -6342,6 +6358,7 @@ fn reviewer_acknowledged_crash_does_not_reappear_after_parent_delete() {
             "child",
             3,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "ongoing".into(),
                 outcome: TurnOutcome::Interrupted,
                 stop_reason: None,
@@ -6491,6 +6508,7 @@ fn reviewer_migration20_recovers_preexisting_orphan_questions() {
     // edge are scrubbed, while the surviving child's callback is still open.
     raw(&w)
         .execute_batch(concat!(
+            include_str!("fixtures/undo_usage.sql"),
             include_str!("fixtures/undo_delegation_limits.sql"),
             include_str!("fixtures/undo_family.sql"),
             "DROP TRIGGER attention_notice_update;
@@ -6671,6 +6689,7 @@ fn d3b_migration20_filters_answers_terminal_and_root_questions() {
     w.store.delete_session("parent", None).unwrap();
     raw(&w)
         .execute_batch(concat!(
+            include_str!("fixtures/undo_usage.sql"),
             include_str!("fixtures/undo_delegation_limits.sql"),
             include_str!("fixtures/undo_family.sql"),
             "DROP TRIGGER attention_notice_update;

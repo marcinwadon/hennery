@@ -377,6 +377,7 @@ async fn foreign_turn_fact_preserves_victim(ending: bool) {
         turn_id: "turn".into(),
     };
     let ended = SessionBody::TurnEnded {
+        usage: None,
         turn_id: "turn".into(),
         outcome: TurnOutcome::Completed,
         stop_reason: None,

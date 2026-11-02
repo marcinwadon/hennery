@@ -21,6 +21,7 @@ fn host_frames_use_snake_case_type_tags() {
         session_id: "s1".into(),
         seq: 7,
         body: SessionBody::TurnEnded {
+            usage: None,
             turn_id: "t1".into(),
             outcome: TurnOutcome::Completed,
             stop_reason: Some("end_turn".into()),
@@ -488,6 +489,7 @@ fn session_started_names_the_request_and_the_agents_session() {
 
 fn config() -> SessionConfig {
     SessionConfig {
+        cache_retention: Default::default(),
         model: Some("large".into()),
         mode: Some("plan".into()),
         axes: [

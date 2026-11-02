@@ -847,6 +847,7 @@ async fn a_host_offline_past_the_threshold_is_presumed_parked_and_reattached_on_
     host.emit(
         &session,
         SessionBody::TurnEnded {
+            usage: None,
             turn_id: turn.clone(),
             outcome: hennery_proto::frames::TurnOutcome::Completed,
             stop_reason: None,
@@ -1345,6 +1346,7 @@ async fn expect_cancel(host: &mut ScriptedHost, session: &str, turn: &str) -> St
 
 fn turn_ended(turn: &str, outcome: hennery_proto::frames::TurnOutcome) -> SessionBody {
     SessionBody::TurnEnded {
+        usage: None,
         turn_id: turn.into(),
         outcome,
         stop_reason: None,

@@ -20,6 +20,7 @@ pub mod runtime;
 pub mod session;
 pub mod transport;
 pub mod uplink;
+pub mod usage;
 pub mod walk;
 
 pub use adapter::AgentCommand;

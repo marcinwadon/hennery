@@ -18,6 +18,7 @@ fn update(n: u32) -> SessionBody {
 
 fn ended(turn: &str) -> SessionBody {
     SessionBody::TurnEnded {
+        usage: None,
         turn_id: turn.into(),
         outcome: TurnOutcome::Completed,
         stop_reason: None,
@@ -376,8 +377,11 @@ fn the_teardown_migration_upgrades_skeleton_turns() {
     // Roll the file back to the walking skeleton's schema (version 1).
     {
         let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch(include_str!("fixtures/undo_delegation.sql"))
-            .unwrap();
+        conn.execute_batch(concat!(
+            include_str!("fixtures/undo_usage.sql"),
+            include_str!("fixtures/undo_delegation.sql")
+        ))
+        .unwrap();
         conn.execute_batch(
             "DROP TRIGGER family_scope_end;
              DROP TRIGGER family_scope;
@@ -1214,6 +1218,7 @@ fn catalogue(model: &str, mode: &str) -> Indexed {
 
 fn config(model: &str, mode: &str) -> SessionConfig {
     SessionConfig {
+        cache_retention: Default::default(),
         model: Some(model.into()),
         mode: Some(mode.into()),
         axes: [("fast".to_string(), ConfigValue::Bool(true))].into_iter().collect(),
@@ -2717,8 +2722,11 @@ fn the_hat_migration_gives_each_session_its_hosts_default_hat() {
     // Back to the store's schema before hats (version 9): plan 10b-iii's
     // migration (version 11) and plan 9a's (version 13) undone too.
     let conn = rusqlite::Connection::open(&db).unwrap();
-    conn.execute_batch(include_str!("fixtures/undo_delegation.sql"))
-        .unwrap();
+    conn.execute_batch(concat!(
+        include_str!("fixtures/undo_usage.sql"),
+        include_str!("fixtures/undo_delegation.sql")
+    ))
+    .unwrap();
     conn.execute_batch(
         "DROP TRIGGER family_scope_end;
          DROP TRIGGER family_scope;

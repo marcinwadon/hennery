@@ -12,6 +12,7 @@ pub mod mcp_source;
 pub mod paths;
 pub mod plugin;
 pub mod rest;
+pub mod usage;
 
 /// Version of the host<->collector protocol, `MAJOR.MINOR`. Sent only in
 /// `hello` / `hello_ack`; minor versions are additive (architecture spec §5.3).

@@ -98,6 +98,7 @@ fn own_prompts_and_metadata_do_not_create_unseen_but_completion_does() {
             "s",
             4,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "t".into(),
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,
@@ -118,6 +119,7 @@ fn own_prompts_and_metadata_do_not_create_unseen_but_completion_does() {
             "s",
             5,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "missing".into(),
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,
@@ -208,6 +210,7 @@ fn upgrade_preserves_explicit_unread_results_without_backfilling_old_activity() 
             "result",
             3,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "t".into(),
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,
@@ -219,12 +222,12 @@ fn upgrade_preserves_explicit_unread_results_without_backfilling_old_activity() 
     drop(store);
     rusqlite::Connection::open(&path)
         .unwrap()
-        .execute_batch(
+        .execute_batch(concat!(include_str!("fixtures/undo_usage.sql"),
             "ALTER TABLE sessions DROP COLUMN mcp_source_requested; ALTER TABLE sessions DROP COLUMN mcp_source_applied;
              DROP INDEX sessions_sidebar_pinned; ALTER TABLE sessions DROP COLUMN sidebar_pinned;
          ALTER TABLE sessions DROP COLUMN unseen_event_id;
          ALTER TABLE sessions DROP COLUMN seen_event_id; PRAGMA user_version=31;",
-        )
+        ))
         .unwrap();
     let upgraded = Store::open(&path).unwrap();
     assert_eq!(unseen(&upgraded, "result"), Some(event));

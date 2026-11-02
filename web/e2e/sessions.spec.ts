@@ -36,6 +36,8 @@ async function seeResult(page: Page) {
 // Every prompt: one permission ask, then a short Markdown message after the
 // echo of its answer (`permission:selected:<option>`, no newline of its own).
 const SCRIPT = {
+  prompt_usage: { inputTokens: 10, outputTokens: 5, totalTokens: 100, cachedReadTokens: 80, cachedWriteTokens: 5 },
+  usage_update: { sessionUpdate: 'usage_update', used: 124000, size: 200000, cost: { amount: 1.25, currency: 'USD' } },
   asks: ['permission'],
   chunks: ['\n\nTwo steps:\n\n', '- first step\n', '- second step\n'],
   chunk_delay_ms: 20,
@@ -188,6 +190,26 @@ for (const width of [1280, 390]) {
       // An item draws its marker only as a list item, of its own (inherited) type.
       expect(await item.evaluate((el) => getComputedStyle(el).display)).toBe('list-item')
       expect(await item.evaluate((el) => getComputedStyle(el).listStyleType)).toBe('disc')
+    })
+
+    test('usage follows real host observations and the meter opens its responsive panel', async ({}, testInfo) => {
+      await expect(page.locator('.usage-meter-button')).toHaveText('62%')
+      await page.locator('.usage-meter-button').click()
+      const panel = page.locator('.usage-panel')
+      await expect(panel).toBeVisible()
+      await expect(panel.getByRole('meter', { name: 'Context used', exact: true })).toHaveAttribute('aria-valuenow', '124000')
+      await expect(panel.getByText('84% of input tokens came from cache', { exact: true })).toBeVisible()
+      await expect(panel.getByText('Not available for Claude on this host.', { exact: true })).toBeVisible()
+      const sessionId = new URL(page.url()).pathname.split('/').pop()!
+      const response = await page.request.get(`/api/sessions/${encodeURIComponent(sessionId)}/usage`)
+      expect(response.ok()).toBe(true)
+      const usage = await response.json()
+      expect(usage.session.tokens.total_tokens).toBe(100)
+      expect(usage.session.reported_turns).toBe(1)
+      expect(usage.session.cost.amount).toBe(1.25)
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true)
+      await page.screenshot({ path: testInfo.outputPath(`usage-${width}.png`) })
+      await page.getByRole('button', { name: 'Close session details', exact: true }).click()
     })
 
     test('the composer’s Send, and a phone’s way back, are on screen', async () => {
@@ -590,6 +612,7 @@ test.describe('redesigned session', () => {
         if (path.startsWith('/api/stream/')) { held.push(route); return }
         if (path === '/api/view/sessions/worker') return json({ items, epoch: 'items', revision: 1, older: false })
         if (path === '/api/sessions/worker') return json({ ...info, pending: [], mcp_delivery: { mode: 'unisolated', servers: 2, at: now } })
+        if (path === '/api/sessions/worker/usage') return json({ session_id: 'worker', source: 'acp', context: null, last_turn: null, session: { tokens: null, models: [], turns: 0, reported_turns: 0, since: null, cost: null, partial: true }, family: { totals: { tokens: null, models: [], turns: 0, reported_turns: 0, since: null, cost: null, partial: true }, sessions: 1, reporting_sessions: 0, cost_reporting_sessions: 0, truncated: false }, retention: { supported: false, requested: 'inherit', attached_request: null } })
         if (path.endsWith('/queue')) return json([])
         if (path.endsWith('/catalog')) return json(catalog())
         if (path.endsWith('/family')) return json({ summary: info, children: [], questions: [], routing: taken ? 'detached' : 'active' })

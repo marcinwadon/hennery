@@ -280,6 +280,7 @@ async fn new_like_this_refuses_missing_foreign_deleted_and_unconfigured_sources(
     let hat = collector.hat("Project");
     for (id, state) in [
         ("unconfigured", "starting"),
+        ("retention-only", "active"),
         ("foreign", "active"),
         ("deleted", "deleted"),
     ] {
@@ -293,6 +294,13 @@ async fn new_like_this_refuses_missing_foreign_deleted_and_unconfigured_sources(
         let conn = rusqlite::Connection::open(collector._dir.path().join("hennery.db")).unwrap();
         conn.execute("UPDATE sessions SET lifecycle=?2 WHERE id=?1", [id, state])
             .unwrap();
+        if id == "retention-only" {
+            conn.execute(
+                "UPDATE sessions SET agent_session_id='agent',cache_retention='1h' WHERE id=?1",
+                [id],
+            )
+            .unwrap();
+        }
         if id == "foreign" {
             conn.execute("UPDATE sessions SET owner_id='other-owner' WHERE id=?1", [id])
                 .unwrap();
@@ -303,6 +311,7 @@ async fn new_like_this_refuses_missing_foreign_deleted_and_unconfigured_sources(
         ("foreign", 404, "not_found"),
         ("deleted", 404, "not_found"),
         ("unconfigured", 409, "configuration_unavailable"),
+        ("retention-only", 409, "configuration_unavailable"),
     ] {
         let (status, body) = send(
             &collector,
@@ -318,7 +327,7 @@ async fn new_like_this_refuses_missing_foreign_deleted_and_unconfigured_sources(
             "{id}: {body}"
         );
     }
-    assert_eq!(session_count(&collector), 3);
+    assert_eq!(session_count(&collector), 4);
 }
 
 #[tokio::test]

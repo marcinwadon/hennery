@@ -1,0 +1,46 @@
+.usage-panel { display:flex; flex-direction:column; gap:16px; min-width:0; font-size:12px; outline:none; }
+.usage-panel h4 { margin:0; font:500 12px/1.3 var(--font-roboto); color:var(--hn-fg-2); }
+.usage-panel p { margin:0; }
+.usage-source { color:var(--hn-fg-3); font-size:11px; }
+.usage-row { display:flex; align-items:baseline; gap:8px; min-width:0; }
+.usage-row h4 { flex:1; }
+.usage-number { font:500 12px/1.35 var(--font-mono); color:var(--hn-fg-1); }
+.usage-note { font:400 12px/1.4 var(--font-inter); color:var(--hn-fg-3); overflow-wrap:anywhere; }
+.usage-coverage { color:var(--st-warn-fg); font:400 12px/1.4 var(--font-inter); overflow-wrap:anywhere; }
+.usage-context,.usage-total { display:flex; flex-direction:column; gap:8px; }
+.usage-context .usage-row:last-child { align-items:center; }
+.usage-context .usage-row:last-child > span { flex:1; }
+.usage-context-track,.usage-mini-track { display:flex; overflow:hidden; background:var(--hn-sunken); border-radius:3px; height:6px; }
+.usage-context-track > span,.usage-mini-track > span { background:var(--hn-accent); }
+.usage-context-track.is-stale > span,.usage-meter-button.is-stale .usage-mini-track > span { background:var(--hn-fg-3); }
+.usage-last-turn { display:flex; flex-direction:column; gap:10px; padding:10px; border:1px solid var(--hn-line); border-radius:8px; background:var(--hn-surface); }
+.usage-input-bar { display:flex; height:4px; gap:1px; overflow:hidden; border-radius:2px; background:var(--hn-sunken); }
+.usage-dot { width:6px; height:6px; border-radius:2px; display:inline-block; flex:none; }
+.usage-panel .input { background:var(--hn-fg-3); }
+.usage-panel .read { background:var(--hn-accent); }
+.usage-panel .write { background:var(--st-start-fg); }
+.usage-token-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px 12px; margin:0; }
+.usage-token-grid dt { display:flex; align-items:center; gap:5px; color:var(--hn-fg-3); font-size:11px; }
+.usage-token-grid dd { margin:4px 0 0; font:500 13px/1.3 var(--font-mono); }
+.usage-totals-grid { display:grid; grid-template-columns:52px 1fr; gap:6px 10px; margin:0; }
+.usage-totals-grid dt { color:var(--hn-fg-3); }
+.usage-totals-grid dd { display:flex; flex-direction:column; gap:2px; margin:0; min-width:0; }
+.usage-models summary { cursor:pointer; color:var(--hn-fg-2); padding:4px 0; }
+.usage-models dl { display:flex; flex-direction:column; gap:6px; margin:8px 0; padding-left:14px; }
+.usage-models dl > div { display:flex; gap:8px; font:400 12px/1.3 var(--font-mono); }
+.usage-models dt { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; }
+.usage-models dd { margin:0; }
+.usage-retention { margin:0; padding:0; border:0; min-width:0; }
+.usage-retention legend { font:500 12px/1.3 var(--font-roboto); color:var(--hn-fg-2); padding:0; margin-bottom:8px; }
+.usage-retention-options { display:flex; padding:2px; border-radius:6px; background:var(--hn-sunken); gap:2px; margin-bottom:8px; }
+.usage-retention-options label { flex:1; position:relative; cursor:pointer; text-align:center; }
+.usage-retention-options input { position:absolute; opacity:0; width:1px; height:1px; }
+.usage-retention-options span { display:block; padding:6px 8px; border-radius:4px; font:500 12px/1.3 var(--font-roboto); color:var(--hn-fg-3); }
+.usage-retention-options input:checked + span { color:var(--hn-fg-1); background:var(--hn-surface); box-shadow:0 1px 2px #0002; }
+.usage-retention-options input:focus-visible + span { outline:2px solid var(--hn-accent); outline-offset:1px; }
+.usage-retention:disabled { opacity:.7; }
+.usage-meter-button { display:inline-flex; align-items:center; gap:6px; border:0; border-radius:6px; padding:0 8px; height:28px; background:transparent; color:var(--hn-fg-2); font:500 12px/1 var(--font-mono); cursor:pointer; flex:none; }
+.usage-meter-button:hover { background:var(--hn-hover); }
+.usage-meter-button.is-stale { color:var(--st-warn-fg); }
+.usage-mini-track { width:32px; height:4px; }
+@media(max-width:1023px) { .usage-retention-options span { min-height:44px; padding:12px 8px; } .usage-meter-button { min-width:44px; min-height:44px; } }

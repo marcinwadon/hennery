@@ -28,6 +28,7 @@ for (const width of [1280, 390]) test(`question previews, closed child attention
     if (path.includes('/questions/')) return json(question())
     if (path === '/api/view/sessions/question') return json({ items: [question()], older: false, epoch: 'items', revision: 1 })
     if (path === '/api/sessions/question/catalog') return json({ session_id: 'question', config_options: [], commands: [] })
+    if (path === '/api/sessions/question/usage') return route.fulfill({ status: 404, body: '{"code":"not_found"}' })
     if (path === '/api/view/sessions/question/family') return json({ summary: base, children: [], questions: [] })
     if (path === '/api/stream/view/sessions/question') { held.push(route); return }
     if (path === '/api/delegation/attention') return json(acknowledged ? [] : [{ id: 'report', child_id: 'child', hat_id: 'hat', pending_id: null, reason: 'endpoint_unavailable' }])

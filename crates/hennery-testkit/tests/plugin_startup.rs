@@ -287,6 +287,7 @@ async fn startup_is_one_typed_block_in_the_same_prompt_and_survives_reconciliati
             "s",
             3,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "t".into(),
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,
@@ -480,6 +481,7 @@ async fn generated_context_is_excluded_from_completed_activity_and_the_view_sepa
             "s",
             3,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "t".into(),
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,
@@ -1010,6 +1012,7 @@ async fn review_pre_assignment_source_must_not_be_verified_in_new_hat() {
             "moving",
             3,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "old-turn".into(),
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,

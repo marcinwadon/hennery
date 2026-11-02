@@ -347,6 +347,7 @@ async fn live_claude_haiku_plan_configuration_survives_late_updates() -> Result<
     let (agent, profile) = command(&cwd, "claude", false)?;
     let (uplink, _replies) = Uplink::new(Outbox::open_in_memory()?);
     let wanted = SessionConfig {
+        cache_retention: Default::default(),
         model: Some("haiku".into()),
         mode: Some("plan".into()),
         axes: BTreeMap::new(),
@@ -481,10 +482,7 @@ impl Harness {
             .context("operator session")?;
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(reqwest::header::ORIGIN, url.parse()?);
-        headers.insert(
-            reqwest::header::COOKIE,
-            format!("__Host-hennery_session={session}").parse()?,
-        );
+        headers.insert(reqwest::header::COOKIE, format!("hennery_session={session}").parse()?);
         let client = reqwest::Client::builder().no_proxy().default_headers(headers).build()?;
         let keys = KeySource::from_vars(&root, Some("23".repeat(32).into()), None)?;
         let gateway: GatewayState = hennery_gateway::open(
@@ -1612,6 +1610,43 @@ async fn pinned_runtime_provider_authentication() -> Result<()> {
 
 #[tokio::test]
 #[ignore = "requires explicit pinned adapter and copied credentials; performs one inference"]
+async fn pinned_runtime_usage_observations() -> Result<()> {
+    let runtime = runtime("HENNERY_D4_PARENT")?;
+    let h = Harness::new(&runtime, None).await?;
+    let result=async {
+        let turn=h.prompt(&h.parent,"Reply with exactly HENNERY_USAGE_OK. Do not call any tools.").await?;
+        let outcome=h.wait("usage turn completion",||h.state.store.ended_turn_outcome(&turn).ok().flatten()).await?;
+        ensure!(outcome==hennery_proto::frames::TurnOutcome::Completed,"provider turn did not complete: {outcome:?}");
+        let u=h.state.store.session_usage(&h.parent)?.context("usage projection")?;
+        let last=u.last_turn.as_ref().context("completed turn")?.usage.as_ref().context("provider token counts")?;
+        ensure!(last.tokens.total_tokens>0 && last.tokens.valid(),"provider usage missing or invalid");
+        ensure!(u.context.as_ref().is_some_and(|c|c.size>0),"provider context observation missing");
+        ensure!(u.session.reported_turns==1,"usage counted more than once");
+        ensure!(last.source==runtime,"usage source differs from actual profile");
+        if runtime=="claude" {
+            ensure!(u.session.cost.is_some(),"Claude did not report cost");
+            ensure!(u.retention.supported,"Claude retention support missing");
+            let response=h.client.patch(format!("{}/api/sessions/{}/cache-retention",h.url,h.parent)).json(&json!({"requested":"1h"})).send().await?;
+            ensure!(response.status()==reqwest::StatusCode::OK,"retention preference refused");
+            let response=h.client.post(format!("{}/api/sessions/{}/park",h.url,h.parent)).send().await?;
+            ensure!(response.status()==reqwest::StatusCode::ACCEPTED,"scratch parent park refused");
+            let response=h.client.post(format!("{}/api/sessions/{}/resume",h.url,h.parent)).send().await?;
+            ensure!(response.status()==reqwest::StatusCode::ACCEPTED,"scratch parent resume refused");
+            let after=h.state.store.session_usage(&h.parent)?.context("resumed usage")?;
+            ensure!(after.retention.attached_request==Some(hennery_proto::usage::CacheRetention::OneHour),"resume did not acknowledge retention request");
+        } else {ensure!(!u.retention.supported,"Codex unexpectedly offered Claude retention");}
+        println!("{}",json!({"case":"usage_observations","runtime":runtime,"tokens":last.tokens,"context":u.context,"reported_turns":u.session.reported_turns,"retention_resume":runtime=="claude","effective_ttl_verified":false}));
+        Ok(())
+    }.await;
+    if result.is_err() {
+        h.diagnostics("usage observation failed")?;
+    }
+    let cleanup = h.finish().await;
+    result.and(cleanup)
+}
+
+#[tokio::test]
+#[ignore = "requires explicit pinned adapter and copied credentials; performs one inference"]
 async fn pinned_runtime_shell_executes_after_operator_approval() -> Result<()> {
     let runtime = runtime("HENNERY_D4_PARENT")?;
     let h = Harness::new(&runtime, None).await?;
@@ -1795,6 +1830,7 @@ fn codex_parent_medium_is_explicit_catalog_checked_and_does_not_raise_child_effo
             json!({"id":"reasoning_effort","options":[{"value":"low"},{"value":"medium"}]}),
         ],
         defaults: SessionConfig {
+            cache_retention: Default::default(),
             model: Some("gpt-6-sol".into()),
             mode: Some("read-only".into()),
             axes: Default::default(),

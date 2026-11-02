@@ -308,6 +308,47 @@ fn fake_with(script: &FakeScript) -> AgentCommand {
     fake
 }
 
+#[tokio::test]
+async fn prompt_usage_survives_the_adapter_transport_and_outbox() {
+    hennery_testkit::first_exec(env!("CARGO_BIN_EXE_hennery-fake-acp"));
+    let script = FakeScript {
+        prompt_usage: Some(
+            json!({"inputTokens":10,"outputTokens":5,"totalTokens":100,"cachedReadTokens":80,"cachedWriteTokens":5}),
+        ),
+        ..Default::default()
+    };
+    let (uplink, _replies) = Uplink::new(Outbox::open_in_memory().unwrap());
+    let actor = session::start(
+        uplink.clone(),
+        "r".into(),
+        "s".into(),
+        fake_with(&script),
+        std::env::temp_dir(),
+    );
+    wait_until(&uplink, |frames| !frames.is_empty()).await;
+    actor.send(SessionCmd::Prompt {
+        plugin_context: None,
+        request_id: "p".into(),
+        turn_id: "t".into(),
+        content: vec![json!({"type":"text","text":"test"})],
+    });
+    let frames = wait_until(&uplink, |f| kinds(f).contains(&"turn_ended".into())).await;
+    let usage = frames
+        .iter()
+        .find_map(|f| match f {
+            HostFrame::Session {
+                body: SessionBody::TurnEnded { usage, .. },
+                ..
+            } => usage.as_ref(),
+            _ => None,
+        })
+        .expect("usage missing");
+    assert_eq!(usage.tokens.total_tokens, 100);
+    assert_eq!(usage.tokens.cache_read_tokens, Some(80));
+    assert_eq!(usage.tokens.cache_write_tokens, Some(5));
+    assert!(usage.models.is_empty());
+}
+
 /// The fake adapter, but with SIGTERM ignored (`trap '' TERM` survives the
 /// `exec` into the same process, per POSIX): its teardown must ride out the
 /// full kill grace before SIGKILL lands, exactly like a real agent CLI that
@@ -1422,6 +1463,7 @@ fn config_script(log: &Path) -> FakeScript {
 
 fn wanted(model: Option<&str>, mode: Option<&str>, axes: &[(&str, ConfigValue)]) -> SessionConfig {
     SessionConfig {
+        cache_retention: Default::default(),
         model: model.map(str::to_string),
         mode: mode.map(str::to_string),
         axes: axes.iter().map(|(id, v)| (id.to_string(), v.clone())).collect(),

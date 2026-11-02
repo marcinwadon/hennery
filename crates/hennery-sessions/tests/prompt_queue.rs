@@ -86,6 +86,7 @@ impl World {
     }
     fn end(&self, turn: &str, outcome: TurnOutcome) {
         self.emit(SessionBody::TurnEnded {
+            usage: None,
             turn_id: turn.into(),
             outcome,
             stop_reason: None,
@@ -164,6 +165,7 @@ fn operator_model_switch_replaces_launch_expectations_and_repairs_a_stale_mismat
         let w = World::new();
         let (hub, mut rx) = host(vec![]);
         let wanted = SessionConfig {
+            cache_retention: Default::default(),
             model: Some("model-a".into()),
             mode: Some("default".into()),
             axes: [("fast".into(), hennery_proto::frames::ConfigValue::Bool(false))].into(),

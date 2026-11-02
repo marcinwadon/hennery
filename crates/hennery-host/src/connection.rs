@@ -395,6 +395,7 @@ async fn handshake(
             capabilities: Capabilities(vec![
                 Capability::Park,
                 Capability::IdleHold,
+                Capability::CacheRetention,
                 Capability::Images,
                 Capability::Projects,
                 Capability::ResolvePath,

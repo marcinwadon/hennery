@@ -22,6 +22,7 @@ import {
   type ClipboardEvent,
   type KeyboardEvent,
   type Ref,
+  type ReactNode,
 } from 'react'
 import { useClient } from '../app-client'
 import { ApiFailure, messageOf } from '../api/errors'
@@ -69,6 +70,7 @@ export interface ComposerHandle {
 }
 
 export interface ComposerProps {
+  usageMeter?: ReactNode
   /** The session prompts go to. A new id is a new composer (see above). */
   sessionId: string
   /** The session as the list shows it, null while unknown. A turn in
@@ -121,7 +123,7 @@ interface Notice {
 /** How a send ended: sent (a 202), or refused, saying why. */
 type Outcome = { sent: true } | { sent: false; notice: Notice }
 
-function SessionComposer({ sessionId, session, capabilities, catalog, configuration, onSettings, settingsExpanded = false, onResume, onJumpToQuestion, onSent, handle, queue = [], onQueueChange }: ComposerProps) {
+function SessionComposer({ sessionId, session, capabilities, catalog, configuration, onSettings, settingsExpanded = false, onResume, onJumpToQuestion, onSent, handle, queue = [], onQueueChange, usageMeter }: ComposerProps) {
   const client = useClient()
   const ids = useId()
   const [text, setText] = useState(() => loadDraft(sessionId))
@@ -551,6 +553,7 @@ function SessionComposer({ sessionId, session, capabilities, catalog, configurat
             )}
             <button className="attach-btn composer-settings-button" type="button" aria-label="Session settings" title="Session settings" aria-expanded={settingsExpanded} onClick={e => onSettings(e.currentTarget)}><Glyph name="adjustments-horizontal" size={18} /></button>
             <span className="composer-actions-space" />
+            {usageMeter}
             {inFlight && (
               <button
                 className="btn btn-danger btn-sm"

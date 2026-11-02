@@ -13,10 +13,12 @@ import type { McpSourceState } from '../generated/protocol'
 import StepList from './StepList'
 import { WaitingBadge } from './SessionScope'
 
-const TABS = ['Family', 'Plan', 'Details'] as const
+const TABS = ['Family', 'Plan', 'Usage', 'Details'] as const
 export type SessionDetailsTab = typeof TABS[number]
 
 interface Props {
+  usage?: ReactNode
+  usageFocus?: number
   open: boolean
   tab: SessionDetailsTab
   onTab: (tab: SessionDetailsTab) => void
@@ -41,6 +43,11 @@ export default function SessionDetails(props: Props) {
   const sheet = useMediaQuery('(max-width: 1023px)')
   const prefix = useId()
   const wrapper = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open || !props.usageFocus || tab !== 'Usage') return
+    const panel = wrapper.current?.querySelector<HTMLElement>('.usage-panel')
+    panel?.focus(); panel?.scrollIntoView?.({ block: 'nearest' })
+  }, [open, props.usageFocus, tab, sheet])
   // Runs after SheetFocus: a settings shortcut targets the settings themselves,
   // while the ordinary Details/Family button keeps the selected-tab focus.
   useEffect(() => {
@@ -55,14 +62,14 @@ export default function SessionDetails(props: Props) {
     {sheet && <div className="session-detail-tabs" role="tablist" aria-label="Session information">
       {TABS.map((name, i) => <button key={name} type="button" role="tab" id={`${prefix}-${name}`} aria-controls={`${prefix}-${name}-panel`} aria-selected={tab === name} tabIndex={tab === name ? 0 : -1}
         onClick={() => setTab(name)} onKeyDown={e => {
-          const index = e.key === 'ArrowRight' ? (i + 1) % 3 : e.key === 'ArrowLeft' ? (i + 2) % 3 : e.key === 'Home' ? 0 : e.key === 'End' ? 2 : -1
+          const index = e.key === 'ArrowRight' ? (i + 1) % TABS.length : e.key === 'ArrowLeft' ? (i + TABS.length - 1) % TABS.length : e.key === 'Home' ? 0 : e.key === 'End' ? TABS.length - 1 : -1
           if (index < 0) return
           e.preventDefault(); setTab(TABS[index]); document.getElementById(`${prefix}-${TABS[index]}`)?.focus()
         }}>{name}</button>)}
     </div>}
     {TABS.map(name => <div key={name} role={sheet ? 'tabpanel' : 'region'} tabIndex={sheet ? 0 : undefined} id={`${prefix}-${name}-panel`} aria-label={sheet ? undefined : name} aria-labelledby={sheet ? `${prefix}-${name}` : undefined} hidden={sheet && tab !== name}>
       {!sheet && <h3 className="session-section-title">{name}</h3>}
-      {name === 'Family' ? props.children : !open || (sheet && tab !== name) ? null : name === 'Plan' ? props.plan?.entries.length ? <StepList entries={props.plan.entries} truncated={props.plan.truncated} open /> : <p className="item-note">No plan has been shared.</p> : <Details {...props} />}
+      {name === 'Family' ? props.children : !open || (sheet && tab !== name) ? null : name === 'Plan' ? props.plan?.entries.length ? <StepList entries={props.plan.entries} truncated={props.plan.truncated} open /> : <p className="item-note">No plan has been shared.</p> : name === 'Usage' ? props.usage ?? <p className="item-note">No usage has been reported.</p> : <Details {...props} />}
     </div>)}
   </>
   return <div ref={wrapper} className={'session-details-wrap' + (sheet ? ' is-sheet' : '')} hidden={!open}>

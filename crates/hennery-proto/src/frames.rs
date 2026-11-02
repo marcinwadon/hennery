@@ -33,6 +33,8 @@ pub enum Capability {
     Park,
     /// Collector-controlled suppression of automatic idle parking.
     IdleHold,
+    /// Per-session Claude cache-retention requests applied at attach.
+    CacheRetention,
     /// Resolving typed paths (`resolve_path`, kernel spec §5.4).
     ResolvePath,
     /// Removing a deleted session's transcript from the agent's own data
@@ -577,6 +579,9 @@ pub enum ConfigValue {
 /// the start request, so the wire stays `model?, mode?, axes{}`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct SessionConfig {
+    #[serde(default, skip_serializing_if = "crate::usage::CacheRetention::is_inherit")]
+    #[ts(as = "Option<crate::usage::CacheRetention>", optional)]
+    pub cache_retention: crate::usage::CacheRetention,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -603,6 +608,9 @@ impl SessionConfig {
 /// mode deltas are ignored.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct Indexed {
+    /// Host-owned launch support and requested retention, not provider readback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_retention: Option<crate::usage::CacheRetention>,
     /// Host-owned acknowledgement, used only on SessionStarted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -665,6 +673,7 @@ impl Indexed {
             return None;
         }
         Some(SessionConfig {
+            cache_retention: Default::default(),
             model: self.current_model.clone(),
             mode: self.current_mode.clone(),
             axes: self.current_axes.clone().unwrap_or_default(),
@@ -709,6 +718,8 @@ pub enum SessionBody {
         payload: Value,
     },
     TurnEnded {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        usage: Option<Box<crate::usage::TurnUsage>>,
         turn_id: String,
         outcome: TurnOutcome,
         #[serde(default, skip_serializing_if = "Option::is_none")]

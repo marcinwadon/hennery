@@ -7,6 +7,12 @@ pub mod tls;
 /// Behaviour of `hennery-fake-acp`, passed as JSON in `HENNERY_FAKE_ACP_SCRIPT`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FakeScript {
+    /// Optional standard usage returned by the prompt response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_usage: Option<serde_json::Value>,
+    /// Optional usage_update before the prompt response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_update: Option<serde_json::Value>,
     /// Text chunks streamed as `agent_message_chunk` updates for every prompt.
     pub chunks: Vec<String>,
     /// Delay before each chunk, in milliseconds.
@@ -299,6 +305,8 @@ pub enum FakeAsk {
 impl Default for FakeScript {
     fn default() -> Self {
         Self {
+            prompt_usage: None,
+            usage_update: None,
             chunks: vec!["Hello".into(), " world".into()],
             chunk_delay_ms: 0,
             prompt_queueing: false,

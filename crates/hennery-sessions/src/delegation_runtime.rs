@@ -419,6 +419,7 @@ pub fn evidence_satisfies(
         && config_offered(
             catalog,
             &SessionConfig {
+                cache_retention: Default::default(),
                 // Unrequested, nonsecurity settings may have current values outside
                 // an adapter's option list. They are not part of the release proof.
                 model: None,

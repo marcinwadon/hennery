@@ -100,6 +100,7 @@ fn cancel(request_id: &str) -> CollectorFrame {
 
 fn ended(turn_id: &str, outcome: TurnOutcome) -> SessionBody {
     SessionBody::TurnEnded {
+        usage: None,
         turn_id: turn_id.into(),
         outcome,
         stop_reason: None,

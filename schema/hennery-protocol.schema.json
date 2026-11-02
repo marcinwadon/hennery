@@ -209,6 +209,14 @@
       ],
       "type": "object"
     },
+    "CacheRetention": {
+      "enum": [
+        "inherit",
+        "5m",
+        "1h"
+      ],
+      "type": "string"
+    },
     "CancelResponse": {
       "description": "`POST /api/sessions/{id}/cancel`: how the open turn ended. Usually\n`cancelled`, but `completed` or `failed` if the turn ended before the\ncancel reached the agent, and `interrupted` if the session was parked or\nclosed while the cancel was outstanding, or its adapter exited.",
       "properties": {
@@ -337,6 +345,11 @@
         {
           "const": "idle_hold",
           "description": "Collector-controlled suppression of automatic idle parking.",
+          "type": "string"
+        },
+        {
+          "const": "cache_retention",
+          "description": "Per-session Claude cache-retention requests applied at attach.",
           "type": "string"
         },
         {
@@ -693,6 +706,9 @@
               },
               "type": "object"
             },
+            "cache_retention": {
+              "$ref": "#/$defs/CacheRetention"
+            },
             "committed_seq": {
               "format": "uint64",
               "minimum": 0,
@@ -859,6 +875,9 @@
               },
               "type": "object"
             },
+            "cache_retention": {
+              "$ref": "#/$defs/CacheRetention"
+            },
             "committed_seq": {
               "description": "The collector's highest committed seq for this session; the host\ncontinues from the larger of this and its own counter (§5.1).",
               "format": "uint64",
@@ -941,6 +960,9 @@
                 "$ref": "#/$defs/ConfigValue"
               },
               "type": "object"
+            },
+            "cache_retention": {
+              "$ref": "#/$defs/CacheRetention"
             },
             "committed_seq": {
               "description": "Fast-forward the host's counter before the first frame (§5.1).",
@@ -1473,6 +1495,29 @@
       ],
       "type": "object"
     },
+    "ContextUsage": {
+      "properties": {
+        "observed_at": {
+          "type": "string"
+        },
+        "size": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "used": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "used",
+        "size",
+        "observed_at"
+      ],
+      "type": "object"
+    },
     "CreateHatRequest": {
       "description": "`POST /api/hats`: a name, 1 to 64 printable characters, unique in any\ncase, and a `#rrggbb` colour (slate when absent).",
       "properties": {
@@ -1809,6 +1854,39 @@
       "required": [
         "role",
         "text"
+      ],
+      "type": "object"
+    },
+    "FamilyUsage": {
+      "properties": {
+        "cost_reporting_sessions": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reporting_sessions": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sessions": {
+          "format": "uint",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "totals": {
+          "$ref": "#/$defs/UsageTotals"
+        },
+        "truncated": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "totals",
+        "sessions",
+        "reporting_sessions",
+        "cost_reporting_sessions",
+        "truncated"
       ],
       "type": "object"
     },
@@ -2799,6 +2877,17 @@
     "Indexed": {
       "description": "Fields the collector may read from a session event. Closed set (ACP core §3.2).\n\nThe catalogue extracts (`config_options`, `current_model`,\n`current_mode`, `current_axes`) travel together: when `config_options`\nis present and not empty, the four are one snapshot of the adapter's\nconfig. An absent or empty `config_options` means \"no read-back\", never\n\"the adapter has no config\" (a response that failed to parse looks\nempty). A live `current_mode` without a snapshot is a mode-only delta;\nit never clears the model, other axes or option inventory. Early/replayed\nmode deltas are ignored.",
       "properties": {
+        "cache_retention": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CacheRetention"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Host-owned launch support and requested retention, not provider readback."
+        },
         "catalog_identity": {
           "anyOf": [
             {
@@ -3819,6 +3908,21 @@
       },
       "required": [
         "servers"
+      ],
+      "type": "object"
+    },
+    "ModelUsage": {
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "tokens": {
+          "$ref": "#/$defs/TokenUsage"
+        }
+      },
+      "required": [
+        "model",
+        "tokens"
       ],
       "type": "object"
     },
@@ -5392,6 +5496,56 @@
         }
       ]
     },
+    "ReportedCost": {
+      "properties": {
+        "amount": {
+          "format": "double",
+          "type": "number"
+        },
+        "currency": {
+          "type": "string"
+        },
+        "observed_at": {
+          "type": "string"
+        },
+        "partial": {
+          "description": "A runtime's cumulative reading; whole-session coverage is not promised.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "amount",
+        "currency",
+        "observed_at",
+        "partial"
+      ],
+      "type": "object"
+    },
+    "RetentionState": {
+      "properties": {
+        "attached_request": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CacheRetention"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "requested": {
+          "$ref": "#/$defs/CacheRetention"
+        },
+        "supported": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "supported",
+        "requested"
+      ],
+      "type": "object"
+    },
     "RotatePluginRequest": {
       "additionalProperties": false,
       "properties": {
@@ -5628,6 +5782,16 @@
             },
             "turn_id": {
               "type": "string"
+            },
+            "usage": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/TurnUsage"
+                },
+                {
+                  "type": "null"
+                }
+              ]
             }
           },
           "required": [
@@ -5891,6 +6055,9 @@
           },
           "type": "object"
         },
+        "cache_retention": {
+          "$ref": "#/$defs/CacheRetention"
+        },
         "commands": {
           "description": "The adapter's slash commands (ACP `AvailableCommand` objects), as\nlast reported; empty until it reports any (ACP core §7). Always\nsent, so the schema and the TypeScript type agree that it is there.",
           "items": true,
@@ -5932,6 +6099,9 @@
             "$ref": "#/$defs/ConfigValue"
           },
           "type": "object"
+        },
+        "cache_retention": {
+          "$ref": "#/$defs/CacheRetention"
         },
         "mode": {
           "type": [
@@ -6289,6 +6459,65 @@
       ],
       "type": "object"
     },
+    "SessionUsage": {
+      "properties": {
+        "context": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ContextUsage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "family": {
+          "$ref": "#/$defs/FamilyUsage"
+        },
+        "last_turn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UsageTurn"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "retention": {
+          "$ref": "#/$defs/RetentionState"
+        },
+        "session": {
+          "$ref": "#/$defs/UsageTotals"
+        },
+        "session_id": {
+          "type": "string"
+        },
+        "source": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "source",
+        "session",
+        "family",
+        "retention"
+      ],
+      "type": "object"
+    },
+    "SetCacheRetention": {
+      "additionalProperties": false,
+      "properties": {
+        "requested": {
+          "$ref": "#/$defs/CacheRetention"
+        }
+      },
+      "required": [
+        "requested"
+      ],
+      "type": "object"
+    },
     "SetHatLogoRequest": {
       "additionalProperties": false,
       "description": "`PUT /api/hats/{id}/logo` (kernel spec §5.1, §8; plan 4d-B2): a PNG, at\nmost 64 KiB, as standard base64 with its padding and nothing around it\n(no `data:` prefix, no whitespace). The body is at most 96 KiB. Step-up.\nThe collector decodes it and writes it afresh, so what is served is\nnever the upload's bytes. 200 with the `HatItem`.\n\nIts own codes: 400 `invalid_logo` (not base64; not a readable PNG; over\n1024 pixels either way); 413 `logo_too_large` (over 64 KiB, or over 256\nKiB once re-encoded); 413 `body_too_large`; 415 `unsupported_logo` (not\na PNG: the web UI turns an SVG, a WebP or a JPEG into one first); 404\n`not_found`; 409 `hat_purging` (a hat frozen for its purge takes no new\nlogo). `DELETE /api/hats/{id}/logo` (step-up) removes it: 200 with the\n`HatItem`, a frozen hat's too, or 404.",
@@ -6505,6 +6734,9 @@
           },
           "type": "object"
         },
+        "cache_retention": {
+          "$ref": "#/$defs/CacheRetention"
+        },
         "cwd": {
           "type": "string"
         },
@@ -6719,6 +6951,47 @@
       ],
       "type": "string"
     },
+    "TokenUsage": {
+      "properties": {
+        "cache_read_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cache_write_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "input_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "total_tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "input_tokens",
+        "output_tokens",
+        "total_tokens"
+      ],
+      "type": "object"
+    },
     "TranscriptRemoval": {
       "description": "The agent's own transcript of a deleted session on its host (plan 9d\ndecision 7): best effort. `notes` name what is never removed, whatever\nthe state.",
       "properties": {
@@ -6764,6 +7037,29 @@
         "interrupted"
       ],
       "type": "string"
+    },
+    "TurnUsage": {
+      "properties": {
+        "models": {
+          "items": {
+            "$ref": "#/$defs/ModelUsage"
+          },
+          "type": "array"
+        },
+        "source": {
+          "description": "Adapter profile, not an asserted billing identity.",
+          "type": "string"
+        },
+        "tokens": {
+          "$ref": "#/$defs/TokenUsage"
+        }
+      },
+      "required": [
+        "source",
+        "tokens",
+        "models"
+      ],
+      "type": "object"
     },
     "UpdateHatRequest": {
       "description": "`PATCH /api/hats/{id}`: absent fields stay as they are.\n`default_for_new_hosts` can only be `true`: a hat stops being that\ndefault when another takes its place.",
@@ -6920,6 +7216,91 @@
           ]
         }
       },
+      "type": "object"
+    },
+    "UsageTotals": {
+      "properties": {
+        "cost": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReportedCost"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "models": {
+          "items": {
+            "$ref": "#/$defs/ModelUsage"
+          },
+          "type": "array"
+        },
+        "partial": {
+          "type": "boolean"
+        },
+        "reported_turns": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "since": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "tokens": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TokenUsage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "turns": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "models",
+        "turns",
+        "reported_turns",
+        "partial"
+      ],
+      "type": "object"
+    },
+    "UsageTurn": {
+      "properties": {
+        "observed_at": {
+          "type": "string"
+        },
+        "outcome": {
+          "type": "string"
+        },
+        "turn_id": {
+          "type": "string"
+        },
+        "usage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnUsage"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "turn_id",
+        "outcome",
+        "observed_at"
+      ],
       "type": "object"
     },
     "VapidKeyResponse": {

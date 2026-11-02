@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## 0.4.0
+
+- Add Usage to session details, with a composer context meter, per-turn input,
+  output and cache counters, durable session totals and visible family totals.
+- Show reported model accounting, observation age and missing-data coverage;
+  runtime cost readings remain separate from billing or subscription limits.
+- Let bundled Claude sessions request inherited, five-minute or one-hour prompt
+  cache retention on the next resume, without changing global settings. Codex
+  and custom runtimes keep their own retention policy.
+- Offer Compact when the runtime advertises it, preserving the composer draft
+  and using the normal prompt admission path.
+- Update both collector and agent hosts to collect new turn counts. Earlier
+  sessions remain readable; historical counts are shown as unknown.
+
 ## 0.3.11
 
 - Security: bound public HTTP connections, request bodies and WebSocket
