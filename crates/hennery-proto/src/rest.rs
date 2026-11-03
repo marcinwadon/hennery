@@ -366,6 +366,11 @@ pub struct SessionDetail {
     pub mcp_source_policy: Option<crate::mcp_source::McpSourceState>,
     #[serde(flatten)]
     pub session: SessionItem,
+    /// The adapter's own identifier, distinct from Hennery's `session_id`.
+    /// Absent until the agent has reported a session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(type = "string | undefined", optional)]
+    pub agent_session_id: Option<String>,
     /// A bounded, readable requested-versus-actual configuration failure.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]

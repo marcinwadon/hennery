@@ -17,6 +17,7 @@ CREATE TABLE external_operations (
  FOREIGN KEY(owner_id,client_id) REFERENCES external_clients(owner_id,id) ON DELETE CASCADE
 );
 CREATE INDEX external_operations_session ON external_operations(owner_id,session_id,position);
+CREATE INDEX external_operations_state ON external_operations(owner_id,state,position);
 CREATE TRIGGER external_control_revoke AFTER UPDATE OF revision,revoked_at ON external_clients
 BEGIN
  UPDATE external_operations SET state='cancelled',code='grant_changed',args='{}'

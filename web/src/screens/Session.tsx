@@ -613,7 +613,7 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
         <UsagePanel state={usage} away={hostAway || !!info?.presumed_parked || connectedOf(hostItems, info?.host_id) === false}
           compact={commands(s.catalog).some(c => c.name === 'compact')} compacting={compactBusy}
           onCompact={info?.lifecycle === 'active' && info.activity === 'idle' && !info.question_waits && !configuration.pending && !configuration.error && s.queue.length === 0 ? () => void compact() : undefined} />
-      </>} open={detailsOpen} tab={detailsTab} onTab={setDetailsTab} onClose={closeDetails} trigger={detailsReturn} settingsFocus={settingsFocus} configuration={configuration} catalog={s.catalog} info={info} hostName={info ? hosts.get(info.host_id) : undefined} hatName={actualHat?.name} plan={plan} delivery={mcp.detail?.mcp_delivery} sourcePolicy={sourcePolicy}>
+      </>} open={detailsOpen} tab={detailsTab} onTab={setDetailsTab} onClose={closeDetails} trigger={detailsReturn} settingsFocus={settingsFocus} configuration={configuration} catalog={s.catalog} info={info} agentSessionId={mcp.detail?.agent_session_id} hostName={info ? hosts.get(info.host_id) : undefined} hatName={actualHat?.name} plan={plan} delivery={mcp.detail?.mcp_delivery} sourcePolicy={sourcePolicy}>
         <FamilyPanel key={id} id={id} summary={summary} hosts={hosts} resync={Math.max(0, s.loads - 1) + familyRefresh} onPage={onFamilyPage} />
       </SessionDetails>
       </div>

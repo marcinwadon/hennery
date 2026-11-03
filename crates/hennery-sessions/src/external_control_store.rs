@@ -362,7 +362,14 @@ impl Store {
         Ok(())
     }
     pub(crate) fn external_recover_operations(&self) -> Result<()> {
-        self.conn().execute("UPDATE external_operations SET state='uncertain',args=json_object(),code='delivery_unknown' WHERE owner_id = ?1 AND state='running'",[self.owner_id()])?;
+        {
+            let conn = self.conn();
+            let pending:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM external_operations WHERE owner_id = ?1 AND state IN ('running','uncertain'))",[self.owner_id()],|r|r.get(0))?;
+            if !pending {
+                return Ok(());
+            }
+            conn.execute("UPDATE external_operations SET state='uncertain',args=json_object(),code='delivery_unknown' WHERE owner_id = ?1 AND state='running'",[self.owner_id()])?;
+        }
         let unsent = {
             let conn = self.conn();
             let mut stmt=conn.prepare("SELECT id,client_id,revision,tool,session_id,turn_id FROM external_operations WHERE owner_id = ?1 AND state='uncertain' AND request_id IS NULL")?;
@@ -382,6 +389,13 @@ impl Store {
     }
     pub(crate) fn external_settle_operations(&self) -> Result<()> {
         let conn = self.conn();
+        // An idle worker must not contend for a SQLite writer or block the
+        // collector's runtime on the busy timeout, including when its ledger
+        // contains only terminal receipts.
+        let pending:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM external_operations WHERE owner_id = ?1 AND state IN ('queued','running','uncertain'))",[self.owner_id()],|r|r.get(0))?;
+        if !pending {
+            return Ok(());
+        }
         conn.execute("UPDATE external_operations SET state='failed',code='not_attached',args=json_object() WHERE owner_id = ?1 AND tool='session_prompt' AND state='queued' AND NOT EXISTS(SELECT 1 FROM sessions s WHERE s.owner_id = ?1 AND s.id=external_operations.session_id AND s.lifecycle IN ('active','parked','starting'))",[self.owner_id()])?;
         conn.execute("UPDATE external_operations SET state='failed',code='not_delivered',args=json_object() WHERE owner_id = ?1 AND tool='session_prompt' AND state IN ('running','uncertain') AND EXISTS(SELECT 1 FROM turns t WHERE t.owner_id = ?1 AND t.session_id=external_operations.session_id AND t.turn_id=external_operations.turn_id AND t.state='not_delivered')",[self.owner_id()])?;
         conn.execute("UPDATE external_operations SET state='cancelled',code='grant_changed',args=json_object() WHERE owner_id = ?1 AND state='queued'

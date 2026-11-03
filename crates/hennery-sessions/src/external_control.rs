@@ -534,6 +534,7 @@ pub fn after_startup(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_millis(100));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {biased;()=state.shutdown.cancelled()=>break,_=tick.tick()=>{}}
             if let Err(error) = state.store.external_settle_operations() {
@@ -993,5 +994,15 @@ mod tests {
             )
             .unwrap();
         assert!(!requested);
+    }
+
+    #[test]
+    fn idle_worker_needs_no_database_write_lock() {
+        let (_dir, state, identity) = world();
+        let command = admitted(&state, &identity, "session_close");
+        state.store.external_finish(&command, "completed", None, None).unwrap();
+        state.store.conn().execute_batch("PRAGMA query_only=ON").unwrap();
+        state.store.external_recover_operations().unwrap();
+        state.store.external_settle_operations().unwrap();
     }
 }

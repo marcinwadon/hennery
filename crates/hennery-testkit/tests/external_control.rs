@@ -20,6 +20,7 @@ struct Harness {
     url: String,
     root: String,
     token: String,
+    listener: std::net::TcpListener,
     server: Option<tokio::task::JoinHandle<std::io::Result<()>>>,
     host: Option<tokio::task::JoinHandle<anyhow::Result<()>>>,
     stop: Option<oneshot::Sender<()>>,
@@ -60,7 +61,13 @@ impl Harness {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let url = format!("http://{addr}");
-        let server = tokio::spawn(hennery_sessions::serve(listener, state.clone()));
+        // Reserve the address across test-only collector restarts. Otherwise
+        // parallel clients can claim the released port for an ephemeral socket
+        // between shutdown and bind. Collector state and host connections are
+        // still recreated against the durable database.
+        let listener = listener.into_std().unwrap();
+        let serving = tokio::net::TcpListener::from_std(listener.try_clone().unwrap()).unwrap();
+        let server = tokio::spawn(hennery_sessions::serve(serving, state.clone()));
         let mut fake = AgentCommand::parse(env!("CARGO_BIN_EXE_hennery-fake-acp")).unwrap();
         let mut script = script;
         script.session_log = Some(dir.path().join("agent.jsonl").to_string_lossy().into_owned());
@@ -90,6 +97,7 @@ impl Harness {
             url,
             root,
             token: String::new(),
+            listener,
             server: Some(server),
             host: Some(host),
             stop: Some(stop),
@@ -198,9 +206,7 @@ impl Harness {
     async fn restart_collector(&mut self) {
         self.state.shutdown.cancel();
         self.server.take().unwrap().await.unwrap().unwrap();
-        let listener = tokio::net::TcpListener::bind(self.url.strip_prefix("http://").unwrap())
-            .await
-            .unwrap();
+        let listener = tokio::net::TcpListener::from_std(self.listener.try_clone().unwrap()).unwrap();
         let db = self.dir.path().join("collector.db");
         self.state = AppState::new(
             Store::open(&db).unwrap(),

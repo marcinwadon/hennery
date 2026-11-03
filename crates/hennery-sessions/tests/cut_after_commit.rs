@@ -32,7 +32,11 @@ fn every_cut_goes_through_commit_then_cut() {
         }
     }
     assert_eq!(cuts.len(), 1, "a cut outside `commit_then_cut`: {cuts:#?}");
-    let store = &files.iter().find(|(path, _)| path.ends_with("store.rs")).unwrap().1;
+    let store = &files
+        .iter()
+        .find(|(path, _)| Path::new(path).file_name().is_some_and(|name| name == "store.rs"))
+        .unwrap()
+        .1;
     let helper = store
         .split("fn commit_then_cut(")
         .nth(1)

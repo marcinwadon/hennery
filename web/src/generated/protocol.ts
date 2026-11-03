@@ -893,6 +893,11 @@ next_cursor?: string | undefined, };
  */
 export type SessionDetail = { mcp_source_policy?: McpSourceState,
 /**
+ * The adapter's own identifier, distinct from Hennery's `session_id`.
+ * Absent until the agent has reported a session.
+ */
+agent_session_id?: string | undefined,
+/**
  * A bounded, readable requested-versus-actual configuration failure.
  */
 configuration_error?: string, open_turn?: OpenTurn | undefined,

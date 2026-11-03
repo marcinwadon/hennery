@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, type ReactNode, type RefObject, type KeyboardEvent } from 'react'
+import { useEffect, useId, useRef, useState, type ReactNode, type RefObject, type KeyboardEvent } from 'react'
 import type { HeaderInfo } from './SessionHeader'
 import type { Item } from '../generated/view'
 import type { McpSessionDelivery, SessionCatalog } from '../generated/protocol'
@@ -25,6 +25,7 @@ interface Props {
   onClose: () => void
   trigger: RefObject<HTMLButtonElement | null>
   info?: HeaderInfo
+  agentSessionId?: string
   hostName?: string
   hatName?: string
   plan?: Extract<Item, { kind: 'plan' }>
@@ -97,11 +98,12 @@ function SheetFocus({ dialog: ref, keys, onClose, trigger }: { dialog: RefObject
   return null
 }
 
-function Details({ info, hostName, hatName, delivery, configuration, catalog, sourcePolicy }: Props) {
+function Details({ info, agentSessionId, hostName, hatName, delivery, configuration, catalog, sourcePolicy }: Props) {
   return <>
     {configuration && <SessionSettings catalog={catalog ?? null} config={configuration} />}
     {info && <dl className="session-facts">
-      <dt>Session ID</dt><dd><bdi><code>{info.session_id}</code></bdi></dd>
+      <SessionIdentifier key={info.session_id} label="Hennery session ID" value={info.session_id} />
+      <SessionIdentifier key={`${info.agent}:${agentSessionId}`} label={`${agentLabel(info.agent)} session ID`} value={agentSessionId} />
       <dt>Host</dt><dd><bdi>{hostName ?? info.host_id}</bdi></dd>
       <dt>Project</dt><dd><bdi>{info.cwd}</bdi></dd>
       {hatName && <><dt>Hat</dt><dd><bdi>{hatName}</bdi></dd></>}
@@ -113,4 +115,21 @@ function Details({ info, hostName, hatName, delivery, configuration, catalog, so
     <McpSourcePolicy state={sourcePolicy} />
     <McpDelivery agent={info?.agent} delivery={delivery} />
   </>
+}
+
+function SessionIdentifier({ label, value }: { label: string; value?: string }) {
+  const [status, setStatus] = useState('')
+  async function copy() {
+    try {
+      if (!value || !navigator.clipboard?.writeText) throw new Error('clipboard unavailable')
+      await navigator.clipboard.writeText(value)
+      setStatus('Copied')
+    } catch {
+      setStatus('Copy unavailable. Select the ID to copy it.')
+    }
+  }
+  return <><dt className="session-identifier-label">{label}</dt><dd className="session-identifier-value">
+    {value ? <div className="session-identifier"><bdi><code>{value}</code></bdi><button type="button" className="btn btn-ghost btn-sm" aria-label={`Copy ${label}`} onClick={() => void copy()}>{status === 'Copied' ? 'Copied' : 'Copy'}</button></div> : <span>Not available</span>}
+    {status && <span role="status" className={status === 'Copied' ? 'sr-only' : 'item-note'}>{status}</span>}
+  </dd></>
 }

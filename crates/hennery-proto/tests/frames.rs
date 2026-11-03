@@ -285,7 +285,8 @@ fn project_root_is_bounded_without_truncating_its_identity() {
 #[test]
 fn session_detail_leaves_out_absent_optionals() {
     use hennery_proto::rest::{OpenTurn, SessionDetail};
-    let detail = SessionDetail {
+    let mut detail = SessionDetail {
+        agent_session_id: None,
         mcp_source_policy: None,
         configuration_error: None,
         session: bare_item(),
@@ -305,6 +306,16 @@ fn session_detail_leaves_out_absent_optionals() {
             "open_turn": {"turn_id": "t", "state": "started"}, "pending": []
         })
     );
+    let old = serde_json::to_value(&detail).unwrap();
+    assert_eq!(
+        serde_json::from_value::<SessionDetail>(old).unwrap().agent_session_id,
+        None
+    );
+    detail.agent_session_id = Some("native-session".into());
+    let encoded = serde_json::to_value(&detail).unwrap();
+    assert_eq!(encoded["session_id"], "s");
+    assert_eq!(encoded["agent_session_id"], "native-session");
+    assert_eq!(serde_json::from_value::<SessionDetail>(encoded).unwrap(), detail);
 }
 
 /// Plan 6b, the review's A1: as the list serves it, a model, mode or
