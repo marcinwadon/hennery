@@ -83,7 +83,7 @@ pub(crate) fn insufficient_scope(state: &AppState) -> Response {
     response.headers_mut().insert(
         header::WWW_AUTHENTICATE,
         header::HeaderValue::from_str(&format!(
-            "Bearer error=\"insufficient_scope\", scope=\"hennery:sessions:read\"{metadata}"
+            "Bearer error=\"insufficient_scope\", scope=\"{SCOPE}\"{metadata}"
         ))
         .expect("validated public origin"),
     );

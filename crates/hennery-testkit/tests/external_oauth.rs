@@ -168,10 +168,13 @@ impl Fixture {
         ]
     }
     async fn pending(&self, client: &str) -> String {
+        self.pending_with(&self.auth(client)).await
+    }
+    async fn pending_with(&self, authorization: &[(&str, String)]) -> String {
         let r = self
             .http
             .get(format!("{}/oauth/external/authorize", self.base))
-            .query(&self.auth(client))
+            .query(authorization)
             .send()
             .await
             .unwrap();
@@ -410,12 +413,77 @@ async fn direct_remote_oauth_round_trip_over_real_tls_and_shipped_proxies() {
         assert_eq!(refresh.status(), 200);
         let next: Value = refresh.json().await.unwrap();
         assert_ne!(next["refresh_token"], token["refresh_token"]);
+        // A scope error must not consume the current refresh token or revoke
+        // its still-valid access token. No new permission is granted here.
+        let expanded = f
+            .http
+            .post(format!("{}/oauth/external/token", f.base))
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", client.as_str()),
+                ("resource", &f.resource()),
+                ("refresh_token", next["refresh_token"].as_str().unwrap()),
+                (
+                    "scope",
+                    "hennery:discover hennery:sessions:read offline_access operator:approve",
+                ),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(expanded.status(), 400);
+        let expanded: Value = expanded.json().await.unwrap();
+        assert_eq!(expanded["error"], "invalid_scope");
+        assert_eq!(
+            f.rpc(next["access_token"].as_str().unwrap(), "host_list", json!({}))
+                .await["result"]["isError"],
+            false
+        );
+        let reordered = next["scope"]
+            .as_str()
+            .unwrap()
+            .split_ascii_whitespace()
+            .rev()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let response = f
+            .http
+            .post(format!("{}/oauth/external/token", f.base))
+            .form(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", client.as_str()),
+                ("resource", &f.resource()),
+                ("refresh_token", next["refresh_token"].as_str().unwrap()),
+                ("scope", reordered.as_str()),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let rotated: Value = response.json().await.unwrap();
+        assert_eq!(rotated["scope"], next["scope"]);
+        assert_ne!(rotated["refresh_token"], next["refresh_token"]);
+        assert_eq!(
+            f.http
+                .get(format!("{}/mcp/external/hennery", f.base))
+                .bearer_auth(next["access_token"].as_str().unwrap())
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            401
+        );
+        assert_eq!(
+            f.rpc(rotated["access_token"].as_str().unwrap(), "host_list", json!({}))
+                .await["result"]["isError"],
+            false
+        );
         let revoke = f
             .http
             .post(format!("{}/oauth/external/revoke", f.base))
             .form(&[
                 ("client_id", client.as_str()),
-                ("token", next["refresh_token"].as_str().unwrap()),
+                ("token", rotated["refresh_token"].as_str().unwrap()),
             ])
             .send()
             .await
@@ -424,7 +492,7 @@ async fn direct_remote_oauth_round_trip_over_real_tls_and_shipped_proxies() {
         assert_eq!(
             f.http
                 .get(format!("{}/mcp/external/hennery", f.base))
-                .bearer_auth(next["access_token"].as_str().unwrap())
+                .bearer_auth(rotated["access_token"].as_str().unwrap())
                 .send()
                 .await
                 .unwrap()
@@ -637,6 +705,7 @@ async fn reduced_consent_requires_a_scope_challenge_without_widening_the_grant()
     let code = callback.query_pairs().find(|(k, _)| k == "code").unwrap().1.to_string();
     let token = f.token(&client, &code).await;
     assert!(!token["scope"].as_str().unwrap().contains("hennery:sessions:read"));
+    let original = f.state.store.external_clients().unwrap().into_iter().next().unwrap();
     let denied = f
         .http
         .post(format!("{}/mcp/external/hennery", f.base))
@@ -646,11 +715,83 @@ async fn reduced_consent_requires_a_scope_challenge_without_widening_the_grant()
         .await
         .unwrap();
     assert_eq!(denied.status(), 403);
-    assert!(
-        denied.headers()["www-authenticate"]
-            .to_str()
-            .unwrap()
-            .contains("insufficient_scope")
+    let challenge = denied.headers()["www-authenticate"].to_str().unwrap();
+    let parameters: std::collections::BTreeMap<_, _> = challenge
+        .strip_prefix("Bearer ")
+        .unwrap()
+        .split(',')
+        .map(|part| {
+            let (name, value) = part.trim().split_once('=').unwrap();
+            (name, value.strip_prefix('"').unwrap().strip_suffix('"').unwrap())
+        })
+        .collect();
+    assert_eq!(parameters["error"], "insufficient_scope");
+    let required: std::collections::BTreeSet<_> = parameters["scope"].split_ascii_whitespace().collect();
+    assert_eq!(
+        required,
+        ["hennery:discover", "hennery:sessions:read"].into_iter().collect()
     );
-    assert!(!f.state.store.external_clients().unwrap()[0].read_metadata);
+    assert_eq!(
+        parameters["resource_metadata"],
+        format!("{}/.well-known/oauth-protected-resource/mcp/external/hennery", f.origin)
+    );
+
+    // Use the actual challenge, without unioning previously granted scopes.
+    let mut authorization = f.auth(&client);
+    authorization.iter_mut().find(|(name, _)| *name == "scope").unwrap().1 = parameters["scope"].into();
+    let upgrade = f.pending_with(&authorization).await;
+    // Merely requesting authorization cannot add authority to the old grant.
+    assert_eq!(f.state.store.external_clients().unwrap().len(), 1);
+    assert!(!original.read_metadata);
+    assert!(!original.existing_sessions);
+    let code = f.code(&upgrade).await; // Explicit authenticated operator consent.
+    let upgraded = f.token(&client, &code).await;
+    assert_eq!(
+        upgraded["scope"]
+            .as_str()
+            .unwrap()
+            .split_ascii_whitespace()
+            .collect::<std::collections::BTreeSet<_>>(),
+        required
+    );
+    assert!(
+        upgraded["refresh_token"].is_null(),
+        "challenge must not add offline access"
+    );
+    for (id, cwd) in [("upgrade-visible", "/project"), ("outside-root", "/project-other")] {
+        f.state
+            .store
+            .create_session(id, "host", "claude", cwd, &f.hat, None)
+            .unwrap();
+    }
+    let retry = f
+        .rpc(upgraded["access_token"].as_str().unwrap(), "session_list", json!({}))
+        .await;
+    assert_eq!(retry["result"]["isError"], false);
+    let sessions = retry["result"]["structuredContent"]["data"]["sessions"]
+        .as_array()
+        .unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0]["session_id"], "upgrade-visible");
+    let grants = f.state.store.external_clients().unwrap();
+    assert_eq!(grants.len(), 2);
+    let retained = grants
+        .iter()
+        .find(|grant| grant.client_id == original.client_id)
+        .unwrap();
+    assert!(!retained.read_metadata);
+    assert!(!retained.existing_sessions);
+    assert_eq!(retained.hat_id, original.hat_id);
+    assert_eq!(retained.roots, original.roots);
+    assert_eq!(retained.revision, original.revision);
+    assert_eq!(retained.expires_at, original.expires_at);
+    let old_access = f
+        .http
+        .post(format!("{}/mcp/external/hennery", f.base))
+        .bearer_auth(token["access_token"].as_str().unwrap())
+        .json(&json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"session_list","arguments":{}}}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(old_access.status(), 403);
 }

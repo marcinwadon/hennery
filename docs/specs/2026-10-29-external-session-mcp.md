@@ -34,7 +34,8 @@ informed the authorization path:
   authenticate an OAuth external call.
 - Invalid or expired authority returns 401. A read needing a scope the operator
   withheld returns 403 with an insufficient-scope challenge; it does not widen
-  the grant.
+  the grant. The challenge includes both discovery and read scopes, so a client
+  can use that set for a new PKCE request and explicit operator consent.
 - Consent returns `iss` and the original `state` to the validated callback.
   Codes are bound to the client, exact callback, resource and S256 verifier.
 - Refresh tokens rotate. Reuse of a spent code or refresh token revokes that
@@ -118,7 +119,9 @@ cursor and an explicit Load more control; old grants remain reachable for revoca
 The store keeps code/access/refresh hashes. Consent expires after ten minutes,
 a code after one minute, and an access token after at most fifteen minutes.
 The refresh family expires with the chosen one-to-90-day grant. Refresh replaces
-the previous access token too. Cached principals are revalidated at the database
+the previous access token too. Refresh may omit scope or repeat the same granted
+scope set in any order. Expansion and downscoping are rejected; a new explicit
+consent is needed to change scope. Cached principals are revalidated at the database
 gate and before publishing collected results; expiration, grant revocation,
 hat purge and host revocation cannot be bypassed by reconnecting or replaying.
 

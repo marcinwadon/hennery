@@ -428,7 +428,17 @@ impl Store {
                 anyhow::bail!("invalid_grant");
             };
             ensure!(expiry > now && valid_grant(&tx, owner, &grant)?, "invalid_grant");
-            ensure!(r.scope.as_ref().is_none_or(|s| s == &scope), "invalid_scope");
+            if let Some(requested) = r.scope.as_deref() {
+                let requested = requested
+                    .split_ascii_whitespace()
+                    .collect::<std::collections::BTreeSet<_>>();
+                let granted = scope
+                    .split_ascii_whitespace()
+                    .collect::<std::collections::BTreeSet<_>>();
+                // Refresh may repeat the same set in any order. Expansion and
+                // downscoping still require separate policy/explicit consent.
+                ensure!(requested == granted, "invalid_scope");
+            }
             tx.execute(
                 "DELETE FROM external_oauth_refresh_history WHERE owner_id = ?1 AND expires_at<?2",
                 params![owner, now],
@@ -542,10 +552,15 @@ mod tests {
             }
         }
         fn admitted(&self) -> TokenRequest {
+            self.admitted_with_metadata(true)
+        }
+        fn admitted_with_metadata(&self, read_metadata: bool) -> TokenRequest {
             let m = self.client();
             let a = self.authorization(&m);
             let id = self.store.begin_oauth(&a, &m, RESOURCE).unwrap();
-            let redirect = self.store.consent_oauth(&self.consent(&id), RESOURCE, ISSUER).unwrap();
+            let mut consent = self.consent(&id);
+            consent.read_metadata = read_metadata;
+            let redirect = self.store.consent_oauth(&consent, RESOURCE, ISSUER).unwrap();
             let u = Url::parse(&redirect).unwrap();
             assert_eq!(u.query_pairs().find(|(k, _)| k == "state").unwrap().1, "client-state");
             assert_eq!(u.query_pairs().find(|(k, _)| k == "iss").unwrap().1, ISSUER);
@@ -712,6 +727,100 @@ mod tests {
         assert!(
             w.store
                 .authenticate_external_resource(&second.access_token, RESOURCE)
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[test]
+    fn refresh_scope_is_an_order_independent_equal_set_and_rejections_do_not_rotate_or_expand() {
+        let w = World::new();
+        let admission = w.admitted_with_metadata(false);
+        let first = w.store.exchange_oauth(&admission, RESOURCE).unwrap();
+        assert_eq!(first.scope, format!("{DISCOVER_SCOPE} offline_access"));
+        let first_identity = w
+            .store
+            .authenticate_external_resource(&first.access_token, RESOURCE)
+            .unwrap()
+            .unwrap();
+        let mut request = TokenRequest {
+            grant_type: "refresh_token".into(),
+            client_id: admission.client_id,
+            resource: RESOURCE.into(),
+            code: None,
+            redirect_uri: None,
+            code_verifier: None,
+            refresh_token: first.refresh_token.clone(),
+            scope: None,
+            client_secret: None,
+        };
+        for invalid in [format!("{SCOPE} offline_access"), DISCOVER_SCOPE.into()] {
+            request.scope = Some(invalid);
+            assert_eq!(
+                w.store
+                    .exchange_oauth(&request, RESOURCE)
+                    .err()
+                    .expect("scope must be rejected")
+                    .to_string(),
+                "invalid_scope"
+            );
+            assert!(w.store.external_roots(&first_identity).is_ok());
+            assert!(
+                w.store
+                    .authenticate_external_resource(&first.access_token, RESOURCE)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        // Omitted scope succeeds on the same refresh token after both rejected
+        // expansion and downscoping; neither rejection consumed or revoked it.
+        request.scope = None;
+        let second = w.store.exchange_oauth(&request, RESOURCE).unwrap();
+        assert_eq!(second.scope, first.scope);
+        assert_ne!(second.refresh_token, first.refresh_token);
+        assert!(w.store.external_roots(&first_identity).is_err());
+        let second_identity = w
+            .store
+            .authenticate_external_resource(&second.access_token, RESOURCE)
+            .unwrap()
+            .unwrap();
+        assert!(!second_identity.client.read_metadata);
+        request.refresh_token = second.refresh_token.clone();
+        request.scope = Some(format!("{SCOPE} offline_access"));
+        assert_eq!(
+            w.store
+                .exchange_oauth(&request, RESOURCE)
+                .err()
+                .expect("scope must be rejected")
+                .to_string(),
+            "invalid_scope"
+        );
+        assert!(w.store.external_roots(&second_identity).is_ok());
+
+        request.scope = Some(format!("offline_access {DISCOVER_SCOPE}"));
+        let third = w.store.exchange_oauth(&request, RESOURCE).unwrap();
+        assert_eq!(third.scope, first.scope);
+        assert_ne!(third.refresh_token, second.refresh_token);
+        assert!(w.store.external_roots(&second_identity).is_err());
+        let third_identity = w
+            .store
+            .authenticate_external_resource(&third.access_token, RESOURCE)
+            .unwrap()
+            .unwrap();
+        assert!(!third_identity.client.read_metadata);
+        // The actual successful rotation, unlike invalid_scope, spends the
+        // previous token. Replaying it still revokes the family.
+        assert_eq!(
+            w.store
+                .exchange_oauth(&request, RESOURCE)
+                .err()
+                .expect("spent refresh must fail")
+                .to_string(),
+            "invalid_grant"
+        );
+        assert!(w.store.external_roots(&third_identity).is_err());
+        assert!(
+            w.store
+                .authenticate_external_resource(&third.access_token, RESOURCE)
                 .unwrap()
                 .is_none()
         );
