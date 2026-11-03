@@ -45,7 +45,11 @@ import '../styles/session.css'
 //   what the delete left of the agent's transcript on the host.
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { hatList, hostList, namesOf } from '../api/names'
-import { resume } from '../api/turns'
+import { resume, prompt } from '../api/turns'
+import { messageOf } from '../api/errors'
+import { commands } from '../lib/catalog'
+import { useSessionUsage } from '../hooks/useSessionUsage'
+import UsagePanel, { UsageMeter } from '../components/SessionUsage'
 import { useClient } from '../app-client'
 import { Composer, type ComposerHandle } from '../components/Composer'
 import { ANSWER_LABEL, answerAsMessage } from '../components/composerWords'
@@ -256,6 +260,10 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
   const detailsTrigger = useRef<HTMLButtonElement>(null)
   const detailsReturn = useRef<HTMLButtonElement>(null)
   const [settingsFocus, setSettingsFocus] = useState(0)
+  const [usageFocus, setUsageFocus] = useState(0)
+  const openUsage = useCallback((trigger: HTMLButtonElement) => {
+    detailsReturn.current = trigger; setDetailsTab('Usage'); setDetailsOpen(true); setUsageFocus(n => n + 1)
+  }, [])
   const toggleDetails = useCallback(() => { detailsReturn.current = detailsTrigger.current; setDetailsOpen(open => !open) }, [])
   const openFamily = useCallback(() => { detailsReturn.current = detailsTrigger.current; setDetailsTab('Family'); setDetailsOpen(true) }, [])
   const openSettings = useCallback((trigger: HTMLButtonElement) => {
@@ -276,6 +284,25 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
   const mcp = useMcpDelivery(id, summary?.lifecycle, Math.max(0, s.loads - 1), s.catalogChanges, (summary ?? family?.summary)?.hat_id)
   const unseen = (summary ?? family?.summary)?.unseen
   const info = useHeaderInfo(id, summary ?? family?.summary, awaitSummary, mcp.detail)
+  const usage = useSessionUsage(id)
+  const [compactBusy, setCompactBusy] = useState(false)
+  const [compactError, setCompactError] = useState<string | null>(null)
+  const compactBaseline = useRef<string | undefined>(undefined)
+  const compactKey = useRef<string | undefined>(undefined)
+  useEffect(() => {
+    if (compactBusy && usage.data?.last_turn?.turn_id !== compactBaseline.current) setCompactBusy(false)
+  }, [compactBusy, usage.data?.last_turn?.turn_id])
+  const compact = async () => {
+    if (compactBusy) return
+    compactBaseline.current = usage.data?.last_turn?.turn_id
+    compactKey.current ??= crypto.randomUUID()
+    setCompactBusy(true); setCompactError(null)
+    try {
+      await prompt(client, id, [{ type: 'text', text: '/compact' }], compactKey.current)
+      compactKey.current = undefined
+      await usage.refresh()
+    } catch (error) { setCompactBusy(false); setCompactError(messageOf(error)) }
+  }
   const { read: acknowledgeResult } = useReadResult(id, info?.review)
   const { search } = useLocation()
   useEffect(() => { if (new URLSearchParams(search).get('family') === '1') openFamily() }, [search, openFamily])
@@ -560,6 +587,7 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
       )}
       {info?.lifecycle === 'parked' && sessionFooter}
       <Composer
+        usageMeter={<UsageMeter context={usage.data?.context} away={hostAway || !!info?.presumed_parked || connectedOf(hostItems, info?.host_id) === false} onClick={openUsage} />}
         onSent={info?.review ? () => void acknowledgeResult() : undefined}
         handle={composer}
         sessionId={id}
@@ -580,7 +608,12 @@ function SelectedSession({ id, summary, awaitSummary = false, tail = TAIL, timin
       />
       {info?.lifecycle !== 'parked' && sessionFooter}
       </div>
-      <SessionDetails open={detailsOpen} tab={detailsTab} onTab={setDetailsTab} onClose={closeDetails} trigger={detailsReturn} settingsFocus={settingsFocus} configuration={configuration} catalog={s.catalog} info={info} hostName={info ? hosts.get(info.host_id) : undefined} hatName={actualHat?.name} plan={plan} delivery={mcp.detail?.mcp_delivery} sourcePolicy={sourcePolicy}>
+      <SessionDetails usageFocus={usageFocus} usage={<>
+        {compactError && <p className="error" role="alert">{compactError}</p>}
+        <UsagePanel state={usage} away={hostAway || !!info?.presumed_parked || connectedOf(hostItems, info?.host_id) === false}
+          compact={commands(s.catalog).some(c => c.name === 'compact')} compacting={compactBusy}
+          onCompact={info?.lifecycle === 'active' && info.activity === 'idle' && !info.question_waits && !configuration.pending && !configuration.error && s.queue.length === 0 ? () => void compact() : undefined} />
+      </>} open={detailsOpen} tab={detailsTab} onTab={setDetailsTab} onClose={closeDetails} trigger={detailsReturn} settingsFocus={settingsFocus} configuration={configuration} catalog={s.catalog} info={info} hostName={info ? hosts.get(info.host_id) : undefined} hatName={actualHat?.name} plan={plan} delivery={mcp.detail?.mcp_delivery} sourcePolicy={sourcePolicy}>
         <FamilyPanel key={id} id={id} summary={summary} hosts={hosts} resync={Math.max(0, s.loads - 1) + familyRefresh} onPage={onFamilyPage} />
       </SessionDetails>
       </div>

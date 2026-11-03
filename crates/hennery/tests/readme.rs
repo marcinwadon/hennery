@@ -727,15 +727,16 @@ fn request(listen: &str, method: &str, path: &str, headers: &[(&str, &str)], bod
     (status, response)
 }
 
-/// The `hennery_session` cookie a response sets.
+/// The session cookie a response sets, as `name=value` to send back:
+/// `__Host-hennery_session` on HTTPS, `hennery_session` on loopback.
 fn session_of(response: &str) -> String {
     response
         .lines()
         .find_map(|line| {
             let (name, value) = line.split_once(':')?;
-            let value = value.trim().strip_prefix("hennery_session=")?;
-            name.eq_ignore_ascii_case("set-cookie")
-                .then(|| value.split(';').next().unwrap().to_string())
+            let value = value.trim();
+            let named = value.starts_with("__Host-hennery_session=") || value.starts_with("hennery_session=");
+            (named && name.eq_ignore_ascii_case("set-cookie")).then(|| value.split(';').next().unwrap().to_string())
         })
         .unwrap_or_else(|| panic!("no session cookie: {response}"))
 }
@@ -758,8 +759,7 @@ fn log_in(listen: &str, origin: &str, password: &str) -> u16 {
 
 /// `GET /api/hosts` with `session`: the status and the hosts.
 fn hosts(listen: &str, session: &str) -> (u16, Vec<serde_json::Value>) {
-    let cookie = format!("hennery_session={session}");
-    let (status, response) = request(listen, "GET", "/api/hosts", &[("Cookie", &cookie)], "");
+    let (status, response) = request(listen, "GET", "/api/hosts", &[("Cookie", session)], "");
     let body = response.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
     let hosts = serde_json::from_str::<Vec<serde_json::Value>>(body).unwrap_or_default();
     (status, hosts)
@@ -1003,7 +1003,7 @@ fn pairing_another_machine_works_as_the_readme_says() {
     up.wait_until("up's own host", || hosts(&listen, &session).1.len() == 1);
 
     // "Add host": what the Hosts screen mints, just after setup.
-    let cookie = format!("hennery_session={session}");
+    let cookie = session.clone();
     let (status, response) = request(
         &listen,
         "POST",
@@ -1092,7 +1092,7 @@ async fn public_join_shell_block_pairs_runs_and_reconnects_over_wss() {
         let listen = up.listening();
         let link = setup_url(&mut up, &collector);
         let session = set_up(&listen, &link, EXAMPLE_URL);
-        let cookie = format!("hennery_session={session}");
+        let cookie = session.clone();
         let (status, response) = request(
             &listen,
             "POST",

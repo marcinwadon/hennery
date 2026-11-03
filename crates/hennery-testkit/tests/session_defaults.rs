@@ -45,7 +45,7 @@ impl Fixture {
                 format!("{}/api/hats/{hat}/session-defaults?agent={agent}", self.url),
             )
             .header("origin", PUBLIC_URL)
-            .header("cookie", format!("hennery_session={}", self.token))
+            .header("cookie", format!("__Host-hennery_session={}", self.token))
     }
 }
 #[tokio::test]
@@ -133,7 +133,7 @@ async fn every_put_including_reset_needs_fresh_step_up_and_origin() {
     f.token = fresh;
     let response = reqwest::Client::new()
         .put(format!("{}/api/hats/{}/session-defaults?agent=custom", f.url, f.hat))
-        .header("cookie", format!("hennery_session={}", f.token))
+        .header("cookie", format!("__Host-hennery_session={}", f.token))
         .header("origin", "https://foreign.example")
         .json(&json!({"revision":0,"config":{}}))
         .send()
@@ -148,7 +148,7 @@ async fn every_put_including_reset_needs_fresh_step_up_and_origin() {
     assert_eq!(response.status(), 401);
     let response = reqwest::Client::new()
         .put(format!("{}/api/hats/{}/session-defaults?agent=custom", f.url, f.hat))
-        .header("cookie", format!("hennery_session={}", f.token))
+        .header("cookie", format!("__Host-hennery_session={}", f.token))
         .json(&json!({"revision":0,"config":{}}))
         .send()
         .await
@@ -199,7 +199,7 @@ async fn bounds_strict_fields_and_frozen_hats() {
     for query in ["", "?agent=custom&extra=1", "?agent=custom&agent=other"] {
         let response = reqwest::Client::new()
             .get(format!("{}/api/hats/{}/session-defaults{query}", f.url, f.hat))
-            .header("cookie", format!("hennery_session={}", f.token))
+            .header("cookie", format!("__Host-hennery_session={}", f.token))
             .send()
             .await
             .unwrap();

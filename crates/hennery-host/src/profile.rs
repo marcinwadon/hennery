@@ -225,11 +225,18 @@ impl Secrets {
                 message: self.redact(&message),
             },
             SessionBody::TurnEnded {
+                usage,
                 turn_id,
                 outcome,
                 stop_reason,
                 error,
             } => SessionBody::TurnEnded {
+                usage: usage.map(|mut usage| {
+                    for model in &mut usage.models {
+                        model.model = self.redact(&model.model);
+                    }
+                    usage
+                }),
                 turn_id,
                 outcome,
                 stop_reason,
@@ -388,6 +395,7 @@ mod tests {
                 stderr_tail: echo.clone(),
             },
             SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "t".into(),
                 outcome: TurnOutcome::Failed,
                 stop_reason: None,

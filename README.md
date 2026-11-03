@@ -96,7 +96,7 @@ Cookies are not isolated by port, so another port on the same hostname is
 not enough. For local use, reserve `localhost` for the memory UI and use
 `127.0.0.1` for hennery's UI, with each configured public URL matching the
 address you open. The memory UI refuses IP-address origins; use HTTPS for
-remote access.
+remote access, through the [memory proxy recipe](packaging/proxy/memory.md).
 
 To import an existing vault, take a snapshot and preview it first. Review
 the proposed files and map each to exactly one hat or exclude it, then apply
@@ -119,7 +119,7 @@ permission requests still require the operator's answer in hennery.
 
 ## Verify a release installer before running it
 
-This procedure targets the 0.3.8 stable release. You need trusted, already installed
+This procedure targets the 0.4.0 stable release. You need trusted, already installed
 `curl`, Git, GnuPG, `jq`, `gh`, and either `sha256sum` or `shasum`.
 
 The release signing subkey's **full fingerprint** is
@@ -153,7 +153,7 @@ printed directory for inspection. Only the authenticated installer is executed.
 (
 set -eu
 release_fingerprint=F26C7F594DFE84D131703AFC23E5A318AE8D2861
-release_tag=v0.3.8
+release_tag=v0.4.0
 release_dir=$(mktemp -d "${TMPDIR:-/tmp}/hennery-release.XXXXXXXX") || exit 1
 printf 'Release verification directory: %s\n' "$release_dir"
 mkdir "$release_dir/keyring" || exit 1
@@ -265,14 +265,14 @@ HENNERY_RELEASE_CHECKSUMS="$release_checksums" HENNERY_ATTESTATION_BUNDLE="$rele
 
 ## Installing
 
-**Stable releases use all four channels below.** The examples target v0.3.8.
+**Stable releases use all four channels below.** The examples target v0.4.0.
 Use the verification procedure above for GitHub downloads:
 
 | Channel | Install |
 |---|---|
-| Homebrew | `brew install marcinwadon/tap/hennery` (0.3.8) from the project's tap. |
-| crates.io | `cargo install hennery --version 0.3.8`; the `hennery` crate installs the binary with its embedded UI. |
-| GHCR | `docker pull ghcr.io/marcinwadon/hennery:0.3.8`; the collector-only image. Agent hosts run separately on your machines. |
+| Homebrew | `brew install marcinwadon/tap/hennery` (0.4.0) from the project's tap. |
+| crates.io | `cargo install hennery --version 0.4.0`; the `hennery` crate installs the binary with its embedded UI. |
+| GHCR | `docker pull ghcr.io/marcinwadon/hennery:0.4.0`; the collector-only image. Agent hosts run separately on your machines. |
 | GitHub Releases | Platform archives and `hennery-installer.sh` on the [Releases page](https://github.com/marcinwadon/hennery/releases), with `SHA256SUMS`, one combined SBOM. Attestations are stored on GitHub. Use the verification procedure above before running the installer. |
 
 Stable releases receive their version tag and `latest`

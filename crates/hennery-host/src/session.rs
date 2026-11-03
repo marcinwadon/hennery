@@ -525,6 +525,7 @@ fn launch_inner(
         Attach::New => None,
     }));
     let actor = Actor {
+        cache_retention: (launch.profile == Profile::Claude).then_some(launch.config.cache_retention),
         mcp_source_policy: launch.mcp_source_policy.clone(),
         catalog_identity: crate::delegation::catalog_identity(&launch.agent, launch.profile),
         workspace_roots,
@@ -924,6 +925,7 @@ impl Drop for AcpTask {
 }
 
 struct Actor {
+    cache_retention: Option<hennery_proto::usage::CacheRetention>,
     mcp_source_policy: Option<hennery_proto::mcp_source::McpSourceSnapshot>,
     catalog_identity: hennery_proto::delegation_host::CatalogIdentity,
     workspace_roots: Option<Vec<PathBuf>>,
@@ -1046,6 +1048,7 @@ impl Actor {
             }
         });
         let mut indexed = self.catalogue_extracts();
+        indexed.cache_retention = self.cache_retention;
         indexed.mcp_source_policy = self.mcp_source_policy.clone();
         if indexed.current_config().is_some() {
             let mut identity = self.catalog_identity.clone();
@@ -1160,12 +1163,21 @@ impl Actor {
             request_id,
             attach,
             config,
-            agent,
+            mut agent,
             cwd,
             profile,
             mcp_servers,
             ..
         } = launch;
+        if let Err(message) = crate::usage::retention(&mut agent, profile, config.cache_retention) {
+            return self.start_failed(
+                request_id,
+                StartError {
+                    code: "cache_retention_unavailable",
+                    message: message.into(),
+                },
+            );
+        }
         let mcp = SessionMcp {
             servers: crate::profile::acp_servers(&mcp_servers),
             meta: profile.session_meta_for(self.mcp_source_policy.as_ref()),
@@ -1627,7 +1639,7 @@ impl Actor {
                             } else {
                                 TurnOutcome::Completed
                             };
-                            self.end_turn(ended.id, outcome, stop_reason(&response), None);
+                            self.end_turn_with_usage(ended.id, outcome, stop_reason(&response), None, crate::usage::from_response(&response, profile));
                             self.probe_git(&probe_cwd, false);
                         }
                         Err(err) => {
@@ -2274,7 +2286,18 @@ impl Actor {
     }
 
     fn end_turn(&self, turn_id: String, outcome: TurnOutcome, stop_reason: Option<String>, error: Option<String>) {
+        self.end_turn_with_usage(turn_id, outcome, stop_reason, error, None);
+    }
+    fn end_turn_with_usage(
+        &self,
+        turn_id: String,
+        outcome: TurnOutcome,
+        stop_reason: Option<String>,
+        error: Option<String>,
+        usage: Option<Box<hennery_proto::usage::TurnUsage>>,
+    ) {
         self.emit(SessionBody::TurnEnded {
+            usage,
             turn_id,
             outcome,
             stop_reason,

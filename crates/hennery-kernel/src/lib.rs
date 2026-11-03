@@ -29,6 +29,7 @@ pub mod recents;
 pub mod redact;
 mod schema;
 pub mod secret;
+pub mod server;
 pub mod web;
 
 pub mod session_defaults;

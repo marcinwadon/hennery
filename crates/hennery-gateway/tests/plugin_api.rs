@@ -38,7 +38,7 @@ async fn unconfigured_owner_list_is_empty_and_does_not_create_control_file() {
             Request::builder()
                 .uri("/api/plugins/registrations")
                 .header("origin", "https://hennery.example")
-                .header("cookie", format!("hennery_session={fresh}"))
+                .header("cookie", format!("__Host-hennery_session={fresh}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -61,7 +61,7 @@ async fn owner_registration_requires_fresh_step_up_before_parsing_or_discovery()
                 .method("POST")
                 .uri("/api/plugins/registrations")
                 .header("origin", "https://hennery.example")
-                .header("cookie", format!("hennery_session={stale}"))
+                .header("cookie", format!("__Host-hennery_session={stale}"))
                 .header("content-type", "application/json")
                 .body(Body::from("{}"))
                 .unwrap(),

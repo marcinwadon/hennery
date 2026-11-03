@@ -61,7 +61,7 @@ impl Collector {
             .unwrap()
             .unwrap();
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("cookie", format!("hennery_session={token}").parse().unwrap());
+        headers.insert("cookie", format!("__Host-hennery_session={token}").parse().unwrap());
         headers.insert("origin", PUBLIC_URL.parse().unwrap());
         reqwest::Client::builder().default_headers(headers).build().unwrap()
     }

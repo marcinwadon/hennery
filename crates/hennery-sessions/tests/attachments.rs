@@ -142,6 +142,7 @@ fn the_same_image_in_a_later_prompt_is_the_same_file_and_row() {
             "s1",
             3,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "t1".into(),
                 outcome: hennery_proto::frames::TurnOutcome::Completed,
                 stop_reason: None,

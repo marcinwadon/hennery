@@ -2,7 +2,7 @@
 //! and logout, step-up, the signed-in sessions, and passkeys (plan 3c).
 
 use crate::json::ApiJson;
-use crate::operator::{Authenticated, Operator, PublicUrl, SetupOutcome, cleared_cookie, session_cookie};
+use crate::operator::{Authenticated, CheckPurpose, Operator, PublicUrl, SetupOutcome, cleared_cookie, session_cookie};
 use crate::passkeys::{PasskeyRecord, Refused, Start};
 use crate::secret::{rfc3339, unix_now};
 use axum::extract::{DefaultBodyLimit, Extension, Path, State};
@@ -118,6 +118,21 @@ pub(crate) fn rate_limited(retry_after: Duration, message: &str) -> Response {
     response
 }
 
+/// 503 `auth_busy` with a one-second `Retry-After`: the password checks
+/// of the request's kind are full (`Operator::admit_check`). Nothing was
+/// counted against the client's address.
+pub(crate) fn auth_busy() -> Response {
+    let mut response = error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "auth_busy",
+        "too many password checks are waiting; try again shortly",
+    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from(1u64));
+    response
+}
+
 /// Whether the session cookie is `Secure`: as `public_url` says, and
 /// `Secure` when there is none yet.
 pub(crate) fn secure_cookies(operator: &Operator) -> bool {
@@ -202,20 +217,24 @@ async fn setup(
 /// `POST /api/auth/login`: 204 and a new session cookie. Every attempt
 /// counts against the client's address until one succeeds; an attempt
 /// that is not refused for that runs exactly one password check, right or
-/// wrong, so the answer takes as long either way (kernel spec §3.2).
+/// wrong, so the answer takes as long either way (kernel spec §3.2). When
+/// the logins' checks are full it is refused busy first, uncounted.
 async fn login(
     State(operator): State<Arc<Operator>>,
     address: crate::client_address::ClientAddress,
     headers: HeaderMap,
     ApiJson(req): ApiJson<LoginRequest>,
 ) -> Response {
+    let Some(admitted) = operator.admit_check(CheckPurpose::Login) else {
+        return auth_busy();
+    };
     if let Err(retry_after) = operator.login_limiter.attempt(address.effective, Instant::now()) {
         return rate_limited(
             retry_after,
             "too many wrong passwords from this address; try again later",
         );
     }
-    let phc = match operator.check_password(req.password).await {
+    let phc = match operator.check_password(admitted, req.password).await {
         Ok(Some(phc)) => phc,
         Ok(None) => return error(StatusCode::UNAUTHORIZED, "invalid_password", "wrong password"),
         Err(err) => return internal(err),
@@ -252,20 +271,24 @@ async fn logout(State(operator): State<Arc<Operator>>, headers: HeaderMap) -> Re
 
 /// `POST /api/auth/step-up/password`: 204, the session stepped up for five
 /// minutes (kernel spec §3.4). Rate limited like login, on a budget of its
-/// own (3b decision 10).
+/// own (3b decision 10), and checked in a pool of its own: a login flood
+/// cannot keep it waiting.
 async fn step_up(
     State(operator): State<Arc<Operator>>,
     address: crate::client_address::ClientAddress,
     Extension(session): Extension<Authenticated>,
     ApiJson(req): ApiJson<StepUpRequest>,
 ) -> Response {
+    let Some(admitted) = operator.admit_check(CheckPurpose::StepUp) else {
+        return auth_busy();
+    };
     if let Err(retry_after) = operator.step_up_limiter.attempt(address.effective, Instant::now()) {
         return rate_limited(
             retry_after,
             "too many wrong passwords from this address; try again later",
         );
     }
-    match operator.check_password(req.password).await {
+    match operator.check_password(admitted, req.password).await {
         Ok(Some(_)) => {}
         Ok(None) => return error(StatusCode::UNAUTHORIZED, "invalid_password", "wrong password"),
         Err(err) => return internal(err),
@@ -330,6 +353,11 @@ fn started(outcome: anyhow::Result<Start>) -> Response {
         Ok(Start::Unavailable) => passkeys_unavailable(),
         Ok(Start::NoPasskeys) => error(StatusCode::CONFLICT, "no_passkeys", "there is no passkey to use"),
         Ok(Start::Invalid(why)) => error(StatusCode::BAD_REQUEST, "invalid", why),
+        Ok(Start::Busy) => auth_busy(),
+        Ok(Start::RateLimited(retry_after)) => rate_limited(
+            retry_after,
+            "too many passkey logins begun from this address; try again later",
+        ),
         Err(err) => internal(err),
     }
 }
@@ -389,18 +417,14 @@ fn passkey_item(record: PasskeyRecord) -> PasskeyItem {
 
 /// `POST /api/auth/passkeys/login/start`: a login ceremony over the
 /// owner's passkeys. Every start counts against the client's address on
-/// the passkey budget until a login succeeds (plan 3c decision 8).
+/// the passkey budget until a login succeeds (plan 3c decision 8), unless
+/// it is refused busy first: its place is reserved before it is counted
+/// (`Operator::start_passkey_login`).
 async fn passkey_login_start(
     State(operator): State<Arc<Operator>>,
     address: crate::client_address::ClientAddress,
 ) -> Response {
-    if let Err(retry_after) = operator.passkey_limiter.attempt(address.effective, Instant::now()) {
-        return rate_limited(
-            retry_after,
-            "too many passkey logins begun from this address; try again later",
-        );
-    }
-    started(operator.start_passkey_login(unix_now()))
+    started(operator.start_passkey_login(address.effective, unix_now()))
 }
 
 /// `POST /api/auth/passkeys/login/finish`: 204 and a new session cookie,

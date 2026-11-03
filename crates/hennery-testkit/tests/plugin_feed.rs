@@ -333,6 +333,7 @@ impl World {
                 id,
                 base + 4,
                 &SessionBody::TurnEnded {
+                    usage: None,
                     turn_id: turn.into(),
                     outcome,
                     stop_reason: None,
@@ -468,6 +469,7 @@ fn sql_filters_hat_mount_owner_hwm_and_outcome_before_pagination() {
             "failed",
             17,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "failed-turn".into(),
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,
@@ -755,6 +757,7 @@ fn thinking_tools_images_context_and_oversized_text_are_excluded() {
             "session",
             7,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "turn".into(),
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,
@@ -1033,6 +1036,7 @@ fn completion_and_origin_guard_each_independent_durable_input() {
             "session",
             7,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "turn".into(),
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,
@@ -1199,6 +1203,7 @@ fn a_grant_after_an_unapplied_fact_has_a_valid_committed_watermark() {
             "session",
             7,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "turn".into(),
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,
@@ -1271,6 +1276,7 @@ fn reviewer_deleted_child_does_not_poison_surviving_parent_feed() {
             "parent",
             3,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "report-turn".into(),
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,
@@ -1352,6 +1358,7 @@ fn reviewer_deleted_parent_does_not_poison_surviving_child_feed() {
             "child",
             3,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "child-turn".into(),
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,

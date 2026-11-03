@@ -215,7 +215,7 @@ async fn every_operator_route_needs_the_session_cookie() {
         );
         let wrong = request(&plain, addr, method, path)
             .header("origin", hennery_testkit::PUBLIC_URL)
-            .header("cookie", format!("hennery_session={}", "0".repeat(64)))
+            .header("cookie", format!("__Host-hennery_session={}", "0".repeat(64)))
             .send()
             .await
             .unwrap();
@@ -250,7 +250,7 @@ async fn every_operator_route_applies_the_browser_rules() {
     let collector = Collector::start().await;
     hennery_testkit::operator_client(&collector.state.operator);
     let token = collector.session_at(hennery_kernel::secret::unix_now());
-    let cookie = format!("hennery_session={token}");
+    let cookie = format!("__Host-hennery_session={token}");
     let plain = reqwest::Client::new();
     for (addr, method, path) in every_route(&collector) {
         let send = |origin: Option<&str>, site: Option<&str>| {
@@ -413,7 +413,7 @@ async fn a_request_that_slides_the_session_sends_its_cookie_again() {
     let fresh = collector.session_at(now);
     let resp = reqwest::Client::new()
         .get(&url)
-        .header("cookie", format!("hennery_session={fresh}"))
+        .header("cookie", format!("__Host-hennery_session={fresh}"))
         .send()
         .await
         .unwrap();
@@ -423,13 +423,16 @@ async fn a_request_that_slides_the_session_sends_its_cookie_again() {
     let stale = collector.session_at(now - 120);
     let resp = reqwest::Client::new()
         .get(&url)
-        .header("cookie", format!("hennery_session={stale}"))
+        .header("cookie", format!("__Host-hennery_session={stale}"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let cookie = resp.headers()["set-cookie"].to_str().unwrap();
-    assert!(cookie.starts_with(&format!("hennery_session={stale};")), "{cookie}");
+    assert!(
+        cookie.starts_with(&format!("__Host-hennery_session={stale};")),
+        "{cookie}"
+    );
     collector.stop().await;
 }
 
@@ -448,7 +451,10 @@ async fn a_tossed_session_cookie_before_the_real_one_does_not_sign_the_owner_out
     let real = collector.session_at(now);
     let resp = reqwest::Client::new()
         .get(&url)
-        .header("cookie", format!("hennery_session={tossed}; hennery_session={real}"))
+        .header(
+            "cookie",
+            format!("__Host-hennery_session={tossed}; __Host-hennery_session={real}"),
+        )
         .send()
         .await
         .unwrap();
@@ -457,14 +463,17 @@ async fn a_tossed_session_cookie_before_the_real_one_does_not_sign_the_owner_out
     let stale = collector.session_at(now - 120);
     let resp = reqwest::Client::new()
         .get(&url)
-        .header("cookie", format!("hennery_session={tossed}"))
-        .header("cookie", format!("hennery_session={stale}"))
+        .header("cookie", format!("__Host-hennery_session={tossed}"))
+        .header("cookie", format!("__Host-hennery_session={stale}"))
         .send()
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
     let cookie = resp.headers()["set-cookie"].to_str().unwrap();
-    assert!(cookie.starts_with(&format!("hennery_session={stale};")), "{cookie}");
+    assert!(
+        cookie.starts_with(&format!("__Host-hennery_session={stale};")),
+        "{cookie}"
+    );
     collector.stop().await;
 }
 

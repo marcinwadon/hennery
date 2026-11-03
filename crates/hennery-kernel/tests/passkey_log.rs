@@ -32,7 +32,7 @@ impl std::io::Write for Captured {
 fn post(path: &str, token: &str, body: serde_json::Value) -> Request<Body> {
     Request::post(path)
         .header("origin", ORIGIN)
-        .header("cookie", format!("hennery_session={token}"))
+        .header("cookie", format!("__Host-hennery_session={token}"))
         .header("content-type", "application/json")
         .body(Body::from(body.to_string()))
         .unwrap()

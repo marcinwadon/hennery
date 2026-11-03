@@ -189,7 +189,10 @@ impl World {
             .header("origin", "https://hennery.example")
             .header(
                 "cookie",
-                format!("hennery_session={}", if fresh { &self.fresh } else { &self.stale }),
+                format!(
+                    "__Host-hennery_session={}",
+                    if fresh { &self.fresh } else { &self.stale }
+                ),
             )
     }
     fn body(&self) -> Value {
@@ -556,7 +559,7 @@ async fn machine_routes_reject_browser_origin_duplicate_auth_queries_and_bodies(
     assert_eq!(
         client
             .post(&url)
-            .header("cookie", format!("hennery_session={}", world.fresh))
+            .header("cookie", format!("__Host-hennery_session={}", world.fresh))
             .send()
             .await
             .unwrap()
@@ -978,6 +981,7 @@ async fn activity_and_inventory_http_use_committed_typed_projection_and_opaque_c
             "source",
             4,
             &SessionBody::TurnEnded {
+                usage: None,
                 turn_id: "turn".into(),
                 outcome: TurnOutcome::Completed,
                 stop_reason: None,
@@ -1069,7 +1073,7 @@ async fn activity_inventory_reject_origins_cookies_scope_queries_and_lease_only_
         assert_eq!(
             client
                 .get(&url)
-                .header("cookie", format!("hennery_session={}", world.fresh))
+                .header("cookie", format!("__Host-hennery_session={}", world.fresh))
                 .send()
                 .await
                 .unwrap()

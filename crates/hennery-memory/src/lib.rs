@@ -5,5 +5,6 @@ pub mod http;
 pub mod import;
 pub mod keys;
 pub mod management;
+pub mod serve;
 pub mod store;
 pub mod ui;

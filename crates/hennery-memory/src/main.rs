@@ -2,7 +2,7 @@
 use clap::{Parser, Subcommand};
 use hennery_memory::{
     consumer::{self, FeedConfig},
-    http, keys,
+    keys,
     store::Store,
     ui,
 };
@@ -88,8 +88,12 @@ enum Command {
     },
     /// Run stateless HTTP MCP. Put TLS/authenticated routing in front for remote use.
     Serve {
-        #[arg(long, default_value = "127.0.0.1:7332")]
+        #[arg(long, default_value = "127.0.0.1:7332", value_parser = loopback_listener)]
         listen: std::net::SocketAddr,
+        /// Exact TCP peer (repeatable, at most eight) whose Hennery-Client-IP
+        /// header keys sign-in budgets. None: the header is ignored.
+        #[arg(long = "proxy-client-ip-peer", value_name = "IP")]
+        proxy_client_ip_peers: Vec<std::net::IpAddr>,
     },
 }
 #[tokio::main]
@@ -173,7 +177,11 @@ async fn run() -> anyhow::Result<()> {
                 serde_json::json!({"namespace":c.namespace,"tool_credential":c.tool,"lifecycle_credential":c.lifecycle,"mode":"standalone; no collector lease or automatic deletion guarantee"})
             );
         }
-        Command::Serve { listen } => {
+        Command::Serve {
+            listen,
+            proxy_client_ip_peers,
+        } => {
+            let policy = hennery_kernel::client_address::ProxyPolicy::new(proxy_client_ip_peers)?;
             let operator = if args.data_dir.join("memory-auth.db").try_exists()? {
                 let operator = Arc::new(hennery_kernel::operator::Operator::open(
                     &args.data_dir.join("memory-auth.db"),
@@ -195,23 +203,48 @@ async fn run() -> anyhow::Result<()> {
             } else {
                 None
             };
-            let mut router = http::router(store.clone());
-            if let Some(operator) = operator {
-                router = router.merge(ui::router(store, operator)?);
-            }
-            axum::serve(
-                listener,
-                router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-            )
-            .with_graceful_shutdown(async {
-                let _ = tokio::signal::ctrl_c().await;
-            })
-            .await?;
+            let router = hennery_memory::serve::app(store.clone(), operator, policy)?;
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+            let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            let signal_shutdown = shutdown.clone();
+            let signals = tokio::spawn(async move {
+                tokio::select! {
+                    _ = interrupt.recv() => {},
+                    _ = terminate.recv() => {},
+                }
+                signal_shutdown.cancel();
+            });
+            let served = hennery_kernel::server::serve_all(vec![listener], router, shutdown, Default::default()).await;
+            signals.abort();
             if let Some(worker) = worker {
                 worker.abort();
             }
             cleanup.abort();
+            served?;
         }
     }
     Ok(())
+}
+
+fn loopback_listener(value: &str) -> Result<std::net::SocketAddr, String> {
+    let address: std::net::SocketAddr = value.parse().map_err(|_| "expected a loopback socket address")?;
+    if !address.ip().to_canonical().is_loopback() {
+        return Err("memory serves plaintext HTTP; use a loopback listener behind a TLS reverse proxy".into());
+    }
+    Ok(address)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn serve_refuses_plaintext_non_loopback_listeners_during_argument_parsing() {
+        for address in ["0.0.0.0:7332", "[::]:7332", "192.0.2.1:7332", "[::ffff:192.0.2.1]:7332"] {
+            assert!(Args::try_parse_from(["memory", "--data-dir", "/unused", "serve", "--listen", address]).is_err());
+        }
+        for address in ["127.0.0.1:0", "127.0.0.2:7332", "[::1]:7332", "[::ffff:127.0.0.1]:7332"] {
+            assert!(Args::try_parse_from(["memory", "--data-dir", "/unused", "serve", "--listen", address]).is_ok());
+        }
+    }
 }

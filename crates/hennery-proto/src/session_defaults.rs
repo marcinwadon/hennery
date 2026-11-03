@@ -38,6 +38,7 @@ fn strict_config<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Se
     }
     let value = Strict::deserialize(deserializer)?;
     Ok(SessionConfig {
+        cache_retention: Default::default(),
         model: value.model,
         mode: value.mode,
         axes: value.axes,

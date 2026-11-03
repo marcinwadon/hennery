@@ -118,7 +118,12 @@ impl Fixture {
             .build()
             .unwrap();
         let mut headers = reqwest::header::HeaderMap::new();
-        headers.insert("cookie", format!("hennery_session={cookie}").parse().unwrap());
+        headers.insert(
+            "cookie",
+            format!("{}={cookie}", hennery_kernel::operator::session_cookie_name(true))
+                .parse()
+                .unwrap(),
+        );
         headers.insert("origin", origin.parse().unwrap());
         let operator = reqwest::Client::builder()
             .no_proxy()
@@ -543,7 +548,10 @@ async fn consent_is_operator_only_origin_checked_and_requires_fresh_stepup() {
         f.http
             .post(&url)
             .header("origin", &f.origin)
-            .header("cookie", format!("hennery_session={stale}"))
+            .header(
+                "cookie",
+                format!("{}={stale}", hennery_kernel::operator::session_cookie_name(true)),
+            )
             .json(&f.grant(&id, true))
             .send()
             .await

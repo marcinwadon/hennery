@@ -268,6 +268,10 @@ needed and sends "You asked: …. My answer: …" as a new turn, labelled as suc
   survives.
 - Thinking is collapsed by default. Tool calls are one line (name, summary,
   status), expandable to pretty-printed input and plain output.
+- Parent instructions and child reports are collapsed by default, selected by
+  typed input provenance. Their speaker, source-session link and any truncation
+  notice remain visible; a disclosure shows the full plain text and attachments.
+  Operator prompts remain expanded.
 
 ### 6.5 Composer
 

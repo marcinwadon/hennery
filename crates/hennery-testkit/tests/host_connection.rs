@@ -828,6 +828,7 @@ async fn a_host_announces_that_it_can_park_take_images_and_serve_projects() {
         Capabilities(vec![
             Capability::Park,
             Capability::IdleHold,
+            Capability::CacheRetention,
             Capability::Images,
             Capability::Projects,
             Capability::ResolvePath,

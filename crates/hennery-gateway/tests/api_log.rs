@@ -87,7 +87,7 @@ async fn a_static_token_is_never_logged_answered_or_stored_in_clear() {
             .method(method)
             .uri(path)
             .header("origin", ORIGIN)
-            .header("cookie", format!("hennery_session={session}"))
+            .header("cookie", format!("__Host-hennery_session={session}"))
             .header("content-type", "application/json")
             .body(Body::from(body))
             .unwrap()
@@ -214,7 +214,7 @@ async fn an_upstream_url_is_logged_and_shown_only_as_its_origin() {
             .method(method)
             .uri(path)
             .header("origin", ORIGIN)
-            .header("cookie", format!("hennery_session={session}"))
+            .header("cookie", format!("__Host-hennery_session={session}"))
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap();
@@ -397,7 +397,7 @@ async fn an_unknown_stored_status_is_logged() {
         .oneshot(
             Request::get("/api/mcp/connections")
                 .header("origin", ORIGIN)
-                .header("cookie", format!("hennery_session={session}"))
+                .header("cookie", format!("__Host-hennery_session={session}"))
                 .body(Body::empty())
                 .unwrap(),
         )

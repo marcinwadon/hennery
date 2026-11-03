@@ -53,6 +53,7 @@ fn question(pending_id: &str, turn: Option<&str>, title: Option<&str>) -> Sessio
 
 fn ended(turn: &str, outcome: TurnOutcome) -> SessionBody {
     SessionBody::TurnEnded {
+        usage: None,
         turn_id: turn.into(),
         outcome,
         stop_reason: None,

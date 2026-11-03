@@ -67,6 +67,7 @@ async function fixture(context: BrowserContext, statusOnly = false) {
     const match = /^\/api\/(?:view\/)?sessions\/(parent|child|child2)(.*)$/.exec(path)
     if (match) {
       const [, id, suffix] = match
+      if (suffix === '/usage') return json(route, { code: 'not_found', message: 'No usage observations' }, 404)
       if (suffix === '/family') { familyReads++; return json(route, family(id, url.searchParams.has('after'))) }
       if (suffix === '/takeover') {
         expect(route.request().postDataJSON()).toEqual({}); detached = true

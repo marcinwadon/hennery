@@ -5,7 +5,7 @@
 
 use hennery_kernel::admin::{ADMIN_SOCKET, Admin, AdminRequest, AdminResponse};
 use hennery_kernel::hosts::Hosts;
-use hennery_kernel::operator::Operator;
+use hennery_kernel::operator::{Operator, session_cookie_name};
 use hennery_kernel::passkeys::Start;
 use hennery_kernel::secret::{sha256_hex, unix_now};
 use hennery_proto::rest::{ApiError, PublicUrlChanged, SettingsUpdateResponse};
@@ -84,7 +84,12 @@ impl Collector {
         reqwest::Client::new()
             .request(method.parse().unwrap(), format!("http://{}{path}", self.addr))
             .header("origin", origin)
-            .header("cookie", format!("hennery_session={session}"))
+            // As the collector reads it: named by the scheme of its
+            // `public_url`, which every test's origin is.
+            .header(
+                "cookie",
+                format!("{}={session}", session_cookie_name(origin.starts_with("https://"))),
+            )
     }
 
     /// `PATCH /api/settings` with `body` as it is, from `origin`.
@@ -308,12 +313,18 @@ async fn a_change_ends_every_session_stream_subscription_and_ceremony() {
     c.subscribe(&other, "https://fcm.googleapis.com/fcm/send/other").await;
     let stream = c.stream(&other).await;
     assert!(matches!(
-        c.state.operator.start_passkey_login(unix_now()).unwrap(),
+        c.state
+            .operator
+            .start_passkey_login(std::net::Ipv4Addr::LOCALHOST.into(), unix_now())
+            .unwrap(),
         Start::NoPasskeys
     ));
     c.register(&other, "laptop");
     assert!(matches!(
-        c.state.operator.start_passkey_login(unix_now()).unwrap(),
+        c.state
+            .operator
+            .start_passkey_login(std::net::Ipv4Addr::LOCALHOST.into(), unix_now())
+            .unwrap(),
         Start::Begun { .. }
     ));
     assert!(!c.state.operator.ceremonies.is_empty());
@@ -326,7 +337,7 @@ async fn a_change_ends_every_session_stream_subscription_and_ceremony() {
     assert_eq!(cookies.len(), 1, "{cookies:?}");
     assert_eq!(
         cookies[0],
-        "hennery_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Secure"
+        "__Host-hennery_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Secure"
     );
     let settings: SettingsUpdateResponse = resp.json().await.unwrap();
     assert_eq!(
@@ -382,7 +393,7 @@ async fn the_cookie_is_cleared_as_the_old_public_url_set_it() {
     assert_eq!(resp.status(), 200);
     assert_eq!(
         set_cookies(&resp),
-        ["hennery_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Secure"]
+        ["__Host-hennery_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Secure"]
     );
     let resp = c
         .patch_from(
@@ -560,7 +571,7 @@ async fn a_session_revoked_while_its_body_arrives_changes_nothing() {
     let body = r#"{"public_url":"https://moved.example"}"#;
     let mut stream = tokio::net::TcpStream::connect(c.addr).await.unwrap();
     let head = format!(
-        "PATCH /api/settings HTTP/1.1\r\nhost: {}\r\norigin: {PUBLIC_URL}\r\ncookie: hennery_session={token}\r\n\
+        "PATCH /api/settings HTTP/1.1\r\nhost: {}\r\norigin: {PUBLIC_URL}\r\ncookie: __Host-hennery_session={token}\r\n\
          content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         c.addr,
         body.len()
@@ -581,7 +592,8 @@ async fn a_session_revoked_while_its_body_arrives_changes_nothing() {
     assert!(answer.starts_with("http/1.1 401"), "{answer}");
     assert!(answer.contains(r#""code":"unauthenticated""#), "{answer}");
     assert!(
-        answer.contains("set-cookie: hennery_session=; httponly; samesite=strict; path=/; max-age=0; secure\r\n"),
+        answer
+            .contains("set-cookie: __host-hennery_session=; httponly; samesite=strict; path=/; max-age=0; secure\r\n"),
         "{answer}"
     );
     assert_eq!(c.dump(), before);
@@ -607,7 +619,7 @@ async fn a_step_up_lapsed_while_its_body_arrives_changes_nothing() {
     let body = r#"{"public_url":"https://moved.example","contact":"me@example.com"}"#;
     let mut stream = tokio::net::TcpStream::connect(c.addr).await.unwrap();
     let head = format!(
-        "PATCH /api/settings HTTP/1.1\r\nhost: {}\r\norigin: {PUBLIC_URL}\r\ncookie: hennery_session={token}\r\n\
+        "PATCH /api/settings HTTP/1.1\r\nhost: {}\r\norigin: {PUBLIC_URL}\r\ncookie: __Host-hennery_session={token}\r\n\
          content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
         c.addr,
         body.len()
@@ -636,7 +648,7 @@ async fn a_step_up_lapsed_while_its_body_arrives_changes_nothing() {
     assert!(answer.starts_with("http/1.1 403"), "{answer}");
     assert!(answer.contains(r#""code":"step_up_required""#), "{answer}");
     // The slide's cookie, renewed; never a cleared one.
-    assert!(!answer.contains("hennery_session=;"), "{answer}");
+    assert!(!answer.contains("__host-hennery_session=;"), "{answer}");
     assert!(!answer.contains("max-age=0"), "{answer}");
     assert_eq!(c.dump(), before);
     assert_eq!(c.state.operator.public_url().unwrap().origin(), PUBLIC_URL);
@@ -704,7 +716,10 @@ async fn the_api_and_the_admin_socket_leave_the_same_state() {
         let mut announced = Vec::new();
         for c in [&api, &admin] {
             assert!(matches!(
-                c.state.operator.start_passkey_login(unix_now()).unwrap(),
+                c.state
+                    .operator
+                    .start_passkey_login(std::net::Ipv4Addr::LOCALHOST.into(), unix_now())
+                    .unwrap(),
                 Start::Begun { .. }
             ));
             let mut ends = c.state.operator.session_ends();

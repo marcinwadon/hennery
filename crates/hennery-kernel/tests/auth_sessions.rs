@@ -4,7 +4,7 @@
 use axum::http::{HeaderMap, HeaderValue, header};
 use hennery_kernel::operator::{
     MAX_SESSION_COOKIES, Operator, SESSION_SLIDE_SECS, SESSION_TTL_SECS, STEP_UP_SECS, SetupOutcome, cleared_cookie,
-    session_cookie, session_tokens,
+    session_cookie, session_cookie_name, session_tokens,
 };
 
 const NOW: i64 = 1_800_000_000;
@@ -106,11 +106,16 @@ fn sessions_are_listed_most_recent_first_and_a_revoked_one_is_gone() {
     assert!(!op.revoke_session(&laptop_id, NOW + 10 + SESSION_TTL_SECS).unwrap());
 }
 
+/// On HTTPS the cookie is `__Host-` prefixed, so a sibling subdomain cannot
+/// plant one (it must be `Secure`, `Path=/` and carry no `Domain`); a
+/// loopback `http://` collector keeps the plain name.
 #[test]
-fn the_cookie_is_http_only_strict_and_secure_except_on_loopback() {
+fn the_cookie_is_http_only_strict_and_secure_and_host_prefixed_except_on_loopback() {
+    assert_eq!(session_cookie_name(true), "__Host-hennery_session");
+    assert_eq!(session_cookie_name(false), "hennery_session");
     assert_eq!(
         session_cookie("abc", true),
-        "hennery_session=abc; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000; Secure"
+        "__Host-hennery_session=abc; HttpOnly; SameSite=Strict; Path=/; Max-Age=2592000; Secure"
     );
     assert_eq!(
         session_cookie("abc", false),
@@ -118,22 +123,88 @@ fn the_cookie_is_http_only_strict_and_secure_except_on_loopback() {
     );
     assert_eq!(
         cleared_cookie(true),
-        "hennery_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Secure"
+        "__Host-hennery_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0; Secure"
+    );
+    assert_eq!(
+        cleared_cookie(false),
+        "hennery_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
     );
 }
 
 #[test]
 fn the_session_tokens_are_found_among_other_cookies_in_order_and_bounded() {
     let mut headers = HeaderMap::new();
-    assert!(session_tokens(&headers).is_empty());
+    assert!(session_tokens(&headers, false).is_empty());
     headers.append(header::COOKIE, HeaderValue::from_static("theme=dark; other_session=x"));
-    assert!(session_tokens(&headers).is_empty());
+    assert!(session_tokens(&headers, false).is_empty());
     headers.append(header::COOKIE, HeaderValue::from_static("a=1;hennery_session=tok; b=2"));
-    assert_eq!(session_tokens(&headers), ["tok"]);
+    assert_eq!(session_tokens(&headers, false), ["tok"]);
     headers.append(
         header::COOKIE,
         HeaderValue::from_static("hennery_session=t2; hennery_session=t3; hennery_session=t4; hennery_session=t5"),
     );
     assert_eq!(MAX_SESSION_COOKIES, 4);
-    assert_eq!(session_tokens(&headers), ["tok", "t2", "t3", "t4"]);
+    assert_eq!(session_tokens(&headers, false), ["tok", "t2", "t3", "t4"]);
+}
+
+/// Each name is read only where it is set: on HTTPS the unprefixed name a
+/// sibling subdomain can toss (or an old browser still holds) is ignored,
+/// so tossed ones cannot push the real cookie out of the four tried; on
+/// loopback the prefixed one is.
+#[test]
+fn only_the_schemes_own_cookie_name_is_read() {
+    let mut headers = HeaderMap::new();
+    headers.append(
+        header::COOKIE,
+        HeaderValue::from_static("hennery_session=a; hennery_session=b; hennery_session=c; hennery_session=d"),
+    );
+    headers.append(header::COOKIE, HeaderValue::from_static("__Host-hennery_session=real"));
+    assert_eq!(session_tokens(&headers, true), ["real"]);
+    assert_eq!(session_tokens(&headers, false), ["a", "b", "c", "d"]);
+}
+
+/// An HTTPS collector refuses a valid token sent under the unprefixed
+/// name, and accepts it under the prefixed one; a loopback collector the
+/// other way round.
+#[test]
+fn a_session_authenticates_only_under_its_schemes_cookie_name() {
+    let cookie = |name: &str, token: &str| {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::COOKIE, format!("{name}={token}").parse().unwrap());
+        headers
+    };
+    let op = Operator::open_in_memory().unwrap();
+    let phc = set_up(&op);
+    let token = op.open_session("browser", &phc, NOW).unwrap().unwrap();
+    assert!(
+        op.authenticate_cookies(&cookie("hennery_session", &token), NOW)
+            .unwrap()
+            .is_none(),
+        "an HTTPS collector read the unprefixed cookie"
+    );
+    assert!(
+        op.authenticate_cookies(&cookie("__Host-hennery_session", &token), NOW)
+            .unwrap()
+            .is_some()
+    );
+
+    let op = Operator::open_in_memory().unwrap();
+    let setup = op.issue_setup_token(NOW).unwrap().unwrap();
+    let SetupOutcome::Done { phc, .. } = op
+        .set_up(&setup, "correct horse battery", "http://127.0.0.1:8080", NOW)
+        .unwrap()
+    else {
+        panic!("setup failed");
+    };
+    let token = op.open_session("browser", &phc, NOW).unwrap().unwrap();
+    assert!(
+        op.authenticate_cookies(&cookie("hennery_session", &token), NOW)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        op.authenticate_cookies(&cookie("__Host-hennery_session", &token), NOW)
+            .unwrap()
+            .is_none()
+    );
 }

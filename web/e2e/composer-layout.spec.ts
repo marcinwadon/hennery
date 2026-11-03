@@ -34,6 +34,7 @@ for (const viewport of [{ width: 320, height: 568 }, { width: 390, height: 844 }
       if (path.startsWith('/api/stream/')) { held.push(route); return }
       if (path === '/api/view/sessions/worker') return json({ items: [{ id: 'm', kind: 'message', version: 1, ts: now, text: 'Ready for another prompt.' }], epoch: 'items', revision: 1, older: false })
       if (path === '/api/sessions/worker') return json({ ...info, pending: [] })
+      if (path.endsWith('/usage')) return json({ code: 'not_found', message: 'No usage observations' }, 404)
       if (path.endsWith('/catalog')) return json(catalog)
       if (path.endsWith('/family')) return json({ summary: info, children: [], questions: [], routing: 'standalone' })
       if (path.endsWith('/queue')) return json(queue)
@@ -70,7 +71,7 @@ for (const viewport of [{ width: 320, height: 568 }, { width: 390, height: 844 }
       await expect(send).toBeInViewport()
       await expect(stop).toBeInViewport()
       if (viewport.width < 1024) {
-        for (const control of [send, stop, settings, composer.getByRole('button', { name: 'Attach images', exact: true })]) {
+        for (const control of [send, stop, settings, composer.getByRole('button', { name: 'Attach images', exact: true }), composer.getByRole('button', { name: 'Context not reported yet. Open Usage.', exact: true })]) {
           const bounds = (await control.boundingBox())!
           expect(bounds.width).toBeGreaterThanOrEqual(44)
           expect(bounds.height).toBeGreaterThanOrEqual(44)

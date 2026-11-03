@@ -234,7 +234,7 @@ export default function SessionMenu({ id, lifecycle, family, queuedCount = 0, ca
       {onRename && <button type="button" onClick={() => { setOpen(false); onRename() }}>Rename</button>}
       <button type="button" disabled={busy || lifecycle === undefined || hostConnected === false} title={hostConnected === false ? 'The host is offline' : undefined} onClick={() => { dismiss(); setError(null); void like.start() }}>New like this</button>
       {sidebarPinned !== undefined && <PinSessionAction key={id} id={id} pinned={sidebarPinned} disabled={busy} />}
-      <button type="button" role="switch" aria-label="Do not park" aria-checked={hold?.pinned ?? false} disabled={busy || pinBusy || hold === null} onClick={() => void togglePin()}><span>Do not park</span><span className="idle-hold-state" aria-hidden="true">{hold ? hold.pinned ? '✓ On' : 'Off' : '…'}</span></button>
+      <button type="button" role="switch" aria-label="Do not park" aria-checked={hold?.pinned ?? false} disabled={busy || pinBusy || hold === null} onClick={() => void togglePin()}><span>Do not park</span><span className="session-toggle-state" aria-hidden="true">{hold ? hold.pinned ? '✓ On' : 'Off' : '…'}</span></button>
       {holdNote && <p className="idle-hold-note" role="status">{holdNote}</p>}
       {showPark && (
         <button type="button" disabled={busy || hostConnected === false} title={hostConnected === false ? 'The host is offline' : undefined} onClick={() => void act(() => park(client, id), parkRefusal)}>

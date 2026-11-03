@@ -28,6 +28,8 @@ jobs:
         git -C "$audit_db" rev-parse HEAD >> "$GITHUB_STEP_SUMMARY"
     - name: Query current registry advisories for every locked web dependency
       run: nix develop .#web -c pnpm --dir web audit
+    - name: Query current registry advisories for both managed adapter locks
+      run: nix develop -c sh packaging/audit-adapters.sh
     - name: Check the live crates.io existence contract (read-only)
       run: |
         nix develop .#release -c node --input-type=module <<'JS'

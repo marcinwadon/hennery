@@ -8,7 +8,7 @@
 //! without one, accepted within five minutes, and refused after.
 
 use hennery_kernel::hosts::Hosts;
-use hennery_kernel::operator::Operator;
+use hennery_kernel::operator::{CheckPurpose, MAX_QUEUED_CHECKS, Operator};
 use hennery_kernel::secret::unix_now;
 use hennery_proto::rest::{ApiError, AuthSessionItem, StepUpRequest};
 use hennery_sessions::AppState;
@@ -158,7 +158,7 @@ impl Collector {
         reqwest::Client::new()
             .request(method.parse().unwrap(), format!("http://{}{path}", self.addr))
             .header("origin", PUBLIC_URL)
-            .header("cookie", format!("hennery_session={session}"))
+            .header("cookie", format!("__Host-hennery_session={session}"))
     }
 
     async fn step_up(&self, session: &str, password: &str) -> reqwest::Response {
@@ -478,6 +478,39 @@ async fn a_locked_out_login_does_not_block_step_up() {
     assert_eq!(c.step_up(&session, OWNER_PASSWORD).await.status(), 204);
 }
 
+/// Logins whose password checks fill their pool (a flood from many
+/// addresses) are answered busy, and leave a signed-in owner's step-up its
+/// own pool: it is checked at once, not queued behind them.
+#[tokio::test]
+async fn a_full_login_pool_does_not_block_step_up() {
+    let c = Collector::start().await;
+    let flood: Vec<_> = std::iter::from_fn(|| c.state.operator.admit_check(CheckPurpose::Login)).collect();
+    assert_eq!(flood.len(), 1 + MAX_QUEUED_CHECKS);
+    assert_eq!(code_of(c.login(OWNER_PASSWORD).await).await, (503, "auth_busy".into()));
+    let session = c.session(0);
+    assert_eq!(c.step_up(&session, OWNER_PASSWORD).await.status(), 204);
+}
+
+/// Step-ups past their own pool are answered busy too, uncounted against
+/// the address's step-up budget.
+#[tokio::test]
+async fn a_full_step_up_pool_answers_busy_without_counting() {
+    let c = Collector::start().await;
+    let session = c.session(0);
+    let held: Vec<_> = std::iter::from_fn(|| c.state.operator.admit_check(CheckPurpose::StepUp)).collect();
+    for _ in 0..8 {
+        assert_eq!(
+            code_of(c.step_up(&session, "wrong password").await).await,
+            (503, "auth_busy".into())
+        );
+    }
+    drop(held);
+    for _ in 0..4 {
+        assert_eq!(c.step_up(&session, "wrong password").await.status(), 401);
+    }
+    assert_eq!(c.step_up(&session, OWNER_PASSWORD).await.status(), 204);
+}
+
 /// Open `GET /api/stream/sessions/s-1` with `session`; `s-1` is made if
 /// it is not there yet (A10: an unknown session's stream is 404).
 async fn open_stream(c: &Collector, session: &str) -> reqwest::Response {
@@ -646,7 +679,7 @@ async fn the_session_list_marks_the_current_one_and_revoking_it_signs_out() {
     assert_eq!(own.status(), 204);
     let cookie = own.headers()["set-cookie"].to_str().unwrap();
     assert!(
-        cookie.starts_with("hennery_session=;") && cookie.contains("Max-Age=0"),
+        cookie.starts_with("__Host-hennery_session=;") && cookie.contains("Max-Age=0"),
         "{cookie}"
     );
     let after = c.request(&mine, "GET", "/api/auth/sessions").send().await.unwrap();
@@ -678,7 +711,7 @@ async fn revoking_the_own_session_on_a_sliding_request_sends_only_the_clearing_c
         .collect();
     assert_eq!(cookies.len(), 1, "{cookies:?}");
     assert!(
-        cookies[0].starts_with("hennery_session=;") && cookies[0].contains("Max-Age=0"),
+        cookies[0].starts_with("__Host-hennery_session=;") && cookies[0].contains("Max-Age=0"),
         "{cookies:?}"
     );
 }

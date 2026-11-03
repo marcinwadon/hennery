@@ -458,10 +458,10 @@ async fn carry_out(request: AdminRequest, admin: &Admin) -> AdminResponse {
 /// How long the client waits for the whole exchange: connecting, sending
 /// the request and reading the answer. The slowest command is a password
 /// reset, one Argon2 hash on a blocking thread: about 0.1 s, measured in a
-/// debug build (where `argon2` is built optimised), run at most
-/// `MAX_CONCURRENT_HASHES` at a time with the logins'. Only a login flood
-/// queued ahead of it (rate limited per address, not in total) could take
-/// it past this; the client then says the outcome is unknown.
+/// debug build (where `argon2` is built optimised), run in the step-up
+/// pool, apart from logins: at most `MAX_QUEUED_CHECKS` admitted step-ups
+/// wait ahead of it, so a login flood cannot take it past this. Should it
+/// still, the client says the outcome is unknown.
 pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The client's side: send `request` to the collector at `socket` and read

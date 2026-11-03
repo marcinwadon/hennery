@@ -89,12 +89,14 @@ async fn screen_requires_separate_auth_origin_and_escapes_content() {
         w.request("GET", "/", None, None, "").await.status(),
         StatusCode::UNAUTHORIZED
     );
-    assert_eq!(
-        w.request("GET", "/", None, Some(format!("hennery_session={}", w.token)), "")
-            .await
-            .status(),
-        StatusCode::UNAUTHORIZED
-    );
+    for kernel in ["hennery_session", "__Host-hennery_session"] {
+        assert_eq!(
+            w.request("GET", "/", None, Some(format!("{kernel}={}", w.token)), "")
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
     assert_eq!(
         w.request("GET", "/", None, Some(format!("{}={}", ui::SESSION_COOKIE, w.tool)), "")
             .await
@@ -180,7 +182,7 @@ async fn login_step_up_and_logout_use_private_cookie_and_gates_precede_body() {
             && cookie.contains("SameSite=Strict")
             && cookie.contains("Secure")
     );
-    assert!(!cookie.starts_with("hennery_session="));
+    assert!(!cookie.starts_with("hennery_session=") && !cookie.starts_with("__Host-hennery_session="));
     assert_eq!(
         w.request("POST", "/step-up", Some(ORIGIN), w.cookie(), "password=wrong")
             .await
@@ -344,12 +346,13 @@ async fn stale_edits_are_visible_conflicts_and_authority_fields_are_rejected() {
     assert_eq!(w.store.managed_entry(&manager, &w.ns, &e.id).unwrap().body, "edited");
     for cookie in [
         format!("hennery_session={}", w.token),
+        format!("__Host-hennery_session={}", w.token),
         format!("{}={}", ui::SESSION_COOKIE, w.token),
     ] {
-        let expected = if cookie.starts_with("hennery_session=") {
-            StatusCode::UNAUTHORIZED
-        } else {
+        let expected = if cookie.starts_with(&format!("{}=", ui::SESSION_COOKIE)) {
             StatusCode::OK
+        } else {
+            StatusCode::UNAUTHORIZED
         };
         assert_eq!(
             w.request("GET", "/api/auth/sessions", None, Some(cookie), "")

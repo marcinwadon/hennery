@@ -272,12 +272,17 @@ fail on any shape change.
 
 ### 5.3 Hello and versioning
 
-The first frame from a host is `hello`: protocol version, host version, host
+The host's `hello` carries protocol version, host version, host
 id and proof of possession (§5.9), capabilities, agents, workspace roots and
 the sessions it still has attached. Its fields and the handshake that follows
 (`hello_ack` → resend → `resend_complete`) are defined in ACP core §3.3 and
-§5.1. The protocol version appears only in `hello` / `hello_ack`, never per
-frame.
+§5.1. Protocol 1.1 negotiates a small signed `authenticate` frame before it
+when the upgrade advertises `Hennery-Hello-Auth: 1` (ACP core §3.5). Without
+that advertisement the host sends the ordinary `hello` first. The protocol
+version appears only in this authentication/hello handshake, never on normal
+session frames. A cumulative 64 KiB wire budget applies before a valid proof;
+authenticated frames retain their existing size limit. Large legacy hellos
+require updating hosts before collectors.
 
 - `protocol_version` is `MAJOR.MINOR`. Minor versions are additive only.
 - The collector accepts hosts whose protocol **major** is its own (M) or the
@@ -374,8 +379,10 @@ to the dead connection, and every session on that machine was lost at once.
 ### 5.9 Host identity on the wire
 
 The host authenticates each connection with its per-host credential (§7.6)
-inside `hello` (`host_id` plus a proof of possession of its private key over a
-collector-supplied nonce). A revoked host is rejected with a distinct error so
+inside the negotiated `authenticate` and the full `hello` (`host_id` plus a
+proof of possession of its private key over a collector-supplied nonce), or
+inside a legacy small `hello`. The full hello is checked again before host
+registration and session reconciliation. A revoked host is rejected with a distinct error so
 `hennery doctor` can say "this host was revoked" rather than "connection failed".
 
 A host has at most **one live connection**. A second connection for the same

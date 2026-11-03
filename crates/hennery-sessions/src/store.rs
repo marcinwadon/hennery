@@ -463,6 +463,16 @@ END;",
     // Child results (35): allow the operator to read existing child results
     // without creating attention or forgetting a prior transcript read.
     include_str!("review_child_backfill.sql"),
+    // Runtime usage is observed data; old turns remain explicitly unknown.
+    "ALTER TABLE turns ADD COLUMN usage TEXT;
+     ALTER TABLE turns ADD COLUMN usage_at TEXT;
+     ALTER TABLE sessions ADD COLUMN usage_context TEXT;
+     ALTER TABLE sessions ADD COLUMN usage_cost TEXT;
+     ALTER TABLE sessions ADD COLUMN usage_totals TEXT;
+     ALTER TABLE sessions ADD COLUMN cache_retention TEXT NOT NULL DEFAULT 'inherit';
+     ALTER TABLE sessions ADD COLUMN cache_retention_attached TEXT;",
+    "CREATE INDEX families_usage_root ON session_families(owner_id,root_id,hat_id);
+     CREATE INDEX turns_usage_state ON turns(owner_id,session_id,state);",
     include_str!("external_clients.sql"),
     include_str!("external_oauth.sql"),
 ];
@@ -1521,7 +1531,12 @@ pub(crate) fn stored_config((model, mode, axes): ConfigColumns) -> Result<Sessio
         Some(axes) => serde_json::from_str(&axes)?,
         None => BTreeMap::new(),
     };
-    Ok(SessionConfig { model, mode, axes })
+    Ok(SessionConfig {
+        model,
+        mode,
+        axes,
+        ..Default::default()
+    })
 }
 
 /// A wire enum's snake_case name, as stored.
@@ -2404,6 +2419,7 @@ impl Store {
             return Ok(None);
         };
         row.config = stored_config(config)?;
+        row.config.cache_retention = self.requested_retention(id)?;
         Ok(Some(row))
     }
 
@@ -3378,6 +3394,8 @@ impl Store {
                  open_turn_id = NULL, activity = NULL, presumed_parked = 0, close_requested = 0, agent_home = NULL,
                  mcp_delivery_mode = NULL, mcp_delivery_servers = NULL, mcp_delivery_at = NULL,
                  mcp_source_requested = NULL, mcp_source_applied = NULL,
+                 usage_context = NULL, usage_cost = NULL, usage_totals = NULL,
+                 cache_retention = 'inherit', cache_retention_attached = NULL,
                  idle_pinned = 0, idle_hold_dirty = 0, prompt_queue_dirty = 0, prompt_queue_held = 0, sidebar_pinned = 0
              WHERE id = ?1 AND owner_id = ?2",
             [session_id, &self.owner],
@@ -3687,6 +3705,8 @@ impl Store {
             |r| r.get(0),
         )?;
         let config = stored_config(config)?;
+        let mut config = config;
+        config.cache_retention = crate::usage::retention_in(&tx, &self.owner, session_id)?;
         let (given, cut) = self.deliver_in(&tx, session_id, &host_id, &stored_hat, mcp, &ts)?;
         commit_then_cut(tx, self.mcp().as_ref(), cut)?;
         Ok(ResumeRequest::Starting {
@@ -3958,6 +3978,20 @@ impl Store {
         Ok(v.unwrap_or(0) as u64)
     }
 
+    /// Reconnect acknowledgement scoped to the authenticated host. Unknown
+    /// and foreign sessions both return zero. Tombstones retain their host
+    /// binding but no host events: late facts are discarded and acked by WS.
+    pub fn committed_seq_for_host(&self, host_id: &str, session_id: &str) -> Result<u64> {
+        let v: Option<i64> = self.conn().query_row(
+            "SELECT MAX(e.host_seq) FROM events e
+             JOIN sessions s ON s.id = e.session_id AND s.owner_id = e.owner_id
+             WHERE s.id = ?1 AND s.host_id = ?2 AND s.owner_id = ?3",
+            [session_id, host_id, &self.owner],
+            |r| r.get(0),
+        )?;
+        Ok(v.unwrap_or(0) as u64)
+    }
+
     /// Ingest one sequenced host frame (`ingest_fact`): the events it
     /// created, in order.
     pub fn ingest(&self, session_id: &str, seq: u64, body: &SessionBody) -> Result<Vec<EventDto>> {
@@ -4101,6 +4135,14 @@ impl Store {
                     )?;
                     // The catalogue after the start's switches (P-13).
                     store_catalogue(&tx, &self.owner, session_id, indexed, &ts)?;
+                    tx.execute(
+                        "UPDATE sessions SET cache_retention_attached=?3 WHERE owner_id = ?1 AND id=?2",
+                        params![
+                            self.owner,
+                            session_id,
+                            indexed.cache_retention.map(|v| serde_json::to_string(&v)).transpose()?
+                        ],
+                    )?;
                     // Where the agent keeps this session's data (plan 9d
                     // decision 1, B8).
                     if let Some(home) = agent_home {
@@ -4158,8 +4200,8 @@ impl Store {
                 // that has already `ended`.
                 let turn_state: Option<String> = tx
                     .query_row(
-                        "SELECT state FROM turns WHERE turn_id = ?1 AND owner_id = ?2",
-                        [turn_id, &self.owner],
+                        "SELECT state FROM turns WHERE turn_id = ?1 AND owner_id = ?2 AND session_id = ?3",
+                        [turn_id, &self.owner, session_id],
                         |r| r.get(0),
                     )
                     .optional()?;
@@ -4276,7 +4318,12 @@ impl Store {
                     mark_unapplied(&tx, &self.owner, fact_id)?;
                 }
             }
-            SessionBody::TurnEnded { turn_id, outcome, .. } => {
+            SessionBody::TurnEnded {
+                turn_id,
+                outcome,
+                usage,
+                ..
+            } => {
                 // Applied only to the open turn; a late duplicate for an
                 // already-ended turn is stored but not applied, and (ACP core
                 // §4.4) must never be pushed to a caller — only the store
@@ -4288,19 +4335,27 @@ impl Store {
                 )?;
                 // Only a `started` turn can be ended by a real `turn_ended`
                 // (fix round 1, ruling B): a stray end must not jump a
-                // `sent`/`not_delivered` turn straight to `ended`.
+                // `sent`/`not_delivered` turn straight to `ended`, nor end
+                // another session's turn by naming its ID under this one.
                 tx.execute(
-                    "UPDATE turns SET state = 'ended', outcome = ?2 WHERE turn_id = ?1 AND state = 'started' AND owner_id = ?3",
+                    "UPDATE turns SET state = 'ended', outcome = ?2
+                     WHERE turn_id = ?1 AND state = 'started' AND owner_id = ?3 AND session_id = ?4",
                     params![
                         turn_id,
                         serde_json::to_value(outcome)?.as_str().unwrap_or_default(),
-                        self.owner
+                        self.owner,
+                        session_id
                     ],
                 )?;
+                if let Some(usage) = usage.as_ref().filter(|v| v.valid()) {
+                    crate::usage::record_turn_in(&tx, &self.owner, session_id, turn_id, usage, &ts)?;
+                }
                 if applied == 0 {
                     created.clear();
                     mark_unapplied(&tx, &self.owner, fact_id)?;
                 } else {
+                    tx.execute("UPDATE turns SET usage_at=?4 WHERE owner_id = ?1 AND session_id=?2 AND turn_id=?3 AND state='ended'",
+                        params![self.owner,session_id,turn_id,ts])?;
                     edge = Some(PushEdge::TurnEnded(*outcome));
                     if matches!(outcome, TurnOutcome::Completed | TurnOutcome::Failed) {
                         crate::review::record(&tx, &self.owner, session_id, fact_id)?;
@@ -4358,7 +4413,7 @@ impl Store {
                     cut = mcp.revoke_in(&tx, session_id)?;
                 }
             }
-            SessionBody::AcpUpdate { indexed, .. } => {
+            SessionBody::AcpUpdate { indexed, payload } => {
                 if !fact_applies(&tx, &self.owner, session_id, indexed.turn_id.as_deref())? {
                     created.clear();
                     mark_unapplied(&tx, &self.owner, fact_id)?;
@@ -4368,6 +4423,7 @@ impl Store {
                     // with extracts.
                     store_catalogue(&tx, &self.owner, session_id, indexed, &ts)?;
                     store_state(&tx, &self.owner, session_id, indexed, &ts)?;
+                    crate::usage::observe_context_in(&tx, &self.owner, session_id, payload, indexed.early, &ts)?;
                 }
             }
             SessionBody::ConfigApplied { indexed, .. } => {

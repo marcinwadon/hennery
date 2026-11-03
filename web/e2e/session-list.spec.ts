@@ -28,6 +28,7 @@ for (const width of [1280, 390]) for (const count of [1, 100]) test(`${count} ch
     if (path === '/api/sessions/parent') return json({ ...parent, pending: [] })
     if (path === '/api/view/sessions/parent') return json({ items: [], epoch: 'items', revision: 1, older: false })
     if (path === '/api/sessions/parent/catalog') return json({ session_id: 'parent', config_options: [], commands: [] })
+    if (path === '/api/sessions/parent/usage') return route.fulfill({ status: 404, body: '{"code":"not_found"}' })
     if (path === '/api/view/sessions/parent/family') {
       const offset = Number(url.searchParams.get('after') ?? 0)
       const all = rows.filter(row => row.family?.parent?.session_id === 'parent')

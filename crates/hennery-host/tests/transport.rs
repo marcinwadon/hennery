@@ -266,6 +266,7 @@ async fn transport_move_preserves_identity_outbox_and_configuration_and_reports_
 #[tokio::test]
 #[cfg(feature = "test-hooks")]
 async fn injected_system_roots_share_the_wss_and_http_policy_without_fallback() {
+    use rustls::pki_types::pem::PemObject;
     let fixture = fixture(
         vec!["localhost".into()],
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -273,10 +274,7 @@ async fn injected_system_roots_share_the_wss_and_http_policy_without_fallback() 
     .await;
     let endpoint = CollectorEndpoint::public(&fixture.url).unwrap();
     assert!(CollectorTransport::with_native_roots(endpoint.clone(), CollectorTrust::System, Default::default).is_err());
-    let cert = rustls_pemfile::certs(&mut fixture.pem.as_bytes())
-        .next()
-        .unwrap()
-        .unwrap();
+    let cert = rustls::pki_types::CertificateDer::from_pem_slice(fixture.pem.as_bytes()).unwrap();
     let transport = CollectorTransport::with_native_roots(endpoint.clone(), CollectorTrust::System, || {
         let mut result = rustls_native_certs::CertificateResult::default();
         result.certs = vec![cert, vec![1, 2, 3].into()];

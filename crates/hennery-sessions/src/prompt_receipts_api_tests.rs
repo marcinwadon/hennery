@@ -168,15 +168,21 @@ async fn rejected_park_releases_only_its_own_hold() {
         };
         state.store.enqueue_operator_prompt("s", &queued).unwrap();
         assert!(!state.store.operator_dispatch_ready("s").unwrap());
-        state
-            .hub
-            .reject(&request_id, "not_attached".into(), "nothing was parked".into());
+        state.hub.reject(
+            host.conn_id,
+            &request_id,
+            "not_attached".into(),
+            "nothing was parked".into(),
+        );
         assert_eq!(first.await.unwrap().1["code"], "not_attached");
         assert_eq!(state.store.operator_dispatch_ready("s").unwrap(), !newer_park);
         if let Some((task, request)) = second {
-            state
-                .hub
-                .reject(&request, "not_attached".into(), "nothing was parked".into());
+            state.hub.reject(
+                host.conn_id,
+                &request,
+                "not_attached".into(),
+                "nothing was parked".into(),
+            );
             task.await.unwrap();
             assert!(state.store.operator_dispatch_ready("s").unwrap());
         }
@@ -212,7 +218,7 @@ async fn a_request_key_reuses_an_immediate_turn_without_sending_again() {
         turn_id: turn_id.clone(),
     };
     state.store.ingest("s", 2, &started).unwrap();
-    state.hub.resolve(&request_id, started);
+    state.hub.resolve(registration.conn_id, "s", &request_id, started);
     let (status, receipt) = initial.await.unwrap();
     assert_eq!(status, StatusCode::ACCEPTED);
     assert_eq!(receipt, json!({"turn_id":turn_id}));

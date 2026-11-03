@@ -3,8 +3,11 @@
 
 use hennery_kernel::operator::{Operator, PublicUrl, Reset, STEP_UP_SECS, SetupOutcome};
 use hennery_kernel::passkeys::{
-    CEREMONY_TTL_SECS, MAX_LABEL_CHARS, PasskeyRecord, Refused, Start, counter_moves_on, relying_party, user_handle,
+    CEREMONY_TTL_SECS, KNOWN_LOGIN_CEREMONIES, MAX_LABEL_CHARS, MAX_LOGIN_CEREMONIES, PasskeyRecord, Refused, Start,
+    counter_moves_on, relying_party, user_handle,
 };
+use hennery_kernel::ratelimit::Policy;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use webauthn_authenticator_rs::WebauthnAuthenticator;
 use webauthn_authenticator_rs::softpasskey::SoftPasskey;
@@ -15,6 +18,8 @@ use webauthn_rs::prelude::{
 const NOW: i64 = 1_800_000_000;
 const PASSWORD: &str = "correct horse battery";
 const PUBLIC_URL: &str = "https://hennery.example";
+/// The address passkey logins start from.
+const CLIENT: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1));
 
 /// Another owner, written straight into the database (none exists in v1),
 /// created later than any real clock reaches (plan 3b-iii decision 3).
@@ -455,7 +460,7 @@ fn begin_login(
     origin: &str,
     now: i64,
 ) -> (String, serde_json::Value) {
-    let Start::Begun { ceremony_id, options } = op.start_passkey_login(now).unwrap() else {
+    let Start::Begun { ceremony_id, options } = op.start_passkey_login(CLIENT, now).unwrap() else {
         panic!("the login did not begin");
     };
     // 3c review, O2: user verification is required.
@@ -517,6 +522,148 @@ fn a_passkey_signs_in_stepped_up_and_is_marked_used() {
     );
     assert_eq!(op.passkeys().unwrap()[0].last_used_at, Some(later));
     assert_eq!(op.passkeys().unwrap()[0].id, record.id);
+}
+
+/// Security review of the audit fixes (P2): a login's place is reserved
+/// before its start is counted against the passkey budget, under the lock
+/// that checks there is one. Starts released together at the last place
+/// for unknown clients, from one key or from several: exactly one begins,
+/// its key is charged once, and every start refused busy is charged
+/// nothing.
+#[test]
+fn starts_racing_for_the_last_place_charge_only_the_one_that_began() {
+    for same_key in [true, false] {
+        let op = Operator::open_in_memory().unwrap();
+        let session_id = set_up(&op, PUBLIC_URL);
+        register(&op, &session_id, &mut authenticator(), "laptop");
+        let places = MAX_LOGIN_CEREMONIES - KNOWN_LOGIN_CEREMONIES;
+        for n in 0..places - 1 {
+            // One address per /24, so no prefix quota is reached.
+            let client = IpAddr::V4(Ipv4Addr::from(0x0a00_0000 + ((n as u32) << 8)));
+            assert!(matches!(
+                op.start_passkey_login(client, NOW).unwrap(),
+                Start::Begun { .. }
+            ));
+        }
+        let racers: Vec<IpAddr> = (0..8u8)
+            .map(|n| IpAddr::V4(Ipv4Addr::new(198, 51, 100, if same_key { 1 } else { n })))
+            .collect();
+        let barrier = std::sync::Barrier::new(racers.len());
+        let outcomes: Vec<Start> = std::thread::scope(|scope| {
+            let racing: Vec<_> = racers
+                .iter()
+                .map(|client| {
+                    let (op, barrier) = (&op, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        op.start_passkey_login(*client, NOW).unwrap()
+                    })
+                })
+                .collect();
+            racing.into_iter().map(|racer| racer.join().unwrap()).collect()
+        });
+        let begun: Vec<usize> = (0..outcomes.len())
+            .filter(|&i| matches!(outcomes[i], Start::Begun { .. }))
+            .collect();
+        assert_eq!(begun.len(), 1, "same key {same_key}: {outcomes:?}");
+        assert!(
+            outcomes
+                .iter()
+                .enumerate()
+                .all(|(i, o)| i == begun[0] || *o == Start::Busy)
+        );
+        let mut probed = racers.clone();
+        probed.dedup();
+        for client in probed {
+            let charged = u32::from(client == racers[begun[0]]);
+            for n in 0..Policy::PASSKEY_LOGIN.free_failures - charged {
+                assert!(
+                    op.passkey_limiter.attempt(client, std::time::Instant::now()).is_ok(),
+                    "same key {same_key}: {client} was charged for a busy start ({n} left)"
+                );
+            }
+            assert!(op.passkey_limiter.attempt(client, std::time::Instant::now()).is_err());
+        }
+    }
+}
+
+/// Fill `limiter`'s address table from another /48 and lock the /48 of
+/// `owner` through a neighbouring /64, as a flood would.
+fn flood_and_lock_the_prefix_of(limiter: &hennery_kernel::ratelimit::Limiter, policy: Policy, owner: IpAddr) {
+    let now = std::time::Instant::now();
+    for n in 0..hennery_kernel::ratelimit::DEFAULT_CAPACITY {
+        let key = IpAddr::from([0x2001, 0xdb8, 0xffff, n as u16, 0, 0, 0, 1]);
+        limiter.attempt(key, now).unwrap();
+    }
+    let IpAddr::V6(owner) = owner else {
+        panic!("an IPv6 owner")
+    };
+    let s = owner.segments();
+    let neighbour = IpAddr::from([s[0], s[1], s[2], s[3].wrapping_add(1), 0, 0, 0, 1]);
+    for _ in 0..=policy.free_failures {
+        let _ = limiter.attempt(neighbour, now);
+    }
+    assert!(
+        limiter.attempt(IpAddr::V6(owner), now).is_err(),
+        "the flood did not lock the prefix"
+    );
+}
+
+/// Final security review (P2): a password sign-in makes its address known
+/// to passkey login as well, so a flood that filled the passkey budget's
+/// table and locked the owner's /48 does not lock out the owner's first
+/// passkey login from there; before, only the ceremony place was kept.
+#[test]
+fn a_password_sign_in_keeps_passkey_login_out_of_a_floods_lockout() {
+    let op = Operator::open_in_memory().unwrap();
+    let session_id = set_up(&op, PUBLIC_URL);
+    register(&op, &session_id, &mut authenticator(), "laptop");
+    let owner: IpAddr = "2001:db8:1:1::1".parse().unwrap();
+    flood_and_lock_the_prefix_of(&op.passkey_limiter, Policy::PASSKEY_LOGIN, owner);
+    assert!(matches!(
+        op.start_passkey_login(owner, NOW).unwrap(),
+        Start::RateLimited(_)
+    ));
+    op.login_limiter.attempt(owner, std::time::Instant::now()).unwrap();
+    op.login_limiter.succeeded(owner);
+    assert!(matches!(
+        op.start_passkey_login(owner, NOW).unwrap(),
+        Start::Begun { .. }
+    ));
+}
+
+/// The other way round: a passkey sign-in makes its address known to
+/// password login, past a flood that locked its prefix there; and the
+/// wrong passwords already counted from it stay counted.
+#[test]
+fn a_passkey_sign_in_protects_password_login_and_keeps_its_count() {
+    let op = Operator::open_in_memory().unwrap();
+    let owner: IpAddr = "2001:db8:1:1::1".parse().unwrap();
+    let now = std::time::Instant::now();
+    for _ in 0..2 {
+        op.login_limiter.attempt(owner, now).unwrap();
+    }
+    op.passkey_limiter.attempt(owner, now).unwrap();
+    op.passkey_limiter.succeeded(owner);
+    for _ in 2..Policy::LOGIN.free_failures {
+        assert!(op.login_limiter.attempt(owner, now).is_ok());
+    }
+    assert!(
+        op.login_limiter.attempt(owner, now).is_err(),
+        "a passkey sign-in cleared the wrong passwords"
+    );
+
+    let op = Operator::open_in_memory().unwrap();
+    flood_and_lock_the_prefix_of(&op.login_limiter, Policy::LOGIN, owner);
+    op.passkey_limiter.attempt(owner, now).unwrap();
+    op.passkey_limiter.succeeded(owner);
+    for _ in 0..Policy::LOGIN.free_failures {
+        assert!(
+            op.login_limiter.attempt(owner, now).is_ok(),
+            "the owner shared the flood's lockout"
+        );
+    }
+    assert!(op.login_limiter.attempt(owner, now).is_err());
 }
 
 /// Kernel spec §3.4: a passkey check steps a session up, as a password
@@ -681,7 +828,7 @@ fn an_answer_without_user_verification_is_refused() {
     let Start::Begun {
         ceremony_id,
         mut options,
-    } = op.start_passkey_login(NOW).unwrap()
+    } = op.start_passkey_login(CLIENT, NOW).unwrap()
     else {
         panic!("the login did not begin");
     };
@@ -788,9 +935,9 @@ fn a_passkey_removed_during_its_ceremony_is_refused() {
 #[test]
 fn without_a_passkey_there_is_nothing_to_sign_in_with() {
     let op = Operator::open_in_memory().unwrap();
-    assert_eq!(op.start_passkey_login(NOW).unwrap(), Start::Unavailable);
+    assert_eq!(op.start_passkey_login(CLIENT, NOW).unwrap(), Start::Unavailable);
     let session_id = set_up(&op, PUBLIC_URL);
-    assert_eq!(op.start_passkey_login(NOW).unwrap(), Start::NoPasskeys);
+    assert_eq!(op.start_passkey_login(CLIENT, NOW).unwrap(), Start::NoPasskeys);
     assert_eq!(op.start_passkey_step_up(&session_id, NOW).unwrap(), Start::NoPasskeys);
     assert!(op.ceremonies.is_empty());
 }
@@ -822,7 +969,7 @@ fn another_owners_passkey_signs_nobody_in() {
         op.finish_passkey_login(&begun_before, &assertion, "", NOW).unwrap(),
         Err(Refused::Passkey)
     );
-    let Start::Begun { options, .. } = op.start_passkey_login(NOW).unwrap() else {
+    let Start::Begun { options, .. } = op.start_passkey_login(CLIENT, NOW).unwrap() else {
         panic!("the login did not begin");
     };
     assert_eq!(options["publicKey"]["allowCredentials"].as_array().unwrap().len(), 1);
@@ -853,7 +1000,7 @@ fn moving_public_url_to_another_host_removes_the_passkeys() {
         op.finish_passkey_login(&ceremony_id, &assertion, "", NOW).unwrap(),
         Err(Refused::Ceremony)
     );
-    assert_eq!(op.start_passkey_login(NOW).unwrap(), Start::NoPasskeys);
+    assert_eq!(op.start_passkey_login(CLIENT, NOW).unwrap(), Start::NoPasskeys);
 }
 
 /// Decision 9 (an amendment to kernel spec §3.2): a move to another port
@@ -913,7 +1060,7 @@ fn moving_public_url_to_an_ip_address_removes_the_passkeys() {
             passkeys_removed: 1
         }
     );
-    assert_eq!(op.start_passkey_login(NOW).unwrap(), Start::Unavailable);
+    assert_eq!(op.start_passkey_login(CLIENT, NOW).unwrap(), Start::Unavailable);
 }
 
 /// Decision 2 (3c review, A1): a password reset, the admin socket's
@@ -941,5 +1088,5 @@ async fn a_password_reset_removes_the_passkeys() {
         op.finish_passkey_login(&ceremony_id, &assertion, "", NOW).unwrap(),
         Err(Refused::Ceremony)
     );
-    assert_eq!(op.start_passkey_login(NOW).unwrap(), Start::NoPasskeys);
+    assert_eq!(op.start_passkey_login(CLIENT, NOW).unwrap(), Start::NoPasskeys);
 }

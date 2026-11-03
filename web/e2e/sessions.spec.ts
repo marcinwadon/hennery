@@ -36,6 +36,8 @@ async function seeResult(page: Page) {
 // Every prompt: one permission ask, then a short Markdown message after the
 // echo of its answer (`permission:selected:<option>`, no newline of its own).
 const SCRIPT = {
+  prompt_usage: { inputTokens: 10, outputTokens: 5, totalTokens: 100, cachedReadTokens: 80, cachedWriteTokens: 5 },
+  usage_update: { sessionUpdate: 'usage_update', used: 124000, size: 200000, cost: { amount: 1.25, currency: 'USD' } },
   asks: ['permission'],
   chunks: ['\n\nTwo steps:\n\n', '- first step\n', '- second step\n'],
   chunk_delay_ms: 20,
@@ -190,6 +192,26 @@ for (const width of [1280, 390]) {
       expect(await item.evaluate((el) => getComputedStyle(el).listStyleType)).toBe('disc')
     })
 
+    test('usage follows real host observations and the meter opens its responsive panel', async ({}, testInfo) => {
+      await expect(page.locator('.usage-meter-button')).toHaveText('62%')
+      await page.locator('.usage-meter-button').click()
+      const panel = page.locator('.usage-panel')
+      await expect(panel).toBeVisible()
+      await expect(panel.getByRole('meter', { name: 'Context used', exact: true })).toHaveAttribute('aria-valuenow', '124000')
+      await expect(panel.getByText('84% of input tokens came from cache', { exact: true })).toBeVisible()
+      await expect(panel.getByText('Not available for Claude on this host.', { exact: true })).toBeVisible()
+      const sessionId = new URL(page.url()).pathname.split('/').pop()!
+      const response = await page.request.get(`/api/sessions/${encodeURIComponent(sessionId)}/usage`)
+      expect(response.ok()).toBe(true)
+      const usage = await response.json()
+      expect(usage.session.tokens.total_tokens).toBe(100)
+      expect(usage.session.reported_turns).toBe(1)
+      expect(usage.session.cost.amount).toBe(1.25)
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true)
+      await page.screenshot({ path: testInfo.outputPath(`usage-${width}.png`) })
+      await page.getByRole('button', { name: 'Close session details', exact: true }).click()
+    })
+
     test('the composer’s Send, and a phone’s way back, are on screen', async () => {
       const composer = page.locator('.composer')
       // Full-width input and a separate action row; the former one-row 88px
@@ -230,8 +252,15 @@ for (const width of [1280, 390]) {
       const trigger = () => page.getByRole('button', { name: 'Session actions', exact: true })
       const sessionPath = new URL(page.url()).pathname
       await trigger().click()
-      await page.getByRole('button', { name: 'Pin to sidebar', exact: true }).click()
-      await expect(page.getByRole('button', { name: 'Unpin from sidebar', exact: true })).toBeEnabled()
+      const pin = page.getByRole('switch', { name: 'Pin to sidebar', exact: true })
+      await expect(pin).toHaveAttribute('aria-checked', 'false')
+      await expect(pin).toHaveText('Pin to sidebarOff')
+      const offBackground = await pin.evaluate(el => getComputedStyle(el).backgroundColor)
+      await pin.click()
+      await expect(pin).toHaveAttribute('aria-checked', 'true')
+      await expect(pin).toHaveText('Pin to sidebar✓ On')
+      await expect(pin).not.toHaveCSS('background-color', offBackground)
+      await page.screenshot({ path: test.info().outputPath('pin-switch-on.png') })
       await expect(page.getByRole('switch', { name: 'Do not park', exact: true })).toHaveAttribute('aria-checked', 'false')
       await page.keyboard.press('Escape')
       await expect(trigger()).toHaveAttribute('aria-expanded', 'false')
@@ -247,8 +276,10 @@ for (const width of [1280, 390]) {
       }
       await page.reload()
       await trigger().click()
-      await page.getByRole('button', { name: 'Unpin from sidebar', exact: true }).click()
-      await expect(page.getByRole('button', { name: 'Pin to sidebar', exact: true })).toBeEnabled()
+      await expect(pin).toHaveAttribute('aria-checked', 'true')
+      await pin.click()
+      await expect(pin).toHaveAttribute('aria-checked', 'false')
+      await expect(pin).toHaveText('Pin to sidebarOff')
       await page.keyboard.press('Escape')
       await expect(pins).toHaveCount(0)
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true)
@@ -430,7 +461,8 @@ for (const width of [1280, 390]) {
       // An active session: Close, Delete, and Park if its host can park.
       const list = page.locator('.session-menu-list')
       const names = await list.getByRole('button').allTextContents()
-      expect(names.filter((n) => n !== 'Park')).toEqual(['Rename', 'New like this', 'Pin to sidebar', 'Close', 'Delete session'])
+      expect(names.filter((n) => n !== 'Park')).toEqual(['Rename', 'New like this', 'Close', 'Delete session'])
+      expect((await list.getByRole('switch', { name: 'Pin to sidebar', exact: true }).boundingBox())!.height).toBeGreaterThanOrEqual(44)
       expect((await list.getByRole('switch', { name: 'Do not park', exact: true }).boundingBox())!.height).toBeGreaterThanOrEqual(44)
       for (const name of names) {
         const box = await list.getByRole('button', { name, exact: true }).boundingBox()
@@ -580,6 +612,7 @@ test.describe('redesigned session', () => {
         if (path.startsWith('/api/stream/')) { held.push(route); return }
         if (path === '/api/view/sessions/worker') return json({ items, epoch: 'items', revision: 1, older: false })
         if (path === '/api/sessions/worker') return json({ ...info, pending: [], mcp_delivery: { mode: 'unisolated', servers: 2, at: now } })
+        if (path === '/api/sessions/worker/usage') return json({ session_id: 'worker', source: 'acp', context: null, last_turn: null, session: { tokens: null, models: [], turns: 0, reported_turns: 0, since: null, cost: null, partial: true }, family: { totals: { tokens: null, models: [], turns: 0, reported_turns: 0, since: null, cost: null, partial: true }, sessions: 1, reporting_sessions: 0, cost_reporting_sessions: 0, truncated: false }, retention: { supported: false, requested: 'inherit', attached_request: null } })
         if (path.endsWith('/queue')) return json([])
         if (path.endsWith('/catalog')) return json(catalog())
         if (path.endsWith('/family')) return json({ summary: info, children: [], questions: [], routing: taken ? 'detached' : 'active' })
@@ -663,6 +696,13 @@ test.describe('redesigned session', () => {
         await page.reload()
         await expect(page.locator('.session-head .badge')).toHaveText('Running')
         await page.locator('.transcript').evaluate(el => { el.scrollTop = 0 })
+        await expect(page.locator('.bubble.user')).toHaveCount(0)
+        const familyMessage = page.getByRole('button', { name: 'Show message', exact: true })
+        await expect(familyMessage).toHaveAttribute('aria-expanded', 'false')
+        await expect(page.getByRole('link', { name: 'Source session', exact: true })).toBeVisible()
+        await familyMessage.click()
+        await expect(page.getByRole('button', { name: 'Hide message', exact: true })).toHaveAttribute('aria-expanded', 'true')
+        await expect(page.getByText('Review the parser and report what needs changing.', { exact: true })).toBeVisible()
         const userBubble = page.locator('.bubble.user').first(), agentBubble = page.locator('.bubble:not(.user)').first()
         expect(await userBubble.evaluate(el => getComputedStyle(el).backgroundColor)).not.toBe(await agentBubble.evaluate(el => getComputedStyle(el).backgroundColor))
         expect(await agentBubble.evaluate(el => getComputedStyle(el).borderTopWidth)).toBe('1px')

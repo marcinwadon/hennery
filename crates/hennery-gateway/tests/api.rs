@@ -101,7 +101,7 @@ impl Api {
             .method("PUT")
             .uri(path)
             .header("origin", ORIGIN)
-            .header("cookie", format!("hennery_session={session}"))
+            .header("cookie", format!("__Host-hennery_session={session}"))
             .header("content-type", "application/json")
             .body(Body::from(body.to_owned()))
             .unwrap();
@@ -116,7 +116,7 @@ impl Api {
             .method(method)
             .uri(path)
             .header("origin", ORIGIN)
-            .header("cookie", format!("hennery_session={session}"));
+            .header("cookie", format!("__Host-hennery_session={session}"));
         let body = match body {
             Some(body) => {
                 req = req.header("content-type", "application/json");
@@ -336,7 +336,7 @@ async fn every_route_needs_the_operators_session_and_origin() {
                 .method(method)
                 .uri(&path)
                 .header("origin", "https://evil.example")
-                .header("cookie", format!("hennery_session={}", api.session(0)))
+                .header("cookie", format!("__Host-hennery_session={}", api.session(0)))
                 .header("content-type", "application/json")
                 .body(Body::from("{}"))
                 .unwrap();
@@ -501,7 +501,7 @@ async fn answers_are_never_cached() {
             .method(method)
             .uri(path)
             .header("origin", ORIGIN)
-            .header("cookie", format!("hennery_session={s}"))
+            .header("cookie", format!("__Host-hennery_session={s}"))
             .header("content-type", "application/json")
             .body(Body::from(r#"{"host_ids":[]}"#))
             .unwrap();
@@ -523,7 +523,7 @@ async fn answers_are_never_cached() {
             .uri("/api/mcp/connections")
             .header("origin", origin);
         if let Some(cookie) = cookie {
-            req = req.header("cookie", format!("hennery_session={cookie}"));
+            req = req.header("cookie", format!("__Host-hennery_session={cookie}"));
         }
         let resp = api.app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
         assert_eq!(resp.status(), status, "{origin}");

@@ -38,6 +38,7 @@ fn complete_review_turn(c: &Collector, session: &str, name: &str, seq: u64) -> i
             turn_id: name.into(),
         },
         SessionBody::TurnEnded {
+            usage: None,
             turn_id: name.into(),
             outcome: TurnOutcome::Completed,
             stop_reason: None,

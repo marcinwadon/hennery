@@ -60,7 +60,7 @@ impl Collector {
             .open_session("browser", &phc, unix_now())
             .unwrap()
             .unwrap();
-        format!("hennery_session={token}")
+        format!("__Host-hennery_session={token}")
     }
 
     fn hat(&self, name: &str) -> String {

@@ -13,10 +13,15 @@ state stays outside Git; public issues are separate approved projections.
    — product, topology, protocol principles, sessions, auth, hats, module
    boundaries, testing. Authoritative where subsystem specs disagree.
 2. Subsystem specs:
+   - [Session usage and cache retention](specs/2026-11-02-session-usage.md) —
+     durable runtime observations, partial family accounting, responsive Usage
+     presentation and requested per-session Claude retention.
    - [ACP core](specs/2026-09-26-acp-core-design.md) — host, adapters,
      host↔collector protocol, session state machine, storage, session API.
    - [Kernel](specs/2026-09-26-kernel-design.md) — storage, config, operator
      auth, pairing, hats, push, HTTP security.
+   - [Public ingress hardening](specs/2026-10-29-public-ingress-hardening.md) —
+     bounded admission, timed reads and negotiated small host authentication.
    - [MCP gateway](specs/2026-09-26-mcp-gateway-design.md) — connections,
      OAuth, per-session tokens, streaming proxy, renderers.
    - [External session MCP](specs/2026-10-29-external-session-mcp.md) — public HTTPS/OAuth, scoped consent and revocation, read discovery, direct remote Desktop setup and pending execution/live acceptance.

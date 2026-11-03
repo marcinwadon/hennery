@@ -129,7 +129,7 @@ impl Harness {
             .method("POST")
             .uri(format!("/api/mcp/connections/{id}/authorize"))
             .header("origin", ORIGIN)
-            .header("cookie", format!("hennery_session={session}"))
+            .header("cookie", format!("__Host-hennery_session={session}"))
             .header("content-type", "application/json")
             .body(Body::from("{}"))
             .unwrap();

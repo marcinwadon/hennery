@@ -556,7 +556,15 @@ async fn main() -> agent_client_protocol::Result<()> {
                         if script.exit_after_chunks.is_some() {
                             crash().await;
                         }
-                        responder.respond(PromptResponse::new(StopReason::EndTurn))
+                        if let Some(update) = script.usage_update.clone() {
+                            cx2.send_notification(SessionNotification::new(
+                                req.session_id.clone(),
+                                serde_json::from_value(update)?,
+                            ))?;
+                        }
+                        let mut response = PromptResponse::new(StopReason::EndTurn);
+                        response.usage = script.prompt_usage.clone().and_then(|v| serde_json::from_value(v).ok());
+                        responder.respond(response)
                     })
                 }
             },

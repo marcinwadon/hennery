@@ -26,6 +26,10 @@ struct Service {
     permits: Arc<Semaphore>,
     admin_permits: Arc<Semaphore>,
     scopes: Arc<Mutex<HashMap<String, Weak<Semaphore>>>>,
+    // Pre-authentication admission per claimed credential kind, taken before
+    // any store lock or SQL.
+    admission: Arc<Semaphore>,
+    admin_admission: Arc<Semaphore>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -137,12 +141,22 @@ struct Brief {
     mode: Option<Mode>,
 }
 pub fn router(store: Arc<Store>) -> Router {
-    Router::new().route("/mcp", post(rpc)).with_state(Service {
-        store,
-        permits: Arc::new(Semaphore::new(32)),
-        admin_permits: Arc::new(Semaphore::new(4)),
-        scopes: Arc::default(),
-    })
+    routes(Service::new(store))
+}
+impl Service {
+    fn new(store: Arc<Store>) -> Self {
+        Self {
+            store,
+            permits: Arc::new(Semaphore::new(32)),
+            admin_permits: Arc::new(Semaphore::new(4)),
+            scopes: Arc::default(),
+            admission: Arc::new(Semaphore::new(32)),
+            admin_admission: Arc::new(Semaphore::new(4)),
+        }
+    }
+}
+fn routes(service: Service) -> Router {
+    Router::new().route("/mcp", post(rpc)).with_state(service)
 }
 const VERSIONS: &[&str] = &["2025-03-26", "2025-06-18", "2025-11-25"];
 fn response(status: StatusCode, value: Value) -> Response {
@@ -160,6 +174,19 @@ fn rpc_error(id: Value, code: i64) -> Response {
         StatusCode::OK,
         json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":"operation refused"}}),
     )
+}
+/// Store work runs on the blocking pool, never a runtime worker. The permits
+/// move into that work: a cancelled caller cannot release them before it ends.
+async fn blocking<P: Send + 'static, T: Send + 'static>(
+    permits: P,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<(P, T)> {
+    tokio::task::spawn_blocking(move || {
+        let value = work();
+        (permits, value)
+    })
+    .await
+    .ok()
 }
 async fn rpc(State(service): State<Service>, request: Request) -> Response {
     if request.uri().query().is_some()
@@ -181,7 +208,30 @@ async fn rpc(State(service): State<Service>, request: Request) -> Response {
         return refused();
     }
     let credential_admin = token.starts_with("hnry_lifecycle_");
-    let Ok(namespace) = service.store.authenticated_namespace(&token, credential_admin) else {
+    if !credential_admin && !token.starts_with("hnry_plugin_") {
+        return refused();
+    }
+    // Admit before the store lock: anonymous tokens wait on it too.
+    let admission = if credential_admin {
+        &service.admin_admission
+    } else {
+        &service.admission
+    };
+    let Ok(admitted) = admission.clone().try_acquire_owned() else {
+        return response(StatusCode::SERVICE_UNAVAILABLE, json!({"error":"busy"}));
+    };
+    let (store, credential) = (service.store.clone(), token.clone());
+    let Some((_, Ok((namespace, stamp)))) = blocking(admitted, move || {
+        let namespace = store.authenticated_namespace(&credential, credential_admin)?;
+        let stamp = if credential_admin {
+            None
+        } else {
+            Some(store.delivery_stamp(&credential)?)
+        };
+        anyhow::Ok((namespace, stamp))
+    })
+    .await
+    else {
         return refused();
     };
     let versions = request
@@ -196,14 +246,6 @@ async fn rpc(State(service): State<Service>, request: Request) -> Response {
     {
         return response(StatusCode::BAD_REQUEST, json!({"error":"invalid protocol version"}));
     }
-    let stamp = if credential_admin {
-        None
-    } else {
-        match service.store.delivery_stamp(&token) {
-            Ok(stamp) => Some(stamp),
-            Err(_) => return refused(),
-        }
-    };
     let pool = if credential_admin {
         &service.admin_permits
     } else {
@@ -253,9 +295,14 @@ async fn rpc(State(service): State<Service>, request: Request) -> Response {
         return rpc_error(Value::Null, -32600);
     }
     let admin = rpc.method.starts_with("hennery_plugin_");
-    if admin != credential_admin || service.store.available(&token, admin).is_err() {
+    if admin != credential_admin {
         return refused();
     }
+    let (store, credential) = (service.store.clone(), token.clone());
+    let Some((permits, Ok(()))) = blocking((permit, scoped_permit), move || store.available(&credential, admin)).await
+    else {
+        return refused();
+    };
     if rpc.method == "notifications/initialized" && rpc.id.is_none() {
         if rpc
             .params
@@ -272,24 +319,27 @@ async fn rpc(State(service): State<Service>, request: Request) -> Response {
     if !admin && !["initialize", "ping", "tools/list", "tools/call"].contains(&rpc.method.as_str()) {
         return rpc_error(id, -32601);
     }
-    let params = rpc.params.as_deref().map(RawValue::get).unwrap_or("{}");
-    let result: Result<Value, anyhow::Error> = (|| {
+    let method = rpc.method;
+    let params = rpc.params.as_deref().map(RawValue::get).unwrap_or("{}").to_string();
+    let (store, credential) = (service.store.clone(), token.clone());
+    let Some((permits, result)) = blocking(permits, move || -> Result<Value, anyhow::Error> {
+        let (params, token, method) = (params.as_str(), credential.as_str(), method.as_str());
         if admin {
-            if rpc.method == "hennery_plugin_forget" {
+            if method == "hennery_plugin_forget" {
                 return Ok(serde_json::to_value(
-                    service.store.forget(&token, object::<Forget>(params)?)?,
+                    store.forget(token, object::<Forget>(params)?)?,
                 )?);
             }
             anyhow::ensure!(
-                rpc.method == "hennery_plugin_capabilities",
+                method == "hennery_plugin_capabilities",
                 "unsupported lifecycle operation"
             );
-            service.store.lifecycle_active(&token)?;
+            store.lifecycle_active(token)?;
             let probe: CapabilitiesProbe = object(params)?;
             anyhow::ensure!(probe.version.is_none_or(|v| v == 1), "unsupported contract version");
             return Ok(json!({"version":1,"activity_v1":true,"forget_v1":true,"startup_context_v1":false}));
         }
-        match rpc.method.as_str() {
+        match method {
             "initialize" => {
                 let init: Initialize = object(params)?;
                 anyhow::ensure!(
@@ -323,8 +373,8 @@ async fn rpc(State(service): State<Service>, request: Request) -> Response {
                 let value = match call.name.as_str() {
                     "memory_recent" => {
                         let q: Recent = object(text)?;
-                        serde_json::to_value(service.store.recent(
-                            &token,
+                        serde_json::to_value(store.recent(
+                            token,
                             &Query {
                                 project_key: q.project_key,
                                 limit: q.limit,
@@ -335,8 +385,8 @@ async fn rpc(State(service): State<Service>, request: Request) -> Response {
                     }
                     "memory_search" => {
                         let q: Search = object(text)?;
-                        serde_json::to_value(service.store.search(
-                            &token,
+                        serde_json::to_value(store.search(
+                            token,
                             &Query {
                                 query: Some(q.query),
                                 kind: q.kind,
@@ -347,11 +397,11 @@ async fn rpc(State(service): State<Service>, request: Request) -> Response {
                         )?)?
                     }
                     "memory_remember" => {
-                        serde_json::to_value(service.store.remember(&token, object::<Remember>(text)?)?)?
+                        serde_json::to_value(store.remember(token, object::<Remember>(text)?)?)?
                     }
                     "memory_brief" => {
                         let q: Brief = object(text)?;
-                        let mut value = service.store.brief(&token, &q.subject, q.project_key)?;
+                        let mut value = store.brief(token, &q.subject, q.project_key)?;
                         if matches!(q.mode, Some(Mode::Model)) {
                             value["fallback_reason"] = json!("model support is not configured");
                         }
@@ -363,7 +413,11 @@ async fn rpc(State(service): State<Service>, request: Request) -> Response {
             }
             _ => anyhow::bail!("unsupported method"),
         }
-    })();
+    })
+    .await
+    else {
+        return rpc_error(id, -32603);
+    };
     match result {
         Ok(result) => {
             let bytes = serde_json::to_vec(&json!({"jsonrpc":"2.0","id":id,"result":result})).expect("result");
@@ -373,16 +427,16 @@ async fn rpc(State(service): State<Service>, request: Request) -> Response {
             // Recheck at delivery, after serialization. No mutex/DB guard is
             // held across the HTTP exchange or any network wait.
             let stream = futures::stream::once(async move {
-                let _permits = (permit, scoped_permit);
-                service
-                    .store
-                    .available(&token, admin)
-                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::PermissionDenied))?;
-                if let Some(stamp) = &stamp {
-                    service
-                        .store
-                        .deliverable(&token, stamp)
-                        .map_err(|_| std::io::Error::from(std::io::ErrorKind::PermissionDenied))?;
+                let checked = blocking(permits, move || {
+                    service.store.available(&token, admin)?;
+                    if let Some(stamp) = &stamp {
+                        service.store.deliverable(&token, stamp)?;
+                    }
+                    anyhow::Ok(())
+                })
+                .await;
+                if !matches!(checked, Some((_, Ok(())))) {
+                    return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
                 }
                 Ok::<Bytes, std::io::Error>(Bytes::from(bytes))
             });
@@ -422,4 +476,130 @@ fn tools() -> Vec<Value> {
     tools.push(json!({"name":"memory_brief","description":"Dated quotations and typed evidence; deterministic, no model","inputSchema":{"type":"object","properties":{"subject":{"type":"string","maxLength":512},"project_key":{"type":"string"},"mode":{"type":"string","enum":["deterministic","model"]}},"required":["subject"],"additionalProperties":false}}));
     tools.push(json!({"name":"memory_remember","description":"Retain agent-authored, unverified text; no verified session identity","inputSchema":{"type":"object","properties":{"title":{"type":"string","maxLength":160},"body":{"type":"string","maxLength":16384},"kind":{"type":"string","enum":["user","feedback","project","reference","decision","entity"]},"tags":{"type":"array","maxItems":16,"items":{"type":"string","maxLength":64}},"idempotency_key":{"type":"string","maxLength":128}},"required":["title","body","idempotency_key"],"additionalProperties":false}}));
     tools
+}
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use tower::ServiceExt;
+    const TOOL: &str = "hnry_plugin_unknown";
+    const LIFECYCLE: &str = "hnry_lifecycle_unknown";
+    fn mcp(token: &str) -> Request {
+        Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
+            .unwrap()
+    }
+    async fn send(app: &Router, token: &str) -> StatusCode {
+        app.clone().oneshot(mcp(token)).await.unwrap().status()
+    }
+    /// A refusal is decided before the first await: poll once, never wait.
+    fn immediate(app: &Router, token: &str) -> Option<StatusCode> {
+        futures::FutureExt::now_or_never(app.clone().oneshot(mcp(token))).map(|response| response.unwrap().status())
+    }
+    fn saturated(service: &Service) -> bool {
+        service.admission.available_permits() == 0 && service.admin_admission.available_permits() == 0
+    }
+    /// Holds the store's own mutex, the contention point every store call
+    /// takes, while a one-thread runtime serves requests. The runtime reports
+    /// through `ready` while the lock is still held; an inline store call
+    /// would stall it, so the bound only detects that failure.
+    fn with_blocked_store<T: Send + 'static>(
+        run: impl FnOnce(Service, mpsc::Sender<()>) -> std::pin::Pin<Box<dyn Future<Output = T> + Send>> + Send + 'static,
+    ) -> (bool, T) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&dir.path().join("memory.db")).unwrap());
+        let service = Service::new(store.clone());
+        let guard = store.inner.lock().unwrap();
+        let (ready, observed) = mpsc::channel();
+        let runtime = std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(run(service, ready))
+        });
+        let responsive = observed.recv_timeout(Duration::from_secs(30)).is_ok();
+        drop(guard);
+        (responsive, runtime.join().unwrap())
+    }
+
+    #[test]
+    fn blocked_store_bounds_pre_auth_admission_per_kind_without_stalling_the_runtime() {
+        let (responsive, (extra, admitted)) = with_blocked_store(|service, ready| {
+            Box::pin(async move {
+                let app = routes(service.clone());
+                let mut pending = Vec::new();
+                for token in [TOOL; 32].into_iter().chain([LIFECYCLE; 4]) {
+                    let app = app.clone();
+                    pending.push(tokio::spawn(async move { send(&app, token).await }));
+                }
+                for _ in 0..1000 {
+                    if saturated(&service) {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                let extra = (immediate(&app, TOOL), immediate(&app, LIFECYCLE));
+                let _ = ready.send(());
+                let mut admitted = Vec::new();
+                for request in pending {
+                    admitted.push(request.await.unwrap());
+                }
+                (extra, admitted)
+            })
+        });
+        assert!(responsive, "the runtime stalled behind the store lock");
+        assert_eq!(
+            extra,
+            (
+                Some(StatusCode::SERVICE_UNAVAILABLE),
+                Some(StatusCode::SERVICE_UNAVAILABLE)
+            )
+        );
+        assert_eq!(admitted, vec![StatusCode::NOT_FOUND; 36]);
+    }
+
+    #[test]
+    fn cancelled_requests_hold_admission_until_blocking_auth_finishes() {
+        let (responsive, (held, refused, released, after)) = with_blocked_store(|service, ready| {
+            Box::pin(async move {
+                let app = routes(service.clone());
+                let mut pending = Vec::new();
+                for _ in 0..32 {
+                    let app = app.clone();
+                    pending.push(tokio::spawn(async move { send(&app, TOOL).await }));
+                }
+                for _ in 0..1000 {
+                    if service.admission.available_permits() == 0 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                for request in pending {
+                    request.abort();
+                    assert!(request.await.unwrap_err().is_cancelled());
+                }
+                let held = service.admission.available_permits();
+                let refused = immediate(&app, TOOL);
+                let _ = ready.send(());
+                let released = tokio::time::timeout(
+                    Duration::from_secs(30),
+                    service.admission.clone().acquire_many_owned(32),
+                )
+                .await
+                .map(drop)
+                .is_ok();
+                (held, refused, released, send(&app, TOOL).await)
+            })
+        });
+        assert!(responsive, "the runtime stalled behind the store lock");
+        assert_eq!(held, 0, "cancelled callers released permits early");
+        assert_eq!(refused, Some(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(released, "blocking work never returned its permits");
+        assert_eq!(after, StatusCode::NOT_FOUND);
+    }
 }

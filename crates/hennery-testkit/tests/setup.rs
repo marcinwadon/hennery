@@ -77,7 +77,7 @@ async fn setup_creates_the_owner_signs_them_in_and_happens_once() {
     assert_eq!(body.public_url, origin);
     // The cookie is a live session, stepped up by the password just set.
     let token = cookie
-        .strip_prefix("hennery_session=")
+        .strip_prefix("__Host-hennery_session=")
         .unwrap()
         .split(';')
         .next()
