@@ -13,12 +13,33 @@ function fixture(): SessionUsage {
     last_turn: { turn_id: 't', outcome: 'completed', observed_at: new Date().toISOString(), usage: { source: 'claude', tokens, models: [] } },
     session: total, family: { totals: total, sessions: 3, reporting_sessions: 2, cost_reporting_sessions: 1, truncated: false },
     retention: { supported: true, requested: 'inherit', attached_request: 'inherit' },
+    budget: { supported: true, requested: 'inherit', attached_request: 'inherit' },
   }
 }
 function state(data: SessionUsage | null): SessionUsageState {
-  return { data, error: null, saving: false, setRetention: vi.fn(async () => {}), refresh: vi.fn(async () => {}) }
+  return { data, error: null, saving: false, setRetention: vi.fn(async () => {}), setBudget: vi.fn(async () => {}), refresh: vi.fn(async () => {}) }
 }
 describe('observed session usage', () => {
+  it('changes automatic-compaction budget only on an explicit choice and explains pending application', async () => {
+    const u = fixture(); u.budget.requested = '500k'
+    const s = state(u)
+    render(<UsagePanel state={s} away={false} />)
+    const select = screen.getByRole('combobox', { name: 'Automatic compaction budget' })
+    expect(select).toHaveValue('500k')
+    expect(s.setBudget).not.toHaveBeenCalled()
+    expect(screen.getByText(/^Requests a compaction budget/)).toHaveTextContent('Takes effect on the next resume.')
+    expect(screen.getByText(/^Requests a compaction budget/)).toHaveTextContent('Summaries can omit details')
+    await userEvent.selectOptions(select, '200k')
+    expect(s.setBudget).toHaveBeenCalledWith('200k')
+  })
+  it('can clear a saved budget after the host loses support', async () => {
+    const u = fixture(); u.budget = { supported: false, requested: '500k', attached_request: null }
+    const s = state(u)
+    render(<UsagePanel state={s} away={false} />)
+    expect(screen.queryByRole('combobox', { name: 'Automatic compaction budget' })).not.toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button', { name: 'Use default compaction' }))
+    expect(s.setBudget).toHaveBeenCalledWith('inherit')
+  })
   it('shows actual cache token share and labels incomplete accounting and cost', async () => {
     render(<UsagePanel state={state(fixture())} away={false} />)
     expect(screen.getByRole('meter', { name: 'Context used' })).toHaveAttribute('aria-valuenow', '124000')

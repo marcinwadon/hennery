@@ -44,3 +44,5 @@
 .usage-meter-button.is-stale { color:var(--st-warn-fg); }
 .usage-mini-track { width:32px; height:4px; }
 @media(max-width:1023px) { .usage-retention-options span { min-height:44px; padding:12px 8px; } .usage-meter-button { min-width:44px; min-height:44px; } }
+.usage-budget-select { display:block; width:100%; min-height:44px; margin-top:4px; padding:6px 10px; border:1px solid var(--hn-control-strong); border-radius:var(--radius-sm); color:var(--hn-fg-1); background:var(--hn-surface); font:inherit; }
+@media (max-width:767px) { .usage-budget-select { font-size:16px; } }

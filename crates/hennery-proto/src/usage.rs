@@ -27,6 +27,50 @@ impl CacheRetention {
     }
 }
 
+/// A requested native automatic-compaction budget, not a billing limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
+pub enum ContextBudget {
+    #[default]
+    #[serde(rename = "inherit")]
+    Inherit,
+    #[serde(rename = "100k")]
+    Tokens100K,
+    #[serde(rename = "200k")]
+    Tokens200K,
+    #[serde(rename = "500k")]
+    Tokens500K,
+    #[serde(rename = "1m")]
+    Tokens1M,
+}
+
+impl ContextBudget {
+    pub fn is_inherit(&self) -> bool {
+        *self == Self::Inherit
+    }
+    pub fn tokens(self) -> Option<u32> {
+        match self {
+            Self::Inherit => None,
+            Self::Tokens100K => Some(100_000),
+            Self::Tokens200K => Some(200_000),
+            Self::Tokens500K => Some(500_000),
+            Self::Tokens1M => Some(1_000_000),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+pub struct BudgetState {
+    pub supported: bool,
+    pub requested: ContextBudget,
+    pub attached_request: Option<ContextBudget>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
+#[serde(deny_unknown_fields)]
+pub struct SetContextBudget {
+    pub requested: ContextBudget,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema, TS)]
 pub struct TokenUsage {
     #[ts(type = "number")]
@@ -167,6 +211,8 @@ pub struct SessionUsage {
     pub session: UsageTotals,
     pub family: FamilyUsage,
     pub retention: RetentionState,
+    #[serde(default)]
+    pub budget: BudgetState,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema, TS)]
 #[serde(deny_unknown_fields)]

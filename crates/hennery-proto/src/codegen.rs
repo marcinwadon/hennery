@@ -35,6 +35,7 @@ pub fn render_schema() -> String {
     add!(
         crate::usage::SessionUsage,
         crate::usage::SetCacheRetention,
+        crate::usage::SetContextBudget,
         crate::session_defaults::HatSessionDefaults,
         crate::session_defaults::PutHatSessionDefaults,
         rest::SetIdlePinRequest,
@@ -243,6 +244,9 @@ pub fn render_ts() -> String {
         crate::usage::SessionUsage,
         crate::usage::SetCacheRetention,
         crate::usage::CacheRetention,
+        crate::usage::SetContextBudget,
+        crate::usage::ContextBudget,
+        crate::usage::BudgetState,
         crate::usage::TokenUsage,
         crate::usage::ModelUsage,
         crate::usage::TurnUsage,

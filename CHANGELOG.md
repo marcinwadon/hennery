@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Add optional automatic-compaction budgets to Usage for bundled Claude and
+  Codex sessions. Saved budgets apply on the next resume and are copied by
+  New like this; native runtime defaults remain available.
+- Show saved and last-attached budget requests separately, and let users clear
+  an override after a host downgrade. Runtime window limits and compaction's
+  loss of detail still apply; a budget is not a billing limit.
+
 ## 0.4.0
 
 - Add Usage to session details, with a composer context meter, per-turn input,

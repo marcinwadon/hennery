@@ -8,3 +8,6 @@ ALTER TABLE sessions DROP COLUMN usage_cost;
 ALTER TABLE sessions DROP COLUMN usage_totals;
 ALTER TABLE sessions DROP COLUMN cache_retention;
 ALTER TABLE sessions DROP COLUMN cache_retention_attached;
+-- Remove the later native-compaction policy before replaying old migrations.
+ALTER TABLE sessions DROP COLUMN context_budget;
+ALTER TABLE sessions DROP COLUMN context_budget_attached;

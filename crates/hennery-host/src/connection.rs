@@ -396,6 +396,7 @@ async fn handshake(
                 Capability::Park,
                 Capability::IdleHold,
                 Capability::CacheRetention,
+                Capability::ContextBudget,
                 Capability::Images,
                 Capability::Projects,
                 Capability::ResolvePath,

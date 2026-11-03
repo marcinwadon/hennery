@@ -1463,6 +1463,7 @@ fn config_script(log: &Path) -> FakeScript {
 
 fn wanted(model: Option<&str>, mode: Option<&str>, axes: &[(&str, ConfigValue)]) -> SessionConfig {
     SessionConfig {
+        context_budget: Default::default(),
         cache_retention: Default::default(),
         model: model.map(str::to_string),
         mode: mode.map(str::to_string),

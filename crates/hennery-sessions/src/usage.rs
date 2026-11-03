@@ -5,9 +5,26 @@ use hennery_proto::usage::*;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 
+struct UsageRow {
+    source: String,
+    hat: String,
+    context: Option<String>,
+    retention_attached: Option<String>,
+    budget_attached: Option<String>,
+}
+
 pub(crate) fn retention_in(conn: &Connection, owner: &str, id: &str) -> Result<CacheRetention> {
     let value: String = conn.query_row(
         "SELECT cache_retention FROM sessions WHERE owner_id = ?1 AND id=?2",
+        params![owner, id],
+        |r| r.get(0),
+    )?;
+    Ok(serde_json::from_value(Value::String(value))?)
+}
+
+pub(crate) fn budget_in(conn: &Connection, owner: &str, id: &str) -> Result<ContextBudget> {
+    let value: String = conn.query_row(
+        "SELECT context_budget FROM sessions WHERE owner_id = ?1 AND id=?2",
         params![owner, id],
         |r| r.get(0),
     )?;
@@ -156,6 +173,29 @@ fn totals_in(conn: &Connection, owner: &str, id: &str) -> Result<UsageTotals> {
 }
 
 impl Store {
+    pub(crate) fn requested_budget(&self, id: &str) -> Result<ContextBudget> {
+        budget_in(&self.conn(), self.owner_id(), id)
+    }
+    pub(crate) fn initial_budget(&self, id: &str, value: ContextBudget) -> Result<()> {
+        self.conn().execute(
+            "UPDATE sessions SET context_budget=?3 WHERE owner_id = ?1 AND id=?2 AND lifecycle='starting'",
+            params![self.owner_id(), id, serde_json::to_value(value)?.as_str()],
+        )?;
+        Ok(())
+    }
+    pub fn set_context_budget(&self, id: &str, requested: ContextBudget) -> Result<bool> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let value = serde_json::to_value(requested)?;
+        let changed = tx.execute(
+            "UPDATE sessions SET context_budget=?3 WHERE owner_id = ?1 AND id=?2 AND lifecycle<>'deleted'
+             AND (context_budget_attached IS NOT NULL OR ?3='inherit')
+             AND NOT EXISTS(SELECT 1 FROM purged_hats h WHERE h.owner_id = ?1 AND h.hat_id=sessions.hat_id)",
+            params![self.owner_id(), id, value.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(changed > 0)
+    }
     pub(crate) fn requested_retention(&self, id: &str) -> Result<CacheRetention> {
         retention_in(&self.conn(), self.owner_id(), id)
     }
@@ -170,16 +210,31 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)?;
         let owner = self.owner_id();
-        let row: Option<(String, String, Option<String>, Option<String>)> = tx
+        let row: Option<UsageRow> = tx
             .query_row(
-                "SELECT agent,hat_id,usage_context,cache_retention_attached FROM sessions s
+                "SELECT agent,hat_id,usage_context,cache_retention_attached,context_budget_attached FROM sessions s
              WHERE owner_id = ?1 AND id=?2 AND lifecycle<>'deleted'
              AND NOT EXISTS(SELECT 1 FROM purged_hats h WHERE h.owner_id = ?1 AND h.hat_id=s.hat_id)",
                 params![owner, id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| {
+                    Ok(UsageRow {
+                        source: r.get(0)?,
+                        hat: r.get(1)?,
+                        context: r.get(2)?,
+                        retention_attached: r.get(3)?,
+                        budget_attached: r.get(4)?,
+                    })
+                },
             )
             .optional()?;
-        let Some((source, hat, context, attached)) = row else {
+        let Some(UsageRow {
+            source,
+            hat,
+            context,
+            retention_attached: attached,
+            budget_attached,
+        }) = row
+        else {
             return Ok(None);
         };
         let session = totals_in(&tx, owner, id)?;
@@ -275,6 +330,11 @@ impl Store {
                 supported: attached.is_some(),
                 requested: retention_in(&tx, owner, id)?,
                 attached_request: attached.map(|s| serde_json::from_str(&s)).transpose()?,
+            },
+            budget: BudgetState {
+                supported: budget_attached.is_some(),
+                requested: budget_in(&tx, owner, id)?,
+                attached_request: budget_attached.map(|s| serde_json::from_str(&s)).transpose()?,
             },
         }))
     }

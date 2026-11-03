@@ -197,6 +197,7 @@ mod tests {
     }
     fn config() -> SessionConfig {
         SessionConfig {
+            context_budget: Default::default(),
             cache_retention: Default::default(),
             model: Some("model-a".into()),
             mode: Some("full".into()),

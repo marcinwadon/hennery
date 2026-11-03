@@ -473,6 +473,8 @@ END;",
      ALTER TABLE sessions ADD COLUMN cache_retention_attached TEXT;",
     "CREATE INDEX families_usage_root ON session_families(owner_id,root_id,hat_id);
      CREATE INDEX turns_usage_state ON turns(owner_id,session_id,state);",
+    "ALTER TABLE sessions ADD COLUMN context_budget TEXT NOT NULL DEFAULT 'inherit';
+     ALTER TABLE sessions ADD COLUMN context_budget_attached TEXT;",
 ];
 
 /// The most distinct (agent session id, roots) pairs a session records
@@ -2418,6 +2420,7 @@ impl Store {
         };
         row.config = stored_config(config)?;
         row.config.cache_retention = self.requested_retention(id)?;
+        row.config.context_budget = self.requested_budget(id)?;
         Ok(Some(row))
     }
 
@@ -3394,6 +3397,7 @@ impl Store {
                  mcp_source_requested = NULL, mcp_source_applied = NULL,
                  usage_context = NULL, usage_cost = NULL, usage_totals = NULL,
                  cache_retention = 'inherit', cache_retention_attached = NULL,
+                 context_budget = 'inherit', context_budget_attached = NULL,
                  idle_pinned = 0, idle_hold_dirty = 0, prompt_queue_dirty = 0, prompt_queue_held = 0, sidebar_pinned = 0
              WHERE id = ?1 AND owner_id = ?2",
             [session_id, &self.owner],
@@ -3705,6 +3709,7 @@ impl Store {
         let config = stored_config(config)?;
         let mut config = config;
         config.cache_retention = crate::usage::retention_in(&tx, &self.owner, session_id)?;
+        config.context_budget = crate::usage::budget_in(&tx, &self.owner, session_id)?;
         let (given, cut) = self.deliver_in(&tx, session_id, &host_id, &stored_hat, mcp, &ts)?;
         commit_then_cut(tx, self.mcp().as_ref(), cut)?;
         Ok(ResumeRequest::Starting {
@@ -4139,6 +4144,14 @@ impl Store {
                             self.owner,
                             session_id,
                             indexed.cache_retention.map(|v| serde_json::to_string(&v)).transpose()?
+                        ],
+                    )?;
+                    tx.execute(
+                        "UPDATE sessions SET context_budget_attached=?3 WHERE owner_id = ?1 AND id=?2",
+                        params![
+                            self.owner,
+                            session_id,
+                            indexed.context_budget.map(|v| serde_json::to_string(&v)).transpose()?
                         ],
                     )?;
                     // Where the agent keeps this session's data (plan 9d

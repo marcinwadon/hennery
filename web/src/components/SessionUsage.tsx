@@ -1,5 +1,5 @@
 import type { SessionUsageState } from '../hooks/useSessionUsage'
-import type { CacheRetention, ContextUsage, ReportedCost, TokenUsage, UsageTotals } from '../generated/protocol'
+import type { CacheRetention, ContextBudget, ContextUsage, ReportedCost, TokenUsage, UsageTotals } from '../generated/protocol'
 import { agentLabel } from '../lib/agent'
 import { useId } from 'react'
 import '../styles/usage.css'
@@ -85,6 +85,18 @@ export default function UsagePanel({ state, away, compact, compacting, onCompact
     <Totals title="This session" total={u.session} source={source} />
     <Totals title="Family" total={u.family.totals} source="Family" family subtitle={`${u.family.truncated ? 'At least ' : ''}${u.family.sessions} ${u.family.sessions === 1 ? 'session' : 'sessions'}`} />
     <p className={u.family.totals.partial ? 'usage-coverage' : 'usage-note'}>{u.family.reporting_sessions} of {u.family.sessions} sessions reporting tokens. {u.family.cost_reporting_sessions} reporting cost.{u.family.truncated ? ' This large family is partially summarized.' : ''}</p>
+    {u.budget && <fieldset className="usage-retention" disabled={state.saving}><legend>Automatic compaction</legend>
+      {u.budget.supported ? <>
+        <label className="usage-note">Context budget <select className="usage-budget-select" aria-label="Automatic compaction budget" value={u.budget.requested}
+          onChange={event => { void state.setBudget(event.target.value as ContextBudget) }}>
+          <option value="inherit">Runtime default</option><option value="100k">100k tokens</option><option value="200k">200k tokens</option><option value="500k">500k tokens</option><option value="1m">1M tokens</option>
+        </select></label>
+        <p className="usage-note">{u.budget.requested === 'inherit' ? 'Uses your agent’s automatic-compaction settings.' : 'Requests a compaction budget within the model’s actual context window. Smaller budgets can compact earlier.'}
+          {u.budget.requested !== u.budget.attached_request ? ' Takes effect on the next resume.' : ' This request was passed at the last attachment.'}
+          {' Your agent’s automatic compaction must be enabled. The agent chooses the exact boundary. Summaries can omit details and compaction costs tokens; savings are not guaranteed.'}</p>
+      </> : <p className="usage-note">Automatic compaction is not available for {source} on this host.</p>}
+      {!u.budget.supported && u.budget.requested !== 'inherit' && <button type="button" className="btn btn-sm" onClick={() => void state.setBudget('inherit')}>Use default compaction</button>}
+    </fieldset>}
     <fieldset className="usage-retention" disabled={state.saving}><legend>Prompt cache retention</legend>
       {u.retention.supported ? <><div className="usage-retention-options">{options.map(([value, label]) => <label key={value}><input type="radio" name={radioName} value={value} checked={u.retention.requested === value} onChange={() => void state.setRetention(value)} /><span>{label}</span></label>)}</div>
         <p className="usage-note">{u.retention.requested === 'inherit' ? 'Uses your Claude settings. Applies to the main conversation.' : `Requested ${u.retention.requested === '1h' ? '1 hour' : '5 min'} for the main conversation.`}

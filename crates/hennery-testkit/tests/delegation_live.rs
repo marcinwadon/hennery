@@ -347,6 +347,7 @@ async fn live_claude_haiku_plan_configuration_survives_late_updates() -> Result<
     let (agent, profile) = command(&cwd, "claude", false)?;
     let (uplink, _replies) = Uplink::new(Outbox::open_in_memory()?);
     let wanted = SessionConfig {
+        context_budget: Default::default(),
         cache_retention: Default::default(),
         model: Some("haiku".into()),
         mode: Some("plan".into()),
@@ -1609,6 +1610,42 @@ async fn pinned_runtime_provider_authentication() -> Result<()> {
 }
 
 #[tokio::test]
+#[ignore = "requires explicit pinned adapter and copied credentials; performs two inferences"]
+async fn pinned_runtime_context_budget() -> Result<()> {
+    use hennery_proto::usage::ContextBudget;
+    let runtime = runtime("HENNERY_D4_PARENT")?;
+    let h = Harness::new(&runtime, None).await?;
+    let result = async {
+        // Native agents can defer transcript persistence until the first turn.
+        let first = h.prompt(&h.parent, "Reply with exactly HENNERY_BUDGET_SEED. Do not call any tools.").await?;
+        let first_outcome = h.wait("initial persisted turn", || h.state.store.ended_turn_outcome(&first).ok().flatten()).await?;
+        ensure!(first_outcome == hennery_proto::frames::TurnOutcome::Completed, "initial native turn did not complete");
+        let response = h.client.patch(format!("{}/api/sessions/{}/context-budget", h.url, h.parent))
+            .json(&json!({"requested":"100k"})).send().await?;
+        ensure!(response.status() == reqwest::StatusCode::OK, "budget preference refused");
+        let response = h.client.post(format!("{}/api/sessions/{}/park", h.url, h.parent)).send().await?;
+        ensure!(response.status() == reqwest::StatusCode::ACCEPTED, "scratch park refused");
+        h.wait("scratch parent parked", || h.state.store.find_session(&h.parent).ok().flatten().filter(|s|s.lifecycle == "parked")).await?;
+        let response = h.client.post(format!("{}/api/sessions/{}/resume", h.url, h.parent)).send().await?;
+        ensure!(response.status() == reqwest::StatusCode::ACCEPTED, "scratch resume refused: {}", response.status());
+        h.wait("budget attachment acknowledgement", || h.state.store.session_usage(&h.parent).ok().flatten()
+            .filter(|u| u.budget.attached_request == Some(ContextBudget::Tokens100K))).await?;
+        let turn = h.prompt(&h.parent, "Reply with exactly HENNERY_BUDGET_OK. Do not call any tools.").await?;
+        let outcome = h.wait("budgeted turn completion", || h.state.store.ended_turn_outcome(&turn).ok().flatten()).await?;
+        ensure!(outcome == hennery_proto::frames::TurnOutcome::Completed, "budgeted native turn did not complete: {outcome:?}");
+        let u = h.state.store.session_usage(&h.parent)?.context("usage projection")?;
+        ensure!(u.budget.supported && u.budget.requested == ContextBudget::Tokens100K, "saved budget mismatch");
+        println!("{}", json!({"case":"native_context_budget","runtime":runtime,"budget":u.budget,"outcome":outcome,"compaction_triggered":false}));
+        Ok(())
+    }.await;
+    if result.is_err() {
+        h.diagnostics("budget acceptance failed")?;
+    }
+    let cleanup = h.finish().await;
+    result.and(cleanup)
+}
+
+#[tokio::test]
 #[ignore = "requires explicit pinned adapter and copied credentials; performs one inference"]
 async fn pinned_runtime_usage_observations() -> Result<()> {
     let runtime = runtime("HENNERY_D4_PARENT")?;
@@ -1830,6 +1867,7 @@ fn codex_parent_medium_is_explicit_catalog_checked_and_does_not_raise_child_effo
             json!({"id":"reasoning_effort","options":[{"value":"low"},{"value":"medium"}]}),
         ],
         defaults: SessionConfig {
+            context_budget: Default::default(),
             cache_retention: Default::default(),
             model: Some("gpt-6-sol".into()),
             mode: Some("read-only".into()),
